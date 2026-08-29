@@ -182,6 +182,50 @@ fn elevation_type_option(cfg: &Config) -> Res<Vec<String>> {
     })
 }
 
+/// How many COGs go in one VRT shard, so that `len` items make at most `jobs`
+/// shards and every item lands in exactly one.
+///
+/// Ceiling division, so the remainder rides in the existing shards rather than
+/// forming a `jobs + 1`th one. Never zero: `chunks(0)` panics, and a zero here
+/// would come from an empty list, which the caller refuses separately.
+fn shard_size(len: usize, jobs: usize) -> usize {
+    len.div_ceil(jobs.max(1)).max(1)
+}
+
+/// GLO-30's pixels per degree at full resolution, from the COG headers.
+///
+/// Every tile is 3600 rows to the degree. Columns thin towards the poles --
+/// measured 3600 at N39 and S45, 1800 at N60, 720 at N80 -- so this is the
+/// *row* figure, which is the one that does not vary.
+const GLO30_PX_PER_DEGREE: u32 = 3600;
+
+/// How many overview levels a GLO-30 COG carries.
+///
+/// Read from the headers, not from the product spec: 1800 / 900 / 450 rows, on
+/// all four of N39 W106, N60 E010, N80 W060 and S45 W070. The count is the same
+/// at every latitude even though the column counts are not, so level 2 is the 8x
+/// reduction everywhere.
+const GLO30_OVERVIEW_LEVELS: u32 = 3;
+
+/// The deepest COG overview level still finer than a `target_px`-wide global
+/// grid, or `None` to read full resolution.
+///
+/// **Deepest-that-is-still-finer, never merely deepest.** Going one level too
+/// far would hand the warp a mosaic coarser than the grid it feeds, which is
+/// upsampling: it would invent detail rather than skip detail the output cannot
+/// hold. So the search walks outward from full resolution and stops before it
+/// would cross the target.
+///
+/// Returns a level for GDAL's `OVERVIEW_LEVEL` open option, which is 0-based on
+/// the *first* overview -- level 0 is the 2x reduction, so level `n` is
+/// `2^(n+1)`.
+fn global_overview_level(target_px: u32) -> Option<u32> {
+    (0..GLO30_OVERVIEW_LEVELS).rfind(|level| {
+        let reduction = 1u32 << (level + 1);
+        (360 * GLO30_PX_PER_DEGREE) / reduction >= target_px
+    })
+}
+
 /// The VRT naming every COG, built by `jobs` shards in parallel.
 ///
 /// **This phase is pure network latency and it must be parallel.** Building it
@@ -198,26 +242,32 @@ fn elevation_type_option(cfg: &Config) -> Res<Vec<String>> {
 /// The shards are combined by a second `gdalbuildvrt` over the part VRTs, which
 /// opens `jobs` local files and no COGs at all.
 ///
-/// **`-resolution highest`, and it is load-bearing twice over.** The default is
-/// `average`, which is not shard-invariant: the average of per-shard averages is
-/// not the global average, so sharding alone would silently move the mosaic's
-/// pixel size. `highest` is a minimum, and a minimum of minima is the global
-/// minimum, so the sharded VRT and the single-pass one describe the same raster.
-/// It is also the better value on its own merits here: GLO-30 is 1 arcsec at the
-/// equator, about 1,296,000 px around, against a z12 target grid of 1,048,576 --
-/// so under `average` the mosaic was coarser than the grid it feeds and the warp
-/// was upsampling. The output geometry is set by [`crate::grid::extent`] either
-/// way; this only decides what the warp gets to read.
-/// How many COGs go in one VRT shard, so that `len` items make at most `jobs`
-/// shards and every item lands in exactly one.
+/// **`-resolution highest` is shard-invariant, which is why it is used.** The
+/// default is `average`, and the average of per-shard averages is not the global
+/// average -- so sharding alone would silently move the mosaic's pixel size.
+/// `highest` is a minimum, and a minimum of minima is the global minimum, so the
+/// sharded VRT and a single-pass one describe the same raster.
 ///
-/// Ceiling division, so the remainder rides in the existing shards rather than
-/// forming a `jobs + 1`th one. Never zero: `chunks(0)` panics, and a zero here
-/// would come from an empty list, which the caller refuses separately.
-fn shard_size(len: usize, jobs: usize) -> usize {
-    len.div_ceil(jobs.max(1)).max(1)
-}
-
+/// **`-oo OVERVIEW_LEVEL` is what stops the warp reading the whole DEM, and it
+/// cost a night's compute to learn.** A VRT does not expose its sources'
+/// overviews, so `gdalwarp` reads the level the VRT declares. MEASURED on the
+/// build box: without this, the global z8 warp pulled **240 GB in 3.75 hours at
+/// a flat 21 MB/s and 1% CPU**, on course for roughly 650 GB and six more hours,
+/// because it was reading near-full-resolution pixels to make a 65,536 px grid.
+///
+/// The arithmetic it was missing: GLO-30 is 3600 px per degree, so the full
+/// mosaic is 1,296,000 px around against a 65,536 px target -- **19.8x more
+/// detail than the output can hold**. Opening each COG at its 8x overview gives
+/// a 162,000 px mosaic, still 2.5x finer than the target, for about 21 GB
+/// instead of 650. Nothing is lost that the warp was not going to throw away.
+///
+/// The level is derived from the target grid by [`global_overview_level`] rather
+/// than hardcoded, because it is only correct relative to
+/// `raster_global_maxzoom`; a deeper global zoom needs a shallower overview.
+///
+/// This applies to the GLOBAL mosaic alone. The per-super-cell VRTs at high
+/// zooms are built full-resolution, which is correct -- there the target grid is
+/// finer than the source and there is nothing to skip.
 fn build_global_vrt(cfg: &Config, list: &TileList) -> Res<PathBuf> {
     let vrt = cfg.work.join("global.vrt");
     if vrt.exists() {
@@ -235,11 +285,34 @@ fn build_global_vrt(cfg: &Config, list: &TileList) -> Res<PathBuf> {
         .enumerate()
         .collect();
 
-    log!(
-        "building global VRT over {} COGs (/vsis3/) in {} shards, {jobs} jobs",
-        tiles.len(),
-        shards.len()
+    // The grid this mosaic exists to feed. The overview level is only correct
+    // relative to it, so it is read from the same place the warp reads it.
+    let target = crate::grid::extent(
+        cfg.raster_global_maxzoom,
+        -180.0,
+        -squallar_geo::MERCATOR_LAT_LIMIT_DEG,
+        180.0,
+        squallar_geo::MERCATOR_LAT_LIMIT_DEG,
     );
+    let overview = global_overview_level(target.nx);
+
+    match overview {
+        Some(level) => log!(
+            "building global VRT over {} COGs (/vsis3/) in {} shards, {jobs} jobs, \
+             at overview level {level} ({}x) for a {}px grid",
+            tiles.len(),
+            shards.len(),
+            1u32 << (level + 1),
+            target.nx
+        ),
+        None => log!(
+            "building global VRT over {} COGs (/vsis3/) in {} shards, {jobs} jobs, \
+             at FULL RESOLUTION -- the {}px grid is finer than any overview",
+            tiles.len(),
+            shards.len(),
+            target.nx
+        ),
+    }
 
     let stage = cfg.work.join("vrt-shards");
     std::fs::create_dir_all(&stage)?;
@@ -253,17 +326,17 @@ fn build_global_vrt(cfg: &Config, list: &TileList) -> Res<PathBuf> {
             .collect();
         let list_file = stage.join(format!("shard-{i:04}.txt"));
         std::fs::write(&list_file, paths)?;
-        run(cmd(
-            "gdalbuildvrt",
-            &[
-                "-q",
-                "-resolution",
-                "highest",
-                "-input_file_list",
-                list_file.to_string_lossy().as_ref(),
-                shard_vrt(*i).to_string_lossy().as_ref(),
-            ],
-        ))
+
+        let mut args: Vec<String> = vec!["-q".into(), "-resolution".into(), "highest".into()];
+        if let Some(level) = overview {
+            args.push("-oo".into());
+            args.push(format!("OVERVIEW_LEVEL={level}"));
+        }
+        args.push("-input_file_list".into());
+        args.push(list_file.to_string_lossy().into_owned());
+        args.push(shard_vrt(*i).to_string_lossy().into_owned());
+
+        run(cmd("gdalbuildvrt", &args))
     });
     if failed > 0 {
         return Err(format!("{failed} of {} VRT shards failed", shards.len()).into());
@@ -661,6 +734,72 @@ mod tests {
         // NON-VACUITY: the unsharded build is what this must not collapse back
         // to, and it is a different number.
         assert_ne!(size, 26_450);
+    }
+
+    /// **The global z8 grid picks the 8x overview, and that is the whole fix.**
+    ///
+    /// Pinned as concrete numbers because the failure it prevents was measured
+    /// and expensive: without an overview the warp read near-full-resolution
+    /// pixels, 240 GB in 3.75 hours, to fill a grid that cannot hold them.
+    #[test]
+    fn the_global_grid_reads_the_deepest_overview_that_is_still_finer() {
+        // z8 global: 256 * 2^8 = 65,536 px.
+        let level = global_overview_level(65_536).expect("z8 has a usable overview");
+        assert_eq!(level, 2, "the 8x level");
+
+        let mosaic = (360 * GLO30_PX_PER_DEGREE) / (1 << (level + 1));
+        assert_eq!(mosaic, 162_000);
+        assert!(
+            mosaic >= 65_536,
+            "the chosen overview must not be coarser than the grid it feeds"
+        );
+
+        // NON-VACUITY, and it has to read the FUNCTION's answer rather than
+        // compare two literals -- the first spelling of this was
+        // `1_296_000 > 19 * 65_536`, which clippy correctly called an assertion
+        // that is always true. This one fails if the chosen level ever collapses
+        // to a token reduction.
+        let full = 360 * GLO30_PX_PER_DEGREE;
+        assert!(
+            mosaic * 7 < full,
+            "the chosen overview reduces {full} to {mosaic}, which is not the \
+             large reduction this exists for"
+        );
+    }
+
+    /// **It steps back rather than upsampling**, at every level.
+    ///
+    /// One level too deep hands the warp a mosaic coarser than its target, which
+    /// invents detail instead of skipping it. Walked across the whole range so
+    /// the boundary is pinned from both sides rather than at one point.
+    #[test]
+    fn a_finer_grid_forces_a_shallower_overview() {
+        for level in 0..GLO30_OVERVIEW_LEVELS {
+            let mosaic = (360 * GLO30_PX_PER_DEGREE) / (1 << (level + 1));
+            // Exactly at the mosaic width, this level still fits.
+            assert_eq!(
+                global_overview_level(mosaic),
+                Some(level),
+                "at {mosaic}px the {level} level is exactly finest-that-fits"
+            );
+            // One pixel finer, it must not be chosen.
+            let chosen = global_overview_level(mosaic + 1);
+            assert!(
+                chosen.is_none() || chosen.unwrap() < level,
+                "at {}px it kept level {level}, which is coarser than the target",
+                mosaic + 1
+            );
+        }
+    }
+
+    /// A grid finer than every overview reads full resolution rather than
+    /// quietly picking the least-bad one.
+    #[test]
+    fn a_grid_finer_than_every_overview_reads_full_resolution() {
+        assert_eq!(global_overview_level(1_296_000), None);
+        assert_eq!(global_overview_level(u32::MAX), None);
+        // And the coarsest useful case still resolves.
+        assert_eq!(global_overview_level(1), Some(GLO30_OVERVIEW_LEVELS - 1));
     }
 
     /// `chunks(0)` panics, so the floor is not cosmetic.
