@@ -1,5 +1,5 @@
-use super::map_overlays::draw_tile_layer;
 use crate::actions::GuiAction;
+use squallar_overlays::render::overlay_state::PaneRef;
 use squallar_radar::hover::{HoverSource, Reading};
 use squallar_radar::types::RenderView;
 use squallar_source::id::known;
@@ -59,10 +59,28 @@ impl super::Gui {
 
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
-        self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        let mut tiles_owned = self.map_tiles.take_base_tiles();
-
         let pane_count = self.visible_pane_count();
+        // The base slot follows the BasemapTiles layer exactly as the terrain
+        // slot follows Terrain: built only while a visible pane draws it,
+        // released the frame none does. The per-source-layer choices are read
+        // off the layer's declared control surface — the sanctioned door to a
+        // handler's own fields — and a changed set rebuilds the source inside
+        // `ensure_base_tiles`.
+        let basemap_on = self.panes[..pane_count]
+            .iter()
+            .any(|pane| pane.is_overlay_enabled(&known::BASEMAP_TILES));
+        if basemap_on {
+            let disabled = crate::basemap_layer::disabled_from_controls(
+                &self
+                    .overlays
+                    .controls(&known::BASEMAP_TILES, &PaneRef::bare(0)),
+            );
+            self.map_tiles
+                .ensure_base_tiles(is_dark_theme, &disabled, &ctx);
+        } else {
+            self.map_tiles.release_base_tiles();
+        }
+        let mut tiles_owned = self.map_tiles.take_base_tiles();
         // The terrain slot follows the layer, not the frame: built only while
         // a visible pane draws it, released the frame none does. A disabled
         // layer must cost zero network, and a source that exists is a source
@@ -232,7 +250,12 @@ impl super::Gui {
                             self.record_pane_content(pane_idx, RenderView::PlanView, pane_rect);
                             let tile_zoom_bias =
                                 tile_zoom_biases.get(pane_idx).copied().unwrap_or(0);
-                            if let Some(tiles) = tiles_owned.as_mut() {
+                            // No tile gate: the Map widget carries the layer
+                            // walk, gestures and every overlay, so it runs
+                            // whether or not a base source exists this frame
+                            // (the BasemapTiles arm inside the walk is what
+                            // draws the ground, when the pane has it on).
+                            {
                                 Map::new(None, &mut map_memory, center)
                                     .zoom_with_ctrl(false)
                                     .panning(false)
@@ -253,14 +276,6 @@ impl super::Gui {
                                     .show(&mut child_ui, |ui, _response, projector, memory| {
                                         let zoom = memory.zoom();
 
-                                        let basemap_labels = draw_tile_layer(
-                                            ui,
-                                            projector,
-                                            zoom,
-                                            tiles,
-                                            tile_zoom_bias,
-                                        );
-
                                         if let Some(gesture) = gesture {
                                             if self.section_draw_armed() {
                                                 self.track_section_draw(
@@ -280,7 +295,8 @@ impl super::Gui {
                                             user_location,
                                             user_heading,
                                             user_fix: user_fix.clone(),
-                                            basemap_labels,
+                                            basemap_labels: Vec::new(),
+                                            basemap_tiles: tiles_owned.as_mut(),
                                             terrain_tiles: terrain_owned.as_mut(),
                                             tile_zoom_bias,
                                             overlay_render_limit,
@@ -1242,7 +1258,11 @@ impl super::Gui {
 
         let overlay_render_limit = self.concurrent_renders;
 
-        let (strip, tiles) = (strip?, tiles?);
+        // `tiles` stays an `Option`: the strip is the pane's projector and
+        // floor for every ground layer, not just the base tiles, so a released
+        // base slot (BasemapTiles off everywhere) must not take the whole
+        // floor with it.
+        let strip = strip?;
         let mut map_memory = map_memory;
         let map_memory = &mut map_memory;
 
@@ -1272,7 +1292,6 @@ impl super::Gui {
             .drag_pan_buttons(egui::DragPanButtons::empty())
             .show(&mut strip_ui, |ui, _response, projector, memory| {
                 let zoom = memory.zoom();
-                let basemap_labels = draw_tile_layer(ui, projector, zoom, tiles, tile_zoom_bias);
 
                 self.map_pane_geo
                     .insert(pane_idx, map_pane_geo_from(projector, strip));
@@ -1284,7 +1303,8 @@ impl super::Gui {
                     user_location,
                     user_heading,
                     user_fix,
-                    basemap_labels,
+                    basemap_labels: Vec::new(),
+                    basemap_tiles: tiles,
                     terrain_tiles: terrain,
                     tile_zoom_bias,
                     overlay_render_limit,

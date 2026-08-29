@@ -5,16 +5,18 @@ use squallar_source::handler::SourceHandler;
 use squallar_source::id::LayerId;
 
 /// Every layer the app registers, in registration order: the overlays crate's
-/// fourteen, radar's one, and this crate's own Terrain — a streaming-tile
-/// layer whose entire engine (archive source, decode, remap, draw) lives in
-/// this crate's tile machinery, so this crate is the one that owns it.
+/// fourteen, radar's one, and this crate's own two — Terrain and BasemapTiles,
+/// streaming-tile layers whose entire engine (archive source, decode, draw)
+/// lives in this crate's tile machinery, so this crate is the one that owns
+/// them.
 pub fn all() -> Vec<Box<dyn SourceHandler>> {
     squallar_overlays::render::handlers::sources()
         .into_iter()
         .chain(squallar_radar::source::sources())
-        .chain(std::iter::once(
+        .chain([
             Box::new(crate::terrain::TerrainHandler::new()) as Box<dyn SourceHandler>,
-        ))
+            Box::new(crate::basemap_layer::BasemapTilesHandler::new()) as Box<dyn SourceHandler>,
+        ])
         .collect()
 }
 
@@ -33,7 +35,7 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 /// the thing it is meant to floor compares the registry against itself and
 /// cannot fail — the shape that cost this campaign an entire class of pins.
 #[cfg(test)]
-pub(crate) const REGISTERED_LAYER_COUNT: usize = 16;
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 17;
 
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
@@ -229,15 +231,15 @@ mod controls_parity_tests {
     /// options. A handler whose disabled tree shrank stranded its
     /// sub-options exactly when a user goes looking for why a layer is off
     /// or what it will show once on (the M9.1 user report), so each of the
-    /// sixteen is pinned by name.
+    /// seventeen is pinned by name.
     #[test]
     fn every_handlers_control_tree_is_identical_hidden_and_shown() {
         let mut registry = OverlayRegistry::with_handlers(all());
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            16,
-            "the registry carries all sixteen handlers, and the walk below \
+            17,
+            "the registry carries all seventeen handlers, and the walk below \
              must cover every one"
         );
         let ctx = PaneRef::bare(0);
@@ -262,7 +264,8 @@ mod state_key_tests {
     /// Every name saved handler state has ever been filed under, as a
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
-    const STATE_KEYS: [&str; 16] = [
+    const STATE_KEYS: [&str; 17] = [
+        "BasemapTiles",
         "Terrain",
         "Gmgsi",
         "ModelData",
@@ -283,7 +286,7 @@ mod state_key_tests {
 
     /// **The tripwire on the bytes saved handler state is filed under.**
     #[test]
-    fn handler_state_keys_are_the_sixteen_names_saved_configs_file_state_under() {
+    fn handler_state_keys_are_the_seventeen_names_saved_configs_file_state_under() {
         let handlers = all();
         assert_eq!(
             handlers.len(),
@@ -300,7 +303,7 @@ mod state_key_tests {
         pinned.sort_unstable();
         assert_eq!(
             live, pinned,
-            "the registered ids are no longer exactly the sixteen names saved \
+            "the registered ids are no longer exactly the seventeen names saved \
              configs file handler state under — a rename or a retirement \
              orphans every user's saved state for that layer",
         );
@@ -384,6 +387,7 @@ mod registry_identity_tests {
             .map(|h| h.id().as_str().to_string())
             .collect();
         let expected: Vec<&str> = vec![
+            "BasemapTiles",
             "Terrain",
             "Gmgsi",
             "ModelData",
@@ -407,7 +411,7 @@ mod registry_identity_tests {
         );
     }
 
-    /// **Every layer's time axis, pinned by name over the composed sixteen.**
+    /// **Every layer's time axis, pinned by name over the composed seventeen.**
     ///
     /// Written as the whole map rather than as "the non-Live ones", so a new
     /// layer cannot join without this list saying what it does with the clock,
@@ -459,6 +463,9 @@ mod registry_identity_tests {
             extends_future: false,
         };
         let expected: Vec<(&str, TimeAxis)> = vec![
+            // One compiled-in archive generation; the ground does not move
+            // with the clock.
+            ("BasemapTiles", TimeAxis::Live),
             // The DEM is a 2021 release; the ground does not move with the
             // clock.
             ("Terrain", TimeAxis::Live),

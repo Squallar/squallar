@@ -59,7 +59,8 @@ const FRAMED_LAYERS: [&str; 4] = ["Gmgsi", "ModelData", "Mrms", "Radar"];
 /// layer declares is pinned by name in
 /// `sources::registry_identity_tests::every_layer_declares_what_it_does_with_the_clock`;
 /// this is the half of that map the residency law needs as a floor.
-const LIVE_LAYERS: [&str; 6] = [
+const LIVE_LAYERS: [&str; 7] = [
+    "BasemapTiles",
     "CityLabels",
     "ColorScale",
     "Metar",
@@ -808,7 +809,7 @@ fn every_stop_a_pane_can_make_is_inside_what_the_layer_asked_to_hold() {
     assert_eq!(
         ruled.len(),
         super::REGISTERED_LAYER_COUNT - LIVE_LAYERS.len(),
-        "ten of this build's sixteen layers read the depicted instant",
+        "ten of this build's seventeen layers read the depicted instant",
     );
 }
 

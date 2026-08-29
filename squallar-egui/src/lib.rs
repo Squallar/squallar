@@ -6,6 +6,13 @@ pub mod actions;
 /// base map source on native when the feature is on.
 #[cfg(feature = "basemap-vector")]
 pub mod basemap_archive;
+/// The BasemapTiles layer: the handler that makes the base map a Layers-panel
+/// citizen, and the per-source-layer toggle table. **Ungated**, unlike
+/// [`basemap_style`]: the layer exists on every build (a raster basemap is
+/// still the ground layer), and `tests/committed_styles_parse.rs` — an
+/// integration binary, which never sees `cfg(test)` items — pins the toggle
+/// table against the committed styles.
+pub mod basemap_layer;
 /// The two committed basemap styles, compiled in.
 ///
 /// **`any(feature, test)`, and both halves are load-bearing.** The `include_str!`

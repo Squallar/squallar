@@ -347,10 +347,17 @@ fn a_config_naming_an_unregistered_layer_is_written_back_byte_preserved() {
         "precondition: the unknown slot sits mid-list in the fixture, or \
          \"kept its position\" is satisfied by appending to the tail",
     );
+    // The one sanctioned addition: a ships-ENABLED layer the fixture predates
+    // joins at its own weight (BasemapTiles, weight 1 — the bottom). The
+    // file's own rows must still be the file's rows, in the file's order.
+    let expected: Vec<String> = std::iter::once("BasemapTiles".to_owned())
+        .chain(file_order.iter().cloned())
+        .collect();
     assert_eq!(
-        live_order, file_order,
-        "the loaded stack is not the file's stack - an unknown id must keep \
-         its saved position, and nothing else may move around it",
+        live_order, expected,
+        "the loaded stack is not the file's stack plus the ships-enabled \
+         join - an unknown id must keep its saved position, and nothing else \
+         may move around it",
     );
 
     // Direction 2: written back, in place, with its config intact.
@@ -362,6 +369,22 @@ fn a_config_naming_an_unregistered_layer_is_written_back_byte_preserved() {
         "the unknown slot did not come back preserved: a build without the \
          layer rewrote a layer it cannot serve",
     );
+    // The one sanctioned delta on save: the ships-enabled BasemapTiles row
+    // this build adds to a stack that predates it. Strip exactly that slot;
+    // every other byte must be the file's own.
+    let mut round_tripped = round_tripped;
+    {
+        let slots = round_tripped["panes"][0]["layer_slots"]
+            .as_array_mut()
+            .expect("layer_slots is a list");
+        let before = slots.len();
+        slots.retain(|slot| slot["id"].as_str() != Some("BasemapTiles"));
+        assert_eq!(
+            before,
+            slots.len() + 1,
+            "the ships-enabled join writes exactly one new slot, no more",
+        );
+    }
     assert_eq!(
         round_tripped, original,
         "the whole file moved under a build that has no arm for one of its \

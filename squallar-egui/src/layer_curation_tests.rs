@@ -409,11 +409,13 @@ fn terrain_appears_for_a_config_written_before_it_existed() {
         "a config that never heard of Terrain must not block adding it",
     );
     let order = gui.pane(0).expect("pane 0").draw_order_vec();
+    // Second from the bottom, not first: the ships-enabled BasemapTiles row
+    // (weight 1) sits under Terrain's 2 in every stack now.
     assert_eq!(
-        order.first(),
+        order.get(1),
         Some(&known::TERRAIN),
-        "Terrain's weight (2) puts it under everything the file named: \
-         {order:?}",
+        "Terrain's weight (2) puts it under everything the file named and \
+         above only the base tiles: {order:?}",
     );
     assert!(
         gui.pane(0)
@@ -428,7 +430,7 @@ fn terrain_appears_for_a_config_written_before_it_existed() {
     assert!(reopened.load_ui_config(&store_with(&saved)));
     let pane = reopened.pane(0).expect("pane 0");
     assert!(
-        pane.draw_order_vec().first() == Some(&known::TERRAIN)
+        pane.draw_order_vec().get(1) == Some(&known::TERRAIN)
             && pane.is_overlay_enabled(&known::TERRAIN),
         "the added Terrain row did not reopen where and how it was left",
     );
@@ -473,4 +475,182 @@ fn a_tombstoned_terrain_stays_removed() {
     // Non-triviality: the same load with no tombstone would have inserted it
     // (the test above), and the named slots are intact.
     assert!(order.contains(&known::RADAR));
+}
+
+/// **A config written before the BasemapTiles layer existed reopens with the
+/// base map present, ON, at the bottom** — additively, no migration, no
+/// CONFIG_VERSION bump. Unlike Terrain the layer ships ENABLED, so "served"
+/// here means the row really joins the old stack: the user's map looks
+/// exactly as it did, because the ground they were already seeing is now a
+/// row they can also curate.
+#[test]
+fn the_basemap_appears_on_at_the_bottom_for_a_config_written_before_it_existed() {
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "Radar", "enabled": true},
+                {"id": "NwsAlerts", "enabled": true}
+            ]
+        }]
+    }"#;
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(json)),
+        "the pre-BasemapTiles config must load",
+    );
+    let pane = gui.pane(0).expect("pane 0");
+    let order = pane.draw_order_vec();
+    assert_eq!(
+        order.first(),
+        Some(&known::BASEMAP_TILES),
+        "BasemapTiles ships enabled, so the old stack sprouts it at its own \
+         weight (1) — the bottom: {order:?}",
+    );
+    assert!(
+        pane.is_overlay_enabled(&known::BASEMAP_TILES),
+        "the ground the user was already seeing must stay shown",
+    );
+    assert!(
+        order.contains(&known::RADAR) && order.contains(&known::NWS_ALERTS),
+        "non-triviality: the file's own slots came through",
+    );
+
+    // Reopen is 1:1: present, on, and still at the bottom after a round trip.
+    let saved = gui.ui_config_json().expect("the config serializes");
+    let mut reopened = Gui::new();
+    assert!(reopened.load_ui_config(&store_with(&saved)));
+    let pane = reopened.pane(0).expect("pane 0");
+    assert!(
+        pane.draw_order_vec().first() == Some(&known::BASEMAP_TILES)
+            && pane.is_overlay_enabled(&known::BASEMAP_TILES),
+        "the BasemapTiles row did not reopen where and how it was left",
+    );
+}
+
+/// **A tombstoned BasemapTiles stays removed** — the removal contract for the
+/// id that did not exist when the tombstone mechanism shipped, and the
+/// sharper case: a ships-ENABLED layer is exactly what the reconcile most
+/// wants to put back.
+#[test]
+fn a_tombstoned_basemap_stays_removed() {
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "Radar", "enabled": true}
+            ],
+            "removed_layers": [
+                {"id": "BasemapTiles"}
+            ]
+        }]
+    }"#;
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(json)),
+        "the config must load"
+    );
+    let pane = gui.pane(0).expect("pane 0");
+    let order = pane.draw_order_vec();
+    assert!(
+        !order.contains(&known::BASEMAP_TILES),
+        "the tombstone is the one thing that excludes a registered layer, \
+         and the reconcile walked over it: {order:?}",
+    );
+    assert!(
+        !pane.is_overlay_enabled(&known::BASEMAP_TILES),
+        "a removed layer answers the draw gate with no, structurally",
+    );
+    // Non-triviality: the same load WITHOUT the tombstone inserts the row
+    // (the test above), and the named slot is intact.
+    assert!(order.contains(&known::RADAR));
+}
+
+/// **The per-source-layer choices reopen 1:1, and a config that predates them
+/// reopens at the defaults.** The choice moved is read back through the
+/// layer's own declared control surface — the door the inspector uses — so
+/// this is the whole path: control edit, handler state, save, load, control
+/// surface again.
+#[test]
+fn the_basemap_source_layer_choices_reopen_one_to_one() {
+    use squallar_source::controls::{ControlItem, ControlUpdate, ControlValue};
+
+    let toggle_state = |gui: &Gui, id: &str| -> Option<bool> {
+        gui.control_item_model_for_test(&known::BASEMAP_TILES)
+            .iter()
+            .find_map(|item| match item {
+                ControlItem::Toggle {
+                    id: got, enabled, ..
+                } if *got == id => Some(*enabled),
+                _ => None,
+            })
+    };
+
+    // A pre-toggle config: no `BasemapTiles` handler state at all.
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "Radar", "enabled": true}
+            ]
+        }]
+    }"#;
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store_with(json)));
+    assert_eq!(
+        toggle_state(&gui, "sl:water"),
+        Some(true),
+        "water ships ON and the old config said nothing about it",
+    );
+    assert_eq!(
+        toggle_state(&gui, "sl:poi"),
+        Some(false),
+        "poi ships OFF and the old config said nothing about it",
+    );
+
+    // Move two choices off their defaults, through the inspector's door.
+    for (id, value) in [("sl:water", false), ("sl:poi", true)] {
+        gui.apply_control_on_pane_for_test(
+            0,
+            &known::BASEMAP_TILES,
+            &ControlUpdate {
+                id,
+                value: ControlValue::Bool(value),
+            },
+        );
+    }
+    assert_eq!(
+        (toggle_state(&gui, "sl:water"), toggle_state(&gui, "sl:poi")),
+        (Some(false), Some(true)),
+        "precondition: the edits landed, or \"reopened\" below is a default",
+    );
+
+    let saved = gui.ui_config_json().expect("the config serializes");
+    let mut reopened = Gui::new();
+    assert!(reopened.load_ui_config(&store_with(&saved)));
+    assert_eq!(
+        (
+            toggle_state(&reopened, "sl:water"),
+            toggle_state(&reopened, "sl:poi"),
+        ),
+        (Some(false), Some(true)),
+        "the per-source-layer choices did not reopen 1:1",
+    );
+    // Control: a choice never touched reopens at its default.
+    assert_eq!(
+        toggle_state(&reopened, "sl:transportation"),
+        Some(true),
+        "an untouched toggle drifted through the round trip",
+    );
 }
