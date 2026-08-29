@@ -81,6 +81,12 @@ pub(crate) const TEXT_GLYPHS: &[(char, &str)] = &[
     ('\u{2264}', "at most (iso thresholds)"),
     ('\u{b5}', "micro (µs offsets)"),
     ('\u{a9}', "copyright (basemap attribution)"),
+    (
+        '\u{b7}',
+        "middle dot separating composed credits (basemap attribution) - the \
+         conventional joint between two providers' notices, where the ASCII \
+         ' - ' would read as part of the neighbouring credit's own words",
+    ),
 ];
 
 #[cfg(test)]

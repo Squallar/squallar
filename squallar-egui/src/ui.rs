@@ -1641,6 +1641,12 @@ impl Gui {
         &self.probes.last_attribution
     }
 
+    /// See [`crate::tiles::MapTileState::latch_base_unreachable_for_test`].
+    #[cfg(test)]
+    pub(crate) fn latch_base_unreachable_for_test(&mut self) {
+        self.map_tiles.latch_base_unreachable_for_test();
+    }
+
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
         &self.probes.widget_id_probes
