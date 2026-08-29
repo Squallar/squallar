@@ -158,9 +158,11 @@ fn archive_block_cache(
 ///
 /// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
 /// `tools/squallar-terrain/README.md` for the pinned provenance. Carried on
-/// the source like every other credit; the map panel today paints only the
-/// **base** source's credit line, so this reaches the glass only when that
-/// gap is closed (recorded there, not here).
+/// the source like every other credit, and read off it by the panel's one
+/// notice: while the terrain slot holds a source, `ui_map` appends this line
+/// to the base credit — one notice per panel still — and drops it the frame
+/// the slot is released, because an idle credit is clutter that dilutes the
+/// required ones.
 pub const TERRAIN_ATTRIBUTION_TEXT: &str = "\u{a9} Copernicus DEM 2021";
 
 /// The terrain hillshade tile source, or `None` when the archive URL will not
@@ -397,6 +399,17 @@ impl MapTileState {
     /// degraded state must be on the glass, not only in the log.
     pub fn base_archive_is_unreachable(&self) -> bool {
         self.base_unreachable
+    }
+
+    /// Put the base slot in the state a dead archive leaves it in: latched
+    /// unreachable, source dropped. For the credit-composition tests, which
+    /// need the latch without a real transport failure to raise it; what the
+    /// tests using it prove is therefore the *composition* given the latch,
+    /// not the latch's own raising.
+    #[cfg(test)]
+    pub(crate) fn latch_base_unreachable_for_test(&mut self) {
+        self.base_unreachable = true;
+        self.tiles = None;
     }
 
     /// Drop the base source: the last visible pane switched the BasemapTiles

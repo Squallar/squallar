@@ -1734,6 +1734,14 @@ impl InputHarness {
         self.gui.attribution_rects_for_test()
     }
 
+    /// Latch the basemap archive unreachable, as a dead host would. The
+    /// credit-composition test's door to the degraded base state; the terrain
+    /// slot is untouched, because the two archives are separate hosts.
+    pub(crate) fn latch_base_unreachable(&mut self) {
+        self.gui.latch_base_unreachable_for_test();
+        self.warm_up();
+    }
+
     /// Pan pane `idx` until `site`'s icon is drawn at `target`, as dragging the
     /// map there does.
     pub(crate) fn place_site_at(&mut self, idx: usize, site: &str, target: egui::Pos2) {

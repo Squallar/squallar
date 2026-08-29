@@ -15470,6 +15470,213 @@ fn the_basemap_credit_clears_the_bottom_chrome_at_every_width() {
     );
 }
 
+/// 66c. **The credit corner names every source actually painting — all four
+///      base x terrain states.**
+///
+/// The Terrain layer's hillshade is Copernicus DEM data, and its licence
+/// wants credit on the glass while its pixels are. The panel still paints
+/// **one** notice per panel: the Copernicus line joins the base credit after
+/// a middle dot while the terrain slot holds a source, and leaves with the
+/// layer — an idle credit is clutter that dilutes the required ones.
+///
+/// The two dimensions are independent because the two archives are separate
+/// hosts: a session whose basemap archive is latched unreachable but whose
+/// Terrain layer is drawing owes the Copernicus credit on the same line as
+/// the unreachable notice. Hence the enumeration, not two spot checks.
+///
+/// The unreachable rows drive the latch through the test door
+/// (`latch_base_unreachable`) rather than a real dead transport, so what
+/// they prove is the composition *given* the latch; the terrain dimension is
+/// driven through the real catalogue toggle in every row that needs it.
+#[test]
+fn the_credit_corner_names_every_source_actually_painting() {
+    use crate::tiles::{
+        ARCHIVE_ATTRIBUTION_TEXT, TERRAIN_ATTRIBUTION_TEXT, UNREACHABLE_ATTRIBUTION_TEXT,
+    };
+
+    for (unreachable, terrain_on) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.frame();
+        if terrain_on {
+            h.add_layer_from_catalog(&known::TERRAIN);
+            h.close_layers();
+        }
+        if unreachable {
+            h.latch_base_unreachable();
+        }
+        h.frame();
+
+        let case = format!("base unreachable: {unreachable}, terrain on: {terrain_on}");
+        let base = if unreachable {
+            UNREACHABLE_ATTRIBUTION_TEXT
+        } else {
+            ARCHIVE_ATTRIBUTION_TEXT
+        };
+        let expected = if terrain_on {
+            format!("{base} \u{b7} {TERRAIN_ATTRIBUTION_TEXT}")
+        } else {
+            base.to_owned()
+        };
+
+        let rects = h.attribution_rects().to_vec();
+        assert_eq!(
+            rects.len(),
+            1,
+            "{case}: drew {} credits; one per panel is the contract",
+            rects.len(),
+        );
+        let panel = h.map_panel_rect();
+        assert!(
+            h.text_painted_in(panel, &expected),
+            "{case}: the notice must read exactly {expected:?}; the credit \
+             runs painted in the panel are {:?}",
+            h.painted_text_rects()
+                .into_iter()
+                .filter(|(r, _)| rects[0].intersects(*r))
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+        );
+        // And nothing beyond the sources actually painting, either way round.
+        if !terrain_on {
+            assert!(
+                !h.text_painted_in(panel, "Copernicus"),
+                "{case}: Copernicus is credited while the Terrain layer is \
+                 off — an idle credit dilutes the required ones",
+            );
+        }
+        if unreachable {
+            assert!(
+                !h.text_painted_in(panel, "OpenStreetMap"),
+                "{case}: a provider credit while the archive is latched \
+                 unreachable — no provider pixels are on the glass",
+            );
+        }
+    }
+}
+
+/// 66d. **The Copernicus credit follows the Terrain layer's own controls —
+///      on through the catalogue's tile, off through the row's eye — and the
+///      wider composed notice still clears the bottom chrome.**
+///
+/// The toggle legs drive the credit through the chrome the user has, not a
+/// state poke: the catalogue tile is what turns the layer on, the stack
+/// row's eye is the layer's one visibility switch.
+///
+/// The geometry legs re-run 66b's collision scan with the composed, wider
+/// line up: 1200x874 with the transport expanded is the width 66b records as
+/// the one that failed before the span-based lift, and 1200x560 with four
+/// panes is its short-height clamp case. The composed notice is wider than
+/// the string that sweep pins, and a wider notice is exactly what walks back
+/// into a centred transport's right edge if the lift test reads anything but
+/// the drawn text's own span.
+#[test]
+fn the_copernicus_credit_follows_the_terrain_toggle() {
+    /// Overlap with area, as 66b counts it: a shared edge is the placement
+    /// working.
+    fn overlaps(a: egui::Rect, b: egui::Rect) -> bool {
+        let hit = a.intersect(b);
+        hit.width() > 0.0 && hit.height() > 0.0
+    }
+
+    for (w, ht, panes) in [(1200.0f32, 874.0f32, 1usize), (1200.0, 560.0, 4)] {
+        let mut h = InputHarness::with_screen(egui::vec2(w, ht));
+        h.set_pane_count(panes);
+        h.frame();
+        let case = format!("{w}x{ht}, {panes} pane(s)");
+        assert!(
+            !h.text_painted_in(h.map_panel_rect(), "Copernicus"),
+            "{case}: precondition — Terrain ships OFF, so a fresh panel owes \
+             no Copernicus credit",
+        );
+
+        // --- ON, through the catalogue's own tile.
+        h.add_layer_from_catalog(&known::TERRAIN);
+        h.close_layers();
+        h.frame();
+        let panel = h.map_panel_rect();
+        assert!(
+            h.text_painted_in(panel, "Copernicus DEM 2021"),
+            "{case}: Terrain is drawing and the Copernicus credit is not on \
+             the glass — a licence obligation, not a nicety",
+        );
+        let rects = h.attribution_rects().to_vec();
+        assert_eq!(
+            rects.len(),
+            1,
+            "{case}: the terrain credit must join the panel's one notice, \
+             not add a second",
+        );
+        let rect = rects[0];
+        assert!(
+            rect.width() > 0.0 && panel.contains_rect(rect),
+            "{case}: the composed credit at {rect:?} is not wholly inside \
+             the map panel {panel:?}",
+        );
+
+        // 66b's failure 3, for the wider line: drawn, on screen, and covered.
+        let transport = h.timeline();
+        let chrome: Vec<(&str, egui::Rect)> = [
+            ("status bar", h.status_bar().rect),
+            ("transport", transport.rect),
+            ("timeline chip", transport.chip),
+            ("phone bottom bar", h.bottom_bar().rect),
+        ]
+        .into_iter()
+        .filter(|(_, r)| r.is_finite())
+        .collect();
+        assert!(
+            !chrome.is_empty(),
+            "non-vacuity: {case} drew no bottom chrome at all, so the \
+             overlap scan below could not have failed",
+        );
+        for (name, bar) in &chrome {
+            assert!(
+                !overlaps(rect, *bar),
+                "{case}: the composed credit at {rect:?} is covered by the \
+                 {name} at {bar:?}",
+            );
+        }
+
+        // --- OFF, through the row's eye — the layer's one visibility switch.
+        h.open_layers();
+        let scroll_pos = h
+            .layers_panel_rect()
+            .expect("the layers panel was just opened")
+            .center();
+        let found = h.scroll_until(scroll_pos, egui::vec2(0.0, -120.0), 60, |h| {
+            h.stack_row(&known::TERRAIN)
+                .is_some_and(|row| h.screen_rect().contains(row.rect.center()))
+        });
+        assert!(
+            found,
+            "{case}: the stack never drew a Terrain row on screen"
+        );
+        let row = h
+            .stack_row(&known::TERRAIN)
+            .expect("the row was just found");
+        assert!(row.eye_on, "{case}: the eye must draw the live (on) state");
+        h.mouse_click(row.eye.center());
+        h.warm_up();
+        h.close_layers();
+        h.frame();
+        let panel = h.map_panel_rect();
+        assert!(
+            !h.text_painted_in(panel, "Copernicus"),
+            "{case}: the layer is off and its credit is still up — an idle \
+             credit is clutter that dilutes the required ones",
+        );
+        assert_eq!(
+            h.attribution_rects().len(),
+            1,
+            "{case}: the base credit must survive the terrain credit's exit",
+        );
+        assert!(
+            h.text_painted_in(panel, "OpenStreetMap"),
+            "{case}: the base credit's own words left with the terrain's",
+        );
+    }
+}
+
 /// **The base map is a layer-walk citizen: dispatched at the bottom of the
 /// pane's paint order while on, absent from it while off.**
 ///

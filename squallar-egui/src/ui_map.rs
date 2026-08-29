@@ -530,7 +530,7 @@ impl super::Gui {
                 // the archive has been found unreachable this session — to the
                 // line that says so: the honest degraded state has to be on
                 // the glass, not only in the log.
-                let credit = tiles_owned.as_ref().map_or(
+                let base_credit = tiles_owned.as_ref().map_or(
                     walkers::sources::Attribution {
                         text: if self.map_tiles.base_archive_is_unreachable() {
                             crate::tiles::UNREACHABLE_ATTRIBUTION_TEXT
@@ -543,12 +543,39 @@ impl super::Gui {
                     },
                     walkers::Tiles::attribution,
                 );
+                // The Terrain layer's credit joins the same notice — still
+                // one per panel — while the terrain slot holds a source. The
+                // slot is not a second source of truth for "is Terrain on":
+                // it is built and released at the top of this function off
+                // the one sanctioned read (a visible pane drawing the layer),
+                // plus the health latch — so `terrain_owned` is `Some`
+                // exactly while Copernicus pixels can reach the glass. A
+                // layer switched off, or one whose archive is dead so the
+                // layer draws nothing, keeps its credit off the glass too: an
+                // idle credit is clutter that dilutes the required ones, the
+                // same rule `UNREACHABLE_ATTRIBUTION_TEXT` follows in owing
+                // no copyright sign. The two archives are separate hosts, so
+                // every base state — the source's own credit, the fallback,
+                // the unreachable line — composes with the terrain credit
+                // independently. The text is the drawn source's own, read off
+                // `Tiles::attribution` exactly as the base's is; one
+                // hyperlink still, and it keeps the base credit's target —
+                // ODbL wants its notice reachable, and the Copernicus
+                // obligation is the visible words.
+                let credit_text = match terrain_owned.as_ref().map(walkers::Tiles::attribution) {
+                    Some(terrain_credit) => std::borrow::Cow::Owned(format!(
+                        "{} \u{b7} {}",
+                        base_credit.text, terrain_credit.text
+                    )),
+                    None => std::borrow::Cow::Borrowed(base_credit.text),
+                };
                 self.draw_basemap_attribution(
                     ui,
                     panel_rect,
                     horizontal_color_scale,
                     pane_count,
-                    credit,
+                    &credit_text,
+                    base_credit.url,
                 );
 
                 self.sync_viewports(&pre_zooms, &pre_positions);
@@ -705,7 +732,8 @@ impl super::Gui {
         panel_rect: egui::Rect,
         horizontal_color_scale: bool,
         pane_count: usize,
-        credit: walkers::sources::Attribution,
+        credit_text: &str,
+        credit_url: &str,
     ) {
         let ctx = ui.ctx();
 
@@ -735,7 +763,7 @@ impl super::Gui {
         );
 
         let right = free.right() - ATTRIBUTION_INSET;
-        let left = right - attribution_span(ui.painter(), credit.text);
+        let left = right - attribution_span(ui.painter(), credit_text);
         let (pivot, y) = match pane_render::color_scale_under_rect(chrome, horizontal_color_scale) {
             // Portrait: under the bar, hung off the top of the bar's own
             // margin so the notice's laid-out height cannot push it back over
@@ -789,10 +817,10 @@ impl super::Gui {
                 let words = ui.visuals().text_color();
                 super::shell::notice_frame(ui.visuals()).show(ui, |ui| {
                     ui.hyperlink_to(
-                        egui::RichText::new(credit.text)
+                        egui::RichText::new(credit_text)
                             .size(ATTRIBUTION_TEXT_SIZE)
                             .color(words),
-                        credit.url,
+                        credit_url,
                     );
                 });
             });
