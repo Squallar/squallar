@@ -412,6 +412,14 @@ impl InputHarness {
             prev_widgets: egui::WidgetRects::default(),
             facts: FrameFactsForTest::default(),
         };
+        // Before any frame runs: a built tile source is an IO thread making
+        // live range requests against the production archive, and the labels
+        // its tiles paint are `TextShape`s at arbitrary map positions — text
+        // that arrives on the glass if (and only if) enough wall-clock time
+        // passes while the test runs. Every painted-glass assertion in this
+        // harness's tests would then be load-sensitive. Offline, the glass
+        // holds exactly the UI's own text, however long the box takes.
+        harness.gui.go_offline_for_tests();
         harness.warm_up();
         // The first frame's `check_auto_polls` starts the initial fetch and
         // nothing here ever completes it, so without this every harness runs

@@ -458,6 +458,17 @@ mod runtime {
                 }
             }
         }
+
+        /// A runtime that owns no thread and never ran a task — the inert
+        /// source's slot. Dropping it sends the quit onto a channel nobody
+        /// holds, which is already a condition [`Runtime::drop`] shrugs at.
+        pub(crate) fn inert() -> Runtime {
+            let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+            Runtime {
+                join_handle: None,
+                quit_tx,
+            }
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -473,12 +484,17 @@ mod runtime {
             wasm_bindgen_futures::spawn_local(future);
             Runtime
         }
+
+        /// The inert slot: on this arm there was never a thread to not own.
+        pub(crate) fn inert() -> Runtime {
+            Runtime
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) use native::{Runtime, spawn};
+    pub(super) use native::{Runtime, inert, spawn};
     #[cfg(target_arch = "wasm32")]
-    pub(super) use web::{Runtime, spawn};
+    pub(super) use web::{Runtime, inert, spawn};
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,6 +1410,49 @@ impl HttpsTiles {
             io_task_gone_reported: false,
             pumps: 0,
             runtime,
+        }
+    }
+
+    /// A source that will never fetch: the shape of a just-built source —
+    /// its credit line carried, its header unread, its cache empty — held
+    /// forever, because no IO task exists behind it.
+    ///
+    /// **For [`crate::tiles::MapTileState::go_offline_for_tests`], and
+    /// nothing else.** A live source races the frames of whatever built it:
+    /// tiles that arrive paint label `TextShape`s at arbitrary positions,
+    /// and a transport fault latches the unreachable credit — either way a
+    /// unit test's glass changes with how much wall-clock time the test
+    /// took. Inert, the glass is the fast-test glass on every run: ground
+    /// pending, credit the provider's own, no thread, no socket.
+    ///
+    /// The far channel ends are dropped, so the first tile request trips the
+    /// once-only "tile IO task is gone" latch instead of queueing — the same
+    /// quiet the frame side already keeps when a real IO task has exited.
+    pub(crate) fn inert(attribution: Attribution, egui_ctx: Context) -> Self {
+        let (request_tx, _request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        let (_tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        let _ = &egui_ctx;
+
+        Self {
+            attribution,
+            tile_size: crate::tiles::TILE_SIDE_POINTS as u32,
+            max_zoom: Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN)),
+            fault: Arc::new(OnceLock::new()),
+            requests_closed: false,
+            cache: LruCache::new(TILE_CACHE_ENTRIES),
+            request_tx,
+            tile_rx,
+            #[cfg(target_arch = "wasm32")]
+            egui_ctx,
+            #[cfg(target_arch = "wasm32")]
+            decode_budget: DecodeBudget::new(),
+            #[cfg(target_arch = "wasm32")]
+            style: Arc::new(Style::default()),
+            #[cfg(target_arch = "wasm32")]
+            archive_kind: None,
+            io_task_gone_reported: false,
+            pumps: 0,
+            runtime: runtime::inert(),
         }
     }
 }

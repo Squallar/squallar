@@ -568,4 +568,15 @@ impl Gui {
         gui.publish_radar_sites();
         gui
     }
+
+    /// Never build a live tile source under this `Gui`.
+    ///
+    /// **For test harnesses that drive [`Self::ui`], and nothing else** —
+    /// theirs is the one `Gui` whose frames must not open sockets, because
+    /// what live tiles paint depends on how much wall-clock time the test
+    /// took. See [`crate::tiles::MapTileState::go_offline_for_tests`] for the
+    /// measured failure this removes.
+    pub fn go_offline_for_tests(&mut self) {
+        self.map_tiles.go_offline_for_tests();
+    }
 }
