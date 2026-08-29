@@ -221,36 +221,6 @@
       "type": "fill"
     },
     {
-      "id": "waterway",
-      "metadata": {
-        "squallar:phase": "ground",
-        "squallar:source-index": 6
-      },
-      "paint": {
-        "line-color": "rgba(63, 90, 109, 1)",
-        "line-width": [
-          "interpolate",
-          [
-            "linear"
-          ],
-          [
-            "zoom"
-          ],
-          8,
-          0.5,
-          9,
-          1,
-          15,
-          2,
-          16,
-          3
-        ]
-      },
-      "source": "openmaptiles",
-      "source-layer": "waterway",
-      "type": "line"
-    },
-    {
       "filter": [
         "all",
         [
@@ -491,6 +461,36 @@
       "source": "openmaptiles",
       "source-layer": "water",
       "type": "fill"
+    },
+    {
+      "id": "waterway",
+      "metadata": {
+        "squallar:phase": "ground",
+        "squallar:source-index": 6
+      },
+      "paint": {
+        "line-color": "rgba(63, 90, 109, 1)",
+        "line-width": [
+          "interpolate",
+          [
+            "linear"
+          ],
+          [
+            "zoom"
+          ],
+          8,
+          0.5,
+          9,
+          1,
+          15,
+          2,
+          16,
+          3
+        ]
+      },
+      "source": "openmaptiles",
+      "source-layer": "waterway",
+      "type": "line"
     },
     {
       "filter": [
