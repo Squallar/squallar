@@ -33,7 +33,6 @@ use squallar_source::time::TimeAxis;
 /// the default sun altitude. (An earlier version of this comment derived it as
 /// `221 · cos(zenith)`, which gives 156 — a wrong formula beside a right
 /// constant.)
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub const HILLSHADE_FLAT: u8 = 181;
 
 /// How far a grey level may sit from [`HILLSHADE_FLAT`] and still be treated
@@ -48,7 +47,6 @@ pub const HILLSHADE_FLAT: u8 = 181;
 /// [`HILLSHADE_ALPHA_GAIN`], a uniform grey wash the design promised not to
 /// spend. Two levels covers the wobble observed (179..=183 over the flat
 /// bulk); real relief starts well past it.
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub const HILLSHADE_FLAT_TOLERANCE: u8 = 2;
 
 /// Alpha per grey level of relief past [`HILLSHADE_FLAT_TOLERANCE`], clamped
@@ -61,7 +59,6 @@ pub const HILLSHADE_FLAT_TOLERANCE: u8 = 2;
 /// saturate, which is what a canyon wall should do. Gain 4 pushed ordinary
 /// mountainsides past 75% ink (paint, not lighting); gain 2 left the ~50-level
 /// relief of the Plains states at ~30% (invisible at arm's length).
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub const HILLSHADE_ALPHA_GAIN: u16 = 3;
 
 /// Grey levels at or below this are NODATA, not shadow, and draw nothing.
@@ -83,7 +80,6 @@ pub const HILLSHADE_ALPHA_GAIN: u16 = 3;
 /// needs the archive rebuilt on a fixed mosaic. The cost of the guard on real
 /// data is nil in practice: genuine v <= 5 shadow exists only in the deepest
 /// canyon tiles, a handful of already-saturated pixels.
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub const HILLSHADE_NODATA_CEILING: u8 = 5;
 
 /// One hillshade grey level as an overlay pixel, **unmultiplied RGBA**.
@@ -93,7 +89,6 @@ pub const HILLSHADE_NODATA_CEILING: u8 = 5;
 /// itself: |v − 181| less the flat tolerance, scaled by
 /// [`HILLSHADE_ALPHA_GAIN`]. Flat ground is fully transparent — the layer
 /// spends pixels only where there is relief.
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 const fn remap_hillshade_pixel(v: u8) -> [u8; 4] {
     if v <= HILLSHADE_NODATA_CEILING {
         return [0, 0, 0, 0];
@@ -124,7 +119,6 @@ const fn remap_hillshade_pixel(v: u8) -> [u8; 4] {
 ///
 /// Runs once per tile at decode time — on the IO runtime's blocking pool on
 /// native, under the wasm pump's decode budget on the web — never per frame.
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub fn remap_hillshade(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
     debug_assert_eq!(size[0] * size[1] * 4, rgba.len());
     let mut remapped = vec![0u8; rgba.len()];
@@ -137,7 +131,6 @@ pub fn remap_hillshade(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
 /// Decode one WebP (or any image the header declared) hillshade tile body and
 /// remap it. Split from the texture upload so it is testable without an egui
 /// context; `tile_source::decode_archive_tile` does the upload.
-#[cfg(any(test, target_arch = "wasm32", feature = "basemap-vector"))]
 pub(crate) fn decode_hillshade_tile(bytes: &[u8]) -> Result<egui::ColorImage, String> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()

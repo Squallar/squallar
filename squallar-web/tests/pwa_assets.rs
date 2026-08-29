@@ -388,9 +388,9 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
 /// for as long as nobody happened to read it. One-directional pins have hidden
 /// the case they existed for three times on this campaign.
 ///
-/// **Tile hosts are not expected here and must never be.** A basemap tile is
-/// cached on purpose, by the `BASEMAP_HOST` regex and its own cache route; the
-/// shared enumeration is data origins only, so this test does not demand them.
+/// The basemap archive's host is not expected here and must never be: its
+/// refusal has a named owner (`isBasemapArchive` routes it "network"), and the
+/// shared enumeration is data origins only, so this test does not demand it.
 #[test]
 fn the_worker_deny_list_names_nothing_that_is_not_a_data_origin() {
     let denied = js_string_list(SERVICE_WORKER, "const NEVER_CACHE_HOSTS = new Set([");

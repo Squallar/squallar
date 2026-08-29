@@ -18,53 +18,10 @@ edition.workspace = true
 # the two gates now agree because they are the same kind of gate.
 gps-serial = ["squallar-nmea-serial/serial"]
 
-# The basemap drawn from vector tiles this client rasterises, rather than from
-# a server's pre-rendered raster tiles. Turning it on adds the PMTiles v3
-# archive reader; the tessellation half is `walkers/mvt`, which is on
-# unconditionally and is not part of this gate.
-#
-# A feature and not a `cfg(target_arch)`, and `gps-serial` above is the recorded
-# reason to be careful which kind of gate this is: there, a call site gated on
-# `not(target_os = "android")` called a body gated on a *feature*, and an OS cfg
-# cannot satisfy a feature cfg. Both halves of this one are features. The
-# per-target split inside it is only over `pmtiles`' own backend features, which
-# is a dependency selection -- what ARCHITECTURE.md permits a `cfg` to do.
-#
-# **Not in a `default` list, and requested by each shipping crate instead** --
-# `squallar/Cargo.toml` turns it on and, since the web draw seam landed, so does
-# `squallar-web/Cargo.toml`. It draws on BOTH targets now: the raster path it
-# replaces is watermarked at source, so the dependency buys a map that works,
-# and the eight crates below are paid for a rendered pixel rather than for a
-# reader nothing calls.
-#
-# Still not a `default` row, and the reason survives both consumers turning it
-# on: a `default` would put `pmtiles` and the `tokio` its `__async` pulls in
-# into the graph of every OTHER consumer too -- `squallar-app`'s own tests, the
-# tools -- which is the cost the original note warned against, just relocated.
-#
-# The wasm32 arm is NOT `pmtiles`' own backend. None of its four compiles there
-# (the `http-async` note below records the two E0277s); `src/basemap_archive.rs`
-# implements `AsyncBackend` over a `RangeSource` instead, and its wasm arm runs
-# the `!Send` `reqwest` work inside `spawn_local` and returns the bytes over a
-# `oneshot`, whose receiver IS `Send`.
-#
-# Measured, `cargo tree -p squallar-egui --target wasm32-unknown-unknown
-# -e normal --prefix none | sort -u`: 262 lines without it, 270 with. **The
-# crates are SEVEN, not the eight that line count reports**, and the difference
-# is the measuring command rather than the graph: `cargo tree` prints a
-# repeated subtree a second time as `tokio v1.53.1 (*)`, which `sort -u` keeps
-# as a distinct line. The seven are `pmtiles`, `tokio`, `async-compression`,
-# `compression-codecs`, `compression-core`, `fast_hilbert` and `varint-rs` --
-# which is what the list here always said, against a count that disagreed with
-# it. Re-measured 2026-08-28 by diffing the two sorted trees rather than
-# subtracting their lengths.
-#
-# Shipped cost, measured the same day on the artifact a person actually
-# downloads: `wasm-pack build squallar-web --target web --release` through
-# `.github/scripts/wasm-threads.sh` gives 13,272,118 B of `.wasm` with the
-# feature off and 13,664,560 B with it on -- **+392,442 B, +2.96%** -- and the
-# wasm-bindgen glue is byte-identical at 187,506 B either way.
-basemap-vector = ["dep:pmtiles"]
+# There is no `basemap-vector` feature any more. The PMTiles archive IS the
+# basemap — the raster path it replaced (CartoDB) was deleted with the feature
+# on 2026-08-29 — so `pmtiles` is an unconditional dependency below, on both
+# targets. The tessellation half is `walkers/mvt`, likewise unconditional.
 
 [dependencies]
 web-time = { workspace = true }
@@ -114,24 +71,24 @@ lru = "=0.18.2"
 # `webpki-roots`, and offers no way to replace it.
 reqwest = { workspace = true }
 
-# The PMTiles v3 archive reader, behind `basemap-vector`. Portable half only:
-# the workspace pin is `default-features = false, features = ["__async"]`, so
-# what arrives here is the reader, its async core and nothing that touches a
-# filesystem or a socket. The `http-async` backend is added for non-wasm
-# targets in the table below -- the same optional dependency named twice, which
-# is why `[features]` has one `dep:pmtiles` and not two entries.
+# The PMTiles v3 archive reader — the basemap's substrate, unconditional since
+# the CartoDB raster path was deleted. Portable half only: the workspace pin is
+# `default-features = false, features = ["__async"]`, so what arrives here is
+# the reader, its async core and nothing that touches a filesystem or a socket.
+# The `http-async` backend is added for non-wasm targets in the table below --
+# the same dependency named twice, re-unified to one node.
 #
 # One consequence worth naming because it cuts against the `tokio` comment
-# below: `__async` is `dep:tokio`, unconditionally, so with `basemap-vector` on
-# **tokio enters the wasm32 graph** -- measured, `cargo tree -p squallar-egui
-# --target wasm32-unknown-unknown -e normal`, 281 nodes off and 289 on, with
-# `tokio v1.53.1` among the eight. That is survivable and not a contradiction of
-# the rule below, which is about tokio's *feature set*: pmtiles asks for
-# `default-features = false, features = ["io-util"]`, and `io-util` is one of
-# the five tokio permits on wasm. It does mean the wasm artifact grows a runtime
-# crate it did not carry before, which is a cost to weigh when this feature
-# stops being off-by-default.
-pmtiles = { workspace = true, optional = true }
+# below: `__async` is `dep:tokio`, unconditionally, so **tokio is in the wasm32
+# graph** -- measured while this was still a feature, `cargo tree -p
+# squallar-egui --target wasm32-unknown-unknown -e normal`, 281 nodes without
+# it and 289 with, `tokio v1.53.1` among the eight. That is survivable and not
+# a contradiction of the rule below, which is about tokio's *feature set*:
+# pmtiles asks for `default-features = false, features = ["io-util"]`, and
+# `io-util` is one of the five tokio permits on wasm. Shipped cost on the web
+# artifact, measured 2026-08-28: +392,442 B of `.wasm`, +2.96% -- the price of
+# a basemap that is not watermarked at source.
+pmtiles = { workspace = true }
 
 # The terrain hillshade archive's tiles are WebP (`tile_type = 4`), decoded and
 # remapped in `terrain::remap_hillshade` before upload. `webp` is image 0.25's
@@ -161,7 +118,7 @@ tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
 # `impl Future<Output = ...> + Send` (`pmtiles-0.23.0/src/async_reader.rs:424`)
 # and on wasm32 `reqwest::Response` is not `Send`, so `HttpBackend` fails to
 # satisfy its own trait. Measured in the CI image, `cargo check -p squallar-egui
-# --target wasm32-unknown-unknown --features basemap-vector,pmtiles/http-async`:
+# --target wasm32-unknown-unknown --features pmtiles/http-async`:
 # two E0277s, "future returned by `read` is not `Send`", at
 # `src/backends/http.rs:67`.
 #
@@ -183,7 +140,7 @@ tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
 #
 # The sentence this replaces read "Nothing here does that yet" long after it
 # stopped being true, and cost an agent a full pass rebuilding what existed.
-pmtiles = { workspace = true, optional = true, features = ["http-async"] }
+pmtiles = { workspace = true, features = ["http-async"] }
 
 # The wasm half of the same split: no threads, no tokio: the fetch loop runs on
 # the browser's event loop and `reqwest` becomes `fetch()`, which also means the
@@ -200,6 +157,5 @@ wasm-bindgen-futures = "=0.4.76"
 # rejected on wasm, and `--all-targets` compiles dev-deps, so leaving this ungated
 # breaks `cargo check --target wasm32-unknown-unknown`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# Drives the async tile tests and the `#[ignore]`d live CartoDB fetch. Not linked
-# into any shipped binary.
+# Drives the async tile tests. Not linked into any shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

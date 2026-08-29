@@ -553,12 +553,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // The vector draw seam
     //
-    // These run in a DEFAULT `cargo test --workspace`, on purpose.
-    // `walkers/mvt` is on unconditionally, so `Tile::Vector` exists on every
-    // build; `basemap-vector` gates the archive that produces one, not the
-    // renderer that draws it. A seam test behind the feature would be invisible
-    // to the workspace suite, which is exactly how the archive reader landed
-    // with 13 tests and moved the total by zero.
+    // These drive the painter with hand-built `Tile::Vector` values rather
+    // than an open archive, so the seam — placement, not rendering — is
+    // pinned in isolation from the IO machinery that produces real tiles.
     // -----------------------------------------------------------------------
 
     use walkers::{ShapeOrText, Text};

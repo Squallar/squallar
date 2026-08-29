@@ -1,113 +1,27 @@
 use crate::tile_source::HttpsTiles;
 use squallar_geo::{lat_to_tile_y, lon_to_tile_x};
-use walkers::{
-    TileId,
-    sources::{Attribution, TileSource},
-};
+use walkers::sources::Attribution;
 
-/// CartoDB's credit: the raster basemap's, and nothing else's.
-///
-/// **This is not "the" attribution any more.** The map panel draws whatever
-/// [`walkers::Tiles::attribution`] answers for the source it is actually
-/// fetching from, so a build reading our own archive credits OpenMapTiles
-/// without this const being involved. It is the [`CartoDb`] impl's string, and
-/// the panel's fallback for a frame with no source at all.
-///
-/// `\u{a9}` is U+00A9, registered in `ui_glyphs` as the basemap attribution
-/// copyright -- never spelled `(c)`.
-pub const ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap \u{a9} CartoDB";
-
-/// Where the credit links. ODbL wants the notice reachable, not just shown.
+/// Where the basemap credit links. ODbL wants the notice reachable, not just
+/// shown.
 pub const ATTRIBUTION_URL: &str = "https://www.openstreetmap.org/copyright";
 
-/// The credit a build that *meant* to draw the vector archive carries once it
-/// has fallen back to the rasters.
+/// The credit the panel paints for a session whose archive has been found
+/// unreachable — the on-screen half of reporting the fault, drawn in the
+/// corner the credit already occupies rather than as a new surface.
 ///
-/// **This is the on-screen half of reporting the fault**, and it is drawn in the
-/// corner the credit already occupies rather than as a new surface: the panel
-/// reads [`walkers::Tiles::attribution`] off whichever source it is actually
-/// drawing, so replacing the source replaces the words. Without it the fallback
-/// would be indistinguishable from a build configured for CartoDB in the first
-/// place, which is exactly the silent-partial-success shape this workspace
-/// keeps finding.
+/// There is no raster provider to fall back to any more (CartoDB was deleted
+/// with the flip to the archive basemap), so an unreachable archive means the
+/// ground layer draws **nothing**, and this line is what keeps that state from
+/// being a silent blank: [`MapTileState::base_archive_is_unreachable`] is how
+/// the panel knows to paint it. It names what is wrong, not what the reader
+/// should do about it; the detail that lets them fix it -- the URL and the
+/// transport error -- is one `log::error!` away and would not fit here.
 ///
-/// It names what is wrong, not what the reader should do about it: the detail
-/// that lets them fix it -- the URL and the transport error -- is one
-/// `log::error!` away and would not fit here.
-///
-/// ASCII apart from the two copyright signs, deliberately: `ui_glyphs` gates
-/// every non-ASCII character UI text carries against the bundled fonts, and an
-/// em dash is not on that inventory.
-#[cfg(feature = "basemap-vector")]
-pub const FALLBACK_ATTRIBUTION_TEXT: &str =
-    "\u{a9} OpenStreetMap \u{a9} CartoDB (basemap archive unavailable)";
-
-/// What [`MapTileState::ensure_base_tiles`] credits a fallback source with.
-///
-/// A `cfg` selecting a value, not a branch: on a build with no vector archive
-/// there is nothing to fall back *from*, the fallback arm is unreachable, and
-/// the ordinary credit is the one that would be honest if it were not.
-#[cfg(feature = "basemap-vector")]
-const FALLBACK_CREDIT: &str = FALLBACK_ATTRIBUTION_TEXT;
-/// See the arm above.
-#[cfg(not(feature = "basemap-vector"))]
-const FALLBACK_CREDIT: &str = ATTRIBUTION_TEXT;
-
-/// CartoDB tile source variants.
-#[derive(Clone)]
-pub enum CartoDbStyle {
-    LightNoLabels,
-    DarkNoLabels,
-}
-
-#[derive(Clone)]
-pub struct CartoDb {
-    style: CartoDbStyle,
-}
-
-impl CartoDb {
-    pub fn light() -> Self {
-        Self {
-            style: CartoDbStyle::LightNoLabels,
-        }
-    }
-
-    pub fn dark() -> Self {
-        Self {
-            style: CartoDbStyle::DarkNoLabels,
-        }
-    }
-}
-
-impl TileSource for CartoDb {
-    fn tile_url(&self, tile_id: TileId) -> String {
-        let style_name = match self.style {
-            CartoDbStyle::LightNoLabels => "light_nolabels",
-            CartoDbStyle::DarkNoLabels => "dark_nolabels",
-        };
-
-        let subdomain = match tile_id.x % 4 {
-            0 => "a",
-            1 => "b",
-            2 => "c",
-            _ => "d",
-        };
-
-        format!(
-            "https://cartodb-basemaps-{}.global.ssl.fastly.net/{}/{}/{}/{}.png",
-            subdomain, style_name, tile_id.zoom, tile_id.x, tile_id.y
-        )
-    }
-
-    fn attribution(&self) -> Attribution {
-        Attribution {
-            text: ATTRIBUTION_TEXT,
-            url: ATTRIBUTION_URL,
-            logo_light: None,
-            logo_dark: None,
-        }
-    }
-}
+/// ASCII, deliberately: `ui_glyphs` gates every non-ASCII character UI text
+/// carries against the bundled fonts, and this string owes no copyright sign
+/// because no provider's pixels are on the glass while it shows.
+pub const UNREACHABLE_ATTRIBUTION_TEXT: &str = "basemap archive unreachable";
 
 // Slippy-map tile coordinates (standard OSM / Web Mercator formulas), from
 // the workspace's geodesy floor.
@@ -125,7 +39,6 @@ impl TileSource for CartoDb {
 /// is the stable pointer at the same host and is what a client should resolve
 /// once it can afford an extra round trip before the first tile; nothing does
 /// yet, and a pointer nobody reads would be a claim rather than a mechanism.
-#[cfg(feature = "basemap-vector")]
 pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20260828.pmtiles";
 
 /// An archive URL that replaces [`BASEMAP_ARCHIVE_URL`] when it is set.
@@ -136,7 +49,7 @@ pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20
 /// network is a change that will stop being checked. `file://` is not a scheme
 /// [`crate::basemap_archive::HttpRangeSource`] serves, so a local archive is
 /// pointed at through a plain HTTP file server.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 
 /// Which archive [`base_source`] opens.
@@ -148,13 +61,13 @@ pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 /// wasm32-unknown-unknown and would simply always answer `NotPresent`, so this
 /// split buys honesty rather than compilation -- a const documented "native
 /// only" that the web arm still read would be prose that is not evidence.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn archive_url() -> String {
     std::env::var(BASEMAP_ARCHIVE_URL_ENV).unwrap_or_else(|_| BASEMAP_ARCHIVE_URL.to_owned())
 }
 
 /// The wasm32 arm of [`archive_url`]: the compiled-in archive, always.
-#[cfg(all(feature = "basemap-vector", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn archive_url() -> String {
     BASEMAP_ARCHIVE_URL.to_owned()
 }
@@ -165,25 +78,24 @@ fn archive_url() -> String {
 /// at open and selects parts mode on its own, so this names the logical
 /// archive and nothing here knows parts exist. The generation
 /// (`4ca64469750e-20260829`) is compiled in, like the basemap's.
-#[cfg(feature = "basemap-vector")]
 pub const TERRAIN_ARCHIVE_URL: &str =
     "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles";
 
 /// An archive URL that replaces [`TERRAIN_ARCHIVE_URL`] when it is set.
 /// Native only, for the reason [`BASEMAP_ARCHIVE_URL_ENV`] is: the draw seam
 /// must stay checkable against a local archive behind a plain HTTP server.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub const TERRAIN_ARCHIVE_URL_ENV: &str = "SQUALLAR_TERRAIN_ARCHIVE";
 
 /// Which archive the terrain source opens — [`archive_url`]'s split, for
 /// [`archive_url`]'s reason.
-#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn terrain_archive_url() -> String {
     std::env::var(TERRAIN_ARCHIVE_URL_ENV).unwrap_or_else(|_| TERRAIN_ARCHIVE_URL.to_owned())
 }
 
 /// The wasm32 arm of [`terrain_archive_url`]: the compiled-in archive, always.
-#[cfg(all(feature = "basemap-vector", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn terrain_archive_url() -> String {
     TERRAIN_ARCHIVE_URL.to_owned()
 }
@@ -195,14 +107,11 @@ fn terrain_archive_url() -> String {
 /// the source like every other credit; the map panel today paints only the
 /// **base** source's credit line, so this reaches the glass only when that
 /// gap is closed (recorded there, not here).
-#[cfg(feature = "basemap-vector")]
 pub const TERRAIN_ATTRIBUTION_TEXT: &str = "\u{a9} Copernicus DEM 2021";
 
-/// The terrain hillshade tile source, or `None` when this build cannot build
-/// one. A per-feature selection of a body, like [`base_source`]'s per-target
-/// splits: on a build without the archive reader there is no terrain engine,
-/// and the layer's toggle simply has nothing to draw.
-#[cfg(feature = "basemap-vector")]
+/// The terrain hillshade tile source, or `None` when the archive URL will not
+/// parse — the only failure visible at construction; the rest surface on
+/// `HttpsTiles::fault` inside the IO task.
 fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
     let url = terrain_archive_url();
     let attribution = Attribution {
@@ -221,70 +130,25 @@ fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
     }
 }
 
-/// See the arm above. Without the archive reader there is nothing to read the
-/// hillshade out of; unlike the basemap there is no raster fallback to fall
-/// to, so the answer is simply no source.
-#[cfg(not(feature = "basemap-vector"))]
-fn terrain_source(_ctx: &egui::Context) -> Option<HttpsTiles> {
-    None
-}
-
 /// The credit the vector basemap carries, in the generator's own words.
 ///
 /// Planetiler prints this pair as the required credit for what it built, so it
 /// is sourced rather than composed. The panel draws it because the archive
 /// source reports it, not because anything here selects between two consts.
-#[cfg(feature = "basemap-vector")]
 pub const ARCHIVE_ATTRIBUTION_TEXT: &str = "\u{a9} OpenStreetMap contributors \u{a9} OpenMapTiles";
 
-/// CartoDB's pre-rendered rasters, for `is_dark`.
-///
-/// The base source on a build without the vector archive, and the fallback on
-/// one that has it but cannot reach it — see [`MapTileState::ensure_base_tiles`].
-/// `credit` is a parameter because a fallback has to say that it *is* one.
-fn cartodb_source(is_dark: bool, ctx: &egui::Context, credit: &'static str) -> HttpsTiles {
-    let source = if is_dark {
-        CartoDb::dark()
-    } else {
-        CartoDb::light()
-    };
-    HttpsTiles::with_attribution(
-        source,
-        ctx.to_owned(),
-        Attribution {
-            text: credit,
-            url: ATTRIBUTION_URL,
-            logo_light: None,
-            logo_dark: None,
-        },
-    )
-}
-
-/// The base-map tile source for `is_dark`: CartoDB's pre-rendered rasters.
-#[cfg(not(feature = "basemap-vector"))]
-fn base_source(
-    is_dark: bool,
-    _disabled_source_layers: &std::collections::BTreeSet<String>,
-    ctx: &egui::Context,
-) -> HttpsTiles {
-    // The rasters are pre-rendered; there is no style to filter, so the
-    // disabled set has nothing to act on in this arm.
-    cartodb_source(is_dark, ctx, ATTRIBUTION_TEXT)
-}
-
-/// The base-map tile source for `is_dark`: our own archive, rendered here.
-///
-/// Falls back to CartoDB if the archive URL will not parse, which is the only
-/// failure visible at construction. The failures that are not — the host being
-/// down, a stale `omt-YYYYMMDD` generation, the body not being PMTiles — happen
-/// inside the IO task, which records them on `HttpsTiles::fault`;
-/// [`MapTileState::ensure_base_tiles`] is where a frame acts on that.
-#[cfg(feature = "basemap-vector")]
+/// The base-map tile source for `is_dark`: our own archive, rendered here, or
+/// `None` if the archive URL will not parse — the only failure visible at
+/// construction. The failures that are not — the host being down, a stale
+/// `omt-YYYYMMDD` generation, the body not being PMTiles — happen inside the
+/// IO task, which records them on `HttpsTiles::fault`;
+/// [`MapTileState::ensure_base_tiles`] is where a frame acts on that. There is
+/// no raster provider to fall back to.
 fn base_source(
     is_dark: bool,
     disabled_source_layers: &std::collections::BTreeSet<String>,
     ctx: &egui::Context,
-) -> HttpsTiles {
+) -> Option<HttpsTiles> {
     let url = archive_url();
 
     let attribution = Attribution {
@@ -300,10 +164,10 @@ fn base_source(
         attribution,
         ctx.to_owned(),
     ) {
-        Ok(tiles) => tiles,
+        Ok(tiles) => Some(tiles),
         Err(error) => {
             log::error!("{url} is not a usable basemap archive URL: {error}");
-            cartodb_source(is_dark, ctx, FALLBACK_ATTRIBUTION_TEXT)
+            None
         }
     }
 }
@@ -338,18 +202,19 @@ pub struct MapTileState {
     /// source on a flip would re-download 24-64 MiB for nothing.
     pub terrain: Option<HttpsTiles>,
 
-    /// Whether the vector archive has already been found unreachable this
-    /// session, so [`Self::ensure_base_tiles`] must not build another one.
+    /// Whether the basemap archive has already been found unreachable this
+    /// session, so [`Self::ensure_base_tiles`] must not build another source.
     ///
-    /// Without the latch a theme flip -- which drops the source and rebuilds it
-    /// -- would go back to the archive, fail again, and blank the map again.
-    /// Cleared by [`Self::clear`], because a suspend/resume or a graphics reset
-    /// is a plausible moment for a network to have come back.
-    ///
-    /// Always present, never `cfg`-gated: a build with no vector archive simply
-    /// never sets it, and `HttpsTiles::fault` answers `None` for a raster
-    /// source on every target.
-    fell_back_to_raster: bool,
+    /// Without the latch every frame after a failed open would build the
+    /// source again, fail again, and keep a dead retry loop warm. There is no
+    /// raster provider to fall back to since the CartoDB path was deleted:
+    /// while latched the ground layer draws **nothing**, said once at
+    /// `error!`, and the panel paints [`UNREACHABLE_ATTRIBUTION_TEXT`] in the
+    /// credit corner (read through [`Self::base_archive_is_unreachable`]) so
+    /// the degraded state is on the glass rather than only in a log. Cleared
+    /// by [`Self::clear`], because a suspend/resume or a graphics reset is a
+    /// plausible moment for a network to have come back.
+    base_unreachable: bool,
 
     /// Which source-layers were disabled in the style [`Self::tiles`] was
     /// built with — the comparison [`Self::ensure_base_tiles`] makes to
@@ -363,12 +228,10 @@ pub struct MapTileState {
     #[cfg(test)]
     pub(crate) base_builds: usize,
 
-    /// [`Self::fell_back_to_raster`]'s twin for the terrain slot, latched for
-    /// the same reason — without it a frame after a failed open would build
-    /// the source again, fail again, and keep a dead retry loop warm. There
-    /// is no raster fallback to fall to: a failed terrain archive means the
-    /// layer draws nothing, said once at `error!`. Cleared by [`Self::clear`],
-    /// because a resume is a plausible moment for the network to be back.
+    /// [`Self::base_unreachable`]'s twin for the terrain slot, latched for
+    /// the same reason. A failed terrain archive means the layer draws
+    /// nothing, said once at `error!`. Cleared by [`Self::clear`], because a
+    /// resume is a plausible moment for the network to be back.
     terrain_failed: bool,
 }
 
@@ -378,7 +241,7 @@ impl Default for MapTileState {
             tiles: None,
             terrain: None,
             current_theme_is_dark: true,
-            fell_back_to_raster: false,
+            base_unreachable: false,
             base_disabled_source_layers: std::collections::BTreeSet::new(),
             #[cfg(test)]
             base_builds: 0,
@@ -414,21 +277,19 @@ impl MapTileState {
     }
 
     /// Ensure the base-map tiles for the current theme are initialized, and
-    /// replace a source that has reported itself unusable.
+    /// retire a source that has reported itself unusable.
     ///
-    /// **A blank map is not an acceptable resting state.** The archive is
-    /// opened by the IO task, two range requests after the frame has already
-    /// been handed a source, so a DNS failure, a 404, a host that is down, a
-    /// stale `omt-YYYYMMDD` generation or a typo in
+    /// The archive is opened by the IO task, two range requests after the
+    /// frame has already been handed a source, so a DNS failure, a 404, a host
+    /// that is down, a stale `omt-YYYYMMDD` generation or a typo in
     /// [`BASEMAP_ARCHIVE_URL_ENV`] all surface here rather than at
-    /// construction. `HttpsTiles::fault` is how they surface; this is what acts
-    /// on them, once, by falling back to the raster source the build already
-    /// knows how to reach.
-    ///
-    /// The fallback is not silent in either direction: it logs at `error!` with
-    /// the transport's own words, and the credit the panel paints changes to
-    /// [`FALLBACK_ATTRIBUTION_TEXT`], because the panel reads the credit off
-    /// whichever source is actually being drawn.
+    /// construction. `HttpsTiles::fault` is how they surface; this is what
+    /// acts on them, once, by latching [`Self::base_unreachable`]. There is no
+    /// raster provider left to fall back to, so the honest degraded state is a
+    /// ground layer that draws nothing -- not silent in either direction: it
+    /// logs at `error!` with the transport's own words, and the panel paints
+    /// [`UNREACHABLE_ATTRIBUTION_TEXT`] in the credit corner for as long as
+    /// the latch holds.
     /// `disabled_source_layers` is the BasemapTiles layer's per-source-layer
     /// choice set; a source built with a different set is **rebuilt**, which
     /// re-downloads the visible tiles exactly as a theme flip does — the
@@ -445,40 +306,43 @@ impl MapTileState {
 
         if let Some(fault) = self.tiles.as_ref().and_then(HttpsTiles::fault) {
             log::error!(
-                "the basemap archive is unusable, falling back to the raster \
-                 basemap for this session: {fault}"
+                "the basemap archive is unusable, so the basemap draws nothing \
+                 this session: {fault}"
             );
-            self.fell_back_to_raster = true;
+            self.base_unreachable = true;
             self.tiles = None;
         }
 
-        // A toggle flip on the raster fallback rebuilds nothing: there is no
-        // style in the rasters for the set to act on.
-        if self.tiles.is_some()
-            && !self.fell_back_to_raster
-            && self.base_disabled_source_layers != *disabled_source_layers
-        {
+        if self.tiles.is_some() && self.base_disabled_source_layers != *disabled_source_layers {
             self.tiles = None;
         }
 
-        if self.tiles.is_none() {
+        if self.tiles.is_none() && !self.base_unreachable {
             self.base_disabled_source_layers = disabled_source_layers.clone();
             #[cfg(test)]
             {
                 self.base_builds += 1;
             }
-            self.tiles = Some(if self.fell_back_to_raster {
-                cartodb_source(is_dark, ctx, FALLBACK_CREDIT)
-            } else {
-                base_source(is_dark, disabled_source_layers, ctx)
-            });
+            self.tiles = base_source(is_dark, disabled_source_layers, ctx);
+            // A URL that will not parse yields no source and never will this
+            // session: latch, exactly as the terrain slot does, so the
+            // per-frame cost of an unbuildable source is one bool read.
+            self.base_unreachable = self.tiles.is_none();
         }
+    }
+
+    /// Whether the archive has been found unreachable this session, so the
+    /// base slot is deliberately empty. The panel reads this to paint
+    /// [`UNREACHABLE_ATTRIBUTION_TEXT`] instead of a provider credit: the
+    /// degraded state must be on the glass, not only in the log.
+    pub fn base_archive_is_unreachable(&self) -> bool {
+        self.base_unreachable
     }
 
     /// Drop the base source: the last visible pane switched the BasemapTiles
     /// layer off. Symmetric with [`Self::release_terrain_tiles`] — a disabled
     /// layer costs zero network, and the accepted cost is a re-download if it
-    /// comes back. The raster-fallback latch survives, exactly as the terrain
+    /// comes back. The unreachable latch survives, exactly as the terrain
     /// failure latch does: a release is not a network recovery.
     pub fn release_base_tiles(&mut self) {
         self.tiles = None;
@@ -540,11 +404,11 @@ impl MapTileState {
 
     /// Clear all tile state (called on suspend/graphics reset).
     ///
-    /// The fallback latch goes with it: a resume is a plausible moment for a
-    /// network that was down to be up, and retrying the archive costs one
+    /// Both unreachable latches go with it: a resume is a plausible moment for
+    /// a network that was down to be up, and retrying the archive costs one
     /// failed open if it is not.
     pub fn clear(&mut self) {
-        self.fell_back_to_raster = false;
+        self.base_unreachable = false;
         self.tiles = None;
         self.terrain = None;
         self.terrain_failed = false;

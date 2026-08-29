@@ -4519,7 +4519,6 @@ dependencies = [
  "squallar-location",
  "squallar-nmea-serial",
  "squallar-source",
- "walkers",
  "winit",
 ]
 

@@ -1,24 +1,21 @@
 /*
- * squallar's service worker: shell cached, weather data never cached, basemap
- * tiles cached aggressively.
+ * squallar's service worker: shell cached, weather data never cached.
  *
  * "Never" is literal — the worker does not call `respondWith()` for weather
  * data, so no code here *can* write it to a cache. Those fetches fail offline
  * and index.html shows a banner. Routing is default-deny, so a new entry in
  * `squallar_radar::sources::DataSources` is uncached with no change here.
  *
- * Tiles are the exception because a slippy-map tile has no time dimension.
- * CartoDB serves them `Cache-Control: public, max-age=15552000` (180 days) and
- * `tileFreshFor` honours that number rather than inventing one.
- *
- * The PMTiles archives (basemap + terrain) are read by `Range`, and the Cache
- * API can neither store a 206 nor match on a range. So their ranged reads are
- * served from a BLOCK cache instead: fixed 64 KiB blocks, each stored as a
- * synthetic-URL 200 — the 206 prohibition applies to what is STORED, never to
- * what is SERVED — and the requested span is reassembled as an exact 206. Any
- * archive request that is not a single `bytes=N-M` range still routes
- * "network" untouched, and any error anywhere in the block path falls through
- * to a plain network fetch: a broken cache must never break the map.
+ * The PMTiles archives (basemap + terrain) are the only basemap now -- the
+ * CartoDB raster tiles and their cache were deleted. They are read by `Range`,
+ * and the Cache API can neither store a 206 nor match on a range. So their
+ * ranged reads are served from a BLOCK cache instead: fixed 64 KiB blocks,
+ * each stored as a synthetic-URL 200 -- the 206 prohibition applies to what is
+ * STORED, never to what is SERVED -- and the requested span is reassembled as
+ * an exact 206. Any archive request that is not a single `bytes=N-M` range
+ * still routes "network" untouched, and any error anywhere in the block path
+ * falls through to a plain network fetch: a broken cache must never break the
+ * map.
  *
  * Every URL resolves against `ROOT`, so the same bytes work at `/squallar/`
  * (Pages) and at `/` (http.server).
@@ -74,7 +71,6 @@ const SW_VERSION = 2;
 const ROOT = new URL("./", self.location.href);
 
 const META_CACHE = `squallar-meta-v${SW_VERSION}`;
-const TILE_CACHE = `squallar-basemap-v${SW_VERSION}`;
 const SHELL_PREFIX = `squallar-shell-v${SW_VERSION}-`;
 const ASSET_CACHE = `squallar-assets-v${SW_VERSION}`;
 
@@ -156,8 +152,9 @@ const SHELL_VERSION_PROBES = [
  * so a new data source cannot be added without someone reading this file, and a
  * retired one cannot linger in the list once it is gone from `DataSources`.
  *
- * Basemap tiles are NOT here on purpose: they are cached deliberately, by
- * `BASEMAP_HOST` and its own route below.
+ * The basemap archive's host is not here either: `isBasemapArchive` routes it
+ * "network" by its own explicit rule below, so listing it here would restate
+ * a refusal that already has a named owner.
  */
 const NEVER_CACHE_HOSTS = new Set([
   "unidata-nexrad-level2.s3.amazonaws.com",
@@ -173,9 +170,6 @@ const NEVER_CACHE_HOSTS = new Set([
   "mesonet.agron.iastate.edu",
   "api.open-meteo.com",
 ]);
-
-/* CartoDB's four tile subdomains, as `squallar_egui::tiles::CartoDb` builds them. */
-const BASEMAP_HOST = /^cartodb-basemaps-[a-d]\.global\.ssl\.fastly\.net$/;
 
 /*
  * The host serving the self-hosted PMTiles v3 basemap archive, as
@@ -221,10 +215,6 @@ const BLOCK_STORAGE_FLOOR_BYTES = 64 * 1024 * 1024;
 /* The block manifest's synthetic key, the `PINS_KEY` way. */
 const BLOCK_MANIFEST_KEY = new URL("__squallar_blk_manifest__", ROOT).href;
 
-/* ~15-25 KB per 256px PNG, so roughly 12-20 MB. */
-const TILE_CACHE_MAX = 700;
-
-const TILE_DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const UPDATE_PROBE_INTERVAL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -257,12 +247,6 @@ function isWeatherDataHost(hostname) {
     host === "weather.gov" ||
     host.endsWith(".weather.gov")
   );
-}
-
-function isBasemapTile(url) {
-  // The host is what confines this rule; the extension only distinguishes a tile
-  // from the other things that host serves, so `.PNG` matches too.
-  return BASEMAP_HOST.test(normalizeHost(url.hostname)) && /\.png$/i.test(url.pathname);
 }
 
 /**
@@ -369,7 +353,6 @@ function isDataAsset(url) {
  *   "navigate"      - a top-level navigation; answer from the cached shell index.
  *   "shell"         - a named app-shell asset.
  *   "asset"         - a named same-origin data asset, cached outside the shell.
- *   "tile"          - a CartoDB basemap tile.
  *   "archive-block" - a single-range read of a PMTiles archive, served
  *                     block-wise from the block cache.
  *
@@ -429,8 +412,6 @@ function routeFor({ url, method = "GET", mode = "no-cors", range = null }) {
   if (isArchiveBlockSource(u)) {
     return parseSingleRange(range) !== null ? "archive-block" : "network";
   }
-
-  if (isBasemapTile(u)) return "tile";
 
   // `ROOT.pathname` ends in a slash, so this is directory containment, not a
   // prefix match: `/squallar/` does not match `/squallar-old/x`. Without it a
@@ -670,7 +651,7 @@ async function cachesToKeep(newShellName) {
   // `squallar-` cache not named here, so leaving it out would re-download the
   // zone pack on every deploy -- which is exactly the cost a cache outside the
   // shell was chosen to avoid.
-  const keep = new Set([META_CACHE, TILE_CACHE, ASSET_CACHE, newShellName]);
+  const keep = new Set([META_CACHE, ASSET_CACHE, newShellName]);
   // The current archive generations' block caches. Without these entries every
   // deploy would silently empty the block cache — the symptom is a slow map,
   // never an error — because `purgeCaches` deletes every `squallar-` cache not
@@ -859,45 +840,6 @@ async function serveNavigation(event) {
   return fetch(event.request);
 }
 
-/** How long a cached tile is good for, per the response's own `Cache-Control`. */
-function tileFreshFor(response) {
-  const control = response.headers.get("cache-control") || "";
-  const match = /(?:^|,)\s*max-age\s*=\s*(\d+)/i.exec(control);
-  if (match) return Number(match[1]) * 1000;
-  return TILE_DEFAULT_MAX_AGE_MS;
-}
-
-function tileIsStale(response) {
-  // An opaque (`no-cors`) response exposes no headers, and a basemap tile does
-  // not go dangerously wrong with age.
-  if (response.type === "opaque") return false;
-
-  const date = response.headers.get("date");
-  // No clock, nothing to assert freshness from. Treating that as fresh used to
-  // mean such an entry was never revalidated for as long as it existed; the cost
-  // of this direction is one conditional request, since the cached tile is still
-  // served immediately.
-  if (!date) return true;
-
-  const age = Date.now() - Date.parse(date);
-  if (!Number.isFinite(age)) return true;
-  return age > tileFreshFor(response);
-}
-
-async function cacheTile(cache, request, response) {
-  // `cache.put` throws on a 206 and on anything non-2xx. Status 0 is an opaque
-  // response, which is cacheable and is what a `no-cors` tile fetch yields.
-  if (response.status === 200 || response.type === "opaque") {
-    await cache.put(request, response.clone());
-  }
-  return response;
-}
-
-/**
- * Cache-first, revalidating once the origin's own `max-age` has passed. Serving
- * stale is safe here in a way it never would be for weather data: the worst
- * outcome is last month's rendering of the same coastline.
- */
 /*
  * Cache-first, and that is the whole policy: these assets are content the NWS
  * republishes on a schedule of months, and the app asks for one once per
@@ -921,56 +863,6 @@ async function serveAsset(event) {
     await cache.put(event.request, response.clone());
   }
   return response;
-}
-
-async function serveTile(event) {
-  const cache = await caches.open(TILE_CACHE);
-  const hit = await cache.match(event.request);
-
-  if (hit) {
-    if (tileIsStale(hit)) {
-      event.waitUntil(
-        fetch(event.request)
-          .then((fresh) => cacheTile(cache, event.request, fresh))
-          .catch(() => {}),
-      );
-    }
-    return hit;
-  }
-
-  // Let a failure reject, exactly as an uncontrolled fetch would, so walkers
-  // sees an ordinary network error rather than a synthetic response.
-  const response = await fetch(event.request);
-  await cacheTile(cache, event.request, response);
-  event.waitUntil(trimTiles());
-  return response;
-}
-
-/*
- * `cache.keys()` walks every entry, so trimming is amortised over a batch.
- * Counting alone was not a bound: the counter is module state, the worker dies
- * after ~30s idle, and a user panning slowly enough to fetch fewer than
- * `TILE_TRIM_BATCH` tiles per lifetime never reached the threshold, so the cache
- * grew without limit — quota pressure, which is what makes the shell's
- * all-or-nothing `addAll` fail. `trimmedThisLifetime` makes the first tile
- * written by any instance pay for a full check.
- */
-const TILE_TRIM_BATCH = 50;
-let tilePutsSinceTrim = 0;
-let trimmedThisLifetime = false;
-
-async function trimTiles() {
-  if (trimmedThisLifetime && ++tilePutsSinceTrim < TILE_TRIM_BATCH) return;
-  trimmedThisLifetime = true;
-  tilePutsSinceTrim = 0;
-
-  const cache = await caches.open(TILE_CACHE);
-  const keys = await cache.keys();
-  const excess = keys.length - TILE_CACHE_MAX;
-  if (excess <= 0) return;
-  // `Cache.keys()` yields insertion order, so the head is the oldest. FIFO
-  // rather than LRU: tracking access times would mean a write per read.
-  await Promise.all(keys.slice(0, excess).map((k) => cache.delete(k)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,7 +1183,6 @@ self.addEventListener("activate", (event) => {
       // Claim the registering page so the update channel works on the first
       // visit rather than only after a reload.
       await self.clients.claim();
-      await trimTiles().catch(() => {});
       await purgeStaleBlockCaches().catch(() => {});
       try {
         await checkForUpdate({ force: true });
@@ -1323,9 +1214,6 @@ self.addEventListener("fetch", (event) => {
       return;
     case "asset":
       event.respondWith(serveAsset(event));
-      return;
-    case "tile":
-      event.respondWith(serveTile(event));
       return;
     case "archive-block":
       event.respondWith(serveArchiveBlock(event));
@@ -1364,15 +1252,12 @@ self.__squallarSwInternals = {
   SHELL_URLS,
   ASSET_PATHS,
   ASSET_CACHE,
+  META_CACHE,
   isDataAsset,
   NEVER_CACHE_HOSTS,
-  TILE_CACHE,
-  TILE_CACHE_MAX,
-  TILE_TRIM_BATCH,
   SHELL_PREFIX,
   routeFor,
   isWeatherDataHost,
-  isBasemapTile,
   BASEMAP_ARCHIVE_HOST,
   isBasemapArchive,
   ARCHIVE_URLS,
@@ -1393,6 +1278,4 @@ self.__squallarSwInternals = {
   isShellAsset,
   normalizeHost,
   validatorToken,
-  tileFreshFor,
-  tileIsStale,
 };

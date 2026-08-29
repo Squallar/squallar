@@ -1,4 +1,4 @@
-//! The PMTiles v3 basemap archive reader, behind `basemap-vector`.
+//! The PMTiles v3 basemap archive reader.
 //!
 //! **Nothing calls this yet.** The draw seam is a later step; this module is
 //! reached only from its own tests. It is here so that the transport questions
@@ -314,12 +314,13 @@ impl HttpRangeSource {
 
     /// [`Self::new`] with the part stride overridden.
     ///
-    /// `#[cfg(test)]` rather than `pub`: the stride is the publish side's
+    /// Test-gated rather than `pub`: the stride is the publish side's
     /// contract, and a call site that could pick its own would be a client
     /// quietly disagreeing with the publisher about where every part
     /// boundary is. The tests need it so the 419 KB fixture can have
-    /// boundaries at all.
-    #[cfg(test)]
+    /// boundaries at all. Gated exactly as its only caller (`mod tests`,
+    /// native-only) is, so the wasm32 test target does not warn it unused.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn with_small_parts(
         client: Client,
         url: &str,

@@ -1,27 +1,16 @@
 pub mod actions;
-/// The PMTiles v3 basemap archive reader.
-///
-/// Behind `basemap-vector`, because that is where the `pmtiles` dependency
-/// lives. Read by [`tile_source::HttpsTiles::from_archive_url`], which is the
-/// base map source on native when the feature is on.
-#[cfg(feature = "basemap-vector")]
+/// The PMTiles v3 basemap archive reader. Read by
+/// [`tile_source::HttpsTiles::from_archive_url`], which is THE base map
+/// source on every target since the raster (CartoDB) path was deleted.
 pub mod basemap_archive;
 /// The BasemapTiles layer: the handler that makes the base map a Layers-panel
-/// citizen, and the per-source-layer toggle table. **Ungated**, unlike
-/// [`basemap_style`]: the layer exists on every build (a raster basemap is
-/// still the ground layer), and `tests/committed_styles_parse.rs` — an
-/// integration binary, which never sees `cfg(test)` items — pins the toggle
-/// table against the committed styles.
+/// citizen, and the per-source-layer toggle table.
+/// `tests/committed_styles_parse.rs` — an integration binary, which never sees
+/// `cfg(test)` items — pins the toggle table against the committed styles.
 pub mod basemap_layer;
-/// The two committed basemap styles, compiled in.
-///
-/// **`any(feature, test)`, and both halves are load-bearing.** The `include_str!`
-/// pair is 241 KB of JSON that a build with the feature off would carry for
-/// nothing — the wasm artifact especially — so the feature keeps it out. The
-/// `test` keeps the tests *in*: with the feature alone they would be invisible
-/// to `cargo test --workspace`, which is precisely how the archive reader
-/// landed with 13 tests and moved the workspace total by zero.
-#[cfg(any(feature = "basemap-vector", test))]
+/// The two committed basemap styles, compiled in. The `include_str!` pair is
+/// 241 KB of JSON, carried by every build because every build renders the
+/// vector basemap from it.
 pub mod basemap_style;
 pub(crate) mod field_facts;
 pub(crate) mod legend_ramp;

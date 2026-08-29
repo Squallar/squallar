@@ -98,7 +98,7 @@ state extract is ample):
 
 ```
 SQUALLAR_PMTILES_ARCHIVE=/path/to/oklahoma.pmtiles \
-  cargo test -p squallar-egui --features basemap-vector
+  cargo test -p squallar-egui
 ```
 
 Under that override `the_header_matches_the_built_archive` skips instead, since

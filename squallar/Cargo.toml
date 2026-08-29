@@ -37,13 +37,7 @@ path = "src/lib.rs"
 
 [dependencies]
 squallar-app = { workspace = true }
-# `basemap-vector` here rather than in `squallar-egui`'s own `default` list:
-# this crate is every NATIVE target (desktop, android, ios) and the archive
-# reader exists on all of them. `squallar-web` deliberately does not ask for
-# it -- on wasm32 the reader is `cfg`'d out entirely, so a default row would
-# ship `pmtiles` and `tokio` in the web bundle for nothing. Features are
-# additive across the graph, so asking here is what makes the flip native-only.
-squallar-egui = { workspace = true, features = ["basemap-vector"] }
+squallar-egui = { workspace = true }
 squallar-kv = { workspace = true }
 # The domain vocabulary (Fix, LocationPermission). `serial` is requested per target below.
 squallar-location = { workspace = true }
@@ -61,11 +55,10 @@ winit = { workspace = true }
 env_logger = "=0.11.11"
 
 [dev-dependencies]
-# Both only for src/network_security_config.rs, which is `#[cfg(test)]`.
+# Only for src/network_security_config.rs, which is `#[cfg(test)]`.
 # The origins are named at the substrate rather than through
 # `squallar_radar::sources`, which is a re-export of exactly this module.
 squallar-source = { workspace = true }
-walkers = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # The facade's JNI location arm (`squallar_location::android`), which
