@@ -4518,6 +4518,7 @@ dependencies = [
  "squallar-kv",
  "squallar-location",
  "squallar-nmea-serial",
+ "squallar-overlays",
  "squallar-source",
  "winit",
 ]

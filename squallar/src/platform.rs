@@ -10,6 +10,28 @@ use squallar_app::platform::{PlatformBridge, RedrawWaker};
 #[cfg(target_os = "android")]
 type InsetsQuerier = fn() -> (f32, f32, f32, f32);
 
+/// Where the web deploy serves the committed NWS zone-geometry pack
+/// (`squallar-web/zones.pack`, staged beside `index.html` by `build.yaml`'s
+/// `web-wasm32` row). Native targets download it from here once, keep it
+/// beside the zone cache, and read the file thereafter; the web build resolves
+/// the same asset relative to its own page instead. Verified serving 2026-08-29
+/// (200, 3,865,522 bytes — the committed pack, byte for byte).
+///
+/// A fifth literal for the squallar.app cutover: `deploy-cloudfront` in
+/// `build.yaml` names the four that move together, and this one moves with
+/// them.
+pub const ZONE_PACK_URL: &str = "https://rustdar.mcswain.dev/zones.pack";
+
+/// Point zone resolution at the deployed pack — the native mirror of
+/// `squallar-web`'s `name_the_zone_pack`. Called once by each entry point,
+/// before the first alerts round consumes it. Nothing is fetched here: the
+/// download happens later, on the alerts fetch task, and only when no pack
+/// file is already beside the zone cache. A failed download degrades to the
+/// HTTP zone resolution that shipped before the pack existed.
+pub fn name_the_zone_pack() {
+    squallar_overlays::nws::zone_pack_source::use_download_url(ZONE_PACK_URL.to_string());
+}
+
 /// This machine's IANA timezone name, or `None` if it cannot be determined.
 ///
 /// A failure here is ordinary: a container with no `/etc/localtime`, or a `TZ`

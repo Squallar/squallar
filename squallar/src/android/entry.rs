@@ -32,6 +32,10 @@ fn android_main(app: AndroidApp) {
     // Redundant, but it keeps the choice at a predictable point.
     squallar_app::tls::init();
 
+    // Before the app, because the first alerts round is what consumes it.
+    // Only names the URL; nothing is fetched here.
+    crate::platform::name_the_zone_pack();
+
     // rustls-platform-verifier reaches Android's TrustManager over JNI; without
     // this, every HTTPS connection fails. `init_with_env` derives the class
     // loader from `Context.getClassLoader()`.

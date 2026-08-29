@@ -114,6 +114,11 @@ mod tests {
         // The attribution link the map footer opens.
         hosts.insert(host_of(squallar_egui::tiles::ATTRIBUTION_URL));
 
+        // The NWS zone pack, downloaded once from the web deploy and kept
+        // beside the zone cache. Read from the entry points' const, so a
+        // moved deploy fails here rather than in the field.
+        hosts.insert(host_of(crate::platform::ZONE_PACK_URL));
+
         hosts
     }
 
