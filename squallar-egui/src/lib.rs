@@ -27,6 +27,7 @@ pub mod radar_layer;
 pub mod shell_api;
 /// The app's layer set, composed from the source crates that own the data.
 pub mod sources;
+pub(crate) mod terrain;
 pub mod tile_source;
 pub mod tiles;
 mod ui;

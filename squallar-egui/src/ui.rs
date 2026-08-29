@@ -1194,6 +1194,16 @@ impl Gui {
     /// vector basemap draws its labels out of the tile it already has, so there
     /// is one pyramid whatever the pane has switched on, and this term stopped
     /// depending on any layer's state.
+    ///
+    /// **The Terrain layer does not re-open that question**, and the reason is
+    /// worth spelling since it looks like the labels story come back: terrain
+    /// *is* a second pyramid over the same ground, but it is a second
+    /// **source** with its own cache at its own bound — and
+    /// `tile_source::TERRAIN_TILE_CACHE_ENTRIES` equals `TILE_CACHE_ENTRIES`
+    /// precisely so this per-source comparison stays the right one for both.
+    /// Each source's working set at `bias` is the figure below unchanged; a
+    /// `layers: 2` here would gate the basemap's cache on the *sum* of two
+    /// caches neither of which holds it.
     fn floor_tile_working_set(&self, bias: u8) -> usize {
         self.panes()
             .iter()

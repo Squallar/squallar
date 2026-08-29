@@ -1,5 +1,33 @@
 # `squallar-egui` test data
 
+## `terrain-hillshade-z10-224-395.webp`
+
+One real tile out of the published terrain hillshade archive
+(`tiles.squallar.app/terrain/4ca64469750e-20260829/`), fetched 2026-08-29:
+z10 224/395, flat Kansas farmland with a river valley through it — flat
+ground, shadow and lit slope in 666 bytes. `terrain::tests` pins the remap
+against it pixel by pixel.
+
+It is **lossy** VP8 WebP, and that is a property the tests depend on rather
+than an accident: the encoder's RGB→YUV→RGB round trip cannot represent the
+gdaldem flat level 181 (this tile decodes with zero pixels at 181; the
+histogram jumps 180 → 182), which is what `terrain::HILLSHADE_FLAT_TOLERANCE`
+exists to absorb. Do not re-encode or "optimise" it.
+
+## `terrain-hillshade-mini.pmtiles`
+
+The same WebP tile wrapped in a minimal, hand-built PMTiles v3 **raster**
+archive: 803 bytes, `tile_type = 4` (WebP), `tile_compression = 1` (none),
+`internal_compression = 1` (none), one root-directory entry, no leaves,
+zooms 10..=10. Built by a one-shot script from the tile above (the varint
+directory and 127-byte header are spelled per the PMTiles v3 spec).
+
+It exists so `tile_source::tests::archive_decode` can prove the decode seam
+takes its routing from a real header the reader parsed — `tile_type = 4`
+routes bodies to the hillshade decoder, against `monaco.pmtiles` whose
+`tile_type = 1` routes to `Tile::from_mvt` — rather than from sniffing the
+bytes.
+
 ## `monaco.pmtiles`
 
 A real PMTiles v3 vector-tile archive covering Monaco, committed so that

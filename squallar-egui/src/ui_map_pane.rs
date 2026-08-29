@@ -22,7 +22,9 @@ use squallar_source::id::{LayerId, known};
 use squallar_source::product::FieldId;
 use squallar_source::time::TimeAxis;
 
-use super::super::map_overlays::{OverlayDrawContext, is_pos_blocked, paint_labels};
+use super::super::map_overlays::{
+    OverlayDrawContext, draw_tile_layer, is_pos_blocked, paint_labels,
+};
 use squallar_radar::fields as radar_fields;
 
 /// Which of a pane's surfaces one call to [`render_pane_map_content`] paints.
@@ -61,6 +63,17 @@ pub(super) struct PaneRenderCtx<'a> {
     /// the ground they arrived on. A pane with the layer off never takes them
     /// and they are dropped with the context.
     pub basemap_labels: Vec<walkers::Text>,
+    /// The terrain hillshade source, taken out of `tiles::MapTileState` for
+    /// the frame the way the base tiles are. `None` while the Terrain layer
+    /// is off in every visible pane (the slot is then released — a disabled
+    /// layer costs zero network) or its archive is unusable. Drawn by the
+    /// `Terrain` arm below, so the hillshade lands at the layer's own
+    /// position in the pane's order: above the base ground, under the
+    /// weather.
+    pub terrain_tiles: Option<&'a mut crate::tile_source::HttpsTiles>,
+    /// The tile zoom bias this pane's ground was drawn at, so the terrain
+    /// tiles sample the same grid the basemap did this frame.
+    pub tile_zoom_bias: u8,
     /// How many overlay rasters this pane and layer may have crossing at once —
     /// the device's `Budgets::concurrent_renders`. See
     /// [`crate::overlay_cache::RendersInFlight::admits`].
@@ -227,6 +240,14 @@ pub(super) fn render_pane_map_content(
                         .pane
                         .displayed_melting_layer_source()
                         .filter(|source| !source.is_measured());
+                }
+                id if *id == known::TERRAIN => {
+                    // A raster layer defers no labels: only a vector tile
+                    // carries text, so the returned list is empty by
+                    // construction and there is nothing to keep.
+                    if let Some(tiles) = ctx.terrain_tiles.as_deref_mut() {
+                        draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                    }
                 }
                 id if *id == known::CITY_LABELS => {
                     // One `OccupiedAreas` for the whole pane, which is what

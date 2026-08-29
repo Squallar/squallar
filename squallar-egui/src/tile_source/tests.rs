@@ -1783,3 +1783,148 @@ mod archive {
         );
     }
 }
+
+/// The archive decode seam: the header's `tile_type`, never the bytes,
+/// decides how a body becomes a [`Tile`]. Two committed fixtures carry the
+/// two real archives' shapes — Monaco (`tile_type = 1`, MVT) and the
+/// single-tile terrain wrap (`tile_type = 4`, the real Kansas WebP inside).
+#[cfg(feature = "basemap-vector")]
+mod archive_decode {
+    use std::path::PathBuf;
+
+    use super::super::{ArchiveTileKind, decode_archive_tile};
+    use super::*;
+    use crate::basemap_archive::{BasemapArchive, FileRangeSource};
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(future)
+    }
+
+    /// Open a committed archive and read one tile out of it, answering the
+    /// header-derived kind alongside the body.
+    fn kind_and_tile(name: &str, z: u8, x: u32, y: u32) -> Option<(ArchiveTileKind, Vec<u8>)> {
+        let path = fixture(name);
+        let source = match FileRangeSource::open(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!(
+                    "SKIPPED: {} would not open ({error}). It is committed; \
+                     `git status` on it.",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        Some(block_on(async {
+            let archive = BasemapArchive::open(source)
+                .await
+                .expect("the committed fixture is a PMTiles archive");
+            let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
+            let bytes = archive
+                .tile(z, x, y)
+                .await
+                .expect("the tile reads")
+                .into_bytes()
+                .expect("the fixture holds this tile");
+            (kind, bytes)
+        }))
+    }
+
+    /// The terrain fixture's header says WebP, so its body routes to the
+    /// hillshade decoder and comes out a raster — with the flat-transparent
+    /// remap applied, not the raw grey.
+    #[test]
+    fn a_raster_archives_header_routes_its_body_to_the_hillshade_decoder() {
+        let Some((kind, bytes)) = kind_and_tile("terrain-hillshade-mini.pmtiles", 10, 224, 395)
+        else {
+            return;
+        };
+        assert_eq!(
+            kind,
+            ArchiveTileKind::Hillshade,
+            "tile_type 4 is a raster archive"
+        );
+
+        let ctx = Context::default();
+        let tile = decode_archive_tile(&bytes, kind, &Style::default(), 10, &ctx)
+            .expect("the WebP body decodes");
+        match tile {
+            Tile::Raster(_) => {}
+            Tile::Vector(_) => panic!("a WebP body under a raster header became a vector tile"),
+        }
+    }
+
+    /// The basemap fixture's header says MVT, so its body routes to
+    /// `Tile::from_mvt` exactly as before the seam existed.
+    #[test]
+    fn an_mvt_archives_header_still_routes_its_body_to_from_mvt() {
+        let Some((kind, bytes)) = kind_and_tile("monaco.pmtiles", 14, 8529, 5974) else {
+            return;
+        };
+        assert_eq!(kind, ArchiveTileKind::Vector, "tile_type 1 is MVT");
+
+        let ctx = Context::default();
+        let tile = decode_archive_tile(
+            &bytes,
+            kind,
+            &crate::basemap_style::committed(true),
+            14,
+            &ctx,
+        )
+        .expect("the MVT body tessellates");
+        match tile {
+            Tile::Vector(_) => {}
+            Tile::Raster(_) => panic!("an MVT body under a vector header became a raster"),
+        }
+    }
+
+    /// **The choice comes from the header, not the bytes.** Each fixture's
+    /// body handed to the *other* archive's kind errors instead of being
+    /// sniffed into whatever it happens to look like — which is exactly what
+    /// `Tile::new`'s guess used to do, and the regression this seam exists
+    /// to prevent.
+    #[test]
+    fn the_bytes_do_not_get_a_vote() {
+        let Some((_, webp)) = kind_and_tile("terrain-hillshade-mini.pmtiles", 10, 224, 395) else {
+            return;
+        };
+        let Some((_, mvt)) = kind_and_tile("monaco.pmtiles", 14, 8529, 5974) else {
+            return;
+        };
+        let ctx = Context::default();
+
+        // Control: `Tile::new` WOULD sniff the WebP body into a raster, so
+        // the error below is the seam refusing, not the body being unreadable.
+        assert!(
+            Tile::new(&webp, &Style::default(), 10, &ctx).is_ok(),
+            "non-vacuity: the sniffing path accepts this body",
+        );
+
+        assert!(
+            decode_archive_tile(&webp, ArchiveTileKind::Vector, &Style::default(), 10, &ctx)
+                .is_err(),
+            "a WebP body under an MVT header is a broken archive, not a raster",
+        );
+        assert!(
+            decode_archive_tile(
+                &mvt,
+                ArchiveTileKind::Hillshade,
+                &Style::default(),
+                14,
+                &ctx
+            )
+            .is_err(),
+            "an MVT body under a raster header is a broken archive, not a map",
+        );
+    }
+}

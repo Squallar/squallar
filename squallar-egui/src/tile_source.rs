@@ -219,6 +219,97 @@ pub const MEASURED_VECTOR_TILE_BYTES: usize = 652_112;
 /// What one cached raster tile costs: 256x256 RGBA.
 pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 
+/// The terrain hillshade source's cache bound.
+///
+/// Its own name, derived the way [`TILE_CACHE_ENTRIES`]' arms derive theirs —
+/// and the derivation lands on the same three counts, because every floor
+/// behind them is zoom geometry rather than content: 96 covers the 1920x1200
+/// working set on wasm and mobile, and the desktop arm is pinned from below at
+/// 242 by `squallar_gpu`'s `MIRROR_SCALE_MAX` (terrain draws on the 3D floor
+/// strips too, so the mirror's deepest rung binds it exactly as it binds the
+/// basemap). Equality is also what keeps `ui.rs`'s zoom-bias gate coherent:
+/// `tile_zoom_bias_for_pane` compares one per-source working set against one
+/// per-source bound, and a smaller terrain bound would let the gate admit a
+/// bias that overruns terrain's cache while the basemap's absorbs it.
+///
+/// What differs is the **byte** worst case, and it is why the shared count is
+/// cheap here: every terrain entry is a raster texture ([`RASTER_TILE_BYTES`]
+/// = 256 KiB — the WebP body is decoded, remapped and uploaded, never
+/// retained), so the bound is worth the raster column of the table above —
+/// 64 MiB desktop, 24 MiB mobile/wasm — with no 646 KB vector tail to size
+/// for.
+pub const TERRAIN_TILE_CACHE_ENTRIES: NonZeroUsize = TILE_CACHE_ENTRIES;
+
+/// How an archive source's tile bodies become [`Tile`]s — decided **once per
+/// archive from its header's `tile_type`**, never by sniffing bodies.
+///
+/// The seam exists because two archives now flow through the same fetch loop
+/// with different pixels in them: the basemap (`tile_type = 1`, MVT) and the
+/// terrain hillshade (`tile_type = 4`, WebP). Before it, every body went
+/// through `walkers::Tile::new`, which *guesses* — image decode if any decoder
+/// recognises the bytes, MVT otherwise — so a raster archive would have
+/// painted raw gdaldem grey over the map and a corrupt MVT body would be
+/// sniffed rather than reported. The header names what the archive holds;
+/// [`decode_archive_tile`] obeys it.
+///
+/// Compiled where a caller exists: the wasm32 pump and the archive
+/// feature's IO task; the tests that drive it are behind the same feature
+/// (the [`DecodeBudget`] gating precedent).
+#[cfg(any(target_arch = "wasm32", feature = "basemap-vector"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArchiveTileKind {
+    /// `tile_type = 1` (MVT): tessellated against the committed style via
+    /// [`Tile::from_mvt`] — an image body in a vector archive is an error,
+    /// not a fallback.
+    Vector,
+    /// A raster `tile_type` (2 PNG, 3 JPEG, 4 WebP, 5 AVIF): decoded as an
+    /// image and remapped by [`crate::terrain::decode_hillshade_tile`]. The
+    /// remap is unconditional because the app's only raster archive is the
+    /// terrain hillshade; a future plain-raster archive must add its own arm
+    /// here rather than inherit the remap.
+    Hillshade,
+    /// `tile_type = 0`: the header declares nothing, so the body is sniffed
+    /// exactly as a plain HTTP tile is. No archive this app opens says this;
+    /// the arm keeps "unknown" behaving as the pre-seam code did instead of
+    /// picking a guess of its own.
+    Undeclared,
+}
+
+/// Turn one archive tile body into a [`Tile`], the way `kind` — the archive
+/// header's word — says to. See [`ArchiveTileKind`] for why the header and
+/// never the bytes.
+///
+/// Costs where it runs: on native this is called on the IO runtime's blocking
+/// pool ([`read_one`]), on wasm32 under the frame pump's
+/// [`WASM_TILE_DECODES_PER_PUMP`] budget — never freely on the frame thread.
+///
+/// Compiled where a caller exists, like [`ArchiveTileKind`].
+#[cfg(any(target_arch = "wasm32", feature = "basemap-vector"))]
+pub(crate) fn decode_archive_tile(
+    bytes: &[u8],
+    kind: ArchiveTileKind,
+    style: &Style,
+    zoom: u8,
+    ctx: &Context,
+) -> Result<Tile, String> {
+    match kind {
+        ArchiveTileKind::Vector => {
+            Tile::from_mvt(bytes, style, zoom).map_err(|error| error.to_string())
+        }
+        ArchiveTileKind::Hillshade => {
+            let remapped = crate::terrain::decode_hillshade_tile(bytes)?;
+            Ok(Tile::Raster(ctx.load_texture(
+                "terrain-hillshade",
+                remapped,
+                Default::default(),
+            )))
+        }
+        ArchiveTileKind::Undeclared => {
+            Tile::new(bytes, style, zoom, ctx).map_err(|error| error.to_string())
+        }
+    }
+}
+
 /// The `max_zoom` value that means "not read yet", not "zero".
 ///
 /// An archive source does not learn its own depth until the IO task has read
@@ -540,6 +631,14 @@ pub struct HttpsTiles {
     #[cfg(target_arch = "wasm32")]
     style: Arc<Style>,
 
+    /// wasm32 only: how this source's archive bodies decode — the archive
+    /// header's word, written once by the IO task at open. `None` for a
+    /// raster HTTP source, whose bodies keep going through [`Tile::new`]'s
+    /// sniff. On native the IO task reads the header off the archive it holds
+    /// instead — see [`read_one`].
+    #[cfg(target_arch = "wasm32")]
+    archive_kind: Option<Arc<OnceLock<ArchiveTileKind>>>,
+
     /// Whether "the tile IO task is gone" has already been said for this
     /// source. See [`drain_up_to`]: the condition is permanent, so the line is
     /// not.
@@ -723,6 +822,9 @@ impl HttpsTiles {
             // which only reads a style for a tile that is not an image.
             #[cfg(target_arch = "wasm32")]
             style: Arc::new(Style::default()),
+            // Not an archive: no header to obey, so the sniff stands.
+            #[cfg(target_arch = "wasm32")]
+            archive_kind: None,
             io_task_gone_reported: false,
             pumps: 0,
             runtime,
@@ -806,26 +908,43 @@ impl HttpsTiles {
             egui_ctx,
             decode_budget,
             style,
+            archive_kind,
             io_task_gone_reported,
             ..
         } = self;
         let style: &Style = style;
+        let archive_kind = archive_kind.as_ref();
 
         let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
         let taken = drain_up_to(
             tile_rx,
             budget,
             io_task_gone_reported,
-            |(tile_id, bytes): (TileId, Vec<u8>)| match Tile::new(
-                &bytes,
-                style,
-                tile_id.zoom,
-                egui_ctx,
-            ) {
-                Ok(tile) => {
-                    cache.put(tile_id, Some(tile));
+            |(tile_id, bytes): (TileId, Vec<u8>)| {
+                let decoded = match archive_kind {
+                    // A raster HTTP source: the body is whatever image the
+                    // provider serves, sniffed as it always was.
+                    None => Tile::new(&bytes, style, tile_id.zoom, egui_ctx)
+                        .map_err(|error| error.to_string()),
+                    // An archive source: the header's word decides. The IO
+                    // task writes the slot at open, before any tile is
+                    // served, so an empty slot cannot be reached through the
+                    // normal order of events; if it ever is, sniffing is the
+                    // pre-seam behaviour rather than a guess of this code's.
+                    Some(kind) => decode_archive_tile(
+                        &bytes,
+                        kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared),
+                        style,
+                        tile_id.zoom,
+                        egui_ctx,
+                    ),
+                };
+                match decoded {
+                    Ok(tile) => {
+                        cache.put(tile_id, Some(tile));
+                    }
+                    Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
                 }
-                Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
             },
         );
         decode_budget.record(taken);
@@ -1171,6 +1290,36 @@ impl HttpsTiles {
         ))
     }
 
+    /// Serve the terrain hillshade archive at `url`.
+    ///
+    /// [`Self::from_archive_url`]'s twin with terrain's facts: an empty style
+    /// (the bodies are raster; nothing tessellates, and the raster decode
+    /// never reads a style) and [`TERRAIN_TILE_CACHE_ENTRIES`] as the bound.
+    /// The hillshade remap is **not** chosen here: the archive's own header
+    /// (`tile_type = 4`) routes its bodies through it — see
+    /// [`ArchiveTileKind`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_archive_url`]: only a URL that will not parse fails at
+    /// construction; everything later lands on [`Self::fault`].
+    pub fn from_terrain_archive_url(
+        url: &str,
+        attribution: Attribution,
+        egui_ctx: Context,
+    ) -> Result<Self, crate::basemap_archive::RangeError> {
+        use crate::basemap_archive::{HttpRangeSource, archive_client};
+
+        let source = HttpRangeSource::new(archive_client(), url)?;
+        Ok(Self::from_range_source(
+            source,
+            Arc::new(Style::default()),
+            attribution,
+            egui_ctx,
+            TERRAIN_TILE_CACHE_ENTRIES,
+        ))
+    }
+
     /// [`Self::from_archive_url`] with the range source and the cache bound
     /// supplied. Crate-private, for the tests, which read the committed Monaco
     /// fixture off disk rather than over a network.
@@ -1189,6 +1338,9 @@ impl HttpsTiles {
 
         let max_zoom = Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN));
         let fault: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        // How this archive's bodies decode -- filled in by the IO task from
+        // the header, at open, before it serves a tile. See [`ArchiveTileKind`].
+        let archive_kind: Arc<OnceLock<ArchiveTileKind>> = Arc::new(OnceLock::new());
 
         // Both clones exist for the reason `with_client_and_cache` clones the
         // context: on wasm32 the frame pump is the tessellating side, so it
@@ -1199,12 +1351,17 @@ impl HttpsTiles {
         let frame_ctx = egui_ctx.clone();
         #[cfg(target_arch = "wasm32")]
         let frame_style = Arc::clone(&style);
+        #[cfg(target_arch = "wasm32")]
+        let frame_archive_kind = Arc::clone(&archive_kind);
 
         let runtime = runtime::spawn(serve_archive_continuously(
             source,
             style,
-            Arc::clone(&max_zoom),
-            Arc::clone(&fault),
+            ArchiveHeaderSlots {
+                max_zoom: Arc::clone(&max_zoom),
+                fault: Arc::clone(&fault),
+                kind: archive_kind,
+            },
             request_rx,
             tile_tx,
             egui_ctx,
@@ -1234,9 +1391,37 @@ impl HttpsTiles {
             // every label.
             #[cfg(target_arch = "wasm32")]
             style: frame_style,
+            #[cfg(target_arch = "wasm32")]
+            archive_kind: Some(frame_archive_kind),
             io_task_gone_reported: false,
             pumps: 0,
             runtime,
+        }
+    }
+}
+
+/// The slots the IO task fills for the frame side once the archive header
+/// is read — created by [`HttpsTiles::from_range_source`], written exactly
+/// once by [`serve_archive_continuously`] at open. One parameter rather than
+/// three, because they travel together and mean the same moment.
+#[cfg(feature = "basemap-vector")]
+struct ArchiveHeaderSlots {
+    max_zoom: Arc<AtomicU8>,
+    fault: Arc<OnceLock<String>>,
+    kind: Arc<OnceLock<ArchiveTileKind>>,
+}
+
+#[cfg(feature = "basemap-vector")]
+impl ArchiveTileKind {
+    /// The header's `tile_type`, as a decode decision. See the enum's own
+    /// docs for the arms; the mapping is total so a new pmtiles `TileType`
+    /// variant is a compile error here rather than a silent sniff.
+    fn from_tile_type(tile_type: pmtiles::TileType) -> Self {
+        use pmtiles::TileType;
+        match tile_type {
+            TileType::Mvt | TileType::Mlt => Self::Vector,
+            TileType::Png | TileType::Jpeg | TileType::Webp | TileType::Avif => Self::Hillshade,
+            TileType::Unknown => Self::Undeclared,
         }
     }
 }
@@ -1268,8 +1453,7 @@ impl HttpsTiles {
 async fn serve_archive_continuously<S>(
     source: S,
     style: Arc<Style>,
-    max_zoom: Arc<AtomicU8>,
-    fault: Arc<OnceLock<String>>,
+    slots: ArchiveHeaderSlots,
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
@@ -1290,14 +1474,20 @@ async fn serve_archive_continuously<S>(
             // bounds the flood; this is what lets the UI act on it.
             let reason = error.to_string();
             log::error!("the basemap archive will not open, so it serves no tiles: {reason}");
-            let _ = fault.set(reason);
+            let _ = slots.fault.set(reason);
             // Nothing else would wake the UI to notice.
             egui_ctx.request_repaint();
             return;
         }
     };
 
-    max_zoom.store(archive.max_zoom(), Ordering::Relaxed);
+    slots.max_zoom.store(archive.max_zoom(), Ordering::Relaxed);
+    // The header's word on what the bodies are, published before the first
+    // tile is served: on wasm32 the frame pump decodes, and this is how it
+    // knows which decoder the archive calls for.
+    let _ = slots
+        .kind
+        .set(ArchiveTileKind::from_tile_type(archive.tile_type()));
     log::info!(
         "basemap archive open: zooms {}-{}, tiles {:?}, compression {:?}",
         archive.min_zoom(),
@@ -1434,11 +1624,15 @@ where
     let payload = {
         let style = Arc::clone(style);
         let egui_ctx = egui_ctx.clone();
+        // The header's word, not the body's shape -- see [`ArchiveTileKind`].
+        let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
 
-        tokio::task::spawn_blocking(move || Tile::new(&bytes, &style, tile_id.zoom, &egui_ctx))
-            .await
-            .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
-            .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
+        tokio::task::spawn_blocking(move || {
+            decode_archive_tile(&bytes, kind, &style, tile_id.zoom, &egui_ctx)
+        })
+        .await
+        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
+        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
     };
 
     // On wasm the tessellation belongs to the frame pump, under its budget.
