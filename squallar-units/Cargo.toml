@@ -6,3 +6,7 @@ edition.workspace = true
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+# `DataSize`'s round-trip test only; the crate itself emits no JSON.
+serde_json = { workspace = true }
