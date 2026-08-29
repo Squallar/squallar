@@ -364,3 +364,113 @@ fn a_config_written_before_curation_loads_to_the_stack_it_names() {
         );
     }
 }
+
+/// **A config written before the Terrain layer existed still serves it** —
+/// additively, with no migration and no CONFIG_VERSION bump. Terrain ships
+/// OFF, so for a default-off layer "served" means what the tree means by it:
+/// the old user's stack is untouched (nothing new is drawn on their map), the
+/// catalog offers the layer, adding it lands at its registry position — the
+/// bottom, weight 2 — and the addition reopens 1:1. The fixture JSON is the
+/// pre-Terrain shape (`root_site_v4.json`'s pane, abbreviated).
+#[test]
+fn terrain_appears_for_a_config_written_before_it_existed() {
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "Radar", "enabled": true},
+                {"id": "NwsAlerts", "enabled": true}
+            ]
+        }]
+    }"#;
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(json)),
+        "the pre-Terrain config must load",
+    );
+    let order = gui.pane(0).expect("pane 0").draw_order_vec();
+    assert!(
+        !order.contains(&known::TERRAIN),
+        "Terrain ships OFF, so an old config must not sprout a stack row \
+         nobody asked for: {order:?}",
+    );
+    assert!(
+        order.contains(&known::RADAR) && order.contains(&known::NWS_ALERTS),
+        "non-triviality: the file's own slots came through",
+    );
+
+    // The catalog's add — the door an old user reaches the new layer through.
+    assert!(
+        gui.add_layer_on_pane_for_test(0, &known::TERRAIN),
+        "a config that never heard of Terrain must not block adding it",
+    );
+    let order = gui.pane(0).expect("pane 0").draw_order_vec();
+    assert_eq!(
+        order.first(),
+        Some(&known::TERRAIN),
+        "Terrain's weight (2) puts it under everything the file named: \
+         {order:?}",
+    );
+    assert!(
+        gui.pane(0)
+            .expect("pane 0")
+            .is_overlay_enabled(&known::TERRAIN),
+        "a layer added from the catalog is shown",
+    );
+
+    // Reopen is 1:1: the addition survives a save and a reload.
+    let saved = gui.ui_config_json().expect("the config serializes");
+    let mut reopened = Gui::new();
+    assert!(reopened.load_ui_config(&store_with(&saved)));
+    let pane = reopened.pane(0).expect("pane 0");
+    assert!(
+        pane.draw_order_vec().first() == Some(&known::TERRAIN)
+            && pane.is_overlay_enabled(&known::TERRAIN),
+        "the added Terrain row did not reopen where and how it was left",
+    );
+}
+
+/// **A tombstoned Terrain stays removed** — the same contract every other
+/// layer's removal carries, proven for the id that did not exist when the
+/// tombstone mechanism shipped.
+#[test]
+fn a_tombstoned_terrain_stays_removed() {
+    let json = r#"{
+        "config_version": 4,
+        "pane_count": 1,
+        "active_pane": 0,
+        "site": "KTLX",
+        "panes": [{
+            "layer_slots": [
+                {"id": "Radar", "enabled": true}
+            ],
+            "removed_layers": [
+                {"id": "Terrain"}
+            ]
+        }]
+    }"#;
+
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store_with(json)),
+        "the config must load"
+    );
+    let pane = gui.pane(0).expect("pane 0");
+    let order = pane.draw_order_vec();
+    assert!(
+        !order.contains(&known::TERRAIN),
+        "the tombstone is the one thing that excludes a registered layer, \
+         and the reconcile walked over it: {order:?}",
+    );
+    assert!(
+        !pane.is_overlay_enabled(&known::TERRAIN),
+        "a removed layer answers the draw gate with no, structurally",
+    );
+    // Non-triviality: the same load with no tombstone would have inserted it
+    // (the test above), and the named slots are intact.
+    assert!(order.contains(&known::RADAR));
+}

@@ -63,6 +63,19 @@ impl super::Gui {
         let mut tiles_owned = self.map_tiles.take_base_tiles();
 
         let pane_count = self.visible_pane_count();
+        // The terrain slot follows the layer, not the frame: built only while
+        // a visible pane draws it, released the frame none does. A disabled
+        // layer must cost zero network, and a source that exists is a source
+        // whose IO task can be asked for tiles.
+        let terrain_on = self.panes[..pane_count]
+            .iter()
+            .any(|pane| pane.is_overlay_enabled(&known::TERRAIN));
+        if terrain_on {
+            self.map_tiles.ensure_terrain_tiles(&ctx);
+        } else {
+            self.map_tiles.release_terrain_tiles();
+        }
+        let mut terrain_owned = self.map_tiles.take_terrain_tiles();
         let modality = self.layout.modality;
         // One read for every pane this frame draws: the figure is the
         // device's, not the pane's.
@@ -268,6 +281,8 @@ impl super::Gui {
                                             user_heading,
                                             user_fix: user_fix.clone(),
                                             basemap_labels,
+                                            terrain_tiles: terrain_owned.as_mut(),
+                                            tile_zoom_bias,
                                             overlay_render_limit,
                                             actions: &mut actions,
                                             pane_rect,
@@ -367,6 +382,7 @@ impl super::Gui {
                                     map_memory: floor_frame.memory,
                                     center: floor_frame.centre,
                                     tiles: tiles_owned.as_mut(),
+                                    terrain: terrain_owned.as_mut(),
                                     tile_zoom_bias: tile_zoom_biases
                                         .get(pane_idx)
                                         .copied()
@@ -516,6 +532,7 @@ impl super::Gui {
             });
 
         self.map_tiles.restore_base_tiles(tiles_owned);
+        self.map_tiles.restore_terrain_tiles(terrain_owned);
 
         actions
     }
@@ -1212,6 +1229,7 @@ impl super::Gui {
             map_memory,
             center,
             tiles,
+            terrain,
             tile_zoom_bias,
             horizontal_color_scale,
             color_scale_floor,
@@ -1267,6 +1285,8 @@ impl super::Gui {
                     user_heading,
                     user_fix,
                     basemap_labels,
+                    terrain_tiles: terrain,
+                    tile_zoom_bias,
                     overlay_render_limit,
                     actions,
                     pane_rect: strip,
@@ -1337,6 +1357,9 @@ struct FloorStripCtx<'a> {
     /// `None` when the frame has no tile source at all, which is the one way
     /// the floor can be missing that is not about the pane.
     tiles: Option<&'a mut crate::tile_source::HttpsTiles>,
+    /// The terrain slot's source, when the frame holds one — the floor strip
+    /// draws the same ground the plan view does, hillshade included.
+    terrain: Option<&'a mut crate::tile_source::HttpsTiles>,
     tile_zoom_bias: u8,
     horizontal_color_scale: bool,
     /// See [`pane_render::PaneRenderCtx::color_scale_floor`]. Carried through

@@ -74,6 +74,10 @@ pub mod known {
     /// their slot state. A ledger row reserves a spelling forever; retiring
     /// the layer does not retire the reservation.
     pub const FAKE_SOURCE: LayerId = LayerId::from_static("FakeSource");
+    /// The terrain hillshade, drawn from the self-hosted PMTiles archive by
+    /// `squallar-egui`'s tile machinery -- a streaming-tile layer like
+    /// `CITY_LABELS`, not a fetch-round overlay.
+    pub const TERRAIN: LayerId = LayerId::from_static("Terrain");
 }
 
 /// Every layer id ever registered.
@@ -91,7 +95,7 @@ pub mod known {
 /// third from the bottom (weight 25), `Mrms` second (weight 15) and `Gmgsi`
 /// **first** (weight 5, under every other layer); all three are appended here
 /// regardless, because append-only wins.
-pub const LAYER_ID_LEDGER: [&str; 16] = [
+pub const LAYER_ID_LEDGER: [&str; 17] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -113,6 +117,7 @@ pub const LAYER_ID_LEDGER: [&str; 16] = [
     // stops a future layer being handed a string already sitting in somebody's
     // config file.
     "FakeSource",
+    "Terrain",
 ];
 
 #[cfg(test)]
@@ -139,6 +144,7 @@ mod tests {
             known::MRMS,
             known::GMGSI,
             known::FAKE_SOURCE,
+            known::TERRAIN,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());
         for id in &known_ids {

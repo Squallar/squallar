@@ -133,6 +133,18 @@ reqwest = { workspace = true }
 # stops being off-by-default.
 pmtiles = { workspace = true, optional = true }
 
+# The terrain hillshade archive's tiles are WebP (`tile_type = 4`), decoded and
+# remapped in `terrain::remap_hillshade` before upload. `webp` is image 0.25's
+# pure-Rust decoder (`image-webp`), so it compiles on wasm32 unchanged. `png`
+# stays because the dev-only loopback tile fixtures are PNGs and a
+# `[dev-dependencies]` re-declaration of the same crate would just re-unify to
+# this set anyway. No new graph node: `walkers` already depends on this exact
+# version with `jpeg` + `png`; this line adds one decoder module to it.
+image = { version = "=0.25.10", default-features = false, features = [
+    "png",
+    "webp",
+] }
+
 # The tile IO runtime. Native only, and *not* in the shared `[dependencies]`
 # table: tokio rejects most of its feature set on wasm outright
 # (`compile_error!("Only features sync,macros,io-util,rt,time are supported on
@@ -180,11 +192,9 @@ pmtiles = { workspace = true, optional = true, features = ["http-async"] }
 wasm-bindgen-futures = "=0.4.76"
 
 [dev-dependencies]
-# Test-only. `image` encodes the PNG fixtures the loopback tile server serves, so
-# the decode path is exercised on a real image whose exact pixels are known
-# rather than on a checked-in blob. Same version walkers already resolves;
-# `png` only, since that is the one format the fixtures use.
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# `image` moved to `[dependencies]` when the terrain hillshade landed: the
+# WebP decode is now a shipped code path, not only the test fixtures' PNG
+# encoder. The tests keep using it from there.
 
 # Same split as `[dependencies]` above, for the same reason: `rt-multi-thread` is
 # rejected on wasm, and `--all-targets` compiles dev-deps, so leaving this ungated

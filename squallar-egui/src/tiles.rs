@@ -159,6 +159,76 @@ fn archive_url() -> String {
     BASEMAP_ARCHIVE_URL.to_owned()
 }
 
+/// The self-hosted terrain hillshade PMTiles archive.
+///
+/// Published as parts (`.part000`..): `HttpRangeSource` probes `<url>.part000`
+/// at open and selects parts mode on its own, so this names the logical
+/// archive and nothing here knows parts exist. The generation
+/// (`4ca64469750e-20260829`) is compiled in, like the basemap's.
+#[cfg(feature = "basemap-vector")]
+pub const TERRAIN_ARCHIVE_URL: &str =
+    "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles";
+
+/// An archive URL that replaces [`TERRAIN_ARCHIVE_URL`] when it is set.
+/// Native only, for the reason [`BASEMAP_ARCHIVE_URL_ENV`] is: the draw seam
+/// must stay checkable against a local archive behind a plain HTTP server.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+pub const TERRAIN_ARCHIVE_URL_ENV: &str = "SQUALLAR_TERRAIN_ARCHIVE";
+
+/// Which archive the terrain source opens — [`archive_url`]'s split, for
+/// [`archive_url`]'s reason.
+#[cfg(all(feature = "basemap-vector", not(target_arch = "wasm32")))]
+fn terrain_archive_url() -> String {
+    std::env::var(TERRAIN_ARCHIVE_URL_ENV).unwrap_or_else(|_| TERRAIN_ARCHIVE_URL.to_owned())
+}
+
+/// The wasm32 arm of [`terrain_archive_url`]: the compiled-in archive, always.
+#[cfg(all(feature = "basemap-vector", target_arch = "wasm32"))]
+fn terrain_archive_url() -> String {
+    TERRAIN_ARCHIVE_URL.to_owned()
+}
+
+/// The credit the hillshade's elevation data requires.
+///
+/// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
+/// `tools/squallar-terrain/README.md` for the pinned provenance. Carried on
+/// the source like every other credit; the map panel today paints only the
+/// **base** source's credit line, so this reaches the glass only when that
+/// gap is closed (recorded there, not here).
+#[cfg(feature = "basemap-vector")]
+pub const TERRAIN_ATTRIBUTION_TEXT: &str = "\u{a9} Copernicus DEM 2021";
+
+/// The terrain hillshade tile source, or `None` when this build cannot build
+/// one. A per-feature selection of a body, like [`base_source`]'s per-target
+/// splits: on a build without the archive reader there is no terrain engine,
+/// and the layer's toggle simply has nothing to draw.
+#[cfg(feature = "basemap-vector")]
+fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
+    let url = terrain_archive_url();
+    let attribution = Attribution {
+        text: TERRAIN_ATTRIBUTION_TEXT,
+        url: "https://spacedata.copernicus.eu/collections/copernicus-digital-elevation-model",
+        logo_light: None,
+        logo_dark: None,
+    };
+
+    match HttpsTiles::from_terrain_archive_url(&url, attribution, ctx.to_owned()) {
+        Ok(tiles) => Some(tiles),
+        Err(error) => {
+            log::error!("{url} is not a usable terrain archive URL: {error}");
+            None
+        }
+    }
+}
+
+/// See the arm above. Without the archive reader there is nothing to read the
+/// hillshade out of; unlike the basemap there is no raster fallback to fall
+/// to, so the answer is simply no source.
+#[cfg(not(feature = "basemap-vector"))]
+fn terrain_source(_ctx: &egui::Context) -> Option<HttpsTiles> {
+    None
+}
+
 /// The credit the vector basemap carries, in the generator's own words.
 ///
 /// Planetiler prints this pair as the required credit for what it built, so it
@@ -240,6 +310,24 @@ pub struct MapTileState {
     pub tiles: Option<HttpsTiles>,
     pub current_theme_is_dark: bool,
 
+    /// The terrain hillshade source — the second slot, beside the basemap's.
+    ///
+    /// Built lazily by [`Self::ensure_terrain_tiles`], **only while some
+    /// visible pane has the Terrain layer on**: a disabled layer must cost
+    /// zero network, and a source that exists is a source whose IO task will
+    /// be asked for tiles. Released by [`Self::release_terrain_tiles`] when
+    /// the last pane switches the layer off (the accepted cost, exactly as
+    /// for a theme flip on the base slot, is a re-download if it comes back),
+    /// and by [`Self::clear`] with everything else.
+    ///
+    /// **A theme flip does NOT touch it.** [`Self::adopt_theme`] drops the
+    /// base slot because the committed style baked into its tiles is the
+    /// theme; the hillshade remap (black shadows, white highlights, alpha
+    /// from relief — `terrain::remap_hillshade`) is theme-independent by
+    /// design, so its pixels are right under both themes and rebuilding the
+    /// source on a flip would re-download 24-64 MiB for nothing.
+    pub terrain: Option<HttpsTiles>,
+
     /// Whether the vector archive has already been found unreachable this
     /// session, so [`Self::ensure_base_tiles`] must not build another one.
     ///
@@ -252,14 +340,24 @@ pub struct MapTileState {
     /// never sets it, and `HttpsTiles::fault` answers `None` for a raster
     /// source on every target.
     fell_back_to_raster: bool,
+
+    /// [`Self::fell_back_to_raster`]'s twin for the terrain slot, latched for
+    /// the same reason — without it a frame after a failed open would build
+    /// the source again, fail again, and keep a dead retry loop warm. There
+    /// is no raster fallback to fall to: a failed terrain archive means the
+    /// layer draws nothing, said once at `error!`. Cleared by [`Self::clear`],
+    /// because a resume is a plausible moment for the network to be back.
+    terrain_failed: bool,
 }
 
 impl Default for MapTileState {
     fn default() -> Self {
         Self {
             tiles: None,
+            terrain: None,
             current_theme_is_dark: true,
             fell_back_to_raster: false,
+            terrain_failed: false,
         }
     }
 }
@@ -285,6 +383,9 @@ impl MapTileState {
         }
         self.current_theme_is_dark = is_dark;
         self.tiles = None;
+        // Deliberately NOT `self.terrain = None`: the hillshade remap is
+        // theme-independent (see the `terrain` field's docs), so a flip
+        // invalidates nothing of it.
     }
 
     /// Ensure the base-map tiles for the current theme are initialized, and
@@ -334,6 +435,50 @@ impl MapTileState {
         self.tiles = tiles;
     }
 
+    /// Ensure the terrain hillshade source exists, and replace one that has
+    /// reported itself unusable. Call **only while some visible pane draws
+    /// the Terrain layer** — the lazy half of the slot's zero-cost-when-off
+    /// contract; [`Self::release_terrain_tiles`] is the other half.
+    ///
+    /// The fault handling is [`Self::ensure_base_tiles`]'s without the
+    /// fallback arm: there is nothing to fall back to, so a dead archive is
+    /// logged once and the layer draws nothing until [`Self::clear`] resets
+    /// the latch.
+    pub fn ensure_terrain_tiles(&mut self, ctx: &egui::Context) {
+        if let Some(fault) = self.terrain.as_ref().and_then(HttpsTiles::fault) {
+            log::error!(
+                "the terrain archive is unusable, so the Terrain layer draws                  nothing this session: {fault}"
+            );
+            self.terrain_failed = true;
+            self.terrain = None;
+        }
+
+        if self.terrain.is_none() && !self.terrain_failed {
+            self.terrain = terrain_source(ctx);
+            // A build with no archive reader, or a URL that will not parse,
+            // yields no source and never will this session: latch, so the
+            // per-frame cost of an unbuildable source is one bool read.
+            self.terrain_failed = self.terrain.is_none();
+        }
+    }
+
+    /// Drop the terrain source: the last pane showing the layer switched it
+    /// off. Symmetric with [`Self::adopt_theme`]'s handling of the base slot:
+    /// the accepted cost is a re-download if the user switches it back on.
+    pub fn release_terrain_tiles(&mut self) {
+        self.terrain = None;
+    }
+
+    /// Temporarily take the terrain tiles out of self for per-pane rendering.
+    pub fn take_terrain_tiles(&mut self) -> Option<HttpsTiles> {
+        self.terrain.take()
+    }
+
+    /// Restore the terrain tiles after per-pane rendering.
+    pub fn restore_terrain_tiles(&mut self, tiles: Option<HttpsTiles>) {
+        self.terrain = tiles;
+    }
+
     /// Clear all tile state (called on suspend/graphics reset).
     ///
     /// The fallback latch goes with it: a resume is a plausible moment for a
@@ -342,6 +487,8 @@ impl MapTileState {
     pub fn clear(&mut self) {
         self.fell_back_to_raster = false;
         self.tiles = None;
+        self.terrain = None;
+        self.terrain_failed = false;
         self.current_theme_is_dark = !self.current_theme_is_dark;
     }
 }
