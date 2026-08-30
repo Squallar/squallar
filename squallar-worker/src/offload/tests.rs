@@ -1,4 +1,7 @@
 use super::*;
+use squallar_elevation::HeightField;
+use squallar_elevation::TileCover;
+use squallar_elevation::jobs::{HeightTile, TerrainHeightJob};
 use squallar_overlays::render::jobs::{decode_overlay_out, encode_overlay_out};
 use squallar_overlays::render::rasterize::RasterizeOutput;
 use squallar_radar::frame::RenderedFrame;
@@ -733,9 +736,98 @@ fn a_rectangular_voxel_job() -> JobRequest {
     )
 }
 
+/// One real 8x8 Terrain-RGB tile, spelled out as bytes.
+///
+/// **Not synthesised at test time.** The framing digest below is over the whole
+/// request including this body, and the row's fixture is written as literal
+/// constants for the reason the model row's is: a digest over what an encoder
+/// computed here would be a digest of whichever PNG encoder happened to be
+/// linked.
+///
+/// Made by the recipe in the comment, and readable by hand: the deflate stream
+/// is a **stored** block, so bytes 55 onward are the raw scanlines - a filter
+/// byte of 0 then eight RGB triples per row - with no compression between the
+/// heights and the file.
+///
+/// ```text
+/// h(col, row) = 2000 + 100 * col + 50 * row metres
+/// packed      = round((h - trgb::BASE_M) / trgb::QUANTUM_M)   # base-256 in RGB
+/// PNG         = 8x8, colour type 2, bit depth 8, no interlace,
+///               IDAT = zlib level 0 (stored)
+/// ```
+///
+/// So the tile's heights run 2000.0 m at its north-west pixel to 3050.0 m at
+/// its south-east one, and the whole of it is inside the fixture box below.
+const A_TERRAIN_TILE_PNG: [u8; 268] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4b, 0x6d, 0x29,
+    0xdc, 0x00, 0x00, 0x00, 0xd3, 0x49, 0x44, 0x41, 0x54, 0x78, 0x01, 0x01, 0xc8, 0x00, 0x37, 0xff,
+    0x00, 0x01, 0xd4, 0xc0, 0x01, 0xd8, 0xa8, 0x01, 0xdc, 0x90, 0x01, 0xe0, 0x78, 0x01, 0xe4, 0x60,
+    0x01, 0xe8, 0x48, 0x01, 0xec, 0x30, 0x01, 0xf0, 0x18, 0x00, 0x01, 0xd6, 0xb4, 0x01, 0xda, 0x9c,
+    0x01, 0xde, 0x84, 0x01, 0xe2, 0x6c, 0x01, 0xe6, 0x54, 0x01, 0xea, 0x3c, 0x01, 0xee, 0x24, 0x01,
+    0xf2, 0x0c, 0x00, 0x01, 0xd8, 0xa8, 0x01, 0xdc, 0x90, 0x01, 0xe0, 0x78, 0x01, 0xe4, 0x60, 0x01,
+    0xe8, 0x48, 0x01, 0xec, 0x30, 0x01, 0xf0, 0x18, 0x01, 0xf4, 0x00, 0x00, 0x01, 0xda, 0x9c, 0x01,
+    0xde, 0x84, 0x01, 0xe2, 0x6c, 0x01, 0xe6, 0x54, 0x01, 0xea, 0x3c, 0x01, 0xee, 0x24, 0x01, 0xf2,
+    0x0c, 0x01, 0xf5, 0xf4, 0x00, 0x01, 0xdc, 0x90, 0x01, 0xe0, 0x78, 0x01, 0xe4, 0x60, 0x01, 0xe8,
+    0x48, 0x01, 0xec, 0x30, 0x01, 0xf0, 0x18, 0x01, 0xf4, 0x00, 0x01, 0xf7, 0xe8, 0x00, 0x01, 0xde,
+    0x84, 0x01, 0xe2, 0x6c, 0x01, 0xe6, 0x54, 0x01, 0xea, 0x3c, 0x01, 0xee, 0x24, 0x01, 0xf2, 0x0c,
+    0x01, 0xf5, 0xf4, 0x01, 0xf9, 0xdc, 0x00, 0x01, 0xe0, 0x78, 0x01, 0xe4, 0x60, 0x01, 0xe8, 0x48,
+    0x01, 0xec, 0x30, 0x01, 0xf0, 0x18, 0x01, 0xf4, 0x00, 0x01, 0xf7, 0xe8, 0x01, 0xfb, 0xd0, 0x00,
+    0x01, 0xe2, 0x6c, 0x01, 0xe6, 0x54, 0x01, 0xea, 0x3c, 0x01, 0xee, 0x24, 0x01, 0xf2, 0x0c, 0x01,
+    0xf5, 0xf4, 0x01, 0xf9, 0xdc, 0x01, 0xfd, 0xc4, 0x30, 0xe2, 0x53, 0xf8, 0x49, 0x61, 0xf5, 0xfc,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// The box, cover and tile the height row's fixtures are all over.
+///
+/// z10 x210 y391 is the Colorado tile `squallar-elevation`'s own committed
+/// fixture comes from; the box is 6 km by 6 km near 39N 106W, which sits inside
+/// that tile with room for the one-pixel margin bilinear reads outside the
+/// outermost post.
+///
+/// **`x_km` and `y_km` differ, and the framing digest below is why.** They were
+/// both `(-3.0, 3.0)`, and review found that reordering the six box terms in
+/// `encode` and `decode` **symmetrically** left the encoded bytes identical, so
+/// the pinned row did not move, so `wire_digest` did not move, so two builds
+/// either side of that edit would have held the same token and exchanged a
+/// transposed box. That is exactly the failure the token exists to prevent, and
+/// this row is the only pin on the request layout. The post grid is asymmetric
+/// for the same reason and always was.
+///
+/// `tile_px` is 8 rather than 256 because a tile's *address* does not depend on
+/// it: the rectangle a box needs is the same at any tile size, and eight keeps
+/// the literal above short enough to read.
+pub(super) fn a_height_job() -> JobRequest {
+    JobRequest::describe(
+        TerrainHeightJob {
+            site: (39.0, -106.0),
+            x_km: (-3.0, 3.0),
+            y_km: (-2.0, 4.0),
+            posts: [5, 3],
+            cover: TileCover {
+                zoom: 10,
+                tile_px: 8,
+                tx0: 210,
+                ty0: 391,
+                tx1: 210,
+                ty1: 391,
+            },
+            tiles: vec![HeightTile {
+                x: 210,
+                y: 391,
+                png: Arc::new(A_TERRAIN_TILE_PNG.to_vec()),
+            }],
+        },
+        ceiling_only_geometry(0),
+    )
+}
+
+/// Every kind survives its own wire form — and **every kind is here**, which is
+/// the half review found silently open: the roster was a bare array, so a row
+/// added without a fixture was simply never round-tripped.
 #[test]
 fn every_job_kind_survives_the_wire_format() {
-    for job in [
+    let jobs = [
         a_job(),
         a_level3_job(),
         a_level3_pair_job(),
@@ -743,6 +835,11 @@ fn every_job_kind_survives_the_wire_format() {
         a_voxel_job(),
         a_sourceless_voxel_job(),
         a_rectangular_voxel_job(),
+        // Added when the roster gained its registry comparison, which found the
+        // decode row had never been round-tripped here. Its own
+        // `a_decode_job_round_trips_its_archive_whole` covered the property;
+        // nothing covered the roster.
+        a_decode_job(),
         an_overlay_sites_job(),
         an_overlay_alerts_job(),
         an_overlay_outlooks_job(),
@@ -752,7 +849,16 @@ fn every_job_kind_survives_the_wire_format() {
         // The window form; the whole-grid form deliberately does NOT
         // round-trip to itself.
         an_overlay_model_job(),
-    ] {
+        a_height_job(),
+    ];
+    let covered: std::collections::BTreeSet<&str> = jobs.iter().map(|job| job.kind()).collect();
+    let composed: std::collections::BTreeSet<&str> = job_codecs().map(|row| row.label).collect();
+    assert_eq!(
+        covered, composed,
+        "the round-trip roster and the composed registry name different kinds: \
+         a row with no fixture here is a wire form nothing round-trips",
+    );
+    for job in jobs {
         assert_eq!(
             JobRequest::from_bytes(&job.to_bytes()),
             Some(job.clone()),
@@ -763,10 +869,18 @@ fn every_job_kind_survives_the_wire_format() {
 }
 
 /// An unallocated code must be refused, not resurrected.
+///
+/// The codes are **derived** from the registry rather than spelled. Review found
+/// the spelled form to be silently open: this test read `[0u8, 14]` while 14 was
+/// the height row's own code, and it still passed, because a voxel payload read
+/// under the height row refuses on its own guards. A stale literal here asserts
+/// nothing about the code it names.
 #[test]
 fn an_unallocated_code_is_refused() {
+    let first_unallocated =
+        u8::try_from(job_codecs().count() + 1).expect("the registry fits the u8 code space");
     let mut bytes = a_voxel_job().to_bytes();
-    for unallocated in [0u8, 14] {
+    for unallocated in [0u8, first_unallocated] {
         bytes[0] = unallocated;
         assert_eq!(
             JobRequest::from_bytes(&bytes),
@@ -782,7 +896,7 @@ fn an_unallocated_code_is_refused() {
 #[test]
 fn every_code_is_the_literal_index_and_label_this_registry_composes() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(u8, &str); 13] = [
+    let table: [(u8, &str); 14] = [
         (1, "radar"),
         (2, "level3"),
         (3, "level3/vild"),
@@ -796,6 +910,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (11, "overlay/reports"),
         (12, "overlay/glm"),
         (13, "overlay/model"),
+        (14, "terrain/heights"),
     ];
 
     // Against the composed registry: row `i` is labelled what this table says
@@ -823,7 +938,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
 
     // And the encoder really posts those bytes — the table could agree with
     // the registry while the framing that writes the byte does not.
-    let framing: [(JobRequest, u8); 13] = [
+    let framing: [(JobRequest, u8); 14] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 3),
@@ -837,7 +952,15 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (an_overlay_reports_job(), 11),
         (an_overlay_glm_job(), 12),
         (an_overlay_model_job(), 13),
+        (a_height_job(), 14),
     ];
+    assert_eq!(
+        framing.len(),
+        job_codecs().count(),
+        "a codec row exists that posts no code byte here: this table is what \
+         says the ENCODER writes the code the table above pins, and a row \
+         missing from it is unchecked in that direction",
+    );
     for (job, code) in framing {
         let bytes = job.to_bytes();
         assert_eq!(
@@ -1391,12 +1514,12 @@ fn a_decode_job_round_trips_its_archive_whole() {
     assert_eq!(back, job);
 }
 
-/// The code space is shared with twelve other kinds, and a decode's payload is
-/// arbitrary bytes.
+/// The code space is shared with thirteen other kinds, and a decode's payload
+/// is arbitrary bytes.
 #[test]
 fn a_decode_job_is_not_readable_as_another_kind() {
     let mut bytes = a_decode_job().to_bytes();
-    for code in (1u8..=13).filter(|&code| code != 6) {
+    for code in (1u8..=14).filter(|&code| code != 6) {
         bytes[0] = code;
         // Whatever it decodes to, it must not decode to a `DecodeJob`.
         assert!(
@@ -1504,9 +1627,10 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
             .input
             .to_bytes()
             .len(),
-        // Opaque payloads: an archive or a Level III object, which this codec
-        // frames and never interprets.
-        "level3" | "level3/vild" | "decode" => 0,
+        // Opaque payloads: an archive, a Level III object or a rectangle of
+        // Terrain-RGB tile bodies, which this codec frames and never
+        // interprets.
+        "level3" | "level3/vild" | "decode" | "terrain/heights" => 0,
         // Every byte is an overlay row's own: the geometry header and the
         // row's fields are all this wire's framing, with no nested payload
         // carrying a pin of its own.
@@ -1541,6 +1665,10 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         // is over stored bits and not over anything a platform's libm
         // computed.
         an_overlay_model_job(),
+        // Literal constants again, for the same reason: the fixture's box, its
+        // cover and its one tile body are all spelled out, so nothing in this
+        // row's digest is what a platform's `sin`/`atan2` answered.
+        a_height_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1582,7 +1710,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 #[test]
 fn every_codec_row_has_a_parity_test() {
     // Deliberately spelled out, label beside test name, in registry order.
-    let named: [(&str, &str); 13] = [
+    let named: [(&str, &str); 14] = [
         (
             "radar",
             "the_radar_render_is_byte_identical_direct_and_via_the_wire",
@@ -1635,6 +1763,10 @@ fn every_codec_row_has_a_parity_test() {
             "overlay/model",
             "the_model_render_is_byte_identical_direct_and_via_the_wire",
         ),
+        (
+            "terrain/heights",
+            "the_height_field_is_byte_identical_direct_and_via_the_wire",
+        ),
     ];
     assert_eq!(
         job_codecs().count(),
@@ -1666,14 +1798,14 @@ fn every_codec_row_has_a_parity_test() {
     }
 }
 
-/// **No `run` body reads a clock** — the grep ratchet over BOTH jobs modules
-/// (WO-M7.2, the pwa_assets source-scrape shape).
+/// **No `run` body reads a clock** — the grep ratchet over EVERY jobs module
+/// the registry composes (WO-M7.2, the pwa_assets source-scrape shape).
 #[test]
 fn no_run_body_reads_a_clock() {
     // `include_str!` rather than a runtime read: the compiler re-runs this
     // test's crate when either module changes, so the ratchet cannot go stale
     // against the file it scans.
-    let modules: [(&str, &str); 2] = [
+    let modules: [(&str, &str); 3] = [
         (
             "squallar-radar/src/jobs.rs",
             include_str!("../../../squallar-radar/src/jobs.rs"),
@@ -1682,7 +1814,30 @@ fn no_run_body_reads_a_clock() {
             "squallar-overlays/src/render/jobs.rs",
             include_str!("../../../squallar-overlays/src/render/jobs.rs"),
         ),
+        (
+            "squallar-elevation/src/jobs.rs",
+            include_str!("../../../squallar-elevation/src/jobs.rs"),
+        ),
     ];
+    // The roster is the registry's, not a hand-kept list: `job_registry.rs`
+    // chains one `JOB_CODECS` per source crate, so the number of modules to scan
+    // is the number of chained registries. Review found the bare `; 3]` silently
+    // open — dropping the elevation row from it survived.
+    let registry = include_str!("../job_registry.rs");
+    let chained = registry
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| line.contains("JOB_CODECS"))
+        .count();
+    assert_eq!(
+        modules.len(),
+        chained,
+        "job_registry.rs chains {chained} registries and this ratchet scans {} \
+         module(s): a chained registry whose run bodies nothing greps is a \
+         worker that can render a picture the direct call would not",
+        modules.len(),
+    );
+
     for (name, source) in modules {
         // Presence controls first, so the scan below cannot be green over the
         // wrong (or an empty) file.
@@ -1842,6 +1997,206 @@ fn the_voxel_build_is_byte_identical_direct_and_via_the_wire() {
         via_wire, direct,
         "the voxel grid differs between the direct call and the wire — the \
          two paths have stopped being one builder",
+    );
+}
+
+/// **The parity gate for the height row: direct call and via-wire execution
+/// resample the identical field**, on a fixture tile that genuinely decodes.
+#[test]
+fn the_height_field_is_byte_identical_direct_and_via_the_wire() {
+    let job = a_height_job();
+    let bytes = job.to_bytes();
+    assert_eq!(
+        JobRequest::from_bytes(&bytes).as_ref(),
+        Some(&job),
+        "the height job does not survive its own wire form",
+    );
+
+    let direct = execute(&job)
+        .and_then(|out| out.take::<HeightField>())
+        .expect("the fixture tile resamples onto the fixture box");
+    assert_eq!(
+        direct.posts,
+        [5, 3],
+        "the field is not the asked-for grid, so the comparison below is not \
+         about the resample this test believes it is",
+    );
+    let (lo, hi) = direct.range_m().expect("a filled field has a range");
+    assert!(
+        hi - lo > 1.0,
+        "the fixture field runs {lo} m to {hi} m, flat enough that a resampler \
+         answering one number everywhere would pass this parity vacuously",
+    );
+    assert!(
+        (2000.0..=3050.0).contains(&lo) && (2000.0..=3050.0).contains(&hi),
+        "the fixture field runs {lo} m to {hi} m, outside the tile's own \
+         2000-3050 m ramp: it was built off the wrong tile or off the \
+         sampler's edge clamp",
+    );
+
+    let via_wire = execute_bytes(&bytes)
+        .and_then(|out| out.take::<HeightField>())
+        .expect("the described height job resamples off its own wire form");
+    assert_eq!(
+        via_wire, direct,
+        "the height field differs between the direct call and the wire - the \
+         two paths have stopped being one resampler",
+    );
+}
+
+/// The reply half: a field comes back through the height row's own reply codec,
+/// head and tail alike, and through nobody else's.
+#[test]
+fn a_height_field_comes_back_under_its_own_out_kind() {
+    let (code, head, tails) =
+        execute_encoded(&a_height_job().to_bytes()).expect("the fixture job answers");
+    assert_eq!(
+        code, 14,
+        "the reply is tagged with the height row's own code"
+    );
+    assert_eq!(
+        tails.len(),
+        1,
+        "the samples are the row's one nominated tail",
+    );
+
+    let row_decode_out = |label: &str| {
+        job_codecs()
+            .find(|row| row.label == label)
+            .expect("the label names a composed row")
+            .decode_out
+    };
+    let back = row_decode_out("terrain/heights")(&head, tails.clone())
+        .expect("a field payload under the height row")
+        .take::<HeightField>()
+        .expect("it is a height field");
+    assert_eq!(
+        back,
+        execute(&a_height_job())
+            .and_then(|out| out.take::<HeightField>())
+            .expect("the direct call answers the same field"),
+    );
+
+    // The same bytes under the other kinds' decoders are refused by those
+    // types' own framing rather than half-decoded into something plausible.
+    for label in ["decode", "voxels", "section"] {
+        assert!(
+            row_decode_out(label)(&head, tails.clone()).is_none(),
+            "the {label} row accepted a height payload"
+        );
+    }
+}
+
+/// **The height reply's layout is THIS layout** — the pin review found missing.
+///
+/// The parity test cannot stand in for this one and it is worth being explicit
+/// about why: direct and via-wire both run the same codec, so any change made
+/// symmetrically in `encode_out` and `decode_out` is invisible to it. Two such
+/// mutants survived the suite before this test existed — samples written and
+/// read big-endian, and a head writing `y_km` before `x_km`. Checker and checked
+/// came from the same belief.
+///
+/// The field is **literal**, not resampled: the samples of a real resample come
+/// out of `great_circle_destination`, and a digest over those would be a digest
+/// of whichever libm ran `sin`. The values are chosen so a byte swap changes
+/// them — `1` and `256` are each other's swap, `0x3039` has two distinct bytes,
+/// and `0` and `u16::MAX` are the ends.
+#[test]
+fn the_height_reply_framing_is_the_one_this_registry_ships() {
+    let field = HeightField {
+        site: (39.0, -106.0),
+        // Different from each other, so a head that swapped the two pairs moves
+        // the digest. Same reason `a_height_job`'s box is not a square.
+        x_km: (-3.0, 3.0),
+        y_km: (-2.0, 4.0),
+        posts: [5, 3],
+        samples: vec![0, 1, 256, 0x3039, u16::MAX, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    };
+    assert_eq!(
+        field.samples.len(),
+        (field.posts[0] * field.posts[1]) as usize,
+        "the literal field is not its own declared grid",
+    );
+
+    let row = job_codecs()
+        .find(|row| row.label == "terrain/heights")
+        .expect("the height row is composed");
+    let mut head = Vec::new();
+    let mut tails = Vec::new();
+    (row.encode_out)(DescribedOut(Box::new(field.clone())), &mut head, &mut tails);
+    assert_eq!(
+        tails.len(),
+        1,
+        "the height reply rides exactly one tail; a second would need its own \
+         digest row",
+    );
+
+    let rows: Vec<String> = [("heights/head", &head), ("heights/samples", &tails[0])]
+        .into_iter()
+        .map(|(name, bytes)| format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes)))
+        .collect();
+    assert_eq!(
+        rows,
+        crate::wire_identity::WIRE_HEIGHT_REPLY_ROWS,
+        "the height reply layout is not the one \
+         `wire_identity::WIRE_HEIGHT_REPLY_ROWS` pins. Left is what this build \
+         writes; right is what that list was last told. A field reordered, \
+         retyped, or written at a different endianness moves these rows and \
+         nothing else in the suite would notice - the parity test runs the same \
+         codec on both arms and cannot see a symmetric change. Re-pin \
+         deliberately: the rows feed `wire_digest`, so a page and a worker \
+         either side of the change respawn rather than exchanging a field one \
+         of them reads transposed."
+    );
+
+    // And the pin is over a layout that still round-trips, so it cannot be
+    // pinning a shape this build cannot read back.
+    assert_eq!(
+        (row.decode_out)(&head, tails)
+            .expect("the pinned bytes decode")
+            .take::<HeightField>()
+            .expect("as a height field"),
+        field,
+    );
+}
+
+/// **A payload this row did not write is refused rather than misread.**
+///
+/// The height row holds the LAST code in the composition, which is the one a
+/// peer of another build reaches for first when its own registry was longer.
+/// The interesting case is therefore a real request of another kind read under
+/// code 14, not a random buffer.
+#[test]
+fn a_malformed_height_job_is_refused_rather_than_misread() {
+    let good = a_height_job().to_bytes();
+    assert!(
+        JobRequest::from_bytes(&good).is_some(),
+        "the control fixture must decode, or every refusal below is vacuous",
+    );
+
+    for other in [a_voxel_job(), a_decode_job(), an_overlay_model_job()] {
+        let mut bytes = other.to_bytes();
+        let was = bytes[0];
+        bytes[0] = 14;
+        assert!(
+            !JobRequest::from_bytes(&bytes)
+                .is_some_and(|job| job.job.downcast_ref::<TerrainHeightJob>().is_some()),
+            "a code-{was} payload read under code 14 produced a height job",
+        );
+    }
+
+    // Truncation and trailing bytes. `JobRequest::from_bytes` checks trailing
+    // bytes only on the `overlay/` rows, so this row's own decode is what has
+    // to catch the second one.
+    assert!(
+        JobRequest::from_bytes(&good[..good.len() - 1]).is_none(),
+        "a truncated height job decoded",
+    );
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(
+        JobRequest::from_bytes(&trailing).is_none(),
+        "a height job with a trailing byte decoded",
     );
 }
 
@@ -3557,7 +3912,8 @@ fn a_malformed_discussions_job_is_refused_rather_than_misread() {
     );
 }
 
-/// On native, a described overlay job rides the pool's **interactive** lane.
+/// On native, a described overlay job — and a height resample — rides the
+/// pool's **interactive** lane.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_described_overlay_job_rides_the_interactive_lane() {
@@ -3608,10 +3964,20 @@ fn a_described_overlay_job_rides_the_interactive_lane() {
         "the model job delivered on {model_lane}: the described model \
          overlay is queueing behind radar renders",
     );
+    // The height row, whose deadline is the volume box's rather than the
+    // radar's: a box that moves posts a volume rebuild and a height resample
+    // together, and queueing the ground behind the thing standing on it is the
+    // same stall the split exists to prevent.
+    let height_lane = lane_of(a_height_job());
+    assert!(
+        height_lane.starts_with("rd-opaque"),
+        "the height job delivered on {height_lane}: the terrain resample is \
+         queueing behind radar renders",
+    );
     let radar_lane = lane_of(a_job());
     assert!(
         radar_lane.starts_with("rd-job"),
         "the radar control delivered on {radar_lane}, so the routing is not \
-         by deadline and the assertion above proves nothing",
+         by deadline and the assertions above prove nothing",
     );
 }

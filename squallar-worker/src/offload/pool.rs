@@ -15,7 +15,11 @@
 //! bounded by `render_dispatch`'s `Budgets::concurrent_renders`); `rd-opaque`
 //! carries the overlay rasterizations, which follow the map and are wanted
 //! *now* (measured: `rasterize_radar_sites` over 200 markers is 3.16 ms at
-//! 1920×1080, 3.70 ms at 3840×2160). Each is sized at the render bound.
+//! 1920×1080, 3.70 ms at 3840×2160), and the `terrain/` rows, which follow the
+//! volume box for the same reason: a box that moves posts a volume rebuild and
+//! a height resample together, and queueing the ground behind the thing
+//! standing on it is the stall the split exists to prevent. Each is sized at
+//! the render bound.
 //! [`super::discard`]'s frees are a third queue, one thread wide because frees
 //! serialise on the allocator — which also means the split removes the queueing
 //! delay without making a free free: under glibc this is a cross-arena free
@@ -199,10 +203,12 @@ impl JobSink for Handle {
     /// with nothing copied: `mpsc` hands the value back inside its `SendError`.
     fn send(&self, id: u64, request: JobRequest) -> Result<(), JobRequest> {
         // The one routing decision this transport makes, over the job's
-        // deadline rather than its kind: an overlay follows the map and must
-        // not queue behind a slate of radar renders. "Is an overlay" is the
-        // row's own `overlay/` label; `offload::tests`' lane test pins it.
-        let lane = if super::row_for(&request.job).label.starts_with("overlay/") {
+        // deadline rather than its kind: an overlay follows the map, and a
+        // height field follows the volume box, and neither must queue behind a
+        // slate of radar renders. The question is asked of the row's own label
+        // prefix; `offload::tests`' lane test pins both families.
+        let label = super::row_for(&request.job).label;
+        let lane = if label.starts_with("overlay/") || label.starts_with("terrain/") {
             &self.interactive
         } else {
             &self.described

@@ -59,35 +59,45 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// The exact declared set. Equality and not ⊆ a list, because every entry here
 /// is a decision.
 ///
-/// **`squallar-source` and `squallar-device-profile` are deliberately absent
-/// for now, and `squallar-source` is a scheduled arrival rather than an open
-/// question.** `JobCodec` — the vtable a job registry row is built from,
-/// a `struct` and not a trait — is defined in `squallar-source/src/job.rs`, so
-/// the work unit that adds the height job *will* declare `squallar-source`, and
-/// this list gains a line then. Nothing in this
-/// crate reaches either crate today, and a declared-but-unused dependency on
-/// `squallar-device-profile` would drag `squallar-radar` into every
-/// `cargo test -p squallar-elevation` for nothing.
+/// **`squallar-source` ARRIVED with the height job row; `squallar-device-profile`
+/// is still deliberately absent.** `JobCodec` — the vtable a job registry row is
+/// built from, a `struct` and not a trait — is defined in
+/// `squallar-source/src/job.rs`, so `src/jobs.rs` cannot build a row without
+/// it. This list gained that line rather than growing a fight over it: the
+/// arrival was written down here before it happened, and the paragraph below is
+/// the measurement it was written against. `squallar-device-profile` stays out
+/// — nothing in this crate reaches it, and a declared-but-unused dependency on
+/// it would drag `squallar-radar` into every `cargo test -p squallar-elevation`
+/// for nothing.
 ///
-/// **That arrival is a one-line ceiling edit and not a charter fight**, which is
-/// worth writing down here so it is not rediscovered as a surprise. Resolved
-/// closures over `cargo metadata`'s `resolve.nodes`, measured 2026-08-30 —
-/// **denominator: distinct packages reachable *as dependencies*, roots
-/// themselves excluded**:
+/// **It was a one-line ceiling edit and not a charter fight**, which is worth
+/// keeping written down so it is not re-litigated. Resolved closures over
+/// `cargo metadata`'s `resolve.nodes`, measured 2026-08-30 — **denominator:
+/// distinct packages reachable *as dependencies*, roots themselves excluded**:
 ///
-/// * from `squallar-elevation` alone: **41 packages, zero forbidden, no
-///   `reqwest`**;
-/// * from elevation ∪ source ∪ device-profile: **236, still zero forbidden**.
+/// * from `squallar-elevation` **before** the job row: **41 packages, zero
+///   forbidden, no `reqwest`**;
+/// * from `squallar-elevation` **as it stands now**, which is what
+///   [`the_offload_worker_can_link_this_crate`] walks: **182, still zero
+///   forbidden**;
+/// * from elevation ∪ source ∪ device-profile, the figure the plan costed the
+///   arrival against: **236, still zero forbidden**.
 ///
-/// (A review of this work unit quoted 237 for the second figure. The one-package
-/// gap is the denominator, not a disagreement: `squallar-elevation` is a root
-/// nothing depends on, so counting the roots too gives 237 there and 42 for the
-/// first. Same graph, two conventions.)
+/// **Three numbers, three different sets, and the middle one is this crate.**
+/// The first draft of this comment offered 41 and 236 and neither was the
+/// crate's own closure — 236 is a union including `squallar-device-profile`,
+/// which this crate does **not** declare. Review caught it. Every figure here
+/// names what it is over.
+///
+/// (A review of this work unit quoted 237 for the union. The one-package gap is
+/// the denominator, not a disagreement: `squallar-elevation` is a root nothing
+/// depends on, so counting the roots too gives 237 there and 42 for the first.
+/// Same graph, two conventions.)
 ///
 /// What the larger closure *does* add is `reqwest`, which is why
 /// [`the_offload_worker_can_link_this_crate`] does not name it — see that test's
 /// own docs. Adding a dependency still changes this test and the plan first, in
-/// writing; this paragraph is that writing for `squallar-source`.
+/// writing.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata(&["--no-deps", "--format-version", "1"]);
@@ -95,7 +105,9 @@ fn the_dependency_ceiling_holds() {
 
     let expected: BTreeSet<(String, String)> = [
         ("normal", "image"),
+        ("normal", "log"),
         ("normal", "squallar-geo"),
+        ("normal", "squallar-source"),
         ("dev", "serde_json"),
     ]
     .into_iter()
@@ -172,12 +184,10 @@ fn resolved_closure() -> BTreeSet<String> {
 /// being is about.
 ///
 /// **`reqwest` is deliberately not on this list**, and the omission is the
-/// interesting part. The plan reserves `squallar-source` as a future dependency
-/// here, and `squallar-source` declares `reqwest` unconditionally (it is where
-/// the TLS provider is installed). So "this crate does not link reqwest" is
-/// true of the *declared* set today and will stop being true of the resolved
-/// graph the moment the job codec lands. Asserting it here would turn that work
-/// unit into a charter fight over a property the plan never actually needed:
+/// interesting part. `squallar-source` — declared here since the height job
+/// row — declares `reqwest` unconditionally (it is where the TLS provider is
+/// installed), so this crate's resolved graph reaches it. Asserting its absence
+/// would be a charter fight over a property the plan never actually needed:
 /// reqwest compiles in a worker, and egui, wgpu and winit do not.
 #[test]
 fn the_offload_worker_can_link_this_crate() {
@@ -208,13 +218,33 @@ fn the_offload_worker_can_link_this_crate() {
         reached.contains("image") && reached.contains("png") && reached.contains("squallar-geo"),
         "the resolve walk found {reached:?}, which is not this crate's graph",
     );
-    // Measured 2026-08-30: 41, roots excluded. Held as a floor rather than an
-    // equality — a patch release adding a transitive package is not an
-    // architecture change, and pinning the count would make it read as one.
+    // Measured on this tree: **182**, roots excluded — 41 before the job row's
+    // `squallar-source` arrived. Held as a floor rather than an equality — a
+    // patch release adding a transitive package is not an architecture change,
+    // and pinning the count would make it read as one — but a floor 9x below
+    // actual is not a floor, it is a formality, so it moves with the measurement
+    // it is taken from.
     assert!(
-        reached.len() >= 20,
-        "the resolve walk reached only {} packages, against the 41 measured on \
+        reached.len() >= 150,
+        "the resolve walk reached only {} packages, against the 182 measured on \
          2026-08-30; it is not seeing this crate's graph: {reached:?}",
         reached.len(),
+    );
+
+    // And the arrival really is in the graph, so the ceiling test's record of
+    // what it cost describes this build rather than a stale measurement.
+    assert!(
+        reached.contains("squallar-source") && reached.contains("reqwest"),
+        "the job row's `squallar-source` is not in the resolved graph, so the \
+         ceiling test's closure figures describe a different tree: {reached:?}",
+    );
+    // And `log` really was free: it is reachable through `squallar-source` ->
+    // `reqwest` whether or not this crate declares it, which is what made the
+    // declaration a one-line charter edit rather than a new graph node. If this
+    // ever fails, declaring `log` DID add a package and the ceiling comment
+    // above is describing a decision that no longer holds.
+    assert!(
+        reached.contains("log"),
+        "`log` is not in the resolved graph: {reached:?}",
     );
 }

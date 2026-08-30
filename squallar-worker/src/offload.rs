@@ -301,7 +301,7 @@ impl JobRequest {
 pub(crate) use crate::job_registry::job_codecs;
 
 /// The dense wire code of `row`: its index in the composed registry, **plus
-/// one** — codes `1..=13`. Plus one so **0 stays unallocated and a zeroed buffer
+/// one** — codes `1..=14`. Plus one so **0 stays unallocated and a zeroed buffer
 /// never decodes**. Panics on a row outside the registry: the caller resolved it
 /// with [`row_for`] from the same registry, so a miss is a build defect and a
 /// wrong code byte would be a payload decoded as another kind.
@@ -318,7 +318,7 @@ fn wire_code(row: &squallar_source::job::JobCodec) -> u8 {
 }
 
 /// The inverse of [`wire_code`]: the row a decoded code byte selects, or `None`
-/// for a code this build does not have — 0 (a zeroed buffer), 14 and beyond.
+/// for a code this build does not have — 0 (a zeroed buffer), 15 and beyond.
 fn row_for_code(code: u8) -> Option<&'static squallar_source::job::JobCodec> {
     let index = usize::from(code.checked_sub(1)?);
     job_codecs().nth(index)

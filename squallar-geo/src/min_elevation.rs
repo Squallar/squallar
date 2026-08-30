@@ -5,9 +5,10 @@
 //! whose builder pass emits it. `squallar-radar` is what will read it, and
 //! `squallar-elevation` is **planned** to stand above `squallar-radar` through
 //! `squallar-device-profile` — the dependency the height-plan fit needs. Today
-//! `squallar-elevation` declares `squallar-geo` and `image` and nothing else,
-//! so the cycle is prospective, not present; its own `tests/charter.rs` asserts
-//! that smaller set. Putting the grid there anyway would mean moving it the day
+//! `squallar-elevation` declares `squallar-geo`, `image` and `squallar-source`
+//! and nothing else, so the cycle is prospective, not present; its own
+//! `tests/charter.rs` asserts that set. Putting the grid there anyway would
+//! mean moving it the day
 //! that dependency lands, and `squallar-geo` is already under radar and already
 //! owns the projection functions this grid is queried alongside, so it belongs
 //! here on its own merits as well.
