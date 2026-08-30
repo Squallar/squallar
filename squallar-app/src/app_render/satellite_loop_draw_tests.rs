@@ -488,12 +488,15 @@ struct Sweep {
     /// How many distinct satellite instants the production renderer produced a
     /// raster for.
     rasters: usize,
-    /// The satellite picture on the glass at each step, hashed — `None` where
-    /// nothing painted at all.
+    /// The satellite picture on the glass at each stop of the rail, in rail
+    /// order, hashed — `None` where nothing painted at all. Keyed by the stop
+    /// the pane's clock named when it was read, never by which iteration of
+    /// the sweep loop read it — see the read loop for why the difference is a
+    /// flake.
     drawn: Vec<Option<u64>>,
-    /// The instant the satellite playhead claimed at each step.
+    /// The instant the satellite playhead claimed at each stop, in rail order.
     instants: Vec<Option<chrono::NaiveDateTime>>,
-    /// The transport's own handle at each step, which is the control.
+    /// The transport's own handle at each stop, which is the control.
     mosaic_handles: Vec<Option<egui::TextureId>>,
     /// How many satellite granules were asked for on the wire across the run.
     satellite_gets: usize,
@@ -664,39 +667,62 @@ fn sweep_a_satellite_loop() -> Sweep {
         let pane = app.gui.pane_mut(0).expect("pane 0");
         pane.transport_state_mut().phase = squallar_egui::pane::LoopPhase::Playing;
     }
-    let mut drawn: Vec<Option<u64>> = Vec::new();
-    let mut instants: Vec<Option<chrono::NaiveDateTime>> = Vec::new();
-    let mut mosaic_handles: Vec<Option<egui::TextureId>> = Vec::new();
-    for _ in 0..sweep {
+    // **Read by stop, never by iteration count.** The pump above is the
+    // production frame, and its Advance phase runs `advance_loop_playback`
+    // behind a wall-clock throttle (`loop_interval`: 100 ms at the default
+    // 10 fps); the forced advance at the bottom of this loop is the fixture's
+    // own driver. Two drivers, one playhead: any iteration that stalls past
+    // the interval — one did, on a machine running the whole workspace suite —
+    // lets the pump fire a second advance between the forced one and the next
+    // read, and a schedule of exactly `sweep` positional reads then skips one
+    // stop and wraps onto a duplicate of its first. Reproduced on demand with
+    // a doctored 150 ms stall after one forced advance: 12 of 13 distinct
+    // pictures, the first picture read at both ends, one hour never read.
+    // So each read files under the stop the pane's clock actually names —
+    // first observation wins, which is what keeps a blank step a blank step —
+    // and the sweep is read when every stop of the rail has been, however the
+    // two drivers interleaved.
+    let mut drawn_at: HashMap<chrono::NaiveDateTime, Option<u64>> = HashMap::new();
+    let mut instants_at: HashMap<chrono::NaiveDateTime, Option<chrono::NaiveDateTime>> =
+        HashMap::new();
+    let mut mosaic_at: HashMap<chrono::NaiveDateTime, Option<egui::TextureId>> = HashMap::new();
+    for _ in 0..sweep * 8 {
         wire.answer(&mut app);
         capture_rasters(&app, &mut rasters);
         pump(&mut app, &ctx);
 
         let pane = app.gui.pane(0).expect("pane 0");
-        // **Handle -> frame -> stamp -> pixels.** The handle alone is upload
-        // identity, which every frame has by construction; what is counted is
-        // the raster it carries.
-        let on_glass = pane
-            .overlay_texture_on_screen(&known::GMGSI)
-            .map(|tex| tex.texture.id());
-        let ls = pane.time_state(&known::GMGSI);
-        let depicts = on_glass.and_then(|id| {
-            ls.frames
-                .iter()
-                .find(|f| {
-                    f.image
-                        .as_ref()
-                        .and_then(squallar_egui::pane::LoopFrameImage::overlay)
-                        .is_some_and(|o| o.texture.id() == id)
-                })
-                .and_then(|f| rasters.get(&f.timestamp).copied())
-        });
-        drawn.push(depicts);
-        instants.push(ls.playhead_stamp());
-        mosaic_handles.push(
-            pane.overlay_texture_on_screen(&known::MRMS)
-                .map(|tex| tex.texture.id()),
-        );
+        if let Some(stop) = pane.time.mode.as_of() {
+            // **Handle -> frame -> stamp -> pixels.** The handle alone is
+            // upload identity, which every frame has by construction; what is
+            // counted is the raster it carries.
+            let on_glass = pane
+                .overlay_texture_on_screen(&known::GMGSI)
+                .map(|tex| tex.texture.id());
+            let ls = pane.time_state(&known::GMGSI);
+            let depicts = on_glass.and_then(|id| {
+                ls.frames
+                    .iter()
+                    .find(|f| {
+                        f.image
+                            .as_ref()
+                            .and_then(squallar_egui::pane::LoopFrameImage::overlay)
+                            .is_some_and(|o| o.texture.id() == id)
+                    })
+                    .and_then(|f| rasters.get(&f.timestamp).copied())
+            });
+            drawn_at.entry(stop).or_insert(depicts);
+            instants_at
+                .entry(stop)
+                .or_insert_with(|| ls.playhead_stamp());
+            mosaic_at.entry(stop).or_insert_with(|| {
+                pane.overlay_texture_on_screen(&known::MRMS)
+                    .map(|tex| tex.texture.id())
+            });
+        }
+        if rail.iter().all(|stop| drawn_at.contains_key(stop)) {
+            break;
+        }
 
         app.gui
             .pane_mut(0)
@@ -706,6 +732,23 @@ fn sweep_a_satellite_loop() -> Sweep {
         app.advance_loop_playback();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    let unvisited: Vec<&chrono::NaiveDateTime> = rail
+        .iter()
+        .filter(|stop| !drawn_at.contains_key(stop))
+        .collect();
+    assert!(
+        unvisited.is_empty(),
+        "premise: playback has to stop on every instant of the rail before the \
+         sweep can be read at all; after {} ticks it never reached {unvisited:?}. \
+         A red here is about this fixture's scheduling, not about the defect.",
+        sweep * 8,
+    );
+    // In rail order, so every claim below is about the sweep the user watches.
+    let drawn: Vec<Option<u64>> = rail.iter().map(|stop| drawn_at[stop]).collect();
+    let instants: Vec<Option<chrono::NaiveDateTime>> =
+        rail.iter().map(|stop| instants_at[stop]).collect();
+    let mosaic_handles: Vec<Option<egui::TextureId>> =
+        rail.iter().map(|stop| mosaic_at[stop]).collect();
 
     Sweep {
         transport_range,
