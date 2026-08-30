@@ -1639,8 +1639,11 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TILE_CACHE_ENTRIES,
-            cache,
-            offline,
+            ArchiveStores {
+                seed: cache,
+                offline,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
         ))
     }
 
@@ -1665,6 +1668,7 @@ impl HttpsTiles {
         attribution: Attribution,
         egui_ctx: Context,
         cache: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+        offline: Option<crate::basemap_download::PlatformSegmentStore>,
     ) -> Result<Self, crate::basemap_archive::RangeError> {
         use crate::basemap_archive::{HttpRangeSource, archive_client, block_cache};
 
@@ -1678,26 +1682,31 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TERRAIN_TILE_CACHE_ENTRIES,
-            // No seed: the warm-up is the basemap's shallow zooms, not the
-            // hillshade's.
-            None,
-            // And no downloaded areas: what a download stores is the basemap
-            // and the static reference layers, never the hillshade.
-            None::<crate::basemap_download::PlatformSegmentStore>,
+            ArchiveStores {
+                // No seed: the warm-up is the basemap's shallow zooms, not
+                // the hillshade's.
+                seed: None,
+                offline,
+                offline_archive: crate::basemap_download::AreaArchive::Terrain,
+            },
         ))
     }
 
     /// [`Self::from_archive_url`] with the range source and the cache bound
     /// supplied. Crate-private, for the tests, which read the committed Monaco
     /// fixture off disk rather than over a network.
+    ///
+    /// The two stores travel as one [`ArchiveStores`] rather than as three
+    /// arguments, because they mean one thing — what this source consults
+    /// before the network — and the archive kind is meaningless apart from the
+    /// store it filters.
     pub(crate) fn from_range_source<S, St>(
         source: S,
         style: Arc<Style>,
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
-        seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
-        offline: Option<St>,
+        stores: ArchiveStores<St>,
     ) -> Self
     where
         S: crate::basemap_archive::ArchiveRangeSource + 'static,
@@ -1755,7 +1764,7 @@ impl HttpsTiles {
             request_rx,
             tile_tx,
             egui_ctx,
-            ArchiveStores { seed, offline },
+            stores,
         ));
 
         Self {
@@ -1870,14 +1879,20 @@ struct ArchiveStyling {
 /// does the same thing with both: consults them before the network, once, at
 /// open. The block cache is a *tier* under the reads; a downloaded area is a
 /// *source* in front of them.
-struct ArchiveStores<St> {
+pub(crate) struct ArchiveStores<St> {
     /// The persistent block cache to seed with the shallow zooms, or `None`
     /// for a source that must not seed (terrain) or a target with no
     /// filesystem.
-    seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+    pub(crate) seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
     /// The downloaded offline areas to put in front of the live archive, or
     /// `None` when this device holds none.
-    offline: Option<St>,
+    pub(crate) offline: Option<St>,
+    /// Which archive's segments this source composes. A store holds an area's
+    /// base map and its hillshade side by side, and each reader takes only its
+    /// own: a segment of the other kind would be refused on its tile type
+    /// anyway, but only after an open, which is a read per segment per launch
+    /// to learn what its name already says.
+    pub(crate) offline_archive: crate::basemap_download::AreaArchive,
 }
 
 /// The slots the IO task fills for the frame side once the archive header
@@ -1985,7 +2000,7 @@ async fn serve_archive_continuously<S, St>(
     // not list, and a segment that will not open, are logged inside and leave
     // the composition serving from the live archive alone.
     if let Some(store) = stores.offline {
-        for (label, source) in store.open_all().await {
+        for (label, source) in store.open_all(stores.offline_archive).await {
             archive.attach_offline(label, source).await;
         }
         if archive.offline_count() > 0 {

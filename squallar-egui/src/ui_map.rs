@@ -1378,15 +1378,41 @@ impl super::Gui {
     /// would be a second chance to disagree about what finished.
     pub(super) fn pump_download_area(&mut self, ctx: &egui::Context) {
         self.download_size.set_box(self.download_pick);
+        self.download_size
+            .set_terrain(self.download_wants_terrain());
         // The same switch `go_offline_for_tests` throws for the tile slots, for
         // the same reason: a unit test's Gui must open no range source against
         // the production archive. Always live outside a harness.
         let live_archive = !self.map_tiles.is_offline();
-        self.download_size.poll(ctx, || {
-            live_archive
-                .then(crate::tiles::archive_range_source)
-                .and_then(Result::ok)
-        });
+        self.download_size.poll(
+            ctx,
+            || {
+                live_archive
+                    .then(crate::tiles::archive_range_source)
+                    .and_then(Result::ok)
+            },
+            || {
+                live_archive
+                    .then(crate::tiles::terrain_range_source)
+                    .and_then(Result::ok)
+            },
+        );
+    }
+
+    /// Whether a download started now would fetch the terrain hillshade.
+    ///
+    /// The user's explicit choice if they made one, and otherwise **whatever
+    /// the Base Map inspector's "Terrain shading" switch says right now** — so
+    /// an area holds what the map on the glass is showing rather than a
+    /// default nobody picked. Read across the visible panes exactly as
+    /// `ensure_terrain_tiles` reads it, so the checkbox and the layer cannot
+    /// come to two answers about whether shading is on.
+    pub(super) fn download_wants_terrain(&self) -> bool {
+        self.download_terrain.unwrap_or_else(|| {
+            self.panes[..self.visible_pane_count()]
+                .iter()
+                .any(|pane| pane.is_overlay_enabled(&known::TERRAIN))
+        })
     }
 
     /// The picked box's level list: three depths, each with the exact size it
@@ -1417,6 +1443,8 @@ impl super::Gui {
         let mut clear = false;
         let mut cancel = false;
         let mut choose = None;
+        let terrain = self.download_wants_terrain();
+        let mut terrain_choice = None;
 
         egui::Area::new(egui::Id::new("download_area_panel"))
             .order(egui::Order::Foreground)
@@ -1438,6 +1466,18 @@ impl super::Gui {
                         if row.clicked() {
                             choose = Some(level);
                         }
+                    }
+
+                    // The hillshade is a second archive and a second cost, so
+                    // it is asked for here rather than assumed: every size in
+                    // the list above is the figure for the archives this box is
+                    // ticked for, and ticking it moves them all.
+                    let mut wants_terrain = terrain;
+                    if ui
+                        .checkbox(&mut wants_terrain, TERRAIN_INCLUDE_LABEL)
+                        .changed()
+                    {
+                        terrain_choice = Some(wants_terrain);
                     }
 
                     if let Some(short) = short {
@@ -1486,6 +1526,11 @@ impl super::Gui {
         if let Some(level) = choose {
             self.download_detail = level;
         }
+        if let Some(wants) = terrain_choice {
+            // Latched the moment it is touched: from here the checkbox is the
+            // user's answer and no longer the switch's.
+            self.download_terrain = Some(wants);
+        }
         if clear {
             self.clear_download_pick();
         }
@@ -1500,7 +1545,8 @@ impl super::Gui {
             // `start_area_download` and nothing else, so this button, Resume
             // and Update all reach the engine the same way and there is no
             // second opinion about where segments live.
-            self.start_area_download(spec, ctx);
+            let terrain = self.download_wants_terrain();
+            self.start_area_download(spec, terrain, ctx);
         }
     }
 
@@ -2524,6 +2570,11 @@ pub(crate) const DOWNLOAD_PANEL_TITLE: &str = "Make available offline";
 
 /// The heading over the three depths.
 pub(crate) const DETAIL_LEVEL_HEADING: &str = "Detail level";
+
+/// The hillshade checkbox's label — the Base Map inspector's own words for the
+/// same thing, so the switch on the map and the box in this panel read as one
+/// feature rather than two.
+pub(crate) const TERRAIN_INCLUDE_LABEL: &str = "Terrain shading";
 
 /// The panel's three buttons.
 pub(crate) const DOWNLOAD_START_LABEL: &str = "Download";

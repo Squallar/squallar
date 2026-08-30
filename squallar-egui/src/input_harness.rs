@@ -1450,6 +1450,21 @@ impl InputHarness {
         self.gui.seed_download_size(ceiling, level, bytes);
     }
 
+    /// Hand the size probe the hillshade half's figure for one level.
+    pub(crate) fn seed_download_terrain_size(
+        &mut self,
+        ceiling: u8,
+        level: crate::ui_download_area::DetailLevel,
+        bytes: u64,
+    ) {
+        self.gui.seed_download_terrain_size(ceiling, level, bytes);
+    }
+
+    /// Whether a download started now would fetch the hillshade.
+    pub(crate) fn download_terrain_wanted(&self) -> bool {
+        self.gui.download_terrain_wanted()
+    }
+
     /// State what the origin's storage has. Test-only, like the method it
     /// calls — see `Gui::set_download_quota` for the production wire that is
     /// still owed.

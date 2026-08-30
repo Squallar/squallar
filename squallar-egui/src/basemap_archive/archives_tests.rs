@@ -26,7 +26,7 @@ use egui::Context;
 use super::tests::{CountingSource, archive_path, block_on, no_archive_banner};
 use super::{BasemapArchives, FileRangeSource};
 use crate::basemap_download::{
-    AreaSpec, BasemapDownload, DownloadOutcome, FsSegmentStore, OfflineSegments,
+    AreaArchive, AreaSpec, BasemapDownload, DownloadOutcome, FsSegmentStore, OfflineSegments,
 };
 use crate::pmt_index::{PmtIndex, tile_id_to_zxy};
 
@@ -177,7 +177,7 @@ fn composed(
     let (live, reads) = CountingSource::new(fixture_source(path));
     let mut archives = block_on(BasemapArchives::open(live)).expect("the fixture opens");
     let store = FsSegmentStore::new(dir.to_path_buf());
-    for (label, source) in block_on(store.open_all()) {
+    for (label, source) in block_on(store.open_all(AreaArchive::Basemap)) {
         block_on(archives.attach_offline(label, source));
     }
     reads.store(0, Ordering::Relaxed);
@@ -486,7 +486,7 @@ fn walking_many_local_segments_costs_no_range_reads() {
     let mut archives = block_on(BasemapArchives::open(live)).expect("the fixture opens");
     let store = FsSegmentStore::new(dir.0.clone());
     let mut counters = Vec::new();
-    for (label, source) in block_on(store.open_all()) {
+    for (label, source) in block_on(store.open_all(AreaArchive::Basemap)) {
         let (counted, reads) = CountingSource::new(source);
         assert!(block_on(archives.attach_offline(label, counted)));
         counters.push(reads);
@@ -544,7 +544,7 @@ fn the_store_lists_published_segments_and_never_a_part_file() {
     std::fs::copy(&path, dir.0.join("listing.99.part")).expect("the part file writes");
 
     let store = FsSegmentStore::new(dir.0.clone());
-    let listed = block_on(store.open_all());
+    let listed = block_on(store.open_all(AreaArchive::Basemap));
     assert!(!listed.is_empty(), "the published segments must be listed");
     assert!(
         listed.iter().all(|(label, _)| label.ends_with(".pmtiles")),
@@ -558,7 +558,7 @@ fn a_store_directory_that_does_not_exist_lists_nothing_rather_than_failing() {
     let dir =
         TempDir::new("a_store_directory_that_does_not_exist_lists_nothing_rather_than_failing");
     let store = FsSegmentStore::new(dir.0.join("never-created"));
-    assert!(block_on(store.open_all()).is_empty());
+    assert!(block_on(store.open_all(AreaArchive::Basemap)).is_empty());
 }
 
 #[test]
@@ -719,5 +719,276 @@ fn a_coordinate_off_the_grid_is_refused_once_rather_than_per_source() {
         reads.load(Ordering::Relaxed),
         0,
         "an off-grid coordinate must not reach a source at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hillshade half
+// ---------------------------------------------------------------------------
+//
+// The same claim as the basemap's, over the second archive: a tile a
+// downloaded area holds is served with the network untouched, and the control
+// is the live archive serving that same tile at a cost. What is different is
+// that both halves live in ONE store, so each test here also has to show the
+// composition took only its own.
+
+use crate::basemap_download::tests::{SegmentBytesSource, raster_archive};
+
+/// A raster archive over `area`, and its own header ceiling.
+///
+/// Deliberately shallower than the area asks for — the terrain build stops
+/// above the basemap's, and a composition that only ever saw equal ceilings
+/// would not be exercising the real shape.
+const TERRAIN_CEILING: u8 = 8;
+
+/// The area both halves of these tests are cut for, and a tile inside it.
+fn terrain_area(area_id: &str) -> AreaSpec {
+    AreaSpec {
+        area_id: area_id.to_owned(),
+        west: 7.40,
+        south: 43.70,
+        east: 7.50,
+        north: 43.76,
+        max_zoom: 11,
+    }
+}
+
+/// Download `area`'s terrain half out of `terrain` into `dir`, asserting it
+/// finished — a partial run leaves a different set than the test reasons about.
+fn download_terrain(
+    terrain: &Arc<Vec<u8>>,
+    dir: &std::path::Path,
+    area: AreaSpec,
+) -> crate::basemap_download::AreaHoldings {
+    let engine = BasemapDownload::with_terrain_and_segment_bytes(
+        SegmentBytesSource(Arc::clone(terrain)),
+        Some(SegmentBytesSource(Arc::clone(terrain))),
+        FsSegmentStore::new(dir.to_path_buf()),
+        area,
+        Context::default(),
+        SMALL_SEGMENT_BYTES,
+    );
+    let start = Instant::now();
+    let outcome = loop {
+        if let Some(outcome) = engine.outcome() {
+            break outcome;
+        }
+        assert!(
+            start.elapsed() < DOWNLOAD_TIMEOUT,
+            "the terrain download did not finish in {DOWNLOAD_TIMEOUT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        matches!(outcome, DownloadOutcome::Complete { .. }),
+        "the terrain download must complete, got {outcome:?}"
+    );
+    engine.holdings().expect("a finished run reports its cut")
+}
+
+/// The terrain composition over a counted live source, with the store's
+/// **terrain** segments in front — the production route
+/// (`from_terrain_archive_url` hands the same store the same archive kind).
+///
+/// Zeroed after open, for [`composed`]'s reason.
+fn composed_terrain(
+    terrain: &Arc<Vec<u8>>,
+    dir: &std::path::Path,
+) -> (
+    BasemapArchives<CountingSource<SegmentBytesSource>, FileRangeSource>,
+    Arc<AtomicUsize>,
+) {
+    let (live, reads) = CountingSource::new(SegmentBytesSource(Arc::clone(terrain)));
+    let mut archives = block_on(BasemapArchives::open(live)).expect("the raster fixture opens");
+    let store = FsSegmentStore::new(dir.to_path_buf());
+    for (label, source) in block_on(store.open_all(AreaArchive::Terrain)) {
+        block_on(archives.attach_offline(label, source));
+    }
+    reads.store(0, Ordering::Relaxed);
+    (archives, reads)
+}
+
+/// The live terrain archive alone, counted — the control.
+fn live_terrain_only(
+    terrain: &Arc<Vec<u8>>,
+) -> (
+    BasemapArchives<CountingSource<SegmentBytesSource>, FileRangeSource>,
+    Arc<AtomicUsize>,
+) {
+    let (live, reads) = CountingSource::new(SegmentBytesSource(Arc::clone(terrain)));
+    let archives = block_on(BasemapArchives::open(live)).expect("the raster fixture opens");
+    reads.store(0, Ordering::Relaxed);
+    (archives, reads)
+}
+
+/// **The whole point of downloading terrain**: a hillshade tile a downloaded
+/// area holds costs the network nothing, and the control proves the live
+/// archive would have served that same tile at a cost.
+#[test]
+fn a_hillshade_tile_inside_a_downloaded_area_costs_the_network_nothing() {
+    const TEST: &str = "a_hillshade_tile_inside_a_downloaded_area_costs_the_network_nothing";
+    let area = terrain_area("hillshade-inside");
+    let terrain = Arc::new(raster_archive(&area, TERRAIN_CEILING));
+
+    // The deepest tile the terrain archive actually holds inside the area —
+    // read off the enumeration rather than guessed, so a coordinate nothing
+    // holds cannot make the zero below trivially true.
+    let (z, x, y) = *crate::basemap_download::area_tiles_to(&area, TERRAIN_CEILING)
+        .iter()
+        .rfind(|(z, _, _)| *z == TERRAIN_CEILING)
+        .expect("the fixture holds tiles at its own ceiling");
+
+    // The control first.
+    let (only_live, live_reads) = live_terrain_only(&terrain);
+    let from_live = block_on(only_live.tile(z, x, y)).expect("the fixture reads");
+    assert!(
+        from_live.is_present(),
+        "the control must be a tile the live terrain archive holds"
+    );
+    let control_reads = live_reads.load(Ordering::Relaxed);
+    assert!(
+        control_reads > 0,
+        "reading {z}/{x}/{y} from the network must cost reads, or this test measures nothing"
+    );
+
+    let dir = TempDir::new(TEST);
+    download_terrain(&terrain, &dir.0, area);
+    let (archives, reads) = composed_terrain(&terrain, &dir.0);
+    assert!(
+        archives.offline_count() > 0,
+        "the store's terrain listing must find the segments the engine published"
+    );
+
+    let served = block_on(archives.tile(z, x, y)).expect("the composition reads");
+    assert_eq!(
+        served.bytes(),
+        from_live.bytes(),
+        "a locally served hillshade tile must be byte-identical to the live one"
+    );
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "a hillshade tile a downloaded area holds must cost the network nothing, and \
+         cost {control_reads} without one"
+    );
+}
+
+/// Each reader takes **only its own** half out of the shared store: the
+/// basemap composition never sees a terrain segment and the terrain
+/// composition never sees a basemap one.
+///
+/// The read-count assertion above cannot catch this on its own — a composition
+/// that took everything would still serve the tile locally. What it would cost
+/// is an open, a tile-type rejection and a warning per segment per launch.
+#[test]
+fn each_composition_lists_only_its_own_archives_segments() {
+    const TEST: &str = "each_composition_lists_only_its_own_archives_segments";
+    let Some(path) = fixture() else {
+        return no_archive_banner(TEST, &archive_path());
+    };
+    let area = terrain_area("both-halves");
+    let terrain = Arc::new(raster_archive(&area, TERRAIN_CEILING));
+    let dir = TempDir::new(TEST);
+
+    // Both halves of one area, into one directory, through the real engine.
+    let engine = BasemapDownload::with_terrain_and_segment_bytes(
+        fixture_source(&path),
+        Some(SegmentBytesSource(Arc::clone(&terrain))),
+        FsSegmentStore::new(dir.0.clone()),
+        area.clone(),
+        Context::default(),
+        SMALL_SEGMENT_BYTES,
+    );
+    let start = Instant::now();
+    let outcome = loop {
+        if let Some(outcome) = engine.outcome() {
+            break outcome;
+        }
+        assert!(
+            start.elapsed() < DOWNLOAD_TIMEOUT,
+            "the download did not finish in {DOWNLOAD_TIMEOUT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(matches!(outcome, DownloadOutcome::Complete { .. }));
+
+    let store = FsSegmentStore::new(dir.0.clone());
+    let basemap = block_on(store.open_all(AreaArchive::Basemap));
+    let hillshade = block_on(store.open_all(AreaArchive::Terrain));
+    assert!(
+        !basemap.is_empty() && !hillshade.is_empty(),
+        "both halves must be on disk, or the disjointness below is vacuous"
+    );
+    let names = |listed: &[(String, FileRangeSource)]| -> Vec<String> {
+        listed.iter().map(|(label, _)| label.clone()).collect()
+    };
+    let basemap_names = names(&basemap);
+    let hillshade_names = names(&hillshade);
+    assert!(
+        basemap_names
+            .iter()
+            .all(|name| !hillshade_names.contains(name)),
+        "a segment was listed as both halves: {basemap_names:?} / {hillshade_names:?}"
+    );
+    assert!(
+        hillshade_names
+            .iter()
+            .all(|name| name.ends_with(".terrain.pmtiles")),
+        "the terrain listing took an artifact that is not one: {hillshade_names:?}"
+    );
+    assert!(
+        basemap_names.iter().all(|name| !name.contains(".terrain.")),
+        "the basemap listing took a hillshade artifact: {basemap_names:?}"
+    );
+}
+
+/// **A corrupt hillshade segment degrades to the live archive, never to a
+/// blank map and never to a notice.** The basemap half is untouched by it.
+#[test]
+fn a_corrupt_hillshade_segment_falls_through_to_the_live_archive() {
+    const TEST: &str = "a_corrupt_hillshade_segment_falls_through_to_the_live_archive";
+    let area = terrain_area("corrupt-hillshade");
+    let terrain = Arc::new(raster_archive(&area, TERRAIN_CEILING));
+    let (z, x, y) = *crate::basemap_download::area_tiles_to(&area, TERRAIN_CEILING)
+        .iter()
+        .rfind(|(z, _, _)| *z == TERRAIN_CEILING)
+        .expect("the fixture holds tiles at its own ceiling");
+
+    let dir = TempDir::new(TEST);
+    download_terrain(&terrain, &dir.0, area);
+
+    // Every published hillshade artifact, overwritten with bytes that are not
+    // an archive. Nothing here may panic and nothing may reach the glass.
+    let mut wrecked = 0;
+    for entry in std::fs::read_dir(&dir.0)
+        .expect("the store lists")
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".terrain.pmtiles") {
+            std::fs::write(entry.path(), b"not a PMTiles archive at all")
+                .expect("the wreck writes");
+            wrecked += 1;
+        }
+    }
+    assert!(
+        wrecked > 0,
+        "nothing was corrupted, so this test proves nothing"
+    );
+
+    let (archives, reads) = composed_terrain(&terrain, &dir.0);
+    assert_eq!(
+        archives.offline_count(),
+        0,
+        "a segment that will not open must be skipped at attach, not composed"
+    );
+    let served = block_on(archives.tile(z, x, y)).expect("the composition still reads");
+    assert!(
+        served.is_present(),
+        "a corrupt local segment cost the tile: the live archive must serve it"
+    );
+    assert!(
+        reads.load(Ordering::Relaxed) > 0,
+        "the tile did not come from the live archive, so the fall-through did not happen"
     );
 }

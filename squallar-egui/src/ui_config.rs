@@ -23,7 +23,7 @@ pub const UI_CONFIG_KEY: &str = "ui";
 /// bytes being preserved are v2 and the key says so.)
 pub const UI_CONFIG_BACKUP_KEY: &str = "ui.v2.backup";
 
-use crate::basemap_download::{AreaSpec, DownloadedArea, valid_area_id};
+use crate::basemap_download::{AreaSpec, DownloadedArea, TerrainHold, valid_area_id};
 use squallar_overlays::spc::outlook::OutlookDay;
 use squallar_source::id::{LayerId, known};
 use squallar_source::product::FieldId;
@@ -556,6 +556,57 @@ struct DownloadedAreaConfig {
     /// write so the generation step needs no migration of its own; absent in
     /// a record written without one, which reads as "not recorded".
     generation: String,
+    /// The terrain half, or absent for an area that holds only the base map.
+    ///
+    /// **Additive, and that is the whole migration** — no `CONFIG_VERSION`
+    /// bump and no `migrate.rs` step, the `favorite_sites` precedent. A record
+    /// written before an area could hold terrain has no block here and
+    /// restores as basemap-only, which is exactly what such an area is.
+    ///
+    /// `skip_serializing_if` so the arrival of terrain moves **no byte** of a
+    /// device that has not downloaded any: a basemap-only record is written
+    /// exactly as the build before this one wrote it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terrain: Option<DownloadedTerrainConfig>,
+}
+
+/// A downloaded area's terrain half, as persisted. Its own cut, bytes and
+/// generation, for [`TerrainHold`]'s reason: the two archives are reconciled
+/// and dated independently.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DownloadedTerrainConfig {
+    /// Segments the terrain plan cut the area into. Requested, never present.
+    segments: u32,
+    /// Terrain tile bytes the area holds, exactly.
+    bytes: squallar_units::DataSize,
+    /// The terrain archive generation these segments were cut from.
+    generation: String,
+}
+
+impl DownloadedTerrainConfig {
+    /// The block for `hold`.
+    fn of(hold: &TerrainHold) -> Self {
+        Self {
+            segments: hold.segments_expected,
+            bytes: hold.bytes,
+            generation: hold.generation.clone(),
+        }
+    }
+
+    /// The terrain half this block names, or `None` for one that names none.
+    ///
+    /// A cut of zero segments is refused for [`DownloadedAreaConfig::restore`]'s
+    /// reason — it would be a half nothing could ever fail to hold all of —
+    /// and the area then restores as basemap-only rather than not at all: a
+    /// nonsense terrain block costs the hillshade, never the rectangle.
+    fn restore(&self) -> Option<TerrainHold> {
+        (self.segments > 0).then(|| TerrainHold {
+            segments_expected: self.segments,
+            bytes: self.bytes,
+            generation: self.generation.clone(),
+        })
+    }
 }
 
 impl DownloadedAreaConfig {
@@ -571,6 +622,7 @@ impl DownloadedAreaConfig {
             segments: area.segments_expected,
             bytes: area.bytes,
             generation: area.generation.clone(),
+            terrain: area.terrain.as_ref().map(DownloadedTerrainConfig::of),
         }
     }
 
@@ -609,6 +661,10 @@ impl DownloadedAreaConfig {
             segments_expected: self.segments,
             bytes: self.bytes,
             generation: self.generation.clone(),
+            terrain: self
+                .terrain
+                .as_ref()
+                .and_then(DownloadedTerrainConfig::restore),
         })
     }
 }
@@ -634,6 +690,15 @@ struct DownloadAreaConfig {
     /// The detail level's token, or empty for "never written". A token this
     /// build has no level for costs the choice and nothing else.
     detail: String,
+    /// Whether the download includes the terrain hillshade, once the user has
+    /// said. Absent — and `None` — means the checkbox follows the Base Map
+    /// inspector's terrain switch, which persists on its own; so an untouched
+    /// checkbox is 1:1 on reopen without this field carrying anything.
+    ///
+    /// `skip_serializing_if` for that reason: a user who never touched the
+    /// checkbox writes the same file this build's predecessor wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terrain: Option<bool>,
 }
 
 impl DownloadAreaConfig {
@@ -642,6 +707,7 @@ impl DownloadAreaConfig {
         armed: bool,
         picked: Option<crate::ui_download_area::PickedBox>,
         detail: crate::ui_download_area::DetailLevel,
+        terrain: Option<bool>,
     ) -> Self {
         Self {
             armed,
@@ -649,6 +715,7 @@ impl DownloadAreaConfig {
             lon: picked.map(|picked| picked.centre.lon),
             half_width_km: picked.map(|picked| picked.half_width_km),
             detail: detail.token().to_owned(),
+            terrain,
         }
     }
 
@@ -1522,6 +1589,7 @@ impl super::Gui {
                 self.download_pick_armed,
                 self.download_pick,
                 self.download_detail,
+                self.download_terrain,
             ),
             split_orientation: self.split_orientation,
             row_ratios: {
@@ -1697,6 +1765,7 @@ impl super::Gui {
         self.download_pick_armed = config.download_area.armed;
         self.download_pick = config.download_area.box_picked();
         self.download_detail = config.download_area.detail();
+        self.download_terrain = config.download_area.terrain;
         self.presets = config.presets;
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();

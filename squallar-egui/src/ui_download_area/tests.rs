@@ -58,16 +58,21 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Drive `probe` until `done` answers true, or fail saying what it was still
 /// waiting for.
+///
+/// `terrain` is the archive the probe reads the hillshade half out of. A probe
+/// with the checkbox clear never reaches it — which is itself the pin that a
+/// basemap-only download opens no terrain archive.
 fn pump(
     probe: &mut AreaSizeProbe,
-    path: &'static str,
+    path: &str,
+    terrain: &str,
     what: &str,
     done: impl Fn(&AreaSizeProbe) -> bool,
 ) {
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        probe.poll(&ctx, || Some(source(path)));
+        probe.poll(&ctx, || Some(source(path)), || Some(source(terrain)));
         if done(probe) {
             return;
         }
@@ -79,14 +84,27 @@ fn pump(
 /// A probe pointed at `path` with `picked` in hand, driven until all three
 /// levels have their figure.
 fn measured(path: &'static str, picked: PickedBox) -> AreaSizeProbe {
+    measured_over(path, MONACO, picked)
+}
+
+/// [`measured`] with the terrain archive named too — for the combined figure.
+fn measured_over(path: &str, terrain: &str, picked: PickedBox) -> AreaSizeProbe {
     let mut probe = AreaSizeProbe::new();
     probe.set_box(Some(picked));
-    pump(&mut probe, path, "read the archive's ceiling", |probe| {
-        probe.ceiling().is_some()
-    });
-    pump(&mut probe, path, "measured all three levels", |probe| {
-        probe.sizes().len() == DETAIL_LEVELS.len()
-    });
+    pump(
+        &mut probe,
+        path,
+        terrain,
+        "read the archive's ceiling",
+        |probe| probe.ceiling().is_some(),
+    );
+    pump(
+        &mut probe,
+        path,
+        terrain,
+        "measured all three levels",
+        |probe| probe.sizes().len() == DETAIL_LEVELS.len(),
+    );
     probe
 }
 
@@ -232,9 +250,13 @@ fn the_deepest_level_stores_to_the_archives_own_ceiling() {
     let probe = {
         let mut probe = AreaSizeProbe::new();
         probe.set_box(Some(picked));
-        pump(&mut probe, TERRAIN_MINI, "read the ceiling", |probe| {
-            probe.ceiling().is_some()
-        });
+        pump(
+            &mut probe,
+            TERRAIN_MINI,
+            TERRAIN_MINI,
+            "read the ceiling",
+            |probe: &AreaSizeProbe| probe.ceiling().is_some(),
+        );
         probe
     };
 
@@ -397,7 +419,7 @@ fn body_of(source: &'static str, signature: &str) -> &'static str {
 #[test]
 fn the_frame_facing_poll_does_no_archive_work() {
     let module = include_str!("../ui_download_area.rs");
-    let body = body_of(module, "    pub(crate) fn poll<S, F>(");
+    let body = body_of(module, "    pub(crate) fn poll<S, T, F, G>(");
 
     for forbidden in [".await", "block_on", "download_bytes", "PmtIndex::open"] {
         assert!(
@@ -565,4 +587,228 @@ fn the_fixtures_this_suite_reads_are_committed() {
             .len();
         assert!(bytes > 0, "{} is empty", path.display());
     }
+}
+
+// ---------------------------------------------------------------------------
+// The combined figure
+// ---------------------------------------------------------------------------
+
+/// A raster archive over `spec` down to `max_zoom`, written where the probe
+/// can open it as a file — the terrain half of the combined figure.
+///
+/// Built rather than committed because what it must be is *specific*: it has
+/// to cover the same ground the basemap fixture does (or the terrain half
+/// would quote zero and the sum would be indistinguishable from the basemap
+/// alone) and stop at a ceiling that is neither 12 nor 14.
+struct TerrainFixture(PathBuf);
+
+impl TerrainFixture {
+    fn new(test: &str, spec: &AreaSpec, max_zoom: u8) -> Self {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "squallar-probe-terrain-{}-{test}.pmtiles",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            crate::basemap_download::tests::raster_archive(spec, max_zoom),
+        )
+        .expect("the terrain fixture writes");
+        Self(path)
+    }
+
+    fn path(&self) -> &str {
+        self.0.to_str().expect("a temp path is UTF-8")
+    }
+}
+
+impl Drop for TerrainFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The ceiling the terrain fixture stops at. **Neither 12 (the shipped
+/// hillshade build's) nor 14 (the basemap's)**, so a figure enumerated against
+/// either constant disagrees with this fixture.
+const PROBE_TERRAIN_CEILING: u8 = 9;
+
+/// `pmt_index`'s own figure for `spec` out of the archive at `path`, clamped
+/// to **that archive's own** header ceiling — the oracle, computed the way the
+/// engine enumerates and by a path that shares no arithmetic with the probe.
+fn oracle(path: &str, spec: &AreaSpec) -> crate::pmt_index::DownloadBytes {
+    block_on(async {
+        let index = crate::pmt_index::PmtIndex::open(source(path))
+            .await
+            .expect("the fixture opens");
+        let ceiling = index.header().max_zoom;
+        index
+            .download_bytes(crate::basemap_download::area_tiles_to(spec, ceiling))
+            .await
+            .expect("the fixture measures")
+    })
+}
+
+/// **The combined figure is exact and it MOVES when the checkbox flips.**
+///
+/// Exact: the figure with terrain on is the two archives' own
+/// `download_bytes` totals added — each its distinct `(offset, length)` sum
+/// over that archive's own tiles, clamped to that archive's own ceiling. Not
+/// scaled, not estimated, and not the basemap's figure with a factor on it.
+///
+/// Moves: the same box with the checkbox clear quotes the basemap's figure
+/// alone. A figure that did not move is the tell for an estimate — and it
+/// would also be the tell for a sum that silently dropped the second archive.
+#[test]
+fn the_combined_figure_is_both_archives_exact_totals_and_moves_with_the_checkbox() {
+    const TEST: &str = "the_combined_figure_is_both_archives_exact_totals_and_moves";
+    let picked = PickedBox::new(MONACO_CENTRE, 8.0).expect("a 16 km box over Monaco");
+    // The deepest level's own spec is what the fixture is cut for, so every
+    // level's tiles fall inside it.
+    let deepest = picked
+        .area_spec(14, DetailLevel::EveryStreet)
+        .expect("a spec");
+    let terrain = TerrainFixture::new(TEST, &deepest, PROBE_TERRAIN_CEILING);
+
+    // The precondition that makes the ceiling half of this falsifiable.
+    let terrain_ceiling = block_on(async {
+        crate::pmt_index::PmtIndex::open(source(terrain.path()))
+            .await
+            .expect("the built fixture opens")
+            .header()
+            .max_zoom
+    });
+    assert_eq!(terrain_ceiling, PROBE_TERRAIN_CEILING);
+    assert_ne!(terrain_ceiling, 12, "a hardcoded 12 would have passed this");
+    assert_ne!(terrain_ceiling, 14, "a hardcoded 14 would have passed this");
+
+    // With the checkbox clear: the basemap's own figure, nothing added.
+    let basemap_only = measured_over(MONACO, terrain.path(), picked);
+    for level in DETAIL_LEVELS {
+        let spec = basemap_only.area_spec(level).expect("a spec");
+        assert_eq!(
+            basemap_only.figure(level),
+            Some(oracle(MONACO, &spec)),
+            "{level:?} without terrain drew a figure that is not the basemap's own"
+        );
+    }
+
+    // With it ticked: the two archives' own figures, summed.
+    let mut both = AreaSizeProbe::new();
+    both.set_box(Some(picked));
+    both.set_terrain(true);
+    pump(
+        &mut both,
+        MONACO,
+        terrain.path(),
+        "read the ceiling",
+        |probe: &AreaSizeProbe| probe.ceiling().is_some(),
+    );
+    pump(
+        &mut both,
+        MONACO,
+        terrain.path(),
+        "measured all three levels over both archives",
+        |probe: &AreaSizeProbe| probe.sizes().len() == DETAIL_LEVELS.len(),
+    );
+
+    for level in DETAIL_LEVELS {
+        let spec = both.area_spec(level).expect("a spec");
+        let base = oracle(MONACO, &spec);
+        let hill = oracle(terrain.path(), &spec);
+        assert!(
+            base.bytes > 0 && hill.bytes > 0,
+            "{level:?}: a half quoting zero makes the sum indistinguishable from the \
+             other half alone ({} + {})",
+            base.bytes,
+            hill.bytes
+        );
+        let expected = crate::pmt_index::DownloadBytes {
+            bytes: base.bytes + hill.bytes,
+            present: base.present + hill.present,
+            absent: base.absent + hill.absent,
+        };
+        assert_eq!(
+            both.figure(level),
+            Some(expected),
+            "{level:?} with terrain drew something other than the two archives' own \
+             totals summed"
+        );
+
+        // And it moved. The detail levels are still named against the BASE
+        // MAP's ceiling, which is what makes the two probes comparable at all.
+        assert_eq!(
+            basemap_only.area_spec(level),
+            both.area_spec(level),
+            "ticking the checkbox renamed the level's own area"
+        );
+        assert!(
+            both.size(level).expect("measured") > basemap_only.size(level).expect("measured"),
+            "{level:?}: the figure did not move when the checkbox was ticked, which is \
+             the tell for an estimate or for a dropped archive"
+        );
+    }
+
+    assert_eq!(
+        both.ceiling(),
+        Some(14),
+        "the terrain archive's shallower ceiling moved the detail levels, which are \
+         the base map's own depth"
+    );
+}
+
+/// Clearing the checkbox gives the basemap figure **back**, not a stale sum —
+/// and it costs no second read, because both halves are still remembered.
+#[test]
+fn clearing_the_checkbox_returns_the_basemap_figure_alone() {
+    const TEST: &str = "clearing_the_checkbox_returns_the_basemap_figure_alone";
+    let picked = PickedBox::new(MONACO_CENTRE, 8.0).expect("a 16 km box over Monaco");
+    let deepest = picked
+        .area_spec(14, DetailLevel::EveryStreet)
+        .expect("a spec");
+    let terrain = TerrainFixture::new(TEST, &deepest, PROBE_TERRAIN_CEILING);
+
+    let mut probe = AreaSizeProbe::new();
+    probe.set_box(Some(picked));
+    probe.set_terrain(true);
+    pump(
+        &mut probe,
+        MONACO,
+        terrain.path(),
+        "read the ceiling",
+        |probe: &AreaSizeProbe| probe.ceiling().is_some(),
+    );
+    pump(
+        &mut probe,
+        MONACO,
+        terrain.path(),
+        "measured both halves",
+        |probe: &AreaSizeProbe| probe.sizes().len() == DETAIL_LEVELS.len(),
+    );
+
+    let level = DetailLevel::TownsAndMainRoads;
+    let combined = probe.size(level).expect("measured with terrain");
+    probe.set_terrain(false);
+    let alone = probe
+        .size(level)
+        .expect("the basemap half is still remembered");
+    assert!(
+        alone < combined,
+        "clearing the checkbox kept the combined figure: {alone:?} vs {combined:?}"
+    );
+    let spec = probe.area_spec(level).expect("a spec");
+    assert_eq!(
+        probe.figure(level),
+        Some(oracle(MONACO, &spec)),
+        "the figure after clearing is not the basemap's own"
+    );
+
+    // Ticking it again answers from memory: no read runs, so the figure is
+    // back on the very next question rather than after another archive walk.
+    probe.set_terrain(true);
+    assert_eq!(
+        probe.size(level),
+        Some(combined),
+        "re-ticking threw away the half already measured"
+    );
 }

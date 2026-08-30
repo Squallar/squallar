@@ -38,7 +38,9 @@ use crate::basemap_archive::ArchiveRangeSource;
 // reads a stored area's depth back through the same three names, and two
 // tables would be two answers.
 pub(crate) use crate::basemap_areas::{DETAIL_LEVELS, DetailLevel};
-use crate::basemap_download::{AreaSpec, DownloadProgress, OfflineQuota, area_tiles};
+use crate::basemap_download::{
+    AreaArchive, AreaSpec, DownloadProgress, OfflineQuota, area_tiles_to,
+};
 use crate::pmt_index::{DownloadBytes, PmtIndex};
 use crate::tile_source::runtime;
 use crate::ui_region::DragBoundsKm;
@@ -173,16 +175,19 @@ impl PickedBox {
 
 /// How many measured figures the probe keeps.
 ///
-/// Three levels of the box in hand plus the previous box's three, so nudging a
-/// box back to where it was answers from memory rather than re-measuring, and
-/// nothing on screen blanks while another level is in flight.
-const KNOWN_FIGURES: usize = 6;
+/// Three levels of the box in hand plus the previous box's three, **per
+/// archive**, so nudging a box back to where it was answers from memory rather
+/// than re-measuring, and flipping the terrain checkbox does not throw away the
+/// half already read.
+const KNOWN_FIGURES: usize = 12;
 
 /// One measurement in flight on the IO runtime.
 struct Inflight {
     /// What is being measured, or `None` for the opening read that only wants
     /// the archive's ceiling.
     area: Option<AreaSpec>,
+    /// Which archive is being read.
+    archive: AreaArchive,
     slot: Arc<OnceLock<Result<Measured, String>>>,
     /// Owns the task. Dropping it cancels the read outright — the same whole
     /// cancel protocol `BasemapDownload` has, for the same reason.
@@ -203,14 +208,22 @@ struct Measured {
 /// archive reads; an ask for a box nobody wants any more is cancelled by
 /// dropping its runtime.
 pub(crate) struct AreaSizeProbe {
-    /// The archive's own `max_zoom`, once a read has reported it. `None` until
-    /// then, which is why the level list draws its rows as measuring rather
-    /// than inventing a depth.
+    /// The **base map** archive's own `max_zoom`, once a read has reported it.
+    /// `None` until then, which is why the level list draws its rows as
+    /// measuring rather than inventing a depth.
+    ///
+    /// The terrain archive's ceiling is not here and never reaches a detail
+    /// level: the levels are named against the ground the download is cut for,
+    /// and the terrain half is clamped to its own header inside the read
+    /// ([`crate::basemap_download::area_tiles_to`]) exactly as the engine
+    /// clamps it.
     ceiling: Option<u8>,
     /// The box every figure here belongs to.
     picked: Option<PickedBox>,
-    /// Figures measured, newest first.
-    known: Vec<(AreaSpec, DownloadBytes)>,
+    /// Whether the figures the probe answers with include the hillshade.
+    terrain: bool,
+    /// Figures measured, newest first, per `(area, archive)`.
+    known: Vec<(AreaSpec, AreaArchive, DownloadBytes)>,
     inflight: Option<Inflight>,
 }
 
@@ -225,6 +238,7 @@ impl AreaSizeProbe {
         Self {
             ceiling: None,
             picked: None,
+            terrain: false,
             known: Vec::new(),
             inflight: None,
         }
@@ -238,12 +252,34 @@ impl AreaSizeProbe {
             return;
         }
         self.picked = picked;
+        self.cancel_stale();
+    }
+
+    /// Tell the probe whether the figures it answers with include the terrain
+    /// hillshade.
+    ///
+    /// Flipping this throws **nothing** away: both halves stay in `known`, so a
+    /// checkbox toggled twice re-answers from memory. What it changes is which
+    /// of them [`Self::figure`] sums, which is why the figure on the glass
+    /// moves the moment the box is ticked and is still the archives' own
+    /// answer rather than a scaled one.
+    pub(crate) fn set_terrain(&mut self, terrain: bool) {
+        if self.terrain == terrain {
+            return;
+        }
+        self.terrain = terrain;
+        self.cancel_stale();
+    }
+
+    /// Drop a reading nobody is waiting for any more.
+    fn cancel_stale(&mut self) {
         // A measurement for a box nobody is looking at any more is cancelled
-        // rather than waited out: the drop is the cancel.
-        let stale = self
-            .inflight
-            .as_ref()
-            .is_some_and(|flight| flight.area.as_ref().is_some_and(|area| !self.wants(area)));
+        // rather than waited out: the drop is the cancel. A *terrain* reading
+        // is stale the moment the checkbox clears, for the same reason.
+        let stale = self.inflight.as_ref().is_some_and(|flight| {
+            flight.area.as_ref().is_some_and(|area| !self.wants(area))
+                || (flight.archive == AreaArchive::Terrain && !self.terrain)
+        });
         if stale {
             self.inflight = None;
         }
@@ -259,14 +295,43 @@ impl AreaSizeProbe {
         self.picked?.area_spec(self.ceiling?, level)
     }
 
-    /// The exact figure for the box in hand at `level`, or `None` while it is
-    /// still being measured.
+    /// The exact figure for the box in hand at `level` **over the archives the
+    /// download will actually fetch**, or `None` while any of them is still
+    /// being measured.
+    ///
+    /// The sum is per-archive exactness added, never re-derived: each half is
+    /// [`crate::pmt_index`]'s distinct `(offset, length)` total for that
+    /// archive's own tiles, and the two archives are separate files, so no span
+    /// can be counted in both. Terrain not yet read answers `None` rather than
+    /// the basemap figure alone — a figure short by a whole archive is the
+    /// estimate this feature exists not to quote.
     pub(crate) fn figure(&self, level: DetailLevel) -> Option<DownloadBytes> {
         let wanted = self.area_spec(level)?;
+        let mut total = self.figure_for(&wanted, AreaArchive::Basemap)?;
+        if self.terrain {
+            let terrain = self.figure_for(&wanted, AreaArchive::Terrain)?;
+            total.bytes += terrain.bytes;
+            total.present += terrain.present;
+            total.absent += terrain.absent;
+        }
+        Some(total)
+    }
+
+    /// One archive's own figure for `area`, if it has been read.
+    fn figure_for(&self, area: &AreaSpec, archive: AreaArchive) -> Option<DownloadBytes> {
         self.known
             .iter()
-            .find(|(area, _)| *area == wanted)
-            .map(|(_, bytes)| *bytes)
+            .find(|(held, kind, _)| held == area && *kind == archive)
+            .map(|(_, _, bytes)| *bytes)
+    }
+
+    /// The archives a download of the box in hand would fetch, in read order.
+    fn wanted_archives(&self) -> &'static [AreaArchive] {
+        if self.terrain {
+            &[AreaArchive::Basemap, AreaArchive::Terrain]
+        } else {
+            &[AreaArchive::Basemap]
+        }
     }
 
     /// [`Self::figure`] as the size it names.
@@ -303,12 +368,25 @@ impl AreaSizeProbe {
     /// absence of a network instead.
     #[cfg(test)]
     pub(crate) fn seed(&mut self, ceiling: u8, level: DetailLevel, bytes: u64) {
+        self.seed_archive(ceiling, level, AreaArchive::Basemap, bytes);
+    }
+
+    /// [`Self::seed`] for one named archive — the terrain half's seam.
+    #[cfg(test)]
+    pub(crate) fn seed_archive(
+        &mut self,
+        ceiling: u8,
+        level: DetailLevel,
+        archive: AreaArchive,
+        bytes: u64,
+    ) {
         self.ceiling = Some(ceiling);
         let Some(area) = self.area_spec(level) else {
             return;
         };
         self.remember(
             area,
+            archive,
             DownloadBytes {
                 bytes,
                 present: 0,
@@ -346,33 +424,56 @@ impl AreaSizeProbe {
     /// this feature and is pinned as such by
     /// [`tests::the_frame_facing_poll_does_no_archive_work`].
     ///
-    /// `source` is called only when a read is actually about to start, so a
-    /// frame with nothing to measure builds no client and parses no URL.
-    pub(crate) fn poll<S, F>(&mut self, ctx: &egui::Context, source: F)
+    /// Each source closure is called only when a read of **that** archive is
+    /// actually about to start, so a frame with nothing to measure builds no
+    /// client and parses no URL, and a download with terrain switched off never
+    /// touches the hillshade archive at all.
+    pub(crate) fn poll<S, T, F, G>(&mut self, ctx: &egui::Context, source: F, terrain_source: G)
     where
         S: ArchiveRangeSource,
+        T: ArchiveRangeSource,
         F: FnOnce() -> Option<S>,
+        G: FnOnce() -> Option<T>,
     {
         self.harvest();
         if self.inflight.is_some() {
             return;
         }
-        let Some(next) = self.next_ask() else {
-            return;
-        };
-        let Some(source) = source() else {
+        let Some((next, archive)) = self.next_ask() else {
             return;
         };
 
         let slot: Arc<OnceLock<Result<Measured, String>>> = Arc::new(OnceLock::new());
-        let runtime = runtime::spawn(read_into(
-            Arc::clone(&slot),
-            ctx.clone(),
-            source,
-            next.clone(),
-        ));
+        // One arm per archive rather than one boxed source, because the two
+        // sources are different types on some targets and a `dyn` here would
+        // put an allocation on the frame path for a value the task owns.
+        let runtime = match archive {
+            AreaArchive::Basemap => {
+                let Some(source) = source() else {
+                    return;
+                };
+                runtime::spawn(read_into(
+                    Arc::clone(&slot),
+                    ctx.clone(),
+                    source,
+                    next.clone(),
+                ))
+            }
+            AreaArchive::Terrain => {
+                let Some(source) = terrain_source() else {
+                    return;
+                };
+                runtime::spawn(read_into(
+                    Arc::clone(&slot),
+                    ctx.clone(),
+                    source,
+                    next.clone(),
+                ))
+            }
+        };
         self.inflight = Some(Inflight {
             area: next,
+            archive,
             slot,
             _runtime: runtime,
         });
@@ -388,12 +489,19 @@ impl AreaSizeProbe {
         };
         let answer = answer.clone();
         let area = flight.area.clone();
+        let archive = flight.archive;
         self.inflight = None;
         match answer {
             Ok(measured) => {
-                self.ceiling = Some(measured.ceiling);
+                // The detail levels are named against the BASE MAP's depth, so
+                // only its header moves the ceiling. The terrain archive is
+                // shallower and naming a level against it would rename every
+                // row the moment the checkbox was ticked.
+                if archive == AreaArchive::Basemap {
+                    self.ceiling = Some(measured.ceiling);
+                }
                 if let (Some(area), Some(bytes)) = (area, measured.bytes) {
-                    self.remember(area, bytes);
+                    self.remember(area, archive, bytes);
                 }
             }
             Err(error) => log::warn!(
@@ -403,21 +511,28 @@ impl AreaSizeProbe {
         }
     }
 
-    /// What to read next: the ceiling if it is not known, otherwise the first
-    /// level of the box in hand whose figure is not.
-    fn next_ask(&self) -> Option<Option<AreaSpec>> {
+    /// What to read next, and out of which archive: the base map's ceiling if
+    /// it is not known, otherwise the first `(level, archive)` pair of the box
+    /// in hand whose own figure is not.
+    fn next_ask(&self) -> Option<(Option<AreaSpec>, AreaArchive)> {
         // The ceiling is read whether or not a box is picked: the manage
         // screen names a stored area's depth against it too, and one header
         // plus root read per session over the archive the ground is already
         // being drawn from is not a cost worth deferring behind a gesture.
         if self.ceiling.is_none() {
-            return Some(None);
+            return Some((None, AreaArchive::Basemap));
         }
-        DETAIL_LEVELS
-            .into_iter()
-            .find(|&level| self.area_spec(level).is_some() && self.figure(level).is_none())
-            .and_then(|level| self.area_spec(level))
-            .map(Some)
+        for level in DETAIL_LEVELS {
+            let Some(area) = self.area_spec(level) else {
+                continue;
+            };
+            for &archive in self.wanted_archives() {
+                if self.figure_for(&area, archive).is_none() {
+                    return Some((Some(area), archive));
+                }
+            }
+        }
+        None
     }
 
     /// Whether `area` is one of the box in hand's three.
@@ -428,9 +543,10 @@ impl AreaSizeProbe {
     }
 
     /// Keep `bytes` for `area`, newest first, bounded at [`KNOWN_FIGURES`].
-    fn remember(&mut self, area: AreaSpec, bytes: DownloadBytes) {
-        self.known.retain(|(held, _)| *held != area);
-        self.known.insert(0, (area, bytes));
+    fn remember(&mut self, area: AreaSpec, archive: AreaArchive, bytes: DownloadBytes) {
+        self.known
+            .retain(|(held, kind, _)| *held != area || *kind != archive);
+        self.known.insert(0, (area, archive, bytes));
         self.known.truncate(KNOWN_FIGURES);
     }
 }
@@ -471,7 +587,10 @@ async fn measure<S: ArchiveRangeSource>(
     let bytes = match &area {
         Some(area) => Some(
             index
-                .download_bytes(area_tiles(area))
+                // Clamped to THIS archive's own ceiling, the engine's own
+                // enumeration (`plan_area`): a figure summed over tiles the
+                // download would never ask for is not the download's figure.
+                .download_bytes(area_tiles_to(area, ceiling))
                 .await
                 .map_err(|error| error.to_string())?,
         ),

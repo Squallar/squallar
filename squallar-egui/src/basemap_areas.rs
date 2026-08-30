@@ -24,7 +24,7 @@
 //! re-download is a button the user may press, never an action anything here
 //! takes.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use egui::Context;
@@ -36,8 +36,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 
 use crate::basemap_download::{
-    AreaSpec, AreaStatus, BasemapDownload, DownloadOutcome, DownloadProgress, DownloadedArea,
-    SegmentStore,
+    AreaArchive, AreaHoldings, AreaSpec, AreaStatus, BasemapDownload, DownloadOutcome,
+    DownloadProgress, DownloadedArea, SegmentStore,
 };
 use crate::tile_source::runtime;
 
@@ -293,16 +293,22 @@ pub(crate) struct ActiveDownload {
     /// `Complete` outcome makes one ([`DownloadedArea::from_outcome`]), which
     /// is why an in-flight area draws as progress rather than as an entry.
     pub(crate) spec: AreaSpec,
-    /// The archive generation this run is cutting from, so the record written
-    /// when it completes dates the bytes it actually holds.
+    /// The basemap archive generation this run is cutting from, so the record
+    /// written when it completes dates the bytes it actually holds.
     pub(crate) generation: String,
+    /// The terrain archive generation, or `None` for a run the user did not
+    /// ask the hillshade of. The two archives are released on their own
+    /// cadences, so one string could never date both.
+    pub(crate) terrain_generation: Option<String>,
     engine: BasemapDownload,
 }
 
 impl ActiveDownload {
-    /// Start `spec` against `source`, publishing into `store`.
-    pub(crate) fn start<S, St>(
+    /// Start `spec` against `source` — and `terrain` when the user asked for
+    /// the hillshade — publishing into `store`.
+    pub(crate) fn start<S, T, St>(
         source: S,
+        terrain: Option<(T, String)>,
         store: St,
         spec: AreaSpec,
         generation: String,
@@ -310,12 +316,19 @@ impl ActiveDownload {
     ) -> Self
     where
         S: crate::basemap_archive::ArchiveRangeSource,
+        T: crate::basemap_archive::ArchiveRangeSource,
         St: SegmentStore,
     {
-        let engine = BasemapDownload::start(source, store, spec.clone(), ctx);
+        let (terrain_source, terrain_generation) = match terrain {
+            Some((source, generation)) => (Some(source), Some(generation)),
+            None => (None, None),
+        };
+        let engine =
+            BasemapDownload::start_with_terrain(source, terrain_source, store, spec.clone(), ctx);
         Self {
             spec,
             generation,
+            terrain_generation,
             engine,
         }
     }
@@ -324,8 +337,9 @@ impl ActiveDownload {
     /// test-only door, for the same reason: the committed fixture is 419 KB
     /// and a multi-segment plan cannot be cut out of it at the production cap.
     #[cfg(test)]
-    pub(crate) fn start_with_segment_bytes<S, St>(
+    pub(crate) fn start_with_segment_bytes<S, T, St>(
         source: S,
+        terrain: Option<(T, String)>,
         store: St,
         spec: AreaSpec,
         generation: String,
@@ -334,13 +348,25 @@ impl ActiveDownload {
     ) -> Self
     where
         S: crate::basemap_archive::ArchiveRangeSource,
+        T: crate::basemap_archive::ArchiveRangeSource,
         St: SegmentStore,
     {
-        let engine =
-            BasemapDownload::with_segment_bytes(source, store, spec.clone(), ctx, segment_bytes);
+        let (terrain_source, terrain_generation) = match terrain {
+            Some((source, generation)) => (Some(source), Some(generation)),
+            None => (None, None),
+        };
+        let engine = BasemapDownload::with_terrain_and_segment_bytes(
+            source,
+            terrain_source,
+            store,
+            spec.clone(),
+            ctx,
+            segment_bytes,
+        );
         Self {
             spec,
             generation,
+            terrain_generation,
             engine,
         }
     }
@@ -351,9 +377,15 @@ impl ActiveDownload {
         self.engine.progress()
     }
 
-    /// How the run ended, once it has.
+    /// How the run ended, once it has — both archives summed.
     pub(crate) fn outcome(&self) -> Option<DownloadOutcome> {
         self.engine.outcome()
+    }
+
+    /// Each archive's own cut, once the run has ended — what the record needs
+    /// to reconcile the two halves apart.
+    pub(crate) fn holdings(&self) -> Option<AreaHoldings> {
+        self.engine.holdings()
     }
 }
 
@@ -393,6 +425,44 @@ struct AreaFacts {
     facts: HashMap<String, AreaFact>,
 }
 
+/// Both of an area's halves as the store lists them.
+///
+/// The terrain listing is asked for **only when the record says the area has
+/// one**: an area downloaded without the hillshade must not spend a listing
+/// discovering that, and an empty map is the same answer it would get.
+///
+/// One `Err` for the pair, on purpose — a half-answered reconcile would put a
+/// figure short by one archive on the glass, which is the held-of-asked pair
+/// lying in the direction that reads as data loss.
+async fn listed_halves<St: SegmentStore>(
+    store: &St,
+    area: &DownloadedArea,
+) -> Result<(BTreeMap<u32, u64>, BTreeMap<u32, u64>), crate::basemap_download::StoreError> {
+    let id = &area.spec.area_id;
+    let basemap = store
+        .existing_segment_bytes(id, AreaArchive::Basemap)
+        .await?;
+    let terrain = match area.terrain {
+        Some(_) => {
+            store
+                .existing_segment_bytes(id, AreaArchive::Terrain)
+                .await?
+        }
+        None => BTreeMap::new(),
+    };
+    Ok((basemap, terrain))
+}
+
+/// What `sized`'s segments below `expected` occupy. See [`AreaFact`] for the
+/// denominator.
+fn held_bytes(sized: &BTreeMap<u32, u64>, expected: u32) -> u64 {
+    sized
+        .iter()
+        .filter(|&(&seg, _)| seg < expected)
+        .map(|(_, &bytes)| bytes)
+        .sum()
+}
+
 /// The manage screen's off-frame-thread arm: it lists and deletes, and the
 /// screen reads its latest answer.
 ///
@@ -424,22 +494,24 @@ impl AreaMaintenance {
                         AreaJob::Reconcile(areas) => {
                             for area in areas {
                                 let id = &area.spec.area_id;
-                                match store.existing_segment_bytes(id).await {
-                                    Ok(sized) => {
-                                        let present: BTreeSet<u32> =
-                                            sized.keys().copied().collect();
-                                        let status = area.reconcile(&present);
+                                match listed_halves(&store, &area).await {
+                                    Ok((basemap, terrain)) => {
+                                        let status = area.reconcile_all(
+                                            &basemap.keys().copied().collect(),
+                                            &terrain.keys().copied().collect(),
+                                        );
                                         // Summed over the same segments the
-                                        // count is taken over: a store left
-                                        // holding a longer cut from an earlier
-                                        // plan must not read as holding more
-                                        // of this one.
+                                        // count is taken over, per archive: a
+                                        // store left holding a longer cut from
+                                        // an earlier plan must not read as
+                                        // holding more of this one.
+                                        let terrain_expected = area
+                                            .terrain
+                                            .as_ref()
+                                            .map_or(0, |hold| hold.segments_expected);
                                         let held = DataSize::from_bytes(
-                                            sized
-                                                .iter()
-                                                .filter(|&(&seg, _)| seg < area.segments_expected)
-                                                .map(|(_, &bytes)| bytes)
-                                                .sum(),
+                                            held_bytes(&basemap, area.segments_expected)
+                                                + held_bytes(&terrain, terrain_expected),
                                         );
                                         if let Ok(mut facts) = facts.lock() {
                                             facts
