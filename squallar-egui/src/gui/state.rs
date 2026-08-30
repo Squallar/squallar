@@ -228,6 +228,20 @@ pub struct Gui {
     /// download *asked for* — never whether the bytes are still there, which
     /// is recomputed from the store.
     pub(super) downloaded_areas: Vec<crate::basemap_download::DownloadedArea>,
+    /// The Downloaded areas screen's off-frame-thread arm, built on the first
+    /// frame that draws the screen and only where this platform has a store.
+    ///
+    /// **Not UI state and never persisted**: what it holds is the store's own
+    /// answer about which segments are present, recomputed every session. A
+    /// persisted copy would be exactly the stale completeness flag the
+    /// download engine refuses to write.
+    pub(super) area_maintenance: Option<crate::basemap_areas::AreaMaintenance>,
+    /// The one offline-area download running, if any.
+    ///
+    /// Not persisted either, and deliberately: a run does not survive a
+    /// launch, and the record that does is written only by a `Complete`
+    /// outcome. The next session offers the resume rather than taking it.
+    pub(super) active_download: Option<crate::basemap_areas::ActiveDownload>,
     /// The stack row being drag-reordered by its grip, if one is in flight.
     pub(super) stack_drag: Option<squallar_source::id::LayerId>,
     /// A layer whose stack row the next stack pass should scroll into view,
@@ -528,6 +542,8 @@ impl Gui {
             search_focus_pass: std::collections::HashMap::new(),
             favorite_sites: Vec::new(),
             downloaded_areas: Vec::new(),
+            area_maintenance: None,
+            active_download: None,
             stack_drag: None,
             stack_scroll_to: None,
             pill_revealed: None,
@@ -607,6 +623,19 @@ impl Gui {
     /// field) for the contract; the download engine is the consumer.
     pub fn basemap_dir(&self) -> Option<&std::path::Path> {
         self.basemap_dir.as_deref()
+    }
+
+    /// [`Self::with_basemap_dir`]'s two writes, after construction — **for
+    /// the test harness only**, which builds its `Gui` before a test knows
+    /// where its temporary directory is.
+    ///
+    /// Gated to the test build so the production route stays the
+    /// construction-time chain and no `set_` ever crosses the App-Gui
+    /// seam for it.
+    #[cfg(test)]
+    pub(crate) fn set_basemap_dir_for_test(&mut self, dir: std::path::PathBuf) {
+        self.map_tiles.set_basemap_dir(Some(dir.clone()));
+        self.basemap_dir = Some(dir);
     }
 
     /// Never build a live tile source under this `Gui`.

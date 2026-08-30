@@ -3,6 +3,10 @@ pub mod actions;
 /// [`tile_source::HttpsTiles::from_archive_url`], which is THE base map
 /// source on every target since the raster (CartoDB) path was deleted.
 pub mod basemap_archive;
+/// What the Downloaded areas screen needs off the frame thread: the detail
+/// vocabulary, the generation fact, and the worker that asks the store whether
+/// an area is still all there.
+pub(crate) mod basemap_areas;
 /// The BasemapTiles layer: the handler that makes the base map a Layers-panel
 /// citizen, and the per-source-layer toggle table.
 /// `tests/committed_styles_parse.rs` — an integration binary, which never sees
