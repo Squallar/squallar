@@ -585,7 +585,10 @@ fn group_two_fetches_are_clamped(shader: &str) -> Result<(), String> {
     // And the fetch really is unguarded, which is *why* the clamp carries the
     // whole weight. If a sentinel is ever put in front of it this rule should
     // be re-derived rather than kept out of habit.
-    if !source.contains("let occluder = occluder_at(in.clip_position.xy);") {
+    // Re-anchored at B2, which renamed the binding to `occluder_texel` so that
+    // no reader — and no whitelist — can confuse this per-pixel vec4 with the
+    // frame-uniform `volume.occluder` the composite's arm now reads.
+    if !source.contains("let occluder_texel = occluder_at(in.clip_position.xy);") {
         return Err(
             "the march no longer fetches the occluder at the top of `fs_raymarch`; \
              re-derive this rule against wherever it moved to"
@@ -739,39 +742,162 @@ fn without_comments(src: &str) -> String {
     out
 }
 
-/// Every identifier in `src`, deduplicated, in source order.
-fn identifiers(src: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if word.is_empty() || word.starts_with(|c: char| c.is_ascii_digit()) {
+/// Every maximal dotted **path** in `src`, deduplicated, in source order —
+/// `volume.occluder.x` as one item, never as `volume`, `occluder`, `x`.
+///
+/// A path rather than a bare name, and the difference is the whole rule after
+/// B2. The composite has a frame-uniform `volume.occluder` and a per-pixel
+/// occluder texel in scope at once; a whitelist of bare names wide enough to
+/// admit `volume.occluder.x` also admits `occluder.x` on the texel, which is
+/// legal WGSL naming the packed `t`'s high digit and is a per-pixel quantity
+/// deciding the arm — the exact defect this rule exists to refuse, brought back
+/// by deleting one word. Carried as a mutant below.
+///
+/// Numeric literals drop out on their own: `0.0` tokenises as a path starting
+/// with a digit.
+fn paths(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let part = |c: char| c.is_alphanumeric() || c == '_';
+    let mut found: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    while at < chars.len() {
+        if !part(chars[at]) {
+            at += 1;
             continue;
         }
-        if !names.iter().any(|n| n == word) {
-            names.push(word.to_string());
+        let start = at;
+        loop {
+            while at < chars.len() && part(chars[at]) {
+                at += 1;
+            }
+            // A dot extends the path only when a name follows it, so a
+            // statement-ending `.` or a float's tail does not swallow the next
+            // token.
+            if at + 1 < chars.len() && chars[at] == '.' && part(chars[at + 1]) {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        let path: String = chars[start..at].iter().collect();
+        if path.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        if !found.iter().any(|f| f == &path) {
+            found.push(path);
         }
     }
-    names
+    found
 }
+
+/// The right-hand side of the one `let <name> = ...;` in `source`, with the
+/// index it starts at.
+fn sole_binding<'a>(source: &'a str, name: &str) -> Result<(&'a str, usize), String> {
+    let binding = format!("let {name} =");
+    let at = source.find(&binding).ok_or_else(|| {
+        format!("the composite no longer binds `{name}` to a name this test can read")
+    })?;
+    if source.matches(&binding).count() != 1 {
+        return Err(format!(
+            "`{name}` is bound in more than one place, so this test cannot say \
+             which one the composite reads",
+        ));
+    }
+    let expression = source[at + binding.len()..]
+        .split(';')
+        .next()
+        .expect("split always yields at least one piece")
+        .trim();
+    Ok((expression, at))
+}
+
+/// The frame's verdict, and the coverage it scales, may read these and nothing
+/// else. **Whole paths**, so the per-pixel `occluder_texel` bound a few lines
+/// above cannot walk in by sharing a word with `volume.occluder`.
+const FRAME_UNIFORM: [&str; 3] = ["eye.z", "volume.eye_in_box.z", "volume.occluder.x"];
+
+/// Spellings in the coverage's expression that carry no value of their own — a
+/// builtin or a `const` — and so cannot make it vary per pixel. The arm gets no
+/// such list: it is a comparison of frame-uniform numbers or it is wrong.
+const PURE: [&str; 6] = ["select", "clamp", "min", "max", "abs", "FLOOR_BELOW_FADE"];
 
 /// The rule itself, over any shader source, so it can be aimed at a mutant.
 fn frame_uniform_arm(shader: &str) -> Result<(), String> {
     let source = without_comments(shader);
 
-    const BINDING: &str = "let eye_above_plane =";
-    let at = source
-        .find(BINDING)
-        .ok_or("the composite no longer binds its arm to a name this can read")?;
-    if source.matches(BINDING).count() != 1 {
-        return Err(
-            "the arm is bound in more than one place, so this test cannot say \
-             which one the composite reads"
-                .into(),
-        );
+    /// The frame's verdict on the composite's order.
+    const ARM: &str = "ground_behind_the_march";
+    /// How much of the ground it paints.
+    const FADE: &str = "floor_fade";
+
+    let (expression, at) = sole_binding(&source, ARM)?;
+    let (fade, _) = sole_binding(&source, FADE)?;
+
+    let reads = |what: &str, src: &str, pure: &[&str]| -> Result<Vec<String>, String> {
+        let mut uniform = Vec::new();
+        for path in paths(src) {
+            if FRAME_UNIFORM.contains(&path.as_str()) {
+                uniform.push(path);
+            } else if !pure.contains(&path.as_str()) {
+                return Err(format!(
+                    "the composite's {what} is `{src}`, which reads `{path}`. It may \
+                     read the frame's own numbers and nothing else — anything varying \
+                     per pixel is how one frame came to composite 193 pixels behind \
+                     the volume and 1172 in front of it, and `occluder_texel.x` is \
+                     that defect one deleted word away from `volume.occluder.x`. If \
+                     `{path}` really is frame-uniform, add it to `FRAME_UNIFORM` \
+                     deliberately",
+                ));
+            }
+        }
+        uniform.sort();
+        Ok(uniform)
+    };
+
+    let arm_reads = reads("arm", expression, &[])?;
+    let fade_reads = reads("coverage", fade, &PURE)?;
+
+    // **The pairing, which was prose until B2 and is now checked.** The order
+    // and the coverage it scales must be functions of the SAME numbers, or a
+    // frame decides that the ground is behind the march and then paints none of
+    // it — measured before B2 as 40960 of 40960 pixels the mesh drew reaching
+    // alpha 0 at pitch −89°, with the clip still cutting the volume the ground
+    // was not drawn over.
+    if arm_reads != fade_reads {
+        return Err(format!(
+            "the arm `{expression}` reads {arm_reads:?} while the coverage `{fade}` \
+             reads {fade_reads:?}. A fade and an order derived from different \
+             numbers describe different frames: the arm sends the ground behind the \
+             march and the fade paints none of it, leaving the hole the clip cut \
+             with nothing in it",
+        ));
     }
+    if !expression.contains("eye_in_box.z") && !expression.contains("eye.z") {
+        return Err(format!(
+            "the composite's arm is `{expression}`, which does not read the eye's \
+             height at all",
+        ));
+    }
+    // The B2 tripwire, and it is a tripwire rather than a proof: the behaviour
+    // is measured in `volume_occluder`. A ground MESH is what the march is
+    // clipped against, so it is behind the accumulation from underneath as much
+    // as from over it; an arm that reads only the eye's side of z = 0 discards
+    // the whole negative-pitch half of a drag, which is reachable by dragging
+    // (`MAX_PITCH_DEG = 89.0`, and the eye crosses z = 0 at about −0.9°).
+    if !expression.contains("occluder.x") {
+        return Err(format!(
+            "the composite's arm is `{expression}`, which does not read whether \
+             a ground pass ran. `eye.z >= 0.0` alone is a predicate written for \
+             a flat lid: with a ground mesh it is false for every camera below \
+             the box floor, where the mesh is drawn, is clipped against, and is \
+             then composited by neither arm",
+        ));
+    }
+
     // The whole composite, not the binding alone. Both edits that got past the
     // first version of this rule left the binding untouched and put the per-ray
     // discriminant back in a **branch condition**: `floor_t > span.x &&
-    // eye_above_plane` is the pre-fix arm exactly for every above-plane camera,
+    // <the arm>` is the pre-fix arm exactly for every above-plane camera,
     // and the same edit on the second arm deletes the map floor outright for
     // every camera under the plane. Both were valid WGSL, both translated to
     // legal GLSL ES 300, and both passed all 714 tests.
@@ -780,39 +906,11 @@ fn frame_uniform_arm(shader: &str) -> Result<(), String> {
         .find("let alpha =")
         .ok_or("the composite no longer ends at the alpha it feeds")?];
 
-    let expression = composite[BINDING.len()..]
-        .split(';')
-        .next()
-        .expect("split always yields at least one piece")
-        .trim();
-
-    // The eye's height, and nothing else. `floor_fade` is scaled by the same
-    // number, and if the two disagree about which side of the plane the camera
-    // is on, the fade and the order it scales are describing different frames.
-    const FRAME_UNIFORM: [&str; 4] = ["eye", "z", "volume", "eye_in_box"];
-    for name in identifiers(expression) {
-        if !FRAME_UNIFORM.contains(&name.as_str()) {
-            return Err(format!(
-                "the composite's arm is `{expression}`, which reads `{name}`. The \
-                 arm may read the eye's height and nothing else — anything varying \
-                 per pixel is how one frame came to composite 193 pixels behind the \
-                 volume and 1172 in front of it. If `{name}` really is \
-                 frame-uniform, add it to `FRAME_UNIFORM` deliberately",
-            ));
-        }
-    }
-    if !expression.contains("eye_in_box.z") && !expression.contains("eye.z") {
-        return Err(format!(
-            "the composite's arm is `{expression}`, which does not read the eye's \
-             height at all",
-        ));
-    }
-
     // Both branch conditions, not just the first. That one was checked before
-    // by a literal `&& eye_above_plane {`, which also rejected the identical
-    // `eye_above_plane && floor_t >= 0.0` with the message "nothing branches on
-    // `eye_above_plane`" — brittle in the direction that fails a correct shader,
-    // and blind in the direction that passes a broken one.
+    // by a literal `&& <the arm> {`, which also rejected the identical
+    // `<the arm> && floor_t >= 0.0` with the message "nothing branches on" it —
+    // brittle in the direction that fails a correct shader, and blind in the
+    // direction that passes a broken one.
     let conditions: Vec<&str> = composite
         .match_indices("if ")
         .map(|(at, _)| {
@@ -830,11 +928,11 @@ fn frame_uniform_arm(shader: &str) -> Result<(), String> {
     // The second arm is the `else`, so the frame's verdict reaches it by the
     // first not having been taken rather than by being named again. What both
     // must obey is the whitelist: `floor_t` belongs here, because "does this ray
-    // meet the plane at all" is genuinely per-ray and always was, and so does
-    // `floor_fade`, the same frame-uniform height read once more. What may not
+    // meet the ground at all" is genuinely per-ray and always was, and so does
+    // `floor_fade`, the same frame's coverage read once more. What may not
     // appear in either is anything that decides *which arm* — which is what
     // `span` was.
-    if !conditions[0].contains("eye_above_plane") {
+    if !conditions[0].contains(ARM) {
         return Err(format!(
             "the arm is chosen by `{}`, which does not read the frame's own \
              verdict — a binding nothing branches on proves nothing about what \
@@ -842,13 +940,13 @@ fn frame_uniform_arm(shader: &str) -> Result<(), String> {
             conditions[0],
         ));
     }
-    const ARM_CONDITION: [&str; 3] = ["floor_t", "eye_above_plane", "floor_fade"];
+    const ARM_CONDITION: [&str; 3] = ["floor_t", ARM, FADE];
     for condition in &conditions {
-        for name in identifiers(condition) {
-            if !ARM_CONDITION.contains(&name.as_str()) {
+        for path in paths(condition) {
+            if !ARM_CONDITION.contains(&path.as_str()) {
                 return Err(format!(
-                    "the arm is chosen by `{condition}`, which reads `{name}`. \
-                     Which side of the plane the camera is on is a property of the \
+                    "the arm is chosen by `{condition}`, which reads `{path}`. \
+                     Which ground the frame is looking at is a property of the \
                      frame; asking it of a per-pixel quantity is the defect this \
                      pins, and it does not matter whether that quantity is spelled \
                      `span.x` or bound to a local first",
@@ -867,16 +965,34 @@ fn the_floor_composites_arm_is_a_property_of_the_frame() {
 }
 
 /// **The rule's own mutants.** Every source below is a way the defect comes
-/// back, and every one of them passed this test — and the other 713 — when the
+/// back, and the first five passed this test — and the other 713 — when the
 /// rule was a blacklist of per-pixel names over the binding expression alone.
+///
+/// Four more arrived with B2, and they are not variations on the first five:
+/// three of them are ways the *generalisation itself* goes wrong, which is a
+/// class that did not exist while the arm read one number. The one that matters
+/// most is `the coverage left on the plane` — the arm sending the ground behind
+/// the march while the fade paints none of it is precisely the hole B1 measured
+/// and handed here, and no `if` in the composite is edited to produce it.
 #[test]
 fn the_arm_rule_rejects_every_way_the_defect_can_come_back() {
+    /// The composite's coverage as the shader spells it, which three mutants
+    /// need in full because the two lanes it reads are what the pairing check
+    /// compares against the arm's.
+    const FADE: &str = "    let floor_fade = select(\n\
+                        \x20       clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0),\n\
+                        \x20       1.0,\n\
+                        \x20       volume.occluder.x > 0.0,\n\
+                        \x20   );";
+    /// Likewise the arm, which four mutants rewrite whole.
+    const ARM: &str = "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0;";
+
     // (name, from, to, must be rejected)
-    let mutants: [(&str, &str, &str, bool); 5] = [
+    let mutants: [(&str, &str, &str, bool); 9] = [
         (
             "the pre-fix per-ray discriminant, back in the first arm",
-            "if floor_t >= 0.0 && eye_above_plane {",
-            "if floor_t > span.x && eye_above_plane {",
+            "if floor_t >= 0.0 && ground_behind_the_march {",
+            "if floor_t > span.x && ground_behind_the_march {",
             true,
         ),
         (
@@ -887,20 +1003,54 @@ fn the_arm_rule_rejects_every_way_the_defect_can_come_back() {
         ),
         (
             "a live per-pixel term hidden behind a semicolon inside a comment",
-            "let eye_above_plane = eye.z >= 0.0;",
-            "let eye_above_plane = eye.z >= 0.0 // one number; the frame's own\n        && floor_t > span.x;",
+            ARM,
+            "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0 \
+             // one number; the frame's own\n        && floor_t > span.x;",
             true,
         ),
         (
             "the box entry aliased to a local, so no forbidden name appears",
-            "if floor_t >= 0.0 && eye_above_plane {",
-            "let entry = span.x;\n    if floor_t > entry && eye_above_plane {",
+            "if floor_t >= 0.0 && ground_behind_the_march {",
+            "let entry = span.x;\n    if floor_t > entry && ground_behind_the_march {",
             true,
         ),
         (
             "CONTROL: the operands swapped, which is the same shader",
-            "if floor_t >= 0.0 && eye_above_plane {",
-            "if eye_above_plane && floor_t >= 0.0 {",
+            "if floor_t >= 0.0 && ground_behind_the_march {",
+            "if ground_behind_the_march && floor_t >= 0.0 {",
+            false,
+        ),
+        (
+            // The reason the whitelist is over dotted PATHS. Both readings are
+            // legal WGSL and one word apart, and the texel's `x` is the high
+            // digit of a packed ray parameter: a per-pixel number deciding the
+            // whole frame's arm.
+            "the per-pixel occluder TEXEL where the frame's uniform belongs",
+            ARM,
+            "let ground_behind_the_march = eye.z >= 0.0 || occluder_texel.x > 0.0;",
+            true,
+        ),
+        (
+            // B1's measured hole, exactly: the clip cuts the volume, the arm
+            // says the ground is behind it, and the coverage is 0 because the
+            // eye is 5 box heights under a plane the ground does not lie on.
+            "the coverage left on the plane while the arm generalised past it",
+            FADE,
+            "    let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);",
+            true,
+        ),
+        (
+            "the arm reverted to the flat lid's predicate, which is B1's hole",
+            ARM,
+            "let ground_behind_the_march = eye.z >= 0.0;",
+            true,
+        ),
+        (
+            // Non-triviality for the two B2 checks above: they must be reading
+            // what the expression MEANS, not matching one blessed literal.
+            "CONTROL: the sentinel tested for non-zero rather than for positive",
+            ARM,
+            "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x != 0.0;",
             false,
         ),
     ];

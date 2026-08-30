@@ -12,14 +12,18 @@
 //! shared process-wide GPU lock: several devices on one adapter each blocking in
 //! `poll(wait_indefinitely)` deadlock on this hardware.
 //!
-//! **What these criteria do and do not certify.** Everything below except
-//! [`the_ground_is_invisible_from_below_the_box_floor`] runs over
-//! [`ABOVE_THE_GROUND_CAMERAS`], a set of six, and holds **only** while the eye
-//! is above the ground's own crest. It is not a stylistic precondition: below
-//! `z = 0` the composite takes neither arm and the mesh's colour is discarded
-//! entirely, which the pinned test at the bottom of this file measures and hands
-//! to B2 in writing. A single camera would have certified "terrain draws from
-//! above" while reading as "terrain draws".
+//! **What these criteria do and do not certify.** Everything below runs over
+//! [`CAMERAS`], a set of eleven spanning the whole drag range: above the ground's
+//! crest, between the crest and the box floor, and under the box floor. B1's
+//! set was six and stopped at the crest, because below it the composite's arm
+//! was written for a flat lid and the mesh's colour was discarded entirely. B1
+//! pinned that hole and B2 generalised the arm, so the pin is now
+//! [`the_ground_is_opaque_from_below_the_box_floor`] — the same three cameras,
+//! asserting the opposite of what its predecessor asserted.
+//!
+//! A single camera would have certified "terrain draws from above" while
+//! reading as "terrain draws"; six certified "terrain draws from above the
+//! crest" while reading the same way.
 //!
 //! **A note on the control, because the plan this implements specified it for a
 //! design that changed underneath it.** An earlier draft gave the ground pass a
@@ -62,34 +66,74 @@ const RIDGE_AMPLITUDE: f32 = 0.25;
 /// One camera: `(yaw, pitch, distance, vertical exaggeration)`.
 type Camera = (f32, f32, f32, f32);
 
-/// **Every camera the criteria below are asserted over, and they are all above
-/// the ground.**
+/// **Every camera the criteria below are asserted over, and they span the drag
+/// range rather than the half of it that used to work.**
 ///
-/// Six, spread over yaw, pitch, standoff and exaggeration — the repo's rule is
-/// to arbitrate across four or five diverse sites rather than tune to one, and
-/// the reason it applies here is measured rather than assumed: at `distance
-/// 2.2` the eye crosses `z = 0` at about pitch −0.9°, so a single positive-pitch
-/// fixture certifies one half of one axis.
-///
-/// The set is deliberately *not* a sweep of the whole drag range. Below the
-/// crest the shipped composite is wrong, and that is B2's arm rule to fix; what
-/// belongs here is the region B1 claims, asserted widely inside it, with the
-/// region it does not claim pinned separately.
-const ABOVE_THE_GROUND_CAMERAS: [Camera; 6] = [
+/// Eleven, spread over yaw, pitch, standoff and exaggeration — the repo's rule is
+/// to arbitrate across four or five diverse sites rather than tune to one — and
+/// across all three regions the composite distinguishes. The reason the last
+/// matters is measured rather than assumed: at `distance 2.2` the eye crosses
+/// `z = 0` at about pitch −0.9° and the crest at about −1.6°, so a
+/// positive-pitch fixture certifies one half of one axis and every camera in
+/// B1's set was in the outermost region of three.
+const CAMERAS: [Camera; 11] = [
+    // -- Above the crest. B1's six, unchanged. --
     // The original fixture: obliquely down from the south-west.
     (215.0, 28.0, 2.2, 1.0),
     // The other side, closer, low enough that rays cross the ridge at a slant.
     (35.0, 12.0, 1.0, 1.0),
     // Steep and vertically exaggerated — the shipped default look.
     (140.0, 60.0, 0.8, 3.0),
-    // Grazing, and the nearest to the plane this set goes: eye z ~ 3.1.
+    // Grazing: eye z ~ 3.1.
     (300.0, 8.0, 2.2, 1.0),
     // Near-overhead, where the ridge's silhouette is at its smallest.
     (0.0, 85.0, 1.5, 1.0),
     // Inside the box at the zoom stop, eye z ~ 0.70 — above the crest, but only
     // just, and with the near plane much closer than anywhere else here.
     (75.0, 28.0, 0.05, 1.0),
+    // -- Between the crest and the box floor: the eye is UNDER the terrain and
+    // over the plane, which is the region the plan named for B2. The clip is
+    // what makes it work — every accumulated sample is in front of the mesh —
+    // and `the_terrain_composites_behind_volume_standing_in_front_of_it` is
+    // what proves the arm that would "fix" it is the one that breaks it. It is
+    // `#[ignore]`d like everything else here; run it with
+    // `cargo test -p squallar-gpu --test volume_occluder -- --ignored`. --
+    //
+    // Eye z 0.056 against a 0.25 crest: just clear of the plane and deep under
+    // the ridge, which stands more than four times the eye's own height.
+    (300.0, -5.0, 0.6, 1.0),
+    // Eye z 0.204, exaggerated 3x and further off — a hair under the crest
+    // rather than far under it, so the region is sampled at both its edges.
+    (35.0, -6.0, 1.0, 3.0),
+    // Both are close standoffs deliberately. The band is only about 1.6° of
+    // pitch wide at `distance 2.2`, and a level camera that far out sees the
+    // box edge-on: measured, `(215, -1, 2.2, 1)` is in the band and the mesh
+    // covers 220 of 40960 pixels, which is too thin for any criterion here to
+    // be measuring a picture.
+    // -- Under the box floor. B1's three pinned-hole cameras, promoted whole:
+    // `the_ground_is_opaque_from_below_the_box_floor` re-selects exactly these
+    // by `eye.z < 0` rather than repeating them, so the two cannot drift. That
+    // one is `#[ignore]`d like everything else here; run it with
+    // `cargo test -p squallar-gpu --test volume_occluder -- --ignored`. --
+    //
+    // The reviewer's own camera: eye z −5.27.
+    (215.0, -18.0, 2.2, 1.0),
+    // Deeper and from the other side: eye z −11.50.
+    (35.0, -40.0, 2.2, 1.0),
+    // Straight up at the clamp stop, `MAX_PITCH_DEG` all the way over: the mesh
+    // fills the frame, and every one of the 40960 pixels it drew composited to
+    // alpha 0 before B2.
+    (140.0, -89.0, 1.0, 1.0),
 ];
+
+/// The three cameras of [`CAMERAS`] that put the eye under the box floor,
+/// selected by the property rather than relisted.
+fn below_the_box_floor() -> Vec<Camera> {
+    CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] < 0.0)
+        .collect()
+}
 
 fn view_at((yaw, pitch, distance, exaggeration): Camera) -> VolumeView {
     let camera =
@@ -97,16 +141,43 @@ fn view_at((yaw, pitch, distance, exaggeration): Camera) -> VolumeView {
     view_for(camera, BOX_KM, SIZE[0] as f32 / SIZE[1] as f32).expect("a view")
 }
 
-/// The precondition every criterion below depends on, asserted rather than
-/// assumed: a fixture that drifted under the ground would make the test measure
-/// the hole instead of the property.
+/// [`CAMERAS`] really does reach all three regions the composite distinguishes,
+/// asserted rather than assumed: every one of these fixtures is a yaw, a pitch
+/// and a standoff, and where that lands the eye is a whole camera pipeline away
+/// from being obvious. A set that drifted into one region would still read as
+/// "eleven cameras".
+#[test]
+fn the_camera_set_reaches_above_the_crest_under_it_and_under_the_floor() {
+    let (mut over, mut between, mut under) = (0usize, 0usize, 0usize);
+    for camera in CAMERAS {
+        let z = view_at(camera).eye_in_box[2];
+        if z >= RIDGE_AMPLITUDE {
+            over += 1;
+        } else if z >= 0.0 {
+            between += 1;
+        } else {
+            under += 1;
+        }
+    }
+    assert_eq!(
+        (over, between, under),
+        (6, 2, 3),
+        "the camera set no longer spans the three regions it is asserted over. \
+         Above the crest the ground is behind the march because the eye is; \
+         between the crest and the floor it is behind because the march was \
+         CLIPPED against it; under the floor it is behind for the same reason \
+         and the shipped composite used to paint none of it",
+    );
+}
+
+/// A precondition for the criteria that genuinely need the eye over the crest,
+/// asserted rather than assumed: a fixture that drifted under the ground would
+/// make the test measure something other than the property it names.
 fn assert_above_the_ground(camera: Camera, view: &VolumeView, ridge: f32) {
     assert!(
         view.eye_in_box[2] > ridge,
         "camera {camera:?} puts the eye at box z {} , which is not above the \
-         {ridge} ridge it is meant to be looking down on. Below the crest the \
-         composite's arm is B2's to fix and this criterion does not hold — see \
-         `the_ground_is_invisible_from_below_the_box_floor`",
+         {ridge} ridge it is meant to be looking down on",
         view.eye_in_box[2],
     );
 }
@@ -123,6 +194,16 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
     uniform.gradient_shading = false;
     // Held constant across every pair below: with the mirror out of the picture,
     // the only ground in the frame is the mesh's own.
+    //
+    // **It is also what hides a defect from every test in this file, and that
+    // is recorded rather than left to be rediscovered.** With `map_floor` on
+    // *and* a ground pass, the pixels where the ray meets z = 0 but never meets
+    // the mesh fall back to the lid, and the composite then paints the lid
+    // behind the march at full coverage from underneath — misordered and
+    // un-faded. Probed at the three below-floor cameras: 76, 74 and 33 such
+    // pixels at alpha > 200. `volume.wgsl`'s `floor_fade` comment carries the
+    // constraint that B3 has to satisfy; a fixture here that turns the mirror
+    // on with the occluder on is what would start measuring it.
     uniform.map_floor = false;
     if occluder {
         // Through the blessed setter, which derives the scale from THIS
@@ -130,8 +211,18 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
         // another eye mis-clips every ray.
         uniform.aim_occluder(ridge, ridge);
     } else {
+        // The mesh still DRAWS — that is what makes the control below a
+        // control — but the march is told no ground pass ran. The ceiling is
+        // zeroed with it to obey the sentinel discipline `ground_max_z`'s own
+        // doc states, and **nothing enforces that**: the composite reads
+        // `occluder.x`, not the ceiling, so a stale ceiling changes no picture
+        // in this tree. An earlier draft of this comment named a guard that
+        // refused the incoherent pair at the seam a uniform reaches the GPU
+        // through; no such guard has ever existed, and the one that lives there
+        // checks the scale against the eye and never looks at the ceiling. If
+        // B3 or B4 gives the ceiling a reader, that is the moment to write one.
         uniform.ground_ridge_amplitude = ridge;
-        uniform.ground_max_z = ridge;
+        uniform.ground_max_z = 0.0;
         uniform.occluder_t_scale = 0.0;
     }
     uniform
@@ -399,9 +490,11 @@ fn the_occluder_decodes_to_the_ray_parameter_the_march_would_solve() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
     pipelines.upload_quad(&queue);
 
-    for camera in ABOVE_THE_GROUND_CAMERAS {
+    // No precondition on the eye's height: this criterion reads the occluder
+    // ATTACHMENT rather than the composite, and `floor_hit` solves the same
+    // plane for a ray travelling up as for one travelling down.
+    for camera in CAMERAS {
         let view = view_at(camera);
-        assert_above_the_ground(camera, &view, 0.0);
         let (cells, indices) = empty_grid();
         // Flat: amplitude zero, so the mesh and `floor_hit` describe one surface.
         let uniform = uniform(cells, &view, 0.0, true);
@@ -532,8 +625,7 @@ fn the_occluder_decodes_to_the_ray_parameter_the_march_would_solve() {
 // (b) The control.
 // ---------------------------------------------------------------------------
 
-/// **The mesh clips the march, and over the region B1 claims it only ever
-/// removes volume from a ray.**
+/// **The mesh clips the march, and it only ever removes volume from a ray.**
 ///
 /// Two frames through the production pair, with the ground's colour
 /// contribution held constant across them — flat ground against a ridge, both
@@ -542,10 +634,29 @@ fn the_occluder_decodes_to_the_ray_parameter_the_march_would_solve() {
 /// frame and not the other, the difference measured is the ground appearing, not
 /// the volume being clipped.
 ///
-/// **The direction is not universal and this doc used to say it was.** It holds
-/// while the eye is above the ground; from below the plane the composite takes
-/// neither arm and the sign inverts on every differing pixel. See
-/// [`the_ground_is_invisible_from_below_the_box_floor`], which is `#[ignore]`d
+/// **This is the one criterion in this file that stays regional after B2, and
+/// the reason is geometric rather than a limit on the composite.** B1 narrowed
+/// it from "universal" to "while the eye is above the ground" because below the
+/// plane the shipped composite took neither arm and the sign inverted. That
+/// reason is gone — the ground is opaque from underneath now — but the
+/// direction still does not hold there, for a different reason that B2
+/// measured: **from below the box floor a taller ridge clips LESS, not more.**
+/// The ray enters the box through its bottom face travelling up, so raising
+/// `h(x, y)` pointwise moves the first upward crossing later and the marchable
+/// span between the two grows.
+///
+/// Measured at `(215, -18, 2.2, 1)`, and the denominators are named because an
+/// earlier draft of this doc got them wrong by 2.5x: of 7053 pixels with ground
+/// in **both** frames, **2843 differ (40.3%) and every one of those got
+/// brighter**; the other 4210 are unchanged. Not "all 7053 got brighter", and
+/// the per-pixel deltas are not summarised here at all — the first four the
+/// assertion prints share one value and that value is not an aggregate.
+///
+/// So this criterion runs over the six cameras above the crest, and every other
+/// criterion in this file runs over all eleven. That split is asserted below,
+/// not left to the reader: a set that quietly shrank would still read as "the
+/// cameras above the crest". See
+/// [`the_ground_is_opaque_from_below_the_box_floor`], which is `#[ignore]`d
 /// like this one; run it with
 /// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
 #[test]
@@ -561,7 +672,19 @@ fn a_ridge_removes_volume_from_every_ray_it_changes_and_adds_none() {
     // marched.
     let (cells, indices) = floor_slab(2);
 
-    for camera in ABOVE_THE_GROUND_CAMERAS {
+    let above: Vec<Camera> = CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] > RIDGE_AMPLITUDE)
+        .collect();
+    assert_eq!(
+        above.len(),
+        6,
+        "the six cameras above the crest are the ones this direction is defined \
+         over, and there are now {}: {above:?}",
+        above.len(),
+    );
+
+    for camera in above {
         let view = view_at(camera);
         assert_above_the_ground(camera, &view, RIDGE_AMPLITUDE);
         let semi_transparent = |ridge: f32| {
@@ -651,7 +774,7 @@ fn with_the_occluder_off_the_same_ridge_changes_nothing() {
     pipelines.upload_quad(&queue);
 
     let (cells, indices) = floor_slab(2);
-    for camera in ABOVE_THE_GROUND_CAMERAS {
+    for camera in CAMERAS {
         let view = view_at(camera);
         let off = |ridge: f32| {
             let mut u = uniform(cells, &view, ridge, false);
@@ -679,7 +802,7 @@ fn with_the_occluder_off_the_same_ridge_changes_nothing() {
 // (e) The non-invisibility criterion.
 // ---------------------------------------------------------------------------
 
-/// **The ground's colour survives the raymarch pass, at every camera above it.**
+/// **The ground's colour survives the raymarch pass, at every camera.**
 ///
 /// This exists because the control above cannot see a terrain that never draws:
 /// a correctly clipped volume over an empty background differs in exactly the
@@ -687,9 +810,13 @@ fn with_the_occluder_off_the_same_ridge_changes_nothing() {
 /// visible ground at all. Here the volume is air, so anything on the screen
 /// inside the ridge's silhouette came from the mesh.
 ///
-/// It is asserted over six cameras rather than one because at one it certified
-/// "terrain draws **from above**" while reading as "terrain draws" — the exact
-/// vacuity this criterion was added to close, one level up.
+/// It is asserted over eleven cameras rather than one because at one it
+/// certified "terrain draws **from above**" while reading as "terrain draws" —
+/// the exact vacuity this criterion was added to close, one level up. At six it
+/// then certified "terrain draws **from above the crest**" and read the same
+/// way, which is the same vacuity a region narrower; the fixture is now the
+/// whole drag range, and `the_camera_set_reaches_above_the_crest_under_it_and_
+/// under_the_floor` is what keeps it there.
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_grounds_own_colour_reaches_the_screen() {
@@ -701,9 +828,8 @@ fn the_grounds_own_colour_reaches_the_screen() {
     let expected = expected_ground_pixel();
     let (cells, indices) = empty_grid();
 
-    for camera in ABOVE_THE_GROUND_CAMERAS {
+    for camera in CAMERAS {
         let view = view_at(camera);
-        assert_above_the_ground(camera, &view, RIDGE_AMPLITUDE);
         let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
         let dark = uniform(cells, &view, RIDGE_AMPLITUDE, false);
         let lit = render(&device, &queue, &pipelines, cells, &indices, &lit);
@@ -765,55 +891,99 @@ fn the_grounds_own_colour_reaches_the_screen() {
 }
 
 // ---------------------------------------------------------------------------
-// The limit of what B1 certifies, measured rather than left implicit.
+// Under the box floor: B1's pinned hole, rewritten to the behaviour that
+// replaced it.
 // ---------------------------------------------------------------------------
 
-/// **From below the box floor the ground is entirely invisible, and B2 owns
-/// the fix.**
+/// **From below the box floor the ground is OPAQUE, and every pixel it drew
+/// reaches the screen.**
 ///
-/// `let eye_above_plane = eye.z >= 0.0` is a predicate written for a *flat*
-/// ground at `z = 0`, and `floor_fade = clamp(1 + eye.z / FLOOR_BELOW_FADE)`
-/// with `FLOOR_BELOW_FADE = 0.08` is zero for any eye more than 0.08 box
-/// heights under the plane. Below the plane neither composite arm runs,
-/// `surface_colour` is never called, and the mesh's colour is discarded — while
-/// the *clip* still applies, so the volume is cut by ground that is not drawn.
+/// This test used to assert the exact opposite, at these exact three cameras,
+/// and B1 left it standing with instructions to rewrite rather than delete it.
+/// What it measured: `eye_above_plane = eye.z >= 0.0` was a predicate written
+/// for a flat lid, and `floor_fade = clamp(1 + eye.z / FLOOR_BELOW_FADE)` with
+/// `FLOOR_BELOW_FADE = 0.08` is zero for any eye more than 0.08 box heights
+/// under the plane — so below the plane neither arm ran, `surface_colour` was
+/// never called, and the mesh's colour was discarded while the *clip* still
+/// applied. 7198/7198, 14664/14664 and 40960/40960 pixels the mesh drew
+/// composited to alpha 0.
 ///
-/// **This is an ordinary camera, not a corner.** `MAX_PITCH_DEG = 89.0` and
-/// pitch is clamped to `[-89, +89]`, and at the default standoff the eye
-/// crosses `z = 0` at about pitch −0.9° — so essentially the whole
-/// negative-pitch half of the drag range is in here. Measured across pitch at
-/// `distance 2.2`: −18° gives `eye_in_box.z = -5.27`, −40° gives −11.50, −89°
-/// gives −18.16, and `floor_fade` is 0 at every one of them.
+/// **It was never a corner.** `MAX_PITCH_DEG = 89.0`, pitch is clamped to
+/// `[-89, +89]`, and at the default standoff the eye crosses `z = 0` at about
+/// pitch −0.9°, so essentially the whole negative-pitch half of an ordinary
+/// drag was in it.
 ///
-/// It is pinned rather than fixed because **generalising that predicate is B2's
-/// whole work unit**, and B2 as planned reserves only "below the terrain
-/// surface but above `z = 0`" — below `z = 0` *with a mesh* is a case neither
-/// unit names. When B2 lands, this test fails and must be rewritten to the
-/// behaviour that replaces it, not deleted.
+/// **The decision B2 made, and it is the better of two bad states rather than
+/// a good one.** See
+/// [`the_mesh_walls_the_volume_off_from_below_and_the_lid_does_not`], which
+/// measures what opacity costs and hands the real fix forward. It is
+/// `#[ignore]`d like this one; run both with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
+///
+/// An earlier draft of this comment argued that `FLOOR_BELOW_FADE` exists
+/// because a featureless infinite lid walls the pane off, and that standing
+/// ground is different because "it has a silhouette, a horizon and an edge to
+/// see past". **That argument is withdrawn: it is false at the camera in this
+/// very fixture.** At `(140, -89, 1.0, 1.0)` the mesh covers 40960 of 40960
+/// pixels. Wall to wall. No silhouette, no edge.
+///
+/// What survives is narrower and is about what B2 can reach. The march is
+/// CLIPPED against the mesh, and that clip is source-order-pinned with its own
+/// mutant battery — it is not B2's to move. With it in place there are exactly
+/// two states: opaque terrain, or the hole B1 measured, where the clip cuts the
+/// volume and a faded mesh paints nothing over the cut, so the user sees
+/// neither weather nor ground. A fade cannot un-do a binary clip, and there is
+/// no coverage between 0 and 1 at which the two agree. Opaque strictly
+/// dominates the hole, needs no third arm and no new number, and is what this
+/// lands. It does **not** answer the user's report; that is recorded as an open
+/// item on the track that owns the clip.
+///
+/// A second cost, recorded rather than glossed: from below, B3's drape is the
+/// top-down map raster painted on the underside of the terrain. That is a
+/// wrong-side texture and it wants a distinct underside shade, which is a
+/// D-track change to what the ground pass writes.
+///
+/// **What this pin uniquely certifies is narrower than its name.** The ridge
+/// half of it is now also covered by `the_grounds_own_colour_reaches_the_screen`
+/// (`#[ignore]`d, same invocation as above),
+/// which runs over all eleven cameras and so includes these three; what only
+/// this test carries is the relief-0 corner below, and that corner is the sole
+/// killer of the empty-span mutant. The name is kept because the behaviour it
+/// names is the one B1 handed forward, but a reader should not take it for more
+/// coverage than that.
+///
+/// **A ridge and a FLAT mesh, because the flat one is its own corner.** A mesh
+/// with no relief stands exactly on the box's bottom face, so from underneath
+/// its `ground_t` **is** the ray's box entry and `span.y = min(span.y,
+/// ground_t)` empties the span. The march's `span.y <= span.x` early-out then
+/// returned transparent over ground the mesh had drawn — the same defect this
+/// test is named for, in the one configuration the ridge cannot reach. It is a
+/// reason to march nothing, not a reason to draw nothing.
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
-fn the_ground_is_invisible_from_below_the_box_floor() {
+fn the_ground_is_opaque_from_below_the_box_floor() {
     let _held = gpu_lock();
     let (device, queue) = device();
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
     pipelines.upload_quad(&queue);
 
-    // The reviewer's own camera, and two more spread across the negative half.
-    for camera in [
-        (215.0f32, -18.0f32, 2.2f32, 1.0f32),
-        (35.0, -40.0, 2.2, 1.0),
-        (140.0, -89.0, 1.0, 1.0),
-    ] {
+    let below = below_the_box_floor();
+    assert_eq!(
+        below.len(),
+        3,
+        "the three cameras this pin was written against are no longer in \
+         `CAMERAS`, so it is measuring something else: {below:?}",
+    );
+
+    let expected = expected_ground_pixel();
+    for (camera, relief) in below
+        .into_iter()
+        .flat_map(|camera| [(camera, RIDGE_AMPLITUDE), (camera, 0.0)])
+    {
         let view = view_at(camera);
-        assert!(
-            view.eye_in_box[2] < 0.0,
-            "precondition: {camera:?} was meant to put the eye under the box \
-             floor, and it is at z {}",
-            view.eye_in_box[2]
-        );
 
         let (cells, indices) = empty_grid();
-        let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
+        let lit = uniform(cells, &view, relief, true);
         let frame = render(&device, &queue, &pipelines, cells, &indices, &lit);
 
         let drew = (0..(SIZE[0] * SIZE[1]) as usize)
@@ -821,28 +991,319 @@ fn the_ground_is_invisible_from_below_the_box_floor() {
             .count();
         assert!(
             drew > (SIZE[0] * SIZE[1]) as usize / 20,
-            "{camera:?}: the mesh drew over only {drew} pixels, so this pin is \
-             not measuring the hole it names"
+            "{camera:?} at relief {relief}: the mesh drew over only {drew} \
+             pixels, so this pin is not measuring the region it names"
         );
-        let invisible = (0..(SIZE[0] * SIZE[1]) as usize)
-            .filter(|at| frame.ground[*at][3] == 255 && frame.offscreen[*at][3] == 0)
-            .count();
+        // One pixel in from the silhouette, for the same reason the criterion
+        // above is: the rasteriser's coverage rule and the march's own
+        // `slab_entry_exit` necessarily disagree on the rim and nowhere else.
+        let ground_mask: Vec<bool> = (0..(SIZE[0] * SIZE[1]) as usize)
+            .map(|at| frame.ground[at][3] == 255)
+            .collect();
+        let well_inside = interior(&ground_mask, 1);
+
+        let mut painted = 0usize;
+        let mut invisible = 0usize;
+        let mut wrong = Vec::new();
+        for (at, inside) in well_inside.iter().enumerate() {
+            if !inside {
+                continue;
+            }
+            painted += 1;
+            let pixel = frame.offscreen[at];
+            if pixel[3] == 0 {
+                invisible += 1;
+            }
+            let off_by = |lane: usize| i32::from(pixel[lane]).abs_diff(i32::from(expected[lane]));
+            if pixel[3] != 255 || (0..3).any(|lane| off_by(lane) > 2) {
+                wrong.push((at, pixel));
+            }
+        }
         eprintln!(
-            "below-plane hole {camera:?}: eye z {:.3}, mesh drew {drew} px, \
-             {invisible} of them composited to alpha 0",
+            "below-floor opacity {camera:?} relief {relief}: eye z {:.3}, mesh \
+             drew {drew} px, {painted} well inside, {invisible} composited to \
+             alpha 0",
             view.eye_in_box[2]
         );
-        assert_eq!(
-            invisible,
-            drew,
-            "{camera:?}: {} of {drew} pixels the mesh drew now reach the \
-             screen. If B2's arm rule has landed, this pin has done its job — \
-             REWRITE it to the behaviour that replaced it rather than deleting \
-             it, and widen `ABOVE_THE_GROUND_CAMERAS` to cover the range that \
-             now works",
-            drew - invisible,
+        assert!(
+            wrong.is_empty(),
+            "{camera:?} at relief {relief}: {} of {painted} pixels the mesh \
+             drew do not carry its colour {expected:?} from underneath (first \
+             {:?}, {invisible} of them fully transparent). An eye under the box \
+             floor is under the terrain, not under a lid: the march is CLIPPED \
+             against the mesh, so fading the mesh out leaves the hole the clip \
+             cut with nothing in it — which is what 40960 of 40960 transparent \
+             pixels at pitch −89° used to be. At relief 0 the mesh stands on \
+             the box's bottom face and the clip empties the span outright, \
+             which the march must answer by drawing the surface rather than by \
+             returning transparent",
+            wrong.len(),
+            &wrong[..wrong.len().min(4)],
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// What opacity from below costs, measured rather than argued.
+// ---------------------------------------------------------------------------
+
+/// **The mesh walls the volume off from below. The lid does not, and a user
+/// reported the lid.**
+///
+/// `volume_gpu::the_floor_is_transparent_from_below` — `#[ignore]`d like this
+/// one, run with `cargo test -p squallar-gpu --test volume_gpu -- --ignored` —
+/// asserts that a saturated slab in the box's top half shows through the ground
+/// from underneath, and its message names the reason: *"an opaque ground from
+/// underneath is the wall the user reported"*. It stays green because it runs
+/// with **no ground pass**, and the symptom it names comes back through the
+/// mesh. This is that test's missing sibling: same question, ground pass on.
+///
+/// **The answer today is the wall, and this pins it rather than hiding it.**
+/// The occlusion is B1's clip, not B2's arm — `span.y = min(span.y, ground_t)`
+/// removes the volume above the terrain whatever the composite then paints, and
+/// that clip is source-order-pinned with its own mutant battery. B2 only chose
+/// what fills the cut: opaque terrain, or the hole B1 measured where nothing is
+/// painted at all and the user sees neither weather nor ground. Opacity
+/// dominates the hole. Neither answers the report.
+///
+/// **The fix, for whoever owns the clip.** The clip and the coverage have to be
+/// one decision. Below the plane that means not clipping against a surface the
+/// composite is going to fade, and compositing it OVER the march with
+/// `ground.a * floor_fade` — the "floor in front" arm, which already exists and
+/// is currently unreachable with a ground pass on. That is a change to a pinned
+/// invariant and to `floor_fade`'s domain, and it is deliberately not made
+/// here.
+///
+/// When it is made, **this test fails and must be rewritten to the behaviour
+/// that replaced it, not deleted** — the same instruction B1 left on the pin
+/// this file's other criteria grew out of.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_mesh_walls_the_volume_off_from_below_and_the_lid_does_not() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
+    pipelines.upload_quad(&queue);
+
+    // Straight up from under the box floor, where the mesh fills the frame:
+    // the camera that makes the "it has an edge to see past" argument false.
+    let camera = (140.0f32, -89.0f32, 1.0f32, 1.0f32);
+    let view = view_at(camera);
+    assert!(
+        view.eye_in_box[2] < 0.0,
+        "precondition: {camera:?} is meant to put the eye under the box floor, \
+         and it is at z {}",
+        view.eye_in_box[2],
+    );
+
+    // The volume in the box's TOP quarter — above the terrain, which is what
+    // makes this about occlusion rather than about the underground sliver the
+    // control above measures.
+    const EDGE: u32 = 8;
+    let cells = [EDGE, EDGE, EDGE];
+    let mut indices = vec![0u8; (EDGE * EDGE * EDGE) as usize];
+    for slab in (EDGE as usize) - 2..EDGE as usize {
+        let base = slab * (EDGE * EDGE) as usize;
+        indices[base..base + (EDGE * EDGE) as usize].fill(200);
+    }
+
+    let painted_with_volume = |occluder: bool| {
+        let mut aimed = uniform(cells, &view, RIDGE_AMPLITUDE, occluder);
+        aimed.extinction_per_km = 0.15;
+        let frame = render(&device, &queue, &pipelines, cells, &indices, &aimed);
+        let ground_only = expected_ground_pixel();
+        let (mut painted, mut carrying) = (0usize, 0usize);
+        for pixel in &frame.offscreen {
+            if pixel[3] == 0 {
+                continue;
+            }
+            painted += 1;
+            if (0..3).any(|lane| i32::from(pixel[lane]).abs_diff(i32::from(ground_only[lane])) > 2)
+            {
+                carrying += 1;
+            }
+        }
+        (painted, carrying)
+    };
+
+    let (lid_painted, lid_carrying) = painted_with_volume(false);
+    let (mesh_painted, mesh_carrying) = painted_with_volume(true);
+    eprintln!(
+        "wall from below {camera:?}: with the lid alone {lid_carrying} of \
+         {lid_painted} painted pixels carry volume; with a ground pass \
+         {mesh_carrying} of {mesh_painted} do"
+    );
+
+    // The lid half: this is `the_floor_is_transparent_from_below`'s claim —
+    // `#[ignore]`d, `cargo test -p squallar-gpu --test volume_gpu -- --ignored`
+    // — re-measured here so the comparison has a control on this hardware
+    // rather than a citation.
+    assert!(
+        lid_carrying * 2 > lid_painted,
+        "with no ground pass only {lid_carrying} of {lid_painted} painted \
+         pixels carry volume from below, so the lid is already walling the \
+         volume off and this test's comparison has no baseline — that is a \
+         regression in `FLOOR_BELOW_FADE`, not in the mesh"
+    );
+    // And the mesh half, which is the open item.
+    assert_eq!(
+        mesh_carrying, 0,
+        "{mesh_carrying} of {mesh_painted} pixels carry volume through the mesh \
+         from below. If the clip has been taught to fade with the coverage, \
+         this pin has done its job — REWRITE it to the behaviour that replaced \
+         it rather than deleting it, and revisit \
+         `the_ground_is_opaque_from_below_the_box_floor`, whose opacity \
+         argument rests on this being the only alternative"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Between the crest and the box floor: the region the plan named, and the
+// predicate it named for it.
+// ---------------------------------------------------------------------------
+
+/// **Terrain the eye is below still composites BEHIND volume standing in front
+/// of it — and the plan's own predicate for this region is what breaks that.**
+///
+/// The plan asked B2 to generalise the arm to *"the eye is above the ground's
+/// maximum height"*, `occluder.y`, on the reasoning that a camera at box
+/// z = 0.05 with a ridge at 0.15 in front of it "composites terrain under an
+/// accumulation it is in front of". **That reasoning does not survive B1's own
+/// clip**, and this test is the measurement rather than the argument.
+///
+/// `span.y = min(span.y, ground_t)` runs before `jitter` and `dt` and is
+/// source-order-pinned there. The mesh is authored inside the unit cube and
+/// `slab_entry_exit` floors its entry at 0, so a ray that meets the mesh met
+/// the box first and the clipped span never ends short of where it began.
+/// Every accumulated sample therefore lies *in front of* the surface, at every
+/// pixel, whatever the eye's height — so the ground is behind the accumulation
+/// and the "floor behind" arm is the correct one here. Sending this region to
+/// the "floor in front" arm instead paints opaque terrain over volume the
+/// clip already proved is nearer than it.
+///
+/// The forced build below is exactly the plan's predicate, and the assertion is
+/// two-sided: the shipped arm must keep the volume, and the crest arm must lose
+/// it. Without the second half this test would pass on a scene with no volume
+/// standing in front of the ridge at all.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_terrain_composites_behind_volume_standing_in_front_of_it() {
+    use squallar_volumetric::raymarch::VOLUME_SHADER_WGSL;
+
+    /// The shipped arm, asserted to match so a moved anchor cannot make this
+    /// force something that does not exist.
+    const ARM: &str = "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0;";
+    /// The plan's own generalisation: above the ground's greatest height.
+    const CREST: &str = "let ground_behind_the_march = eye.z >= volume.occluder.y;";
+
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    assert_eq!(
+        VOLUME_SHADER_WGSL.matches(ARM).count(),
+        1,
+        "the composite's arm is no longer `{ARM}`, so this test is forcing \
+         something that does not exist — re-anchor it rather than deleting it",
+    );
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let shipped = VolumePipelines::new(&device, attachments(format));
+    let crest = VolumePipelines::from_shader_source(
+        &device,
+        attachments(format),
+        &VOLUME_SHADER_WGSL.replace(ARM, CREST),
+    );
+    for pipelines in [&shipped, &crest] {
+        pipelines.upload_quad(&queue);
+    }
+
+    // Semi-transparent, so a pixel carrying volume AND ground is distinguishable
+    // from one carrying ground alone — a saturated ray is white however far it
+    // marched, and would hide the very difference this measures.
+    let (cells, indices) = floor_slab(2);
+    let ground_only = expected_ground_pixel();
+
+    // **Every camera the eye is below the crest at, which is both regions and
+    // not just the band above the plane.** Under the box floor the crest
+    // predicate is false too, and so is the flat lid's `eye.z >= 0.0` — the arm
+    // this replaced. Restricting this to the band would have left the shipped
+    // arm's advantage unmeasured at exactly the cameras B1 pinned as a hole.
+    let below_the_crest: Vec<Camera> = CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] < RIDGE_AMPLITUDE)
+        .collect();
+    assert_eq!(
+        below_the_crest.len(),
+        5,
+        "the cameras below the crest are what this criterion is defined over, \
+         and there are now {}: {below_the_crest:?}",
+        below_the_crest.len(),
+    );
+
+    let mut total_darkened = 0usize;
+    for camera in below_the_crest {
+        let view = view_at(camera);
+        let z = view.eye_in_box[2];
+        let mut aimed = uniform(cells, &view, RIDGE_AMPLITUDE, true);
+        aimed.extinction_per_km = 0.15;
+        let with_shipped = render(&device, &queue, &shipped, cells, &indices, &aimed);
+        let with_crest = render(&device, &queue, &crest, cells, &indices, &aimed);
+
+        let ground_mask: Vec<bool> = (0..(SIZE[0] * SIZE[1]) as usize)
+            .map(|at| with_shipped.ground[at][3] == 255)
+            .collect();
+        let well_inside = interior(&ground_mask, 1);
+
+        // A pixel carries volume in front of the ground when the shipped
+        // composite is not the bare ground colour there. Two codes of slack,
+        // the same tolerance the non-invisibility criterion uses.
+        let carries_volume = |pixel: [u8; 4]| {
+            (0..3).any(|lane| i32::from(pixel[lane]).abs_diff(i32::from(ground_only[lane])) > 2)
+        };
+
+        let (mut with_volume, mut darkened, mut kept) = (0usize, 0usize, 0usize);
+        for (at, inside) in well_inside.iter().enumerate() {
+            if !inside || !carries_volume(with_shipped.offscreen[at]) {
+                continue;
+            }
+            with_volume += 1;
+            if carries_volume(with_crest.offscreen[at]) {
+                kept += 1;
+            } else {
+                darkened += 1;
+            }
+        }
+        total_darkened += darkened;
+
+        eprintln!(
+            "below-crest arm {camera:?}: eye z {z:.3} against a \
+             {RIDGE_AMPLITUDE} crest, {with_volume} px carry volume in front \
+             of the ground; the crest predicate loses {darkened} of them and \
+             keeps {kept}"
+        );
+        assert!(
+            with_volume > 500,
+            "{camera:?}: only {with_volume} pixels carry volume in front of the \
+             ground, so this fixture cannot tell the two arms apart and the \
+             assertion below would be vacuous"
+        );
+        // `kept == 0`, which is what the doc claims and what all five cameras
+        // measure. A 25% floor stood here first and was 4x looser than the
+        // measurement: a criterion whose threshold is nowhere near its own
+        // number is not pinning the number.
+        assert_eq!(
+            kept, 0,
+            "{camera:?}: the crest predicate kept {kept} of {with_volume} \
+             pixels carrying volume in front of the ground, and the shipped arm \
+             keeps all of them. Every camera measured so far loses every one — \
+             a survivor means the two arms are not the different composites \
+             this test claims, and the shipped arm's advantage here is unproven"
+        );
+    }
+    assert!(
+        total_darkened > 0,
+        "no camera in `CAMERAS` puts the eye below the crest, so this criterion \
+         ran over nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -861,7 +1322,7 @@ fn the_mesh_stands_at_the_height_the_analytic_field_gives_it() {
     pipelines.upload_quad(&queue);
 
     let (cells, indices) = empty_grid();
-    for camera in ABOVE_THE_GROUND_CAMERAS {
+    for camera in CAMERAS {
         let view = view_at(camera);
         let uniform = uniform(cells, &view, RIDGE_AMPLITUDE, true);
         let t_scale = uniform.occluder_t_scale;

@@ -140,9 +140,21 @@ pub struct VolumeUniform {
     /// `min` against the box exit is a no-op rather than a clip. Rides
     /// `occluder.x`.
     pub occluder_t_scale: f32,
-    /// The ground surface's greatest height, in box `z`. Written for B2's arm
-    /// rule, which generalises "the eye is above the plane" to "the eye is
-    /// above the ground"; nothing reads it yet. Rides `occluder.y`.
+    /// The ground surface's greatest height, in box `z`. Zero when no ground
+    /// pass ran, by the same sentinel discipline as
+    /// [`Self::occluder_t_scale`] — but **not** an iff, because a mesh that is
+    /// flat at sea level across the whole box is zero with a pass running, and
+    /// that ambiguity is half of why the composite does not read it.
+    ///
+    /// **Reserved by B1 for the composite's arm, and B2 measured that it is the
+    /// wrong number for it, so nothing reads it yet.** Two reasons, both in
+    /// `volume.wgsl`'s arm comment: the march is CLIPPED against the ground, so
+    /// an eye under the crest still has every accumulated sample in front of
+    /// the surface and "above the ceiling" discards 10817 of 10817 pixels of
+    /// volume standing in front of a ridge; and the ceiling is a knife edge
+    /// where a pass sentinel is not, since a mesh that happens to be flat would
+    /// flip the frame's composite on the terrain's content. The arm reads
+    /// [`Self::occluder_t_scale`] as its sentinel instead. Rides `occluder.y`.
     pub ground_max_z: f32,
     /// Amplitude of the analytic stand-in ridge, in box `z`, or zero for flat
     /// ground. B3 replaces it with a sampled height field; until then it is
