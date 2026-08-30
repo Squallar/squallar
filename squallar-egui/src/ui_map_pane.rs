@@ -91,6 +91,29 @@ pub(super) struct PaneRenderCtx<'a> {
     /// Which halves of the pane's content this pass is for. See
     /// [`PaneSurfaces`].
     pub surfaces: PaneSurfaces,
+    /// Whether the pane this pass belongs to draws its ground as a **lit 3D
+    /// mesh** rather than as flat map pixels.
+    ///
+    /// It is the floor strip's half of one question, and the renderer's half
+    /// is `VolumeFrameState::heights`; both read the same answer, so the
+    /// drape and the mesh cannot disagree about which ground is being drawn.
+    /// See [`PaneRenderCtx::double_shades`] for what it suppresses and why,
+    /// and `ui_map::pane_ground_heights` for where the answer comes from.
+    ///
+    /// `false` for every 2D pane by construction: a pane drawing its map in
+    /// plan has no mesh and no second light.
+    ///
+    /// **The one gap, declared.** The strip is drawn *before* the volume
+    /// painter runs -- it has to be, it is the mirror that painter samples --
+    /// so this is "the pane has a field to draw ground from", not "the mesh
+    /// drew". The renderer takes one further step the strip cannot wait for:
+    /// a field whose footprint cannot be placed over the drawn box falls back
+    /// to the flat lid. Such a frame gets an unshaded lid rather than a
+    /// double-shaded mesh, which is the safe side of the two, and it is the
+    /// stand-in case that `DrawnBox::for_target` already treats as transient.
+    /// Closing it would need the *previous* frame's outcome fed back, which
+    /// trades a rare transient for a permanent one-frame lag.
+    pub draws_3d_ground: bool,
     /// Whether this frame's color scale bars run along the bottom edge
     /// (`true`) or the right edge (`false`). Resolved once per map panel.
     pub horizontal_color_scale: bool,
@@ -117,6 +140,27 @@ pub(super) struct PaneRenderCtx<'a> {
     /// composite in `GraphicLayers::drain`'s order, not in this sequence.
     #[cfg(test)]
     pub paint_order: Vec<(LayerId, egui::LayerId)>,
+}
+
+impl PaneRenderCtx<'_> {
+    /// Whether this pass must skip `id` to stop the pane's ground being
+    /// shaded twice.
+    ///
+    /// A 3D pane's ground is a lit mesh, and the floor strip is the texture
+    /// that mesh is draped with. Hillshade is shading already baked into
+    /// pixels, by a sun frozen in map space; drape it over a mesh the scene's
+    /// own light shades and the terrain carries two shadows cast by two suns,
+    /// one of which does not move when the camera does.
+    ///
+    /// Conjunct by conjunct. Only a [`GroundOnly`](PaneSurfaces::GroundOnly)
+    /// pass is a floor strip, so nothing a 2D pane draws can move through
+    /// here whatever a caller passes. Only a pane whose ground is a mesh has
+    /// the second light. And only `TERRAIN` carries baked shading -- the base
+    /// tiles beneath it are unlit colour and must keep drawing, or the mesh
+    /// has nothing to wear.
+    fn double_shades(&self, id: &LayerId) -> bool {
+        self.surfaces == PaneSurfaces::GroundOnly && self.draws_3d_ground && *id == known::TERRAIN
+    }
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -175,6 +219,12 @@ pub(super) fn render_pane_map_content(
             // The ground/glass split: a pass not painting this layer's surface
             // skips the arm entirely, so it also skips the paint-order record.
             if !ctx.surfaces.paints(handler.surface()) {
+                continue;
+            }
+            // And the strip of a pane whose ground is a lit mesh skips the
+            // layer that would shade that mesh a second time -- same skip,
+            // same place, so it too leaves the paint-order record alone.
+            if ctx.double_shades(id) {
                 continue;
             }
             // Every arm below paints through `ui.painter()` — the pane's own
@@ -3306,3 +3356,7 @@ mod theme_flip_tests;
 #[path = "ui_map_pane/as_of_token_tests.rs"]
 #[cfg(test)]
 mod as_of_token_tests;
+
+#[path = "ui_map_pane/floor_strip_shading_tests.rs"]
+#[cfg(test)]
+mod floor_strip_shading_tests;

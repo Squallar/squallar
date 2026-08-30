@@ -309,6 +309,12 @@ impl super::Gui {
                                             actions: &mut actions,
                                             pane_rect,
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
+                                            // A pane drawing its map in plan
+                                            // has no mesh and no second
+                                            // light. Not a lookup: the 3D
+                                            // ground is drawn by the volume
+                                            // arm, which this arm is not.
+                                            draws_3d_ground: false,
                                             horizontal_color_scale,
                                             color_scale_floor,
                                             pointer_available,
@@ -1656,6 +1662,10 @@ impl super::Gui {
         strip_ui.set_clip_rect(strip);
 
         let mut strip_click_consumed = false;
+        // Read before the closure takes `pane`, and read from the same
+        // function the renderer's own `heights` comes from -- see
+        // `pane_ground_heights`.
+        let draws_3d_ground = pane_ground_heights(pane, pane_idx).is_some();
 
         Map::new(None, map_memory, center)
             .zoom_with_ctrl(false)
@@ -1689,6 +1699,7 @@ impl super::Gui {
                     actions,
                     pane_rect: strip,
                     surfaces: pane_render::PaneSurfaces::GroundOnly,
+                    draws_3d_ground,
                     horizontal_color_scale,
                     color_scale_floor,
                     pointer_available: false,
@@ -1927,6 +1938,41 @@ impl VolumeOutcome {
     }
 }
 
+/// The height field pane `pane_idx`'s ground is drawn as, or `None` while it
+/// has none and the pane draws the flat map floor at box `z = 0`.
+///
+/// **The one answer to "does this pane draw 3D ground", and it has two
+/// readers.** `volume_pane_outcome` puts it on the `VolumeFrameState` the
+/// renderer decides the mesh from, and `draw_floor_strip` asks whether the
+/// strip must suppress the hillshade
+/// ([`PaneRenderCtx::draws_3d_ground`](pane_render::PaneRenderCtx::draws_3d_ground)).
+/// Those two must never disagree -- a strip that dropped the hillshade for a
+/// pane drawing the flat lid would lose shading the lid has no other source
+/// of, and a strip that kept it for a pane drawing the mesh would shade that
+/// mesh twice -- so they read one function rather than two beliefs.
+///
+/// **Owed, and named here rather than left as a shrug.** B3 built the whole
+/// path a field travels -- archive tiles, the offload row, the resample, the
+/// `R16Uint` upload, the mesh, the drape -- and proved it end to end against a
+/// fixture archive. What it did not build is the scheduler that decides when a
+/// pane asks for one, because the archive A2 would fetch from is not
+/// published: `HEIGHT_ARCHIVE_URL` still carries `UNPUBLISHED-GENERATION`, so
+/// a wired request would 404 on every tile and the pane would draw exactly
+/// this `None` anyway. **So it answers `None` for every pane today**, which is
+/// why nothing that gates on it can be proven by driving the app: the
+/// two-directional evidence for the suppression is at
+/// `render_pane_map_content`'s own seam, where both answers are constructible
+/// (`ui_map_pane/floor_strip_shading_tests.rs`).
+///
+/// Whoever wires the scheduler fills in this body, and both readers flip
+/// together because there is only the one.
+fn pane_ground_heights(
+    _pane: &crate::pane::PaneState,
+    _pane_idx: usize,
+) -> Option<std::sync::Arc<crate::volume_view::GroundHeightField>> {
+    None
+}
+
 /// The 3D arm's decision, with the painting left to its caller so that every
 /// path out of it is a `return` of a reason rather than a `return` plus a call
 /// somebody can forget to make.
@@ -2082,15 +2128,7 @@ fn volume_pane_outcome(
         alpha: alpha_curves.get(&product),
         view_mode,
         iso_threshold: iso_thresholds.get(&product),
-        // **Owed, and named here rather than left as a shrug.** B3 built the
-        // whole path a field travels — archive tiles, the offload row, the
-        // resample, the `R16Uint` upload, the mesh, the drape — and proved it
-        // end to end against a fixture archive. What it did not build is the
-        // scheduler that decides when a pane asks for one, because the archive
-        // A2 would fetch from is not published: `HEIGHT_ARCHIVE_URL` still
-        // carries `UNPUBLISHED-GENERATION`, so a wired request would 404 on
-        // every tile and the pane would draw exactly this `None` anyway.
-        heights: None,
+        heights: pane_ground_heights(pane, pane_idx),
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()
