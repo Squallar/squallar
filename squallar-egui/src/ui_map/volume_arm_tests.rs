@@ -2901,3 +2901,67 @@ fn a_lone_3d_pane_still_gates_on_the_selection_it_has_now() {
          means the walk gated on a slot member nothing kept current",
     );
 }
+
+/// **The pane's light reaches the painter, and the toggle moves it.**
+///
+/// The wire between the checkbox and the frame, which nothing else can see: a
+/// build that always sent the readable light would compile, draw a perfectly
+/// good picture, and have no accurate mode at all.
+#[test]
+fn the_pane_sends_the_painter_the_light_it_is_set_to() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    let light = last_seen(&painter).light;
+    let crate::volume_view::VolumeLight::Sun(sun) = light else {
+        panic!("a fresh 3D pane at a placed site should be under the sun, not {light:?}");
+    };
+    assert!(
+        sun.elevation_deg.is_finite(),
+        "the sun reached the painter without a placeable elevation",
+    );
+
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .readable_light = true;
+    h.frames_for(2, FRAME_DT);
+    assert_eq!(
+        last_seen(&painter).light,
+        crate::volume_view::VolumeLight::Headlight,
+        "turning the sun off has to reach the painter, or the toggle is a \
+         checkbox that changes a saved bool and nothing else",
+    );
+}
+
+/// The sun the painter is sent is the one over the **box**, and the volume's
+/// own collection time is what places it.
+///
+/// The two things the plan was specific about and that a plausible-looking
+/// wrong build would get wrong in silence: taking the instant from the pane's
+/// playhead, which is `None` on a live pane and would leave the commonest pane
+/// unlit, and taking the place from the map's centre rather than from the
+/// ground the box is about.
+#[test]
+fn the_sun_is_placed_over_the_box_at_the_volumes_own_moment() {
+    let (_h, painter) = volume_harness(StubVolumePainter::painting());
+    let frame = last_seen(&painter);
+    let crate::volume_view::VolumeLight::Sun(sun) = frame.light else {
+        panic!("the pane is not under the sun");
+    };
+
+    let site = squallar_radar::sites::get_radar_site("KTLX").expect("a placed site");
+    let expected = crate::volume_view::sun_over(
+        squallar_geo::GeoPoint {
+            lat: site.lat,
+            lon: site.lon,
+        },
+        crate::volume_view::unix_seconds_of(frame.target.volume.collected),
+    )
+    .expect("the sun over KTLX at the fixture's own moment");
+    assert_eq!(
+        sun, expected,
+        "the light the painter was sent is not the sun over this pane's own \
+         box at this volume's own collection time",
+    );
+}

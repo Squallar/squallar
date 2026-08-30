@@ -403,6 +403,14 @@ pub struct VolumePane {
     pub alpha_editor_open: bool,
     /// How this pane draws its volume: the lit accumulation or an isosurface.
     pub view_mode: VolumeViewMode,
+    /// Whether this pane has turned the real sun **off** in favour of the
+    /// readable light.
+    ///
+    /// The inverted sense is [`Self::hide_floor`]'s, and for the same reason:
+    /// the accurate sun is the decided default for both the ground and the
+    /// volume, so `false` — what `Default` and every config written before
+    /// this field give — has to be the sun. Persisted; reopen is exactly 1:1.
+    pub readable_light: bool,
 }
 
 /// How a 3D pane draws its volume. `Default` is the lit volume — what every
@@ -439,6 +447,21 @@ pub fn volume_base_km_msl(region: Option<VolumeRegion>, site: Option<GeoPoint>) 
     base_km_msl_in(squallar_radar::voxel::floor_grid(), region, site)
 }
 
+/// **Where the box is centred**, and so where the sun is placed over it: the
+/// picked region's centre when there is one, the site otherwise, and `None`
+/// for a pane whose site is not placed.
+///
+/// One expression, read by the floor derivation and by the light, because they
+/// have to agree about which patch of ground the pane is about — and it is the
+/// point `build_voxels` records as the grid's own anchor.
+///
+/// A pane with no placed site answers `None` rather than guessing, exactly as
+/// [`volume_base_km_msl`] keeps the default floor rather than framing a box it
+/// cannot place. There is no such thing as the sun over nowhere.
+pub fn volume_box_anchor(region: Option<VolumeRegion>, site: Option<GeoPoint>) -> Option<GeoPoint> {
+    Some(region.map_or(site?, VolumeRegion::centre))
+}
+
 /// [`volume_base_km_msl`] and [`box_size_km`]'s shared routing, against an
 /// explicit grid.
 fn base_km_msl_in(
@@ -446,10 +469,9 @@ fn base_km_msl_in(
     region: Option<VolumeRegion>,
     site: Option<GeoPoint>,
 ) -> f64 {
-    let Some(site) = site else {
+    let (Some(site), Some(centre)) = (site, volume_box_anchor(region, site)) else {
         return squallar_radar::voxel::DEFAULT_BASE_KM_MSL;
     };
-    let centre = region.map_or(site, VolumeRegion::centre);
     squallar_radar::voxel::base_km_msl_for_box_in(
         grid,
         (site.lat, site.lon),

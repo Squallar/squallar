@@ -274,9 +274,13 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
     uniform.clip_from_box = view.clip_from_box;
     uniform.eye_in_box = view.eye_in_box;
     // Ambient only, so the march's shading is exactly 1 and the picture is a
-    // function of the geometry rather than of a normal.
+    // function of the geometry rather than of a normal — and the same for the
+    // ground, which C2 gave a normal of its own. Every criterion in this file
+    // reads the mesh's colour as a discrete identity, so the light has to be
+    // one under which the mesh's colour is the mirror's own.
     uniform.ambient = 1.0;
     uniform.gradient_shading = false;
+    uniform.set_light(gpu_harness::UNLIT);
     // **The mirror is bound in every frame here, and `map_floor` is on.**
     //
     // B1 held the mirror out of the picture and hardcoded `map_floor = false`

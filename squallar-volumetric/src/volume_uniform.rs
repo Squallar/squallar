@@ -2,16 +2,18 @@
 
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. Two `mat4x4<f32>` + twelve `vec4<f32>`.
+/// Bytes in the uniform block. Two `mat4x4<f32>` + fourteen `vec4<f32>`.
 ///
 /// **Append-only.** The ground pass shares this one block with the raymarch
 /// rather than carrying its own, which is what makes it structurally
-/// impossible for the mesh and the march to disagree about the camera. Growing
-/// it at the end is what keeps every `OFFSET_*` below where it already was —
-/// B1 grew it 224 to 304 for `clip_from_box` and the occluder, B3 grew it 304
-/// to 320 for [`OFFSET_GROUND_BOX`], and neither moved anything before it.
-/// `REQUIRED_UNIFORM_BINDING_SIZE` is 512 and did not have to move either.
-pub const VOLUME_UNIFORM_BYTES: usize = 320;
+/// impossible for the mesh and the march to disagree about the camera — and
+/// C2 made the same true of the light. Growing it at the end is what keeps
+/// every `OFFSET_*` below where it already was — B1 grew it 224 to 304 for
+/// `clip_from_box` and the occluder, B3 grew it 304 to 320 for
+/// [`OFFSET_GROUND_BOX`], C2 grew it 320 to 352 for [`OFFSET_SUN_BEAM`] and
+/// [`OFFSET_SKY_AMBIENT`], and none of them moved anything before it.
+/// `REQUIRED_UNIFORM_BINDING_SIZE` is 512 and has not had to move yet.
+pub const VOLUME_UNIFORM_BYTES: usize = 352;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -32,6 +34,8 @@ pub const OFFSET_GRID_FROM_BOX_B: usize = 208;
 pub const OFFSET_CLIP_FROM_BOX: usize = 224;
 pub const OFFSET_OCCLUDER: usize = 288;
 pub const OFFSET_GROUND_BOX: usize = 304;
+pub const OFFSET_SUN_BEAM: usize = 320;
+pub const OFFSET_SKY_AMBIENT: usize = 336;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
@@ -46,11 +50,82 @@ pub const DEFAULT_EARLY_OUT_TRANSMITTANCE: f32 = 0.004;
 /// in the shader's 0-1 index units. **Zero here, deliberately.**
 pub const DEFAULT_EDGE_SOFT_WIDTH: f32 = 0.0;
 
-/// Fraction of a lit surface's colour that survives facing away from the light.
+/// Fraction of the **beam** a lit voxel keeps facing away from the light.
+///
+/// The march's own wrap term, not the sky: it multiplies
+/// [`VolumeUniform::sun_beam`] rather than standing beside it, so it
+/// contributes nothing at all once the beam is zero. That is what keeps
+/// `squallar_geo::solar`'s night floor reachable through it — the defect that
+/// module's own `ambient` field exists to prevent is a floor *inside* the
+/// cosine, and this is one, so the sky term is carried separately and added
+/// after rather than folded in here.
 pub const DEFAULT_AMBIENT: f32 = 0.35;
 
-/// The camera-relative light direction the volume is lit from, in box space.
+/// The light direction the volume has always been lit from, in box space.
+///
+/// **The doc this constant carried until C2 called it "camera-relative", and
+/// it is not.** It is a constant in box space and the camera orbits the box,
+/// so the shoulder it comes over is the *box's*, not the viewer's: at yaw 35
+/// degrees it is a back light. What it does deliver is the thing the phrase
+/// was reaching for — a fixed, always-above light under which no orientation
+/// of the box is unlit — and that is why [`HEADLIGHT`] is still the readable
+/// mode. Making it track the camera would move every picture the GPU suites
+/// pin and belongs to whoever wants it, with a measurement.
 pub const DEFAULT_LIGHT_DIR: [f32; 3] = [-0.4, -0.5, 0.77];
+
+/// **The one light both surfaces are lit by**, and the only thing either of
+/// them reads to decide how bright it is.
+///
+/// Ground and volume take their direction *and* their colour from this one
+/// value, which is what stops a warm sunset ground sitting under a
+/// neutral-white storm — two composited pictures rather than one scene. It
+/// reaches the GPU through [`VolumeUniform::set_light`] as a unit; there is no
+/// supported way to set three of these four.
+///
+/// The arithmetic every consumer performs, `squallar_geo::solar::SunLight`'s
+/// own:
+///
+/// ```text
+/// lit = albedo * (beam * response + sky)
+/// ```
+///
+/// `response` is each surface's own directional term and is the *only* thing
+/// the two do differently — a wrap-lit gradient for the participating medium,
+/// a level-relative cosine for the opaque ground and the flat map lid. See
+/// `volume.wgsl`'s `lit`, `shading` and `ground_response`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceLight {
+    /// Unit vector **from the lit surface toward the light**, in box space —
+    /// which for this box is the local east-north-up frame, since `box_x_km`
+    /// is kilometres east and `box_y_km` kilometres north. Normalised by the
+    /// shader.
+    pub direction: [f32; 3],
+    /// Linear-light RGB of the **direct beam**, applied through each surface's
+    /// own directional response. Zero once the sun is down, which is what
+    /// makes [`Self::sky`] the only light at night.
+    pub beam: [f32; 3],
+    /// Linear-light RGB of the **sky**, applied with no cosine at all, because
+    /// scattered light arrives from the whole hemisphere.
+    pub sky: [f32; 3],
+    /// See [`DEFAULT_AMBIENT`]. Read only by the march's wrap term.
+    pub wrap_floor: f32,
+}
+
+/// **The readable light**: today's fixed direction, a unit white beam and no
+/// sky at all.
+///
+/// The beam being exactly one and the sky exactly zero is not a taste
+/// judgement — it is what makes `beam * response + sky` collapse to `response`
+/// and every picture this renderer drew before C2 come back bit-identical.
+/// `the_headlight_is_the_arithmetic_identity` is the assertion that says so;
+/// it is `#[ignore]`d for a real adapter, so run it with
+/// `cargo test -p squallar-gpu --test volume_light -- --ignored`.
+pub const HEADLIGHT: SurfaceLight = SurfaceLight {
+    direction: DEFAULT_LIGHT_DIR,
+    beam: [1.0, 1.0, 1.0],
+    sky: [0.0, 0.0, 0.0],
+    wrap_floor: DEFAULT_AMBIENT,
+};
 
 /// Everything the raymarch reads that is not a texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,9 +147,10 @@ pub struct VolumeUniform {
     /// `grid_dims * grid_from_box_scale` cells; this lane is **not corrected**
     /// for it, because correcting it measured worse across a swap.
     pub grid_dims: [u32; 3],
-    /// Light direction in box space. Normalised by the shader.
+    /// See [`SurfaceLight::direction`]. Set through [`Self::set_light`].
     pub light_dir: [f32; 3],
-    /// Ambient floor, 0..1. See [`DEFAULT_AMBIENT`].
+    /// See [`SurfaceLight::wrap_floor`] and [`DEFAULT_AMBIENT`]. Rides
+    /// `light_dir_ambient.w`.
     pub ambient: f32,
     /// See [`DEFAULT_EXTINCTION_PER_KM`].
     pub extinction_per_km: f32,
@@ -183,6 +259,12 @@ pub struct VolumeUniform {
     /// its heights are true, instead of being stretched over a box it was
     /// never resampled for. Rides `ground_box`.
     pub ground_box: [f32; 4],
+    /// See [`SurfaceLight::beam`]. Rides `sun_beam.xyz`; `w` is reserved and
+    /// written zero.
+    pub sun_beam: [f32; 3],
+    /// See [`SurfaceLight::sky`]. Rides `sky_ambient.xyz`; `w` is reserved and
+    /// written zero.
+    pub sky_ambient: [f32; 3],
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
@@ -206,8 +288,8 @@ impl VolumeUniform {
             box_size_km,
             vertical_exaggeration: 1.0,
             grid_dims,
-            light_dir: DEFAULT_LIGHT_DIR,
-            ambient: DEFAULT_AMBIENT,
+            light_dir: HEADLIGHT.direction,
+            ambient: HEADLIGHT.wrap_floor,
             extinction_per_km: DEFAULT_EXTINCTION_PER_KM,
             empty_index_threshold: DEFAULT_EMPTY_INDEX_THRESHOLD,
             early_out_transmittance: DEFAULT_EARLY_OUT_TRANSMITTANCE,
@@ -234,6 +316,33 @@ impl VolumeUniform {
             height_scale: 0.0,
             height_offset: 0.0,
             ground_box: IDENTITY_GROUND_BOX,
+            sun_beam: HEADLIGHT.beam,
+            sky_ambient: HEADLIGHT.sky,
+        }
+    }
+
+    /// **The one blessed way to light a frame.**
+    ///
+    /// Direction, beam, sky and the wrap floor land together or not at all.
+    /// The four are independent public lanes, so a caller that set three of
+    /// them could aim the ground at the sun and leave the volume under the
+    /// studio light — the exact "two composited pictures" this unit exists to
+    /// make unwritable. Pinned by
+    /// `neither_surface_can_be_lit_by_a_light_the_other_does_not_have`.
+    pub fn set_light(&mut self, light: SurfaceLight) {
+        self.light_dir = light.direction;
+        self.sun_beam = light.beam;
+        self.sky_ambient = light.sky;
+        self.ambient = light.wrap_floor;
+    }
+
+    /// The light this uniform carries, read back as the unit it was set as.
+    pub fn light(&self) -> SurfaceLight {
+        SurfaceLight {
+            direction: self.light_dir,
+            beam: self.sun_beam,
+            sky: self.sky_ambient,
+            wrap_floor: self.ambient,
         }
     }
 
@@ -410,6 +519,8 @@ impl VolumeUniform {
             ],
         );
         write_vec4(&mut out, OFFSET_GROUND_BOX, self.ground_box);
+        write_vec4(&mut out, OFFSET_SUN_BEAM, xyz_w(self.sun_beam, 0.0));
+        write_vec4(&mut out, OFFSET_SKY_AMBIENT, xyz_w(self.sky_ambient, 0.0));
 
         out
     }

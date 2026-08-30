@@ -9,7 +9,7 @@ use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging
 use squallar_volumetric::raymarch::{
     CoarseLevel, FLOOR_FORMAT, OffscreenPlan, PaneMirror, VolumePipelines,
 };
-use squallar_volumetric::uniform::VolumeUniform;
+use squallar_volumetric::uniform::{SurfaceLight, VolumeUniform};
 
 /// Held for the length of a test, so only one talks to the GPU at a time.
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -375,6 +375,27 @@ pub fn raymarch_once_with_floor(
 pub fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
     pixels[((size[1] / 2) * size[0] + size[0] / 2) as usize]
 }
+
+/// **A light under which every surface takes exactly its own albedo**, which
+/// way ever it faces: no beam at all, and a unit-white sky.
+///
+/// A real point of `SurfaceLight`'s domain — a uniformly bright overcast — and
+/// not a sentinel the shader tests for, which is why the shader has no arm for
+/// it. `lit` is `albedo * (0 * response + 1)` under it, so the directional term
+/// cancels out of both surfaces at once.
+///
+/// The geometry suites are rendered under it for the reason they already set
+/// `ambient = 1.0` for the march: they read the mesh's colour as a **discrete
+/// identity** — is this pixel the ground, or is it something else — and a
+/// directional term turns every one of those criteria into a number with a
+/// tolerance. What that costs is that nothing in them can see the light, which
+/// is `volume_light.rs`'s whole subject.
+pub const UNLIT: SurfaceLight = SurfaceLight {
+    direction: squallar_volumetric::uniform::DEFAULT_LIGHT_DIR,
+    beam: [0.0, 0.0, 0.0],
+    sky: [1.0, 1.0, 1.0],
+    wrap_floor: squallar_volumetric::uniform::DEFAULT_AMBIENT,
+};
 
 /// One orbit camera: `(yaw degrees, pitch degrees, standoff, vertical
 /// exaggeration)`.

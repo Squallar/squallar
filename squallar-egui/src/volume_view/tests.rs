@@ -396,6 +396,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         alpha: None,
         view_mode: crate::pane::VolumeViewMode::LitVolume,
         iso_threshold: 18.0,
+        light: crate::volume_view::VolumeLight::Headlight,
         heights: None,
     };
     let VolumePaint::Callback { payload, .. } = painter.paint(&frame) else {
@@ -950,5 +951,206 @@ fn a_degenerate_framing_asks_for_no_texels_at_all() {
     assert_eq!(
         floor_magnification(camera, [0.0, 0.0, 0.0], 900.0, 4000.0, 35.0),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C2: one light, two modes
+// ---------------------------------------------------------------------------
+
+/// The Colorado front range, and an instant in the middle of a 2026 afternoon.
+const PLACE: squallar_geo::GeoPoint = squallar_geo::GeoPoint {
+    lat: 39.0,
+    lon: -106.0,
+};
+const AFTERNOON: f64 = 1_782_000_000.0 + 20.0 * 3_600.0;
+
+/// **A refused instant takes the readable light**, and nothing about the frame
+/// says night.
+///
+/// This is the whole of C2's answer to "what does a refusal do", and the two
+/// alternatives are both worse. `unwrap_or(<night>)` is the silent-night
+/// defect the `Option` was introduced to remove — it paints a dark pane that
+/// looks like a correct 3 a.m. picture and is a refusal. Declining to draw
+/// trades the whole picture for a light, over a timestamp.
+///
+/// The readable light is a complete, legible, correct picture of the volume,
+/// so nothing here is half-done — and the pane's own control reads this same
+/// function and reports which light came back, which is what keeps the
+/// substitution from being silent.
+#[test]
+fn a_refused_instant_takes_the_readable_light_and_never_a_silent_night() {
+    // Every input `squallar_geo::solar::sun_light` refuses, one per reason.
+    for (instant, anchor, why) in [
+        (f64::NAN, Some(PLACE), "a non-finite instant"),
+        (f64::INFINITY, Some(PLACE), "an infinite instant"),
+        (
+            // Past +/-5 Julian centuries from J2000, where every polynomial in
+            // that module overflows.
+            1.0e19,
+            Some(PLACE),
+            "an instant outside the theory's window",
+        ),
+        (
+            AFTERNOON,
+            Some(squallar_geo::GeoPoint {
+                lat: 91.0,
+                lon: 0.0,
+            }),
+            "a latitude that is not a place",
+        ),
+        (AFTERNOON, None, "a site this build cannot place"),
+    ] {
+        assert_eq!(
+            volume_light(true, anchor, instant),
+            VolumeLight::Headlight,
+            "{why} did not fall back to the readable light",
+        );
+    }
+}
+
+/// The refusal is a refusal of the SUN, not of the mode: the same call with a
+/// place and an instant answers with the sun.
+///
+/// The non-triviality half of the test above, which would be just as green
+/// against a build that never returned a sun at all.
+#[test]
+fn a_placed_site_at_an_ordinary_instant_really_does_get_the_sun() {
+    let light = volume_light(true, Some(PLACE), AFTERNOON);
+    let VolumeLight::Sun(sun) = light else {
+        panic!("the front range on a 2026 afternoon was refused: {light:?}");
+    };
+    assert!(
+        sun.elevation_deg > 0.0,
+        "the sun is {} degrees up at 20:00 UTC over 106 W in June, which is \
+         about 14:00 local and should be daylight",
+        sun.elevation_deg,
+    );
+    // `direction_enu` is a unit vector and box space is that frame, so this is
+    // a unit vector too. A direction that is not normalised would be a
+    // brightness the shader's `normalize` silently discards on one surface and
+    // not the other.
+    let length = sun
+        .direction_box
+        .iter()
+        .map(|c| f64::from(*c) * f64::from(*c))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        (length - 1.0).abs() < 1e-5,
+        "the box-space sun direction is {length} long, not one",
+    );
+    // Up is the elevation's own sine, which is what makes box space the local
+    // east-north-up frame rather than merely resembling it.
+    assert!(
+        (f64::from(sun.direction_box[2]) - f64::from(sun.elevation_deg).to_radians().sin()).abs()
+            < 1e-5,
+        "the direction's up component is not the elevation's sine",
+    );
+}
+
+/// **The readable light is the readable light in both directions**: asking for
+/// it never consults the sun, whatever the instant.
+#[test]
+fn the_readable_mode_never_reaches_for_the_sun() {
+    for instant in [AFTERNOON, f64::NAN, 0.0] {
+        assert_eq!(
+            volume_light(false, Some(PLACE), instant),
+            VolumeLight::Headlight
+        );
+    }
+}
+
+/// A volume's collection time really is the Unix instant it names.
+///
+/// `sun_light` takes seconds because `squallar-geo`'s charter forbids it
+/// chrono, so this conversion is the one place the two calendars meet — and a
+/// wrong one would place every sun in the app at the same believable wrong
+/// hour. Pinned against a date computed by hand rather than by chrono, which
+/// is the thing being checked.
+#[test]
+fn a_collection_time_converts_to_the_instant_it_names() {
+    let at = |y, m, d, hh, mm, ss| {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, ss)
+            .unwrap()
+    };
+    assert_eq!(unix_seconds_of(at(1970, 1, 1, 0, 0, 0)), 0.0);
+    assert_eq!(unix_seconds_of(at(1970, 1, 2, 0, 0, 0)), 86_400.0);
+    // 2000-01-01T00:00:00Z: thirty years, of which 1972, 1976 ... 1996 are the
+    // seven leap years plus 2000 is not yet reached, so 30 * 365 + 7 days.
+    assert_eq!(
+        unix_seconds_of(at(2000, 1, 1, 0, 0, 0)),
+        (30.0 * 365.0 + 7.0) * 86_400.0,
+    );
+    // And before the epoch, which a `u64` spelling would wrap.
+    assert_eq!(unix_seconds_of(at(1969, 12, 31, 23, 59, 59)), -1.0);
+}
+
+/// **The white balance is a balance**: a zenith sun is exactly neutral and
+/// exactly one, which is what lets a basemap authored under neutral light read
+/// as itself at noon.
+///
+/// Measured on the ramps rather than on a picture, so it holds whether or not
+/// a GPU is present. `squallar-gpu/tests/volume_light.rs` renders it, and is
+/// `#[ignore]`d for a real adapter.
+#[test]
+fn a_zenith_sun_is_exactly_white() {
+    let beam = squallar_geo::solar::sun_tint(90.0);
+    let sky = squallar_geo::solar::sky_ambient(90.0);
+    let white = super::zenith_white();
+    for channel in 0..3 {
+        assert!(
+            (white[channel] - (beam[channel] + sky[channel])).abs() < 1e-12,
+            "the white this renderer balances against is not the light a level \
+             surface takes under a zenith sun",
+        );
+        assert!(
+            white[channel] > 1.0,
+            "channel {channel} of daylight is {}, so there would be nothing to \
+             balance and the criterion below could not fail",
+            white[channel],
+        );
+    }
+    // And it is not neutral before the balance, which is the reason the
+    // balance exists: the sky is blue and a white basemap took its colour.
+    assert!(
+        white[2] - white[0] > 0.1,
+        "unbalanced daylight is already neutral ({white:?}), so nothing here \
+         is being corrected",
+    );
+}
+
+/// The sun is placed over the ground the box is actually about: the picked
+/// region's centre when there is one, the site otherwise.
+#[test]
+fn the_sun_is_placed_over_the_box_and_not_over_the_site_it_was_dragged_from() {
+    let site = squallar_geo::GeoPoint {
+        lat: 35.0,
+        lon: -97.0,
+    };
+    assert_eq!(
+        crate::pane::volume_box_anchor(None, Some(site)),
+        Some(site),
+        "a pane with no region is the default box about its site",
+    );
+    let centre = squallar_geo::GeoPoint {
+        lat: 36.0,
+        lon: -99.0,
+    };
+    let region =
+        crate::pane::VolumeRegion::new(centre, squallar_radar::voxel::HalfExtentKm::square(100.0))
+            .expect("a region on Earth");
+    assert_eq!(
+        crate::pane::volume_box_anchor(Some(region), Some(site)),
+        Some(centre),
+        "a picked region moves the box, so it moves the sun with it",
+    );
+    assert_eq!(
+        crate::pane::volume_box_anchor(Some(region), None),
+        None,
+        "a pane whose site is not placed has no frame to put a box in, and \
+         there is no such thing as the sun over nowhere",
     );
 }
