@@ -16,6 +16,11 @@ pub(crate) mod field_facts;
 pub(crate) mod legend_ramp;
 pub mod overlay_cache;
 pub mod pane;
+/// The exact-size PMTiles v3 directory reader: what a set of tiles costs to
+/// download, to the byte. Beside [`basemap_archive`], never in its render
+/// path — the stock crate keeps serving tiles; this answers the one question
+/// its API declines to.
+pub mod pmt_index;
 pub(crate) mod point_painter;
 /// The radar layer's own glue: what the presentation holds for radar that no
 /// other layer has.

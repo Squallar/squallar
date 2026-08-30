@@ -90,6 +90,13 @@ reqwest = { workspace = true }
 # a basemap that is not watermarked at source.
 pmtiles = { workspace = true }
 
+# `pmt_index`'s one decode: PMTiles v3 directories are gzip-deflated when
+# `internal_compression = 2`, which is what planetiler emits. The workspace pin
+# is the pure-Rust miniz_oxide backend (see squallar-netcdf's warning against
+# `zlib-ng`), so it compiles on wasm32 unchanged. Already in the graph twice
+# (squallar-radar, squallar-overlays); no new node.
+flate2 = { workspace = true }
+
 # The terrain hillshade archive's tiles are WebP (`tile_type = 4`), decoded and
 # remapped in `terrain::remap_hillshade` before upload. `webp` is image 0.25's
 # pure-Rust decoder (`image-webp`), so it compiles on wasm32 unchanged. `png`
