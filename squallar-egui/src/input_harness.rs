@@ -1408,6 +1408,58 @@ impl InputHarness {
         self.frames_for(2, FRAME_DT);
     }
 
+    /// Whether the offline-download pick is armed.
+    pub(crate) fn download_pick_armed(&self) -> bool {
+        self.gui.download_pick_armed()
+    }
+
+    /// Arm or disarm the offline-download pick.
+    pub(crate) fn set_download_pick_armed(&mut self, armed: bool) {
+        self.gui.set_download_pick_armed(armed);
+    }
+
+    /// Drag a square out while the download pick is armed — [`Self::drag_region`]
+    /// over the same gesture, on the other arm.
+    pub(crate) fn drag_download_area(&mut self, centre: egui::Pos2, corner: egui::Pos2) {
+        self.drag_region(centre, corner);
+    }
+
+    /// The committed download box, if one was picked.
+    pub(crate) fn download_pick(&self) -> Option<crate::ui_download_area::PickedBox> {
+        self.gui.download_pick()
+    }
+
+    /// Which detail level the level list has selected.
+    pub(crate) fn download_detail(&self) -> crate::ui_download_area::DetailLevel {
+        self.gui.download_detail()
+    }
+
+    /// State the archive ceiling stored depths are named against.
+    pub(crate) fn seed_archive_ceiling(&mut self, ceiling: u8) {
+        self.gui.seed_archive_ceiling(ceiling);
+    }
+
+    /// Hand the size probe a ceiling and one level's figure, as
+    /// [`crate::ui_download_area::AreaSizeProbe::seed`] does.
+    pub(crate) fn seed_download_size(
+        &mut self,
+        ceiling: u8,
+        level: crate::ui_download_area::DetailLevel,
+        bytes: u64,
+    ) {
+        self.gui.seed_download_size(ceiling, level, bytes);
+    }
+
+    /// State what the origin's storage has. Test-only, like the method it
+    /// calls — see `Gui::set_download_quota` for the production wire that is
+    /// still owed.
+    pub(crate) fn set_download_quota(
+        &mut self,
+        quota: Option<crate::basemap_download::OfflineQuota>,
+    ) {
+        self.gui.set_download_quota(quota);
+    }
+
     /// The line pane `idx` is aimed along, if it is a section pane with one.
     pub(crate) fn section_line(&self, idx: usize) -> Option<SectionLine> {
         self.gui.pane(idx)?.cross_section()?.line

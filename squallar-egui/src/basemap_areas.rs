@@ -44,32 +44,137 @@ use crate::tile_source::runtime;
 // The detail vocabulary
 // ---------------------------------------------------------------------------
 
-/// What each stored depth lets you make out, deepest zoom first matched.
+/// How deep an area is stored, named for what the user can make out at it.
 ///
 /// **Framed by what is legible, never as a zoom number** — the decision taken
-/// with the user. The deepest level is `z14` because the published archives
-/// stop there: street-and-building detail on the glass comes from over-zoom
-/// rendering of `z14` tiles, so a level below this one would be copy
-/// promising something no download could deliver.
-pub(crate) const DETAIL_LEVELS: &[(u8, &str)] = &[
-    (10, "Cities and highways"),
-    (12, "Towns and main roads"),
-    (14, "Every street"),
+/// with the user. There are three and not four because the deepest is the
+/// archive's own ceiling: a level below it would be copy promising data no
+/// download can fetch, which is "never warn about the unfixable" in its
+/// positive form. Street and building detail past the ceiling comes from
+/// over-zoom rendering of the deepest stored tile, exactly as it does for the
+/// live archive.
+///
+/// **The zooms are not in this type.** They are [`Self::zoom_in`]'s answer
+/// against an archive's own `max_zoom`, so the offline ceiling and
+/// `tile_source`'s render clamp come from one number rather than two that can
+/// drift, and an archive that goes deeper makes every level deeper without an
+/// edit here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DetailLevel {
+    /// The shape of the place and its highways.
+    CitiesAndHighways,
+    /// The roads you would actually drive.
+    TownsAndMainRoads,
+    /// Everything the archive has.
+    EveryStreet,
+}
+
+/// The three levels, shallowest first — the order the list draws in.
+pub const DETAIL_LEVELS: [DetailLevel; 3] = [
+    DetailLevel::CitiesAndHighways,
+    DetailLevel::TownsAndMainRoads,
+    DetailLevel::EveryStreet,
 ];
 
-/// What an area cut to `max_zoom` lets you make out.
+/// Zoom levels between one detail level and the next.
+///
+/// **Measured against where content enters a production OMT-schema style**,
+/// not chosen for roundness: rivers at z9, major road labels at z11, highway
+/// and major-road casings at z12, service roads and taxiways at z13, streams
+/// at z14. Two levels apart is the smallest step across which the *legible*
+/// content changes, which is what the three names describe. Against the
+/// shipped ceiling of 14 this reproduces the z10 / z12 / z14 the design table
+/// names.
+pub const DETAIL_LEVEL_STEP: u8 = 2;
+
+impl DetailLevel {
+    /// The user-facing name. The only vocabulary this feature has for depth.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CitiesAndHighways => "Cities and highways",
+            Self::TownsAndMainRoads => "Towns and main roads",
+            Self::EveryStreet => "Every street",
+        }
+    }
+
+    /// Zoom levels below the archive's ceiling this level sits at.
+    fn steps_below_ceiling(self) -> u8 {
+        match self {
+            Self::CitiesAndHighways => 2 * DETAIL_LEVEL_STEP,
+            Self::TownsAndMainRoads => DETAIL_LEVEL_STEP,
+            Self::EveryStreet => 0,
+        }
+    }
+
+    /// The deepest zoom this level stores in an archive whose ceiling is
+    /// `archive_max_zoom` — **the header's own figure**, never a constant.
+    ///
+    /// Relative to the ceiling rather than pinned to absolute zooms, because
+    /// the ceiling is the one thing an archive declares about its depth: an
+    /// archive built deeper is deeper because it carries more at the bottom,
+    /// and each name should keep meaning a fixed step of detail below
+    /// everything-there-is rather than a schema figure the deeper build may
+    /// not share.
+    ///
+    /// An archive shallower than `2 * DETAIL_LEVEL_STEP` collapses the top
+    /// levels onto zoom 0 — three names over fewer than three depths. That is
+    /// a property of such an archive rather than something to paper over, and
+    /// no archive this app ships is one.
+    pub fn zoom_in(self, archive_max_zoom: u8) -> u8 {
+        archive_max_zoom.saturating_sub(self.steps_below_ceiling())
+    }
+
+    /// The persisted spelling. A token rather than a derived `Serialize`, so a
+    /// config naming a level this build does not know costs the *choice* and
+    /// not the whole file — `DownloadedAreaConfig::restore`'s discipline.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::CitiesAndHighways => "cities_and_highways",
+            Self::TownsAndMainRoads => "towns_and_main_roads",
+            Self::EveryStreet => "every_street",
+        }
+    }
+
+    /// [`Self::token`]'s inverse, or `None` for a spelling this build has no
+    /// level for.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        DETAIL_LEVELS
+            .into_iter()
+            .find(|level| level.token() == token)
+    }
+}
+
+impl Default for DetailLevel {
+    /// The middle level: the roads you would drive, which is what a person
+    /// downloading a place for offline use is nearly always after, and the
+    /// only one of the three that is not an extreme.
+    fn default() -> Self {
+        Self::TownsAndMainRoads
+    }
+}
+
+/// What an area cut to `max_zoom` lets you make out, against an archive whose
+/// ceiling is `archive_max_zoom`.
 ///
 /// A record carries the depth its download asked for, which need not be one of
-/// [`DETAIL_LEVELS`]' exact zooms — a hand-placed area, or a level table that
-/// moved after the download. The shallowest level that covers the depth is the
-/// honest label; anything past the deepest gets the deepest, because there is
-/// no data past it to describe.
-pub(crate) fn detail_label(max_zoom: u8) -> &'static str {
-    let deepest = DETAIL_LEVELS[DETAIL_LEVELS.len() - 1].1;
+/// the levels' exact zooms — a hand-placed area, or a ceiling that moved after
+/// the download. The shallowest level that covers the depth is the honest
+/// label; anything past the deepest gets the deepest, because there is no data
+/// past it to describe.
+///
+/// **The ceiling is the archive's, not a constant**, for
+/// [`DetailLevel::zoom_in`]'s reason. `None` — no header read this session —
+/// reads as the deepest label rather than as an invented zoom, and refines the
+/// moment one lands.
+pub(crate) fn detail_label(max_zoom: u8, archive_max_zoom: Option<u8>) -> &'static str {
+    let Some(ceiling) = archive_max_zoom else {
+        return DetailLevel::EveryStreet.label();
+    };
     DETAIL_LEVELS
-        .iter()
-        .find(|(zoom, _)| max_zoom <= *zoom)
-        .map_or(deepest, |(_, label)| label)
+        .into_iter()
+        .find(|level| max_zoom <= level.zoom_in(ceiling))
+        .unwrap_or(DetailLevel::EveryStreet)
+        .label()
 }
 
 // ---------------------------------------------------------------------------

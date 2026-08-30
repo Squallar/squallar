@@ -104,6 +104,9 @@ impl Gui {
             self.render_phone_error_toast(ctx, shell.map_rect, self.ui_faded);
         }
 
+        self.pump_download_area(ctx);
+        self.render_download_area(ctx, shell.map_rect);
+
         self.render_overlay_popup(ctx);
 
         self.render_catalog(ctx, &mut actions);
@@ -332,6 +335,16 @@ impl Gui {
             self.set_region_pick_armed(false);
             return true;
         }
+        if self.download_pick_armed {
+            self.set_download_pick_armed(false);
+            return true;
+        }
+        // Under the arm, because backing out of an armed drag is what the user
+        // means first; a committed box is the next layer down.
+        if self.download_pick.is_some() {
+            self.clear_download_pick();
+            return true;
+        }
         false
     }
 
@@ -394,6 +407,9 @@ impl Gui {
             return true;
         }
         if self.region_pick_armed {
+            return true;
+        }
+        if self.download_pick_armed || self.download_pick.is_some() {
             return true;
         }
         false

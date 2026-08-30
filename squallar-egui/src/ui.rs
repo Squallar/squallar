@@ -158,6 +158,8 @@ pub(crate) struct TopBarProbe {
     pub pane_count_max: usize,
     pub section_arm: (egui::Rect, bool),
     pub region_arm: (egui::Rect, bool),
+    /// The offline-download arm toggle: where it drew, and whether it is lit.
+    pub offline_arm: (egui::Rect, bool),
     pub inspector_toggle: (egui::Rect, bool),
     /// The phone bar's scan summary chip text, verbatim.
     pub scan_text: String,
@@ -177,6 +179,7 @@ impl Default for TopBarProbe {
             pane_count_max: 0,
             section_arm: (egui::Rect::NOTHING, false),
             region_arm: (egui::Rect::NOTHING, false),
+            offline_arm: (egui::Rect::NOTHING, false),
             inspector_toggle: (egui::Rect::NOTHING, false),
             scan_text: String::new(),
             collapse: egui::Rect::NOTHING,
@@ -1459,6 +1462,7 @@ impl Gui {
             self.section_edit_drag = None;
             self.region_pick_armed = false;
             self.region_drag = None;
+            self.set_download_pick_armed(false);
         } else {
             self.section_anchor = None;
         }
@@ -1474,13 +1478,116 @@ impl Gui {
             self.section_edit_drag = None;
             self.section_draw_armed = false;
             self.section_anchor = None;
+            self.set_download_pick_armed(false);
         } else {
             self.region_drag = None;
         }
     }
 
+    /// Whether the offline download pick is armed.
+    pub fn download_pick_armed(&self) -> bool {
+        self.download_pick_armed
+    }
+
+    /// Arm or disarm the offline download pick.
+    ///
+    /// The 3D pick's setter with the box in place of the volume: the three
+    /// modal drags are mutually exclusive, and disarming drops the half-drawn
+    /// box rather than leaving it to be finished by a pan.
+    pub(crate) fn set_download_pick_armed(&mut self, armed: bool) {
+        self.download_pick_armed = armed;
+        if armed {
+            self.section_edit_drag = None;
+            self.section_draw_armed = false;
+            self.section_anchor = None;
+            self.region_pick_armed = false;
+            self.region_drag = None;
+        } else {
+            self.download_drag = None;
+        }
+    }
+
+    /// Forget the picked box and the level list it drew.
+    ///
+    /// **Neither a running download nor a finished area's record is touched.**
+    /// The engine's run belongs to `active_download`, which the Downloaded
+    /// areas screen also watches, and an area whose bytes are on disk does not
+    /// stop existing because the box that picked it was cleared.
+    pub(crate) fn clear_download_pick(&mut self) {
+        self.download_pick = None;
+        self.download_size.set_box(None);
+    }
+
+    /// What the origin's storage has, for the quota arithmetic in
+    /// [`crate::ui_download_area`].
+    ///
+    /// **The production wire is OWED, and it is owed by the web store**, not
+    /// by this method. The route's client exists and is tested
+    /// ([`HttpSegmentStore::quota`](crate::basemap_download::HttpSegmentStore::quota)),
+    /// but the only platform with a quota to report is web, and
+    /// `tiles::offline_store`'s wasm32 arm still answers `None` because the
+    /// service worker's store is not reachable from the Rust side yet. Until
+    /// it is, nothing outside a test writes this field, and the level list's
+    /// quota arithmetic is reachable only from the suite that pins it.
+    ///
+    /// Stated here rather than papered over with a `pub` seam nobody calls:
+    /// a public setter on `Gui` is a build failure under
+    /// `arch_ratchets::the_gui_setter_surface_never_grows`, whose ceiling is 0
+    /// and may only fall, and inventing a differently-spelled one to carry a
+    /// value no shipped caller supplies would be the re-spelling that rule
+    /// forbids by name.
+    #[cfg(test)]
+    pub(crate) fn set_download_quota(
+        &mut self,
+        quota: Option<crate::basemap_download::OfflineQuota>,
+    ) {
+        self.download_quota = quota;
+    }
+
+    /// The committed download box, if one was picked.
+    #[cfg(test)]
+    pub(crate) fn download_pick(&self) -> Option<crate::ui_download_area::PickedBox> {
+        self.download_pick
+    }
+
+    /// Which detail level the level list has selected.
+    #[cfg(test)]
+    pub(crate) fn download_detail(&self) -> crate::ui_download_area::DetailLevel {
+        self.download_detail
+    }
+
+    /// State the archive ceiling stored depths are named against — the tests'
+    /// seam; see
+    /// [`AreaSizeProbe::seed_ceiling`](crate::ui_download_area::AreaSizeProbe::seed_ceiling).
+    #[cfg(test)]
+    pub(crate) fn seed_archive_ceiling(&mut self, ceiling: u8) {
+        self.download_size.seed_ceiling(ceiling);
+    }
+
+    /// Hand the size probe a ceiling and one level's figure — the tests' seam;
+    /// see [`AreaSizeProbe::seed`](crate::ui_download_area::AreaSizeProbe::seed).
+    #[cfg(test)]
+    pub(crate) fn seed_download_size(
+        &mut self,
+        ceiling: u8,
+        level: crate::ui_download_area::DetailLevel,
+        bytes: u64,
+    ) {
+        self.download_size.seed(ceiling, level, bytes);
+    }
+
     pub(crate) fn region_preview(&self, pane_idx: PaneId) -> Option<(squallar_geo::GeoPoint, f64)> {
         self.region_drag
+            .filter(|drag| drag.pane_idx() == pane_idx)
+            .map(|drag| (drag.centre(), drag.half_width_km()))
+    }
+
+    /// The download box being dragged on `pane_idx` right now, if one is.
+    pub(crate) fn download_preview(
+        &self,
+        pane_idx: PaneId,
+    ) -> Option<(squallar_geo::GeoPoint, f64)> {
+        self.download_drag
             .filter(|drag| drag.pane_idx() == pane_idx)
             .map(|drag| (drag.centre(), drag.half_width_km()))
     }

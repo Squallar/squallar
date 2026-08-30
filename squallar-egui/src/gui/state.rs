@@ -104,6 +104,36 @@ pub struct Gui {
     /// A finished region and the map pane it was dragged on, applied **after**
     /// the pane loop.
     pub(super) pending_region: Option<(PaneId, crate::pane::VolumeRegion)>,
+    /// Whether the **offline download** pick is armed: the next drag on a map
+    /// pane draws the square of ground to make available offline, rather than
+    /// panning. The 3D pick's twin, and mutually exclusive with it — one drag,
+    /// two arms, each with its own bounds.
+    pub(super) download_pick_armed: bool,
+    /// The in-flight download box, on the same
+    /// [`crate::ui_region::RegionDrag`] the 3D pick uses — with the download
+    /// arm's bounds, which have no 10 km floor.
+    pub(super) download_drag: Option<crate::ui_region::RegionDrag>,
+    /// The committed download box, as the drag described it.
+    ///
+    /// **App-wide rather than per-pane, and persisted**: an area is a fact
+    /// about the device, and reopening puts the box and its level list back
+    /// exactly where they were. Absent from an older config, which loads as
+    /// "nothing picked".
+    pub(super) download_pick: Option<crate::ui_download_area::PickedBox>,
+    /// Which detail level the level list has selected. Persisted; absence
+    /// loads as [`crate::ui_download_area::DetailLevel::default`].
+    pub(super) download_detail: crate::ui_download_area::DetailLevel,
+    /// The exact size figure for the picked box, measured off the frame
+    /// thread. Derived, never persisted — it is the archive's answer, not the
+    /// user's choice.
+    pub(super) download_size: crate::ui_download_area::AreaSizeProbe,
+    /// What the origin's storage has, when a platform can say.
+    ///
+    /// `None` everywhere today: the only platform with an origin quota is
+    /// web, and the Rust side cannot reach the service worker's store yet.
+    /// See `Gui::set_download_quota` for what is owed and why no `pub` seam
+    /// was invented to carry it.
+    pub(super) download_quota: Option<crate::basemap_download::OfflineQuota>,
     /// An endpoint drag in flight on a committed section's ground track, or
     /// `None`.
     pub(super) section_edit_drag: Option<crate::ui_section_edit::SectionEditDrag>,
@@ -517,6 +547,12 @@ impl Gui {
             region_pick_armed: false,
             region_drag: None,
             pending_region: None,
+            download_pick_armed: false,
+            download_drag: None,
+            download_pick: None,
+            download_detail: crate::ui_download_area::DetailLevel::default(),
+            download_size: crate::ui_download_area::AreaSizeProbe::new(),
+            download_quota: None,
             section_edit_drag: None,
             section_handles: Vec::new(),
             pending_section_edit: None,

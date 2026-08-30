@@ -17,24 +17,40 @@ const SEPTEMBER_2026: &str = "basemap_2Fomt-20260904.pmtiles";
 
 /// The levels are named by what you can make out, and a depth between two
 /// named ones gets the shallower claim rather than the flattering one.
+///
+/// **The zooms come from the ceiling handed in, never from a constant.** The
+/// second block runs the same depths against a ceiling of 16 and gets
+/// different answers, which is what a table hardcoding 14 could not do.
 #[test]
 fn a_detail_label_never_promises_more_than_the_depth_holds() {
-    assert_eq!(detail_label(10), "Cities and highways");
-    assert_eq!(detail_label(12), "Towns and main roads");
-    assert_eq!(detail_label(14), "Every street");
+    let z14 = Some(14);
+    assert_eq!(detail_label(10, z14), "Cities and highways");
+    assert_eq!(detail_label(12, z14), "Towns and main roads");
+    assert_eq!(detail_label(14, z14), "Every street");
     // Between levels: z11 holds less than z12, so it reads as the level it
     // actually reaches.
-    assert_eq!(detail_label(11), "Towns and main roads");
-    assert_eq!(detail_label(0), "Cities and highways");
+    assert_eq!(detail_label(11, z14), "Towns and main roads");
+    assert_eq!(detail_label(0, z14), "Cities and highways");
     // Past the deepest published zoom there is no more data to describe, so
     // the deepest label stands rather than a fourth one being invented.
-    assert_eq!(detail_label(20), "Every street");
+    assert_eq!(detail_label(20, z14), "Every street");
 
-    for &(_, label) in DETAIL_LEVELS {
+    // A deeper archive renames every depth, because the levels are steps
+    // below its ceiling rather than fixed zooms.
+    let z16 = Some(16);
+    assert_eq!(detail_label(12, z16), "Cities and highways");
+    assert_eq!(detail_label(14, z16), "Towns and main roads");
+    assert_eq!(detail_label(16, z16), "Every street");
+
+    // No ceiling read yet: the deepest label, never an invented zoom.
+    assert_eq!(detail_label(10, None), "Every street");
+
+    for level in DETAIL_LEVELS {
         assert!(
-            !label.chars().any(|c| c.is_ascii_digit()),
-            "a level label may not carry a number: {label:?} - the vocabulary \
+            !level.label().chars().any(|c| c.is_ascii_digit()),
+            "a level label may not carry a number: {:?} - the vocabulary \
              is what you can make out, never a zoom",
+            level.label(),
         );
     }
 }

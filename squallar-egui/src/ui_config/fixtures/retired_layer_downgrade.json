@@ -6,6 +6,13 @@
     ]
   ],
   "config_version": 5,
+  "download_area": {
+    "armed": false,
+    "detail": "towns_and_main_roads",
+    "half_width_km": null,
+    "lat": null,
+    "lon": null
+  },
   "downloaded_areas": [],
   "favorite_sites": [],
   "heading_source": "Auto",

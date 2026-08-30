@@ -41,6 +41,11 @@ pub(crate) mod terrain;
 pub mod tile_source;
 pub mod tiles;
 mod ui;
+/// The download arm of the region drag: the box it picks, the exact live size
+/// figure measured off the frame thread, and the quota arithmetic the
+/// selection UI spends them on. The detail vocabulary itself lives in
+/// [`basemap_areas`], which the manage screen reads it back through.
+pub(crate) mod ui_download_area;
 pub(crate) mod ui_input;
 pub(crate) mod ui_layout;
 pub(crate) mod ui_region;

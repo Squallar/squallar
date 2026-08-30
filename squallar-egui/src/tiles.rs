@@ -181,6 +181,27 @@ pub(crate) fn offline_store(
     None
 }
 
+/// A range source over the base map archive, for the two readers that are not
+/// the render path: the size measurement and the download engine.
+///
+/// **The same URL and the same client the map itself reads through**, so a
+/// figure is quoted against the archive the download will actually fetch from.
+/// Deliberately *not* `HttpsTiles`: its request channel is bounded at 6 and
+/// its LRU is the live map's working set, so measuring or downloading through
+/// it would evict what the user is looking at.
+///
+/// # Errors
+///
+/// [`crate::basemap_archive::RangeError`] if the archive URL will not parse —
+/// the same and only construction-time failure `from_archive_url` has.
+pub(crate) fn archive_range_source()
+-> Result<crate::basemap_archive::HttpRangeSource, crate::basemap_archive::RangeError> {
+    crate::basemap_archive::HttpRangeSource::new(
+        crate::basemap_archive::archive_client(),
+        &archive_url(),
+    )
+}
+
 /// The credit the hillshade's elevation data requires.
 ///
 /// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
@@ -490,6 +511,16 @@ impl MapTileState {
     pub(crate) fn latch_base_unreachable_for_test(&mut self) {
         self.base_unreachable = true;
         self.tiles = None;
+    }
+
+    /// Whether this instance is building only inert sources.
+    ///
+    /// Read by the frame path's *other* archive readers — the offline-area
+    /// size measurement and the download engine — so that one switch covers
+    /// every route to the production archive rather than only the tile slots.
+    /// Always false outside a test harness.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.offline
     }
 
     /// Build only inert tile sources for the rest of this instance's life.

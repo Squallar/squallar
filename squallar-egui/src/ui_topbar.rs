@@ -14,6 +14,21 @@ const SECTION_TOGGLE_LABEL: &str = "\u{2215} X-sec";
 /// identically: the two are the bar's armed-drag pair and a user has to be able to
 /// see at a glance which of them is lit.
 const REGION_TOGGLE_LABEL: &str = "\u{26f6} Region";
+/// The offline-download arm toggle, the third of the bar's armed-drag set.
+///
+/// **Icon-only at every width, unlike its two siblings**, and that is a
+/// measurement rather than a taste: the bar's roomy/tight decision is made
+/// from what the right-hand run leaves, and a fourth worded toggle takes
+/// Medium's floor (600 pt) past the point where the pane segments keep even
+/// their tight captions — which is `the_bar_never_overlaps_at_mediums_
+/// narrowest_width`'s exact finding. The word lives in the hover text and in
+/// the menu leaf, both of which the parity walk keeps reachable at every
+/// width.
+const OFFLINE_TOGGLE_GLYPH: &str = "\u{2b8b}";
+/// The word [`OFFLINE_TOGGLE_GLYPH`] stands in for. "Offline" and not
+/// "Download": what the user gets is the map working without a network, and
+/// the transfer is the means.
+const OFFLINE_TOGGLE_HINT: &str = "Download an area for offline use";
 /// The inspector toggle. Selected-state styled while the inspector is open — the
 /// mirror of [`LAYERS_TOGGLE_LABEL`] for the right-hand panel.
 const INSPECTOR_TOGGLE_LABEL: &str = "\u{2699} Inspector";
@@ -129,6 +144,18 @@ impl super::Gui {
                             self.set_region_pick_armed(!region_armed);
                         }
 
+                        let offline_armed = self.download_pick_armed();
+                        let offline = ui
+                            .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
+                            .on_hover_text(OFFLINE_TOGGLE_HINT);
+                        #[cfg(test)]
+                        {
+                            probe.offline_arm = (offline.rect, offline_armed);
+                        }
+                        if offline.clicked() {
+                            self.set_download_pick_armed(!offline_armed);
+                        }
+
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             self.render_top_bar_run(
                                 ui,
@@ -207,6 +234,21 @@ impl super::Gui {
                 if region.clicked() {
                     self.set_region_pick_armed(!region_armed);
                     if !region_armed && self.top_sheet_page().is_some() {
+                        self.clear_sheet_pages();
+                    }
+                }
+
+                let offline_armed = self.download_pick_armed();
+                let offline = ui
+                    .selectable_label(offline_armed, OFFLINE_TOGGLE_GLYPH)
+                    .on_hover_text(OFFLINE_TOGGLE_HINT);
+                #[cfg(test)]
+                {
+                    probe.offline_arm = (offline.rect, offline_armed);
+                }
+                if offline.clicked() {
+                    self.set_download_pick_armed(!offline_armed);
+                    if !offline_armed && self.top_sheet_page().is_some() {
                         self.clear_sheet_pages();
                     }
                 }
