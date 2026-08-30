@@ -525,8 +525,21 @@ impl TilePlane {
     /// compose: a fetch round that lands a shrunken tile set would otherwise
     /// produce a believable height field and report success.
     ///
-    /// The needed cover is recomputed from the box at this plane's own zoom and
-    /// tile size, so a plane at the wrong zoom is refused too.
+    /// The needed cover is recomputed from the box **at this plane's own
+    /// declared zoom and tile size**, so a plane whose addresses do not match
+    /// the box at the zoom it claims is refused.
+    ///
+    /// **That is narrower than "a plane at the wrong zoom is refused", which is
+    /// what this sentence used to say and is false.** A *mislabelled* zoom is
+    /// undetectable here and produces a plausible wrong field: declare `zoom: 8`
+    /// for tiles that are really z10, fill every address the honest z8 cover
+    /// names with a real body, and this returns `Ok` with heights off by
+    /// hundreds of metres (measured: 2735.5-2780.25 m against a truth of
+    /// 2367.25-2546.25 m). There is no defence available at this layer -- a PNG
+    /// carries no zoom, and every internal consistency check passes because the
+    /// declaration is consistent with itself. The invariant "these bodies came
+    /// from the zoom they are labelled with" belongs to whatever fetches them,
+    /// and it is owed by the first fetch layer to be written.
     pub fn resample(
         &self,
         site: (f64, f64),

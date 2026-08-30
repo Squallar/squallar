@@ -6,7 +6,7 @@
 //! holds that as a ceiling on the declared dependencies *and* on the resolved
 //! graph, so it is a gate rather than a sentence.
 //!
-//! Three pieces:
+//! Four pieces:
 //!
 //! * [`trgb`] — the Mapbox Terrain-RGB constants and `unpack`, re-spelled from
 //!   `tools/squallar-terrain` (a separate workspace, so it cannot be `use`d)
@@ -14,16 +14,20 @@
 //! * [`height`] — [`HeightField`] and its `u16` encoding, 2 bytes per post.
 //! * [`resample`] — tiles to one contiguous pixel plane, then the forward
 //!   projection per post.
+//! * [`jobs`] — the one codec row that runs the two inside the offload worker,
+//!   composed last by `squallar_worker::job_registry`.
 //!
 //! The box floor's 1°×1° minimum-elevation grid is **not** here even though the
 //! same builder pass emits it: it lives in `squallar_geo::min_elevation`,
 //! because `squallar-radar` will read it and this crate is **planned** to stand
-//! above `squallar-radar` through `squallar-device-profile`. Today this crate
-//! declares neither — `tests/charter.rs` asserts the smaller set — so the cycle
-//! is prospective rather than present, and the grid is placed for where the
-//! graph is going. That module's docs carry the argument in full.
+//! above `squallar-radar` through `squallar-device-profile`. This crate does
+//! not declare `squallar-device-profile` — `tests/charter.rs` asserts the exact
+//! set, which is `image`, `squallar-geo` and `squallar-source` — so the cycle is
+//! prospective rather than present, and the grid is placed for where the graph
+//! is going. That module's docs carry the argument in full.
 
 pub mod height;
+pub mod jobs;
 pub mod resample;
 pub mod trgb;
 
@@ -31,4 +35,5 @@ pub use height::{
     HEIGHT_BASE_M, HEIGHT_CEILING_M, HEIGHT_QUANTUM_M, HeightField, decode_height_m,
     encode_height_m,
 };
+pub use jobs::{HeightTile, TerrainHeightJob};
 pub use resample::{ElevationError, TileCover, TilePlane, cover_for, post_center_km, post_geo};

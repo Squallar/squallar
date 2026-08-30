@@ -11,11 +11,11 @@
 //! decoded volume) are pinned by `squallar-radar`'s own digest suites and do
 //! not feed this one.
 
-/// The 14 job-framing rows, exactly as
+/// The 15 job-framing rows, exactly as
 /// `offload::tests::the_job_framing_is_the_one_this_protocol_ships` asserts
 /// them, in test order: `kind | framed-prefix length | FNV-1a-64 digest`.
-/// (`voxels` contributes two rows — the picked-region and sourceless forms
-/// frame differently.)
+/// Fifteen rows for **fourteen** kinds: `voxels` contributes two — the
+/// picked-region and sourceless forms frame differently.
 ///
 /// The literal list lives HERE, never regenerated from the encoder; the test
 /// points at it. Re-pinning a row changes [`wire_digest`] and so the local
@@ -38,6 +38,19 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     "overlay/reports | 200 | 0x8b8cebdb5011dbc0",
     "overlay/glm | 243 | 0xf628cffc30d313df",
     "overlay/model | 265 | 0x01f0be29a2ccb24f",
+    // The height row, chained last so no code before it is renumbered. Its
+    // whole payload is framing: the tile bodies are opaque PNGs this codec
+    // frames and never interprets, the same ruling `framing_of` gives an
+    // archive and a Level III object.
+    // Row-length arithmetic, independent of the encoder: 1 code byte + 44
+    // envelope + 81 prefix (6xf64 box + 2xu32 posts + u8 zoom + 5xu32 cover +
+    // u32 count) + one tile of 12 header + 268 body = 406.
+    // Re-pinned once, deliberately, before this row ever shipped: the fixture
+    // box was a square, so a symmetric reorder of the six box terms in `encode`
+    // and `decode` left these bytes identical and this row could not see it.
+    // `x_km` and `y_km` now differ. The length is unchanged at 406 -- the field
+    // widths did not move, only the values that make the swap visible.
+    "terrain/heights | 406 | 0xc776d09fd53b08e0",
 ];
 
 /// The 2 overlay-reply framing rows, exactly as
@@ -69,6 +82,28 @@ pub const WIRE_FRAME_REPLY_ROWS: &[&str] = &[
     "frame/bare/image | 4 | 0xbe7a5e775165785d",
 ];
 
+/// The 2 height-reply framing rows, exactly as
+/// `offload::tests::the_height_reply_framing_is_the_one_this_registry_ships`
+/// asserts them: the `terrain/heights` reply's head+tail wire form, over a
+/// **literal** [`squallar_elevation::HeightField`] rather than a resampled one,
+/// so the digest is over stored bits and not over whatever libm answered.
+///
+/// **This list exists because review found the reply layout pinned nowhere.**
+/// The request side had the framing row; the reply had only a length assertion,
+/// so field order and endianness were free — samples written big-endian and read
+/// big-endian survived the whole suite, as did a head writing `y_km` before
+/// `x_km`. `every_codec_row_has_a_parity_test` cannot catch either by
+/// construction: the direct arm and the via-wire arm run the same codec, so a
+/// symmetric change is invisible to it. Every other reply family in the tree
+/// already had such a list; this row was the exception.
+///
+/// Row-length arithmetic (independent of the encoder): head
+/// 6x8 (box) + 2x4 (posts) = 56; samples 5 x 3 posts x 2 bytes = 30.
+pub const WIRE_HEIGHT_REPLY_ROWS: &[&str] = &[
+    "heights/head | 56 | 0xdb55a1bbf0c427c2",
+    "heights/samples | 30 | 0xd62e344d457129b5",
+];
+
 /// The canonical envelope's layout as one literal sentence, folded into
 /// [`wire_digest`] so a reshaped envelope changes the local build token.
 /// The code byte ahead of the envelope is covered by the per-row index
@@ -88,7 +123,8 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// The wire's identity as one number: FNV-1a 64 over, in order, each row of
 /// [`WIRE_FRAMING_ROWS`] prefixed by the composed-registry index of the
 /// row's kind, then [`CANONICAL_ENVELOPE_LAYOUT`], then every row of
-/// [`WIRE_REPLY_ROWS`], then every row of [`WIRE_FRAME_REPLY_ROWS`].
+/// [`WIRE_REPLY_ROWS`], then every row of [`WIRE_FRAME_REPLY_ROWS`], then
+/// every row of [`WIRE_HEIGHT_REPLY_ROWS`].
 ///
 /// Panics on a pinned row whose label is not in the registry.
 pub fn wire_digest() -> u64 {
@@ -103,7 +139,7 @@ pub fn wire_digest() -> u64 {
             .unwrap_or_else(|| {
                 panic!("the pinned framing row {row:?} names no composed-registry kind")
             });
-        hash = fnv1a64(hash, &[u8::try_from(index).expect("13 rows fit a byte")]);
+        hash = fnv1a64(hash, &[u8::try_from(index).expect("14 kinds fit a byte")]);
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash = fnv1a64(hash, CANONICAL_ENVELOPE_LAYOUT.as_bytes());
@@ -111,6 +147,9 @@ pub fn wire_digest() -> u64 {
         hash = fnv1a64(hash, row.as_bytes());
     }
     for row in WIRE_FRAME_REPLY_ROWS {
+        hash = fnv1a64(hash, row.as_bytes());
+    }
+    for row in WIRE_HEIGHT_REPLY_ROWS {
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash

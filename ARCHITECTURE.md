@@ -79,21 +79,26 @@ on the substrate. **They do not know about each other**: the
 overlays→radar edge is cut, and anything both sides need lives in
 `squallar-source` instead.
 
-**`squallar-elevation` stands beside them, on `squallar-geo` alone.**
-Terrain-RGB decode and the resample of a tile plane onto a volume box's post
-grid. It is a separate crate for one reason: both must run **inside the offload
-worker**, which links neither egui, wgpu nor winit, and its
+**`squallar-elevation` stands beside them, on `squallar-geo` and
+`squallar-source`.** Terrain-RGB decode, the resample of a tile plane onto a
+volume box's post grid, and the one codec row (`terrain/heights`) that runs both
+off the frame thread. It is a separate crate for one reason: all of it must run
+**inside the offload worker**, which links neither egui, wgpu nor winit, and its
 `tests/charter.rs` holds that as a ceiling on the declared set *and* as a walk
-of the resolved graph. Its eventual position is above `squallar-device-profile`
-— the plan reserves that dependency for the height-plan fit — so it is written
-as though it were already there and never reaches downward.
+of the resolved graph. `squallar-source` is there because `JobCodec` is a
+`struct` and not a trait, so no registry row can be built without it; it brings
+`reqwest` into the resolved graph, which a worker links, and none of the
+renderer stack, which it does not. Its eventual position is above
+`squallar-device-profile` — the plan reserves that dependency for the
+height-plan fit — so it is written as though it were already there and never
+reaches downward.
 
 **Band 3 and up — engine, renderer and shell.** `squallar-device-profile`
 (budgets and constants) sits above `squallar-radar`; `squallar-worker` (the job
-funnel, the pool, the wire) above the two data crates; `squallar-egui` (pure UI)
-above the data crates and the device profile; `squallar-gpu` (wgpu renderer,
-upload path, mirror, staging ring) and `squallar-volumetric` (the 3D stack) above
-that; `squallar-location` — the location facade, standing only on
+funnel, the pool, the wire) above the three data crates; `squallar-egui` (pure
+UI) above the data crates and the device profile; `squallar-gpu` (wgpu
+renderer, upload path, mirror, staging ring) and `squallar-volumetric` (the 3D
+stack) above that; `squallar-location` — the location facade, standing only on
 `squallar-geo`, `squallar-kv` and `squallar-nmea-serial`, and wrapping every OS's
 location quirks behind one Rust surface (`linux`, `windows`, `apple`,
 `android`, `web`, plus the NMEA serial provider) — off to one side of them;
@@ -297,7 +302,10 @@ That is a different question from this one.
 * **Owner**: `squallar-source/src/job.rs` (`JobInput`, `JobOut`, `DescribedJob`,
   `DescribedOut`, `JobGeometry`, `JobCost`, `JobCodec`, `JobSpec`,
   `JobOutCodec`); funnel in `squallar-worker/src/offload.rs`; composition in
-  `squallar-worker/src/job_registry.rs`.
+  `squallar-worker/src/job_registry.rs`, which chains three registries in one
+  spelled-out expression — radar, overlays, elevation. **A new registry chains
+  on the END**: a wire code is an index into the composition plus one, so a row
+  inserted earlier renumbers every code after it.
 * **The pin**: `squallar-app/tests/arch_ratchets.rs::offload_names_zero_source_crate_types`
   — `offload.rs` names **zero** `squallar_overlays::` or `squallar_radar::` paths,
   in either direction, prose included, with a presence control on

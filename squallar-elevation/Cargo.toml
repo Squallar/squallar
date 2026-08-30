@@ -21,6 +21,19 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # is written, so there is no second projection to disagree with the first.
 squallar-geo = { workspace = true }
 
+# So a refused decode and "there is no terrain here" are not the same
+# observable. Adds NO package to the resolved graph: `log` is already reachable
+# through squallar-source -> reqwest, verified on this tree, so the whole cost is
+# the line in `tests/charter.rs` beside this one.
+log = { workspace = true }
+
+# The job vocabulary, for `src/jobs.rs` only. `JobCodec` is a `struct` and not a
+# trait, so a registry row cannot be built without declaring the crate that
+# defines it. This is the arrival `tests/charter.rs` pre-announced: it brings
+# `reqwest` into the resolved graph, which compiles in a worker, and brings none
+# of egui, wgpu or winit, which do not.
+squallar-source = { workspace = true }
+
 [dev-dependencies]
 # `tests/charter.rs` parses `cargo metadata` output to pin this crate's
 # dependency ceiling and the resolved graph it is allowed to reach.

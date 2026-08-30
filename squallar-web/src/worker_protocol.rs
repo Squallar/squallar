@@ -24,7 +24,7 @@ pub const RELEASE: &str = "release";
 pub const ID: &str = "id";
 /// Page → worker: the framed job, as `squallar_worker`'s `JobRequest::to_bytes`
 /// writes it. Its leading byte is a **composed-registry index plus one**
-/// (codes 1..=13, 0 unallocated), then the canonical envelope every kind
+/// (codes 1..=14, 0 unallocated), then the canonical envelope every kind
 /// shares.
 pub const REQUEST: &str = "req";
 pub const TOKEN: &str = "token";
