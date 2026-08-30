@@ -222,10 +222,11 @@ fn a_device_with_no_areas_draws_an_empty_state_rather_than_nothing() {
 ///
 /// Decimal MB/GB is a property of every figure the screen prints, so stating
 /// it per row would be the same fact repeated N times and dropped when N is
-/// zero. The negative half is what makes this a test rather than a
-/// restatement: no row may carry the words.
+//// **Users know what MB means.** The screen states sizes and never explains
+/// their base. The positive half — a real size is on the glass — is what keeps
+/// the negative from passing on an empty screen.
 #[test]
-fn the_size_denominator_is_named_once_in_the_header_and_never_on_a_row() {
+fn the_screen_states_sizes_without_explaining_their_denominator() {
     let dir = TempDir::new("denominator");
     dir.place_segments("tulsa", 4);
     let mut h = harness_over(&dir);
@@ -235,19 +236,18 @@ fn the_size_denominator_is_named_once_in_the_header_and_never_on_a_row() {
     settle_statuses(&mut h, &["tulsa"]);
     h.frame_after(1.0 / 60.0);
 
+    let drawn = row_text(&h);
     assert!(
-        row_says(&h, "decimal MB and GB"),
-        "the header does not name the denominator its sizes are in; it drew {:?}",
-        row_text(&h),
+        drawn
+            .iter()
+            .any(|row| row.contains(" MB") || row.contains(" GB")),
+        "no size reached the glass, so the negative below proves nothing; it drew {drawn:?}",
     );
-    let mentions = row_text(&h)
-        .iter()
-        .filter(|drawn| drawn.contains("decimal MB and GB"))
-        .count();
-    assert_eq!(
-        mentions, 1,
-        "the denominator is stated {mentions} times; it belongs in the header \
-         once, never on a row",
+    assert!(
+        !drawn
+            .iter()
+            .any(|row| row.contains("decimal") || row.contains("1,000,000")),
+        "the screen explained its byte denominator; it drew {drawn:?}",
     );
 }
 
