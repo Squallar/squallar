@@ -64,9 +64,29 @@ impl HalfExtentKm {
         self.east_km.is_finite() && self.north_km.is_finite()
     }
 
-    /// This extent floored at [`MIN_HALF_WIDTH_KM`] per axis, then brought
-    /// inside [`MAX_HALF_DIAGONAL_KM`] without changing its aspect ratio: both
-    /// axes scale by one factor, so the corner lands exactly on the bound.
+    /// This extent floored at [`MIN_HALF_WIDTH_KM`] per axis and brought inside
+    /// [`MAX_HALF_DIAGONAL_KM`] at the corner — **both** bounds, on every ask.
+    ///
+    /// The ordinary answer scales both axes by one factor, so the aspect ratio
+    /// is unchanged and the corner lands exactly on the bound. Two asks cannot
+    /// be answered that way, and the floor applied above the scale does not
+    /// survive either of them:
+    ///
+    /// - A box long enough to trip the corner bound with its short axis already
+    ///   on the floor. One factor cannot hold both bounds at once — `(10 000,
+    ///   10)` scaled to the corner leaves 0.665 km on the north axis — so the
+    ///   floor keeps the short axis and the long one takes exactly what the
+    ///   corner leaves it.
+    /// - An ask near `f64::MAX`, where [`Self::corner_km`] overflows to
+    ///   infinity and a scale of zero would answer a 10³⁰⁸ km box with a box of
+    ///   no extent at all, whose every column resamples one point. Normalising
+    ///   by the longer axis keeps the aspect exact and the arithmetic in range.
+    ///
+    /// Neither is reachable from a picked region: the one gesture that sizes
+    /// one caps at [`MAX_HALF_WIDTH_KM`] and is always square, and a square at
+    /// that cap has its corner bit-exactly on the bound, so it is returned
+    /// unscaled. They are reachable from a stored region, which is a number in
+    /// a file this build is not the only writer of.
     pub fn clamped(self) -> Self {
         let floored = Self {
             east_km: self.east_km.max(MIN_HALF_WIDTH_KM),
@@ -76,10 +96,36 @@ impl HalfExtentKm {
         if corner <= MAX_HALF_DIAGONAL_KM {
             return floored;
         }
-        let scale = MAX_HALF_DIAGONAL_KM / corner;
-        Self {
+        let longest = floored.east_km.max(floored.north_km);
+        let scale = if corner.is_finite() {
+            MAX_HALF_DIAGONAL_KM / corner
+        } else {
+            MAX_HALF_DIAGONAL_KM
+                / longest
+                / (floored.east_km / longest).hypot(floored.north_km / longest)
+        };
+        let scaled = Self {
             east_km: floored.east_km * scale,
             north_km: floored.north_km * scale,
+        };
+        if scaled.east_km >= MIN_HALF_WIDTH_KM && scaled.north_km >= MIN_HALF_WIDTH_KM {
+            return scaled;
+        }
+        // The widest the long axis may stand with the short one on the floor:
+        // the corner bound solved for `short == MIN_HALF_WIDTH_KM`.
+        let long_km = (MAX_HALF_DIAGONAL_KM * MAX_HALF_DIAGONAL_KM
+            - MIN_HALF_WIDTH_KM * MIN_HALF_WIDTH_KM)
+            .sqrt();
+        if floored.east_km >= floored.north_km {
+            Self {
+                east_km: long_km,
+                north_km: MIN_HALF_WIDTH_KM,
+            }
+        } else {
+            Self {
+                east_km: MIN_HALF_WIDTH_KM,
+                north_km: long_km,
+            }
         }
     }
 }

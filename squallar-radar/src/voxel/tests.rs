@@ -957,6 +957,67 @@ fn the_cap_circumscribes_the_widest_ring_rather_than_fitting_inside_it() {
     );
 }
 
+#[test]
+fn a_stopped_box_holds_the_floor_as_well_as_the_corner() {
+    // The corner stop scales both axes by one factor, and a factor under 1.0
+    // applied to an axis already sitting on the floor puts it back under the
+    // floor. Every row here trips the corner bound with a short axis at or
+    // near `MIN_HALF_WIDTH_KM`, and the last two overflow `corner_km` outright
+    // — `hypot(f64::MAX, f64::MAX)` is infinite, and a scale of zero answers a
+    // box with no extent, whose every column resamples one point.
+    for asked in [
+        HalfExtentKm {
+            east_km: 700.0,
+            north_km: 5.0,
+        },
+        HalfExtentKm {
+            east_km: 10_000.0,
+            north_km: 10.0,
+        },
+        HalfExtentKm {
+            east_km: 10.0,
+            north_km: 1.0e10,
+        },
+        HalfExtentKm::square(f64::MAX),
+        HalfExtentKm {
+            east_km: f64::MAX,
+            north_km: 10.0,
+        },
+    ] {
+        let got = asked.clamped();
+        assert!(
+            got.east_km >= MIN_HALF_WIDTH_KM && got.north_km >= MIN_HALF_WIDTH_KM,
+            "{asked:?} stopped at {got:?}, under the {MIN_HALF_WIDTH_KM} km \
+             floor this function's first two lines exist to give it",
+        );
+        assert!(
+            got.corner_km() <= MAX_HALF_DIAGONAL_KM * (1.0 + 1e-12),
+            "{asked:?} stopped at {got:?}, whose corner {} stands outside \
+             {MAX_HALF_DIAGONAL_KM}",
+            got.corner_km(),
+        );
+    }
+
+    // The overflow arm must answer a square with a square: normalising by the
+    // longer axis is what keeps the aspect exact where the scale cannot.
+    let huge = HalfExtentKm::square(f64::MAX).clamped();
+    assert!(
+        (huge.east_km - MAX_HALF_WIDTH_KM).abs() < 1e-9
+            && (huge.north_km - MAX_HALF_WIDTH_KM).abs() < 1e-9,
+        "a square ask lands on the cap however large it is, got {huge:?}",
+    );
+
+    // Why the silence is defensible: the widest box the region pick can commit
+    // is `square(MAX_HALF_WIDTH_KM)`, and it comes back bit-for-bit. Nothing a
+    // user can drag is ever scaled, so there is no shrink to report to them.
+    let widest = HalfExtentKm::square(MAX_HALF_WIDTH_KM).clamped();
+    assert_eq!(
+        (widest.east_km, widest.north_km),
+        (MAX_HALF_WIDTH_KM, MAX_HALF_WIDTH_KM),
+        "the widest pickable box must be delivered unscaled, got {widest:?}",
+    );
+}
+
 // ── The box's own extent ────────────────────────────────────────────────
 
 const SURVEILLANCE_GATES: usize = 1832;
