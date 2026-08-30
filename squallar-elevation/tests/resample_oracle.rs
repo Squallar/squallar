@@ -24,7 +24,7 @@
 use std::f64::consts::PI;
 
 use squallar_elevation::height::{HEIGHT_QUANTUM_M, decode_height_m, encode_height_m};
-use squallar_elevation::resample::{TileCover, TilePlane, cover_for, post_center_km};
+use squallar_elevation::resample::{TileCover, TilePlane, cover_for};
 use squallar_elevation::trgb;
 
 // ---------------------------------------------------------------------------
@@ -270,6 +270,64 @@ fn a_cover_with_a_tile_missing_is_an_error_and_not_a_hole() {
     );
 }
 
+/// The three refusals around a tile bag that nothing else constructed: a tile
+/// the cover does not name, a tile named twice, and a tile of the wrong size.
+///
+/// All three matter at the job layer, which assembles from network results and
+/// can hand over a bag with any of those shapes.
+#[test]
+fn a_tile_bag_that_does_not_match_the_cover_is_refused_three_ways() {
+    use squallar_elevation::ElevationError;
+
+    let one = TileCover {
+        zoom: 10,
+        tile_px: 256,
+        tx0: 210,
+        ty0: 391,
+        tx1: 210,
+        ty1: 391,
+    };
+
+    // A tile outside the rectangle. Supplying it means the caller and the
+    // cover disagree about which box is being built.
+    assert_eq!(
+        TilePlane::assemble(one, &[(210, 391, REAL_TILE), (211, 391, REAL_TILE)])
+            .expect_err("211 is outside the cover"),
+        ElevationError::UnexpectedTile { x: 211, y: 391 }
+    );
+
+    // The same address twice. Taking the first would be a silent choice
+    // between two bodies this crate cannot tell apart.
+    assert_eq!(
+        TilePlane::assemble(one, &[(210, 391, REAL_TILE), (210, 391, REAL_TILE)])
+            .expect_err("a duplicate address"),
+        ElevationError::DuplicateTile { x: 210, y: 391 }
+    );
+
+    // A tile whose pixel grid is not the cover's. Laying it out anyway would
+    // put every later row at the wrong offset.
+    let mut small = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(128, 128))
+        .write_to(
+            &mut std::io::Cursor::new(&mut small),
+            image::ImageFormat::Png,
+        )
+        .expect("the encoder runs");
+    assert_eq!(
+        TilePlane::assemble(one, &[(210, 391, &small)]).expect_err("a 128 px tile in a 256 cover"),
+        ElevationError::TileSize {
+            x: 210,
+            y: 391,
+            width: 128,
+            height: 128
+        }
+    );
+
+    // Control: the well-formed bag is accepted, so none of the three refusals
+    // above is really about the cover or the fixture.
+    assert!(TilePlane::assemble(one, &[(210, 391, REAL_TILE)]).is_ok());
+}
+
 // ---------------------------------------------------------------------------
 // The analytic field, and the tiles that carry it.
 
@@ -379,6 +437,86 @@ fn tolerance_m() -> f64 {
     trgb::QUANTUM_M / 2.0 + HEIGHT_QUANTUM_M / 2.0 + bilinear + 1e-3
 }
 
+/// **The oracle's own post grid, written here and not imported.**
+///
+/// This used to call the crate's `resample::post_center_km`, which made the
+/// whole oracle blind to the centring rule: deleting the `+ 0.5` shifted the
+/// resampler and the "truth" by the same half cell, and the entire suite stayed
+/// green. Checker and checked out of the same belief. Spelling it out here is
+/// what makes `the_posts_are_cell_centres_and_not_cell_edges` and the oracle
+/// able to see a change to that rule.
+///
+/// `(lo + hi) / 2 + (i - (n - 1) / 2) * step` rather than
+/// `lo + (i + 0.5) * step`: the same points, reached from the grid's centre
+/// outward instead of from its low edge, so an algebraic slip in one form does
+/// not reproduce in the other.
+fn oracle_post_km(
+    x_km: (f64, f64),
+    y_km: (f64, f64),
+    posts: [u32; 2],
+    i: u32,
+    j: u32,
+) -> (f64, f64) {
+    let axis = |(lo, hi): (f64, f64), n: u32, k: u32| {
+        let step = (hi - lo) / f64::from(n);
+        (lo + hi) / 2.0 + (f64::from(k) - (f64::from(n) - 1.0) / 2.0) * step
+    };
+    (axis(x_km, posts[0], i), axis(y_km, posts[1], j))
+}
+
+/// Posts sit at cell **centres**, half a cell inside the box's edges.
+///
+/// Pinned against hand-computed positions rather than against the function, and
+/// stated at both the outer posts and a middle one. Deleting the `+ 0.5` from
+/// `resample::post_center_km` reddens this directly; before the oracle stopped
+/// importing that function, the deletion survived the whole suite.
+#[test]
+fn the_posts_are_cell_centres_and_not_cell_edges() {
+    // Two posts over (-10, 10): cells are 10 km wide, centres at -5 and +5.
+    // Four over (-40, 40): cells are 20 km, centres at -30, -10, 10, 30.
+    let x_km = (-10.0, 10.0);
+    let y_km = (-40.0, 40.0);
+    let posts = [2u32, 4];
+    let field = squallar_elevation::HeightField {
+        site: SITE,
+        x_km,
+        y_km,
+        posts,
+        samples: vec![0; 8],
+    };
+
+    for (i, j, want) in [
+        (0u32, 0u32, (-5.0_f64, -30.0_f64)),
+        (1, 0, (5.0, -30.0)),
+        (0, 3, (-5.0, 30.0)),
+        (1, 2, (5.0, 10.0)),
+    ] {
+        let got = field.post_center_km(i, j);
+        assert!(
+            (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+            "post ({i},{j}) is at {got:?}, and cell centres put it at {want:?}"
+        );
+        // The oracle's independently written grid says the same thing.
+        let mine = oracle_post_km(x_km, y_km, posts, i, j);
+        assert!(
+            (got.0 - mine.0).abs() < 1e-12 && (got.1 - mine.1).abs() < 1e-12,
+            "the crate says {got:?} and this file's own grid says {mine:?}"
+        );
+    }
+
+    // The property in words: no post sits ON an edge, and the outermost posts
+    // are exactly half a cell in.
+    let half_cell_x = (x_km.1 - x_km.0) / f64::from(posts[0]) / 2.0;
+    assert!(
+        (field.post_center_km(0, 0).0 - (x_km.0 + half_cell_x)).abs() < 1e-12,
+        "the first post is not half a cell inside the low edge"
+    );
+    assert!(
+        field.post_center_km(0, 0).0 > x_km.0,
+        "the first post landed on the box edge, which is the cell-corner rule"
+    );
+}
+
 /// The naive box→geo map: degrees per kilometre about the site, latitude
 /// scaled by `cos φ₀`. This is the "anything simpler" the design refuses.
 fn equirectangular(x_km: f64, y_km: f64) -> (f64, f64) {
@@ -402,7 +540,7 @@ fn the_resample_matches_the_analytic_oracle() {
         for i in 0..POSTS[0] {
             // The truth is taken at the post's TRUE position, computed here
             // from the plan's formula rather than from the crate.
-            let (x, y) = post_center_km(half, half, POSTS, i, j);
+            let (x, y) = oracle_post_km(half, half, POSTS, i, j);
             let (lat, lon) = squallar_geo::great_circle_destination(
                 SITE.0,
                 SITE.1,
@@ -436,7 +574,7 @@ fn the_resample_matches_the_analytic_oracle() {
     let mut saw_bump = false;
     for j in 0..POSTS[1] {
         for i in 0..POSTS[0] {
-            let (x, y) = post_center_km(half, half, POSTS, i, j);
+            let (x, y) = oracle_post_km(half, half, POSTS, i, j);
             let (lat, lon) = squallar_geo::great_circle_destination(
                 SITE.0,
                 SITE.1,
@@ -468,7 +606,7 @@ fn the_equirectangular_twin_fails_the_same_assertion_it_was_written_against() {
     let mut worst_corner_km = 0.0f64;
     for j in 0..POSTS[1] {
         for i in 0..POSTS[0] {
-            let (x, y) = post_center_km(half, half, POSTS, i, j);
+            let (x, y) = oracle_post_km(half, half, POSTS, i, j);
             let (true_lat, true_lon) = squallar_geo::great_circle_destination(
                 SITE.0,
                 SITE.1,
@@ -509,9 +647,23 @@ fn the_equirectangular_twin_fails_the_same_assertion_it_was_written_against() {
         "the equirectangular map's worst height error is only {worst_height} m against a \
          {tol} m budget"
     );
-    // Recorded, not asserted to a digit: 30.8 km at the corners and ~31 km
-    // worst overall at 39°N/106°W with HALF_KM = 460.
+    // Recorded, not asserted to a digit, and **the two figures here have
+    // different denominators and must not be quoted as one**:
+    //
+    //   * 30.32 km — `worst_corner_km`, the gap at the outermost post
+    //     *centres*, which is what this loop measures, because the outermost
+    //     post sits half a cell inside the box edge;
+    //   * 30.797 km — the gap at the true box corner (±460, ±460), which is
+    //     the figure this crate's module docs quote.
+    //
+    // Both at 39°N/106°W with HALF_KM = 460. The module docs say "the corners
+    // of a 920 km box" and mean the second; this test cannot reach it, because
+    // no post is there.
     assert!(worst_km >= worst_corner_km);
+    assert!(
+        (30.0..31.0).contains(&worst_corner_km),
+        "the outermost-post-centre gap is {worst_corner_km} km, not the ~30.3 km recorded"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -597,5 +749,120 @@ fn a_post_on_a_tile_boundary_reads_the_same_height_from_either_side() {
         (from_left - truth).abs() > tol && (from_right - truth).abs() > tol,
         "per-tile sampling landed inside the budget ({from_left} / {from_right} \
          against {truth}); the seam is not being reproduced"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The precondition: a plane may only be resampled onto a box it covers.
+
+/// A plane that does not cover the box is an `Err`, not a plausible field.
+///
+/// Both shapes were demonstrated on the unguarded version and both returned
+/// `Ok`: a plane over the 1040 km box resampled onto a 9200 km one gave a
+/// corner post of −24.5 m where the truth is −7086.7 m, and a single 27 km z10
+/// tile resampled onto a 920 km box gave a field ranging 2489..3694 m —
+/// entirely the sampler's edge clamp, and entirely believable. Nothing in the
+/// types ties a plane to a box, so this has to be checked rather than assumed.
+#[test]
+fn a_plane_that_does_not_cover_the_box_is_refused_rather_than_edge_clamped() {
+    use squallar_elevation::ElevationError;
+
+    let plane = synth_plane();
+    // Three times the plane's box. The reviewer's original demonstration used
+    // ten times, which now trips `CrossesAntimeridian` first — a 9200 km box at
+    // 39°N runs its corner rays 6500 km over the pole and the longitudes come
+    // back past ±180. That is a correct refusal for a different reason, and it
+    // would not exercise this one.
+    let too_big = (-HALF_KM * 3.0, HALF_KM * 3.0);
+
+    match plane.resample(SITE, too_big, too_big, POSTS) {
+        Err(ElevationError::PlaneDoesNotCoverBox { needed, have }) => {
+            assert!(
+                !have.covers(&needed),
+                "the error was raised for a cover that does contain the box"
+            );
+            assert_eq!(have, plane.cover());
+        }
+        other => panic!("a 2760 km box on a 1040 km plane gave {other:?}"),
+    }
+
+    // The single-tile shape, at the fixture's own zoom.
+    let one = TileCover {
+        zoom: 10,
+        tile_px: 256,
+        tx0: 210,
+        ty0: 391,
+        tx1: 210,
+        ty1: 391,
+    };
+    let tile = TilePlane::assemble(one, &[(210, 391, REAL_TILE)]).expect("the fixture decodes");
+    let half = (-HALF_KM, HALF_KM);
+    assert!(
+        matches!(
+            tile.resample(SITE, half, half, POSTS),
+            Err(ElevationError::PlaneDoesNotCoverBox { .. })
+        ),
+        "one z10 tile is about 27 km across and must not answer a 920 km box"
+    );
+
+    // Control, and the half that makes this a statement about coverage: the
+    // plane the box was built for still resamples, and its field is the one
+    // the oracle checks.
+    let ok = plane
+        .resample(SITE, half, half, POSTS)
+        .expect("the plane covers its own box");
+    let (lo, hi) = ok.range_m().expect("a non-empty field");
+    assert!(
+        hi - lo > 1500.0,
+        "the control field carries only {} m of relief",
+        hi - lo
+    );
+}
+
+/// A plane at the wrong zoom is refused too, even when its tiles would span the
+/// box on the ground.
+///
+/// The needed cover is recomputed at the plane's own zoom, so "wrong grid" and
+/// "too small" are one check rather than two.
+#[test]
+fn a_plane_at_the_wrong_zoom_cannot_stand_in_for_one_at_the_right_zoom() {
+    use squallar_elevation::ElevationError;
+
+    let plane = synth_plane();
+    assert_eq!(plane.cover().zoom, ZOOM);
+
+    // A cover at z10 that is nowhere near the box: same site, wrong grid.
+    let one = TileCover {
+        zoom: 10,
+        tile_px: 256,
+        tx0: 210,
+        ty0: 391,
+        tx1: 210,
+        ty1: 391,
+    };
+    assert!(!plane.cover().covers(&one), "the zooms differ");
+    assert!(matches!(
+        TilePlane::assemble(one, &[(210, 391, REAL_TILE)])
+            .expect("decodes")
+            .resample(SITE, (-HALF_KM, HALF_KM), (-HALF_KM, HALF_KM), POSTS),
+        Err(ElevationError::PlaneDoesNotCoverBox { .. })
+    ));
+}
+
+/// A box the cover itself refuses is refused by the resample, with the cover's
+/// own error rather than a coverage complaint.
+#[test]
+fn the_resample_forwards_the_covers_refusals_rather_than_masking_them() {
+    use squallar_elevation::ElevationError;
+
+    let plane = synth_plane();
+    let half = (-HALF_KM, HALF_KM);
+    assert_eq!(
+        plane.resample((f64::NAN, SITE.1), half, half, POSTS),
+        Err(ElevationError::NonFiniteExtent)
+    );
+    assert_eq!(
+        plane.resample(SITE, half, half, [0, 129]),
+        Err(ElevationError::Empty)
     );
 }
