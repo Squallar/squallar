@@ -419,27 +419,26 @@ fn the_light_a_3d_pane_is_under_survives_a_save_and_load() {
             .unwrap()
             .set_view(squallar_radar::types::RenderView::Volume);
     }
-    assert!(
-        !gui.pane(0).unwrap().volume().unwrap().readable_light,
-        "precondition: a fresh 3D pane is lit by the real sun, which is the \
-         decided default for both its ground and its volume",
+    assert_eq!(
+        gui.pane(0).unwrap().volume().unwrap().sun_lighting,
+        crate::pane::DEFAULT_SUN_LIGHTING,
+        "precondition: a fresh 3D pane opens under the documented default",
     );
-    gui.pane_mut(0)
-        .unwrap()
-        .volume_mut()
-        .unwrap()
-        .readable_light = true;
+    gui.pane_mut(0).unwrap().volume_mut().unwrap().sun_lighting =
+        !crate::pane::DEFAULT_SUN_LIGHTING;
     gui.save_ui_config(&store);
 
     let mut restored = crate::Gui::new();
     assert!(restored.load_ui_config(&store));
-    assert!(
-        restored.pane(0).unwrap().volume().unwrap().readable_light,
-        "a pane that asked for the readable light must come back under it",
+    assert_eq!(
+        restored.pane(0).unwrap().volume().unwrap().sun_lighting,
+        !crate::pane::DEFAULT_SUN_LIGHTING,
+        "a pane that moved its light must come back under the light it moved to",
     );
-    assert!(
-        !restored.pane(1).unwrap().volume().unwrap().readable_light,
-        "and the toggle is per pane: its neighbour keeps the sun",
+    assert_eq!(
+        restored.pane(1).unwrap().volume().unwrap().sun_lighting,
+        crate::pane::DEFAULT_SUN_LIGHTING,
+        "and the toggle is per pane: its neighbour keeps the default",
     );
 }
 
@@ -461,10 +460,11 @@ fn a_config_written_before_the_light_toggle_comes_back_under_the_sun() {
     let mut gui = crate::Gui::new();
     assert!(gui.load_ui_config(&store));
     let volume = gui.pane(0).unwrap().volume().unwrap();
-    assert!(
-        !volume.readable_light,
-        "an absent key must mean the shipped default, and the decided default \
-         is the real sun",
+    assert_eq!(
+        volume.sun_lighting,
+        crate::pane::DEFAULT_SUN_LIGHTING,
+        "an absent key must mean the shipped default, whatever that constant \
+         currently says",
     );
     assert!(
         volume.hide_floor,

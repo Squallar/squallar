@@ -383,7 +383,7 @@ pub fn resolution_km(half_width_km: f64, cells: usize) -> Option<f64> {
 }
 
 /// A pane showing a 3D view of the volume.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VolumePane {
     /// Where the eye is. See [`OrbitCamera`].
     pub camera: OrbitCamera,
@@ -403,14 +403,70 @@ pub struct VolumePane {
     pub alpha_editor_open: bool,
     /// How this pane draws its volume: the lit accumulation or an isosurface.
     pub view_mode: VolumeViewMode,
-    /// Whether this pane has turned the real sun **off** in favour of the
-    /// readable light.
+    /// **The light this pane was last drawn under**, or `None` if it has not
+    /// been drawn.
     ///
-    /// The inverted sense is [`Self::hide_floor`]'s, and for the same reason:
-    /// the accurate sun is the decided default for both the ground and the
-    /// volume, so `false` — what `Default` and every config written before
-    /// this field give — has to be the sun. Persisted; reopen is exactly 1:1.
-    pub readable_light: bool,
+    /// Session state, not persisted, and written by the 3D arm at the moment
+    /// it builds the frame — so the pane's own control can report which light
+    /// the picture on the glass is under instead of computing a second answer.
+    ///
+    /// **A second computation was the first shape of this and it was wrong in
+    /// two routine states.** The control derived its own light from
+    /// [`Self::rendered_for`] — the target *installed* — while the frame's
+    /// light comes from the target the pane is *asking for*. Those diverge
+    /// throughout every 3D loop, because `volume_build_due` refuses while a
+    /// loop plays so `rendered_for` never advances; and on every
+    /// rebuild-in-flight, because the store deliberately answers with the
+    /// previous grid. Near sunrise that let the readout say "above the
+    /// horizon" over a picture whose beam was identically zero.
+    pub shown_light: Option<crate::volume_view::VolumeLight>,
+    /// Whether this pane is lit by the real sun rather than by the readable
+    /// light. See [`DEFAULT_SUN_LIGHTING`]. Persisted; reopen is exactly 1:1.
+    pub sun_lighting: bool,
+}
+
+/// **Whether a fresh 3D pane is lit by the real sun.**
+///
+/// `false`, and the plan asked for `true`. The reason is not a doubt about the
+/// light; it is what the light currently has to work with.
+///
+/// The ground mesh is unreachable — `heights` is `None` at every frame build
+/// until the archive A2 would fetch from is published — so the only ground a
+/// pane draws is the **flat map lid**, and accurate mode's whole visible
+/// effect is the tint on it and on the volume. Measured on the shipped light
+/// style, the lid runs `[0.797, 0.804, 0.801]` under a high sun and
+/// `[0.136, 0.158, 0.201]` at night: an 83% drop. A severe-weather pane opened
+/// at 3 a.m. — the peak use case — would come up with a near-black basemap by
+/// default, and the escape would be a checkbox whose own hover text concedes
+/// the alternative is the readable one at night.
+///
+/// The plan's answer to a dark night was that terrain still reads by
+/// silhouette. That argument does not cover this, because there is no terrain
+/// yet to read.
+///
+/// **So: ship the mechanism, default to the readable light.** This is one line
+/// and `a_fresh_pane_opens_under_the_documented_default_light` is the test
+/// that follows it; flip both the day a height field is reachable.
+pub const DEFAULT_SUN_LIGHTING: bool = false;
+
+impl Default for VolumePane {
+    /// Written out rather than derived, so [`DEFAULT_SUN_LIGHTING`] is the
+    /// **only** place the shipped light is stated. A derived `Default` would
+    /// give `false` by the type's own rule and would go on giving it after
+    /// someone flipped the constant.
+    fn default() -> Self {
+        Self {
+            camera: OrbitCamera::default(),
+            region: None,
+            source_pane: None,
+            rendered_for: None,
+            shown_light: None,
+            hide_floor: false,
+            alpha_editor_open: false,
+            view_mode: VolumeViewMode::default(),
+            sun_lighting: DEFAULT_SUN_LIGHTING,
+        }
+    }
 }
 
 /// How a 3D pane draws its volume. `Default` is the lit volume — what every

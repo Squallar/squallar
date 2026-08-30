@@ -580,19 +580,32 @@ fn unchecked_fetches_are_clamped(shader: &str) -> Result<(), String> {
         if !body.contains("textureLoad(") {
             return Err(format!("`{name}` no longer loads a texel at all"));
         }
-        // The clamp's UPPER bound, not a bare `clamp(`: `ground_height`
-        // clamps its decoded VALUE into the unit cube as well, and a rule that
-        // could not tell the two apart accepted the coordinate clamp's
-        // deletion. It was spelled `clamp(vec2<i32>(` until C2 gave
-        // `ground_height` a signed post — the coordinate no longer needs a
-        // conversion, so the last texel is what the three fetches have in
-        // common and the value clamp does not.
-        if !body.contains("dims - vec2<i32>(1") {
+        // **One `clamp` call carrying BOTH bounds**, and the two halves have
+        // to be found inside the same call rather than anywhere in the body.
+        //
+        // The rule was spelled `clamp(vec2<i32>(` until C2 gave
+        // `ground_height` a signed post, and the re-anchoring C2 first reached
+        // for — the upper bound alone — was a weakening: `min(post, dims -
+        // vec2<i32>(1))` satisfied it, on a vertex-stage `textureLoad` with
+        // nothing guarding it below zero, which is undefined under GLES'
+        // `BoundsCheckPolicy::Unchecked` exactly as an overrun is. A lower
+        // bound is half the rule and was never optional.
+        //
+        // Anchored on `vec2<i32>(0` and `dims - vec2<i32>(1` as PREFIXES, so
+        // the control mutant below — the same bounds spelled two-component —
+        // still reads as the correct shader it is.
+        let clamped_fetch = body.match_indices("clamp(").any(|(at, _)| {
+            let call = &body[at..];
+            let call = &call[..call.find(';').unwrap_or(call.len())];
+            call.contains("vec2<i32>(0") && call.contains("dims - vec2<i32>(1")
+        });
+        if !clamped_fetch {
             return Err(format!(
-                "`{name}` reaches a texel with no `clamp`. The march calls it \
-                 before it knows whether a ground pass ran, and the placeholder \
-                 bound when none did is 1x1 — on GLES that is an unchecked \
-                 out-of-range `texelFetch` on every pixel of every frame",
+                "`{name}` reaches a texel with no `clamp` carrying both an \
+                 origin lower bound and the texture's own last texel. The march \
+                 calls it before it knows whether a ground pass ran, and the \
+                 placeholder bound when none did is 1x1 — on GLES an \
+                 out-of-range `texelFetch` is undefined in either direction",
             ));
         }
         if !body.contains("textureDimensions(") {
@@ -629,7 +642,7 @@ fn every_unchecked_fetch_is_clamped_into_its_own_texture() {
 #[test]
 fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
     // (name, from, to, must be rejected)
-    let mutants: [(&str, &str, &str, bool); 5] = [
+    let mutants: [(&str, &str, &str, bool); 7] = [
         (
             "the occluder's clamp deleted, which is byte-identical on a desktop \
              adapter and undefined on GLES",
@@ -663,6 +676,20 @@ fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
             "return clamp(raw * volume.occluder.z + volume.occluder.w, 0.0, 1.0);",
             "return raw * volume.occluder.z + volume.occluder.w;",
             false,
+        ),
+        (
+            "the height field's clamp reduced to its UPPER bound alone, which \
+             is the weakening C2 shipped for one commit: undefined below zero \
+             on GLES, in a vertex stage",
+            "clamp(post, vec2<i32>(0), dims - vec2<i32>(1))",
+            "min(post, dims - vec2<i32>(1))",
+            true,
+        ),
+        (
+            "the occluder's clamp reduced to its LOWER bound alone",
+            "clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1))",
+            "max(vec2<i32>(px), vec2<i32>(0))",
+            true,
         ),
     ];
 

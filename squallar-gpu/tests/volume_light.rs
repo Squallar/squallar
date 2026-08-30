@@ -40,7 +40,7 @@
 //! constructs both halves of it — the march bypassing `lit`, and the ground
 //! fragment bypassing it — and requires the criterion to go red on each.
 //!
-//! And [`the_headlight_is_the_arithmetic_identity`] would pass against a
+//! And [`the_headlight_light_collapses_to_the_identity`] would pass against a
 //! renderer whose light did nothing at all, so
 //! [`the_identity_criterion_rejects_a_light_that_does_nothing`] requires the
 //! same two builds to *differ* under the sun.
@@ -275,42 +275,93 @@ fn floor_lanes() -> ([f32; 4], [f32; 4]) {
 }
 
 /// The uniform every frame here is built from, under `light`.
-fn uniform(cells: [u32; 3], view: &VolumeView, light: SurfaceLight, ground: bool) -> VolumeUniform {
-    aimed(cells, view, light, ground.then_some(RIDGE), 1.0)
+/// Everything a criterion here varies about a frame, named rather than passed
+/// as a row of bare booleans.
+#[derive(Clone, Copy)]
+struct Fixture {
+    /// The mesh's own ceiling, or `None` for a frame with no ground pass.
+    ground_max_z: Option<f32>,
+    /// Whether the flat map lid is drawn. **`false` is what makes a volume
+    /// reading actually ground-free**: with the lid on, it composites behind
+    /// the accumulation and leaks into the mean — measured at up to 0.0048,
+    /// which is 31% of [`MIN_SHIFT`], and a denominator that is not what its
+    /// name says.
+    lid: bool,
+    /// Whether the march takes its central-difference gradient. **Off in most
+    /// of this file for a reason and on in one criterion for a bigger one.**
+    ///
+    /// Off, `shading` is exactly 1 and `lit` is the whole of what the volume
+    /// does with the light — the arm a frame takes on every quality rung below
+    /// the top. But off in *every* criterion is how C2 shipped a build in
+    /// which the march's directional response was untested and a storm could
+    /// be lit from the antipode of the ground under it:
+    /// [`both_surfaces_are_lit_from_the_same_side`] is the criterion that
+    /// turns it on, `#[ignore]`d like everything in this file.
+    gradient_shading: bool,
+    /// The camera's vertical stretch, which the shading's normals are taken
+    /// against. Defaults to the camera fixture's own, so a frame here is one
+    /// the app could produce; [`the_mesh_is_lit_by_the_shape_it_is_drawn_as`]
+    /// — `#[ignore]`d, like everything here — overrides it deliberately,
+    /// because the lane is its subject.
+    exaggeration: f32,
+    /// Where the height field's footprint sits in the drawn box. The identity
+    /// is a field built for the box being drawn; anything else is a field
+    /// standing in over a sub-rectangle, which is the state B3 built the lane
+    /// for and which every fixture in this plan had left untested.
+    ground_box: [f32; 4],
 }
 
-/// [`uniform`] told which field's ceiling it is aiming at and how far the
-/// camera stretches the vertical.
-///
-/// **The exaggeration is a lane rather than a fixture default here**, and it
-/// was one of C2's own mutation survivors: with `box_size_km.w` left at 1 in
-/// every frame, a mesh normal that ignored the stretch was invisible to
-/// everything. It is what makes the shading agree with the silhouette on a box
-/// the camera is shown three times as tall as it is.
-fn aimed(
+impl Fixture {
+    /// A frame with the mesh, the lid, and this camera's own stretch.
+    fn ground(camera: OrbitFixture) -> Self {
+        Self {
+            ground_max_z: Some(RIDGE),
+            lid: true,
+            gradient_shading: false,
+            exaggeration: camera.3,
+            ground_box: squallar_volumetric::uniform::IDENTITY_GROUND_BOX,
+        }
+    }
+
+    /// A frame carrying the accumulation and nothing else: no mesh, no lid.
+    fn volume_only(camera: OrbitFixture) -> Self {
+        Self {
+            ground_max_z: None,
+            lid: false,
+            ..Self::ground(camera)
+        }
+    }
+
+    /// A frame carrying the flat lid and nothing else.
+    fn lid_only(camera: OrbitFixture) -> Self {
+        Self {
+            ground_max_z: None,
+            ..Self::ground(camera)
+        }
+    }
+}
+
+fn uniform(
     cells: [u32; 3],
     view: &VolumeView,
     light: SurfaceLight,
-    ground_max_z: Option<f32>,
-    exaggeration: f32,
+    fixture: Fixture,
 ) -> VolumeUniform {
     let mut uniform = VolumeUniform::new(BOX_KM, cells);
     uniform.box_from_clip = view.box_from_clip;
     uniform.clip_from_box = view.clip_from_box;
     uniform.eye_in_box = view.eye_in_box;
-    uniform.vertical_exaggeration = exaggeration;
-    // The march's own gradient off, so the volume reading is a function of the
-    // LIGHT rather than of a fixture's normals. `shading` is then exactly 1 and
-    // `lit` is the whole of what the volume does with the light — which is the
-    // arm a `!shade` frame takes on every quality rung below the top, and the
-    // one an unlit-volume defect would hide in.
-    uniform.gradient_shading = false;
+    uniform.vertical_exaggeration = fixture.exaggeration;
+    uniform.gradient_shading = fixture.gradient_shading;
     let (uv, geo) = floor_lanes();
     uniform.floor_uv = uv;
     uniform.floor_geo = geo;
-    uniform.map_floor = true;
-    if let Some(max_z) = ground_max_z {
+    uniform.map_floor = fixture.lid;
+    if let Some(max_z) = fixture.ground_max_z {
+        // Clears `map_floor` on its own: the mesh IS the ground, so a frame
+        // that has one has no lid.
         uniform.aim_occluder(max_z, HEIGHT_SCALE, 0.0);
+        uniform.ground_box = fixture.ground_box;
     }
     uniform.set_light(light);
     uniform
@@ -358,6 +409,31 @@ const FULL: u8 = 200;
 /// A grid of nothing but air, so the offscreen carries the map lid alone.
 const AIR: u8 = 0;
 
+/// Cells a side in every grid this file marches.
+const CELLS: u32 = 8;
+
+/// A grid whose index **rises steadily west to east**, so the march's
+/// central-difference gradient points east at every cell and the outward
+/// normal it derives faces west — the same way the ramp ground faces.
+///
+/// `shading` negates the gradient to get its normal, because the field climbs
+/// *into* the data, so a density rising eastward is a surface facing west.
+/// That is what lets one criterion require the ground and the volume to
+/// brighten under the same sun.
+fn westward_field() -> Vec<u8> {
+    let mut indices = Vec::with_capacity((CELLS * CELLS * CELLS) as usize);
+    for _k in 0..CELLS {
+        for _j in 0..CELLS {
+            for i in 0..CELLS {
+                // Well clear of the empty-index threshold at either end, so
+                // every cell is marched and none of them is air.
+                indices.push(80 + (i * 20) as u8);
+            }
+        }
+    }
+    indices
+}
+
 fn render(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -379,14 +455,35 @@ fn render_grid(
     mirror: &PaneMirror,
     fill: u8,
 ) -> Frame {
-    let cells = [8u32, 8, 8];
-    let indices = vec![fill; 8 * 8 * 8];
+    let n = (CELLS * CELLS * CELLS) as usize;
+    render_field(
+        device,
+        queue,
+        pipelines,
+        uniform,
+        heights,
+        mirror,
+        &vec![fill; n],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_field(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    uniform: &VolumeUniform,
+    heights: Option<&GroundHeights>,
+    mirror: &PaneMirror,
+    indices: &[u8],
+) -> Frame {
+    let cells = [CELLS; 3];
     let volume = pipelines
         .upload_volume(
             device,
             queue,
             cells,
-            &indices,
+            indices,
             &gpu_harness::grey_ramp_lut(),
             &mut VolumeStaging::new(device),
         )
@@ -478,7 +575,7 @@ fn lid_reading(
         &scene.device,
         &scene.queue,
         &scene.pipelines,
-        &uniform([8, 8, 8], &view, light, false),
+        &uniform([8, 8, 8], &view, light, Fixture::lid_only(camera)),
         None,
         &scene.mirror,
         AIR,
@@ -581,7 +678,7 @@ fn readings(scene: &Scene, camera: OrbitFixture, light: SurfaceLight) -> ([f64; 
         &scene.device,
         &scene.queue,
         &scene.pipelines,
-        &uniform(cells, &view, light, true),
+        &uniform(cells, &view, light, Fixture::ground(camera)),
         Some(&scene.heights),
         &scene.mirror,
     );
@@ -597,7 +694,7 @@ fn readings(scene: &Scene, camera: OrbitFixture, light: SurfaceLight) -> ([f64; 
         &scene.device,
         &scene.queue,
         &scene.pipelines,
-        &uniform(cells, &view, light, false),
+        &uniform(cells, &view, light, Fixture::volume_only(camera)),
         None,
         &scene.mirror,
     );
@@ -611,21 +708,64 @@ fn readings(scene: &Scene, camera: OrbitFixture, light: SurfaceLight) -> ([f64; 
     (ground, volume)
 }
 
-/// Whether **both** surfaces moved between the two lights at this camera, and
-/// the two shifts.
+/// How far one surface moved between two lights, in **both** the senses that
+/// matter.
+#[derive(Clone, Copy)]
+struct Move {
+    /// The largest per-channel move. Says the surface took *a* light.
+    shift: f64,
+    /// How far red-minus-blue moved. Says it took *this* light.
+    warming: f64,
+}
+
+impl Move {
+    /// Whether this surface really went from the studio lamp to a sunset.
+    ///
+    /// **Both halves, and the second one is not decoration.** A magnitude test
+    /// alone passes on a build where `set_light` never writes the beam at all:
+    /// the beam lane keeps `HEADLIGHT`'s white, the surface is then lit by a
+    /// full-strength white sun under a sunset sky, and the sky term on its own
+    /// clears a 4/255 magnitude floor easily. That is a wholly wrong picture —
+    /// a permanent noon beam — and C2's first-pass flagship could not see it.
+    /// The colour is what a sunset *is*, so the colour is what has to move.
+    fn is_a_sunset(&self) -> bool {
+        self.shift >= MIN_SHIFT && self.warming >= MIN_WARMING
+    }
+}
+
+/// How far red-minus-blue must travel for a surface to have taken the *sun's
+/// colour* rather than merely some light.
 ///
-/// One function, so the criterion below and the control that must fail are
+/// A twentieth, against a beam whose own red-minus-blue at 2 degrees is 0.74
+/// of full scale before any albedo. Measured over the eleven cameras the
+/// ground warms by 0.086 to 0.249 and the volume by 0.242, so the margin runs
+/// from 1.7x at the tightest camera to about 5x — and a build whose beam never
+/// reaches the GPU warms by the sky's own difference alone, which is under a
+/// hundredth.
+const MIN_WARMING: f64 = 0.05;
+
+/// How far red sits above blue in a reading.
+fn warmth(reading: [f64; 3]) -> f64 {
+    reading[0] - reading[2]
+}
+
+/// Whether **both** surfaces went from the readable light to a sunset at this
+/// camera, and by how much.
+///
+/// One function, so the criterion below and the controls that must fail are
 /// measuring the same thing rather than two things written to agree.
-fn both_moved(scene: &Scene, camera: OrbitFixture) -> (bool, bool, f64, f64) {
+fn both_moved(scene: &Scene, camera: OrbitFixture) -> (Move, Move) {
     let (ground_head, volume_head) = readings(scene, camera, HEADLIGHT);
     let (ground_sun, volume_sun) = readings(scene, camera, sunset());
-    let ground_shift = shift(ground_head, ground_sun);
-    let volume_shift = shift(volume_head, volume_sun);
     (
-        ground_shift >= MIN_SHIFT,
-        volume_shift >= MIN_SHIFT,
-        ground_shift,
-        volume_shift,
+        Move {
+            shift: shift(ground_head, ground_sun),
+            warming: warmth(ground_sun) - warmth(ground_head),
+        },
+        Move {
+            shift: shift(volume_head, volume_sun),
+            warming: warmth(volume_sun) - warmth(volume_head),
+        },
     )
 }
 
@@ -647,17 +787,24 @@ fn both_surfaces_change_together_under_the_sun() {
     let _lock = gpu_lock();
     let scene = scene(VOLUME_SHADER_WGSL);
     for camera in ORBIT_CAMERAS {
-        let (ground_moved, volume_moved, ground_shift, volume_shift) = both_moved(&scene, camera);
+        let (ground, volume) = both_moved(&scene, camera);
         println!(
-            "{camera:?}: ground moved {:.4}, volume moved {:.4} (floor {MIN_SHIFT:.4})",
-            ground_shift, volume_shift,
+            "{camera:?}: ground moved {:.4} and warmed {:+.4}, volume moved \
+             {:.4} and warmed {:+.4} (floors {MIN_SHIFT:.4} / {MIN_WARMING:.4})",
+            ground.shift, ground.warming, volume.shift, volume.warming,
         );
         assert!(
-            ground_moved && volume_moved,
-            "{camera:?}: the sunset moved the ground by {ground_shift:.4} and the \
-             volume by {volume_shift:.4}, and both had to move. A scene in which \
-             only one surface takes the tint is a warm ground under a \
-             neutral-white storm - two pictures composited, not one scene",
+            ground.is_a_sunset() && volume.is_a_sunset(),
+            "{camera:?}: the sunset moved the ground by {:.4} and warmed it by \
+             {:+.4}, and moved the volume by {:.4} and warmed it by {:+.4}. Both \
+             have to do both. A scene in which only one surface takes the tint \
+             is a warm ground under a neutral-white storm - two pictures \
+             composited, not one scene - and a scene where both merely CHANGE \
+             is one a permanently white beam would also draw",
+            ground.shift,
+            ground.warming,
+            volume.shift,
+            volume.warming,
         );
     }
 }
@@ -706,25 +853,24 @@ fn the_criterion_rejects_a_build_where_only_one_surface_takes_the_tint() {
         let scene = scene(&mutated);
         let mut failed_somewhere = false;
         for camera in ORBIT_CAMERAS {
-            let (ground_moved, volume_moved, ground_shift, volume_shift) =
-                both_moved(&scene, camera);
+            let (ground, volume) = both_moved(&scene, camera);
             println!(
-                "CONTROL {name}\n  {camera:?}: ground {:.4}, volume {:.4}",
-                ground_shift, volume_shift,
+                "CONTROL {name}\n  {camera:?}: ground {:.4}/{:+.4}, volume {:.4}/{:+.4}",
+                ground.shift, ground.warming, volume.shift, volume.warming,
             );
-            // The surface that kept its light must still move, or the control
-            // proves nothing but that the shader stopped working.
-            let kept_moving = if ground_should_move {
-                volume_moved
+            // The surface that kept its light must still take a sunset, or the
+            // control proves nothing but that the shader stopped working.
+            let kept_its_light = if ground_should_move {
+                volume.is_a_sunset()
             } else {
-                ground_moved
+                ground.is_a_sunset()
             };
             assert!(
-                kept_moving,
+                kept_its_light,
                 "{name}: {camera:?} broke BOTH surfaces, so this control is not \
                  the one-sided build it claims to be and its red says nothing",
             );
-            failed_somewhere |= !(ground_moved && volume_moved);
+            failed_somewhere |= !(ground.is_a_sunset() && volume.is_a_sunset());
         }
         assert!(
             failed_somewhere,
@@ -735,29 +881,35 @@ fn the_criterion_rejects_a_build_where_only_one_surface_takes_the_tint() {
     }
 }
 
-/// **C2's second half: the readable light is the picture this renderer always
-/// drew.**
+/// **The readable light's arithmetic collapses to the identity.**
 ///
-/// Byte-for-byte, at every camera, against a build carrying the pre-C2
-/// arithmetic — `lit` collapsed to `albedo * response` and the ground's
-/// response to a flat one. Not a tolerance: under the headlight the beam is
-/// exactly one and the sky exactly zero, so the two shaders compute the same
-/// expression and any difference at all is a real one.
+/// Byte-for-byte, at every camera, against the same shader with the light
+/// multiplied out — `lit` reduced to `albedo * response` and the ground's
+/// response to a flat one.
 ///
-/// Rendered with **no height field**, which is the configuration every pane
-/// ships today — `heights` is `None` at the frame build until the archive A2
-/// would fetch from is published. So this is the claim that C2 changed nothing
-/// a user can currently see unless they ask for it.
+/// **What this can and cannot see, stated because an earlier draft of this
+/// comment over-claimed.** Under `HEADLIGHT` the beam is one and the sky zero,
+/// so `albedo * (1 * r + 0)` against `albedo * r` is an IEEE identity — which
+/// means this criterion tests that `HEADLIGHT`'s constants really do reach the
+/// GPU and that `ground_response` of a level normal is exactly one, and
+/// **nothing else**. Its reference is manufactured out of the shader under
+/// test, so it carries every other change that shader has. The claim that C2
+/// left the shipped picture alone belongs to
+/// [`the_headlight_draws_the_picture_the_shader_drew_before_c2`] — `#[ignore]`d
+/// beside this one — which compares against a pre-C2 shader pinned out of git.
+///
+/// Rendered with **no height field**, the configuration every pane ships
+/// today.
 #[test]
 #[ignore = "needs a GPU"]
-fn the_headlight_is_the_arithmetic_identity() {
+fn the_headlight_light_collapses_to_the_identity() {
     let _lock = gpu_lock();
     let (before, mutated) = pre_c2_arithmetic();
     let now = scene(VOLUME_SHADER_WGSL);
     assert_ne!(mutated, VOLUME_SHADER_WGSL);
 
     for camera in ORBIT_CAMERAS {
-        let (a, b) = lidless_pair(&before, &now, camera, HEADLIGHT);
+        let (a, b) = meshless_pair(&before, &now, camera, HEADLIGHT);
         let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
         assert_eq!(
             differing,
@@ -774,10 +926,10 @@ fn the_headlight_is_the_arithmetic_identity() {
 
 /// **The identity criterion's own non-triviality half.**
 ///
-/// [`the_headlight_is_the_arithmetic_identity`] — `#[ignore]`d beside this
-/// one — would be just as green against a renderer whose light did nothing at
-/// all, in either mode. So the same two builds must *differ*, at every camera,
-/// under the sun.
+/// [`the_headlight_light_collapses_to_the_identity`] — `#[ignore]`d beside
+/// this one — would be just as green against a renderer whose light did
+/// nothing at all, in either mode. So the same two builds must *differ*, at
+/// every camera, under the sun.
 #[test]
 #[ignore = "needs a GPU"]
 fn the_identity_criterion_rejects_a_light_that_does_nothing() {
@@ -786,7 +938,7 @@ fn the_identity_criterion_rejects_a_light_that_does_nothing() {
     let now = scene(VOLUME_SHADER_WGSL);
 
     for camera in ORBIT_CAMERAS {
-        let (a, b) = lidless_pair(&before, &now, camera, sunset());
+        let (a, b) = meshless_pair(&before, &now, camera, sunset());
         let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
         println!(
             "{camera:?}: {differing} of {} pixels differ under a sunset",
@@ -797,6 +949,96 @@ fn the_identity_criterion_rejects_a_light_that_does_nothing() {
             "{camera:?}: the pre-C2 arithmetic draws the SUNSET frame \
              identically too, so the identity criterion is measuring a light \
              that reaches nothing",
+        );
+    }
+}
+
+/// **The shader as it stood the commit before C2**, byte-exact out of git:
+///
+/// ```text
+/// git show 7f16b547:squallar-volumetric/src/volume.wgsl
+/// ```
+///
+/// A historical artifact and **not a copy to keep in step**. It is here so
+/// that "the readable light draws the picture this renderer always drew" is
+/// measured against the picture this renderer actually drew, rather than
+/// against a reference manufactured out of the shader under test — which is
+/// what [`the_headlight_light_collapses_to_the_identity`] does, and which
+/// cannot see any change the shader carries.
+///
+/// Both criteria that read it are `#[ignore]`d for a real adapter; run them
+/// with `cargo test -p squallar-gpu --test volume_light -- --ignored`.
+///
+/// **When this goes red for a reason that is not about light**, because
+/// someone legitimately changed what the march draws: that is the pin doing
+/// its job, and the answer is to retire it deliberately with a measurement of
+/// what moved, in a commit that says so. It is not to re-record it — a
+/// re-recorded blob is the shader under test again, and this file would be
+/// back to asserting `x * 1 + 0 == x`.
+const PRE_C2_SHADER: &str = include_str!("volume_light/pre_c2_volume.wgsl");
+
+/// **The readable light draws the picture the shader drew before C2**, at
+/// every camera, byte for byte.
+///
+/// The real form of the claim: not "the light multiplies out" but "this is the
+/// same picture", against a shader that predates every line of this unit and
+/// carries none of its changes. Rendered in the configuration every pane ships
+/// today — the flat map lid and no height field, because `heights` is `None`
+/// at the frame build until the archive A2 would fetch from is published.
+///
+/// So this is what says a user who never asks for the sun sees exactly what
+/// they saw before. `#[ignore]`d for a real adapter.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_headlight_draws_the_picture_the_shader_drew_before_c2() {
+    let _lock = gpu_lock();
+    assert!(
+        !PRE_C2_SHADER.contains("fn lit(") && !PRE_C2_SHADER.contains("sun_beam"),
+        "the pinned pre-C2 shader has C2 in it, so it is not the thing it \
+         claims to be and this criterion compares a shader to itself",
+    );
+    let before = scene(PRE_C2_SHADER);
+    let now = scene(VOLUME_SHADER_WGSL);
+
+    for camera in ORBIT_CAMERAS {
+        let (a, b) = meshless_pair(&before, &now, camera, HEADLIGHT);
+        let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(
+            differing,
+            0,
+            "{camera:?}: {differing} of {} pixels differ between the picture \
+             this shader drew the commit before C2 and the one it draws now, \
+             under the readable light. That light is supposed to be the \
+             identity - beam one, sky zero, a level lid's response exactly one \
+             - so this is a picture that moved for users who never asked for \
+             the sun",
+            a.len(),
+        );
+    }
+}
+
+/// The pre-C2 pin's own non-triviality half: the two shaders **do** differ
+/// under the sun, so the criterion above is not comparing two identical
+/// strings by another name.
+///
+/// `#[ignore]`d for a real adapter.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_pre_c2_pin_can_tell_the_two_shaders_apart() {
+    let _lock = gpu_lock();
+    let before = scene(PRE_C2_SHADER);
+    let now = scene(VOLUME_SHADER_WGSL);
+    for camera in ORBIT_CAMERAS {
+        let (a, b) = meshless_pair(&before, &now, camera, sunset());
+        let differing = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        println!(
+            "{camera:?}: {differing} of {} pixels differ under a sunset",
+            a.len()
+        );
+        assert!(
+            differing > 0,
+            "{camera:?}: the pre-C2 shader draws the SUNSET frame identically \
+             too, so the pin is comparing something to itself",
         );
     }
 }
@@ -827,8 +1069,9 @@ fn pre_c2_arithmetic() -> (Scene, String) {
 }
 
 /// The two builds' offscreens for one camera under one light, with **no ground
-/// mesh** — the shipped configuration, where the only ground is the flat lid.
-fn lidless_pair(
+/// mesh** — the shipped configuration, where the only ground a pane draws is
+/// the flat lid.
+fn meshless_pair(
     before: &Scene,
     now: &Scene,
     camera: OrbitFixture,
@@ -836,7 +1079,7 @@ fn lidless_pair(
 ) -> (Vec<[u8; 4]>, Vec<[u8; 4]>) {
     let view = view_at(camera);
     let cells = [8u32, 8, 8];
-    let uniform = uniform(cells, &view, light, false);
+    let uniform = uniform(cells, &view, light, Fixture::lid_only(camera));
     let one = render(
         &before.device,
         &before.queue,
@@ -1013,6 +1256,261 @@ fn night_is_dim_but_never_black_on_the_terrain() {
     }
 }
 
+/// **Ground and volume are lit from the same side**, at every camera — the
+/// criterion that makes a second light visible rather than merely unwritable.
+///
+/// C2 shipped for one commit with the march's `shading` normalising its own
+/// copy of the direction lane. Negating that copy lit the raymarched storm
+/// from the exact antipode of the ground it stands on, in one frame, and every
+/// criterion in this file stayed green — because `gradient_shading` was
+/// `false` in **every** fixture, so `shading` never executed at all and the
+/// volume's whole directional response was untested by its own suite.
+///
+/// So this one turns it on. The scene is arranged so both surfaces face the
+/// same way: ground that rises steadily west to east faces west, and a density
+/// that rises west to east has a gradient pointing east, which `shading`
+/// negates into a normal facing west. Light them from the west and from the
+/// east; **both** have to be brighter under the western sun. A sign flip in
+/// either response breaks the agreement, whichever one it is in.
+///
+/// `#[ignore]`d for a real adapter, like everything here.
+#[test]
+#[ignore = "needs a GPU"]
+fn both_surfaces_are_lit_from_the_same_side() {
+    let _lock = gpu_lock();
+    let scene = scene(VOLUME_SHADER_WGSL);
+    let (west, east) = grazing_pair(10.0);
+    let field = westward_field();
+
+    for camera in ORBIT_CAMERAS {
+        let view = view_at(camera);
+        let read = |light: SurfaceLight| -> (f64, f64) {
+            let lit_ground = render_field(
+                &scene.device,
+                &scene.queue,
+                &scene.pipelines,
+                &uniform(
+                    [CELLS; 3],
+                    &view,
+                    light,
+                    Fixture {
+                        ground_max_z: Some(RAMP_BASE + RAMP_RISE),
+                        gradient_shading: true,
+                        ..Fixture::ground(camera)
+                    },
+                ),
+                Some(&scene.ramp),
+                &scene.mirror,
+                &field,
+            );
+            let lit_volume = render_field(
+                &scene.device,
+                &scene.queue,
+                &scene.pipelines,
+                &uniform(
+                    [CELLS; 3],
+                    &view,
+                    light,
+                    Fixture {
+                        gradient_shading: true,
+                        ..Fixture::volume_only(camera)
+                    },
+                ),
+                None,
+                &scene.mirror,
+                &field,
+            );
+            let (ground, ground_px) = mean_rgb(&lit_ground.ground, |px| px[3] == 255);
+            let (volume, volume_px) = mean_rgb(&lit_volume.offscreen, |px| px[3] > 0);
+            assert!(
+                ground_px >= MIN_PIXELS && volume_px >= MIN_PIXELS,
+                "{camera:?}: {ground_px} ground and {volume_px} volume pixels, \
+                 which is not a scene to average over",
+            );
+            (ground[1], volume[1])
+        };
+
+        let (ground_west, volume_west) = read(west);
+        let (ground_east, volume_east) = read(east);
+        println!(
+            "{camera:?}: ground {ground_west:.4}/{ground_east:.4}, volume \
+             {volume_west:.4}/{volume_east:.4} (west/east)",
+        );
+        assert!(
+            ground_west > ground_east + MIN_SHIFT && volume_west > volume_east + MIN_SHIFT,
+            "{camera:?}: a west-facing ground reads {ground_west:.4} under a \
+             western sun and {ground_east:.4} under an eastern one, and a \
+             west-facing volume reads {volume_west:.4} and {volume_east:.4}. \
+             Both have to prefer the same sun. Two surfaces that disagree about \
+             which way the light comes from is the two-composited-pictures \
+             failure with the pictures lit from opposite sides, and every pixel \
+             of it is plausible on its own",
+        );
+    }
+}
+
+/// **The flat map lid dims toward a grazing sun.**
+///
+/// `ground_response` is exactly one for the lid at any sun above
+/// `LEVEL_COSINE_FLOOR`, which is what keeps the readable light's picture
+/// unchanged — and it is why replacing the lid's whole response with a literal
+/// `1.0` left all of C2's first-pass criteria green. The lid is the only
+/// ground a pane draws today, so its response having no coverage at all was
+/// the largest uncovered surface in the change.
+///
+/// The last five degrees are where the response is not one, and this measures
+/// there. **Both lights carry the same beam and sky** and differ only in the
+/// direction's elevation, so the beam ramp cannot be what moves the reading —
+/// the response is the only thing left. Under a constant response the two are
+/// identical.
+///
+/// `#[ignore]`d for a real adapter.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_flat_lid_dims_toward_a_grazing_sun() {
+    let _lock = gpu_lock();
+    let scene = scene(VOLUME_SHADER_WGSL);
+    // One light's colours, two directions: 30 degrees up, and 2 degrees up.
+    // `LEVEL_COSINE_FLOOR` is sin(5 degrees), so the lid's response is 1 at 30
+    // and sin(2)/sin(5) = 0.40 at 2.
+    let colours = sun_at(10.0);
+    let aimed_at = |elevation_deg: f64| {
+        let (sin_el, cos_el) = elevation_deg.to_radians().sin_cos();
+        SurfaceLight {
+            direction: [0.0, -cos_el as f32, sin_el as f32],
+            ..colours
+        }
+    };
+    let (high, grazing) = (aimed_at(30.0), aimed_at(2.0));
+
+    let mut measured = 0usize;
+    for camera in ORBIT_CAMERAS {
+        let Some((bright, _)) = lid_reading(&scene, camera, high) else {
+            println!("{camera:?}: no lid in frame, skipped");
+            continue;
+        };
+        measured += 1;
+        let (dim, _) = lid_reading(&scene, camera, grazing).expect(
+            "the lid's coverage does not read the light, so a camera that saw \
+             it under one direction must see it under the other",
+        );
+        println!(
+            "{camera:?}: lid reads {:.4} at 30 degrees and {:.4} at 2, same beam",
+            bright[1], dim[1],
+        );
+        assert!(
+            bright[1] > dim[1] + MIN_SHIFT,
+            "{camera:?}: the lid reads {:.4} under a 30-degree sun and {:.4} \
+             under a 2-degree one carrying the SAME beam and sky, so its \
+             response is not a function of where the light is. A flat lid that \
+             never dims while the mesh beside it does is two grounds with two \
+             responses",
+            bright[1],
+            dim[1],
+        );
+    }
+    assert!(
+        measured >= LID_CAMERAS,
+        "only {measured} of {} cameras had a lid to read, and the floor is \
+         {LID_CAMERAS}",
+        ORBIT_CAMERAS.len(),
+    );
+}
+
+/// **A field standing in over part of the box is lit at its own slope**, not
+/// at the slope it would have if it covered the whole box.
+///
+/// `ground_normal` divides its rise by the run between two posts, and that run
+/// is the **field's** footprint — `box_size_km.xy * ground_box.xy` — which is
+/// the drawn box's only while the two are the same box. Dropping the
+/// `ground_box` factor left `volume_light`, `volume_drape`, `volume_occluder`,
+/// `volume_shader` and `volume_silhouette` all green, because every fixture in
+/// this plan leaves the lane at the identity. It is the fourth time an
+/// identity fixture has hidden a lane in this plan.
+///
+/// The state it hides is exactly the one B3 built the lane for: a field built
+/// for an older box, standing in over a sub-rectangle so the pane draws
+/// something rather than nothing while a newer field is in flight. There the
+/// posts are half as far apart on the ground, so the terrain is **twice as
+/// steep** — and with the factor gone it would be lit as the gentle thing it
+/// is not, while being drawn as the steep thing it is.
+///
+/// `#[ignore]`d for a real adapter.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_field_standing_in_over_part_of_the_box_is_lit_at_its_own_slope() {
+    let _lock = gpu_lock();
+    let scene = scene(VOLUME_SHADER_WGSL);
+    let (west, _) = grazing_pair(10.0);
+    // The same ramp over half the box's width, centred. Same rise, half the
+    // run, so twice the slope and a west-facing face turned twice as far
+    // toward a western sun.
+    let half = [0.5, 1.0, 0.25, 0.0];
+
+    for camera in ORBIT_CAMERAS {
+        let view = view_at(camera);
+        let read = |ground_box: [f32; 4]| -> f64 {
+            let frame = render(
+                &scene.device,
+                &scene.queue,
+                &scene.pipelines,
+                &uniform(
+                    [CELLS; 3],
+                    &view,
+                    west,
+                    Fixture {
+                        ground_max_z: Some(RAMP_BASE + RAMP_RISE),
+                        ground_box,
+                        ..Fixture::ground(camera)
+                    },
+                ),
+                Some(&scene.ramp),
+                &scene.mirror,
+            );
+            let (reading, count) = mean_rgb(&frame.ground, |px| px[3] == 255);
+            assert!(
+                count >= MIN_PIXELS,
+                "{camera:?}: the mesh drew {count} pixels over {ground_box:?}",
+            );
+            reading[1]
+        };
+
+        let whole = read(squallar_volumetric::uniform::IDENTITY_GROUND_BOX);
+        let standing_in = read(half);
+        println!(
+            "{camera:?}: the ramp reads {whole:.4} over the whole box and \
+             {standing_in:.4} over half of it",
+        );
+        assert!(
+            standing_in > whole + MIN_SHIFT,
+            "{camera:?}: the same field reads {whole:.4} over the whole box and \
+             {standing_in:.4} over half of it, and half the run at the same \
+             rise is twice the slope - it has to catch more of a western sun. \
+             A normal that divided by the DRAWN box would answer the same both \
+             times, and every fixture in this plan but this one leaves \
+             `ground_box` at the identity",
+        );
+    }
+}
+
+/// A light's colours at `elevation_deg`, aimed from due west and from due
+/// east: the same beam and sky, mirrored in azimuth, so only the direction
+/// moves.
+fn grazing_pair(elevation_deg: f64) -> (SurfaceLight, SurfaceLight) {
+    let colours = sun_at(elevation_deg as f32);
+    let (sin_el, cos_el) = elevation_deg.to_radians().sin_cos();
+    (
+        SurfaceLight {
+            direction: [-cos_el as f32, 0.0, sin_el as f32],
+            ..colours
+        },
+        SurfaceLight {
+            direction: [cos_el as f32, 0.0, sin_el as f32],
+            ..colours
+        },
+    )
+}
+
 /// **The mesh is lit by the shape it is DRAWN as**: the right flank is bright,
 /// and a stretched box is lit as the steep thing it is stretched into.
 ///
@@ -1063,12 +1561,15 @@ fn the_mesh_is_lit_by_the_shape_it_is_drawn_as() {
             &scene.device,
             &scene.queue,
             &scene.pipelines,
-            &aimed(
+            &uniform(
                 [8, 8, 8],
                 &view,
                 light,
-                Some(RAMP_BASE + RAMP_RISE),
-                exaggeration,
+                Fixture {
+                    ground_max_z: Some(RAMP_BASE + RAMP_RISE),
+                    exaggeration,
+                    ..Fixture::ground(camera)
+                },
             ),
             Some(&scene.ramp),
             &scene.mirror,
@@ -1156,7 +1657,7 @@ fn a_slope_toward_a_low_sun_is_brighter_than_one_turned_away() {
                 &scene.device,
                 &scene.queue,
                 &scene.pipelines,
-                &uniform(cells, &view, light, true),
+                &uniform(cells, &view, light, Fixture::ground(camera)),
                 Some(&scene.heights),
                 &scene.mirror,
             ));

@@ -21,11 +21,12 @@ mod layer_stack;
 pub use layer_stack::{LayerStack, RemovedLayer};
 
 pub use content::{
-    BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_VERTICAL_EXAGGERATION, MAX_EYE_DISTANCE,
-    MAX_VERTICAL_EXAGGERATION, MIN_EYE_DISTANCE, MIN_VERTICAL_EXAGGERATION, MapPane, MapRender,
-    OrbitCamera, OrbitDelta, PaneContent, PaneKind, SectionLine, SectionTarget, SectionUnavailable,
-    VolumePane, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode, box_size_km,
-    box_size_km_for_base, box_size_km_in, resolution_km, volume_base_km_msl, volume_box_anchor,
+    BASE_HALF_WIDTH_KM, CrossSectionPane, DEFAULT_SUN_LIGHTING, DEFAULT_VERTICAL_EXAGGERATION,
+    MAX_EYE_DISTANCE, MAX_VERTICAL_EXAGGERATION, MIN_EYE_DISTANCE, MIN_VERTICAL_EXAGGERATION,
+    MapPane, MapRender, OrbitCamera, OrbitDelta, PaneContent, PaneKind, SectionLine, SectionTarget,
+    SectionUnavailable, VolumePane, VolumeRegion, VolumeStamp, VolumeTarget, VolumeViewMode,
+    box_size_km, box_size_km_for_base, box_size_km_in, resolution_km, volume_base_km_msl,
+    volume_box_anchor,
 };
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;

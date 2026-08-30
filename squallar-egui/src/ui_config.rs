@@ -809,11 +809,12 @@ struct VolumeConfig {
     /// Whether this pane has turned the map floor **off**, in
     /// [`crate::pane::VolumePane::hide_floor`]'s own inverted sense.
     hide_floor: bool,
-    /// Whether this pane has turned the real sun **off**, in
-    /// [`crate::pane::VolumePane::readable_light`]'s own inverted sense. A
-    /// config written before this field loads as `false`, which is the sun —
-    /// the decided default, and the same picture a fresh pane opens at.
-    readable_light: bool,
+    /// Whether this pane is lit by the real sun, in
+    /// [`crate::pane::VolumePane::sun_lighting`]'s own sense. A config written
+    /// before this field loads as
+    /// [`crate::pane::DEFAULT_SUN_LIGHTING`] through the `#[serde(default)]`
+    /// on this struct, which is the same picture a fresh pane opens at.
+    sun_lighting: bool,
     /// Lit volume or isosurface. `#[serde(default)]` on the struct makes an
     /// older config a lit volume; the lenient deserializer makes a *newer*
     /// config's unknown mode a lit volume too, instead of a failed load —
@@ -856,7 +857,7 @@ impl VolumeConfig {
             || self.pivot != default.pivot
             || self.vertical_exaggeration != default.vertical_exaggeration
             || self.hide_floor != default.hide_floor
-            || self.readable_light != default.readable_light
+            || self.sun_lighting != default.sun_lighting
             || self.view_mode != default.view_mode
             || self.region.is_some()
             || self.source_pane.is_some()
@@ -877,7 +878,7 @@ impl Default for VolumeConfig {
             pivot: camera.pivot(),
             vertical_exaggeration: camera.vertical_exaggeration(),
             hide_floor: false,
-            readable_light: false,
+            sun_lighting: crate::pane::DEFAULT_SUN_LIGHTING,
             view_mode: crate::pane::VolumeViewMode::default(),
             region: None,
             source_pane: None,
@@ -2000,7 +2001,7 @@ fn content_config(
                 pivot: camera.pivot(),
                 vertical_exaggeration: camera.vertical_exaggeration(),
                 hide_floor: map.volume.hide_floor,
-                readable_light: map.volume.readable_light,
+                sun_lighting: map.volume.sun_lighting,
                 view_mode: map.volume.view_mode,
                 region: map.volume.region.map(|region| VolumeRegionConfig {
                     centre_lat: region.centre().lat,
@@ -2099,8 +2100,11 @@ fn restore_map(
                 inside
             }),
             rendered_for: None,
+            // Session state: a restored pane has not been drawn yet, so there
+            // is no light it is under to report.
+            shown_light: None,
             hide_floor: saved.hide_floor,
-            readable_light: saved.readable_light,
+            sun_lighting: saved.sun_lighting,
             alpha_editor_open: false,
             view_mode: saved.view_mode,
         },

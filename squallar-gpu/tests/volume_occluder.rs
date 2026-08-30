@@ -278,6 +278,10 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
     // ground, which C2 gave a normal of its own. Every criterion in this file
     // reads the mesh's colour as a discrete identity, so the light has to be
     // one under which the mesh's colour is the mirror's own.
+    //
+    // The two lines survive each other: `set_light` writes the three colour
+    // and direction lanes and deliberately not `ambient`, which belongs to the
+    // medium rather than to the light.
     uniform.ambient = 1.0;
     uniform.gradient_shading = false;
     uniform.set_light(gpu_harness::UNLIT);

@@ -642,9 +642,17 @@ fn the_shader_gates_the_occluder_on_the_scale_lane_being_positive() {
 /// Three claims, all of them about `volume.wgsl`:
 ///
 /// * the two colour lanes are named **only** inside `lit`;
-/// * the direction lane is named only inside the three response functions;
+/// * the **direction** lane is named only inside `light_direction`, and every
+///   response function calls that;
 /// * `lit` is called by all four things that carry colour — the ground mesh's
 ///   fragment, the map lid, the march's accumulation and the isosurface.
+///
+/// **The direction clause is the correction to a version of this test that
+/// counted READS rather than requiring one.** It accepted three independent
+/// readers, and negating one of them lit the raymarched storm from the exact
+/// antipode of the ground under it, in the same frame, while this test stayed
+/// green — because a count of reads cannot see what a reader does with the
+/// vector. One reader is the property; a count is not.
 ///
 /// The picture criteria live in `squallar-gpu/tests/volume_light.rs`, which is
 /// `#[ignore]`d because it needs a real adapter.
@@ -678,18 +686,28 @@ fn neither_surface_can_be_lit_by_a_light_the_other_does_not_have() {
     }
 
     let direction = "volume.light_dir_ambient.xyz";
-    let readers: usize = ["ground_response", "shading", "iso_shading"]
-        .iter()
-        .map(|name| body_of(name).matches(direction).count())
-        .sum();
+    let total = shader.matches(direction).count();
+    let inside = body_of("light_direction").matches(direction).count();
     assert_eq!(
-        (shader.matches(direction).count(), readers),
-        (3, 3),
-        "the light's DIRECTION is read somewhere other than the three \
-         functions that turn it into a surface's response. Those three are the \
-         whole of the difference between how the ground and the volume take \
-         the light, and a fourth reader is a fourth answer",
+        (total, inside),
+        (1, 1),
+        "the light's DIRECTION lane is named {total} time(s) in volume.wgsl and \
+         {inside} of them are inside `light_direction`. A second reader is a \
+         second light: negate one copy and the storm is lit from the antipode \
+         of the ground it stands on, in one frame, with every pixel of it \
+         plausible",
     );
+
+    // And every response really does go through it, rather than one of them
+    // quietly keeping a vector of its own by another spelling.
+    for name in ["ground_response", "shading", "iso_shading"] {
+        let body = body_of(name);
+        assert!(
+            body.contains("light_direction()"),
+            "`{name}` turns the light into a response without asking \
+             `light_direction` for it, so it is answering from somewhere else",
+        );
+    }
 
     // `lit(` at a call site: not its own definition, and not the tail of a
     // longer identifier. `vs_blit(` ends in `lit(` and was counted as a fifth

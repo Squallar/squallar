@@ -79,8 +79,13 @@ pub const DEFAULT_LIGHT_DIR: [f32; 3] = [-0.4, -0.5, 0.77];
 /// Ground and volume take their direction *and* their colour from this one
 /// value, which is what stops a warm sunset ground sitting under a
 /// neutral-white storm — two composited pictures rather than one scene. It
-/// reaches the GPU through [`VolumeUniform::set_light`] as a unit; there is no
-/// supported way to set three of these four.
+/// reaches the GPU through [`VolumeUniform::set_light`] as a unit.
+///
+/// **The march's wrap floor is not in here**, and that is the correction to an
+/// earlier draft which carried it as a fourth field. It is a property of how
+/// this renderer draws a participating medium rather than of the light, it is
+/// the same number under every light, and carrying it here made one assignment
+/// in `set_light` a no-op everywhere it mattered.
 ///
 /// The arithmetic every consumer performs, `squallar_geo::solar::SunLight`'s
 /// own:
@@ -107,8 +112,6 @@ pub struct SurfaceLight {
     /// Linear-light RGB of the **sky**, applied with no cosine at all, because
     /// scattered light arrives from the whole hemisphere.
     pub sky: [f32; 3],
-    /// See [`DEFAULT_AMBIENT`]. Read only by the march's wrap term.
-    pub wrap_floor: f32,
 }
 
 /// **The readable light**: today's fixed direction, a unit white beam and no
@@ -117,14 +120,14 @@ pub struct SurfaceLight {
 /// The beam being exactly one and the sky exactly zero is not a taste
 /// judgement — it is what makes `beam * response + sky` collapse to `response`
 /// and every picture this renderer drew before C2 come back bit-identical.
-/// `the_headlight_is_the_arithmetic_identity` is the assertion that says so;
-/// it is `#[ignore]`d for a real adapter, so run it with
+/// `the_headlight_draws_the_picture_the_shader_drew_before_c2` is the
+/// assertion that says so, against a pre-C2 shader pinned out of git; it is
+/// `#[ignore]`d for a real adapter, so run it with
 /// `cargo test -p squallar-gpu --test volume_light -- --ignored`.
 pub const HEADLIGHT: SurfaceLight = SurfaceLight {
     direction: DEFAULT_LIGHT_DIR,
     beam: [1.0, 1.0, 1.0],
     sky: [0.0, 0.0, 0.0],
-    wrap_floor: DEFAULT_AMBIENT,
 };
 
 /// Everything the raymarch reads that is not a texture.
@@ -289,7 +292,7 @@ impl VolumeUniform {
             vertical_exaggeration: 1.0,
             grid_dims,
             light_dir: HEADLIGHT.direction,
-            ambient: HEADLIGHT.wrap_floor,
+            ambient: DEFAULT_AMBIENT,
             extinction_per_km: DEFAULT_EXTINCTION_PER_KM,
             empty_index_threshold: DEFAULT_EMPTY_INDEX_THRESHOLD,
             early_out_transmittance: DEFAULT_EARLY_OUT_TRANSMITTANCE,
@@ -321,19 +324,29 @@ impl VolumeUniform {
         }
     }
 
-    /// **The one blessed way to light a frame.**
+    /// **The spelling production uses to light a frame**: direction, beam and
+    /// sky in one call.
     ///
-    /// Direction, beam, sky and the wrap floor land together or not at all.
-    /// The four are independent public lanes, so a caller that set three of
-    /// them could aim the ground at the sun and leave the volume under the
-    /// studio light — the exact "two composited pictures" this unit exists to
-    /// make unwritable. Pinned by
-    /// `neither_surface_can_be_lit_by_a_light_the_other_does_not_have`.
+    /// Not a capability boundary, and an earlier draft of this comment claimed
+    /// it was. The three lanes are `pub` fields on a `pub` struct because the
+    /// byte-layout fixtures drive them with deliberately incoherent values, so
+    /// `uniform.sun_beam = [..]` compiles and always will. What actually makes
+    /// a second light unwritable is on the other side of the seam: the shader
+    /// reads all three through **one** function each, and
+    /// `neither_surface_can_be_lit_by_a_light_the_other_does_not_have` pins
+    /// that as source text.
+    ///
+    /// [`Self::ambient`] is deliberately **not** here. It is the march's own
+    /// wrap floor — a property of how this renderer draws a participating
+    /// medium — and it is the same number under every light, so carrying it in
+    /// [`SurfaceLight`] made this method's fourth assignment a no-op at every
+    /// production call site and a live hazard at the one fixture that sets
+    /// `ambient` itself: `volume_occluder.rs` sets it to 1 for a reason and
+    /// had it written back two lines later.
     pub fn set_light(&mut self, light: SurfaceLight) {
         self.light_dir = light.direction;
         self.sun_beam = light.beam;
         self.sky_ambient = light.sky;
-        self.ambient = light.wrap_floor;
     }
 
     /// The light this uniform carries, read back as the unit it was set as.
@@ -342,7 +355,6 @@ impl VolumeUniform {
             direction: self.light_dir,
             beam: self.sun_beam,
             sky: self.sky_ambient,
-            wrap_floor: self.ambient,
         }
     }
 
@@ -443,7 +455,7 @@ impl VolumeUniform {
                 <= 1e-3 * self.occluder_t_scale
     }
 
-    /// The 320 bytes the GPU reads, little-endian.
+    /// The 352 bytes the GPU reads, little-endian.
     pub fn to_bytes(&self) -> [u8; VOLUME_UNIFORM_BYTES] {
         let mut out = [0u8; VOLUME_UNIFORM_BYTES];
 

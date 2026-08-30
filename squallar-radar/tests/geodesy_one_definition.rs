@@ -105,6 +105,19 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          `the_shaders_km_per_degree_is_the_radar_crates_own` compares it to \
          `KM_PER_DEGREE_LAT` on f32 bits, so it cannot drift.",
     ),
+    (
+        "squallar-gpu/tests/volume_light/pre_c2_volume.wgsl",
+        "const KM_PER_DEGREE_LAT: f32 = 111.194927;",
+        "The same line, in a FROZEN COPY of the shader as it stood at \
+         `7f16b547` — the commit before C2 — which `volume_light.rs` renders \
+         against so that \"the readable light draws the picture this renderer \
+         always drew\" is measured against the picture it actually drew rather \
+         than against a reference manufactured out of the shader under test. \
+         It is a historical artifact and is byte-exact out of git: editing it \
+         to satisfy a scanner would destroy the only thing it is for. It is \
+         also inert — nothing but that one criterion compiles it, and the \
+         entry above is what keeps the live spelling honest.",
+    ),
 ];
 
 /// Blank out comments and string/char literals, preserving byte offsets and
