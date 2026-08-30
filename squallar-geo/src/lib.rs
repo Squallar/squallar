@@ -3,6 +3,11 @@
 //!
 //! [`EARTH_RADIUS_KM`] and the [`KM_PER_DEGREE_LAT`] derived from it are the
 //! only sphere anything above may convert degrees to ground kilometres on.
+//!
+//! [`min_elevation`] is the one piece of *data* here rather than arithmetic: a
+//! global 1°×1° minimum-elevation grid. It sits at this level because the crate
+//! that emits it stands above the crate that reads it, and its module docs give
+//! the cycle in full.
 
 /// Where the sun is over a point on the ground, and what colour its light is.
 ///
@@ -14,6 +19,8 @@
 pub mod solar;
 
 use std::f64::consts::PI;
+
+pub mod min_elevation;
 
 /// Mean radius of Earth in kilometers — the IUGG mean radius, and the one
 /// sphere every *horizontal* measurement in this workspace stands on.
