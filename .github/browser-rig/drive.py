@@ -2788,13 +2788,18 @@ def run_smoke(args):
                    d["mean"]))
     adapter = result.get("adapter") or classify_adapter(env)
     alabel = adapter_label(adapter)
-    # The arm and the adapter lead every summary, and are repeated on each
-    # line that carries a cap or a frame time. A figure whose adapter is
-    # unknown is worse than no figure: it gets quoted.
+    # The arm, the adapter AND crossOriginIsolated lead every summary, and
+    # are repeated on each line that carries a cap or a frame time. A figure
+    # whose adapter is unknown is worse than no figure: it gets quoted. COI
+    # is a DENOMINATOR, not a detail: without it there is no SAB, the worker
+    # pool is the one-thread fallback, and every frame figure describes a
+    # threading configuration the app never ships in -- run_measure.sh
+    # treats coi!=true as an INVALID row.
     binfo = result.get("binary") or {}
-    print("[%s] SUMMARY arm=%s adapter=%s (%s) via %s"
+    print("[%s] SUMMARY arm=%s adapter=%s (%s) via %s coi=%s"
           % (tag, result.get("arm"), alabel, adapter.get("vendor"),
-             binfo.get("gpu_mode") or binfo.get("ff_mode") or "?"))
+             binfo.get("gpu_mode") or binfo.get("ff_mode") or "?",
+             env.get("cross_origin_isolated")))
     hd = binfo.get("host_display") or {}
     if hd:
         print("[%s] SUMMARY display=%s (%s) xauthority=%s"
