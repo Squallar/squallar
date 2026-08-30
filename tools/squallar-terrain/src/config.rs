@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use crate::Res;
+use crate::grid::LonLatBox;
+use crate::md5;
 use crate::tiles::Pin;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,21 @@ pub fn lossy_terrain_rgb_error(fmt: &str) -> Box<dyn std::error::Error + Send + 
     .into()
 }
 
+/// Why a bounding box is refused, as an error.
+///
+/// `RASTER_BBOX` exists because the only regional lever before it was
+/// `ONLY_SUPERCELL`, a SUBSTRING match on a super-cell name. A region is a
+/// two-dimensional block range — CONUS at z11 with `SUPERCELL=64` is columns
+/// 5-10 by rows 10-13 — and no substring of `sc_z11_000320_000640` expresses
+/// that. Silently building the globe is what the old lever did when asked for a
+/// region, so a box this function rejects must not be silently ignored either.
+pub fn bbox_error(raw: &str, why: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "RASTER_BBOX={raw}: {why}. Spell it west,south,east,north in degrees,          e.g. RASTER_BBOX=-125,24,-66,50 for CONUS."
+    )
+    .into()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Encoding {
     /// 1-band grey, `gdaldem hillshade`. The default.
@@ -128,6 +145,10 @@ pub struct Config {
     /// Tiles per side of a raster super-cell. 64 -> 16384x16384 px -> 1.07 GB
     /// as Float32, and identically so everywhere on the globe.
     pub supercell: u32,
+    /// The region to build, `west,south,east,north` in degrees. `None` is the
+    /// globe. A super-cell survives if its tile extent INTERSECTS this box, so
+    /// the built region is the box rounded outward to whole super-cells.
+    pub raster_bbox: Option<LonLatBox>,
     /// Substring filters, for re-running one region after a failure.
     pub only_chunk: Option<String>,
     pub only_supercell: Option<String>,
@@ -160,6 +181,12 @@ impl Config {
                 );
             }
         };
+        // Parsed above the literal, like `encoding`, so the failure carries
+        // bbox_error's sentence rather than env_parse's flattened one.
+        let raster_bbox = match env("RASTER_BBOX") {
+            None => None,
+            Some(raw) => Some(raw.parse::<LonLatBox>().map_err(|e| bbox_error(&raw, &e))?),
+        };
         let cfg = Self {
             bucket: env("DEM_BUCKET").unwrap_or_else(|| DEM_BUCKET_DEFAULT.into()),
             work,
@@ -180,6 +207,7 @@ impl Config {
             raster_global_maxzoom: env_parse("RASTER_GLOBAL_MAXZOOM", 8u8)?,
             chunk_deg: env_parse("CHUNK_DEG", 5i32)?,
             supercell: env_parse("SUPERCELL", 64u32)?,
+            raster_bbox,
             only_chunk: env("ONLY_CHUNK"),
             only_supercell: env("ONLY_SUPERCELL"),
         };
@@ -205,7 +233,65 @@ impl Config {
         if self.encoding == Encoding::TerrainRgb && self.tile_format != "PNG" {
             return Err(lossy_terrain_rgb_error(&self.tile_format));
         }
+        if let Some(b) = self.raster_bbox {
+            verify_bbox(b)?;
+        }
         Ok(())
+    }
+
+    /// Everything about a run that changes WHICH TILES its super-cells produce.
+    ///
+    /// Deliberately NOT the zoom range. `raster-acc/z{z}.mbtiles` and the
+    /// `sc_z{z}_…` `.done` markers already carry the zoom, so two runs that
+    /// differ only in zoom range compose correctly and SHOULD share
+    /// intermediates — that sharing is the resume feature. Everything listed
+    /// here does not compose: a `.done` marker dropped by a hillshade run means
+    /// nothing to a terrain-RGB run, and before this existed it silently meant
+    /// "already built".
+    pub fn raster_scope(&self) -> String {
+        format!(
+            "enc={} fmt={} gmax={} side={} bbox={} only={}",
+            self.encoding.as_str(),
+            self.tile_format,
+            self.raster_global_maxzoom,
+            self.supercell,
+            self.raster_bbox
+                .map_or_else(|| "global".to_string(), |b| b.to_string()),
+            self.only_supercell.as_deref().unwrap_or("-"),
+        )
+    }
+
+    /// [`Self::raster_scope`] as a short, filesystem-safe directory suffix.
+    ///
+    /// The encoding rides in front unhashed because these directories hold
+    /// hundreds of gigabytes and an operator reading `df` deserves to know which
+    /// build they belong to.
+    pub fn raster_scope_tag(&self) -> String {
+        let scope = self.raster_scope();
+        format!(
+            "{}-{}",
+            self.encoding.as_str(),
+            &md5::hex(scope.as_bytes())[..8]
+        )
+    }
+
+    /// The full identity of the OUTPUT ARCHIVE, which does include the zoom
+    /// range: two runs that differ only in zoom range share intermediates but
+    /// produce different archives, and aim at the same filename.
+    pub fn raster_archive_scope(&self) -> String {
+        format!(
+            "{} z{}-z{}",
+            self.raster_scope(),
+            self.raster_minzoom,
+            self.raster_maxzoom
+        )
+    }
+
+    /// Where [`Self::raster_archive_scope`] is recorded beside the archive.
+    pub fn raster_scope_stamp(&self) -> PathBuf {
+        let mut p = self.raster_pmtiles().into_os_string();
+        p.push(".scope");
+        PathBuf::from(p)
     }
 
     pub fn contours_pmtiles(&self) -> PathBuf {
@@ -232,6 +318,36 @@ impl Config {
     pub fn tile_vsis3(&self, name: &str) -> String {
         format!("/vsis3/{}/{name}/{name}.tif", self.bucket)
     }
+}
+
+/// Reject a bounding box that is inverted, off the globe, or degenerate.
+///
+/// Inversion is the one that matters: `-66,50,-125,24` is CONUS with the pairs
+/// swapped, and it names a box that no super-cell intersects. Left to run it
+/// builds NOTHING and exits 0 on an empty archive.
+pub fn verify_bbox(b: LonLatBox) -> Res<()> {
+    let raw = b.to_string();
+    if !(-180.0..=180.0).contains(&b.w) || !(-180.0..=180.0).contains(&b.e) {
+        return Err(bbox_error(&raw, "longitudes must lie in -180..=180"));
+    }
+    if !(-90.0..=90.0).contains(&b.s) || !(-90.0..=90.0).contains(&b.n) {
+        return Err(bbox_error(&raw, "latitudes must lie in -90..=90"));
+    }
+    if b.w >= b.e {
+        return Err(bbox_error(
+            &raw,
+            "west is not west of east — the box is INVERTED or empty, and an \
+             inverted box intersects no super-cell at all",
+        ));
+    }
+    if b.s >= b.n {
+        return Err(bbox_error(
+            &raw,
+            "south is not south of north — the box is INVERTED or empty, and an \
+             inverted box intersects no super-cell at all",
+        ));
+    }
+    Ok(())
 }
 
 /// Reject a schedule whose intervals are not harmonic.
@@ -328,6 +444,267 @@ mod tests {
         ];
         let err = verify_schedule(&bad).unwrap_err().to_string();
         assert!(err.contains("NON-HARMONIC"), "{err}");
+    }
+
+    /// A `Config` that touches no environment. `from_env` reads process-global
+    /// state, and two of these tests would race on it.
+    fn base() -> Config {
+        Config {
+            bucket: DEM_BUCKET_DEFAULT.into(),
+            work: PathBuf::from("/w"),
+            out: PathBuf::from("/w/out"),
+            tmp: PathBuf::from("/w/tmp"),
+            jobs: 8,
+            encoding: Encoding::Hillshade,
+            raster_minzoom: 0,
+            raster_maxzoom: 12,
+            tile_format: "WEBP".into(),
+            raster_global_maxzoom: 8,
+            chunk_deg: 5,
+            supercell: 64,
+            raster_bbox: None,
+            only_chunk: None,
+            only_supercell: None,
+        }
+    }
+
+    const CONUS: LonLatBox = LonLatBox {
+        w: -125.0,
+        s: 24.0,
+        e: -66.0,
+        n: 50.0,
+    };
+
+    /// The published object name, pinned. `squallar-egui/src/tiles.rs`,
+    /// `squallar-web/sw.js`, `squallar-web/tests/sw_routing.test.mjs` and
+    /// `squallar-egui/src/basemap_archive/block_cache/tests.rs` all carry this
+    /// string literally. The zoom range and the region deliberately do NOT
+    /// appear in it; `raster::guard_output_scope` is what keeps two scopes from
+    /// sharing it silently.
+    #[test]
+    fn the_archive_filename_is_keyed_on_the_encoding_alone() {
+        assert_eq!(
+            base().raster_pmtiles(),
+            PathBuf::from("/w/out/squallar-terrain-hillshade.pmtiles")
+        );
+        let rgb = Config {
+            encoding: Encoding::TerrainRgb,
+            tile_format: "PNG".into(),
+            raster_minzoom: 11,
+            raster_maxzoom: 12,
+            raster_bbox: Some(CONUS),
+            ..base()
+        };
+        assert_eq!(
+            rgb.raster_pmtiles(),
+            PathBuf::from("/w/out/squallar-terrain-terrain-rgb.pmtiles")
+        );
+        assert_eq!(
+            rgb.raster_scope_stamp(),
+            PathBuf::from("/w/out/squallar-terrain-terrain-rgb.pmtiles.scope")
+        );
+    }
+
+    /// RESUME MUST STILL WORK WITHIN A SCOPE. `raster-acc/z{z}.mbtiles` and the
+    /// `sc_z{z}_...` markers already carry the zoom, so a run that stops at z11
+    /// and a run that continues from z11 have to land in the same directories
+    /// or the whole resume feature is gone.
+    #[test]
+    fn the_intermediate_scope_ignores_the_zoom_range() {
+        let a = Config {
+            raster_minzoom: 0,
+            raster_maxzoom: 11,
+            ..base()
+        };
+        let b = Config {
+            raster_minzoom: 11,
+            raster_maxzoom: 12,
+            ..base()
+        };
+        assert_eq!(a.raster_scope_tag(), b.raster_scope_tag());
+        assert_eq!(a.raster_scope(), b.raster_scope());
+    }
+
+    /// ...but the ARCHIVE those two runs write is not the same archive, so the
+    /// stamp beside it must tell them apart. Without this the guard would wave
+    /// a z11-z12 build straight over a z0-z11 one.
+    #[test]
+    fn the_archive_scope_does_not_ignore_the_zoom_range() {
+        let a = Config {
+            raster_minzoom: 0,
+            raster_maxzoom: 11,
+            ..base()
+        };
+        let b = Config {
+            raster_minzoom: 11,
+            raster_maxzoom: 12,
+            ..base()
+        };
+        assert_ne!(a.raster_archive_scope(), b.raster_archive_scope());
+        assert!(a.raster_archive_scope().ends_with("z0-z11"));
+    }
+
+    /// Every knob that makes a `.done` marker from another run a LIE.
+    ///
+    /// The encoding row is the one that was live: a default hillshade
+    /// `build raster` followed by `RASTER_ENCODING=terrain-rgb` under the same
+    /// WORK found every marker already present, built nothing, and shipped the
+    /// hillshade tiles labelled terrain-RGB.
+    #[test]
+    fn the_intermediate_scope_separates_every_knob_that_changes_the_tiles() {
+        let b = base();
+        for (what, other) in [
+            (
+                "encoding",
+                Config {
+                    encoding: Encoding::TerrainRgb,
+                    tile_format: "PNG".into(),
+                    ..base()
+                },
+            ),
+            (
+                "tile format",
+                Config {
+                    tile_format: "PNG".into(),
+                    ..base()
+                },
+            ),
+            (
+                "global maxzoom",
+                Config {
+                    raster_global_maxzoom: 9,
+                    ..base()
+                },
+            ),
+            (
+                "super-cell side",
+                Config {
+                    supercell: 32,
+                    ..base()
+                },
+            ),
+            (
+                "bbox",
+                Config {
+                    raster_bbox: Some(CONUS),
+                    ..base()
+                },
+            ),
+            (
+                "only_supercell",
+                Config {
+                    only_supercell: Some("sc_z11_000320".into()),
+                    ..base()
+                },
+            ),
+        ] {
+            assert_ne!(
+                b.raster_scope_tag(),
+                other.raster_scope_tag(),
+                "{what} must not share intermediates"
+            );
+            assert_ne!(b.raster_scope(), other.raster_scope(), "{what}");
+        }
+    }
+
+    /// The tag goes in a directory name, so it has to be spellable as one.
+    #[test]
+    fn the_scope_tag_is_filesystem_safe() {
+        let tag = Config {
+            encoding: Encoding::TerrainRgb,
+            tile_format: "PNG".into(),
+            raster_bbox: Some(CONUS),
+            ..base()
+        }
+        .raster_scope_tag();
+        assert!(
+            tag.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "{tag}"
+        );
+        assert!(tag.starts_with("terrain-rgb-"), "{tag}");
+    }
+
+    /// Four comma-separated degrees, and nothing else. The shapes here are the
+    /// ones a human types: three fields, GDAL's `-te` spacing, a bare word.
+    #[test]
+    fn a_malformed_bbox_is_refused() {
+        for bad in [
+            "",
+            "-125,24,-66",
+            "-125,24,-66,50,0",
+            "-125 24 -66 50",
+            "-125,24,-66,north",
+            "conus",
+            "-125,24,-66,NaN",
+        ] {
+            assert!(
+                bad.parse::<LonLatBox>().is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let b: LonLatBox = " -125 , 24 , -66 , 50 ".parse().unwrap();
+        assert_eq!(b, CONUS);
+        assert_eq!(b.to_string(), "-125,24,-66,50");
+    }
+
+    /// The guard has to reject, or it is not a guard. An inverted box is the
+    /// dangerous one: it parses, it reads as four plausible numbers, and it
+    /// intersects no super-cell anywhere -- a build that produces nothing.
+    #[test]
+    fn an_inverted_or_off_globe_bbox_is_refused() {
+        verify_bbox(CONUS).unwrap();
+        for (bad, want) in [
+            (
+                LonLatBox {
+                    w: -66.0,
+                    s: 24.0,
+                    e: -125.0,
+                    n: 50.0,
+                },
+                "INVERTED",
+            ),
+            (
+                LonLatBox {
+                    w: -125.0,
+                    s: 50.0,
+                    e: -66.0,
+                    n: 24.0,
+                },
+                "INVERTED",
+            ),
+            (
+                LonLatBox {
+                    w: -125.0,
+                    s: 24.0,
+                    e: -125.0,
+                    n: 50.0,
+                },
+                "INVERTED",
+            ),
+            (
+                LonLatBox {
+                    w: -125.0,
+                    s: 24.0,
+                    e: -66.0,
+                    n: 95.0,
+                },
+                "-90..=90",
+            ),
+            (
+                LonLatBox {
+                    w: -195.0,
+                    s: 24.0,
+                    e: -66.0,
+                    n: 50.0,
+                },
+                "-180..=180",
+            ),
+        ] {
+            let err = verify_bbox(bad).unwrap_err().to_string();
+            assert!(err.contains(want), "{bad:?}: {err}");
+            assert!(err.contains("west,south,east,north"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

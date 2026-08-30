@@ -23,8 +23,11 @@ Grid arithmetic, for inspection:
 `chunks` and `supercells` read tileList.txt on stdin.
 
 Environment: WORK OUT TMP JOBS DEM_BUCKET RASTER_ENCODING RASTER_MINZOOM
-RASTER_MAXZOOM RASTER_TILE_FORMAT RASTER_GLOBAL_MAXZOOM CHUNK_DEG SUPERCELL
-ONLY_CHUNK ONLY_SUPERCELL
+RASTER_MAXZOOM RASTER_TILE_FORMAT RASTER_GLOBAL_MAXZOOM RASTER_BBOX CHUNK_DEG
+SUPERCELL ONLY_CHUNK ONLY_SUPERCELL
+
+RASTER_BBOX=west,south,east,north in degrees clips the raster pass to a region,
+rounded outward to whole super-cells. RASTER_BBOX=-125,24,-66,50 is CONUS.
 ";
 
 fn main() -> ExitCode {

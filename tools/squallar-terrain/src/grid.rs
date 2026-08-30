@@ -62,6 +62,86 @@ pub struct TileRange {
     pub ty1: u32,
 }
 
+impl TileRange {
+    /// Whether two ranges share at least one tile.
+    ///
+    /// Both are INCLUSIVE on all four edges — `tx1`/`ty1` are tiles that belong
+    /// to the range, not one-past-the-end — so the comparisons are `<=`. Using
+    /// `<` here would drop the super-cells along a region's south and east
+    /// borders, which is the half of a clip nobody looks at.
+    pub fn intersects(self, other: Self) -> bool {
+        self.tx0 <= other.tx1
+            && other.tx0 <= self.tx1
+            && self.ty0 <= other.ty1
+            && other.ty0 <= self.ty1
+    }
+}
+
+/// A lon/lat rectangle in degrees, as `RASTER_BBOX=west,south,east,north`.
+///
+/// Distinct from [`Bbox`], which is a whole-degree box DERIVED from a tile range
+/// and carries the centre latitude `gdaldem` needs. This one is an input: the
+/// region an operator asked for, in the order every GDAL `-te`-adjacent tool
+/// spells it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LonLatBox {
+    pub w: f64,
+    pub s: f64,
+    pub e: f64,
+    pub n: f64,
+}
+
+impl LonLatBox {
+    /// The inclusive tile range this box covers at `zoom`.
+    ///
+    /// [`tile_range`] unchanged, so a clip and a warp read the same arithmetic.
+    /// That carries `tile_range`'s edge rule with it: a box edge landing exactly
+    /// on a tile boundary does not claim the tile that STARTS there. Regional
+    /// bounding boxes are quoted in whole or tenth degrees and never land on a
+    /// Mercator tile boundary, so this is a documented property rather than a
+    /// live hazard — and a second spelling of the projection would be worse.
+    pub fn tile_range(self, zoom: u8) -> TileRange {
+        tile_range(zoom, self.w, self.s, self.e, self.n)
+    }
+}
+
+impl std::fmt::Display for LonLatBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{},{},{},{}", self.w, self.s, self.e, self.n)
+    }
+}
+
+impl std::str::FromStr for LonLatBox {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+        let [w, s_, e, n] = parts.as_slice() else {
+            return Err(format!(
+                "expected four comma-separated degrees west,south,east,north; got {} field(s)",
+                parts.len()
+            ));
+        };
+        let mut v = [0.0f64; 4];
+        for (slot, (field, label)) in
+            v.iter_mut()
+                .zip([(w, "west"), (s_, "south"), (e, "east"), (n, "north")])
+        {
+            *slot = field
+                .parse::<f64>()
+                .ok()
+                .filter(|d| d.is_finite())
+                .ok_or_else(|| format!("{label}={field:?} is not a finite number of degrees"))?;
+        }
+        Ok(Self {
+            w: v[0],
+            s: v[1],
+            e: v[2],
+            n: v[3],
+        })
+    }
+}
+
 /// A rectangle in EPSG:3857 metres, and the pixel grid covering it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Extent {
@@ -187,6 +267,104 @@ impl Bbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `TileRange` is inclusive on all four edges, so two ranges that share
+    /// exactly ONE tile intersect. Every corner is checked: a `<` typo on one
+    /// axis loses one border of every clipped region and nothing else, which is
+    /// invisible until someone pans there.
+    #[test]
+    fn two_ranges_sharing_one_tile_intersect() {
+        let want = TileRange {
+            tx0: 312,
+            ty0: 694,
+            tx1: 648,
+            ty1: 883,
+        };
+        for (label, r) in [
+            (
+                "south-east corner tile",
+                TileRange {
+                    tx0: 648,
+                    ty0: 883,
+                    tx1: 711,
+                    ty1: 946,
+                },
+            ),
+            (
+                "north-west corner tile",
+                TileRange {
+                    tx0: 249,
+                    ty0: 631,
+                    tx1: 312,
+                    ty1: 694,
+                },
+            ),
+            (
+                "one tile, dead centre",
+                TileRange {
+                    tx0: 400,
+                    ty0: 800,
+                    tx1: 400,
+                    ty1: 800,
+                },
+            ),
+        ] {
+            assert!(r.intersects(want), "{label}");
+            assert!(want.intersects(r), "{label}, the other way round");
+        }
+    }
+
+    /// One tile past each edge is a miss, or the clip is not a clip.
+    #[test]
+    fn a_range_one_tile_outside_does_not_intersect() {
+        let want = TileRange {
+            tx0: 312,
+            ty0: 694,
+            tx1: 648,
+            ty1: 883,
+        };
+        for (label, r) in [
+            (
+                "east",
+                TileRange {
+                    tx0: 649,
+                    ty0: 694,
+                    tx1: 712,
+                    ty1: 883,
+                },
+            ),
+            (
+                "west",
+                TileRange {
+                    tx0: 248,
+                    ty0: 694,
+                    tx1: 311,
+                    ty1: 883,
+                },
+            ),
+            (
+                "south",
+                TileRange {
+                    tx0: 312,
+                    ty0: 884,
+                    tx1: 648,
+                    ty1: 947,
+                },
+            ),
+            (
+                "north",
+                TileRange {
+                    tx0: 312,
+                    ty0: 630,
+                    tx1: 648,
+                    ty1: 693,
+                },
+            ),
+        ] {
+            assert!(!r.intersects(want), "{label}");
+            assert!(!want.intersects(r), "{label}, the other way round");
+        }
+    }
     // Only the tests pin the Mercator limit; the module itself works in tile
     // coordinates and never names it.
     use squallar_geo::MERCATOR_LAT_LIMIT_DEG;

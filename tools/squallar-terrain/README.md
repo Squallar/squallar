@@ -573,13 +573,76 @@ RASTER_ENCODING=terrain-rgb squallar-terrain build raster
 Knobs (all environment, all listed by `squallar-terrain --help`):
 `WORK` `OUT` `TMP` `JOBS` `DEM_BUCKET` `CHUNK_DEG` `SUPERCELL`
 `RASTER_ENCODING` `RASTER_MINZOOM` `RASTER_MAXZOOM` `RASTER_GLOBAL_MAXZOOM`
-`RASTER_TILE_FORMAT`. `ONLY_CHUNK` and `ONLY_SUPERCELL` are substring filters on
-the cell name, for smoke-testing one region or re-running one that failed.
+`RASTER_TILE_FORMAT` `RASTER_BBOX`. `ONLY_CHUNK` and `ONLY_SUPERCELL` are
+substring filters on the cell name, for smoke-testing one region or re-running
+one that failed.
+
+### Building a region
+
+`RASTER_BBOX=west,south,east,north` in degrees clips the raster pass.
+`RASTER_BBOX=-125,24,-66,50` is CONUS.
+
+**`ONLY_SUPERCELL` cannot do this and never could.** It is
+`name.contains(filter)` against a name like `sc_z11_000320_000640`, and a region
+is a two-dimensional block range — CONUS at z11 with `SUPERCELL=64` is block
+columns 5–10 by rows 10–13, whose names agree on neither field. No substring
+selects them, so asking for a region with `ONLY_SUPERCELL` and no box either
+misses most of it or builds the globe — the land subset of a 32×32 z11 block
+grid rather than a 7×4 corner of it.
+`tiles::tests::no_substring_filter_can_express_the_conus_block_range` proves the
+substring claim exhaustively rather than by assertion.
+
+The clip is per super-cell, not per tile — a block that overlaps the box at all
+is built whole, so the region produced is the box rounded outward to super-cell
+boundaries. A box that is inverted, degenerate or off the globe is refused by
+`verify()`, and a box that contains no land at all is refused by the raster pass
+before it warps anything, because a region with nothing in it is a typo and not
+a build. `ONLY_SUPERCELL` is deliberately **not** held to that second rule: it
+names one zoom by construction, so selecting nothing at the other zooms of a
+range is what a one-cell smoke test looks like.
+
+`RASTER_BBOX` does **not** shrink the global mercator mosaic. That is built
+whole whenever `RASTER_MINZOOM <= RASTER_GLOBAL_MAXZOOM`. A regional run above
+the global zoom skips the mosaic entirely, which is the case that matters.
+
+### Scope, resume, and not destroying the last run
 
 Both passes **resume**: a chunk whose output archive already exists is skipped,
 and a super-cell drops a `.done` marker. Killing and restarting is safe. A pass
 that lost chunks reports how many and exits non-zero rather than joining a
 partial archive and exiting 0.
+
+A `.done` marker names a super-cell and a zoom (`sc_z11_000320_000640`) and
+**nothing else**, so resume is only sound between runs that would produce the
+same tiles for that cell. The raster pass therefore keys its intermediates —
+`raster-acc-<tag>/`, `raster-stage-<tag>/`, `raster-all-<tag>.mbtiles` — on a
+**scope**: encoding, tile format, `RASTER_GLOBAL_MAXZOOM`, `SUPERCELL`,
+`RASTER_BBOX` and `ONLY_SUPERCELL`. Runs differing in any of those cannot see
+each other's markers.
+
+The zoom range is deliberately **not** in that scope. `raster-acc/z{z}.mbtiles`
+and the marker names already carry the zoom, so a run that stops at z11 and a
+run that continues from z11 share intermediates on purpose — that sharing is the
+resume feature, and `config::tests::the_intermediate_scope_ignores_the_zoom_range`
+pins it.
+
+The archive filename is keyed on the **encoding alone**, because
+`squallar-terrain-hillshade.pmtiles` is the published object name and is pinned
+by `squallar-egui/src/tiles.rs`, `squallar-web/sw.js` and two test files in the
+app workspace. Two differently scoped runs therefore aim at one path, so a
+scope stamp is written beside the archive (`<archive>.pmtiles.scope`) and a run whose
+scope does not match it **refuses to start** rather than deleting hours of work
+in `remove_file`. Point `OUT` at a separate directory per scope:
+
+```sh
+WORK=/mnt/terrain-work OUT=/mnt/terrain-work/out-global \
+RASTER_ENCODING=terrain-rgb RASTER_MINZOOM=0 RASTER_MAXZOOM=11 \
+  squallar-terrain build raster
+WORK=/mnt/terrain-work OUT=/mnt/terrain-work/out-conus \
+RASTER_ENCODING=terrain-rgb RASTER_MINZOOM=11 RASTER_MAXZOOM=12 \
+RASTER_BBOX=-125,24,-66,50 \
+  squallar-terrain build raster
+```
 
 The grid arithmetic is inspectable without running a build:
 

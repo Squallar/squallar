@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use crate::config::{ATTRIBUTION, Config, Encoding, TILELIST};
 use crate::grid::{Extent, frac_tile_x, frac_tile_y, tile_bbox, tile_extent};
 use crate::run::{capture, cmd, need, parallel, run};
-use crate::tiles::{Cell, SuperCell, TileList, supercells, tile_name};
+use crate::tiles::{Cell, SuperCell, TileList, clip_to_bbox, supercells, tile_name};
 use crate::{Res, log, mbtiles, pmtiles, trgb};
 
 pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
@@ -45,11 +45,26 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
         "pmtiles",
     ])?;
 
-    let stage = cfg.tmp.join("raster-stage");
-    let acc = cfg.work.join("raster-acc");
+    let out = cfg.raster_pmtiles();
+    let stamp = cfg.raster_scope_stamp();
+    let archive_scope = cfg.raster_archive_scope();
+    guard_output_scope(&out, &stamp, &archive_scope)?;
+
+    // Namespaced by SCOPE, not shared. A `.done` marker names a super-cell and
+    // a zoom (`sc_z11_000320_000640`) and nothing else, so a hillshade run and
+    // a terrain-RGB run under one WORK used to read each other's markers as
+    // their own: the second run skipped every cell, merged the first run's
+    // tiles, and stamped them with its own encoding in the metadata. The
+    // archive that comes out of that is well-formed, plausibly sized, exits 0,
+    // and is the wrong pixels under the right name.
+    let tag = cfg.raster_scope_tag();
+    let stage = cfg.tmp.join(format!("raster-stage-{tag}"));
+    let acc = cfg.work.join(format!("raster-acc-{tag}"));
     std::fs::create_dir_all(&cfg.out)?;
     std::fs::create_dir_all(&stage)?;
     std::fs::create_dir_all(&acc)?;
+    log!("scope {archive_scope}");
+    log!("  intermediates {} + {}", acc.display(), stage.display());
 
     let global = cfg
         .work
@@ -97,10 +112,7 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
             "z{z}: enumerating {0}x{0}-tile super-cells over land",
             cfg.supercell
         );
-        let mut cells = supercells(list, z, cfg.supercell);
-        if let Some(f) = &cfg.only_supercell {
-            cells.retain(|c| c.name.contains(f.as_str()));
-        }
+        let cells = select_supercells(cfg, list, z)?;
         log!("z{z}: {} super-cells, {sc_jobs} jobs", cells.len());
 
         let target = acc.join(format!("z{z}.mbtiles"));
@@ -124,7 +136,7 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
     }
 
     log!("merging per-zoom archives");
-    let combined = cfg.work.join("raster-all.mbtiles");
+    let combined = cfg.work.join(format!("raster-all-{tag}.mbtiles"));
     let _ = std::fs::remove_file(&combined);
     for z in cfg.raster_minzoom..=cfg.raster_maxzoom {
         let f = acc.join(format!("z{z}.mbtiles"));
@@ -161,7 +173,6 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
         "converting to PMTiles v3 ({} tiles)",
         mbtiles::tile_count(&combined)?
     );
-    let out = cfg.raster_pmtiles();
     let _ = std::fs::remove_file(&out);
     // `--tmpdir` explicitly: go-pmtiles deduplicates through a temp file, and
     // without this it lands in /tmp -- the AL2023 ROOT EBS VOLUME -- while
@@ -178,12 +189,79 @@ pub fn build(cfg: &Config, list: &TileList) -> Res<()> {
         ],
     ))?;
     pmtiles::assert_archive(&out)?;
+    std::fs::write(&stamp, format!("{archive_scope}\n"))?;
     log!(
         "raster: {} ({} bytes)",
         out.display(),
         std::fs::metadata(&out)?.len()
     );
     Ok(())
+}
+
+/// The land super-cells this run builds at `z`: enumerated, clipped to
+/// `RASTER_BBOX`, then filtered by `ONLY_SUPERCELL`.
+///
+/// The two levers are not interchangeable and are not held to the same
+/// standard. A BOX is zoom-independent in intent, so a box that selects nothing
+/// selects nothing at every zoom, and is a typo. `raster::build` would
+/// eventually catch that on "no raster tiles were produced at any zoom" — but
+/// only after warping an 8.6 GB global mosaic first, and without naming the box.
+///
+/// `ONLY_SUPERCELL` names ONE zoom by construction (`sc_z12_…`), so selecting
+/// nothing at the other zooms of a range is exactly what a one-cell smoke test
+/// looks like, and refusing it would break the workflow the filter exists for.
+fn select_supercells(cfg: &Config, list: &TileList, z: u8) -> Res<Vec<SuperCell>> {
+    let mut cells = supercells(list, z, cfg.supercell);
+    if let Some(b) = cfg.raster_bbox {
+        let enumerated = cells.len();
+        clip_to_bbox(&mut cells, z, b);
+        if cells.is_empty() && enumerated > 0 {
+            return Err(format!(
+                "z{z}: RASTER_BBOX={b} selected 0 of {enumerated} land super-cells. \
+                 A region that contains no land is a typo, not a build."
+            )
+            .into());
+        }
+    }
+    if let Some(f) = &cfg.only_supercell {
+        cells.retain(|c| c.name.contains(f.as_str()));
+    }
+    Ok(cells)
+}
+
+/// Refuse to delete an archive that a DIFFERENTLY SCOPED run produced.
+///
+/// [`Config::raster_pmtiles`] is keyed on the ENCODING alone, and stays that
+/// way on purpose: `squallar-terrain-hillshade.pmtiles` is the published object
+/// name and is pinned by `squallar-egui/src/tiles.rs`, `squallar-web/sw.js` and
+/// two test files in the app workspace. Renaming the local output would put the
+/// build and the publish recipe out of step for a bug that costs one directory
+/// to avoid.
+///
+/// So the name stays and the collision gets loud instead. A global z0-z11 run
+/// and a regional z11-z12 run aim at the same path, and the second used to
+/// `remove_file` the first's work and say nothing.
+///
+/// A missing stamp is refused too, not waved through: an archive of unknown
+/// scope is exactly the case this exists to catch, and "it was probably fine"
+/// is how it got destroyed the first time.
+pub fn guard_output_scope(out: &Path, stamp: &Path, scope: &str) -> Res<()> {
+    if !out.exists() {
+        return Ok(());
+    }
+    let previous = std::fs::read_to_string(stamp).ok();
+    match previous.as_deref().map(str::trim) {
+        Some(p) if p == scope => Ok(()),
+        other => Err(format!(
+            "{} already holds an archive from a DIFFERENT run, and this build would \
+             delete it.\n     have: {}\n     want: {scope}\n     \
+             Point OUT at a separate directory for this run, or delete that archive \
+             if it is disposable.",
+            out.display(),
+            other.unwrap_or("(no scope stamp — it predates scope stamping)"),
+        )
+        .into()),
+    }
 }
 
 /// GDAL only grew MBTiles `ELEVATION_TYPE` in 3.13.0, and even there it is only
@@ -953,6 +1031,185 @@ pub fn pack_terrain_rgb(e: &Extent, elev: &Path) -> Res<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope_scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("squallar-terrain-scope-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `out`, `stamp` and a written archive, as a completed run leaves them.
+    fn a_finished_run(dir: &Path, scope: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let out = dir.join("squallar-terrain-terrain-rgb.pmtiles");
+        let stamp = dir.join("squallar-terrain-terrain-rgb.pmtiles.scope");
+        std::fs::write(&out, b"PMTiles\x03").unwrap();
+        std::fs::write(&stamp, format!("{scope}\n")).unwrap();
+        (out, stamp)
+    }
+
+    const GLOBAL_Z0_11: &str = "enc=terrain-rgb fmt=PNG gmax=8 side=64 bbox=global only=- z0-z11";
+    const CONUS_Z11_12: &str =
+        "enc=terrain-rgb fmt=PNG gmax=8 side=64 bbox=-125,24,-66,50 only=- z11-z12";
+
+    fn a_config(bbox: Option<crate::grid::LonLatBox>, only: Option<&str>) -> Config {
+        Config {
+            bucket: String::new(),
+            work: PathBuf::from("/w"),
+            out: PathBuf::from("/w/out"),
+            tmp: PathBuf::from("/w/tmp"),
+            jobs: 8,
+            encoding: Encoding::TerrainRgb,
+            raster_minzoom: 11,
+            raster_maxzoom: 12,
+            tile_format: "PNG".into(),
+            raster_global_maxzoom: 8,
+            chunk_deg: 5,
+            supercell: 64,
+            raster_bbox: bbox,
+            only_chunk: None,
+            only_supercell: only.map(str::to_string),
+        }
+    }
+
+    fn a_list(cells: &[(i32, i32)]) -> TileList {
+        let raw: String = cells
+            .iter()
+            .map(|&(lat, lon)| format!("{}\r\n", tile_name(Cell { lat, lon })))
+            .collect();
+        TileList::parse(raw.as_bytes()).unwrap()
+    }
+
+    const CONUS: crate::grid::LonLatBox = crate::grid::LonLatBox {
+        w: -125.0,
+        s: 24.0,
+        e: -66.0,
+        n: 50.0,
+    };
+
+    /// Both levers survive, and they compose: the box narrows to a region and
+    /// the substring picks one cell out of it.
+    #[test]
+    fn the_bbox_clips_and_only_supercell_still_works_on_top_of_it() {
+        let list = a_list(&[(39, -106), (48, 7), (35, 139)]);
+        let all = select_supercells(&a_config(None, None), &list, 11).unwrap();
+        assert_eq!(all.len(), 4, "{all:?}");
+
+        let clipped = select_supercells(&a_config(Some(CONUS), None), &list, 11).unwrap();
+        let names: Vec<&str> = clipped.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["sc_z11_000384_000768"]);
+
+        let both =
+            select_supercells(&a_config(Some(CONUS), Some("sc_z11_000384")), &list, 11).unwrap();
+        assert_eq!(both.len(), 1);
+        let neither =
+            select_supercells(&a_config(Some(CONUS), Some("sc_z11_001024")), &list, 11).unwrap();
+        assert!(neither.is_empty(), "the substring still filters");
+    }
+
+    /// A box over open water selects nothing at EVERY zoom. Left alone the
+    /// build warps an 8.6 GB global mosaic and only then reports "no raster
+    /// tiles were produced at any zoom", without naming the box.
+    #[test]
+    fn a_bbox_that_contains_no_land_is_refused_by_name() {
+        let list = a_list(&[(39, -106), (48, 7)]);
+        let empty = crate::grid::LonLatBox {
+            w: -140.0,
+            s: -60.0,
+            e: -130.0,
+            n: -50.0,
+        };
+        let err = select_supercells(&a_config(Some(empty), None), &list, 11)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("-140,-60,-130,-50"), "{err}");
+        assert!(err.contains("selected 0 of"), "{err}");
+    }
+
+    /// ONLY_SUPERCELL is NOT held to that standard: it names one zoom by
+    /// construction, so a one-cell smoke test over a zoom RANGE legitimately
+    /// selects nothing at every other zoom in the range.
+    #[test]
+    fn a_one_cell_smoke_test_over_a_zoom_range_is_not_an_error() {
+        let list = a_list(&[(39, -106)]);
+        let cfg = a_config(None, Some("sc_z12_000832_001536"));
+        assert_eq!(select_supercells(&cfg, &list, 12).unwrap().len(), 1);
+        let other = select_supercells(&cfg, &list, 11).unwrap();
+        assert!(other.is_empty(), "{other:?}");
+    }
+
+    /// Nothing there yet is the ordinary case, and it must not be an error.
+    #[test]
+    fn a_first_run_writes_freely() {
+        let d = scope_scratch("first");
+        let out = d.join("squallar-terrain-terrain-rgb.pmtiles");
+        let stamp = d.join("squallar-terrain-terrain-rgb.pmtiles.scope");
+        guard_output_scope(&out, &stamp, GLOBAL_Z0_11).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// THE COLLISION. `raster_pmtiles()` is keyed on the encoding alone, so a
+    /// global z0-z11 run and a CONUS z11-z12 run aim at one path. The second
+    /// used to `remove_file` the first's archive and say nothing.
+    #[test]
+    fn two_differently_scoped_runs_cannot_silently_collide() {
+        let d = scope_scratch("collide");
+        let (out, stamp) = a_finished_run(&d, GLOBAL_Z0_11);
+        let err = guard_output_scope(&out, &stamp, CONUS_Z11_12)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(GLOBAL_Z0_11), "must name what is there: {err}");
+        assert!(err.contains(CONUS_Z11_12), "must name what wants in: {err}");
+        assert!(err.contains("OUT"), "must say how to proceed: {err}");
+        assert!(out.exists(), "the archive must still be there");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The zoom range alone is enough to make it a different archive, even
+    /// though it is deliberately NOT enough to make it different intermediates.
+    #[test]
+    fn a_zoom_range_alone_is_a_different_archive() {
+        let d = scope_scratch("zooms");
+        let (out, stamp) = a_finished_run(&d, GLOBAL_Z0_11);
+        assert!(
+            guard_output_scope(
+                &out,
+                &stamp,
+                "enc=terrain-rgb fmt=PNG gmax=8 side=64 bbox=global only=- z11-z12"
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Rebuilding the SAME scope in place is a rerun, not a collision. Refusing
+    /// it would make every retry an argument with the tool.
+    #[test]
+    fn the_same_scope_may_rebuild_in_place() {
+        let d = scope_scratch("rerun");
+        let (out, stamp) = a_finished_run(&d, GLOBAL_Z0_11);
+        guard_output_scope(&out, &stamp, GLOBAL_Z0_11).unwrap();
+        // The trailing newline the writer adds is not part of the identity.
+        std::fs::write(&stamp, GLOBAL_Z0_11).unwrap();
+        guard_output_scope(&out, &stamp, GLOBAL_Z0_11).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// An archive of UNKNOWN scope is exactly the case the guard exists for.
+    /// Every archive built before scope stamping looks like this, the 50 GB
+    /// hillshade included.
+    #[test]
+    fn an_unstamped_archive_is_refused_rather_than_assumed_ours() {
+        let d = scope_scratch("unstamped");
+        let out = d.join("squallar-terrain-terrain-rgb.pmtiles");
+        let stamp = d.join("squallar-terrain-terrain-rgb.pmtiles.scope");
+        std::fs::write(&out, b"PMTiles\x03").unwrap();
+        let err = guard_output_scope(&out, &stamp, GLOBAL_Z0_11)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no scope stamp"), "{err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     /// A believable latitude-sorted planet: rows of varying width, some short
     /// (islands), some wide (continents), in exactly the order
