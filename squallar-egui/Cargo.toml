@@ -88,7 +88,14 @@ reqwest = { workspace = true }
 # `io-util` is one of the five tokio permits on wasm. Shipped cost on the web
 # artifact, measured 2026-08-28: +392,442 B of `.wasm`, +2.96% -- the price of
 # a basemap that is not watermarked at source.
-pmtiles = { workspace = true }
+# `write` is `PmTilesStreamWriter` for `basemap_download`'s segment writer. It
+# is in the crate's default set, which the workspace pin deliberately turns
+# off, so it is asked for by name here (confirmed against pmtiles-0.23.0's
+# manifest: `write = ["dep:countio", "dep:flate2", "dep:twox-hash"]` — all
+# pure Rust, so it costs the wasm32 target nothing it cannot compile).
+# Unconditional because BOTH targets write segments: the artifact is built in
+# a `Cursor<Vec<u8>>` and only the finished bytes reach a target's store.
+pmtiles = { workspace = true, features = ["write"] }
 
 # `pmt_index`'s one decode: PMTiles v3 directories are gzip-deflated when
 # `internal_compression = 2`, which is what planetiler emits. The workspace pin

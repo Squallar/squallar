@@ -606,8 +606,10 @@ enum FetchPayload {
     Parsed(Arc<walkers::mvt::ParsedTile>),
 }
 
-/// Managed IO runtime for the tile fetch task.
-mod runtime {
+/// Managed IO runtime for the tile fetch task — and for
+/// [`crate::basemap_download`], which owns the same kind of task for the same
+/// reason and must not grow a second copy of this split.
+pub(crate) mod runtime {
     #[cfg(not(target_arch = "wasm32"))]
     mod native {
         /// Owns the IO thread. Dropping it stops the fetch task.
@@ -693,9 +695,9 @@ mod runtime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) use native::{Runtime, inert, spawn};
+    pub(crate) use native::{Runtime, inert, spawn};
     #[cfg(target_arch = "wasm32")]
-    pub(super) use web::{Runtime, inert, spawn};
+    pub(crate) use web::{Runtime, inert, spawn};
 }
 
 // ---------------------------------------------------------------------------
