@@ -651,3 +651,58 @@ fn a_damaged_archive_is_refused_with_its_defect_named() {
         "a root directory cut short must be truncation, not a decode: {short:?}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The budget on what is carried between readers
+// ---------------------------------------------------------------------------
+
+/// A leaf of `entries` entries, each distinguishable by its tile id.
+fn leaf_of(entries: usize) -> std::sync::Arc<Vec<super::DirEntry>> {
+    std::sync::Arc::new(
+        (0..entries as u64)
+            .map(|tile_id| super::DirEntry {
+                tile_id,
+                run_length: 1,
+                offset: tile_id,
+                length: 1,
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn the_shared_leaves_hold_a_budget_and_evict_the_oldest_to_keep_it() {
+    // Four leaves of a quarter of the budget each, then a fifth: the budget
+    // holds, and it is the least recently *used* that leaves — not the least
+    // recently inserted, which a plain queue would evict instead.
+    let quarter = super::SHARED_LEAF_BYTES / 4 / core::mem::size_of::<super::DirEntry>();
+    let shared = super::SharedLeaves::new();
+    for offset in 0..4u64 {
+        shared.put(offset, &leaf_of(quarter));
+    }
+    assert!(shared.get(0).is_some(), "the budget holds four quarters");
+
+    // Touching 1 makes 2 the oldest.
+    let _ = shared.get(1);
+    shared.put(4, &leaf_of(quarter));
+    assert!(
+        shared.get(2).is_none(),
+        "the least recently used goes first"
+    );
+    assert!(shared.get(1).is_some(), "the touched leaf stays");
+    assert!(shared.get(4).is_some(), "the newcomer is held");
+
+    // Re-offering a held leaf must not double-count it into an eviction.
+    shared.put(4, &leaf_of(quarter));
+    assert!(shared.get(1).is_some(), "a repeat put evicted a live leaf");
+
+    // A leaf larger than the whole budget is declined rather than allowed to
+    // empty the store to hold one entry.
+    let huge = super::SHARED_LEAF_BYTES / core::mem::size_of::<super::DirEntry>() + 1;
+    shared.put(9, &leaf_of(huge));
+    assert!(shared.get(9).is_none(), "an oversized leaf is not kept");
+    assert!(
+        shared.get(4).is_some(),
+        "and it evicted nothing to find out"
+    );
+}

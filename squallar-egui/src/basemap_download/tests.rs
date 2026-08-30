@@ -1153,3 +1153,371 @@ fn only_a_complete_outcome_yields_a_record() {
     assert_eq!(record.bytes, DataSize::from_bytes(112_000_000));
     assert_eq!(record.generation, generation());
 }
+
+// ---------------------------------------------------------------------------
+// Planning a leaf-bearing archive
+// ---------------------------------------------------------------------------
+//
+// Monaco addresses all 246 of its tiles from its root, so nothing above this
+// line reads a leaf directory at all — and the planning stall the published
+// planet archive shows is made entirely of leaf reads. Measured against that
+// archive over HTTPS on 2026-08-29: a 568 km box to z14 (110,026 tiles)
+// touches 20 distinct leaves; the size probe read all 20, and the engine then
+// re-read all 20, one round trip at a time, before the first tile byte moved.
+// The archive below is the smallest thing with that shape.
+
+/// Leaf directories in [`leafy_archive`]. More than
+/// [`crate::pmt_index::MAX_INFLIGHT_LEAF_READS`] on purpose: a fixture at or
+/// under the bound could not tell a bounded burst from an unbounded one.
+const LEAFY_LEAVES: usize = 21;
+
+/// Tiles per leaf in [`leafy_archive`] — 341 ids over [`LEAFY_LEAVES`].
+const LEAFY_PER_LEAF: usize = 17;
+
+/// The deepest zoom [`leafy_archive`] holds. `z0..=4` is 341 tiles, which is
+/// every tile id from 0 to 340 inclusive, so the whole-world area below
+/// enumerates exactly the archive's contents and the walk must reach every
+/// leaf.
+const LEAFY_MAX_ZOOM: u8 = 4;
+
+/// LEB128-encode `value` onto `out`.
+fn push_varint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Serialize `(tile_id, run_length, length, offset)` rows in the v3
+/// four-column layout, offsets absolute (`offset + 1`).
+fn encode_directory(rows: &[(u64, u64, u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_varint(rows.len() as u64, &mut out);
+    let mut previous = 0u64;
+    for &(tile_id, ..) in rows {
+        push_varint(tile_id - previous, &mut out);
+        previous = tile_id;
+    }
+    for &(_, run_length, ..) in rows {
+        push_varint(run_length, &mut out);
+    }
+    for &(_, _, length, _) in rows {
+        push_varint(length, &mut out);
+    }
+    for &(.., offset) in rows {
+        push_varint(offset + 1, &mut out);
+    }
+    out
+}
+
+/// Where [`leafy_archive`]'s leaf section sits — what tells a read counter
+/// which reads were directory round trips.
+#[derive(Clone, Copy)]
+struct LeafSection {
+    offset: u64,
+    length: u64,
+}
+
+/// A whole v3 archive whose 341 tiles are addressed through [`LEAFY_LEAVES`]
+/// leaf directories: header, root, metadata, leaves, tile data, with plain
+/// (uncompressed) directories.
+fn leafy_archive() -> (Vec<u8>, LeafSection) {
+    let tiles = 341u64;
+    let blob = 4u64;
+
+    let leaves: Vec<Vec<u8>> = (0..tiles)
+        .collect::<Vec<_>>()
+        .chunks(LEAFY_PER_LEAF)
+        .map(|ids| {
+            let rows: Vec<(u64, u64, u64, u64)> =
+                ids.iter().map(|&id| (id, 1, blob, id * blob)).collect();
+            encode_directory(&rows)
+        })
+        .collect();
+    assert_eq!(leaves.len(), LEAFY_LEAVES, "the fixture's leaf count");
+
+    let mut leaf_bytes = Vec::new();
+    let mut root_rows = Vec::new();
+    for (at, leaf) in leaves.iter().enumerate() {
+        root_rows.push((
+            (at * LEAFY_PER_LEAF) as u64,
+            0,
+            leaf.len() as u64,
+            leaf_bytes.len() as u64,
+        ));
+        leaf_bytes.extend_from_slice(leaf);
+    }
+    let root = encode_directory(&root_rows);
+    let metadata = b"{}".to_vec();
+
+    let root_offset = crate::pmt_index::HEADER_BYTES as u64;
+    let metadata_offset = root_offset + root.len() as u64;
+    let leaf_offset = metadata_offset + metadata.len() as u64;
+    let tile_data_offset = leaf_offset + leaf_bytes.len() as u64;
+
+    let mut header = vec![0u8; crate::pmt_index::HEADER_BYTES];
+    header[0..7].copy_from_slice(b"PMTiles");
+    header[7] = 3;
+    header[8..16].copy_from_slice(&root_offset.to_le_bytes());
+    header[16..24].copy_from_slice(&(root.len() as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&metadata_offset.to_le_bytes());
+    header[32..40].copy_from_slice(&(metadata.len() as u64).to_le_bytes());
+    header[40..48].copy_from_slice(&leaf_offset.to_le_bytes());
+    header[48..56].copy_from_slice(&(leaf_bytes.len() as u64).to_le_bytes());
+    header[56..64].copy_from_slice(&tile_data_offset.to_le_bytes());
+    header[64..72].copy_from_slice(&(tiles * blob).to_le_bytes());
+    header[72..80].copy_from_slice(&tiles.to_le_bytes());
+    header[80..88].copy_from_slice(&tiles.to_le_bytes());
+    header[88..96].copy_from_slice(&tiles.to_le_bytes());
+    header[96] = 1; // clustered
+    header[97] = 1; // internal_compression: none
+    header[98] = 1; // tile_compression: none
+    header[99] = 1; // tile_type: mvt
+    header[100] = 0;
+    header[101] = LEAFY_MAX_ZOOM;
+
+    let mut archive = header;
+    archive.extend_from_slice(&root);
+    archive.extend_from_slice(&metadata);
+    archive.extend_from_slice(&leaf_bytes);
+    for id in 0..tiles {
+        archive.extend_from_slice(&[(id & 0xff) as u8; 4]);
+    }
+    (
+        archive,
+        LeafSection {
+            offset: leaf_offset,
+            length: leaf_bytes.len() as u64,
+        },
+    )
+}
+
+/// The whole world at [`LEAFY_MAX_ZOOM`] — every tile [`leafy_archive`] holds
+/// and not one it does not.
+fn leafy_area(area_id: &str) -> AreaSpec {
+    AreaSpec {
+        area_id: area_id.to_owned(),
+        west: -179.9,
+        south: -84.9,
+        east: 179.9,
+        north: 84.9,
+        max_zoom: LEAFY_MAX_ZOOM,
+    }
+}
+
+/// One cooperative yield inside a read that answers from memory.
+///
+/// **The instrument would read serial without it, however concurrent the code
+/// under it is**: a future that finishes on its first poll never lets the
+/// executor start the one behind it, so a peak-in-flight counter over an
+/// in-memory source would measure the source rather than the planner.
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// What one [`LeafReadCounter`] saw.
+#[derive(Default)]
+struct LeafReads {
+    leaf_reads: AtomicUsize,
+    inflight: AtomicUsize,
+    peak_inflight: AtomicUsize,
+}
+
+/// An in-memory [`RangeSource`] that counts leaf-directory reads and how many
+/// were in flight at once, and answers
+/// [`RangeSource::archive_identity`] with whatever it was handed — `None`
+/// standing in for the anonymous in-memory source `verify_segment` opens a
+/// finished segment over.
+struct LeafReadCounter {
+    bytes: Arc<Vec<u8>>,
+    section: LeafSection,
+    identity: Option<String>,
+    seen: Arc<LeafReads>,
+}
+
+impl RangeSource for LeafReadCounter {
+    fn archive_identity(&self) -> Option<String> {
+        self.identity.clone()
+    }
+
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        let bytes = Arc::clone(&self.bytes);
+        let seen = Arc::clone(&self.seen);
+        let is_leaf =
+            offset >= self.section.offset && offset < self.section.offset + self.section.length;
+        async move {
+            if is_leaf {
+                seen.leaf_reads.fetch_add(1, Ordering::SeqCst);
+                let now = seen.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                seen.peak_inflight.fetch_max(now, Ordering::SeqCst);
+                yield_once().await;
+                seen.inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+            let from = (offset as usize).min(bytes.len());
+            let to = from.saturating_add(length).min(bytes.len());
+            Ok(bytes[from..to].to_vec())
+        }
+    }
+}
+
+/// Plan `area` over a fresh reader of `archive` named `identity`, and report
+/// the plan beside what that reader's leaf reads looked like.
+fn plan_over(
+    archive: &Arc<Vec<u8>>,
+    section: LeafSection,
+    identity: Option<&str>,
+    area: &AreaSpec,
+) -> (super::DownloadPlan, Arc<LeafReads>) {
+    let seen = Arc::new(LeafReads::default());
+    let source = LeafReadCounter {
+        bytes: Arc::clone(archive),
+        section,
+        identity: identity.map(str::to_owned),
+        seen: Arc::clone(&seen),
+    };
+    let plan = block_on(async {
+        let index = PmtIndex::open(source).await.expect("the archive opens");
+        plan_area(&index, area, SEGMENT_BYTES)
+            .await
+            .expect("the plan builds")
+    });
+    (plan, seen)
+}
+
+/// The plan as a value two runs can be compared on: the totals, the cut, and
+/// every segment's tiles in order.
+type PlanShape = (u64, u64, u64, Vec<(u32, u64, Vec<(u8, u32, u32)>)>);
+
+/// See [`PlanShape`].
+fn plan_shape(plan: &super::DownloadPlan) -> PlanShape {
+    (
+        plan.fetch_bytes,
+        plan.present_tiles,
+        plan.absent_tiles,
+        plan.segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.seg,
+                    segment.tile_bytes,
+                    segment.tile_coords().collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A unique archive name per call, so one test's shared directories can never
+/// be another's — the suite shares a process with the registry.
+fn unique_identity(what: &str) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "test://{what}/{}/{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+#[test]
+fn the_planner_never_re_reads_a_leaf_an_earlier_reader_of_the_archive_already_read() {
+    let (archive, section) = leafy_archive();
+    let archive = Arc::new(archive);
+    let area = leafy_area("leafy-shared");
+    let named = unique_identity("shared");
+
+    // The size probe's reader: it pays for every leaf.
+    let (probe, probe_seen) = plan_over(&archive, section, Some(&named), &area);
+    assert_eq!(
+        probe_seen.leaf_reads.load(Ordering::SeqCst),
+        LEAFY_LEAVES,
+        "the first reader of the archive must read every leaf the area touches"
+    );
+
+    // The engine's reader, opened separately over the same archive.
+    let (engine, engine_seen) = plan_over(&archive, section, Some(&named), &area);
+    assert_eq!(
+        engine_seen.leaf_reads.load(Ordering::SeqCst),
+        0,
+        "the engine re-read leaves the probe had already decoded"
+    );
+
+    // The control, without which the assertion above would pass just as well
+    // on a build that had simply stopped reading leaves at all.
+    let (other, other_seen) = plan_over(&archive, section, Some(&unique_identity("other")), &area);
+    assert_eq!(
+        other_seen.leaf_reads.load(Ordering::SeqCst),
+        LEAFY_LEAVES,
+        "a reader of a differently-named archive must share nothing"
+    );
+
+    // Sharing changes when the bytes arrive, never what they say: the plan is
+    // still the pure function of the area and the archive resume rests on.
+    assert_eq!(plan_shape(&probe), plan_shape(&engine));
+    assert_eq!(plan_shape(&probe), plan_shape(&other));
+    assert_eq!(probe.fetch_bytes, 341 * 4);
+    assert_eq!(probe.present_tiles, 341);
+    assert_eq!(probe.absent_tiles, 0);
+}
+
+#[test]
+fn an_unnamed_archives_directories_are_never_shared_with_another_reader() {
+    // The property that keeps `verify_segment` honest: it opens a just-built
+    // segment over an in-memory source, and a segment handed another
+    // segment's directories would verify the wrong bytes.
+    let (archive, section) = leafy_archive();
+    let archive = Arc::new(archive);
+    let area = leafy_area("leafy-anonymous");
+
+    for round in 0..2 {
+        let (_, seen) = plan_over(&archive, section, None, &area);
+        assert_eq!(
+            seen.leaf_reads.load(Ordering::SeqCst),
+            LEAFY_LEAVES,
+            "reader {round} of an anonymous archive was handed someone else's directories"
+        );
+    }
+}
+
+#[test]
+fn the_planners_leaf_reads_overlap_rather_than_queueing_one_at_a_time() {
+    let (archive, section) = leafy_archive();
+    let archive = Arc::new(archive);
+    let area = leafy_area("leafy-concurrent");
+    let (_, seen) = plan_over(
+        &archive,
+        section,
+        Some(&unique_identity("concurrent")),
+        &area,
+    );
+
+    assert_eq!(
+        seen.peak_inflight.load(Ordering::SeqCst),
+        crate::pmt_index::MAX_INFLIGHT_LEAF_READS,
+        "the planner's leaf reads must fill the in-flight bound rather than queue \
+         behind each other — and must not exceed it"
+    );
+    assert_eq!(
+        seen.leaf_reads.load(Ordering::SeqCst),
+        LEAFY_LEAVES,
+        "overlapping the reads must not read a leaf twice"
+    );
+}

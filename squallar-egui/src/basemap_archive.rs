@@ -121,6 +121,21 @@ pub trait RangeSource {
         offset: u64,
         length: usize,
     ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send;
+
+    /// A stable name for the archive behind these bytes, or `None` when the
+    /// source cannot promise the bytes will never move under a reader.
+    ///
+    /// The name is what lets two readers of one archive share decoded
+    /// directories ([`crate::pmt_index`]), so answering `Some` is a promise
+    /// that the same name always addresses the same bytes for as long as the
+    /// process lives. A name that outlived its bytes would hand the second
+    /// reader the first one's directories for a different file, which is why
+    /// the default is `None` and each implementation opts in by name: a
+    /// wrapper that forwards only `read_range` inherits anonymity rather than
+    /// its inner source's promise.
+    fn archive_identity(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A [`RangeSource`] the reader can hold.
@@ -380,6 +395,18 @@ impl HttpRangeSource {
 }
 
 impl RangeSource for HttpRangeSource {
+    /// The archive URL.
+    ///
+    /// A published archive's generation is *in its URL*
+    /// (`omt-20260828.pmtiles`, `4ca64469750e-20260829/...`), so a new
+    /// generation is a new name and the promise [`RangeSource::archive_identity`]
+    /// makes holds without anything here having to check a header or an ETag.
+    /// The `.partNNN` suffix is derived from this URL rather than carried
+    /// beside it, so the parts layout does not give one archive two names.
+    fn archive_identity(&self) -> Option<String> {
+        Some(self.url.to_string())
+    }
+
     fn read_range(
         &self,
         offset: u64,

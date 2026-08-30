@@ -33,7 +33,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use futures::StreamExt as _;
 
 use crate::basemap_archive::{ArchiveRangeSource, RangeError, RangeSource};
 
@@ -52,6 +54,45 @@ const SPEC_VERSION: u8 = 3;
 /// in [`PmtIndex::span_for_id`] allows a little slack over that rather than
 /// trusting the file to terminate.
 const MAX_DIRECTORY_DEPTH: usize = 4;
+
+/// How many leaf-directory reads [`PmtIndex::warm_leaves`] keeps in flight.
+///
+/// **The planning phase's cost is round trips, not bytes.** Measured against
+/// the published planet archive over HTTPS on 2026-08-29: enumerating a 568 km
+/// box to z14 (110,026 tiles) touches 20 distinct leaves, each read averaging
+/// 33 KB and 28 ms, and one at a time that is 20 sequential round trips
+/// carrying 660 KB. The count is what the wait is made of, so the fix is to
+/// overlap the round trips rather than to read fewer bytes.
+///
+/// Sixteen rather than the six [`crate::tile_source`] bounds tile fetches at:
+/// that channel is bounded to keep a bulk pull from starving the live map's
+/// working set, and these reads are a *bounded, one-off* burst of a few tens
+/// of small ranges that the user is actively waiting on. The widest area this
+/// download arm will accept (2000 km half-width) is still a few tens of
+/// leaves, so this bounds the burst to two or three waves rather than making
+/// it unbounded.
+pub const MAX_INFLIGHT_LEAF_READS: usize = 16;
+
+/// Bytes of decoded leaf directories carried from one reader of an archive to
+/// the next.
+///
+/// **A cross-reader accelerator, never the working cache.** Every
+/// [`PmtIndex`] keeps every leaf it reads for its own lifetime regardless
+/// ([`PmtIndex::leaves`]), so this budget can never make one walk re-read a
+/// leaf that walk already has; all it bounds is how much of a *finished*
+/// reader's work the next reader inherits. That is the whole point: the size
+/// probe and the download engine open the archive separately over the same
+/// area, and without this the engine repeats every directory round trip the
+/// probe just made.
+///
+/// **Measured, not assumed**: one leaf of the published planet archive
+/// decodes to 17,653 entries — 564,896 bytes of [`DirEntry`] — from 34,529
+/// compressed bytes (2026-08-29, leaf at `leaf_offset`). The widest single
+/// area measured across ten world cities touched 36 leaves, so 24 MB carries
+/// any one of them whole. The doc this replaces said "a leaf is a few KB
+/// decoded", which was true of the Monaco fixture and wrong by 100× about the
+/// archive that ships.
+pub const SHARED_LEAF_BYTES: usize = 24_000_000;
 
 /// How a directory's bytes are compressed on disk.
 ///
@@ -492,6 +533,95 @@ fn parse_header(bytes: &[u8]) -> Result<IndexHeader, IndexError> {
 }
 
 // ---------------------------------------------------------------------------
+// The leaves readers of one archive share
+// ---------------------------------------------------------------------------
+
+/// Decoded leaf directories carried between readers of one archive, bounded
+/// at [`SHARED_LEAF_BYTES`] and least-recently-used out.
+///
+/// The entries are held as the same [`Arc`]s the readers hold, so a leaf in
+/// both a live [`PmtIndex`] and this store is one allocation, and a leaf
+/// evicted here is freed only once the last reader of it is gone.
+struct SharedLeaves {
+    store: Mutex<LeafStore>,
+}
+
+/// [`SharedLeaves`]' contents and what they cost, kept together so the byte
+/// total can never drift from the map it counts.
+struct LeafStore {
+    by_offset: lru::LruCache<u64, Arc<Vec<DirEntry>>>,
+    held_bytes: usize,
+}
+
+/// What one decoded leaf costs the budget: its entries, at their real size.
+fn leaf_bytes(entries: &[DirEntry]) -> usize {
+    core::mem::size_of_val(entries)
+}
+
+impl SharedLeaves {
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(LeafStore {
+                by_offset: lru::LruCache::unbounded(),
+                held_bytes: 0,
+            }),
+        }
+    }
+
+    /// The decoded leaf at `offset`, if it is still held.
+    fn get(&self, offset: u64) -> Option<Arc<Vec<DirEntry>>> {
+        self.store
+            .lock()
+            .expect("the shared leaf lock is never poisoned: no holder panics")
+            .by_offset
+            .get(&offset)
+            .map(Arc::clone)
+    }
+
+    /// Offer a decoded leaf, evicting the least recently used until the
+    /// budget holds. A leaf larger than the whole budget is simply not kept —
+    /// storing it would evict everything to hold one entry.
+    fn put(&self, offset: u64, entries: &Arc<Vec<DirEntry>>) {
+        let cost = leaf_bytes(entries);
+        if cost > SHARED_LEAF_BYTES {
+            return;
+        }
+        let mut store = self
+            .store
+            .lock()
+            .expect("the shared leaf lock is never poisoned: no holder panics");
+        if let Some(replaced) = store.by_offset.put(offset, Arc::clone(entries)) {
+            store.held_bytes -= leaf_bytes(&replaced);
+        }
+        store.held_bytes += cost;
+        while store.held_bytes > SHARED_LEAF_BYTES {
+            let Some((_, evicted)) = store.by_offset.pop_lru() else {
+                break;
+            };
+            store.held_bytes -= leaf_bytes(&evicted);
+        }
+    }
+}
+
+/// The shared leaves for the archive `identity` names, created on first ask.
+///
+/// One store per archive name, on [`crate::basemap_archive::block_cache`]'s
+/// registry model: a process-wide map, and the identity is the archive's own
+/// (see [`RangeSource::archive_identity`] for why only a source that can
+/// promise immutability answers with one).
+fn shared_leaves(identity: &str) -> Arc<SharedLeaves> {
+    static ARCHIVES: OnceLock<Mutex<HashMap<String, Arc<SharedLeaves>>>> = OnceLock::new();
+    let archives = ARCHIVES.get_or_init(|| Mutex::new(HashMap::new()));
+    Arc::clone(
+        archives
+            .lock()
+            .expect("the shared archive registry lock is never poisoned: no holder panics")
+            .entry(identity.to_owned())
+            .or_insert_with(|| Arc::new(SharedLeaves::new())),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------
 
@@ -505,10 +635,21 @@ pub struct PmtIndex<S> {
     source: S,
     header: IndexHeader,
     root: Arc<Vec<DirEntry>>,
-    /// Decoded leaves by their offset in the leaf section. Never evicted: a
-    /// leaf is a few KB decoded, and the set touched by one download area is
-    /// bounded by the area itself.
+    /// Decoded leaves by their offset in the leaf section. Never evicted for
+    /// this reader's lifetime: the set one download area touches is bounded
+    /// by the area itself, and a walk that has already paid for a leaf must
+    /// never pay again part-way through.
+    ///
+    /// **Not "a few KB"** — measured on the published planet archive, one
+    /// leaf decodes to 17,653 entries, 564,896 bytes; the widest area
+    /// measured touched 36 of them. That is the figure [`SHARED_LEAF_BYTES`]
+    /// is sized against.
     leaves: Mutex<HashMap<u64, Arc<Vec<DirEntry>>>>,
+    /// Leaves this archive's *other* readers decoded, when the source can
+    /// name the archive. `None` for an anonymous source — an in-memory
+    /// segment being verified, or a test double — which is what keeps a
+    /// reader of one archive from ever being handed another's directories.
+    shared: Option<Arc<SharedLeaves>>,
 }
 
 impl<S: ArchiveRangeSource> PmtIndex<S> {
@@ -535,6 +676,7 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
         let root = decode_directory(&decompress(root_bytes, header.internal_compression)?)?;
 
         Ok(Self {
+            shared: source.archive_identity().as_deref().map(shared_leaves),
             source,
             header,
             root: Arc::new(root),
@@ -600,6 +742,17 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
     where
         I: IntoIterator<Item = (u8, u32, u32)>,
     {
+        let tiles: Vec<(u8, u32, u32)> = tiles.into_iter().collect();
+        // The directory round trips, overlapped, before the walk asks for
+        // them one at a time. A coordinate off the grid is skipped here and
+        // still errors below.
+        self.warm_leaves(
+            tiles
+                .iter()
+                .filter_map(|&(z, x, y)| zxy_to_tile_id(z, x, y)),
+        )
+        .await;
+
         let mut spans = HashSet::new();
         let mut total = DownloadBytes::default();
         for (z, x, y) in tiles {
@@ -642,8 +795,77 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
         Ok(tiles)
     }
 
-    /// The decoded leaf at `offset` in the leaf section, from the cache or
-    /// the source.
+    /// Read every leaf directory the walk over `tile_ids` will need, up to
+    /// [`MAX_INFLIGHT_LEAF_READS`] reads at a time.
+    ///
+    /// **A prefetch and nothing else.** It resolves no span, returns no
+    /// answer and reports no error: a leaf that will not read is left
+    /// uncached, and the walk that needs it fails exactly where and with
+    /// exactly what it would have failed with had this never been called. So
+    /// the plan a caller builds afterwards is the same plan, tile for tile
+    /// and error for error, whatever order the reads land in — which is what
+    /// resume depends on, since a resume is a set difference over segments
+    /// the *previous* run cut.
+    ///
+    /// Ids that resolve straight out of the root cost nothing here; an
+    /// archive with no leaves at all reads nothing.
+    pub async fn warm_leaves<I>(&self, tile_ids: I)
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        // Ids still walking, each paired with the directory it is walking in.
+        let mut walking: Vec<(u64, Arc<Vec<DirEntry>>)> = tile_ids
+            .into_iter()
+            .map(|id| (id, Arc::clone(&self.root)))
+            .collect();
+
+        for _ in 0..MAX_DIRECTORY_DEPTH {
+            // The leaves this hop needs, deduplicated. The dedup is what
+            // makes the burst the size of the *distinct* leaf set rather than
+            // of the tile set.
+            let mut seen = HashSet::new();
+            let wanted: Vec<(u64, u64)> = walking
+                .iter()
+                .filter_map(|(id, directory)| find_entry(directory, *id))
+                .filter(|entry| entry.run_length == 0 && seen.insert(entry.offset))
+                .map(|entry| (entry.offset, entry.length))
+                .collect();
+            if wanted.is_empty() {
+                return;
+            }
+
+            futures::stream::iter(wanted.into_iter().map(|(offset, length)| async move {
+                // Dropped on purpose: see the "prefetch and nothing else"
+                // paragraph above. The walk re-reads and reports it.
+                let _ = self.leaf(offset, length).await;
+            }))
+            .buffer_unordered(MAX_INFLIGHT_LEAF_READS)
+            .for_each(|()| async {})
+            .await;
+
+            // Advance the ids that landed in a leaf this hop; the rest are
+            // answered, absent, or on a leaf that would not read.
+            let cached = self
+                .leaves
+                .lock()
+                .expect("the leaf cache lock is never poisoned: no holder panics");
+            walking = walking
+                .iter()
+                .filter_map(|(id, directory)| {
+                    let entry = find_entry(directory, *id)?;
+                    (entry.run_length == 0)
+                        .then(|| cached.get(&entry.offset))
+                        .flatten()
+                        .map(|leaf| (*id, Arc::clone(leaf)))
+                })
+                .collect();
+            drop(cached);
+        }
+    }
+
+    /// The decoded leaf at `offset` in the leaf section, from this reader's
+    /// cache, from what another reader of the same archive already decoded,
+    /// or from the source.
     async fn leaf(&self, offset: u64, length: u64) -> Result<Arc<Vec<DirEntry>>, IndexError> {
         if let Some(hit) = self
             .leaves
@@ -652,6 +874,14 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
             .get(&offset)
         {
             return Ok(Arc::clone(hit));
+        }
+
+        if let Some(hit) = self.shared.as_ref().and_then(|shared| shared.get(offset)) {
+            self.leaves
+                .lock()
+                .expect("the leaf cache lock is never poisoned: no holder panics")
+                .insert(offset, Arc::clone(&hit));
+            return Ok(hit);
         }
 
         let bytes = read_exact(
@@ -666,6 +896,9 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
             self.header.internal_compression,
         )?)?);
 
+        if let Some(shared) = &self.shared {
+            shared.put(offset, &entries);
+        }
         self.leaves
             .lock()
             .expect("the leaf cache lock is never poisoned: no holder panics")

@@ -358,7 +358,20 @@ pub async fn plan_area<S: ArchiveRangeSource>(
     let mut distinct = HashSet::new();
     let mut fetch_bytes = 0u64;
 
-    for (z, x, y) in area_tiles(area) {
+    let tiles = area_tiles(area);
+    // The area's directory round trips, overlapped, before the walk below
+    // asks for them one at a time. A prefetch only: it changes when the
+    // bytes arrive, never which spans the walk resolves, so the plan stays
+    // the pure function of the area and the archive that resume depends on.
+    index
+        .warm_leaves(
+            tiles
+                .iter()
+                .filter_map(|&(z, x, y)| zxy_to_tile_id(z, x, y)),
+        )
+        .await;
+
+    for (z, x, y) in tiles {
         match index.tile_span(z, x, y).await? {
             Some(span) => {
                 let id = zxy_to_tile_id(z, x, y).expect("tile_span validated the coordinate");
