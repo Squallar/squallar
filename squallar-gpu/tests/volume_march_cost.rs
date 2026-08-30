@@ -5,6 +5,13 @@
 //! quality ladder uses, with shading on and off. `#[ignore]`d: its input is a
 //! Level II file on someone's disk.
 //!
+//! ci-excluded: a measurement instrument, not a criterion. It needs a Level II
+//! volume named by `VOL` and panics without one, and radar data is not going
+//! into this repository. A timestamp-query cost measured on a software
+//! rasteriser would not mean anything either. Read by the `gpu` job's
+//! derivation in `.github/workflows/test.yaml`; see
+//! `gpu_job_covers_every_suite.rs`.
+//!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \
 //! CENTRE_LAT=41.0 CENTRE_LON=-93.4 HALF_KM=75 \

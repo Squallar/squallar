@@ -84,50 +84,139 @@ jobs:
       # the margin its probe saw, which is the only readable record of what the
       # battery proved on a given run.
       #
-      # volume_shader_mutants is the guard on the other two. It substitutes one
+      # volume_shader_mutants is the guard on all the others. It substitutes one
       # expression at a time into `volume.wgsl`, rebuilds the pipelines from the
       # mutated string -- wgpu compiles WGSL at runtime, so no rebuild is
-      # involved -- and requires a probe to notice. Without it, every row above
+      # involved -- and requires a probe to notice. Without it, every suite here
       # could be passing over a shader nobody has proved is being read: three
-      # such tests were found by hand in this campaign. Measured on both: 0.45 s
-      # on an RTX 3090 and 0.43 s on lavapipe, against the 19 s the two rows
-      # above take there. A mutant is one shader compile and one small render,
-      # and neither is what a software rasteriser is slow at.
+      # such tests were found by hand in this campaign.
+      #
+      # Cost of the whole derived set, measured 2026-08-30 on lavapipe
+      # (llvmpipe, Mesa 26.2.1 / LLVM 22.1.8, debug profile) with
+      # MESA_SHADER_CACHE_DISABLE=true. Harness time per suite: the denominator
+      # is one `cargo test` binary each, and the compile in front of them is in
+      # none of these figures.
+      #
+      #   volume_occluder       16.5 s  (10 tests)
+      #   volume_silhouette     16.1 s  (10)
+      #   volume_shader_mutants 10.6 s  (1 test = 36 mutants over 18 probes)
+      #   volume_light           9.6 s  (13)
+      #   volume_gpu             8.9 s  (25)
+      #   volume_drape           6.1 s  (6)
+      #   volume_ground_aspect   3.1 s  (2)
+      #   raster_upload_gpu      0.4 s  (2)
+      #   --------------------------------
+      #   71.1 s over 69 tests, plus 1.3 s for the unit step: 72.7 s of job.
+      #
+      # Cold is the honest number and the cache disable is the load-bearing
+      # part of that command. Warm, the same set takes 41.5 s, because Mesa
+      # keeps compiled shaders in ~/.cache/mesa_shader_cache and only
+      # volume_shader_mutants is compile-bound -- it alone swings 10.6 s cold
+      # against 0.95 s warm, a 10x, while the rasterisation-bound suites barely
+      # move. Nothing here caches that directory (rust-cache carries cargo
+      # artifacts, not Mesa's), so every run on this runner is a cold one and
+      # the warm figure would understate the row by 43 %.
+      #
+      # The five suites this job gained on 2026-08-30 cost 35.6 s of the 71.1,
+      # against 35.5 s for the three it already ran: closing the hole doubled
+      # the row. Both halves are still far below the compile in front of them.
+      #
+      # Measured on a 32-thread Ryzen 9 7950X. llvmpipe is a CPU rasteriser and
+      # scales with cores, so a 4-vCPU ubuntu-24.04 runner will be SLOWER than
+      # every figure above; they are a floor, not a prediction, and are not
+      # scaled to the runner because a scaled figure is not a measurement.
+      #
+      # An earlier revision of this comment put volume_shader_mutants at 0.43 s
+      # on lavapipe against "the 19 s the two rows above take". The battery has
+      # since grown to 36 mutants over 18 probes and that figure was stale by
+      # 25x, which is why the table above says what it is counting and under
+      # which cache.
       - name: Run the adapter-only integration tests
         # `-p squallar-gpu` since WO-RV land 3: the ENTIRE GPU-bound suite lives
         # in squallar-gpu/tests (the hardware quarantine — this job is the ONE
         # owner of every `--ignored` adapter invocation; `cargo test` on any
         # other package needs no adapter).
-        run: |
-          cargo test -p squallar-gpu \
-            --test volume_gpu --test volume_silhouette --test volume_shader_mutants \
-            -- --ignored --nocapture
-      # The other three `#[ignore]`d files in squallar-gpu/tests --
-      # volume_real_mask, volume_march_cost and floor_alignment -- are
-      # deliberately not here. Each reads a Level II volume from a path given in
-      # the environment, no such file exists in this repository, and radar data
-      # is not going into git. They remain hand-run.
-      - name: Run the adapter-only unit tests
-        # Named exactly: `--exact` because a rename would leave the filter
-        # matching nothing, and the harness exits 0 on zero tests -- silently
-        # reopening exactly the hole this job was added to close. So the
-        # counts are asserted rather than assumed.
         #
-        # Two invocations since WO-RG: the renderer's sentinel test moved to
-        # squallar-gpu with the renderer; the volume trio moved to
+        # The target list is DERIVED, and deliberately so. It used to be three
+        # names written out here, beside a comment listing "the other three"
+        # files this job skipped. Nobody had to update either, so nobody did:
+        # by 2026-08-30 five suites carrying 33 `#[ignore]`d tests --
+        # volume_drape, volume_ground_aspect, volume_light, volume_occluder and
+        # raster_upload_gpu -- had landed into a job that never named them, and
+        # four of them said in their own module docs that this job opted in.
+        # The acceptance evidence for B1, B3, B4, C2 and D1 was gated by
+        # nothing. A hand-maintained list is what produced that, so there is no
+        # longer one: every file in the directory with a column-0 `#[ignore]`
+        # attribute runs, unless its module doc opts out with a
+        # `//! ci-excluded:` line saying why.
+        #
+        # Both greps and this glob are held to `gpu_job_covers_every_suite.rs`
+        # in that same directory, which also refuses a literal `--test <name>`
+        # here and requires every opt-out to name a reason and really read the
+        # environment. That test runs in the ordinary `test` job, so the two
+        # cannot drift apart unnoticed.
+        run: |
+          shopt -s nullglob
+          args=()
+          ran=()
+          for f in squallar-gpu/tests/*.rs; do
+            stem=$(basename "$f" .rs)
+            # Opted out: a measurement instrument wanting a Level II volume
+            # from the environment. It would panic here on the unset variable.
+            if grep -q '^//! ci-excluded:' "$f"; then
+              printf 'skipping %-22s %s\n' "$stem" "$(sed -n 's|^//! ci-excluded: ||p' "$f" | head -1)"
+              continue
+            fi
+            # Not an adapter-only suite at all -- the `test` job runs it.
+            grep -q '^#\[ignore' "$f" || continue
+            args+=(--test "$stem")
+            ran+=("$stem")
+          done
+          echo "Derived ${#ran[@]} adapter-only suites: ${ran[*]}"
+          # An empty derivation would drop the `--test` filters entirely and
+          # `cargo test -p squallar-gpu -- --ignored` would then run every
+          # target in the package, the opted-out ones included. A broken glob
+          # must stop this job, not silently change what it means. Eight suites
+          # ran on 2026-08-30; the floor is a floor, not the count.
+          if [ "${#ran[@]}" -lt 6 ]; then
+            echo "::error::derived only ${#ran[@]} suites; the glob or the marker has broken"
+            exit 1
+          fi
+          cargo test -p squallar-gpu "${args[@]}" -- --ignored --nocapture
+      - name: Run the adapter-only unit tests
+        # The `#[ignore]`d tests that live in a lib rather than in
+        # squallar-gpu/tests. Two crates have them: the renderer's sentinel
+        # moved to squallar-gpu with the renderer, and the volume trio to
         # squallar-volumetric with the 3D stack at WO-RV (the `volume::` module
         # segment became the crate root, so the paths lost that prefix).
+        #
+        # This step used to name all four with `--exact`, guarding a rename
+        # with an asserted count -- `3 passed` and `1 passed` written out. That
+        # guard is real for a rename but blind to an addition: a fifth ignored
+        # lib test would be filtered out by `--exact` and the `3 passed` would
+        # still hold, which is the same silent-omission defect the integration
+        # step above was rebuilt to remove. It was not yet stale on 2026-08-30
+        # (the lists were exactly complete), but it was stale-able.
+        #
+        # So the count is DISCOVERED and every ignored test in the lib runs.
+        # `--list --ignored` enumerates them; the run must report exactly that
+        # many. A rename still cannot pass (the two numbers come from one
+        # binary), an addition now runs instead of hiding, and nothing here is
+        # a name a human has to keep in step.
         run: |
-          cargo test -p squallar-volumetric --lib -- --ignored --nocapture --exact \
-            tests::a_real_adapter_supports_the_volume_format \
-            raymarch::staging::tests::the_two_routes_write_the_same_plane \
-            raymarch::staging::tests::the_worst_case_residency_is_the_ring_and_the_widening_together \
-            | tee "$RUNNER_TEMP/lib-gpu.log"
-          grep -q '^test result: ok\. 3 passed' "$RUNNER_TEMP/lib-gpu.log"
-          cargo test -p squallar-gpu --lib -- --ignored --nocapture --exact \
-            egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
-            | tee "$RUNNER_TEMP/lib-gpu-renderer.log"
-          grep -q '^test result: ok\. 1 passed' "$RUNNER_TEMP/lib-gpu-renderer.log"
+          for pkg in squallar-volumetric squallar-gpu; do
+            expected=$(cargo test -p "$pkg" --lib -- --list --ignored | grep -c ': test$')
+            echo "$pkg declares $expected ignored lib test(s)"
+            # Zero would make the run below trivially green, which is how a
+            # moved module would read as success.
+            if [ "$expected" -lt 1 ]; then
+              echo "::error::$pkg declares no ignored lib tests; this step has lost its subject"
+              exit 1
+            fi
+            cargo test -p "$pkg" --lib -- --ignored --nocapture \
+              | tee "$RUNNER_TEMP/lib-gpu-$pkg.log"
+            grep -q "^test result: ok\. $expected passed" "$RUNNER_TEMP/lib-gpu-$pkg.log"
+          done
 
   test:
     name: Test

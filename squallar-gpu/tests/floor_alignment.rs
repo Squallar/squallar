@@ -22,6 +22,11 @@
 //!
 //! `#[ignore]`d because it reads a volume from disk:
 //!
+//! ci-excluded: it reads a Level II volume named by `VOL` and panics without
+//! one, and radar data is not going into this repository. Read by the `gpu`
+//! job's derivation in `.github/workflows/test.yaml`; see
+//! `gpu_job_covers_every_suite.rs`.
+//!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 [THRESH=15] [OUT=/tmp/prefix] \
 //! cargo test -p squallar-gpu --release --test floor_alignment -- --ignored --nocapture

@@ -4,6 +4,12 @@
 //! lifted from another application can be pointed at squallar's own pipeline and
 //! the silhouettes compared pixel for pixel. `#[ignore]`d and env-driven.
 //!
+//! ci-excluded: a measurement instrument, not a criterion. It needs a Level II
+//! volume named by `VOL` and an output prefix in `OUT`, panics on either unset,
+//! and radar data is not going into this repository. Read by the `gpu` job's
+//! derivation in `.github/workflows/test.yaml`; see
+//! `gpu_job_covers_every_suite.rs`.
+//!
 //! ```text
 //! VOL=/path/to/KDMX20250314_175512_V06 \
 //! CENTRE_LAT=41.0 CENTRE_LON=-93.4 HALF_KM=75 THRESH=20 \
