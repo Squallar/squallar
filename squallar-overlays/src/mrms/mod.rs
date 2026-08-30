@@ -47,6 +47,8 @@ use crate::render::gridded::ResidentGrid;
 pub mod decode;
 pub mod fetch;
 pub mod fields;
+/// The 3D stack. Nothing draws it -- see the module doc.
+pub mod volume;
 
 /// The MRMS products this layer offers.
 ///

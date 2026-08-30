@@ -81,14 +81,19 @@ fn urlencoded(value: &str) -> String {
 
 /// Every key under one day prefix, above `start_after` when one is given, in the
 /// bucket's own (timestamp) order.
-async fn list_day(
+///
+/// **The bucket's own directory name, not an [`MrmsProduct`]**: the 3D stack
+/// (`super::volume`) lists 33 level directories that carry no colour bar and no
+/// `fields.rs` row, so they are not products in this module's sense and cannot
+/// name themselves through that enum.
+pub(crate) async fn list_day(
     client: &reqwest::Client,
     sources: &DataSources,
-    product: MrmsProduct,
+    prefix_name: &str,
     date: NaiveDate,
     start_after: Option<NaiveDateTime>,
 ) -> Result<Vec<String>, FetchError> {
-    let prefix = DataSources::mrms_day_prefix(product.prefix_name(), &date);
+    let prefix = DataSources::mrms_day_prefix(prefix_name, &date);
     let bucket = sources.s3_bucket_url(&sources.mrms_bucket);
     let mut keys: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
@@ -97,10 +102,7 @@ async fn list_day(
         let mut url = format!("{bucket}/?list-type=2&prefix={prefix}");
         if let Some(after) = start_after {
             url.push_str("&start-after=");
-            url.push_str(&urlencoded(&DataSources::mrms_key(
-                product.prefix_name(),
-                &after,
-            )));
+            url.push_str(&urlencoded(&DataSources::mrms_key(prefix_name, &after)));
         }
         if let Some(ref t) = token {
             url.push_str("&continuation-token=");
@@ -187,7 +189,7 @@ pub async fn latest_key(
 ) -> Result<String, FetchError> {
     let mut last_error: Option<FetchError> = None;
     for (date, start_after) in listing_attempts(at) {
-        match list_day(client, sources, product, date, start_after).await {
+        match list_day(client, sources, product.prefix_name(), date, start_after).await {
             // `max()`, not `last()`: S3 answers in lexicographic key order
             // today, and these keys sort by their own timestamp, but the
             // ordering of a listing is the server's promise rather than ours.
@@ -351,7 +353,7 @@ pub async fn list_frame_keys(
         // same `start-after` economy the live poll uses, ~1 KB against ~90 KB.
         let start_after =
             (day == range.0.date() && range.0.time() != chrono::NaiveTime::MIN).then_some(range.0);
-        match list_day(client, sources, product, day, start_after).await {
+        match list_day(client, sources, product.prefix_name(), day, start_after).await {
             Ok(listed) => {
                 keys.extend(listed.into_iter().filter_map(|key| {
                     let valid = key_valid_time(&key)?;

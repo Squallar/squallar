@@ -104,10 +104,22 @@ const SENTINEL_EPSILON: f32 = 0.05;
 /// "missing" as.
 #[inline]
 pub fn to_reading(product: MrmsProduct, raw: f32) -> f32 {
+    reading(product.missing_codes(), raw)
+}
+
+/// [`to_reading`] against an explicit code set rather than a [`MrmsProduct`].
+///
+/// The 3D stack (`volume`) reads a product that is **not** an [`MrmsProduct`] —
+/// it has no colour bar, no persisted spelling and no `fields.rs` row, because
+/// nothing draws it — so it names its codes directly. Both spellings run this
+/// one body: a second sentinel test written out again is the shape that let
+/// radar's reflectivity ladder drift a whole band from this crate's.
+#[inline]
+pub fn reading(missing: &[f32], raw: f32) -> f32 {
     if !raw.is_finite() {
         return f32::NAN;
     }
-    for &code in product.missing_codes() {
+    for &code in missing {
         if (raw - code).abs() < SENTINEL_EPSILON {
             return f32::NAN;
         }
@@ -272,8 +284,67 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// One MRMS granule as GRIB2 states it, before any product framing.
+///
+/// The half of a decode that is the same for every object in the bucket: the
+/// grid, its envelope, its valid time and its values. [`parse_grib2`] wraps this
+/// into an [`MrmsGrid`] -- a paint, a legend and a `fields.rs` row; the 3D stack
+/// takes it plain, because it has none of those and draws nothing.
+pub struct RawGrid {
+    pub ni: usize,
+    pub nj: usize,
+    pub coords: GridCoords,
+    pub bounds: GeoBounds,
+    /// Section 1's reference time, which for MRMS **is** the valid time.
+    pub valid: chrono::NaiveDateTime,
+    /// Section 4's **first fixed surface** as `(type, value)`, when the product
+    /// definition template carries one: the code-table 4.5 surface type and the
+    /// value in that surface's own unit (metres for types 102 and 103).
+    ///
+    /// `None` for a template `grib` does not read a surface out of, which the
+    /// two shipped 2D products do not need and the 3D stack refuses --
+    /// `super::volume` reads the height back off the granule so the level
+    /// table is checked against the data rather than against a directory name.
+    pub first_fixed_surface: Option<(u8, f64)>,
+    /// In the grid's own scanning order, with `missing` already mapped to
+    /// `f32::NAN`.
+    pub values: Vec<f32>,
+}
+
 /// Decode one MRMS granule's GRIB2 bytes.
 pub fn parse_grib2(bytes: &[u8], product: MrmsProduct) -> Result<MrmsGrid, String> {
+    let raw = parse_grib2_raw(bytes, product.missing_codes())?;
+
+    let paint = crate::render::gridded::field_paint(&super::fields::spec(product).id)
+        .ok_or_else(|| format!("MRMS product {} registers no paint", product.as_str()))?;
+    let (visible_points, value_range) =
+        crate::hrrr::summarize_values(&raw.values, |v| paint.paints(v));
+
+    Ok(MrmsGrid {
+        product,
+        grid: std::sync::Arc::new(ResidentGrid {
+            field: super::fields::spec(product).id.clone(),
+            ni: raw.ni,
+            nj: raw.nj,
+            coords: raw.coords,
+            values: raw.values,
+        }),
+        bounds: raw.bounds,
+        valid: raw.valid,
+        visible_points,
+        value_range,
+    })
+}
+
+/// Decode one MRMS granule's GRIB2 bytes into its [`RawGrid`], mapping every
+/// value within `SENTINEL_EPSILON` of a code in `missing` to `f32::NAN`.
+///
+/// **`missing` is a parameter and not a lookup**, for the reason
+/// [`MrmsProduct::missing_codes`] gives at length: which numbers a product
+/// reserves is a fact about that product, and taking one product's set for
+/// another is what left a third of the rate mosaic reporting -3 mm/h as a
+/// measurement.
+pub fn parse_grib2_raw(bytes: &[u8], missing: &[f32]) -> Result<RawGrid, String> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("MRMS GRIB2 parse error: {e}"))?;
 
@@ -293,6 +364,10 @@ pub fn parse_grib2(bytes: &[u8], product: MrmsProduct) -> Result<MrmsGrid, Strin
         .map_err(|e| format!("MRMS: cannot determine grid shape: {e}"))?;
 
     let valid = reference_time(&submessage)?;
+    let first_fixed_surface = submessage
+        .prod_def()
+        .fixed_surfaces()
+        .map(|(first, _second)| (first.surface_type, first.value()));
 
     // Read before the submessage is consumed by the decoder.
     let decoder = Grib2SubmessageDecoder::from(submessage)
@@ -306,7 +381,7 @@ pub fn parse_grib2(bytes: &[u8], product: MrmsProduct) -> Result<MrmsGrid, Strin
         .dispatch()
         .map_err(|e| format!("MRMS decode error: {e}"))?
     {
-        values.push(to_reading(product, raw));
+        values.push(reading(missing, raw));
     }
 
     if values.is_empty() {
@@ -327,23 +402,14 @@ pub fn parse_grib2(bytes: &[u8], product: MrmsProduct) -> Result<MrmsGrid, Strin
     };
     crate::hrrr::fetch::check_domain_longitude(&bounds, &super::MRMS_DOMAIN_LON, "MRMS")?;
 
-    let paint = crate::render::gridded::field_paint(&super::fields::spec(product).id)
-        .ok_or_else(|| format!("MRMS product {} registers no paint", product.as_str()))?;
-    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, |v| paint.paints(v));
-
-    Ok(MrmsGrid {
-        product,
-        grid: std::sync::Arc::new(ResidentGrid {
-            field: super::fields::spec(product).id.clone(),
-            ni,
-            nj,
-            coords,
-            values,
-        }),
+    Ok(RawGrid {
+        ni,
+        nj,
+        coords,
         bounds,
         valid,
-        visible_points,
-        value_range,
+        first_fixed_surface,
+        values,
     })
 }
 
