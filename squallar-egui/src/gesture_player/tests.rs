@@ -324,6 +324,63 @@ fn the_marker_lines_are_pinned() {
     );
 }
 
+/// The rig driver, read at compile time so a moved file is a build failure.
+const DRIVE_PY: &str = include_str!("../../../.github/browser-rig/drive.py");
+
+/// The other end of the marker seam: the sentences above, substituted into
+/// the very patterns `drive.py`'s `FRAME_LINE_PROBE` brackets bin-diffs
+/// with — the same discipline `raster_telemetry_line_tests` holds for the
+/// raster lines, because a pattern restated is a second place to be wrong.
+#[test]
+fn the_rig_brackets_with_the_markers_this_player_actually_writes() {
+    let pattern = |name: &str| -> String {
+        let head = format!("var {name} = /");
+        let at = DRIVE_PY.find(&head).unwrap_or_else(|| {
+            panic!("drive.py no longer declares `{head}…`; the rig's marker probe moved")
+        });
+        let rest = &DRIVE_PY[at + head.len()..];
+        let end = rest
+            .find("/;")
+            .expect("the regex literal is not closed on its own line");
+        rest[..end].to_string()
+    };
+    let substituted = |pat: &str, values: &[&str]| -> String {
+        let mut out = pat.to_owned();
+        for v in values {
+            let group = [r"([a-z0-9-]+)", r"(\d+)"]
+                .into_iter()
+                .filter_map(|g| out.find(g).map(|at| (at, g)))
+                .min()
+                .expect("fewer capture groups than values offered");
+            out.replace_range(group.0..group.0 + group.1.len(), v);
+        }
+        assert!(
+            !out.contains(['\\', '(', ')', '[', ']', '*', '+', '?', '|', '^', '$']),
+            "the pattern has a metacharacter outside its known groups, so \
+             substitution no longer produces the sentence it matches: {out:?}",
+        );
+        out
+    };
+
+    let begin = pattern("gesture_begin_re");
+    assert_eq!(
+        begin_line(GestureScript::PanZoom2D),
+        substituted(&begin, &["pan-zoom-2d"]),
+        "the begin marker and the rig's bracket pattern have drifted",
+    );
+    // The floor: the substitution really can disagree.
+    assert_ne!(
+        begin_line(GestureScript::Orbit3D),
+        substituted(&begin, &["pan-zoom-2d"]),
+    );
+
+    assert_eq!(
+        loop_complete_line(GestureScript::UiSweep, 1203),
+        substituted(&pattern("gesture_loop_re"), &["ui-sweep", "1203"]),
+        "the loop marker and the rig's bracket pattern have drifted",
+    );
+}
+
 /// The registry side of dormancy: nothing registers unless a sweep is
 /// collecting, and taking the frame empties it.
 #[test]
