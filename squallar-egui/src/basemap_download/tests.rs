@@ -7,7 +7,7 @@
 //! engine is exercised over the same wire shapes it meets in production, on
 //! the committed Monaco fixture.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 use egui::Context;
 
 use super::{
-    AreaSpec, BasemapDownload, DownloadOutcome, FsSegmentStore, HttpSegmentStore,
-    OFFLINE_BASE_PATH, SEGMENT_BYTES, SegmentStore, TileSpan, area_tiles, coalesce, plan_area,
-    valid_area_id,
+    AreaSpec, AreaStatus, BasemapDownload, DownloadOutcome, DownloadedArea, FsSegmentStore,
+    HttpSegmentStore, OFFLINE_BASE_PATH, SEGMENT_BYTES, SegmentStore, TileSpan, area_status,
+    area_tiles, coalesce, plan_area, valid_area_id,
 };
 use crate::basemap_archive::{FileRangeSource, HttpRangeSource, RangeError, RangeSource};
 use crate::pmt_index::{PmtIndex, zxy_to_tile_id};
+use squallar_units::DataSize;
 
 // ---------------------------------------------------------------------------
 // Fixture and helpers
@@ -1020,4 +1021,135 @@ fn the_http_store_speaks_the_service_worker_contract() {
     let store = HttpSegmentStore::new(loopback_client(), origin);
     block_on(store.remove_area(&area.area_id)).expect("the delete succeeds");
     assert!(store_server.stored().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The record, and completeness recomputed rather than stored
+// ---------------------------------------------------------------------------
+
+/// A record for a seven-segment area, holding no claim about what is present.
+fn seven_segment_record(area_id: &str) -> DownloadedArea {
+    DownloadedArea {
+        spec: monaco_area(area_id, 12),
+        segments_expected: 7,
+        bytes: DataSize::from_bytes(112_000_000),
+        generation: "basemap_2Fomt-20260828.pmtiles".to_owned(),
+    }
+}
+
+/// **The defect this feature is most exposed to, as a test.** An area whose
+/// bytes are half gone must read as half gone — with both true counts — no
+/// matter that the record persisted says seven.
+#[test]
+fn a_record_whose_segments_are_missing_reads_as_incomplete_with_true_counts() {
+    let dir = TempDir::new("reconcile-missing");
+    let store = FsSegmentStore::new(dir.0.clone());
+    let area = seven_segment_record("reconcile-missing");
+
+    for seg in [0u32, 3, 6] {
+        block_on(store.publish(&area.spec.area_id, seg, vec![0u8; 16]))
+            .expect("the store accepts a segment");
+    }
+
+    let status = block_on(area_status(&store, &area)).expect("the store lists its segments");
+    assert_eq!(
+        status,
+        AreaStatus {
+            present: 3,
+            expected: 7,
+        },
+        "the counts must be the store's, not the record's",
+    );
+    assert!(
+        !status.is_complete(),
+        "a persisted record read as complete while four of its seven segments \
+         are not on the device",
+    );
+
+    // The record itself is untouched by any of that: it says what was asked
+    // for, which is what makes the answer above recomputable at every launch
+    // rather than a flag someone has to remember to clear.
+    assert_eq!(area.segments_expected, 7);
+
+    // And the same record over a full store is complete — without which the
+    // assertion above could pass on a reconciliation that never says yes.
+    for seg in [1u32, 2, 4, 5] {
+        block_on(store.publish(&area.spec.area_id, seg, vec![0u8; 16]))
+            .expect("the store accepts a segment");
+    }
+    let filled = block_on(area_status(&store, &area)).expect("the store lists its segments");
+    assert_eq!(
+        filled,
+        AreaStatus {
+            present: 7,
+            expected: 7,
+        }
+    );
+    assert!(filled.is_complete());
+}
+
+/// Segments past the record's own cut are not counted, and an area expecting
+/// nothing is never complete.
+#[test]
+fn reconciliation_counts_against_the_records_own_cut_and_never_divides_by_nothing() {
+    let area = seven_segment_record("cut");
+    let over = BTreeSet::from([0u32, 1, 2, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        area.reconcile(&over),
+        AreaStatus {
+            present: 3,
+            expected: 7,
+        },
+        "leftovers from a longer earlier cut made a three-segment area look done",
+    );
+
+    let empty = DownloadedArea {
+        segments_expected: 0,
+        ..seven_segment_record("empty")
+    };
+    assert!(
+        !empty.reconcile(&BTreeSet::new()).is_complete(),
+        "a zero denominator made the emptiest possible record the most \
+         confident one",
+    );
+}
+
+/// Only a finished download yields a record — layer 1 against silent partial
+/// success, at the type.
+#[test]
+fn only_a_complete_outcome_yields_a_record() {
+    let spec = monaco_area("outcome", 12);
+    let generation = || "basemap_2Fomt-20260828.pmtiles".to_owned();
+
+    let partial = DownloadOutcome::Partial {
+        done: 3,
+        of: 7,
+        bytes: 48_000_000,
+        first_error: "the connection went away".to_owned(),
+    };
+    assert!(
+        DownloadedArea::from_outcome(spec.clone(), generation(), &partial).is_none(),
+        "a half-downloaded area produced a persistable record",
+    );
+    assert!(
+        DownloadedArea::from_outcome(
+            spec.clone(),
+            generation(),
+            &DownloadOutcome::Failed {
+                error: "no archive".to_owned(),
+            },
+        )
+        .is_none(),
+    );
+
+    let complete = DownloadOutcome::Complete {
+        bytes: 112_000_000,
+        segments: 7,
+    };
+    let record = DownloadedArea::from_outcome(spec.clone(), generation(), &complete)
+        .expect("a Complete outcome is exactly what a record is made of");
+    assert_eq!(record.spec, spec);
+    assert_eq!(record.segments_expected, 7);
+    assert_eq!(record.bytes, DataSize::from_bytes(112_000_000));
+    assert_eq!(record.generation, generation());
 }
