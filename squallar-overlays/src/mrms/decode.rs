@@ -306,6 +306,15 @@ pub struct RawGrid {
     /// `super::volume` reads the height back off the granule so the level
     /// table is checked against the data rather than against a directory name.
     pub first_fixed_surface: Option<(u8, f64)>,
+    /// Section 4's `(parameter category, parameter number)`, when the product
+    /// definition template carries them.
+    ///
+    /// **What tells two MRMS products apart when everything else agrees.** The
+    /// 2D column-max composite and the 3D 0.50 km level declare the *same*
+    /// first fixed surface -- (102, 500 m) -- the same grid, the same packing
+    /// and the same envelope, so a height check alone cannot tell one from the
+    /// other. The category can: see `super::volume::PARAMETER`.
+    pub parameter: Option<(u8, u8)>,
     /// In the grid's own scanning order, with `missing` already mapped to
     /// `f32::NAN`.
     pub values: Vec<f32>,
@@ -368,6 +377,10 @@ pub fn parse_grib2_raw(bytes: &[u8], missing: &[f32]) -> Result<RawGrid, String>
         .prod_def()
         .fixed_surfaces()
         .map(|(first, _second)| (first.surface_type, first.value()));
+    let parameter = submessage
+        .prod_def()
+        .parameter_category()
+        .zip(submessage.prod_def().parameter_number());
 
     // Read before the submessage is consumed by the decoder.
     let decoder = Grib2SubmessageDecoder::from(submessage)
@@ -409,6 +422,7 @@ pub fn parse_grib2_raw(bytes: &[u8], missing: &[f32]) -> Result<RawGrid, String>
         bounds,
         valid,
         first_fixed_surface,
+        parameter,
         values,
     })
 }
