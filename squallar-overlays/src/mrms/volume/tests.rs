@@ -24,11 +24,18 @@
 
 use super::*;
 use crate::hrrr::GridCoords;
+use crate::hrrr::GridCoords::Regular;
 
 const LEVEL_0_GZ: &[u8] =
     include_bytes!("../../../testdata/MRMS_MergedReflectivityQC_00.50_20260830-090042.grib2.gz");
 const LEVEL_32_GZ: &[u8] =
     include_bytes!("../../../testdata/MRMS_MergedReflectivityQC_19.00_20260830-090042.grib2.gz");
+/// The 2D column-max composite this crate already ships — **the substitution
+/// the level check exists to refuse**, and the one it could not see before the
+/// parameter category was carried.
+const COMPOSITE_GZ: &[u8] = include_bytes!(
+    "../../../testdata/MRMS_MergedReflectivityQCComposite_00.50_20260821-000039.grib2.gz"
+);
 
 fn decoded(gz: &[u8]) -> RawGrid {
     let grib = super::super::decode::gunzip(gz).expect("the committed granule is a gzip member");
@@ -172,23 +179,109 @@ fn a_committed_granule_declares_the_height_its_directory_names() {
             level_prefix_name(level),
         );
         assert_eq!(value_m, LEVELS_KM_MSL[level] * 1000.0);
-        check_declared_level(level, &raw).expect("the table agrees with the granule");
+        assert_eq!(raw.parameter, Some(PARAMETER));
+        check_granule_is_this_level(level, &raw).expect("the table agrees with the granule");
         assert_eq!((raw.ni, raw.nj), (7000, 3500));
         assert!(matches!(raw.coords, GridCoords::Regular { .. }));
     }
 }
 
 /// The non-triviality half: the same check *refuses* a granule stacked at the
-/// wrong height. Without this the test above passes for a `check_declared_level`
-/// that returns `Ok(())` unconditionally.
+/// wrong height. Without this the test above passes for a
+/// `check_granule_is_this_level` that returns `Ok(())` unconditionally.
 #[test]
 fn the_height_check_refuses_a_granule_at_another_level() {
     let raw = decoded(LEVEL_0_GZ);
     for level in 1..LEVEL_COUNT {
-        let err = check_declared_level(level, &raw)
+        let err = check_granule_is_this_level(level, &raw)
             .expect_err("the 0.50 km granule is not any other level");
         assert!(err.contains("declares"), "{err}");
     }
+}
+
+/// **The substitution a height check cannot see.**
+///
+/// The 2D composite and the 0.50 km level declare the *same* first fixed
+/// surface — `(102, 500 m)` — the same 7000 × 3500 grid, the same packing and
+/// the same reserved codes. An earlier version of this suite checked only the
+/// height, and swapping the composite granule into level 0's slot passed all 14
+/// of its tests. The parameter category is what tells them apart, and this
+/// asserts the premise as well as the refusal: if the two ever declared the
+/// same category, the refusal below would be resting on nothing.
+#[test]
+fn the_level_check_refuses_the_two_dimensional_composite() {
+    let level = decoded(LEVEL_0_GZ);
+    let composite = decoded(COMPOSITE_GZ);
+
+    // The premise: everything except the category agrees.
+    assert_eq!(level.first_fixed_surface, composite.first_fixed_surface);
+    assert_eq!((level.ni, level.nj), (composite.ni, composite.nj));
+    for (a, b) in [
+        (level.bounds.min_lat, composite.bounds.min_lat),
+        (level.bounds.max_lat, composite.bounds.max_lat),
+        (level.bounds.min_lon, composite.bounds.min_lon),
+        (level.bounds.max_lon, composite.bounds.max_lon),
+    ] {
+        assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+    }
+    // The two grids agree to within 3e-10 degrees — the same corners, the same
+    // shape, a step that differs only in the last bits of the section-3
+    // encoding. **That near-miss is not a discriminator and must not be used as
+    // one**: it is 3e-8 of a 0.01 deg cell, it is a property of how two
+    // granules happened to be written rather than of what they are, and a
+    // check resting on it would pass or fail by rounding.
+    let (
+        Regular {
+            lat0: la,
+            lon0: lo,
+            dlat: da,
+            dlon: do_,
+            ..
+        },
+        Regular {
+            lat0: lb,
+            lon0: lo2,
+            dlat: db,
+            dlon: do2,
+            ..
+        },
+    ) = (&level.coords, &composite.coords)
+    else {
+        panic!("both MRMS grids are the regular arm")
+    };
+    assert_eq!((la, lo), (lb, lo2));
+    assert!((da - db).abs() < 1e-8 && (do_ - do2).abs() < 1e-8);
+
+    // The discriminator, and it is the only one.
+    assert_eq!(level.parameter, Some(PARAMETER));
+    assert_eq!(composite.parameter, Some(COMPOSITE_PARAMETER));
+    assert_ne!(PARAMETER, COMPOSITE_PARAMETER);
+
+    let err = check_granule_is_this_level(0, &composite)
+        .expect_err("the composite is not the 0.50 km level, however alike they look");
+    assert!(err.contains("column-max composite"), "{err}");
+    // And it is refused at every level, not only the one it shares a height
+    // with.
+    for l in 0..LEVEL_COUNT {
+        assert!(check_granule_is_this_level(l, &composite).is_err());
+    }
+}
+
+/// A granule that states no parameter at all is refused rather than admitted on
+/// its height — the `None` arm the two fixtures cannot reach.
+#[test]
+fn a_granule_with_no_parameter_is_refused() {
+    let mut raw = decoded(LEVEL_0_GZ);
+    raw.parameter = None;
+    let err = check_granule_is_this_level(0, &raw).expect_err("no category, no claim");
+    assert!(err.contains("no parameter category"), "{err}");
+
+    // A neighbouring category is refused without the composite's explanation.
+    let mut raw = decoded(LEVEL_0_GZ);
+    raw.parameter = Some((9, 1));
+    let err = check_granule_is_this_level(0, &raw).expect_err("a different parameter number");
+    assert!(err.contains("not (9, 0)"), "{err}");
+    assert!(!err.contains("column-max composite"), "{err}");
 }
 
 /// The fixtures really carry the codes [`MISSING_CODES`] declares, and no
@@ -260,6 +353,7 @@ fn level(l: usize, ni: usize, nj: usize, valid: chrono::NaiveDateTime, fill: f32
             },
             valid,
             first_fixed_surface: Some((SURFACE_TYPE_ALTITUDE_MSL, LEVELS_KM_MSL[l] * 1000.0)),
+            parameter: Some(PARAMETER),
             values: vec![fill; ni * nj],
         },
     }
@@ -310,15 +404,52 @@ fn a_stack_missing_one_level_is_refused() {
     assert!(err.contains("MergedReflectivityQC_06.50"), "{err}");
 }
 
+/// **The hole is `NaN`, never `0.0`** — the second line of defence behind
+/// `finish`'s refusal of a partial stack.
+///
+/// 0 dBZ is a *reading*: a level that never arrived would read downstream as a
+/// real, weak echo at that height rather than as an absence, and `Occupancy`
+/// would count it at the 0 dBZ bar. Unobservable through `finish` today, which
+/// is precisely why it needs a test of its own — an unobservable defence is one
+/// nothing holds.
+#[test]
+fn an_unfilled_level_is_nan_and_never_zero() {
+    let mut a = VolumeAssembler::new();
+    a.push(level(7, 4, 3, stamp(42), 3.0)).expect("push");
+    let filled = a.partial_values();
+    assert_eq!(filled.len(), LEVEL_COUNT * 12);
+    for (i, &v) in filled.iter().enumerate() {
+        let level_of = i / 12;
+        if level_of == 7 {
+            assert_eq!(v, 3.0);
+        } else {
+            assert!(
+                v.is_nan(),
+                "level {level_of} cell {i} filled with {v}, not NaN"
+            );
+        }
+    }
+    // And the count agrees: only the one pushed level is a reading.
+    assert_eq!(Occupancy::of(filled).readings, 12);
+}
+
 #[test]
 fn the_assembler_refuses_every_way_two_levels_can_disagree() {
-    // A different valid time: a stack of two timesteps is not a timestep.
+    // A valid time past the tolerance: a stack of two timesteps is not a
+    // timestep. The neighbouring scan is ~120 s away, so this is the case that
+    // matters and it is refused by a wide margin.
     let mut a = VolumeAssembler::new();
     a.push(level(0, 4, 3, stamp(42), 0.0)).expect("push");
     let err = a
-        .push(level(1, 4, 3, stamp(44), 0.0))
+        .push(level(
+            1,
+            4,
+            3,
+            stamp(42) + chrono::Duration::seconds(120),
+            0.0,
+        ))
         .expect_err("two timesteps");
-    assert!(err.contains("valid"), "{err}");
+    assert!(err.contains("more than the"), "{err}");
 
     // A different shape.
     let mut a = VolumeAssembler::new();
@@ -353,6 +484,23 @@ fn the_assembler_refuses_every_way_two_levels_can_disagree() {
         .expect_err("one level twice");
     assert!(err.contains("arrived twice"), "{err}");
 
+    // A different envelope at the same shape and the same coordinates. Only
+    // reachable by construction — the decoder derives bounds from the
+    // coordinates — but the branch exists, the test's name claims every way,
+    // and an unreachable-by-decode branch is exactly the one a future decoder
+    // change would reach first.
+    let mut a = VolumeAssembler::new();
+    a.push(level(0, 4, 3, stamp(42), 0.0)).expect("push");
+    let mut moved = level(1, 4, 3, stamp(42), 0.0);
+    moved.grid.bounds = squallar_geo::GeoBounds {
+        min_lat: 21.0,
+        max_lat: 55.0,
+        min_lon: -130.0,
+        max_lon: -60.0,
+    };
+    let err = a.push(moved).expect_err("two envelopes");
+    assert!(err.contains("envelope"), "{err}");
+
     // A granule whose section 4 disagrees with the index it is pushed at.
     let mut a = VolumeAssembler::new();
     let mut mislevelled = level(5, 4, 3, stamp(42), 0.0);
@@ -366,6 +514,187 @@ fn the_assembler_refuses_every_way_two_levels_can_disagree() {
     agl.grid.first_fixed_surface = Some((103, LEVELS_KM_MSL[5] * 1000.0));
     let err = a.push(agl).expect_err("above ground is another axis");
     assert!(err.contains("mean sea level"), "{err}");
+}
+
+// ── Which stamps are one timestep ───────────────────────────────────────────
+//
+// `timesteps` and `stamps_at_or_before` are pure, and everything below runs on
+// the default `cargo test` row. That is deliberate: a review found that
+// replacing the whole cross-level match with "take the first level's stamps"
+// passed every test in this file, because the only callers were `#[ignore]`d.
+// The claim in this module's own commit message — "the stamp is the
+// intersection and never the newest of any one level" — was defended by
+// nothing. These are what defend it.
+
+/// A whole day of aligned stamps at the real 120 s cadence, `count` of them.
+fn aligned_day(count: usize) -> Vec<Vec<chrono::NaiveDateTime>> {
+    let base = stamp(0);
+    let series: Vec<chrono::NaiveDateTime> = (0..count)
+        .map(|k| base + chrono::Duration::seconds(120 * k as i64))
+        .collect();
+    vec![series; LEVEL_COUNT]
+}
+
+#[test]
+fn aligned_levels_give_one_timestep_per_scan() {
+    let found = timesteps(&aligned_day(5));
+    assert_eq!(found.len(), 5);
+    for (k, t) in found.iter().enumerate() {
+        assert!(t.is_aligned());
+        assert_eq!(t.span_seconds(), 0);
+        assert_eq!(
+            t.valid(),
+            stamp(0) + chrono::Duration::seconds(120 * k as i64)
+        );
+        assert!(t.stamps.iter().all(|s| *s == t.valid()));
+    }
+}
+
+/// **The mutant this exists to kill.** Level 0 carries a stamp no other level
+/// published — exactly the `003242`/`003243` partition, in the direction where
+/// taking the first level's list would invent a timestep 32 levels cannot serve.
+#[test]
+fn a_stamp_only_the_first_level_published_is_not_a_timestep() {
+    let mut per_level = aligned_day(3);
+    let orphan = stamp(0) + chrono::Duration::seconds(3600);
+    per_level[0].push(orphan);
+    per_level[0].sort_unstable();
+
+    let found = timesteps(&per_level);
+    assert_eq!(found.len(), 3, "the orphan stamp became a timestep");
+    assert!(
+        found.iter().all(|t| t.valid() != orphan),
+        "a stamp only one level published was admitted",
+    );
+
+    // And in the other direction: a stamp every level *but* the first has is
+    // not a timestep either, which "take the last level's list" would also get
+    // wrong.
+    let mut per_level = aligned_day(3);
+    let without_first = stamp(0) + chrono::Duration::seconds(7200);
+    for stamps in per_level.iter_mut().skip(1) {
+        stamps.push(without_first);
+        stamps.sort_unstable();
+    }
+    assert_eq!(timesteps(&per_level).len(), 3);
+}
+
+/// **The F2 recovery, in the shape the bucket actually publishes it**: the low
+/// six levels one second behind the other 27, zero overlap. An exact-match
+/// intersection loses the whole timestep; the tolerance keeps it, and keeps
+/// each level's own stamp so the keys resolve.
+#[test]
+fn a_one_second_partition_across_the_levels_is_still_one_timestep() {
+    let mut per_level = aligned_day(1);
+    let early = stamp(0);
+    let late = early + chrono::Duration::seconds(1);
+    for (l, stamps) in per_level.iter_mut().enumerate() {
+        stamps[0] = if l < 6 { early } else { late };
+    }
+
+    // The premise: no stamp is shared by all 33, so an exact intersection is
+    // empty. Stated rather than assumed, or the recovery below proves nothing.
+    let shared: Vec<_> = per_level[0]
+        .iter()
+        .filter(|s| per_level.iter().all(|l| l.contains(s)))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "the partition is not a partition: {shared:?}"
+    );
+
+    let found = timesteps(&per_level);
+    assert_eq!(found.len(), 1, "the partitioned timestep was lost");
+    let t = found[0];
+    assert!(!t.is_aligned());
+    assert_eq!(t.span_seconds(), 1);
+    assert_eq!(t.valid(), late, "a timestep is named by its latest level");
+    // Each level keeps its OWN stamp, or 27 of the 33 keys would 404.
+    for l in 0..LEVEL_COUNT {
+        assert_eq!(t.stamps[l], if l < 6 { early } else { late });
+    }
+}
+
+/// The tolerance has an edge, and past it the levels are two scans.
+#[test]
+fn a_split_wider_than_the_tolerance_is_not_one_timestep() {
+    for offset in [STAMP_TOLERANCE_SECONDS, STAMP_TOLERANCE_SECONDS + 1] {
+        let mut per_level = aligned_day(1);
+        for stamps in per_level.iter_mut().skip(6) {
+            stamps[0] += chrono::Duration::seconds(offset);
+        }
+        let found = timesteps(&per_level);
+        if offset <= STAMP_TOLERANCE_SECONDS {
+            assert_eq!(found.len(), 1, "a {offset} s split is inside the tolerance");
+            assert_eq!(found[0].span_seconds(), offset);
+        } else {
+            assert!(found.is_empty(), "a {offset} s split is two scans, not one");
+        }
+    }
+}
+
+/// Two adjacent scans at the real cadence are never merged — the tolerance is
+/// 2.5 % of 120 s, and this is what says so in code rather than in prose.
+#[test]
+fn adjacent_scans_are_never_merged_into_one_timestep() {
+    let found = timesteps(&aligned_day(2));
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        (found[1].valid() - found[0].valid()).num_seconds(),
+        120,
+        "two scans collapsed into one",
+    );
+}
+
+/// A level that published nothing takes every timestep with it, and a wrongly
+/// sized input answers empty rather than guessing.
+#[test]
+fn a_level_with_no_stamps_leaves_no_timestep() {
+    let mut per_level = aligned_day(4);
+    per_level[19].clear();
+    assert!(timesteps(&per_level).is_empty());
+
+    assert!(timesteps(&[]).is_empty());
+    assert!(timesteps(&aligned_day(4)[..LEVEL_COUNT - 1]).is_empty());
+}
+
+/// **The F5 mutant**: without the `at` filter this returns the whole day, and a
+/// "newest at or before 15:00Z" question is answered with the evening's scan.
+#[test]
+fn stamps_are_filtered_to_the_instant_that_was_asked_about() {
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+    let keys: Vec<String> = [0u32, 6, 12, 18]
+        .iter()
+        .map(|h| DataSources::mrms_key(&level_prefix_name(0), &day.and_hms_opt(*h, 0, 42).unwrap()))
+        .collect();
+
+    let at = day.and_hms_opt(12, 30, 0).unwrap();
+    let got = stamps_at_or_before(&keys, at);
+    assert_eq!(got.len(), 3, "an unfiltered listing answers the whole day");
+    assert_eq!(
+        got.last().copied(),
+        Some(day.and_hms_opt(12, 0, 42).unwrap())
+    );
+    assert!(got.iter().all(|s| *s <= at));
+
+    // The boundary is inclusive: a stamp exactly at `at` is at or before it.
+    let exact = day.and_hms_opt(12, 0, 42).unwrap();
+    assert_eq!(stamps_at_or_before(&keys, exact).len(), 3);
+    assert_eq!(
+        stamps_at_or_before(&keys, exact - chrono::Duration::seconds(1)).len(),
+        2,
+    );
+
+    // Ascending and deduped, and a key with no decodable stamp is dropped
+    // rather than kept: an undatable key cannot be shown to be at or before
+    // anything.
+    let mut noisy = keys.clone();
+    noisy.push(keys[0].clone());
+    noisy.push("CONUS/MergedReflectivityQC_00.50/20260830/".to_string());
+    noisy.reverse();
+    let got = stamps_at_or_before(&noisy, day.and_hms_opt(23, 59, 59).unwrap());
+    assert_eq!(got.len(), 4);
+    assert!(got.windows(2).all(|w| w[0] < w[1]));
 }
 
 // ── Occupancy ───────────────────────────────────────────────────────────────
@@ -403,12 +732,20 @@ fn a_stacks_occupancy_is_the_sum_of_its_levels() {
     let per_level = v.per_level_occupancy();
     assert_eq!(per_level.len(), LEVEL_COUNT);
     assert_eq!(whole.cells, v.cells());
+    // **Not** re-folding `per_level` here: `occupancy()` *is* that fold, so the
+    // comparison would be `x == x`. Sum the fields independently instead, which
+    // is the claim the fold is supposed to deliver.
     assert_eq!(
-        whole,
-        per_level
-            .into_iter()
-            .fold(Occupancy::default(), Occupancy::merged),
+        whole.readings,
+        per_level.iter().map(|o| o.readings).sum::<usize>(),
     );
+    for (i, threshold) in OCCUPANCY_THRESHOLDS_DBZ.iter().enumerate() {
+        assert_eq!(
+            whole.at_or_above[i],
+            per_level.iter().map(|o| o.at_or_above[i]).sum::<usize>(),
+            "the {threshold} dBZ counts do not add up",
+        );
+    }
     // The synthetic stack fills level `l` with `l` dBZ, so every level from 5
     // up clears the 5 dBZ bar and no cell is missing.
     assert_eq!(whole.readings, whole.cells);
@@ -502,17 +839,21 @@ async fn the_bucket_publishes_exactly_the_thirty_three_levels_declared() {
 /// **One timestep, stacked, with what it cost.**
 ///
 /// The measurement E1 exists to take. Every figure is printed with its own
-/// denominator and **nothing is averaged across timesteps**: an active
-/// afternoon and a quiet night differ by orders of magnitude, and one mean
+/// denominator and **nothing is averaged across timesteps**: a broad winter
+/// system and a quiet summer night differ by orders of magnitude, and one mean
 /// describes neither.
 ///
 /// Which timesteps it measures:
 ///
-/// * unset — the newest stamp all 33 levels have published;
-/// * `SQUALLAR_MRMS_STACK_AT=2026-08-29T21:00,2026-08-30T09:00` — for each
-///   instant, the newest complete stamp at or before it. Stamps are not
-///   clock-aligned, so an instant names a *neighbourhood*, and the stamp
+/// * unset — the newest timestep all 33 levels have published;
+/// * `SQUALLAR_MRMS_STACK_AT=2026-01-14T09:00,2026-08-29T21:00` — for each
+///   instant, the newest complete timestep at or before it. Stamps are not
+///   clock-aligned, so an instant names a *neighbourhood*, and the timestep
 ///   actually measured is printed.
+///
+/// **Sample across the retention, not across a week.** The bucket keeps at
+/// least 20 months, so a week of August says nothing about February; the module
+/// doc's table is 24 draws across 12 months for exactly this reason.
 ///
 /// `#[ignore]`d because it is network, and because each timestep holds 3.2 GB.
 /// Run it `--release`: a debug decode is several times slower and the wall
@@ -547,22 +888,26 @@ async fn the_live_stack_decodes_and_reports_its_own_cost() {
     } else {
         requested
     };
-    let mut stamps: Vec<chrono::NaiveDateTime> = Vec::new();
+
+    let mut wanted: Vec<StackStamps> = Vec::new();
     for at in instants {
         let listing = std::time::Instant::now();
-        let stamp = latest_complete_stamp(&client, &sources, at)
+        let timestep = latest_timestep(&client, &sources, at)
             .await
-            .unwrap_or_else(|e| panic!("no complete stamp at or before {at}Z: {e}"));
+            .unwrap_or_else(|e| panic!("no complete timestep at or before {at}Z: {e}"));
         println!(
-            "asked for {at}Z, newest complete stamp at or before it is {stamp}Z              ({LEVEL_COUNT} bounded listings in {:.2} s)",
+            "asked for {at}Z, newest complete timestep at or before it is {}Z (stamp span {} s; {LEVEL_COUNT} bounded listings in {:.2} s)",
+            timestep.valid(),
+            timestep.span_seconds(),
             listing.elapsed().as_secs_f64(),
         );
-        stamps.push(stamp);
+        wanted.push(timestep);
     }
 
-    for stamp in stamps {
+    for timestep in wanted {
+        let stamp = timestep.valid();
         let started = std::time::Instant::now();
-        let volume = fetch_stack(&client, &sources, &stamp)
+        let volume = fetch_stack(&client, &sources, &timestep)
             .await
             .expect("33 levels stack");
         let elapsed = started.elapsed();
@@ -570,12 +915,15 @@ async fn the_live_stack_decodes_and_reports_its_own_cost() {
         assert_eq!((volume.ni, volume.nj), (7000, 3500));
         assert_eq!(volume.cells(), 808_500_000);
         assert_eq!(volume.resident_bytes(), CONUS_STACK_BYTES);
+        // The granules' own section 1 times agree with the keys they were
+        // fetched under, split and all.
         assert_eq!(volume.valid, stamp);
+        assert_eq!(volume.valid_span_seconds, timestep.span_seconds());
 
         let o = volume.occupancy();
         println!(
             "\nMRMS 3D stack {stamp}Z\n\
-               levels                {LEVEL_COUNT}\n\
+               levels                {LEVEL_COUNT} (stamp span {} s)\n\
                grid                  {}x{} = {} points per level\n\
                cells                 {} (the denominator of every share below)\n\
                download (gzipped)    {} B\n\
@@ -587,6 +935,7 @@ async fn the_live_stack_decodes_and_reports_its_own_cost() {
                >= 5 dBZ              {} ({:.4} %)\n\
                >= 20 dBZ             {} ({:.4} %)\n\
                >= 40 dBZ             {} ({:.4} %)",
+            volume.valid_span_seconds,
             volume.ni,
             volume.nj,
             volume.points_per_level(),
@@ -633,7 +982,8 @@ async fn the_live_stack_decodes_and_reports_its_own_cost() {
         // decode's mapping and would be reported as a reading. Genuine -3.0 dBZ
         // returns are ordinary, which is why the bar is coverage-mask scale
         // rather than zero — the 2D composite fixture carries 347 of them in
-        // 24.5 M points.
+        // 24.5 M points, and this sweep has measured anywhere from 5 231 to
+        // 240 594 across a stack, both far under the bar.
         let threes = volume
             .values
             .iter()
@@ -645,6 +995,146 @@ async fn the_live_stack_decodes_and_reports_its_own_cost() {
             "-3 occurs {threes} times of {}, which is coverage-mask scale for a \
              code this product does not declare",
             o.cells,
+        );
+    }
+}
+
+/// **How often the 33 levels do not share a stamp, and what the tolerance
+/// recovers** — the measurement behind [`STAMP_TOLERANCE_SECONDS`].
+///
+/// Lists a whole UTC day for all 33 levels and reports, with denominators: each
+/// level's granule count, the union of stamps, the **exact** intersection (what
+/// a single-stamp design could address), the tolerant timestep count, how many
+/// of those are split across levels, and the largest hole in each series
+/// against the ~120 s cadence.
+///
+/// `#[ignore]`d because it is network — ~3 MB of listings per day.
+///
+/// `cargo test -p squallar-overlays -- --ignored --nocapture the_levels_do_not`
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+#[ignore = "hits the live noaa-mrms-pds S3 bucket for 33 whole-day listings"]
+async fn the_levels_do_not_always_share_a_stamp_and_the_tolerance_recovers_them() {
+    let client = squallar_source::tls::client(
+        squallar_source::tls::USER_AGENT,
+        std::time::Duration::from_secs(120),
+    )
+    .build()
+    .expect("client");
+    let sources = DataSources::production();
+
+    let days: Vec<chrono::NaiveDate> = std::env::var("SQUALLAR_MRMS_DAY")
+        .unwrap_or_else(|_| "20260829,20260315".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y%m%d")
+                .unwrap_or_else(|e| panic!("{s:?} is not a YYYYMMDD day: {e}"))
+        })
+        .collect();
+
+    for day in days {
+        let end = day.and_hms_opt(23, 59, 59).unwrap();
+        let mut per_level: Vec<Vec<chrono::NaiveDateTime>> = Vec::with_capacity(LEVEL_COUNT);
+        for level in 0..LEVEL_COUNT {
+            let keys = super::super::fetch::list_day(
+                &client,
+                &sources,
+                &level_prefix_name(level),
+                day,
+                None,
+            )
+            .await
+            .expect("the day lists");
+            per_level.push(stamps_at_or_before(&keys, end));
+        }
+
+        let counts: Vec<usize> = per_level.iter().map(Vec::len).collect();
+        let mut union: Vec<chrono::NaiveDateTime> = per_level.iter().flatten().copied().collect();
+        union.sort_unstable();
+        union.dedup();
+        let exact: Vec<chrono::NaiveDateTime> = union
+            .iter()
+            .copied()
+            .filter(|s| per_level.iter().all(|l| l.binary_search(s).is_ok()))
+            .collect();
+        let tolerant = timesteps(&per_level);
+        let split = tolerant.iter().filter(|t| !t.is_aligned()).count();
+        let tolerant_valids: Vec<chrono::NaiveDateTime> =
+            tolerant.iter().map(StackStamps::valid).collect();
+
+        let largest_gap = |series: &[chrono::NaiveDateTime]| -> i64 {
+            series
+                .windows(2)
+                .map(|w| (w[1] - w[0]).num_seconds())
+                .max()
+                .unwrap_or(0)
+        };
+        let per_level_max = *counts.iter().max().unwrap();
+
+        println!(
+            "\n{day}\n\
+               per-level granules     {}..{}\n\
+               union of stamps        {}\n\
+               exact intersection     {} — {} of {} unaddressable by one stamp ({:.1} %)\n\
+               tolerant timesteps     {} ({} split across levels)\n\
+               largest hole, exact    {} s\n\
+               largest hole, tolerant {} s   (cadence ~120 s)",
+            counts.iter().min().unwrap(),
+            per_level_max,
+            union.len(),
+            exact.len(),
+            per_level_max.saturating_sub(exact.len()),
+            per_level_max,
+            100.0 * (per_level_max.saturating_sub(exact.len())) as f64 / per_level_max as f64,
+            tolerant.len(),
+            split,
+            largest_gap(&exact),
+            largest_gap(&tolerant_valids),
+        );
+
+        // **The tolerance curve**: what each extra second of slack buys, and
+        // where it stops buying anything. This is what picks
+        // `STAMP_TOLERANCE_SECONDS` from data instead of from a guess.
+        println!("  tolerance   timesteps   split   largest hole");
+        for tolerance in [0i64, 1, 2, 3, 4, 5, 6, 8, 10, 15, 30] {
+            let found = timesteps_within(&per_level, tolerance);
+            let valids: Vec<chrono::NaiveDateTime> = found.iter().map(StackStamps::valid).collect();
+            println!(
+                "  {tolerance:>9}   {:>9}   {:>5}   {:>9} s",
+                found.len(),
+                found.iter().filter(|t| !t.is_aligned()).count(),
+                largest_gap(&valids),
+            );
+        }
+
+        // Shown rather than asserted: on a day where every level happened to
+        // align there is nothing to show, and a hard assertion here would be a
+        // claim about NOAA's scheduler rather than about this code.
+        if let Some(t) = tolerant.iter().find(|t| !t.is_aligned()) {
+            let early = t.stamps.iter().min().unwrap();
+            let late = t.stamps.iter().max().unwrap();
+            let n_early = t.stamps.iter().filter(|s| *s == early).count();
+            println!(
+                "  example split: {n_early} levels at {early}, {} at {late}",
+                LEVEL_COUNT - n_early,
+            );
+        }
+
+        // What *is* asserted holds on any day: the tolerance never loses a
+        // timestep an exact match would have found, never invents one the union
+        // does not contain, and never merges two scans.
+        assert!(
+            tolerant.len() >= exact.len(),
+            "the tolerance found fewer timesteps than an exact match",
+        );
+        assert!(tolerant.len() <= union.len());
+        assert!(
+            tolerant_valids
+                .windows(2)
+                .all(|w| (w[1] - w[0]).num_seconds() > 60),
+            "two scans were merged into one timestep",
         );
     }
 }

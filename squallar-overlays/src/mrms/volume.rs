@@ -44,62 +44,103 @@
 //!
 //! ## What a timestep costs, measured
 //!
-//! Seven timesteps, 2026-08-27 to 2026-08-30, taken with
+//! **Sampled across the retention, not across a week.** An earlier draft of this
+//! module measured seven timesteps inside one late-August week and wrote design
+//! conclusions off them. The bucket retains at least 20 months, so that was a
+//! choice rather than a constraint, and it was the wrong one: every band below
+//! is wider than that week suggested, some by more than an order of magnitude.
+//! The caveat was even written down — "not a year… a winter stratiform event is
+//! unmeasured here" — and the conclusion was stated anyway. A caveat that names
+//! a direction and is then ignored is worse than no caveat.
+//!
+//! **24 blind draws**, uniform over `2025-09-01` to `2026-08-29` in both date and
+//! time of day, seed `20260830`, taken with
 //! `the_live_stack_decodes_and_reports_its_own_cost` (`#[ignore]`d because it is
 //! network) on a `--release` build, one desktop, one home connection.
-//! **Every share below has one denominator: 33 × 24 500 000 = 808 500 000 cells
-//! of that one timestep.** Nothing here is averaged across rows — see the
-//! spread, which is the point.
+//! **Every share has one denominator: 33 × 24 500 000 = 808 500 000 cells of one
+//! timestep**, and the ranges below are min/max over the 24 — never a mean,
+//! because the extremes are what a residency scheme has to survive.
 //!
-//! | Stamp (UTC) | Download (gz) | readings | ≥ 5 dBZ | ≥ 20 dBZ | ≥ 40 dBZ |
-//! |---|---:|---:|---:|---:|---:|
-//! | 2026-08-27 20:58:43 | 30 916 431 B | 2.851 % | 2.714 % | 0.738 % | 0.0489 % |
-//! | 2026-08-28 08:58:41 | 18 392 787 B | 1.543 % | 1.433 % | 0.357 % | 0.0157 % |
-//! | 2026-08-28 20:58:40 | 29 836 909 B | 2.767 % | 2.610 % | 0.608 % | 0.0333 % |
-//! | 2026-08-29 09:58:42 | 19 899 508 B | 1.843 % | 1.731 % | 0.578 % | 0.0197 % |
-//! | 2026-08-29 20:56:38 | 28 242 562 B | 2.665 % | 2.513 % | 0.618 % | 0.0249 % |
-//! | 2026-08-30 01:58:42 | 25 439 250 B | 2.501 % | 2.338 % | 0.603 % | 0.0134 % |
-//! | 2026-08-30 09:24:42 | 25 435 169 B | 2.532 % | 2.363 % | 0.545 % | 0.0133 % |
+//! | Figure | Range over 24 draws | Spread |
+//! |---|---|---:|
+//! | Download, gzipped, all 33 levels | **13.41 – 37.95 MB** | 2.8× |
+//! | Fetch + gunzip + decode + stack | **9.7 – 11.1 s** | 1.1× |
+//! | `readings` (a value at all) | **1.143 – 4.135 %** | 3.6× |
+//! | ≥ 5 dBZ | **1.068 – 3.854 %** | 3.6× |
+//! | ≥ 20 dBZ | **0.0715 – 1.2095 %** | 16.9× |
+//! | ≥ 40 dBZ | **0.0000 – 0.0467 %** | unbounded — one draw held none |
 //!
-//! **A timestep is 18–31 MB gzipped**, against MRMS's ~2-minute cadence.
+//! An independent 20-draw sample over the same retention, run by a reviewer with
+//! a different seed, found 14.9–44.7 MB, readings 1.291–6.049 %, ≥ 5 dBZ
+//! 0.714–4.600 % and ≥ 40 dBZ 0.0000134–0.0504 %. **Two seeds, two samplers,
+//! overlapping ranges**: taken together the bands to design against are
+//! **13–45 MB**, **readings 1.1–6.0 %**, **≥ 5 dBZ 0.7–4.6 %** — a **6.4×**
+//! spread on the number that matters — and **≥ 40 dBZ 0 – 0.05 %**.
 //!
-//! **97.1 to 98.5 % of the stack is not a reading at all.** `readings` counts
-//! finite values — everything that is neither of [`MISSING_CODES`] — and over
-//! seven timesteps it never reached 3 %. For scale, and **not as a like-for-like
-//! comparison** (a different granule at a different hour): the committed 2D
-//! composite fixture is 4.8 % readings, its reserved codes covering 95.2 % of
-//! which only 34 % is the no-coverage mask. So the stack is roughly half as
-//! dense per cell as the column maximum it would replace, and what dominates it
-//! is `-99` — "no echo at this height" — because most of the atmosphere above
-//! a covered point holds nothing at any given moment.
+//! ### The mechanism, which one August week cannot show
 //!
-//! **The quiet-to-active spread is a small multiple, not orders of magnitude.**
-//! The diurnal peak (~21:00Z, mid-afternoon over the plains) and the overnight
-//! minimum (~09:00Z) differ by **1.9×** in the ≥ 5 dBZ share and **3.7×** in the
-//! ≥ 40 dBZ share, over seven timesteps spanning three days. A scheme sized for
-//! 3 % occupancy is not routinely surprised; one sized for the mean of these
-//! rows would be, which is why they are stated separately. Seven timesteps in
-//! one late-August week is also **not a year**: a winter stratiform event or a
-//! landfalling tropical system are unmeasured here.
+//! Six of the 24 draws, chosen to show the shape rather than to flatter it:
 //!
-//! **Occupancy peaks in the middle of the column, not at the bottom.** The
-//! densest levels are 5.5–6.0 km (5.17 % of their own level ≥ 5 dBZ on the
-//! 2026-08-29 20:56:38Z stack) and the sparsest are the two ends — 0.31 % at
+//! | Stamp (UTC) | Download | readings | ≥ 5 dBZ | ≥ 20 dBZ | ≥ 40 dBZ | ≥5 / readings | ≥20 / ≥5 |
+//! |---|---:|---:|---:|---:|---:|---:|---:|
+//! | 2025-11-28 06:54:35 | 22.78 MB | 2.468 % | 1.126 % | 0.071 % | 0.0003 % | 46 % | 6 % |
+//! | 2025-12-20 10:42:37 | 18.88 MB | 2.120 % | 1.244 % | 0.090 % | **0.0000 %** | 59 % | 7 % |
+//! | 2026-01-02 07:18:36 | 25.83 MB | 2.830 % | 1.659 % | 0.100 % | 0.0004 % | 59 % | 6 % |
+//! | 2026-05-23 21:26:41 | **37.95 MB** | **4.135 %** | **3.854 %** | **1.210 %** | 0.0467 % | 93 % | 31 % |
+//! | 2026-07-02 12:24:38 | 15.31 MB | 1.332 % | 1.261 % | 0.406 % | 0.0268 % | 95 % | 32 % |
+//! | 2025-09-12 07:46:37 | **13.41 MB** | **1.143 %** | **1.068 %** | 0.321 % | 0.0158 % | 93 % | 30 % |
+//!
+//! **Cold-season mosaics are broad and weak; warm-season ones are narrow and
+//! strong**, and the two last columns are where that is visible. In winter only
+//! 46–59 % of readings clear 5 dBZ and only 6–7 % of those clear 20; in summer
+//! 93–95 % clear 5 and 30–32 % clear 20. So a winter system maximises *area*
+//! while minimising *cores* — and **sparse residency is priced on area**, which
+//! is exactly why the summer week understated it. The single densest draw is a
+//! late-May convective afternoon that is both broad *and* strong, and it sets
+//! every ceiling in the table above.
+//!
+//! ### What that means for a residency scheme, stated as bands not as a number
+//!
+//! * **Size for ~5 % of cells carrying a paintable return, not 3 %.** The
+//!   measured ceiling is 3.854 % here and 4.600 % in the reviewer's sample; 3 %
+//!   is exceeded by 1 of these 24 draws and by 5 of the reviewer's 20.
+//! * **A core-following scheme cannot have a fixed budget.** The ≥ 40 dBZ
+//!   fraction spans zero to 0.0467 %: on 2025-12-20 the entire CONUS column held
+//!   **no cell at all** above 40 dBZ. Any design keyed on cores must degrade to
+//!   "there are none" as an ordinary case rather than as an error.
+//! * **Download is 13–45 MB per timestep against a ~120 s cadence.** Continuous
+//!   ingest is 0.1–0.4 MB/s sustained.
+//! * Still **97 to 99 % of the stack is not a reading at all** — the sparsity
+//!   the whole track rests on is real. It is *how much* of the remainder to
+//!   budget for that the August week got wrong, not whether the field is sparse.
+//!
+//! ### Occupancy is not uniform in the vertical
+//!
+//! On the 2026-08-29 20:56:38Z stack the densest levels are 5.5–6.0 km (5.17 %
+//! of their own level ≥ 5 dBZ) and the sparsest are the two ends — 0.31 % at
 //! 0.50 km, 0.03 % at 19 km. Per-level bytes follow the same curve and peak at
 //! 5.5 km, so the top and bottom of the roster are cheap in both dimensions.
 //! **Why the bottom level is the emptier end is not something these counts
 //! prove**, and two ordinary explanations fit: 0.5 km MSL is below the ground
 //! over much of the west, and the beam is above it at any useful range
-//! elsewhere. It is recorded as an observation, not a mechanism.
+//! elsewhere. Recorded as an observation, not a mechanism.
+//!
+//! ### The 2D composite, for scale and not as a comparison
+//!
+//! The committed 2D composite fixture is **4.8 % readings**: its two reserved
+//! codes cover 95.2 % of its 24 500 000 cells, of which `-999` — the
+//! no-coverage mask — is **33.96 % of all cells** and 35.68 % of the reserved
+//! ones. That is a different granule at a different hour and is **not** a
+//! like-for-like comparison with any row above; it is here only so that "the
+//! stack is sparser than the column maximum" has a number beside it.
 //!
 //! ## Wall clock, measured
 //!
-//! On the same seven runs, and **stated as two figures because they have
-//! different shapes**:
+//! **Two figures, different shapes, never added**, over the same 24 draws:
 //!
-//! * finding a stamp all 33 levels have: **0.50–0.65 s**, 33 bounded listings
+//! * finding a timestep all 33 levels have: **0.33–0.76 s**, 33 bounded listings
 //!   of ~1 KB;
-//! * fetch + gunzip + GRIB2 decode + stack: **10.6–14.1 s** at
+//! * fetch + gunzip + GRIB2 decode + stack: **9.7–11.1 s** at
 //!   [`STACK_FETCH_CONCURRENCY`], `--release`.
 //!
 //! A debug build is several times slower; a wall clock taken there would
@@ -125,12 +166,38 @@ pub const LEVEL_COUNT: usize = 33;
 /// level above ground". The distinction is the whole difference between a stack
 /// that sits on the terrain and one that sits on the geoid, and it is checked
 /// against the granule rather than taken from the directory name — see
-/// [`check_declared_level`].
+/// [`check_granule_is_this_level`].
 pub const LEVELS_KM_MSL: [f64; LEVEL_COUNT] = [
     0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00, // 0.25 km
     3.50, 4.00, 4.50, 5.00, 5.50, 6.00, 6.50, 7.00, 7.50, 8.00, 8.50, 9.00, // 0.50 km
     10.00, 11.00, 12.00, 13.00, 14.00, 15.00, 16.00, 17.00, 18.00, 19.00, // 1.00 km
 ];
+
+/// Section 4's `(parameter category, parameter number)` for
+/// `MergedReflectivityQC`.
+///
+/// **This, not the height, is what tells a level from the 2D composite.** Read
+/// off the committed granules: the 3D levels declare `(9, 0)` and the 2D
+/// `MergedReflectivityQCComposite_00.50` declares `(10, 0)` — and the two are
+/// otherwise indistinguishable to this decoder. Both state first fixed surface
+/// `(102, 500 m)`, both are 7000 × 3500 at 0.01°, both use the same packing and
+/// the same reserved codes. A review substituted the composite granule into the
+/// 0.50 km level's slot and **every offline test passed**, because the check
+/// here only proved the *height* and the height is genuinely identical.
+///
+/// The number is `0` for both, so it discriminates nothing on its own; it is
+/// carried and asserted anyway, because a product that changed its parameter
+/// *number* while keeping its category is exactly the substitution this pair
+/// exists to refuse.
+pub const PARAMETER: (u8, u8) = (9, 0);
+
+/// The 2D composite's `(category, number)`, which is **not** a level's.
+///
+/// Named rather than left implicit so the error message can say what the
+/// granule looks like it actually is, and so
+/// `tests::the_level_check_refuses_the_two_dimensional_composite` reads as the
+/// statement it is.
+pub const COMPOSITE_PARAMETER: (u8, u8) = (10, 0);
 
 /// Code table 4.5's "specific altitude above mean sea level".
 pub const SURFACE_TYPE_ALTITUDE_MSL: u8 = 102;
@@ -164,6 +231,14 @@ const LEVEL_TOLERANCE_M: f64 = 1.0;
 /// `tests::the_live_stack_decodes_and_reports_its_own_cost`, which is
 /// **`#[ignore]`d** — `cargo test -p squallar-overlays --release -- --ignored
 /// the_live_stack`.
+///
+/// **The `-3` count is seasonal, so it is quoted as a range and not as one
+/// number.** Over the 24 draws above it ran from **2 430** (2026-08-13) to
+/// **267 092** (2025-11-28) of 808 500 000 cells — a 110x spread, tracking the
+/// cold-season weak returns that table describes. The conclusion is unchanged
+/// and the margin is large: the worst case is **0.033 %** against a 1 % bar, so
+/// these are genuine -3.0 dBZ returns and not a coverage mask. An earlier draft
+/// quoted 5 231 from a single August stamp as though it were the figure.
 pub const MISSING_CODES: [f32; 2] = [-999.0, -99.0];
 
 /// One stacked timestep's values, in bytes: 33 × 7000 × 3500 `f32` =
@@ -208,16 +283,45 @@ pub fn level_key(level: usize, stamp: &NaiveDateTime) -> String {
     DataSources::mrms_key(&level_prefix_name(level), stamp)
 }
 
-/// Refuse a granule whose own section 4 does not agree with the height its
-/// directory name claims.
+/// Refuse a granule that is not `level` of this product, on its own section 4.
 ///
-/// **The one check that makes the level table evidence rather than a belief.**
-/// A directory NOAA renamed, a roster edited out of order, or a level silently
-/// re-published at a different altitude all produce a stack that decodes
-/// perfectly and is wrong in the vertical — the failure that has no visible
-/// symptom until something is measured against it.
-fn check_declared_level(level: usize, raw: &RawGrid) -> Result<(), String> {
+/// **What makes the level table evidence rather than a belief**, and it takes
+/// two facts rather than one:
+///
+/// * the **parameter category** ([`PARAMETER`]) says it is `MergedReflectivityQC`
+///   at all. An earlier version of this function checked only the height, and a
+///   review proved the gap by substituting the 2D composite granule into the
+///   0.50 km slot: identical surface, identical grid, every test green.
+/// * the **first fixed surface** says which level. A directory NOAA renamed, a
+///   roster edited out of order, or a level re-published at another altitude all
+///   produce a stack that decodes perfectly and is wrong in the vertical — a
+///   failure with no visible symptom until something is measured against it.
+fn check_granule_is_this_level(level: usize, raw: &RawGrid) -> Result<(), String> {
     let expected_m = LEVELS_KM_MSL[level] * 1000.0;
+    match raw.parameter {
+        None => {
+            return Err(format!(
+                "MRMS {}: the granule states no parameter category, so nothing \
+                 says it is MergedReflectivityQC rather than a mosaic that \
+                 happens to share its grid",
+                level_prefix_name(level),
+            ));
+        }
+        Some(p) if p == PARAMETER => {}
+        Some(p) => {
+            let looks_like = if p == COMPOSITE_PARAMETER {
+                " — that is the 2D column-max composite, which declares the same \
+                 first fixed surface as the 0.50 km level and is otherwise \
+                 indistinguishable here"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "MRMS {}: parameter is {p:?}, not {PARAMETER:?}{looks_like}",
+                level_prefix_name(level),
+            ));
+        }
+    }
     let Some((surface_type, value_m)) = raw.first_fixed_surface else {
         return Err(format!(
             "MRMS {}: the granule states no first fixed surface, so its height \
@@ -257,9 +361,19 @@ pub struct LevelFetch {
 
 /// **One timestep of MRMS 3D reflectivity**, all 33 levels, stacked.
 pub struct MrmsVolume {
-    /// Every level's section 1 reference time, which they agree on or the stack
-    /// is refused.
+    /// **The latest of the 33 levels' section 1 reference times.**
+    ///
+    /// The latest and not "the one they agree on", because 2–6 % of timesteps
+    /// are published one second apart across a partition of the levels — see
+    /// [`STAMP_TOLERANCE_SECONDS`]. [`Self::valid_span_seconds`] is how far they
+    /// actually spread, and it is 0 for the common case.
     pub valid: NaiveDateTime,
+    /// Seconds between the earliest and latest level's reference time: **0 when
+    /// the levels agree**, at most [`STAMP_TOLERANCE_SECONDS`] otherwise.
+    ///
+    /// Carried rather than discarded so a caller can see that a timestep was
+    /// assembled across a split rather than having to trust that it was not.
+    pub valid_span_seconds: i64,
     pub bounds: GeoBounds,
     /// The horizontal grid, shared by every level by construction: the
     /// assembler refuses a level whose coordinates differ.
@@ -290,6 +404,7 @@ impl std::fmt::Debug for MrmsVolume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MrmsVolume")
             .field("valid", &self.valid)
+            .field("valid_span_seconds", &self.valid_span_seconds)
             .field("levels", &LEVEL_COUNT)
             .field("ni", &self.ni)
             .field("nj", &self.nj)
@@ -435,7 +550,7 @@ impl Occupancy {
 /// allocation at once, which at this size is another 3.2 GB.
 pub struct VolumeAssembler {
     shape: Option<(usize, usize)>,
-    valid: Option<NaiveDateTime>,
+    valid: Option<(NaiveDateTime, NaiveDateTime)>,
     coords: Option<GridCoords>,
     bounds: Option<GeoBounds>,
     values: Vec<f32>,
@@ -486,7 +601,7 @@ impl VolumeAssembler {
                 level_prefix_name(level),
             ));
         }
-        check_declared_level(level, &grid)?;
+        check_granule_is_this_level(level, &grid)?;
 
         let name = level_prefix_name(level);
         let shape = *self.shape.get_or_insert((grid.ni, grid.nj));
@@ -504,12 +619,21 @@ impl VolumeAssembler {
                 shape.1,
             ));
         }
-        let valid = *self.valid.get_or_insert(grid.valid);
-        if valid != grid.valid {
+        // **Within the tolerance, not equal.** 1-6 % of timesteps are
+        // published a few seconds apart across a partition of the levels
+        // ([`STAMP_TOLERANCE_SECONDS`]), so demanding equality here would
+        // refuse every timestep the tolerant matcher exists to recover. The
+        // window is 8.3 % of the ~120 s cadence, so the neighbouring scan is
+        // still 12x away and "a stack of two timesteps" is still refused.
+        let span = self.valid.get_or_insert((grid.valid, grid.valid));
+        span.0 = span.0.min(grid.valid);
+        span.1 = span.1.max(grid.valid);
+        if (span.1 - span.0).num_seconds() > STAMP_TOLERANCE_SECONDS {
             return Err(format!(
-                "MRMS 3D: {name} is valid {} where the stack is valid {valid}; \
-                 a stack of two timesteps is not a timestep",
-                grid.valid,
+                "MRMS 3D: {name} is valid {} and the stack already spans {} to \
+                 {}, more than the {STAMP_TOLERANCE_SECONDS} s one scan may \
+                 spread; a stack of two timesteps is not a timestep",
+                grid.valid, span.0, span.1,
             ));
         }
         let coords = self.coords.get_or_insert_with(|| grid.coords.clone());
@@ -528,6 +652,13 @@ impl VolumeAssembler {
 
         let n = shape.0 * shape.1;
         if self.values.is_empty() {
+            // **`NAN` and not `0.0`**, which is the second line of defence
+            // behind `finish`'s refusal of a partial stack: 0 dBZ is a
+            // *reading* and would occupy a hole rather than mark it, so a level
+            // that never arrived would read downstream as a real, weak echo at
+            // that height. `Occupancy` counts only finite values, so a leak
+            // shows up as a missing count rather than as inflated coverage.
+            // Pinned by `tests::an_unfilled_level_is_nan_and_never_zero`.
             self.values = vec![f32::NAN; LEVEL_COUNT * n];
         }
         self.values[level * n..(level + 1) * n].copy_from_slice(&grid.values);
@@ -535,6 +666,15 @@ impl VolumeAssembler {
         self.compressed_bytes[level] = compressed_bytes;
         self.grib_bytes[level] = grib_bytes;
         Ok(())
+    }
+
+    /// The buffer as filled so far — every unfilled level still `NaN`.
+    ///
+    /// Exists for `tests::an_unfilled_level_is_nan_and_never_zero`: the fill is
+    /// unobservable through [`Self::finish`], which refuses a partial stack, and
+    /// an unobservable second line of defence is one nothing holds.
+    pub fn partial_values(&self) -> &[f32] {
+        &self.values
     }
 
     /// Which levels have not arrived.
@@ -559,8 +699,10 @@ impl VolumeAssembler {
             ));
         }
         let (ni, nj) = self.shape.expect("a filled stack has a shape");
+        let (earliest, latest) = self.valid.expect("a filled stack has a valid time");
         Ok(MrmsVolume {
-            valid: self.valid.expect("a filled stack has a valid time"),
+            valid: latest,
+            valid_span_seconds: (latest - earliest).num_seconds(),
             bounds: self.bounds.expect("a filled stack has an envelope"),
             coords: self.coords.expect("a filled stack has coordinates"),
             ni,
@@ -572,15 +714,177 @@ impl VolumeAssembler {
     }
 }
 
-/// The stamps `level` published in the two UTC days up to `at`, ascending and
-/// **filtered to `at`**.
+/// **How far apart two levels' stamps may be and still be one scan**, in
+/// seconds.
+///
+/// **Because "every level publishes under the same stamp" is false**, and it is
+/// false often enough to matter. The mechanism is an exact partition rather
+/// than a race: on `20260829` at `003242` the levels 00.50 through 01.75
+/// published and at `003243` the other 27 did, with **zero overlap** — the same
+/// scan, spelled one second apart.
+///
+/// Measured over six whole UTC days spread across 12 months, every one of which
+/// published exactly **720 granules per level**
+/// (`tests::the_levels_do_not_always_share_a_stamp_and_the_tolerance_recovers_them`,
+/// `#[ignore]`d because it is network):
+///
+/// | Day | Exact intersection | Lost to a single stamp | Largest hole, exact | Tolerance that recovers all 720 |
+/// |---|---:|---:|---:|---:|
+/// | 2025-09-15 | 679 | 41 (5.7 %) | 481 s | 8 s |
+/// | 2025-12-01 | 712 | 8 (1.1 %) | 241 s | 6 s |
+/// | 2026-02-14 | 705 | 15 (2.1 %) | 246 s | 4 s |
+/// | 2026-03-15 | 705 | 15 (2.1 %) | 363 s | **10 s** |
+/// | 2026-06-01 | 697 | 23 (3.2 %) | 362 s | 6 s |
+/// | 2026-08-29 | 680 | 40 (5.6 %) | 361 s | 5 s |
+///
+/// So an exact match loses **1.1 % to 5.7 %** of timesteps and opens holes of
+/// **241 s to 481 s against a ~120 s cadence, on days with no outage at all**.
+///
+/// **The residual, after the fix: zero.** At 10 s every one of the six days
+/// resolves **720 of 720** timesteps — a 0.0 % unfetchable rate, down from
+/// 1.1-5.7 % — and the largest hole in the fetchable series falls to 126-137 s,
+/// which *is* one cadence. There is no remaining hole to report.
+///
+/// **Ten is read off that curve, not guessed.** Every one of the six days
+/// reaches 720 of 720 at 10 s and the worst of them needs exactly 10; past it
+/// the curve is flat out to 30 s. An earlier draft used 3 s on the strength of
+/// two days — as did the review that found the split — and that left 2 to 5
+/// timesteps a day still unfetchable. The six-day sweep is what moved it.
+///
+/// It is safe at the top end for the same reason it is chosen: 10 s is **8.3 %
+/// of the ~120 s cadence**, so the neighbouring scan is 12× the window away and
+/// no clustering can merge two of them. [`timesteps_within`] also caps a cluster
+/// at this many seconds from its *first* stamp rather than between consecutive
+/// pairs, so a chain of 1 s steps cannot drift one wider.
+pub const STAMP_TOLERANCE_SECONDS: i64 = 10;
+
+/// **The 33 stamps that together are one timestep** — one per level, all within
+/// [`STAMP_TOLERANCE_SECONDS`] of each other.
+///
+/// Not a single stamp, because a single stamp cannot address 2–6 % of
+/// timesteps. Each level is fetched at *its own* published stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackStamps {
+    /// Indexed by level, in [`LEVELS_KM_MSL`]'s order.
+    pub stamps: [NaiveDateTime; LEVEL_COUNT],
+}
+
+impl StackStamps {
+    /// The timestep's own identity: the **latest** of the 33.
+    ///
+    /// The latest and not the earliest or a mean, so that a timestep is named by
+    /// the instant every one of its levels had been published by — which is the
+    /// only one of the three a "newest at or before `at`" question can be
+    /// answered against without lying by up to the tolerance.
+    pub fn valid(&self) -> NaiveDateTime {
+        self.stamps.iter().copied().max().expect("33 stamps")
+    }
+
+    /// How far the 33 stamps spread, in seconds — 0 when they agree.
+    pub fn span_seconds(&self) -> i64 {
+        let lo = self.stamps.iter().min().expect("33 stamps");
+        let hi = self.stamps.iter().max().expect("33 stamps");
+        (*hi - *lo).num_seconds()
+    }
+
+    /// Whether every level published the same second, which is the common case
+    /// and **not** the invariant.
+    pub fn is_aligned(&self) -> bool {
+        self.span_seconds() == 0
+    }
+}
+
+/// **Every timestep all 33 levels published, from each level's own stamp list.**
+///
+/// Pure, and deliberately so: this is the whole of the "the stamp is the
+/// intersection, never one level's newest" claim, and a network-free function is
+/// one a default `cargo test` row can hold. `per_level` must have
+/// [`LEVEL_COUNT`] entries, each sorted ascending; anything else answers empty
+/// rather than guessing.
+///
+/// The algorithm is a clustering, not a set intersection. The union is walked in
+/// order and cut wherever the next stamp is more than
+/// [`STAMP_TOLERANCE_SECONDS`] past the cluster's **first** — bounding the whole
+/// cluster rather than each consecutive pair, so a chain of 1 s steps cannot
+/// drift a cluster arbitrarily wide. A cluster becomes a timestep only when
+/// **every** level has a stamp inside it; a level with two stamps in one cluster
+/// contributes its earliest, which cannot happen at a 120 s cadence and is
+/// resolved rather than left to ordering.
+pub fn timesteps(per_level: &[Vec<NaiveDateTime>]) -> Vec<StackStamps> {
+    timesteps_within(per_level, STAMP_TOLERANCE_SECONDS)
+}
+
+/// [`timesteps`] at an arbitrary tolerance.
+///
+/// **The tolerance is a parameter here so that its value can be chosen from a
+/// curve rather than asserted.** `tests::the_levels_do_not_always_share_a_stamp_
+/// and_the_tolerance_recovers_them` (`#[ignore]`d, network) sweeps it over a
+/// whole day and prints what each second buys; [`STAMP_TOLERANCE_SECONDS`]
+/// records where that curve goes flat.
+pub fn timesteps_within(per_level: &[Vec<NaiveDateTime>], tolerance: i64) -> Vec<StackStamps> {
+    // **The length invariant is carried by the `try_from` below and nowhere
+    // else.** An explicit `per_level.len() != LEVEL_COUNT` guard used to sit
+    // here; a mutation sweep showed it could be deleted with every test still
+    // green, because a short or long input already fails to fill a
+    // `[NaiveDateTime; LEVEL_COUNT]` and yields no timestep. A branch no test
+    // can distinguish is a branch that should not exist.
+    let mut union: Vec<NaiveDateTime> = per_level.iter().flatten().copied().collect();
+    union.sort_unstable();
+    union.dedup();
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < union.len() {
+        let first = union[i];
+        let mut j = i;
+        while j < union.len() && (union[j] - first).num_seconds() <= tolerance {
+            j += 1;
+        }
+        let last = union[j - 1];
+        let picked: Vec<NaiveDateTime> = per_level
+            .iter()
+            .filter_map(|stamps| {
+                stamps
+                    .iter()
+                    .copied()
+                    .filter(|s| *s >= first && *s <= last)
+                    .min()
+            })
+            .collect();
+        if let Ok(stamps) = <[NaiveDateTime; LEVEL_COUNT]>::try_from(picked) {
+            out.push(StackStamps { stamps });
+        }
+        i = j;
+    }
+    out
+}
+
+/// The stamps a listing's keys carry, **at or before `at`**, sorted and deduped.
+///
+/// Pure, so the `at` filter has a home a default test row can reach. The filter
+/// is load-bearing whenever `at` is not now: [`super::fetch::listing_attempts`]
+/// bounds where a listing *starts* and never where it ends, so a day prefix
+/// asked about 15:00Z still answers with that whole UTC day and an unfiltered
+/// maximum would be this evening's scan drawn over a mid-afternoon instant. A
+/// key with no decodable stamp is dropped rather than kept: an undatable key
+/// cannot be shown to be at or before anything.
+pub fn stamps_at_or_before(keys: &[String], at: NaiveDateTime) -> Vec<NaiveDateTime> {
+    let mut stamps: Vec<NaiveDateTime> = keys
+        .iter()
+        .filter_map(|k| super::fetch::key_valid_time(k))
+        .filter(|valid| *valid <= at)
+        .collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    stamps
+}
+
+/// The stamps `level` published in the two UTC days up to `at`.
 ///
 /// Reuses [`super::fetch::listing_attempts`]' ladder whole — bounded, unbounded,
 /// yesterday — so the 3D path inherits the midnight-boundary and stalled-feed
 /// handling rather than restating it, and takes `at` as a parameter for the same
-/// reason [`super::fetch::latest_key`] does: `listing_attempts` bounds where a
-/// listing *starts* and never where it ends, so an unfiltered list asked about
-/// 15:00Z still carries that evening's stamps.
+/// reason [`super::fetch::latest_key`] does.
 async fn level_stamps(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -592,14 +896,8 @@ async fn level_stamps(
     for (date, start_after) in super::fetch::listing_attempts(at) {
         match super::fetch::list_day(client, sources, &name, date, start_after).await {
             Ok(keys) => {
-                let mut stamps: Vec<NaiveDateTime> = keys
-                    .iter()
-                    .filter_map(|k| super::fetch::key_valid_time(k))
-                    .filter(|valid| *valid <= at)
-                    .collect();
+                let stamps = stamps_at_or_before(&keys, at);
                 if !stamps.is_empty() {
-                    stamps.sort_unstable();
-                    stamps.dedup();
                     return Ok(stamps);
                 }
             }
@@ -613,63 +911,86 @@ async fn level_stamps(
     }))
 }
 
-/// The stamps every one of the 33 levels published, given each level's own
-/// sorted list.
+/// Each level's stamps, or the first listing failure.
 ///
-/// **The intersection and not the union or the maximum**: the levels do not land
-/// simultaneously, so the newest stamp of the 0.5 km directory is routinely a
-/// stamp the 19 km directory has not written yet, and building 33 keys from it
-/// would 404 part of the stack. A level that could not be listed at all is an
-/// error rather than an empty set, or a feed outage would silently narrow the
-/// intersection instead of reporting itself.
-fn intersect_stamps(
-    per_level: Vec<Result<Vec<NaiveDateTime>, FetchError>>,
-) -> Result<Vec<NaiveDateTime>, FetchError> {
-    let mut common: Option<Vec<NaiveDateTime>> = None;
-    for (level, stamps) in per_level.into_iter().enumerate() {
-        let stamps = stamps.map_err(|e| {
-            FetchError::transient(format!(
-                "MRMS 3D: {} could not be listed, so no stamp is known to be \
-                 complete: {e}",
-                level_prefix_name(level),
-            ))
-        })?;
-        common = Some(match common {
-            None => stamps,
-            Some(so_far) => so_far
-                .into_iter()
-                .filter(|s| stamps.binary_search(s).is_ok())
-                .collect(),
-        });
-    }
-    Ok(common.unwrap_or_default())
+/// **A level that could not be listed is an error and never an empty set.**
+/// Folding an outage into the clustering would silently drop every timestep
+/// instead of saying the feed was unreachable.
+async fn all_level_stamps(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    at: NaiveDateTime,
+) -> Result<Vec<Vec<NaiveDateTime>>, FetchError> {
+    let per_level: Vec<Result<Vec<NaiveDateTime>, FetchError>> =
+        futures::stream::iter(0..LEVEL_COUNT)
+            .map(|level| level_stamps(client, sources, level, at))
+            .buffered(LISTING_CONCURRENCY)
+            .collect()
+            .await;
+    per_level
+        .into_iter()
+        .enumerate()
+        .map(|(level, stamps)| {
+            stamps.map_err(|e| {
+                FetchError::transient(format!(
+                    "MRMS 3D: {} could not be listed, so no timestep is known to \
+                     be complete: {e}",
+                    level_prefix_name(level),
+                ))
+            })
+        })
+        .collect()
 }
 
-/// **The newest stamp at or before `at` that every one of the 33 levels has
+/// **The newest timestep at or before `at` that every one of the 33 levels has
 /// published.**
 ///
 /// 33 bounded listings, ~1 KB apiece. `at` is a parameter and not a clock read,
 /// matching [`super::fetch::latest_key`]: the instant the caller depicts is the
-/// caller's to state, and it is what makes this testable without a wall clock.
-pub async fn latest_complete_stamp(
+/// caller's to state, and it is what makes this drivable without a wall clock.
+pub async fn latest_timestep(
     client: &reqwest::Client,
     sources: &DataSources,
     at: NaiveDateTime,
-) -> Result<NaiveDateTime, FetchError> {
-    let per_level = futures::stream::iter(0..LEVEL_COUNT)
-        .map(|level| level_stamps(client, sources, level, at))
-        .buffered(LISTING_CONCURRENCY)
-        .collect()
-        .await;
-    intersect_stamps(per_level)?
+) -> Result<StackStamps, FetchError> {
+    let per_level = all_level_stamps(client, sources, at).await?;
+    timesteps(&per_level)
         .into_iter()
-        .max()
+        .max_by_key(StackStamps::valid)
         .ok_or_else(|| {
             FetchError::absent(format!(
-                "MRMS 3D: no stamp in the two UTC days up to {at} is published by \
-             all {LEVEL_COUNT} levels"
+                "MRMS 3D: no timestep in the two UTC days up to {at} is published \
+                 by all {LEVEL_COUNT} levels"
             ))
         })
+}
+
+/// **Every timestep of one whole UTC day**, ascending.
+///
+/// The instrument behind [`STAMP_TOLERANCE_SECONDS`]' figures, and the enumeration
+/// a loop over a national volume would need. **The cost, with its denominator**:
+/// 33 *unbounded* day listings — one per level, ~720 keys and ~90 KB of XML each,
+/// so ~3 MB for the day — against the ~25 MB one timestep of granules costs.
+pub async fn day_timesteps(
+    client: &reqwest::Client,
+    sources: &DataSources,
+    day: chrono::NaiveDate,
+) -> Result<Vec<StackStamps>, FetchError> {
+    let end = day
+        .and_hms_opt(23, 59, 59)
+        .expect("23:59:59 is a time of day");
+    let per_level: Vec<Result<Vec<NaiveDateTime>, FetchError>> =
+        futures::stream::iter(0..LEVEL_COUNT)
+            .map(|level| async move {
+                let name = level_prefix_name(level);
+                let keys = super::fetch::list_day(client, sources, &name, day, None).await?;
+                Ok(stamps_at_or_before(&keys, end))
+            })
+            .buffered(LISTING_CONCURRENCY)
+            .collect()
+            .await;
+    let per_level: Vec<Vec<NaiveDateTime>> = per_level.into_iter().collect::<Result<_, _>>()?;
+    Ok(timesteps(&per_level))
 }
 
 /// Download and decode one level of one timestep.
@@ -715,17 +1036,16 @@ pub async fn fetch_level(
 
 /// **One timestep, all 33 levels, stacked.**
 ///
-/// 33 GETs at [`STACK_FETCH_CONCURRENCY`] in flight. The keys are constructed
-/// rather than listed: a stamp fixes all 33 of them, which is the whole reason
-/// [`latest_complete_stamp`] exists.
+/// 33 GETs at [`STACK_FETCH_CONCURRENCY`] in flight, **each level at its own
+/// stamp** — which is why the argument is a [`StackStamps`] and not one instant.
 pub async fn fetch_stack(
     client: &reqwest::Client,
     sources: &DataSources,
-    stamp: &NaiveDateTime,
+    timestep: &StackStamps,
 ) -> Result<MrmsVolume, FetchError> {
     let mut assembler = VolumeAssembler::new();
     let mut levels = futures::stream::iter(0..LEVEL_COUNT)
-        .map(|level| fetch_level(client, sources, level, stamp))
+        .map(|level| fetch_level(client, sources, level, &timestep.stamps[level]))
         .buffer_unordered(STACK_FETCH_CONCURRENCY);
     while let Some(fetched) = levels.next().await {
         assembler.push(fetched?).map_err(FetchError::transient)?;
@@ -740,9 +1060,13 @@ pub async fn fetch_latest_stack(
     sources: &DataSources,
     at: NaiveDateTime,
 ) -> Result<MrmsVolume, FetchError> {
-    let stamp = latest_complete_stamp(client, sources, at).await?;
-    log::info!("MRMS 3D: stacking {LEVEL_COUNT} levels of {stamp}");
-    fetch_stack(client, sources, &stamp).await
+    let timestep = latest_timestep(client, sources, at).await?;
+    log::info!(
+        "MRMS 3D: stacking {LEVEL_COUNT} levels of {} (stamp span {} s)",
+        timestep.valid(),
+        timestep.span_seconds(),
+    );
+    fetch_stack(client, sources, &timestep).await
 }
 
 #[cfg(test)]
