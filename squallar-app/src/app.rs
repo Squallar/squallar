@@ -979,6 +979,19 @@ impl App {
             return;
         };
 
+        // The GPU pass probe, only where this install asked for the frame
+        // timing lines: an install that never set the key pays zero query
+        // submissions, not merely a cheap path. `install_gpu_probe` answers
+        // `false` on a device without TIMESTAMP_QUERY — every WebGL2 leg —
+        // and `report_frame_telemetry` prints the honest absence line there.
+        if self.frame_telemetry_loud
+            && state
+                .egui_renderer
+                .install_gpu_probe(&state.device, &state.queue)
+        {
+            log::info!("gpu pass probe installed: timestamp queries bracket the frame's passes");
+        }
+
         let quality = quality::select(class, self.budgets.quality_ceiling);
 
         // Nothing is built on a device that cannot render a volume — the pipelines would

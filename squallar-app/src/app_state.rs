@@ -57,9 +57,14 @@ impl AppState {
             info.driver_info,
         );
 
-        // One feature, asked for only where the adapter already has it — the caller
-        // computes the mask so the staging-ring coupling stays out of the device fn.
-        let features = adapter.features() & squallar_gpu::staging_ring::STAGING_RING_FEATURE;
+        // Two features, each asked for only where the adapter already has it — the
+        // caller computes the mask so the staging-ring coupling stays out of the
+        // device fn. TIMESTAMP_QUERY is requested whenever it exists so the GPU
+        // pass probe CAN be installed later; the probe itself is built only when
+        // an install asks for frame telemetry, and an unused feature costs the
+        // device nothing.
+        let features = adapter.features()
+            & (squallar_gpu::staging_ring::STAGING_RING_FEATURE | wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = squallar_gpu::device::request_device(&adapter, features).await;
 
         let volume_support = squallar_volumetric::probe(&adapter, &device.limits());

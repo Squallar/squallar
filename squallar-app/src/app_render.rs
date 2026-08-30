@@ -396,6 +396,40 @@ fn prep_costs_line(c: &squallar_gpu::egui_renderer::pass_costs::PassCosts) -> St
     )
 }
 
+/// The `gpu passes:` line — what each bracketed pass family costs the GPU.
+///
+/// Three denominators share this line and are never added: each family's
+/// `n=` is every pass of that kind ENCODED (six volume panes are six raymarch
+/// passes); its percentiles are over one bracketed pass per frame in which
+/// the family ran; the trailing `frames` is resolves collected — the floor
+/// under every percentile. GPU time, a different clock from every `frame *`
+/// line above, and **never added to service**. Cumulative from boot.
+fn gpu_passes_line(r: &squallar_gpu::gpu_probe::GpuPassReport) -> String {
+    use squallar_gpu::gpu_probe::ProbedPass;
+    let family = |pass: ProbedPass| {
+        format!(
+            "n={}, p50={} us, p99={} us",
+            r.passes(pass),
+            pctl_us(r.hist(pass), 0.50),
+            pctl_us(r.hist(pass), 0.99),
+        )
+    };
+    format!(
+        "gpu passes: raymarch {}; ground {}; mirror {}; main {}; {} frames",
+        family(ProbedPass::Raymarch),
+        family(ProbedPass::Ground),
+        family(ProbedPass::Mirror),
+        family(ProbedPass::Main),
+        r.frames,
+    )
+}
+
+/// What a keyed-loud install hears instead of [`gpu_passes_line`] on an
+/// adapter that cannot time a pass — every WebGL2 leg, always. An absence
+/// stated as one, never an extrapolated figure; the rig greps this sentence
+/// verbatim, so it is pinned beside the others.
+const GPU_PASSES_UNAVAILABLE_LINE: &str = "gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)";
+
 /// The `frame cadence:` line, histogram embedded.
 ///
 /// Denominator: the interval between consecutive **presented** frames'
@@ -988,6 +1022,25 @@ impl super::App {
         );
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
+            // The GPU pass family: real figures where a probe is installed,
+            // the verbatim absence where this install asked (the probe is
+            // built only for keyed-loud installs) and the adapter cannot
+            // answer — every WebGL2 leg. A not-loud install has no probe by
+            // choice and hears neither line: the absence sentence names a
+            // missing FEATURE, and saying it beside a capable adapter would
+            // be false prose.
+            match state.egui_renderer.gpu_pass_report() {
+                Some(report) => say_telemetry(loud, &gpu_passes_line(&report)),
+                None if loud
+                    && !state
+                        .device
+                        .features()
+                        .contains(wgpu::Features::TIMESTAMP_QUERY) =>
+                {
+                    say_telemetry(loud, GPU_PASSES_UNAVAILABLE_LINE);
+                }
+                None => {}
+            }
         }
         say_telemetry(loud, &frame_cadence_line(ledger.cadence()));
     }
@@ -2235,7 +2288,12 @@ impl super::App {
             SurfaceStatus::Ready(texture) => texture,
             SurfaceStatus::Skip | SurfaceStatus::Lost => {
                 self.frame_ledger.mark_skipped();
+                // The mirror and raymarch passes this frame encoded are still
+                // in this submit, so their brackets resolve here too — a
+                // skipped surface is not a skipped measurement.
+                state.egui_renderer.probe_end_frame(&mut encoder);
                 frame.submit(&state.queue, encoder);
+                state.egui_renderer.probe_collect();
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
                 if matches!(status, SurfaceStatus::Lost) {
@@ -2271,7 +2329,12 @@ impl super::App {
             .egui_renderer
             .draw(&mut encoder, &surface_view, &frame);
 
+        // After the last pass of the frame, before its submit: the probe's
+        // claimed brackets resolve in the same command stream that wrote
+        // them. The collect after the submit never blocks — see the probe.
+        state.egui_renderer.probe_end_frame(&mut encoder);
         frame.submit(&state.queue, encoder);
+        state.egui_renderer.probe_collect();
         state.egui_renderer.free_textures(frame.textures_to_free());
         surface_texture.present();
         self.frame_ledger.mark_present_return();

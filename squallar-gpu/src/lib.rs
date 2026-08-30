@@ -12,6 +12,9 @@
 /// present mode.
 pub mod device;
 pub mod egui_renderer;
+/// GPU pass timing through timestamp queries — the opt-in probe behind the
+/// `gpu passes:` telemetry line.
+pub mod gpu_probe;
 pub mod staging_ring;
 
 /// Type alias for a reference-counted Window.

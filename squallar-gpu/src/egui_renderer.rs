@@ -20,6 +20,11 @@ pub struct EguiRenderer {
     /// Whether this frame's raw input carried interaction. Written by
     /// [`Self::begin_frame`]; see [`Self::frame_had_interaction`].
     frame_interacted: bool,
+    /// The GPU pass probe, present only where [`Self::install_gpu_probe`] was
+    /// called and the device can time a pass. `None` on every ordinary
+    /// install, and every use is behind the `Option` — an uninstalled probe
+    /// submits zero query operations.
+    probe: Option<crate::gpu_probe::GpuPassProbe>,
 }
 
 /// The attachment layout of the egui render pass. A pipeline drawing into it
@@ -215,7 +220,48 @@ impl EguiRenderer {
             uploads: texture_upload::TextureUploads::new(device),
             pass_costs: pass_costs::PassCostLedger::default(),
             frame_interacted: false,
+            probe: None,
         }
+    }
+
+    /// Install the GPU pass probe, and say whether one was installed. The
+    /// caller gates on the install having asked for frame telemetry; this
+    /// answers `false` on a device without `TIMESTAMP_QUERY` (every WebGL2
+    /// leg), which is the app's cue for the honest absence line. A clone of
+    /// the probe's handle goes into the callback resources so the volume
+    /// callback's `prepare` can bracket the passes it encodes.
+    pub fn install_gpu_probe(&mut self, device: &Device, queue: &Queue) -> bool {
+        let Some(probe) = crate::gpu_probe::GpuPassProbe::new(device, queue) else {
+            return false;
+        };
+        self.renderer.callback_resources.insert(probe.handle());
+        self.probe = Some(probe);
+        true
+    }
+
+    /// Close the probe's frame: totals drained, claimed brackets resolved
+    /// into `encoder`. Call after the last pass of the frame is recorded,
+    /// before the submit. A no-op without a probe.
+    pub fn probe_end_frame(&mut self, encoder: &mut CommandEncoder) {
+        if let Some(probe) = self.probe.as_mut() {
+            probe.end_frame(encoder);
+        }
+    }
+
+    /// Harvest the probe's ring. Call after the frame's `queue.submit`;
+    /// never blocks. A no-op without a probe.
+    pub fn probe_collect(&mut self) {
+        if let Some(probe) = self.probe.as_mut() {
+            probe.collect();
+        }
+    }
+
+    /// What the probe has measured, or `None` where none is installed — the
+    /// app's telemetry line keys presence off exactly this.
+    pub fn gpu_pass_report(&self) -> Option<crate::gpu_probe::GpuPassReport> {
+        self.probe
+            .as_ref()
+            .map(crate::gpu_probe::GpuPassProbe::report)
     }
 
     /// Whether the frame the last [`Self::begin_frame`] opened carried
@@ -429,7 +475,13 @@ impl EguiRenderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                // The stamps land in this pass's own submit; the probe's
+                // resolve reads them from the frame's later one, which is
+                // legal — a resolve reads whatever the slot last held.
+                timestamp_writes: self
+                    .probe
+                    .as_ref()
+                    .and_then(|probe| probe.pass_timestamps(crate::gpu_probe::ProbedPass::Mirror)),
                 label: Some("egui pane mirror pass"),
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -468,7 +520,10 @@ impl EguiRenderer {
                 depth_slice: None,
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: self
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.pass_timestamps(crate::gpu_probe::ProbedPass::Main)),
             label: Some("egui main render pass"),
             occlusion_query_set: None,
             multiview_mask: None,
