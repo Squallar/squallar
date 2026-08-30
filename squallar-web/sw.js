@@ -185,15 +185,23 @@ const BASEMAP_ARCHIVE_HOST = "tiles.squallar.app";
 
 /*
  * The archives whose ranged reads the block cache serves, exactly as the Rust
- * consts name them: `squallar_egui::tiles::BASEMAP_ARCHIVE_URL` and
- * `::TERRAIN_ARCHIVE_URL`. `tests/pwa_assets.rs` pins this list against both
- * consts in BOTH directions, so a regenerated archive cannot ship without this
- * file moving with it — which is what lets `cachesToKeep` below treat these
- * two generations as current and purge every other one.
+ * consts name them: `squallar_egui::tiles::BASEMAP_ARCHIVE_URL`,
+ * `::TERRAIN_ARCHIVE_URL`, `::HEIGHT_ARCHIVE_URL` and
+ * `::CONUS_HEIGHT_ARCHIVE_URL`. `tests/pwa_assets.rs` pins this list against
+ * all four consts in BOTH directions, so a regenerated archive cannot ship
+ * without this file moving with it — which is what lets `cachesToKeep` below
+ * treat these four generations as current and purge every other one.
+ *
+ * The two terrain-RGB entries carry `UNPUBLISHED-GENERATION` because no
+ * terrain-RGB archive has been built yet. They are listed anyway: the list is
+ * what `cachesToKeep` KEEPS, so an archive that arrives before this file does
+ * is an archive whose blocks are purged on every deploy.
  */
 const ARCHIVE_URLS = [
   "https://tiles.squallar.app/basemap/omt-20260828.pmtiles",
   "https://tiles.squallar.app/terrain/7c94bc6966ab-20260829/squallar-terrain-hillshade.pmtiles",
+  "https://tiles.squallar.app/terrain-rgb/UNPUBLISHED-GENERATION/squallar-terrain-terrain-rgb.pmtiles",
+  "https://tiles.squallar.app/terrain-rgb-conus/UNPUBLISHED-GENERATION/squallar-terrain-terrain-rgb.pmtiles",
 ];
 
 /*

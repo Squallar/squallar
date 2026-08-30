@@ -1294,9 +1294,13 @@ impl<L: ArchiveRangeSource, O: ArchiveRangeSource> BasemapArchives<L, O> {
 /// gate rather than carrying one of its own.
 pub mod block_cache;
 
+/// `pub(crate)` for its loopback harness, which two suites outside this
+/// module read: `block_cache::tests` and `tiles::height_tests`. A second
+/// loopback server written beside it could disagree with this one about what
+/// a range request is, and every one of those suites' assertions is a range.
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
-mod tests;
+pub(crate) mod tests;
 
 /// The composition's own suite. Beside [`tests`] rather than inside it
 /// because what it measures is different: [`tests`] gates one reader over one

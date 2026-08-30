@@ -1144,3 +1144,350 @@ fn repeated_flips_never_hold_more_than_the_one_live_source() {
         "six flips over one session must reuse the one source they started with"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The archive URL consts, enumerated from the source rather than hand-listed
+// ---------------------------------------------------------------------------
+
+/// `tiles.rs`'s own source, for [`declared_archive_url_consts`].
+///
+/// Read as text because the thing being ratcheted is *declaration*: a fifth
+/// archive const that nothing lists is invisible to any check written in terms
+/// of the four names somebody already remembered. The idiom is
+/// `arch_ratchets.rs`'s.
+const TILES_SOURCE: &str = include_str!("../tiles.rs");
+
+/// Every `pub const <NAME>_ARCHIVE_URL: &str = "https://…"` in `TILES_SOURCE`.
+///
+/// The two halves of the match are both load-bearing. The **name** must end in
+/// `_ARCHIVE_URL` exactly, which is what keeps `HEIGHT_ARCHIVE_URL_ENV` — the
+/// name of an environment variable, not of an archive — out of the set. The
+/// **value** must be an `https://` literal, which keeps a future const that
+/// derives its URL rather than spelling one from being read as a literal that
+/// happens to sit nearby.
+///
+/// A const that is declared some third way is not caught, and that is the
+/// known edge: this ratchets the shape the four real ones are written in, and
+/// a fifth written differently is the case the `len` comparison in the caller
+/// still catches from the other side.
+fn declared_archive_url_consts() -> std::collections::BTreeMap<String, String> {
+    const DECL: &str = "pub const ";
+    const TYPED: &str = ": &str =";
+
+    let mut found = std::collections::BTreeMap::new();
+    for (at, _) in TILES_SOURCE.match_indices(DECL) {
+        let rest = &TILES_SOURCE[at + DECL.len()..];
+        // One declaration, bounded at its own terminator so a scan can never
+        // read a name from one item and a literal from the next.
+        let Some(end) = rest.find(';') else { continue };
+        let item = &rest[..end];
+
+        let Some(name_end) = item.find(TYPED) else {
+            continue;
+        };
+        let name = item[..name_end].trim();
+        if !name.ends_with("_ARCHIVE_URL") {
+            continue;
+        }
+
+        let value = &item[name_end + TYPED.len()..];
+        let Some(open) = value.find('"') else {
+            continue;
+        };
+        let after = &value[open + 1..];
+        let Some(close) = after.find('"') else {
+            continue;
+        };
+        let url = &after[..close];
+        if url.starts_with("https://") {
+            found.insert(name.to_owned(), url.to_owned());
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// The archive URL set, and the generations that follow from it
+// ---------------------------------------------------------------------------
+
+/// **The height archives have not been built, and this is what says so.**
+///
+/// Both height URLs carry [`HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER`] instead of
+/// a `<12-hex>-<YYYYMMDD>` generation, because inventing one that looks right
+/// would compile, satisfy every other pin in the tree, and 404 in the field.
+///
+/// # This test is meant to go red
+///
+/// The day a real terrain-RGB archive is published and its generation is
+/// pasted into `tiles.rs`, this test fails. That is its whole purpose: the
+/// failure message below is the checklist of everything that has to move in
+/// the same commit, and it cannot be skipped, because the URLs cannot be
+/// changed without reddening it.
+#[test]
+fn the_height_archives_are_still_unpublished() {
+    const CHECKLIST: &str = "\
+A real generation has been configured for a height archive. Everything below \
+moves in the SAME commit, or the build ships a URL that answers 404:\n\
+  1. squallar-egui/src/tiles.rs -- HEIGHT_ARCHIVE_URL and CONUS_HEIGHT_ARCHIVE_URL\n\
+  2. squallar-web/sw.js         -- ARCHIVE_URLS, pinned BOTH ways by \
+squallar-web/tests/pwa_assets.rs\n\
+  3. this test                  -- delete it, or re-point it at whatever is still \
+unpublished\n\
+Nothing else needs to move: the Android host allowlist and the block-cache live \
+set are both derived from the consts in (1).";
+
+    for (name, url) in [
+        ("HEIGHT_ARCHIVE_URL", HEIGHT_ARCHIVE_URL),
+        ("CONUS_HEIGHT_ARCHIVE_URL", CONUS_HEIGHT_ARCHIVE_URL),
+    ] {
+        assert!(
+            url.contains(HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER),
+            "{name} no longer carries {HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER}.\n{CHECKLIST}"
+        );
+    }
+
+    // Non-triviality, and length alone is not enough. A placeholder emptied to
+    // "" makes `contains` true of every string on earth; a placeholder
+    // *retargeted at a real generation* makes it true of exactly the URL this
+    // test exists to reject, while still being 20-odd characters long. So the
+    // marker must also not be generation-SHAPED: `<12-hex>-<8-digit>` is what
+    // the publish step writes, and the marker may never look like one.
+    assert!(
+        HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER.len() > 8,
+        "the placeholder marker is too short to be unmissable in a URL"
+    );
+    assert!(
+        !is_generation_shaped(HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER),
+        "HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER has been pointed at something \
+         shaped like a real generation, which would make this whole test pass \
+         over a live URL.\n{CHECKLIST}"
+    );
+
+    // And the shape test itself is not vacuous: it says yes to the real thing.
+    assert!(
+        is_generation_shaped("7c94bc6966ab-20260829"),
+        "the shape check does not recognise a published generation, so it \
+         refuses nothing"
+    );
+    assert!(
+        !is_generation_shaped("7c94bc6966ab-2026082"),
+        "the shape check accepts a short date"
+    );
+    assert!(
+        !is_generation_shaped("7c94bc6966zz-20260829"),
+        "the shape check accepts a non-hex prefix"
+    );
+}
+
+/// Whether `name` is shaped like a published archive generation:
+/// twelve lowercase hex digits, a hyphen, then an eight-digit date.
+///
+/// The shape `tools/squallar-terrain` writes and the one both live archive
+/// URLs already carry (`omt-20260828` is the basemap's older two-part form;
+/// this is the terrain form, `7c94bc6966ab-20260829`).
+fn is_generation_shaped(name: &str) -> bool {
+    let Some((hash, date)) = name.split_once('-') else {
+        return false;
+    };
+    hash.len() == 12
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        && date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Every archive URL the build reads is in the one list the block cache's live
+/// set is derived from.
+///
+/// **The failure mode this ratchets against is silent.**
+/// `gc_stale_generations` `remove_dir_all`s every directory under the shared
+/// cache root whose name is not in `live_generations`, from `ensure_open`
+/// inside a `get_or_init`, so an archive missing from [`live_archive_urls`]
+/// loses its whole cache at the first cache open of *every* launch. Nothing
+/// errors; the map is just slow forever.
+///
+/// A fifth archive URL that is declared and not listed reddens here. That the
+/// derived config really carries all four is asserted in the child half of
+/// `height_tests`, which is the one process in the suite that installs a cache
+/// directory — doing it here would install a process-wide root that every
+/// other test in this binary would then start writing through.
+///
+/// Native only, because what it ratchets is: there is no filesystem behind the
+/// web target, so [`live_archive_urls`] and `archive_block_cache` are both
+/// `cfg(not(wasm32))`, and a test reaching them from this ungated module is a
+/// red `--all-targets` wasm row under a green lib one.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_live_generation_set_covers_every_archive_url_the_build_reads() {
+    use crate::basemap_archive::block_cache::generation_for_url;
+
+    // The overrides would make `live_archive_urls` answer something other than
+    // the consts, and this test compares the two. Asserted rather than
+    // skipped: a developer running under an override deserves to be told why
+    // this reddened, not to have it quietly pass.
+    for name in [
+        BASEMAP_ARCHIVE_URL_ENV,
+        TERRAIN_ARCHIVE_URL_ENV,
+        HEIGHT_ARCHIVE_URL_ENV,
+    ] {
+        assert!(
+            std::env::var(name).is_err(),
+            "{name} is set, so live_archive_urls answers the override rather \
+             than the const this test enumerates"
+        );
+    }
+
+    let declared = declared_archive_url_consts();
+    let urls = live_archive_urls();
+
+    // **The enumeration, and the direction that matters.** Every archive URL
+    // const `tiles.rs` declares must be in the live set. A fifth const added
+    // and forgotten is exactly the silent-wipe hazard, and it is caught by
+    // reading this module's own source rather than by a hand-kept list that
+    // would have to be updated by the same person who forgot.
+    for (name, url) in &declared {
+        assert!(
+            urls.iter().any(|live| live == url),
+            "{name} is declared in tiles.rs and is not in live_archive_urls, \
+             so its block cache is deleted at the first cache open of every \
+             launch — a slow map, never an error. Add it to that list."
+        );
+    }
+
+    // And the other direction: the live set names nothing that is not a
+    // declared archive.
+    assert_eq!(
+        urls.len(),
+        declared.len(),
+        "live_archive_urls names {} URLs but tiles.rs declares {} archive \
+         consts: {:?}",
+        urls.len(),
+        declared.len(),
+        declared.keys().collect::<Vec<_>>()
+    );
+
+    // Non-triviality floor: a scan that found nothing, or that matched the
+    // wrong shape, would make the loop above vacuous. The four known consts
+    // must be in it, by name and by value.
+    for (name, url) in [
+        ("BASEMAP_ARCHIVE_URL", BASEMAP_ARCHIVE_URL),
+        ("TERRAIN_ARCHIVE_URL", TERRAIN_ARCHIVE_URL),
+        ("HEIGHT_ARCHIVE_URL", HEIGHT_ARCHIVE_URL),
+        ("CONUS_HEIGHT_ARCHIVE_URL", CONUS_HEIGHT_ARCHIVE_URL),
+    ] {
+        assert_eq!(
+            declared.get(name).map(String::as_str),
+            Some(url),
+            "the source scan did not read {name} out of tiles.rs, so the \
+             enumeration above is not enumerating"
+        );
+    }
+    // And it must not have swept up an `_ENV` const, which names a variable
+    // rather than an archive.
+    assert!(
+        !declared.contains_key("HEIGHT_ARCHIVE_URL_ENV"),
+        "the scan matched an override variable name as an archive URL"
+    );
+
+    // Distinct generation directories, so the archives are distinct caches
+    // rather than one directory several names collide in.
+    let generations: std::collections::BTreeSet<String> =
+        urls.iter().map(|url| generation_for_url(url)).collect();
+    assert_eq!(
+        generations.len(),
+        urls.len(),
+        "two archive URLs derive the same generation directory: {generations:?}"
+    );
+}
+
+/// **[`height_range_source`] opens the height archive and not one of the other
+/// three.**
+///
+/// The suite around this one proves the read *chain* by spelling its body out
+/// with a loopback client, which leaves the production function itself
+/// unexecuted — and the two arguments it passes are the client and the URL.
+/// The client is the half the loopback copy deliberately differs on; **the URL
+/// is the half nothing else checks**, and it is the one whose failure is
+/// silent: pointed at the hillshade, every body still decodes, every base-256
+/// triple still yields a plausible metre figure, and the ground is simply
+/// wrong. No fault, no log.
+///
+/// `archive_identity` is the whole assertion and it needs no server:
+/// `HttpRangeSource::new` only parses the URL, so `https_only` never engages
+/// and nothing is fetched.
+#[test]
+fn the_height_range_source_opens_the_height_archive() {
+    use crate::basemap_archive::RangeSource as _;
+
+    let identity = height_range_source()
+        .expect("the compiled-in height archive URL parses")
+        .archive_identity();
+
+    assert_eq!(
+        identity.as_deref(),
+        Some(HEIGHT_ARCHIVE_URL),
+        "height_range_source is pointed at the wrong archive. Reading heights \
+         out of the hillshade is silent: the bodies decode, every pixel unpacks \
+         to a plausible elevation, and the ground is wrong with no fault raised."
+    );
+
+    // The three siblings, so "the right one" is a distinction rather than a
+    // coincidence of there being one archive.
+    for (name, other) in [
+        ("BASEMAP_ARCHIVE_URL", BASEMAP_ARCHIVE_URL),
+        ("TERRAIN_ARCHIVE_URL", TERRAIN_ARCHIVE_URL),
+        ("CONUS_HEIGHT_ARCHIVE_URL", CONUS_HEIGHT_ARCHIVE_URL),
+    ] {
+        assert_ne!(
+            identity.as_deref(),
+            Some(other),
+            "height_range_source opened {name}"
+        );
+    }
+}
+
+/// The generation the height reader records is the generation of the archive
+/// it actually opens — the two derivations meeting at the source itself rather
+/// than both being spelled from the same const.
+#[test]
+fn the_height_generation_names_the_archive_the_source_opens() {
+    use crate::basemap_archive::RangeSource as _;
+    use crate::basemap_archive::block_cache::generation_for_url;
+
+    let identity = height_range_source()
+        .expect("the compiled-in height archive URL parses")
+        .archive_identity()
+        .expect("an HttpRangeSource promises its URL");
+
+    assert_eq!(
+        height_generation(),
+        generation_for_url(&identity),
+        "the block cache would file this archive's blocks under a generation \
+         no reader of it looks in"
+    );
+}
+
+/// The height generation is derived from the URL the reader opens, so a record
+/// and the block cache cannot disagree about which archive a byte came from.
+#[test]
+fn the_height_generation_is_the_one_the_reader_opens() {
+    use crate::basemap_archive::block_cache::generation_for_url;
+
+    assert_eq!(
+        height_generation(),
+        generation_for_url(&height_archive_url()),
+        "height_generation and height_archive_url have drifted apart"
+    );
+
+    // A generation is one portable path component: it is a directory name
+    // under the shared cache root.
+    let generation = height_generation();
+    assert!(
+        !generation.is_empty() && !generation.contains('/'),
+        "the height generation {generation:?} is not a single path component"
+    );
+    assert_ne!(
+        generation,
+        terrain_generation(),
+        "the height archive and the hillshade must not share a cache directory"
+    );
+}

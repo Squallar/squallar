@@ -1570,6 +1570,9 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            // Nothing declared: the header's word stands, which is what the
+            // archives under test are read by.
+            None,
             // No seed and no downloaded areas: these read the committed
             // fixture over a bare source, and the composition's own suite is
             // what covers the local-first walk.
@@ -1839,6 +1842,9 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            // Nothing declared: the header's word stands, which is what the
+            // archives under test are read by.
+            None,
             // No seed and no downloaded areas: these read the committed
             // fixture over a bare source, and the composition's own suite is
             // what covers the local-first walk.
@@ -2042,6 +2048,9 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            // Nothing declared: the header's word stands, which is what the
+            // archives under test are read by.
+            None,
             // No seed and no downloaded areas: these read the committed
             // fixture over a bare source, and the composition's own suite is
             // what covers the local-first walk.
@@ -2102,6 +2111,7 @@ mod archive {
 /// two real archives' shapes — Monaco (`tile_type = 1`, MVT) and the
 /// single-tile terrain wrap (`tile_type = 4`, the real Kansas WebP inside).
 mod archive_decode {
+    use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
     use super::super::{ArchiveTileKind, decode_archive_tile};
@@ -2238,5 +2248,285 @@ mod archive_decode {
             .is_err(),
             "an MVT body under a raster header is a broken archive, not a map",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Packed elevation
+    // -----------------------------------------------------------------------
+
+    /// A 2x2 PNG, valid enough that every image decoder in the tree accepts it.
+    ///
+    /// It stands in for a terrain-RGB body: the point of the tests below is
+    /// that a body a decoder *would* take is refused anyway, so a body a
+    /// decoder would reject could not tell them apart.
+    fn a_real_png() -> Vec<u8> {
+        let mut bitmap = image::RgbImage::new(2, 2);
+        for y in 0..2 {
+            for x in 0..2 {
+                bitmap.put_pixel(x, y, image::Rgb([1 + x as u8, 2 + y as u8, 3]));
+            }
+        }
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        bitmap
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("the fixture encodes as a PNG");
+        encoded.into_inner()
+    }
+
+    /// A one-tile archive of `kind`, holding `body`, written to a temp file.
+    ///
+    /// A file rather than an in-memory source because `FileRangeSource` is
+    /// already in scope here and the archive is a few hundred bytes.
+    fn one_tile_archive_file(label: &str, kind: pmtiles::TileType, body: &[u8]) -> PathBuf {
+        let mut sink = std::io::Cursor::new(Vec::new());
+        let mut writer = pmtiles::PmTilesWriter::new(kind)
+            .tile_compression(pmtiles::Compression::None)
+            .min_zoom(0)
+            .max_zoom(0)
+            .bounds(-180.0, -85.0, 180.0, 85.0)
+            .create(&mut sink)
+            .expect("the writer opens");
+        writer
+            .add_tile(
+                pmtiles::TileCoord::new(0, 0, 0).expect("0/0/0 is a tile"),
+                body,
+            )
+            .expect("the tile writes");
+        writer.finalize().expect("the archive finalizes");
+
+        let path = std::env::temp_dir().join(format!(
+            "squallar-declared-kind-{}-{label}.pmtiles",
+            std::process::id()
+        ));
+        std::fs::write(&path, sink.into_inner()).expect("the archive writes");
+        path
+    }
+
+    /// Build a source over a declared archive and let its IO task settle,
+    /// answering the fault it recorded, if any.
+    fn fault_of_declared(
+        path: &std::path::Path,
+        declared: Option<ArchiveTileKind>,
+    ) -> Option<String> {
+        let ctx = Context::default();
+        let mut tiles = HttpsTiles::from_range_source(
+            FileRangeSource::open(path).expect("the archive file opens"),
+            std::sync::Arc::new(Style::default()),
+            Attribution {
+                text: "test",
+                url: "https://example.invalid/",
+                logo_light: None,
+                logo_dark: None,
+            },
+            ctx,
+            NonZeroUsize::new(8).expect("8 is not zero"),
+            declared,
+            crate::tile_source::ArchiveStores {
+                seed: None,
+                offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
+        );
+
+        // Either outcome — a fault, or a depth published — means the IO task
+        // finished with the header. Waiting on only one of the two would make
+        // the timeout the assertion.
+        pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            tiles
+                .fault()
+                .map(|fault| Some(fault.to_owned()))
+                .or_else(|| tiles.source_max_zoom().map(|_| None))
+        })
+        .expect("the IO task never read the header")
+    }
+
+    /// **The declaration is checked against the header, not trusted.**
+    ///
+    /// `TerrainRgb` is the one kind the header cannot confirm — `tile_type = 2`
+    /// is PNG for a hillshade and for an elevation grid alike — so all the open
+    /// can check is that the bodies are PNG at all. It checks that much: a
+    /// `TerrainRgb` declared over a WebP archive is recorded as a fault, the
+    /// same shape as an archive that will not open.
+    #[test]
+    fn a_declared_terrain_rgb_over_a_non_png_archive_records_a_fault() {
+        let png = one_tile_archive_file("png", pmtiles::TileType::Png, &a_real_png());
+        let webp = one_tile_archive_file("webp", pmtiles::TileType::Webp, b"body");
+
+        // The control, first: the same declaration over a PNG archive is
+        // accepted, so the fault below is about the header and not about
+        // declaring anything at all.
+        assert_eq!(
+            fault_of_declared(&png, Some(ArchiveTileKind::TerrainRgb)),
+            None,
+            "a TerrainRgb declared over a PNG archive must be accepted"
+        );
+
+        let fault = fault_of_declared(&webp, Some(ArchiveTileKind::TerrainRgb))
+            .expect("a TerrainRgb declared over a WebP archive must be a fault");
+        assert!(
+            fault.contains("TerrainRgb") && fault.contains("Webp"),
+            "the fault must name both what was declared and what the header \
+             says, or it cannot be acted on: {fault}"
+        );
+
+        // And the undeclared control: the same WebP archive opened with no
+        // declaration is fine, because the header's word is the whole truth.
+        assert_eq!(
+            fault_of_declared(&webp, None),
+            None,
+            "an undeclared archive must open on its header alone"
+        );
+
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&webp);
+    }
+
+    /// How long a one-tile local archive gets to serve its only tile.
+    ///
+    /// Short because the *control* below has to fit inside it — the refusal is
+    /// asserted as "nothing arrived in this long", and a window the positive
+    /// case could not fill would make that vacuous.
+    const LOCAL_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// Whether a source over `path`, declared `declared`, ever serves the one
+    /// tile its archive holds.
+    fn serves_its_tile(path: &std::path::Path, declared: Option<ArchiveTileKind>) -> bool {
+        let ctx = Context::default();
+        let mut tiles = HttpsTiles::from_range_source(
+            FileRangeSource::open(path).expect("the archive file opens"),
+            std::sync::Arc::new(Style::default()),
+            Attribution {
+                text: "test",
+                url: "https://example.invalid/",
+                logo_light: None,
+                logo_dark: None,
+            },
+            ctx,
+            NonZeroUsize::new(8).expect("8 is not zero"),
+            declared,
+            crate::tile_source::ArchiveStores {
+                seed: None,
+                offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
+        );
+
+        pump_until(LOCAL_ARCHIVE_TIMEOUT, || {
+            tiles.pump();
+            tiles.at(TileId {
+                x: 0,
+                y: 0,
+                zoom: 0,
+            })
+        })
+        .is_some()
+    }
+
+    /// **The declaration reaches the decode, not just the fault slot.**
+    ///
+    /// A declared `TerrainRgb` over a genuine PNG archive opens cleanly — the
+    /// header cannot contradict it — and then serves **nothing**, because
+    /// every body it holds is refused by the `TerrainRgb` arm. The control is
+    /// the same archive with nothing declared, which paints, and which is what
+    /// this would silently have done before the kind was carried from the open
+    /// to `read_one` instead of being derived twice.
+    #[test]
+    fn a_declared_terrain_rgb_archive_paints_nothing() {
+        let png = one_tile_archive_file("serves", pmtiles::TileType::Png, &a_real_png());
+
+        assert!(
+            serves_its_tile(&png, None),
+            "non-vacuity: the same archive with nothing declared must paint its \
+             tile inside {LOCAL_ARCHIVE_TIMEOUT:?}, or the refusal below is \
+             just a short timeout"
+        );
+        assert!(
+            !serves_its_tile(&png, Some(ArchiveTileKind::TerrainRgb)),
+            "an archive declared to hold packed elevation painted a picture"
+        );
+
+        let _ = std::fs::remove_file(&png);
+    }
+
+    /// **A terrain-RGB body never becomes a picture.**
+    ///
+    /// The bodies are PNG and a decoder will happily take one — that is the
+    /// hazard. The arm refuses instead, and says why in a sentence a reader of
+    /// the log can act on.
+    #[test]
+    fn a_terrain_rgb_body_is_refused_rather_than_painted() {
+        let png = a_real_png();
+        let ctx = Context::default();
+
+        // Non-vacuity: the sniffing path accepts this body, so the refusal
+        // below is the arm's and not the bytes'.
+        assert!(
+            Tile::new(&png, &Style::default(), 0, &ctx).is_ok(),
+            "non-vacuity: the sniffing path accepts this body"
+        );
+        // And so does the hillshade arm, which is the arm the header alone
+        // would have chosen for it.
+        assert!(
+            decode_archive_tile(&png, ArchiveTileKind::Hillshade, &Style::default(), 0, &ctx)
+                .is_ok(),
+            "non-vacuity: the hillshade arm accepts this body"
+        );
+
+        // `Tile` is not `Debug`, so the error is taken by match rather than
+        // by `expect_err`.
+        let Err(error) = decode_archive_tile(
+            &png,
+            ArchiveTileKind::TerrainRgb,
+            &Style::default(),
+            0,
+            &ctx,
+        ) else {
+            panic!("packed elevation must not decode into a tile");
+        };
+        assert!(
+            error.contains("packed elevation") && error.contains("no picture"),
+            "the refusal must say what the archive holds: {error}"
+        );
+    }
+
+    /// The header can never produce [`ArchiveTileKind::TerrainRgb`]; only a
+    /// caller can. Over every `tile_type` the format has.
+    #[test]
+    fn the_header_alone_never_answers_terrain_rgb() {
+        use pmtiles::TileType;
+
+        let every = [
+            TileType::Unknown,
+            TileType::Mvt,
+            TileType::Png,
+            TileType::Jpeg,
+            TileType::Webp,
+            TileType::Avif,
+            TileType::Mlt,
+        ];
+        for tile_type in every {
+            assert_ne!(
+                ArchiveTileKind::from_tile_type(tile_type),
+                ArchiveTileKind::TerrainRgb,
+                "{tile_type:?} derived TerrainRgb from the header, which no \
+                 header field can distinguish"
+            );
+        }
+
+        // The declaration rule: TerrainRgb takes PNG and only PNG, and every
+        // other kind is confirmed exactly.
+        for tile_type in every {
+            assert_eq!(
+                ArchiveTileKind::TerrainRgb.accepts_tile_type(tile_type),
+                tile_type == TileType::Png,
+                "TerrainRgb accepted {tile_type:?}"
+            );
+            let exact = ArchiveTileKind::from_tile_type(tile_type);
+            assert!(
+                exact.accepts_tile_type(tile_type),
+                "{exact:?} refused the very tile_type it was derived from"
+            );
+        }
     }
 }

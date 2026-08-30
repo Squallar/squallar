@@ -104,12 +104,15 @@ mod tests {
             hosts.insert(host_of(&url));
         }
 
-        // The basemap and terrain archives are this walker's own addition:
-        // they are not data origins, and `sw.js` routes them "network" by its
-        // own explicit rule. Read from the client's consts, so a regenerated
-        // archive that moves hosts fails here rather than in the field.
+        // The basemap, terrain and terrain-RGB height archives are this
+        // walker's own addition: they are not data origins, and `sw.js` routes
+        // them "network" by its own explicit rule. Read from the client's
+        // consts, so a regenerated archive that moves hosts fails here rather
+        // than in the field.
         hosts.insert(host_of(squallar_egui::tiles::BASEMAP_ARCHIVE_URL));
         hosts.insert(host_of(squallar_egui::tiles::TERRAIN_ARCHIVE_URL));
+        hosts.insert(host_of(squallar_egui::tiles::HEIGHT_ARCHIVE_URL));
+        hosts.insert(host_of(squallar_egui::tiles::CONUS_HEIGHT_ARCHIVE_URL));
 
         // The attribution link the map footer opens.
         hosts.insert(host_of(squallar_egui::tiles::ATTRIBUTION_URL));

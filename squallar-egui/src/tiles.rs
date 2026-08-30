@@ -46,9 +46,14 @@ pub const BASEMAP_ARCHIVE_URL: &str = "https://tiles.squallar.app/basemap/omt-20
 /// Native only, and read once per source construction. It exists because the
 /// published archive is the *only* other way to exercise this path, and a
 /// change to the draw seam that can only be checked against 83 GB over a
-/// network is a change that will stop being checked. `file://` is not a scheme
-/// [`crate::basemap_archive::HttpRangeSource`] serves, so a local archive is
-/// pointed at through a plain HTTP file server.
+/// network is a change that will stop being checked.
+///
+/// **It must name an `https://` URL.** `file://` is not a scheme
+/// [`crate::basemap_archive::HttpRangeSource`] serves, and a plain-HTTP local
+/// server does not work either: the client every archive read goes through is
+/// `squallar_source::tls`, which sets `https_only`, pinned by
+/// `the_archive_client_refuses_cleartext`. A cleartext override is rejected on
+/// the scheme before a byte is fetched. Serve the local archive over TLS.
 #[cfg(not(target_arch = "wasm32"))]
 pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 
@@ -83,7 +88,8 @@ pub const TERRAIN_ARCHIVE_URL: &str =
 
 /// An archive URL that replaces [`TERRAIN_ARCHIVE_URL`] when it is set.
 /// Native only, for the reason [`BASEMAP_ARCHIVE_URL_ENV`] is: the draw seam
-/// must stay checkable against a local archive behind a plain HTTP server.
+/// must stay checkable against a local archive. **Over TLS** — see that const
+/// for why cleartext is refused before a byte is fetched.
 #[cfg(not(target_arch = "wasm32"))]
 pub const TERRAIN_ARCHIVE_URL_ENV: &str = "SQUALLAR_TERRAIN_ARCHIVE";
 
@@ -98,6 +104,81 @@ fn terrain_archive_url() -> String {
 #[cfg(target_arch = "wasm32")]
 fn terrain_archive_url() -> String {
     TERRAIN_ARCHIVE_URL.to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// The height archives: terrain-RGB, read as data rather than drawn as pixels
+// ---------------------------------------------------------------------------
+
+/// The generation segment both height archive URLs carry **while no height
+/// archive has been published**.
+///
+/// The archives these URLs name do not exist: building them is a separate
+/// work unit that needs ~1.75 TB of scratch and hours of S3 streaming, and it
+/// has not run. A plausible-looking `<12-hex>-<YYYYMMDD>` here would compile,
+/// pass every pin in the tree and 404 in the field, so the placeholder says so
+/// in the URL itself instead.
+///
+/// [`crate::tiles::tests`]'s `the_height_archives_are_still_unpublished` holds
+/// both URLs against this string, so the day a real generation is configured
+/// that test goes red and its message names every other site that has to move
+/// in the same commit. Removing the marker without moving them is the failure
+/// mode it exists to make impossible.
+pub const HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER: &str = "UNPUBLISHED-GENERATION";
+
+/// The self-hosted global terrain-RGB PMTiles archive: packed elevation,
+/// z0-z11.
+///
+/// Published like the hillshade, in parts, so [`crate::basemap_archive::HttpRangeSource`]
+/// probes `<url>.part000` at open and a bare `GET` of this path 404s by
+/// design.
+///
+/// **The bodies are PNG and there is no picture in them.** Each pixel is a
+/// base-256 elevation triple; anything that hands one to an image compositor
+/// is a bug, which is what `tile_source::ArchiveTileKind::TerrainRgb`
+/// exists to catch.
+///
+/// The generation is [`HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER`] until the
+/// archive exists.
+pub const HEIGHT_ARCHIVE_URL: &str = "https://tiles.squallar.app/terrain-rgb/UNPUBLISHED-GENERATION/squallar-terrain-terrain-rgb.pmtiles";
+
+/// The CONUS terrain-RGB archive: the same encoding at z11-z12 over
+/// `-125,24,-66,50`, which is where the radar sites that need a metre-scale
+/// ground are.
+///
+/// A second archive rather than a deeper first one because the two are built
+/// by separate runs with separate scopes and are independently openable. Its
+/// generation is [`HEIGHT_ARCHIVE_GENERATION_PLACEHOLDER`] for the same reason
+/// [`HEIGHT_ARCHIVE_URL`]'s is.
+///
+/// It is in [`live_archive_urls`] from the day it is declared, even though
+/// nothing opens it yet: a generation the block cache does not know about is
+/// deleted at the first cache open of every launch, so the list has to lead
+/// the reader rather than follow it.
+pub const CONUS_HEIGHT_ARCHIVE_URL: &str = "https://tiles.squallar.app/terrain-rgb-conus/UNPUBLISHED-GENERATION/squallar-terrain-terrain-rgb.pmtiles";
+
+/// An archive URL that replaces [`HEIGHT_ARCHIVE_URL`] when it is set.
+/// Native only, for the reason [`BASEMAP_ARCHIVE_URL_ENV`] is.
+///
+/// **It cannot name a cleartext URL through [`height_range_source`]**, for the
+/// reason [`BASEMAP_ARCHIVE_URL_ENV`] cannot: `archive_client` sets
+/// `https_only`. A local archive is therefore served over TLS, or read through
+/// a source built with a client of the caller's own -- which is what
+/// `tiles::height_tests` does.
+#[cfg(not(target_arch = "wasm32"))]
+pub const HEIGHT_ARCHIVE_URL_ENV: &str = "SQUALLAR_HEIGHT_ARCHIVE";
+
+/// Which archive the height reader opens -- [`archive_url`]'s split, for
+/// [`archive_url`]'s reason.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn height_archive_url() -> String {
+    std::env::var(HEIGHT_ARCHIVE_URL_ENV).unwrap_or_else(|_| HEIGHT_ARCHIVE_URL.to_owned())
+}
+
+/// The wasm32 arm of [`height_archive_url`]: the compiled-in archive, always.
+#[cfg(target_arch = "wasm32")]
+pub fn height_archive_url() -> String {
+    HEIGHT_ARCHIVE_URL.to_owned()
 }
 
 /// Where the persistent archive block cache lives, installed once by the
@@ -121,14 +202,38 @@ pub fn install_basemap_cache_dir(dir: std::path::PathBuf) {
     let _ = BASEMAP_CACHE_DIR.set(dir);
 }
 
+/// Every archive URL this build reads, in the one place they are enumerated.
+///
+/// **The whole of the block cache's invalidation is derived from this list**,
+/// and a URL missing from it is not a degraded cache but a deleted one:
+/// `gc_stale_generations` `remove_dir_all`s every directory under the shared
+/// root whose name is not a live generation, from `ensure_open` inside a
+/// `get_or_init`, so the omission costs its archive the whole of its cache at
+/// the first cache open of **every launch** — a slow map, never an error.
+///
+/// It is therefore every archive, not the one being opened: the sources are
+/// built lazily and in no fixed order, and a live set that only knew the
+/// opening source would cost the others theirs.
+///
+/// `the_live_generation_set_covers_every_archive_url_the_build_reads` in
+/// `tiles::tests` is the ratchet: a fifth archive that is declared and not
+/// listed here reddens rather than silently wiping a fourth.
+#[cfg(not(target_arch = "wasm32"))]
+fn live_archive_urls() -> Vec<String> {
+    vec![
+        archive_url(),
+        terrain_archive_url(),
+        height_archive_url(),
+        CONUS_HEIGHT_ARCHIVE_URL.to_owned(),
+    ]
+}
+
 /// The block cache configuration for the archive at `url`, or `None` when no
 /// cache directory was installed.
 ///
-/// **The one place the GC's live-generation set is derived**, and it is
-/// derived from *both* archive URLs no matter which source is being built:
-/// basemap and terrain have different generations both alive at once, the
-/// terrain source is built lazily, and a live set that only knew the opening
-/// source would cost the other its cache every launch.
+/// The live-generation set is [`live_archive_urls`] mapped through
+/// `generation_for_url`, no matter which source is being built — see that
+/// function for why the set is every archive rather than this one.
 #[cfg(not(target_arch = "wasm32"))]
 fn archive_block_cache(url: &str) -> Option<crate::basemap_archive::block_cache::BlockCacheConfig> {
     use crate::basemap_archive::block_cache;
@@ -137,10 +242,10 @@ fn archive_block_cache(url: &str) -> Option<crate::basemap_archive::block_cache:
     Some(block_cache::BlockCacheConfig {
         root,
         generation: block_cache::generation_for_url(url),
-        live_generations: vec![
-            block_cache::generation_for_url(&archive_url()),
-            block_cache::generation_for_url(&terrain_archive_url()),
-        ],
+        live_generations: live_archive_urls()
+            .iter()
+            .map(|url| block_cache::generation_for_url(url))
+            .collect(),
         cap_bytes: block_cache::BLOCK_CACHE_BYTES,
     })
 }
@@ -225,6 +330,47 @@ pub(crate) fn terrain_range_source()
 /// hillshade a byte came from.
 pub(crate) fn terrain_generation() -> String {
     crate::basemap_archive::block_cache::generation_for_url(&terrain_archive_url())
+}
+
+/// A range source over the global height archive.
+///
+/// **Deliberately not a third [`HttpsTiles`], and not by analogy with
+/// [`terrain_source`].** Heights are data, not pixels: an `HttpsTiles` would
+/// decode every body into a texture, run the hillshade remap over packed
+/// elevation, and spend the render path's own tile cache on grids nothing
+/// draws. The reader above this is the layer `terrain_range_source` already
+/// shows is reusable —
+///
+/// ```text
+/// height_range_source()                       // parts probe, free
+///   -> block_cache::BlockCachedSource::new(_, archive_block_cache(&url))
+///   -> BasemapArchives::open(_)
+///   -> .tile(z, x, y) -> TileBytes             // undecoded, on BOTH targets
+/// ```
+///
+/// — and the bytes stay undecoded all the way to whoever unpacks them, which
+/// is not this crate.
+///
+/// The archive is published in parts and a bare `GET` of the logical name
+/// 404s **by design**; `HttpRangeSource` probes `<url>.part000` at open and
+/// selects parts mode itself.
+///
+/// # Errors
+///
+/// [`crate::basemap_archive::RangeError`] if the archive URL will not parse —
+/// the same and only construction-time failure `terrain_range_source` has.
+pub fn height_range_source()
+-> Result<crate::basemap_archive::HttpRangeSource, crate::basemap_archive::RangeError> {
+    crate::basemap_archive::HttpRangeSource::new(
+        crate::basemap_archive::archive_client(),
+        &height_archive_url(),
+    )
+}
+
+/// The generation the height archive this build reads carries — the one
+/// derivation, exactly as [`terrain_generation`] is for the hillshade.
+pub fn height_generation() -> String {
+    crate::basemap_archive::block_cache::generation_for_url(&height_archive_url())
 }
 
 /// The credit the hillshade's elevation data requires.
@@ -786,3 +932,12 @@ pub fn tile_span(projector: &walkers::Projector, rect: egui::Rect, tile_zoom: u8
 #[path = "tiles/tests.rs"]
 #[cfg(test)]
 mod tests;
+
+/// The height reader's own suite: a fixture archive over a loopback server,
+/// read through the override. Beside [`tests`] rather than inside it because
+/// it needs the archive module's loopback harness and a child process, and
+/// neither is a thing the tile-geometry suite has any business carrying.
+#[path = "tiles/height_tests.rs"]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod height_tests;
