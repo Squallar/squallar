@@ -22,8 +22,8 @@ use squallar_egui::volume_view::view_for;
 use squallar_gpu::egui_renderer::AttachmentConfig;
 use squallar_radar::types::RadarProduct;
 use squallar_radar::voxel::{DESKTOP_SHAPE, HalfExtentKm, VolumeGrid, VoxelRequest, build_voxels};
-use squallar_volumetric::raymarch::VolumePipelines;
 use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
+use squallar_volumetric::raymarch::{OffscreenPlan, VolumePipelines};
 use squallar_volumetric::uniform::VolumeUniform;
 
 /// The volume reader and the site it learns. See `live_volume/mod.rs`.
@@ -108,7 +108,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             uniform.edge_soft_width = squallar_volumetric::bridge::EDGE_SOFT_WIDTH;
             volume.write_uniform(&queue, &uniform);
 
-            let target = pipelines.create_offscreen(&device, size);
+            let target = pipelines.create_offscreen(&device, OffscreenPlan::native(size));
             let (mean_ms, min_ms) = timed_passes(&device, &queue, &pipelines, &target, &volume);
             println!(
                 "{}x{} shading {}: mean {mean_ms:.3} ms, min {min_ms:.3} ms over \
@@ -126,7 +126,7 @@ fn measure_the_raymarch_cost_on_a_real_volume() {
             std::fs::create_dir_all(parent).expect("creating SWEEP_OUT's directory");
         }
         let size = [1440u32, 900];
-        let target = pipelines.create_offscreen(&device, size);
+        let target = pipelines.create_offscreen(&device, OffscreenPlan::native(size));
         for frame in 0..60u32 {
             let camera = OrbitCamera::restore(
                 yaw + 0.05 * frame as f32,

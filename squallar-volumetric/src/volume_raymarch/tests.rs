@@ -246,6 +246,8 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
         (0, BINDING_JITTER_TEXTURE, "jitter_texture"),
         (1, BINDING_FLOOR_TEXTURE, "floor_texture"),
         (1, BINDING_FLOOR_SAMPLER, "floor_sampler"),
+        (2, BINDING_OCCLUDER_TEXTURE, "occluder_texture"),
+        (2, BINDING_GROUND_TEXTURE, "ground_texture"),
     ] {
         let expected = format!("@group({group}) @binding({binding}) var");
         let line = VOLUME_SHADER_WGSL
@@ -260,8 +262,8 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
 
     let bindings = shader_code().matches("@binding(").count();
     assert_eq!(
-        bindings, 10,
-        "volume.wgsl declares {bindings} bindings; this file names 10, and a \
+        bindings, 12,
+        "volume.wgsl declares {bindings} bindings; this file names 12, and a \
              binding the layouts do not declare fails pipeline creation"
     );
 }
@@ -291,24 +293,29 @@ fn each_sampled_texture_has_exactly_one_sampler() {
     let samplers = code.matches(": sampler;").count();
     assert_eq!(
         (textures, samplers),
-        (5, 4),
+        (7, 4),
         "volume.wgsl declares {textures} textures and {samplers} samplers; \
              naga refuses a texture sampled through two samplers in one entry \
              point"
     );
-    // The unsampled one is the jitter tile, and it is unsampled *because* it is
-    // loaded.
-    assert!(
-        code.contains("textureLoad(jitter_texture"),
-        "nothing loads `jitter_texture`; it is the texture that carries no sampler, so if it \
-         is sampled instead the pipeline has a texture with no sampler to sample it through",
-    );
+    // The three unsampled ones are the jitter tile and the ground pass's two
+    // outputs, and each is unsampled *because* it is loaded: the jitter tile is
+    // indexed by pixel, and the other two are read at a 1:1 texel-to-pixel
+    // invariant, which is what keeps the WebGL2 float-filterability question
+    // from ever arising.
+    for loaded in ["jitter_texture", "occluder_texture", "ground_texture"] {
+        assert!(
+            code.contains(&format!("textureLoad({loaded}")),
+            "nothing loads `{loaded}`; it is one of the textures that carries no sampler, so if \
+             it is sampled instead the pipeline has a texture with no sampler to sample it \
+             through",
+        );
+    }
     assert_eq!(
         code.matches("textureLoad(").count(),
-        1,
-        "volume.wgsl has more than one `textureLoad`; only the jitter tile is bound without a \
-         sampler, so a second load is either a texture that lost its sampler or a sampled read \
-         written as a load",
+        3,
+        "volume.wgsl has more `textureLoad`s than the three textures bound without a sampler, \
+         so one is either a texture that lost its sampler or a sampled read written as a load",
     );
 }
 
@@ -875,24 +882,320 @@ fn an_offscreen_extent_is_clamped_up_from_zero_and_left_alone_otherwise() {
     assert_eq!(offscreen_extent([1440, 900]), [1440, 900]);
 }
 
-/// A held offscreen is rebuilt for a new size and kept for the same one.
+/// A held offscreen is rebuilt for a new plan and kept for the same one.
 #[test]
-fn an_offscreen_is_rebuilt_only_when_its_size_changed() {
+fn an_offscreen_is_rebuilt_only_when_its_plan_changed() {
+    let held = OffscreenPlan::native([1440, 900]);
     assert!(
-        offscreen_needs_rebuild(None, [1440, 900]),
+        offscreen_needs_rebuild(None, held),
         "nothing held must always be built"
     );
     assert!(
-        !offscreen_needs_rebuild(Some([1440, 900]), [1440, 900]),
+        !offscreen_needs_rebuild(Some(held), held),
         "an offscreen of the right size was thrown away and rebuilt"
     );
-    for changed in [[1441, 900], [1440, 901], [900, 1440]] {
+    for size in [[1441, 900], [1440, 901], [900, 1440]] {
         assert!(
-            offscreen_needs_rebuild(Some([1440, 900]), changed),
-            "a {changed:?} pane reused a 1440x900 offscreen, so it would be \
+            offscreen_needs_rebuild(Some(held), OffscreenPlan { size, ..held }),
+            "a {size:?} pane reused a 1440x900 offscreen, so it would be \
                  blitted at the wrong scale"
         );
     }
+    // **The two fields a size comparison cannot see.** A governor that moves a
+    // rung leaves the pane's pixel count where it was whenever the fit was
+    // already shrinking to the budget rather than dividing, and turning the
+    // ground pass on decides whether three attachments exist at all — a target
+    // built without them cannot grow them.
+    assert!(
+        offscreen_needs_rebuild(
+            Some(held),
+            OffscreenPlan {
+                rung: ResolutionRung::Half,
+                ..held
+            }
+        ),
+        "a target built at one rung was kept for another, so the offscreen and \
+         the quality the uniform reports have come apart"
+    );
+    assert!(
+        offscreen_needs_rebuild(
+            Some(held),
+            OffscreenPlan {
+                ground: GroundPass::On,
+                ..held
+            }
+        ),
+        "a target built with no ground attachments was kept for a pane that \
+         draws ground; the ground pass would then record into nothing and the \
+         march would read the 1x1 placeholder for ever"
+    );
+}
+
+/// The same packing, in exact arithmetic: floor to a code, then divide.
+///
+/// `f64` throughout, so nothing here rounds at all — this is the definition the
+/// `f32` implementation is judged against, rather than a second implementation
+/// with the same hazards.
+fn packing_model(v: f32) -> f64 {
+    let x = f64::from(v.clamp(0.0, 1.0)) * f64::from(PACK24_CODES);
+    x.floor() / f64::from(PACK24_CODES)
+}
+
+/// What an `Rgba8Unorm` attachment does to the digits between the write and
+/// the read: **clamp to 0..1, then quantise to a byte.**
+///
+/// Load-bearing, and the reason the flooring pack is not merely tidier: a pack
+/// whose arithmetic can produce a digit outside 0..1 loses it here, in the
+/// texture, where no Rust arithmetic would ever show it.
+fn through_unorm(digits: [f32; 3]) -> [u8; 3] {
+    digits.map(|d| (d.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// **The packing floors to a code and never reorders.**
+///
+/// The *encode* is one-sided: `pack24` floors, so the code written is never
+/// past the true value, which is what keeps the clip from letting a ray
+/// through the ground. The **decode is not** one-sided, and the earlier
+/// wording here said it was: `code * (1/16777215)` is one `f32` multiply and
+/// rounds up on about half the code space, so a decoded `t` can sit one code
+/// PAST the true one — ~0.15 m in a 240 km box, against a ~1.8 km march cell.
+/// Operationally irrelevant; the absolute phrasing was not.
+///
+/// Judged against exact `f64` arithmetic rather than against the input value,
+/// because `code / 16777215` is itself a rounded `f32` — near 1.0 a quantum
+/// *is* an ulp, and an assertion written against the input would be measuring
+/// `f32`'s resolution rather than the packing's.
+#[test]
+fn the_packing_floors_to_a_code_across_the_whole_code_space() {
+    let quantum = 1.0 / f64::from(PACK24_CODES);
+    // The whole path the GPU takes: float in, digits, the unorm texture, float
+    // out. Anything short of the texture is not the round trip that happens.
+    let round_trip = |v: f32| f64::from(unpack24_bytes(through_unorm(pack24(v))));
+    // The tolerance is two codes: `x = v * 16777215.0` is one `f32` multiply,
+    // so `x` may land a code either side of the exact product and the floor may
+    // then pick a neighbouring code. Two codes out of 16.7 million is three
+    // centimetres of displayed vertical against a ~1.8 km march cell.
+    let tolerance = 2.0 * quantum;
+
+    let mut worst = 0.0f64;
+    let mut previous = f64::NEG_INFINITY;
+    // Every code is 16.7 M round trips; a stride coprime with 255 and 65536
+    // walks all three digits and both carries without walking all of it.
+    let stride = 4373u32;
+    let mut code = 0u32;
+    while code <= PACK24_CODES {
+        let v = code as f32 / PACK24_CODES as f32;
+        // The digits `pack24` produces must be storable AS unorm digits, with
+        // nothing for the texture to clamp away.
+        for digit in pack24(v) {
+            assert!(
+                (0.0..=1.0).contains(&digit),
+                "code {code} packs to a digit of {digit}, which an `Rgba8Unorm` \
+                 attachment clamps — the value the march reads back would then \
+                 be a whole digit away from the one written"
+            );
+        }
+        let back = round_trip(v);
+        worst = worst.max((back - packing_model(v)).abs());
+        assert!(
+            back >= previous,
+            "the packing is not monotone: code {code} decoded to {back} after \
+             a larger value {previous}"
+        );
+        previous = back;
+        code += stride;
+    }
+    assert!(
+        worst <= tolerance,
+        "the packing's worst departure from an exact floor is {worst}, over the \
+         {tolerance} two codes allow — the digits themselves are being \
+         reordered or dropped, not merely rounded"
+    );
+
+    // Both carries by hand: a stride can step over them, and this is where a
+    // *rounding* pack rather than a flooring one overflows a digit past what
+    // the texture can hold. This is the reason `pack24` is written with `floor`.
+    for code in [
+        0u32, 1, 255, 256, 257, 65_535, 65_536, 65_537, 16_777_214, 16_777_215,
+    ] {
+        let v = code as f32 / PACK24_CODES as f32;
+        let off = (round_trip(v) - packing_model(v)).abs();
+        assert!(
+            off <= tolerance,
+            "code {code} round-trips {off} away from an exact floor, over the \
+             {tolerance} two codes allow"
+        );
+    }
+
+    // Saturation is safe in both directions: it is what makes an over-estimated
+    // `t_scale` a no-op rather than a clip.
+    assert_eq!(unpack24(pack24(2.0)), 1.0);
+    assert_eq!(unpack24(pack24(-1.0)), 0.0);
+}
+
+/// **The shader's packing and this file's mirror are one arithmetic.**
+///
+/// Everything above exercises the RUST mirror. Nothing else pins the shader's
+/// copy to it, and the occluder is the entire occlusion channel — so a
+/// mutation of the WGSL is invisible to every other test in the tree. The one
+/// that motivated this: dropping the high term from the low digit,
+/// `floor(x - mid * 256.0)` for `floor(x - hi * 65536.0 - mid * 256.0)`, drives
+/// the blue digit past 1.0 for any `t >= t_scale / 256`, the unorm write clamps
+/// it to 255 on every drawn texel — **8 of the 24 bits gone** — and the GPU
+/// registration oracle moves by too little to notice.
+///
+/// A text pin, in the style of `the_shader_and_the_ground_post_count_agree`,
+/// because the two copies are in two languages and only their source can be
+/// compared. It is deliberately whole lines: a partial match would accept the
+/// mutation that motivated it.
+#[test]
+fn the_shader_and_this_files_packing_are_one_arithmetic() {
+    for line in [
+        // `pack24`, every line of it.
+        "    let x = clamp(v, 0.0, 1.0) * 16777215.0;",
+        "    let hi = floor(x * (1.0 / 65536.0));",
+        "    let mid = floor((x - hi * 65536.0) * (1.0 / 256.0));",
+        "    let lo = floor(x - hi * 65536.0 - mid * 256.0);",
+        "    return vec3<f32>(hi, mid, lo) * (1.0 / 255.0);",
+        // and `unpack24`.
+        "    return dot(round(c * 255.0), vec3<f32>(65536.0, 256.0, 1.0)) * (1.0 / 16777215.0);",
+    ] {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(line),
+            "volume.wgsl no longer contains `{line}`. The shader's packing has \
+             drifted from this file's mirror, and every property proved of the \
+             mirror above — the floor, the carries, the digits an `Rgba8Unorm` \
+             can hold — is now proved of a function the GPU does not run",
+        );
+    }
+    // And the constant both sides scale by, which is the one number that would
+    // make the two disagree without either body changing.
+    assert!(
+        VOLUME_SHADER_WGSL.contains(&format!("* {PACK24_CODES}.0;")),
+        "volume.wgsl no longer scales by {PACK24_CODES}, so its code space and \
+         this file's have come apart",
+    );
+}
+/// And the tolerance is not slack enough to hide the failure it exists to
+/// catch: a pack that rounds its digits instead of flooring them drives the
+/// top digit past what an `Rgba8Unorm` can hold, and the texture clamps it away.
+#[test]
+fn a_rounding_pack_loses_a_whole_digit_at_the_carries() {
+    /// [`pack24`] with `round` where it has `floor`, which is the edit a
+    /// reviewer makes when the flooring looks like an accident.
+    fn rounding_pack(v: f32) -> [f32; 3] {
+        let x = v.clamp(0.0, 1.0) * 16_777_215.0;
+        let hi = (x * (1.0 / 65536.0)).round();
+        let mid = ((x - hi * 65536.0) * (1.0 / 256.0)).round();
+        let lo = (x - hi * 65536.0 - mid * 256.0).round();
+        [hi / 255.0, mid / 255.0, lo / 255.0]
+    }
+
+    let quantum = 1.0 / f64::from(PACK24_CODES);
+    let mut worst = 0.0f64;
+    for code in [255u32, 256, 65_535, 65_536, 16_777_215] {
+        let v = code as f32 / PACK24_CODES as f32;
+        let back = f64::from(unpack24_bytes(through_unorm(rounding_pack(v))));
+        worst = worst.max((back - packing_model(v)).abs());
+    }
+    assert!(
+        worst > 100.0 * quantum,
+        "a rounding pack was only {worst} away from an exact floor at the \
+         carries, under 100 quanta — so the tolerance above would accept it and \
+         the shipped `floor` is not what the test is holding"
+    );
+}
+
+/// The bytes a readback yields decode the same way the shader's floats do.
+#[test]
+fn the_byte_decode_and_the_float_decode_are_one_function() {
+    for code in [0u32, 1, 255, 256, 65_535, 65_536, 12_345_678, PACK24_CODES] {
+        let bytes = [
+            (code >> 16) as u8,
+            ((code >> 8) & 0xff) as u8,
+            (code & 0xff) as u8,
+        ];
+        let floats = bytes.map(|b| f32::from(b) / 255.0);
+        assert_eq!(
+            unpack24_bytes(bytes),
+            unpack24(floats),
+            "code {code} decodes differently from bytes than from the unorm \
+             floats the shader sees, so a readback oracle and the march are \
+             reading two different numbers"
+        );
+    }
+}
+
+/// **The shader's height field and this file's mirror are one arithmetic,
+/// clamp included.**
+///
+/// The clamp is not tidiness: [`crate::uniform::VolumeUniform::t_scale_for`]
+/// bounds the packing by the farthest corner of the **unit cube**, and that is
+/// only an upper bound on a post while the field cannot leave the cube. The
+/// amplitude arrives in a plain public lane, so a shader whose copy lost the
+/// clamp would put posts outside, saturate the packing and decode them SHORT —
+/// the march clipping early while the composite paints terrain at the wrong
+/// depth. The host sweep below proves that of the mirror; only this proves the
+/// shader still agrees with it.
+#[test]
+fn the_shader_and_this_files_ground_height_are_one_arithmetic() {
+    for line in [
+        "    let d = (uv.x - 0.5) / GROUND_RIDGE_SIGMA;",
+        "    return clamp(volume.occluder.z * exp(-0.5 * d * d), 0.0, 1.0);",
+    ] {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(line),
+            "volume.wgsl no longer contains `{line}`. Its height field has \
+             drifted from this file's mirror, so the host oracle predicts a \
+             surface the GPU does not draw — and if it is the clamp that went, \
+             `t_scale_for`'s corner bound has stopped being an upper bound at \
+             all",
+        );
+    }
+    let sigma = format!("const GROUND_RIDGE_SIGMA: f32 = {GROUND_RIDGE_SIGMA};");
+    assert!(
+        VOLUME_SHADER_WGSL.contains(&sigma),
+        "volume.wgsl does not declare `{sigma}`, so the two ridges are \
+         different shapes",
+    );
+}
+
+/// The vertex count and the grid the vertex stage lays out are one arithmetic.
+#[test]
+fn the_draw_issues_exactly_the_grids_two_triangles_a_cell() {
+    let cells = GROUND_POSTS - 1;
+    assert_eq!(ground_vertex_count(), 6 * cells * cells);
+    // Every vertex index the draw issues must land inside the grid: the last
+    // one's quad is the last cell, not one past it.
+    let last_quad = (ground_vertex_count() - 1) / 6;
+    assert_eq!(last_quad % cells, cells - 1);
+    assert_eq!(last_quad / cells, cells - 1);
+}
+
+/// The stand-in height field is a ridge, not a step or a plane.
+#[test]
+fn the_stand_in_ridge_peaks_in_the_middle_and_falls_away_on_both_sides() {
+    let amplitude = 0.25f32;
+    assert_eq!(ground_height([0.5, 0.5], amplitude), amplitude);
+    assert_eq!(ground_height([0.5, 0.5], 0.0), 0.0);
+    let mut previous = 0.0f32;
+    // Offsets either side of the crest, `0.5 ± d` rather than `u` and `1 - u`:
+    // the pair must be exact mirrors in `f32` or the asymmetry measured is the
+    // test's own inputs.
+    for step in (0..=50).rev() {
+        let d = 0.5 * step as f32 / 64.0;
+        let h = ground_height([0.5 - d, 0.5], amplitude);
+        assert!(h >= previous, "the ridge is not monotone up to its crest");
+        assert_eq!(
+            h,
+            ground_height([0.5 + d, 0.5], amplitude),
+            "the ridge is not symmetric about the box's middle at ±{d}"
+        );
+        previous = h;
+    }
+    // It must actually be near zero at the box's edges, or the "ridge" is a
+    // plateau and the control below would be measuring a lift, not a shape.
+    assert!(ground_height([0.0, 0.5], amplitude) < amplitude * 1e-3);
 }
 
 /// An upload whose shapes disagree is refused, and one that agrees is not.

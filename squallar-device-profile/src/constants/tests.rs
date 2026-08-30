@@ -638,7 +638,7 @@ fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
 #[test]
 fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
     use crate::quality::{
-        DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING,
+        DESKTOP_PLATFORM_CEILING, GroundPass, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING,
     };
 
     for (target, budget, ceiling) in [
@@ -658,7 +658,7 @@ fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
             DESKTOP_PLATFORM_CEILING,
         ),
     ] {
-        let fitted = ceiling.fit(VOLUME_OFFSCREEN_REFERENCE_PANE_PX, budget);
+        let fitted = ceiling.fit(VOLUME_OFFSCREEN_REFERENCE_PANE_PX, budget, GroundPass::Off);
         assert_eq!(
             fitted.quality, ceiling,
             "the {target} budget of {budget} B cannot render the \

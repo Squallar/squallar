@@ -1,4 +1,5 @@
-// The offscreen volume raymarch, and the quad that composites it into egui.
+// The offscreen volume raymarch, the ground pass that occludes it, and the quad
+// that composites the result into egui.
 //
 // naga/WGSL validator constraints, not preferences:
 //   * `textureSampleLevel` for everything sampled: the march breaks on a
@@ -7,13 +8,20 @@
 //   * `RAYMARCH_STEP_CEILING` stays `const` so the loop bound folds to a literal.
 //   * One sampler per texture per pipeline; group/binding pairs unique across the
 //     whole module, whether or not one entry point sees both (raymarch 0..4 and 7,
-//     blit 5..6); `textureNumLevels` unreachable on WebGL2, so used nowhere.
+//     blit 5..6, the ground pass's two outputs read back at group 2);
+//     `textureNumLevels` unreachable on WebGL2, so used nowhere.
 
-// One `mat4x4<f32>` plus ten `vec4<f32>`: 64 + 160 = 224 bytes, std140-clean.
+// Two `mat4x4<f32>` plus eleven `vec4<f32>`: 128 + 176 = 304 bytes, std140-clean.
 // Every member is `f32`, including the conceptually-integer (`grid_dims`) and
 // conceptually-bool (`flags`) ones: mixing integer and float members in a std140
-// block is where driver bugs live. `volume_uniform.rs` writes those 224 bytes by
-// hand and pins every offset; `REQUIRED_UNIFORM_BINDING_SIZE` is 256.
+// block is where driver bugs live. `volume_uniform.rs` writes those 304 bytes by
+// hand and pins every offset; `REQUIRED_UNIFORM_BINDING_SIZE` is 512.
+//
+// **One block, three entry points.** The ground pass reads its camera from this
+// same buffer rather than carrying its own, which is what makes it structurally
+// impossible for the mesh and the march to disagree about where the camera is —
+// the bug class that misregisters occlusion by a pixel. It grows at the END so
+// no existing offset moves.
 struct Volume {
     // Clip space to box space, the unit cube [0,1]^3 over the voxel grid. Built
     // as box_from_world * world_from_view * view_from_clip, never by inversion.
@@ -56,6 +64,16 @@ struct Volume {
     // `t = grid_from_box_a.xyz * p + grid_from_box_b.xyz`; scale 1 offset 0 —
     // the ordinary case — is `t = p` exactly.
     grid_from_box_b: vec4<f32>,
+    // Box space to clip space: the direction the ground mesh is drawn through.
+    // Built forward as clip_from_view * view_from_world * world_from_box, never
+    // by inverting box_from_clip above.
+    clip_from_box: mat4x4<f32>,
+    // x: the ray parameter a saturated occluder texel decodes to, in box units,
+    // and ZERO when no ground pass ran — the march tests this to decide whether
+    // to read the occluder at all. y: the ground surface's greatest box z,
+    // written for the composite's arm and read by nothing yet. z: amplitude of
+    // the analytic stand-in ridge, in box z. w: reserved, zero.
+    occluder: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
@@ -93,6 +111,22 @@ const JITTER_TILE_MASK: i32 = 63;
 // `floor_colour` reprojects into it. Premultiplied alpha, encoded per `floor_geo.w`.
 @group(1) @binding(0) var floor_texture: texture_2d<f32>;
 @group(1) @binding(1) var floor_sampler: sampler;
+
+// The ground pass's two outputs, read back by the march at **group 2**.
+//
+// Group 2 and not group 0: group 0 is per-GRID and group 1 is the frame-wide
+// mirror, while these two are per-OFFSCREEN and are recreated with it. Putting
+// them in group 0 would tie a per-target texture's lifetime to a per-grid bind
+// group and desynchronise the two.
+//
+// `Rgba8Unorm`, `textureLoad`, no samplers — the same construct as the jitter
+// tile, which `volume_shader.rs` already proves becomes `texelFetch` on both
+// GLES arms. **A depth texture cannot be used here at all**: naga hard-errors on
+// `textureLoad` from depth, `textureSampleLevel` on one emits a `sampler2DShadow`
+// `textureLod` overload that does not exist in GLSL ES 3.00, and every measured
+// browser leg of this build selects the GL backend.
+@group(2) @binding(0) var occluder_texture: texture_2d<f32>;
+@group(2) @binding(1) var ground_texture: texture_2d<f32>;
 
 // sRGB transfer functions, character-for-character egui's own, `egui-wgpu-0.35.0/src/egui.wgsl:44-57`.
 
@@ -386,6 +420,153 @@ fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
     return linear_from_gamma_rgb(entry.rgb) * iso_shading(p);
 }
 
+// ---------------------------------------------------------------------------
+// The ground pass: opaque geometry that occludes the march.
+// ---------------------------------------------------------------------------
+
+// A 0-1 value across 24 bits of an `Rgba8Unorm`'s RGB, most significant first.
+//
+// **Floor-based, so it round-trips exactly through unorm quantisation.** Each
+// digit is an integer in 0..255 divided by 255, which is a value the format
+// stores without rounding; anything that let a digit land between two codes
+// would come back a whole digit out at the carries.
+fn pack24(v: f32) -> vec3<f32> {
+    let x = clamp(v, 0.0, 1.0) * 16777215.0;
+    let hi = floor(x * (1.0 / 65536.0));
+    let mid = floor((x - hi * 65536.0) * (1.0 / 256.0));
+    let lo = floor(x - hi * 65536.0 - mid * 256.0);
+    return vec3<f32>(hi, mid, lo) * (1.0 / 255.0);
+}
+
+fn unpack24(c: vec3<f32>) -> f32 {
+    return dot(round(c * 255.0), vec3<f32>(65536.0, 256.0, 1.0)) * (1.0 / 16777215.0);
+}
+
+// Posts along each axis of the ground grid. `const` for the same naga reason as
+// RAYMARCH_STEP_CEILING, and mirrored by `raymarch::GROUND_POSTS`, which is what
+// the draw's vertex count is computed from — pinned by
+// `the_shader_and_the_ground_post_count_agree`.
+const GROUND_POSTS: u32 = 512u;
+
+// Width of the analytic stand-in ridge, as a fraction of the box's east-west
+// extent. A Gaussian rather than a cone so the surface has no crease for the
+// occluder's `t` to interpolate across discontinuously.
+const GROUND_RIDGE_SIGMA: f32 = 0.12;
+
+// The stand-in ground's straight LINEAR RGB, which is what the composite arms
+// expect. Mirrored by `raymarch::GROUND_STAND_IN_COLOUR`. B3 replaces this with
+// the map drape, reprojected by the same body `floor_colour` uses.
+const GROUND_STAND_IN_COLOUR: vec3<f32> = vec3<f32>(0.35, 0.22, 0.10);
+
+// The stand-in height field: one ridge running north across the box, peaked at
+// its middle, `occluder.z` tall. Zero amplitude is flat ground, which is what
+// registration test (a) reads against a host-side `floor_hit`.
+fn ground_height(uv: vec2<f32>) -> f32 {
+    let d = (uv.x - 0.5) / GROUND_RIDGE_SIGMA;
+    // **Clamped INTO the unit cube, here in the code and not in a test's
+    // precondition.** `t_scale_for`'s bound is the farthest cube CORNER, and
+    // that bound is only sound while every post is inside the cube; the
+    // amplitude arrives in a plain `f32` lane a caller can set to anything.
+    // A post past the cube saturates the packing and decodes SHORT of where it
+    // is, so the march would clip early while the composite painted terrain at
+    // the wrong depth — a failure that looks like a rendering bug and is a
+    // uniform-lane bug.
+    return clamp(volume.occluder.z * exp(-0.5 * d * d), 0.0, 1.0);
+}
+
+struct GroundVertex {
+    @builtin(position) clip_position: vec4<f32>,
+    // The surface point in box space. Interpolated rather than the ray
+    // parameter itself: `t` is a norm and is NOT affine in world space, so a
+    // per-vertex `t` would be wrong across a triangle however it were
+    // interpolated. The position is affine, so this is exact.
+    @location(0) box_p: vec3<f32>,
+}
+
+// A fixed-topology grid with **no vertex or index buffer at all**: positions
+// come from `@builtin(vertex_index)`.
+//
+// The pipeline must be built with `buffers: &[]` and not a zero-attribute
+// `VertexBufferLayout` — a layout with no attributes still pushes a vertex step
+// and would then demand a bound buffer at draw time.
+//
+// Authored in BOX space, so the vertical exaggeration applies for free through
+// the box the camera was framed against and cannot drift from the volume's.
+@vertex
+fn vs_ground(@builtin(vertex_index) vid: u32) -> GroundVertex {
+    let cells = GROUND_POSTS - 1u;
+    let quad = vid / 6u;
+    let corner = vid % 6u;
+    let i = quad % cells;
+    let j = quad / cells;
+    // Two triangles, (0,0)-(1,0)-(0,1) and (0,1)-(1,0)-(1,1). Spelled as
+    // comparisons rather than an indexed table: WGSL only lets a non-const index
+    // reach an array through a memory view, so a literal table would need a
+    // `var` and the initialisation that comes with it every invocation.
+    let dx = select(0u, 1u, corner == 1u || corner == 4u || corner == 5u);
+    let dy = select(0u, 1u, corner == 2u || corner == 3u || corner == 5u);
+    let uv = vec2<f32>(f32(i + dx), f32(j + dy)) / f32(cells);
+    let p = vec3<f32>(uv.x, uv.y, ground_height(uv));
+
+    var out: GroundVertex;
+    out.clip_position = volume.clip_from_box * vec4<f32>(p, 1.0);
+    out.box_p = p;
+    return out;
+}
+
+struct GroundTargets {
+    // The packed ray parameter in RGB, the hit flag in A.
+    @location(0) occluder: vec4<f32>,
+    // Straight linear RGB, coverage in A.
+    @location(1) colour: vec4<f32>,
+}
+
+@fragment
+fn fs_ground(in: GroundVertex) -> GroundTargets {
+    // `t` rather than depth, because `direction` is normalised in the march, so
+    // `t` IS box-space distance from the eye — already the parameterisation the
+    // composite consumes.
+    let t = length(in.box_p - volume.eye_in_box.xyz);
+    var out: GroundTargets;
+    out.occluder = vec4<f32>(pack24(t / max(volume.occluder.x, 1e-6)), 1.0);
+    out.colour = vec4<f32>(GROUND_STAND_IN_COLOUR, 1.0);
+    return out;
+}
+
+// The occluder texel under a pixel.
+//
+// The `clamp` is not defensive style: `BoundsCheckPolicy` is `Unchecked` on
+// GLES, so an out-of-range `texelFetch` is undefined, and the placeholder bound
+// when no ground pass ran is 1x1.
+fn occluder_at(px: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(occluder_texture));
+    let at = clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(occluder_texture, at, 0);
+}
+
+// Whether the ground mesh drew over this pixel at all. Off entirely when no
+// ground pass ran, which is the `occluder.x == 0` sentinel.
+fn ground_covered(occluder: vec4<f32>) -> bool {
+    return volume.occluder.x > 0.0 && occluder.a > 0.5;
+}
+
+// Where the ground mesh was hit, in the march's own ray parameter, or negative
+// when it did not cover this pixel.
+fn ground_hit_t(occluder: vec4<f32>) -> f32 {
+    if !ground_covered(occluder) {
+        return -1.0;
+    }
+    return unpack24(occluder.rgb) * volume.occluder.x;
+}
+
+// The ground mesh's own colour under a pixel: straight linear RGB with its
+// coverage, the same convention `floor_colour` answers in.
+fn ground_colour_at(px: vec2<f32>) -> vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(ground_texture));
+    let at = clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1));
+    return textureLoad(ground_texture, at, 0);
+}
+
 // Where this ray meets the box's bottom face — the z = 0 plane clipped to the unit
 // square — or negative for none. Solved through `slab_direction` so the coincidence
 // with the box exit (eye above) or entry (eye below) is EXACT: `slab_entry_exit`
@@ -490,16 +671,50 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     return vec4<f32>(linear, sample.a);
 }
 
+// The ground this ray lands on: the MESH's own colour where it drew, and the
+// map floor's reprojection where it did not.
+//
+// One function, so the composite's two arms below stay the two arms the frame's
+// verdict chooses between. Which surface is under the pixel is a property of the
+// pixel, and always was — `floor_t >= 0.0` already carried exactly that.
+fn surface_colour(
+    px: vec2<f32>,
+    occluder: vec4<f32>,
+    eye: vec3<f32>,
+    direction: vec3<f32>,
+    t: f32,
+) -> vec4<f32> {
+    if ground_covered(occluder) {
+        let mesh = ground_colour_at(px);
+        return vec4<f32>(mesh.rgb, mesh.a);
+    }
+    return floor_colour(eye, direction, t);
+}
+
 @fragment
 fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     let eye = volume.eye_in_box.xyz;
     let direction = normalize(unproject(in.ndc, 1.0) - eye);
-    let span = slab_entry_exit(eye, direction);
+    let occluder = occluder_at(in.clip_position.xy);
+    let ground_t = ground_hit_t(occluder);
+
+    // **The march CLIPS against the ground; it does not merely depth-test.**
+    // This must be here, before `jitter` and `dt` are derived below, because
+    // both are computed from `span` — a plain prepass looks right from one
+    // angle and wrong from the next, because a ray entering above a ridge and
+    // leaving over a valley would still accumulate underground samples.
+    var span = slab_entry_exit(eye, direction);
+    if ground_t >= 0.0 {
+        span.y = min(span.y, ground_t);
+    }
     if span.y <= span.x {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    let floor_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
+    // The mesh's hit wins over the flat map floor's: it IS the ground wherever
+    // it drew, so there is no double-ground to order.
+    let map_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
+    let floor_t = select(map_t, ground_t, ground_t >= 0.0);
     let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell metric
@@ -578,14 +793,14 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // accumulation. Coverage is the floor's alpha times the fade, 1 above.
     var transmitted = transmittance;
     if floor_t >= 0.0 && eye_above_plane {
-        let ground = floor_colour(eye, direction, floor_t);
+        let ground = surface_colour(in.clip_position.xy, occluder, eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = accumulated + transmittance * cover * ground.rgb;
         transmitted = transmittance * (1.0 - cover);
     } else if floor_t >= 0.0 && floor_fade > 0.0 {
         // The floor in front: an eye under the plane meets it at (or before) the
         // box entry, so the faded ground composites OVER the march.
-        let ground = floor_colour(eye, direction, floor_t);
+        let ground = surface_colour(in.clip_position.xy, occluder, eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = ground.rgb * cover + accumulated * (1.0 - cover);
         transmitted = transmitted * (1.0 - cover);

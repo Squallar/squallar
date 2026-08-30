@@ -6,9 +6,10 @@ use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use squallar_volumetric::raymarch::{
     BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
-    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_JITTER_TEXTURE, BINDING_LUT_SAMPLER,
-    BINDING_LUT_TEXTURE, BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR,
-    ENTRY_FS_RAYMARCH, ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_RAYMARCH, ShaderStage,
+    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_GROUND_TEXTURE, BINDING_JITTER_TEXTURE,
+    BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE, BINDING_OCCLUDER_TEXTURE, BINDING_UNIFORM,
+    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_GROUND, ENTRY_FS_RAYMARCH, ENTRY_POINTS,
+    ENTRY_VS_BLIT, ENTRY_VS_GROUND, ENTRY_VS_RAYMARCH, GROUND_POSTS, ShaderStage,
     VOLUME_SHADER_WGSL,
 };
 
@@ -41,6 +42,24 @@ const RAYMARCH_LAYOUT: Layout = &[
     // keeps one counter per binding type across the whole pipeline layout.
     (1, BINDING_FLOOR_TEXTURE, BindingKind::Texture),
     (1, BINDING_FLOOR_SAMPLER, BindingKind::Sampler),
+    // The ground pass's two outputs, read back at group 2. Two textures and no
+    // sampler after either: both are reached with `textureLoad`. They are last,
+    // so the floor's slots do not move.
+    (2, BINDING_OCCLUDER_TEXTURE, BindingKind::Texture),
+    (2, BINDING_GROUND_TEXTURE, BindingKind::Texture),
+];
+
+/// The ground pipeline's, which is group 0 alone — its two stages read the
+/// camera out of the shared uniform block and nothing else. Required as its own
+/// row because `layout_for` **panics** on an entry point it has no layout for,
+/// and appending the occluder to `RAYMARCH_LAYOUT` would not have supplied one.
+const GROUND_LAYOUT: Layout = &[
+    (0, BINDING_UNIFORM, BindingKind::UniformBuffer),
+    (0, BINDING_GRID_TEXTURE, BindingKind::Texture),
+    (0, BINDING_GRID_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
+    (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_JITTER_TEXTURE, BindingKind::Texture),
 ];
 
 /// The blit's, whose counters restart at zero — which is the whole reason the
@@ -54,6 +73,7 @@ const BLIT_LAYOUT: Layout = &[
 fn layout_for(entry_point: &str) -> Layout {
     match entry_point {
         ENTRY_VS_RAYMARCH | ENTRY_FS_RAYMARCH => RAYMARCH_LAYOUT,
+        ENTRY_VS_GROUND | ENTRY_FS_GROUND => GROUND_LAYOUT,
         ENTRY_VS_BLIT | ENTRY_FS_BLIT_GAMMA | ENTRY_FS_BLIT_LINEAR => BLIT_LAYOUT,
         other => panic!("no pipeline layout is declared for the entry point `{other}`"),
     }
@@ -330,6 +350,16 @@ fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
     // sharpest thing this test now checks — a map that keyed off binding
     // numbers, or that counted both types together, gets this wrong.
     assert_eq!(slot(1, BINDING_FLOOR_SAMPLER), 2);
+    // Group 2 continues the same counter again, and adds no sampler at all —
+    // which is why the floor's sampler slot above did not move when the ground
+    // pass landed.
+    assert_eq!(
+        slot(2, BINDING_OCCLUDER_TEXTURE),
+        4,
+        "the occluder must take the texture counter's fifth slot, after the \
+         floor's fourth — a group boundary does not restart it"
+    );
+    assert_eq!(slot(2, BINDING_GROUND_TEXTURE), 5);
 
     let blit = binding_map(BLIT_LAYOUT);
     for binding in [BINDING_BLIT_TEXTURE, BINDING_BLIT_SAMPLER] {
@@ -338,6 +368,309 @@ fn the_binding_map_counts_per_binding_type_the_way_wgpu_hal_does() {
             Some(&0),
             "the blit's counters do not restart at zero; wgpu-hal builds one \
              map per pipeline layout, not one per device"
+        );
+    }
+}
+
+/// **No entry point emits a shadow sampler, in either translation mode.**
+///
+/// The single highest-value assertion in this file. Occlusion travels as the
+/// march's own ray parameter packed into an `Rgba8Unorm` *because a depth
+/// texture cannot be read at all* on this build's web and Android-GLES targets:
+/// naga hard-errors on `textureLoad` from depth, and `textureSampleLevel` on one
+/// maps to `sampler2DShadow` and emits a `textureLod` overload that does not
+/// exist in GLSL ES 3.00 — which fails at *driver* compile, silently, on a
+/// target no Rust test executes. This is the mechanical tripwire that stops the
+/// depth route being reintroduced by someone who does not have that finding.
+#[test]
+fn no_entry_point_emits_a_shadow_sampler() {
+    for (name, stage) in ENTRY_POINTS {
+        for is_webgl in [true, false] {
+            let glsl_source = translate(name, naga_stage(stage), is_webgl);
+            for banned in [
+                "sampler2DShadow",
+                "sampler2DArrayShadow",
+                "samplerCubeShadow",
+            ] {
+                assert!(
+                    !glsl_source.contains(banned),
+                    "`{name}` (is_webgl={is_webgl}) emits `{banned}`. Something \
+                     in this shader is reading a depth texture, and the ES 3.00 \
+                     `textureLod` overload for one does not exist — the driver \
+                     rejects it at compile time in a browser, where no Rust test \
+                     runs. Occlusion travels as a packed ray parameter in an \
+                     `Rgba8Unorm` precisely so this never appears."
+                );
+            }
+        }
+    }
+}
+
+/// And the tripwire is not vacuous: the very construct it forbids does emit
+/// the sampler, translated through this same writer with this same policy.
+#[test]
+fn the_shadow_sampler_tripwire_notices_a_depth_texture() {
+    // The design that was rejected, in miniature: read the occluder as depth.
+    const DEPTH_READ: &str = "\
+@group(0) @binding(0) var occluder_depth: texture_depth_2d;
+@group(0) @binding(1) var occluder_sampler: sampler_comparison;
+
+@fragment
+fn fs_depth(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = at.xy * 0.001;
+    return vec4<f32>(textureSampleCompareLevel(occluder_depth, occluder_sampler, uv, 0.5));
+}
+";
+    let module = naga::front::wgsl::parse_str(DEPTH_READ).expect("the counter-example is valid");
+    let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+        .validate(&module)
+        .expect("the counter-example validates");
+    const DEPTH_LAYOUT: Layout = &[(0, 0, BindingKind::Texture), (0, 1, BindingKind::Sampler)];
+    let options = writer_options(true, DEPTH_LAYOUT);
+    let pipeline_options = glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: "fs_depth".to_owned(),
+        multiview: None,
+    };
+    let mut glsl_source = String::new();
+    let mut writer = glsl::Writer::new(
+        &mut glsl_source,
+        &module,
+        &info,
+        &options,
+        &pipeline_options,
+        policies(),
+    )
+    .expect("the counter-example can be set up for GLSL ES 300");
+    writer.write().expect("the counter-example translates");
+    drop(writer);
+    assert!(
+        glsl_source.contains("sampler2DShadow"),
+        "reading a depth texture did NOT emit `sampler2DShadow`, so the \
+         assertion above proves nothing about the shipped shader. naga's \
+         mapping has changed and the whole occluder-as-packed-`t` argument \
+         needs re-deriving, not this test relaxing"
+    );
+}
+
+/// **The march clips against the ground before it derives its step.**
+///
+/// A source-order rule, because it cannot be checked any other way: `jitter`
+/// and `dt` are both computed *from* `span`, so a clamp applied after them is a
+/// depth test rather than a clip — it looks right from one angle and wrong from
+/// the next, a ray entering above a ridge and leaving over a valley still
+/// accumulating underground samples.
+fn clip_precedes_the_step(shader: &str) -> Result<(), String> {
+    let source = without_comments(shader);
+    let at = |needle: &str| {
+        source
+            .find(needle)
+            .ok_or_else(|| format!("the march no longer contains `{needle}`"))
+    };
+    let clip = at("span.y = min(")?;
+    for after in ["let jitter", "let dt ="] {
+        let derived = at(after)?;
+        if clip >= derived {
+            return Err(format!(
+                "`span.y = min(` is at {clip} and `{after}` at {derived}: the \
+                 ground clamp lands after the step is derived from `span`, so \
+                 the march depth-tests against the ground instead of clipping \
+                 to it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_ground_clamp_precedes_the_jitter_and_the_step() {
+    if let Err(why) = clip_precedes_the_step(VOLUME_SHADER_WGSL) {
+        panic!("{why}");
+    }
+}
+
+/// **The order rule's own mutants.** Each is a way the clamp stops being a
+/// clip. Re-anchor rather than delete.
+#[test]
+fn the_order_rule_rejects_every_way_the_clamp_can_slip_past_the_step() {
+    const CLIP: &str = "    if ground_t >= 0.0 {\n        span.y = min(span.y, ground_t);\n    }\n";
+    // (name, from, to, must be rejected)
+    let mutants: [(&str, &str, &str, bool); 3] = [
+        (
+            "the clamp deleted outright, which is the plain depth-test build",
+            CLIP,
+            "",
+            true,
+        ),
+        (
+            "the clamp moved below the step, so `dt` is derived from the \
+             unclipped span",
+            CLIP,
+            "",
+            true,
+        ),
+        (
+            "CONTROL: the clamp spelled with the operands the other way round, \
+             which is the same shader",
+            "span.y = min(span.y, ground_t);",
+            "span.y = min(ground_t, span.y);",
+            false,
+        ),
+    ];
+
+    for (index, (name, from, to, must_reject)) in mutants.into_iter().enumerate() {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(from),
+            "{name}: the anchor is gone, so this mutant is not being applied to \
+             anything — re-anchor it rather than deleting it",
+        );
+        let mut mutated = VOLUME_SHADER_WGSL.replacen(from, to, 1);
+        // The second mutant is the first one's deletion plus a re-insertion
+        // after the step, which is the edit a reviewer would actually make.
+        if index == 1 {
+            const ANCHOR: &str = "    var t = span.x + jitter * dt;";
+            assert!(
+                mutated.contains(ANCHOR),
+                "{name}: the re-insertion point is gone — re-anchor it",
+            );
+            mutated = mutated.replacen(ANCHOR, &format!("{CLIP}{ANCHOR}"), 1);
+        }
+        match (clip_precedes_the_step(&mutated), must_reject) {
+            (Err(_), true) | (Ok(()), false) => {}
+            (Ok(()), true) => panic!("{name}: the rule accepted it"),
+            (Err(why), false) => panic!("{name}: the rule rejected a correct shader: {why}"),
+        }
+    }
+}
+
+/// **Every group-2 fetch is clamped into the texture it reads.**
+///
+/// A source rule, because the target it protects is one no Rust test executes.
+/// `fs_raymarch` calls `occluder_at` **unconditionally**, before the
+/// `volume.occluder.x > 0.0` sentinel — and production binds `GroundPass::Off`,
+/// so group 2 is the **1x1** placeholder while `clip_position.xy` runs to the
+/// full pane. On the GLES arm `image_load` is `BoundsCheckPolicy::Unchecked`
+/// (see `policies()` above), so an unclamped `texelFetch` there is undefined on
+/// every pixel of every 3D frame in a browser. Deleting the clamp is
+/// byte-identical on a desktop Vulkan adapter, which is why nothing but this
+/// notices.
+fn group_two_fetches_are_clamped(shader: &str) -> Result<(), String> {
+    let source = without_comments(shader);
+    for name in ["occluder_at", "ground_colour_at"] {
+        let at = source.find(&format!("fn {name}(")).ok_or_else(|| {
+            format!("`{name}` is gone; re-anchor this rule rather than deleting it")
+        })?;
+        let body = &source[at..];
+        let body = &body[..body
+            .find("\n}")
+            .ok_or_else(|| format!("`{name}` has no closing brace"))?];
+        if !body.contains("textureLoad(") {
+            return Err(format!("`{name}` no longer loads a texel at all"));
+        }
+        if !body.contains("clamp(") {
+            return Err(format!(
+                "`{name}` reaches a texel with no `clamp`. The march calls it \
+                 before it knows whether a ground pass ran, and the placeholder \
+                 bound when none did is 1x1 — on GLES that is an unchecked \
+                 out-of-range `texelFetch` on every pixel of every frame",
+            ));
+        }
+        if !body.contains("textureDimensions(") {
+            return Err(format!(
+                "`{name}` clamps against something other than the texture's own \
+                 dimensions, so the bound is not the one the fetch needs",
+            ));
+        }
+    }
+    // And the fetch really is unguarded, which is *why* the clamp carries the
+    // whole weight. If a sentinel is ever put in front of it this rule should
+    // be re-derived rather than kept out of habit.
+    if !source.contains("let occluder = occluder_at(in.clip_position.xy);") {
+        return Err(
+            "the march no longer fetches the occluder at the top of `fs_raymarch`; \
+             re-derive this rule against wherever it moved to"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_group_two_fetch_is_clamped_into_its_own_texture() {
+    if let Err(why) = group_two_fetches_are_clamped(VOLUME_SHADER_WGSL) {
+        panic!("{why}");
+    }
+}
+
+/// **The clamp rule's own mutants.** Re-anchor rather than delete.
+#[test]
+fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
+    // (name, from, to, must be rejected)
+    let mutants: [(&str, &str, &str, bool); 3] = [
+        (
+            "the occluder's clamp deleted, which is byte-identical on a desktop \
+             adapter and undefined on GLES",
+            "    let at = clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1));\n    return textureLoad(occluder_texture, at, 0);",
+            "    return textureLoad(occluder_texture, vec2<i32>(px), 0);",
+            true,
+        ),
+        (
+            "the ground colour's clamp deleted",
+            "    let at = clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1));\n    return textureLoad(ground_texture, at, 0);",
+            "    return textureLoad(ground_texture, vec2<i32>(px), 0);",
+            true,
+        ),
+        (
+            "CONTROL: the clamp's bounds spelled with the same values in a \
+             different order, which is the same shader",
+            "clamp(vec2<i32>(px), vec2<i32>(0), dims - vec2<i32>(1))",
+            "clamp(vec2<i32>(px), vec2<i32>(0, 0), dims - vec2<i32>(1, 1))",
+            false,
+        ),
+    ];
+
+    for (name, from, to, must_reject) in mutants {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(from),
+            "{name}: the anchor is gone, so this mutant is not being applied to \
+             anything — re-anchor it rather than deleting it",
+        );
+        let mutated = VOLUME_SHADER_WGSL.replacen(from, to, 1);
+        match (group_two_fetches_are_clamped(&mutated), must_reject) {
+            (Err(_), true) | (Ok(()), false) => {}
+            (Ok(()), true) => panic!("{name}: the rule accepted an unguarded fetch"),
+            (Err(why), false) => panic!("{name}: the rule rejected a correct shader: {why}"),
+        }
+    }
+}
+/// The ground grid's post count is one number, not two that agree by
+/// inspection: the draw's vertex count is derived from the Rust one.
+#[test]
+fn the_shader_and_the_ground_post_count_agree() {
+    let expected = format!("const GROUND_POSTS: u32 = {GROUND_POSTS}u;");
+    assert!(
+        VOLUME_SHADER_WGSL.contains(&expected),
+        "volume.wgsl does not declare `{expected}`, so the grid the vertex \
+         stage lays out and the vertex count the draw issues describe different \
+         meshes — the tail of the grid would simply not be drawn, or the last \
+         row would wrap"
+    );
+}
+
+/// The ground pass writes two colour targets, and the second one is not
+/// optional: the raymarch pass clears the offscreen, so a ground colour written
+/// there would be destroyed before anything read it.
+#[test]
+fn the_ground_pass_writes_both_an_occluder_and_a_colour() {
+    let source = without_comments(VOLUME_SHADER_WGSL);
+    for location in ["@location(0) occluder:", "@location(1) colour:"] {
+        assert!(
+            source.contains(location),
+            "the ground pass no longer declares `{location}`. With one target \
+             there is no path for the ground's colour to reach the screen at \
+             all, and the occluder control cannot see that — a correctly \
+             clipped volume over an empty background differs in exactly the \
+             direction it asserts"
         );
     }
 }

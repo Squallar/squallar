@@ -15,11 +15,15 @@ fn lanes(bytes: &[u8; VOLUME_UNIFORM_BYTES]) -> [f32; VOLUME_UNIFORM_LANES] {
 /// A uniform whose every lane is a distinct, recognisable number.
 fn distinct() -> VolumeUniform {
     let mut matrix = [[0.0f32; 4]; 4];
-    for (column, values) in matrix.iter_mut().enumerate() {
-        for (row, slot) in values.iter_mut().enumerate() {
+    let mut forward = [[0.0f32; 4]; 4];
+    for (column, (values, forward)) in matrix.iter_mut().zip(forward.iter_mut()).enumerate() {
+        for (row, (slot, forward)) in values.iter_mut().zip(forward.iter_mut()).enumerate() {
             // Column-major, so the lane index is column * 4 + row, and the
             // value says which is which: 10 * column + row.
             *slot = (column * 10 + row) as f32;
+            // The second matrix's own recognisable numbers, offset far enough
+            // that a lane read out of the wrong block is unmistakable.
+            *forward = (1200 + column * 10 + row) as f32;
         }
     }
     VolumeUniform {
@@ -45,14 +49,23 @@ fn distinct() -> VolumeUniform {
         grid_from_box_scale: [901.0, 902.0, 903.0],
         grid_bounded: true,
         grid_from_box_offset: [1001.0, 1002.0, 1003.0],
+        clip_from_box: forward,
+        occluder_t_scale: 1301.0,
+        ground_max_z: 1302.0,
+        ground_ridge_amplitude: 1303.0,
     }
 }
 
-/// The block is exactly 224 bytes, and the shader declares the same.
+/// The block is exactly 304 bytes, and the shader declares the same.
 #[test]
-fn the_block_is_a_mat4_and_ten_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 64 + 10 * 16);
-    assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_two_mat4s_and_eleven_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 11 * 16);
+    assert_eq!(OFFSET_OCCLUDER + 16, VOLUME_UNIFORM_BYTES);
+    // The growth is append-only: every offset that existed before the ground
+    // pass is still where it was, which is what let the block grow without a
+    // single lane of the march moving.
+    assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, OFFSET_CLIP_FROM_BOX);
+    assert_eq!(OFFSET_CLIP_FROM_BOX + 64, OFFSET_OCCLUDER);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -65,7 +78,7 @@ fn the_block_is_a_mat4_and_ten_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (1, 10),
+        (2, 11),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -98,6 +111,8 @@ fn the_shader_declares_the_members_in_the_order_this_file_packs_them() {
         "floor_geo",
         "grid_from_box_a",
         "grid_from_box_b",
+        "clip_from_box",
+        "occluder",
     ] {
         let needle = format!("{member}:");
         let found = declaration[at..].find(&needle).unwrap_or_else(|| {
@@ -130,8 +145,11 @@ fn every_lane_lands_at_its_std140_offset() {
     );
 
     // The offsets themselves, as literals.
+    // An array rather than a tuple: thirteen members is past the arity `Debug`
+    // is implemented for, and a failure that cannot print the two sides is a
+    // failure a reader cannot act on.
     assert_eq!(
-        (
+        [
             OFFSET_BOX_FROM_CLIP,
             OFFSET_EYE_IN_BOX,
             OFFSET_BOX_SIZE_KM,
@@ -143,8 +161,10 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_FLOOR_GEO,
             OFFSET_GRID_FROM_BOX_A,
             OFFSET_GRID_FROM_BOX_B,
-        ),
-        (0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208),
+            OFFSET_CLIP_FROM_BOX,
+            OFFSET_OCCLUDER,
+        ],
+        [0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288],
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
              else in this file can tell you they are wrong."
@@ -184,6 +204,11 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_GRID_FROM_BOX_B,
             [1001.0, 1002.0, 1003.0, 0.0],
             "grid_from_box_offset + a reserved zero",
+        ),
+        (
+            OFFSET_OCCLUDER,
+            [1301.0, 1302.0, 1303.0, 0.0],
+            "occluder_t_scale + ground_max_z + ridge amplitude + a reserved zero",
         ),
     ] {
         let lane = offset / 4;
@@ -347,6 +372,136 @@ fn the_defaults_are_a_marchable_configuration() {
     assert!((0.0..=1.0).contains(&uniform.ambient));
     assert!(uniform.light_dir.iter().any(|&c| c != 0.0));
     assert_eq!(uniform.box_from_clip, IDENTITY);
+    assert_eq!(uniform.clip_from_box, IDENTITY);
+    assert_eq!(
+        uniform.occluder_t_scale, 0.0,
+        "a fresh uniform must have the occluder OFF: zero is the sentinel the \
+         march tests, and a non-zero scale over a placeholder texture would \
+         have it clipping every ray against ground that does not exist",
+    );
+}
+
+/// **The `t` scale is an over-estimate, and the whole mesh fits inside it.**
+///
+/// A `t` clamped to 1 by the packing decodes to the scale, so the scale must be
+/// past the far side of the box for the march's `min` to be a no-op rather than
+/// a wall. Checked over the posts themselves, not argued from the corners.
+#[test]
+fn the_t_scale_covers_every_post_of_the_grid() {
+    // Eyes outside the box, inside it, and on a face — the third is the one an
+    // eye-relative derivation is most likely to get wrong.
+    for eye in [
+        [0.5f32, -1.9, 1.2],
+        [3.0, 3.0, 3.0],
+        [0.5, 0.5, 0.5],
+        [0.0, 0.0, 0.0],
+        [-0.2, 1.1, 0.03],
+    ] {
+        let scale = VolumeUniform::t_scale_for(eye);
+        assert!(scale > 0.0 && scale.is_finite());
+        let posts = 64;
+        let mut worst_ratio = 0.0f32;
+        for j in 0..=posts {
+            for i in 0..=posts {
+                let uv = [i as f32 / posts as f32, j as f32 / posts as f32];
+                // Every amplitude a stand-in ridge can be given, **including
+                // ones past the top of the box**: the lane is a plain `f32` a
+                // caller can set to anything, and `ground_height` clamps into
+                // the cube so that the corner bound below stays sound. Stopping
+                // this sweep at 1.0 would test only the precondition, not the
+                // clamp that enforces it.
+                for amplitude in [0.0, 0.25, 0.5, 1.0, 1.2, 1.5, 4.0, 1e6] {
+                    let p = [uv[0], uv[1], crate::raymarch::ground_height(uv, amplitude)];
+                    let t = ((p[0] - eye[0]).powi(2)
+                        + (p[1] - eye[1]).powi(2)
+                        + (p[2] - eye[2]).powi(2))
+                    .sqrt();
+                    worst_ratio = worst_ratio.max(t / scale);
+                }
+            }
+        }
+        assert!(
+            worst_ratio < 1.0,
+            "a post is {worst_ratio} of the way to the {scale} scale from an \
+             eye at {eye:?}; a post at or past the scale saturates the packing \
+             and decodes SHORT of where it is, which clips the march early",
+        );
+
+        // And the slack is the margin, not luck. The bound is the farthest
+        // *corner* — the unit cube is convex and `|p - eye|` is convex, so its
+        // maximum over the cube is at a vertex, and every post is inside the
+        // cube by construction. A post need not reach that corner (the ridge is
+        // a Gaussian, so only its crest is near the top face), which is why the
+        // tightness is asserted here and not on the posts above.
+        let farthest_corner = (0..8u32)
+            .map(|corner| {
+                let p = [
+                    (corner & 1) as f32,
+                    ((corner >> 1) & 1) as f32,
+                    ((corner >> 2) & 1) as f32,
+                ];
+                ((p[0] - eye[0]).powi(2) + (p[1] - eye[1]).powi(2) + (p[2] - eye[2]).powi(2)).sqrt()
+            })
+            .fold(0.0f32, f32::max);
+        let margin = scale / farthest_corner;
+        assert!(
+            (margin - T_SCALE_MARGIN).abs() < 1e-5,
+            "the scale is {margin} times the farthest corner from an eye at \
+             {eye:?}, not the {T_SCALE_MARGIN} the constant names — either the \
+             derivation stopped being corner-based, or the margin is slack \
+             nobody chose and the packing is spending digits on empty space",
+        );
+    }
+}
+
+/// **The two coupled occluder lanes are checked where a uniform reaches the
+/// GPU, and the check is not vacuous.**
+#[test]
+fn an_occluder_scale_from_another_eye_is_recognised_as_one() {
+    let mut uniform = VolumeUniform::new([240.0, 240.0, 20.0], [8, 8, 8]);
+    uniform.eye_in_box = [0.5, -1.9, 1.2];
+    assert!(
+        uniform.occluder_is_aimed_at_its_own_eye(),
+        "the occluder is off, which is the zero sentinel, and off must count as \
+         aimed or every pane without a ground pass would trip the check",
+    );
+
+    uniform.aim_occluder(0.25, 0.25);
+    assert!(
+        uniform.occluder_is_aimed_at_its_own_eye(),
+        "a scale set through `aim_occluder` is not recognised as this eye's own",
+    );
+    assert!(uniform.occluder_t_scale > 0.0);
+
+    // The eye moves and the scale does not — the exact shape of the defect,
+    // and the reason the two are checked against each other at all.
+    uniform.eye_in_box = [0.5, 4.0, 3.0];
+    assert!(
+        !uniform.occluder_is_aimed_at_its_own_eye(),
+        "a scale left over from another eye read as aimed, so the check at \
+         `write_uniform` would pass a frame whose every ray clips at the wrong \
+         depth",
+    );
+    uniform.aim_occluder(0.25, 0.25);
+    assert!(uniform.occluder_is_aimed_at_its_own_eye());
+}
+
+/// The shader reads the scale off the lane this file writes it to, and treats
+/// zero as "no ground pass".
+#[test]
+fn the_shader_gates_the_occluder_on_the_scale_lane_being_positive() {
+    let shader = include_str!("../volume.wgsl");
+    assert!(
+        shader.contains("volume.occluder.x > 0.0"),
+        "the shader no longer gates the occluder read on a positive scale, so \
+         every pane would read the group-2 placeholder as though a ground pass \
+         had run",
+    );
+    assert!(
+        shader.contains("span.y = min(span.y, ground_t);"),
+        "the march no longer clips its span against the ground, so the ground \
+         pass draws an occluder nothing consumes",
+    );
 }
 
 /// The default light really does come from above and from the left.

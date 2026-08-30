@@ -42,7 +42,7 @@ use squallar_radar::voxel::{
     HalfExtentKm, VolumeGrid, VoxelRequest, build_voxels_with_motion, default_shape,
 };
 use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use squallar_volumetric::raymarch::{FLOOR_FORMAT, VolumePipelines};
+use squallar_volumetric::raymarch::{FLOOR_FORMAT, OffscreenPlan, VolumePipelines};
 use squallar_volumetric::uniform::VolumeUniform;
 
 /// The volume reader and the site it learns, shared with the other two live
@@ -271,7 +271,7 @@ fn render_a_real_volume_mask() {
                 )
                 .expect("the grid uploads twice as readily as once");
             volume.write_uniform(&queue, &uniform);
-            let target = pipelines.create_offscreen(&device, size);
+            let target = pipelines.create_offscreen(&device, OffscreenPlan::native(size));
             let mut encoder = device.create_command_encoder(&Default::default());
             pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&mirror));
             queue.submit(Some(encoder.finish()));
@@ -785,7 +785,7 @@ fn raymarch_once(
         )
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
-    let target = pipelines.create_offscreen(device, size);
+    let target = pipelines.create_offscreen(device, OffscreenPlan::native(size));
 
     let mut encoder = device.create_command_encoder(&Default::default());
     pipelines.encode_raymarch(&mut encoder, &target, &volume);

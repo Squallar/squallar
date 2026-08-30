@@ -40,7 +40,9 @@ use squallar_egui::pane::OrbitCamera;
 use squallar_egui::volume_view::view_for;
 use squallar_gpu::egui_renderer::AttachmentConfig;
 use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use squallar_volumetric::raymarch::{RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines};
+use squallar_volumetric::raymarch::{
+    OffscreenPlan, RAYMARCH_STEP_CEILING, RAYMARCH_STEP_CELLS, VolumePipelines,
+};
 use squallar_volumetric::uniform::VolumeUniform;
 
 // ---------------------------------------------------------------------------
@@ -184,7 +186,7 @@ fn raymarch_once(
         )
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
-    let target = pipelines.create_offscreen(device, size);
+    let target = pipelines.create_offscreen(device, OffscreenPlan::native(size));
     let mut encoder = device.create_command_encoder(&Default::default());
     pipelines.encode_raymarch(&mut encoder, &target, &volume);
     queue.submit(Some(encoder.finish()));

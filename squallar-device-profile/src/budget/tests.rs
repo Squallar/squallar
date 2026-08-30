@@ -674,7 +674,7 @@ fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
 /// **The discrete desktop GPU stops eating the compromise it was still eating.**
 #[test]
 fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
-    use crate::quality::{ResolutionRung, VolumeQuality};
+    use crate::quality::{GroundPass, ResolutionRung, VolumeQuality};
 
     const FOUR_K: [u32; 2] = [3840, 2160];
     let unpromoted = resolve(&shipped_profile(BudgetLimits::DESKTOP));
@@ -684,8 +684,8 @@ fn a_discrete_desktop_gpu_can_afford_a_4k_pane_at_native_resolution() {
     });
     assert_eq!(discrete.promotion, Promotion::Ceiling);
 
-    let before = VolumeQuality::BEST.fit(FOUR_K, unpromoted.offscreen_bytes);
-    let after = VolumeQuality::BEST.fit(FOUR_K, discrete.offscreen_bytes);
+    let before = VolumeQuality::BEST.fit(FOUR_K, unpromoted.offscreen_bytes, GroundPass::Off);
+    let after = VolumeQuality::BEST.fit(FOUR_K, discrete.offscreen_bytes, GroundPass::Off);
     assert_eq!(
         before.quality.resolution,
         ResolutionRung::Half,

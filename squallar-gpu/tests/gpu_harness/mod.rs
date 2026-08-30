@@ -6,7 +6,9 @@ use egui_wgpu::wgpu;
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 use squallar_gpu::egui_renderer::AttachmentConfig;
 use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use squallar_volumetric::raymarch::{CoarseLevel, FLOOR_FORMAT, PaneMirror, VolumePipelines};
+use squallar_volumetric::raymarch::{
+    CoarseLevel, FLOOR_FORMAT, OffscreenPlan, PaneMirror, VolumePipelines,
+};
 use squallar_volumetric::uniform::VolumeUniform;
 
 /// Held for the length of a test, so only one talks to the GPU at a time.
@@ -293,7 +295,7 @@ pub fn raymarch_once_at(
          uniform block's grid_dims would describe a different texture"
     );
     volume.write_uniform(queue, uniform);
-    let target = pipelines.create_offscreen(device, size);
+    let target = pipelines.create_offscreen(device, OffscreenPlan::native(size));
     assert_eq!(
         target.size(),
         size,
@@ -362,7 +364,7 @@ pub fn raymarch_once_with_floor(
         )
         .expect("the grid and palette were refused");
     volume.write_uniform(queue, uniform);
-    let target = pipelines.create_offscreen(device, size);
+    let target = pipelines.create_offscreen(device, OffscreenPlan::native(size));
     let mut encoder = device.create_command_encoder(&Default::default());
     pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(floor));
     queue.submit(Some(encoder.finish()));
