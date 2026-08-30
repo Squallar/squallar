@@ -30,6 +30,10 @@ squallar-egui = { workspace = true }
 # The device-class policy floor: MIRROR_MAX_SIDE and the mirror byte cascade
 # live there; `device_class_of` returns its DeviceClass.
 squallar-device-profile = { workspace = true }
+# The pass-cost ledger stamps the phases of `end_pass_and_upload` on every
+# target, and `std::time::Instant` panics on wasm32; web-time is the alias
+# that is std-backed everywhere else.
+web-time = { workspace = true }
 # Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
 # re-export. This entry is not there to be imported from; it exists to *choose
 # wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
