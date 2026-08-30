@@ -98,6 +98,7 @@ pub(crate) struct TestBridge {
     config_dir: Option<PathBuf>,
     zone_cache_dir: Option<PathBuf>,
     basemap_cache_dir: Option<PathBuf>,
+    basemap_dir: Option<PathBuf>,
     store: Rc<MemoryKvStore>,
     /// Installed by `set_back_handler`.
     back_handler: Option<fn()>,
@@ -140,6 +141,7 @@ impl TestBridge {
             config_dir: None,
             zone_cache_dir: None,
             basemap_cache_dir: None,
+            basemap_dir: None,
             store: Rc::new(MemoryKvStore::default()),
             back_handler: None,
             exits_on_unhandled_back: false,
@@ -167,6 +169,7 @@ impl TestBridge {
             config_dir: Some(PathBuf::from("/desktop/config")),
             zone_cache_dir: Some(PathBuf::from("/desktop/zones")),
             basemap_cache_dir: Some(PathBuf::from("/desktop/basemap")),
+            basemap_dir: Some(PathBuf::from("/desktop/basemap-downloads")),
             ..Self::bare()
         }
     }
@@ -189,6 +192,7 @@ impl TestBridge {
             config_dir: Some(PathBuf::from("/ios/config")),
             zone_cache_dir: Some(PathBuf::from("/ios/zones")),
             basemap_cache_dir: Some(PathBuf::from("/ios/basemap")),
+            basemap_dir: Some(PathBuf::from("/ios/basemap-downloads")),
             ..Self::bare()
         }
     }
@@ -369,6 +373,14 @@ impl PlatformBridge for TestBridge {
         self.basemap_cache_dir.as_deref()
     }
 
+    fn set_basemap_dir(&mut self, dir: PathBuf) {
+        self.basemap_dir = Some(dir);
+    }
+
+    fn basemap_dir(&self) -> Option<&Path> {
+        self.basemap_dir.as_deref()
+    }
+
     fn set_config_dir(&mut self, dir: PathBuf) {
         self.config_dir = Some(dir);
     }
@@ -477,5 +489,38 @@ impl squallar_location::LocationProvider for TestLocationProvider {
 
     fn serial_active(&self) -> bool {
         self.gps.borrow().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one bridge slot the Gui reads exactly once, at construction — so a
+    /// value that does not survive the set/get round trip is a Gui that never
+    /// learns its download store at all.
+    #[test]
+    fn a_basemap_dir_set_on_the_bridge_is_visible_through_it() {
+        let mut bridge = TestBridge::android();
+        assert_eq!(
+            bridge.basemap_dir(),
+            None,
+            "an Android bridge knows no paths until android_main supplies them"
+        );
+
+        bridge.set_basemap_dir(PathBuf::from("/data/files/basemap-downloads"));
+        assert_eq!(
+            bridge.basemap_dir(),
+            Some(Path::new("/data/files/basemap-downloads")),
+        );
+    }
+
+    /// Desktop and iOS derive a download store at construction, as they do
+    /// their other three directories; web never has one.
+    #[test]
+    fn the_preset_bridges_answer_basemap_dir_as_their_platforms_do() {
+        assert!(TestBridge::desktop().basemap_dir().is_some());
+        assert!(TestBridge::ios().basemap_dir().is_some());
+        assert_eq!(TestBridge::web().basemap_dir(), None);
     }
 }

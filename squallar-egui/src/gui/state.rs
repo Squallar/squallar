@@ -19,6 +19,14 @@ pub struct Gui {
     pub(super) time_dialog: TimeDialogState,
     pub(super) initial_zoom_set: bool,
     pub(super) map_tiles: MapTileState,
+    /// Where downloaded offline basemap areas persist on this platform, or
+    /// `None` where there is nowhere to put them (web; an Android whose
+    /// entry never learnt its files root). A platform fact, not UI state:
+    /// handed over once at construction ([`Gui::with_basemap_dir`]), never
+    /// persisted, never poked through a setter. The directory may not exist
+    /// yet — creating it is the download engine's job, which is also the
+    /// only reader.
+    pub(super) basemap_dir: Option<std::path::PathBuf>,
     pub(super) user_fix: Option<squallar_location::Fix>,
     /// When [`user_fix`](Self::user_fix) arrived.
     pub(super) user_fix_at: Option<web_time::Instant>,
@@ -455,6 +463,7 @@ impl Gui {
             },
             initial_zoom_set: false,
             map_tiles: MapTileState::default(),
+            basemap_dir: None,
             user_fix: None,
             user_fix_at: None,
             location_permission: squallar_location::LocationPermission::default(),
@@ -569,6 +578,23 @@ impl Gui {
         gui
     }
 
+    /// The download store this `Gui` was constructed over, in one move — the
+    /// construction-time route the seam ratchet leaves open: `app.rs` chains
+    /// this onto [`Gui::new`], so no `set_` push ever crosses the App→Gui
+    /// seam for it. `None` is the bridge answering "no filesystem for it",
+    /// and every `Gui` a test builds bare.
+    pub fn with_basemap_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.basemap_dir = dir;
+        self
+    }
+
+    /// Where downloaded offline basemap areas persist, or `None` when this
+    /// platform has nowhere to put them. See [`Self::basemap_dir`] (the
+    /// field) for the contract; the download engine is the consumer.
+    pub fn basemap_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_dir.as_deref()
+    }
+
     /// Never build a live tile source under this `Gui`.
     ///
     /// **For test harnesses that drive [`Self::ui`], and nothing else** —
@@ -578,5 +604,26 @@ impl Gui {
     /// measured failure this removes.
     pub fn go_offline_for_tests(&mut self) {
         self.map_tiles.go_offline_for_tests();
+    }
+}
+
+#[cfg(test)]
+mod basemap_dir_tests {
+    use super::*;
+
+    /// The construction pass-through, both ways: the one route the path has
+    /// into this crate is `Gui::new().with_basemap_dir(..)`, so a `Gui` built
+    /// with a path must expose it and a `Gui` built bare must expose `None` —
+    /// there is no setter to correct either afterwards.
+    #[test]
+    fn a_gui_built_with_a_basemap_dir_exposes_it() {
+        let dir = std::path::PathBuf::from("/somewhere/basemap-downloads");
+        let gui = Gui::new().with_basemap_dir(Some(dir.clone()));
+        assert_eq!(gui.basemap_dir(), Some(dir.as_path()));
+    }
+
+    #[test]
+    fn a_gui_built_without_a_basemap_dir_exposes_none() {
+        assert_eq!(Gui::new().basemap_dir(), None);
     }
 }

@@ -479,7 +479,14 @@ impl App {
             squallar_egui::tiles::install_basemap_cache_dir(dir.to_path_buf());
         }
 
-        let mut gui = Gui::new();
+        // The offline download store rides in the same way, but as a `Gui`
+        // field rather than a process global: its one consumer is the Gui's
+        // own download engine, and a per-instance copy is what keeps "built
+        // without one" testable. Construction is the whole route — there is
+        // deliberately no setter — so a bridge that will ever answer `Some`
+        // (Android included) is populated before this line runs.
+        let mut gui =
+            Gui::new().with_basemap_dir(platform.basemap_dir().map(std::path::Path::to_path_buf));
         let supports_exit = platform.supports_exit();
         let loop_frame_budget = budgets.loop_frames_held;
         let location_settings_available = location.settings_available();

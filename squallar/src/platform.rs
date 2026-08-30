@@ -54,6 +54,7 @@ pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     basemap_cache_dir: Option<std::path::PathBuf>,
+    basemap_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Handed to the theme/back producers this bridge starts.
     redraw_waker: RedrawWaker,
@@ -73,6 +74,7 @@ impl DesktopPlatform {
             back_handler: None,
             zone_cache_dir: Self::default_zone_cache_dir(),
             basemap_cache_dir: Self::default_basemap_cache_dir(),
+            basemap_dir: Self::default_basemap_dir(),
             config_dir: Self::default_config_dir(),
             redraw_waker: RedrawWaker::new(),
         }
@@ -109,6 +111,25 @@ impl DesktopPlatform {
             std::path::PathBuf::from(base)
                 .join("squallar")
                 .join("basemap"),
+        )
+    }
+
+    /// Where downloaded offline basemap areas persist. The same root and the
+    /// same fallback chain as `default_zone_cache_dir`: nothing on a desktop
+    /// clears this behind the user, so the one clearable `squallar` root
+    /// keeps all three together. A distinct leaf from `basemap` — that one
+    /// is the evictable block cache, and the GC there must never walk over
+    /// the user's downloads. The directory is not created here; that is the
+    /// download engine's job.
+    fn default_basemap_dir() -> Option<std::path::PathBuf> {
+        let base = std::env::var("XDG_CACHE_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cache", h)))
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .ok()?;
+        Some(
+            std::path::PathBuf::from(base)
+                .join("squallar")
+                .join("basemap-downloads"),
         )
     }
 }
@@ -202,6 +223,14 @@ impl PlatformBridge for DesktopPlatform {
         self.basemap_cache_dir.as_deref()
     }
 
+    fn set_basemap_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_dir = Some(dir);
+    }
+
+    fn basemap_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_dir.as_deref()
+    }
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
         self.config_dir = Some(dir);
     }
@@ -250,6 +279,15 @@ pub struct AndroidPlatform {
     back_claim_reporter: Option<fn(bool)>,
     zone_cache_dir: Option<std::path::PathBuf>,
     basemap_cache_dir: Option<std::path::PathBuf>,
+    /// Downloaded offline basemap areas. Unlike its two cache siblings this
+    /// must be **durable**: Android advertises "Clear cache" as safe and
+    /// sheds `getCacheDir()` under storage pressure, and an offline area that
+    /// silently vanishes defeats the low-bandwidth purpose it was downloaded
+    /// for. `android_main` derives it under the files root (`config`'s
+    /// parent), and — unlike the siblings — sets it on this bridge *before*
+    /// `App::new`, because the Gui learns it at construction and there is no
+    /// setter to push it through later.
+    basemap_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     /// Handed to the theme poller below, so a light/dark switch noticed on that
     /// thread gets a frame to be applied on.
@@ -277,6 +315,7 @@ impl AndroidPlatform {
             back_claim_reporter: None,
             zone_cache_dir: None,
             basemap_cache_dir: None,
+            basemap_dir: None,
             config_dir: None,
             redraw_waker: RedrawWaker::new(),
         }
@@ -374,6 +413,14 @@ impl PlatformBridge for AndroidPlatform {
         self.basemap_cache_dir.as_deref()
     }
 
+    fn set_basemap_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_dir = Some(dir);
+    }
+
+    fn basemap_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_dir.as_deref()
+    }
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
         self.config_dir = Some(dir);
     }
@@ -446,6 +493,7 @@ pub struct IosPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     basemap_cache_dir: Option<std::path::PathBuf>,
+    basemap_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
     redraw_waker: RedrawWaker,
 }
@@ -464,6 +512,14 @@ impl IosPlatform {
             back_handler: None,
             zone_cache_dir: Self::sandbox_subdir("Library/Caches/squallar/zones"),
             basemap_cache_dir: Self::sandbox_subdir("Library/Caches/squallar/basemap"),
+            // Downloaded offline areas. Caches, like its siblings, and on
+            // Apple's own rule: re-downloadable data belongs there, and the
+            // Application Support alternative would put up to hundreds of MB
+            // of re-fetchable tiles into every iCloud backup. The trade is
+            // that iOS may purge Caches under severe storage pressure — the
+            // download engine's generation handling already has to cope with
+            // missing bytes, so purge lands on a handled path.
+            basemap_dir: Self::sandbox_subdir("Library/Caches/squallar/basemap-downloads"),
             config_dir: Self::sandbox_subdir("Library/Application Support/squallar"),
             redraw_waker: RedrawWaker::new(),
         }
@@ -523,6 +579,14 @@ impl PlatformBridge for IosPlatform {
 
     fn basemap_cache_dir(&self) -> Option<&std::path::Path> {
         self.basemap_cache_dir.as_deref()
+    }
+
+    fn set_basemap_dir(&mut self, dir: std::path::PathBuf) {
+        self.basemap_dir = Some(dir);
+    }
+
+    fn basemap_dir(&self) -> Option<&std::path::Path> {
+        self.basemap_dir.as_deref()
     }
 
     fn set_config_dir(&mut self, dir: std::path::PathBuf) {
