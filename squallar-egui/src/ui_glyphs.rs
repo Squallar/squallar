@@ -10,6 +10,14 @@ pub(crate) const ICON_GLYPHS: &[(char, &str)] = &[
     ('\u{229e}', "Pane (bottom bar)"),
     ('\u{26f6}', "3D region arm (top bar) and the 3D view header"),
     (
+        '\u{2b8b}',
+        "offline-download arm (top bar) - the third armed drag, and the only \
+         one whose gesture ends in bytes arriving. An arrow to a bar rather \
+         than the obvious U+2B07: every plain down-arrow a reader would reach \
+         for first (U+2B07, U+2193, U+21E9, U+21D3, U+2913, U+2B73) is absent \
+         from the bundled proportional family and would draw as tofu",
+    ),
+    (
         '\u{2215}',
         "cross-section arm (top bar) and the section header",
     ),

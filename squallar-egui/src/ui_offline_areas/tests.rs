@@ -99,9 +99,20 @@ const OLDER_GENERATION: &str = "basemap_2Fomt-20250701.pmtiles";
 const TALL_SCREEN: egui::Vec2 = egui::vec2(1024.0, 1600.0);
 
 /// A harness on [`TALL_SCREEN`] pointed at `dir` for offline areas.
+/// The published archive's detail ceiling, which this harness stands in for.
+///
+/// **Stated here rather than compiled into the app.** A harness Gui builds
+/// inert tile sources and opens no archive, so no header read happens and
+/// `detail_label` has no ceiling to name a stored depth against — the levels
+/// are steps below the archive's own `max_zoom`, never fixed zooms. A test
+/// that asserts a level therefore has to say which archive it is asserting
+/// against, and this is that statement.
+const HARNESS_ARCHIVE_CEILING: u8 = 14;
+
 fn harness_over(dir: &TempDir) -> InputHarness {
     let mut h = InputHarness::with_screen(TALL_SCREEN);
     h.use_basemap_dir(dir.0.clone());
+    h.seed_archive_ceiling(HARNESS_ARCHIVE_CEILING);
     h
 }
 

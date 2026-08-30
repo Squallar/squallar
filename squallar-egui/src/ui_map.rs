@@ -179,7 +179,9 @@ impl super::Gui {
 
                     let mut map_memory = std::mem::take(&mut pane.map_memory);
 
-                    let armed_draw = (self.section_draw_armed() || self.region_pick_armed())
+                    let armed_draw = (self.section_draw_armed()
+                        || self.region_pick_armed()
+                        || self.download_pick_armed())
                         && is_active
                         && pane.is_map();
                     let (pointer, gesture) = if armed_draw {
@@ -283,6 +285,10 @@ impl super::Gui {
                                                 );
                                             } else if self.region_pick_armed() {
                                                 self.track_region_pick(
+                                                    pane_idx, gesture, projector,
+                                                );
+                                            } else if self.download_pick_armed() {
+                                                self.track_download_pick(
                                                     pane_idx, gesture, projector,
                                                 );
                                             }
@@ -470,6 +476,11 @@ impl super::Gui {
                             Some((SECTION_ARM_HINT, SECTION_TRACK_COLOR))
                         } else if self.region_pick_armed() {
                             Some((REGION_ARM_HINT, crate::ui_region::REGION_ARM_COLOR))
+                        } else if self.download_pick_armed() {
+                            Some((
+                                crate::ui_download_area::DOWNLOAD_ARM_HINT,
+                                crate::ui_download_area::DOWNLOAD_ARM_COLOR,
+                            ))
                         } else {
                             None
                         };
@@ -966,6 +977,82 @@ impl super::Gui {
         }
     }
 
+    /// Advance the armed offline-download pick by one frame's gesture.
+    ///
+    /// [`Self::track_region_pick`]'s twin over the **same** drag, and the
+    /// whole of the difference is the two things a drag was decoupled from its
+    /// consumer to allow: the bounds handed to `begin` are this arm's, so a
+    /// town under the resampler's 10 km floor commits, and what the committed
+    /// centre-and-extent becomes is a picked box rather than a resampler
+    /// region.
+    fn track_download_pick(
+        &mut self,
+        pane_idx: usize,
+        gesture: crate::ui_input::ArmedDragGesture,
+        projector: &walkers::Projector,
+    ) {
+        use crate::ui_input::ArmedDragGesture;
+
+        let ground = |pos: egui::Pos2| {
+            let position = projector.unproject(egui::vec2(pos.x, pos.y));
+            squallar_geo::GeoPoint {
+                lat: position.y(),
+                lon: position.x(),
+            }
+        };
+
+        match gesture {
+            ArmedDragGesture::Idle => {}
+            ArmedDragGesture::Anchored(pos) => {
+                self.download_drag = crate::ui_region::RegionDrag::begin(
+                    pane_idx,
+                    ground(pos),
+                    crate::ui_download_area::download_pick_bounds(),
+                );
+            }
+            ArmedDragGesture::Dragging(pos) => {
+                if let Some(drag) = self
+                    .download_drag
+                    .as_mut()
+                    .filter(|drag| drag.pane_idx() == pane_idx)
+                {
+                    drag.extend_to(ground(pos));
+                }
+            }
+            ArmedDragGesture::Released(pos) => {
+                let Some(mut drag) = self.download_drag.take() else {
+                    return;
+                };
+                if drag.pane_idx() != pane_idx {
+                    return;
+                }
+                drag.extend_to(ground(pos));
+                match drag.commit().and_then(|(centre, half_width_km)| {
+                    crate::ui_download_area::PickedBox::new(centre, half_width_km)
+                }) {
+                    Some(picked) => {
+                        self.download_pick = Some(picked);
+                        self.set_download_pick_armed(false);
+                    }
+                    None => log::debug!(
+                        "the offline-area drag was {:.2} km across, under the {:.0} km a \
+                         deliberate box starts at; discarded",
+                        2.0 * drag.half_width_km(),
+                        2.0 * crate::ui_download_area::MIN_DOWNLOAD_HALF_WIDTH_KM,
+                    ),
+                }
+            }
+            ArmedDragGesture::Cancelled => {
+                if self
+                    .download_drag
+                    .is_some_and(|drag| drag.pane_idx() == pane_idx)
+                {
+                    self.download_drag = None;
+                }
+            }
+        }
+    }
+
     /// Cells along a voxel grid's horizontal axes on **this device**, or `None`
     /// if no 3D pane has built one yet.
     fn volume_cells_across(&self) -> Option<usize> {
@@ -1209,11 +1296,220 @@ impl super::Gui {
             )
         {
             paint_region_box(painter, rect, crate::ui_region::REGION_ARM_COLOR, true);
-            paint_region_hint(painter, rect, half_width_km, cells_across);
+            if let Some(text) = region_hint_text(half_width_km, cells_across) {
+                paint_region_hint(painter, rect, &text, crate::ui_region::REGION_ARM_COLOR);
+            }
         }
+
+        self.draw_download_box(ui, projector, pane_idx);
 
         #[cfg(test)]
         self.probes.last_region_boxes.extend(painted);
+    }
+
+    /// The offline-download box: the one being dragged on this pane, and the
+    /// committed one, each with the chip that describes it.
+    ///
+    /// The committed box draws on **every** map pane rather than only the one
+    /// it was picked on: a downloaded area is a fact about the device rather
+    /// than about a window, so a second map over the same ground shows it too.
+    fn draw_download_box(
+        &self,
+        ui: &egui::Ui,
+        projector: &walkers::Projector,
+        pane_idx: crate::pane::PaneId,
+    ) {
+        let painter = ui.painter();
+        let color = crate::ui_download_area::DOWNLOAD_ARM_COLOR;
+
+        if let Some(picked) = self.download_pick
+            && let Some(rect) = region_screen_rect(projector, picked.centre, picked.half_extent())
+        {
+            paint_region_box(painter, rect, color, false);
+            paint_region_hint(painter, rect, &self.download_hint_text(picked), color);
+        }
+
+        if let Some((centre, half_width_km)) = self.download_preview(pane_idx)
+            && let Some(rect) = region_screen_rect(
+                projector,
+                centre,
+                squallar_radar::voxel::HalfExtentKm::square(half_width_km),
+            )
+        {
+            paint_region_box(painter, rect, color, true);
+            // Mid-drag the sentence is the width alone. A size figure is exact
+            // or it is nothing, and measuring one per frame of a drag would
+            // spend an archive read on a box the pointer has already left.
+            paint_region_hint(
+                painter,
+                rect,
+                &format!("{:.0} km", 2.0 * half_width_km),
+                color,
+            );
+        }
+    }
+
+    /// The committed download box's chip: its width, its detail level, and the
+    /// exact size that level costs once it has been measured.
+    ///
+    /// **The same widget as the 3D pick's `km/cell` chip with a different
+    /// sentence** — the box drawn is the box described, in both arms.
+    fn download_hint_text(&self, picked: crate::ui_download_area::PickedBox) -> String {
+        let level = self.download_detail;
+        format!(
+            "{:.0} km - {} - {}",
+            picked.across_km(),
+            level.label(),
+            self.download_size.size_label(level),
+        )
+    }
+
+    /// Keep the size figure moving.
+    ///
+    /// **The only frame-path work the selection UI does**, and it is
+    /// bookkeeping:
+    /// [`AreaSizeProbe::poll`](crate::ui_download_area::AreaSizeProbe::poll)
+    /// reads a `OnceLock` and may hand a task to the IO runtime. No archive is
+    /// opened here and no byte is summed here.
+    ///
+    /// **Publishing a finished run is not here.** `settle_offline_download`
+    /// rides the per-frame drive rather than any screen, because a download
+    /// completes whether or not anyone is watching, and a second publish path
+    /// would be a second chance to disagree about what finished.
+    pub(super) fn pump_download_area(&mut self, ctx: &egui::Context) {
+        self.download_size.set_box(self.download_pick);
+        // The same switch `go_offline_for_tests` throws for the tile slots, for
+        // the same reason: a unit test's Gui must open no range source against
+        // the production archive. Always live outside a harness.
+        let live_archive = !self.map_tiles.is_offline();
+        self.download_size.poll(ctx, || {
+            live_archive
+                .then(crate::tiles::archive_range_source)
+                .and_then(Result::ok)
+        });
+    }
+
+    /// The picked box's level list: three depths, each with the exact size it
+    /// costs, and the one action that spends it.
+    pub(super) fn render_download_area(&mut self, ctx: &egui::Context, map_rect: egui::Rect) {
+        use crate::ui_download_area::{DETAIL_LEVELS, quota_shortfall, shortfall_action_label};
+
+        let Some(picked) = self.download_pick else {
+            return;
+        };
+        let sizes = self.download_size.sizes();
+        let spec_id = self
+            .download_size
+            .area_spec(self.download_detail)
+            .map(|spec| spec.area_id);
+        let free = crate::ui_download_area::free_space(self.download_quota);
+        let short = quota_shortfall(&sizes, self.download_detail, free);
+        // The one in-flight run the app has, whichever surface started it, so
+        // this panel and the Downloaded areas screen show the same download
+        // rather than two views that could disagree.
+        let progress = self
+            .active_download
+            .as_ref()
+            .filter(|active| Some(&active.spec.area_id) == spec_id.as_ref())
+            .map(crate::basemap_areas::ActiveDownload::progress);
+
+        let mut start = false;
+        let mut clear = false;
+        let mut cancel = false;
+        let mut choose = None;
+
+        egui::Area::new(egui::Id::new("download_area_panel"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::LEFT_TOP)
+            .fixed_pos(map_rect.left_top() + egui::vec2(PANEL_MARGIN, PANEL_MARGIN))
+            .show(ctx, |ui| {
+                super::shell::chrome_frame(&ctx.global_style()).show(ui, |ui| {
+                    ui.set_width(DOWNLOAD_PANEL_WIDTH);
+                    ui.label(egui::RichText::new(DOWNLOAD_PANEL_TITLE).strong());
+                    // The denominator, named once for the whole list rather
+                    // than re-derived on every row.
+                    ui.label(format!(
+                        "{:.0} km across - {DECIMAL_SIZES_NOTE}",
+                        picked.across_km()
+                    ));
+                    ui.separator();
+                    ui.label(DETAIL_LEVEL_HEADING);
+                    for level in DETAIL_LEVELS {
+                        let size = self.download_size.size_label(level);
+                        let row = ui.selectable_label(
+                            level == self.download_detail,
+                            format!("{}  -  {size}", level.label()),
+                        );
+                        if row.clicked() {
+                            choose = Some(level);
+                        }
+                    }
+
+                    if let Some(short) = short {
+                        ui.separator();
+                        ui.label(crate::ui_download_area::shortfall_line(short));
+                        if let Some(alternative) = short.alternative
+                            && ui.button(shortfall_action_label(alternative)).clicked()
+                        {
+                            choose = Some(alternative);
+                        }
+                    }
+
+                    ui.separator();
+                    match progress {
+                        Some(progress) => {
+                            ui.label(format!(
+                                "{} of {} parts - {} of {}",
+                                progress.segments_done,
+                                progress.segments_total,
+                                progress.bytes_done.label(),
+                                progress.bytes_total.label(),
+                            ));
+                            if ui.button(DOWNLOAD_CANCEL_LABEL).clicked() {
+                                cancel = true;
+                            }
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                // Refused while the level's figure is not in
+                                // hand: starting a download whose size we
+                                // cannot yet state is starting one the user
+                                // did not agree to.
+                                let ready = self.download_size.size(self.download_detail).is_some();
+                                if ui
+                                    .add_enabled(ready, egui::Button::new(DOWNLOAD_START_LABEL))
+                                    .clicked()
+                                {
+                                    start = true;
+                                }
+                                if ui.button(DOWNLOAD_DISMISS_LABEL).clicked() {
+                                    clear = true;
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+
+        if let Some(level) = choose {
+            self.download_detail = level;
+        }
+        if clear {
+            self.clear_download_pick();
+        }
+        if cancel {
+            // Dropping the engine is the whole cancel protocol; the segments
+            // already written stay, and a later start completes the
+            // difference. The box stays picked - cancelling a download is not
+            // un-choosing the ground.
+            self.active_download = None;
+        }
+        if start && let Some(spec) = self.download_size.area_spec(self.download_detail) {
+            // `start_area_download` and nothing else, so this button, Resume
+            // and Update all reach the engine the same way and there is no
+            // second opinion about where segments live.
+            self.start_area_download(spec, ctx);
+        }
     }
 
     /// Detect which pane was clicked and make it the active pane.
@@ -2223,19 +2519,40 @@ fn paint_region_box(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
     );
 }
 
-/// The width and per-cell resolution of the box being dragged, over its top
-/// edge.
-fn paint_region_hint(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    half_width_km: f64,
-    cells: Option<usize>,
-) {
-    let Some(text) = region_hint_text(half_width_km, cells) else {
-        return;
-    };
+/// The download panel's inset from the map's top-left corner, points.
+const PANEL_MARGIN: f32 = 12.0;
+
+/// How wide the download panel draws. Wide enough for the longest level name
+/// beside a `310 MB`, narrow enough to leave the map readable behind it at
+/// phone width.
+const DOWNLOAD_PANEL_WIDTH: f32 = 260.0;
+
+/// The download panel's title.
+pub(crate) const DOWNLOAD_PANEL_TITLE: &str = "Make available offline";
+
+/// The size denominator, stated once for the whole list rather than on every
+/// row — `DataSize`'s own rule.
+pub(crate) const DECIMAL_SIZES_NOTE: &str = "sizes in decimal MB, 1,000,000 bytes";
+
+/// The heading over the three depths.
+pub(crate) const DETAIL_LEVEL_HEADING: &str = "Detail level";
+
+/// The panel's three buttons.
+pub(crate) const DOWNLOAD_START_LABEL: &str = "Download";
+/// See [`DOWNLOAD_START_LABEL`].
+pub(crate) const DOWNLOAD_CANCEL_LABEL: &str = "Cancel download";
+/// See [`DOWNLOAD_START_LABEL`].
+pub(crate) const DOWNLOAD_DISMISS_LABEL: &str = "Clear box";
+
+/// One box's own sentence, over its top edge, on a chip in the arm's colour.
+///
+/// The 3D pick spends it on `"{across} km - {km}/cell"`; the download arm on
+/// the box's width, its detail level and the exact size that costs. One
+/// widget, two sentences — which is the whole of the difference between the
+/// two arms' chips.
+fn paint_region_hint(painter: &egui::Painter, rect: egui::Rect, text: &str, color: egui::Color32) {
     let galley = painter.layout_no_wrap(
-        text,
+        text.to_owned(),
         egui::FontId::proportional(12.0),
         egui::Color32::from_rgb(20, 20, 20),
     );
@@ -2243,7 +2560,7 @@ fn paint_region_hint(
     painter.rect_filled(
         egui::Rect::from_min_size(origin, galley.size()).expand(3.0),
         2.0,
-        crate::ui_region::REGION_ARM_COLOR,
+        color,
     );
     painter.galley(origin, galley, egui::Color32::PLACEHOLDER);
 }
@@ -2582,3 +2899,7 @@ mod volume_arm_tests;
 #[path = "ui_map/region_pick_tests.rs"]
 #[cfg(test)]
 mod region_pick_tests;
+
+#[cfg(test)]
+#[path = "ui_map/download_pick_tests.rs"]
+mod download_pick_tests;

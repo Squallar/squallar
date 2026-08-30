@@ -833,6 +833,35 @@ impl HttpSegmentStore {
             .map_err(|error| StoreError::Transport(error.to_string()))?;
         serde_json::from_slice(&body).map_err(|error| StoreError::Listing(error.to_string()))
     }
+
+    /// The `__quota__` route's answer: what the origin has, so "does this fit"
+    /// is answerable *before* the download starts rather than discovered at
+    /// byte 280 M.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Transport`] if the route will not answer,
+    /// [`StoreError::Status`] on a non-2xx, [`StoreError::Listing`] if the body
+    /// is not the documented JSON.
+    pub async fn quota(&self) -> Result<OfflineQuota, StoreError> {
+        let response = self
+            .client
+            .get(self.url("__quota__")?)
+            .send()
+            .await
+            .map_err(|error| StoreError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(StoreError::Status {
+                action: "reading the storage quota",
+                status: response.status().as_u16(),
+            });
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| StoreError::Transport(error.to_string()))?;
+        serde_json::from_slice(&body).map_err(|error| StoreError::Listing(error.to_string()))
+    }
 }
 
 /// One row of the service worker's `__list__` answer. `bytes` is in the
@@ -840,6 +869,36 @@ impl HttpSegmentStore {
 #[derive(serde::Deserialize)]
 struct ListedSegment {
     url: String,
+}
+
+/// What the origin's storage has, as `navigator.storage.estimate()` reports it
+/// through the worker's `__quota__` route.
+///
+/// **Either figure may be unknown, and unknown is not zero.** The route answers
+/// `null` rather than `0` for exactly this reason: a zero quota reads as
+/// "nothing fits", which is a fabrication a size figure would be gated on.
+/// [`Self::free`] therefore answers `None` rather than a number whenever it
+/// cannot subtract two real figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct OfflineQuota {
+    /// Bytes the origin is already using, or `None` if the browser will not
+    /// say.
+    pub usage: Option<u64>,
+    /// Bytes the origin may use in total, or `None` if the browser will not
+    /// say.
+    pub quota: Option<u64>,
+}
+
+impl OfflineQuota {
+    /// What is left, or `None` when either figure is unknown — never a guess.
+    ///
+    /// Saturating, because a usage over quota is a state browsers do report
+    /// and "nothing free" is the honest reading of it.
+    pub fn free(self) -> Option<DataSize> {
+        Some(DataSize::from_bytes(
+            self.quota?.saturating_sub(self.usage?),
+        ))
+    }
 }
 
 impl OfflineSegments for HttpSegmentStore {

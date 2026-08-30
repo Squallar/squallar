@@ -613,6 +613,65 @@ impl DownloadedAreaConfig {
     }
 }
 
+/// The offline-area selection as persisted: the arm, the box and the level.
+///
+/// The *choice*, never the work — no size figure and no progress. A size is
+/// the archive's answer and is re-measured on the box; a download in flight is
+/// cancelled by the process ending, and offering to resume it is the manage
+/// screen's job rather than a restored field's.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DownloadAreaConfig {
+    /// Whether the offline arm was lit. Restored so that reopening is what the
+    /// window last showed, chip and all.
+    armed: bool,
+    /// The picked box's centre latitude, degrees. `None` for no box.
+    lat: Option<f64>,
+    /// The picked box's centre longitude, degrees.
+    lon: Option<f64>,
+    /// Half the box's width, kilometres.
+    half_width_km: Option<f64>,
+    /// The detail level's token, or empty for "never written". A token this
+    /// build has no level for costs the choice and nothing else.
+    detail: String,
+}
+
+impl DownloadAreaConfig {
+    /// The block for a Gui's selection.
+    fn of(
+        armed: bool,
+        picked: Option<crate::ui_download_area::PickedBox>,
+        detail: crate::ui_download_area::DetailLevel,
+    ) -> Self {
+        Self {
+            armed,
+            lat: picked.map(|picked| picked.centre.lat),
+            lon: picked.map(|picked| picked.centre.lon),
+            half_width_km: picked.map(|picked| picked.half_width_km),
+            detail: detail.token().to_owned(),
+        }
+    }
+
+    /// The box this block names, or `None` for one that names none —
+    /// [`PickedBox::new`](crate::ui_download_area::PickedBox::new) is the
+    /// validation, so a hand-edited centre off the globe restores as no box
+    /// rather than as a bad one.
+    fn box_picked(&self) -> Option<crate::ui_download_area::PickedBox> {
+        crate::ui_download_area::PickedBox::new(
+            squallar_geo::GeoPoint {
+                lat: self.lat?,
+                lon: self.lon?,
+            },
+            self.half_width_km?,
+        )
+    }
+
+    /// The level this block names, or the default for one that names none.
+    fn detail(&self) -> crate::ui_download_area::DetailLevel {
+        crate::ui_download_area::DetailLevel::from_token(&self.detail).unwrap_or_default()
+    }
+}
+
 impl super::Gui {
     /// Every area this device has made available offline, in the order they
     /// finished.
@@ -910,6 +969,18 @@ struct UiConfig {
     /// field was.
     #[serde(default)]
     downloaded_areas: Vec<DownloadedAreaConfig>,
+    /// **The offline-area selection, exactly as it was left**: whether the
+    /// arm is lit, the box that was picked, and which detail level its list
+    /// had selected.
+    ///
+    /// At the root beside `downloaded_areas` and for the same reason — an
+    /// area is a fact about the device, and the box that would become one is
+    /// not a fact about a window. Additive on `downloaded_areas`' terms:
+    /// `#[serde(default)]`, **no `CONFIG_VERSION` bump and no `migrate.rs`
+    /// step**; absence loads as "not armed, nothing picked, the default
+    /// level", which is what every session written before this field was.
+    #[serde(default)]
+    download_area: DownloadAreaConfig,
     /// **How the window splits between panes**, and where the user dragged the
     /// dividers. App-wide rather than per-pane: all three describe the window.
     ///
@@ -1314,6 +1385,7 @@ impl Default for UiConfig {
             pin_pane_controls: false,
             favorite_sites: Vec::new(),
             downloaded_areas: Vec::new(),
+            download_area: DownloadAreaConfig::default(),
             split_orientation: crate::pane::SplitOrientation::Auto,
             // Empty rather than the one-pane run: the fields' absence is what
             // says "no dividers were described", and `adopt_ratios` refuses an
@@ -1446,6 +1518,11 @@ impl super::Gui {
                 .iter()
                 .map(DownloadedAreaConfig::of)
                 .collect(),
+            download_area: DownloadAreaConfig::of(
+                self.download_pick_armed,
+                self.download_pick,
+                self.download_detail,
+            ),
             split_orientation: self.split_orientation,
             row_ratios: {
                 let (rows, _) = self.pane_layout.ratios();
@@ -1617,6 +1694,9 @@ impl super::Gui {
             .iter()
             .filter_map(DownloadedAreaConfig::restore)
             .collect();
+        self.download_pick_armed = config.download_area.armed;
+        self.download_pick = config.download_area.box_picked();
+        self.download_detail = config.download_area.detail();
         self.presets = config.presets;
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();

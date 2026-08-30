@@ -91,13 +91,26 @@ impl super::Gui {
 
         let live_generation =
             crate::basemap_archive::block_cache::generation_for_url(&crate::tiles::archive_url());
+        // The archive's own ceiling, from the one header read the size probe
+        // makes each session. A stored depth is named against it rather than
+        // against a constant, so a deeper archive renames every row without an
+        // edit; `None` until the read lands, which reads as the deepest level
+        // and refines rather than inventing a zoom.
+        let archive_max_zoom = self.download_size.ceiling();
         let mut command = None;
         for area in &self.downloaded_areas {
             let status = self
                 .area_maintenance
                 .as_ref()
                 .and_then(|maintenance| maintenance.status(&area.spec.area_id));
-            let asked = render_area(ui, area, status, &live_generation, store_reachable);
+            let asked = render_area(
+                ui,
+                area,
+                status,
+                &live_generation,
+                store_reachable,
+                archive_max_zoom,
+            );
             // First press wins. Only one button can be clicked in a frame, so
             // this decides nothing in practice - it just refuses to let a
             // later row silently discard an earlier row's command.
@@ -197,22 +210,22 @@ impl super::Gui {
     /// download on a metered connection is the exact opposite of what this
     /// feature is for. Resume needs no separate path — the engine skips the
     /// segments the store already holds, so a resume *is* a start.
-    fn start_area_download(&mut self, spec: AreaSpec, ctx: &egui::Context) {
+    pub(in crate::ui) fn start_area_download(&mut self, spec: AreaSpec, ctx: &egui::Context) {
         let Some(store) = crate::tiles::offline_store(self.basemap_dir.as_deref()) else {
             return;
         };
-        let url = crate::tiles::archive_url();
-        let source = match crate::basemap_archive::HttpRangeSource::new(
-            crate::tile_source::tile_client(),
-            &url,
-        ) {
+        // The size figure and the download read the archive through one
+        // constructor, so a quoted figure and the bytes that arrive cannot
+        // come from two different clients or two different URLs.
+        let source = match crate::tiles::archive_range_source() {
             Ok(source) => source,
             Err(error) => {
-                log::error!("{url} is not a usable archive URL to download from: {error}");
+                log::error!("the basemap archive is not a usable URL to download from: {error}");
                 return;
             }
         };
-        let generation = crate::basemap_archive::block_cache::generation_for_url(&url);
+        let generation =
+            crate::basemap_archive::block_cache::generation_for_url(&crate::tiles::archive_url());
         self.active_download = Some(ActiveDownload::start(
             source,
             store,
@@ -256,6 +269,9 @@ fn render_area(
     status: Option<AreaStatus>,
     live_generation: &str,
     store_reachable: bool,
+    // The live archive's own detail ceiling, once a header read has reported
+    // one - what a stored depth is named against, rather than a constant.
+    archive_max_zoom: Option<u8>,
 ) -> Option<AreaCommand> {
     let mut command = None;
     // The name and the figure on one line, in the panel's own left-to-right
@@ -267,7 +283,7 @@ fn render_area(
         ui.label(size_or_parts(area, status));
     });
     ui.label(
-        RichText::new(detail_label(area.spec.max_zoom))
+        RichText::new(detail_label(area.spec.max_zoom, archive_max_zoom))
             .small()
             .weak(),
     );

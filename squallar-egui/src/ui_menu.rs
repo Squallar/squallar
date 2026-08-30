@@ -8,6 +8,8 @@ pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 pub(crate) const DRAW_CROSS_SECTION_LABEL: &str = "Draw cross-section";
 
 pub(crate) const PICK_REGION_LABEL: &str = "Pick 3D region (drag a square on a map)";
+/// The offline-download arm's leaf, beside the other two armed drags.
+pub(crate) const DOWNLOAD_AREA_LABEL: &str = "Download an area (drag a square on a map)";
 
 /// A command the user can invoke from the menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +39,7 @@ pub(super) enum MenuToggle {
     /// Arm the 3D region pick: the next drag on a map pane draws the square of
     /// ground a 3D view resamples, instead of panning.
     PickRegion,
+    DownloadArea,
 }
 
 pub(super) enum MenuNode {
@@ -229,6 +232,13 @@ impl super::Gui {
                         toggle: MenuToggle::PickRegion,
                         value: self.region_pick_armed(),
                     },
+                    // The third of the set, and adjacent for the same reason:
+                    // arming any one un-arms the other two.
+                    MenuNode::Toggle {
+                        label: DOWNLOAD_AREA_LABEL,
+                        toggle: MenuToggle::DownloadArea,
+                        value: self.download_pick_armed(),
+                    },
                     MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
@@ -334,6 +344,14 @@ impl super::Gui {
                     self.drawer_open = false;
                 }
             }
+            MenuEvent::Toggled(MenuToggle::DownloadArea, on) => {
+                // The arm above again, with the download box. Same setter, and
+                // the same drawer close for the same reason.
+                self.set_download_pick_armed(on);
+                if on {
+                    self.drawer_open = false;
+                }
+            }
         }
     }
 }
@@ -410,7 +428,7 @@ mod tests {
         overlays.sort();
         format!(
             "settings={} insp={} sel={:?} time={} drawer={} auto_poll={} live_chunks={} \
-             notify={} view={:?} pending_view={:?} armed={} \
+             notify={} view={:?} pending_view={:?} armed={}/{}/{} \
              overlays={overlays:?}",
             gui.settings_visible(),
             gui.insp_open,
@@ -426,10 +444,15 @@ mod tests {
             // arm does, so a fingerprint holding only the *applied* view would
             // report the arm as a no-op.
             gui.pending_pane_view_for_test(),
-            // The armed draw is a mode with no other observable — it converts
-            // nothing until a gesture completes — so without it the toggle's arm
-            // would read as a no-op.
+            // The armed drags are modes with no other observable — they convert
+            // nothing until a gesture completes — so without them the toggles'
+            // arms would read as no-ops. All three, because arming any one
+            // un-arms the other two: a fingerprint holding only some of them
+            // reads a real change as none whenever the arm it dropped is the
+            // one that moved.
             gui.section_draw_armed(),
+            gui.region_pick_armed(),
+            gui.download_pick_armed(),
         )
     }
 
