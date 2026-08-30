@@ -258,13 +258,16 @@ Band 1 Block=4x1 Type=Float32, ColorInterp=Undefined
     /// the reader that will consume it reading the values back.
     #[test]
     fn a_synthetic_dem_walk_emits_a_grid_the_reader_answers_from() {
-        // Death Valley, the Dead Sea and a Colorado cell, at their real
-        // published depths, plus a second observation of one cell to show the
-        // accumulator keeps the lower.
+        // Three cells at their **measured** minima: `gdalinfo -mm` over the
+        // three COGs on 2026-08-30, GLO-30 2021 Public release. Not the
+        // surveyed depths of the landmarks inside them — Badwater is −86 m and
+        // the cell reads −91.451 — and not, for Colorado, the 2396.2 m minimum
+        // of the committed z10 *tile*, which covers a fortieth of the cell and
+        // reads 844 m higher than the cell does.
         let record = "\
-Copernicus_DSM_COG_10_N36_00_W117_00_DEM -86.4
-Copernicus_DSM_COG_10_N31_00_E035_00_DEM -430.5
-Copernicus_DSM_COG_10_N39_00_W106_00_DEM 2396.2
+Copernicus_DSM_COG_10_N36_00_W117_00_DEM -91.451
+Copernicus_DSM_COG_10_N31_00_E035_00_DEM -427.834
+Copernicus_DSM_COG_10_N39_00_W106_00_DEM 1552.236
 ";
         let parsed = parse_minima(record).expect("three well-formed lines");
         assert_eq!(parsed.len(), 3);
@@ -281,16 +284,33 @@ Copernicus_DSM_COG_10_N39_00_W106_00_DEM 2396.2
 
         // Floored to the metre downward, because a floor may never sit above
         // the ground.
-        assert_eq!(read.at(36.25, -116.83), Some(-87.0));
-        assert_eq!(read.at(31.5, 35.5), Some(-431.0));
-        assert_eq!(read.at(39.5, -105.5), Some(2396.0));
+        assert_eq!(read.at(36.25, -116.83), Some(-92.0));
+        assert_eq!(read.at(31.5, 35.5), Some(-428.0));
+        assert_eq!(read.at(39.5, -105.5), Some(1552.0));
 
         // Ocean, and the neighbours of the published cells, read as absence.
         assert_eq!(read.at(15.0, -140.0), None);
         assert_eq!(read.at(37.5, -116.5), None);
         // A box over the Death Valley cell and three unpublished neighbours
         // answers the one real minimum, not the sentinel.
-        assert_eq!(read.min_over_bbox(-117.5, 36.0, -116.0, 37.5), Some(-87.0));
+        assert_eq!(read.min_over_bbox(-117.5, 36.0, -116.0, 37.5), Some(-92.0));
+    }
+
+    /// The record is deduplicated by cell, first line winning — a resumed run
+    /// can append a cell it already recorded.
+    ///
+    /// Named because it is a policy and not an accident: the accumulator's
+    /// keep-the-lower rule (pinned in `squallar_geo::min_elevation`) never sees
+    /// the second line, so the two rules do not compose.
+    #[test]
+    fn a_cell_recorded_twice_keeps_the_first_line_and_not_the_lower_one() {
+        let parsed = parse_minima(
+            "Copernicus_DSM_COG_10_N36_00_W117_00_DEM -91.451\n\
+             Copernicus_DSM_COG_10_N36_00_W117_00_DEM -500.0\n",
+        )
+        .expect("two well-formed lines");
+        assert_eq!(parsed.len(), 1);
+        assert!((parsed[0].1 + 91.451).abs() < 1e-9, "kept {}", parsed[0].1);
     }
 
     #[test]

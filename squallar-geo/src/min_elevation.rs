@@ -2,12 +2,15 @@
 //! metres, and the bbox query the volume box's floor is derived from.
 //!
 //! It lives here, in the geodesy floor, and not with the elevation decoder
-//! whose builder pass emits it. `squallar-radar` is what reads it, and
-//! `squallar-elevation` stands above `squallar-radar` through
-//! `squallar-device-profile` — so putting the grid there and reading it from
-//! radar would close a dependency cycle Cargo refuses to build. `squallar-geo`
-//! is already under radar and already owns the projection functions this grid
-//! is queried alongside.
+//! whose builder pass emits it. `squallar-radar` is what will read it, and
+//! `squallar-elevation` is **planned** to stand above `squallar-radar` through
+//! `squallar-device-profile` — the dependency the height-plan fit needs. Today
+//! `squallar-elevation` declares `squallar-geo` and `image` and nothing else,
+//! so the cycle is prospective, not present; its own `tests/charter.rs` asserts
+//! that smaller set. Putting the grid there anyway would mean moving it the day
+//! that dependency lands, and `squallar-geo` is already under radar and already
+//! owns the projection functions this grid is queried alongside, so it belongs
+//! here on its own merits as well.
 //!
 //! **Nodata is excluded from the minimum, and it is not a detail.** The grid
 //! records a sentinel wherever the source DEM publishes no cell, which is every
@@ -308,6 +311,30 @@ mod tests {
         // Degenerate and non-finite boxes are refused, not guessed at.
         assert_eq!(g.min_over_bbox(-117.0, 37.0, -116.0, 36.0), None);
         assert_eq!(g.min_over_bbox(f64::NAN, 36.0, -116.0, 37.0), None);
+    }
+
+    /// The `north < south` guard, at the only shape that can tell it apart from
+    /// its absence.
+    ///
+    /// An inverted box spanning two rows answers `None` either way — `top` is
+    /// below `bottom`, so `top..=bottom` is empty and the fold sees nothing.
+    /// That is `None` for the wrong reason, and it leaves the guard untested.
+    /// An inversion **inside one row** separates them: both edges land in row
+    /// 53, the empty-range accident does not happen, and without the guard the
+    /// fold would answer the cell's real minimum for a box that names no area.
+    #[test]
+    fn an_inversion_inside_a_single_row_is_refused_by_the_guard_and_not_by_an_empty_range() {
+        let raw = grid_with(&[(36.5, -116.5, -86.0)]);
+        let g = MinElevationGrid::new(&raw).expect("a full-length grid");
+
+        assert_eq!(g.min_over_bbox(-117.0, 36.8, -116.0, 36.2), None);
+
+        // The two controls that make that a statement about the guard. Both
+        // edges are in the same row, so the row walk is NOT empty...
+        assert_eq!(row_of_lat(36.8), row_of_lat(36.2));
+        // ...and the same box the right way up answers the real minimum, so
+        // the cell is reachable and the `None` above is the inversion.
+        assert_eq!(g.min_over_bbox(-117.0, 36.2, -116.0, 36.8), Some(-86.0));
     }
 
     #[test]
