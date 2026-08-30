@@ -482,7 +482,11 @@ pub(crate) fn decompress(
 // ---------------------------------------------------------------------------
 
 /// Parse the fixed 127-byte header off the front of an archive.
-fn parse_header(bytes: &[u8]) -> Result<IndexHeader, IndexError> {
+///
+/// `pub(crate)` so [`crate::basemap_archive::RangeBackend`] can read the root
+/// directory's declared bounds off the same parser this index uses, rather
+/// than growing a second one beside it that could disagree.
+pub(crate) fn parse_header(bytes: &[u8]) -> Result<IndexHeader, IndexError> {
     if bytes.len() < HEADER_BYTES {
         return Err(IndexError::Truncated {
             what: "the header",
