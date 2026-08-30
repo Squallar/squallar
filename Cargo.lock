@@ -4590,6 +4590,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squallar-device-profile",
+ "squallar-elevation",
  "squallar-geo",
  "squallar-kv",
  "squallar-location",

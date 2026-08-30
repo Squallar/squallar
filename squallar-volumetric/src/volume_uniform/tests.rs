@@ -52,20 +52,24 @@ fn distinct() -> VolumeUniform {
         clip_from_box: forward,
         occluder_t_scale: 1301.0,
         ground_max_z: 1302.0,
-        ground_ridge_amplitude: 1303.0,
+        height_scale: 1303.0,
+        height_offset: 1304.0,
+        ground_box: [1401.0, 1402.0, 1403.0, 1404.0],
     }
 }
 
-/// The block is exactly 304 bytes, and the shader declares the same.
+/// The block is exactly 320 bytes, and the shader declares the same.
 #[test]
-fn the_block_is_two_mat4s_and_eleven_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 11 * 16);
-    assert_eq!(OFFSET_OCCLUDER + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_two_mat4s_and_twelve_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 12 * 16);
+    assert_eq!(OFFSET_GROUND_BOX + 16, VOLUME_UNIFORM_BYTES);
     // The growth is append-only: every offset that existed before the ground
-    // pass is still where it was, which is what let the block grow without a
-    // single lane of the march moving.
+    // pass is still where it was, which is what let the block grow twice —
+    // 224 to 304 at B1, 304 to 320 at B3 — without a single lane of the march
+    // moving.
     assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, OFFSET_CLIP_FROM_BOX);
     assert_eq!(OFFSET_CLIP_FROM_BOX + 64, OFFSET_OCCLUDER);
+    assert_eq!(OFFSET_OCCLUDER + 16, OFFSET_GROUND_BOX);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -78,7 +82,7 @@ fn the_block_is_two_mat4s_and_eleven_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (2, 11),
+        (2, 12),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -113,6 +117,7 @@ fn the_shader_declares_the_members_in_the_order_this_file_packs_them() {
         "grid_from_box_b",
         "clip_from_box",
         "occluder",
+        "ground_box",
     ] {
         let needle = format!("{member}:");
         let found = declaration[at..].find(&needle).unwrap_or_else(|| {
@@ -145,7 +150,7 @@ fn every_lane_lands_at_its_std140_offset() {
     );
 
     // The offsets themselves, as literals.
-    // An array rather than a tuple: thirteen members is past the arity `Debug`
+    // An array rather than a tuple: fourteen members is past the arity `Debug`
     // is implemented for, and a failure that cannot print the two sides is a
     // failure a reader cannot act on.
     assert_eq!(
@@ -163,8 +168,11 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_GRID_FROM_BOX_B,
             OFFSET_CLIP_FROM_BOX,
             OFFSET_OCCLUDER,
+            OFFSET_GROUND_BOX,
         ],
-        [0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288],
+        [
+            0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288, 304
+        ],
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
              else in this file can tell you they are wrong."
@@ -207,8 +215,13 @@ fn every_lane_lands_at_its_std140_offset() {
         ),
         (
             OFFSET_OCCLUDER,
-            [1301.0, 1302.0, 1303.0, 0.0],
-            "occluder_t_scale + ground_max_z + ridge amplitude + a reserved zero",
+            [1301.0, 1302.0, 1303.0, 1304.0],
+            "occluder_t_scale + ground_max_z + the height affine",
+        ),
+        (
+            OFFSET_GROUND_BOX,
+            [1401.0, 1402.0, 1403.0, 1404.0],
+            "ground_box",
         ),
     ] {
         let lane = offset / 4;
@@ -404,14 +417,15 @@ fn the_t_scale_covers_every_post_of_the_grid() {
         for j in 0..=posts {
             for i in 0..=posts {
                 let uv = [i as f32 / posts as f32, j as f32 / posts as f32];
-                // Every amplitude a stand-in ridge can be given, **including
-                // ones past the top of the box**: the lane is a plain `f32` a
-                // caller can set to anything, and `ground_height` clamps into
-                // the cube so that the corner bound below stays sound. Stopping
-                // this sweep at 1.0 would test only the precondition, not the
-                // clamp that enforces it.
-                for amplitude in [0.0, 0.25, 0.5, 1.0, 1.2, 1.5, 4.0, 1e6] {
-                    let p = [uv[0], uv[1], crate::raymarch::ground_height(uv, amplitude)];
+                // Every box z a decoded height sample can produce, **including
+                // ones past the top of the box**: the affine is two plain `f32`
+                // lanes a caller can set to anything, a field really can reach
+                // above a box floored 100 m under its minimum, and the shader's
+                // decode clamps into the cube so that the corner bound below
+                // stays sound. Stopping this sweep at 1.0 would test only the
+                // precondition, not the clamp that enforces it.
+                for raw_z in [0.0f32, 0.25, 0.5, 1.0, 1.2, 1.5, 4.0, 1e6] {
+                    let p = [uv[0], uv[1], raw_z.clamp(0.0, 1.0)];
                     let t = ((p[0] - eye[0]).powi(2)
                         + (p[1] - eye[1]).powi(2)
                         + (p[2] - eye[2]).powi(2))
@@ -430,9 +444,8 @@ fn the_t_scale_covers_every_post_of_the_grid() {
         // And the slack is the margin, not luck. The bound is the farthest
         // *corner* — the unit cube is convex and `|p - eye|` is convex, so its
         // maximum over the cube is at a vertex, and every post is inside the
-        // cube by construction. A post need not reach that corner (the ridge is
-        // a Gaussian, so only its crest is near the top face), which is why the
-        // tightness is asserted here and not on the posts above.
+        // cube by construction. A post need not reach that corner, which is
+        // why the tightness is asserted here and not on the posts above.
         let farthest_corner = (0..8u32)
             .map(|corner| {
                 let p = [
@@ -466,7 +479,7 @@ fn an_occluder_scale_from_another_eye_is_recognised_as_one() {
          aimed or every pane without a ground pass would trip the check",
     );
 
-    uniform.aim_occluder(0.25, 0.25);
+    uniform.aim_occluder(0.25, 1.0 / 65_535.0, 0.0);
     assert!(
         uniform.occluder_is_aimed_at_its_own_eye(),
         "a scale set through `aim_occluder` is not recognised as this eye's own",
@@ -482,8 +495,84 @@ fn an_occluder_scale_from_another_eye_is_recognised_as_one() {
          `write_uniform` would pass a frame whose every ray clips at the wrong \
          depth",
     );
-    uniform.aim_occluder(0.25, 0.25);
+    uniform.aim_occluder(0.25, 1.0 / 65_535.0, 0.0);
     assert!(uniform.occluder_is_aimed_at_its_own_eye());
+}
+
+/// **Aiming the occluder puts the flat lid out, and the two cannot both be on.**
+///
+/// The mesh IS the ground. Holding both painted the lid behind the march at
+/// full opacity wherever a ray crossed `z = 0` without meeting the mesh — B1
+/// measured 76, 74 and 33 such pixels at the three below-floor cameras, at
+/// alpha above 200. `aim_occluder` is the one blessed way to turn a ground pass
+/// on, so clearing `map_floor` there is what makes the pair unbuildable in the
+/// order production builds it in.
+#[test]
+fn aiming_the_occluder_puts_the_map_lid_out() {
+    let mut uniform = VolumeUniform::new([240.0, 240.0, 20.0], [8, 8, 8]);
+    uniform.eye_in_box = [0.5, -1.9, 1.2];
+    uniform.map_floor = true;
+    assert!(
+        uniform.ground_is_one_surface(),
+        "a lid with no ground pass is one surface, and this must say so or the predicate would refuse every pane shipping today",
+    );
+
+    uniform.aim_occluder(0.25, 1.0 / 65_535.0, 0.0);
+    assert!(
+        !uniform.map_floor,
+        "aiming the occluder left the lid on; the frame would hold two grounds",
+    );
+    assert!(uniform.ground_is_one_surface());
+
+    // The non-triviality half: the predicate really is reading the pair rather
+    // than being true of everything. Setting the lid back on AFTER the aim is
+    // the one order that reaches the defect, and it is what the predicate is
+    // for.
+    uniform.map_floor = true;
+    assert!(
+        !uniform.ground_is_one_surface(),
+        "a lid set back on after the aim read as one surface, so nothing would notice a caller building the pair in that order",
+    );
+}
+
+/// The height affine is one derivation, and it is the field's own encoding
+/// carried into the drawn box's own z range.
+#[test]
+fn the_height_affine_turns_a_raw_sample_into_the_box_it_stands_in() {
+    // A real box: floor at sea level, top at 18 km MSL, and the shipped
+    // `HeightField` encoding.
+    let (scale, offset) = VolumeUniform::height_affine(-500.0, 0.25, (0.0, 18.0))
+        .expect("a box with vertical extent");
+    let box_z = |raw: u16| f64::from(raw) * f64::from(scale) + f64::from(offset);
+
+    // Sea level is raw 2000 (`-500 + 2000 * 0.25 == 0`), which must land on the
+    // box floor exactly.
+    assert!(
+        box_z(2000).abs() < 1e-6,
+        "sea level does not land on a box floored at 0 km MSL: {}",
+        box_z(2000),
+    );
+    // Denver, 1609 m: raw 8436, and 1.609 / 18 of the way up the box.
+    let denver = ((1609.0 + 500.0) / 0.25) as u16;
+    assert!(
+        (box_z(denver) - 1.609 / 18.0).abs() < 1e-4,
+        "1609 m lands at box z {}, not {}",
+        box_z(denver),
+        1.609 / 18.0,
+    );
+    // A box that does not start at sea level shifts, and does not rescale.
+    let (_, raised) = VolumeUniform::height_affine(-500.0, 0.25, (1.0, 18.0))
+        .expect("a box with vertical extent");
+    assert!(
+        (f64::from(raised) - (-0.5 - 1.0) / 17.0).abs() < 1e-6,
+        "a base of 1 km MSL did not move the encoding's own zero with it",
+    );
+
+    assert_eq!(
+        VolumeUniform::height_affine(-500.0, 0.25, (18.0, 18.0)),
+        None,
+        "a box with no vertical extent must be refused rather than divided by; the quotient reaches the GPU as an infinity and the matrix after it as NaN",
+    );
 }
 
 /// The shader reads the scale off the lane this file writes it to, and treats

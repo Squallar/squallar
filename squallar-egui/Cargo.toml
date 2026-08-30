@@ -173,3 +173,18 @@ wasm-bindgen-futures = "=0.4.76"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Drives the async tile tests. Not linked into any shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# **Dev only, and gated with `tokio` above for the same reason.**
+# `tiles/real_terrain_tests.rs` - the only consumer - drives the height reader
+# end to end: archive bytes off a loopback server, through the reader, into the
+# resample that turns them into a `HeightField`. Proving the two halves join
+# needs the crate that owns the second one. That test is native-only (it binds a
+# loopback port), so the dependency is too: `--all-targets` compiles dev-deps,
+# and an ungated entry would build this crate and its `image` decoder into every
+# wasm check for nothing.
+#
+# It is NOT a normal dependency: nothing shipped here decodes elevation, the
+# resample runs inside the offload worker (which is what `squallar-elevation`
+# exists for), and the renderer takes a plain `volume_view::GroundHeightField`
+# carrier rather than the elevation crate's own type for exactly that reason.
+squallar-elevation = { workspace = true }

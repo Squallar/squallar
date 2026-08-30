@@ -70,25 +70,38 @@ pub const VOLUME_ENV_VAR: &str = "SQUALLAR_VOLUME";
 const MIN_TEXTURE_DIMENSION_3D: u32 = 32;
 
 /// Sampled textures a volume pipeline binds at once: the grid, its colour LUT,
-/// the jitter tile, the map floor's pane mirror, and the ground pass's two
-/// outputs — the occluder and the ground's own colour.
+/// the jitter tile, the map floor's pane mirror, the ground pass's two outputs
+/// — the occluder and the ground's own colour — and the height field the mesh
+/// stands on.
 ///
-/// "Sampled" is wgpu's name for the binding *class*, not a claim that all six
-/// are read through a sampler — the jitter tile and both group-2 targets are
-/// read with `textureLoad` and carry none, and occupy a slot regardless. What
-/// this has to match is the number of texture bindings the raymarch's layouts
-/// declare across all three groups. Held to the shader by
+/// "Sampled" is wgpu's name for the binding *class*, not a claim that all seven
+/// are read through a sampler — the jitter tile, both group-2 targets and the
+/// height field are read with `textureLoad` and carry none, and occupy a slot
+/// regardless. The height field cannot carry one at all: it is `R16Uint`, and
+/// WGSL declares no sampler for an integer texture. What this has to match is
+/// the number of texture bindings the raymarch's layouts declare across all
+/// four groups. Held to the shader by
 /// `the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares`.
-const REQUIRED_SAMPLED_TEXTURES: u32 = 6;
+///
+/// **It is a module-wide count, and therefore an OVER-estimate of what the
+/// adapter is actually asked for.** `max_sampled_textures_per_shader_stage` is
+/// per stage, and the height field is bound to the VERTEX stage alone while the
+/// other six are all fragment — so no stage of any pipeline here binds more
+/// than six, and asking for seven would refuse an adapter that could have run.
+/// That is accepted rather than split: the figure this is measured against is
+/// **16** on the WebGL2 floor (`downlevel_webgl2_defaults()`), so the margin is
+/// nine either way, and one count the whole shader can be read against beats
+/// two that have to be kept in step per stage.
+const REQUIRED_SAMPLED_TEXTURES: u32 = 7;
 
 /// Samplers a volume pipeline binds at once: the grid's, the LUT's, the floor's.
 ///
 /// One per texture *that is sampled*: naga rejects a texture sampled through
 /// two samplers in one entry point (`Error::ImageMultipleSamplers`), and the
-/// grid wants `Linear` while an exact-index LUT lookup wants `Nearest`. Three
-/// fewer than [`REQUIRED_SAMPLED_TEXTURES`] because the jitter tile and the
-/// ground pass's two outputs are read with `textureLoad` and carry no sampler
-/// at all.
+/// grid wants `Linear` while an exact-index LUT lookup wants `Nearest`. Four
+/// fewer than [`REQUIRED_SAMPLED_TEXTURES`] because the jitter tile, the ground
+/// pass's two outputs and the height field are read with `textureLoad` and
+/// carry no sampler at all.
 const REQUIRED_SAMPLERS: u32 = 3;
 
 /// Bytes of uniform data one volume draw needs bound at once.

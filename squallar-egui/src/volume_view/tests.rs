@@ -396,6 +396,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         alpha: None,
         view_mode: crate::pane::VolumeViewMode::LitVolume,
         iso_threshold: 18.0,
+        heights: None,
     };
     let VolumePaint::Callback { payload, .. } = painter.paint(&frame) else {
         panic!("the painting stub must paint");

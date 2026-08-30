@@ -1075,20 +1075,26 @@ static MUTANTS: &[Mutant] = &[
         probe: &FLOOR_REGISTRATION,
     },
     Mutant {
+        // **Re-anchored at B3**, which moved these two lines out of
+        // `floor_colour` and into `box_x_km` / `box_y_km` so that the ground
+        // mesh's own fragments could turn their surface point into kilometres
+        // through the very lines the lid does. The mutation is the same one;
+        // it now reaches both surfaces, which is stronger rather than weaker.
         name: "the floor's north axis is reprojected through the box's east extent",
         class: "floor",
-        pattern: "let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;",
-        replacement: "let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.x;",
+        pattern: "    return volume.floor_geo.z + p_y * volume.box_size_km.y;",
+        replacement: "    return volume.floor_geo.z + p_y * volume.box_size_km.x;",
         occurrences: 1,
         probe: &WIDE_FLOOR_REGISTRATION,
     },
     Mutant {
+        // Re-anchored with its neighbour above. One function rather than two
+        // adjacent lines, so the transposition is spelled where the axis is
+        // chosen.
         name: "the floor's two reprojection lines are exchanged, so the map is transposed",
         class: "floor",
-        pattern: "let x_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;\n    \
-                  let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;",
-        replacement: "let x_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;\n    \
-                      let y_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;",
+        pattern: "    return volume.floor_geo.y + p_x * volume.box_size_km.x;",
+        replacement: "    return volume.floor_geo.z + p_x * volume.box_size_km.y;",
         occurrences: 1,
         probe: &WIDE_FLOOR_REGISTRATION,
     },

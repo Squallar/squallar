@@ -376,6 +376,55 @@ pub fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
     pixels[((size[1] / 2) * size[0] + size[0] / 2) as usize]
 }
 
+/// One orbit camera: `(yaw degrees, pitch degrees, standoff, vertical
+/// exaggeration)`.
+pub type OrbitFixture = (f32, f32, f32, f32);
+
+/// **The eleven cameras every ground-pass criterion is asserted over.**
+///
+/// Spread over yaw, pitch, standoff and exaggeration, and — against the box
+/// `volume_occluder.rs` uses — across all three regions the composite
+/// distinguishes: above the ground's crest, between the crest and the box
+/// floor, and under the box floor. Which region a fixture lands in is a whole
+/// camera pipeline away from being obvious, so the file that depends on the
+/// split asserts it rather than assuming it
+/// (`the_camera_set_reaches_above_the_crest_under_it_and_under_the_floor`).
+///
+/// It lives here rather than in one suite because two suites read it, and two
+/// lists that have to agree is what this repository keeps removing.
+pub const ORBIT_CAMERAS: [OrbitFixture; 11] = [
+    // -- Above the crest. B1's six, unchanged. --
+    // The original fixture: obliquely down from the south-west.
+    (215.0, 28.0, 2.2, 1.0),
+    // The other side, closer, low enough that rays cross the ridge at a slant.
+    (35.0, 12.0, 1.0, 1.0),
+    // Steep and vertically exaggerated — the shipped default look.
+    (140.0, 60.0, 0.8, 3.0),
+    // Grazing: eye z ~ 3.1.
+    (300.0, 8.0, 2.2, 1.0),
+    // Near-overhead, where the ridge's silhouette is at its smallest.
+    (0.0, 85.0, 1.5, 1.0),
+    // Inside the box at the zoom stop, eye z ~ 0.70 — above the crest, but only
+    // just, and with the near plane much closer than anywhere else here.
+    (75.0, 28.0, 0.05, 1.0),
+    // -- Between the crest and the box floor. Both are close standoffs
+    // deliberately: the band is only about 1.6 degrees of pitch wide at
+    // standoff 2.2, and a level camera that far out sees the box edge-on. --
+    //
+    // Eye z 0.056 against a 0.25 crest.
+    (300.0, -5.0, 0.6, 1.0),
+    // Eye z 0.204, exaggerated 3x and further off.
+    (35.0, -6.0, 1.0, 3.0),
+    // -- Under the box floor. B1's three pinned-hole cameras, promoted whole. --
+    //
+    // The reviewer's own camera: eye z -5.27.
+    (215.0, -18.0, 2.2, 1.0),
+    // Deeper and from the other side: eye z -11.50.
+    (35.0, -40.0, 2.2, 1.0),
+    // Straight up at the clamp stop, `MAX_PITCH_DEG` all the way over.
+    (140.0, -89.0, 1.0, 1.0),
+];
+
 /// The box side that spans exactly one degree of latitude, in kilometres.
 pub const DEGREE_BOX_KM: f32 = squallar_geo::KM_PER_DEGREE_LAT as f32;
 

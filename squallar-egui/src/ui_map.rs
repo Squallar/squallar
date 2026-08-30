@@ -2082,6 +2082,15 @@ fn volume_pane_outcome(
         alpha: alpha_curves.get(&product),
         view_mode,
         iso_threshold: iso_thresholds.get(&product),
+        // **Owed, and named here rather than left as a shrug.** B3 built the
+        // whole path a field travels — archive tiles, the offload row, the
+        // resample, the `R16Uint` upload, the mesh, the drape — and proved it
+        // end to end against a fixture archive. What it did not build is the
+        // scheduler that decides when a pane asks for one, because the archive
+        // A2 would fetch from is not published: `HEIGHT_ARCHIVE_URL` still
+        // carries `UNPUBLISHED-GENERATION`, so a wired request would 404 on
+        // every tile and the pane would draw exactly this `None` anyway.
+        heights: None,
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()
