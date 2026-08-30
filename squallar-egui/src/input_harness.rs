@@ -1916,6 +1916,13 @@ impl InputHarness {
         self.screen_rect
     }
 
+    /// Point this `Gui` at `dir` for offline areas — `Gui::with_basemap_dir`'s
+    /// two writes, reachable after construction because the harness builds its
+    /// `Gui` before a test knows where its temp directory is.
+    pub(crate) fn use_basemap_dir(&mut self, dir: std::path::PathBuf) {
+        self.gui.set_basemap_dir_for_test(dir);
+    }
+
     /// Read access to the UI under test (e.g. to assert what a frame left).
     pub(crate) fn gui(&self) -> &Gui {
         &self.gui

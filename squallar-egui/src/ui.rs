@@ -107,6 +107,8 @@ pub(crate) use settings::LOCATION_DENIED_NOTE;
 #[cfg(test)]
 pub(crate) use settings::{DrawnSettingsRow, SETTINGS_ROWS};
 
+#[path = "ui_offline_areas.rs"]
+mod offline_areas;
 #[path = "gui/probes.rs"]
 mod probes;
 pub(crate) use probes::ControlProbe;

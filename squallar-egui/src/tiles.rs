@@ -62,13 +62,13 @@ pub const BASEMAP_ARCHIVE_URL_ENV: &str = "SQUALLAR_BASEMAP_ARCHIVE";
 /// split buys honesty rather than compilation -- a const documented "native
 /// only" that the web arm still read would be prose that is not evidence.
 #[cfg(not(target_arch = "wasm32"))]
-fn archive_url() -> String {
+pub(crate) fn archive_url() -> String {
     std::env::var(BASEMAP_ARCHIVE_URL_ENV).unwrap_or_else(|_| BASEMAP_ARCHIVE_URL.to_owned())
 }
 
 /// The wasm32 arm of [`archive_url`]: the compiled-in archive, always.
 #[cfg(target_arch = "wasm32")]
-fn archive_url() -> String {
+pub(crate) fn archive_url() -> String {
     BASEMAP_ARCHIVE_URL.to_owned()
 }
 
@@ -163,7 +163,7 @@ fn archive_block_cache(
 /// route exists there is nothing to read back. Neither arm branches inside a
 /// body — each *is* the body its target selects.
 #[cfg(not(target_arch = "wasm32"))]
-fn offline_store(
+pub(crate) fn offline_store(
     basemap_dir: Option<&std::path::Path>,
 ) -> Option<crate::basemap_download::PlatformSegmentStore> {
     Some(crate::basemap_download::FsSegmentStore::new(
@@ -175,7 +175,7 @@ fn offline_store(
 /// would read through are not built yet, and a store pointed at a route that
 /// does not answer would spend a request per launch to be told so.
 #[cfg(target_arch = "wasm32")]
-fn offline_store(
+pub(crate) fn offline_store(
     _basemap_dir: Option<&std::path::Path>,
 ) -> Option<crate::basemap_download::PlatformSegmentStore> {
     None

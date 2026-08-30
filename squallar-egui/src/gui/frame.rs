@@ -18,6 +18,11 @@ impl Gui {
 
         self.check_auto_polls(&mut actions);
 
+        // A download finishes whether or not its screen is open, and the
+        // record it publishes is what makes the area exist to the rest of the
+        // app - so the publish rides the frame, not the screen.
+        self.settle_offline_download();
+
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
         self.settle_pane_layout();
         #[cfg(test)]

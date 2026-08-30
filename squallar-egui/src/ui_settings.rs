@@ -58,6 +58,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "storm.speed",
     "storm.direction",
     "data.auto_poll",
+    "offline.areas",
     "about.version",
     "about.platform",
     "reset",
@@ -385,6 +386,16 @@ impl super::Gui {
                 {
                     self.set_auto_poll_enabled(enabled);
                 }
+                true
+            }
+            "offline.areas" => {
+                section_break(ui);
+                // Every area is a SUB-row of this one id: `SETTINGS_ROWS` is
+                // `&'static` and the area list is not, so one id per area
+                // cannot be spelled. The screen draws its own empty state,
+                // which is what keeps this row on the glass for the parity
+                // walk's fresh `Gui`.
+                self.render_downloaded_areas(ui);
                 true
             }
             "about.version" => {

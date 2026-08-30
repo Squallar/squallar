@@ -769,7 +769,7 @@ fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, 
 /// [`squallar_radar::tls::client`] and nothing else — platform verifier, *ring*,
 /// `https_only`. There is deliberately no way to inject a different client from
 /// outside the crate.
-fn tile_client() -> reqwest::Client {
+pub(crate) fn tile_client() -> reqwest::Client {
     squallar_radar::tls::client(squallar_radar::tls::USER_AGENT, REQUEST_TIMEOUT)
         .build()
         .expect("the tile HTTP client should build")
