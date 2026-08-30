@@ -59,12 +59,35 @@ fn declared_deps(meta: &serde_json::Value, package: &str) -> BTreeSet<(String, S
 /// The exact declared set. Equality and not ⊆ a list, because every entry here
 /// is a decision.
 ///
-/// **`squallar-source` and `squallar-device-profile` are deliberately absent**
-/// for now. The plan reserves them for the work unit that adds the job codec
-/// and the height-plan fit; nothing in this crate reaches either today, and a
-/// declared-but-unused dependency on `squallar-device-profile` would drag
-/// `squallar-radar` into every `cargo test -p squallar-elevation` for nothing.
-/// Adding one changes this test and the plan first, in writing.
+/// **`squallar-source` and `squallar-device-profile` are deliberately absent
+/// for now, and `squallar-source` is a scheduled arrival rather than an open
+/// question.** `JobCodec` — the vtable a job registry row is built from,
+/// a `struct` and not a trait — is defined in `squallar-source/src/job.rs`, so
+/// the work unit that adds the height job *will* declare `squallar-source`, and
+/// this list gains a line then. Nothing in this
+/// crate reaches either crate today, and a declared-but-unused dependency on
+/// `squallar-device-profile` would drag `squallar-radar` into every
+/// `cargo test -p squallar-elevation` for nothing.
+///
+/// **That arrival is a one-line ceiling edit and not a charter fight**, which is
+/// worth writing down here so it is not rediscovered as a surprise. Resolved
+/// closures over `cargo metadata`'s `resolve.nodes`, measured 2026-08-30 —
+/// **denominator: distinct packages reachable *as dependencies*, roots
+/// themselves excluded**:
+///
+/// * from `squallar-elevation` alone: **41 packages, zero forbidden, no
+///   `reqwest`**;
+/// * from elevation ∪ source ∪ device-profile: **236, still zero forbidden**.
+///
+/// (A review of this work unit quoted 237 for the second figure. The one-package
+/// gap is the denominator, not a disagreement: `squallar-elevation` is a root
+/// nothing depends on, so counting the roots too gives 237 there and 42 for the
+/// first. Same graph, two conventions.)
+///
+/// What the larger closure *does* add is `reqwest`, which is why
+/// [`the_offload_worker_can_link_this_crate`] does not name it — see that test's
+/// own docs. Adding a dependency still changes this test and the plan first, in
+/// writing; this paragraph is that writing for `squallar-source`.
 #[test]
 fn the_dependency_ceiling_holds() {
     let meta = metadata(&["--no-deps", "--format-version", "1"]);
@@ -185,9 +208,13 @@ fn the_offload_worker_can_link_this_crate() {
         reached.contains("image") && reached.contains("png") && reached.contains("squallar-geo"),
         "the resolve walk found {reached:?}, which is not this crate's graph",
     );
+    // Measured 2026-08-30: 41, roots excluded. Held as a floor rather than an
+    // equality — a patch release adding a transitive package is not an
+    // architecture change, and pinning the count would make it read as one.
     assert!(
-        reached.len() >= 8,
-        "the resolve walk reached only {} packages: {reached:?}",
+        reached.len() >= 20,
+        "the resolve walk reached only {} packages, against the 41 measured on \
+         2026-08-30; it is not seeing this crate's graph: {reached:?}",
         reached.len(),
     );
 }

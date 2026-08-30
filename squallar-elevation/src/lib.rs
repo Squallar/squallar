@@ -17,8 +17,11 @@
 //!
 //! The box floor's 1°×1° minimum-elevation grid is **not** here even though the
 //! same builder pass emits it: it lives in `squallar_geo::min_elevation`,
-//! because `squallar-radar` reads it and this crate stands above
-//! `squallar-radar`. That module's docs carry the argument in full.
+//! because `squallar-radar` will read it and this crate is **planned** to stand
+//! above `squallar-radar` through `squallar-device-profile`. Today this crate
+//! declares neither — `tests/charter.rs` asserts the smaller set — so the cycle
+//! is prospective rather than present, and the grid is placed for where the
+//! graph is going. That module's docs carry the argument in full.
 
 pub mod height;
 pub mod resample;

@@ -22,8 +22,18 @@ pub const HEIGHT_CEILING_M: f64 = HEIGHT_BASE_M + 65_535.0 * HEIGHT_QUANTUM_M;
 /// Metres to a stored count, saturating at both ends of the encoding.
 ///
 /// Rounds, so the error is half a quantum either way rather than a whole one
-/// downward. A `NaN` — which a hole in the source DEM would produce — encodes
-/// as the floor, matching the builder's rule for the same case.
+/// downward.
+///
+/// **A `NaN` encodes as the floor, and that is a lossy answer, not a sentinel.**
+/// The encoding spends all 65,536 codes on heights, so there is no spare one for
+/// "absent" — a `NaN` becomes −500 m, an ordinary-looking pit. That is the
+/// opposite of what `squallar_geo::min_elevation` does, and deliberately: a
+/// floor grid must be able to say "no ground here", a height field is only ever
+/// built from tiles that carry a value for every pixel. The matching rule is
+/// enforced one level up rather than here — [`crate::resample::TilePlane::resample`]
+/// refuses a non-finite sample outright, so no pit can reach a field through
+/// this crate's own path. This function keeps the total answer for a direct
+/// caller.
 #[inline]
 pub fn encode_height_m(height_m: f64) -> u16 {
     if height_m.is_nan() {
@@ -83,17 +93,14 @@ impl HeightField {
 
     /// The box-space centre of post `(i, j)`, in kilometres.
     ///
-    /// Post **centres**, so the field covers the box's extent evenly and the
-    /// first and last posts sit half a cell inside the edges rather than on
-    /// them. The ground mesh reads the same rule, which is what keeps the two
-    /// from disagreeing about where a post is.
+    /// **Delegates to [`crate::resample::post_center_km`] and does not restate
+    /// it.** This used to be a second copy of the arithmetic, with a comment
+    /// claiming the two could not disagree — nothing tied them together, and
+    /// two spellings of a half-cell offset can drift by half a cell, 3.6 km at
+    /// 129 posts over a 920 km box. That is precisely the registration the
+    /// ground mesh depends on, so there is one definition and this reads it.
     pub fn post_center_km(&self, i: u32, j: u32) -> (f64, f64) {
-        (
-            self.x_km.0
-                + (f64::from(i) + 0.5) * (self.x_km.1 - self.x_km.0) / f64::from(self.posts[0]),
-            self.y_km.0
-                + (f64::from(j) + 0.5) * (self.y_km.1 - self.y_km.0) / f64::from(self.posts[1]),
-        )
+        crate::resample::post_center_km(self.x_km, self.y_km, self.posts, i, j)
     }
 
     /// Lowest and highest height in the field, in metres. `None` when empty.
