@@ -356,6 +356,7 @@ fn the_arm_the_box_and_the_level_all_survive_a_reopen() {
 /// The bbox of the committed fixture, so a real engine has real bytes to move.
 /// Only the id has to match the picked box — that is what the panel keys the
 /// in-flight run on.
+#[cfg(not(target_arch = "wasm32"))]
 fn monaco_run_spec(area_id: String) -> crate::basemap_download::AreaSpec {
     crate::basemap_download::AreaSpec {
         area_id,
@@ -376,11 +377,13 @@ fn monaco_run_spec(area_id: String) -> crate::basemap_download::AreaSpec {
 ///
 /// The sibling in `ui_offline_areas::tests` is the same idea with a top-up
 /// door it needs and this does not.
+#[cfg(not(target_arch = "wasm32"))]
 struct StalledSource {
     inner: crate::basemap_archive::FileRangeSource,
     budget: std::sync::atomic::AtomicI64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl crate::basemap_archive::RangeSource for StalledSource {
     async fn read_range(
         &self,
@@ -403,6 +406,7 @@ impl crate::basemap_archive::RangeSource for StalledSource {
 ///
 /// The figures come from a real engine over the committed Monaco fixture, held
 /// mid-run by a spent read budget so the reading is settled rather than raced.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_panels_in_flight_block_draws_bytes_and_never_a_part_count() {
     const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");

@@ -74,6 +74,15 @@ or not anything gates on them.
   clean-tree control before believing a filtered red or green.
 - A zero-line `git diff` over a path that does not exist is not a proof. Show the path is
   tracked and non-empty first.
+- The wasm gate is
+  `.github/scripts/wasm-threads.sh cargo check --workspace --all-targets --target wasm32-unknown-unknown`,
+  and **every word of it is load-bearing**. The wrapper, because a plain
+  `cargo check --target wasm32-unknown-unknown` can never pass (rayon's `compile_error!`, by
+  design) — so its red says nothing. And **`--all-targets`**, because without it only the
+  libs are compiled: a `#[cfg(test)]` module reaching a native-only item
+  (`tokio`, `FileRangeSource`, `FsSegmentStore`) reads green on the lib spelling while CI's
+  row is red. That is how 18 errors landed on main and sat there (fixed 2026-08-30). This is
+  CI's row verbatim — run it, not a shorter one.
 
 ## Git
 

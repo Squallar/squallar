@@ -336,7 +336,13 @@ impl ActiveDownload {
     /// [`Self::start`] with the segment cap handed in — the engine's own
     /// test-only door, for the same reason: the committed fixture is 419 KB
     /// and a multi-segment plan cannot be cut out of it at the production cap.
+    ///
+    /// Native-only alongside `#[cfg(test)]`: its only callers are the fixture
+    /// suites in `ui_offline_areas::tests` and `ui_map::download_pick_tests`,
+    /// which read a committed archive off disk through `FileRangeSource` and
+    /// so cannot compile for wasm32.
     #[cfg(test)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn start_with_segment_bytes<S, T, St>(
         source: S,
         terrain: Option<(T, String)>,
