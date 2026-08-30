@@ -406,6 +406,72 @@ fn a_hidden_map_floor_survives_a_save_and_load() {
     );
 }
 
+/// The light a 3D pane is under survives a save and load, per pane.
+///
+/// Reopen is exactly 1:1, and the light is a piece of UI state like any other.
+#[test]
+fn the_light_a_3d_pane_is_under_survives_a_save_and_load() {
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    gui.set_pane_count_for_test(2);
+    for idx in 0..2 {
+        gui.pane_mut(idx)
+            .unwrap()
+            .set_view(squallar_radar::types::RenderView::Volume);
+    }
+    assert!(
+        !gui.pane(0).unwrap().volume().unwrap().readable_light,
+        "precondition: a fresh 3D pane is lit by the real sun, which is the \
+         decided default for both its ground and its volume",
+    );
+    gui.pane_mut(0)
+        .unwrap()
+        .volume_mut()
+        .unwrap()
+        .readable_light = true;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert!(
+        restored.pane(0).unwrap().volume().unwrap().readable_light,
+        "a pane that asked for the readable light must come back under it",
+    );
+    assert!(
+        !restored.pane(1).unwrap().volume().unwrap().readable_light,
+        "and the toggle is per pane: its neighbour keeps the sun",
+    );
+}
+
+/// A config written before the light toggle existed comes back **under the
+/// sun**, which is the shipped default rather than the old picture.
+#[test]
+fn a_config_written_before_the_light_toggle_comes_back_under_the_sun() {
+    let store = MemoryKvStore::default();
+    store
+        .store(
+            UI_CONFIG_KEY,
+            r#"{
+                    "site": "KDMX",
+                    "panes": [{"kind": "Volume", "site": "KDMX", "volume": {"hide_floor": true}}]
+                }"#,
+        )
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+    let volume = gui.pane(0).unwrap().volume().unwrap();
+    assert!(
+        !volume.readable_light,
+        "an absent key must mean the shipped default, and the decided default \
+         is the real sun",
+    );
+    assert!(
+        volume.hide_floor,
+        "and the rest of the pane's 3D state came back with it",
+    );
+}
+
 /// The derived-rung choice survives a save and load, both directions.
 #[test]
 fn the_storm_motion_fallback_survives_a_save_and_load() {

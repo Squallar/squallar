@@ -23,7 +23,7 @@ use crate::raymarch::staging::VolumeStaging;
 use crate::raymarch::{
     CoarseLevel, OffscreenPlan, OffscreenTarget, VolumePipelines, VolumeTextures,
 };
-use crate::uniform::VolumeUniform;
+use crate::uniform::{HEADLIGHT, SurfaceLight, VolumeUniform};
 use squallar_device_profile::quality::{GroundPass, VolumeQuality};
 use squallar_gpu::egui_renderer::AttachmentConfig;
 
@@ -721,6 +721,16 @@ impl VolumePainter for BridgeVolumePainter {
         // `OrbitCamera` floors it at 1, which is what licenses the shader to
         // divide by it unguarded.
         uniform.vertical_exaggeration = frame.camera.vertical_exaggeration();
+        // **The one light, for the ground and the volume both**, in the one
+        // call that sets all four of its lanes together. There is no arm here
+        // that lights one surface and not the other, and there is no second
+        // place to set a light: `set_light` is the whole of it, and both
+        // surfaces read the lanes it writes.
+        //
+        // Computed in `squallar-egui` and carried on the frame rather than
+        // derived here — this crate has `squallar-geo` only as a
+        // dev-dependency and its charter pins that.
+        uniform.set_light(surface_light_for(frame.light));
         // The rung this pane actually got, not the one the adapter was offered:
         // The fit can step the resolution down, and shading rides the same
         // struct.
@@ -1134,6 +1144,28 @@ fn crop_into(
 /// cell count, maximised over the three axes. This is what
 /// [`cloud_reconstruction_lod_for`] scales the smoothing by; on every shipped
 /// box the horizontal axes are the coarse ones (the vertical is ~0.14 km).
+/// **The one translation from a pane's light to the GPU's**, so the bridge and
+/// anything that measures it are reading the same mapping rather than two that
+/// were written to agree.
+///
+/// The wrap floor is [`HEADLIGHT`]'s in both arms and that is not an
+/// oversight: it multiplies the beam rather than standing beside it, so it is
+/// zero at night by construction and cannot make `squallar_geo::solar`'s night
+/// floor unreachable — and a participating medium lit by a clamped cosine
+/// alone has a hard terminator drawn across every storm core, which is the
+/// thing the wrap term exists to prevent.
+pub fn surface_light_for(light: squallar_egui::volume_view::VolumeLight) -> SurfaceLight {
+    match light {
+        squallar_egui::volume_view::VolumeLight::Headlight => HEADLIGHT,
+        squallar_egui::volume_view::VolumeLight::Sun(sun) => SurfaceLight {
+            direction: sun.direction_box,
+            beam: sun.beam,
+            sky: sun.sky,
+            wrap_floor: HEADLIGHT.wrap_floor,
+        },
+    }
+}
+
 fn largest_cell_km(uniform: &VolumeUniform) -> f32 {
     (0..3)
         .map(|axis| uniform.box_size_km[axis] / uniform.grid_dims[axis].max(1) as f32)

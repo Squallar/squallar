@@ -80,6 +80,168 @@ impl MapPaneGeo {
     }
 }
 
+/// **Which light a 3D pane's ground and volume are both lit by.**
+///
+/// One value, not two, and that is the point of C2: the terrain, the flat map
+/// lid and the raymarched storm are lit off one uniform, so a warm sunset
+/// ground under a neutral-white storm is not a defect to be found but an
+/// arithmetic nothing can write. `squallar_volumetric::uniform::SurfaceLight`
+/// is the shape this reaches the GPU as.
+///
+/// **Computed here, in `squallar-egui`, and carried through** — not in
+/// `squallar-volumetric` where the rest of the uniform is built. That crate
+/// has `squallar-geo` only as a dev-dependency and its own charter pins it
+/// there, so putting the solar arithmetic beside the rest of the uniform would
+/// mean promoting a band-0 crate into the volumetric graph to avoid passing
+/// one struct.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VolumeLight {
+    /// The fixed, always-above light this renderer has always used. Readable
+    /// from any orientation of the box, and the light a pane falls back to.
+    Headlight,
+    /// The real sun over the box's own anchor at the volume's own collection
+    /// time.
+    Sun(SunOverBox),
+}
+
+impl VolumeLight {
+    /// Whether this is the real sun. The pane's control asks, so it can say
+    /// which light the picture is under rather than which one was asked for.
+    pub fn is_sun(&self) -> bool {
+        matches!(self, Self::Sun(_))
+    }
+}
+
+/// The sun as this renderer needs it: a direction in box space and the two
+/// colours that go with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunOverBox {
+    /// Unit vector from the ground toward the sun, in **box space**.
+    ///
+    /// `squallar_geo::solar` answers in the local east-north-up frame, and box
+    /// space *is* that frame for this box — `volume.wgsl`'s `box_x_km` is
+    /// kilometres east of the anchor and `box_y_km` kilometres north — so the
+    /// three components carry across unchanged.
+    ///
+    /// **No exaggeration correction, deliberately.** Both surfaces take their
+    /// normals against the *displayed* geometry, so a box stretched 3x is lit
+    /// as the steep thing it is drawn as; correcting the light instead would
+    /// make the shading disagree with the silhouette in the same picture.
+    pub direction_box: [f32; 3],
+    /// Linear-light RGB of the direct beam, `squallar_geo::solar::sun_tint`.
+    /// Zero at and below the horizon.
+    pub beam: [f32; 3],
+    /// Linear-light RGB of the sky, `squallar_geo::solar::sky_ambient`. Never
+    /// zero, which is what makes the night floor reach a pixel.
+    pub sky: [f32; 3],
+    /// The sun's geometric elevation, degrees. Carried for the pane's own
+    /// readout.
+    pub elevation_deg: f32,
+}
+
+/// The sun over `anchor` at `unix_seconds`, or `None` on exactly the inputs
+/// `squallar_geo::solar::sun_light` refuses.
+///
+/// **One light for a whole box is an approximation, and a stated one.** The
+/// sun's hour angle runs four minutes of solar time per degree of longitude,
+/// so the two ends of the widest box this app can frame are about half an hour
+/// apart. A per-fragment sun would be a second light, which is the one thing
+/// this unit exists to prevent.
+pub fn sun_over(anchor: squallar_geo::GeoPoint, unix_seconds: f64) -> Option<SunOverBox> {
+    let sun = squallar_geo::solar::sun_light(anchor.lat, anchor.lon, unix_seconds)?;
+    let [east, north, up] = sun.direction_enu;
+    let white = zenith_white();
+    let balance = |c: [f64; 3]| {
+        let mut out = [0.0f32; 3];
+        for (slot, (value, reference)) in out.iter_mut().zip(c.into_iter().zip(white)) {
+            *slot = (value / reference) as f32;
+        }
+        out
+    };
+    Some(SunOverBox {
+        direction_box: [east as f32, north as f32, up as f32],
+        beam: balance(sun.colour),
+        sky: balance(sun.ambient),
+        elevation_deg: sun.position.elevation_deg as f32,
+    })
+}
+
+/// **The light a level surface takes under a zenith sun**, per channel — the
+/// white this renderer balances against, and the exposure `squallar_geo::solar`
+/// deliberately leaves to its consumer.
+///
+/// Dividing by it makes the sun's light *exactly* neutral and *exactly* one at
+/// the zenith, so a basemap at noon reads as the colour it was authored as and
+/// every departure from that is a real move of the sun. Two things it fixes,
+/// both measured on the shipped light style rather than argued:
+///
+/// * **Unbalanced, a noon basemap is blue.** `colour + ambient` at the zenith
+///   is `[1.25, 1.29, 1.40]` — a clear sky really does add a quarter again, and
+///   more of it in blue. The eye adapts to that outdoors and a screen does not,
+///   so `www/styles/light.json`'s near-white palette came out 0.098 blue-minus-
+///   red at a 60-degree sun, at every one of the eleven cameras.
+/// * **Unbalanced, it also clips.** Those same figures put a 0.955-albedo
+///   background at 1.19 and a 0.895 landcover at 1.12, which are both 1.0 on a
+///   screen: the style's whole tonal separation between background, landcover
+///   and water is inside 0.06 of albedo, and an unbalanced daylight flattens it
+///   to one white.
+///
+/// Derived from C1's own two ramps rather than written down, so it cannot
+/// disagree with them about what daylight is.
+fn zenith_white() -> [f64; 3] {
+    let beam = squallar_geo::solar::sun_tint(90.0);
+    let sky = squallar_geo::solar::sky_ambient(90.0);
+    let mut out = [0.0f64; 3];
+    for (slot, (b, s)) in out.iter_mut().zip(beam.into_iter().zip(sky)) {
+        // Never zero: `sun_tint(90)` is 1 in every channel by its own table's
+        // last knot, and `sky_ambient` is documented never to be zero at all.
+        *slot = b + s;
+    }
+    out
+}
+
+/// **The one place a refused instant is decided**, and it decides on the
+/// headlight.
+///
+/// `sun_light` answers `None` rather than a half-answer for a non-finite
+/// argument, a latitude that is not a place, or an instant further from J2000
+/// than about five centuries. Three answers were available and two of them are
+/// wrong. `unwrap_or(<night>)` is the worst: it is exactly the silent-night
+/// defect the `Option` was introduced to remove, and it paints a dark pane
+/// that looks like a correct 3 a.m. picture and is a refusal. Refusing to draw
+/// at all is worse than it sounds too — the instant reaching here is the
+/// volume's own collection time, and a pane that blanks because a timestamp is
+/// odd has traded the whole picture for a light.
+///
+/// So a refused instant takes **the readable light**: a complete, legible,
+/// correct picture of the volume rather than a degraded one, and the same
+/// picture the toggle's other position draws. Nothing is half-done, so this is
+/// not the silent-partial-success shape. What keeps it from being *silent* is
+/// that the pane's own control calls this same function and reports which
+/// light came back — see `ui_map::render_volume_controls`.
+pub fn volume_light(
+    accurate: bool,
+    anchor: Option<squallar_geo::GeoPoint>,
+    unix_seconds: f64,
+) -> VolumeLight {
+    if !accurate {
+        return VolumeLight::Headlight;
+    }
+    match anchor.and_then(|anchor| sun_over(anchor, unix_seconds)) {
+        Some(sun) => VolumeLight::Sun(sun),
+        None => VolumeLight::Headlight,
+    }
+}
+
+/// A volume's collection time as Unix seconds.
+///
+/// The conversion lives at the call site because `squallar-geo`'s charter
+/// forbids it a chrono dependency, so its solar API takes a plain `f64`. One
+/// spelling, here, rather than one per caller.
+pub fn unix_seconds_of(collected: chrono::NaiveDateTime) -> f64 {
+    collected.and_utc().timestamp() as f64
+}
+
 /// Everything the painter is told about one 3D pane on one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeFrameState {
@@ -115,6 +277,9 @@ pub struct VolumeFrameState {
     /// means). Read only in isosurface mode; the renderer translates it into
     /// index space against the grid's own ramp.
     pub iso_threshold: f32,
+    /// **The light this pane's ground and volume are both lit by.** See
+    /// [`VolumeLight`].
+    pub light: VolumeLight,
     /// The terrain this pane's ground should be drawn as, or `None` while no
     /// height field has landed for it — in which case the pane draws the flat
     /// map floor at box `z = 0`, exactly as it always has.

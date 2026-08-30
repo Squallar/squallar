@@ -580,10 +580,14 @@ fn unchecked_fetches_are_clamped(shader: &str) -> Result<(), String> {
         if !body.contains("textureLoad(") {
             return Err(format!("`{name}` no longer loads a texel at all"));
         }
-        // `clamp(vec2<i32>(`, not a bare `clamp(`: `ground_height` clamps its
-        // decoded VALUE into the unit cube as well, and a rule that could not
-        // tell the two apart accepted the coordinate clamp's deletion.
-        if !body.contains("clamp(vec2<i32>(") {
+        // The clamp's UPPER bound, not a bare `clamp(`: `ground_height`
+        // clamps its decoded VALUE into the unit cube as well, and a rule that
+        // could not tell the two apart accepted the coordinate clamp's
+        // deletion. It was spelled `clamp(vec2<i32>(` until C2 gave
+        // `ground_height` a signed post — the coordinate no longer needs a
+        // conversion, so the last texel is what the three fetches have in
+        // common and the value clamp does not.
+        if !body.contains("dims - vec2<i32>(1") {
             return Err(format!(
                 "`{name}` reaches a texel with no `clamp`. The march calls it \
                  before it knows whether a ground pass ran, and the placeholder \
@@ -625,7 +629,7 @@ fn every_unchecked_fetch_is_clamped_into_its_own_texture() {
 #[test]
 fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
     // (name, from, to, must be rejected)
-    let mutants: [(&str, &str, &str, bool); 4] = [
+    let mutants: [(&str, &str, &str, bool); 5] = [
         (
             "the occluder's clamp deleted, which is byte-identical on a desktop \
              adapter and undefined on GLES",
@@ -649,9 +653,16 @@ fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
         (
             "the height field's clamp deleted, in a VERTEX stage where an \
              undefined fetch moves geometry rather than a pixel",
-            "    let at = clamp(vec2<i32>(post), vec2<i32>(0), dims - vec2<i32>(1));\n    let raw = f32(textureLoad(height_texture, at, 0).r);",
-            "    let raw = f32(textureLoad(height_texture, vec2<i32>(post), 0).r);",
+            "    let at = clamp(post, vec2<i32>(0), dims - vec2<i32>(1));\n    let raw = f32(textureLoad(height_texture, at, 0).r);",
+            "    let raw = f32(textureLoad(height_texture, post, 0).r);",
             true,
+        ),
+        (
+            "CONTROL: the height field's VALUE clamp deleted, which is a real \
+             defect and is not this rule's; the rule must not answer for it",
+            "return clamp(raw * volume.occluder.z + volume.occluder.w, 0.0, 1.0);",
+            "return raw * volume.occluder.z + volume.occluder.w;",
+            false,
         ),
     ];
 

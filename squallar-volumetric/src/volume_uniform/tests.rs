@@ -55,21 +55,25 @@ fn distinct() -> VolumeUniform {
         height_scale: 1303.0,
         height_offset: 1304.0,
         ground_box: [1401.0, 1402.0, 1403.0, 1404.0],
+        sun_beam: [1501.0, 1502.0, 1503.0],
+        sky_ambient: [1601.0, 1602.0, 1603.0],
     }
 }
 
-/// The block is exactly 320 bytes, and the shader declares the same.
+/// The block is exactly 352 bytes, and the shader declares the same.
 #[test]
-fn the_block_is_two_mat4s_and_twelve_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 12 * 16);
-    assert_eq!(OFFSET_GROUND_BOX + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_two_mat4s_and_fourteen_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 14 * 16);
+    assert_eq!(OFFSET_SKY_AMBIENT + 16, VOLUME_UNIFORM_BYTES);
     // The growth is append-only: every offset that existed before the ground
-    // pass is still where it was, which is what let the block grow twice —
-    // 224 to 304 at B1, 304 to 320 at B3 — without a single lane of the march
-    // moving.
+    // pass is still where it was, which is what let the block grow three times
+    // — 224 to 304 at B1, 304 to 320 at B3, 320 to 352 at C2 — without a
+    // single lane of the march moving.
     assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, OFFSET_CLIP_FROM_BOX);
     assert_eq!(OFFSET_CLIP_FROM_BOX + 64, OFFSET_OCCLUDER);
     assert_eq!(OFFSET_OCCLUDER + 16, OFFSET_GROUND_BOX);
+    assert_eq!(OFFSET_GROUND_BOX + 16, OFFSET_SUN_BEAM);
+    assert_eq!(OFFSET_SUN_BEAM + 16, OFFSET_SKY_AMBIENT);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -82,7 +86,7 @@ fn the_block_is_two_mat4s_and_twelve_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (2, 12),
+        (2, 14),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -118,6 +122,8 @@ fn the_shader_declares_the_members_in_the_order_this_file_packs_them() {
         "clip_from_box",
         "occluder",
         "ground_box",
+        "sun_beam",
+        "sky_ambient",
     ] {
         let needle = format!("{member}:");
         let found = declaration[at..].find(&needle).unwrap_or_else(|| {
@@ -150,7 +156,7 @@ fn every_lane_lands_at_its_std140_offset() {
     );
 
     // The offsets themselves, as literals.
-    // An array rather than a tuple: fourteen members is past the arity `Debug`
+    // An array rather than a tuple: sixteen members is past the arity `Debug`
     // is implemented for, and a failure that cannot print the two sides is a
     // failure a reader cannot act on.
     assert_eq!(
@@ -169,9 +175,11 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_CLIP_FROM_BOX,
             OFFSET_OCCLUDER,
             OFFSET_GROUND_BOX,
+            OFFSET_SUN_BEAM,
+            OFFSET_SKY_AMBIENT,
         ],
         [
-            0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288, 304
+            0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288, 304, 320, 336
         ],
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
@@ -222,6 +230,16 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_GROUND_BOX,
             [1401.0, 1402.0, 1403.0, 1404.0],
             "ground_box",
+        ),
+        (
+            OFFSET_SUN_BEAM,
+            [1501.0, 1502.0, 1503.0, 0.0],
+            "sun_beam + a reserved zero",
+        ),
+        (
+            OFFSET_SKY_AMBIENT,
+            [1601.0, 1602.0, 1603.0, 0.0],
+            "sky_ambient + a reserved zero",
         ),
     ] {
         let lane = offset / 4;
@@ -610,6 +628,89 @@ fn the_shader_gates_the_occluder_on_the_scale_lane_being_positive() {
         shader.contains("span.y = min(span.y, ground_t);"),
         "the march no longer clips its span against the ground, so the ground \
          pass draws an occluder nothing consumes",
+    );
+}
+
+/// **There is one light, and every surface reads it through one function.**
+///
+/// The structural half of C2, and it is a source scan rather than a picture
+/// because the picture cannot see it: a shader in which the ground read
+/// `sun_beam` and the march read a second lane would draw a perfectly
+/// plausible frame in which the two surfaces were lit differently, and every
+/// pixel of it would be defensible on its own.
+///
+/// Three claims, all of them about `volume.wgsl`:
+///
+/// * the two colour lanes are named **only** inside `lit`;
+/// * the direction lane is named only inside the three response functions;
+/// * `lit` is called by all four things that carry colour — the ground mesh's
+///   fragment, the map lid, the march's accumulation and the isosurface.
+///
+/// The picture criteria live in `squallar-gpu/tests/volume_light.rs`, which is
+/// `#[ignore]`d because it needs a real adapter.
+#[test]
+fn neither_surface_can_be_lit_by_a_light_the_other_does_not_have() {
+    let shader = include_str!("../volume.wgsl");
+
+    // The body of a top-level `fn`, by its own closing brace at column zero.
+    let body_of = |name: &str| -> String {
+        let at = shader
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("`{name}` is gone from volume.wgsl"));
+        let rest = &shader[at..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("`{name}` has no closing brace"));
+        rest[..end].to_owned()
+    };
+
+    for lane in ["volume.sun_beam", "volume.sky_ambient"] {
+        let total = shader.matches(lane).count();
+        let inside = body_of("lit").matches(lane).count();
+        assert_eq!(
+            (total, inside),
+            (1, 1),
+            "`{lane}` is named {total} time(s) in volume.wgsl and {inside} of \
+             them are inside `lit`. A second reader of a light lane is how a \
+             frame comes to hold two lights: the picture stays plausible \
+             everywhere and no rendering criterion can see it",
+        );
+    }
+
+    let direction = "volume.light_dir_ambient.xyz";
+    let readers: usize = ["ground_response", "shading", "iso_shading"]
+        .iter()
+        .map(|name| body_of(name).matches(direction).count())
+        .sum();
+    assert_eq!(
+        (shader.matches(direction).count(), readers),
+        (3, 3),
+        "the light's DIRECTION is read somewhere other than the three \
+         functions that turn it into a surface's response. Those three are the \
+         whole of the difference between how the ground and the volume take \
+         the light, and a fourth reader is a fourth answer",
+    );
+
+    // `lit(` at a call site: not its own definition, and not the tail of a
+    // longer identifier. `vs_blit(` ends in `lit(` and was counted as a fifth
+    // caller until this took the preceding byte into account.
+    let calls = shader
+        .match_indices("lit(")
+        .filter(|(at, _)| {
+            shader[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+        .count()
+        - shader.matches("fn lit(").count();
+    assert_eq!(
+        calls, 4,
+        "`lit` is called {calls} times, not by all four things that carry \
+         colour: the mesh's fragment, the map lid, the march's accumulation \
+         and the isosurface. A surface that stopped calling it would keep its \
+         geometry and lose its light, which is what \
+         `volume_light.rs`'s own control constructs",
     );
 }
 

@@ -38,7 +38,11 @@ struct Volume {
     // product's isosurface measures from, in 0-1 index units, negative for a
     // sequential product. Isosurface mode only.
     grid_dims: vec4<f32>,
-    // xyz: unit light direction in box space. w: the ambient term, 0..1.
+    // xyz: unit vector from a lit surface TOWARD the light, in box space -
+    // which for this box is the local east-north-up frame, since box_x_km is
+    // kilometres east and box_y_km kilometres north. w: the march's wrap
+    // floor, 0..1 - the fraction of the BEAM a voxel facing away still takes,
+    // and never the sky, which rides its own lane below.
     light_dir_ambient: vec4<f32>,
     // x: extinction per km at LUT alpha 1. z: transmittance at which the march
     // stops early. w: the ramp's width above y, in 0-1 index units; 0 is hard. y:
@@ -92,6 +96,15 @@ struct Volume {
     // covers, which is where its heights are true, rather than stretched over
     // a box it was never resampled for.
     ground_box: vec4<f32>,
+    // xyz: linear-light RGB of the DIRECT BEAM, applied through each surface's
+    // own directional response and identically zero once the sun has set. w:
+    // reserved, zero.
+    sun_beam: vec4<f32>,
+    // xyz: linear-light RGB of the SKY, applied with no cosine at all, because
+    // scattered light arrives from the whole hemisphere - and because a term
+    // inside the cosine is zero everywhere the sun is down, which would make
+    // every twilight and night colour unreachable. w: reserved, zero.
+    sky_ambient: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
@@ -322,6 +335,68 @@ fn field_at(p: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(texel.r / max(texel.g, COVERAGE_EPSILON), texel.g);
 }
 
+// ---------------------------------------------------------------------------
+// The one light.
+// ---------------------------------------------------------------------------
+//
+// **Ground, map lid and volume all reach the light through `lit`, and nothing
+// else in this file reads `sun_beam`, `sky_ambient` or `light_dir_ambient.xyz`
+// at all.** That is the whole of C2's structural claim: there is one uniform
+// and one function, so a frame in which the terrain is under a sunset and the
+// storm above it is under a studio lamp is not a bug to be found, it is an
+// arithmetic that cannot be written. `volume_light.rs` forces the failing
+// control - a build where only one surface takes the tint - and requires it to
+// go red.
+
+// Below this level cosine the light is grazing enough that dividing by it in
+// `ground_response` amplifies noise rather than relief. sin(5 degrees).
+const LEVEL_COSINE_FLOOR: f32 = 0.0871557;
+
+// The most of the level-ground beam one slope may take. At a low sun a face
+// square to the beam really does receive many times what level ground does -
+// this is the alpenglow that makes a sunset ridge read - but `1 / L.z` runs
+// away without a bound, and the beam is already near its brightest at 2
+// degrees. Two is a chosen exposure, not a measurement.
+const SLOPE_RESPONSE_CEILING: f32 = 2.0;
+
+// The light on a surface whose albedo is `albedo` and whose directional
+// response to the beam is `response`.
+//
+// `albedo * (beam * response + sky)` — the arithmetic
+// `squallar_geo::solar::SunLight` documents, and the reason the sky is a
+// separate term rather than a floor folded into `response`: a term inside the
+// cosine is zero everywhere the sun is down, which would make every twilight
+// and night colour unreachable no matter what the ramp said.
+//
+// Under the readable light the beam is exactly one and the sky exactly zero,
+// so this collapses to `albedo * response` and every picture drawn before C2
+// comes back bit-identical.
+fn lit(albedo: vec3<f32>, response: f32) -> vec3<f32> {
+    return albedo * (volume.sun_beam.xyz * response + volume.sky_ambient.xyz);
+}
+
+// An opaque surface's response to the beam: its cosine RELATIVE to the cosine
+// level ground takes.
+//
+// **Relative, not the bare `N.L`, and the reason is that the beam's colour is
+// already a function of solar elevation.** `sun_tint` reddens and then
+// vanishes toward the horizon because it integrates the air mass the beam
+// crossed; a bare cosine on level ground would dim by `sin(elevation)` a
+// second time and the basemap would be black an hour before sunset. Relative
+// to level ground the two compose once each — the ramp carries how much light
+// there is, this carries how much of it this piece of ground is turned toward
+// — and it is what makes the FLAT map lid's response exactly one, so the lid
+// under the readable light is the lid this renderer always drew.
+//
+// It also makes relief contrast scale with the sun the way it does outdoors:
+// the divisor shrinks as the sun drops, so a ridge that is barely modelled at
+// noon is dramatic at 6 degrees.
+fn ground_response(normal: vec3<f32>) -> f32 {
+    let l = normalize(volume.light_dir_ambient.xyz);
+    let level = max(l.z, LEVEL_COSINE_FLOOR);
+    return clamp(dot(normal, l) / level, 0.0, SLOPE_RESPONSE_CEILING);
+}
+
 // The premultiplied channel alone — `coverage x index` — which the lit volume's
 // gradient is taken of, **not** the reconstructed index: at an echo edge this falls
 // continuously to zero while the index stays a real mean of real neighbours, so it is
@@ -452,7 +527,7 @@ fn iso_shading(p: vec3<f32>) -> f32 {
 fn iso_surface_colour(p: vec3<f32>) -> vec3<f32> {
     let index = field_at(p).x;
     let entry = textureSampleLevel(lut_texture, lut_sampler, lut_coord(index), 0.0);
-    return linear_from_gamma_rgb(entry.rgb) * iso_shading(p);
+    return lit(linear_from_gamma_rgb(entry.rgb), iso_shading(p));
 }
 
 // ---------------------------------------------------------------------------
@@ -620,11 +695,55 @@ fn ground_posts() -> vec2<u32> {
 // The `clamp` on the coordinate is the same rule the group-2 fetches obey:
 // `BoundsCheckPolicy` is `Unchecked` on GLES, so an out-of-range `texelFetch`
 // is undefined, and the placeholder bound when no field has landed is 1x1.
-fn ground_height(post: vec2<u32>) -> f32 {
+// **Signed**, so the normal's central difference can ask post 0 for its
+// western neighbour. A `u32` spelling would wrap -1 to 4294967295 and the
+// clamp would answer the field's EAST rim, which is a plausible height from
+// the wrong side of the box.
+fn ground_height(post: vec2<i32>) -> f32 {
     let dims = vec2<i32>(textureDimensions(height_texture));
-    let at = clamp(vec2<i32>(post), vec2<i32>(0), dims - vec2<i32>(1));
+    let at = clamp(post, vec2<i32>(0), dims - vec2<i32>(1));
     let raw = f32(textureLoad(height_texture, at, 0).r);
     return clamp(raw * volume.occluder.z + volume.occluder.w, 0.0, 1.0);
+}
+
+// The mesh's outward unit normal at a post, in the DISPLAYED metric — the same
+// space `shading` takes the volume's normals in, so the two surfaces are lit
+// off geometry of one shape.
+//
+// A central difference over the post grid divided by the ground distance
+// between the posts it was taken over, so the slope is a rise over a run in
+// kilometres rather than a per-post difference that changes meaning with the
+// post count. The rise carries `box_size_km.w`, the vertical exaggeration, for
+// the reason the volume's does: the camera is shown a stretched box, and a
+// ridge drawn three times as steep as it is has to be lit as the ridge it is
+// drawn as or the shading contradicts the silhouette.
+//
+// The separation is measured rather than assumed to be two posts: at the
+// field's rim the clamp folds one side onto the centre, so the difference
+// there is over one post spacing and dividing it by two would halve the slope
+// along the whole edge.
+fn ground_normal(post: vec2<i32>) -> vec3<f32> {
+    let posts = vec2<i32>(ground_posts());
+    let lo = max(post - vec2<i32>(1), vec2<i32>(0));
+    let hi = min(post + vec2<i32>(1), posts - vec2<i32>(1));
+    let steps = vec2<f32>(hi - lo);
+    // The FIELD's own footprint in kilometres, not the drawn box's: they are
+    // the same only while `ground_box` is the identity, and a field standing
+    // in for an older box covers a sub-rectangle of it.
+    let span_km = vec2<f32>(
+        volume.box_size_km.x * volume.ground_box.x,
+        volume.box_size_km.y * volume.ground_box.y,
+    );
+    let run_km = steps * span_km / max(vec2<f32>(posts), vec2<f32>(1.0));
+    let rise_km = volume.box_size_km.z * volume.box_size_km.w;
+    let east = ground_height(vec2<i32>(hi.x, post.y)) - ground_height(vec2<i32>(lo.x, post.y));
+    let north = ground_height(vec2<i32>(post.x, hi.y)) - ground_height(vec2<i32>(post.x, lo.y));
+    // A one-post field has no run to divide by, and no rise either: `hi` and
+    // `lo` fold onto the same texel, so the differences above are exactly zero
+    // and the floored divisor turns an indeterminate form into a level normal
+    // rather than into a `normalize` of infinities.
+    let slope = vec2<f32>(east, north) * rise_km / max(run_km, vec2<f32>(1e-9));
+    return normalize(vec3<f32>(-slope.x, -slope.y, 1.0));
 }
 
 // Which post grid column `column` samples, and where that column sits along its
@@ -679,6 +798,13 @@ struct GroundVertex {
     // per-vertex `t` would be wrong across a triangle however it were
     // interpolated. The position is affine, so this is exact.
     @location(0) box_p: vec3<f32>,
+    // The surface normal, at the post's own rate. Taken per VERTEX rather than
+    // per fragment because one post is one texel by construction, so the field
+    // has no detail between posts for a per-fragment difference to find - it
+    // would be four more `textureLoad`s a pixel to reconstruct the same plane.
+    // Re-normalised in the fragment, since interpolating unit vectors does not
+    // preserve their length.
+    @location(1) normal: vec3<f32>,
 }
 
 // A fixed-topology grid with **no vertex or index buffer at all**: positions
@@ -713,15 +839,21 @@ fn vs_ground(@builtin(vertex_index) vid: u32) -> GroundVertex {
     // The field's own footprint placed in the drawn box, the apron carrying it
     // out to the box's edge. The placement is the identity while the two are
     // the same box, which is every settled frame.
+    let at = vec2<i32>(post);
     let p = vec3<f32>(
         box_axis(column.x, posts.x, volume.ground_box.x, volume.ground_box.z),
         box_axis(column.y, posts.y, volume.ground_box.y, volume.ground_box.w),
-        ground_height(post),
+        ground_height(at),
     );
 
     var out: GroundVertex;
     out.clip_position = volume.clip_from_box * vec4<f32>(p, 1.0);
     out.box_p = p;
+    // The apron ring repeats its rim post's height, and it takes that post's
+    // normal with it. Half a post spacing wide, so the alternative - a level
+    // normal, honest about the apron's own flatness - would buy a shading seam
+    // right along the box edge for a strip too narrow to read.
+    out.normal = ground_normal(at);
     return out;
 }
 
@@ -747,11 +879,21 @@ fn fs_ground(in: GroundVertex) -> GroundTargets {
     let ground = map_colour_at_km(box_x_km(in.box_p.x), box_y_km(in.box_p.y));
     var out: GroundTargets;
     out.occluder = vec4<f32>(pack24(t / max(volume.occluder.x, 1e-6)), 1.0);
+    // **The light, on the drape.** A basemap under a sunset reads as lit by
+    // the sunset, which is the point - and the relief the mesh has is only
+    // visible at all because the cosine varies across it. `lit` is the same
+    // function the march and the lid call, off the same lanes.
+    //
     // Alpha is the MIRROR's, not 1: off the mirror there is no map to drape
     // with, and painting an opaque untextured sheet there would be a wall of
     // flat colour across ground the pane is not showing. It is the same answer
-    // `map_colour_at_km` gives the lid in the same place.
-    out.colour = ground;
+    // `map_colour_at_km` gives the lid in the same place. The light multiplies
+    // the colour only, so an absent map stays absent rather than becoming a
+    // dark map.
+    out.colour = vec4<f32>(
+        lit(ground.rgb, ground_response(normalize(in.normal))),
+        ground.a,
+    );
     return out;
 }
 
@@ -819,7 +961,21 @@ fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
 // first, and the lid and the terrain cannot be registered differently.
 fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let hit = eye + direction * t;
-    return map_colour_at_km(box_x_km(hit.x), box_y_km(hit.y));
+    let map = map_colour_at_km(box_x_km(hit.x), box_y_km(hit.y));
+    // **The lid takes the same light as the mesh, at the one normal a plane at
+    // z = 0 has.** Not an exemption and not a second arm: a lid that skipped
+    // `lit` would leave a neutral basemap under a sunset-lit storm, which is
+    // the same two-pictures failure as an unlit volume and is the one that
+    // ships TODAY, because no pane has a height field yet and the lid is the
+    // only ground a pane draws.
+    //
+    // `ground_response` of straight up is exactly one whenever the light is
+    // above `LEVEL_COSINE_FLOOR`, so under the readable light this line is a
+    // multiply by one and the lid is the lid this renderer always drew.
+    return vec4<f32>(
+        lit(map.rgb, ground_response(vec3<f32>(0.0, 0.0, 1.0))),
+        map.a,
+    );
 }
 
 // The ground this ray lands on: the MESH's own colour where it drew, and the
@@ -981,9 +1137,19 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
             // The table is gamma-encoded (`get_color_for_value`); accumulation is
             // physical, so decode first.
             var colour = linear_from_gamma_rgb(entry.rgb);
+            // The response, then the light. `shading` is seven fetches, so
+            // the branch stays a branch rather than becoming a `select`, which
+            // WGSL evaluates both arms of. With the gradient off the medium
+            // has no directional response at all and takes the whole beam —
+            // which is a response of one, not "no light": a volume that
+            // skipped `lit` here would be the neutral-white storm over a
+            // sunset ground that this unit exists to prevent, and the shading
+            // rung is chosen by the quality fit rather than by the user.
+            var response = 1.0;
             if shade {
-                colour = colour * shading(p);
+                response = shading(p);
             }
+            colour = lit(colour, response);
             // 0 at the skip threshold, 1 at `transfer.w` index units above it,
             // smoothstep between. It scales the OPTICAL DEPTH, not the accumulated
             // alpha, so a saturating extinction still saturates; at `transfer.w = 0`

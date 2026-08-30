@@ -30,6 +30,19 @@ pub(crate) const VOLUME_SIDEBAR_HEADER: &str = "\u{26f6}  3D view";
 /// The Map floor checkbox's label.
 pub(crate) const MAP_FLOOR_LABEL: &str = "Map floor";
 
+/// The accurate-sun toggle's label. Phrased as what it turns ON, like every
+/// other checkbox here, even though the pane stores the negative.
+pub(crate) const SUN_LIGHT_LABEL: &str = "Sunlight";
+
+/// What the sun control says when the pane asked for the sun and the arithmetic
+/// refused the volume's own timestamp.
+///
+/// It names what the picture IS rather than apologising: the readable light is
+/// a whole correct picture, not a degraded one, and the reader can act on this
+/// by scrubbing to another volume or by leaving the box unticked.
+pub(crate) const SUN_UNPLACEABLE_NOTE: &str = "The sun cannot be placed for this volume's site and time, so the pane is under the \
+     readable light.";
+
 /// What the sidebar says when the Map floor checkbox cannot produce anything.
 pub(crate) const MAP_FLOOR_INERT_NOTE: &str =
     "No floor yet - nothing is being drawn to stand it under:";
@@ -2071,6 +2084,7 @@ fn volume_pane_outcome(
     volume.camera.nudge(delta);
     let camera = volume.camera;
     let floor = !volume.hide_floor;
+    let accurate_light = !volume.readable_light;
 
     let Some(painter) = painter else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
@@ -2098,6 +2112,16 @@ fn volume_pane_outcome(
         None => pane.volume_target_for(&product, volume_stamp),
     };
     let collected = target.volume.collected;
+    // **The one light both surfaces get**, off the volume's own collection
+    // time rather than the pane's playhead: `TimeMode::as_of` is `None` on a
+    // live pane by design, which is the commonest pane there is, and the
+    // volume's collection time is what the picture actually depicts whether
+    // the pane is live or scrubbed.
+    let light = crate::volume_view::volume_light(
+        accurate_light,
+        crate::pane::volume_box_anchor(region, site_geo),
+        crate::volume_view::unix_seconds_of(collected),
+    );
     // **The level trigger, and the whole of it.** `volume_build_due` holds
     // all three refusals — not in Volume mode, playing a 3D loop, already
     // rendered for this target — and the arrival path asks the same function
@@ -2132,6 +2156,7 @@ fn volume_pane_outcome(
         // to substitute the default field's key for an unregistered one.
         alpha: alpha_curves.get(&product),
         view_mode,
+        light,
         iso_threshold: iso_thresholds.get(&product),
         heights: pane_ground_heights(pane, pane_idx),
     }) {
@@ -2185,6 +2210,13 @@ pub(crate) fn render_volume_controls(
     drawing_nothing: Option<&str>,
 ) {
     let product = pane.selected_product();
+    // Read before the pane is borrowed mutably. The sun's own answer needs the
+    // site, and the site belongs to the pane rather than to its 3D half.
+    let site_geo =
+        squallar_radar::sites::get_radar_site(pane.site()).map(|site| squallar_geo::GeoPoint {
+            lat: site.lat,
+            lon: site.lon,
+        });
     let Some(volume) = pane.volume_mut() else {
         return;
     };
@@ -2285,6 +2317,56 @@ pub(crate) fn render_volume_controls(
                     .small()
                     .weak(),
                 );
+            }
+        }
+
+        let mut sunlight = !volume.readable_light;
+        if ui
+            .checkbox(&mut sunlight, SUN_LIGHT_LABEL)
+            .on_hover_text(
+                "Lights the ground and the storm above it by the real sun, from where the box \
+                 is on Earth and when the volume was collected - warm and low near sunrise \
+                 and sunset, cool and dim through twilight, and down to a night floor the \
+                 terrain still reads by. One light, so the two surfaces always agree. Turn it \
+                 off for the fixed studio light, which is dimmer nowhere and is the readable \
+                 choice at night.",
+            )
+            .changed()
+        {
+            volume.readable_light = !sunlight;
+        }
+        // **What the picture is actually under, not what was asked for.** The
+        // arithmetic refuses a timestamp it cannot honour rather than
+        // answering a plausible night, and the pane then draws under the
+        // readable light. Saying so here is what stops that being a silent
+        // substitution; it is read off the volume the pane has ON SCREEN, so
+        // it describes the picture rather than the next one.
+        if let Some(collected) = volume.rendered_for.as_ref().map(|t| t.volume.collected) {
+            let light = crate::volume_view::volume_light(
+                sunlight,
+                crate::pane::volume_box_anchor(volume.region, site_geo),
+                crate::volume_view::unix_seconds_of(collected),
+            );
+            match light {
+                crate::volume_view::VolumeLight::Sun(sun) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Sun {:.1}\u{b0} {} the horizon.",
+                            sun.elevation_deg.abs(),
+                            if sun.elevation_deg >= 0.0 {
+                                "above"
+                            } else {
+                                "below"
+                            },
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                crate::volume_view::VolumeLight::Headlight if sunlight => {
+                    ui.label(egui::RichText::new(SUN_UNPLACEABLE_NOTE).small().weak());
+                }
+                crate::volume_view::VolumeLight::Headlight => {}
             }
         }
 
