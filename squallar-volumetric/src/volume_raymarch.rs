@@ -6,6 +6,7 @@ use crate::VOLUME_TEXTURE_FORMAT;
 use crate::blue_noise::{BLUE_NOISE_EDGE, blue_noise_tile};
 use crate::uniform::{VOLUME_UNIFORM_BYTES, VolumeUniform};
 use squallar_device_profile::constants::{VOLUME_LUT_BYTES, VOLUME_TEXTURE_BUDGET_BYTES};
+use squallar_device_profile::quality::{FittedOffscreen, GroundPass, ResolutionRung};
 use squallar_gpu::egui_renderer::AttachmentConfig;
 use staging::VolumeStaging;
 
@@ -28,6 +29,10 @@ pub const RAYMARCH_STEP_CELLS: f32 = 1.0;
 pub const ENTRY_VS_RAYMARCH: &str = "vs_raymarch";
 /// Fragment entry point of the raymarch.
 pub const ENTRY_FS_RAYMARCH: &str = "fs_raymarch";
+/// Vertex entry point of the ground pass: the procedural grid.
+pub const ENTRY_VS_GROUND: &str = "vs_ground";
+/// Fragment entry point of the ground pass: the occluder and the drape.
+pub const ENTRY_FS_GROUND: &str = "fs_ground";
 /// Vertex entry point of the compositing quad.
 pub const ENTRY_VS_BLIT: &str = "vs_blit";
 /// Fragment entry point of the quad on a **non-sRGB** target: pass-through.
@@ -36,9 +41,15 @@ pub const ENTRY_FS_BLIT_GAMMA: &str = "fs_blit_gamma_framebuffer";
 pub const ENTRY_FS_BLIT_LINEAR: &str = "fs_blit_linear_framebuffer";
 
 /// Every entry point in [`VOLUME_SHADER_WGSL`], with the stage it belongs to.
-pub const ENTRY_POINTS: [(&str, ShaderStage); 5] = [
+///
+/// This list is what pulls a stage into the GLSL ES 300 gate: an entry point it
+/// omits is never translated by `volume_shader.rs` and reaches a WebGL2 browser
+/// having been checked by nothing.
+pub const ENTRY_POINTS: [(&str, ShaderStage); 7] = [
     (ENTRY_VS_RAYMARCH, ShaderStage::Vertex),
     (ENTRY_FS_RAYMARCH, ShaderStage::Fragment),
+    (ENTRY_VS_GROUND, ShaderStage::Vertex),
+    (ENTRY_FS_GROUND, ShaderStage::Fragment),
     (ENTRY_VS_BLIT, ShaderStage::Vertex),
     (ENTRY_FS_BLIT_GAMMA, ShaderStage::Fragment),
     (ENTRY_FS_BLIT_LINEAR, ShaderStage::Fragment),
@@ -83,8 +94,111 @@ pub const BINDING_FLOOR_SAMPLER: u32 = 1;
 /// The format the **placeholder** mirror is created with, and nothing else.
 pub const FLOOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// The ground pass's outputs, read back by the raymarch in **group 2**.
+///
+/// Group 2 and not group 0: group 0 is per-*grid* and these two are
+/// per-*offscreen*, recreated with it. Binding them at group 0 would tie a
+/// per-target texture's lifetime to a per-grid bind group and desynchronise
+/// the two. Group 2 also means the existing binding-map slot assertions do not
+/// move — the occluder takes texture slot 4, after the floor's 3.
+pub const BINDING_OCCLUDER_TEXTURE: u32 = 0;
+/// See [`BINDING_OCCLUDER_TEXTURE`].
+pub const BINDING_GROUND_TEXTURE: u32 = 1;
+
 /// The format the raymarch renders into.
 pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The format the occluder is written and read in: the packed ray parameter
+/// across RGB, the hit flag in A.
+///
+/// **Not a depth texture, and that is the constraint this whole design is shaped
+/// by.** naga hard-errors on `textureLoad` from depth; `textureSampleLevel` on
+/// one emits a `sampler2DShadow` `textureLod` overload that does not exist in
+/// GLSL ES 3.00 and fails silently at driver compile; `READ_ONLY_DEPTH_STENCIL`
+/// is never set by the GLES adapter; and depth-to-buffer copies are
+/// unsupported. `no_entry_point_emits_a_shadow_sampler` is the tripwire that
+/// stops the depth route being reintroduced.
+pub const OCCLUDER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The format the ground pass's colour target is written and read in.
+///
+/// A second colour attachment is not optional: the raymarch pass *clears* the
+/// offscreen and its pipeline declares `blend: None`, so anything the ground
+/// wrote there would be destroyed before the march ran. MRT is available at the
+/// floor — `max_color_attachments: 4` and
+/// `max_color_attachment_bytes_per_sample: 32` in `downlevel_defaults()`,
+/// inherited by `downlevel_webgl2_defaults()`; two `Rgba8Unorm` targets is 8
+/// bytes. `INDEPENDENT_BLEND` is conditional on GLES so both share one blend
+/// state, which costs nothing here because the ground pass does not blend.
+pub const GROUND_COLOUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// The ground pass's own depth attachment. It never leaves this crate:
+/// `AttachmentConfig::depth_format` stays `None` and egui's own pass carries no
+/// depth, which two pin tests scrape for.
+pub const GROUND_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Posts along each axis of the procedural ground grid.
+///
+/// Must equal the shader's own `GROUND_POSTS`, pinned by
+/// `the_shader_and_the_ground_post_count_agree`. Fixed here; B4's level of
+/// detail makes it a rung and re-fits the field to the camera's footprint.
+pub const GROUND_POSTS: u32 = 512;
+
+/// The stand-in ground's straight **linear** RGB, mirroring the shader's
+/// `GROUND_STAND_IN_COLOUR`. B3 replaces it with the map drape.
+pub const GROUND_STAND_IN_COLOUR: [f32; 3] = [0.35, 0.22, 0.10];
+
+/// Width of the analytic stand-in ridge, as a fraction of the box's east-west
+/// extent. Mirrors the shader's `GROUND_RIDGE_SIGMA`.
+pub const GROUND_RIDGE_SIGMA: f32 = 0.12;
+
+/// The stand-in height field, in box `z`, mirroring the shader's
+/// `ground_height` so a host oracle can predict what the mesh drew.
+///
+/// **Clamped into the unit cube, as the shader's copy is.** See the comment
+/// there: [`VolumeUniform::t_scale_for`]'s corner bound is only sound while
+/// every post is inside the cube, and the amplitude is a plain lane.
+pub fn ground_height(uv: [f32; 2], amplitude: f32) -> f32 {
+    let d = (uv[0] - 0.5) / GROUND_RIDGE_SIGMA;
+    (amplitude * (-0.5 * d * d).exp()).clamp(0.0, 1.0)
+}
+
+/// Vertices the ground draw issues: two triangles per cell of a
+/// [`GROUND_POSTS`]-square grid, from `@builtin(vertex_index)` alone.
+pub fn ground_vertex_count() -> u32 {
+    let cells = GROUND_POSTS - 1;
+    6 * cells * cells
+}
+
+/// A 0-1 value across 24 bits of an `Rgba8Unorm`'s RGB, most significant first
+/// — the Rust mirror of the shader's `pack24`.
+///
+/// Floor-based, so every digit is an integer over 255 and the format stores it
+/// without rounding. A rounding pack would come back a whole digit out at the
+/// carries.
+pub fn pack24(v: f32) -> [f32; 3] {
+    let x = v.clamp(0.0, 1.0) * 16_777_215.0;
+    let hi = (x * (1.0 / 65536.0)).floor();
+    let mid = ((x - hi * 65536.0) * (1.0 / 256.0)).floor();
+    let lo = (x - hi * 65536.0 - mid * 256.0).floor();
+    [hi / 255.0, mid / 255.0, lo / 255.0]
+}
+
+/// The Rust mirror of the shader's `unpack24`.
+pub fn unpack24(c: [f32; 3]) -> f32 {
+    let digit = |v: f32| (v * 255.0).round();
+    (digit(c[0]) * 65536.0 + digit(c[1]) * 256.0 + digit(c[2])) * (1.0 / 16_777_215.0)
+}
+
+/// [`unpack24`] over the bytes a readback actually yields.
+pub fn unpack24_bytes(rgb: [u8; 3]) -> f32 {
+    (f32::from(rgb[0]) * 65536.0 + f32::from(rgb[1]) * 256.0 + f32::from(rgb[2]))
+        * (1.0 / 16_777_215.0)
+}
+
+/// Codes the 24-bit packing has: the quantum every round-trip is judged
+/// against.
+pub const PACK24_CODES: u32 = 16_777_215;
 
 /// The format the colour table is uploaded as.
 pub const LUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -139,9 +253,11 @@ fn label(what: &str) -> String {
 /// Everything a volume draw needs that does not depend on the data or the pane.
 pub struct VolumePipelines {
     raymarch: wgpu::RenderPipeline,
+    ground: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     volume_layout: wgpu::BindGroupLayout,
     floor_layout: wgpu::BindGroupLayout,
+    occluder_layout: wgpu::BindGroupLayout,
     blit_layout: wgpu::BindGroupLayout,
     quad: wgpu::Buffer,
     grid_sampler: wgpu::Sampler,
@@ -152,6 +268,10 @@ pub struct VolumePipelines {
     /// The raymarch's layout is total either way, and the shader's floor arm
     /// stays dead until `flags.w` turns it on.
     empty_floor: PaneMirror,
+    /// What binds at group 2 when this pane's offscreen carries no ground
+    /// attachments: one texel of each, zero-initialised, so the alpha the march
+    /// tests reads as "no ground here". The layout stays total either way.
+    empty_occluder: wgpu::BindGroup,
     blit_entry_point: &'static str,
 }
 
@@ -178,7 +298,10 @@ impl VolumePipelines {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: BINDING_UNIFORM,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // The ground pass's VERTEX stage reads this same block —
+                    // the camera the mesh is drawn through and the camera the
+                    // march unprojects through are one buffer, deliberately.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -262,6 +385,34 @@ impl VolumePipelines {
                     binding: BINDING_FLOOR_SAMPLER,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // Two textures, no samplers: both are reached with `textureLoad`, at a
+        // 1:1 texel-to-pixel invariant, so no filterability question arises.
+        let occluder_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&label("occluder.layout")),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: BINDING_OCCLUDER_TEXTURE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: BINDING_GROUND_TEXTURE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -359,7 +510,18 @@ impl VolumePipelines {
         let raymarch_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&label("raymarch.pipeline_layout")),
-                bind_group_layouts: &[Some(&volume_layout), Some(&floor_layout)],
+                bind_group_layouts: &[
+                    Some(&volume_layout),
+                    Some(&floor_layout),
+                    Some(&occluder_layout),
+                ],
+                immediate_size: 0,
+            });
+        // Group 0 alone: the ground stages read the uniform and nothing else.
+        let ground_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&label("ground.pipeline_layout")),
+                bind_group_layouts: &[Some(&volume_layout)],
                 immediate_size: 0,
             });
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -392,6 +554,58 @@ impl VolumePipelines {
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let ground = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&label("ground")),
+            layout: Some(&ground_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(ENTRY_VS_GROUND),
+                compilation_options: Default::default(),
+                // **A genuinely empty slice, never a zero-attribute
+                // `VertexBufferLayout`.** A layout with no attributes still
+                // pushes a vertex step and would then demand a bound buffer at
+                // draw time. Empty: pipeline creation loops zero times, the
+                // draw check is `0 < 0`, the GLES backend leaves
+                // `dirty_vbuf_mask` at zero and skips attribute setup, and naga
+                // emits `uint(gl_VertexID)` ungated.
+                buffers: &[],
+            },
+            // The same rasterisation as the quad, `cull_mode: None` included:
+            // the grid's winding flips with the camera's side, and a culled
+            // underside is a hole rather than a saving.
+            primitive: QUAD_PRIMITIVE,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: GROUND_DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(ENTRY_FS_GROUND),
+                compilation_options: Default::default(),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: OCCLUDER_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: GROUND_COLOUR_FORMAT,
+                        // `INDEPENDENT_BLEND` is conditional on GLES, so both
+                        // targets share one state; `None` on both is what makes
+                        // that free rather than a compromise.
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             multiview_mask: None,
             cache: None,
@@ -431,12 +645,15 @@ impl VolumePipelines {
         // this constructor deliberately does not take is not needed for it.
         let empty_floor =
             create_pane_mirror(device, &floor_layout, &floor_sampler, [1, 1], FLOOR_FORMAT);
+        let empty_occluder = create_empty_occluder(device, &occluder_layout);
 
         Self {
             raymarch,
+            ground,
             blit,
             volume_layout,
             floor_layout,
+            occluder_layout,
             blit_layout,
             quad,
             grid_sampler,
@@ -444,6 +661,7 @@ impl VolumePipelines {
             floor_sampler,
             blit_sampler,
             empty_floor,
+            empty_occluder,
             blit_entry_point,
         }
     }
@@ -513,8 +731,10 @@ impl VolumePipelines {
         self.blit_entry_point
     }
 
-    /// A target of `size` texels, with the bind group the blit reads it through.
-    pub fn create_offscreen(&self, device: &wgpu::Device, size: [u32; 2]) -> OffscreenTarget {
+    /// A target for `plan`, with the bind group the blit reads it through and,
+    /// when the plan asks for it, the ground pass's three attachments.
+    pub fn create_offscreen(&self, device: &wgpu::Device, plan: OffscreenPlan) -> OffscreenTarget {
+        let size = plan.size;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label("offscreen")),
             size: wgpu::Extent3d {
@@ -551,23 +771,39 @@ impl VolumePipelines {
                 },
             ],
         });
-        OffscreenTarget {
+        let plan = OffscreenPlan {
             size: offscreen_extent(size),
+            ..plan
+        };
+        let ground = match plan.ground {
+            GroundPass::Off => None,
+            GroundPass::On => Some(create_ground_targets(
+                device,
+                &self.occluder_layout,
+                plan.size,
+            )),
+        };
+        OffscreenTarget {
+            plan,
             texture,
             view,
             bind_group,
+            ground,
         }
     }
 
-    /// Replace `target` only when the size it was built for has changed.
+    /// Replace `target` only when what it was built for has changed.
     pub fn ensure_offscreen(
         &self,
         device: &wgpu::Device,
         target: &mut Option<OffscreenTarget>,
-        size: [u32; 2],
+        plan: OffscreenPlan,
     ) -> bool {
-        let wanted = offscreen_extent(size);
-        if !offscreen_needs_rebuild(target.as_ref().map(OffscreenTarget::size), wanted) {
+        let wanted = OffscreenPlan {
+            size: offscreen_extent(plan.size),
+            ..plan
+        };
+        if !offscreen_needs_rebuild(target.as_ref().map(OffscreenTarget::plan), wanted) {
             return false;
         }
         *target = Some(self.create_offscreen(device, wanted));
@@ -767,6 +1003,67 @@ impl VolumePipelines {
         })
     }
 
+    /// Record the ground pass into `target`, or do nothing when this target
+    /// carries no ground attachments.
+    ///
+    /// **Recorded into the caller's existing encoder, immediately before
+    /// [`Self::encode_raymarch_with_floor`]** — no second encoder and no second
+    /// submit, because wgpu inserts the attachment-to-sampled barrier between
+    /// two passes in one encoder.
+    pub fn encode_ground(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &OffscreenTarget,
+        volume: &VolumeTextures,
+    ) {
+        let Some(ground) = target.ground.as_ref() else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(&label("ground.pass")),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &ground.occluder_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Saturated, NOT transparent: an undrawn texel then
+                        // decodes to `t_scale`, which is past everything, so the
+                        // march's `min` is a no-op there even if the alpha test
+                        // were ever dropped.
+                        load: wgpu::LoadOp::Clear(OCCLUDER_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &ground.colour_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+            ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &ground.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.ground);
+        pass.set_bind_group(0, &volume.bind_group, &[]);
+        // No vertex buffer, and none is bound: every position comes from
+        // `@builtin(vertex_index)`.
+        pass.draw(0..ground_vertex_count(), 0..1);
+    }
+
     /// Record the raymarch into `target`.
     pub fn encode_raymarch(
         &self,
@@ -816,6 +1113,14 @@ impl VolumePipelines {
         pass.set_pipeline(&self.raymarch);
         pass.set_bind_group(0, &volume.bind_group, &[]);
         pass.set_bind_group(1, &floor.unwrap_or(&self.empty_floor).bind_group, &[]);
+        pass.set_bind_group(
+            2,
+            target
+                .ground
+                .as_ref()
+                .map_or(&self.empty_occluder, |g| &g.bind_group),
+            &[],
+        );
         pass.set_vertex_buffer(0, self.quad.slice(..));
         pass.draw(0..QUAD_VERTEX_COUNT, 0..1);
     }
@@ -829,24 +1134,221 @@ impl VolumePipelines {
     }
 }
 
+/// What an offscreen is built for.
+///
+/// The **rung** rides here beside the size because a governor may move a rung
+/// mid-session, and a target compared on size alone would then be kept while
+/// describing a quality it no longer has. The **ground pass** rides here because
+/// it decides whether the three extra attachments exist, and a target built
+/// without them cannot grow them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffscreenPlan {
+    /// Texels along each axis.
+    pub size: [u32; 2],
+    /// The resolution rung this size came off.
+    pub rung: ResolutionRung,
+    /// Whether the ground pass's attachments are carried.
+    pub ground: GroundPass,
+}
+
+impl OffscreenPlan {
+    /// A plan for a target with no ground pass, at the finest rung — what
+    /// every caller wanting today's picture at an explicit size asks for.
+    pub fn native(size: [u32; 2]) -> Self {
+        Self {
+            size,
+            rung: ResolutionRung::Native,
+            ground: GroundPass::Off,
+        }
+    }
+
+    /// The plan a fit produced.
+    pub fn of(fitted: FittedOffscreen) -> Self {
+        Self {
+            size: fitted.size,
+            rung: fitted.quality.resolution,
+            ground: fitted.ground,
+        }
+    }
+}
+
 /// The pane-sized target the raymarch renders into.
 pub struct OffscreenTarget {
-    size: [u32; 2],
+    plan: OffscreenPlan,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    /// The ground pass's attachments, and the group-2 bind group the march
+    /// reads them back through. Recreated in lockstep with the colour target
+    /// above, which is the whole reason they live here rather than beside the
+    /// pipelines.
+    ground: Option<GroundTargets>,
 }
 
 impl OffscreenTarget {
     /// Texels along each axis.
     pub fn size(&self) -> [u32; 2] {
-        self.size
+        self.plan.size
+    }
+
+    /// Everything this target was built for.
+    pub fn plan(&self) -> OffscreenPlan {
+        self.plan
+    }
+
+    /// Whether this target carries the ground pass's attachments.
+    pub fn ground_pass(&self) -> GroundPass {
+        self.plan.ground
     }
 
     /// The texture itself, for a readback in a test.
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
     }
+
+    /// The occluder attachment, for a readback in a test. `None` when this
+    /// target carries no ground pass.
+    pub fn occluder_texture(&self) -> Option<&wgpu::Texture> {
+        self.ground.as_ref().map(|g| &g.occluder)
+    }
+
+    /// The ground colour attachment, for a readback in a test.
+    pub fn ground_texture(&self) -> Option<&wgpu::Texture> {
+        self.ground.as_ref().map(|g| &g.colour)
+    }
+}
+
+/// The three attachments a ground-drawing pane's offscreen carries.
+struct GroundTargets {
+    occluder: wgpu::Texture,
+    occluder_view: wgpu::TextureView,
+    colour: wgpu::Texture,
+    colour_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+/// What the occluder is cleared to: every digit saturated, so an undrawn texel
+/// decodes to exactly 1.0 and therefore to `t_scale` — past the far side of the
+/// box, where the march's `min` against the box exit is a no-op.
+const OCCLUDER_CLEAR: wgpu::Color = wgpu::Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 0.0,
+};
+
+/// The ground pass's attachments at `size`, and the bind group the march reads
+/// the two colour ones back through.
+fn create_ground_targets(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    size: [u32; 2],
+) -> GroundTargets {
+    let extent = wgpu::Extent3d {
+        width: size[0].max(1),
+        height: size[1].max(1),
+        depth_or_array_layers: 1,
+    };
+    let colour_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        // The one word that lets a test decode what the pass actually wrote.
+        | wgpu::TextureUsages::COPY_SRC;
+    let occluder = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label("occluder")),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OCCLUDER_FORMAT,
+        usage: colour_usage,
+        view_formats: &[],
+    });
+    let colour = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label("ground_colour")),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: GROUND_COLOUR_FORMAT,
+        usage: colour_usage,
+        view_formats: &[],
+    });
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label("ground_depth")),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: GROUND_DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let occluder_view = occluder.create_view(&wgpu::TextureViewDescriptor::default());
+    let colour_view = colour.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&label("occluder.bind_group")),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: BINDING_OCCLUDER_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(&occluder_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: BINDING_GROUND_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(&colour_view),
+            },
+        ],
+    });
+    GroundTargets {
+        occluder,
+        occluder_view,
+        colour,
+        colour_view,
+        depth_view,
+        bind_group,
+    }
+}
+
+/// The 1x1 pair bound at group 2 when a pane draws no ground. Created and never
+/// written: WebGPU zero-initialises, so the alpha the march tests reads zero,
+/// which is "no ground here".
+fn create_empty_occluder(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
+    let one = |what: &str, format| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(&label(what)),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    };
+    let occluder = one("occluder.placeholder", OCCLUDER_FORMAT);
+    let colour = one("ground_colour.placeholder", GROUND_COLOUR_FORMAT);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&label("occluder.placeholder.bind_group")),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: BINDING_OCCLUDER_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(&occluder),
+            },
+            wgpu::BindGroupEntry {
+                binding: BINDING_GROUND_TEXTURE,
+                resource: wgpu::BindingResource::TextureView(&colour),
+            },
+        ],
+    })
 }
 
 /// The pane mirror on the GPU: a frame-sized copy of the 2D pane's own render,
@@ -975,7 +1477,22 @@ impl VolumeTextures {
     }
 
     /// Point the raymarch's camera somewhere.
+    ///
+    /// The one seam a uniform reaches the GPU through, and therefore where the
+    /// occluder's two coupled lanes are checked: `occluder_t_scale` is derived
+    /// from `eye_in_box`, both are public, and a scale computed against another
+    /// eye mis-clips every ray in the frame while the picture still looks
+    /// plausible. `debug_assert`, so the frame path pays nothing in release.
     pub fn write_uniform(&self, queue: &wgpu::Queue, uniform: &VolumeUniform) {
+        debug_assert!(
+            uniform.occluder_is_aimed_at_its_own_eye(),
+            "occluder_t_scale is {} but this uniform's eye at {:?} wants {}; \
+             set it through `VolumeUniform::aim_occluder`, which derives one \
+             from the other",
+            uniform.occluder_t_scale,
+            uniform.eye_in_box,
+            VolumeUniform::t_scale_for(uniform.eye_in_box),
+        );
         queue.write_buffer(&self.uniform, 0, &uniform.to_bytes());
     }
 
@@ -1302,8 +1819,12 @@ pub fn offscreen_extent(size: [u32; 2]) -> [u32; 2] {
     [size[0].max(1), size[1].max(1)]
 }
 
-/// Whether a held offscreen has to be thrown away for a new size.
-fn offscreen_needs_rebuild(held: Option<[u32; 2]>, wanted: [u32; 2]) -> bool {
+/// Whether a held offscreen has to be thrown away.
+///
+/// The whole plan, not the size alone: two of a plan's three fields can move
+/// without the size moving with them, and a target kept across either is
+/// describing something it is not.
+fn offscreen_needs_rebuild(held: Option<OffscreenPlan>, wanted: OffscreenPlan) -> bool {
     held != Some(wanted)
 }
 

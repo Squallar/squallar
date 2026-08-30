@@ -35,7 +35,56 @@ use crate::constants::{VOLUME_OFFSCREEN_BUDGET_BYTES, VOLUME_OFFSCREEN_REFERENCE
 /// Bytes one offscreen pixel costs: `Rgba8Unorm`. The blit's premise is that
 /// the offscreen holds sRGB-encoded premultiplied bytes, so an
 /// `Rgba8UnormSrgb` target would undo the encode the raymarch just did.
+///
+/// **The colour target alone.** A pane drawing 3D ground carries three more
+/// attachments beside it, and [`GroundPass::bytes_per_pixel`] — not this
+/// constant — is what every byte figure in this module multiplies by.
 pub const OFFSCREEN_BYTES_PER_PIXEL: usize = 4;
+
+/// Bytes the ground pass's occluder attachment costs a pixel: `Rgba8Unorm`,
+/// carrying the packed ray parameter in RGB and the hit flag in A.
+pub const OCCLUDER_BYTES_PER_PIXEL: usize = 4;
+
+/// Bytes the ground pass's colour attachment costs a pixel: `Rgba8Unorm`. A
+/// second colour target rather than a write into the offscreen, because the
+/// raymarch pass *clears* that one — anything the ground wrote there would be
+/// destroyed before it was read.
+pub const GROUND_COLOUR_BYTES_PER_PIXEL: usize = 4;
+
+/// Bytes the ground pass's own depth attachment costs a pixel: `Depth32Float`.
+/// It lives inside the volume crate; egui's own pass still carries no depth.
+pub const GROUND_DEPTH_BYTES_PER_PIXEL: usize = 4;
+
+/// Everything a ground-drawing pane adds to its offscreen, per pixel: 12 B on
+/// top of [`OFFSCREEN_BYTES_PER_PIXEL`], so 16 in total rather than 4.
+pub const GROUND_BYTES_PER_PIXEL: usize =
+    OCCLUDER_BYTES_PER_PIXEL + GROUND_COLOUR_BYTES_PER_PIXEL + GROUND_DEPTH_BYTES_PER_PIXEL;
+
+/// Whether a pane's offscreen carries the ground pass's three attachments.
+///
+/// It rides every byte figure in this module rather than being added on top of
+/// one, because [`VolumeQuality::fit`] walks a ladder until the result *fits*:
+/// charging four bytes a pixel for a target that costs sixteen would
+/// over-commit every ceiling here by three times the colour target, which is a
+/// budget miss no later clamp recovers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroundPass {
+    /// The colour target alone — today's picture, and every pane with no
+    /// height field behind it.
+    Off,
+    /// The occluder, the ground colour and the ground depth beside it.
+    On,
+}
+
+impl GroundPass {
+    /// Bytes one pixel of this pane's offscreen costs, every attachment counted.
+    pub fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Off => OFFSCREEN_BYTES_PER_PIXEL,
+            Self::On => OFFSCREEN_BYTES_PER_PIXEL + GROUND_BYTES_PER_PIXEL,
+        }
+    }
+}
 
 /// How far the offscreen is scaled down from the pane it will be blitted into.
 /// Named by the *linear* scale: `Half` is half the width and half the height,
@@ -202,16 +251,22 @@ pub fn select(class: DeviceClass, ceiling: VolumeQuality) -> VolumeQuality {
 pub struct FittedOffscreen {
     pub size: [u32; 2],
     pub quality: VolumeQuality,
+    /// Which attachment set this size was fitted against. Carried rather than
+    /// re-decided, so [`FittedOffscreen::bytes`] cannot price a target the fit
+    /// did not.
+    pub ground: GroundPass,
 }
 
 impl FittedOffscreen {
     pub fn bytes(&self) -> usize {
-        offscreen_bytes(self.size)
+        offscreen_bytes(self.size, self.ground)
     }
 }
 
-pub fn offscreen_bytes(size: [u32; 2]) -> usize {
-    size[0] as usize * size[1] as usize * OFFSCREEN_BYTES_PER_PIXEL
+/// Bytes an offscreen of `size` occupies, every attachment `ground` implies
+/// included.
+pub fn offscreen_bytes(size: [u32; 2], ground: GroundPass) -> usize {
+    size[0] as usize * size[1] as usize * ground.bytes_per_pixel()
 }
 
 impl VolumeQuality {
@@ -219,20 +274,30 @@ impl VolumeQuality {
     /// Total by construction: always at least 1 x 1. At the bottom rung an
     /// oversized pane is scaled proportionally rather than refused, so the
     /// result can exceed the budget only for a budget under one pixel.
-    pub fn fit(self, pane_px: [u32; 2], budget_bytes: usize) -> FittedOffscreen {
+    pub fn fit(
+        self,
+        pane_px: [u32; 2],
+        budget_bytes: usize,
+        ground: GroundPass,
+    ) -> FittedOffscreen {
         let mut resolution = self.resolution;
         loop {
             let size = scale_pane(pane_px, resolution);
             let quality = Self { resolution, ..self };
-            if offscreen_bytes(size) <= budget_bytes {
-                return FittedOffscreen { size, quality };
+            if offscreen_bytes(size, ground) <= budget_bytes {
+                return FittedOffscreen {
+                    size,
+                    quality,
+                    ground,
+                };
             }
             match resolution.next_coarser() {
                 Some(coarser) => resolution = coarser,
                 None => {
                     return FittedOffscreen {
-                        size: shrink_into_budget(size, budget_bytes),
+                        size: shrink_into_budget(size, budget_bytes, ground),
                         quality,
+                        ground,
                     };
                 }
             }
@@ -250,8 +315,8 @@ fn scale_pane(pane_px: [u32; 2], rung: ResolutionRung) -> [u32; 2] {
     ]
 }
 
-fn shrink_into_budget(size: [u32; 2], budget_bytes: usize) -> [u32; 2] {
-    let affordable_pixels = budget_bytes / OFFSCREEN_BYTES_PER_PIXEL;
+fn shrink_into_budget(size: [u32; 2], budget_bytes: usize, ground: GroundPass) -> [u32; 2] {
+    let affordable_pixels = budget_bytes / ground.bytes_per_pixel();
     let pixels = size[0] as f64 * size[1] as f64;
     if pixels <= affordable_pixels as f64 {
         return size;
@@ -268,9 +333,16 @@ fn shrink_into_budget(size: [u32; 2], budget_bytes: usize) -> [u32; 2] {
 /// The production path takes neither: a pane's offscreen is fitted against the
 /// resolved `Budgets::offscreen_bytes` the painter was handed.
 pub fn reference_offscreen() -> FittedOffscreen {
+    reference_offscreen_with(GroundPass::Off)
+}
+
+/// [`reference_offscreen`] for a pane that draws 3D ground: four times the
+/// bytes a pixel, and therefore fitted smaller out of the same budget.
+pub fn reference_offscreen_with(ground: GroundPass) -> FittedOffscreen {
     PLATFORM_CEILING.fit(
         VOLUME_OFFSCREEN_REFERENCE_PANE_PX,
         VOLUME_OFFSCREEN_BUDGET_BYTES,
+        ground,
     )
 }
 

@@ -20,9 +20,11 @@ use squallar_radar::voxel::VolumeGrid;
 
 use crate::VolumeSupport;
 use crate::raymarch::staging::VolumeStaging;
-use crate::raymarch::{CoarseLevel, OffscreenTarget, VolumePipelines, VolumeTextures};
+use crate::raymarch::{
+    CoarseLevel, OffscreenPlan, OffscreenTarget, VolumePipelines, VolumeTextures,
+};
 use crate::uniform::VolumeUniform;
-use squallar_device_profile::quality::VolumeQuality;
+use squallar_device_profile::quality::{GroundPass, VolumeQuality};
 use squallar_gpu::egui_renderer::AttachmentConfig;
 
 /// The fewest see-through entries a grid's table may have, anywhere on its
@@ -650,7 +652,13 @@ impl VolumePainter for BridgeVolumePainter {
             return VolumePaint::Empty(why);
         }
 
-        let fitted = self.quality.fit(frame.size_px, self.offscreen_bytes);
+        // No height source exists yet, so no pane asks for the ground pass and
+        // every offscreen is fitted against the colour target alone. B3 turns
+        // this on for a pane whose height field has landed; `fit` is what holds
+        // the four attachments to the one budget when it does.
+        let fitted = self
+            .quality
+            .fit(frame.size_px, self.offscreen_bytes, GroundPass::Off);
         // The box the pane asked for, which is the grid's own whenever the
         // build for it has landed.
         let Some(drawn) = DrawnBox::for_lookup(&found, &frame.target, &grid) else {
@@ -677,6 +685,10 @@ impl VolumePainter for BridgeVolumePainter {
             [shape.nx as u32, shape.ny as u32, shape.nz as u32],
         );
         uniform.box_from_clip = view.box_from_clip;
+        // The forward twin, from the same `view_for` call. Written whether or
+        // not a ground pass runs: one derivation is what makes it impossible for
+        // the mesh and the march to be looking through two cameras.
+        uniform.clip_from_box = view.clip_from_box;
         uniform.eye_in_box = view.eye_in_box;
         // Where the drawn box's unit cube sits in the grid. The identity while
         // nothing is pending, which is a multiply by one and an add of zero.
@@ -768,7 +780,7 @@ impl VolumePainter for BridgeVolumePainter {
             // upload — the one seam the curve is applied at.
             alpha: frame.alpha.clone(),
             uniform,
-            offscreen_px: fitted.size,
+            offscreen: OffscreenPlan::of(fitted),
             live_ids: self.store.live_ids(),
         };
 
@@ -1097,10 +1109,10 @@ impl VolumeResources {
         &mut self,
         device: &wgpu::Device,
         pane_idx: usize,
-        size_px: [u32; 2],
+        plan: OffscreenPlan,
     ) -> bool {
         let slot = self.targets.entry(pane_idx).or_default();
-        self.pipelines.ensure_offscreen(device, slot, size_px);
+        self.pipelines.ensure_offscreen(device, slot, plan);
         slot.is_some()
     }
 
@@ -1167,7 +1179,12 @@ impl VolumeResources {
             .targets
             .values()
             .flatten()
-            .map(|target| squallar_device_profile::quality::offscreen_bytes(target.size()))
+            .map(|target| {
+                squallar_device_profile::quality::offscreen_bytes(
+                    target.size(),
+                    target.ground_pass(),
+                )
+            })
             .sum();
         let uploads: usize = self
             .uploads
@@ -1237,7 +1254,7 @@ struct VolumeCallback {
     /// change — never per unchanged frame.
     alpha: Option<AlphaCurve>,
     uniform: VolumeUniform,
-    offscreen_px: [u32; 2],
+    offscreen: OffscreenPlan,
     /// Every grid the store still holds, so `prepare` can free the uploads for
     /// the ones it does not. Carried on the callback rather than read from the
     /// store because `prepare` runs with no access to anything but its
@@ -1289,7 +1306,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // both exist is written there.
         resources.retain_uploads(&self.live_ids);
 
-        if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen_px) {
+        if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen) {
             return Vec::new();
         }
         let shape = self.grid.dims();
@@ -1358,6 +1375,13 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // Into egui's own encoder, which egui submits before its own commands —
         // so the offscreen is written before the blit reads it. The other order
         // paints the previous frame's volume, which reads as input lag.
+        //
+        // The ground pass goes into that same encoder immediately before the
+        // march, with no second encoder and no second submit: wgpu inserts the
+        // attachment-to-sampled barrier between two passes in one encoder. It
+        // is a no-op for a target carrying no ground attachments, which is
+        // every target until B3 gives a pane a height field.
+        pipelines.encode_ground(egui_encoder, target, textures);
         pipelines.encode_raymarch_with_floor(egui_encoder, target, textures, floor_texture);
 
         Vec::new()

@@ -261,6 +261,115 @@ fn the_matrix_product_is_column_major() {
     assert_eq!(multiply(translate, scale)[3], [1.0, 2.0, 3.0, 1.0]);
 }
 
+/// **The registration guarantee itself.** `clip_from_box` is built forward
+/// and `box_from_clip` backward, from the same camera; their product being the
+/// identity is what says the ground mesh and the march that occludes against
+/// it are looking through one camera rather than two that agree by inspection.
+#[test]
+fn the_forward_and_backward_cameras_are_exact_inverses() {
+    // Every camera the other matrix tests use, plus the zoom stop, plus an
+    // exaggerated box — the residual an inversion carries is largest where the
+    // matrix is worst conditioned, which is the flattest box and the nearest eye.
+    let cameras = [
+        (0.0f32, 0.0f32, 2.5f32, 1.0f32, 1.6f32),
+        (225.0, 25.0, 2.5, 1.0, 1.6),
+        (37.0, -80.0, 1.2, 3.0, 0.4),
+        (359.0, 89.0, 0.05, 3.0, 3.2),
+    ];
+    let mut worst = 0.0f32;
+    let mut worst_round_trip = 0.0f32;
+    for (yaw, pitch, distance, exaggeration, aspect) in cameras {
+        let camera = OrbitCamera::restore(yaw, pitch, distance, [0.0; 3], exaggeration)
+            .expect("finite camera");
+        let view = view_for(camera, BOX_KM, aspect).expect("a view");
+        let product = multiply(view.clip_from_box, view.box_from_clip);
+        for (column, values) in product.iter().enumerate() {
+            for (row, value) in values.iter().enumerate() {
+                let expected = if column == row { 1.0 } else { 0.0 };
+                worst = worst.max((value - expected).abs());
+            }
+        }
+
+        // And the property the two matrices are actually used for: a point in
+        // the box, projected forward by the ground pass's matrix and
+        // unprojected back by the march's, returns to itself.
+        for corner in 0..8u32 {
+            for offset in [0.0f32, 0.37] {
+                let p = [
+                    (corner & 1) as f32 * (1.0 - 2.0 * offset) + offset,
+                    ((corner >> 1) & 1) as f32 * (1.0 - 2.0 * offset) + offset,
+                    ((corner >> 2) & 1) as f32 * (1.0 - 2.0 * offset) + offset,
+                ];
+                let mut clip = [0.0f32; 4];
+                for (r, slot) in clip.iter_mut().enumerate() {
+                    *slot = (0..3).map(|k| view.clip_from_box[k][r] * p[k]).sum::<f32>()
+                        + view.clip_from_box[3][r];
+                }
+                // Behind the eye: no pixel, so nothing to register.
+                if clip[3] <= 1e-4 {
+                    continue;
+                }
+                let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+                let back = unproject(view.box_from_clip, ndc);
+                for axis in 0..3 {
+                    worst_round_trip = worst_round_trip.max((back[axis] - p[axis]).abs());
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "camera inverse: worst entry {worst:e}, worst point round trip \
+         {worst_round_trip:e} box units"
+    );
+
+    // **The bound is what `f32` allows, not what the derivation deserves.**
+    // The two matrices are each a product of three factors whose entries run to
+    // the box's own kilometres and the focal length — order 10^2 to 10^3 — so
+    // the identity's off-diagonal zeros are differences of numbers that size,
+    // and one ulp of those is ~1e-5 absolute. What this rules out is a matrix
+    // that is *structurally* wrong — transposed, wrong-signed, built at another
+    // aspect — and those miss by order 1, five orders past this. The control
+    // below is what shows the bound is still narrow enough to catch one.
+    assert!(
+        worst < 1e-4,
+        "clip_from_box · box_from_clip is off the identity by {worst}; the two \
+         cameras have stopped being one derivation, and occlusion registers a \
+         pixel out"
+    );
+    // And the property the ground pass actually depends on: a point in the box
+    // projected forward and unprojected back returns to itself. In box units
+    // against the box's own extent — at the 256-pixel offscreen these suites
+    // render, the box is about 940 m to the pixel and this bound is under a
+    // tenth of one.
+    assert!(
+        worst_round_trip < 1e-3,
+        "a box point came back {worst_round_trip} box units away from itself \
+         through the two cameras — the mesh and the march would draw the same \
+         surface in two places"
+    );
+}
+
+/// And the identity is not vacuous: a matrix that is *not* the inverse fails it.
+#[test]
+fn the_inverse_check_would_notice_a_camera_that_did_not_match() {
+    let camera = OrbitCamera::restore(225.0, 25.0, 2.5, [0.0; 3], 1.0).expect("finite camera");
+    let view = view_for(camera, BOX_KM, 1.6).expect("a view");
+    // The same camera at a different aspect — the kind of near-miss an
+    // independently-derived forward matrix would produce.
+    let other = view_for(camera, BOX_KM, 1.61).expect("a view");
+    let product = multiply(other.clip_from_box, view.box_from_clip);
+    let worst = (0..4)
+        .flat_map(|c| (0..4).map(move |r| (c, r)))
+        .map(|(c, r)| (product[c][r] - if c == r { 1.0 } else { 0.0 }).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst > 1e-3,
+        "a camera built at a different aspect still read as the inverse (worst \
+         {worst}), so the identity above proves nothing"
+    );
+}
+
 /// The stub painter is not a substitute for the frontend's downcast test.
 #[test]
 fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {

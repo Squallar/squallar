@@ -185,6 +185,19 @@ pub trait VolumePainter: Send + Sync {
 pub struct VolumeView {
     /// Clip space to box space, column-major.
     pub box_from_clip: Mat4,
+    /// Box space to clip space — the direction geometry is drawn through,
+    /// built **forward** as `clip_from_view · view_from_world ·
+    /// world_from_box`, never by inverting [`Self::box_from_clip`].
+    ///
+    /// Every factor has a closed form, so no general 4x4 inverse is taken
+    /// anywhere. What is measured here rather than argued is the pair's own
+    /// agreement, by `the_forward_and_backward_cameras_are_exact_inverses`:
+    /// a box point survives the trip out through one and back through the
+    /// other to under 1e-3 box units, and the two matrices' product is the
+    /// identity to what `f32` allows over factors this size. The residual of
+    /// the inverted alternative is **not** measured here — the plan's 2e-5
+    /// figure for it comes from a spike, not from this tree.
+    pub clip_from_box: Mat4,
     /// The perspective eye, in box space.
     pub eye_in_box: [f32; 3],
     /// Where the eye is in world kilometres, relative to the box centre. Not
@@ -373,8 +386,21 @@ fn build_view(
 
     let box_from_clip = multiply(box_from_world, multiply(world_from_view, view_from_clip));
 
+    // The same three stages the other way round, each built rather than
+    // inverted: `perspective` is the analytic twin of `inverse_perspective`,
+    // `view_from_world` is the camera basis transposed with the eye subtracted
+    // in that basis, and `world_from_box` is the scale and translate
+    // `box_from_world` undoes. Composed forward, so the ground mesh and the
+    // march cannot disagree about the camera by a residual.
+    let clip_from_view = perspective(FOV_Y_DEG, aspect, near, far)?;
+    let view_from_world = camera_basis_inverse(right, up, forward, eye_km);
+    let world_from_box = world_from_box(stretched);
+
+    let clip_from_box = multiply(clip_from_view, multiply(view_from_world, world_from_box));
+
     Some(VolumeView {
         box_from_clip,
+        clip_from_box,
         eye_in_box: to_box(eye_km, stretched),
         eye_km,
     })
@@ -411,6 +437,22 @@ fn box_from_world(box_size_km: [f32; 3]) -> Mat4 {
     ]
 }
 
+/// [`box_from_world`] undone in closed form: shift the unit cube's centre to
+/// the origin, then scale by the box's extent.
+fn world_from_box(box_size_km: [f32; 3]) -> Mat4 {
+    [
+        [box_size_km[0], 0.0, 0.0, 0.0],
+        [0.0, box_size_km[1], 0.0, 0.0],
+        [0.0, 0.0, box_size_km[2], 0.0],
+        [
+            -0.5 * box_size_km[0],
+            -0.5 * box_size_km[1],
+            -0.5 * box_size_km[2],
+            1.0,
+        ],
+    ]
+}
+
 /// The camera-to-world matrix, built rather than inverted.
 fn camera_basis(right: [f32; 3], up: [f32; 3], forward: [f32; 3], eye: [f32; 3]) -> Mat4 {
     [
@@ -419,6 +461,39 @@ fn camera_basis(right: [f32; 3], up: [f32; 3], forward: [f32; 3], eye: [f32; 3])
         [-forward[0], -forward[1], -forward[2], 0.0],
         [eye[0], eye[1], eye[2], 1.0],
     ]
+}
+
+/// The camera-to-world matrix undone in closed form: the rotation is
+/// orthonormal, so its inverse is its transpose, and the translation is the eye
+/// resolved in that same basis and negated. No general inverse is taken.
+fn camera_basis_inverse(right: [f32; 3], up: [f32; 3], forward: [f32; 3], eye: [f32; 3]) -> Mat4 {
+    let back = [-forward[0], -forward[1], -forward[2]];
+    let dot = |a: [f32; 3]| a[0] * eye[0] + a[1] * eye[1] + a[2] * eye[2];
+    [
+        [right[0], up[0], back[0], 0.0],
+        [right[1], up[1], back[1], 0.0],
+        [right[2], up[2], back[2], 0.0],
+        [-dot(right), -dot(up), -dot(back), 1.0],
+    ]
+}
+
+/// wgpu's right-handed perspective, whose clip `z` runs `0..1` — the forward
+/// map [`inverse_perspective`] undoes.
+fn perspective(fov_y_deg: f32, aspect: f32, near: f32, far: f32) -> Option<Mat4> {
+    if !(near.is_finite() && far.is_finite() && near > 0.0 && far > near) {
+        return None;
+    }
+    let f = 1.0 / (0.5 * fov_y_deg.to_radians()).tan();
+    if !f.is_finite() || f <= 0.0 {
+        return None;
+    }
+    let mut m = [[0.0f32; 4]; 4];
+    m[0][0] = f / aspect;
+    m[1][1] = f;
+    m[2][2] = far / (near - far);
+    m[2][3] = -1.0;
+    m[3][2] = far * near / (near - far);
+    Some(m)
 }
 
 /// The analytic inverse of wgpu's right-handed perspective, whose clip `z` runs

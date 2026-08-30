@@ -24,7 +24,7 @@ use egui_wgpu::wgpu;
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 use squallar_volumetric::raymarch::{
     CoarseLevel, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, GRID_BYTES_PER_CELL, GRID_MIP_LEVELS,
-    OffscreenTarget, VolumePipelines, mirror_is_gamma_encoded,
+    OffscreenPlan, OffscreenTarget, VolumePipelines, mirror_is_gamma_encoded,
 };
 use squallar_volumetric::uniform::{ISO_OFF, VolumeUniform};
 
@@ -100,20 +100,20 @@ fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
 
     let mut held: Option<OffscreenTarget> = None;
     assert!(
-        pipelines.ensure_offscreen(&device, &mut held, [1440, 900]),
+        pipelines.ensure_offscreen(&device, &mut held, OffscreenPlan::native([1440, 900])),
         "nothing held must be built"
     );
     assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1440, 900]));
 
     assert!(
-        !pipelines.ensure_offscreen(&device, &mut held, [1440, 900]),
+        !pipelines.ensure_offscreen(&device, &mut held, OffscreenPlan::native([1440, 900])),
         "an offscreen of exactly the right size was thrown away and rebuilt, \
          which is a pane-sized allocation on every frame"
     );
     assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1440, 900]));
 
     assert!(
-        pipelines.ensure_offscreen(&device, &mut held, [720, 450]),
+        pipelines.ensure_offscreen(&device, &mut held, OffscreenPlan::native([720, 450])),
         "a resized pane reused its old offscreen, so the blit would upscale \
          the wrong texture"
     );
@@ -121,7 +121,7 @@ fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
 
     // A pane dragged to nothing: the clamp is what stops `create_texture`
     // refusing a zero extent, from a call with no `Result`.
-    assert!(pipelines.ensure_offscreen(&device, &mut held, [0, 0]));
+    assert!(pipelines.ensure_offscreen(&device, &mut held, OffscreenPlan::native([0, 0])));
     assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1, 1]));
 }
 
@@ -1668,7 +1668,7 @@ fn blitted(
     // what `Color32` already is — egui premultiplies after encoding, so its own
     // four bytes are the convention the raymarch's last line produces.
     let offscreen_size = [(rect.width() as u32).max(1), (rect.height() as u32).max(1)];
-    let offscreen = pipelines.create_offscreen(device, offscreen_size);
+    let offscreen = pipelines.create_offscreen(device, OffscreenPlan::native(offscreen_size));
     let texels: Vec<u8> = std::iter::repeat_n(
         colour.to_array(),
         (offscreen_size[0] * offscreen_size[1]) as usize,
@@ -1715,7 +1715,7 @@ fn blitted(
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of() {
-    use squallar_device_profile::quality::offscreen_bytes;
+    use squallar_device_profile::quality::{GroundPass, offscreen_bytes};
     use squallar_volumetric::bridge::VolumeResources;
     use squallar_volumetric::raymarch::resident_grid_bytes_at;
 
@@ -1744,8 +1744,8 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
     const KEPT_ID: u64 = 7;
     const GONE_ID: u64 = 9;
 
-    assert!(resources.ensure_pane_offscreen(&device, 0, KEPT_PANE_PX));
-    assert!(resources.ensure_pane_offscreen(&device, 1, GONE_PANE_PX));
+    assert!(resources.ensure_pane_offscreen(&device, 0, OffscreenPlan::native(KEPT_PANE_PX)));
+    assert!(resources.ensure_pane_offscreen(&device, 1, OffscreenPlan::native(GONE_PANE_PX)));
     assert!(resources.ensure_upload(
         &device,
         &queue,
@@ -1767,8 +1767,8 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
         CoarseLevel::Omitted,
     ));
 
-    let kept_pane = offscreen_bytes(KEPT_PANE_PX);
-    let gone_pane = offscreen_bytes(GONE_PANE_PX);
+    let kept_pane = offscreen_bytes(KEPT_PANE_PX, GroundPass::Off);
+    let gone_pane = offscreen_bytes(GONE_PANE_PX, GroundPass::Off);
     let kept_grid =
         resident_grid_bytes_at(kept_cells, CoarseLevel::Omitted).expect("a tiny grid fits");
     let gone_grid =
@@ -1849,7 +1849,7 @@ fn both_upload_routes_paint_the_same_frame() {
             )
             .expect("the grid and palette were refused");
         volume.write_uniform(&queue, &uniform);
-        let target = pipelines.create_offscreen(&device, SIZE);
+        let target = pipelines.create_offscreen(&device, OffscreenPlan::native(SIZE));
         let mut encoder = device.create_command_encoder(&Default::default());
         pipelines.encode_raymarch(&mut encoder, &target, &volume);
         queue.submit(Some(encoder.finish()));

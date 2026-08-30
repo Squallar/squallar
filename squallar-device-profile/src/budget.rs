@@ -535,7 +535,11 @@ pub struct Budgets {
     pub grid_cells: [u32; 3],
     /// Ceiling on one pane's 3D volume textures.
     pub volume_texture_bytes: usize,
-    /// Ceiling on the pane-sized target one volume raymarches into.
+    /// Ceiling on **every attachment** of the pane-sized target one volume
+    /// raymarches into, not on the colour target alone: `VolumeQuality::fit`
+    /// prices a pane against `quality::GroundPass::bytes_per_pixel`, so a pane
+    /// drawing 3D ground is fitted four times smaller out of this same figure
+    /// rather than being allowed to spend four times it.
     pub offscreen_bytes: usize,
     /// Ceiling on the whole application's single pane-mirror texture.
     pub mirror_bytes: usize,
@@ -616,6 +620,14 @@ impl Budgets {
     }
 
     /// Every GPU texture the application budgets at once, worst case.
+    ///
+    /// The offscreen term is `max_panes * offscreen_bytes` and stays that
+    /// whether or not the panes draw 3D ground, because
+    /// [`Self::offscreen_bytes`] is a ceiling on the whole attachment set and
+    /// `VolumeQuality::fit` is what holds a ground-drawing pane to it. If that
+    /// ever stops being true — if a pane is allowed to add attachments on top
+    /// of the figure it was fitted against — this sum understates by three
+    /// times the colour target per pane.
     pub fn app_texture_bytes(&self) -> usize {
         self.loop_pool_ceiling_bytes
             + self.volume_loop_bytes()

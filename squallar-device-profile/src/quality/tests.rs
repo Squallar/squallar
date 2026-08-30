@@ -16,7 +16,7 @@ fn a_rung_divides_both_axes_by_its_linear_divisor() {
             resolution: rung,
             shading: GradientShading::On,
         }
-        .fit([1440, 900], UNLIMITED);
+        .fit([1440, 900], UNLIMITED, GroundPass::Off);
         assert_eq!(fitted.size, expected, "{rung:?} scaled the pane wrongly");
         assert_eq!(fitted.quality.resolution, rung, "{rung:?} was not kept");
     }
@@ -25,10 +25,12 @@ fn a_rung_divides_both_axes_by_its_linear_divisor() {
 /// The measured table's own sizes are reachable, which is the point of it.
 #[test]
 fn the_measured_rows_are_reachable_from_the_ladder() {
-    let native = VolumeQuality::BEST.fit([2560, 1440], UNLIMITED);
+    let native = VolumeQuality::BEST.fit([2560, 1440], UNLIMITED, GroundPass::Off);
     assert_eq!(native.size, [2560, 1440]);
     assert_eq!(
-        VolumeQuality::BEST.fit([1440, 900], UNLIMITED).size,
+        VolumeQuality::BEST
+            .fit([1440, 900], UNLIMITED, GroundPass::Off)
+            .size,
         [1440, 900]
     );
     assert_eq!(
@@ -36,7 +38,7 @@ fn the_measured_rows_are_reachable_from_the_ladder() {
             resolution: ResolutionRung::Half,
             shading: GradientShading::On,
         }
-        .fit([1440, 900], UNLIMITED)
+        .fit([1440, 900], UNLIMITED, GroundPass::Off)
         .size,
         [720, 450]
     );
@@ -51,7 +53,7 @@ fn a_tiny_pane_never_rounds_to_a_zero_sized_texture() {
                 resolution: rung,
                 shading: GradientShading::Off,
             }
-            .fit(pane, UNLIMITED);
+            .fit(pane, UNLIMITED, GroundPass::Off);
             assert!(
                 fitted.size[0] >= 1 && fitted.size[1] >= 1,
                 "{rung:?} scaled {pane:?} to {:?}",
@@ -66,7 +68,7 @@ fn a_tiny_pane_never_rounds_to_a_zero_sized_texture() {
 fn a_pane_over_budget_steps_down_a_rung_and_reports_it() {
     // 2560 x 1440 at Native is 14.06 MiB; at Half it is 3.52 MiB.
     let budget = 8 * 1024 * 1024;
-    let fitted = VolumeQuality::BEST.fit([2560, 1440], budget);
+    let fitted = VolumeQuality::BEST.fit([2560, 1440], budget, GroundPass::Off);
 
     assert_eq!(fitted.quality.resolution, ResolutionRung::Half);
     assert_eq!(fitted.size, [1280, 720]);
@@ -85,7 +87,7 @@ fn a_pane_over_budget_steps_down_a_rung_and_reports_it() {
 fn a_pane_over_budget_at_every_rung_is_shrunk_proportionally() {
     // 7680 x 4320 at Quarter is 1920 x 1080 = 7.91 MiB, against 2 MiB.
     let budget = 2 * 1024 * 1024;
-    let fitted = VolumeQuality::BEST.fit([7680, 4320], budget);
+    let fitted = VolumeQuality::BEST.fit([7680, 4320], budget, GroundPass::Off);
 
     assert_eq!(fitted.quality.resolution, ResolutionRung::Quarter);
     assert!(
@@ -121,7 +123,7 @@ fn no_pane_and_no_rung_can_exceed_the_budget() {
                 resolution: rung,
                 shading: GradientShading::On,
             }
-            .fit(pane, budget);
+            .fit(pane, budget, GroundPass::Off);
             assert!(
                 fitted.bytes() <= budget,
                 "{rung:?} on a {pane:?} pane produced {:?} = {} B, over the \
@@ -141,7 +143,7 @@ fn a_fit_within_budget_leaves_the_quality_alone() {
         resolution: ResolutionRung::Half,
         shading: GradientShading::Off,
     };
-    let fitted = quality.fit([1440, 900], UNLIMITED);
+    let fitted = quality.fit([1440, 900], UNLIMITED, GroundPass::Off);
     assert_eq!(fitted.quality, quality);
 }
 
@@ -447,4 +449,60 @@ fn a_discrete_adapter_reaches_whatever_ceiling_it_is_given() {
             "a discrete adapter did not reach the {ceiling:?} ceiling"
         );
     }
+}
+
+/// **The ground pass is priced by the same fit, not on top of it.**
+///
+/// A pane drawing 3D ground carries four attachments where a pane without it
+/// carries one, and the budget it is held to is the same figure. Fitting the
+/// four against the one attachment's cost is what would over-commit every
+/// ceiling in this module by three times the colour target — a miss no later
+/// clamp recovers, because `fit` has already returned a size by then.
+#[test]
+fn a_ground_drawing_pane_is_fitted_against_all_four_of_its_attachments() {
+    assert_eq!(GroundPass::Off.bytes_per_pixel(), OFFSCREEN_BYTES_PER_PIXEL);
+    assert_eq!(
+        GroundPass::On.bytes_per_pixel(),
+        4 * OFFSCREEN_BYTES_PER_PIXEL,
+        "the occluder, the ground colour and the ground depth are one \
+         `Rgba8Unorm` each and one `Depth32Float`; four bytes a pixel apiece is \
+         what makes the total four times the colour target"
+    );
+
+    // One pane, one budget, both answers: the ground-drawing one must be held
+    // to the same bytes, which it can only be by being fitted smaller.
+    const PANE: [u32; 2] = [2560, 1440];
+    const BUDGET: usize = 20 * 1024 * 1024;
+    let plain = VolumeQuality::BEST.fit(PANE, BUDGET, GroundPass::Off);
+    let ground = VolumeQuality::BEST.fit(PANE, BUDGET, GroundPass::On);
+    for fitted in [plain, ground] {
+        assert!(
+            fitted.bytes() <= BUDGET,
+            "a {:?} offscreen with ground {:?} is {} B against a {BUDGET} B \
+             budget",
+            fitted.size,
+            fitted.ground,
+            fitted.bytes(),
+        );
+    }
+    assert!(
+        ground.size[0] * ground.size[1] < plain.size[0] * plain.size[1],
+        "the ground-drawing pane was fitted at {:?}, the same or larger than \
+         the plain pane's {:?}, out of one budget — so the three extra \
+         attachments were never charged for",
+        ground.size,
+        plain.size,
+    );
+
+    // And the shrink at the bottom rung charges the same denominator: a fit
+    // that stepped the ladder correctly and then shrank against 4 B/px would
+    // land four times over budget with no rung left to spend.
+    let tiny = VolumeQuality::CHEAPEST.fit(PANE, 64 * 1024, GroundPass::On);
+    assert_eq!(tiny.quality.resolution, ResolutionRung::Quarter);
+    assert!(
+        tiny.bytes() <= 64 * 1024,
+        "the bottom-rung shrink produced {:?} = {} B against a 65536 B budget",
+        tiny.size,
+        tiny.bytes(),
+    );
 }

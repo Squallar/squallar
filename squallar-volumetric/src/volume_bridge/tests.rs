@@ -1070,6 +1070,104 @@ fn the_skip_threshold_follows_the_effective_curve() {
     );
 }
 
+/// **The ground pass is recorded BEFORE the march, into the same encoder.**
+///
+/// The same source-scan arrangement as the painter's guards, and for the same
+/// reason: `prepare` needs a `wgpu::Device`, so no host test can reach it — and
+/// the GPU suite records the two calls into an encoder of *its own*, so it
+/// structurally cannot see this file's order. Swapping them here would leave
+/// the march reading the previous frame's occluder, and every test in the tree
+/// would still pass.
+///
+/// Inert while the ground pass is off, which is exactly why it is pinned now:
+/// B3 turns it on, and the defect would land silently under the change that
+/// makes it visible.
+#[test]
+fn the_ground_pass_is_encoded_before_the_march_it_occludes() {
+    let source = include_str!("../volume_bridge.rs");
+    let start = source
+        .find("    fn prepare(")
+        .expect("the callback's prepare is no longer where this test looks for it");
+    let body = &source[start..];
+    let end = body
+        .find("\n    }\n")
+        .expect("prepare has no closing brace");
+    let body = &body[..end];
+
+    let ground = body
+        .find("pipelines.encode_ground(egui_encoder, target, textures);")
+        .expect(
+            "`prepare` no longer records the ground pass into egui's encoder, so \
+             a pane with height attachments would draw an occluder nothing reads",
+        );
+    let march = body
+        .find("pipelines.encode_raymarch_with_floor(egui_encoder,")
+        .expect("`prepare` no longer records the march");
+    assert!(
+        ground < march,
+        "the ground pass is recorded AFTER the march that reads its occluder, \
+         so the march samples whatever the previous frame left there — a \
+         one-frame-late occlusion that reads as input lag, and that no GPU test \
+         here can see because those record the pair into their own encoder",
+    );
+    assert_eq!(
+        body.matches("encoder.finish()").count(),
+        0,
+        "`prepare` finishes an encoder of its own; the barrier between the \
+         ground pass and the march is wgpu's, and it exists only because both \
+         passes are in ONE encoder",
+    );
+}
+
+/// **The forward camera the mesh is drawn through comes from the view, not
+/// from the backward one.**
+///
+/// One line, reached by nothing: every GPU test builds its own `VolumeUniform`,
+/// so the production assignment is untested. Filling it from
+/// `view.box_from_clip` compiles, type-checks, and draws a mesh nowhere near
+/// where the march looks for it.
+#[test]
+fn the_uniform_takes_the_forward_camera_from_the_view_that_made_the_backward_one() {
+    let source = include_str!("../volume_bridge.rs");
+    assert!(
+        source.contains("uniform.clip_from_box = view.clip_from_box;"),
+        "the ground pass's camera is no longer assigned from the same \
+         `view_for` call the march's came from — sharing one uniform block is \
+         structural only while one derivation fills both lanes",
+    );
+    assert!(
+        !source.contains("uniform.clip_from_box = view.box_from_clip"),
+        "the forward lane is being filled from the BACKWARD matrix; the mesh \
+         would be drawn through the inverse of the camera the march \
+         unprojects with",
+    );
+}
+
+/// **The offscreen is fitted against the attachment set it will actually
+/// carry.**
+///
+/// `VolumeQuality::fit` prices a pane at `GroundPass::bytes_per_pixel`, and the
+/// plan of the target that gets built comes from that same `FittedOffscreen`.
+/// Fitting one and building the other is how a pane ends up four times over its
+/// texture budget with no rung left to spend.
+#[test]
+fn the_fit_and_the_target_agree_about_the_ground_pass() {
+    let source = include_str!("../volume_bridge.rs");
+    assert!(
+        source.contains(".fit(frame.size_px, self.offscreen_bytes, GroundPass::Off)"),
+        "the offscreen fit no longer names the ground pass it is pricing. \
+         While no height source exists this is `Off` and the argument is what \
+         says so; when B3 makes it a decision, this is where that decision has \
+         to be re-pinned rather than silently widened",
+    );
+    assert!(
+        source.contains("OffscreenPlan::of(fitted)"),
+        "the target's plan is no longer derived from the fit that produced the \
+         size, so the two can disagree about the rung or the attachment set \
+         while the budget arithmetic believes they cannot",
+    );
+}
+
 /// The curve is applied on the upload path and only through the staleness
 /// comparison — the same source-scan arrangement as the painter's guards, and
 /// for the same reason: the upload needs a `wgpu::Device`, so no host test can

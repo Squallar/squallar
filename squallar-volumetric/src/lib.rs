@@ -70,32 +70,38 @@ pub const VOLUME_ENV_VAR: &str = "SQUALLAR_VOLUME";
 const MIN_TEXTURE_DIMENSION_3D: u32 = 32;
 
 /// Sampled textures a volume pipeline binds at once: the grid, its colour LUT,
-/// the jitter tile and the map floor's pane mirror.
+/// the jitter tile, the map floor's pane mirror, and the ground pass's two
+/// outputs — the occluder and the ground's own colour.
 ///
-/// "Sampled" is wgpu's name for the binding *class*, not a claim that all four
-/// are read through a sampler — the jitter tile is read with `textureLoad` and
-/// carries none, and occupies a slot regardless. What this has to match is the
-/// number of texture bindings the raymarch's layouts declare across both
-/// groups. Held to the shader by
+/// "Sampled" is wgpu's name for the binding *class*, not a claim that all six
+/// are read through a sampler — the jitter tile and both group-2 targets are
+/// read with `textureLoad` and carry none, and occupy a slot regardless. What
+/// this has to match is the number of texture bindings the raymarch's layouts
+/// declare across all three groups. Held to the shader by
 /// `the_probe_asks_the_adapter_for_every_binding_the_raymarch_declares`.
-const REQUIRED_SAMPLED_TEXTURES: u32 = 4;
+const REQUIRED_SAMPLED_TEXTURES: u32 = 6;
 
 /// Samplers a volume pipeline binds at once: the grid's, the LUT's, the floor's.
 ///
 /// One per texture *that is sampled*: naga rejects a texture sampled through
 /// two samplers in one entry point (`Error::ImageMultipleSamplers`), and the
-/// grid wants `Linear` while an exact-index LUT lookup wants `Nearest`. One
-/// fewer than [`REQUIRED_SAMPLED_TEXTURES`] because the jitter tile is read
-/// with `textureLoad` and carries no sampler at all.
+/// grid wants `Linear` while an exact-index LUT lookup wants `Nearest`. Three
+/// fewer than [`REQUIRED_SAMPLED_TEXTURES`] because the jitter tile and the
+/// ground pass's two outputs are read with `textureLoad` and carry no sampler
+/// at all.
 const REQUIRED_SAMPLERS: u32 = 3;
 
 /// Bytes of uniform data one volume draw needs bound at once.
 ///
-/// The raymarch's uniform block is one `mat4x4<f32>` plus ten `vec4<f32>` — 224
-/// bytes, [`uniform::VOLUME_UNIFORM_BYTES`] — and this is the next
+/// The raymarch's uniform block is two `mat4x4<f32>` plus eleven `vec4<f32>` —
+/// 304 bytes, [`uniform::VOLUME_UNIFORM_BYTES`] — and this is the next
 /// std140-friendly bound above it. `u64` because
 /// `Limits::max_uniform_buffer_binding_size` is, unlike the three counts above.
-const REQUIRED_UNIFORM_BINDING_SIZE: u64 = 256;
+///
+/// Against a **16 KiB** WebGL2 floor, so the growth that carried the ground
+/// pass's camera into the same block costs nothing at the least capable device
+/// this build targets.
+const REQUIRED_UNIFORM_BINDING_SIZE: u64 = 512;
 
 /// Whether this device can render a 3D volume, decided before anything is made.
 ///

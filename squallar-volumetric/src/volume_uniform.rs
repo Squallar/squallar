@@ -2,8 +2,13 @@
 
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. One `mat4x4<f32>` + ten `vec4<f32>`.
-pub const VOLUME_UNIFORM_BYTES: usize = 224;
+/// Bytes in the uniform block. Two `mat4x4<f32>` + eleven `vec4<f32>`.
+///
+/// **Append-only.** The ground pass shares this one block with the raymarch
+/// rather than carrying its own, which is what makes it structurally
+/// impossible for the mesh and the march to disagree about the camera. Growing
+/// it at the end is what keeps every `OFFSET_*` below where it already was.
+pub const VOLUME_UNIFORM_BYTES: usize = 304;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -21,6 +26,8 @@ pub const OFFSET_FLOOR_UV: usize = 160;
 pub const OFFSET_FLOOR_GEO: usize = 176;
 pub const OFFSET_GRID_FROM_BOX_A: usize = 192;
 pub const OFFSET_GRID_FROM_BOX_B: usize = 208;
+pub const OFFSET_CLIP_FROM_BOX: usize = 224;
+pub const OFFSET_OCCLUDER: usize = 288;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
@@ -118,6 +125,31 @@ pub struct VolumeUniform {
     /// See [`VolumeUniform::grid_from_box_scale`]. Rides `grid_from_box_b.xyz`;
     /// `w` is reserved and written zero.
     pub grid_from_box_offset: [f32; 3],
+    /// Box space to clip space, **column-major**, the direction the ground
+    /// mesh is drawn through. The forward twin of
+    /// [`VolumeUniform::box_from_clip`], built rather than inverted; sharing
+    /// one uniform block with the march is what makes the two impossible to
+    /// disagree.
+    pub clip_from_box: [[f32; 4]; 4],
+    /// The ray parameter a fully-saturated occluder texel decodes to, in box
+    /// units, and **zero when no ground pass ran** — which is what the march
+    /// tests to decide whether to read the occluder at all.
+    ///
+    /// An **over-estimate**, deliberately: a `t` clamped to 1 by the packing
+    /// decodes to this value, which is past the far side of the box, so the
+    /// `min` against the box exit is a no-op rather than a clip. Rides
+    /// `occluder.x`.
+    pub occluder_t_scale: f32,
+    /// The ground surface's greatest height, in box `z`. Written for B2's arm
+    /// rule, which generalises "the eye is above the plane" to "the eye is
+    /// above the ground"; nothing reads it yet. Rides `occluder.y`.
+    pub ground_max_z: f32,
+    /// Amplitude of the analytic stand-in ridge, in box `z`, or zero for flat
+    /// ground. B3 replaces it with a sampled height field; until then it is
+    /// what gives the first increment real heights to occlude with, which the
+    /// plan requires — a flat ground drawn as geometry provably clips nothing.
+    /// Rides `occluder.z`.
+    pub ground_ridge_amplitude: f32,
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
@@ -156,10 +188,68 @@ impl VolumeUniform {
             grid_from_box_scale: IDENTITY_GRID_FROM_BOX.0,
             grid_bounded: false,
             grid_from_box_offset: IDENTITY_GRID_FROM_BOX.1,
+            clip_from_box: IDENTITY,
+            // No ground pass: zero is the sentinel the march tests, so the
+            // occluder arm is dead and the group-2 placeholder is never read
+            // for anything but its own zeroed alpha.
+            occluder_t_scale: 0.0,
+            ground_max_z: 0.0,
+            ground_ridge_amplitude: 0.0,
         }
     }
 
-    /// The 224 bytes the GPU reads, little-endian.
+    /// The `t` scale to pack an occluder against for this camera: **1.05 times
+    /// the farthest unit-cube corner from the eye**.
+    ///
+    /// The unit cube is convex and `|p − eye|` is a convex function of `p`, so
+    /// its maximum over the cube is attained at a corner — every vertex of a
+    /// ground mesh authored in box space is therefore inside this bound before
+    /// the 5% is added. `pinned by the_t_scale_covers_every_post_of_the_grid`.
+    pub fn t_scale_for(eye_in_box: [f32; 3]) -> f32 {
+        let mut farthest = 0.0f32;
+        for corner in 0..8u32 {
+            let p = [
+                (corner & 1) as f32,
+                ((corner >> 1) & 1) as f32,
+                ((corner >> 2) & 1) as f32,
+            ];
+            let d = ((p[0] - eye_in_box[0]).powi(2)
+                + (p[1] - eye_in_box[1]).powi(2)
+                + (p[2] - eye_in_box[2]).powi(2))
+            .sqrt();
+            farthest = farthest.max(d);
+        }
+        T_SCALE_MARGIN * farthest
+    }
+
+    /// Turn the occluder on **for this uniform's own eye**.
+    ///
+    /// The one blessed way to set the scale. `occluder_t_scale` is derived from
+    /// `eye_in_box`, and the two are independent public fields, so a scale
+    /// computed against a different eye would silently mis-clip every ray in
+    /// the frame — the picture would look plausible and be wrong.
+    /// `VolumeTextures::write_uniform` re-checks the pair under
+    /// `debug_assertions`, at the one seam a uniform reaches the GPU through.
+    pub fn aim_occluder(&mut self, ground_max_z: f32, ridge_amplitude: f32) {
+        self.occluder_t_scale = Self::t_scale_for(self.eye_in_box);
+        self.ground_max_z = ground_max_z;
+        self.ground_ridge_amplitude = ridge_amplitude;
+    }
+
+    /// Whether the occluder's scale is the one **this** uniform's eye implies.
+    ///
+    /// True when the occluder is off, which is the zero sentinel. Checked at
+    /// the seam a uniform reaches the GPU through — `VolumeTextures::
+    /// write_uniform` — rather than in [`Self::to_bytes`], which is a pure
+    /// serialiser that byte-layout fixtures drive with deliberately
+    /// incoherent lanes.
+    pub fn occluder_is_aimed_at_its_own_eye(&self) -> bool {
+        self.occluder_t_scale == 0.0
+            || (self.occluder_t_scale - Self::t_scale_for(self.eye_in_box)).abs()
+                <= 1e-3 * self.occluder_t_scale
+    }
+
+    /// The 304 bytes the GPU reads, little-endian.
     pub fn to_bytes(&self) -> [u8; VOLUME_UNIFORM_BYTES] {
         let mut out = [0u8; VOLUME_UNIFORM_BYTES];
 
@@ -221,10 +311,28 @@ impl VolumeUniform {
             OFFSET_GRID_FROM_BOX_B,
             xyz_w(self.grid_from_box_offset, 0.0),
         );
+        for (column, values) in self.clip_from_box.iter().enumerate() {
+            write_vec4(&mut out, OFFSET_CLIP_FROM_BOX + column * 16, *values);
+        }
+        write_vec4(
+            &mut out,
+            OFFSET_OCCLUDER,
+            [
+                self.occluder_t_scale,
+                self.ground_max_z,
+                self.ground_ridge_amplitude,
+                0.0,
+            ],
+        );
 
         out
     }
 }
+
+/// How far past the farthest corner [`VolumeUniform::t_scale_for`] reaches.
+/// A saturating `t` must decode to something the box exit's `min` ignores, so
+/// the scale has to be an over-estimate rather than a tight one.
+pub const T_SCALE_MARGIN: f32 = 1.05;
 
 /// The identity, column-major.
 const IDENTITY: [[f32; 4]; 4] = [
