@@ -352,8 +352,14 @@ fn every_key_in_a_large_index_is_findable_and_no_other_one_is() {
 /// must leave the process exactly as it was: resolving over HTTP.
 #[test]
 fn install_publishes_a_good_pack_and_a_bad_one_changes_nothing() {
-    // Deliberately not asserting `installed().is_none()` first: this static is
-    // process-wide and another test in this binary may have installed one.
+    // The slot is process-wide, and this test both writes it and reads it back
+    // twice. Without the guard it raced `zone_pack_source`'s installer tests in
+    // both directions: this one's `before` comparison saw their pack arrive,
+    // and its corpus landed on top of the pack they were about to look up.
+    let _slot = super::hold_install_slot();
+    // Deliberately not asserting `installed().is_none()` first: tests that ran
+    // before this one may have left a pack installed, and the guard only
+    // excludes the ones running *beside* it.
     let before = installed().map(|pack| pack.byte_len());
 
     assert_eq!(

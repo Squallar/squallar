@@ -7,16 +7,10 @@ use super::*;
 use crate::nws::zone_pack::{Coding, Kind, PackedZone, ZonePack};
 
 /// Held by every test that calls [`zone_pack::install`] (directly or through
-/// the loader) from install to last assertion. The installed pack is one
-/// process-wide slot and `install` *replaces* it, so two installer tests
-/// running on different threads would otherwise race each other's lookups.
-static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn hold_install_slot() -> std::sync::MutexGuard<'static, ()> {
-    // A poisoned lock means another installer test failed, not that this one
-    // cannot run.
-    INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-}
+/// the loader) from install to last assertion. Defined beside the slot it
+/// guards so `zone_pack`'s own installer test can hold the same one; a copy
+/// private to this module left that test unserialised against these.
+use crate::nws::zone_pack::hold_install_slot;
 
 /// A pack holding one county square under `ugc` — a UGC no other test in this
 /// binary uses. The installed pack is process-wide, so an id shared with
