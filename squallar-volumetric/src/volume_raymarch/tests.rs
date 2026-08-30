@@ -1916,6 +1916,59 @@ mod budget_agreement {
         );
     }
 
+    /// **The prism pipeline and the terrain pipeline share one pipeline
+    /// layout**, and nothing else in this workspace can tell you if they stop.
+    ///
+    /// It is a source rule because the consequence of breaking it is not a
+    /// validation error, a warning or a panic — it is a **silently zeroed
+    /// texture**. WebGPU inherits a bind group across a pipeline change only
+    /// where the two layouts agree on every group up to and including it, so a
+    /// building pipeline with its own narrower layout unbinds group 3, and
+    /// re-binding it inside the pass does not bring it back. Measured on
+    /// Vulkan/RTX 3090 while D2 was being written: the whole city extruded from
+    /// the box floor while the terrain drawn beside it in the same pass was
+    /// correct, and every CPU test in the workspace stayed green.
+    ///
+    /// The rendered criterion that catches it —
+    /// `the_prisms_stand_on_the_terrain_and_not_on_the_box_floor` — is
+    /// `#[ignore]`d for needing an adapter and is in no CI job, so on the
+    /// default `cargo test` row **this is the only thing standing between the
+    /// tree and that bug returning**. Run the rendered one with
+    /// `cargo test -p squallar-gpu --test volume_buildings -- --ignored`.
+    #[test]
+    fn the_prisms_share_the_ground_passs_pipeline_layout() {
+        let source = include_str!("../volume_raymarch.rs");
+        // Exactly one layout is created for the pair, and both pipelines name
+        // it. Counting rather than matching a spelling, so a rename carries and
+        // a second layout does not.
+        let created = source.matches("create_pipeline_layout(").count();
+        let ground_layouts = source
+            .matches("label: Some(&label(\"ground.pipeline_layout\"))")
+            .count();
+        let uses = source
+            .matches("layout: Some(&ground_pipeline_layout)")
+            .count();
+        assert_eq!(
+            ground_layouts, 1,
+            "the ground pass's pipeline layout is created {ground_layouts} \
+             times; there must be exactly one for the two pipelines to share"
+        );
+        assert_eq!(
+            uses, 2,
+            "`ground_pipeline_layout` is named by {uses} pipelines, not the two \
+             that must share it — the terrain grid and the building prisms. A \
+             prism pipeline given a layout of its own reads the height texture \
+             as ZEROS and stands the whole city on the box floor, with no \
+             validation error and no CPU test to catch it"
+        );
+        assert_eq!(
+            created, 3,
+            "{created} pipeline layouts are created in this module. There are \
+             three: the raymarch's, the ground pass's — shared with the prisms \
+             — and the blit's. A fourth is how the prisms get their own back"
+        );
+    }
+
     /// A pixel costs what the offscreen's format actually costs.
     #[test]
     fn a_pixel_costs_what_the_offscreen_format_costs() {

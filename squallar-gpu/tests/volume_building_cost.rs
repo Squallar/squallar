@@ -8,8 +8,14 @@
 //! `squallar-buildings`' committed Monaco tile, extruded through the same
 //! `read_footprints` + `extrude` the worker's job row runs, and replicated on a
 //! grid to reach the vertex counts the rung ladder actually offers. That is
-//! what makes this reproducible on the CI `gpu` job rather than a number one
-//! machine once produced.
+//! what makes it reproducible by anyone with an adapter rather than a number
+//! one machine once produced.
+//!
+//! **No CI job runs it.** `.github/workflows/test.yaml`'s `gpu` job names
+//! `volume_gpu`, `volume_silhouette` and `volume_shader_mutants` and nothing
+//! else. An earlier version of this paragraph said "reproducible on the CI
+//! `gpu` job", which was false; being cheap to re-run is what it actually has,
+//! and that is a different claim.
 //!
 //! # The denominators, because there are three and they are not the same
 //!
@@ -38,7 +44,9 @@ use squallar_device_profile::quality::{GroundPass, ResolutionRung};
 use squallar_egui::pane::OrbitCamera;
 use squallar_egui::volume_view::view_for;
 use squallar_volumetric::raymarch::staging::{STAGING_RING_FEATURE, VolumeStaging};
-use squallar_volumetric::raymarch::{BuildingPrisms, OffscreenPlan, VolumePipelines};
+use squallar_volumetric::raymarch::{
+    BUILDING_UPLOAD_BYTES_PER_CALL, BuildingPrisms, OffscreenPlan, VolumePipelines,
+};
 use squallar_volumetric::uniform::VolumeUniform;
 
 mod gpu_harness;
@@ -235,15 +243,7 @@ fn measure_the_building_pass_cost_on_a_real_city() {
         );
 
         for (tiles, mesh) in &cities {
-            let prisms = pipelines
-                .upload_buildings(
-                    &device,
-                    &queue,
-                    &mesh.positions,
-                    &mesh.normals,
-                    &mesh.indices,
-                )
-                .expect("the city mesh was refused");
+            let prisms = filled(&device, &queue, &pipelines, mesh);
             let (mean, min) = timed_ground_passes(
                 &device,
                 &queue,
@@ -272,6 +272,95 @@ fn measure_the_building_pass_cost_on_a_real_city() {
             );
         }
     }
+}
+
+/// **What `upload_buildings` costs the FRAME THREAD**, which is a different
+/// question from what the pass costs the GPU and is measured in a different
+/// clock.
+///
+/// `CallbackTrait::prepare` runs on the frame thread, and this repository's
+/// rule is that heavy work never lands there — "it runs rarely" explicitly not
+/// an exception. The upload interleaves positions and normals into one byte
+/// buffer, which is `O(vertices)` host work on that thread, so the rule says
+/// measure it rather than argue about it.
+///
+/// Wall clock and not a GPU timestamp: the quantity is host time, and the
+/// `write_buffer` at the end of it is a queue write rather than a submit.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the module doc"]
+fn measure_what_the_upload_costs_the_frame_thread() {
+    let _guard = gpu_lock();
+    let (device, queue) = device_with_timestamps();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+
+    println!(
+        "\nHOST time inside the upload, on the frame thread — a different clock \
+         and a different denominator from every figure above, and never added \
+         to them. `worst call` is what a FRAME pays, bounded by \
+         BUILDING_UPLOAD_BYTES_PER_CALL = {BUILDING_UPLOAD_BYTES_PER_CALL} B; \
+         `whole mesh` is the sum over every call, which is what a single frame \
+         paid before the upload was bounded."
+    );
+    for copies in [1u32, 2, 3, 4, 5] {
+        let mesh = replicated_city(copies);
+        let bytes = mesh.bytes();
+
+        // A warm-up allocation, so the first timed pass is not billed for the
+        // allocator's first touch of the pages.
+        drop(filled(&device, &queue, &pipelines, &mesh));
+
+        let mut worst_call = 0.0f64;
+        let mut whole = 0.0f64;
+        let mut calls = 0usize;
+        let mut prisms = pipelines
+            .begin_buildings(&device, &mesh.positions, &mesh.normals, &mesh.indices)
+            .expect("the city mesh was refused");
+        loop {
+            let at = std::time::Instant::now();
+            let done = pipelines.advance_buildings(
+                &queue,
+                &mut prisms,
+                &mesh.positions,
+                &mesh.normals,
+                &mesh.indices,
+            );
+            let took = at.elapsed().as_secs_f64() * 1.0e3;
+            worst_call = worst_call.max(took);
+            whole += took;
+            calls += 1;
+            if done {
+                break;
+            }
+        }
+        println!(
+            "  {:>2} tiles: {:>7} vertices, {:>7} indices, {:>8.3} MB -> {calls:>3} calls, \
+             worst call {worst_call:.4} ms, whole mesh {whole:.4} ms",
+            copies * copies,
+            mesh.positions.len(),
+            mesh.indices.len(),
+            bytes as f64 / 1.0e6,
+        );
+    }
+}
+
+/// A mesh carried over in as many calls as it takes.
+fn filled(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    mesh: &BuildingMesh,
+) -> BuildingPrisms {
+    let mut prisms = pipelines
+        .begin_buildings(device, &mesh.positions, &mesh.normals, &mesh.indices)
+        .expect("the city mesh was refused");
+    while !pipelines.advance_buildings(
+        queue,
+        &mut prisms,
+        &mesh.positions,
+        &mesh.normals,
+        &mesh.indices,
+    ) {}
+    prisms
 }
 
 /// GPU milliseconds of the ground pass alone, over [`TIMED_FRAMES`] frames.

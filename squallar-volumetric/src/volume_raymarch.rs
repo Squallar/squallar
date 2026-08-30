@@ -421,8 +421,10 @@ impl VolumePipelines {
     /// [`Self::from_shader_source`] for a module that **predates the prism
     /// stages**, leaving the building pipeline unbuilt.
     ///
-    /// It exists for one caller and the reason is worth stating rather than
-    /// leaving as an option nobody explains. `volume_light.rs` pins a copy of
+    /// It exists for one FILE — `volume_light.rs`, whose every scene is built
+    /// through it, not just the two that read the pin — and the reason is
+    /// worth stating rather than leaving as an option nobody explains. That
+    /// file pins a copy of
     /// this shader as it stood before C2 and renders through it, so that "the
     /// readable light draws the picture this renderer always drew" is measured
     /// against the picture this renderer actually drew rather than against one
@@ -436,6 +438,21 @@ impl VolumePipelines {
     /// Nothing is lost from what the pin measures: no prism mesh is handed to
     /// `encode_ground` in either criterion that reads it, so the pipeline this
     /// skips would never have been bound.
+    ///
+    /// **What IS lost, and it is worth naming rather than leaving to be
+    /// discovered.** Because every scene in that file takes this constructor,
+    /// `volume_light.rs` — the file that owns C2's "neither surface can be lit
+    /// by a light the other does not have" — never constructs a prism, so the
+    /// third lit surface is not inside its cross-surface sweep. It is not
+    /// unpinned, it has moved: the source-level half is
+    /// `squallar_volumetric::uniform`'s own `lit` call count, which requires
+    /// five callers and names the prisms as one of them, and the rendered half
+    /// is `volume_buildings::a_prisms_walls_are_shaded_by_the_faces_they_are`,
+    /// which drives the prisms under the shipped headlight and under a light
+    /// with no beam and requires the roof's response to be exactly one. That
+    /// one is `#[ignore]`d for needing an adapter; run it with
+    /// `cargo test -p squallar-gpu --test volume_buildings -- --ignored`. Whoever
+    /// gives that file a prism scene should delete this paragraph with it.
     pub fn from_shader_source_without_prisms(
         device: &wgpu::Device,
         egui_attachments: AttachmentConfig,
@@ -1392,6 +1409,14 @@ impl VolumePipelines {
         let (Some(buildings), Some(building_pipeline)) = (buildings, self.building.as_ref()) else {
             return;
         };
+        // **A partly-written mesh is not drawn.** The tail of its buffers is
+        // still zeroes, and a zeroed vertex is a degenerate triangle through
+        // the box origin — a fan of slivers across the whole pane rather than a
+        // missing building. The terrain has already drawn above, so the pane
+        // shows ground with no city on it for the few frames the upload takes.
+        if !buildings.is_complete() {
+            return;
+        }
         pass.set_pipeline(building_pipeline);
         // **Every group re-set, including the mirror the prisms never sample.**
         // The two pipelines share one layout precisely so that nothing here can
@@ -1501,10 +1526,27 @@ impl VolumePipelines {
     ///
     /// An empty mesh answers `None` too. There is nothing to draw, and a zero
     /// length buffer is not a legal wgpu allocation.
-    pub fn upload_buildings(
+    ///
+    /// # It does not finish, and that is the point
+    ///
+    /// This allocates and validates; the bytes go across in bounded slices
+    /// through [`Self::advance_buildings`], because **the whole conversion does
+    /// not fit in a frame**. Measured in release on this box: interleaving and
+    /// writing a 337,104-vertex city — around the shipped default rung — takes
+    /// **5.76 ms**, and 599,296 vertices takes **10.3 ms**. A 60 Hz frame is
+    /// 16.7 ms, so the one-shot version spent a third to two-thirds of a frame
+    /// on the frame thread. "It only runs when the mesh changes" is the
+    /// exemption this repository explicitly does not grant.
+    ///
+    /// A caller that wants it all at once — a cost harness, a test — calls
+    /// [`Self::advance_buildings`] in a loop until it answers complete.
+    ///
+    /// It takes no `queue`, and that is the signature saying what it does: this
+    /// call allocates and validates, and every byte crosses through
+    /// [`Self::advance_buildings`].
+    pub fn begin_buildings(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         positions: &[[f32; 3]],
         normals: &[[f32; 3]],
         indices: &[u32],
@@ -1545,22 +1587,6 @@ impl VolumePipelines {
             return None;
         }
 
-        // Interleaved position-then-normal, which is the layout the pipeline
-        // declares and the stride the buildings crate's budget prices. Built
-        // here rather than shipped that way because the worker's reply
-        // nominates the two as separate tails, and concatenating a 9 MB mesh
-        // at each end to save this walk would cost more than it saved.
-        let mut vertices = Vec::with_capacity(vertex_bytes as usize);
-        for (position, normal) in positions.iter().zip(normals) {
-            for axis in position.iter().chain(normal) {
-                vertices.extend_from_slice(&axis.to_le_bytes());
-            }
-        }
-        let mut index_bytes_out = Vec::with_capacity(index_bytes as usize);
-        for index in indices {
-            index_bytes_out.extend_from_slice(&index.to_le_bytes());
-        }
-
         let vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&label("building.vertices")),
             size: vertex_bytes,
@@ -1573,15 +1599,121 @@ impl VolumePipelines {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&vertices_buffer, 0, &vertices);
-        queue.write_buffer(&indices_buffer, 0, &index_bytes_out);
 
+        // Nothing is written here. `advance_buildings` carries the bytes over
+        // in bounded slices, and `is_complete` is what says the mesh may draw.
         Some(BuildingPrisms {
             vertices: vertices_buffer,
             indices: indices_buffer,
             index_count,
             vertex_count,
+            vertices_written: 0,
+            indices_written: 0,
         })
+    }
+
+    /// Carry at most [`BUILDING_UPLOAD_BYTES_PER_CALL`] more bytes of `mesh`
+    /// into `prisms`, and answer whether the mesh is now whole.
+    ///
+    /// **The frame thread's whole share of a building mesh**, and the bound is
+    /// what makes it one. Interleaving and writing a whole city is 5.76 ms at
+    /// the shipped default rung in a release build on a fast desktop; spread
+    /// over calls it is a fixed slice of a frame and the city arrives a few
+    /// frames later, which is the trade this repository names outright —
+    /// interaction is realtime, data may lag.
+    ///
+    /// The slices are taken from the caller's own slices rather than from a
+    /// staged copy, so nothing is held between calls but two integers. A caller
+    /// handing in a different mesh from the one that started must start a new
+    /// [`Self::begin_buildings`]; the id check in `volume_bridge` is what
+    /// enforces that upstream.
+    ///
+    /// Answers `true` when there is nothing left to do, so a loop
+    /// `while !advance_buildings(..) {}` terminates and is what a test or a
+    /// cost harness uses to fill a mesh at once.
+    pub fn advance_buildings(
+        &self,
+        queue: &wgpu::Queue,
+        prisms: &mut BuildingPrisms,
+        positions: &[[f32; 3]],
+        normals: &[[f32; 3]],
+        indices: &[u32],
+    ) -> bool {
+        // A mesh that no longer matches the buffers it is filling would write
+        // one city's bytes into another's allocation. Answered rather than
+        // asserted: this is the frame thread.
+        if positions.len() != prisms.vertex_count as usize
+            || normals.len() != positions.len()
+            || indices.len() != prisms.index_count as usize
+        {
+            log::error!(
+                "3D volume view: refusing to advance a {}-vertex upload with a \
+                 {}-vertex mesh",
+                prisms.vertex_count,
+                positions.len(),
+            );
+            return prisms.is_complete();
+        }
+
+        let mut budget = BUILDING_UPLOAD_BYTES_PER_CALL;
+
+        // **Vertices first, and the whole reason for the order is that the two
+        // buffers are not interchangeable**: an index buffer complete before
+        // the vertices it addresses still cannot be drawn, and `is_complete`
+        // is what gates the draw either way. Doing them in a fixed order keeps
+        // the number of calls a mesh takes a function of its size alone.
+        if prisms.vertices_written < prisms.vertex_count {
+            let stride = BUILDING_VERTEX_BYTES as usize;
+            let remaining = (prisms.vertex_count - prisms.vertices_written) as usize;
+            let count = remaining.min((budget / BUILDING_VERTEX_BYTES).max(1) as usize);
+            let from = prisms.vertices_written as usize;
+            // Interleaved position-then-normal, which is the layout the
+            // pipeline declares and the stride the buildings crate's budget
+            // prices. Built here rather than shipped that way because the
+            // worker's reply nominates the two as separate tails, and
+            // concatenating the whole mesh at each end to save this walk would
+            // cost more than it saved.
+            //
+            // Written into a pre-sized buffer rather than a grown one:
+            // `chunks_exact_mut` proves the length once instead of per write.
+            // The explicit `to_le_bytes` stays for the reason the height
+            // texture's does — the wire encoding and the native one are two
+            // different facts and a cast would decide which silently.
+            let mut bytes = vec![0u8; count * stride];
+            for (slot, (position, normal)) in bytes.chunks_exact_mut(stride).zip(
+                positions[from..from + count]
+                    .iter()
+                    .zip(&normals[from..from + count]),
+            ) {
+                for (word, axis) in slot
+                    .chunks_exact_mut(4)
+                    .zip(position.iter().chain(normal.iter()))
+                {
+                    word.copy_from_slice(&axis.to_le_bytes());
+                }
+            }
+            queue.write_buffer(
+                &prisms.vertices,
+                from as u64 * BUILDING_VERTEX_BYTES,
+                &bytes,
+            );
+            prisms.vertices_written += count as u32;
+            budget = budget.saturating_sub(bytes.len() as u64);
+        }
+
+        if budget > 0 && prisms.indices_written < prisms.index_count {
+            let remaining = (prisms.index_count - prisms.indices_written) as usize;
+            let count = remaining.min((budget / BUILDING_INDEX_BYTES).max(1) as usize);
+            let from = prisms.indices_written as usize;
+            let mut bytes = vec![0u8; count * BUILDING_INDEX_BYTES as usize];
+            for (word, index) in bytes.chunks_exact_mut(4).zip(&indices[from..from + count]) {
+                word.copy_from_slice(&index.to_le_bytes());
+            }
+            queue.write_buffer(&prisms.indices, from as u64 * BUILDING_INDEX_BYTES, &bytes);
+            prisms.indices_written += count as u32;
+        }
+
+        prisms.is_complete()
     }
 
     /// Record the raymarch into `target`.
@@ -1926,6 +2058,10 @@ pub struct BuildingPrisms {
     indices: wgpu::Buffer,
     index_count: u32,
     vertex_count: u32,
+    /// Vertices whose bytes have reached the buffer so far.
+    vertices_written: u32,
+    /// Indices whose bytes have reached the buffer so far.
+    indices_written: u32,
 }
 
 impl BuildingPrisms {
@@ -1944,6 +2080,16 @@ impl BuildingPrisms {
     pub fn buffer_bytes(&self) -> u64 {
         u64::from(self.vertex_count) * BUILDING_VERTEX_BYTES
             + u64::from(self.index_count) * BUILDING_INDEX_BYTES
+    }
+
+    /// Whether every byte of the mesh has reached the GPU.
+    ///
+    /// **A partly-written mesh is never drawn**, and that is why this is a
+    /// question rather than a fraction: the unwritten tail of a buffer is
+    /// zeroes, so drawing one would put a fan of degenerate triangles through
+    /// the box origin. `encode_ground` skips a mesh that answers `false`.
+    pub fn is_complete(&self) -> bool {
+        self.vertices_written == self.vertex_count && self.indices_written == self.index_count
     }
 }
 
@@ -2509,6 +2655,36 @@ pub fn blit_entry_point_for(format: wgpu::TextureFormat) -> &'static str {
 /// at, which is the number that crate's whole rung ladder is built on;
 /// `the_vertex_stride_is_what_the_budget_prices` holds the pair.
 pub const BUILDING_VERTEX_BYTES: u64 = 24;
+
+/// The most mesh bytes one [`VolumePipelines::advance_buildings`] call
+/// converts and writes: **1 MiB**.
+///
+/// **Measured against a frame rather than chosen for tidiness.** In a release
+/// build on this box the interleave-and-write runs at about 1.8 GB/s of output
+/// — 5.76 ms for the 10.36 MB a 337,104-vertex city occupies — so a mebibyte is
+/// on the order of **0.6 ms**, a small fraction of a 16.7 ms frame and bounded
+/// whatever the city's size. A full default-rung mesh then lands over about ten
+/// calls, and the prisms appear a sixth of a second after the terrain they
+/// stand on.
+///
+/// That lag is the trade this repository names outright: interaction is
+/// realtime, data may lag. The alternative measured 5.65 ms in one frame, and
+/// 12.4 ms for a mesh half again as large.
+///
+/// **The bound is not perfectly flat, and the exception reproduces.** Across
+/// three release runs the worst call is 0.57-0.60 ms at 1.15, 4.61, 10.36 and
+/// 28.78 MB — and **2.81-2.94 ms at 18.42 MB**, every time. It is not the
+/// conversion, which is linear in the slice and the slice is fixed; it is one
+/// call in that run paying for a `write_buffer` staging allocation. Worth
+/// naming rather than rounding away: the guarantee this constant buys is "a
+/// fraction of a frame", not "0.6 ms", and the outlier is a sixth of a frame
+/// rather than the two-thirds the unbounded version cost.
+///
+/// It is deliberately **not** a `cfg` cascade. A slower machine converts fewer
+/// bytes per millisecond, not fewer per byte, so the honest answer for one is a
+/// smaller number measured there — and nothing in this workspace measures the
+/// machine yet.
+pub const BUILDING_UPLOAD_BYTES_PER_CALL: u64 = 1 << 20;
 
 /// Bytes one prism index occupies. `u32`, matching
 /// `squallar_buildings::PRISM_INDEX_BYTES`, because that crate's finest rung is

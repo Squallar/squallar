@@ -933,17 +933,42 @@ fn fs_ground(in: GroundVertex) -> GroundTargets {
 // The albedo every prism is painted with, linear RGB: a light warm grey.
 //
 // **One colour for every building, and the vector-tile `colour` property is
-// deliberately not read.** The archive this workspace ships carries it on 22
-// of 126 `building` features, so a per-feature lane would be absent on 83% of
-// them and this constant would still be the answer wherever it was; the
-// per-feature value is a refinement of it rather than a replacement for it.
-// What reading it would cost is not small: the property is a STRING, so it
-// needs a colour parser somewhere, and the only place that may run is the
-// worker - which means a wider reply, a fourth tail, and either a fourth
-// vertex attribute (`squallar_buildings::PRISM_VERTEX_BYTES` 24 -> 28, a 17%
-// wider VRAM row) or a per-building instance lane this draw has no instancing
-// for. What would overturn this is a measurement that a single-albedo city
-// reads worse than a 17%-smaller one that is 17% coloured.
+// deliberately not read.** The decision stands; an earlier version of this
+// comment argued it from a coverage figure, and every part of that figure was
+// the wrong number.
+//
+// What was said: the archive carries `colour` on 22 of 126 features, so a
+// per-feature lane is absent on 83% of them. Three things are wrong with using
+// that as the argument.
+//
+//   * **The denominator is one z14 tile of Monaco.** This repository's own rule
+//     is to arbitrate a convention across four or five diverse sites and a
+//     holdout, never a single site, and 126 features of one European old town
+//     is the narrowest possible base for a claim about OpenMapTiles at large.
+//   * **It is not the population that draws.** Only 43 of those 126 land inside
+//     the box the prism suites render, so even within the tile the ratio that
+//     matters was never measured.
+//   * **The drawn set is BIASED toward the tagged one.** `shed_order` keeps a
+//     prefix by height, so what survives the budget to reach the glass is the
+//     tall and the landmark buildings — and `building:colour` is tagged
+//     disproportionately on exactly those. 17% is therefore a LOWER bound on
+//     coverage among drawn prisms, not the upper bound the argument used it as.
+//
+// The cost dichotomy was wrong too. It said the choice was a 17% wider vertex
+// or per-building instancing this draw has none of. But normals are unit
+// vectors, so `Snorm8x4` carries one in four bytes: 12 for the position, 4 for
+// the normal, 4 for the colour is **20 bytes**, which is NARROWER than the 24
+// this ships. And "a 17% wider VRAM row" inverts what a wider vertex costs —
+// the row is a fixed budget, so a wider vertex buys FEWER buildings, not a
+// bigger allocation.
+//
+// **What actually decides it is scope.** `colour` is a STRING, so honouring it
+// needs a CSS-colour parser, and the only place it may run is the worker — so
+// it is a wider reply, a fourth tail, a new capability in a crate whose charter
+// and tests do not cover parsing colours, and a vertex format change. That is
+// D1's wire, not D2's draw. This constant is what a building looks like until
+// somebody does that work, and the 20-byte layout is the shape it should take
+// when they do.
 const BUILDING_ALBEDO: vec3<f32> = vec3<f32>(0.62, 0.60, 0.58);
 
 // How far outside the unit cube a building fragment is still written.
@@ -989,8 +1014,23 @@ fn ground_post_coord(u: f32, posts: u32, scale: f32, offset: f32) -> f32 {
 // everywhere off the diagonals. A building standing at the bilinear height on
 // a twisted cell hovers or sinks by exactly that much, which is the defect
 // this unit exists not to have. Picking the triangle by `f.x + f.y <= 1.0` and
-// evaluating its own plane makes "the building stands on the terrain" true by
-// construction rather than to a tolerance.
+// evaluating its own plane is what makes a prism VERTEX sit exactly on the
+// drawn terrain.
+//
+// **At the vertices, and interpolated in between** — the claim is not stronger
+// than that and an earlier version of this comment said "by construction"
+// without the qualifier. The rasteriser interpolates a wall's base linearly
+// between its two end vertices while the terrain under it is piecewise planar
+// with a knee at every cell boundary, so a wall spanning several cells has a
+// base that is a CHORD of the ground: it floats over a crest and sinks into a
+// hollow between its ends. The size of it is the terrain's own deviation from
+// that chord — at the ~47 m posts `squallar_elevation::plan` gives over a
+// dollied patch, a footprint crossing a crest with a 20 m rise over 100 m
+// picks up a couple of metres, tripled at the shipped 3x exaggeration.
+//
+// It is not what this unit set out to fix and it is not fixed here. Subdividing
+// a wall against the post grid is the answer, and it belongs with the
+// per-building anchor below rather than beside it.
 //
 // `raymarch::ground_surface_at` is the Rust mirror, and `volume_buildings.rs`
 // drives the two against each other.
@@ -1043,6 +1083,34 @@ struct BuildingVertex {
 // authored in the same box space `vs_ground` is, and the camera is framed
 // against the exaggerated box, so both surfaces are stretched by one factor in
 // one place. A building stretched here would be stretched twice.
+//
+// # A building on a slope is SHEARED, and that is a consequence rather than an
+// # answer
+//
+// Every vertex takes the ground under its own position, so a footprint on a
+// hillside gets a base that follows the hill and a roof parallel to it. Real
+// buildings have level bases and flat roofs; a real renderer picks ONE height
+// per building — its centroid's, usually — and lets the base cut into the hill
+// on the uphill side.
+//
+// **This draws the sheared version because the mesh cannot express the other
+// one**, not because it was chosen. A per-building height needs a per-building
+// anchor, and `squallar_buildings` emits positions and normals and nothing
+// else: a vertex here cannot name the footprint it belongs to. The fix is one
+// more vertex lane carrying the footprint's anchor in the same kilometres,
+// which is a `squallar-buildings` wire change and not a redesign. Until then a
+// prism on a 10% grade over a 40 m footprint leans by about 4 m, tripled at 3x
+// exaggeration.
+//
+// **The roofs are worse, and it is the same root.** `squallar_buildings::prism`
+// authors every roof normal as straight up, and this stage displaces the roof's
+// z per vertex without touching it — so a roof over sloping ground is DRAWN
+// tilted and LIT as though horizontal, about 8.5 degrees apart on a 10% grade at
+// 3x exaggeration. `ground_normal` states the opposite principle for the terrain
+// in this same file: a ridge drawn three times as steep as it is has to be lit
+// as the ridge it is drawn as, or the shading contradicts the silhouette. The
+// prisms do not honour that yet, and the anchor lane is what would let them:
+// with one height per building the roof is level again and its normal is true.
 @vertex
 fn vs_building(@location(0) km: vec3<f32>, @location(1) normal: vec3<f32>) -> BuildingVertex {
     let uv = vec2<f32>(

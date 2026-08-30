@@ -77,6 +77,13 @@ fn the_dependency_ceiling_holds() {
                     // buildings crate links neither egui nor wgpu by charter,
                     // which is exactly why this edge may only ever be a
                     // dev-dependency.
+                    //
+                    // **The clause below asks for the charter AND the plan to
+                    // change first, in writing. Only the charter has.** The
+                    // plan's D2 does not mention this dependency, and the
+                    // amendment is owed rather than made — recording it here
+                    // because a half-satisfied escape clause that nobody wrote
+                    // down is how the clause stops meaning anything.
                     | "squallar-buildings"
                     | "nexrad-model"
                     | "chrono"
