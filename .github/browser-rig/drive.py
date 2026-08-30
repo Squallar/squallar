@@ -38,6 +38,21 @@ global (dot-path) until it holds a JSON-serialisable value -- the future
 instrumented build exposes richer stats via such a global, and
 `--poll-global NAME` wires it from the CLI.
 
+Frame telemetry (WO-5): scrapes the app's own `frame service` / `frame
+segments` / `frame prep costs` / `gpu passes` / `frame cadence` lines
+(seeded loud via squallar.frame_telemetry) and BIN-DIFFS the embedded
+42-count histograms between the gesture marker lines to report
+gesture-window-only percentiles -- cumulative-from-boot figures are labelled
+as such and never quoted as window figures. `--w3c-gesture` drives real
+input through the driver's /actions endpoint (pointer + wheel input
+sources; a driver that refuses the wheel source falls back to a synthesized
+WheelEvent, recorded per browser). `--expect-interaction-frames` is the one
+gate built on any of it, and it is a COUNT assert: the interact family
+strictly grew. `--wait-console-regex` is the generic wait-until-console-line
+primitive. `--android` (chromedriver + androidPackage + adb reverse) and
+`--browser safari` (safaridriver) are implemented per spec but NOT
+device-tested from this box; they say so where they run.
+
 Two arms, selected with --arm, NEVER merged:
 
   software  (default) the CI arm and the one every pinned Tier-2 figure was
@@ -80,6 +95,7 @@ import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from collections import Counter
@@ -686,7 +702,8 @@ def firefox_capabilities(binary, window, headless=True, extra_prefs=None):
 def launch(browser, out_dir, tag, driver_path=None, binary=None,
            window=(1280, 900), headless=True, tmp_root=None,
            ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
-           display=None, chromium_args=()):
+           display=None, chromium_args=(), android=False,
+           android_package="com.android.chrome"):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
@@ -741,7 +758,27 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     if arm == "hardware":
         host = resolve_host_display(display)
 
-    if browser == "chromium":
+    if browser == "chromium" and android:
+        # The Android mode: chromedriver drives the phone's own Chrome over
+        # adb. No binary is picked (the package IS the binary), no headless
+        # flag exists, and the arm flags are moot -- the phone's GPU answers.
+        # The caller must have `adb reverse tcp:P tcp:P` in place before
+        # navigating (run_smoke does it), or 127.0.0.1 on the phone is the
+        # phone. IMPLEMENTED PER SPEC, NOT DEVICE-TESTED IN THIS TREE: no
+        # Android device was attached when this landed; arg validation and
+        # the wire shape are what is exercised.
+        driver_path = driver_path or DEFAULT_CHROMEDRIVER
+        caps = {"capabilities": {"alwaysMatch": {
+            "browserName": "chrome",
+            "acceptInsecureCerts": True,
+            "goog:chromeOptions": {"androidPackage": android_package},
+            "goog:loggingPrefs": {"browser": "ALL"},
+        }}}
+        argv = [driver_path, "--port=%d" % port, "--log-level=INFO"]
+        info = {"android_package": android_package,
+                "driver_version": _version_of(driver_path),
+                "gpu_mode": "android-device"}
+    elif browser == "chromium":
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         pick = pick_chromium_binary(driver_path, preferred=binary)
         chrome_headless = headless
@@ -806,13 +843,31 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
             caps = firefox_capabilities(binary, window,
                                         headless=(mode == "headless"),
                                         extra_prefs=ff_prefs)
+    elif browser == "safari":
+        # The safaridriver mode: an external driver the rig does not manage
+        # beyond starting it on a port -- Apple ships it with macOS and it
+        # drives the system Safari (or, with `--driver .../safaridriver` on
+        # an iOS-paired Mac, a device through Safari's remote automation).
+        # IMPLEMENTED PER SPEC, NOT EXECUTED IN THIS TREE: there is no macOS
+        # or safaridriver on this box; the wire shape is W3C-standard and the
+        # probes above are all plain /execute scripts, but nothing here has
+        # met a real Safari. acceptInsecureCerts is deliberately absent --
+        # safaridriver rejects it; TLS legs need the mkcert CA trusted on the
+        # device instead (serve.py's header documents the provisioning).
+        driver_path = driver_path or shutil.which("safaridriver")
+        if not driver_path:
+            raise WebDriverError("no safaridriver binary; pass --driver")
+        argv = [driver_path, "-p", str(port)]
+        caps = {"capabilities": {"alwaysMatch": {"browserName": "safari"}}}
+        info = {"binary": "safari (system)",
+                "driver_version": _version_of(driver_path)}
     else:
-        raise ValueError("browser must be chromium or firefox")
+        raise ValueError("browser must be chromium, firefox or safari")
     info["driver_path"] = driver_path
     info["arm"] = arm
     if host is not None:
         info["host_display"] = dict(host)
-    if browser == "chromium":
+    if browser == "chromium" and not android:
         info["chromium_args"] = (caps["capabilities"]["alwaysMatch"]
                                  ["goog:chromeOptions"]["args"])
     if tmp_note:
@@ -841,6 +896,22 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         driver.stop()
         raise
     return driver, session, info
+
+
+def adb_reverse(port, serial=None):
+    """Map the device's 127.0.0.1:<port> back to this host over adb, so the
+    served rig URL works unchanged inside the phone's Chrome. Part of the
+    --android mode; see the launch() branch for its device-untested status."""
+    adb = shutil.which("adb")
+    if not adb:
+        raise WebDriverError("--android needs adb on PATH for `adb reverse`")
+    argv = [adb] + (["-s", serial] if serial else []) + \
+           ["reverse", "tcp:%d" % port, "tcp:%d" % port]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise WebDriverError("adb reverse failed rc=%d: %s"
+                             % (r.returncode, (r.stderr or r.stdout).strip()))
+    return " ".join(argv)
 
 
 # --------------------------------------------------------------------------
@@ -1166,6 +1237,385 @@ return { attached: attached, different: different, off_frame: off_frame,
          transport: transport, rasters: rasters, uploads: uploads,
          console_total: C.length };
 """
+
+# The frame timing lines, written by App::report_frame_telemetry every 2 s
+# when the `squallar.frame_telemetry` localStorage key is seeded (a separate
+# switch from `squallar.raster_telemetry`; a leg seeds only what it reads).
+# All running totals, so the LAST match wins for the headline reading -- but
+# the interact and cadence lines embed their whole 42-count histograms
+# (under-floor clamp, 40 geometric bins, over-ceiling clamp) precisely so a
+# reading can be BIN-DIFFED against an earlier one: percentiles do not
+# difference, histograms do. Every reading of those two families is therefore
+# kept, with its page-side timestamp, for the gesture-window diff.
+#
+# Sentences pinned from the Rust side by `frame_telemetry_line_tests`, which
+# reads these very patterns out of this file -- the same seam
+# `raster_telemetry_line_tests` holds for the two raster lines. The absence
+# sentence is scanned VERBATIM: on an adapter with no TIMESTAMP_QUERY (every
+# WebGL2 leg) the app states the absence rather than extrapolating, and the
+# rig reports it as such rather than as null.
+#
+# NO figure scraped here ever gates CI; the only gate built on these lines is
+# --expect-interaction-frames, a count assert.
+FRAME_LINE_PROBE = r"""
+var C = window.__rig_console || [];
+var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var svc_idle_re = /frame service \(idle\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us/;
+var segments_re = /frame segments \(interact, p99 us\): pre=(\d+|none|over), pump=(\d+|none|over), ui=(\d+|none|over), prepare=(\d+|none|over), finish=(\d+|none|over), post=(\d+|none|over); acquire n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us/;
+var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply, (\d+) us mirror, (\d+) us buffers and callbacks/;
+var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
+var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
+var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
+var interact = null, idle = null, segments = null, prep = null, gpu = null;
+var cadence = null, gpu_unavailable = false;
+var interact_all = [], cadence_all = [];
+var begins = [], loops = [];
+for (var i = 0; i < C.length; i++) {
+  var m = String(C[i].msg || "");
+  var t = C[i].t;
+  var x = svc_interact_re.exec(m);
+  if (x) {
+    interact = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
+                 p99: x[4], hist: x[5] };
+    interact_all.push(interact);
+  }
+  x = svc_idle_re.exec(m);
+  if (x) idle = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
+                  p99: x[4] };
+  x = segments_re.exec(m);
+  if (x) segments = { t: t, pre: x[1], pump: x[2], ui: x[3], prepare: x[4],
+                      finish: x[5], post: x[6],
+                      acquire_n: parseInt(x[7], 10), acquire_p50: x[8],
+                      acquire_p99: x[9] };
+  x = prep_costs_re.exec(m);
+  if (x) prep = { t: t, passes: parseInt(x[1], 10),
+                  tessellate_us: parseInt(x[2], 10),
+                  upload_apply_us: parseInt(x[3], 10),
+                  mirror_us: parseInt(x[4], 10),
+                  buffers_and_callbacks_us: parseInt(x[5], 10) };
+  x = gpu_passes_re.exec(m);
+  if (x) gpu = { t: t,
+                 raymarch: { n: parseInt(x[1], 10), p50: x[2], p99: x[3] },
+                 ground: { n: parseInt(x[4], 10), p50: x[5], p99: x[6] },
+                 mirror: { n: parseInt(x[7], 10), p50: x[8], p99: x[9] },
+                 main: { n: parseInt(x[10], 10), p50: x[11], p99: x[12] },
+                 frames: parseInt(x[13], 10) };
+  if (m.indexOf("gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)") !== -1)
+    gpu_unavailable = true;
+  x = cadence_re.exec(m);
+  if (x) {
+    cadence = { t: t, n: parseInt(x[1], 10), p50: x[2], p99: x[3],
+                hist: x[4] };
+    cadence_all.push(cadence);
+  }
+  x = gesture_begin_re.exec(m);
+  if (x) begins.push({ t: t, script: x[1] });
+  x = gesture_loop_re.exec(m);
+  if (x) loops.push({ t: t, script: x[1], frames: parseInt(x[2], 10) });
+}
+return { interact: interact, idle: idle, segments: segments, prep: prep,
+         gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
+         interact_all: interact_all, cadence_all: cadence_all,
+         gesture_begins: begins, gesture_loops: loops,
+         console_total: C.length };
+"""
+
+
+# ---- the Hist replica --------------------------------------------------
+# The 42-slot histogram the interact/cadence lines embed, replicated from
+# squallar-device-profile's hist.rs so a bin-diff answers the same
+# conservative upper-edge percentiles the app itself would. Edge j (ns) is
+# FIRST_OCTAVE[j % 4] << (j // 4); slot 0 is the under-62.5 us clamp whose
+# upper bound is edge 0, slots 1..=40 are the geometric bins, slot 41 is the
+# at-or-over-64 ms clamp, which has no upper edge and answers "over".
+
+HIST_SLOTS = 42
+HIST_FIRST_OCTAVE_NS = (62500, 74325, 88388, 105112)
+
+
+def hist_edge_ns(i):
+    return HIST_FIRST_OCTAVE_NS[i % 4] << (i // 4)
+
+
+def hist_parse(s):
+    """The `hist=` comma list -> 42 ints, or None on a malformed one."""
+    try:
+        counts = [int(x) for x in str(s).split(",")]
+    except ValueError:
+        return None
+    return counts if len(counts) == HIST_SLOTS else None
+
+
+def hist_diff(now, then):
+    """Counts gained between two readings of one recorder; saturating, so a
+    swapped pair reads as zeros rather than as garbage (same contract as
+    Hist::diff)."""
+    return [max(0, a - b) for a, b in zip(now, then)]
+
+
+def hist_percentile_upper_us(counts, q):
+    """Conservative q-quantile in whole microseconds: the upper edge (rounded
+    up) of the slot holding the ceil(q*total)-th smallest sample. None on an
+    empty histogram; 'over' for a sample in the over-ceiling clamp."""
+    total = sum(counts)
+    if total == 0:
+        return None
+    rank = min(max(int(-(-(q * total) // 1)), 1), total)
+    seen = 0
+    for slot, c in enumerate(counts):
+        seen += c
+        if seen >= rank:
+            if slot == HIST_SLOTS - 1:
+                return "over"
+            return -(-hist_edge_ns(slot) // 1000)
+    raise AssertionError("total counted a sample the walk did not reach")
+
+
+def hist_stats(counts):
+    return {"n": sum(counts),
+            "p50_us": hist_percentile_upper_us(counts, 0.50),
+            "p90_us": hist_percentile_upper_us(counts, 0.90),
+            "p99_us": hist_percentile_upper_us(counts, 0.99)}
+
+
+class FrameLineWatcher:
+    """Accumulates frame-line readings across polls.
+
+    The page-side console ring holds 1200 entries and evicts, so the reading
+    that brackets the START of a gesture window can be gone from the ring by
+    the time the window ends. Every interact/cadence reading seen at any poll
+    is therefore kept here, keyed by its page-side timestamp; the marker
+    lines likewise."""
+
+    def __init__(self, session):
+        self.session = session
+        self.interact = {}
+        self.cadence = {}
+        self.begins = {}
+        self.loops = {}
+        self.last = {}
+
+    def poll(self):
+        sig = self.session.execute(FRAME_LINE_PROBE) or {}
+        for r in sig.get("interact_all") or []:
+            self.interact[(r.get("t"), r.get("n"))] = r
+        for r in sig.get("cadence_all") or []:
+            self.cadence[(r.get("t"), r.get("n"))] = r
+        for r in sig.get("gesture_begins") or []:
+            self.begins[(r.get("t"), r.get("script"))] = r
+        for r in sig.get("gesture_loops") or []:
+            self.loops[(r.get("t"), r.get("frames"))] = r
+        self.last = sig
+        return sig
+
+    def interact_n(self):
+        """The newest cumulative interact-frame count, or None when the line
+        has never been seen (not loud, or no reading yet) -- a different fact
+        from n=0, which is a written line about an untouched window."""
+        best = None
+        for r in self.interact.values():
+            if best is None or r["n"] > best:
+                best = r["n"]
+        return best
+
+    def readings(self, family):
+        rs = list((self.interact if family == "interact" else
+                   self.cadence).values())
+        rs.sort(key=lambda r: (r.get("t") or 0, r.get("n") or 0))
+        return rs
+
+
+def gesture_window_stats(watcher):
+    """The gesture-window bin-diff: percentiles over ONLY the frames between
+    the first `gesture script ... begin` marker and the last
+    `... loop complete` marker, for the interact and cadence families.
+
+    Two cumulative histogram readings bracket the window: A = the last
+    reading at or before the first marker (or an all-zero baseline when the
+    script was already running at the first reading), B = the first reading
+    at or after the last loop marker (or the newest reading, stated as the
+    weaker basis). The diff is the window; this is what kills the spike's
+    cumulative-from-boot p99 contamination.
+
+    Returns None when no marker was ever seen -- an unarmed leg has no
+    window, and inventing one from wall clock would put boot frames back into
+    the tail."""
+    begins = sorted(watcher.begins.values(), key=lambda r: r.get("t") or 0)
+    loops = sorted(watcher.loops.values(), key=lambda r: r.get("t") or 0)
+    if not begins and not loops:
+        return None
+    t0 = begins[0]["t"] if begins else None
+    if loops:
+        t1, basis = loops[-1]["t"], "first-begin-to-last-loop-marker"
+    else:
+        t1, basis = None, "first-begin-to-newest-reading (no loop completed)"
+    out = {"script": (begins[0].get("script") if begins
+                      else loops[-1].get("script")),
+           "t0": t0, "t1": t1, "loops_completed": len(loops), "basis": basis}
+    for family in ("interact", "cadence"):
+        rs = [r for r in watcher.readings(family)
+              if hist_parse(r.get("hist")) is not None]
+        if not rs:
+            out[family] = {"error": "no histogram-bearing reading scraped"}
+            continue
+        a = None
+        if t0 is not None:
+            for r in rs:
+                if r["t"] <= t0 and (a is None or r["t"] > a["t"]):
+                    a = r
+        b = None
+        if t1 is not None:
+            for r in rs:
+                if r["t"] >= t1 and (b is None or r["t"] < b["t"]):
+                    b = r
+        if b is None:
+            b = rs[-1]
+        a_counts = (hist_parse(a["hist"]) if a is not None
+                    else [0] * HIST_SLOTS)
+        d = hist_diff(hist_parse(b["hist"]), a_counts)
+        stats = hist_stats(d)
+        stats["bracket_a_t"] = a["t"] if a is not None else None
+        stats["bracket_b_t"] = b["t"]
+        out[family] = stats
+    return out
+
+
+# ---- W3C actions gestures ----------------------------------------------
+# Real input through the driver's own /actions endpoint (stdlib wire, no
+# selenium): a pointer input source for drags and a wheel input source for
+# scroll. Verified against geckodriver FIRST (Firefox governs); chromedriver
+# accepts the same payloads. Some drivers refuse the wheel source
+# ("unknown/unsupported input source"); the fallback is a synthesized
+# WheelEvent via execute_script, and WHICH route ran is recorded per browser
+# on the result -- a synthesized event skips the browser's input pipeline, so
+# the two must never be pooled silently.
+
+WHEEL_FALLBACK_SCRIPT = """
+var x = arguments[0], y = arguments[1], dy = arguments[2], n = arguments[3];
+var el = document.elementFromPoint(x, y) || document.body;
+for (var i = 0; i < n; i++) {
+  el.dispatchEvent(new WheelEvent('wheel', {
+    deltaY: dy, deltaMode: 0, clientX: x, clientY: y,
+    bubbles: true, cancelable: true, composed: true }));
+}
+return n;
+"""
+
+
+def perform_actions(session, actions, timeout=60.0):
+    return session.cmd("POST", "/actions", {"actions": actions},
+                       timeout=timeout)
+
+
+def release_actions(session):
+    try:
+        session.cmd("DELETE", "/actions", timeout=30.0)
+    except WebDriverError:
+        pass
+
+
+def w3c_pan(session, cx, cy, dx, dy, duration_ms=700, steps=14):
+    """One press-drag-release through the pointer input source."""
+    acts = [{"type": "pointerMove", "duration": 0, "x": int(cx), "y": int(cy)},
+            {"type": "pointerDown", "button": 0}]
+    for k in range(1, steps + 1):
+        acts.append({"type": "pointerMove",
+                     "duration": max(1, duration_ms // steps),
+                     "x": int(cx + dx * k / steps),
+                     "y": int(cy + dy * k / steps)})
+    acts.append({"type": "pointerUp", "button": 0})
+    perform_actions(session, [{"type": "pointer", "id": "rig-mouse",
+                               "parameters": {"pointerType": "mouse"},
+                               "actions": acts}])
+
+
+def w3c_wheel(session, x, y, delta_y, notches=2, pause_ms=120):
+    """Wheel notches through the wheel input source. Raises WebDriverError
+    when the driver refuses the source; the caller owns the fallback."""
+    acts = []
+    for _ in range(notches):
+        acts.append({"type": "scroll", "x": int(x), "y": int(y),
+                     "deltaX": 0, "deltaY": int(delta_y),
+                     "duration": 0, "origin": "viewport"})
+        acts.append({"type": "pause", "duration": pause_ms})
+    perform_actions(session, [{"type": "wheel", "id": "rig-wheel",
+                               "actions": acts}])
+
+
+def drive_w3c_gesture(session, kind, seconds, inner):
+    """Drive `kind` ('pan', 'wheel' or 'pan+wheel') for ~`seconds` seconds
+    around the viewport centre. Pans come in mirrored pairs and wheel legs
+    zoom in exactly as much as they zoom back out, so the scene ends where it
+    began. Returns what actually ran, wheel route included."""
+    w, h = (inner or [1280, 900])[:2]
+    cx, cy = w // 2, h // 2
+    reach = max(40, min(w, h) // 5)
+    out = {"kind": kind, "asked_seconds": seconds, "pans": 0,
+           "wheel_notches": 0, "wheel_source": None}
+    t0 = time.monotonic()
+    flip = 1
+    while time.monotonic() - t0 < seconds:
+        if "pan" in kind:
+            # The mirrored pair: the second stroke undoes the first.
+            w3c_pan(session, cx, cy, flip * reach, flip * reach // 2)
+            w3c_pan(session, cx, cy, -flip * reach, -flip * reach // 2)
+            out["pans"] += 2
+            flip = -flip
+        if "wheel" in kind:
+            for delta in (-120, 120):
+                if out["wheel_source"] in (None, "w3c-wheel"):
+                    try:
+                        w3c_wheel(session, cx, cy, delta)
+                        out["wheel_source"] = "w3c-wheel"
+                    except WebDriverError as e:
+                        out["wheel_source"] = (
+                            "synthesized-WheelEvent (driver refused the "
+                            "wheel input source: %.120s)" % e)
+                        session.execute(WHEEL_FALLBACK_SCRIPT,
+                                        [cx, cy, delta, 2])
+                else:
+                    session.execute(WHEEL_FALLBACK_SCRIPT, [cx, cy, delta, 2])
+                out["wheel_notches"] += 2
+    release_actions(session)
+    out["ran_seconds"] = round(time.monotonic() - t0, 2)
+    return out
+
+
+# ---- generic console wait ----------------------------------------------
+
+CONSOLE_MATCH_PROBE = """
+var re = new RegExp(arguments[0]);
+var C = window.__rig_console || [];
+for (var i = C.length - 1; i >= 0; i--) {
+  var m = String(C[i].msg || "");
+  if (re.test(m)) return { matched: true, t: C[i].t, index: i,
+                           msg: m.slice(0, 400) };
+}
+return { matched: false, scanned: C.length };
+"""
+
+
+def wait_console_regex(session, pattern, timeout=60.0, interval=0.5):
+    """Poll the console ring until a line matches `pattern` (a JS regex
+    source string). The generic wait-until-console-line primitive: readiness
+    for anything the app announces, without a new probe per sentence."""
+    t0 = time.monotonic()
+    last = None
+    while time.monotonic() - t0 < timeout:
+        last = session.execute(CONSOLE_MATCH_PROBE, [pattern]) or {}
+        if last.get("matched"):
+            out = dict(last)
+            out.update({"ok": True, "pattern": pattern,
+                        "waited_s": round(time.monotonic() - t0, 2)})
+            return out
+        time.sleep(interval)
+    return {"ok": False, "pattern": pattern,
+            "waited_s": round(time.monotonic() - t0, 2),
+            "error": "no console line matched /%s/ within %.0fs (scanned %s "
+                     "ring entries at the last poll)"
+                     % (pattern, timeout, (last or {}).get("scanned"))}
+
 
 # Which backend the APP settled on, read out of its own startup log.
 #
@@ -1853,7 +2303,15 @@ def run_smoke(args):
             binary=args.binary, window=window, headless=not args.headed,
             tmp_root=tmp_root, ff_prefs=parse_kv(args.ff_pref, json_values=True),
             extra_env=parse_kv(args.env), ff_mode=args.ff_mode, arm=args.arm,
-            display=args.display, chromium_args=args.chromium_arg)
+            display=args.display, chromium_args=args.chromium_arg,
+            android=args.android, android_package=args.android_package)
+        if args.android:
+            # Before navigate, or 127.0.0.1 on the phone is the phone.
+            port_ = urllib.parse.urlsplit(args.url).port
+            if port_ is None:
+                port_ = 443 if args.url.startswith("https") else 80
+            stage("adb-reverse", port=port_)
+            result["adb_reverse"] = adb_reverse(port_, args.adb_serial)
         result["binary"] = info
         caps = session.caps
         result["session"] = {
@@ -1919,6 +2377,26 @@ def run_smoke(args):
         stage("app-backend", backend=app_backend_name(result["app_backend"]),
               waited=result["app_backend"].get("waited_s"))
 
+        # The frame-line watcher accumulates every histogram-bearing reading
+        # for the whole leg (the console ring evicts). The baseline interact
+        # count taken HERE is what --expect-interaction-frames must see
+        # strictly exceeded by the end of the leg.
+        frames_watch = FrameLineWatcher(session)
+        frames_watch.poll()
+        interact_before = frames_watch.interact_n()
+        if args.expect_interaction_frames or args.w3c_gesture:
+            stage("frame-lines-baseline", interact_n=interact_before)
+
+        if args.wait_console_regex:
+            result["console_waits"] = []
+            for pat in args.wait_console_regex:
+                stage("wait-console-regex", pattern=pat)
+                w = wait_console_regex(session, pat,
+                                       timeout=args.wait_console_timeout)
+                result["console_waits"].append(w)
+                stage("wait-console-regex-done", ok=w.get("ok"),
+                      waited=w.get("waited_s"))
+
         if args.poll_global:
             stage("poll-global", name=args.poll_global)
             try:
@@ -1961,6 +2439,19 @@ def run_smoke(args):
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
 
+        if args.w3c_gesture:
+            stage("w3c-gesture", kind=args.w3c_gesture,
+                  seconds=args.gesture_seconds)
+            try:
+                result["w3c_gesture"] = drive_w3c_gesture(
+                    session, args.w3c_gesture, args.gesture_seconds,
+                    (result.get("env") or {}).get("inner"))
+            except WebDriverError as e:
+                release_actions(session)
+                result["w3c_gesture"] = {"error": str(e)}
+            stage("w3c-gesture-done", **(result["w3c_gesture"] or {}))
+            frames_watch.poll()
+
         stage("raf-warm", frames=args.frames)
         result["raf_warm"] = raf_sample(session, args.frames)
         stage("raf-warm-done", **{k: (round(v, 2) if isinstance(v, float) else v)
@@ -1970,6 +2461,7 @@ def run_smoke(args):
         stage("data-window", seconds=args.data_window)
         time.sleep(args.data_window / 2)
         result["resources_mid"] = session.execute(RESOURCES_PROBE)
+        frames_watch.poll()
         time.sleep(args.data_window / 2)
         result["resources"] = session.execute(RESOURCES_PROBE)
         stage("resources", count=(result["resources"] or {}).get("count"),
@@ -2029,6 +2521,49 @@ def run_smoke(args):
         result["texture_upload_totals"] = _sig.get("uploads")
         if result["texture_upload_totals"]:
             stage("texture-uploads", **result["texture_upload_totals"])
+
+        # The frame-telemetry readout: the newest cumulative reading per
+        # family, the count assert, and the gesture-window bin-diff when
+        # marker lines bracketed one. No ms figure from any of this gates —
+        # the one gate is the interact COUNT strictly increasing.
+        frames_watch.poll()
+        if args.expect_interaction_frames:
+            base = interact_before if interact_before is not None else 0
+            stage("interaction-frames-wait", before=interact_before)
+            t_int = time.monotonic()
+            n_now = frames_watch.interact_n()
+            # One extra telemetry period past the gestures, so the reading
+            # that carries their frames has had a tick to be written.
+            while ((n_now is None or n_now <= base)
+                   and time.monotonic() - t_int < 30.0):
+                time.sleep(1.0)
+                frames_watch.poll()
+                n_now = frames_watch.interact_n()
+            ok = n_now is not None and n_now > base
+            result["interaction_frames"] = {"ok": ok,
+                                            "before": interact_before,
+                                            "after": n_now}
+            if not ok:
+                result["interaction_frames"]["error"] = (
+                    "the `frame service (interact)` count never rose above "
+                    "its %s baseline (last seen: %s). Either no interaction "
+                    "frame was tagged — the count path this assert exists to "
+                    "prove — or the line was never written at all, which "
+                    "means the leg did not seed squallar.frame_telemetry"
+                    % (interact_before, n_now))
+            stage("interaction-frames-done", **result["interaction_frames"])
+        fl_last = frames_watch.last or {}
+        result["frame_lines"] = {
+            k: fl_last.get(k) for k in ("interact", "idle", "segments",
+                                        "prep", "gpu", "gpu_unavailable",
+                                        "cadence")}
+        gw = gesture_window_stats(frames_watch)
+        if gw is not None:
+            result["gesture_window"] = gw
+            stage("gesture-window",
+                  script=gw.get("script"), loops=gw.get("loops_completed"),
+                  interact_n=(gw.get("interact") or {}).get("n"),
+                  cadence_n=(gw.get("cadence") or {}).get("n"))
 
         # Late on purpose: registration, install and activation all have to
         # finish first, and the data window has just paid for that time.
@@ -2109,6 +2644,13 @@ def run_smoke(args):
                      and (rp is None or bool(rp.get("ok")))
                      and (zc is None or bool(zc.get("ok")))
                      and (ovr is None or bool(ovr.get("ok"))))
+        # The count assert (--expect-interaction-frames) and any requested
+        # console waits. Counts and presence only; no ms figure is in here.
+        ifr = result.get("interaction_frames")
+        ifr_ok = ifr is None or bool(ifr.get("ok"))
+        cwaits = result.get("console_waits")
+        cwaits_ok = (cwaits is None
+                     or all(bool(w.get("ok")) for w in cwaits))
 
         # Isolation assertions (opt-in). Both are written so that they FAIL
         # when the thing they name is absent -- an isolation proof that cannot
@@ -2149,7 +2691,7 @@ def run_smoke(args):
 
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
-                          and worker_ok
+                          and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and hw_ok is not False)
         result["verdict"] = {
@@ -2172,6 +2714,9 @@ def run_smoke(args):
                                      else bool(wrt.get("ok"))),
             "doctored_respawn_ok": (None if dr is None
                                     else bool(dr.get("ok"))),
+            "interaction_frames_ok": (None if ifr is None
+                                      else bool(ifr.get("ok"))),
+            "console_waits_ok": (None if cwaits is None else cwaits_ok),
             "rayon_pool_ok": (None if rp is None else bool(rp.get("ok"))),
             "zero_copy_replies_ok": (None if zc is None else bool(zc.get("ok"))),
             "overlay_rasters_ok": (None if ovr is None else bool(ovr.get("ok"))),
@@ -2380,6 +2925,88 @@ def run_smoke(args):
               % (tag, tut.get("deltas"), tut.get("bytes"),
                  tut.get("whole_bytes"), tut.get("bands"),
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
+    # The frame-telemetry readout. Cumulative rows are labelled cumulative
+    # and the gesture-window rows are labelled with their bracket, because
+    # the spike showed cumulative-from-boot p99s are boot-contaminated and
+    # the two must never be quoted as the same figure. GPU rows are a
+    # different clock from the service rows and are never added to them.
+    fl = result.get("frame_lines") or {}
+    if fl.get("interact"):
+        i = fl["interact"]
+        print("[%s] SUMMARY [%s] frame service (interact) [cumulative from "
+              "boot]: n=%s p50=%s us p90=%s us p99=%s us"
+              % (tag, alabel, i.get("n"), i.get("p50"), i.get("p90"),
+                 i.get("p99")))
+    if fl.get("idle"):
+        i = fl["idle"]
+        print("[%s] SUMMARY [%s] frame service (idle) [cumulative from "
+              "boot]: n=%s p50=%s us p90=%s us p99=%s us"
+              % (tag, alabel, i.get("n"), i.get("p50"), i.get("p90"),
+                 i.get("p99")))
+    if fl.get("segments"):
+        s = fl["segments"]
+        print("[%s] SUMMARY [%s] frame segments (interact, p99 us, "
+              "cumulative): pre=%s pump=%s ui=%s prepare=%s finish=%s "
+              "post=%s; acquire n=%s p50=%s us p99=%s us"
+              % (tag, alabel, s.get("pre"), s.get("pump"), s.get("ui"),
+                 s.get("prepare"), s.get("finish"), s.get("post"),
+                 s.get("acquire_n"), s.get("acquire_p50"),
+                 s.get("acquire_p99")))
+    if fl.get("prep"):
+        p = fl["prep"]
+        print("[%s] SUMMARY [%s] frame prep costs [cumulative us]: %s "
+              "passes, tessellate=%s upload_apply=%s mirror=%s "
+              "buffers_and_callbacks=%s"
+              % (tag, alabel, p.get("passes"), p.get("tessellate_us"),
+                 p.get("upload_apply_us"), p.get("mirror_us"),
+                 p.get("buffers_and_callbacks_us")))
+    if fl.get("gpu"):
+        g = fl["gpu"]
+        fam = lambda f: "n=%s p50=%s p99=%s" % (f.get("n"), f.get("p50"),
+                                                f.get("p99"))
+        print("[%s] SUMMARY [%s] gpu passes [GPU clock, us, cumulative; "
+              "never added to service]: raymarch %s; ground %s; mirror %s; "
+              "main %s; %s frames"
+              % (tag, alabel, fam(g.get("raymarch") or {}),
+                 fam(g.get("ground") or {}), fam(g.get("mirror") or {}),
+                 fam(g.get("main") or {}), g.get("frames")))
+    elif fl.get("gpu_unavailable"):
+        print("[%s] SUMMARY [%s] gpu passes: unavailable (adapter lacks "
+              "TIMESTAMP_QUERY) -- an absence, never an extrapolation"
+              % (tag, alabel))
+    if fl.get("cadence"):
+        c = fl["cadence"]
+        print("[%s] SUMMARY [%s] frame cadence [cumulative from boot]: "
+              "n=%s p50=%s us p99=%s us"
+              % (tag, alabel, c.get("n"), c.get("p50"), c.get("p99")))
+    gw = result.get("gesture_window")
+    if gw:
+        print("[%s] SUMMARY [%s] gesture window (%s, %s loops, %s):"
+              % (tag, alabel, gw.get("script"), gw.get("loops_completed"),
+                 gw.get("basis")))
+        for family in ("interact", "cadence"):
+            d = gw.get(family) or {}
+            if d.get("error"):
+                print("[%s] SUMMARY [%s]   window %s: %s"
+                      % (tag, alabel, family, d["error"]))
+            else:
+                print("[%s] SUMMARY [%s]   window %s: n=%s p50=%s us "
+                      "p90=%s us p99=%s us"
+                      % (tag, alabel, family, d.get("n"), d.get("p50_us"),
+                         d.get("p90_us"), d.get("p99_us")))
+    ifr = result.get("interaction_frames")
+    if ifr is not None:
+        print("[%s] SUMMARY interaction frames: %s (interact n %s -> %s%s)"
+              % (tag, "OK" if ifr.get("ok") else "FAILED",
+                 ifr.get("before"), ifr.get("after"),
+                 "" if ifr.get("ok") else "; " + str(ifr.get("error"))))
+    for w in (result.get("console_waits") or []):
+        print("[%s] SUMMARY console wait /%s/: %s%s"
+              % (tag, w.get("pattern"), "OK" if w.get("ok") else "FAILED",
+                 "" if w.get("ok") else "; " + str(w.get("error"))))
+    wg_ = result.get("w3c_gesture")
+    if wg_ is not None:
+        print("[%s] SUMMARY w3c gesture: %s" % (tag, json.dumps(wg_)))
     rm = result.get("rasterization_ms")
     if rm and rm.get("by_kind"):
         # One line per KIND, never a pooled figure: see the probe.
@@ -2395,7 +3022,7 @@ def run_smoke(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="headless WebDriver smoke/measurement rig for squallar-web")
-    ap.add_argument("--browser", choices=("chromium", "firefox"))
+    ap.add_argument("--browser", choices=("chromium", "firefox", "safari"))
     ap.add_argument("--url")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--tag", default=None, help="output file prefix "
@@ -2466,6 +3093,48 @@ def main(argv=None):
                     help="seconds for the worker-wire assertions (default "
                          "180; Tier 2 runs against LIVE network, so the first "
                          "job reply waits on a real volume fetch)")
+    ap.add_argument("--expect-interaction-frames", action="store_true",
+                    help="fail unless the scraped `frame service (interact)` "
+                         "count STRICTLY INCREASED over the leg -- the count "
+                         "assert that proves driven frames really tag as "
+                         "interaction (WO-1's deferred mechanical "
+                         "non-vacuity). Needs the squallar.frame_telemetry "
+                         "seed; a leg that never wrote the line fails with "
+                         "that stated. Count only -- no ms figure gates")
+    ap.add_argument("--w3c-gesture", choices=("pan", "wheel", "pan+wheel"),
+                    default=None,
+                    help="drive real input through the driver's W3C /actions "
+                         "endpoint after settle: mirrored pointer drags "
+                         "and/or wheel notches around the viewport centre, "
+                         "net-zero so the scene ends where it began. Verified "
+                         "on geckodriver first (Firefox governs); a driver "
+                         "that refuses the wheel input source falls back to "
+                         "a synthesized WheelEvent, recorded per browser on "
+                         "the result as wheel_source")
+    ap.add_argument("--gesture-seconds", type=float, default=4.0,
+                    help="how long --w3c-gesture drives (default 4)")
+    ap.add_argument("--wait-console-regex", action="append", default=[],
+                    metavar="REGEX",
+                    help="wait until a console-ring line matches this JS "
+                         "regex before proceeding (after the app-backend "
+                         "wait); repeatable, and each one failing to match "
+                         "within --wait-console-timeout fails the run. The "
+                         "generic wait-until-console-line primitive")
+    ap.add_argument("--wait-console-timeout", type=float, default=60.0)
+    ap.add_argument("--android", action="store_true",
+                    help="drive the phone's own Chrome over adb: chromedriver "
+                         "with goog:chromeOptions.androidPackage, plus `adb "
+                         "reverse tcp:P tcp:P` before navigating so the "
+                         "served URL works unchanged on the device. Requires "
+                         "--browser chromium and adb on PATH. IMPLEMENTED "
+                         "BUT NOT DEVICE-TESTED: no Android device was "
+                         "attached when this landed")
+    ap.add_argument("--android-package", default="com.android.chrome",
+                    help="Android package for --android (default "
+                         "com.android.chrome)")
+    ap.add_argument("--adb-serial", default=None,
+                    help="adb device serial for --android (default: the one "
+                         "attached device)")
     ap.add_argument("--no-second-raf", action="store_true")
     ap.add_argument("--headed", action="store_true",
                     help="disable headless flags (debugging only)")
@@ -2531,6 +3200,17 @@ def main(argv=None):
         return selftest()
     if not args.browser or not args.url:
         ap.error("--browser and --url are required (or use --selftest)")
+    if args.android:
+        # Arg-validated here, loudly, because the mode cannot be smoke-tested
+        # without a device: a wrong invocation must fail at the CLI, not
+        # three minutes into a phone session.
+        if args.browser != "chromium":
+            ap.error("--android drives Chrome over chromedriver; pass "
+                     "--browser chromium")
+        if not shutil.which("adb"):
+            ap.error("--android needs adb on PATH (for `adb reverse`)")
+    if args.adb_serial and not args.android:
+        ap.error("--adb-serial is only meaningful with --android")
     return run_smoke(args)
 
 
