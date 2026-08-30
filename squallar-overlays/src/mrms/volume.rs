@@ -310,7 +310,7 @@ fn check_granule_is_this_level(level: usize, raw: &RawGrid) -> Result<(), String
         Some(p) if p == PARAMETER => {}
         Some(p) => {
             let looks_like = if p == COMPOSITE_PARAMETER {
-                " — that is the 2D column-max composite, which declares the same \
+                " - that is the 2D column-max composite, which declares the same \
                  first fixed surface as the 0.50 km level and is otherwise \
                  indistinguishable here"
             } else {
