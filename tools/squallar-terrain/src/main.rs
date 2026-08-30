@@ -5,12 +5,16 @@ use squallar_terrain::config::{BANDS, Config, DEM_BUCKET_REGION, TILELIST};
 use squallar_terrain::grid;
 use squallar_terrain::run::{cmd, need, run};
 use squallar_terrain::tiles::{TileList, chunks, supercells};
-use squallar_terrain::{Res, contours, log, logging, raster};
+use squallar_terrain::{Res, contours, floor, log, logging, raster};
 
 const USAGE: &str = "\
 squallar-terrain — Copernicus GLO-30 contour and terrain archives
 
-  build [all|contours|raster]    the whole job (default)
+  build [all|contours|raster|floor]   the whole job (default)
+
+`floor` emits the global 1x1-degree minimum-elevation grid the app compiles in
+for its 3D box base. It reads every COG at full resolution and is resumable
+through floor-minima.txt in the work directory.
 
 Grid arithmetic, for inspection:
 
@@ -136,6 +140,10 @@ fn build(what: &str) -> Res<()> {
         cfg.raster_maxzoom,
         cfg.tile_format
     );
+    log!(
+        "  floor    1x1-degree minimum grid -> {}",
+        cfg.out.join(floor::GRID_FILENAME).display()
+    );
 
     // Fetched once and shared, so the pin is checked once and both passes agree
     // on which tiles exist.
@@ -145,10 +153,14 @@ fn build(what: &str) -> Res<()> {
         "all" => {
             contours::build(&cfg, &list)?;
             raster::build(&cfg, &list)?;
+            floor::build(&cfg, &list)?;
         }
         "contours" => contours::build(&cfg, &list)?,
         "raster" => raster::build(&cfg, &list)?,
-        other => return Err(format!("usage: build [all|contours|raster], not {other:?}").into()),
+        "floor" => floor::build(&cfg, &list)?,
+        other => {
+            return Err(format!("usage: build [all|contours|raster|floor], not {other:?}").into());
+        }
     }
 
     log!("done");

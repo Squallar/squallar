@@ -331,3 +331,44 @@ fn a_contour_interval_with_no_features_is_distinguishable_from_a_failure() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `floor::min_of_cog` against the real `gdalinfo` binary, on a raster this
+/// test writes itself.
+///
+/// ENVI rather than GeoTIFF: the format is a raw plane plus a text header, so
+/// the fixture needs no GDAL to CREATE and the test exercises the read and the
+/// parse alone. `#[ignore]` for the same reason as everything else in this file
+/// — it needs GDAL on PATH, and a test that quietly passes without its
+/// prerequisite is a gate that cannot fail.
+#[test]
+#[ignore]
+fn a_synthetic_raster_is_read_through_real_gdalinfo() {
+    let dir = scratch("floor-min");
+    let img = dir.join("synthetic.img");
+    // Death Valley's published minimum among fifteen ordinary heights, and last
+    // in the plane, so the answer cannot be the first pixel or the mean.
+    let values: [f32; 16] = [
+        100.0, 250.5, 4053.7, 0.0, -12.25, 900.0, 1200.0, 3000.0, 2396.2, -3.5, 55.0, 7.0, 8.0,
+        9.0, 10.0, -86.4,
+    ];
+    let mut raw = Vec::new();
+    for v in values {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&img, raw).unwrap();
+    std::fs::write(
+        dir.join("synthetic.hdr"),
+        "ENVI\nsamples = 4\nlines = 4\nbands = 1\nheader offset = 0\n\
+         file type = ENVI Standard\ndata type = 4\ninterleave = bsq\nbyte order = 0\n\
+         map info = {Geographic Lat/Lon, 1, 1, -117.0, 37.0, 0.25, 0.25, WGS-84}\n",
+    )
+    .unwrap();
+
+    let got = squallar_terrain::floor::min_of_cog(img.to_string_lossy().as_ref())
+        .expect("gdalinfo -mm reads the plane");
+    assert!(
+        (got + 86.4).abs() < 1e-3,
+        "gdalinfo reported {got} m, not the -86.4 m written into the plane"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
