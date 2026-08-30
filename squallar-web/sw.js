@@ -17,6 +17,11 @@
  * falls through to a plain network fetch: a broken cache must never break the
  * map.
  *
+ * `__squallar_offline__/` is the offline-area store: the download engine PUTs
+ * whole sub-archive segments to app-origin URLs the worker itself is the origin
+ * for, and reads them back by `Range`. Deliberate user downloads: nothing here
+ * ever evicts one — only a DELETE from the engine removes a segment.
+ *
  * Every URL resolves against `ROOT`, so the same bytes work at `/squallar/`
  * (Pages) and at `/` (http.server).
  *
@@ -215,6 +220,25 @@ const BLOCK_STORAGE_FLOOR_BYTES = 64 * 1024 * 1024;
 /* The block manifest's synthetic key, the `PINS_KEY` way. */
 const BLOCK_MANIFEST_KEY = new URL("__squallar_blk_manifest__", ROOT).href;
 
+/*
+ * The offline-area store: whole sub-archive segments the user deliberately
+ * downloaded, PUT by the download engine under `__squallar_offline__/`.
+ * Deliberately NOT generation-keyed, unlike `squallar-blk-<gen>`: a segment is
+ * a self-contained sub-archive that outlives archive generations by design.
+ * And deliberately outside every trim path: the block cache's budget and
+ * eviction never touch it — a deliberate download is removed by a DELETE and
+ * by nothing else.
+ */
+const OFFLINE_CACHE = "squallar-offline-v1";
+
+/* The store's app-origin directory. Nothing navigates here; the worker is the
+ * origin for every URL under it. */
+const OFFLINE_DIR = new URL("__squallar_offline__/", ROOT);
+
+/* Reserved GET-only endpoints under the store directory; never stored. */
+const OFFLINE_LIST_URL = new URL("__list__", OFFLINE_DIR).href;
+const OFFLINE_QUOTA_URL = new URL("__quota__", OFFLINE_DIR).href;
+
 const UPDATE_PROBE_INTERVAL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -346,6 +370,17 @@ function isDataAsset(url) {
 }
 
 /**
+ * The offline-area store's directory. An explicit predicate, the
+ * `isBasemapArchive` way, because default-deny masks a deleted rule: the
+ * suite asserts on this function directly, not just on routes that happen to
+ * come out "network". The trailing slash in `OFFLINE_DIR.pathname` makes this
+ * directory containment — `__squallar_offline__x` does not match.
+ */
+function isOfflineStore(url) {
+  return url.origin === OFFLINE_DIR.origin && url.pathname.startsWith(OFFLINE_DIR.pathname);
+}
+
+/**
  * Classify one request. The whole caching policy is this function.
  *
  * Returns one of:
@@ -355,6 +390,8 @@ function isDataAsset(url) {
  *   "asset"         - a named same-origin data asset, cached outside the shell.
  *   "archive-block" - a single-range read of a PMTiles archive, served
  *                     block-wise from the block cache.
+ *   "offline-store" - a download-engine request under `__squallar_offline__/`;
+ *                     the worker is the origin, for GET, PUT and DELETE.
  *
  * The block caches are the reason `cachesToKeep` names every current
  * generation: every `squallar-`-prefixed cache it does not name is deleted by
@@ -374,9 +411,6 @@ function isDataAsset(url) {
  * the request's `Range` header value, or null/undefined without one.
  */
 function routeFor({ url, method = "GET", mode = "no-cors", range = null }) {
-  // Only GET is ever cacheable, and squallar issues nothing else.
-  if (method !== "GET") return "network";
-
   let u;
   try {
     u = new URL(url, ROOT);
@@ -400,6 +434,20 @@ function routeFor({ url, method = "GET", mode = "no-cors", range = null }) {
   // weather origin if squallar is ever served from one, behind a proxy or on a
   // shared host.
   if (isWeatherDataHost(u.hostname)) return "network";
+
+  // The offline-area store owns its directory for exactly the engine's three
+  // verbs — PUT and DELETE are how segments arrive and leave, which is why
+  // this precedes the GET-only rule. A navigation here is not the engine and
+  // stays out of the store.
+  if (isOfflineStore(u)) {
+    if (mode === "navigate") return "network";
+    if (method === "GET" || method === "PUT" || method === "DELETE") return "offline-store";
+    return "network";
+  }
+
+  // Only GET is ever cacheable; beyond the store's verbs squallar issues
+  // nothing else.
+  if (method !== "GET") return "network";
 
   // Before the rules that say yes, for the same reason the deny list is: a raw
   // range response cannot be cached, so nothing downstream may try. An archive
@@ -650,8 +698,11 @@ async function cachesToKeep(newShellName) {
   // ASSET_CACHE is kept for the reason it exists: `purgeCaches` deletes every
   // `squallar-` cache not named here, so leaving it out would re-download the
   // zone pack on every deploy -- which is exactly the cost a cache outside the
-  // shell was chosen to avoid.
-  const keep = new Set([META_CACHE, ASSET_CACHE, newShellName]);
+  // shell was chosen to avoid. OFFLINE_CACHE is kept for the stronger form of
+  // the same hazard: it holds DELIBERATE user downloads that nothing refetches
+  // on its own, so an unlisted entry would not cost a re-download — it would
+  // silently destroy the user's offline areas on the next deploy.
+  const keep = new Set([META_CACHE, ASSET_CACHE, OFFLINE_CACHE, newShellName]);
   // The current archive generations' block caches. Without these entries every
   // deploy would silently empty the block cache — the symptom is a slow map,
   // never an error — because `purgeCaches` deletes every `squallar-` cache not
@@ -1113,6 +1164,193 @@ async function serveArchiveBlock(event) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Offline-area store
+// ---------------------------------------------------------------------------
+
+/*
+ * Ask the page(s) to request durable storage, once per worker lifetime, on the
+ * first stored segment. It has to be the page: the Storage Standard exposes
+ * `StorageManager.persist()` as `[Exposed=Window]` — Window only — while
+ * `persisted()` and `estimate()` are `Exposed=(Window,Worker)`. So the worker
+ * checks `persisted()` here and index.html answers `squallar:request-persist`
+ * by calling `persist()`.
+ */
+let persistRequested = false;
+
+async function requestPersistence() {
+  if (persistRequested) return;
+  persistRequested = true;
+  try {
+    const storage = self.navigator && self.navigator.storage;
+    if (storage && typeof storage.persisted === "function" && (await storage.persisted())) return;
+  } catch {
+    // Unknown reads as not-persisted: asking the page again is harmless.
+  }
+  await notifyClients({ type: "squallar:request-persist" });
+}
+
+/** `{usage, quota}` from `navigator.storage.estimate()`; null means UNKNOWN.
+ * Never 0 — a zero quota would read as "nothing fits", which is a fabrication
+ * the download engine would act on. */
+async function offlineQuota() {
+  let usage = null;
+  let quota = null;
+  try {
+    const storage = self.navigator && self.navigator.storage;
+    if (storage && typeof storage.estimate === "function") {
+      const estimate = (await storage.estimate()) || {};
+      if (Number.isFinite(estimate.usage)) usage = estimate.usage;
+      if (Number.isFinite(estimate.quota)) quota = estimate.quota;
+    }
+  } catch {
+    // Answered as unknown.
+  }
+  return new Response(JSON.stringify({ usage, quota }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * `{url, bytes}` for every stored segment, enumerated from the cache itself —
+ * never from a stored manifest, which could say "complete" over a cache a
+ * half-landed PUT left short. On web this listing IS the filesystem fact the
+ * launch-time completeness recomputation reads. The byte count is the header
+ * `Cache.put` wrote atomically with the body; a missing or mangled header
+ * falls back to reading the blob's own size rather than guessing.
+ */
+async function offlineList() {
+  const cache = await caches.open(OFFLINE_CACHE);
+  const segments = [];
+  for (const request of await cache.keys()) {
+    const url = typeof request === "string" ? request : request.url;
+    const stored = await cache.match(url);
+    if (!stored) continue;
+    const declared = Number(stored.headers.get("x-squallar-segment-bytes"));
+    const bytes =
+      Number.isSafeInteger(declared) && declared >= 0 ? declared : (await stored.blob()).size;
+    segments.push({ url, bytes });
+  }
+  return new Response(JSON.stringify(segments), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * The offline-area store's request handler.
+ *
+ *   PUT    <dir>/{area}/{seg}.pmtiles   store the whole body; 200.
+ *   GET    same, no Range               the stored 200, whole.
+ *   GET    same, `bytes=N-M`            exact 206 via lazy `Blob.slice` — the
+ *                                       archive-block route's technique, and
+ *                                       the same exactness contract: the wasm
+ *                                       reader errors on any other status and
+ *                                       on an over-long body.
+ *   DELETE same                         remove one segment; 404 if absent.
+ *   DELETE <dir>/{area}/                remove every segment of the area.
+ *
+ * Segments are stored as synthetic 200s because `Cache.put()` throws on a 206
+ * by spec; the 206 is synthesized at serve time. A span past EOF clamps, and
+ * one starting past EOF answers 416, exactly as an origin would.
+ */
+async function offlineStore(event) {
+  const u = new URL(event.request.url);
+  const key = u.origin + u.pathname;
+  const method = event.request.method;
+
+  if (key === OFFLINE_LIST_URL || key === OFFLINE_QUOTA_URL) {
+    // GET-only endpoints, and never stored: a PUT accepted here would become a
+    // phantom row in the very listing it landed in.
+    if (method !== "GET") return new Response(null, { status: 405 });
+    return key === OFFLINE_QUOTA_URL ? offlineQuota() : offlineList();
+  }
+
+  if (method === "PUT") {
+    // A directory is not a segment; the whole-area form exists only for DELETE.
+    if (u.pathname.endsWith("/")) return new Response(null, { status: 405 });
+    const blob = await event.request.blob();
+    const cache = await caches.open(OFFLINE_CACHE);
+    await cache.put(
+      key,
+      new Response(blob, {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(blob.size),
+          "x-squallar-segment-bytes": String(blob.size),
+        },
+      }),
+    );
+    event.waitUntil(requestPersistence().catch(() => {}));
+    return new Response(null, { status: 200 });
+  }
+
+  if (method === "DELETE") {
+    const cache = await caches.open(OFFLINE_CACHE);
+    if (u.pathname.endsWith("/")) {
+      // The bare directory would name every area at once; refuse it.
+      if (key === OFFLINE_DIR.href) return new Response(null, { status: 405 });
+      let removed = 0;
+      for (const request of await cache.keys()) {
+        const stored = typeof request === "string" ? request : request.url;
+        if (stored.startsWith(key) && (await cache.delete(stored))) removed += 1;
+      }
+      // 200 even at zero: removing an absent area is the state it asks for.
+      return new Response(JSON.stringify({ removed }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const removed = await cache.delete(key);
+    return new Response(null, { status: removed ? 200 : 404 });
+  }
+
+  const cache = await caches.open(OFFLINE_CACHE);
+  const hit = await cache.match(key);
+  if (!hit) return new Response(null, { status: 404 });
+
+  const span = parseSingleRange(requestRange(event.request));
+  // No Range — or not the single `bytes=N-M` form, which an origin is also
+  // free to ignore with a full 200.
+  if (span === null) return hit;
+
+  const blob = await hit.blob();
+  if (span.start >= blob.size) {
+    return new Response(null, {
+      status: 416,
+      headers: { "content-range": `bytes */${blob.size}` },
+    });
+  }
+  const end = Math.min(span.end, blob.size - 1);
+  // `Blob.slice` is a lazy view, not a copy, in both Firefox and Chromium.
+  const piece = blob.slice(span.start, end + 1);
+  return new Response(piece, {
+    status: 206,
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(piece.size),
+      "content-range": `bytes ${span.start}-${end}/${blob.size}`,
+    },
+  });
+}
+
+/**
+ * Unlike the archive path there is no fallback here: the worker IS the origin
+ * for these URLs, so an error must read as one. A PUT answered 200 with
+ * nothing stored is a segment the launch-time completeness recomputation would
+ * count as downloaded — the silent partial success this store exists to
+ * prevent.
+ */
+async function serveOfflineStore(event) {
+  try {
+    return await offlineStore(event);
+  } catch (e) {
+    return new Response(String(e), { status: 500 });
+  }
+}
+
 /**
  * Retire the block caches of generations this deploy no longer reads, and
  * their manifest rows. Runs on EVERY activate — unlike `purgeCaches`, which
@@ -1218,6 +1456,9 @@ self.addEventListener("fetch", (event) => {
     case "archive-block":
       event.respondWith(serveArchiveBlock(event));
       return;
+    case "offline-store":
+      event.respondWith(serveOfflineStore(event));
+      return;
     default:
       // "network": no `respondWith`, so this worker is not in the request path
       // at all. Every weather-data request ends here.
@@ -1278,4 +1519,8 @@ self.__squallarSwInternals = {
   isShellAsset,
   normalizeHost,
   validatorToken,
+  OFFLINE_CACHE,
+  OFFLINE_LIST_URL,
+  OFFLINE_QUOTA_URL,
+  isOfflineStore,
 };

@@ -425,3 +425,59 @@ describe("forced update escape hatch", () => {
     );
   });
 });
+
+// ===========================================================================
+describe("persistent storage: the page answers the worker's request", () => {
+  // =========================================================================
+  //
+  // The Storage Standard exposes `StorageManager.persist()` to Window only —
+  // `persisted()` and `estimate()` are Window+Worker — so when the service
+  // worker stores the first offline-area segment, the page is the only
+  // context that can ask the browser for durability. Without it a
+  // deliberately-downloaded area is best-effort and evictable under pressure.
+
+  it("calls navigator.storage.persist() when the worker asks", async () => {
+    const page = await runBootstrap();
+    let calls = 0;
+    page.navigator.storage = {
+      persist: () => {
+        calls += 1;
+        return Promise.resolve(true);
+      },
+    };
+
+    page.serviceWorker.dispatch("message", { data: { type: "squallar:request-persist" } });
+    await page.settle();
+
+    assert.equal(calls, 1, "the page is the only context that can call persist(); it did not");
+    assert.equal(
+      page.infos.some((line) => line.includes("persistent storage granted")),
+      true,
+      "the outcome must land in the console, where the worker's own notices do",
+    );
+    // The update prompt is not this message's business.
+    assert.equal(page.element("squallar-update").hidden, true);
+  });
+
+  it("records a denial without nagging", async () => {
+    const page = await runBootstrap();
+    page.navigator.storage = { persist: () => Promise.resolve(false) };
+
+    page.serviceWorker.dispatch("message", { data: { type: "squallar:request-persist" } });
+    await page.settle();
+
+    assert.equal(
+      page.infos.some((line) => line.includes("persistent storage declined")),
+      true,
+    );
+    assert.equal(page.warnings.length, 0, "a denial is a fact for the manage screen, not a warning");
+  });
+
+  it("survives a browser with no navigator.storage at all", async () => {
+    const page = await runBootstrap();
+    page.serviceWorker.dispatch("message", { data: { type: "squallar:request-persist" } });
+    await page.settle();
+    // Not throwing is the property; the prompt stays untouched too.
+    assert.equal(page.element("squallar-update").hidden, true);
+  });
+});

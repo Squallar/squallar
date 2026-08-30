@@ -1592,3 +1592,330 @@ describe("archive blocks: ranged reads survive in a persistent block cache", () 
     );
   });
 });
+
+// ===========================================================================
+describe("offline store: deliberate downloads survive everything but DELETE", () => {
+  // =========================================================================
+  //
+  // `__squallar_offline__/` is the download engine's durable store: whole
+  // sub-archive segments PUT under app-origin URLs the worker itself is the
+  // origin for, read back by `Range` as exact 206s, removed only by DELETE.
+  // There is no network behind these URLs, so the store's failures must read
+  // as failures — and the keep-set entry is what the feature lives or dies
+  // on: every `squallar-` cache `cachesToKeep` does not name is purged on
+  // every deploy, and the symptom of forgetting it here is not a slow map but
+  // the user's downloaded areas silently destroyed.
+
+  const STORE = `${ORIGIN}__squallar_offline__/`;
+
+  /** A deterministic segment body: byte i is (i * 17 + seed) % 256. */
+  function segmentBytes(length, seed = 5) {
+    const bytes = new Uint8Array(length);
+    for (let i = 0; i < length; i += 1) bytes[i] = (i * 17 + seed) % 256;
+    return bytes;
+  }
+
+  function putSegment(worker, url, bytes) {
+    return worker.fetch(new Request(url, { method: "PUT", body: bytes, duplex: "half" }));
+  }
+
+  function getSegment(worker, url, range = null) {
+    return worker.fetch(new Request(url, range ? { headers: { range } } : undefined));
+  }
+
+  function deleteUrl(worker, url) {
+    return worker.fetch(new Request(url, { method: "DELETE" }));
+  }
+
+  async function statusOf(event) {
+    return (await event.response).status;
+  }
+
+  async function bodyOf(event) {
+    return Buffer.from(await (await event.response).arrayBuffer());
+  }
+
+  async function listStore(worker) {
+    const event = await worker.fetch(new Request(worker.internals.OFFLINE_LIST_URL));
+    const response = await event.response;
+    assert.equal(response.status, 200, "__list__ must answer 200");
+    return response.json();
+  }
+
+  it("stores a segment on PUT and serves it back whole, touching no network", async () => {
+    const worker = await bootWorker();
+    const url = `${STORE}okc-metro/003.pmtiles`;
+    const bytes = segmentBytes(100_000);
+
+    const put = await putSegment(worker, url, bytes);
+    assert.equal(put.handled, true, "the worker must own the PUT");
+    assert.equal(await statusOf(put), 200);
+
+    const get = await getSegment(worker, url);
+    assert.equal(get.handled, true, "the worker must own the read");
+    const response = await get.response;
+    assert.equal(response.status, 200, "an un-ranged GET answers the whole segment");
+    assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(bytes)), "the bytes are wrong");
+
+    assert.equal(
+      worker.network.log.filter((e) => e.url === url).length,
+      0,
+      "a store URL reached the network; the worker IS the origin for these",
+    );
+  });
+
+  it("serves an exact 206 from a lazy slice of the stored segment", async () => {
+    const worker = await bootWorker();
+    const url = `${STORE}okc-metro/000.pmtiles`;
+    const bytes = segmentBytes(70_000);
+    await putSegment(worker, url, bytes);
+
+    // Interior, aligned-start, and tail spans.
+    for (const [start, end] of [
+      [0, 15],
+      [4096, 8191],
+      [69_000, 69_999],
+    ]) {
+      const event = await getSegment(worker, url, `bytes=${start}-${end}`);
+      const response = await event.response;
+      assert.equal(response.status, 206, "the reader errors RangeRequestsUnsupported on anything else");
+      assert.equal(
+        response.headers.get("content-range"),
+        `bytes ${start}-${end}/${bytes.length}`,
+        "the Content-Range must describe exactly the bytes returned",
+      );
+      const body = Buffer.from(await response.arrayBuffer());
+      assert.equal(body.length, end - start + 1, "the reader errors ResponseBodyTooLong on an over-long body");
+      assert.ok(body.equals(Buffer.from(bytes.slice(start, end + 1))), `bytes=${start}-${end}`);
+    }
+
+    // A span past EOF clamps, and one starting past EOF is unsatisfiable,
+    // exactly as an origin would answer both.
+    const clamped = await getSegment(worker, url, "bytes=69990-80000");
+    assert.equal(
+      (await clamped.response).headers.get("content-range"),
+      `bytes 69990-69999/${bytes.length}`,
+    );
+    assert.ok((await bodyOf(clamped)).equals(Buffer.from(bytes.slice(69_990))));
+
+    const past = await getSegment(worker, url, "bytes=70000-70010");
+    const pastResponse = await past.response;
+    assert.equal(pastResponse.status, 416);
+    assert.equal(pastResponse.headers.get("content-range"), `bytes */${bytes.length}`);
+  });
+
+  it("answers 404 for a segment never stored, ranged or not", async () => {
+    const worker = await bootWorker();
+    const url = `${STORE}nowhere/000.pmtiles`;
+    for (const range of [null, "bytes=0-99"]) {
+      const event = await getSegment(worker, url, range);
+      assert.equal(event.handled, true, "a miss is still the worker's answer, not the network's");
+      assert.equal(await statusOf(event), 404);
+    }
+  });
+
+  it("removes one segment, or a whole area with the trailing-slash form", async () => {
+    const worker = await bootWorker();
+    const a0 = `${STORE}okc-metro/000.pmtiles`;
+    const a1 = `${STORE}okc-metro/001.pmtiles`;
+    const b0 = `${STORE}tulsa/000.pmtiles`;
+    for (const url of [a0, a1, b0]) await putSegment(worker, url, segmentBytes(1_000));
+
+    assert.equal(await statusOf(await deleteUrl(worker, a0)), 200);
+    assert.equal(await statusOf(await getSegment(worker, a0)), 404, "the DELETEd segment still serves");
+    assert.equal(await statusOf(await getSegment(worker, a1)), 200, "DELETE of one segment took its neighbour");
+    assert.equal(await statusOf(await deleteUrl(worker, a0)), 404, "DELETE of an absent segment must say so");
+
+    assert.equal(await statusOf(await deleteUrl(worker, `${STORE}okc-metro/`)), 200);
+    assert.equal(await statusOf(await getSegment(worker, a1)), 404, "the area form left a segment behind");
+    assert.equal(await statusOf(await getSegment(worker, b0)), 200, "the area form crossed into another area");
+
+    // The bare directory would name every area at once; it is refused.
+    assert.equal(await statusOf(await deleteUrl(worker, STORE)), 405);
+    assert.equal(await statusOf(await getSegment(worker, b0)), 200);
+  });
+
+  it("lists exactly what is stored, with true byte counts, and follows DELETE", async () => {
+    const worker = await bootWorker();
+    assert.deepEqual(await listStore(worker), [], "an empty store must list as empty, not error");
+
+    const small = `${STORE}okc-metro/000.pmtiles`;
+    const large = `${STORE}okc-metro/001.pmtiles`;
+    await putSegment(worker, small, segmentBytes(1_234));
+    await putSegment(worker, large, segmentBytes(56_789));
+
+    const listed = (await listStore(worker)).sort((x, y) => x.url.localeCompare(y.url));
+    assert.deepEqual(listed, [
+      { url: small, bytes: 1_234 },
+      { url: large, bytes: 56_789 },
+    ]);
+
+    // A re-PUT replaces, never duplicates, and the count follows the new body.
+    await putSegment(worker, small, segmentBytes(2_000));
+    const replaced = (await listStore(worker)).sort((x, y) => x.url.localeCompare(y.url));
+    assert.deepEqual(
+      replaced.map((s) => s.bytes),
+      [2_000, 56_789],
+      "the listing reports a stale size; launch-time completeness would believe it",
+    );
+
+    await deleteUrl(worker, small);
+    assert.deepEqual(await listStore(worker), [{ url: large, bytes: 56_789 }]);
+
+    // The reserved endpoints refuse verbs that would store them as segments —
+    // a stored __list__ would be a phantom row inside itself.
+    const abuse = await worker.fetch(
+      new Request(worker.internals.OFFLINE_LIST_URL, {
+        method: "PUT",
+        body: segmentBytes(4),
+        duplex: "half",
+      }),
+    );
+    assert.equal(await statusOf(abuse), 405);
+    assert.deepEqual(await listStore(worker), [{ url: large, bytes: 56_789 }]);
+  });
+
+  it("survives a deploy while an unlisted squallar- cache is purged beside it", async () => {
+    // THE hazard, per the plan: `purgeCaches` deletes every `squallar-` cache
+    // `cachesToKeep` does not name, on every deploy. Same trigger discipline
+    // as the block-cache test above — the purge runs on a DEPLOY, so one is
+    // published, and the stray cache purged alongside is the control that the
+    // purge actually ran.
+    let worker = await bootWorker({ tag: "A" });
+    const url = `${STORE}okc-metro/000.pmtiles`;
+    const bytes = segmentBytes(50_000);
+    await putSegment(worker, url, bytes);
+
+    const { OFFLINE_CACHE } = worker.internals;
+    assert.ok(
+      (await worker.cacheNames()).includes(OFFLINE_CACHE),
+      "the PUT created no cache; the rest of this test would be vacuous",
+    );
+
+    const stray = "squallar-offline-stale-probe";
+    await (await worker.caches.open(stray)).put(new Request(`${ORIGIN}x`), new Response("x"));
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "squallar:check-update" });
+    worker = await restartWorker(worker);
+
+    const names = await worker.cacheNames();
+    assert.ok(
+      !names.includes(stray),
+      `${stray} survived the deploy, so the purge did not run and this test proves nothing`,
+    );
+    assert.ok(
+      names.includes(OFFLINE_CACHE),
+      `the deploy purged ${OFFLINE_CACHE}; deliberate downloads must survive every deploy`,
+    );
+
+    // And the segment still serves, byte for byte, through the new worker.
+    const event = await getSegment(worker, url, "bytes=100-199");
+    const response = await event.response;
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("content-range"), `bytes 100-199/${bytes.length}`);
+    assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(bytes.slice(100, 200))));
+  });
+
+  it("routes exactly the store's URLs and verbs, nothing else", async () => {
+    const worker = await bootWorker();
+    const { routeFor, isOfflineStore, OFFLINE_LIST_URL, OFFLINE_QUOTA_URL } = worker.internals;
+    const segment = `${STORE}okc-metro/000.pmtiles`;
+
+    for (const method of ["GET", "PUT", "DELETE"]) {
+      assert.equal(routeFor({ url: segment, method }), "offline-store", method);
+    }
+    assert.equal(routeFor({ url: OFFLINE_LIST_URL }), "offline-store");
+    assert.equal(routeFor({ url: OFFLINE_QUOTA_URL }), "offline-store");
+
+    // Not owned: other verbs, navigations, lookalike paths, other origins.
+    assert.equal(routeFor({ url: segment, method: "POST" }), "network");
+    assert.equal(routeFor({ url: segment, method: "HEAD" }), "network");
+    assert.equal(routeFor({ url: segment, mode: "navigate" }), "network");
+    assert.equal(routeFor({ url: `${ORIGIN}__squallar_offline__x/a.pmtiles`, method: "PUT" }), "network");
+    assert.equal(
+      routeFor({ url: "https://tiles.squallar.app/__squallar_offline__/a/0.pmtiles" }),
+      "network",
+    );
+    assert.equal(routeFor({ url: shellUrl("zones.pack"), method: "PUT" }), "network");
+
+    // The predicate itself, because default-deny masks its deletion.
+    const u = (s) => new URL(s);
+    assert.equal(isOfflineStore(u(segment)), true);
+    assert.equal(isOfflineStore(u(OFFLINE_LIST_URL)), true);
+    assert.equal(isOfflineStore(u(`${ORIGIN}__squallar_offline__x/a.pmtiles`)), false);
+    assert.equal(isOfflineStore(u("https://other.example/__squallar_offline__/a/0.pmtiles")), false);
+
+    // And behaviourally: a lookalike PUT is not the worker's to answer.
+    const event = await worker.fetch(
+      new Request(`${ORIGIN}__squallar_offline__x/a.pmtiles`, {
+        method: "PUT",
+        body: segmentBytes(4),
+        duplex: "half",
+      }),
+    );
+    assert.equal(event.handled, false, "the worker called respondWith for a lookalike URL");
+  });
+
+  it("answers the quota route from the worker's own storage estimate", async () => {
+    const worker = await bootWorker();
+    // `estimate()` is Exposed=(Window,Worker), so the worker answers this
+    // itself; `persist()` is Window-only, which is the next test's subject.
+    worker.scope.navigator = {
+      storage: { estimate: async () => ({ usage: 12_345, quota: 900_000 }) },
+    };
+    const event = await worker.fetch(new Request(worker.internals.OFFLINE_QUOTA_URL));
+    const response = await event.response;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { usage: 12_345, quota: 900_000 });
+
+    // No estimate available answers UNKNOWN, never a fabricated zero.
+    delete worker.scope.navigator;
+    const bare = await worker.fetch(new Request(worker.internals.OFFLINE_QUOTA_URL));
+    assert.deepEqual(await (await bare.response).json(), { usage: null, quota: null });
+  });
+
+  it("asks the page once to request persistence, on the first stored segment", async () => {
+    // `StorageManager.persist()` is [Exposed=Window] (Storage Standard), so
+    // the worker cannot call it; it asks the page, which index.html answers.
+    const worker = await bootWorker();
+    const client = worker.addClient();
+    const asks = () =>
+      client.messages.filter((m) => m && m.type === "squallar:request-persist").length;
+
+    await putSegment(worker, `${STORE}okc-metro/000.pmtiles`, segmentBytes(10));
+    assert.equal(asks(), 1, "the first PUT must prompt the page to call navigator.storage.persist()");
+
+    await putSegment(worker, `${STORE}okc-metro/001.pmtiles`, segmentBytes(10));
+    assert.equal(asks(), 1, "the ask is once per worker lifetime, not once per segment");
+
+    // Already-persisted storage needs no ask; `persisted()` IS worker-exposed.
+    const granted = await bootWorker();
+    granted.scope.navigator = { storage: { persisted: async () => true } };
+    const page = granted.addClient();
+    await putSegment(granted, `${STORE}okc-metro/000.pmtiles`, segmentBytes(10));
+    assert.equal(
+      page.messages.filter((m) => m && m.type === "squallar:request-persist").length,
+      0,
+      "storage is already persistent and the page was nagged anyway",
+    );
+  });
+
+  it("answers an error, not a 200, when a PUT cannot store", async () => {
+    const worker = await bootWorker();
+    const realOpen = worker.caches.open.bind(worker.caches);
+    worker.caches.open = async (name) => {
+      if (name === worker.internals.OFFLINE_CACHE) throw new Error("quota exceeded");
+      return realOpen(name);
+    };
+
+    const put = await putSegment(worker, `${STORE}okc-metro/000.pmtiles`, segmentBytes(10));
+    assert.equal(put.handled, true, "the worker must still answer; there is no network behind this URL");
+    const status = await statusOf(put);
+    assert.ok(
+      status >= 500,
+      `a failed PUT answered ${status}; a 200 here is a segment the launch-time ` +
+        "completeness recomputation would count as downloaded",
+    );
+  });
+});

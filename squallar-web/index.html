@@ -227,8 +227,27 @@
         }
 
         navigator.serviceWorker.addEventListener("message", function (event) {
-          if (event.data && event.data.type === "squallar:shell-updated") {
+          var type = event.data && event.data.type;
+          if (type === "squallar:shell-updated") {
             showUpdate();
+          } else if (type === "squallar:request-persist") {
+            // The worker asks on the first offline-area download because it
+            // cannot ask for itself: the Storage Standard exposes
+            // `StorageManager.persist()` to Window only, while `persisted()`
+            // and `estimate()` are Window+Worker. Without persistence the
+            // browser may evict a deliberately-downloaded area under storage
+            // pressure. A denial is a fact for the manage screen to state
+            // beside the areas it affects, not something to nag about here.
+            if (navigator.storage && typeof navigator.storage.persist === "function") {
+              navigator.storage
+                .persist()
+                .then(function (granted) {
+                  console.info(
+                    "squallar: persistent storage " + (granted ? "granted" : "declined")
+                  );
+                })
+                .catch(function () {});
+            }
           }
         });
 
