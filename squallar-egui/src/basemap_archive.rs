@@ -312,6 +312,29 @@ impl HttpRangeSource {
         Self::with_part_bytes(client, url, PART_BYTES)
     }
 
+    /// A source reading `url` as **one file**, with the layout probe skipped.
+    ///
+    /// For an archive that cannot be published as parts because nothing
+    /// published it: a downloaded sub-archive is written whole by this
+    /// client, at [`crate::basemap_download::SEGMENT_BYTES`] — three orders
+    /// of magnitude under the [`PART_BYTES`] ceiling the parts exist for. The
+    /// probe against such a URL can only ever cost one request per segment to
+    /// be told what is already known, and on web that request goes to the
+    /// service worker holding the segment.
+    ///
+    /// This selects a *value* the probe would otherwise decide; it is not a
+    /// second read path. Everything after the layout verdict is
+    /// [`Self::new`]'s code unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the string that would not parse as a URL.
+    pub fn monolith(client: Client, url: &str) -> Result<Self, RangeError> {
+        let source = Self::with_part_bytes(client, url, PART_BYTES)?;
+        let _ = source.layout.set(ArchiveLayout::Monolith);
+        Ok(source)
+    }
+
     /// [`Self::new`] with the part stride overridden.
     ///
     /// Test-gated rather than `pub`: the stride is the publish side's
@@ -980,6 +1003,265 @@ impl<S: ArchiveRangeSource> BasemapArchive<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The composition
+// ---------------------------------------------------------------------------
+
+/// What one archive's own header says it could hold: a zoom band and a bbox.
+///
+/// Split out of [`OfflineSegment`] so the predicate is testable without an
+/// archive behind it — it is the whole of what keeps a per-tile walk over N
+/// local archives off the wire, and a rejection rule that can only be
+/// exercised through a file is a rejection rule nothing pins directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Coverage {
+    min_zoom: u8,
+    max_zoom: u8,
+    /// The area's bbox, as the writer declared it in the segment's header.
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+impl Coverage {
+    /// Whether an archive with this header could hold `z/x/y`.
+    ///
+    /// **Conservative in one direction only**: `false` means it provably does
+    /// not hold the tile, `true` means the directories have to be asked. The
+    /// bbox is turned into a tile range with `squallar_geo::lon_to_tile_x`
+    /// and `lat_to_tile_y` — the same two functions
+    /// `basemap_download::area_tiles` enumerated the segment's contents with,
+    /// so the enumeration and the rejection cannot round to different edges.
+    fn holds(&self, z: u8, x: u32, y: u32) -> bool {
+        if z < self.min_zoom || z > self.max_zoom {
+            return false;
+        }
+        let west = squallar_geo::lon_to_tile_x(self.west, z);
+        let east = squallar_geo::lon_to_tile_x(self.east, z);
+        let north = squallar_geo::lat_to_tile_y(self.north, z);
+        let south = squallar_geo::lat_to_tile_y(self.south, z);
+        (west..=east).contains(&x) && (north..=south).contains(&y)
+    }
+}
+
+/// One opened local sub-archive, with what its own header says it holds.
+///
+/// The [`Coverage`] is read at open and never re-read; answering from it
+/// touches the source not at all. See [`BasemapArchives::tile`] for why that
+/// matters more than it looks.
+struct OfflineSegment<O: ArchiveRangeSource> {
+    /// What to call it in a log. The store's own name for the artifact.
+    label: String,
+    archive: BasemapArchive<O>,
+    coverage: Coverage,
+}
+
+/// The live archive with any locally downloaded sub-archives in front of it.
+///
+/// # It is a second source of ranges, not a second reader
+///
+/// Every archive here is a [`BasemapArchive`] over a [`RangeSource`] — the
+/// same reader, the same directory cache, the same [`TileBytes`] vocabulary.
+/// What this type adds is an *order*, and the order is the whole feature:
+/// [`Self::tile`] asks the local segments first and the live archive only
+/// after all of them have positively answered `Absent`. **A local hit that
+/// deferred to the network would spend exactly the bandwidth this feature
+/// exists to save.**
+///
+/// Partial coverage is therefore automatic and per-tile. Nothing anywhere
+/// asks "is the viewport covered": half a viewport served locally and half
+/// over the network is not a state to detect, report or warn about, it is
+/// what the walk does on every tile independently.
+///
+/// # Per tile, N segments do not cost N reads
+///
+/// Two things keep the walk cheap, and neither is a cache that might miss:
+///
+/// * `Coverage::holds` rejects a segment from its header's own bbox and zoom
+///   band, in memory, before any directory is consulted. The
+///   download engine cuts an area into zoom-banded segments, so at a given
+///   zoom most of an area's segments are rejected on the zoom alone.
+/// * A segment that passes is asked through [`BasemapArchive::tile`], whose
+///   `HashMapCache` holds the root directory from `open` onward. On a
+///   segment small enough to have no leaf directories — 16 MB is, by a wide
+///   margin — an `Absent` answer is decided in memory and costs **zero**
+///   range reads. A segment with leaves pays one read per leaf, once.
+///
+/// # A local archive is never allowed to fail the tile
+///
+/// A segment that will not open is skipped at [`BasemapArchives::attach_offline`] with
+/// a log, and one that errors mid-life is skipped at [`BasemapArchives::tile`] with a
+/// log. Both degrade to "fetch it from the network", which is what walking
+/// on to the live archive already does — so a corrupt local file costs
+/// bandwidth, never a blank map, and never a notice the user cannot act on.
+pub struct BasemapArchives<L: ArchiveRangeSource, O: ArchiveRangeSource> {
+    /// In an `Arc` because the block-cache seed holds the live archive while
+    /// this composition serves from it; the seed is the live archive's alone.
+    live: Arc<BasemapArchive<L>>,
+    offline: Vec<OfflineSegment<O>>,
+    /// [`Self::max_zoom`], recomputed on every attach so the render ceiling
+    /// is one number rather than a walk per frame.
+    max_zoom: u8,
+    min_zoom: u8,
+}
+
+impl<L: ArchiveRangeSource, O: ArchiveRangeSource> BasemapArchives<L, O> {
+    /// Open the live archive. Local segments are attached afterwards, one at
+    /// a time, so that a store that answers slowly or not at all cannot delay
+    /// the header the frame side is waiting on.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchiveError::Open`], exactly as [`BasemapArchive::open`] — the live
+    /// archive failing is still a fault, because a composition with no live
+    /// archive can only ever serve what happens to be downloaded.
+    pub async fn open(live: L) -> Result<Self, ArchiveError> {
+        let live = BasemapArchive::open(live).await?;
+        let max_zoom = live.max_zoom();
+        let min_zoom = live.min_zoom();
+        Ok(Self {
+            live: Arc::new(live),
+            offline: Vec::new(),
+            max_zoom,
+            min_zoom,
+        })
+    }
+
+    /// Put one local sub-archive in front of the live one, answering whether
+    /// it was taken.
+    ///
+    /// **Never fails, never panics, never reaches the glass.** A segment that
+    /// will not open, or whose bodies are not the kind the live archive's are,
+    /// is logged and skipped — the tiles it would have served come from the
+    /// network instead, which is the composition working rather than failing.
+    /// The tile-type check is what stops a hand-placed raster archive being
+    /// fed to the vector decoder the live header selected.
+    pub async fn attach_offline(&mut self, label: String, source: O) -> bool {
+        let archive = match BasemapArchive::open(source).await {
+            Ok(archive) => archive,
+            Err(error) => {
+                log::warn!(
+                    "the downloaded basemap segment {label} will not open, so its tiles come \
+                     from the network instead: {error}"
+                );
+                return false;
+            }
+        };
+
+        if archive.tile_type() != self.live.tile_type() {
+            log::warn!(
+                "the downloaded basemap segment {label} holds {:?} tiles where the archive holds \
+                 {:?}, so it is not used",
+                archive.tile_type(),
+                self.live.tile_type()
+            );
+            return false;
+        }
+
+        let header = archive.header();
+        let coverage = Coverage {
+            min_zoom: header.min_zoom,
+            max_zoom: header.max_zoom,
+            west: header.min_longitude,
+            south: header.min_latitude,
+            east: header.max_longitude,
+            north: header.max_latitude,
+        };
+        log::info!("downloaded basemap segment {label} in front of the archive: {coverage:?}");
+        self.max_zoom = self.max_zoom.max(coverage.max_zoom);
+        self.min_zoom = self.min_zoom.min(coverage.min_zoom);
+        self.offline.push(OfflineSegment {
+            label,
+            archive,
+            coverage,
+        });
+        true
+    }
+
+    /// The live archive, for the one caller that is about the live archive
+    /// alone: the block cache's shallow-zoom seed.
+    pub fn live(&self) -> &Arc<BasemapArchive<L>> {
+        &self.live
+    }
+
+    /// How many local segments are in front of the live archive.
+    pub fn offline_count(&self) -> usize {
+        self.offline.len()
+    }
+
+    /// The live archive's header — what the bodies are and how they are
+    /// compressed. A segment is only attached if its own header agrees, so
+    /// there is one answer rather than a per-source one.
+    pub fn header(&self) -> &Header {
+        self.live.header()
+    }
+
+    /// The deepest zoom anything in the composition stores.
+    ///
+    /// **The ceiling is the live archive's unless a local segment is deeper**,
+    /// which a segment cut from that archive can never be. So over-zoom past
+    /// a downloaded area's own maximum is not a case: the published ceiling
+    /// does not move, `Tiles::at` clamps against the same number it always
+    /// did, and the stretched ancestor comes from
+    /// `HttpsTiles::cached_or_interpolated` exactly as it does past the live
+    /// archive's own maximum. There is no second over-zoom rule and no string
+    /// to show for one.
+    pub fn max_zoom(&self) -> u8 {
+        self.max_zoom
+    }
+
+    /// The shallowest zoom anything in the composition stores.
+    pub fn min_zoom(&self) -> u8 {
+        self.min_zoom
+    }
+
+    /// What the tiles are. The live archive's word — see [`Self::header`].
+    pub fn tile_type(&self) -> TileType {
+        self.live.tile_type()
+    }
+
+    /// How the tiles are compressed on the wire. [`Self::tile`] has already
+    /// undone this by the time it answers.
+    pub fn tile_compression(&self) -> Compression {
+        self.live.tile_compression()
+    }
+
+    /// Fetch one tile, decompressed, from the first source that holds it.
+    ///
+    /// Local segments first, in attach order, then the live archive. See the
+    /// type doc for why that order is the feature and why it costs no reads
+    /// to walk.
+    ///
+    /// # Errors
+    ///
+    /// [`ArchiveError::Coordinate`] if `z/x/y` is not a tile, and whatever the
+    /// **live** archive answers with. A local segment's failure is never one
+    /// of these: it is logged and walked past.
+    pub async fn tile(&self, z: u8, x: u32, y: u32) -> Result<TileBytes, ArchiveError> {
+        // Once, here, rather than once per source: an off-grid coordinate is
+        // the caller's error and every archive would answer it identically.
+        TileCoord::new(z, x, y).map_err(|_| ArchiveError::Coordinate { z, x, y })?;
+
+        for segment in &self.offline {
+            if !segment.coverage.holds(z, x, y) {
+                continue;
+            }
+            match segment.archive.tile(z, x, y).await {
+                Ok(TileBytes::Present(bytes)) => return Ok(TileBytes::Present(bytes)),
+                Ok(TileBytes::Absent) => {}
+                Err(error) => log::warn!(
+                    "the downloaded basemap segment {} would not answer {z}/{x}/{y}, so it is \
+                     read from the network instead: {error}",
+                    segment.label
+                ),
+            }
+        }
+
+        self.live.tile(z, x, y).await
+    }
+}
+
 /// The persistent block cache over [`RangeSource`], and the background seed
 /// that warms it. A submodule of the archive reader, beside the seam
 /// gate rather than carrying one of its own.
@@ -988,3 +1270,11 @@ pub mod block_cache;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests;
+
+/// The composition's own suite. Beside [`tests`] rather than inside it
+/// because what it measures is different: [`tests`] gates one reader over one
+/// source, this gates the *order* two readers are asked in, and every
+/// assertion in it is a read count.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod archives_tests;

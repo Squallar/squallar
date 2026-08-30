@@ -584,6 +584,10 @@ impl Gui {
     /// seam for it. `None` is the bridge answering "no filesystem for it",
     /// and every `Gui` a test builds bare.
     pub fn with_basemap_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        // The base tile slot reads its downloaded areas back out of the same
+        // directory the download engine writes them into, so it is handed the
+        // path here rather than growing a second route to it.
+        self.map_tiles.set_basemap_dir(dir.clone());
         self.basemap_dir = dir;
         self
     }

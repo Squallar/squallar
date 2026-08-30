@@ -181,13 +181,17 @@ pub(super) fn block_on<F: Future>(future: F) -> F::Output {
 // ---------------------------------------------------------------------------
 
 /// Wraps a source and counts the ranges asked of it.
-struct CountingSource<S> {
+///
+/// `pub(super)` so the composition's suite counts with the same instrument
+/// this one does: a second counter written beside it could disagree about
+/// what a read is, and the whole of both suites' evidence is read counts.
+pub(super) struct CountingSource<S> {
     inner: S,
     reads: Arc<AtomicUsize>,
 }
 
 impl<S> CountingSource<S> {
-    fn new(inner: S) -> (Self, Arc<AtomicUsize>) {
+    pub(super) fn new(inner: S) -> (Self, Arc<AtomicUsize>) {
         let reads = Arc::new(AtomicUsize::new(0));
         (
             Self {
