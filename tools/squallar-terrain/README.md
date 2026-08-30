@@ -37,6 +37,7 @@ src/tiles.rs             Copernicus tile names, the pinned list, chunking
 src/trgb.rs              Mapbox Terrain-RGB v1 packing
 src/raster.rs            the raster archive
 src/contours.rs          the vector archive
+src/floor.rs             the 1x1-degree minimum-elevation grid the app compiles in
 src/run.rs               subprocess pipelines with per-member exit status
 src/mbtiles.rs           MBTiles merge and metadata, via sqlite3
 src/pmtiles.rs           the magic-bytes assertion
@@ -565,10 +566,41 @@ By hand:
 
 ```sh
 TERRAIN_NO_RUN=1 TERRAIN_BIN_URL=… ./bootstrap-al2023.sh
-WORK=/mnt/terrain-work squallar-terrain build              # both archives
+WORK=/mnt/terrain-work squallar-terrain build              # archives + floor grid
 WORK=/mnt/terrain-work squallar-terrain build contours     # just the vector one
 RASTER_ENCODING=terrain-rgb squallar-terrain build raster
+WORK=/mnt/terrain-work squallar-terrain build floor        # just the floor grid
 ```
+
+### The floor grid
+
+`build floor` emits `squallar-min-elevation-1deg.bin` — 360 × 180 signed `i16`
+metres, 129,600 bytes, big-endian, row 0 northernmost. The app compiles it in
+and reads the minimum over a radar box's footprint to put the 3D volume's base
+at the true ground rather than at sea level. Format, reader and builder all live
+in `squallar_geo::min_elevation`; this pass only drives them, so writer and
+reader cannot disagree about byte order or row origin.
+
+**One grid cell is one COG**: GLO-30 publishes exactly one 1°×1° tile per
+populated cell, so the pass takes each tile's minimum into the cell that tile
+names. Cells GLO-30 does not publish — every ocean cell — keep the `i16::MIN`
+sentinel, which is what lets the reader tell "no ground here" from "ground at
+zero"; a coastal radar overlaps ocean on every scan and a minimum that adopted
+the sentinel would answer −32,768 m.
+
+It reads every COG at **full resolution**, because `gdalinfo -mm` is the only
+exact minimum available. `-oo OVERVIEW_LEVEL=2` would read a sixty-fourth of the
+bytes and is *wrong for this purpose, not merely coarse*: GLO-30's overviews are
+averaged, so an overview's minimum sits above the true one, and a box floor
+above the ground clips the ground. `-approx_stats` fails the same way. The pass
+is therefore resumable through `floor-minima.txt` in the work directory: each
+tile's answer is appended as it lands and a re-run skips what is recorded. It
+refuses to write a grid unless every cell in the pinned tile list is accounted
+for.
+
+Two cells, measured 2026-08-30 with `gdalinfo -mm` over `/vsis3/`, are the pins
+the app-side reader carries: `N36_00_W117_00` (Death Valley) −91.451 m and
+`N31_00_E035_00` (the Dead Sea) −427.834 m.
 
 Knobs (all environment, all listed by `squallar-terrain --help`):
 `WORK` `OUT` `TMP` `JOBS` `DEM_BUCKET` `CHUNK_DEG` `SUPERCELL`

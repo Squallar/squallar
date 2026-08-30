@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod contours;
+pub mod floor;
 pub mod grid;
 pub mod logging;
 pub mod mbtiles;
