@@ -244,7 +244,13 @@ struct SliderDrag {
 
 pub struct GesturePlayer {
     script: GestureScript,
-    armed_at: web_time::Instant,
+    /// The schedule's epoch: the FIRST FRAME's clock reading, not arming's.
+    /// The app arms at construction, before its window exists; a schedule run
+    /// from that moment misses every action scheduled before the first draw
+    /// — measured on this box as the first eye toggle of loop 1, which left
+    /// that layer phase-inverted for the whole run. `None` until the first
+    /// [`Self::elapsed_secs`].
+    armed_at: Option<web_time::Instant>,
     /// Loop-local time of the previous call; `None` before the first.
     prev_t: Option<f64>,
     loops_completed: u64,
@@ -275,7 +281,7 @@ impl GesturePlayer {
         log::info!("{}", begin_line(script));
         Some(Self {
             script,
-            armed_at: web_time::Instant::now(),
+            armed_at: None,
             prev_t: None,
             loops_completed: 0,
             frames_this_loop: 0,
@@ -289,10 +295,15 @@ impl GesturePlayer {
         })
     }
 
-    /// Seconds since arming, for the shipped caller. Tests never use this —
-    /// they hand [`Self::events_for_frame`] explicit times.
-    pub fn elapsed_secs(&self) -> f64 {
-        self.armed_at.elapsed().as_secs_f64()
+    /// Seconds since the first frame asked — the schedule's clock, for the
+    /// shipped caller. The first call stamps the epoch, so loop 1 starts at
+    /// the first frame and plays exactly like every later loop. Tests never
+    /// use this — they hand [`Self::events_for_frame`] explicit times.
+    pub fn elapsed_secs(&mut self) -> f64 {
+        self.armed_at
+            .get_or_insert_with(web_time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
     }
 
     /// This frame's scripted events — a deterministic function of
