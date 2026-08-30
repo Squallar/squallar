@@ -4,9 +4,10 @@
 /// Every codec row this build composes, in order: the six radar rows
 /// (radar, level3, level3/vild, section, voxels, decode), then the seven
 /// overlay rows (sites, alerts, outlooks, discussions, reports, glm, model),
-/// then the one elevation row (terrain/heights). Wire codes are indices into
-/// this composition plus one (1..=14, 0 unallocated so a zeroed buffer never
-/// decodes), so it must stay a single spelled-out expression.
+/// then the one elevation row (terrain/heights), then the one buildings row
+/// (buildings/prisms). Wire codes are indices into this composition plus one
+/// (1..=15, 0 unallocated so a zeroed buffer never decodes), so it must stay a
+/// single spelled-out expression.
 ///
 /// **A new registry chains on the END.** A row inserted anywhere earlier —
 /// including appended into `squallar_radar::jobs::JOB_CODECS`, which reads like
@@ -19,4 +20,5 @@ pub(crate) fn job_codecs() -> impl Iterator<Item = &'static squallar_source::job
         .iter()
         .chain(squallar_overlays::render::jobs::JOB_CODECS.iter())
         .chain(squallar_elevation::jobs::JOB_CODECS.iter())
+        .chain(squallar_buildings::jobs::JOB_CODECS.iter())
 }

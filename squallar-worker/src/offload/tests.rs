@@ -1,4 +1,8 @@
 use super::*;
+use squallar_buildings::budget::PrismCeilings;
+use squallar_buildings::jobs::{BuildingMeshJob, BuildingTile};
+use squallar_buildings::prism::BuildingMesh;
+use squallar_buildings::tile::{BoxFrame, TileId};
 use squallar_elevation::HeightField;
 use squallar_elevation::TileCover;
 use squallar_elevation::jobs::{HeightTile, TerrainHeightJob};
@@ -822,6 +826,68 @@ pub(super) fn a_height_job() -> JobRequest {
     )
 }
 
+/// One real `building` layer out of the archive this workspace ships, whole.
+///
+/// z14/8529/5975 of `squallar-egui/testdata/monaco.pmtiles`, the committed
+/// planetiler v0.10.2 OpenMapTiles build, with the other source layers dropped
+/// and the `building` layer re-wrapped as a tile: 113 bytes carrying one
+/// building at `render_height = 5`, `render_min_height = 0`.
+///
+/// **Real bytes and not a synthetic tile**, which is what the literal length
+/// buys — this is the smallest `building` layer in the whole archive, so the
+/// row's parity can be checked against something upstream chose rather than
+/// against something this repository wrote to be easy. The keys are
+/// `render_height` and `render_min_height` and the values ride MVT's `sint`
+/// arm, which is what `squallar_buildings::footprint` reads. Do not re-encode.
+const A_BUILDING_TILE_MVT: [u8; 113] = [
+    0x1a, 0x6f, 0x0a, 0x08, 0x62, 0x75, 0x69, 0x6c, 0x64, 0x69, 0x6e, 0x67, 0x12, 0x34, 0x08, 0xaf,
+    0x81, 0xe4, 0x18, 0x12, 0x04, 0x00, 0x00, 0x01, 0x01, 0x18, 0x03, 0x22, 0x25, 0x09, 0xf2, 0x23,
+    0x7f, 0x62, 0xbd, 0x01, 0xbe, 0x01, 0xa7, 0x04, 0x3e, 0x09, 0x61, 0x44, 0x05, 0x04, 0x02, 0x02,
+    0x18, 0xb2, 0x01, 0x11, 0x02, 0x18, 0x06, 0x00, 0x02, 0x10, 0xa0, 0x02, 0x1b, 0xa6, 0x01, 0xa7,
+    0x01, 0x0f, 0x1a, 0x0d, 0x72, 0x65, 0x6e, 0x64, 0x65, 0x72, 0x5f, 0x68, 0x65, 0x69, 0x67, 0x68,
+    0x74, 0x1a, 0x11, 0x72, 0x65, 0x6e, 0x64, 0x65, 0x72, 0x5f, 0x6d, 0x69, 0x6e, 0x5f, 0x68, 0x65,
+    0x69, 0x67, 0x68, 0x74, 0x22, 0x02, 0x30, 0x0a, 0x22, 0x02, 0x30, 0x00, 0x28, 0x80, 0x20, 0x78,
+    0x02,
+];
+
+/// The box the building row's fixtures are over: z14/8529/5975's own centre,
+/// with a 6 km by 6 km box around it that swallows the 1.77 km tile whole.
+///
+/// **`x_km` and `y_km` differ**, on exactly the reasoning `a_height_job`
+/// records: a symmetric reorder of the six box terms in `encode` and `decode`
+/// leaves the encoded bytes identical when the two pairs are equal, so the
+/// pinned framing row would not move and two builds either side of the edit
+/// would exchange a transposed box.
+///
+/// **The two ceilings differ from each other for the same reason**, and they
+/// are the shipped `PrismCeilings::DEFAULT`'s VRAM row beside a 256 MiB
+/// single-buffer limit rather than two round numbers, so the fit the row runs
+/// is the fit a caller would get.
+pub(super) fn a_building_job() -> JobRequest {
+    JobRequest::describe(
+        BuildingMeshJob {
+            frame: BoxFrame {
+                site: (43.715_534_726_205_11, 7.415_771_484_375),
+                x_km: (-3.0, 3.0),
+                y_km: (-2.0, 4.0),
+            },
+            ceilings: PrismCeilings {
+                vram_bytes: 16 << 20,
+                max_buffer_bytes: 1 << 28,
+            },
+            tiles: vec![BuildingTile {
+                tile: TileId {
+                    z: 14,
+                    x: 8529,
+                    y: 5975,
+                },
+                mvt: Arc::new(A_BUILDING_TILE_MVT.to_vec()),
+            }],
+        },
+        ceiling_only_geometry(0),
+    )
+}
+
 /// Every kind survives its own wire form — and **every kind is here**, which is
 /// the half review found silently open: the roster was a bare array, so a row
 /// added without a fixture was simply never round-tripped.
@@ -850,6 +916,7 @@ fn every_job_kind_survives_the_wire_format() {
         // round-trip to itself.
         an_overlay_model_job(),
         a_height_job(),
+        a_building_job(),
     ];
     let covered: std::collections::BTreeSet<&str> = jobs.iter().map(|job| job.kind()).collect();
     let composed: std::collections::BTreeSet<&str> = job_codecs().map(|row| row.label).collect();
@@ -896,7 +963,7 @@ fn an_unallocated_code_is_refused() {
 #[test]
 fn every_code_is_the_literal_index_and_label_this_registry_composes() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(u8, &str); 14] = [
+    let table: [(u8, &str); 15] = [
         (1, "radar"),
         (2, "level3"),
         (3, "level3/vild"),
@@ -911,6 +978,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (12, "overlay/glm"),
         (13, "overlay/model"),
         (14, "terrain/heights"),
+        (15, "buildings/prisms"),
     ];
 
     // Against the composed registry: row `i` is labelled what this table says
@@ -938,7 +1006,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
 
     // And the encoder really posts those bytes — the table could agree with
     // the registry while the framing that writes the byte does not.
-    let framing: [(JobRequest, u8); 14] = [
+    let framing: [(JobRequest, u8); 15] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 3),
@@ -953,6 +1021,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (an_overlay_glm_job(), 12),
         (an_overlay_model_job(), 13),
         (a_height_job(), 14),
+        (a_building_job(), 15),
     ];
     assert_eq!(
         framing.len(),
@@ -1519,7 +1588,7 @@ fn a_decode_job_round_trips_its_archive_whole() {
 #[test]
 fn a_decode_job_is_not_readable_as_another_kind() {
     let mut bytes = a_decode_job().to_bytes();
-    for code in (1u8..=14).filter(|&code| code != 6) {
+    for code in (1u8..=15).filter(|&code| code != 6) {
         bytes[0] = code;
         // Whatever it decodes to, it must not decode to a `DecodeJob`.
         assert!(
@@ -1630,7 +1699,7 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
         // Opaque payloads: an archive, a Level III object or a rectangle of
         // Terrain-RGB tile bodies, which this codec frames and never
         // interprets.
-        "level3" | "level3/vild" | "decode" | "terrain/heights" => 0,
+        "level3" | "level3/vild" | "decode" | "terrain/heights" | "buildings/prisms" => 0,
         // Every byte is an overlay row's own: the geometry header and the
         // row's fields are all this wire's framing, with no nested payload
         // carrying a pin of its own.
@@ -1669,6 +1738,11 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         // cover and its one tile body are all spelled out, so nothing in this
         // row's digest is what a platform's `sin`/`atan2` answered.
         a_height_job(),
+        // And literal again for the same reason: the fixture's box terms and
+        // its one tile body are spelled out, so this row's digest is over
+        // stored bits rather than over what a platform's `sin`/`atan2`
+        // answered.
+        a_building_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1710,7 +1784,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 #[test]
 fn every_codec_row_has_a_parity_test() {
     // Deliberately spelled out, label beside test name, in registry order.
-    let named: [(&str, &str); 14] = [
+    let named: [(&str, &str); 15] = [
         (
             "radar",
             "the_radar_render_is_byte_identical_direct_and_via_the_wire",
@@ -1767,6 +1841,10 @@ fn every_codec_row_has_a_parity_test() {
             "terrain/heights",
             "the_height_field_is_byte_identical_direct_and_via_the_wire",
         ),
+        (
+            "buildings/prisms",
+            "the_building_mesh_is_byte_identical_direct_and_via_the_wire",
+        ),
     ];
     assert_eq!(
         job_codecs().count(),
@@ -1805,7 +1883,7 @@ fn no_run_body_reads_a_clock() {
     // `include_str!` rather than a runtime read: the compiler re-runs this
     // test's crate when either module changes, so the ratchet cannot go stale
     // against the file it scans.
-    let modules: [(&str, &str); 3] = [
+    let modules: [(&str, &str); 4] = [
         (
             "squallar-radar/src/jobs.rs",
             include_str!("../../../squallar-radar/src/jobs.rs"),
@@ -1817,6 +1895,10 @@ fn no_run_body_reads_a_clock() {
         (
             "squallar-elevation/src/jobs.rs",
             include_str!("../../../squallar-elevation/src/jobs.rs"),
+        ),
+        (
+            "squallar-buildings/src/jobs.rs",
+            include_str!("../../../squallar-buildings/src/jobs.rs"),
         ),
     ];
     // The roster is the registry's, not a hand-kept list: `job_registry.rs`
@@ -2197,6 +2279,223 @@ fn a_malformed_height_job_is_refused_rather_than_misread() {
     assert!(
         JobRequest::from_bytes(&trailing).is_none(),
         "a height job with a trailing byte decoded",
+    );
+}
+
+// ── The buildings row ───────────────────────────────────────────────────────
+
+/// **The parity gate for the buildings row: direct call and via-wire execution
+/// extrude the identical mesh**, on a real tile that genuinely decodes.
+#[test]
+fn the_building_mesh_is_byte_identical_direct_and_via_the_wire() {
+    let job = a_building_job();
+    let bytes = job.to_bytes();
+    assert_eq!(
+        JobRequest::from_bytes(&bytes).as_ref(),
+        Some(&job),
+        "the building job does not survive its own wire form",
+    );
+
+    let direct = execute(&job)
+        .and_then(|out| out.take::<BuildingMesh>())
+        .expect("the fixture tile extrudes over the fixture box");
+    assert_eq!(
+        (direct.kept, direct.shed, direct.refused_tiles),
+        (1, 0, 0),
+        "the fixture tile carries one building, kept whole under a 16 MiB row",
+    );
+    assert!(
+        direct.is_coherent() && !direct.is_empty(),
+        "the fixture mesh is incoherent or empty, so the comparison below is \
+         not about the extrusion this test believes it is",
+    );
+    // A prism and not a flat patch: a builder answering one plane everywhere
+    // would pass the parity below vacuously.
+    let heights: std::collections::BTreeSet<u32> =
+        direct.positions.iter().map(|v| v[2].to_bits()).collect();
+    assert_eq!(
+        heights.len(),
+        2,
+        "the fixture building runs 0 m to 5 m, so its vertices sit at exactly \
+         two heights; {heights:?} is not that building",
+    );
+    let normals: std::collections::BTreeSet<[u32; 3]> = direct
+        .normals
+        .iter()
+        .map(|n| [n[0].to_bits(), n[1].to_bits(), n[2].to_bits()])
+        .collect();
+    assert!(
+        normals.len() >= 4,
+        "the mesh carries {} distinct normals; a prism has a roof and at \
+         least three walls facing different ways",
+        normals.len(),
+    );
+
+    let via_wire = execute_bytes(&bytes)
+        .and_then(|out| out.take::<BuildingMesh>())
+        .expect("the described building job extrudes off its own wire form");
+    assert_eq!(
+        via_wire, direct,
+        "the mesh differs between the direct call and the wire - the two \
+         paths have stopped being one extruder",
+    );
+}
+
+/// The reply half: a mesh comes back through the buildings row's own reply
+/// codec, head and tails alike, and through nobody else's.
+#[test]
+fn a_building_mesh_comes_back_under_its_own_out_kind() {
+    let (code, head, tails) =
+        execute_encoded(&a_building_job().to_bytes()).expect("the fixture job answers");
+    assert_eq!(
+        code, 15,
+        "the reply is tagged with the buildings row's own code",
+    );
+    assert_eq!(
+        tails.len(),
+        3,
+        "positions, normals and indices are the row's three nominated tails",
+    );
+
+    let row_decode_out = |label: &str| {
+        job_codecs()
+            .find(|row| row.label == label)
+            .expect("the label names a composed row")
+            .decode_out
+    };
+    let back = row_decode_out("buildings/prisms")(&head, tails.clone())
+        .expect("a mesh payload under the buildings row")
+        .take::<BuildingMesh>()
+        .expect("it is a building mesh");
+    assert_eq!(
+        back,
+        execute(&a_building_job())
+            .and_then(|out| out.take::<BuildingMesh>())
+            .expect("the direct call answers the same mesh"),
+    );
+
+    // The same bytes under the other kinds' decoders are refused by those
+    // types' own framing rather than half-decoded into something plausible.
+    for label in ["terrain/heights", "voxels", "section"] {
+        assert!(
+            row_decode_out(label)(&head, tails.clone()).is_none(),
+            "the {label} row accepted a building payload",
+        );
+    }
+}
+
+/// **The buildings reply's layout is THIS layout.**
+///
+/// The parity test cannot stand in for this one, for the reason the height
+/// reply's own pin records: direct and via-wire both run the same codec, so
+/// any change made symmetrically in `encode_out` and `decode_out` is invisible
+/// to it. This row has a second way to be symmetric that the height row does
+/// not - positions and normals are the same length, so swapping the two tails
+/// would move no length at all.
+///
+/// The mesh is **literal**, not extruded: a real extrusion's vertices come out
+/// of `great_circle_destination` and lyon, and a digest over those would be a
+/// digest of whichever libm ran `sin`. The values are chosen so a byte swap, a
+/// field swap and a tail swap each change something - the three counters are
+/// 1, 2 and 3; no coordinate repeats; and the normals are unit axes that no
+/// position could be mistaken for.
+#[test]
+fn the_building_reply_framing_is_the_one_this_registry_ships() {
+    let mesh = BuildingMesh {
+        positions: vec![[1.0, -2.5, 3.25], [4.5, 5.75, -6.125], [7.5, 8.25, 9.0]],
+        normals: vec![[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+        // Not `[0, 1, 2]`: a decoder that ignored the order would read the
+        // ascending run back correctly whatever it did.
+        indices: vec![2, 0, 1],
+        kept: 1,
+        shed: 2,
+        refused_tiles: 3,
+    };
+    assert!(
+        mesh.is_coherent(),
+        "the literal mesh is not one this build could have produced",
+    );
+
+    let row = job_codecs()
+        .find(|row| row.label == "buildings/prisms")
+        .expect("the buildings row is composed");
+    let mut head = Vec::new();
+    let mut tails = Vec::new();
+    (row.encode_out)(DescribedOut(Box::new(mesh.clone())), &mut head, &mut tails);
+    assert_eq!(
+        tails.len(),
+        3,
+        "the buildings reply rides exactly three tails; a fourth would need \
+         its own digest row",
+    );
+
+    let rows: Vec<String> = [
+        ("prisms/head", &head),
+        ("prisms/positions", &tails[0]),
+        ("prisms/normals", &tails[1]),
+        ("prisms/indices", &tails[2]),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| format!("{name} | {} | {:#018x}", bytes.len(), layout_digest(bytes)))
+    .collect();
+    assert_eq!(
+        rows,
+        crate::wire_identity::WIRE_BUILDING_REPLY_ROWS,
+        "the buildings reply layout is not the one \
+         `wire_identity::WIRE_BUILDING_REPLY_ROWS` pins. Left is what this \
+         build writes; right is what that list was last told. A field \
+         reordered, retyped, written at a different endianness, or two tails \
+         swapped moves these rows and nothing else in the suite would notice. \
+         Re-pin deliberately: the rows feed `wire_digest`, so a page and a \
+         worker either side of the change respawn rather than exchanging \
+         geometry one of them reads transposed."
+    );
+
+    // And the pin is over a layout that still round-trips, so it cannot be
+    // pinning a shape this build cannot read back.
+    assert_eq!(
+        (row.decode_out)(&head, tails)
+            .expect("the pinned bytes decode")
+            .take::<BuildingMesh>()
+            .expect("as a building mesh"),
+        mesh,
+    );
+}
+
+/// **A payload this row did not write is refused rather than misread.**
+///
+/// The buildings row now holds the LAST code in the composition, which is the
+/// one a peer of another build reaches for first when its own registry was
+/// longer. The interesting case is therefore a real request of another kind
+/// read under code 15, not a random buffer.
+#[test]
+fn a_malformed_building_job_is_refused_rather_than_misread() {
+    let good = a_building_job().to_bytes();
+    assert!(
+        JobRequest::from_bytes(&good).is_some(),
+        "the control fixture must decode, or every refusal below is vacuous",
+    );
+
+    for other in [a_voxel_job(), a_decode_job(), a_height_job()] {
+        let mut bytes = other.to_bytes();
+        let was = bytes[0];
+        bytes[0] = 15;
+        assert!(
+            !JobRequest::from_bytes(&bytes)
+                .is_some_and(|job| job.job.downcast_ref::<BuildingMeshJob>().is_some()),
+            "a code-{was} payload read under code 15 produced a building job",
+        );
+    }
+
+    assert!(
+        JobRequest::from_bytes(&good[..good.len() - 1]).is_none(),
+        "a truncated building job decoded",
+    );
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(
+        JobRequest::from_bytes(&trailing).is_none(),
+        "a building job with a trailing byte decoded",
     );
 }
 
