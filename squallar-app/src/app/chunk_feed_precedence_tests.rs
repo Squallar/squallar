@@ -19,6 +19,12 @@ const SHIPPED_CELLS: [u32; 3] = squallar_device_profile::constants::VOLUME_GRID_
 /// the field, and it never reads the payload. The downcast half — where the
 /// payload is the whole question — is pinned separately in
 /// `volume_layer_tests`, against a real extracted volume.
+///
+/// The **site** is handed over separately because the box is a rectangle in the
+/// site's tangent frame and its floor is derived over that frame.
+/// `RadarSource::volume_job` takes it off the payload, which a stand-in payload
+/// cannot answer; this helper is already given the site's own coordinates and
+/// passes them, so the request it shapes is the one production would shape.
 fn shaped_request(
     target: &squallar_egui::pane::VolumeTarget,
     site_lat: f64,
@@ -27,7 +33,8 @@ fn shaped_request(
     max_axis: u32,
 ) -> squallar_radar::voxel::VoxelRequest {
     let ctx = volume_job_context(target, site_lat, site_lon, cells, max_axis, Box::new(()));
-    squallar_radar::voxel::request_for(&ctx).expect("Reflectivity is a field radar registers")
+    squallar_radar::voxel::request_for(&ctx, (site_lat, site_lon))
+        .expect("Reflectivity is a field radar registers")
 }
 
 fn at(minute: u32) -> chrono::NaiveDateTime {
@@ -370,7 +377,7 @@ fn the_pane_and_the_resampler_agree_about_the_stand_in_box() {
     let base = squallar_egui::pane::BASE_HALF_WIDTH_KM;
     assert_eq!(base, squallar_radar::voxel::box_half_width_km(f64::NAN));
     assert_eq!(
-        squallar_egui::pane::box_size_km(None),
+        squallar_egui::pane::box_size_km(None, None),
         [
             (2.0 * base) as f32,
             (2.0 * base) as f32,

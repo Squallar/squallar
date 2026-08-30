@@ -172,6 +172,388 @@ pub const DEFAULT_BASE_KM_MSL: f64 = 0.0;
 /// Top of the box a 3D view resamples by default, kilometres MSL.
 pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
 
+/// The step the derived box floor is quantised to, metres.
+///
+/// The answer it quantises already only moves when the box touches a different
+/// 1 degree cell, so this is not what stops the floor jittering as a box is
+/// dragged — see [`base_km_msl_for_box`] for what does. It is here so that two
+/// boxes reading cells whose minima differ by a metre get the same floor, and
+/// so that the number the readout carries is one a reader can hold.
+///
+/// It is a **floor** everywhere it is applied. A quantisation that rounded to
+/// nearest would put the box's bottom face above the ground it stands on half
+/// the time, which is the one thing this derivation may never do.
+pub const BASE_STEP_M: f64 = 100.0;
+
+/// How far a picked box's own lowest ground must stand above its region's
+/// before the box is given its own floor rather than the region's, metres.
+///
+/// See [`base_km_msl_for_box`] for why the comparison is against the region
+/// and not against the previously derived answer.
+pub const BASE_HYSTERESIS_M: f64 = 200.0;
+
+/// The thinnest box this derivation will leave between the floor it picks and
+/// [`DEFAULT_TOP_KM_MSL`], km.
+///
+/// The floor grid is a compiled-in asset of signed metres whose cells reach
+/// 32,767 m, and `build_voxels` refuses only `top <= base`. Everest is 8,849 m
+/// and every real cell is below it, so this clamp is unreachable from correct
+/// data; it is here so a corrupt asset produces a thin box rather than an
+/// inverted one.
+pub const MIN_BOX_SPAN_KM: f64 = 6.0;
+
+/// Perimeter samples per edge when a box's floor query is turned into a bbox.
+///
+/// **Odd on purpose, and the count is not the guarantee.** The box's latitude
+/// extrema sit where the site's own meridian crosses the north and south edges
+/// — not at the edge midpoints, once the centre is offset from the site — so
+/// [`floor_query_bbox`] samples those crossings *explicitly* rather than hoping
+/// an odd count lands on them. An earlier revision relied on the odd count and
+/// was right only for boxes centred on the site.
+///
+/// What the walk itself is for is the residue: between two samples the edge
+/// curves, and at an interior extremum the excess over the better sample is
+/// second order in the spacing. The widest edge this build can express is
+/// `2 × MAX_HALF_DIAGONAL_KM` = 1329.2 km (a `clamped` box bounds its
+/// **corner**, so one axis may reach the whole diagonal), so seventeen samples
+/// put them **83.1 km** apart and the residue under `83.1² / (2 · R)` = 0.54 km.
+/// [`FLOOR_BBOX_PAD_DEG`] then dominates that by an order of magnitude.
+///
+/// A previous revision quoted 58.75 km here. That is the widest *square* box's
+/// spacing and the wrong denominator for a bound that has to hold for every
+/// extent `HalfExtentKm::clamped` admits.
+///
+/// **This count and the explicit crossings mask each other, measured.** Dropping
+/// to 2 samples leaves every test green, because the crossings are sampled by
+/// name; dropping the crossings leaves every test green, because 17 samples land
+/// within ~10 km of the crossing on a realistic box and
+/// [`FLOOR_BBOX_PAD_DEG`] absorbs the difference. Removing **both** reddens. So
+/// neither is individually load-bearing and the pair is; that is defence in
+/// depth rather than a gap, and it is written down here rather than left for
+/// the next reader's mutation run to rediscover.
+const FLOOR_EDGE_SAMPLES: usize = 17;
+
+/// How far the floor query's bbox is grown on every side, degrees.
+///
+/// It dominates the perimeter walk's second-order residue (0.54 km = 0.0049° at
+/// the worst spacing [`FLOOR_EDGE_SAMPLES`] allows) by about 4x. The cost is
+/// that a box whose edge lands within 0.02° — 2.2 km — of a 1 degree cell
+/// boundary reads the next cell too, which can only lower the floor, and a
+/// floor may be low.
+const FLOOR_BBOX_PAD_DEG: f64 = 0.02;
+
+/// The geographic bbox the floor grid is queried over for the box a request
+/// names, as `(west, south, east, north)`, or `None` for a box that is not one.
+///
+/// # It is the box `build_voxels` builds, not a square about the centre
+///
+/// The resampled box is an axis-aligned rectangle in the **site's** tangent
+/// frame: [`horizontal_ranges_km`] offsets the centre by its bearing and range
+/// from the site and reaches `east_km` / `north_km` along the *site's* axes,
+/// and the rows are then sampled at
+/// `great_circle_destination(site, atan2(x, y), hypot(x, y))` — which is also
+/// exactly the construction `VolumeGrid::footprint` reports. A square about the
+/// centre coincides with that only when the centre *is* the site or is due
+/// north or south of it; at KTLX with the centre 5° of longitude away the built
+/// box stands 23.5 km east and 20.8 km south of such a square, and over 756
+/// realistic picks 2.0 % of them touch a 1 degree cell the square never reads.
+/// One of those put the floor 3,836 m above the ground the resampler samples.
+/// So this takes the site and calls the resampler's own function for the
+/// ranges.
+///
+/// # The three things the walk cannot get from sampling alone
+///
+/// * **The latitude extrema** are at the site's meridian, `x = 0`, where it
+///   crosses the north and south edges — which for an offset centre is not an
+///   edge midpoint. Those crossings, and the `y = 0` ones, are sampled by name.
+/// * **A pole inside the box** is a strict interior extremum that no boundary
+///   sample reaches. A box holding the north pole reaches latitude 90 and every
+///   longitude, and is answered as such.
+/// * **The residue between samples** is covered by [`FLOOR_BBOX_PAD_DEG`].
+///
+/// # The longitudes are normalised last, deliberately
+///
+/// `squallar_geo::great_circle_destination` answers `site_lon + dlon` and does
+/// **not** wrap. Every sample here is one such answer about a single site, so
+/// they all lie in one unwrapped interval narrower than 360°; the span is taken
+/// in those terms and only the two surviving edges are wrapped, through
+/// `squallar_geo::normalize_lon`. Comparing already-wrapped longitudes is the
+/// failure `squallar_elevation::resample::cover_for` hit while it was being
+/// written. A wrapped box comes back with `west > east`, which is how the grid
+/// spells one.
+fn floor_query_bbox(
+    site: (f64, f64),
+    centre: (f64, f64),
+    half: HalfExtentKm,
+) -> Option<(f64, f64, f64, f64)> {
+    if !(site.0.is_finite()
+        && site.1.is_finite()
+        && centre.0.is_finite()
+        && centre.1.is_finite()
+        && half.is_finite())
+    {
+        return None;
+    }
+    // The resampler's own arithmetic, not a copy of it.
+    let (x_range, y_range) = horizontal_ranges_km(centre, half, site.0, site.1);
+    if !(x_range.0.is_finite()
+        && x_range.1.is_finite()
+        && y_range.0.is_finite()
+        && y_range.1.is_finite())
+    {
+        return None;
+    }
+
+    let at = |x_km: f64, y_km: f64| {
+        squallar_geo::great_circle_destination(
+            site.0,
+            site.1,
+            x_km.atan2(y_km).to_degrees().rem_euclid(360.0),
+            x_km.hypot(y_km),
+        )
+    };
+    let lerp = |lo: f64, hi: f64, i: usize| {
+        lo + (hi - lo) * (i as f64) / ((FLOOR_EDGE_SAMPLES - 1) as f64)
+    };
+    let holds = |(lo, hi): (f64, f64), v: f64| lo <= v && v <= hi;
+
+    let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_lon, mut max_lon) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut see = |(lat, lon): (f64, f64)| {
+        south = south.min(lat);
+        north = north.max(lat);
+        min_lon = min_lon.min(lon);
+        max_lon = max_lon.max(lon);
+        lat.is_finite() && lon.is_finite()
+    };
+
+    for i in 0..FLOOR_EDGE_SAMPLES {
+        let x = lerp(x_range.0, x_range.1, i);
+        let y = lerp(y_range.0, y_range.1, i);
+        for p in [
+            at(x, y_range.0),
+            at(x, y_range.1),
+            at(x_range.0, y),
+            at(x_range.1, y),
+        ] {
+            if !see(p) {
+                return None;
+            }
+        }
+    }
+    // The axis crossings, by name rather than by luck: the site's meridian
+    // carries the latitude extrema and its east-west axis the longitude ones,
+    // and neither is an edge midpoint once the centre is offset from the site.
+    if holds(x_range, 0.0) && !see(at(0.0, y_range.0)) {
+        return None;
+    }
+    if holds(x_range, 0.0) && !see(at(0.0, y_range.1)) {
+        return None;
+    }
+    if holds(y_range, 0.0) && !see(at(x_range.0, 0.0)) {
+        return None;
+    }
+    if holds(y_range, 0.0) && !see(at(x_range.1, 0.0)) {
+        return None;
+    }
+
+    // A pole inside the box: latitude 90 is a strict interior extremum, and
+    // every meridian meets there, so the box covers the whole longitude range.
+    // The pole sits on the site's meridian at its own great-circle range.
+    let north_pole_km = (90.0 - site.0) * squallar_geo::KM_PER_DEGREE_LAT;
+    let south_pole_km = -(90.0 + site.0) * squallar_geo::KM_PER_DEGREE_LAT;
+    if holds(x_range, 0.0) && holds(y_range, north_pole_km) {
+        return Some((-180.0, (south - FLOOR_BBOX_PAD_DEG).max(-90.0), 180.0, 90.0));
+    }
+    if holds(x_range, 0.0) && holds(y_range, south_pole_km) {
+        return Some((-180.0, -90.0, 180.0, (north + FLOOR_BBOX_PAD_DEG).min(90.0)));
+    }
+
+    let south = (south - FLOOR_BBOX_PAD_DEG).max(-90.0);
+    let north = (north + FLOOR_BBOX_PAD_DEG).min(90.0);
+    let min_lon = min_lon - FLOOR_BBOX_PAD_DEG;
+    let max_lon = max_lon + FLOOR_BBOX_PAD_DEG;
+    // A box whose samples span a whole turn has gone round a pole, which the
+    // check above returns early for. **Unexercised**: that is a geometric
+    // argument rather than a tested one, so the branch is kept as the total
+    // answer rather than deleted on the strength of it.
+    if max_lon - min_lon >= 360.0 {
+        return Some((-180.0, south, 180.0, north));
+    }
+    Some((
+        squallar_geo::normalize_lon(min_lon),
+        south,
+        squallar_geo::normalize_lon(max_lon),
+        north,
+    ))
+}
+
+/// The lowest ground `grid` publishes anywhere in the **bbox** of the box the
+/// site, centre and extent name, metres MSL.
+///
+/// The bbox and not the box: it is a strict superset of the rectangle, so a
+/// cell just outside a corner counts. That is safe in the only direction that
+/// matters — the answer can only be lower than the box's own ground — and it
+/// is the reason this derivation is not tight.
+///
+/// `None` where the grid is absent, where it publishes no cell in that bbox at
+/// all, or where the box is not a box.
+fn min_ground_m(
+    grid: Option<squallar_geo::min_elevation::MinElevationGrid<'_>>,
+    site: (f64, f64),
+    centre: (f64, f64),
+    half: HalfExtentKm,
+) -> Option<f64> {
+    let (west, south, east, north) = floor_query_bbox(site, centre, half)?;
+    grid?.min_over_bbox(west, south, east, north)
+}
+
+/// The square the hysteresis's regional term is taken over: one that **contains**
+/// `picked`, and is at least [`MAX_HALF_WIDTH_KM`] on a side.
+///
+/// Sizing it off the pick rather than fixing it at [`MAX_HALF_WIDTH_KM`] is not
+/// a refinement. [`HalfExtentKm::clamped`] bounds a box's **corner** at
+/// [`MAX_HALF_DIAGONAL_KM`], not its axes, so `(660, 10)` survives unscaled and
+/// reaches 190 km beyond a 470 km square. A regional term that did not contain
+/// the pick could sit **above** the pick's own ground, and the hysteresis would
+/// then hand the box a floor above the ground it stands on.
+fn regional_extent(picked: HalfExtentKm) -> HalfExtentKm {
+    HalfExtentKm::square(picked.east_km.max(picked.north_km).max(MAX_HALF_WIDTH_KM))
+}
+
+/// **Where the bottom of a box over this ground goes, km MSL** — the lowest
+/// ground published anywhere in the box the resampler will build, quantised
+/// down to [`BASE_STEP_M`], or [`DEFAULT_BASE_KM_MSL`] where nothing is
+/// published for it.
+///
+/// `site` is the radar the box's frame is built about, and it is **not**
+/// optional: [`horizontal_ranges_km`] places the box along the *site's* axes,
+/// so a derivation given only the centre queries a different patch of ground
+/// than the one `build_voxels` samples. See [`floor_query_bbox`].
+///
+/// Not the site's own elevation: a valley below the site would still be
+/// clipped. Not the fine minimum of an arriving height field either — that
+/// would make the box's z origin depend on an asynchronous arrival, so the
+/// origin would move when it landed, the whole `VolumeGrid` would be
+/// invalidated, and mesh and volume would sit on two vertical datums while a
+/// stand-in grid was up. The 1 degree grid is compiled in, synchronous,
+/// offline and deterministic, and a floor only has to be at or below the
+/// ground.
+///
+/// # The safety property, and how it is held
+///
+/// The answer is never above the lowest ground in the box. That does **not**
+/// rest on the hysteresis being well behaved: the chosen metre value is one of
+/// two candidates, both of which are held at or below the minimum over the
+/// picked box's own bbox, and that bbox is a superset of the box. An earlier
+/// revision rested it on "a superset's minimum is at or below a subset's",
+/// which was **false** for the extents [`HalfExtentKm::clamped`] admits — it
+/// bounds the *corner* at [`MAX_HALF_DIAGONAL_KM`], so `(660, 10)` survives
+/// unscaled and is not inside a 470 km square. Both halves of that are fixed
+/// here: the regional square is sized off the picked extent so it really does
+/// contain it, and the regional candidate is additionally held at or below the
+/// picked one so the property does not depend on that argument at all.
+///
+/// # The hysteresis, and why it is against the region rather than the last answer
+///
+/// Quantising to [`BASE_STEP_M`] relocates the discontinuity rather than
+/// removing it: a box dragged until its cell footprint changes still flips its
+/// floor, and the flip is now a whole 100 m. So the floor is derived **twice** —
+/// once over the box as asked for, and once over a square that contains it and
+/// is at least [`MAX_HALF_WIDTH_KM`] on a side — and the box takes the regional
+/// answer unless its own stands more than [`BASE_HYSTERESIS_M`] above it.
+///
+/// The regional term barely moves as a small box is dragged about inside it, so
+/// a box that is not meaningfully high off the regional floor keeps one number
+/// wherever it is put; a box that has genuinely climbed — a front-range pick a
+/// kilometre and a half above the plains it shares a region with — takes its
+/// own. Doing it this way rather than against the previously derived value
+/// keeps this a **pure function of the pick**, with no state threaded through
+/// the request, which is what lets the two user-visible consumers in
+/// `squallar-egui` reach the same number by calling it rather than by being
+/// told.
+///
+/// # An unpublished box keeps the default floor
+///
+/// If the grid publishes no cell in the picked box's bbox, the answer is
+/// [`DEFAULT_BASE_KM_MSL`] — never the regional minimum. An earlier revision
+/// fell back to the regional value, so an ocean pick 300 km off a single 2,000 m
+/// land cell answered 2,000 m and clipped the whole lower box over sea level.
+///
+/// # What it is not: tight
+///
+/// A 1 degree cell is about 111 km by 85 km, so on a 20-50 km picked box the
+/// answer is the minimum over up to four of them and can sit ~1500 m below the
+/// box's actual floor on the Colorado front range. That is **safe** — a floor
+/// may be low — but it is not tight, and the "finer cells" figure the plan
+/// quotes is a default-box number that does not transfer to small boxes.
+///
+/// # Today it answers [`DEFAULT_BASE_KM_MSL`] for every box on Earth
+///
+/// `squallar_geo::min_elevation::GRID_ASSET` is `None` until the terrain
+/// builder's floor pass has run against the real DEM, so the fallback is the
+/// only branch a shipped build takes. The behaviour with data is exercised
+/// through [`base_km_msl_for_box_in`].
+pub fn base_km_msl_for_box(
+    site: (f64, f64),
+    centre: (f64, f64),
+    half_extent_km: Option<HalfExtentKm>,
+) -> f64 {
+    base_km_msl_for_box_in(floor_grid(), site, centre, half_extent_km)
+}
+
+/// The compiled-in floor grid, or `None` while the builder has emitted none —
+/// which is every build shipped today.
+pub fn floor_grid() -> Option<squallar_geo::min_elevation::MinElevationGrid<'static>> {
+    squallar_geo::min_elevation::GRID_ASSET
+        .and_then(squallar_geo::min_elevation::MinElevationGrid::new)
+}
+
+/// [`base_km_msl_for_box`] against an explicit floor grid.
+///
+/// The seam exists so the derivation is testable at all: the compiled-in asset
+/// is absent in every build today, so without it the only reachable branch is
+/// the fallback, and a test of the fallback alone cannot tell a working
+/// derivation from one that never reads the grid.
+pub fn base_km_msl_for_box_in(
+    grid: Option<squallar_geo::min_elevation::MinElevationGrid<'_>>,
+    site: (f64, f64),
+    centre: (f64, f64),
+    half_extent_km: Option<HalfExtentKm>,
+) -> f64 {
+    // The extent `build_voxels` will use, spelled the way it spells it. A box
+    // that named none is the default box, whose width the builder takes from
+    // the volume's own reach; the request cannot know that reach, so the widest
+    // it can be is both the safe query and the stable one.
+    let picked = half_extent_km
+        .map(HalfExtentKm::clamped)
+        .unwrap_or(HalfExtentKm::square(MAX_HALF_WIDTH_KM));
+
+    // Nothing published for this box: keep the default floor. Adopting the
+    // regional minimum here would clip an ocean pick to distant land.
+    let Some(picked_m) = min_ground_m(grid, site, centre, picked) else {
+        return DEFAULT_BASE_KM_MSL;
+    };
+
+    let regional = regional_extent(picked);
+    // **Held at or below the picked minimum.** Redundant given that
+    // `regional_extent` really does contain the pick — and mutation testing
+    // says so: removing this `min` alone leaves every test green. It is kept
+    // because it makes the safety property hold *arithmetically* rather than
+    // by a containment argument, and the containment argument is exactly what
+    // was wrong before.
+    let regional_m =
+        min_ground_m(grid, site, centre, regional).map_or(picked_m, |m| m.min(picked_m));
+
+    let chosen_m = if picked_m - regional_m > BASE_HYSTERESIS_M {
+        picked_m
+    } else {
+        regional_m
+    };
+    ((chosen_m / BASE_STEP_M).floor() * BASE_STEP_M / 1000.0)
+        .min(DEFAULT_TOP_KM_MSL - MIN_BOX_SPAN_KM)
+}
+
 /// What one grid's index plane may occupy, bytes.
 pub const VOXEL_TEXTURE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
@@ -307,18 +689,49 @@ pub struct VoxelRequest {
 /// vertical extent is deliberately not part of what the caller may aim: a
 /// picked region moves the box across the ground and never up or down.
 ///
+/// **The floor follows the ground, and the caller still cannot aim it.**
+/// [`base_km_msl_for_box`] reads the compiled-in floor grid over the box
+/// `build_voxels` will build, so the bottom face sits at or below the lowest
+/// ground in the box rather than at sea level. It is derived from the pick, not
+/// asked for: the numbers that place the box place its floor, and moving the
+/// box is the only way to move it.
+///
+/// **`site` is required and must be the radar `build_voxels` will be handed.**
+/// The box is a rectangle in the site's tangent frame, so the floor cannot be
+/// derived from the centre alone. `RadarSource::volume_job` reads it off the
+/// same `RenderInput` that `VoxelJob::run` reads it off, so there is one source
+/// of truth rather than two that agree by inspection.
+///
 /// **The budget is spent here, not upstream.** `cells` is what the device
 /// affords and `max_axis` is what its 3D textures will hold;
 /// [`shape_for_budget`] is the arithmetic that turns the two into a grid, and
 /// it lives on this side because it is about how a *radar* volume is best
 /// sampled — wide and shallow — not about the device.
-pub fn request_for(ctx: &squallar_source::volume::VolumeJobContext) -> Option<VoxelRequest> {
+pub fn request_for(
+    ctx: &squallar_source::volume::VolumeJobContext,
+    site: (f64, f64),
+) -> Option<VoxelRequest> {
+    request_for_in(floor_grid(), ctx, site)
+}
+
+/// [`request_for`] against an explicit floor grid.
+///
+/// Without this seam the wiring is unfalsifiable: `GRID_ASSET` is `None` in
+/// every build today, so a `request_for` that never read the grid at all would
+/// be indistinguishable from one that does.
+pub fn request_for_in(
+    grid: Option<squallar_geo::min_elevation::MinElevationGrid<'_>>,
+    ctx: &squallar_source::volume::VolumeJobContext,
+    site: (f64, f64),
+) -> Option<VoxelRequest> {
+    let centre = (ctx.centre.lat, ctx.centre.lon);
+    let half_extent_km = ctx
+        .half_extent_km
+        .map(|(east_km, north_km)| HalfExtentKm { east_km, north_km });
     Some(VoxelRequest {
-        centre: (ctx.centre.lat, ctx.centre.lon),
-        half_extent_km: ctx
-            .half_extent_km
-            .map(|(east_km, north_km)| HalfExtentKm { east_km, north_km }),
-        base_km_msl: DEFAULT_BASE_KM_MSL,
+        centre,
+        half_extent_km,
+        base_km_msl: base_km_msl_for_box_in(grid, site, centre, half_extent_km),
         top_km_msl: DEFAULT_TOP_KM_MSL,
         product: crate::fields::product_for(&ctx.field)?,
         shape: shape_for_budget(VoxelShape::of_cells(ctx.cells), ctx.max_axis as usize),

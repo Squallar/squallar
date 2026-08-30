@@ -1357,7 +1357,7 @@ fn the_caption_reports_the_resolution_the_box_buys() {
         "KTLX",
         at(33),
         None,
-        tight.half_extent_km(),
+        boxed(tight.half_extent_km()),
         Default::default(),
         SETTLED,
         Some(DESKTOP_CELLS),
@@ -1581,8 +1581,102 @@ fn at(minute: u32) -> chrono::NaiveDateTime {
 
 /// A square half-extent, for the caption tests whose subject is something
 /// other than the box's shape.
-fn square(half_km: f64) -> squallar_radar::voxel::HalfExtentKm {
-    squallar_radar::voxel::HalfExtentKm::square(half_km)
+/// **The caption's floor comes from the box it is describing, not from the
+/// pane's live region.**
+///
+/// Between a region change and the new grid landing, the drawn box is the one
+/// that was built and the region is the one that was picked. Reading the floor
+/// off the drawn box's own span keeps the width and the height on one subject.
+#[test]
+fn the_captions_floor_is_read_off_the_box_it_describes() {
+    // A built box 16.4 km tall stands at 1.6 km MSL, whatever any region says.
+    // Approximate because a box span is carried as `f32`: 16.4 is not one.
+    assert!((floor_of_drawn_box([40.0, 40.0, 16.4]) - 1.6).abs() < 1e-4);
+    // And a sea-level box still reads zero.
+    assert_eq!(
+        floor_of_drawn_box([40.0, 40.0, 18.0]),
+        squallar_radar::voxel::DEFAULT_BASE_KM_MSL,
+    );
+
+    // The round trip through the stand-in the arm uses when nothing is built:
+    // the box the pane makes for a floor reports that floor back.
+    let region = crate::pane::VolumeRegion::new(
+        squallar_geo::GeoPoint {
+            lat: 39.5,
+            lon: -104.5,
+        },
+        squallar_radar::voxel::HalfExtentKm::square(20.0),
+    )
+    .expect("a valid region");
+    for base in [0.0f64, 1.6, -0.1] {
+        let stand_in = crate::pane::box_size_km_for_base(Some(region), base);
+        assert!(
+            (floor_of_drawn_box(stand_in) - base).abs() < 1e-4,
+            "a stand-in box built for {base} km MSL reported {} back",
+            floor_of_drawn_box(stand_in),
+        );
+    }
+}
+
+/// **The readout states the floor the box actually stands on.**
+///
+/// It said "0 kft" for every box on Earth while the resampler's floor followed
+/// the ground, which for a decision whose stated reason is being accurate about
+/// a slice of the earth is the one thing it may not do. 1.6 km MSL is 5 kft.
+#[test]
+fn the_caption_reads_the_floor_the_box_actually_stands_on() {
+    let over_ground = volume_caption(
+        "KFTG",
+        at(33),
+        None,
+        CaptionBox {
+            half: squallar_radar::voxel::HalfExtentKm::square(20.0),
+            base_km_msl: 1.6,
+        },
+        Default::default(),
+        SETTLED,
+        Some(DESKTOP_CELLS),
+    );
+    let line = over_ground
+        .iter()
+        .find(|l| l.contains("kft MSL"))
+        .unwrap_or_else(|| panic!("no height line in {over_ground:?}"));
+    assert!(
+        line.starts_with("5-59 kft MSL"),
+        "a box floored at 1.6 km MSL stands at 5 kft and must say so: {line:?}",
+    );
+
+    // The control: the same call at sea level still reads zero, so the line
+    // above is the floor being read and not a constant that moved.
+    let sea_level = volume_caption(
+        "KTLX",
+        at(33),
+        None,
+        square(20.0),
+        Default::default(),
+        SETTLED,
+        Some(DESKTOP_CELLS),
+    );
+    assert!(
+        sea_level.iter().any(|l| l.starts_with("0-59 kft MSL")),
+        "{sea_level:?}",
+    );
+}
+
+/// A square caption box standing on sea level, which is where every box on
+/// Earth stands while the compiled-in floor grid is absent. The floor the
+/// caption reads is exercised on its own in
+/// `the_caption_reads_the_floor_the_box_actually_stands_on`.
+fn square(half_km: f64) -> CaptionBox {
+    boxed(squallar_radar::voxel::HalfExtentKm::square(half_km))
+}
+
+/// [`square`] for an extent that is already in hand.
+fn boxed(half: squallar_radar::voxel::HalfExtentKm) -> CaptionBox {
+    CaptionBox {
+        half,
+        base_km_msl: squallar_radar::voxel::DEFAULT_BASE_KM_MSL,
+    }
 }
 
 /// The mirror pass's guest list is this frame's floor strips — and nothing

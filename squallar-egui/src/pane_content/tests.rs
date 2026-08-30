@@ -521,3 +521,237 @@ fn the_exaggeration_knob_clamps_the_finite_and_refuses_the_rest() {
         );
     }
 }
+
+/// A floor grid publishing exactly the cells named and nothing else.
+fn floor_grid_of(cells: &[(f64, f64, f64)]) -> Vec<u8> {
+    let mut b = squallar_geo::min_elevation::MinElevationGridBuilder::new();
+    for (lat, lon, m) in cells {
+        assert!(b.observe(*lat, *lon, *m), "({lat},{lon}) is on the grid");
+    }
+    b.finish()
+}
+
+/// **The stand-in box the camera frames is the box the resampler will build.**
+///
+/// This is what pops when it is wrong: [`box_size_km`] is the pane's own answer
+/// until a built grid replaces it, so a vertical fixed at
+/// `DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL` is long by the floor's offset on
+/// the first frame of every volume over ground that is not at sea level.
+#[test]
+fn the_stand_in_box_carries_the_floor_the_resampler_will_derive() {
+    let raw = floor_grid_of(&[(39.5, -104.5, 1650.0)]);
+    let grid = squallar_geo::min_elevation::MinElevationGrid::new(&raw).expect("a full grid");
+
+    let site = point(39.5, -104.5);
+    let region = VolumeRegion::new(
+        point(39.5, -104.5),
+        squallar_radar::voxel::HalfExtentKm::square(20.0),
+    )
+    .expect("a valid region");
+
+    let over_ground = box_size_km_in(Some(grid), Some(region), Some(site));
+    assert_eq!(
+        over_ground[2],
+        (squallar_radar::voxel::DEFAULT_TOP_KM_MSL - 1.6) as f32,
+        "1650 m of ground floors to 1.6 km MSL and the box top is fixed, so \
+         the span the camera frames is 16.4 km and not 18",
+    );
+    // The horizontal is untouched by any of this.
+    assert_eq!([over_ground[0], over_ground[1]], [40.0, 40.0]);
+
+    // The control: with no grid to read, the same call is the constant it
+    // always was, so the assertion above is about the grid.
+    let no_grid = box_size_km_in(None, Some(region), Some(site));
+    assert_eq!(
+        no_grid[2],
+        (squallar_radar::voxel::DEFAULT_TOP_KM_MSL - squallar_radar::voxel::DEFAULT_BASE_KM_MSL)
+            as f32,
+    );
+    assert_eq!(
+        box_size_km(Some(region), Some(site)),
+        no_grid,
+        "and that is what a shipped build does today, since the compiled-in \
+         grid is absent",
+    );
+}
+
+/// **The pane routes the pick to the floor exactly as the app routes it to the
+/// resampler**, and the site is the box's *frame* rather than a fallback centre.
+#[test]
+fn the_floor_is_asked_for_over_the_pick_the_resampler_is_given() {
+    // A high cell inside the pick and a low one two degrees north of it: inside
+    // the default box about the site, outside a 40 km pick. That difference is
+    // what makes the two branches below distinguishable at all.
+    let raw = floor_grid_of(&[(39.5, -104.5, 1650.0), (41.5, -104.5, 100.0)]);
+    let grid = squallar_geo::min_elevation::MinElevationGrid::new(&raw).expect("a full grid");
+    let site = point(39.5, -104.5);
+    let region = VolumeRegion::new(
+        point(39.5, -104.5),
+        squallar_radar::voxel::HalfExtentKm::square(20.0),
+    )
+    .expect("a valid region");
+
+    let picked = base_km_msl_in(Some(grid), Some(region), Some(site));
+    let defaulted = base_km_msl_in(Some(grid), None, Some(site));
+    assert_eq!(
+        picked,
+        squallar_radar::voxel::base_km_msl_for_box_in(
+            Some(grid),
+            (39.5, -104.5),
+            (39.5, -104.5),
+            Some(squallar_radar::voxel::HalfExtentKm::square(20.0)),
+        ),
+    );
+    assert_eq!(
+        defaulted,
+        squallar_radar::voxel::base_km_msl_for_box_in(
+            Some(grid),
+            (39.5, -104.5),
+            (39.5, -104.5),
+            None,
+        ),
+    );
+    assert_ne!(
+        picked, defaulted,
+        "the two asks differ by the extent alone; equal answers mean the extent \
+         is being dropped and every pick is getting the default box's floor",
+    );
+
+    // **No site is no frame.** `build_voxels` places the box along the site's
+    // axes, so a pane whose radar is unplaced cannot derive a floor at all and
+    // must keep the default rather than framing the box on its own centre.
+    assert_eq!(
+        base_km_msl_in(Some(grid), Some(region), None),
+        squallar_radar::voxel::DEFAULT_BASE_KM_MSL,
+        "an unplaced site has no frame to derive in",
+    );
+    assert_eq!(
+        base_km_msl_in(Some(grid), None, None),
+        squallar_radar::voxel::DEFAULT_BASE_KM_MSL,
+    );
+
+    // **The site FRAMES the box; the region only centres it.** A wide region
+    // about a radar several degrees away covers different ground than the same
+    // region framed on its own centre. Both the offset and the cell the two
+    // frames disagree about are searched for rather than guessed, against the
+    // function under test itself, so this cannot quietly stop biting.
+    let wide_half =
+        squallar_radar::voxel::HalfExtentKm::square(squallar_radar::voxel::MAX_HALF_WIDTH_KM);
+    let found = [2.0f64, 4.0, 6.0, 8.0]
+        .into_iter()
+        .flat_map(|dlon| [0.0f64, 2.0, -2.0].map(move |dlat| (dlat, dlon)))
+        .find_map(|(dlat, dlon)| {
+            let radar = point(39.5, -104.5);
+            let wide = VolumeRegion::new(point(radar.lat + dlat, radar.lon + dlon), wide_half)?;
+            (20..60)
+                .flat_map(|lat| {
+                    (-130..-80).map(move |lon| (f64::from(lat) + 0.5, f64::from(lon) + 0.5))
+                })
+                .find_map(|(lat, lon)| {
+                    let one = floor_grid_of(&[(lat, lon, -200.0)]);
+                    let g = squallar_geo::min_elevation::MinElevationGrid::new(&one)
+                        .expect("a full grid");
+                    let framed = base_km_msl_in(Some(g), Some(wide), Some(radar));
+                    let self_framed = base_km_msl_in(Some(g), Some(wide), Some(wide.centre()));
+                    (framed == -200.0 / 1000.0 && self_framed != -200.0 / 1000.0).then_some((
+                        radar,
+                        wide,
+                        (lat, lon),
+                    ))
+                })
+        });
+    let (radar, wide, (mark_lat, mark_lon)) = found.expect(
+        "no offset in the sweep produced a cell the site frame reads and the \
+         centre frame does not; this pin has stopped distinguishing the two",
+    );
+    let one = floor_grid_of(&[(mark_lat, mark_lon, -200.0)]);
+    let marked = squallar_geo::min_elevation::MinElevationGrid::new(&one).expect("a full grid");
+    assert_eq!(
+        base_km_msl_in(Some(marked), Some(wide), Some(radar)),
+        squallar_radar::voxel::base_km_msl_for_box_in(
+            Some(marked),
+            (radar.lat, radar.lon),
+            (wide.centre().lat, wide.centre().lon),
+            Some(wide_half),
+        ),
+        "the pane must ask for the box framed on the site and centred on the \
+         region, which is what the resampler builds",
+    );
+    assert_ne!(
+        base_km_msl_in(Some(marked), Some(wide), Some(radar)),
+        base_km_msl_in(Some(marked), Some(wide), Some(wide.centre())),
+        "and framing on the region's own centre reads different ground, so the \
+         site is doing work here rather than riding along",
+    );
+}
+
+/// **Every production floor site reads the compiled-in grid.**
+///
+/// The one thing behaviour cannot pin while `GRID_ASSET` is `None`: a consumer
+/// that never consulted the grid at all is extensionally identical to one that
+/// does, so `cargo test` is green either way. Four production sites thread the
+/// asset into the derivation and this is what says so, in the source-scanning
+/// idiom `arch_ratchets.rs` already uses.
+///
+/// It goes stale the day the asset lands and behaviour can carry the claim
+/// instead; deleting it then is correct.
+#[test]
+fn every_production_floor_site_reads_the_compiled_in_grid() {
+    let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let sites: &[(&str, &str, &str)] = &[
+        (
+            "squallar-radar/src/voxel.rs",
+            "base_km_msl_for_box_in(floor_grid(), site, centre, half_extent_km)",
+            "`base_km_msl_for_box`, the derivation every consumer reaches",
+        ),
+        (
+            "squallar-radar/src/voxel.rs",
+            "request_for_in(floor_grid(), ctx, site)",
+            "`request_for`, which puts the floor on the request the worker runs",
+        ),
+        (
+            "squallar-radar/src/source.rs",
+            "crate::voxel::request_for(&ctx, site)",
+            "`RadarSource::volume_job`, the one production caller",
+        ),
+        (
+            "squallar-radar/src/source.rs",
+            ".map(|input| (input.radar_lat(), input.radar_lon()))",
+            "the site the floor is framed on, read off the same payload \
+             `VoxelJob::run` reads it off",
+        ),
+        (
+            "squallar-egui/src/pane_content.rs",
+            "base_km_msl_in(squallar_radar::voxel::floor_grid(), region, site)",
+            "`volume_base_km_msl`, which the 3D arm captions from",
+        ),
+        (
+            "squallar-egui/src/pane_content.rs",
+            "box_size_km_in(squallar_radar::voxel::floor_grid(), region, site)",
+            "`box_size_km`, the stand-in box the camera frames",
+        ),
+        (
+            "squallar-egui/src/ui_map.rs",
+            "crate::pane::volume_base_km_msl(region, site_geo)",
+            "the 3D arm, which derives the floor once per pane per frame",
+        ),
+        (
+            "squallar-egui/src/ui_map.rs",
+            "base_km_msl: floor_of_drawn_box(drawn_box_km),",
+            "the caption, whose floor must come off the box it is describing \
+             rather than off the pane's live region",
+        ),
+    ];
+    for (file, spelling, what) in sites {
+        let path = root.join(file);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        assert!(
+            src.contains(spelling),
+            "{file} no longer spells `{spelling}` - {what}. If the call moved, \
+             re-point this row; if it stopped reading the grid, that is the \
+             defect this test exists for, and no behavioural test can see it \
+             while the compiled-in asset is absent.",
+        );
+    }
+}
