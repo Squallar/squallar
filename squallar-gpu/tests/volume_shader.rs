@@ -8,9 +8,9 @@ use squallar_volumetric::raymarch::{
     BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
     BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_GROUND_TEXTURE, BINDING_HEIGHT_TEXTURE,
     BINDING_JITTER_TEXTURE, BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE, BINDING_OCCLUDER_TEXTURE,
-    BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_GROUND, ENTRY_FS_RAYMARCH,
-    ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_GROUND, ENTRY_VS_RAYMARCH, ShaderStage,
-    VOLUME_SHADER_WGSL,
+    BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_BUILDING, ENTRY_FS_GROUND,
+    ENTRY_FS_RAYMARCH, ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_BUILDING, ENTRY_VS_GROUND,
+    ENTRY_VS_RAYMARCH, ShaderStage, VOLUME_SHADER_WGSL,
 };
 
 /// What kind of resource one bind group layout entry is.
@@ -70,6 +70,26 @@ const GROUND_LAYOUT: Layout = &[
     (3, BINDING_HEIGHT_TEXTURE, BindingKind::Texture),
 ];
 
+/// The building pipeline's: groups 0 and 3, with holes at 1 and 2.
+///
+/// One row shorter than [`GROUND_LAYOUT`] and that is the whole difference: the
+/// prisms read the camera and the placement out of the shared uniform block (0)
+/// and the terrain they stand on out of the height field (3), but they take no
+/// drape, so the mirror at group 1 is not bound for them. **Its own row and not
+/// a reuse of the ground's**, because the counters wgpu-hal assigns are a
+/// function of the whole pipeline layout: dropping the mirror's texture moves
+/// the height field's slot from 3 to 2, and compiling `vs_building` against the
+/// ground's map would hand a WebGL2 driver the wrong texture unit.
+const BUILDING_LAYOUT: Layout = &[
+    (0, BINDING_UNIFORM, BindingKind::UniformBuffer),
+    (0, BINDING_GRID_TEXTURE, BindingKind::Texture),
+    (0, BINDING_GRID_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
+    (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
+    (0, BINDING_JITTER_TEXTURE, BindingKind::Texture),
+    (3, BINDING_HEIGHT_TEXTURE, BindingKind::Texture),
+];
+
 /// The blit's, whose counters restart at zero — which is the whole reason the
 /// two are kept apart.
 const BLIT_LAYOUT: Layout = &[
@@ -82,9 +102,96 @@ fn layout_for(entry_point: &str) -> Layout {
     match entry_point {
         ENTRY_VS_RAYMARCH | ENTRY_FS_RAYMARCH => RAYMARCH_LAYOUT,
         ENTRY_VS_GROUND | ENTRY_FS_GROUND => GROUND_LAYOUT,
+        ENTRY_VS_BUILDING | ENTRY_FS_BUILDING => BUILDING_LAYOUT,
         ENTRY_VS_BLIT | ENTRY_FS_BLIT_GAMMA | ENTRY_FS_BLIT_LINEAR => BLIT_LAYOUT,
         other => panic!("no pipeline layout is declared for the entry point `{other}`"),
     }
+}
+
+/// **The shader's own terrain lookup evaluates a TRIANGLE's plane, never a
+/// bilinear interpolation of the same four posts.**
+///
+/// A mechanical source rule, in the mould of
+/// [`the_arm_rule_rejects_every_way_the_defect_can_come_back`], and it exists
+/// because the property is real and **no rendered fixture can see it**. That
+/// was measured rather than assumed: mutating `ground_surface_at` into the
+/// bilinear form survives every criterion in
+/// `squallar-gpu/tests/volume_buildings.rs`, because a smooth height field's
+/// per-cell twist is far under the registration tolerance a usable offscreen
+/// can defend. `squallar_volumetric::raymarch`'s Rust mirror is pinned against
+/// the same mutation by
+/// `a_building_stands_on_the_meshs_plane_and_not_on_a_bilinear_guess` — but the
+/// mirror is not the thing that draws, and this is what holds the twin.
+///
+/// What it requires: the function branches on the anti-diagonal `f.x + f.y`,
+/// which is where `vs_ground` splits its cell, and each arm names the three
+/// corners of one triangle and not all four. A bilinear form has no branch and
+/// touches all four in both halves, so it cannot satisfy either half.
+#[test]
+fn the_ground_surface_lookup_evaluates_a_triangle_and_not_a_bilinear_cell() {
+    let body = ground_surface_body();
+    assert!(
+        body.contains("f.x + f.y <= 1.0"),
+        "`ground_surface_at` no longer branches on the anti-diagonal that \
+         `vs_ground` splits its cells along, so it cannot be evaluating either \
+         triangle's plane:\n{body}",
+    );
+    let arms: Vec<&str> = body.split("f.x + f.y <= 1.0").collect();
+    assert_eq!(arms.len(), 2, "the anti-diagonal is tested more than once");
+
+    // Each arm names three of the four corners. The rule is a COUNT rather than
+    // a spelling, so a legitimate re-ordering of the terms is free and a fourth
+    // corner is not.
+    let (_, rest) = arms[1].split_once("return").expect("an arm returns");
+    let (near, far) = rest.split_once("return").expect("two arms return");
+    for (which, text) in [("the near triangle", near), ("the far triangle", far)] {
+        let named = ["h00", "h10", "h01", "h11"]
+            .into_iter()
+            .filter(|corner| text.contains(corner))
+            .count();
+        assert_eq!(
+            named, 3,
+            "{which} of `ground_surface_at` names {named} of the cell's four \
+             post heights. A plane through three corners names three; naming \
+             all four is the bilinear rule, which disagrees with the mesh \
+             `vs_ground` actually draws by the cell's twist everywhere off the \
+             diagonals:\n{text}",
+        );
+    }
+}
+
+/// The rule above rejects the bilinear form it is written against.
+///
+/// Without this the rule could be satisfied by a function that no longer
+/// existed, or by one whose branch had drifted — the non-triviality half that
+/// `volume_shader.rs`'s other source rules each carry.
+#[test]
+fn the_triangle_rule_rejects_a_bilinear_lookup() {
+    let bilinear = "\
+fn ground_surface_at(uv: vec2<f32>) -> f32 {
+    let a = h00 + f.x * (h10 - h00);
+    let b = h01 + f.x * (h11 - h01);
+    return a + f.y * (b - a);
+}
+";
+    assert!(
+        !bilinear.contains("f.x + f.y <= 1.0"),
+        "the mutant this rule is written against would satisfy its own first \
+         clause, so the rule cannot reject it",
+    );
+}
+
+/// `ground_surface_at`'s body, from its signature to the closing brace at
+/// column zero.
+fn ground_surface_body() -> String {
+    let at = VOLUME_SHADER_WGSL
+        .find("fn ground_surface_at(")
+        .expect("volume.wgsl no longer declares `ground_surface_at`");
+    let rest = &VOLUME_SHADER_WGSL[at..];
+    let end = rest
+        .find("\n}\n")
+        .expect("`ground_surface_at` does not close at column zero");
+    rest[..end].to_owned()
 }
 
 /// Build a binding map the way `wgpu-hal/src/gles/device.rs:1219-1243` does.

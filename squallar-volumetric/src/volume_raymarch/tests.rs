@@ -1847,6 +1847,75 @@ mod budget_agreement {
         }
     }
 
+    /// **The surface a building stands on is the mesh's own plane, never a
+    /// bilinear read of the same four posts.**
+    ///
+    /// `vs_ground` splits each cell along the anti-diagonal into
+    /// (0,0)-(1,0)-(0,1) and (0,1)-(1,0)-(1,1), so the drawn terrain is
+    /// piecewise PLANAR. A bilinear interpolation of the same posts agrees with
+    /// it on both diagonals and on every edge, and differs everywhere else by
+    /// the cell's TWIST — `h00 - h10 - h01 + h11`. A prism standing at the
+    /// bilinear height on a twisted cell hovers or sinks by exactly that much.
+    ///
+    /// **This is pinned here and not on the GPU, and the reason is a measured
+    /// failure to pin it there.** A mutation of `ground_surface_at` into the
+    /// bilinear form survived every criterion in
+    /// `squallar-gpu/tests/volume_buildings.rs`: that suite's fixture is a
+    /// smooth Gaussian ridge over 256 posts, whose twist per cell is far under
+    /// the registration tolerance a 320-pixel offscreen can defend. No GPU
+    /// fixture at a usable size can separate the two, so the separation is
+    /// asserted where it is a property of arithmetic — over a cell built to be
+    /// maximally twisted, where the two answers differ by a quarter of the
+    /// field's whole range.
+    #[test]
+    fn a_building_stands_on_the_meshs_plane_and_not_on_a_bilinear_guess() {
+        use crate::raymarch::ground_surface_at;
+
+        // A 2x2 field with one corner raised: the saddle whose twist is 1.
+        let heights = |i: u32, j: u32| if i == 1 && j == 1 { 1.0f32 } else { 0.0 };
+        let posts = [2u32, 2];
+        let ground_box = crate::uniform::IDENTITY_GROUND_BOX;
+
+        // **The cell centre, which is where the two rules differ by the most.**
+        // Post `p` sits at `(p + 0.5) / 2`, so posts 0 and 1 are at 0.25 and
+        // 0.75 and the centre of the cell between them is 0.5 — a cell-local
+        // (0.5, 0.5), exactly on the anti-diagonal the two triangles share.
+        // Both of them read 0 there, because every corner of that edge is 0;
+        // a bilinear read of the same four posts reads a quarter, which is the
+        // whole twist. So one point carries both halves: the mesh is
+        // continuous across its own split, and the rival is furthest away
+        // precisely where the mesh is flattest.
+        let uv = [0.5f32, 0.5];
+        let plane = ground_surface_at(uv, posts, ground_box, heights);
+        // The rival, spelled out rather than reached for, so this test carries
+        // its own alternative instead of trusting a description of it.
+        let s = |u: f32| (u * 2.0 - 0.5).clamp(0.0, 1.0);
+        let (fu, fv) = (s(uv[0]), s(uv[1]));
+        let bilinear = fu * fv;
+
+        assert!(
+            plane.abs() < 1e-6,
+            "the mesh's own plane reads {plane} at the cell centre, where both \
+             of its triangles meet on an edge whose three defining corners are \
+             all zero. Either the triangle split has moved or the surface is \
+             no longer piecewise planar"
+        );
+        assert!(
+            (bilinear - 0.25).abs() < 1e-6,
+            "the rival this test is written against reads {bilinear} rather \
+             than the quarter a maximally twisted cell gives, so the fixture \
+             is no longer twisted and the comparison below proves nothing"
+        );
+        assert!(
+            (plane - bilinear).abs() > 0.2,
+            "the mesh's plane reads {plane} and a bilinear read of the same \
+             four posts reads {bilinear}. On a maximally twisted cell these \
+             must differ by a quarter of the field's range; that they do not \
+             means `ground_surface_at` has become the bilinear rule, and every \
+             building on sloping ground now hovers or sinks by the cell's twist"
+        );
+    }
+
     /// A pixel costs what the offscreen's format actually costs.
     #[test]
     fn a_pixel_costs_what_the_offscreen_format_costs() {

@@ -4648,6 +4648,7 @@ dependencies = [
  "nexrad-model",
  "pollster",
  "serde_json",
+ "squallar-buildings",
  "squallar-device-profile",
  "squallar-egui",
  "squallar-geo",

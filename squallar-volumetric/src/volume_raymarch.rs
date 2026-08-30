@@ -33,6 +33,10 @@ pub const ENTRY_FS_RAYMARCH: &str = "fs_raymarch";
 pub const ENTRY_VS_GROUND: &str = "vs_ground";
 /// Fragment entry point of the ground pass: the occluder and the drape.
 pub const ENTRY_FS_GROUND: &str = "fs_ground";
+/// Vertex entry point of the building prisms: the mesh, lifted onto the ground.
+pub const ENTRY_VS_BUILDING: &str = "vs_building";
+/// Fragment entry point of the building prisms: the same occluder, one albedo.
+pub const ENTRY_FS_BUILDING: &str = "fs_building";
 /// Vertex entry point of the compositing quad.
 pub const ENTRY_VS_BLIT: &str = "vs_blit";
 /// Fragment entry point of the quad on a **non-sRGB** target: pass-through.
@@ -45,11 +49,13 @@ pub const ENTRY_FS_BLIT_LINEAR: &str = "fs_blit_linear_framebuffer";
 /// This list is what pulls a stage into the GLSL ES 300 gate: an entry point it
 /// omits is never translated by `volume_shader.rs` and reaches a WebGL2 browser
 /// having been checked by nothing.
-pub const ENTRY_POINTS: [(&str, ShaderStage); 7] = [
+pub const ENTRY_POINTS: [(&str, ShaderStage); 9] = [
     (ENTRY_VS_RAYMARCH, ShaderStage::Vertex),
     (ENTRY_FS_RAYMARCH, ShaderStage::Fragment),
     (ENTRY_VS_GROUND, ShaderStage::Vertex),
     (ENTRY_FS_GROUND, ShaderStage::Fragment),
+    (ENTRY_VS_BUILDING, ShaderStage::Vertex),
+    (ENTRY_FS_BUILDING, ShaderStage::Fragment),
     (ENTRY_VS_BLIT, ShaderStage::Vertex),
     (ENTRY_FS_BLIT_GAMMA, ShaderStage::Fragment),
     (ENTRY_FS_BLIT_LINEAR, ShaderStage::Fragment),
@@ -199,6 +205,57 @@ pub fn post_of_column(column: u32, posts: u32) -> u32 {
     column.clamp(1, posts.max(1)) - 1
 }
 
+/// The post-grid coordinate a box-unit position sits at along one axis: the
+/// Rust mirror of the shader's `ground_post_coord`.
+///
+/// See that function for why the clamp is exact at the apron rather than
+/// approximate.
+pub fn ground_post_coord(u: f32, posts: u32, scale: f32, offset: f32) -> f32 {
+    let denom = if scale.abs() < 1e-6 { 1.0 } else { scale };
+    let s = ((u - offset) / denom) * posts as f32 - 0.5;
+    s.clamp(0.0, (posts as f32) - 1.0)
+}
+
+/// **The ground mesh's own surface height at a point of the drawn box's unit
+/// square** — the Rust mirror of the shader's `ground_surface_at`, and the
+/// oracle a building's base is judged against.
+///
+/// `height_at` answers one post's height in box `z`, already decoded through
+/// the uniform's affine and clamped into the unit cube the way the shader's
+/// `ground_height` does; this function's whole job is *which* posts and *what
+/// weights*, which is the part the two implementations could disagree about.
+///
+/// **Piecewise planar, never bilinear.** `vs_ground` splits each cell along
+/// the anti-diagonal into (0,0)-(1,0)-(0,1) and (0,1)-(1,0)-(1,1), so the
+/// drawn surface is two planes per cell and a bilinear read of the same four
+/// posts differs from it by the cell's twist everywhere off the diagonals.
+pub fn ground_surface_at(
+    uv: [f32; 2],
+    posts: [u32; 2],
+    ground_box: [f32; 4],
+    height_at: impl Fn(u32, u32) -> f32,
+) -> f32 {
+    let s = [
+        ground_post_coord(uv[0], posts[0], ground_box[0], ground_box[2]),
+        ground_post_coord(uv[1], posts[1], ground_box[1], ground_box[3]),
+    ];
+    let last = [posts[0].saturating_sub(2), posts[1].saturating_sub(2)];
+    let base = [
+        (s[0].floor() as u32).min(last[0]),
+        (s[1].floor() as u32).min(last[1]),
+    ];
+    let f = [s[0] - base[0] as f32, s[1] - base[1] as f32];
+    let h00 = height_at(base[0], base[1]);
+    let h10 = height_at(base[0] + 1, base[1]);
+    let h01 = height_at(base[0], base[1] + 1);
+    let h11 = height_at(base[0] + 1, base[1] + 1);
+    if f[0] + f[1] <= 1.0 {
+        h00 + f[0] * (h10 - h00) + f[1] * (h01 - h00)
+    } else {
+        h11 + (1.0 - f[0]) * (h01 - h11) + (1.0 - f[1]) * (h10 - h11)
+    }
+}
+
 /// Where grid column `column` sits along its axis, in the **drawn box's** unit
 /// square, for a field of `posts` posts placed at `(scale, offset)` — the Rust
 /// mirror of the shader's `box_axis`.
@@ -319,6 +376,10 @@ fn label(what: &str) -> String {
 pub struct VolumePipelines {
     raymarch: wgpu::RenderPipeline,
     ground: wgpu::RenderPipeline,
+    /// `None` only for a set built from a module that has no prism stages —
+    /// see [`VolumePipelines::from_shader_source_without_prisms`]. Production
+    /// always has one.
+    building: Option<wgpu::RenderPipeline>,
     blit: wgpu::RenderPipeline,
     volume_layout: wgpu::BindGroupLayout,
     floor_layout: wgpu::BindGroupLayout,
@@ -342,7 +403,7 @@ pub struct VolumePipelines {
 }
 
 impl VolumePipelines {
-    /// Build both pipelines for the pass egui draws into.
+    /// Build every pipeline for the pass egui draws into.
     pub fn new(device: &wgpu::Device, egui_attachments: AttachmentConfig) -> Self {
         Self::from_shader_source(device, egui_attachments, VOLUME_SHADER_WGSL)
     }
@@ -353,6 +414,41 @@ impl VolumePipelines {
         device: &wgpu::Device,
         egui_attachments: AttachmentConfig,
         wgsl: &str,
+    ) -> Self {
+        Self::build(device, egui_attachments, wgsl, true)
+    }
+
+    /// [`Self::from_shader_source`] for a module that **predates the prism
+    /// stages**, leaving the building pipeline unbuilt.
+    ///
+    /// It exists for one caller and the reason is worth stating rather than
+    /// leaving as an option nobody explains. `volume_light.rs` pins a copy of
+    /// this shader as it stood before C2 and renders through it, so that "the
+    /// readable light draws the picture this renderer always drew" is measured
+    /// against the picture this renderer actually drew rather than against one
+    /// manufactured out of the shader under test. That pin is a **historical
+    /// artifact and must stay byte-identical** — its own doc forbids
+    /// re-recording it — and it has no `vs_building`, no `fs_building` and no
+    /// `fn lit` for one to call. Without this constructor D2 would have retired
+    /// that pin, which would have been retiring a light measurement because a
+    /// building landed.
+    ///
+    /// Nothing is lost from what the pin measures: no prism mesh is handed to
+    /// `encode_ground` in either criterion that reads it, so the pipeline this
+    /// skips would never have been bound.
+    pub fn from_shader_source_without_prisms(
+        device: &wgpu::Device,
+        egui_attachments: AttachmentConfig,
+        wgsl: &str,
+    ) -> Self {
+        Self::build(device, egui_attachments, wgsl, false)
+    }
+
+    fn build(
+        device: &wgpu::Device,
+        egui_attachments: AttachmentConfig,
+        wgsl: &str,
+        prisms: bool,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&label("shader")),
@@ -705,6 +801,88 @@ impl VolumePipelines {
             cache: None,
         });
 
+        let building = prisms.then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&label("building")),
+                // **The GROUND pass's own layout, shared rather than narrowed**, and
+                // it is a correctness requirement rather than a saving.
+                //
+                // The prisms read only the uniform (0) and the height field (3);
+                // the obvious layout therefore leaves the mirror's group 1 empty.
+                // That build compiles, validates, draws — and reads the height
+                // texture as **zeros**, so every building in the scene stands at
+                // box `z = 0` on terrain the terrain pass drew correctly beside it.
+                // WebGPU inherits a bind group across a pipeline change only where
+                // the two layouts agree on every group up to and including it, so
+                // a layout that differs at group 1 unbinds group 3 — and re-binding
+                // it in the pass does not bring the texture back. Measured on
+                // Vulkan/RTX 3090: with a narrower layout the whole city extrudes
+                // from the box floor and
+                // `the_prisms_stand_on_the_terrain_and_not_on_the_box_floor` reads
+                // the flat-ground twin as the match. That one is `#[ignore]`d for
+                // needing an adapter; run it with
+                // `cargo test -p squallar-gpu --test volume_buildings -- --ignored`.
+                //
+                // One pass, one pipeline layout, two pipelines. The prisms declare
+                // a mirror they never sample, which costs one bind-group set per
+                // frame and buys an invariant that cannot be broken by editing one
+                // of the two lists.
+                layout: Some(&ground_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(ENTRY_VS_BUILDING),
+                    compilation_options: Default::default(),
+                    // **The one draw in this crate with a real vertex buffer**, and
+                    // the deliberate exception the buildings crate's own module doc
+                    // argues: the ground is a regular grid derivable from
+                    // `@builtin(vertex_index)`, and a city is irregular polygons
+                    // whose count is bounded by what is in the footprint. There is
+                    // no topology to derive.
+                    buffers: &[BUILDING_VERTEX_LAYOUT],
+                },
+                // **`cull_mode: None`, like every other pipeline here.** A prism is
+                // a closed solid wound counter-clockwise seen from outside, so back
+                // faces could be dropped — but a footprint whose winding the tile
+                // got wrong would then vanish entirely rather than shade oddly, and
+                // the depth test already picks the nearest face. A hole through a
+                // tower costs more than the fill it would save.
+                primitive: QUAD_PRIMITIVE,
+                // The ground pass's own depth buffer, shared: prisms and terrain
+                // resolve against each other in one pass with no second mechanism,
+                // which is what makes a building behind a ridge disappear behind it
+                // for free.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: GROUND_DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(ENTRY_FS_BUILDING),
+                    compilation_options: Default::default(),
+                    // The same two targets in the same order as the ground's, so
+                    // one pass description serves both draws.
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: OCCLUDER_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        Some(wgpu::ColorTargetState {
+                            format: GROUND_COLOUR_FORMAT,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+
         let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(&label("blit")),
             layout: Some(&blit_pipeline_layout),
@@ -744,6 +922,7 @@ impl VolumePipelines {
         Self {
             raymarch,
             ground,
+            building,
             blit,
             volume_layout,
             floor_layout,
@@ -1105,6 +1284,7 @@ impl VolumePipelines {
     /// [`Self::encode_raymarch_with_floor`]** — no second encoder and no second
     /// submit, because wgpu inserts the attachment-to-sampled barrier between
     /// two passes in one encoder.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_ground(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1112,6 +1292,27 @@ impl VolumePipelines {
         volume: &VolumeTextures,
         floor: Option<&PaneMirror>,
         heights: Option<&GroundHeights>,
+        buildings: Option<&BuildingPrisms>,
+    ) {
+        self.encode_ground_with_timestamps(encoder, target, volume, floor, heights, buildings, None)
+    }
+
+    /// [`Self::encode_ground`], with timestamp queries bracketing the pass.
+    ///
+    /// The pass is what the cost harness measures, and it is one pass for both
+    /// draws — so a figure taken here is the terrain and the prisms together
+    /// and cannot be split between them by subtraction. `volume_building_cost`
+    /// separates them by encoding the pass twice, with and without the mesh.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_ground_with_timestamps(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &OffscreenTarget,
+        volume: &VolumeTextures,
+        floor: Option<&PaneMirror>,
+        heights: Option<&GroundHeights>,
+        buildings: Option<&BuildingPrisms>,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites>,
     ) {
         let Some(ground) = target.ground.as_ref() else {
             return;
@@ -1150,7 +1351,7 @@ impl VolumePipelines {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1180,6 +1381,33 @@ impl VolumePipelines {
             return;
         };
         pass.draw(0..vertices, 0..1);
+
+        // **The prisms, into the same pass and after the terrain.** Same
+        // attachments, same depth buffer, same packed `t` — so a building
+        // occludes the volume and is occluded by a ridge with no mechanism
+        // beyond the depth test this pass already had. Drawing them second is
+        // not an ordering requirement (the depth test settles it either way);
+        // it is so that a target with no mesh in it is byte-identical to the
+        // frame B3 shipped.
+        let (Some(buildings), Some(building_pipeline)) = (buildings, self.building.as_ref()) else {
+            return;
+        };
+        pass.set_pipeline(building_pipeline);
+        // **Every group re-set, including the mirror the prisms never sample.**
+        // The two pipelines share one layout precisely so that nothing here can
+        // be dropped, and re-setting all three is what keeps that true if a
+        // future pipeline stops sharing it: a group left to inheritance across
+        // a pipeline change is a texture that reads as zeros rather than an
+        // error, which for group 3 puts the whole city on the box floor.
+        pass.set_bind_group(0, &volume.bind_group, &[]);
+        pass.set_bind_group(1, &floor.unwrap_or(&self.empty_floor).bind_group, &[]);
+        // The same field the terrain just drew from, read out of the one
+        // texture. There is no second height source for a building to disagree
+        // with the ground under it about.
+        pass.set_bind_group(3, &heights.bind_group, &[]);
+        pass.set_vertex_buffer(0, buildings.vertices.slice(..));
+        pass.set_index_buffer(buildings.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..buildings.index_count, 0, 0..1);
     }
 
     /// Upload a height field as a [`HEIGHT_FORMAT`] texture, one texel a post.
@@ -1247,6 +1475,113 @@ impl VolumePipelines {
             },
         );
         Some(held)
+    }
+
+    /// Upload a building mesh as the interleaved vertex buffer and index buffer
+    /// the prism draw reads.
+    ///
+    /// **Slices and not `squallar_buildings::BuildingMesh`**, deliberately:
+    /// `tests/charter.rs` pins this crate's normal dependencies by name and the
+    /// buildings crate is not among them — it links neither wgpu nor egui and
+    /// exists to run inside the worker. Positions, normals and indices are the
+    /// whole of what a renderer needs, so the type stays on the other side of
+    /// the seam and only the numbers cross.
+    ///
+    /// `None` — never a panic, because this runs on the frame thread where a
+    /// wasm panic aborts the tab — for a mesh whose normals do not pair with
+    /// its positions, whose index count is not a whole number of triangles,
+    /// whose indices do not all address its own vertices, or whose buffers
+    /// would pass this adapter's largest single allocation. The coherence check
+    /// is the one that is not merely defensive: an index off the end of the
+    /// vertex buffer is an out-of-bounds fetch on the GPU, which is a driver's
+    /// business rather than something this side of the boundary can catch.
+    /// `squallar_buildings::BuildingMesh::is_coherent` makes the same check at
+    /// the wire seam; this is a second boundary and it holds it for itself,
+    /// because the caller here need not have come off a wire at all.
+    ///
+    /// An empty mesh answers `None` too. There is nothing to draw, and a zero
+    /// length buffer is not a legal wgpu allocation.
+    pub fn upload_buildings(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        positions: &[[f32; 3]],
+        normals: &[[f32; 3]],
+        indices: &[u32],
+    ) -> Option<BuildingPrisms> {
+        if positions.is_empty() || indices.is_empty() {
+            return None;
+        }
+        if positions.len() != normals.len() || !indices.len().is_multiple_of(3) {
+            log::error!(
+                "3D volume view: refusing a prism mesh of {} positions, {} normals and {} \
+                 indices",
+                positions.len(),
+                normals.len(),
+                indices.len(),
+            );
+            return None;
+        }
+        let vertex_count = u32::try_from(positions.len()).ok()?;
+        let index_count = u32::try_from(indices.len()).ok()?;
+        // One pass, and it rides the serialisation below rather than being a
+        // second walk of the same buffer.
+        if indices.iter().copied().max()? >= vertex_count {
+            log::error!(
+                "3D volume view: refusing a prism mesh whose indices reach past its {vertex_count} \
+                 vertices",
+            );
+            return None;
+        }
+
+        let vertex_bytes = u64::from(vertex_count) * BUILDING_VERTEX_BYTES;
+        let index_bytes = u64::from(index_count) * BUILDING_INDEX_BYTES;
+        let ceiling = device.limits().max_buffer_size;
+        if vertex_bytes > ceiling || index_bytes > ceiling {
+            log::error!(
+                "3D volume view: refusing a prism mesh of {vertex_bytes} vertex bytes and \
+                 {index_bytes} index bytes; this adapter's largest buffer is {ceiling}",
+            );
+            return None;
+        }
+
+        // Interleaved position-then-normal, which is the layout the pipeline
+        // declares and the stride the buildings crate's budget prices. Built
+        // here rather than shipped that way because the worker's reply
+        // nominates the two as separate tails, and concatenating a 9 MB mesh
+        // at each end to save this walk would cost more than it saved.
+        let mut vertices = Vec::with_capacity(vertex_bytes as usize);
+        for (position, normal) in positions.iter().zip(normals) {
+            for axis in position.iter().chain(normal) {
+                vertices.extend_from_slice(&axis.to_le_bytes());
+            }
+        }
+        let mut index_bytes_out = Vec::with_capacity(index_bytes as usize);
+        for index in indices {
+            index_bytes_out.extend_from_slice(&index.to_le_bytes());
+        }
+
+        let vertices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&label("building.vertices")),
+            size: vertex_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&label("building.indices")),
+            size: index_bytes,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&vertices_buffer, 0, &vertices);
+        queue.write_buffer(&indices_buffer, 0, &index_bytes_out);
+
+        Some(BuildingPrisms {
+            vertices: vertices_buffer,
+            indices: indices_buffer,
+            index_count,
+            vertex_count,
+        })
     }
 
     /// Record the raymarch into `target`.
@@ -1578,6 +1913,38 @@ impl PaneMirror {
 /// Whether a mirror in `format` holds **gamma-encoded** texels.
 pub fn mirror_is_gamma_encoded(format: wgpu::TextureFormat) -> bool {
     !format.is_srgb()
+}
+
+/// A building mesh on the GPU: one interleaved vertex buffer and one index
+/// buffer.
+///
+/// **The only vertex and index buffers this crate allocates**, which is why
+/// they get a size of their own to report: the terrain's grid is procedural
+/// and really does cost zero here.
+pub struct BuildingPrisms {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+    vertex_count: u32,
+}
+
+impl BuildingPrisms {
+    /// Indices in the mesh — three per triangle.
+    pub fn index_count(&self) -> u32 {
+        self.index_count
+    }
+
+    /// Vertices in the mesh.
+    pub fn vertex_count(&self) -> u32 {
+        self.vertex_count
+    }
+
+    /// GPU bytes the pair occupies, priced the way
+    /// `squallar_buildings::budget` prices a rung.
+    pub fn buffer_bytes(&self) -> u64 {
+        u64::from(self.vertex_count) * BUILDING_VERTEX_BYTES
+            + u64::from(self.index_count) * BUILDING_INDEX_BYTES
+    }
 }
 
 /// A height field on the GPU: one `R16Uint` texel per post, plus the bind group
@@ -2134,6 +2501,37 @@ pub fn blit_entry_point_for(format: wgpu::TextureFormat) -> &'static str {
         ENTRY_FS_BLIT_GAMMA
     }
 }
+
+/// One prism vertex as the GPU reads it: three `f32` of position then three of
+/// normal, interleaved.
+///
+/// The same 24 bytes `squallar_buildings::PRISM_VERTEX_BYTES` prices a vertex
+/// at, which is the number that crate's whole rung ladder is built on;
+/// `the_vertex_stride_is_what_the_budget_prices` holds the pair.
+pub const BUILDING_VERTEX_BYTES: u64 = 24;
+
+/// Bytes one prism index occupies. `u32`, matching
+/// `squallar_buildings::PRISM_INDEX_BYTES`, because that crate's finest rung is
+/// sixteen times past what a `u16` addresses.
+pub const BUILDING_INDEX_BYTES: u64 = 4;
+
+/// The vertex layout the building pipeline reads its mesh through.
+const BUILDING_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: BUILDING_VERTEX_BYTES,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &[
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 12,
+            shader_location: 1,
+        },
+    ],
+};
 
 /// The vertex layout both pipelines read the quad through.
 const QUAD_VERTEX_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {

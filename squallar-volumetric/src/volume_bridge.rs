@@ -787,6 +787,30 @@ impl VolumePainter for BridgeVolumePainter {
             uniform.ground_box = ground.ground_box;
         }
 
+        // **Where a prism's kilometres land in this box.** Written whenever a
+        // ground pass runs, whether or not a mesh is in hand, for the reason
+        // `clip_from_box` is: one derivation, so a mesh that lands next frame
+        // cannot be placed by a stale one. The two numbers are the drawn box's
+        // own south-west corner as kilometres from the site — the same pair
+        // the drape's `FloorSource` carries.
+        //
+        // The mesh is carried only when its site is the grid's. The prisms are
+        // authored in SITE-relative kilometres, which is what lets one upload
+        // survive a box change; the site is the one thing that must not move
+        // under them, and a mesh built around another one would put every
+        // building somewhere plausible and wrong.
+        let buildings = if ground.is_some()
+            && uniform.place_buildings(drawn.x_km.0 as f32, drawn.y_km.0 as f32)
+        {
+            frame
+                .buildings
+                .as_ref()
+                .filter(|mesh| mesh.site == grid.anchor())
+                .cloned()
+        } else {
+            None
+        };
+
         // What the adaptive mirror rung is chosen from. Recorded only when a
         // floor is actually resolved, so a pane with the floor hidden — or one
         // whose source map has not said where it is — asks for no texels.
@@ -820,6 +844,8 @@ impl VolumePainter for BridgeVolumePainter {
             // Carried only when a placement resolved, so `prepare` cannot
             // upload a field the uniform was not aimed at.
             heights: ground.and(frame.heights.clone()),
+            // Already gated on the ground pass and on the site above.
+            buildings,
             // The Volume Alpha curve rides to `prepare`, which owns the LUT
             // upload — the one seam the curve is applied at.
             alpha: frame.alpha.clone(),
@@ -1205,6 +1231,13 @@ pub struct VolumeResources {
     /// field it holds. Per pane and not per grid: a field belongs to the box a
     /// pane is drawing, which a stand-in grid does not fix.
     heights: HashMap<usize, HeldHeights>,
+    /// One uploaded building mesh per pane, beside the field it stands on.
+    ///
+    /// Per pane for the reason the field is: the prisms belong to the box the
+    /// pane is drawing. Kept in a map of its own rather than folded into
+    /// [`HeldHeights`] because the two arrive on different jobs and either can
+    /// land without the other — a new field must not throw the city away.
+    buildings: HashMap<usize, HeldBuildings>,
     /// The host memory every grid upload widens its index plane into, held
     /// across uploads instead of allocated inside each one.
     staging: VolumeStaging,
@@ -1218,6 +1251,16 @@ struct HeldHeights {
     /// frame thread, so the id is what says "already there".
     id: u64,
     held: crate::raymarch::GroundHeights,
+}
+
+/// One pane's uploaded prism mesh, and which mesh it is.
+struct HeldBuildings {
+    /// [`squallar_egui::volume_view::BuildingPrismMesh::id`] of what is on the
+    /// GPU. A city is megabytes of vertex and index buffer and does not change
+    /// between frames, so the id is what keeps the upload off every frame but
+    /// the one that changed.
+    id: u64,
+    held: crate::raymarch::BuildingPrisms,
 }
 
 /// One grid's GPU upload, and which Volume Alpha curve its colour table was
@@ -1244,6 +1287,7 @@ impl VolumeResources {
             uploads: HashMap::new(),
             mirror: None,
             heights: HashMap::new(),
+            buildings: HashMap::new(),
             // Empty, not pre-sized: the shape is not known until the first
             // upload, and a machine that never opens a 3D pane must pay nothing
             // — the same rule the mirror above follows.
@@ -1255,6 +1299,7 @@ impl VolumeResources {
     pub fn release_pane(&mut self, pane_idx: usize, live_ids: &[u64]) {
         self.targets.remove(&pane_idx);
         self.heights.remove(&pane_idx);
+        self.buildings.remove(&pane_idx);
         self.retain_uploads(live_ids);
     }
 
@@ -1294,6 +1339,46 @@ impl VolumeResources {
         };
         self.heights
             .insert(pane_idx, HeldHeights { id: field.id, held });
+        true
+    }
+
+    /// Make `pane_idx`'s prism mesh resident, uploading only when the mesh on
+    /// the GPU is not the one asked for, and answer whether one is in hand.
+    ///
+    /// The twin of [`Self::ensure_pane_heights`], down to a pane that stops
+    /// asking giving its buffers back in the same call.
+    pub fn ensure_pane_buildings(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pane_idx: usize,
+        mesh: Option<&squallar_egui::volume_view::BuildingPrismMesh>,
+    ) -> bool {
+        let Some(mesh) = mesh else {
+            self.buildings.remove(&pane_idx);
+            return false;
+        };
+        if self
+            .buildings
+            .get(&pane_idx)
+            .is_some_and(|held| held.id == mesh.id)
+        {
+            return true;
+        }
+        let Some(held) = self.pipelines.upload_buildings(
+            device,
+            queue,
+            &mesh.positions,
+            &mesh.normals,
+            &mesh.indices,
+        ) else {
+            // `upload_buildings` has already logged which invariant it refused
+            // on. The pane draws bare terrain rather than half a city.
+            self.buildings.remove(&pane_idx);
+            return false;
+        };
+        self.buildings
+            .insert(pane_idx, HeldBuildings { id: mesh.id, held });
         true
     }
 
@@ -1457,6 +1542,10 @@ struct VolumeCallback {
     /// occluder, which is what keeps the uniform and the texture describing
     /// one surface.
     heights: Option<Arc<squallar_egui::volume_view::GroundHeightField>>,
+    /// The buildings standing on that field, or `None` for bare terrain.
+    /// `Some` only when `heights` is: a prism is a height above the ground and
+    /// has nowhere to stand without one.
+    buildings: Option<Arc<squallar_egui::volume_view::BuildingPrismMesh>>,
     /// The Volume Alpha curve the LUT must be uploaded through, or `None` for
     /// the grid's own table, bit-exactly. `prepare` compares this against
     /// what the upload cache holds and rewrites the 1 KiB table only on
@@ -1522,6 +1611,18 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // that stopped asking for terrain gives its field back.
         let has_heights =
             resources.ensure_pane_heights(device, queue, self.pane_idx, self.heights.as_deref());
+        // Beside it and unconditional, for the same reason: `None` is how a
+        // pane that stopped asking for buildings gives its buffers back. A
+        // mesh with no field under it is dropped here rather than drawn at sea
+        // level — `paint` already refuses to carry one, and this is the second
+        // place that stays true if it ever stops.
+        let has_buildings = has_heights
+            && resources.ensure_pane_buildings(
+                device,
+                queue,
+                self.pane_idx,
+                self.buildings.as_deref(),
+            );
         let shape = self.grid.dims();
         if !resources.ensure_upload(
             device,
@@ -1554,6 +1655,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             uploads,
             mirror,
             heights,
+            buildings,
             // The upload above is the only reader, and it has already run —
             // including the staging ring's own submit, so nothing here is
             // waiting on a plane that has not been handed to the queue.
@@ -1621,6 +1723,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             floor_texture,
             has_heights
                 .then(|| heights.get(&self.pane_idx))
+                .flatten()
+                .map(|held| &held.held),
+            has_buildings
+                .then(|| buildings.get(&self.pane_idx))
                 .flatten()
                 .map(|held| &held.held),
         );

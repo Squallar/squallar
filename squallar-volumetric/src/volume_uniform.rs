@@ -2,7 +2,7 @@
 
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. Two `mat4x4<f32>` + fourteen `vec4<f32>`.
+/// Bytes in the uniform block. Two `mat4x4<f32>` + fifteen `vec4<f32>`.
 ///
 /// **Append-only.** The ground pass shares this one block with the raymarch
 /// rather than carrying its own, which is what makes it structurally
@@ -11,9 +11,10 @@ use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 /// every `OFFSET_*` below where it already was — B1 grew it 224 to 304 for
 /// `clip_from_box` and the occluder, B3 grew it 304 to 320 for
 /// [`OFFSET_GROUND_BOX`], C2 grew it 320 to 352 for [`OFFSET_SUN_BEAM`] and
-/// [`OFFSET_SKY_AMBIENT`], and none of them moved anything before it.
+/// [`OFFSET_SKY_AMBIENT`], D2 grew it 352 to 368 for
+/// [`OFFSET_BUILDING_BOX`], and none of them moved anything before it.
 /// `REQUIRED_UNIFORM_BINDING_SIZE` is 512 and has not had to move yet.
-pub const VOLUME_UNIFORM_BYTES: usize = 352;
+pub const VOLUME_UNIFORM_BYTES: usize = 368;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -36,6 +37,7 @@ pub const OFFSET_OCCLUDER: usize = 288;
 pub const OFFSET_GROUND_BOX: usize = 304;
 pub const OFFSET_SUN_BEAM: usize = 320;
 pub const OFFSET_SKY_AMBIENT: usize = 336;
+pub const OFFSET_BUILDING_BOX: usize = 352;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
@@ -268,6 +270,18 @@ pub struct VolumeUniform {
     /// See [`SurfaceLight::sky`]. Rides `sky_ambient.xyz`; `w` is reserved and
     /// written zero.
     pub sky_ambient: [f32; 3],
+    /// Where a building mesh's kilometres land in the drawn box's unit square:
+    /// `(u_per_km_east, v_per_km_north, u_at_the_site, v_at_the_site)`, applied
+    /// as `uv = scale * km + offset`.
+    ///
+    /// **The prisms are authored in site-relative kilometres, not box units**,
+    /// which is what this lane exists to undo. Baking the box into the vertex
+    /// buffer instead would make every box change a full re-upload of the whole
+    /// city; this way it is four floats. [`IDENTITY_BUILDING_BOX`] is what
+    /// [`Self::new`] writes and means "kilometres already are box units", which
+    /// no real box is — [`Self::place_buildings`] is the spelling that puts a
+    /// real one in.
+    pub building_box: [f32; 4],
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
@@ -281,6 +295,14 @@ pub const IDENTITY_GRID_FROM_BOX: ([f32; 3], [f32; 3]) = ([1.0; 3], [0.0; 3]);
 /// A height field whose footprint **is** the drawn box — the settled case.
 /// See [`VolumeUniform::ground_box`].
 pub const IDENTITY_GROUND_BOX: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
+
+/// The building placement that leaves kilometres reading as box units.
+///
+/// **Not a settled case, unlike [`IDENTITY_GROUND_BOX`]** — no box a pane draws
+/// is one kilometre across with its site at the south-west corner. It is what
+/// [`VolumeUniform::new`] writes so the lane is never a plausible-looking
+/// wrong number, and what a frame with no prisms in it keeps.
+pub const IDENTITY_BUILDING_BOX: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
@@ -321,7 +343,33 @@ impl VolumeUniform {
             ground_box: IDENTITY_GROUND_BOX,
             sun_beam: HEADLIGHT.beam,
             sky_ambient: HEADLIGHT.sky,
+            building_box: IDENTITY_BUILDING_BOX,
         }
+    }
+
+    /// Place a building mesh's kilometres in **this uniform's own box**.
+    ///
+    /// `west_km` and `south_km` are the drawn box's south-west corner as
+    /// kilometres east and north of the site the prisms were built around —
+    /// the same two numbers `FloorSource` carries for the drape, and the same
+    /// pair `squallar_buildings::BoxFrame` names as `x_km.0` / `y_km.0`.
+    ///
+    /// **The one blessed spelling**, for the reason [`Self::aim_occluder`] is
+    /// one: the scale comes off [`Self::box_size_km`], so a placement composed
+    /// against a different box would register the whole city somewhere else
+    /// and every pixel of the result would look plausible. Leaves the lane
+    /// untouched and answers `false` for a box with no horizontal extent,
+    /// which would reach the GPU as an infinity.
+    pub fn place_buildings(&mut self, west_km: f32, south_km: f32) -> bool {
+        let (east, north) = (self.box_size_km[0], self.box_size_km[1]);
+        if !(east.is_finite() && north.is_finite() && east > 0.0 && north > 0.0)
+            || !west_km.is_finite()
+            || !south_km.is_finite()
+        {
+            return false;
+        }
+        self.building_box = [1.0 / east, 1.0 / north, -west_km / east, -south_km / north];
+        true
     }
 
     /// **The spelling production uses to light a frame**: direction, beam and
@@ -533,6 +581,7 @@ impl VolumeUniform {
         write_vec4(&mut out, OFFSET_GROUND_BOX, self.ground_box);
         write_vec4(&mut out, OFFSET_SUN_BEAM, xyz_w(self.sun_beam, 0.0));
         write_vec4(&mut out, OFFSET_SKY_AMBIENT, xyz_w(self.sky_ambient, 0.0));
+        write_vec4(&mut out, OFFSET_BUILDING_BOX, self.building_box);
 
         out
     }
