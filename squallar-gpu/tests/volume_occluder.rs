@@ -545,7 +545,9 @@ fn the_occluder_decodes_to_the_ray_parameter_the_march_would_solve() {
 /// **The direction is not universal and this doc used to say it was.** It holds
 /// while the eye is above the ground; from below the plane the composite takes
 /// neither arm and the sign inverts on every differing pixel. See
-/// [`the_ground_is_invisible_from_below_the_box_floor`].
+/// [`the_ground_is_invisible_from_below_the_box_floor`], which is `#[ignore]`d
+/// like this one; run it with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_ridge_removes_volume_from_every_ray_it_changes_and_adds_none() {
