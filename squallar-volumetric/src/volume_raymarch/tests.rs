@@ -1198,6 +1198,62 @@ fn the_ground_grid_is_laid_out_from_the_height_textures_own_dimensions() {
     );
 }
 
+/// **The two post ceilings are one number, across a crate boundary neither side
+/// can declare.**
+///
+/// `squallar_elevation::plan::MAX_POSTS_PER_AXIS` is where the fit ladder stops
+/// asking for posts; [`MAX_POSTS_PER_AXIS`] here is where the draw stops being
+/// expressible in a `u32`. They are derived from different ends and they have
+/// to agree, and nothing joins them: `squallar-elevation` is not a dependency
+/// of this crate and must not become one -- the resample runs inside the
+/// offload worker, which links neither egui nor wgpu, and that crate's own
+/// `tests/charter.rs` holds the set. So the pin is on its source text, through
+/// the same `concat!(env!("CARGO_MANIFEST_DIR"), "/..")` idiom
+/// [`the_post_centre_convention_is_the_resamplers_own`] uses for the other
+/// number the two halves share.
+///
+/// **What a divergence would do is worse than a compile error.** If the
+/// elevation ceiling rose above this one, `HeightPlan::fit` would answer plans
+/// that `upload_heights` refuses -- a camera at some zoom levels would simply
+/// have no ground, with a `log::error!` nobody reads and nothing red anywhere.
+#[test]
+fn the_fit_ladder_and_the_draw_agree_on_the_post_ceiling() {
+    let plan = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../squallar-elevation/src/plan.rs"
+    ));
+    let declared = plan
+        .split_once("pub const MAX_POSTS_PER_AXIS: u32 = ")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(value, _)| value.replace('_', ""))
+        .expect(
+            "`squallar_elevation::plan::MAX_POSTS_PER_AXIS` is gone; re-anchor \
+             this pin on whatever bounds the fit ladder's posts now, rather \
+             than deleting it -- it is the only thing holding the two ceilings \
+             together",
+        );
+    let declared: u32 = declared
+        .trim()
+        .parse()
+        .expect("the elevation ceiling is a plain integer literal");
+    assert_eq!(
+        declared, MAX_POSTS_PER_AXIS,
+        "the fit ladder stops at {declared} posts an axis and the draw stops \
+         at {MAX_POSTS_PER_AXIS}. Whichever is larger names fields the other \
+         cannot handle, and the failure is a pane with no ground rather than \
+         anything that reddens",
+    );
+    // The non-triviality half: the number really was read out of the other
+    // crate, not defaulted from this one.
+    assert!(
+        plan.contains("pub const MAX_POSTS_PER_AXIS: u32 = 8192;"),
+        "the pin did not find the literal it claims to have parsed",
+    );
+    // And the shared ceiling is itself drawable, which is the property this
+    // crate's half of it is derived from.
+    assert!(ground_vertex_count([declared, declared]).is_some());
+}
+
 /// The vertex count and the grid the vertex stage lays out are one arithmetic,
 /// at whatever size the field arrived.
 #[test]
