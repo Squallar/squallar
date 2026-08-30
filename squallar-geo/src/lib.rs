@@ -4,6 +4,15 @@
 //! [`EARTH_RADIUS_KM`] and the [`KM_PER_DEGREE_LAT`] derived from it are the
 //! only sphere anything above may convert degrees to ground kilometres on.
 
+/// Where the sun is over a point on the ground, and what colour its light is.
+///
+/// It lives here rather than beside the renderer for the reason every other
+/// function in this crate does: it is arithmetic over `std` with no graphics,
+/// no clock and no I/O in it, and both the ground pass and the volume have to
+/// reach the *same* answer. This crate is band 0 — every rendering crate
+/// already stands on it, so nothing above can close a cycle by asking.
+pub mod solar;
+
 use std::f64::consts::PI;
 
 /// Mean radius of Earth in kilometers — the IUGG mean radius, and the one
