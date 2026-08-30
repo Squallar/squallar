@@ -309,12 +309,12 @@ impl super::Gui {
                                             actions: &mut actions,
                                             pane_rect,
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
-                                            // A pane drawing its map in plan
-                                            // has no mesh and no second
-                                            // light. Not a lookup: the 3D
-                                            // ground is drawn by the volume
-                                            // arm, which this arm is not.
-                                            draws_3d_ground: false,
+                                            // Not a lookup: the 3D ground is
+                                            // drawn by the volume arm, which
+                                            // this arm is not, and the type
+                                            // offers a plan view no other
+                                            // answer.
+                                            draws_3d_ground: pane_render::GroundIsMesh::PLAN_VIEW,
                                             horizontal_color_scale,
                                             color_scale_floor,
                                             pointer_available,
@@ -1664,8 +1664,13 @@ impl super::Gui {
         let mut strip_click_consumed = false;
         // Read before the closure takes `pane`, and read from the same
         // function the renderer's own `heights` comes from -- see
-        // `pane_ground_heights`.
-        let draws_3d_ground = pane_ground_heights(pane, pane_idx).is_some();
+        // `pane_ground_heights`. One expression, and the only binding of this
+        // name in the module: a second one composing the answer out of
+        // something else is what `GroundIsMesh` and the source pin in
+        // `ui_map_pane/floor_strip_shading_tests.rs` exist to refuse.
+        let draws_3d_ground = pane_render::GroundIsMesh::from_height_field(
+            pane_ground_heights(pane, pane_idx).as_deref(),
+        );
 
         Map::new(None, map_memory, center)
             .zoom_with_ctrl(false)

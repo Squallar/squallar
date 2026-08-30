@@ -23,9 +23,45 @@ use super::*;
 use crate::pane::PaneState;
 use squallar_overlays::render::overlay_state::OverlayRegistry;
 
-/// What one call to [`render_pane_map_content`] dispatched, in paint order --
-/// the same record `ui_map.rs` pushes into its `last_paint_order` probe.
-fn dispatched(surfaces: PaneSurfaces, draws_3d_ground: bool) -> Vec<LayerId> {
+/// A pane whose ground IS a mesh, spelled the only way the type allows: by
+/// holding the height field the ground would be drawn from.
+///
+/// There is no shortcut here on purpose. `GroundIsMesh`'s field is private to
+/// `pane_render`, so `GroundIsMesh(true)` does not compile from anywhere a
+/// caller lives, and the fixture has to build the real carrier -- which is the
+/// same thing production will hand it once a scheduler exists.
+fn a_field() -> GroundIsMesh {
+    let field = crate::volume_view::GroundHeightField {
+        id: 1,
+        site: (35.3331, -97.2778),
+        x_km: (-40.0, 40.0),
+        y_km: (-40.0, 40.0),
+        posts: [2, 2],
+        samples: std::sync::Arc::new(vec![0, 1, 2, 3]),
+        base_m: 300.0,
+        quantum_m: 1.0,
+        range_m: (300.0, 303.0),
+    };
+    let ground = GroundIsMesh::from_height_field(Some(&field));
+    assert_ne!(
+        ground,
+        GroundIsMesh::PLAN_VIEW,
+        "fixture: a held field must answer differently from a plan view, or \
+         every row below is comparing one state with itself"
+    );
+    ground
+}
+
+/// What one call to [`render_pane_map_content`] dispatched, in paint order.
+///
+/// **Read off the `PaneRenderCtx` directly, because no floor strip has ever
+/// been observable through the app harness.** `last_paint_order` is pushed at
+/// exactly one site, the `GroundAndGlass` arm; `draw_floor_strip` never
+/// pushes, and the strip's own `ctx.paint_order` is dropped with the closure.
+/// So there is no probe to drive a strip through even if
+/// `pane_ground_heights` could answer -- which is the second, independent
+/// reason the wiring below is pinned in source rather than exercised.
+fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
     let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
     let egui_ctx = egui::Context::default();
 
@@ -59,7 +95,7 @@ fn dispatched(surfaces: PaneSurfaces, draws_3d_ground: bool) -> Vec<LayerId> {
     });
     let mut ui = egui::Ui::new(
         egui_ctx.clone(),
-        egui::Id::new(("floor_strip_shading", draws_3d_ground)),
+        egui::Id::new(("floor_strip_shading", ground == GroundIsMesh::PLAN_VIEW)),
         egui::UiBuilder::new()
             .layer_id(egui::LayerId::background())
             .max_rect(canvas),
@@ -83,7 +119,7 @@ fn dispatched(surfaces: PaneSurfaces, draws_3d_ground: bool) -> Vec<LayerId> {
         actions: &mut actions,
         pane_rect: canvas,
         surfaces,
-        draws_3d_ground,
+        draws_3d_ground: ground,
         horizontal_color_scale: true,
         color_scale_floor: canvas.max.y,
         pointer_available: false,
@@ -109,8 +145,8 @@ fn dispatched(surfaces: PaneSurfaces, draws_3d_ground: bool) -> Vec<LayerId> {
 /// layer rather than went empty.
 #[test]
 fn the_strip_of_a_pane_whose_ground_is_a_mesh_draws_no_hillshade() {
-    let mesh = dispatched(PaneSurfaces::GroundOnly, true);
-    let flat = dispatched(PaneSurfaces::GroundOnly, false);
+    let mesh = dispatched(PaneSurfaces::GroundOnly, a_field());
+    let flat = dispatched(PaneSurfaces::GroundOnly, GroundIsMesh::PLAN_VIEW);
 
     assert!(
         !mesh.contains(&known::TERRAIN),
@@ -148,8 +184,8 @@ fn the_strip_of_a_pane_whose_ground_is_a_mesh_draws_no_hillshade() {
 /// surface and not about a flag that never fires.
 #[test]
 fn a_2d_panes_walk_keeps_the_hillshade_even_under_the_3d_flag() {
-    let two_d = dispatched(PaneSurfaces::GroundAndGlass, true);
-    let strip = dispatched(PaneSurfaces::GroundOnly, true);
+    let two_d = dispatched(PaneSurfaces::GroundAndGlass, a_field());
+    let strip = dispatched(PaneSurfaces::GroundOnly, a_field());
 
     assert!(
         two_d.contains(&known::TERRAIN),
@@ -163,66 +199,172 @@ fn a_2d_panes_walk_keeps_the_hillshade_even_under_the_3d_flag() {
     );
 }
 
-/// **The wiring, pinned in source, because it cannot be pinned in behaviour.**
+/// Every production module of `ui::map`, which is exactly the set that can
+/// construct a [`PaneSurfaces`] or a [`GroundIsMesh`].
+///
+/// **The set matters, and an earlier version of this pin got it wrong** by
+/// reading `ui_map.rs` alone. Both types are `pub(super)` in
+/// `ui::map::pane_render`, and `pub(super)` visibility is inherited by every
+/// descendant of `ui::map` -- so a second floor strip in `ui_section_pane.rs`
+/// or `ui_volume_alpha.rs` would have sailed past a pin whose own message
+/// said "a second floor strip appeared".
+const MAP_MODULES: &[(&str, &str)] = &[
+    (
+        "ui_map.rs",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui_map.rs")),
+    ),
+    (
+        "ui_section_pane.rs",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui_section_pane.rs"
+        )),
+    ),
+    (
+        "ui_volume_alpha.rs",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui_volume_alpha.rs"
+        )),
+    ),
+];
+
+/// How many times `needle` occurs across every production module of `ui::map`.
+fn across_map_modules(needle: &str) -> usize {
+    MAP_MODULES
+        .iter()
+        .map(|(_, src)| squeezed(src).matches(needle).count())
+        .sum()
+}
+
+/// Source with every run of whitespace collapsed to one space, so a needle
+/// spanning a line break matches whatever column rustfmt chose to wrap at.
+/// A pin that a re-wrap can redden is a maintenance trap, not a gate.
+fn squeezed(src: &str) -> String {
+    src.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **The wiring, pinned in source, because it cannot be pinned in behaviour
+/// and this unit's other two tests cannot see it.**
 ///
 /// `pane_ground_heights` answers `None` for every pane while the height
-/// archive is unpublished, so `draws_3d_ground` is `false` at the strip
-/// whether it is read from that function or hardcoded, and the two spellings
-/// are indistinguishable to any test that drives the app. That is precisely
-/// the state B3 met when it pinned its four production derivation sites by
-/// source text rather than by behaviour, and this is the same idiom for the
-/// same reason.
+/// archive is unpublished, so the strip's flag reads "plan view" whether it
+/// comes from that function or from a literal, and no test that drives the
+/// app could tell. And the strip is not observable through the app harness at
+/// all -- see [`dispatched`]. Closing this behaviourally needs *two* edits
+/// this unit does not own: a scheduler, and a probe.
 ///
-/// What it holds is the join the two tests above cannot reach: the strip's
-/// flag and the renderer's `heights` come from **one** function, and the
-/// plan-view walk is handed `false` outright rather than being asked.
+/// **What it holds, and what a previous version of it did not.** The first
+/// spelling asserted only that the pinned line *existed*, which a mutant
+/// walked straight through: one added line,
+/// `let draws_3d_ground = draws_3d_ground || pane.volume().is_some();`, made
+/// every 3D pane's strip drop its hillshade while `pane_ground_heights` stayed
+/// `None` and no mesh ever drew -- a permanently unshaded floor on every 3D
+/// pane -- and `cargo test --workspace` stayed at 5039 passed / 0 failed,
+/// byte-identical to the control. Checker and checked shared the belief "the
+/// text is there, so the wiring is there". So this pin counts **bindings and
+/// initialisers**, not the presence of a line: a second producer of the name
+/// is what the mutant needs and what the counts refuse.
 ///
-/// **Delete it the day a scheduler fills `pane_ground_heights` in**, because
-/// from that day the join is reachable by driving the app and a source pin is
-/// the weaker of the two statements.
+/// It is the weaker half of a pair. The stronger half is [`GroundIsMesh`]
+/// itself, whose private field means that mutant no longer typechecks; this
+/// catches the mutations that stay well-typed, chiefly a strip hardcoded to
+/// `PLAN_VIEW`, which would silently disable the suppression for ever the day
+/// a scheduler lands.
+///
+/// **Delete it the day a scheduler fills `pane_ground_heights` in and the
+/// strip gains a probe**, because from that day the join is reachable
+/// behaviourally and a source pin is the weaker statement.
 #[test]
 fn the_strips_flag_and_the_renderers_heights_are_read_from_one_function() {
-    const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui_map.rs"));
+    let ui_map = squeezed(MAP_MODULES[0].1);
+    let ui_map = ui_map.as_str();
 
-    // The pin is reading the file it thinks it is.
+    // The pin is reading the files it thinks it is.
     assert!(
-        SRC.contains("fn draw_floor_strip") && SRC.contains("fn volume_pane_outcome"),
+        ui_map.contains("fn draw_floor_strip") && ui_map.contains("fn volume_pane_outcome"),
         "this pin is not looking at the module that draws the floor strip"
     );
+
     assert_eq!(
-        SRC.matches("PaneSurfaces::GroundOnly").count(),
+        across_map_modules("PaneSurfaces::GroundOnly"),
         1,
-        "a second floor strip appeared; it needs its own answer to whether its \
-         pane's ground is a mesh, and this pin needs to know about it"
+        "a second floor strip appeared somewhere in ui::map; it needs its own \
+         answer to whether its pane's ground is a mesh, and this pin needs to \
+         know about it"
     );
     assert_eq!(
-        SRC.matches("PaneSurfaces::GroundAndGlass").count(),
+        across_map_modules("PaneSurfaces::GroundAndGlass"),
         1,
-        "a second plan-view walk appeared; the pin below no longer says which \
-         one is handed `false`"
+        "a second plan-view walk appeared in ui::map; the counts below no \
+         longer say which one is handed PLAN_VIEW"
+    );
+
+    // **One producer of the name, one consumer, one plan-view answer.** These
+    // three counts are what the earlier pin lacked: a mutant that composes the
+    // answer out of a second belief has to bind the name twice, and a mutant
+    // that hardcodes the strip has to move the initialiser.
+    assert_eq!(
+        across_map_modules("draws_3d_ground ="),
+        1,
+        "`draws_3d_ground` is bound more than once in ui::map. A second \
+         binding is how the answer stops being `pane_ground_heights`'s and \
+         starts being the caller's -- the exact mutation that unshaded every \
+         3D floor with the whole board green"
+    );
+    assert_eq!(
+        across_map_modules("draws_3d_ground,"),
+        1,
+        "the floor strip's `PaneRenderCtx` must take the bound value by \
+         shorthand; an explicit initialiser here can say something the binding \
+         does not"
+    );
+    assert_eq!(
+        across_map_modules("draws_3d_ground:"),
+        1,
+        "exactly one call site names the field explicitly, and it is the \
+         plan-view walk asserted below"
     );
 
     assert_eq!(
-        SRC.matches("let draws_3d_ground = pane_ground_heights(pane, pane_idx).is_some();")
+        ui_map
+            .matches(
+                "let draws_3d_ground = pane_render::GroundIsMesh::from_height_field( pane_ground_heights(pane, pane_idx).as_deref(), );"
+            )
             .count(),
         1,
-        "the floor strip must ask `pane_ground_heights`, not a belief of its own"
+        "the floor strip must ask `pane_ground_heights` and nothing else, in \
+         one expression with no room between the call and the flag"
     );
     assert_eq!(
-        SRC.matches("heights: pane_ground_heights(pane, pane_idx),")
+        ui_map
+            .matches("draws_3d_ground: pane_render::GroundIsMesh::PLAN_VIEW,")
+            .count(),
+        1,
+        "the plan-view walk is PLAN_VIEW by construction and says so in one place"
+    );
+    assert_eq!(
+        ui_map
+            .matches("heights: pane_ground_heights(pane, pane_idx),")
             .count(),
         1,
         "the renderer's height field must come off the SAME function the strip \
          asked, or the drape and the mesh can disagree about which ground is \
          being drawn"
     );
+
+    // The non-triviality half of a source pin: the needles are ones that can
+    // be absent. A pin whose every needle is a substring of itself proves
+    // nothing.
     assert_eq!(
-        SRC.matches("draws_3d_ground: false,").count(),
+        across_map_modules("GroundIsMesh::from_height_field"),
         1,
-        "the plan-view walk is `false` by construction and says so in one place"
+        "exactly one production site turns a height field into the strip's answer"
     );
-    assert!(
-        !SRC.contains("draws_3d_ground: true"),
-        "nothing may hardcode the answer on; it is a question about the pane"
+    assert_eq!(
+        across_map_modules("pane_ground_heights(pane, pane_idx)"),
+        2,
+        "two readers of the one function -- the strip and the renderer -- and \
+         no third"
     );
 }
