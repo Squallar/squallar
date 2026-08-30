@@ -919,6 +919,78 @@ impl RangeSource for ShortByOneSource {
     }
 }
 
+/// A source whose every answer is truncated to `cap` bytes.
+struct CappedSource {
+    inner: FileRangeSource,
+    cap: usize,
+}
+
+impl RangeSource for CappedSource {
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        let cap = self.cap;
+        let read = self.inner.read_range(offset, length);
+        async move {
+            let mut bytes = read.await?;
+            bytes.truncate(cap);
+            Ok(bytes)
+        }
+    }
+}
+
+/// **An archive truncated inside its root directory fails the open; it never
+/// aborts the task.**
+///
+/// `pmtiles` opens with a plain "up to `length`" read and slices the header
+/// *and* the root directory out of the one answer without bounds-checking the
+/// second, so a source answering between the header's 127 bytes and the end
+/// of the root directory panics in `bytes` rather than erroring. Measured on
+/// the committed fixture before the guard: 0 and 100 bytes failed cleanly,
+/// 127 through 637 aborted the task, 638 opened. A truncated segment or a
+/// `part000` that stopped early is such a source, and
+/// `a_truncated_local_segment_is_skipped_and_the_tile_still_arrives`
+/// truncates to 7 bytes, which lands below the window and misses it.
+#[test]
+fn an_archive_truncated_inside_its_root_directory_fails_the_open_rather_than_panicking() {
+    const TEST: &str =
+        "an_archive_truncated_inside_its_root_directory_fails_the_open_rather_than_panicking";
+    if open_archive_file(TEST).is_none() {
+        return;
+    }
+
+    // Every cap from the header's last byte to just inside the root
+    // directory's end: the whole window, not a sample of it.
+    for cap in [127usize, 128, 200, 400, 637] {
+        let inner = open_archive_file(TEST).expect("the fixture was there a moment ago");
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(BasemapArchive::open(CappedSource { inner, cap }))
+        }));
+        match opened {
+            Err(_) => panic!(
+                "an archive answering {cap} bytes aborted the task; a truncated archive must \
+                 fail the open, not unwind through it"
+            ),
+            Ok(Ok(_)) => panic!(
+                "an archive answering {cap} bytes opened, which is fewer than its own root \
+                 directory needs"
+            ),
+            Ok(Err(error)) => assert!(
+                matches!(error, ArchiveError::Open(_)),
+                "the truncation surfaces as a failed open: {error}"
+            ),
+        }
+    }
+
+    // And the first cap that holds the whole prelude still opens, so the
+    // guard is a bound rather than a blanket refusal.
+    let inner = open_archive_file(TEST).expect("the fixture was there a moment ago");
+    block_on(BasemapArchive::open(CappedSource { inner, cap: 638 }))
+        .expect("an answer holding the header and the whole root directory opens");
+}
+
 /// **A short read is never decoded.** The reader asks for structures whose
 /// lengths it knows, so one byte missing is an error at the seam rather than
 /// a directory or a tile body handed to a decoder a byte light.

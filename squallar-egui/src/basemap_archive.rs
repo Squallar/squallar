@@ -268,6 +268,33 @@ impl<S: ArchiveRangeSource> AsyncBackend for RangeBackend<S> {
             .await
             .map_err(|error| PmtError::Reading(std::io::Error::other(error)))?;
 
+        // `pmtiles` opens with a plain "up to `length`" read at offset zero
+        // and then slices BOTH the header and the root directory out of the
+        // one answer with `Bytes::split_off`/`split_to`
+        // (`pmtiles-0.23.0/src/async_reader.rs:88-102`) — which **panic**
+        // rather than erroring when the answer stops inside either. It only
+        // guards the header's own 127 bytes. Measured against the committed
+        // fixture: an answer of 0 or 100 bytes fails the open cleanly, and
+        // one of 127..=637 aborts the task.
+        //
+        // A truncated segment, or a `part000` that stops early, is exactly
+        // such a source. The bound is checked here because this is the one
+        // place holding both the read and what it answered, off the same
+        // header parser [`crate::pmt_index`] uses so the two cannot disagree
+        // about where the root directory is.
+        if offset == 0
+            && let Ok(header) = crate::pmt_index::parse_header(&bytes)
+            && (bytes.len() as u64) < header.root_offset.saturating_add(header.root_length)
+        {
+            return Err(PmtError::Reading(std::io::Error::other(format!(
+                "the archive answered {} bytes of its opening read, which stops inside the root \
+                 directory it declares at {}..{}",
+                bytes.len(),
+                header.root_offset,
+                header.root_offset.saturating_add(header.root_length)
+            ))));
+        }
+
         Ok(BackendResponse::new(bytes.into()))
     }
 }
