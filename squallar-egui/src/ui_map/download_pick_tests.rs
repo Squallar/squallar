@@ -348,3 +348,161 @@ fn the_arm_the_box_and_the_level_all_survive_a_reopen() {
          it was left"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The in-flight block
+// ---------------------------------------------------------------------------
+
+/// The bbox of the committed fixture, so a real engine has real bytes to move.
+/// Only the id has to match the picked box — that is what the panel keys the
+/// in-flight run on.
+fn monaco_run_spec(area_id: String) -> crate::basemap_download::AreaSpec {
+    crate::basemap_download::AreaSpec {
+        area_id,
+        west: 7.35,
+        south: 43.70,
+        east: 7.50,
+        north: 43.78,
+        max_zoom: 14,
+    }
+}
+
+/// A source that answers `budget` reads and then parks forever.
+///
+/// The engine is serial, so a spent budget **freezes** the ledger: nothing
+/// increments and no outcome lands, which is the only way to hold a run
+/// genuinely in flight while the glass is read. A finished run would not do —
+/// the frame settles it and the panel goes back to its start button.
+///
+/// The sibling in `ui_offline_areas::tests` is the same idea with a top-up
+/// door it needs and this does not.
+struct StalledSource {
+    inner: crate::basemap_archive::FileRangeSource,
+    budget: std::sync::atomic::AtomicI64,
+}
+
+impl crate::basemap_archive::RangeSource for StalledSource {
+    async fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, crate::basemap_archive::RangeError> {
+        use std::sync::atomic::Ordering;
+        if self.budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        self.inner.read_range(offset, length).await
+    }
+}
+
+/// **This is the panel the user watched sit at "0 of 20 parts".** It now draws
+/// a bar over the bytes with the exact byte figures beside it, and the segment
+/// vocabulary appears nowhere on it.
+///
+/// The figures come from a real engine over the committed Monaco fixture, held
+/// mid-run by a spent read budget so the reading is settled rather than raced.
+#[test]
+fn the_panels_in_flight_block_draws_bytes_and_never_a_part_count() {
+    const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
+    if std::fs::metadata(MONACO).is_err() {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "\n\
+             ###########################################################################\n\
+             ## SKIPPED, NOT PASSED: the_panels_in_flight_block_draws_bytes_and_never_a_part_count\n\
+             ##   no PMTiles archive at squallar-egui/testdata/monaco.pmtiles\n\
+             ##   this test asserted NOTHING.\n\
+             ###########################################################################"
+        );
+        return;
+    }
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("squallar-download-panel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut h = harness();
+    h.set_download_pick_armed(true);
+    h.warm_up();
+    let (centre, corner) = centre_and_corner(&h, 0, 60.0);
+    h.drag_download_area(centre, corner);
+    h.seed_download_size(SEEDED_CEILING, DetailLevel::TownsAndMainRoads, 47_000_000);
+    h.warm_up();
+
+    // The panel shows the one in-flight run whose id is the picked box's, so
+    // the engine is started under exactly that id.
+    let area_id = h
+        .gui()
+        .download_size
+        .area_spec(h.gui().download_detail)
+        .expect("a picked box has a spec")
+        .area_id;
+    let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
+        StalledSource {
+            inner: crate::basemap_archive::FileRangeSource::open(std::path::Path::new(MONACO))
+                .expect("the fixture opens"),
+            // Enough to open the index, plan, and land some tile bytes; far
+            // short of finishing the run.
+            budget: std::sync::atomic::AtomicI64::new(8),
+        },
+        crate::basemap_download::FsSegmentStore::new(dir.clone()),
+        monaco_run_spec(area_id),
+        String::new(),
+        h.ctx().clone(),
+        120_000,
+    );
+    // Frozen is proved, not assumed: two readings a beat apart that agree.
+    let start = std::time::Instant::now();
+    let progress = loop {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "the fixture download never reached a held mid-run state: {:?}",
+            engine.progress(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let first = engine.progress();
+        if !first.denominator_known() || first.bytes_done.bytes() == 0 {
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if engine.progress() == first {
+            break first;
+        }
+    };
+    assert!(
+        engine.outcome().is_none(),
+        "the run finished; the panel would have settled it away",
+    );
+
+    h.gui_mut().active_download = Some(engine);
+    h.warm_up();
+
+    let drawn = h.painted_text_strings_in(panel_rect(&h));
+    let bytes = crate::ui_download_area::progress_bytes_line(progress);
+    assert!(
+        drawn.iter().any(|text| text.contains(&bytes)),
+        "the panel does not show the exact byte figures ({bytes:?}); drawn: {drawn:?}",
+    );
+    assert!(
+        drawn.iter().any(|text| text.ends_with('%')),
+        "the panel drew no bar over the bytes; drawn: {drawn:?}",
+    );
+    let vocabulary: Vec<&String> = drawn
+        .iter()
+        .filter(|text| {
+            let folded = text.to_ascii_lowercase();
+            folded.contains("part") || folded.contains("segment")
+        })
+        .collect();
+    assert!(
+        vocabulary.is_empty(),
+        "the panel draws the segment vocabulary: {vocabulary:?}",
+    );
+
+    h.gui_mut().active_download = None;
+    let _ = std::fs::remove_dir_all(&dir);
+}

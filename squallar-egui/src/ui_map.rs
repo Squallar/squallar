@@ -1453,13 +1453,10 @@ impl super::Gui {
                     ui.separator();
                     match progress {
                         Some(progress) => {
-                            ui.label(format!(
-                                "{} of {} parts - {} of {}",
-                                progress.segments_done,
-                                progress.segments_total,
-                                progress.bytes_done.label(),
-                                progress.bytes_total.label(),
-                            ));
+                            // The same block the Downloaded areas screen
+                            // draws: one in-flight run, one shape, so the two
+                            // views cannot come to two answers about it.
+                            crate::ui_download_area::render_download_progress(ui, progress);
                             if ui.button(DOWNLOAD_CANCEL_LABEL).clicked() {
                                 cancel = true;
                             }
