@@ -235,6 +235,15 @@ pub struct App {
     /// before the first one. The running totals are a periodic readout and
     /// this is its clock; see that function.
     raster_telemetry_said: Option<web_time::Instant>,
+    /// What each frame cost this thread — see [`crate::frame_ledger`].
+    frame_ledger: crate::frame_ledger::FrameLedger,
+    /// Whether this install says the frame timing lines out loud — see
+    /// [`render::frame_telemetry_is_loud`]. Read once, at construction, for
+    /// the same reason [`Self::raster_telemetry_loud`] is.
+    frame_telemetry_loud: bool,
+    /// When [`App::report_frame_telemetry`] last wrote its lines; the same
+    /// periodic-readout clock shape as [`Self::raster_telemetry_said`].
+    frame_telemetry_said: Option<web_time::Instant>,
     /// The last predictive-back claim pushed to the platform, so the push is
     /// edge-triggered. `false` at construction because nothing is open on the
     /// first frame — which is also what the platform assumes until told
@@ -513,6 +522,7 @@ impl App {
         // Read here and not at the report, because the report runs once a
         // frame and a config read is not a per-frame cost.
         let raster_telemetry_loud = render::raster_telemetry_is_loud(platform.kv().as_deref());
+        let frame_telemetry_loud = render::frame_telemetry_is_loud(platform.kv().as_deref());
 
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
@@ -557,6 +567,9 @@ impl App {
             cached_dark_theme: None,
             raster_telemetry_loud,
             raster_telemetry_said: None,
+            frame_ledger: crate::frame_ledger::FrameLedger::default(),
+            frame_telemetry_loud,
+            frame_telemetry_said: None,
             back_claimed: false,
             exit_requested: false,
             autosave: AutosaveState {
@@ -656,6 +669,7 @@ impl App {
     }
 
     fn handle_redraw(&mut self) {
+        self.frame_ledger.mark_frame_start();
         self.input.clear_frame_state();
         self.poll_platform_state();
         self.poll_data_channels();
@@ -727,6 +741,15 @@ impl App {
                 self.egui_repaint_at = None;
             }
         }
+
+        // Close the frame's timing sample, bucketed by the renderer's own
+        // reading of this frame's input, and say the periodic lines if due.
+        let interacted = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.egui_renderer.frame_had_interaction());
+        self.frame_ledger.finalize(interacted);
+        self.report_frame_telemetry();
     }
 
     /// Take a theme reading, and say whether it changed anything.

@@ -216,6 +216,22 @@ pub(crate) fn raster_telemetry_is_loud(store: Option<&dyn squallar_kv::KvStore>)
     store.is_some_and(|kv| kv.load(RASTER_TELEMETRY_KEY).as_deref() == Some("1"))
 }
 
+/// The config key an install sets to hear the frame timing lines at `info`.
+///
+/// A separate switch from [`RASTER_TELEMETRY_KEY`], same mechanism: the two
+/// instruments answer different questions and a rig leg seeds only the ones
+/// it reads. On the browser this is the `localStorage` entry
+/// `squallar.frame_telemetry` — `squallar_web::kv::storage_key` is the
+/// prefix.
+pub(crate) const FRAME_TELEMETRY_KEY: &str = "frame_telemetry";
+
+/// Whether this install says the frame timing lines at `info` rather than
+/// `debug`. Same contract as [`raster_telemetry_is_loud`]: only a stored
+/// `"1"` turns it on.
+pub(crate) fn frame_telemetry_is_loud(store: Option<&dyn squallar_kv::KvStore>) -> bool {
+    store.is_some_and(|kv| kv.load(FRAME_TELEMETRY_KEY).as_deref() == Some("1"))
+}
+
 /// Whether a reading is due, given when the last one was said.
 ///
 /// A separate function because the alternative is a test that waits on a wall
@@ -224,8 +240,8 @@ fn telemetry_is_due(said: Option<web_time::Instant>, now: web_time::Instant) -> 
     said.is_none_or(|last| now.duration_since(last) >= RASTER_TELEMETRY_PERIOD)
 }
 
-/// Write one running-total line at the level this install asked for.
-fn say_raster_telemetry(loud: bool, line: &str) {
+/// Write one telemetry line at the level this install asked for.
+fn say_telemetry(loud: bool, line: &str) {
     if loud {
         log::info!("{line}");
     } else {
@@ -276,9 +292,131 @@ fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTo
     )
 }
 
+// ── The frame timing lines ──
+//
+// Values, not `log!` arguments, for the same seam reason as the raster lines
+// above: the browser rig reads these sentences back out of the console with
+// regexes, and `frame_telemetry_line_tests` pins each one. Every figure is a
+// whole microsecond and every percentile is a conservative bin upper edge —
+// see `squallar_device_profile::hist`. **No figure in any of these lines ever
+// gates CI.**
+
+/// A histogram percentile for a line: whole microseconds, `none` on an empty
+/// histogram, `over` when the ranked sample sits in the over-64 ms clamp,
+/// whose upper edge does not exist.
+fn pctl_us(h: &squallar_device_profile::hist::Hist, q: f64) -> String {
+    match h.percentile_upper_micros(q) {
+        None => "none".to_owned(),
+        Some(u32::MAX) => "over".to_owned(),
+        Some(us) => us.to_string(),
+    }
+}
+
+/// A histogram's raw counts for a line: 42 comma-separated totals — the
+/// under-62.5 µs clamp, the 40 geometric bins in edge order, the at-or-over
+/// 64 ms clamp. Cumulative from boot; a windowed reading is the difference of
+/// two of these.
+fn hist_counts(h: &squallar_device_profile::hist::Hist) -> String {
+    h.counts()
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The `frame service (interact):` line, histogram embedded.
+///
+/// Denominator: presented frames whose egui raw input carried at least one
+/// pointer/touch/wheel/zoom event. Service is the frame thread's own work —
+/// the whole redraw minus the swapchain acquire (the vsync block). Cumulative
+/// from boot.
+fn frame_service_interact_line(h: &squallar_device_profile::hist::Hist) -> String {
+    format!(
+        "frame service (interact): n={}, p50={} us, p90={} us, p99={} us, hist={}",
+        h.total(),
+        pctl_us(h, 0.50),
+        pctl_us(h, 0.90),
+        pctl_us(h, 0.99),
+        hist_counts(h),
+    )
+}
+
+/// The `frame service (idle):` line.
+///
+/// Denominator: presented frames whose egui raw input carried none of the
+/// interaction events — the floor under the interact family, and the figure
+/// that prices this instrument's own overhead. Cumulative from boot.
+fn frame_service_idle_line(h: &squallar_device_profile::hist::Hist) -> String {
+    format!(
+        "frame service (idle): n={}, p50={} us, p90={} us, p99={} us",
+        h.total(),
+        pctl_us(h, 0.50),
+        pctl_us(h, 0.90),
+        pctl_us(h, 0.99),
+    )
+}
+
+/// The `frame segments:` line — where an interact frame's service goes.
+///
+/// Denominator: interact frames only (see [`frame_service_interact_line`]),
+/// p99 per segment. The acquire is reported beside them and is **not** a
+/// service segment: it is the vsync block, already excluded from service, and
+/// adding it to the six segments does not produce any figure this instrument
+/// quotes.
+fn frame_segments_line(
+    s: &crate::frame_ledger::SegmentHists,
+    acquire: &squallar_device_profile::hist::Hist,
+) -> String {
+    format!(
+        "frame segments (interact, p99 us): pre={}, pump={}, ui={}, \
+         prepare={}, finish={}, post={}; acquire n={}, p50={} us, p99={} us",
+        pctl_us(&s.pre, 0.99),
+        pctl_us(&s.pump, 0.99),
+        pctl_us(&s.ui, 0.99),
+        pctl_us(&s.prepare, 0.99),
+        pctl_us(&s.finish, 0.99),
+        pctl_us(&s.post, 0.99),
+        acquire.total(),
+        pctl_us(acquire, 0.50),
+        pctl_us(acquire, 0.99),
+    )
+}
+
+/// The `frame prep costs:` running-total line.
+///
+/// Denominator: every egui pass this renderer ended, presented or not — see
+/// [`squallar_gpu::egui_renderer::pass_costs::PassCosts`], whose fields these
+/// are. Cumulative microsecond totals, not percentiles: cost per pass is the
+/// figure divided by the pass count of the same reading.
+fn prep_costs_line(c: &squallar_gpu::egui_renderer::pass_costs::PassCosts) -> String {
+    format!(
+        "frame prep costs: {} passes, {} us tessellate, {} us upload apply, \
+         {} us mirror, {} us buffers and callbacks",
+        c.passes, c.tessellate_us, c.upload_apply_us, c.mirror_us, c.buffers_and_callbacks_us,
+    )
+}
+
+/// The `frame cadence:` line, histogram embedded.
+///
+/// Denominator: the interval between consecutive **presented** frames'
+/// starts — redraw to redraw, both input families. The co-criterion beside
+/// service: on a leg whose GPU passes cannot be timed, a limping cadence is
+/// what betrays a GPU-bound frame whose CPU service reads innocent. **Never
+/// added to service** — the two share no denominator. Cumulative from boot.
+fn frame_cadence_line(h: &squallar_device_profile::hist::Hist) -> String {
+    format!(
+        "frame cadence: n={}, p50={} us, p99={} us, hist={}",
+        h.total(),
+        pctl_us(h, 0.50),
+        pctl_us(h, 0.99),
+        hist_counts(h),
+    )
+}
+
 impl super::App {
     /// Set up and run the egui UI pass.
     pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
+        self.frame_ledger.mark_setup_entry();
         // Before the pass, because the cache it writes is read by everything
         // that rasterizes off-frame — see `App::resolve_theme`.
         let use_dark_theme = self.resolve_theme();
@@ -344,7 +482,9 @@ impl super::App {
         self.push_frame_inputs();
 
         // Last, so this frame is laid out over everything applied above.
+        self.frame_ledger.mark_ui_start();
         let gui_action = self.gui.ui(&ctx);
+        self.frame_ledger.mark_ui_end();
 
         (size_in_pixels, gui_action)
     }
@@ -808,11 +948,48 @@ impl super::App {
         self.raster_telemetry_said = Some(now);
         let loud = self.raster_telemetry_loud;
         if let Some(t) = rasters {
-            say_raster_telemetry(loud, &overlay_raster_line(&t));
+            say_telemetry(loud, &overlay_raster_line(&t));
         }
         if let Some(u) = uploads {
-            say_raster_telemetry(loud, &texture_upload_line(&u));
+            say_telemetry(loud, &texture_upload_line(&u));
         }
+    }
+
+    /// Say the five frame timing lines, at most once per
+    /// [`RASTER_TELEMETRY_PERIOD`] — the frame instrument shares the raster
+    /// one's cadence deliberately, so one 2 s console poll hears both.
+    ///
+    /// Unlike the raster report there is no `*_if_moved` arm: this runs at
+    /// the end of a frame, so the ledger has always moved since the last due
+    /// tick, and printing every family every tick — the interact one at
+    /// `n=0` included — is what lets a reader see "nobody touched the
+    /// window" as a figure rather than as an absence.
+    ///
+    /// **How loud**: `debug` on an ordinary install, `info` where
+    /// [`frame_telemetry_is_loud`] says this install asked — the same
+    /// level-not-sentence switch as the raster lines, for the same
+    /// browser-console reason.
+    pub(super) fn report_frame_telemetry(&mut self) {
+        let now = web_time::Instant::now();
+        if !telemetry_is_due(self.frame_telemetry_said, now) {
+            return;
+        }
+        self.frame_telemetry_said = Some(now);
+        let loud = self.frame_telemetry_loud;
+        let ledger = &self.frame_ledger;
+        say_telemetry(
+            loud,
+            &frame_service_interact_line(ledger.service_interact()),
+        );
+        say_telemetry(loud, &frame_service_idle_line(ledger.service_idle()));
+        say_telemetry(
+            loud,
+            &frame_segments_line(ledger.segments(), ledger.acquire()),
+        );
+        if let Some(state) = self.state.as_ref() {
+            say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
+        }
+        say_telemetry(loud, &frame_cadence_line(ledger.cadence()));
     }
 
     /// Promote every held raster, as the frame after the last band lands does.
@@ -2028,6 +2205,9 @@ impl super::App {
                 });
 
         // Finish egui's pass and upload its textures, THEN ask for a surface.
+        // The acquire span is stamped through a closure-local `Cell` so the
+        // ledger borrow stays disjoint from the closures' captures.
+        let acquire_span = std::cell::Cell::new(None);
         let (mut frame, status) = finish_then_acquire(
             || {
                 state.egui_renderer.end_pass_and_upload(
@@ -2039,13 +2219,22 @@ impl super::App {
                     mirror,
                 )
             },
-            |finished| Self::get_surface_texture(&state.surface, finished),
+            |finished| {
+                let acquire_start = web_time::Instant::now();
+                let acquired = Self::get_surface_texture(&state.surface, finished);
+                acquire_span.set(Some((acquire_start, web_time::Instant::now())));
+                acquired
+            },
         );
+        if let Some((acquire_start, acquire_end)) = acquire_span.get() {
+            self.frame_ledger.record_acquire(acquire_start, acquire_end);
+        }
         let repaint_delay = frame.repaint_delay();
 
         let surface_texture = match status {
             SurfaceStatus::Ready(texture) => texture,
             SurfaceStatus::Skip | SurfaceStatus::Lost => {
+                self.frame_ledger.mark_skipped();
                 frame.submit(&state.queue, encoder);
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
@@ -2069,6 +2258,7 @@ impl super::App {
                     self.gui.clear_graphics_state();
                     self.state = None;
                 }
+                self.frame_ledger.mark_present_return();
                 return repaint_delay;
             }
         };
@@ -2084,6 +2274,7 @@ impl super::App {
         frame.submit(&state.queue, encoder);
         state.egui_renderer.free_textures(frame.textures_to_free());
         surface_texture.present();
+        self.frame_ledger.mark_present_return();
         repaint_delay
     }
 
@@ -4675,6 +4866,12 @@ fn render_already_queued<'a>(
 #[path = "app_render/raster_telemetry_line_tests.rs"]
 #[cfg(test)]
 mod raster_telemetry_line_tests;
+
+/// The five frame timing sentences, pinned word for word, and the key that
+/// makes them loud.
+#[path = "app_render/frame_telemetry_line_tests.rs"]
+#[cfg(test)]
+mod frame_telemetry_line_tests;
 
 /// The order one frame is assembled in.
 #[path = "app_render/declared_nyquist_dispatch_tests.rs"]
