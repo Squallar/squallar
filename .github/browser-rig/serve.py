@@ -61,6 +61,36 @@ SIGTERM/SIGINT):
     python3 serve.py --dir /home/reddragon/projects/squallar/squallar-web \
         --port 0 --log out/serve.log
     # stdout: RIG-SERVE-READY <port> http://127.0.0.1:<port>/
+
+TLS (WO-5, the mobile-row blocker): a phone on plain LAN HTTP is not a
+secure context, so no crossOriginIsolated, no SharedArrayBuffer, a dead
+rasterization worker, and `run_here` on the page thread -- the mobile legs
+would silently measure a threading configuration the app never ships in.
+Three ways to serve https:
+
+  --tls-cert C --tls-key K   a cert you provisioned (mkcert is the intended
+                             tool -- its CA is installable on phones)
+  --tls                      generate a throwaway self-signed pair via the
+                             openssl CLI (SANs: localhost, 127.0.0.1, this
+                             box's LAN IP). Desktop drivers accept it via
+                             acceptInsecureCerts; PHONES DO NOT -- see below.
+  (neither)                  plain http, unchanged
+
+Phone provisioning (do this once per test device; safaridriver rejects
+acceptInsecureCerts, and Android Chrome has no such switch for a manual
+run):
+  1. host:   mkcert -install && mkcert <LAN-IP> localhost 127.0.0.1
+  2. host:   serve with --tls-cert <LAN-IP>+2.pem --tls-key <LAN-IP>+2-key.pem
+             --host 0.0.0.0
+  3. phone:  copy the CA from `mkcert -CAROOT` (rootCA.pem) to the device and
+             install it -- iOS: AirDrop/mail the file, Settings > General >
+             VPN & Device Management > install profile, THEN Settings >
+             General > About > Certificate Trust Settings > enable full
+             trust. Android: Settings > Security > More > Install from
+             device storage > CA certificate (accept the warning).
+  4. phone:  browse to https://<LAN-IP>:<port>/index-rig.html -- the page
+             must report crossOriginIsolated=true (drive.py prints it as a
+             denominator on every leg; a row without it is invalid).
 """
 
 import argparse
@@ -69,10 +99,52 @@ import http.server
 import json
 import os
 import signal
+import socket
+import ssl
+import subprocess
 import sys
 import threading
 
 DEFAULT_DIR = "/home/reddragon/projects/squallar/squallar-web"
+
+
+def lan_ip():
+    """This box's LAN address, for the self-signed SAN list. A UDP connect
+    never sends a packet; it only asks the kernel which source address the
+    default route would use."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 80))  # TEST-NET-1; nothing is sent
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def selfsigned_pair(out_dir):
+    """A throwaway self-signed cert/key via the openssl CLI (mkcert-less
+    fallback). Fresh every call -- 30 days of validity on a file nobody
+    keeps. Desktop drivers accept it through acceptInsecureCerts; phones
+    need the mkcert route in the module doc instead."""
+    os.makedirs(out_dir, exist_ok=True)
+    cert = os.path.join(out_dir, "rig-selfsigned.crt")
+    key = os.path.join(out_dir, "rig-selfsigned.key")
+    sans = ["DNS:localhost", "IP:127.0.0.1"]
+    ip = lan_ip()
+    if ip:
+        sans.append("IP:%s" % ip)
+    r = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256",
+         "-nodes", "-days", "30", "-keyout", key, "-out", cert,
+         "-subj", "/CN=squallar-rig",
+         "-addext", "subjectAltName=%s" % ",".join(sans)],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("openssl self-signed generation failed rc=%d: %s"
+                           % (r.returncode, r.stderr.strip()[-400:]))
+    return cert, key
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -319,12 +391,19 @@ class RigServer(http.server.ThreadingHTTPServer):
 
 def start_server(directory=DEFAULT_DIR, port=0, host="127.0.0.1",
                  log=None, block_sw=True, instrument_worker=True, coep=False,
-                 seed_local_storage=None, doctor_first_worker=False):
+                 seed_local_storage=None, doctor_first_worker=False,
+                 tls_cert=None, tls_key=None):
     """Start serving in a daemon thread. Returns (httpd, thread).
     Stop with stop_server(httpd, thread). Port 0 picks a free port;
-    read it from httpd.server_address[1]."""
+    read it from httpd.server_address[1]. With tls_cert+tls_key the
+    listening socket is TLS-wrapped and the served scheme is https."""
     handler = functools.partial(RigHandler, directory=directory)
     httpd = RigServer((host, port), handler)
+    httpd.rig_tls = bool(tls_cert and tls_key)
+    if httpd.rig_tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(tls_cert, tls_key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     httpd.rig_dir = directory
     httpd.rig_log = log
     httpd.rig_log_lock = threading.Lock()
@@ -373,7 +452,33 @@ def main(argv=None):
                     help="answer the FIRST /worker.js request with a stub that "
                          "posts a doctored build token; later requests get the "
                          "real file (the Tier-2 respawn leg)")
+    ap.add_argument("--tls-cert", default=None, metavar="PEM",
+                    help="serve https with this certificate (pair with "
+                         "--tls-key; mkcert output is the intended input -- "
+                         "see the module doc for phone provisioning)")
+    ap.add_argument("--tls-key", default=None, metavar="PEM",
+                    help="private key for --tls-cert")
+    ap.add_argument("--tls", action="store_true",
+                    help="serve https with a throwaway self-signed pair "
+                         "generated via the openssl CLI (SANs: localhost, "
+                         "127.0.0.1, this box's LAN IP). Desktop drivers "
+                         "accept it via acceptInsecureCerts; phones need "
+                         "the mkcert route instead")
     args = ap.parse_args(argv)
+
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print("FATAL: --tls-cert and --tls-key come as a pair",
+              file=sys.stderr)
+        return 1
+    tls_cert, tls_key = args.tls_cert, args.tls_key
+    if args.tls and not tls_cert:
+        try:
+            tls_cert, tls_key = selfsigned_pair(
+                os.path.dirname(os.path.abspath(args.log))
+                if args.log != "-" else ".")
+        except (RuntimeError, OSError) as e:
+            print("FATAL: %s" % e, file=sys.stderr)
+            return 1
 
     if not os.path.isfile(os.path.join(args.dir, "index.html")):
         print("FATAL: no index.html under %s" % args.dir, file=sys.stderr)
@@ -398,10 +503,12 @@ def main(argv=None):
         block_sw=not args.no_block_sw,
         instrument_worker=not args.no_instrument_worker, coep=args.coep,
         seed_local_storage=seed,
-        doctor_first_worker=args.doctor_first_worker)
+        doctor_first_worker=args.doctor_first_worker,
+        tls_cert=tls_cert, tls_key=tls_key)
     port = httpd.server_address[1]
+    scheme = "https" if httpd.rig_tls else "http"
     # Exactly one machine-parseable stdout line.
-    print("RIG-SERVE-READY %d http://%s:%d/" % (port, args.host, port),
+    print("RIG-SERVE-READY %d %s://%s:%d/" % (port, scheme, args.host, port),
           flush=True)
 
     stop = threading.Event()
