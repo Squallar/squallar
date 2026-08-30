@@ -230,6 +230,12 @@ impl super::Gui {
                 {
                     probe.close = close.rect;
                 }
+                // A UiSweep target: the button leg of the sweep — press,
+                // release, and the inspector the sweep opened goes away.
+                crate::gesture_player::click_registry::register(
+                    crate::gesture_player::ui_sweep::INSPECTOR_CLOSE,
+                    close.rect,
+                );
                 if close.clicked() {
                     self.insp_open = false;
                 }

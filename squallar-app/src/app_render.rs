@@ -232,6 +232,25 @@ pub(crate) fn frame_telemetry_is_loud(store: Option<&dyn squallar_kv::KvStore>) 
     store.is_some_and(|kv| kv.load(FRAME_TELEMETRY_KEY).as_deref() == Some("1"))
 }
 
+/// The config key that arms the gesture player: a script name from
+/// `squallar_egui::gesture_player`. On the browser this is the `localStorage`
+/// entry `squallar.gesture_script` — `squallar_web::kv::storage_key` is the
+/// prefix — so the rig can seed it beside `frame_telemetry`.
+pub(crate) const GESTURE_SCRIPT_KEY: &str = "gesture_script";
+
+/// Arm the gesture player, or `None` — the shipping state. `env` is the
+/// `SQUALLAR_GESTURE_SCRIPT` variable's value, taken as a parameter so this
+/// stays a pure function of its inputs; it outranks the stored key, and the
+/// read compiles identically on every target (the variable simply never
+/// exists on the web).
+pub(crate) fn gesture_player_from(
+    env: Option<String>,
+    store: Option<&dyn squallar_kv::KvStore>,
+) -> Option<squallar_egui::gesture_player::GesturePlayer> {
+    let name = env.or_else(|| store.and_then(|kv| kv.load(GESTURE_SCRIPT_KEY)))?;
+    squallar_egui::gesture_player::GesturePlayer::from_name(&name)
+}
+
 /// Whether a reading is due, given when the last one was said.
 ///
 /// A separate function because the alternative is a test that waits on a wall
@@ -464,8 +483,33 @@ impl super::App {
             // The CSS-size-to-backing-store ratio, and nothing else.
             let zoom_factor = state.surface_config.width as f32 / window_size.width.max(1) as f32;
 
+            // The gesture player's frame, empty on every unarmed install.
+            // Computed against the window in egui points, since that is the
+            // space the events land in.
+            let extra_events = match self.gesture_player.as_mut() {
+                Some(player) => {
+                    let ppp = state
+                        .egui_renderer
+                        .context()
+                        .pixels_per_point()
+                        .max(f32::EPSILON);
+                    let screen = egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(
+                            window_size.width as f32 / ppp,
+                            window_size.height as f32 / ppp,
+                        ),
+                    );
+                    let now_secs = player.elapsed_secs();
+                    player.events_for_frame(now_secs, screen)
+                }
+                None => Vec::new(),
+            };
+
             // Start egui frame
-            state.egui_renderer.begin_frame(window, zoom_factor);
+            state
+                .egui_renderer
+                .begin_frame(window, zoom_factor, extra_events);
 
             state.egui_renderer.apply_theme(use_dark_theme);
 
@@ -4952,6 +4996,12 @@ mod raster_telemetry_line_tests;
 #[path = "app_render/frame_telemetry_line_tests.rs"]
 #[cfg(test)]
 mod frame_telemetry_line_tests;
+
+/// The gesture player's arming seam: absent key and variable arm nothing —
+/// the non-vacuity pair's dormant half — and the key is pinned.
+#[path = "app_render/gesture_arming_tests.rs"]
+#[cfg(test)]
+mod gesture_arming_tests;
 
 /// The order one frame is assembled in.
 #[path = "app_render/declared_nyquist_dispatch_tests.rs"]

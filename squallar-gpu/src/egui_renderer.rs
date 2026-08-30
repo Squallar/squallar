@@ -297,9 +297,22 @@ impl EguiRenderer {
     /// native pixels-per-point on the raw input. A finished pixels_per_point
     /// gets divided back out by the scale egui currently holds, which
     /// overshoots on the frame a monitor's DPI changes.
-    pub fn begin_frame(&mut self, window: &Window, zoom_factor: f32) {
+    ///
+    /// `extra_events` is the gesture player's injection seam: appended ahead
+    /// of the normalizers, so a scripted Line-unit wheel notch or per-finger
+    /// touch takes the same rewrite path a real one would, and ahead of the
+    /// interaction scan, so a scripted frame tags *interact* with no special
+    /// case. Empty on every unarmed install, which leaves the raw input
+    /// byte-identical.
+    pub fn begin_frame(
+        &mut self,
+        window: &Window,
+        zoom_factor: f32,
+        extra_events: Vec<egui::Event>,
+    ) {
         self.context().set_zoom_factor(zoom_factor);
         let mut raw_input = self.state.take_egui_input(window);
+        raw_input.events.extend(extra_events);
         // Before `begin_pass`: egui buckets touches by device as it folds the
         // events in.
         squallar_egui::normalize_touch_devices(&mut raw_input);

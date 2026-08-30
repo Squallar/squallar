@@ -16,32 +16,11 @@
 //! # Event fidelity
 //!
 //! The pointer helpers emit exactly the event sequences the real integrations
-//! produce. `egui-winit` 0.35.0 (`src/lib.rs`):
-//!
-//! | winit event                | emitted here                                          |
-//! |----------------------------|-------------------------------------------------------|
-//! | `TouchPhase::Started`      | `Touch{Start}`, `PointerMoved`, `PointerButton{down}` |
-//! | `TouchPhase::Moved`        | `Touch{Move}`, `PointerMoved`                         |
-//! | `TouchPhase::Ended`        | `Touch{End}`, `PointerButton{up}`, `PointerGone`      |
-//! | `TouchPhase::Cancelled`    | `Touch{Cancel}`, `PointerGone` — **no release**       |
-//! | `WindowEvent::CursorLeft`  | `PointerGone` alone — and the position is forgotten,  |
-//! |                            | so a release out there is dropped (`lib.rs:784`)      |
-//!
-//! eframe 0.35.0's web canvas (`src/web/events.rs`):
-//!
-//! | DOM event     | emitted here                                                |
-//! |---------------|-------------------------------------------------------------|
-//! | `touchstart`  | `PointerButton{down}` **then** `Touch{Start}` — order flipped |
-//! | `touchmove`   | `PointerMoved`, `Touch{Move}`                               |
-//! | `touchend`    | `PointerButton{up}`, `PointerGone`, `Touch{End}`            |
-//! | `touchcancel` | `Touch{Cancel}` **alone** — no release, no `PointerGone`    |
-//! | `mousemove`   | `PointerMoved`                                              |
-//!
-//! A cancelled touch never reports a release and egui does not clear
-//! `pointer.down` on `PointerGone`, so any gesture that only exits on "pointer
-//! up" stays stuck forever; on the web there is no `PointerGone` either.
+//! produce — the tables live in [`crate::input_fidelity`], the one copy this
+//! harness and the shipped [`crate::gesture_player`] both emit from.
 
 use crate::Gui;
+use crate::input_fidelity::{self, WEB_FINGER_A, WEB_FINGER_B, web_touch};
 use crate::pane::{PaneKind, SectionLine};
 use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
@@ -540,32 +519,19 @@ impl InputHarness {
 
     /// Scroll the widget under `pos`, as a wheel or a two-finger drag does.
     pub(crate) fn scroll_at(&mut self, pos: egui::Pos2, delta: egui::Vec2) {
-        self.events.push(egui::Event::PointerMoved(pos));
-        self.events.push(egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta,
-            phase: egui::TouchPhase::Move,
-            modifiers: egui::Modifiers::default(),
-        });
+        input_fidelity::wheel(&mut self.events, pos, egui::MouseWheelUnit::Point, delta);
     }
 
     /// One wheel notch over `pos`, in whichever unit the browser chose to
-    /// report it in. `egui-winit` derives the unit straight from winit's
-    /// `MouseScrollDelta`, so this is the only thing that differs between a
-    /// browser that sends `DOM_DELTA_PIXEL` and one that sends `DOM_DELTA_LINE`.
+    /// report it in — see [`input_fidelity::wheel`] for where the unit comes
+    /// from.
     pub(crate) fn wheel_notch(
         &mut self,
         pos: egui::Pos2,
         unit: egui::MouseWheelUnit,
         delta_y: f32,
     ) {
-        self.events.push(egui::Event::PointerMoved(pos));
-        self.events.push(egui::Event::MouseWheel {
-            unit,
-            delta: egui::vec2(0.0, delta_y),
-            phase: egui::TouchPhase::Move,
-            modifiers: egui::Modifiers::default(),
-        });
+        input_fidelity::wheel(&mut self.events, pos, unit, egui::vec2(0.0, delta_y));
     }
 
     /// Every menu leaf the last frame's chrome actually drew, whichever
@@ -2060,164 +2026,117 @@ impl InputHarness {
     // --- mouse input (mirrors egui-winit's cursor + button handling) --------
 
     pub(crate) fn mouse_move(&mut self, pos: egui::Pos2) {
-        self.events.push(egui::Event::PointerMoved(pos));
+        input_fidelity::mouse_move(&mut self.events, pos);
     }
 
     pub(crate) fn mouse_press(&mut self, pos: egui::Pos2) {
-        self.mouse_move(pos);
-        self.events.push(pointer_button(pos, true));
+        input_fidelity::mouse_press(&mut self.events, pos);
     }
 
     pub(crate) fn mouse_release(&mut self, pos: egui::Pos2) {
-        self.mouse_move(pos);
-        self.events.push(pointer_button(pos, false));
+        input_fidelity::mouse_release(&mut self.events, pos);
     }
 
     /// The right button down. The 3D pane's pan is on it, and egui reports
     /// per-button drags — so a test that pressed the primary button would be
     /// testing the orbit.
     pub(crate) fn mouse_press_secondary(&mut self, pos: egui::Pos2) {
-        self.mouse_move(pos);
-        self.events
-            .push(pointer_button_of(pos, egui::PointerButton::Secondary, true));
+        input_fidelity::mouse_press_secondary(&mut self.events, pos);
     }
 
     pub(crate) fn mouse_release_secondary(&mut self, pos: egui::Pos2) {
-        self.mouse_move(pos);
-        self.events.push(pointer_button_of(
-            pos,
-            egui::PointerButton::Secondary,
-            false,
-        ));
+        input_fidelity::mouse_release_secondary(&mut self.events, pos);
     }
 
-    /// The cursor left the window: `egui-winit` maps `WindowEvent::CursorLeft`
-    /// to a bare [`egui::Event::PointerGone`] and forgets the pointer position
-    /// (`egui-winit-0.34.1/src/lib.rs:340`). **No release is reported** — and
-    /// while the position is forgotten, a real mouse release happening outside
-    /// the window is dropped on the floor too (`lib.rs:796`), which is why
-    /// egui's `primary_down()` can stay latched across the excursion.
+    /// See [`input_fidelity::cursor_left`]: a bare `PointerGone`, **no
+    /// release**, and egui's `primary_down()` can stay latched across the
+    /// excursion.
     pub(crate) fn cursor_left(&mut self) {
-        self.events.push(egui::Event::PointerGone);
+        input_fidelity::cursor_left(&mut self.events);
     }
 
     /// Raw device motion (`DeviceEvent::MouseMotion` → [`egui::Event::MouseMoved`]).
     pub(crate) fn mouse_moved_raw(&mut self, delta: egui::Vec2) {
-        self.events.push(egui::Event::MouseMoved(delta));
+        input_fidelity::mouse_moved_raw(&mut self.events, delta);
     }
 
     // --- web input (mirrors eframe 0.34.1's canvas listeners) ---------------
 
-    /// `touchstart`, as eframe's web canvas emits it: the primary
-    /// `PointerButton{pressed}` **first**, then `push_touches(Start)`
-    /// (`eframe/src/web/events.rs:676`) — the opposite order to `egui-winit`,
-    /// which is why the tracker correlates the pair over the whole frame.
+    /// `touchstart` on the web canvas: button first, touch second — see
+    /// [`input_fidelity::web_touch_start`] for why the order matters.
     pub(crate) fn web_touch_start(&mut self, pos: egui::Pos2) {
-        self.events.push(pointer_button(pos, true));
-        self.events.push(touch(egui::TouchPhase::Start, pos));
+        input_fidelity::web_touch_start(&mut self.events, pos);
     }
 
-    /// `touchmove` (`events.rs:709`): a bare `PointerMoved`, with the raw touch
-    /// pushed alongside it.
     pub(crate) fn web_touch_move(&mut self, pos: egui::Pos2) {
-        self.events.push(egui::Event::PointerMoved(pos));
-        self.events.push(touch(egui::TouchPhase::Move, pos));
+        input_fidelity::web_touch_move(&mut self.events, pos);
     }
 
-    /// `touchcancel` (`events.rs:788`): `push_touches(Cancel)` and **nothing
-    /// else** — no release, no `PointerGone`. egui's `primary_down()` therefore
-    /// stays latched `true` with no event ever clearing it, so a tracker that
-    /// keys cancellation on `PointerGone` alone never fires at all here.
+    /// `touchcancel` on the web: the cancel **alone** — see
+    /// [`input_fidelity::web_touch_cancel`] for the latch this creates.
     pub(crate) fn web_touch_cancel(&mut self, pos: egui::Pos2) {
-        self.events.push(touch(egui::TouchPhase::Cancel, pos));
+        input_fidelity::web_touch_cancel(&mut self.events, pos);
     }
 
-    /// `mousemove` (`events.rs:627`): a bare `PointerMoved`. Note this reaches
-    /// the canvas whether or not any touch is involved, which is what makes a
-    /// motion-based un-latch dangerous after a cancellation on the web.
     pub(crate) fn web_mouse_move(&mut self, pos: egui::Pos2) {
-        self.events.push(egui::Event::PointerMoved(pos));
+        input_fidelity::web_mouse_move(&mut self.events, pos);
     }
 
     // --- touch input (mirrors egui-winit's `on_touch`) ----------------------
 
     pub(crate) fn touch_start(&mut self, pos: egui::Pos2) {
-        self.events.push(touch(egui::TouchPhase::Start, pos));
-        self.events.push(egui::Event::PointerMoved(pos));
-        self.events.push(pointer_button(pos, true));
+        input_fidelity::touch_start(&mut self.events, pos);
     }
 
     pub(crate) fn touch_move(&mut self, pos: egui::Pos2) {
-        self.events.push(touch(egui::TouchPhase::Move, pos));
-        self.events.push(egui::Event::PointerMoved(pos));
+        input_fidelity::touch_move(&mut self.events, pos);
     }
 
     pub(crate) fn touch_end(&mut self, pos: egui::Pos2) {
-        self.events.push(touch(egui::TouchPhase::End, pos));
-        self.events.push(pointer_button(pos, false));
-        self.events.push(egui::Event::PointerGone);
+        input_fidelity::touch_end(&mut self.events, pos);
     }
 
     /// The OS/browser took the gesture away: **no release is reported**, only
     /// `PointerGone`, exactly as `egui-winit` does for `TouchPhase::Cancelled`.
     pub(crate) fn touch_cancel(&mut self, pos: egui::Pos2) {
-        self.events.push(touch(egui::TouchPhase::Cancel, pos));
-        self.events.push(egui::Event::PointerGone);
+        input_fidelity::touch_cancel(&mut self.events, pos);
     }
 
     /// A *secondary* finger's touch being cancelled: a raw `Touch{Cancel}` for
     /// another `TouchId`, with no `PointerGone`, since the emulated pointer is
     /// still owned by the primary finger.
     pub(crate) fn secondary_touch_cancel(&mut self, pos: egui::Pos2) {
-        self.events.push(egui::Event::Touch {
-            device_id: egui::TouchDeviceId(0),
-            id: egui::TouchId(1),
-            phase: egui::TouchPhase::Cancel,
-            pos,
-            force: None,
-        });
+        input_fidelity::secondary_touch_cancel(&mut self.events, pos);
     }
 
     // --- multi-touch (mirrors winit's web backend) --------------------------
 
     /// A second finger lands while the first stays down.
     pub(crate) fn web_second_finger_down(&mut self, pos: egui::Pos2) {
-        self.events
-            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::Start, pos));
+        input_fidelity::web_second_finger_down(&mut self.events, pos);
     }
 
     /// Both fingers move. Only the first drives the emulated pointer.
     pub(crate) fn web_pinch_move(&mut self, a: egui::Pos2, b: egui::Pos2) {
-        self.events
-            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::Move, a));
-        self.events.push(egui::Event::PointerMoved(a));
-        self.events
-            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::Move, b));
+        input_fidelity::web_pinch_move(&mut self.events, a, b);
     }
 
     /// The first finger goes down, on the web backend's per-finger device.
     pub(crate) fn web_first_finger_down(&mut self, pos: egui::Pos2) {
-        self.events
-            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::Start, pos));
-        self.events.push(egui::Event::PointerMoved(pos));
-        self.events.push(pointer_button(pos, true));
+        input_fidelity::web_first_finger_down(&mut self.events, pos);
     }
 
     /// Lift the **second** finger, leaving the first down — pinch ending with
     /// one finger still on the glass.
     pub(crate) fn web_second_finger_up(&mut self, pos: egui::Pos2) {
-        self.events
-            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::End, pos));
+        input_fidelity::web_second_finger_up(&mut self.events, pos);
     }
 
     /// Lift the **first** finger — the one backing the emulated pointer —
     /// while the second stays down. `egui-winit` releases and drops the pointer
     /// here (`lib.rs:904`), so this is the ordering that can strand the map.
     pub(crate) fn web_first_finger_up(&mut self, pos: egui::Pos2) {
-        self.events
-            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::End, pos));
-        self.events.push(pointer_button(pos, false));
-        self.events.push(egui::Event::PointerGone);
+        input_fidelity::web_first_finger_up(&mut self.events, pos);
     }
 
     /// Spread two fingers apart from `center` over `steps` frames, from
@@ -2306,6 +2225,13 @@ impl InputHarness {
         self.frame_after(FRAME_DT);
         self.mouse_release(pos);
         self.frame_after(0.05)
+    }
+
+    /// Queue pre-built events for the next frame — the harness-side stand-in
+    /// for `EguiRenderer::begin_frame`'s `extra_events` append, so a scripted
+    /// player can be driven through the same normalize-then-pass pipeline.
+    pub(crate) fn inject_events(&mut self, events: Vec<egui::Event>) {
+        self.events.extend(events);
     }
 
     /// Run one egui pass: `Gui::ui` followed by the pane pointer resolution.
@@ -2436,51 +2362,15 @@ impl InputHarness {
     }
 }
 
-fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
-    pointer_button_of(pos, egui::PointerButton::Primary, pressed)
-}
-
-fn pointer_button_of(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
-    egui::Event::PointerButton {
-        pos,
-        button,
-        pressed,
-        modifiers: egui::Modifiers::default(),
-    }
-}
-
-fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
-    egui::Event::Touch {
-        device_id: egui::TouchDeviceId(0),
-        id: egui::TouchId(0),
-        phase,
-        pos,
-        force: None,
-    }
-}
-
-/// The browser `pointerId`s the two fingers arrive under. winit's web backend
-/// uses that one number for **both** the touch id and the device id
-/// (`window_target.rs:410`), so these deliberately do the same.
-const WEB_FINGER_A: u64 = 3;
-const WEB_FINGER_B: u64 = 4;
-
-/// A touch exactly as winit's web backend reports it: a device id fabricated
-/// per finger from the pointer id.
-fn web_touch(pointer_id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
-    egui::Event::Touch {
-        device_id: egui::TouchDeviceId(pointer_id),
-        id: egui::TouchId(pointer_id),
-        phase,
-        pos,
-        force: None,
-    }
-}
-
 /// The pane grid at the width it is drawn at, the toggle over it, and closing
 /// one specific pane.
 #[cfg(test)]
 mod pane_layout_tests;
+
+/// The click-registry gate (WO-4): one UiSweep loop drives the real widgets
+/// through the real input path, counted from the registry.
+#[cfg(test)]
+mod gesture_sweep_tests;
 
 #[cfg(test)]
 mod tests;
