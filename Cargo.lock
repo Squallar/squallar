@@ -4655,6 +4655,7 @@ dependencies = [
  "squallar-radar",
  "squallar-volumetric",
  "syn 3.0.3",
+ "web-time",
  "wgpu",
  "winit",
 ]

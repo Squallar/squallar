@@ -100,6 +100,12 @@ fn the_dependency_ceiling_holds() {
                     | "wgpu"
                     | "squallar-egui"
                     | "squallar-device-profile"
+                    // The pass-cost ledger stamps `end_pass_and_upload`'s
+                    // phases on every target, and `std::time::Instant` panics
+                    // on wasm32; web-time is the std-backed alias everywhere
+                    // else and carries no API of its own. Admitted with the
+                    // frame-instrument plan, in writing, per the clause below.
+                    | "web-time"
             ),
             other => panic!(
                 "squallar-gpu declares a `{other}` dependency on {name}; \

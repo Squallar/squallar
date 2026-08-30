@@ -448,3 +448,59 @@ fn the_mirror_pass_submits_between_the_two_uploads_and_runs_before_prepare() {
          one frame behind the pane it mirrors on every pan.",
     );
 }
+
+/// The interact/idle bucketing keys off exactly the events a hand makes:
+/// every pointer/touch/wheel/zoom event tags the frame, an empty input does
+/// not, and neither does anything a keyboard or the window manager sends —
+/// that is the denominator every "interact" figure downstream carries.
+#[test]
+fn only_a_hand_on_the_app_makes_the_frame_interact() {
+    assert!(
+        !super::input_carries_interaction(&[]),
+        "an empty input tagged the frame interact, so the idle family is \
+         unreachable and every idle figure is measuring interaction",
+    );
+
+    let hands: [egui::Event; 5] = [
+        egui::Event::PointerMoved(egui::pos2(4.0, 4.0)),
+        egui::Event::PointerButton {
+            pos: egui::pos2(4.0, 4.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+        egui::Event::Touch {
+            device_id: egui::TouchDeviceId(1),
+            id: egui::TouchId(1),
+            phase: egui::TouchPhase::Start,
+            pos: egui::pos2(4.0, 4.0),
+            force: None,
+        },
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        },
+        egui::Event::Zoom(1.1),
+    ];
+    for event in hands {
+        assert!(
+            super::input_carries_interaction(std::slice::from_ref(&event)),
+            "{event:?} did not tag the frame interact, so frames driven by \
+             that gesture are counted against the idle bar",
+        );
+    }
+
+    let not_hands = [
+        egui::Event::WindowFocused(true),
+        egui::Event::Text("k".to_owned()),
+    ];
+    for event in not_hands {
+        assert!(
+            !super::input_carries_interaction(std::slice::from_ref(&event)),
+            "{event:?} tagged the frame interact; the interact family's \
+             denominator is pointer/touch/wheel/zoom events and nothing else",
+        );
+    }
+}

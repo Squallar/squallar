@@ -15,6 +15,11 @@ pub struct EguiRenderer {
     attachment_config: AttachmentConfig,
     /// Where egui's texture deltas actually cross PCIe.
     uploads: texture_upload::TextureUploads,
+    /// What ending each pass cost, phase by phase.
+    pass_costs: pass_costs::PassCostLedger,
+    /// Whether this frame's raw input carried interaction. Written by
+    /// [`Self::begin_frame`]; see [`Self::frame_had_interaction`].
+    frame_interacted: bool,
 }
 
 /// The attachment layout of the egui render pass. A pipeline drawing into it
@@ -38,6 +43,9 @@ pub use mirror::{
     MirrorRungs, mirror_plan, mirror_size_for, wanted_scale_for,
 };
 pub use squallar_device_profile::constants::MIRROR_MAX_SIDE;
+
+/// What ending each egui pass costs the frame thread, phase by phase.
+pub mod pass_costs;
 
 /// How a texture delta gets onto the GPU without the frame paying for it.
 pub mod texture_upload;
@@ -78,6 +86,12 @@ pub struct PreparedFrame {
     /// is *not* `#[must_use]`, and dropping it makes a callback render nothing
     /// at all, with no validation error. Drained by [`PreparedFrame::submit`].
     user_command_buffers: Vec<wgpu::CommandBuffer>,
+}
+
+/// Whole microseconds from `a` to `b`, for the pass-cost stamps. Saturates
+/// rather than overflowing; `web_time::Instant` is std-backed off the web.
+fn micros_between(a: web_time::Instant, b: web_time::Instant) -> u64 {
+    b.duration_since(a).as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 /// Callbacks' command buffers first, egui's own last: a callback's `prepare`
@@ -132,6 +146,25 @@ pub(crate) fn install_repaint_wake(ctx: &Context, wake: impl Fn() + Send + Sync 
     });
 }
 
+/// Whether one frame's raw input carried a hand on the app: at least one
+/// pointer move, pointer button, touch, wheel or zoom event. This is the whole
+/// definition of an *interact* frame everywhere the frame telemetry buckets by
+/// it — keyboard, focus and IME events are deliberately not in it, because the
+/// bar being held is "the picture answers the hand", and a keystroke does not
+/// move the map.
+fn input_carries_interaction(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::PointerMoved(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::Touch { .. }
+                | egui::Event::MouseWheel { .. }
+                | egui::Event::Zoom(_)
+        )
+    })
+}
+
 impl EguiRenderer {
     pub fn context(&self) -> &Context {
         self.state.egui_ctx()
@@ -180,7 +213,17 @@ impl EguiRenderer {
                 msaa_samples,
             },
             uploads: texture_upload::TextureUploads::new(device),
+            pass_costs: pass_costs::PassCostLedger::default(),
+            frame_interacted: false,
         }
+    }
+
+    /// Whether the frame the last [`Self::begin_frame`] opened carried
+    /// interaction in its raw input — see [`input_carries_interaction`] for
+    /// the exact event set. Read after the pass, when the app buckets the
+    /// frame's timing into its interact or idle family.
+    pub fn frame_had_interaction(&self) -> bool {
+        self.frame_interacted
     }
 
     /// The attachments [`Self::draw`]'s render pass has. See [`AttachmentConfig`].
@@ -218,6 +261,9 @@ impl EguiRenderer {
         // `line_scroll_speed` already scales correctly.
         #[cfg(target_arch = "wasm32")]
         squallar_egui::normalize_wheel_units(&mut raw_input, zoom_factor);
+        // After the rewrites, so an event they re-spell is judged in the form
+        // egui will fold in.
+        self.frame_interacted = input_carries_interaction(&raw_input.events);
         self.state.egui_ctx().begin_pass(raw_input);
     }
 
@@ -256,6 +302,7 @@ impl EguiRenderer {
             pixels_per_point,
         };
 
+        let stamp_tessellate = web_time::Instant::now();
         let mut tris = self
             .state
             .egui_ctx()
@@ -263,21 +310,33 @@ impl EguiRenderer {
 
         // Not `Renderer::update_texture` in a loop: that is up to 59 ms of
         // blocking host stores on this thread at the raster ceiling.
+        let stamp_upload = web_time::Instant::now();
         let uploading = self.uploads.apply(
             device,
             queue,
             &mut self.renderer,
             &full_output.textures_delta.set,
         );
+        let stamp_upload_done = web_time::Instant::now();
         // Before the `update_buffers` below, not after — see `render_mirror`.
+        let mut mirror_us = 0u64;
         if let Some(request) = mirror {
+            let stamp_mirror = web_time::Instant::now();
             self.render_mirror(device, queue, &mut tris, &request);
+            mirror_us = micros_between(stamp_mirror, web_time::Instant::now());
         }
         // `update_buffers` also dispatches every callback's `prepare` and
         // returns their command buffers; they must reach the submit.
+        let stamp_buffers = web_time::Instant::now();
         let user_command_buffers =
             self.renderer
                 .update_buffers(device, queue, encoder, &tris, &screen_descriptor);
+        self.pass_costs.note(
+            micros_between(stamp_tessellate, stamp_upload),
+            micros_between(stamp_upload, stamp_upload_done),
+            mirror_us,
+            micros_between(stamp_buffers, web_time::Instant::now()),
+        );
 
         PreparedFrame {
             tris,
@@ -435,6 +494,20 @@ impl EguiRenderer {
     /// What this renderer's texture uploads have moved, asked unconditionally.
     pub fn upload_totals(&self) -> texture_upload::UploadTotals {
         self.uploads.totals()
+    }
+
+    /// What ending passes has cost this renderer's frame thread, asked
+    /// unconditionally. See [`pass_costs::PassCosts`], which also says what
+    /// its denominator is — **every pass ended**, presented or not.
+    pub fn pass_costs(&self) -> pass_costs::PassCosts {
+        self.pass_costs.totals()
+    }
+
+    /// [`Self::pass_costs`], but only when a pass has ended since the last
+    /// time this was asked — the same contract as
+    /// [`Self::upload_totals_if_moved`].
+    pub fn pass_costs_if_moved(&mut self) -> Option<pass_costs::PassCosts> {
+        self.pass_costs.totals_if_moved()
     }
 
     /// See [`texture_upload::TextureUploads::is_delivered`].
