@@ -163,6 +163,121 @@ pub fn area_tiles(area: &AreaSpec) -> Vec<(u8, u32, u32)> {
 }
 
 // ---------------------------------------------------------------------------
+// The persisted record
+// ---------------------------------------------------------------------------
+
+/// One area this device has made available offline, as the app carries it
+/// between the store and the persisted list.
+///
+/// **The record says what was REQUESTED.** Nothing in it asserts that the
+/// bytes are still there: `segments_expected` is the cut the plan made, and
+/// whether the store still holds that many is [`DownloadedArea::reconcile`]'s
+/// answer, recomputed from the store's own listing at every launch. There is
+/// no completeness flag here to go stale — which is what makes the named
+/// silent-partial-success defect structurally impossible rather than guarded
+/// against.
+///
+/// It carries an [`AreaSpec`] whole rather than re-spelling its fields, so a
+/// persisted area is startable: handing the spec back to
+/// [`BasemapDownload::start`] resumes it as the set difference over segments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadedArea {
+    /// What was asked for: the id, the bbox and the detail ceiling.
+    pub spec: AreaSpec,
+    /// Segments the plan cut the area into. **Requested, not present** — see
+    /// the type doc.
+    pub segments_expected: u32,
+    /// Tile bytes the finished area holds: distinct `(offset, length)` pairs
+    /// once each, the module's one byte denominator.
+    pub bytes: DataSize,
+    /// The archive generation the area was cut from, in
+    /// `basemap_archive::block_cache::generation_for_url`'s spelling — the one
+    /// derivation of a generation from an archive URL, so this and the block
+    /// cache cannot come to two answers about which archive a byte came from.
+    ///
+    /// A sub-archive carries its own header and directories and stays valid
+    /// forever, so this never expires anything; it is what lets a later step
+    /// state "Downloaded September 2026 · update available" as a fact the user
+    /// may act on, never as a warning and never as an automatic re-download.
+    pub generation: String,
+}
+
+impl DownloadedArea {
+    /// The record for a finished download, or `None` for one that did not
+    /// finish.
+    ///
+    /// **This is the whole of layer 1 against silent partial success**: a
+    /// `Partial` or `Failed` run yields no record, so the area never reaches
+    /// the persisted list and never draws as one the device has. The counts
+    /// come off the outcome itself rather than from a caller, so a record
+    /// cannot disagree with the run that produced it.
+    pub fn from_outcome(
+        spec: AreaSpec,
+        generation: String,
+        outcome: &DownloadOutcome,
+    ) -> Option<Self> {
+        let DownloadOutcome::Complete { bytes, segments } = outcome else {
+            return None;
+        };
+        Some(Self {
+            spec,
+            segments_expected: *segments,
+            bytes: DataSize::from_bytes(*bytes),
+            generation,
+        })
+    }
+
+    /// This area's segments against what `present` holds — the store's own
+    /// listing, from [`SegmentStore::existing_segments`].
+    ///
+    /// Segments at or past `segments_expected` are **not** counted: a store
+    /// left holding a longer cut from an earlier plan would otherwise read as
+    /// more complete than the area it is being reconciled against.
+    pub fn reconcile(&self, present: &BTreeSet<u32>) -> AreaStatus {
+        let expected = self.segments_expected;
+        let present = present.iter().filter(|&&seg| seg < expected).count();
+        AreaStatus {
+            present: u32::try_from(present).unwrap_or(u32::MAX),
+            expected,
+        }
+    }
+}
+
+/// How much of a persisted area the store actually holds, both figures
+/// against the same denominator: the area's own segment cut.
+///
+/// Two numbers rather than a boolean, because "3 of 7 parts" is what a manage
+/// screen draws *in place of* a size — the same reason [`DownloadOutcome`]'s
+/// `Partial` carries its counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AreaStatus {
+    /// Segments of this area's cut the store holds complete.
+    pub present: u32,
+    /// Segments the area was cut into.
+    pub expected: u32,
+}
+
+impl AreaStatus {
+    /// Whether every segment the area asked for is in the store.
+    ///
+    /// An area expecting nothing is **not** complete: a zero denominator would
+    /// otherwise make the emptiest possible record the most confident one.
+    pub fn is_complete(self) -> bool {
+        self.expected > 0 && self.present >= self.expected
+    }
+}
+
+/// [`DownloadedArea::reconcile`] against a live store — the launch-time
+/// question, asked of the store rather than of the record.
+pub async fn area_status<St: SegmentStore>(
+    store: &St,
+    area: &DownloadedArea,
+) -> Result<AreaStatus, StoreError> {
+    let present = store.existing_segments(&area.spec.area_id).await?;
+    Ok(area.reconcile(&present))
+}
+
+// ---------------------------------------------------------------------------
 // The plan
 // ---------------------------------------------------------------------------
 
@@ -376,8 +491,9 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// Refuse an id that could traverse a path or hide as a dotfile. Both stores
-/// call this before building any name from the id.
-fn valid_area_id(area_id: &str) -> Result<(), StoreError> {
+/// call this before building any name from the id, and a persisted record is
+/// validated against it on the way back in — the one spelling of the rule.
+pub fn valid_area_id(area_id: &str) -> Result<(), StoreError> {
     let safe = !area_id.is_empty()
         && !area_id.starts_with('.')
         && area_id

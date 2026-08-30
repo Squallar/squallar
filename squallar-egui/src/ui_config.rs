@@ -23,6 +23,7 @@ pub const UI_CONFIG_KEY: &str = "ui";
 /// bytes being preserved are v2 and the key says so.)
 pub const UI_CONFIG_BACKUP_KEY: &str = "ui.v2.backup";
 
+use crate::basemap_download::{AreaSpec, DownloadedArea, valid_area_id};
 use squallar_overlays::spc::outlook::OutlookDay;
 use squallar_source::id::{LayerId, known};
 use squallar_source::product::FieldId;
@@ -521,6 +522,152 @@ impl VolumeRegionConfig {
     }
 }
 
+/// A downloaded offline basemap area, as persisted.
+///
+/// Flat scalars rather than a nested bbox, on [`VolumeRegionConfig`]'s terms:
+/// the file is read by builds that may not share this one's types, and
+/// [`Self::restore`] is where a nonsense block becomes no area at all rather
+/// than a bad one.
+///
+/// **No completeness member, by design.** What is stored is what the download
+/// *asked for*; whether the device still holds it is recomputed from the
+/// store at launch ([`DownloadedArea::reconcile`]). A green flag in this file
+/// is exactly the stale fact the silent-partial-success defect is made of.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct DownloadedAreaConfig {
+    /// The area's id — it names files and URLs on both targets, so it is
+    /// validated back through the stores' own [`valid_area_id`].
+    area_id: String,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    /// The deepest zoom the area stored.
+    max_zoom: u8,
+    /// Segments the plan cut the area into. Requested, never present.
+    segments: u32,
+    /// Tile bytes the area holds, exactly — `u64` through
+    /// [`DataSize`](squallar_units::DataSize)'s transparent representation,
+    /// because an `f32` is inexact above 2²⁴ and every figure this feature
+    /// quotes is larger than that.
+    bytes: squallar_units::DataSize,
+    /// The archive generation the area was cut from. Carried from the first
+    /// write so the generation step needs no migration of its own; absent in
+    /// a record written without one, which reads as "not recorded".
+    generation: String,
+}
+
+impl DownloadedAreaConfig {
+    /// The block for `area`.
+    fn of(area: &DownloadedArea) -> Self {
+        Self {
+            area_id: area.spec.area_id.clone(),
+            west: area.spec.west,
+            south: area.spec.south,
+            east: area.spec.east,
+            north: area.spec.north,
+            max_zoom: area.spec.max_zoom,
+            segments: area.segments_expected,
+            bytes: area.bytes,
+            generation: area.generation.clone(),
+        }
+    }
+
+    /// The area this block names, or `None` for one that names none.
+    ///
+    /// Refused: an id no store would build a filename from, a bbox that is not
+    /// a real rectangle on the globe, a zoom the tile-id space cannot express,
+    /// and a cut of zero segments — which would otherwise be an area nothing
+    /// could ever fail to hold all of.
+    fn restore(&self) -> Option<DownloadedArea> {
+        valid_area_id(&self.area_id).ok()?;
+        if self.segments == 0 {
+            return None;
+        }
+        // The zoom is checked by asking the tile-id space rather than by
+        // repeating its ceiling here.
+        crate::pmt_index::zxy_to_tile_id(self.max_zoom, 0, 0)?;
+        let real_rectangle = self.west < self.east
+            && self.south < self.north
+            && (-180.0..=180.0).contains(&self.west)
+            && (-180.0..=180.0).contains(&self.east)
+            && (-90.0..=90.0).contains(&self.south)
+            && (-90.0..=90.0).contains(&self.north);
+        if !real_rectangle {
+            return None;
+        }
+        Some(DownloadedArea {
+            spec: AreaSpec {
+                area_id: self.area_id.clone(),
+                west: self.west,
+                south: self.south,
+                east: self.east,
+                north: self.north,
+                max_zoom: self.max_zoom,
+            },
+            segments_expected: self.segments,
+            bytes: self.bytes,
+            generation: self.generation.clone(),
+        })
+    }
+}
+
+impl super::Gui {
+    /// Every area this device has made available offline, in the order they
+    /// finished.
+    ///
+    /// A list of what was *requested*: a caller asking whether one is still
+    /// all there reconciles it against the store
+    /// ([`basemap_download::area_status`](crate::basemap_download::area_status)).
+    pub fn downloaded_areas(&self) -> &[DownloadedArea] {
+        &self.downloaded_areas
+    }
+
+    /// The record for `area_id`, if this device has one.
+    pub fn downloaded_area(&self, area_id: &str) -> Option<&DownloadedArea> {
+        self.downloaded_areas
+            .iter()
+            .find(|area| area.spec.area_id == area_id)
+    }
+
+    /// **Publish a finished area.** The last act of a download, and the one
+    /// that makes the area exist to the rest of the app — the same discipline
+    /// as `squallar::kv::write_blob`'s rename, kept in the manifest so one
+    /// rule covers native and web instead of two rename semantics.
+    ///
+    /// Only a `Complete` outcome yields a [`DownloadedArea`]
+    /// ([`DownloadedArea::from_outcome`]), so a half-finished download has
+    /// nothing to hand this method.
+    ///
+    /// A record for the same id is replaced in place, keeping its position: a
+    /// re-download at a newer generation is the same area, not a second one.
+    pub fn record_downloaded_area(&mut self, area: DownloadedArea) {
+        match self
+            .downloaded_areas
+            .iter()
+            .position(|held| held.spec.area_id == area.spec.area_id)
+        {
+            Some(at) => self.downloaded_areas[at] = area,
+            None => self.downloaded_areas.push(area),
+        }
+    }
+
+    /// Drop `area_id`'s record, answering whether there was one.
+    ///
+    /// The record only; deleting the bytes is
+    /// [`SegmentStore::remove_area`](crate::basemap_download::SegmentStore::remove_area)'s
+    /// job. Dropping the record first is the safe order — an area whose bytes
+    /// outlive its record is invisible, where the reverse would be a listed
+    /// area with nothing behind it.
+    pub fn forget_downloaded_area(&mut self, area_id: &str) -> bool {
+        let before = self.downloaded_areas.len();
+        self.downloaded_areas
+            .retain(|area| area.spec.area_id != area_id);
+        self.downloaded_areas.len() != before
+    }
+}
+
 /// A 3D pane, as persisted: where the eye is, how far the vertical is stretched,
 /// and what ground was picked.
 #[derive(Serialize, Deserialize)]
@@ -749,6 +896,20 @@ struct UiConfig {
     /// written before this field was.
     #[serde(default)]
     favorite_sites: Vec<String>,
+    /// **The areas this device has made available offline**, in the order
+    /// they finished.
+    ///
+    /// At the root on `favorite_sites`' reasoning, one step over: a favourite
+    /// is a fact about the person, a downloaded area is a fact about the
+    /// *device*. Neither is a fact about a window, and a pane that happens to
+    /// be showing the ground an area covers does not own it.
+    ///
+    /// Additive on the same terms — `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step**. Absence loads as "no
+    /// downloaded areas", which is what every session written before this
+    /// field was.
+    #[serde(default)]
+    downloaded_areas: Vec<DownloadedAreaConfig>,
     /// **How the window splits between panes**, and where the user dragged the
     /// dividers. App-wide rather than per-pane: all three describe the window.
     ///
@@ -1152,6 +1313,7 @@ impl Default for UiConfig {
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
             favorite_sites: Vec::new(),
+            downloaded_areas: Vec::new(),
             split_orientation: crate::pane::SplitOrientation::Auto,
             // Empty rather than the one-pane run: the fields' absence is what
             // says "no dividers were described", and `adopt_ratios` refuses an
@@ -1279,6 +1441,11 @@ impl super::Gui {
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
             favorite_sites: self.favorite_sites.clone(),
+            downloaded_areas: self
+                .downloaded_areas
+                .iter()
+                .map(DownloadedAreaConfig::of)
+                .collect(),
             split_orientation: self.split_orientation,
             row_ratios: {
                 let (rows, _) = self.pane_layout.ratios();
@@ -1442,6 +1609,14 @@ impl super::Gui {
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
         self.favorite_sites = config.favorite_sites;
+        // A block that names no area is dropped, not restored badly — the
+        // `VolumeRegionConfig::restore` arrangement, and the reason a hand-
+        // edited or truncated entry costs its own area and nothing else.
+        self.downloaded_areas = config
+            .downloaded_areas
+            .iter()
+            .filter_map(DownloadedAreaConfig::restore)
+            .collect();
         self.presets = config.presets;
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
@@ -1927,6 +2102,11 @@ mod pane_layout_config_tests;
 #[path = "ui_config/presets_config_tests.rs"]
 #[cfg(test)]
 mod presets_config_tests;
+
+/// The downloaded offline basemap areas, across a restart.
+#[path = "ui_config/downloaded_areas_tests.rs"]
+#[cfg(test)]
+mod downloaded_areas_tests;
 
 #[path = "ui_config/fixture_tests.rs"]
 #[cfg(test)]

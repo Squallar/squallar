@@ -219,6 +219,15 @@ pub struct Gui {
     /// person, not about a window. Persisted; absent from an older config,
     /// which loads as "nothing starred" — what those sessions were.
     pub(super) favorite_sites: Vec<String>,
+    /// The offline basemap areas this device holds, in the order they
+    /// finished — see [`Gui::downloaded_areas`].
+    ///
+    /// **App-wide rather than per-pane**: a downloaded area is a fact about
+    /// the device, not about a window. Persisted; absent from an older config,
+    /// which loads as "no downloaded areas". Every entry says what its
+    /// download *asked for* — never whether the bytes are still there, which
+    /// is recomputed from the store.
+    pub(super) downloaded_areas: Vec<crate::basemap_download::DownloadedArea>,
     /// The stack row being drag-reordered by its grip, if one is in flight.
     pub(super) stack_drag: Option<squallar_source::id::LayerId>,
     /// A layer whose stack row the next stack pass should scroll into view,
@@ -518,6 +527,7 @@ impl Gui {
             site_query: String::new(),
             search_focus_pass: std::collections::HashMap::new(),
             favorite_sites: Vec::new(),
+            downloaded_areas: Vec::new(),
             stack_drag: None,
             stack_scroll_to: None,
             pill_revealed: None,

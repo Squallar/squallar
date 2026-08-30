@@ -6,6 +6,7 @@
     ]
   ],
   "config_version": 5,
+  "downloaded_areas": [],
   "favorite_sites": [],
   "heading_source": "Auto",
   "loop_lookback_secs": 3600,
