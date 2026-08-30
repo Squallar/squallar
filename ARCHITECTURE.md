@@ -93,6 +93,22 @@ renderer stack, which it does not. Its eventual position is above
 height-plan fit — so it is written as though it were already there and never
 reaches downward.
 
+**`squallar-buildings` stands beside it, on the same two crates.** The
+`building` source layer's parse, the projection of its footprints into a volume
+box's kilometres, the lyon triangulation and extrusion, and the one codec row
+(`buildings/prisms`) that runs all of it off the frame thread. A separate crate
+from `squallar-elevation` rather than a module inside it, for the same reason
+that one is separate from everything else *and* for one more: their dependency
+sets have nothing in common past `squallar-geo` and `squallar-source`. A
+Terrain-RGB decoder wants a PNG decoder; a footprint extruder wants
+`lyon_tessellation`, `mvt-reader` and `geo-types`. Its `tests/charter.rs` walks
+the resolved graph the same way, and forbids `walkers` by name as well as the
+renderer stack — walkers is where the tessellator and the tile reader reach this
+workspace from, so taking them through it would look like the cheaper route and
+would put egui in a worker crate's graph. The three arrivals cost **zero** new
+packages in `Cargo.lock`: `squallar-egui` enables walkers' `mvt` feature
+unconditionally, so all three were already resolved.
+
 **Band 3 and up — engine, renderer and shell.** `squallar-device-profile`
 (budgets and constants) sits above `squallar-radar`; `squallar-worker` (the job
 funnel, the pool, the wire) above the three data crates; `squallar-egui` (pure
@@ -107,7 +123,7 @@ dispatch, app state) above all of them; and the two entry crates on top —
 `squallar` (desktop/Android/iOS binary and `squallar_native` lib) and
 `squallar-web` (browser).
 
-**The direction is enforced, not merely intended.** Eleven crates carry a
+**The direction is enforced, not merely intended.** Twelve crates carry a
 `tests/charter.rs` that reads `cargo metadata --no-deps --format-version 1` and
 asserts against **declared** dependencies, so no feature selection can mask what
 they see. Each charter has a `the_dependency_ceiling_holds` test with an
@@ -118,7 +134,8 @@ and most add a direction test:
 |---|---|
 | `squallar-source/tests/charter.rs` | `the_overlays_to_radar_edge_stays_cut` |
 | `squallar-geo/tests/charter.rs` | `the_floor_sits_under_the_substrate` |
-| `squallar-elevation/tests/charter.rs` | `the_offload_worker_can_link_this_crate` — the only one that walks the **resolved** graph rather than the declared set, because linking is the property |
+| `squallar-elevation/tests/charter.rs` | `the_offload_worker_can_link_this_crate` — one of the two that walk the **resolved** graph rather than the declared set, because linking is the property |
+| `squallar-buildings/tests/charter.rs` | `the_offload_worker_can_link_this_crate` — the other resolved-graph walk, and the one that also forbids `walkers` by name |
 | `squallar-device-profile/tests/charter.rs` | `the_floor_sits_under_the_app_side` |
 | `squallar-gpu/tests/charter.rs` | `the_boundary_sits_under_the_app` |
 | `squallar-volumetric/tests/charter.rs` | `the_stack_sits_under_the_app` |
@@ -623,9 +640,10 @@ measured, not because the construct is allowed.
 
 ### 6.4 Other standing pins
 
-* **Dependency ceilings** — the eleven `tests/charter.rs` files of §1. (This
+* **Dependency ceilings** — the twelve `tests/charter.rs` files of §1. (This
   line read "nine" against a ten-row table until 2026-08-30; it was already one
-  behind before `squallar-elevation` made it two.)
+  behind before `squallar-elevation` made it two. `squallar-buildings` made it
+  twelve the same day.)
 * **Cited-test resolution** — `squallar-radar/tests/doc_citations_resolve.rs`
   scans **every `//`, `///` and `//!` comment in the workspace** and requires
   any backticked name whose final `::` segment is snake_case with **five or

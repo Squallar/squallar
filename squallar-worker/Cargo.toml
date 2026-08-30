@@ -1,7 +1,7 @@
 # The job engine: the offload funnel, the wire identity, the composed codec
 # registry, the native pool — job VOCABULARY stays in squallar-source, codec
 # rows beside their pipelines in squallar-radar / squallar-overlays /
-# squallar-elevation; this crate composes and runs them.
+# squallar-elevation / squallar-buildings; this crate composes and runs them.
 [package]
 name = "squallar-worker"
 version.workspace = true
@@ -9,8 +9,8 @@ edition.workspace = true
 
 # Deliberately these and NOTHING else normal: `tests/charter.rs` holds the
 # ceiling. The engine composes the source crates' codec registries
-# (squallar-radar, squallar-overlays and squallar-elevation, over
-# squallar-source's vocabulary), reads
+# (squallar-radar, squallar-overlays, squallar-elevation and
+# squallar-buildings, over squallar-source's vocabulary), reads
 # its thread and raster budgets from the device floor
 # (squallar-device-profile), and speaks geometry in squallar-geo's types. A
 # dependency lands here only after the charter test and the plan change
@@ -20,6 +20,7 @@ squallar-source = { workspace = true }
 squallar-radar = { workspace = true }
 squallar-overlays = { workspace = true }
 squallar-elevation = { workspace = true }
+squallar-buildings = { workspace = true }
 squallar-device-profile = { workspace = true }
 squallar-geo = { workspace = true }
 # The premultiply exception, recorded: `offload::premultiply_raster` IS

@@ -11,10 +11,10 @@
 //! decoded volume) are pinned by `squallar-radar`'s own digest suites and do
 //! not feed this one.
 
-/// The 15 job-framing rows, exactly as
+/// The 16 job-framing rows, exactly as
 /// `offload::tests::the_job_framing_is_the_one_this_protocol_ships` asserts
 /// them, in test order: `kind | framed-prefix length | FNV-1a-64 digest`.
-/// Fifteen rows for **fourteen** kinds: `voxels` contributes two — the
+/// Sixteen rows for **fifteen** kinds: `voxels` contributes two — the
 /// picked-region and sourceless forms frame differently.
 ///
 /// The literal list lives HERE, never regenerated from the encoder; the test
@@ -51,6 +51,7 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     // `x_km` and `y_km` now differ. The length is unchanged at 406 -- the field
     // widths did not move, only the values that make the swap visible.
     "terrain/heights | 406 | 0xc776d09fd53b08e0",
+    "buildings/prisms | 239 | 0x607da6bb1409aaa8",
 ];
 
 /// The 2 overlay-reply framing rows, exactly as
@@ -104,6 +105,29 @@ pub const WIRE_HEIGHT_REPLY_ROWS: &[&str] = &[
     "heights/samples | 30 | 0xd62e344d457129b5",
 ];
 
+/// The 4 buildings-reply framing rows, exactly as
+/// `offload::tests::the_building_reply_framing_is_the_one_this_registry_ships`
+/// asserts them: the `buildings/prisms` reply's head and three tails, over a
+/// **literal** `squallar_buildings::prism::BuildingMesh` rather than an
+/// extruded one, so the digest is over stored bits and not over whatever libm
+/// and lyon answered.
+///
+/// **This row has a symmetry the height row does not**, which is why it is
+/// pinned per tail rather than as a total: positions and normals are the same
+/// length, so a build that swapped the two tails would move no length
+/// anywhere and the parity test -- which runs the same codec on both arms --
+/// could not see it either.
+///
+/// Row-length arithmetic (independent of the encoder): head 5x4 = 20;
+/// positions and normals 3 vertices x 3 axes x 4 = 36 each; indices 3 x 4 =
+/// 12.
+pub const WIRE_BUILDING_REPLY_ROWS: &[&str] = &[
+    "prisms/head | 20 | 0x3412020b8d2915c5",
+    "prisms/positions | 36 | 0x2c6e36aef59d52d0",
+    "prisms/normals | 36 | 0x1048b47ceb2b9eb8",
+    "prisms/indices | 12 | 0x9ef40c127c771966",
+];
+
 /// The canonical envelope's layout as one literal sentence, folded into
 /// [`wire_digest`] so a reshaped envelope changes the local build token.
 /// The code byte ahead of the envelope is covered by the per-row index
@@ -124,7 +148,8 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// [`WIRE_FRAMING_ROWS`] prefixed by the composed-registry index of the
 /// row's kind, then [`CANONICAL_ENVELOPE_LAYOUT`], then every row of
 /// [`WIRE_REPLY_ROWS`], then every row of [`WIRE_FRAME_REPLY_ROWS`], then
-/// every row of [`WIRE_HEIGHT_REPLY_ROWS`].
+/// every row of [`WIRE_HEIGHT_REPLY_ROWS`], then every row of
+/// [`WIRE_BUILDING_REPLY_ROWS`].
 ///
 /// Panics on a pinned row whose label is not in the registry.
 pub fn wire_digest() -> u64 {
@@ -139,7 +164,7 @@ pub fn wire_digest() -> u64 {
             .unwrap_or_else(|| {
                 panic!("the pinned framing row {row:?} names no composed-registry kind")
             });
-        hash = fnv1a64(hash, &[u8::try_from(index).expect("14 kinds fit a byte")]);
+        hash = fnv1a64(hash, &[u8::try_from(index).expect("15 kinds fit a byte")]);
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash = fnv1a64(hash, CANONICAL_ENVELOPE_LAYOUT.as_bytes());
@@ -150,6 +175,9 @@ pub fn wire_digest() -> u64 {
         hash = fnv1a64(hash, row.as_bytes());
     }
     for row in WIRE_HEIGHT_REPLY_ROWS {
+        hash = fnv1a64(hash, row.as_bytes());
+    }
+    for row in WIRE_BUILDING_REPLY_ROWS {
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash

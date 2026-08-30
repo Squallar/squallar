@@ -67,6 +67,7 @@ fn the_dependency_ceiling_holds() {
         ("normal", "squallar-radar"),
         ("normal", "squallar-overlays"),
         ("normal", "squallar-elevation"),
+        ("normal", "squallar-buildings"),
         ("normal", "squallar-device-profile"),
         ("normal", "squallar-geo"),
         ("normal", "egui"),
@@ -88,8 +89,9 @@ fn the_dependency_ceiling_holds() {
         "squallar-worker's declared dependencies moved off the charter: the \
          engine composes the source crates and reads the device floor; egui \
          is the premultiply exception, recorded; squallar-elevation is the \
-         third codec registry, chained last so no wire code is renumbered; a \
-         new dependency changes this test and the plan first, in writing.",
+         third codec registry and squallar-buildings the fourth, each chained \
+         after the last so no wire code is renumbered; a new dependency \
+         changes this test and the plan first, in writing.",
     );
 }
 

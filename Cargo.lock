@@ -4566,6 +4566,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "squallar-buildings"
+version = "0.1.0"
+dependencies = [
+ "geo-types",
+ "log",
+ "lyon_tessellation",
+ "mvt-reader",
+ "serde_json",
+ "squallar-geo",
+ "squallar-source",
+]
+
+[[package]]
 name = "squallar-device-profile"
 version = "0.1.0"
 dependencies = [
@@ -4829,6 +4842,7 @@ dependencies = [
  "log",
  "nexrad-model",
  "serde_json",
+ "squallar-buildings",
  "squallar-device-profile",
  "squallar-elevation",
  "squallar-geo",
