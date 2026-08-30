@@ -55,7 +55,10 @@
 //!   decide which shape it is reading — see its docs for the contract. The
 //!   split lives entirely inside that source: [`part_spans`] cuts a global
 //!   range into per-part reads and nothing above the [`RangeSource`] seam
-//!   knows parts exist.
+//!   knows parts exist. The stride that arithmetic assumes is **checked, not
+//!   trusted**: a part stopping short of it with a later part still there is
+//!   [`RangeError::ShortPart`], never `Ok` with fewer bytes than were asked
+//!   for.
 //! * **The directory cache is mandatory.** With `NoCache` every tile costs two
 //!   range requests on an archive deep enough to have leaf directories: one for
 //!   the leaf, one for the tile. [`BasemapArchive`] holds a
@@ -91,6 +94,12 @@ const STATUS_PARTIAL_CONTENT: u16 = 206;
 /// arithmetic in [`part_spans`] is only correct while the two agree. It is
 /// under Cloudflare's 512 MB cacheable-object ceiling (measured: a 3.34 GB
 /// object BYPASSes the cache), which is the entire point of the parts.
+///
+/// Nothing in the bytes carries the promise, and the publisher is not in this
+/// repository, so [`HttpRangeSource`] **checks** it rather than assuming it:
+/// a part answering short is the archive ending only if no later part exists,
+/// and [`RangeError::ShortPart`] is what a disagreement reads as. See
+/// [`HttpRangeSource::check_short_part_is_the_last`].
 pub const PART_BYTES: u64 = 500_000_000;
 
 /// Whether `status` is a host cleanly saying "no such object".
@@ -174,6 +183,26 @@ pub enum RangeError {
         /// How many attempts were made.
         attempts: u32,
     },
+    /// A part that is not the archive's last ran short of the publish stride.
+    ///
+    /// The publish side's own contract ([`PART_BYTES`]) is that every part but
+    /// the final one is exactly the stride long, and the parts arithmetic in
+    /// [`part_spans`] is only correct while that holds. Nothing in the bytes
+    /// carries the promise, so [`HttpRangeSource`] checks it at the one place
+    /// it would otherwise be assumed: a short answer is the archive ending
+    /// only if no later part exists. When one does, this says so instead of
+    /// returning fewer bytes than were asked for and letting a decoder three
+    /// layers up call it a corrupt archive.
+    ShortPart {
+        /// The part that ran short.
+        part: u64,
+        /// Bytes it answered with.
+        got: usize,
+        /// Bytes the span asked it for.
+        wanted: usize,
+        /// The stride the reader and the publisher are supposed to agree on.
+        stride: u64,
+    },
     /// The task carrying the request went away before it answered. wasm32
     /// only: the JS work runs in a detached task and the page can drop it.
     Cancelled,
@@ -187,6 +216,18 @@ impl fmt::Display for RangeError {
                 f,
                 "the source answered {status} rather than {STATUS_PARTIAL_CONTENT} on all \
                  {attempts} attempts; it does not appear to serve range requests"
+            ),
+            Self::ShortPart {
+                part,
+                got,
+                wanted,
+                stride,
+            } => write!(
+                f,
+                "part{part:03} answered {got} bytes of the {wanted} asked for, but part{:03} \
+                 exists, so the archive did not end there: the published parts do not match the \
+                 {stride}-byte stride this reader cuts ranges at",
+                part + 1
             ),
             Self::Cancelled => write!(f, "the range request was dropped before it answered"),
         }
@@ -270,6 +311,16 @@ pub struct HttpRangeSource {
     /// future — everything it touches is cloned in — and the verdict must be
     /// shared across those clones rather than re-probed per read.
     layout: Arc<std::sync::OnceLock<ArchiveLayout>>,
+    /// Which part the archive ends in, learned the first time a read runs
+    /// short and then held like [`Self::layout`] is.
+    ///
+    /// A short answer from part `k` is the archive ending *or* a part that
+    /// broke the publish contract, and the two are told apart by asking
+    /// whether `part(k+1)` exists. Held so that costs one request per source
+    /// rather than one per short read: the archive is immutable for the
+    /// source's lifetime (see [`RangeSource::archive_identity`]), so where it
+    /// ends cannot move under a reader.
+    last_part: Arc<std::sync::OnceLock<u64>>,
 }
 
 /// How the archive is published at [`HttpRangeSource::url`].
@@ -377,6 +428,7 @@ impl HttpRangeSource {
             url,
             part_bytes,
             layout: Arc::new(std::sync::OnceLock::new()),
+            last_part: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -416,6 +468,7 @@ impl RangeSource for HttpRangeSource {
         let url = self.url.clone();
         let part_bytes = self.part_bytes;
         let layout = Arc::clone(&self.layout);
+        let last_part = Arc::clone(&self.last_part);
 
         async move {
             match Self::layout_for(&layout, &client, &url).await? {
@@ -426,19 +479,32 @@ impl RangeSource for HttpRangeSource {
                     for span in part_spans(offset, length, part_bytes) {
                         let part = Self::part_url(&url, span.part);
                         let chunk = read_ranged(&client, &part, span.offset, span.length).await?;
-                        // A part can only run short of the span if it is the
-                        // archive's final, short part — every other part is
-                        // exactly `part_bytes` long by contract. So a short
-                        // chunk is the archive ending, matching `read_range`'s
-                        // own "up to `length`" contract, and asking the next
-                        // part for the remainder would be asking a file that
-                        // does not exist. An over-long chunk (a server
-                        // answering more than the range asked) is clamped so
-                        // the next span still lands at its right global
-                        // offset.
+                        // An over-long chunk (a server answering more than the
+                        // range asked) is clamped so the next span still lands
+                        // at its right global offset.
                         let got = chunk.len().min(span.length);
                         bytes.extend_from_slice(&chunk[..got]);
                         if got < span.length {
+                            // The part ran out inside the span. By the publish
+                            // contract only the archive's FINAL part is short,
+                            // which would make this the archive ending and a
+                            // short answer right — `read_range` reads *up to*
+                            // `length`. But that contract is the publisher's
+                            // word, and nothing in the bytes carries it: a
+                            // stride the publisher and `PART_BYTES` disagree
+                            // on, or an upload that stopped early, is a
+                            // mid-sequence short part, and reading it as the
+                            // end returns `Ok` with fewer bytes than were
+                            // asked for. That short answer is then cached to
+                            // disk by [`block_cache::BlockCachedSource`], so
+                            // one bad second at the origin would be served
+                            // short for the rest of the generation. So the
+                            // claim is CHECKED rather than assumed, once per
+                            // source.
+                            Self::check_short_part_is_the_last(
+                                &client, &url, &last_part, part_bytes, span, got,
+                            )
+                            .await?;
                             break;
                         }
                     }
@@ -538,34 +604,49 @@ impl HttpRangeSource {
     /// One probe of `<url>.part000`, with the retry bounded like every other
     /// range request. See [`Self::layout_for`] for what each answer means.
     async fn probe(client: &Client, url: &Url) -> Result<ArchiveLayout, RangeError> {
-        let part0 = Self::part_url(url, 0);
+        if Self::part_exists(client, url, 0).await? {
+            Ok(ArchiveLayout::Parts)
+        } else {
+            Ok(ArchiveLayout::Monolith)
+        }
+    }
+
+    /// Whether `<url>.partNNN` is there, retried like every other range
+    /// request.
+    ///
+    /// Any success — a `206`, or a `200` from a host ignoring the `Range`
+    /// header — proves the part exists; a *clean* absence
+    /// ([`is_clean_absence`]) proves it does not. Anything else — a timeout, a
+    /// `5xx`, a `403` — is a host failing to answer and is **returned as the
+    /// error it is**, because both callers turn "absent" into a durable
+    /// verdict (the archive's shape, or where the archive ends) and reading an
+    /// origin's bad second as absence would hold the wrong one for the
+    /// source's lifetime.
+    async fn part_exists(client: &Client, url: &Url, index: u64) -> Result<bool, RangeError> {
+        let part = Self::part_url(url, index);
         // First bytes only. On a `200` the body — up to 500 MB of part — is
         // dropped unread, exactly as `execute` does for every range request.
         let range = "bytes=0-15".to_owned();
         let mut last_error = None;
 
         for attempt in 1..=RANGE_ATTEMPTS {
-            match transport::fetch(client.clone(), part0.clone(), range.clone()).await {
-                Ok(RangeReply::Range { .. } | RangeReply::NotRanged { .. }) => {
-                    return Ok(ArchiveLayout::Parts);
-                }
-                Ok(RangeReply::Failed { status }) if is_clean_absence(status) => {
-                    return Ok(ArchiveLayout::Monolith);
-                }
+            match transport::fetch(client.clone(), part.clone(), range.clone()).await {
+                Ok(RangeReply::Range { .. } | RangeReply::NotRanged { .. }) => return Ok(true),
+                Ok(RangeReply::Failed { status }) if is_clean_absence(status) => return Ok(false),
                 Ok(RangeReply::Failed { status }) => {
                     log::debug!(
-                        "{part0} answered {status} to the part probe (attempt {attempt} of \
+                        "{part} answered {status} to the part probe (attempt {attempt} of \
                          {RANGE_ATTEMPTS})"
                     );
                     last_error = Some(RangeError::Transport(format!(
-                        "{part0} answered {status} to the part probe; neither part nor a clean \
+                        "{part} answered {status} to the part probe; neither part nor a clean \
                          absence, after {attempt} attempts"
                     )));
                 }
                 Err(error @ RangeError::Cancelled) => return Err(error),
                 Err(error) => {
                     log::debug!(
-                        "{part0} probe failed (attempt {attempt} of {RANGE_ATTEMPTS}): {error}"
+                        "{part} probe failed (attempt {attempt} of {RANGE_ATTEMPTS}): {error}"
                     );
                     last_error = Some(error);
                 }
@@ -573,8 +654,58 @@ impl HttpRangeSource {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            RangeError::Transport(format!("{part0}: the part probe made no attempt"))
+            RangeError::Transport(format!("{part}: the part probe made no attempt"))
         }))
+    }
+
+    /// Establish that `span`'s part running short is the archive ending, not
+    /// a part that broke the publish contract.
+    ///
+    /// The whole of the check the parts loop's short branch used to assume.
+    /// A part answering fewer bytes than its span asked for has two readings —
+    /// the archive ends inside it, or it is a mid-sequence part that is
+    /// shorter than [`PART_BYTES`] — and only the first makes a short `Ok`
+    /// the right answer. They are told apart by whether the *next* part
+    /// exists, which is one 16-byte request, taken **once per source**: the
+    /// archive is immutable for the source's lifetime, so the verdict is held
+    /// in `last_part` and every later short read reads it for free.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeError::ShortPart`] when a later part is there, so the archive
+    /// provably did not end. A probe that will not answer surfaces as its own
+    /// error rather than as either verdict.
+    async fn check_short_part_is_the_last(
+        client: &Client,
+        url: &Url,
+        last_part: &std::sync::OnceLock<u64>,
+        part_bytes: u64,
+        span: PartSpan,
+        got: usize,
+    ) -> Result<(), RangeError> {
+        let short = RangeError::ShortPart {
+            part: span.part,
+            got,
+            wanted: span.length,
+            stride: part_bytes,
+        };
+
+        if let Some(&last) = last_part.get() {
+            return if span.part == last {
+                Ok(())
+            } else {
+                Err(short)
+            };
+        }
+
+        if Self::part_exists(client, url, span.part + 1).await? {
+            return Err(short);
+        }
+
+        if last_part.set(span.part).is_ok() {
+            log::info!("basemap archive: {url} ends in part{:03}", span.part);
+        }
+        Ok(())
     }
 }
 
