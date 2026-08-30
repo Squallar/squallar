@@ -16,6 +16,10 @@
 //!   projection per post.
 //! * [`jobs`] — the one codec row that runs the two inside the offload worker,
 //!   composed last by `squallar_worker::job_registry`.
+//! * [`plan`] — which posts over which footprint, fitted down a rung ladder
+//!   until the texture bytes, the tile count and the adapter's own
+//!   `max_texture_dimension_2d` all fit. The camera's LOD, and the half of the
+//!   height path that must not run on the frame thread.
 //!
 //! The box floor's 1°×1° minimum-elevation grid is **not** here even though the
 //! same builder pass emits it: it lives in `squallar_geo::min_elevation`,
@@ -28,6 +32,7 @@
 
 pub mod height;
 pub mod jobs;
+pub mod plan;
 pub mod resample;
 pub mod trgb;
 
@@ -36,4 +41,8 @@ pub use height::{
     encode_height_m,
 };
 pub use jobs::{HeightTile, TerrainHeightJob};
+pub use plan::{
+    CameraFootprint, FitRequest, Footprint, HeightCeilings, HeightPlan, HeightPlanner, PlanLimit,
+    PostRung,
+};
 pub use resample::{ElevationError, TileCover, TilePlane, cover_for, post_center_km, post_geo};

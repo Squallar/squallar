@@ -46,6 +46,7 @@ use squallar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCode
 use squallar_source::wire::Reader;
 
 use crate::height::HeightField;
+use crate::plan::MAX_POSTS_PER_AXIS;
 use crate::resample::{TileCover, TilePlane};
 
 /// This crate's one codec row. Chained after the radar and overlay registries,
@@ -114,10 +115,10 @@ const REPLY_HEAD_BYTES: usize = 6 * 8 + 2 * 4;
 /// 4096 is eight times the widest real tile.
 const MAX_TILE_PX: u32 = 4096;
 
-/// The most posts one axis of a field may carry. A 920 km box at 1 km posts is
-/// 921; 8192 is a post every 112 m over the same box. The cover's boundary walk
-/// is linear in this, so it also bounds the work a later refusal can cost.
-const MAX_POSTS_PER_AXIS: u32 = 8192;
+// The most posts one axis of a field may carry is `plan::MAX_POSTS_PER_AXIS`,
+// imported above. It used to be spelled here as well; a refusal ceiling and the
+// fit that stops short of it are the last two numbers that should be allowed to
+// disagree.
 
 /// The most posts one field may carry, 4,194,304 -- 8 MiB of `u16`, against
 /// 848,241 for the 921x921 case above.

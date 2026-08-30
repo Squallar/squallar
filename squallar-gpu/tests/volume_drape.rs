@@ -436,6 +436,28 @@ struct Comparison {
 /// Factored out so the mutant below is measured by the *same* comparison the
 /// criterion above is, rather than by a second one written to agree with it.
 fn compare(view: &VolumeView, t_scale: f32, frame: &Frame) -> Comparison {
+    compare_where(view, t_scale, frame, ridge_height, |_| true)
+}
+
+/// [`compare`] over a placed field, and over a chosen part of the box.
+///
+/// `surface` is the analytic surface the mesh is meant to describe — the
+/// identity field's own for the criterion above, the placed one with its apron
+/// for the patch-edge criterion. `select` is the region of the **drawn box**
+/// the caller is asking about, so "the apron drapes correctly" can be asserted
+/// without the interior's points diluting it.
+///
+/// Factored this way rather than copied: the whole value of the checkerboard
+/// oracle is that one comparison is what every criterion in this file goes
+/// through, and a second spelling of it is a second thing that can be wrong in
+/// a way that agrees.
+fn compare_where(
+    view: &VolumeView,
+    t_scale: f32,
+    frame: &Frame,
+    surface: impl Fn([f32; 2]) -> f32,
+    select: impl Fn([f32; 2]) -> bool,
+) -> Comparison {
     let mut compared = 0usize;
     let mut wrong: Vec<(f64, f64, bool, u8)> = Vec::new();
     let mut off_surface = 0usize;
@@ -471,8 +493,11 @@ fn compare(view: &VolumeView, t_scale: f32, frame: &Frame) -> Comparison {
             // circular: the occluder is a channel the shader wrote, and if
             // it did not describe the analytic surface this file drew, the
             // colour comparison below would be about nowhere.
-            if (p[2] - ridge_height([p[0], p[1]])).abs() > 2e-3 {
+            if (p[2] - surface([p[0], p[1]])).abs() > 2e-3 {
                 off_surface += 1;
+                continue;
+            }
+            if !select([p[0], p[1]]) {
                 continue;
             }
             let (lat, lon) = true_geo([p[0], p[1]]);
@@ -1063,5 +1088,339 @@ fn the_placement_criterion_notices_a_shader_that_ignores_the_lane() {
          The lane the uniform grew from 304 to 320 bytes to carry would then \
          be verified as host arithmetic with nothing measuring the shader that \
          consumes it",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B4: the patch edge.
+// ---------------------------------------------------------------------------
+
+/// **The placement a re-fit at the zoom stop actually produces.**
+///
+/// `MIN_EYE_DISTANCE = 0.05` against a default standoff of about 1.94 puts the
+/// eye 32.5 km off a 920 km box's pivot, and 40 degrees of vertical field of
+/// view at 25 degrees of pitch over a 16:10 viewport subtends about 66 km of
+/// ground. 66.4 / 920 is 0.0722, centred.
+///
+/// **Deliberately not [`PLACED`]'s quarter.** That fixture was chosen to make
+/// the placement lane visible; this one is the number
+/// `squallar_elevation::plan` answers for the camera the whole unit exists for,
+/// and at 0.5% of the box's area the apron is nearly the entire picture —
+/// which is exactly the regime the open question is about.
+const REFIT: [f32; 4] = [0.0722, 0.0722, 0.4639, 0.4639];
+
+/// The surface a re-fitted mesh describes: the field inside [`REFIT`], and the
+/// rim post's own height held flat outside it.
+fn refit_height(p: [f32; 2]) -> f32 {
+    let lo = post_center_fraction(0, POSTS);
+    let hi = post_center_fraction(POSTS - 1, POSTS);
+    let axis = |v: f32, scale: f32, offset: f32| ((v - offset) / scale).clamp(lo, hi);
+    ridge_height([
+        axis(p[0], REFIT[0], REFIT[2]),
+        axis(p[1], REFIT[1], REFIT[3]),
+    ])
+}
+
+/// Whether a box-space point is outside the re-fitted field's own footprint —
+/// the apron, which under a zoom-stop re-fit is 99.5% of the drawn box.
+fn on_the_apron(p: [f32; 2]) -> bool {
+    let outside = |v: f32, scale: f32, offset: f32| {
+        let f = (v - offset) / scale;
+        !(0.0..=1.0).contains(&f)
+    };
+    outside(p[0], REFIT[0], REFIT[2]) || outside(p[1], REFIT[1], REFIT[3])
+}
+
+/// What the reconstruction found either side of the patch edge:
+/// `(interior relief in box z, discriminating apron points)`.
+///
+/// **The second figure is the non-triviality half of the surface criterion, and
+/// it is what stops "the apron is flat" being a sentence nothing can
+/// contradict.** A first draft of this measured the apron's residual against
+/// the flat model and asserted it small — but the same residual was the filter
+/// for "is this point on the mesh at all", so the assertion was capped below
+/// its own threshold by construction and could not fail. That is this
+/// repository's documented vacuous-verification shape exactly, caught here by
+/// writing down what the number was bounded by.
+///
+/// What is counted instead is apron points where the flat-skirt model and the
+/// **stretched** one — the field pulled over the whole drawn box, which is what
+/// a shader ignoring the apron would draw — differ by more than the criterion's
+/// own tolerance. Every one of those is a point at which
+/// [`the_patch_edge_stands_still_under_orbit_and_keeps_its_drape`]'s surface
+/// check is discriminating rather than agreeing with both answers at once.
+/// That test is `#[ignore]`d and runs under
+/// `cargo test -p squallar-gpu --test volume_drape -- --ignored`.
+fn patch_edge_evidence(view: &VolumeView, t_scale: f32, frame: &Frame) -> (f32, usize) {
+    let mut discriminating = 0usize;
+    let mut interior = (f32::MAX, f32::MIN);
+    for row in (0..SIZE[1]).step_by(3) {
+        for column in (0..SIZE[0]).step_by(3) {
+            let at = (row * SIZE[0] + column) as usize;
+            if frame.ground[at][3] != 255 {
+                continue;
+            }
+            let t = squallar_volumetric::raymarch::unpack24_bytes([
+                frame.occluder[at][0],
+                frame.occluder[at][1],
+                frame.occluder[at][2],
+            ]) * t_scale;
+            let direction = ray_through(view, column, row);
+            let p = [
+                view.eye_in_box[0] + direction[0] * t,
+                view.eye_in_box[1] + direction[1] * t,
+                view.eye_in_box[2] + direction[2] * t,
+            ];
+            if on_the_apron([p[0], p[1]]) {
+                // The two answers, and whether this point can tell them apart.
+                // Deliberately computed from the point's POSITION alone and
+                // never from what was observed there: a rule that read the
+                // pixel would be selecting away the failures it exists to find.
+                let flat = refit_height([p[0], p[1]]);
+                let stretched = ridge_height([p[0], p[1]]);
+                if (flat - stretched).abs() > 4e-3 {
+                    discriminating += 1;
+                }
+            } else if (p[2] - refit_height([p[0], p[1]])).abs() <= 2e-3 {
+                interior = (interior.0.min(p[2]), interior.1.max(p[2]));
+            }
+        }
+    }
+    let span = if interior.0 <= interior.1 {
+        interior.1 - interior.0
+    } else {
+        0.0
+    };
+    (span, discriminating)
+}
+
+/// The **answer to B4's open sub-question: what the patch edge does under
+/// orbit.**
+///
+/// It does three things, and this measures all three at all eleven cameras:
+///
+/// 1. **It stands still.** The mesh is authored in box space and `ground_box`
+///    is a box-space affine, so the surface — crease included — is a function
+///    of `(x, y)` with no camera in it. The criterion is that one host model of
+///    that function predicts every reconstructed surface point from every
+///    camera. A crease that swam with the eye would fail it at the cameras it
+///    swam to.
+/// 2. **It is a terrace lip, not a hole and not a cliff.** The apron is flat at
+///    the rim post's own height and joins the field's rim exactly — `box_axis`
+///    duplicates the rim post rather than pulling it out — so the surface is
+///    continuous across the edge and its *slope* is what jumps. No gap, no
+///    z-fight, and no ground missing: what the eye sees is a lip.
+/// 3. **The map keeps its registration across it.** `fs_ground` drapes at the
+///    fragment's own surface point, and the apron's fragments have real box
+///    coordinates even though their height is the rim's — so the basemap runs
+///    on across the lip undisturbed. That is the half nothing measured before:
+///    every checkerboard sample in this file until now was taken over a field
+///    on the identity placement, where there is no apron to be wrong about.
+///
+/// The third is the one with a plausible wrong answer, and
+/// [`the_patch_edge_criterion_notices_a_drape_clamped_to_the_field`] is the
+/// mutant for it — clamping the *colour* to the field's footprint the way the
+/// *height* is clamped is the natural mistake, and it smears the rim's map
+/// across the entire apron. That mutant is `#[ignore]`d like everything else
+/// in this file; run it with
+/// `cargo test -p squallar-gpu --test volume_drape -- --ignored`. Measured on
+/// this hardware: it is noticed at **11 of 11 cameras, on 4539 of 9215
+/// compared apron points**.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_patch_edge_stands_still_under_orbit_and_keeps_its_drape() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
+    pipelines.upload_quad(&queue);
+    let mirror = planted_mirror(
+        &device,
+        &queue,
+        &pipelines,
+        [MIRROR_EDGE, MIRROR_EDGE],
+        &checker_rgba(),
+    );
+    let heights = pipelines
+        .upload_heights(&device, &queue, [POSTS, POSTS], &ridge_samples())
+        .expect("the fixture height field was refused");
+
+    let mut apron_compared_total = 0usize;
+    let mut cameras_with_relief = 0usize;
+    let mut discriminating_total = 0usize;
+    let mut worst_surface_error = 0.0f32;
+    for camera in ORBIT_CAMERAS {
+        let view = view_at(camera);
+        let mut placed = uniform([8, 8, 8], &view);
+        placed.ground_box = REFIT;
+        let frame = render(&device, &queue, &pipelines, &placed, &heights, &mirror);
+
+        // (1) It stands still: one box-space model predicts every camera.
+        let (worst, checked) = surface_error(&view, placed.occluder_t_scale, &frame, refit_height);
+        worst_surface_error = worst_surface_error.max(worst);
+        assert!(
+            checked >= 30,
+            "{camera:?}: only {checked} surface points were reconstructed",
+        );
+        assert!(
+            worst < 4e-3,
+            "{camera:?}: a reconstructed surface point is {worst:.3e} box units \
+             off the box-space surface the re-fit describes, over {checked} \
+             points. The patch edge is somewhere this camera put it rather than \
+             where the placement did — it swims",
+        );
+
+        // (2) It is a lip: the check above is discriminating out on the apron
+        // and not only over the patch, and the patch really has a field in it.
+        let (interior_relief, discriminating) =
+            patch_edge_evidence(&view, placed.occluder_t_scale, &frame);
+        discriminating_total += discriminating;
+        if interior_relief > RIDGE * 0.3 {
+            cameras_with_relief += 1;
+        }
+
+        // (3) The drape runs on across it: the checkerboard oracle, restricted
+        // to apron points.
+        let Comparison {
+            compared,
+            wrong,
+            off_surface: _,
+        } = compare_where(
+            &view,
+            placed.occluder_t_scale,
+            &frame,
+            refit_height,
+            on_the_apron,
+        );
+        apron_compared_total += compared;
+        assert!(
+            wrong.is_empty(),
+            "{camera:?}: {} of {compared} APRON surface points carry the wrong \
+             checker cell (first: {:?}). The map does not run on across the \
+             patch edge — the flat skirt outside the re-fitted field is drawn \
+             with the wrong part of the basemap on it",
+            wrong.len(),
+            &wrong[..wrong.len().min(4)],
+        );
+    }
+
+    // The apron is where nearly every pixel is at this placement, so a run that
+    // compared few of them would be a run that had measured the interior and
+    // called it the edge. Measured on this hardware: 9215 apron points
+    // compared across the eleven cameras, worst surface residual 4.8e-4 against
+    // a 4e-3 tolerance.
+    assert!(
+        apron_compared_total >= 3000,
+        "only {apron_compared_total} apron points were compared across all \
+         eleven cameras",
+    );
+    // **The surface criterion is discriminating on the apron.** Measured on
+    // this hardware: **158,896** of the reconstructed apron points sit where
+    // the flat skirt and the stretched field disagree by more than the
+    // tolerance, so the per-camera check above is telling those two answers
+    // apart at a hundred thousand places rather than agreeing with both.
+    //
+    // **Two counts, two denominators, never added.** This one is every
+    // reconstructed apron point; `apron_compared_total` is only those the
+    // CHECKERBOARD could also use, which means clear of a cell boundary by
+    // `CENTRE_CLEARANCE` on both axes. That filter keeps
+    // `(1 - 2 * 0.38)^2 = 0.0576`, and `158896 * 0.0576` is **9152** against
+    // the 9215 measured — under a percent apart, which is what the clearance
+    // rule alone predicts. (An earlier note rounded 0.0576 to 0.058 and got
+    // 9216, one off the measurement; that agreement was a rounding artefact
+    // and is not evidence of anything.) A thousand is margin, not a tuned
+    // figure.
+    assert!(
+        discriminating_total >= 1000,
+        "only {discriminating_total} apron points can tell the flat skirt from \
+         a stretched field, so 'the surface is the placed one' is not being \
+         asserted about the patch edge at all",
+    );
+    // And the fixture really does have a field inside the patch: without this
+    // the criterion would pass against a field with no relief anywhere, where
+    // there is no edge to have a question about. Measured: 10 of 11.
+    assert!(
+        cameras_with_relief >= 3,
+        "only {cameras_with_relief} of eleven cameras reconstructed any relief \
+         INSIDE the re-fitted patch, so 'the apron is flat and the interior is \
+         not' is measuring one half of a comparison",
+    );
+    assert!(worst_surface_error < 4e-3);
+}
+
+/// **The mutant control for the patch edge's drape: a shader that clamps the
+/// map to the field's own footprint the way it clamps the height.**
+///
+/// This is the natural mistake, not a contrived one. The apron *is* the rim
+/// extended — `post_of_column` clamps the height sample to the rim post — and
+/// applying the same clamp to `map_colour_at_km`'s arguments reads as finishing
+/// the job. What it actually does is smear the basemap's rim pixel across
+/// 99.5% of the box at a zoom-stop re-fit, and no criterion in this directory
+/// noticed before this one, because every other fixture sits on the identity
+/// placement where the clamp is a no-op.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_patch_edge_criterion_notices_a_drape_clamped_to_the_field() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let attachments = attachments(wgpu::TextureFormat::Rgba8Unorm);
+
+    const TRUE_DRAPE: &str =
+        "    let ground = map_colour_at_km(box_x_km(in.box_p.x), box_y_km(in.box_p.y));";
+    const CLAMPED_DRAPE: &str = "    let ground = map_colour_at_km(box_x_km(clamp(in.box_p.x, volume.ground_box.z, volume.ground_box.z + volume.ground_box.x)), box_y_km(clamp(in.box_p.y, volume.ground_box.w, volume.ground_box.w + volume.ground_box.y)));";
+
+    let source = squallar_volumetric::raymarch::VOLUME_SHADER_WGSL;
+    assert_eq!(
+        source.matches(TRUE_DRAPE).count(),
+        1,
+        "the ground fragment's drape has moved; re-anchor this mutant rather \
+         than deleting it. Anchor was:\n{TRUE_DRAPE}",
+    );
+    let pipelines = VolumePipelines::from_shader_source(
+        &device,
+        attachments,
+        &source.replacen(TRUE_DRAPE, CLAMPED_DRAPE, 1),
+    );
+    pipelines.upload_quad(&queue);
+    let mirror = planted_mirror(
+        &device,
+        &queue,
+        &pipelines,
+        [MIRROR_EDGE, MIRROR_EDGE],
+        &checker_rgba(),
+    );
+    let heights = pipelines
+        .upload_heights(&device, &queue, [POSTS, POSTS], &ridge_samples())
+        .expect("the fixture height field was refused");
+
+    let mut noticed = 0usize;
+    let mut wrong_total = 0usize;
+    let mut compared_total = 0usize;
+    for camera in ORBIT_CAMERAS {
+        let view = view_at(camera);
+        let mut placed = uniform([8, 8, 8], &view);
+        placed.ground_box = REFIT;
+        let frame = render(&device, &queue, &pipelines, &placed, &heights, &mirror);
+        let Comparison {
+            compared, wrong, ..
+        } = compare_where(
+            &view,
+            placed.occluder_t_scale,
+            &frame,
+            refit_height,
+            on_the_apron,
+        );
+        compared_total += compared;
+        wrong_total += wrong.len();
+        if compared >= 30 && !wrong.is_empty() {
+            noticed += 1;
+        }
+    }
+
+    assert!(
+        noticed >= 6,
+        "a shader that drapes the apron with the field's rim colour was \
+         noticed at only {noticed} of eleven cameras ({wrong_total} wrong of \
+         {compared_total} compared). The apron would then be an untested lane \
+         covering nearly the whole box whenever the camera is dollied in",
     );
 }
