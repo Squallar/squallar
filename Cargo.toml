@@ -4,6 +4,7 @@ members = [
     "squallar",
     "squallar-app",
     "squallar-device-profile",
+    "squallar-elevation",
     "squallar-worker",
     "squallar-gpu",
     "squallar-volumetric",
@@ -72,6 +73,7 @@ nexrad-level3 = { path = "nexrad-level3" }
 squallar-app = { path = "squallar-app" }
 squallar-device-profile = { path = "squallar-device-profile" }
 squallar-egui = { path = "squallar-egui" }
+squallar-elevation = { path = "squallar-elevation" }
 squallar-geo = { path = "squallar-geo" }
 squallar-gpu = { path = "squallar-gpu" }
 squallar-kv = { path = "squallar-kv" }

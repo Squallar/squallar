@@ -1,0 +1,27 @@
+# Terrain-RGB decode and the box-space height resample.
+#
+# Its own crate because both run inside the offload worker, which links neither
+# egui, wgpu nor winit. `tests/charter.rs` holds that as a ceiling on the
+# declared set AND on the resolved graph, so it is a gate rather than a
+# sentence.
+[package]
+name = "squallar-elevation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# The PNG decoder, and nothing else from `image`: a Terrain-RGB tile is 8-bit
+# RGB PNG by construction (`tools/squallar-terrain`'s `verify()` refuses a lossy
+# tile format for that encoding, because one count of R is 6553.6 m). No new
+# graph node -- `squallar-egui` already depends on this exact version, and
+# `vendor/walkers` on the same version with `png` among its features.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+# The forward map. `great_circle_destination` is called directly and no inverse
+# is written, so there is no second projection to disagree with the first.
+squallar-geo = { workspace = true }
+
+[dev-dependencies]
+# `tests/charter.rs` parses `cargo metadata` output to pin this crate's
+# dependency ceiling and the resolved graph it is allowed to reach.
+serde_json = { workspace = true }
