@@ -244,6 +244,14 @@ pub struct App {
     /// When [`App::report_frame_telemetry`] last wrote its lines; the same
     /// periodic-readout clock shape as [`Self::raster_telemetry_said`].
     frame_telemetry_said: Option<web_time::Instant>,
+    /// The `gpu passes:` sentence as last composed for the diagnostics
+    /// overlay — the same line the telemetry family prints. `None` where no
+    /// probe is installed; the overlay shows its own absence text there.
+    gpu_passes_panel_line: Option<String>,
+    /// The probe's collected-frame count [`Self::gpu_passes_panel_line`] was
+    /// composed at, so the sentence is rebuilt only when a figure can have
+    /// moved rather than allocated every frame.
+    gpu_passes_panel_frames: Option<u64>,
     /// The last predictive-back claim pushed to the platform, so the push is
     /// edge-triggered. `false` at construction because nothing is open on the
     /// first frame — which is also what the platform assumes until told
@@ -570,6 +578,8 @@ impl App {
             frame_ledger: crate::frame_ledger::FrameLedger::default(),
             frame_telemetry_loud,
             frame_telemetry_said: None,
+            gpu_passes_panel_line: None,
+            gpu_passes_panel_frames: None,
             back_claimed: false,
             exit_requested: false,
             autosave: AutosaveState {

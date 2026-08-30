@@ -474,6 +474,7 @@ impl InputHarness {
             catalogue_pending: self.facts.catalogue_pending,
             liveness: &liveness,
             floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
+            frame_diagnostics: None,
         });
     }
 

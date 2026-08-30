@@ -54,6 +54,7 @@ impl Gui {
             self.probes.last_bottom_bar = BottomBarProbe::default();
             self.probes.last_sheet = SheetProbe::default();
             self.probes.last_error_toast = None;
+            self.probes.last_diagnostics_rows.clear();
         }
 
         if self.layout.width != crate::ui_layout::WidthClass::Compact {
@@ -110,6 +111,8 @@ impl Gui {
         self.render_overlay_popup(ctx);
 
         self.render_catalog(ctx, &mut actions);
+
+        self.render_diagnostics_panel(ctx);
 
         self.apply_pending_pane_close(ctx, &mut actions);
 

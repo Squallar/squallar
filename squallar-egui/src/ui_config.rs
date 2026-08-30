@@ -895,6 +895,11 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+/// Whether a `bool` field is at its `false` default, for `skip_serializing_if`.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1019,6 +1024,17 @@ struct UiConfig {
     /// loads an older config as unpinned, which is what those sessions were.
     #[serde(default)]
     pin_pane_controls: bool,
+    /// Whether the frame diagnostics overlay is showing — the Interface
+    /// section's "Show frame diagnostics". Additive on `pin_pane_controls`'
+    /// terms — no `CONFIG_VERSION` bump and no `migrate.rs` step; an older
+    /// config loads as hidden, which is what those sessions were.
+    /// `skip_serializing_if` while hidden for `viewing_live`'s reason: writing
+    /// the key into every file would move the bytes of configs that say
+    /// nothing about it, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(default, skip_serializing_if = "is_false")]
+    diagnostics_panel: bool,
     /// **The user's starred radar sites**, bare ICAO identifiers in the order
     /// they were starred — the same spelling a pick persists, so a favourite
     /// and a current site are the one kind of value.
@@ -1458,6 +1474,7 @@ impl Default for UiConfig {
             storm_motion_override: super::StormMotionOverride::default(),
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
             pin_pane_controls: false,
+            diagnostics_panel: false,
             favorite_sites: Vec::new(),
             downloaded_areas: Vec::new(),
             download_area: DownloadAreaConfig::default(),
@@ -1587,6 +1604,7 @@ impl super::Gui {
             },
             srv_fallback: self.srv_fallback,
             pin_pane_controls: self.pin_pane_controls,
+            diagnostics_panel: self.diagnostics_panel,
             favorite_sites: self.favorite_sites.clone(),
             downloaded_areas: self
                 .downloaded_areas
@@ -1761,6 +1779,7 @@ impl super::Gui {
         self.storm_motion_override = config.storm_motion_override;
         self.srv_fallback = config.srv_fallback;
         self.pin_pane_controls = config.pin_pane_controls;
+        self.diagnostics_panel = config.diagnostics_panel;
         self.favorite_sites = config.favorite_sites;
         // A block that names no area is dropped, not restored badly — the
         // `VolumeRegionConfig::restore` arrangement, and the reason a hand-

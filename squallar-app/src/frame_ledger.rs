@@ -234,6 +234,28 @@ impl FrameLedger {
     pub(crate) fn cadence(&self) -> &Hist {
         &self.cadence
     }
+
+    /// Every histogram this ledger keeps, borrowed as the diagnostics
+    /// overlay's frame input. `gpu_passes` is `None` here — the GPU pass
+    /// line is not this ledger's to compose, and `push_frame_inputs` overlays
+    /// it from the probe's report where one is installed.
+    pub(crate) fn diagnostics(&self) -> squallar_egui::shell_api::FrameDiagnostics<'_> {
+        squallar_egui::shell_api::FrameDiagnostics {
+            service_interact: &self.service_interact,
+            service_idle: &self.service_idle,
+            segments: [
+                &self.segments.pre,
+                &self.segments.pump,
+                &self.segments.ui,
+                &self.segments.prepare,
+                &self.segments.finish,
+                &self.segments.post,
+            ],
+            acquire: &self.acquire,
+            cadence: &self.cadence,
+            gpu_passes: None,
+        }
+    }
 }
 
 #[cfg(test)]

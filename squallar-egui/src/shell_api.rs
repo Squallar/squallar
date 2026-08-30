@@ -4,7 +4,35 @@
 //! out-direction, `GuiAction`, already had this shape and lives in
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
 
+use squallar_device_profile::hist::Hist;
 use squallar_radar::types::ScanInfo;
+
+/// The frame instrument's histograms, borrowed for one frame — what the
+/// diagnostics overlay windows. Cumulative-from-boot recorders; the overlay
+/// itself takes the trailing-window diff, so nothing here is ever displayed
+/// raw. References rather than copies: composing this costs pointer packing,
+/// whether or not the overlay is showing.
+#[derive(Clone, Copy)]
+pub struct FrameDiagnostics<'a> {
+    /// Service of presented frames whose input carried a pointer/touch/
+    /// wheel event. Service is the redraw minus the swapchain acquire.
+    pub service_interact: &'a Hist,
+    /// Service of presented frames whose input carried none.
+    pub service_idle: &'a Hist,
+    /// Where an interact frame's service went:
+    /// `[pre, pump, ui, prepare, finish, post]`.
+    pub segments: [&'a Hist; 6],
+    /// The swapchain-acquire span of interact frames — the vsync wait,
+    /// excluded from service and reported beside it.
+    pub acquire: &'a Hist,
+    /// Redraw-to-redraw interval of presented frames, both input families.
+    /// Never added to service; the two share no denominator.
+    pub cadence: &'a Hist,
+    /// A GPU pass-timing line, verbatim, once a probe can supply one.
+    /// `None` prints as the overlay's absence text — absence, never
+    /// extrapolation.
+    pub gpu_passes: Option<&'a str>,
+}
 
 /// One frame's facts, composed by the App from state it already owns, applied
 /// by `Gui::apply_frame_inputs` once per frame immediately before `Gui::ui`.
@@ -52,6 +80,10 @@ pub struct FrameInputs<'a> {
     /// so the UI always read it a frame late; composed at the top of the next
     /// frame it has the identical observable timing.
     pub floor_tile_zoom_bias: u8,
+    /// The frame instrument's histograms, when the shell has them — the
+    /// diagnostics overlay's input. `None` from a caller with no ledger (the
+    /// test harness); the overlay then shows itself still collecting.
+    pub frame_diagnostics: Option<FrameDiagnostics<'a>>,
 }
 
 /// Event-shaped pushes applied at the call site's existing control-flow

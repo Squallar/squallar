@@ -303,6 +303,12 @@ pub struct Gui {
     pub(super) pills_raise_pending: bool,
     /// Whether the pane pill rows render at full opacity unconditionally.
     pub(super) pin_pane_controls: bool,
+    /// Whether the frame diagnostics overlay is showing — the Interface
+    /// section's "Show frame diagnostics" switch. Persisted.
+    pub(super) diagnostics_panel: bool,
+    /// The overlay's trailing-window state. Session-only bookkeeping —
+    /// emptied whenever the overlay is hidden.
+    pub(super) diagnostics: diagnostics::DiagnosticsState,
     /// Whether the floating chrome is faded away — the map-first
     /// state one qualifying click enters and the next one leaves. Session-only
     /// like every open-surface flag: hiding the UI is a gesture, not a
@@ -598,6 +604,8 @@ impl Gui {
             pills_drawn_last_frame: 0,
             pills_raise_pending: false,
             pin_pane_controls: false,
+            diagnostics_panel: false,
+            diagnostics: diagnostics::DiagnosticsState::default(),
             ui_faded: false,
             fade_candidate: false,
             press_switched_pane: false,
