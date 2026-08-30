@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::Res;
-use crate::grid::{TileRange, tile_range};
+use crate::grid::{LonLatBox, TileRange, tile_range};
 use crate::md5;
 
 /// GLO-30 is `_COG_10_` — one tenth of an arc-second times ten, i.e. 1". The
@@ -268,6 +268,25 @@ pub fn supercells(list: &TileList, zoom: u8, side: u32) -> Vec<SuperCell> {
         .collect()
 }
 
+/// Drop every super-cell whose tile extent misses `bbox` at `zoom`.
+///
+/// THE LEVER `ONLY_SUPERCELL` COULD NOT BE. That one is
+/// `name.contains(filter)` against `sc_z11_000320_000640`, and a region is a
+/// two-dimensional block range: CONUS at z11 with `SUPERCELL=64` is columns
+/// 5-10 by rows 10-13, nine populated blocks whose names agree on neither
+/// field. No substring selects them, and asking for a region with no lever at
+/// all builds the globe — 1024 z11 blocks against nine.
+///
+/// The clip is per-BLOCK, not per-tile: a super-cell that overlaps the box at
+/// all is built whole, so the region actually produced is `bbox` rounded
+/// outward to super-cell boundaries. Cutting a block in half would break the
+/// invariant the whole raster pass rests on — every super-cell is the same
+/// pixel count everywhere on the globe.
+pub fn clip_to_bbox(cells: &mut Vec<SuperCell>, zoom: u8, bbox: LonLatBox) {
+    let want = bbox.tile_range(zoom);
+    cells.retain(|c| c.range.intersects(want));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +436,153 @@ mod tests {
             assert_eq!(sc.range.tx0 % 64, 0);
             assert_eq!(sc.range.ty0 % 64, 0);
         }
+    }
+
+    /// CONUS, the box the terrain-RGB z11-z12 archive is actually built with.
+    const CONUS: LonLatBox = LonLatBox {
+        w: -125.0,
+        s: 24.0,
+        e: -66.0,
+        n: 50.0,
+    };
+
+    /// Five CONUS degree cells spread to the corners, plus four that must not
+    /// survive: Alberta (north of the box), France, Japan and Sydney.
+    fn a_global_scattering() -> TileList {
+        list_of(&[
+            (39, -106),
+            (24, -98),
+            (48, -123),
+            (25, -81),
+            (48, -68),
+            (55, -115),
+            (48, 7),
+            (35, 139),
+            (-33, 151),
+        ])
+    }
+
+    /// The retained set is a two-DIMENSIONAL block range, and it is spelled out
+    /// rather than re-derived: block columns 5-10 by rows 10-13 at z11 with
+    /// `SUPERCELL=64`, which is `tx0` in {320, 384, 448, 512, 576, 640} against
+    /// `ty0` in {640, 704, 768, 832}.
+    ///
+    /// Alberta at 55N is the interesting drop. Its northern block (row 9) goes,
+    /// but its southern one (row 10) is the SAME block Washington already
+    /// contributes -- a super-cell 64 tiles tall spans a lot of latitude, and
+    /// the clip is per-block by construction. Asserting the whole set is what
+    /// catches that; asserting "Alberta is gone" would be false.
+    #[test]
+    fn a_conus_bbox_keeps_the_conus_block_range_and_drops_the_rest() {
+        let mut cells = supercells(&a_global_scattering(), 11, 64);
+        let before: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
+        clip_to_bbox(&mut cells, 11, CONUS);
+        let after: Vec<&str> = cells.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            after,
+            [
+                "sc_z11_000320_000640",
+                "sc_z11_000320_000704",
+                "sc_z11_000384_000768",
+                "sc_z11_000448_000832",
+                "sc_z11_000512_000832",
+                "sc_z11_000576_000640",
+                "sc_z11_000576_000704",
+                "sc_z11_000640_000640",
+                "sc_z11_000640_000704",
+            ],
+            "unclipped set was {before:?}"
+        );
+        // Every dropped block, named, so a clip that widens is caught too.
+        for gone in [
+            "sc_z11_000320_000576", // Alberta, block row 9
+            "sc_z11_001024_000640", // France
+            "sc_z11_001024_000704",
+            "sc_z11_001792_000768", // Japan
+            "sc_z11_001856_001216", // Sydney
+        ] {
+            assert!(
+                before.iter().any(|n| n == gone),
+                "{gone} was never enumerated"
+            );
+            assert!(!after.contains(&gone), "{gone} survived the clip");
+        }
+    }
+
+    /// WHY THE BOX EXISTS. `ONLY_SUPERCELL` is `name.contains(filter)`, and no
+    /// filter of that shape selects the CONUS block range: exhaustively, every
+    /// substring of a retained name either misses one of the nine or catches
+    /// one of the five that must go.
+    ///
+    /// Enumerating substrings of ONE retained name is complete, not a sample --
+    /// a filter that matches all nine must be a substring of each of them.
+    #[test]
+    fn no_substring_filter_can_express_the_conus_block_range() {
+        let list = a_global_scattering();
+        let mut want = supercells(&list, 11, 64);
+        clip_to_bbox(&mut want, 11, CONUS);
+        let want: Vec<String> = want.into_iter().map(|c| c.name).collect();
+        assert_eq!(want.len(), 9);
+
+        let first = want[0].clone();
+        for lo in 0..first.len() {
+            for hi in (lo + 1)..=first.len() {
+                let Some(filter) = first.get(lo..hi) else {
+                    continue;
+                };
+                let mut got = supercells(&list, 11, 64);
+                got.retain(|c| c.name.contains(filter));
+                let got: Vec<String> = got.into_iter().map(|c| c.name).collect();
+                assert_ne!(
+                    got, want,
+                    "ONLY_SUPERCELL={filter:?} would have expressed the region \
+                     and RASTER_BBOX would be unnecessary"
+                );
+            }
+        }
+    }
+
+    /// The unfiltered z11 globe, for scale: the second archive command without
+    /// a region lever does not build a region, it builds this.
+    #[test]
+    fn a_missing_bbox_builds_every_land_block_on_the_globe() {
+        let mut cells = supercells(&a_global_scattering(), 11, 64);
+        assert_eq!(cells.len(), 14);
+        clip_to_bbox(&mut cells, 11, CONUS);
+        assert_eq!(cells.len(), 9);
+    }
+
+    /// A region's EAST border, where a super-cell overlaps the box by exactly
+    /// ONE tile column. This is the half of a clip nobody looks at: an
+    /// exclusive comparison drops the border blocks and the terrain just ends
+    /// short of the coast, in the direction the operator is least likely to
+    /// pan.
+    ///
+    /// `SUPERCELL=8` rather than 64 to reach the case: CONUS's east edge is
+    /// tile column 648 at z11, which is a multiple of 8 and not of 64, so the
+    /// block starting at 648 touches the box on exactly its first column.
+    #[test]
+    fn the_clip_keeps_a_block_the_box_touches_by_one_tile() {
+        let want = CONUS.tile_range(11);
+        assert_eq!(
+            (want.tx0, want.ty0, want.tx1, want.ty1),
+            (312, 694, 648, 883)
+        );
+        // One degree cell straddling the east edge, at 39N 67W.
+        let mut cells = supercells(&list_of(&[(39, -67)]), 11, 8);
+        assert_eq!(cells.len(), 4);
+        clip_to_bbox(&mut cells, 11, CONUS);
+        let names: Vec<&str> = cells.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "sc_z11_000640_000768",
+                "sc_z11_000640_000776",
+                // tile columns 648-655: the box reaches 648 and stops.
+                "sc_z11_000648_000768",
+                "sc_z11_000648_000776",
+            ]
+        );
     }
 
     /// Two cells inside one block produce one super-cell, not two.
