@@ -98,7 +98,7 @@ fn the_ladder_is_monotone_in_the_row_it_is_given() {
         row *= 2;
     }
     assert!(
-        distinct.len() >= 8,
+        distinct.len() >= 6,
         "the sweep produced only {} distinct answers, so a `fit` that ignored \
          its argument would have passed the monotonicity above",
         distinct.len(),
@@ -160,8 +160,8 @@ fn the_rung_ladder_terminates_at_its_floor() {
     }
     assert_eq!(rung.vertex_ceiling(), MIN_VERTEX_CEILING);
     assert_eq!(
-        steps, 8,
-        "the ladder is {steps} rungs long; 1,048,576 halved to 4,096 is 8",
+        steps, 5,
+        "the ladder is {steps} rungs long; 1,048,576 halved to 32,768 is 5",
     );
 }
 
@@ -221,6 +221,63 @@ fn the_shed_order_is_stable_at_a_size_where_instability_would_show() {
         .collect();
     let expected: Vec<usize> = (0..N).step_by(2).chain((1..N).step_by(2)).collect();
     assert_eq!(shed_order(&interleaved), expected);
+}
+
+/// **The capacity figure is what the fixture actually costs**, re-measured
+/// here rather than written down once and trusted.
+///
+/// [`MEASURED_VERTICES_PER_BUILDING`] is the only number behind every "how
+/// many buildings" claim in this module, and it is the number a review found
+/// wrong by 8.7x: the doc said "~100 vertices per building" and attributed it
+/// to the confirmation archive while it was really the cost of a four-sided
+/// box. This is the gate that stops that happening again -- it extrudes the
+/// committed tile and compares.
+#[test]
+fn the_measured_vertices_per_building_is_what_the_fixture_actually_costs() {
+    use crate::footprint::read_footprints;
+    use crate::footprint::tests::{REAL_BUILDING_TILE, REAL_TILE_ID, a_frame};
+    use crate::prism::extrude;
+
+    let footprints = read_footprints(REAL_TILE_ID, REAL_BUILDING_TILE, &a_frame())
+        .expect("the fixture tile reads");
+    let generous = PrismBudget::fit(PrismCeilings {
+        vram_bytes: u64::MAX,
+        max_buffer_bytes: u64::MAX,
+    });
+    let mesh = extrude(&footprints, &generous);
+    assert_eq!(mesh.shed, 0, "the measurement must be over the whole tile");
+
+    let measured = mesh.positions.len() as f64 / footprints.len() as f64;
+    assert!(
+        (measured - MEASURED_VERTICES_PER_BUILDING).abs() < 0.05,
+        "one building costs {measured:.1} vertices, against the \
+         {MEASURED_VERTICES_PER_BUILDING} this module prices every capacity \
+         claim at",
+    );
+
+    // The three capacity sentences in this module's docs, as arithmetic.
+    let buildings_at = |ceiling: u32| (f64::from(ceiling) / measured).round() as u32;
+    assert_eq!(buildings_at(FINEST_VERTEX_CEILING), 1204);
+    assert_eq!(buildings_at(262_144), 301);
+    assert_eq!(buildings_at(MIN_VERTEX_CEILING), 38);
+
+    // And the floor rung really does clear the largest single building in the
+    // fixture, which is the property that moved it off 4,096. Without this the
+    // floor is a rung that always answers an empty mesh, because the shed
+    // keeps a prefix and the first building it cannot fit stops it.
+    let largest = footprints
+        .iter()
+        .map(|f| extrude(std::slice::from_ref(f), &generous).positions.len())
+        .max()
+        .expect("the tile has buildings");
+    assert_eq!(largest, 21_977, "the fixture's largest building moved");
+    assert!(
+        largest < MIN_VERTEX_CEILING as usize,
+        "the coarsest rung is {MIN_VERTEX_CEILING} vertices and the largest \
+         single building in the confirmation archive costs {largest}: the \
+         floor cannot hold one building, so it is a rung that always draws \
+         nothing",
+    );
 }
 
 #[test]

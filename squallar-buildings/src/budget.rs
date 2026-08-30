@@ -63,42 +63,81 @@ pub const PRISM_INDEX_BYTES: u64 = 4;
 
 /// Indices this budget prices each vertex at.
 ///
-/// **Headroom over a measured ratio, not a guess.** The topology
-/// `crate::prism` emits is fixed: a ring of `n` edges gives `4n` wall
-/// vertices and `6n` wall indices, plus a cap of about `n` vertices and about
-/// `3n` indices, plus the same again for a floor cap when the building does
-/// not start on the ground. That is `5n` vertices against `9n` indices
-/// without a floor and `6n` against `12n` with one — 1.8 and 2.0. Three is
-/// where a tessellation that needed Steiner points for a self-intersecting
-/// footprint still fits, and the mesh builder holds the real index count under
-/// its own ceiling anyway.
+/// **Headroom over a ratio that is now measured as well as derived.** The
+/// derivation: the topology `crate::prism` emits is fixed, so a ring of `n`
+/// edges gives `4n` wall vertices and `6n` wall indices, plus a cap of about
+/// `n` vertices and about `3n` indices, plus the same again for a floor cap
+/// when the building does not start on the ground — `5n` against `9n` without
+/// a floor and `6n` against `12n` with one, which is 1.8 and 2.0.
+///
+/// **Measured on the committed fixture** (43 real buildings, 7,551 ring
+/// vertices, 37,457 mesh positions, 63,102 indices): **1.6847** over the whole
+/// tile and **1.8824** for the worst single building. The derivation was
+/// written first and the measurement agrees with it; the doc said "measured"
+/// before either figure existed, which was prose standing in for evidence.
+///
+/// Three is where a tessellation that needed Steiner points for a
+/// self-intersecting footprint still fits, and the mesh builder holds the real
+/// index count under its own ceiling anyway.
 pub const INDICES_PER_VERTEX_CEILING: u64 = 3;
 
-/// The most vertices any rung allows: 1,048,576.
+/// The most vertices any rung allows: 1,048,576, which is about **1,200
+/// buildings**.
 ///
 /// **A refusal ceiling that the fit starts from, not a target.** At
 /// [`PRISM_VERTEX_BYTES`] this is 25.17 MB of positions and normals before a
 /// single index, which no shipped `vram_bytes` reaches; it is the top of the
 /// ladder so that a caller handing over a generous row gets a bounded answer
 /// rather than an unbounded one.
+///
+/// The building figure is [`MEASURED_VERTICES_PER_BUILDING`], not an estimate
+/// from the shape of a box.
 pub const FINEST_VERTEX_CEILING: u32 = 1 << 20;
 
-/// The coarsest rung: 4,096 vertices, roughly forty buildings.
+/// Mesh vertices one real building costs, measured: **871.1**.
 ///
-/// The ladder stops here rather than at zero. A pane that can afford forty
-/// towers should draw forty towers; the alternative is a rung ladder that
-/// walks all the way to an empty mesh, which is a blank pane dressed up as a
-/// fitted one.
-pub const MIN_VERTEX_CEILING: u32 = 1 << 12;
+/// 43 buildings of `testdata/monaco-building-z14-8529-5974.mvt` extrude to
+/// 37,457 positions. Every "how many buildings" figure in this module is that
+/// number and no other, and
+/// `the_measured_vertices_per_building_is_what_the_fixture_actually_costs`
+/// re-measures it so the constant cannot drift from the fixture it came from.
+///
+/// **An earlier draft of this module said "~100 vertices per building", and
+/// it was wrong by 8.7x.** A hundred is what a *four-sided box* costs — four
+/// cap vertices and four wall quads. Real footprints in the confirmation
+/// archive carry **175.6** ring vertices each, not four, and this module's own
+/// `5n` topology formula predicts 878 from that. The figure was attributed to
+/// the archive while being derived from a rectangle, and it was the crate's
+/// only capacity claim.
+pub const MEASURED_VERTICES_PER_BUILDING: f64 = 871.1;
+
+/// The coarsest rung: 32,768 vertices, about **37 buildings**.
+///
+/// The ladder stops here rather than at zero. A pane that can afford three
+/// dozen towers should draw three dozen towers; the alternative is a rung
+/// ladder that walks all the way to an empty mesh, which is a blank pane
+/// dressed up as a fitted one.
+///
+/// **It was 4,096 and that was a floor in name only**, which the capacity
+/// measurement is what exposed. At [`MEASURED_VERTICES_PER_BUILDING`] it is
+/// 4.7 buildings — and worse, the largest single building in the confirmation
+/// archive costs **21,977** vertices on its own, so the old floor could not
+/// hold one real building at all. Since the shed keeps a *prefix* of the
+/// height order, a rung that cannot fit the first building answers an empty
+/// mesh however many small ones stand behind it: the floor would have been a
+/// rung that always drew nothing. 32,768 clears that building with room, and
+/// costs 1.18 MB.
+pub const MIN_VERTEX_CEILING: u32 = 1 << 15;
 
 /// The VRAM row this crate asks for when the caller has no measured figure of
 /// its own: 16 MiB.
 ///
 /// **Chosen against the arithmetic above, and not measured** — the same
-/// posture `squallar_elevation::jobs`' `MAX_TILE_PX` records for itself.
-/// It fits the ladder at 262,144 vertices, which is 9.44 MB of buffers and of
-/// order 2,600 buildings at the ~100 vertices per building the confirmation
-/// archive's footprints average. A real figure should replace it the day
+/// posture `squallar_elevation::jobs`' `MAX_TILE_PX` records for itself, and
+/// the distinction is still live: nothing has drawn a building, so no frame
+/// has been timed. It fits the ladder at 262,144 vertices, which is 9.44 MB of
+/// buffers and **301 buildings** at [`MEASURED_VERTICES_PER_BUILDING`] — about
+/// seven tiles of downtown Monaco. A real figure should replace it the day
 /// something measures a frame.
 pub const DEFAULT_PRISM_VRAM_BYTES: u64 = 16 << 20;
 

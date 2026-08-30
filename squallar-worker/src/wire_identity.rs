@@ -152,6 +152,25 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// [`WIRE_BUILDING_REPLY_ROWS`].
 ///
 /// Panics on a pinned row whose label is not in the registry.
+///
+/// # The folds are not gated, and that is a live gap
+///
+/// **Recorded 2026-08-30, found by adversarial review of the buildings row and
+/// pre-existing to it.** Every row list above is pinned to what the encoder
+/// writes, by its own test. What is *not* pinned is this function's dependence
+/// on them: replacing the whole body with a constant, or deleting any one of
+/// the four `for` loops below, leaves the worker suite green. Nothing asserts
+/// that a moved row moves the digest.
+///
+/// So the claim these rows are kept for — that a page and a worker of
+/// different builds respawn rather than exchange bytes one of them misreads —
+/// rests on a fold that no test would notice the removal of. The rows are
+/// real; the wiring from rows to token is prose.
+///
+/// Not fixed here because it is not this unit's defect and a digest test is
+/// its own piece of work: it needs to assert that perturbing each list changes
+/// the answer, which means a way to perturb them that is not a source edit.
+/// Left named rather than left silent.
 pub fn wire_digest() -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for row in WIRE_FRAMING_ROWS {

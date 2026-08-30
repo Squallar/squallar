@@ -65,14 +65,24 @@ pub const RENDER_MIN_HEIGHT: &str = "render_min_height";
 /// Set on the parts an OpenMapTiles build wants left out of a 3D view.
 pub const HIDE_3D: &str = "hide_3d";
 
-/// The most extent-unit vertices one tile's `building` layer may contribute.
+/// The most ring vertices one tile's `building` layer may contribute:
+/// 4,194,304.
 ///
 /// **A refusal ceiling and not a measured budget.** These bytes arrive off a
 /// message port, and the vertex budget in [`crate::budget`] bounds what comes
-/// *out* of the tessellator rather than what goes in. The busiest tile in the
-/// confirmation archive carries 43 features across 118 KB; this is four orders
-/// of magnitude above that, and exists so a doctored tile answers an error
-/// instead of exhausting the worker.
+/// *out* of the tessellator rather than what goes in.
+///
+/// **The headroom, in the unit the ceiling is actually in.** The busiest tile
+/// in the confirmation archive carries 43 features whose rings hold **7,551**
+/// vertices between them, so this is **x555** — about 2.7 orders of magnitude,
+/// not the four an earlier draft claimed. That draft also reached for a *byte*
+/// count ("43 features across 118 KB") to size a *vertex* ceiling, which is
+/// two errors in one sentence: the wrong quantity, and the wrong value of it.
+///
+/// Held by [`read_footprints_under`], which is what
+/// `a_tile_whose_rings_pass_the_ceiling_is_refused_rather_than_projected`
+/// drives at a small ceiling — a fixture carrying four million real vertices
+/// would be minutes of geodesy per run.
 pub const MAX_RING_VERTICES_PER_TILE: usize = 1 << 22;
 
 /// What went wrong, said out loud.
@@ -203,6 +213,25 @@ pub fn read_footprints(
     mvt: &[u8],
     frame: &BoxFrame,
 ) -> Result<Vec<BuildingFootprint>, BuildingsError> {
+    read_footprints_under(tile, mvt, frame, MAX_RING_VERTICES_PER_TILE)
+}
+
+/// [`read_footprints`] with the ring-vertex ceiling handed in.
+///
+/// **It exists so the ceiling has a gate.** A tile carrying
+/// [`MAX_RING_VERTICES_PER_TILE`] real vertices is four million forward
+/// geodetic solutions per run, so the guard could not be exercised at its own
+/// value without making the suite unusable — and an unexercised refusal is one
+/// nobody has watched fire. Driving it at a small ceiling is the exercise;
+/// `the_public_reader_hands_over_the_ceiling_this_module_declares` is what
+/// says the public entry point still hands over the real one, so the two
+/// cannot drift into testing a path production does not take.
+pub(crate) fn read_footprints_under(
+    tile: TileId,
+    mvt: &[u8],
+    frame: &BoxFrame,
+    max_ring_vertices: usize,
+) -> Result<Vec<BuildingFootprint>, BuildingsError> {
     if !tile.is_addressable() {
         return Err(BuildingsError::NotAddressable(tile));
     }
@@ -242,7 +271,7 @@ pub fn read_footprints(
             continue;
         }
         vertices += rings.iter().map(|ring| ring.points.len()).sum::<usize>();
-        if vertices > MAX_RING_VERTICES_PER_TILE {
+        if vertices > max_ring_vertices {
             return Err(BuildingsError::TooManyVertices { vertices });
         }
 
