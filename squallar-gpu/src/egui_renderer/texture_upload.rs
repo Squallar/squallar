@@ -96,37 +96,66 @@ pub struct UploadTotals {
     /// Texture deltas filed, by any route. See the type's own note: this is
     /// what makes a zero byte count readable.
     pub deltas: u64,
-    /// Bytes handed straight to `Renderer::update_texture` — every delta at or
-    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own. Whole
-    /// on the frame's own queue, so they are on the GPU before anything draws
-    /// them.
-    pub unbanded_bytes: u64,
+    /// Bytes handed whole to `Renderer::update_texture` — every delta at or
+    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own. **A
+    /// routing figure and a subset of [`Self::blocking_bytes`], never added to
+    /// it**: `update_texture` is `write_texture` on the frame's own queue, so
+    /// these bytes are blocking too, whatever the device.
+    pub whole_bytes: u64,
     /// Bands [`TextureUploads::drain`] moved. The non-vacuity partner of the
     /// two banded byte figures the way [`Self::deltas`] is of all of them: a
     /// raster filed as bands but never drained shows `bands == 0` with the
     /// delta counted.
     pub bands: u64,
-    /// Of the banded bytes, those the copy engine pulled out of a staging slot
-    /// (see [`crate::staging_ring`]). Measured 24.7 GB/s against the BAR
-    /// window's 2.1 GB/s, and they cost the frame a memcpy rather than a
-    /// blocking host write.
+    /// Bytes the copy engine pulled out of a staging slot (see
+    /// [`crate::staging_ring`]). Measured 24.7 GB/s against the BAR window's
+    /// 2.1 GB/s, and they cost the frame a memcpy rather than a blocking host
+    /// write. Always banded.
     pub staged_bytes: u64,
-    /// Of the banded bytes, those `write_texture` pushed through the BAR window
-    /// on the frame thread — a device with no ring, or a band that ran out of
-    /// [`DECLINE_PATIENCE`]. **This is the figure that is frame time**, and a
-    /// device with a ring is supposed to keep it near zero.
+    /// Every byte `write_texture` pushed through the BAR window on the frame
+    /// thread — whole deltas through `Renderer::update_texture` and bands on
+    /// a device with no ring or past [`DECLINE_PATIENCE`] alike. **This is
+    /// the figure that is frame time on every device.** It is classified by
+    /// the path the bytes took, never by whether their delta straddled
+    /// [`UPLOAD_BAND_BYTES`]: spike B (2026-08-30) measured Firefox's
+    /// ~8.51 MB pictures banded and counted ~13 GB blocking while Chromium's
+    /// ~7.57 MB pictures went whole and counted ~0.1 GB — the same ringless
+    /// traffic, opposite readings, flipped by 32 px of canvas width.
     pub blocking_bytes: u64,
 }
 
 impl UploadTotals {
-    /// Every byte this renderer has put on the GPU, by any route.
+    /// Every byte this renderer has put on the GPU, by any route. The two
+    /// terms are disjoint: a byte either blocked the frame thread or was
+    /// pulled by the copy engine.
     pub fn bytes(&self) -> u64 {
-        self.unbanded_bytes + self.staged_bytes + self.blocking_bytes
+        self.staged_bytes + self.blocking_bytes
     }
 
     /// Bytes that crossed as bands rather than whole.
     pub fn banded_bytes(&self) -> u64 {
-        self.staged_bytes + self.blocking_bytes
+        self.bytes() - self.whole_bytes
+    }
+
+    /// Count `bytes` handed whole to `Renderer::update_texture`: one
+    /// `write_texture` on the frame's own queue, so whole AND blocking.
+    /// The one ledger arithmetic for that route — [`TextureUploads::file`]
+    /// and the host-test seam both call it, so they cannot drift apart.
+    fn count_whole_write(&mut self, bytes: u64) {
+        self.whole_bytes += bytes;
+        self.blocking_bytes += bytes;
+    }
+
+    /// Count one band of `bytes`, `staged` naming the route that moved it.
+    /// The one ledger arithmetic for the banded routes, shared the way
+    /// [`Self::count_whole_write`] is.
+    fn count_band(&mut self, bytes: u64, staged: bool) {
+        self.bands += 1;
+        if staged {
+            self.staged_bytes += bytes;
+        } else {
+            self.blocking_bytes += bytes;
+        }
     }
 
     /// How far along this ledger is, as one number, so a caller can tell
@@ -265,7 +294,7 @@ impl TextureUploads {
         // band go through `update_texture` untouched.
         if !mine && image.as_raw().len() <= UPLOAD_BAND_BYTES {
             renderer.update_texture(device, queue, id, delta);
-            self.totals.unbanded_bytes += image.as_raw().len() as u64;
+            self.totals.count_whole_write(image.as_raw().len() as u64);
             // Whole, on this frame's queue, before anything can draw it.
             self.delivered.insert(id);
             return;
@@ -416,15 +445,8 @@ impl TextureUploads {
             if moved {
                 // Counted where the bytes move, and split by the route that
                 // moved them: `staged` cost the frame a memcpy, the other arm
-                // cost it a blocking host write. Two `u64` adds, no branch of
-                // their own.
-                self.totals.bands += 1;
-                let bytes = plan.bytes() as u64;
-                if staged {
-                    self.totals.staged_bytes += bytes;
-                } else {
-                    self.totals.blocking_bytes += bytes;
-                }
+                // cost it a blocking host write.
+                self.totals.count_band(plan.bytes() as u64, staged);
                 band.done += plan.rows;
                 band.declined = 0;
                 let done = band.done >= plan.height;
@@ -539,17 +561,24 @@ impl TextureUploads {
     }
 
     /// Record a moved band the way [`Self::drain`] does, with no device to
-    /// move it with — for the host test of the report's cadence. The real
-    /// arithmetic on a real adapter is
-    /// `the_upload_ledger_counts_every_byte_of_a_banded_raster_once`.
+    /// move it with — for the host test of the report's cadence. Calls the
+    /// same [`UploadTotals::count_band`] the drain calls, so the seam and the
+    /// real path share one arithmetic; the real arithmetic on a real adapter
+    /// is `the_upload_ledger_counts_every_byte_of_a_banded_raster_once`.
     #[cfg(test)]
     pub fn note_band_for_test(&mut self, bytes: u64, staged: bool) {
-        self.totals.bands += 1;
-        if staged {
-            self.totals.staged_bytes += bytes;
-        } else {
-            self.totals.blocking_bytes += bytes;
-        }
+        self.totals.count_band(bytes, staged);
+    }
+
+    /// Record one whole delta the way [`Self::file`]'s `update_texture` arm
+    /// does, with no device to move it with — the host-test seam for the
+    /// classification. Calls the same [`UploadTotals::count_whole_write`] the
+    /// real arm calls; the real path on a real adapter is
+    /// `a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle`.
+    #[cfg(test)]
+    pub fn note_whole_delta_for_test(&mut self, bytes: u64) {
+        self.totals.deltas += 1;
+        self.totals.count_whole_write(bytes);
     }
 
     /// The texture this module allocated for `id`, if it owns one.

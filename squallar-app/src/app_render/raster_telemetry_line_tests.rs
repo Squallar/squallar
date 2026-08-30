@@ -110,19 +110,21 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
          the same thing it reports when the overlay path never ran at all",
     );
 
+    // `whole` is a routing subset of `blocking` (25 of the 86 blocking bytes
+    // moved whole), and the GPU total is the disjoint pair staged + blocking.
     let uploads = UploadTotals {
         deltas: 13,
-        unbanded_bytes: 25,
+        whole_bytes: 25,
         bands: 37,
         staged_bytes: 49,
-        blocking_bytes: 61,
+        blocking_bytes: 86,
     };
     // `bytes()` is derived, not a field, so it is named here at its own value
-    // rather than trusted to appear: 25 + 49 + 61.
+    // rather than trusted to appear: 49 + 86.
     assert_eq!(uploads.bytes(), 135);
     assert_eq!(
         super::texture_upload_line(&uploads),
-        rendered(&pattern("uploads_re"), &[13, 135, 25, 37, 49, 61]),
+        rendered(&pattern("uploads_re"), &[13, 135, 25, 37, 49, 86]),
         "the `texture uploads:` line and the rig's own probe for it have drifted",
     );
 }

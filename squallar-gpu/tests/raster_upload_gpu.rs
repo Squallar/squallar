@@ -177,11 +177,12 @@ fn the_upload_ledger_counts_every_byte_of_a_banded_raster_once(
         totals.banded_bytes(),
         (SIDE * SIDE * 4) as u64,
         "a {SIDE}px RGBA raster is {} B and the ledger says {} B crossed as \
-         bands (staged {} + blocking {})",
+         bands (staged {} B; blocking {} B, {} B of it whole)",
         SIDE * SIDE * 4,
         totals.banded_bytes(),
         totals.staged_bytes,
         totals.blocking_bytes,
+        totals.whole_bytes,
     );
     assert!(
         totals.bands > 1,
@@ -191,11 +192,16 @@ fn the_upload_ledger_counts_every_byte_of_a_banded_raster_once(
         SIDE * SIDE * 4,
     );
     if with_ring {
+        // The whole-route bytes (the font atlas here) are blocking on every
+        // device -- `update_texture` is `write_texture` on the frame's own
+        // queue. What the ring must keep off the frame thread is every BAND.
         assert_eq!(
-            totals.blocking_bytes, 0,
-            "{} B went through `write_texture` on a device with a ring; that is \
-             frame thread, and it is what the ring exists to avoid",
             totals.blocking_bytes,
+            totals.whole_bytes,
+            "{} B of bands went through `write_texture` on a device with a \
+             ring; that is frame thread, and it is what the ring exists to \
+             avoid",
+            totals.blocking_bytes - totals.whole_bytes,
         );
         assert!(totals.staged_bytes > 0);
     } else {
@@ -204,7 +210,12 @@ fn the_upload_ledger_counts_every_byte_of_a_banded_raster_once(
             "{} B were reported staged on a device with no ring",
             totals.staged_bytes,
         );
-        assert_eq!(totals.blocking_bytes, totals.banded_bytes());
+        assert_eq!(
+            totals.blocking_bytes,
+            totals.bytes(),
+            "a ringless device moves every byte through blocking \
+             `write_texture` on the frame thread",
+        );
     }
 }
 
@@ -307,6 +318,86 @@ fn every_texel_lands(with_ring: bool) {
 #[ignore = "needs a real GPU adapter with MAPPABLE_PRIMARY_BUFFERS"]
 fn a_banded_dma_upload_lands_every_texel_where_it_belongs() {
     every_texel_lands(true);
+}
+
+/// **One picture either side of the band budget, on a device with no ring:
+/// the ledger calls every byte of both blocking.**
+///
+/// Spike B's pair, measured 2026-08-30 on identical web traffic: Firefox's
+/// ~8.51 MB pictures banded and were counted ~13 GB blocking; Chromium's
+/// ~7.57 MB pictures went whole and were counted ~0.1 GB — opposite ledger
+/// classifications flipped by 32 px of canvas width. Both move every byte
+/// through a blocking `write_texture` on the frame thread (a whole delta goes
+/// through `Renderer::update_texture`, which is `write_texture` on the frame's
+/// own queue), so "which bytes were frame time" must not depend on whether a
+/// picture straddles [`UPLOAD_BAND_BYTES`].
+#[test]
+#[ignore = "needs a real GPU adapter"]
+fn a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle() {
+    let Some((device, queue, has_ring)) = device(false) else {
+        eprintln!("no adapter; nothing to check");
+        return;
+    };
+    assert!(!has_ring, "this run needs the ringless arm");
+
+    let mut renderer = egui_wgpu::Renderer::new(
+        &device,
+        wgpu::TextureFormat::Bgra8Unorm,
+        egui_wgpu::RendererOptions::default(),
+    );
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        max_texture_side: Some(device.limits().max_texture_dimension_2d as usize),
+        ..Default::default()
+    });
+    // 1400 px RGBA is 7 840 000 B — under the 8 MiB band, the Chromium side.
+    // 1500 px RGBA is 9 000 000 B — over it, the Firefox side.
+    let under = ctx.load_texture(
+        "under-the-band",
+        egui::ColorImage::filled([1400, 1400], egui::Color32::from_rgb(10, 20, 30)),
+        egui::TextureOptions::NEAREST,
+    );
+    let over = ctx.load_texture(
+        "over-the-band",
+        egui::ColorImage::filled([1500, 1500], egui::Color32::from_rgb(40, 50, 60)),
+        egui::TextureOptions::NEAREST,
+    );
+    let delta = ctx.end_pass().textures_delta;
+
+    let mut uploads = TextureUploads::new(&device);
+    assert!(!uploads.has_ring());
+    run_to_completion(
+        &mut uploads,
+        &device,
+        &queue,
+        &mut renderer,
+        &delta.set,
+        None,
+    );
+
+    let totals = uploads.totals();
+    let traffic = (1400u64 * 1400 + 1500 * 1500) * 4;
+    assert!(
+        totals.deltas >= 2,
+        "the two rasters never reached the ledger (deltas={})",
+        totals.deltas,
+    );
+    assert!(
+        totals.bytes() >= traffic,
+        "the ledger counted {} B against at least {traffic} B of rasters",
+        totals.bytes(),
+    );
+    assert_eq!(
+        totals.blocking_bytes,
+        totals.bytes(),
+        "a device with no ring moves every byte through a blocking \
+         `write_texture` on the frame thread, whichever side of the \
+         {UPLOAD_BAND_BYTES}-byte band its picture fell on; the ledger called \
+         {} of {} B blocking",
+        totals.blocking_bytes,
+        totals.bytes(),
+    );
+    drop((under, over));
 }
 
 /// The fallback route: `write_texture` per band, packed rows, which is what
