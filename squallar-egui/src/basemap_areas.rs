@@ -24,10 +24,11 @@
 //! re-download is a button the user may press, never an action anything here
 //! takes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use egui::Context;
+use squallar_units::DataSize;
 // The portable channel, as `tile_source` uses for the same reason: tokio's
 // `sync` is a native-only dependency of this crate, and the worker runs on
 // both targets.
@@ -368,11 +369,28 @@ enum AreaJob {
     Delete(String),
 }
 
+/// What the store answered about one area: how much of its cut is here, and
+/// what those stored segments occupy.
+///
+/// The held figure is the **artifacts'** size — tile data plus each segment's
+/// own header, directories and metadata copy — because that is what a store
+/// can answer from a listing. The asked-for figure a row pairs it with is the
+/// record's tile-byte total, so the pair is a little short of like-for-like;
+/// closing that would mean re-planning the area against the live archive on
+/// every launch, which is a network walk of every tile in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AreaFact {
+    /// Segments of this area's cut the store holds.
+    pub(crate) status: AreaStatus,
+    /// What those segments occupy.
+    pub(crate) held: DataSize,
+}
+
 /// The answers the worker has published so far. An id absent from this is one
 /// the store has not been asked about yet, or one it would not answer for.
 #[derive(Default)]
 struct AreaFacts {
-    statuses: HashMap<String, AreaStatus>,
+    facts: HashMap<String, AreaFact>,
 }
 
 /// The manage screen's off-frame-thread arm: it lists and deletes, and the
@@ -406,11 +424,27 @@ impl AreaMaintenance {
                         AreaJob::Reconcile(areas) => {
                             for area in areas {
                                 let id = &area.spec.area_id;
-                                match store.existing_segments(id).await {
-                                    Ok(present) => {
+                                match store.existing_segment_bytes(id).await {
+                                    Ok(sized) => {
+                                        let present: BTreeSet<u32> =
+                                            sized.keys().copied().collect();
                                         let status = area.reconcile(&present);
+                                        // Summed over the same segments the
+                                        // count is taken over: a store left
+                                        // holding a longer cut from an earlier
+                                        // plan must not read as holding more
+                                        // of this one.
+                                        let held = DataSize::from_bytes(
+                                            sized
+                                                .iter()
+                                                .filter(|&(&seg, _)| seg < area.segments_expected)
+                                                .map(|(_, &bytes)| bytes)
+                                                .sum(),
+                                        );
                                         if let Ok(mut facts) = facts.lock() {
-                                            facts.statuses.insert(id.clone(), status);
+                                            facts
+                                                .facts
+                                                .insert(id.clone(), AreaFact { status, held });
                                         }
                                     }
                                     // Unknown, and left unknown: a listing
@@ -432,7 +466,7 @@ impl AreaMaintenance {
                                 );
                             }
                             if let Ok(mut facts) = facts.lock() {
-                                facts.statuses.remove(&area_id);
+                                facts.facts.remove(&area_id);
                             }
                         }
                     }
@@ -468,8 +502,8 @@ impl AreaMaintenance {
 
     /// What the store last said about `area_id`, or `None` for an area it has
     /// not answered for.
-    pub(crate) fn status(&self, area_id: &str) -> Option<AreaStatus> {
-        self.facts.lock().ok()?.statuses.get(area_id).copied()
+    pub(crate) fn fact(&self, area_id: &str) -> Option<AreaFact> {
+        self.facts.lock().ok()?.facts.get(area_id).copied()
     }
 
     /// Remove every artifact of `area_id` from the store.
@@ -485,7 +519,7 @@ impl AreaMaintenance {
     pub(crate) fn recheck(&mut self, area_id: &str) {
         self.asked.remove(area_id);
         if let Ok(mut facts) = self.facts.lock() {
-            facts.statuses.remove(area_id);
+            facts.facts.remove(area_id);
         }
     }
 }

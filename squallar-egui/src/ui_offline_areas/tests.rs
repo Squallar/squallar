@@ -1,11 +1,12 @@
 //! The Downloaded areas screen, driven like a user: opened through the menu,
 //! scrolled to, read off the glass and clicked.
 //!
-//! **Against a real store.** Every status these tests read comes from an
+//! **Against a real store.** Every figure these tests read comes from an
 //! [`FsSegmentStore`](crate::basemap_download::FsSegmentStore) over a real
-//! temporary directory, listing real files — so "3 of 7 parts" is the store's
-//! answer rather than a double's. What is faked is only the *content* of a
-//! segment: `existing_segments` is a listing, and it does not read a byte.
+//! temporary directory, listing real files and stat-ing their real sizes — so
+//! a half-held area's held figure is the store's answer rather than a
+//! double's. What is faked is only the *content* of a segment: the listing
+//! reads a size, never a byte of the archive inside.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::input_harness::InputHarness;
 use crate::ui::SETTINGS_ROWS;
+use crate::ui_download_area::PREPARING_LABEL;
 use squallar_units::DataSize;
 
 /// The size of the complete area, chosen so its label ("112 MB") appears
@@ -20,6 +22,14 @@ use squallar_units::DataSize;
 /// that.
 const COMPLETE_BYTES: u64 = 112_345_678;
 const COMPLETE_SIZE_LABEL: &str = "112 MB";
+
+/// What each placed segment occupies on disk.
+///
+/// **Real bytes, really written**: the held figure a half-held row draws is a
+/// sum of `stat` answers, so a fixture of seven-byte files would let a row
+/// that printed a constant "0.0 MB" pass. Sized so a three-segment hold labels
+/// as something no other figure on the screen spells.
+const SEGMENT_PAYLOAD_BYTES: u64 = 1_200_000;
 
 /// A per-test directory under the OS temp dir, removed on drop — the
 /// `basemap_download` suite's shape.
@@ -38,10 +48,14 @@ impl TempDir {
     }
 
     /// Publish `count` segments of `area_id`, as the store's own naming
-    /// contract spells them. The bytes are never read by a listing.
+    /// contract spells them.
+    ///
+    /// The *content* is never read — a listing opens no archive — but the
+    /// *size* is, so each file is written at [`SEGMENT_PAYLOAD_BYTES`].
     fn place_segments(&self, area_id: &str, count: u32) {
+        let payload = vec![0u8; usize::try_from(SEGMENT_PAYLOAD_BYTES).expect("fits a usize")];
         for seg in 0..count {
-            std::fs::write(self.0.join(format!("{area_id}.{seg}.pmtiles")), b"segment")
+            std::fs::write(self.0.join(format!("{area_id}.{seg}.pmtiles")), &payload)
                 .expect("a segment should be writable");
         }
     }
@@ -150,7 +164,7 @@ fn settle_statuses(h: &mut InputHarness, ids: &[&str]) {
             h.gui()
                 .area_maintenance
                 .as_ref()
-                .and_then(|maintenance| maintenance.status(id))
+                .and_then(|maintenance| maintenance.fact(id))
                 .is_some()
         });
         if answered {
@@ -190,6 +204,29 @@ fn row_says(h: &InputHarness, needle: &str) -> bool {
     row_text(h).iter().any(|text| text.contains(needle))
 }
 
+/// Whether the row drew `needle` as a **whole label**, not as a fragment of a
+/// longer one.
+///
+/// The size slot is one `ui.label`, so its painted string is the whole of what
+/// that slot says. "112 MB" is a substring of "3.6 MB of 112 MB", and only
+/// equality can tell the finished-area figure apart from the pair that
+/// contains it — which is the difference the half-download assertions turn on.
+fn row_draws_label(h: &InputHarness, needle: &str) -> bool {
+    row_text(h).iter().any(|text| text == needle)
+}
+
+/// Every mention of the implementation vocabulary the user ruled out, in
+/// whatever the row drew. Case-folded, so a capitalised "Parts" is caught too.
+fn parts_vocabulary_on_the_glass(h: &InputHarness) -> Vec<String> {
+    row_text(h)
+        .into_iter()
+        .filter(|text| {
+            let folded = text.to_ascii_lowercase();
+            folded.contains("part") || folded.contains("segment")
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The empty state
 // ---------------------------------------------------------------------------
@@ -218,13 +255,11 @@ fn a_device_with_no_areas_draws_an_empty_state_rather_than_nothing() {
     );
 }
 
-/// The one place the byte denominator is named — the header, not a row.
+/// **Users know what MB means.** The screen states sizes and never explains
+/// their base.
 ///
-/// Decimal MB/GB is a property of every figure the screen prints, so stating
-/// it per row would be the same fact repeated N times and dropped when N is
-//// **Users know what MB means.** The screen states sizes and never explains
-/// their base. The positive half — a real size is on the glass — is what keeps
-/// the negative from passing on an empty screen.
+/// The positive half — a real size is on the glass — is what keeps the
+/// negative from passing on an empty screen.
 #[test]
 fn the_screen_states_sizes_without_explaining_their_denominator() {
     let dir = TempDir::new("denominator");
@@ -317,19 +352,26 @@ fn a_complete_area_shows_its_size_and_detail_level() {
         "the row is still checking after the store answered: {text:?}",
     );
     assert!(
-        !row_says(&h, "parts"),
-        "a complete area draws a part count: {text:?}",
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "a complete area draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
     );
 }
 
-/// **The negative assertion.** A half-held area draws its part counts *in
-/// place of* a size, never beside one: the defect this guards is rendering a
-/// half-download as done, and only the absence of the size figure rules it
-/// out. The record still carries the byte total — it says what the download
-/// asked for — so a screen that printed it would be reading a real number and
-/// making a false claim with it.
+/// **The negative assertion.** A half-held area draws a held-of-asked byte
+/// pair *in place of* a size, never beside one: the defect this guards is
+/// rendering a half-download as done, and only the absence of the bare size
+/// figure rules it out. The record still carries the byte total — it says what
+/// the download asked for — so a screen that printed it alone would be reading
+/// a real number and making a false claim with it.
+///
+/// The two assertions are a matched pair over **one slot**: the pair is drawn
+/// as a whole label and the finished-area figure is drawn as no label at all.
+/// Substring matching cannot express that — "112 MB" is inside
+/// "3.6 MB of 112 MB" — which is why both go through
+/// [`row_draws_label`].
 #[test]
-fn a_partial_area_draws_its_part_counts_and_no_size() {
+fn a_partial_area_draws_held_and_asked_bytes_and_never_its_size_alone() {
     let dir = TempDir::new("partial");
     dir.place_segments("norman", 3);
     let mut h = harness_over(&dir);
@@ -337,33 +379,48 @@ fn a_partial_area_draws_its_part_counts_and_no_size() {
     assert_eq!(
         record.bytes.label(),
         COMPLETE_SIZE_LABEL,
-        "the record carries a size, which is exactly what must not be drawn",
+        "the record carries a size, which is exactly what must not be drawn alone",
     );
     h.gui_mut().record_downloaded_area(record);
     open_areas_screen(&mut h);
     settle_statuses(&mut h, &["norman"]);
     h.frame_after(1.0 / 60.0);
 
+    let held = DataSize::from_bytes(3 * SEGMENT_PAYLOAD_BYTES).label();
+    let pair = format!("{held} of {COMPLETE_SIZE_LABEL}");
     let text = row_text(&h);
-    assert!(
-        row_says(&h, "3 of 7 parts"),
-        "the half-held area does not draw its counts: {text:?}",
+    assert_ne!(
+        held, COMPLETE_SIZE_LABEL,
+        "the fixture's held and asked figures label the same, so this test \
+         could not tell the two apart",
     );
     assert!(
-        !row_says(&h, COMPLETE_SIZE_LABEL),
-        "the half-held area drew its size {COMPLETE_SIZE_LABEL:?} - a \
-         half-download rendered as done: {text:?}",
+        row_draws_label(&h, &pair),
+        "the half-held area does not draw {pair:?}: {text:?}",
     );
-    // The counts are the store's answer, not the record's: the record asked
-    // for seven and the directory holds three.
+    assert!(
+        !row_draws_label(&h, COMPLETE_SIZE_LABEL),
+        "the half-held area drew its size {COMPLETE_SIZE_LABEL:?} on its own - \
+         a half-download rendered as done: {text:?}",
+    );
+    assert!(
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "the half-held area draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
+    );
+    // Both halves are the store's answer, not the record's: the record asked
+    // for seven segments and the directory holds three of them.
     assert_eq!(
         h.gui()
             .area_maintenance
             .as_ref()
-            .and_then(|maintenance| maintenance.status("norman")),
-        Some(crate::basemap_download::AreaStatus {
-            present: 3,
-            expected: 7
+            .and_then(|maintenance| maintenance.fact("norman")),
+        Some(crate::basemap_areas::AreaFact {
+            status: crate::basemap_download::AreaStatus {
+                present: 3,
+                expected: 7,
+            },
+            held: DataSize::from_bytes(3 * SEGMENT_PAYLOAD_BYTES),
         }),
     );
 }
@@ -424,9 +481,10 @@ fn an_older_generation_area_stays_usable_and_only_offers_an_update() {
     h.frames_for(20, 1.0 / 60.0);
 
     let text = row_text(&h);
-    // Usable: the size is drawn, so it reads as an area the device holds.
+    // Usable: the bare size is drawn, so it reads as an area the device holds
+    // whole rather than as one short of its asked-for bytes.
     assert!(
-        row_says(&h, COMPLETE_SIZE_LABEL),
+        row_draws_label(&h, COMPLETE_SIZE_LABEL),
         "an older-generation area lost its size - it reads as not held: {text:?}",
     );
     assert!(
@@ -546,8 +604,8 @@ fn monaco_spec() -> AreaSpec {
     }
 }
 
-/// A cap small enough to cut the 419 KB fixture into several segments, so
-/// "N of M parts" has an M worth drawing.
+/// A cap small enough to cut the 419 KB fixture into several segments, so a
+/// run can be caught genuinely mid-download rather than already finished.
 const MONACO_SEGMENT_BYTES: u64 = 120_000;
 
 /// The shouted skip the sibling suites use — straight at stderr, because
@@ -567,16 +625,30 @@ fn skipped(test: &str) {
     );
 }
 
-/// A source that answers `budget` reads and then never answers again.
+/// A source that answers only as many reads as the test has granted it.
 ///
-/// The engine is serial, so once the budget is spent the ledger is **frozen**:
-/// no further read starts, nothing increments, and `outcome()` stays `None` —
-/// a genuinely in-flight download, held still so the glass and the counters
-/// can be compared without a race. Cancellation is the engine's own: dropping
-/// it drops the runtime the blocked read is parked on.
+/// The engine is serial, so with the budget spent the ledger is **frozen**: no
+/// further read starts, nothing increments, and `outcome()` stays `None` — a
+/// genuinely in-flight download, held still so the glass and the counters can
+/// be compared without a race. Cancellation is the engine's own: dropping it
+/// drops the runtime the blocked read is parked on.
+///
+/// The budget is a shared cell rather than a constructor argument so a test can
+/// **top it up**: that is how the same run is caught first with no plan and
+/// then with one, which is the before/after the preparing state is about.
 struct BudgetedSource {
     inner: crate::basemap_archive::FileRangeSource,
-    budget: std::sync::atomic::AtomicI64,
+    budget: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl BudgetedSource {
+    fn over(path: &str, budget: &std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        Self {
+            inner: crate::basemap_archive::FileRangeSource::open(std::path::Path::new(path))
+                .expect("the fixture opens"),
+            budget: std::sync::Arc::clone(budget),
+        }
+    }
 }
 
 impl crate::basemap_archive::RangeSource for BudgetedSource {
@@ -586,43 +658,99 @@ impl crate::basemap_archive::RangeSource for BudgetedSource {
         length: usize,
     ) -> Result<Vec<u8>, crate::basemap_archive::RangeError> {
         use std::sync::atomic::Ordering;
-        if self.budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        // Claim one read, or park until the test grants another. Claimed by
+        // compare-exchange rather than `fetch_sub`, so a parked read does not
+        // drive the counter arbitrarily negative while it waits.
+        loop {
+            let left = self.budget.load(Ordering::SeqCst);
+            if left > 0
+                && self
+                    .budget
+                    .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.inner.read_range(offset, length).await
     }
 }
 
-/// The in-flight block draws the engine's own counters, each figure beside the
-/// denominator it is against.
+/// One read: the archive header, and not a byte past it.
+///
+/// **Measured, not guessed.** The Monaco fixture is small enough that its root
+/// directory covers every tile in the area, so a budget of three already
+/// planned the whole run (`segments_total: 4`) and there was no preparing
+/// state left to catch. Opening the index is the first thing `drive` does and
+/// it is squarely inside the phase this label is for.
+const READS_BEFORE_A_PLAN: i64 = 1;
+
+/// Enough to plan and land some tile bytes, and short of finishing the run —
+/// the sibling suite's figure, for its reason: the run has to still be in
+/// flight when the glass is read, or the frame settles it away and there is no
+/// block left to assert about.
+const READS_TO_A_PLAN_AND_SOME_BYTES: i64 = 8;
+
+/// Freeze `engine` mid-run and answer with the state it is frozen in.
+///
+/// "Frozen" is proved rather than assumed: two readings a beat apart that
+/// agree. What the glass is then compared against is one state, not two.
+fn frozen_mid_run(
+    engine: &crate::basemap_areas::ActiveDownload,
+    what: &str,
+    ready: impl Fn(&crate::basemap_download::DownloadProgress) -> bool,
+) -> crate::basemap_download::DownloadProgress {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the fixture download never reached {what}: {:?}",
+            engine.progress(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let first = engine.progress();
+        if !ready(&first) {
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        let second = engine.progress();
+        if first == second {
+            assert!(
+                engine.outcome().is_none(),
+                "the run finished; this is no longer the in-flight case",
+            );
+            return second;
+        }
+    }
+}
+
+/// The in-flight block draws a bar over the bytes **and the exact byte figures
+/// beside it** — never a percentage in place of the numbers, and never a part
+/// count.
 ///
 /// The reading comes from a **real engine** over the committed Monaco fixture,
-/// held mid-run by a spent read budget. The ledger is proved quiescent — two
-/// readings a beat apart that agree — before the glass is read, so what is
-/// compared is one state, not two.
+/// held mid-run by a spent read budget. The bar's own percentage is asserted
+/// too, because that is the only thing on the glass that carries the
+/// *fraction*: it is what proves the bar is filled from the ledger's bytes
+/// rather than parked at some constant.
 #[test]
-fn the_progress_block_draws_the_engines_own_ledger() {
+fn the_progress_block_draws_a_byte_bar_and_the_exact_byte_figures() {
     const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
     if std::fs::metadata(MONACO).is_err() {
-        skipped("the_progress_block_draws_the_engines_own_ledger");
+        skipped("the_progress_block_draws_a_byte_bar_and_the_exact_byte_figures");
         return;
     }
 
     let dir = TempDir::new("progress");
-    let source = BudgetedSource {
-        inner: crate::basemap_archive::FileRangeSource::open(std::path::Path::new(MONACO))
-            .expect("the fixture opens"),
-        // Enough to open the index, plan, and land some tile bytes; far short
-        // of finishing the run.
-        budget: std::sync::atomic::AtomicI64::new(8),
-    };
+    // Enough to open the index, plan, and land some tile bytes; far short of
+    // finishing the run.
+    let budget = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(8));
     let store = crate::basemap_download::FsSegmentStore::new(dir.0.clone());
 
     let mut h = harness_over(&dir);
     let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
-        source,
+        BudgetedSource::over(MONACO, &budget),
         store,
         monaco_spec(),
         live_generation(),
@@ -630,45 +758,23 @@ fn the_progress_block_draws_the_engines_own_ledger() {
         MONACO_SEGMENT_BYTES,
     );
 
-    // Wait for the plan, then for the ledger to stop moving.
-    let start = Instant::now();
-    let progress = loop {
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "the fixture download never planned"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-        let first = engine.progress();
-        if first.segments_total == 0 {
-            continue;
-        }
-        std::thread::sleep(Duration::from_millis(150));
-        let second = engine.progress();
-        if first == second {
-            break second;
-        }
-    };
-    assert!(
-        engine.outcome().is_none(),
-        "the run finished; this is no longer the in-flight case",
-    );
+    let progress = frozen_mid_run(&engine, "a plan with bytes on it", |p| {
+        p.denominator_known() && p.bytes_done.bytes() > 0
+    });
     // The non-triviality floor: all-zero figures would let a block that
-    // printed constants pass.
+    // printed constants pass, and a full bar would not distinguish a fraction
+    // from a hard-coded one.
     assert!(
-        progress.segments_total > 1
-            && progress.bytes_total.bytes() > 0
-            && progress.bytes_done.bytes() > 0,
-        "the frozen ledger holds nothing to draw: {progress:?}",
+        progress.bytes_total.bytes() > 0
+            && progress.bytes_done.bytes() > 0
+            && progress.bytes_done < progress.bytes_total,
+        "the frozen ledger holds no partial byte figure to draw: {progress:?}",
     );
 
     h.gui_mut().active_download = Some(engine);
     open_areas_screen(&mut h);
     let text = row_text(&h);
 
-    let segments = format!(
-        "{} of {} parts stored",
-        progress.segments_done, progress.segments_total
-    );
     let bytes = format!(
         "{} of {} fetched this run",
         progress.bytes_done.label(),
@@ -679,19 +785,149 @@ fn the_progress_block_draws_the_engines_own_ledger() {
             .any(|drawn| drawn.contains("Downloading monaco")),
         "the in-flight area is not named: {text:?}",
     );
-    assert!(
-        text.iter().any(|drawn| drawn.contains(&segments)),
-        "the glass does not show the ledger's segment figures ({segments:?}): {text:?}",
-    );
+    // The exact numbers, both of them, transferred and total.
     assert!(
         text.iter().any(|drawn| drawn.contains(&bytes)),
         "the glass does not show the ledger's byte figures ({bytes:?}): {text:?}",
+    );
+    // And the bar, filled from those same bytes. **Computed here from the two
+    // byte counts, never from `byte_fraction`**: an expectation taken from the
+    // function under test would agree with any constant that function
+    // returned. `ProgressBar` prints its percentage truncated, which is what
+    // the cast reproduces.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "reproducing egui's own `(progress * 100.0) as usize` over \
+                  the ledger's own two byte counts"
+    )]
+    let percentage = {
+        let fraction = progress.bytes_done.bytes() as f64 / progress.bytes_total.bytes() as f64;
+        format!("{}%", (fraction * 100.0) as usize)
+    };
+    assert_ne!(
+        percentage, "0%",
+        "the frozen ledger rounds to an empty bar, so a bar filled from a \
+         constant zero would pass this",
+    );
+    assert!(
+        text.iter().any(|drawn| drawn == &percentage),
+        "the bar is not filled from the ledger's bytes - expected {percentage:?} \
+         for {} of {}: {text:?}",
+        progress.bytes_done.bytes(),
+        progress.bytes_total.bytes(),
+    );
+    assert!(
+        !row_says(&h, PREPARING_LABEL),
+        "a run with a denominator still says it is preparing: {text:?}",
+    );
+    assert!(
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "the in-flight block draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
     );
     // An in-flight area is progress, not an entry: it has no record yet, and
     // nothing draws it as one.
     assert!(
         h.gui().downloaded_area("monaco").is_none(),
         "an unfinished download published a record",
+    );
+}
+
+/// Before the plan exists there is no byte denominator, and the block says so
+/// **instead of** drawing a bar at zero.
+///
+/// This is the reported defect: the cut runs for minutes over a real area, and
+/// a bar pinned at 0% through it is indistinguishable from a hang. Both halves
+/// are asserted on one run — the preparing state while the plan is out, and
+/// its replacement by the real bar once the denominator lands — so a block
+/// that simply always said "preparing" would fail the second half.
+#[test]
+fn the_block_says_it_is_preparing_until_a_byte_denominator_exists() {
+    const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
+    if std::fs::metadata(MONACO).is_err() {
+        skipped("the_block_says_it_is_preparing_until_a_byte_denominator_exists");
+        return;
+    }
+
+    let dir = TempDir::new("preparing");
+    let budget = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(READS_BEFORE_A_PLAN));
+    let mut h = harness_over(&dir);
+    let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
+        BudgetedSource::over(MONACO, &budget),
+        crate::basemap_download::FsSegmentStore::new(dir.0.clone()),
+        monaco_spec(),
+        live_generation(),
+        h.ctx().clone(),
+        MONACO_SEGMENT_BYTES,
+    );
+
+    let planning = frozen_mid_run(&engine, "a stalled plan", |p| !p.denominator_known());
+    assert_eq!(
+        planning.byte_fraction(),
+        None,
+        "a run with no plan answered with a fraction",
+    );
+
+    h.gui_mut().active_download = Some(engine);
+    open_areas_screen(&mut h);
+    let text = row_text(&h);
+    assert!(
+        text.iter()
+            .any(|drawn| drawn.contains("Downloading monaco")),
+        "the in-flight area is not named while it prepares: {text:?}",
+    );
+    assert!(
+        row_says(&h, PREPARING_LABEL),
+        "the planning phase is mute - it drew {text:?}",
+    );
+    assert!(
+        !text.iter().any(|drawn| drawn.ends_with('%')),
+        "a bar was drawn over a denominator that does not exist yet: {text:?}",
+    );
+
+    // Now let it plan. The preparing state is replaced by the real bar and the
+    // real figures — which is what keeps the assertion above from passing on a
+    // block that never leaves this state.
+    budget.store(
+        READS_TO_A_PLAN_AND_SOME_BYTES,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let start = Instant::now();
+    loop {
+        let progress = h
+            .gui()
+            .active_download
+            .as_ref()
+            .expect("the run is budgeted to stall, so it is still in flight")
+            .progress();
+        if progress.denominator_known() && progress.bytes_done.bytes() > 0 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the fixture download never planned once its budget was topped up: {progress:?}",
+        );
+        h.frame_after(1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.frame_after(1.0 / 60.0);
+
+    let text = row_text(&h);
+    assert!(
+        !row_says(&h, PREPARING_LABEL),
+        "the preparing state outlived the plan: {text:?}",
+    );
+    assert!(
+        text.iter()
+            .any(|drawn| drawn.contains(" of ") && drawn.contains(" MB")),
+        "the real byte figures never replaced the preparing state: {text:?}",
+    );
+    assert!(
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "the in-flight block draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
     );
 }
 
@@ -758,8 +994,8 @@ fn a_finished_run_publishes_its_record_dated_to_the_archive_it_cut_from() {
         row_text(&h),
     );
     assert!(
-        !row_says(&h, "parts"),
-        "a complete download draws a part count: {:?}",
-        row_text(&h),
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "a complete download draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
     );
 }

@@ -66,7 +66,7 @@
 //! [`DownloadProgress`] states per field whether its denominator is the whole
 //! area or this run's remaining work.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -246,9 +246,15 @@ impl DownloadedArea {
 /// How much of a persisted area the store actually holds, both figures
 /// against the same denominator: the area's own segment cut.
 ///
-/// Two numbers rather than a boolean, because "3 of 7 parts" is what a manage
-/// screen draws *in place of* a size — the same reason [`DownloadOutcome`]'s
-/// `Partial` carries its counts.
+/// Two numbers rather than a boolean, for the reason [`DownloadOutcome`]'s
+/// `Partial` carries its counts: a screen that can only ask "done?" has
+/// nowhere to put a half-held area but beside a finished one.
+///
+/// **These two never reach the glass.** Segments are an implementation fact
+/// the user has no way to picture, so the manage screen spends them as a
+/// held-of-asked byte pair instead — where "held" is the stored artifacts'
+/// size (see [`SegmentStore`]'s denominator note) and "asked" is the tile-byte
+/// total the download quoted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AreaStatus {
     /// Segments of this area's cut the store holds complete.
@@ -518,6 +524,16 @@ pub fn valid_area_id(area_id: &str) -> Result<(), StoreError> {
 /// `publish` must be atomic: after it, `existing_segments` lists the segment
 /// complete; before or during it, the segment is absent. That property is what
 /// makes launch-time completeness a recomputable fact rather than a flag.
+///
+/// # The listing's byte denominator is the artifact's, not the plan's
+///
+/// [`Self::existing_segment_bytes`] reports what each stored segment
+/// **occupies** — its tile data plus its own header, directories and metadata
+/// copy — which is not the module's tile-byte denominator and is a little
+/// larger than it per segment. It is the only held figure a store can answer
+/// without re-planning the area against the live archive, and re-planning is a
+/// network walk of every tile in the area. See
+/// [`AreaStatus`] for where the difference lands on the glass.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait SegmentStore: Send + Sync + 'static {
     /// Store one finished segment's bytes, atomically.
@@ -527,11 +543,29 @@ pub trait SegmentStore: Send + Sync + 'static {
         seg: u32,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+    /// The segments the store holds *complete* for `area_id`, each with the
+    /// bytes its artifact occupies. See the trait doc for the denominator.
+    fn existing_segment_bytes(
+        &self,
+        area_id: &str,
+    ) -> impl Future<Output = Result<BTreeMap<u32, u64>, StoreError>> + Send;
     /// The segments the store holds *complete* for `area_id`.
+    ///
+    /// Derived from [`Self::existing_segment_bytes`] and never separately
+    /// implemented, so the count and the sizes cannot come to two answers
+    /// about what is here.
     fn existing_segments(
         &self,
         area_id: &str,
-    ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>> + Send;
+    ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>> + Send {
+        async move {
+            Ok(self
+                .existing_segment_bytes(area_id)
+                .await?
+                .into_keys()
+                .collect())
+        }
+    }
     /// Remove every artifact of `area_id`, finished or not.
     fn remove_area(&self, area_id: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
@@ -547,11 +581,24 @@ pub trait SegmentStore: 'static {
         seg: u32,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), StoreError>>;
-    /// The segments the store holds *complete* for `area_id`.
+    /// See the native arm above.
+    fn existing_segment_bytes(
+        &self,
+        area_id: &str,
+    ) -> impl Future<Output = Result<BTreeMap<u32, u64>, StoreError>>;
+    /// See the native arm above.
     fn existing_segments(
         &self,
         area_id: &str,
-    ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>>;
+    ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>> {
+        async move {
+            Ok(self
+                .existing_segment_bytes(area_id)
+                .await?
+                .into_keys()
+                .collect())
+        }
+    }
     /// Remove every artifact of `area_id`, finished or not.
     fn remove_area(&self, area_id: &str) -> impl Future<Output = Result<(), StoreError>>;
 }
@@ -726,14 +773,17 @@ impl SegmentStore for FsSegmentStore {
         })
     }
 
-    async fn existing_segments(&self, area_id: &str) -> Result<BTreeSet<u32>, StoreError> {
+    async fn existing_segment_bytes(
+        &self,
+        area_id: &str,
+    ) -> Result<BTreeMap<u32, u64>, StoreError> {
         valid_area_id(area_id)?;
         // A store nothing has published into holds no segments; absence of
         // the directory is that, not a fault.
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeSet::new());
+                return Ok(BTreeMap::new());
             }
             Err(error) => {
                 return Err(StoreError::Io(format!(
@@ -743,13 +793,30 @@ impl SegmentStore for FsSegmentStore {
             }
         };
 
-        let mut segments = BTreeSet::new();
+        let mut segments = BTreeMap::new();
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str()
-                && let Some(seg) = Self::segment_of(name, area_id)
-            {
-                segments.insert(seg);
-            }
+            let Some(seg) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Self::segment_of(name, area_id))
+            else {
+                continue;
+            };
+            // The segment is listed whatever its size reads as: it is on disk
+            // and the completeness count is what listing answers. A size that
+            // will not stat contributes zero, which understates the held
+            // figure rather than dropping a segment from the count.
+            let bytes = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    log::warn!(
+                        "{area_id}.{seg}: the offline store would not size the segment, so the \
+                         held figure is short by it: {error}"
+                    );
+                    0
+                }
+            };
+            segments.insert(seg, bytes);
         }
         Ok(segments)
     }
@@ -864,11 +931,18 @@ impl HttpSegmentStore {
     }
 }
 
-/// One row of the service worker's `__list__` answer. `bytes` is in the
-/// contract too; only `url` is needed here and unknown fields are ignored.
+/// One row of the service worker's `__list__` answer.
+///
+/// `bytes` is what the segment occupies in the cache, as the worker wrote it
+/// atomically with the body. A row from a worker too old to send one counts as
+/// zero rather than dropping the segment: the segment is *there*, and a held
+/// figure short by it is a smaller wrong than a completeness count short by
+/// it.
 #[derive(serde::Deserialize)]
 struct ListedSegment {
     url: String,
+    #[serde(default)]
+    bytes: u64,
 }
 
 /// What the origin's storage has, as `navigator.storage.estimate()` reports it
@@ -973,19 +1047,22 @@ impl SegmentStore for HttpSegmentStore {
         Ok(())
     }
 
-    async fn existing_segments(&self, area_id: &str) -> Result<BTreeSet<u32>, StoreError> {
+    async fn existing_segment_bytes(
+        &self,
+        area_id: &str,
+    ) -> Result<BTreeMap<u32, u64>, StoreError> {
         valid_area_id(area_id)?;
         let listed = self.list_rows().await?;
 
         let needle = format!("{OFFLINE_BASE_PATH}/{area_id}/");
-        let mut segments = BTreeSet::new();
+        let mut segments = BTreeMap::new();
         for row in listed {
             if let Some(at) = row.url.rfind(&needle)
                 && let Some(seg) = row.url[at + needle.len()..]
                     .strip_suffix(SEGMENT_SUFFIX)
                     .and_then(|stem| stem.parse().ok())
             {
-                segments.insert(seg);
+                segments.insert(seg, row.bytes);
             }
         }
         Ok(segments)
@@ -1163,6 +1240,46 @@ pub struct DownloadProgress {
     /// buffers**, not process heap — allocator slack, HTTP internals and the
     /// directory cache are not in it.
     pub peak_held: DataSize,
+}
+
+impl DownloadProgress {
+    /// Whether this run has a byte denominator yet.
+    ///
+    /// The plan is cut before a byte moves — every tile of the area looked up
+    /// through the archive's directories — and until it lands there is no
+    /// total for a bar to fill against. A screen must say it is preparing
+    /// rather than draw a bar pinned at zero: over a large area the cut runs
+    /// for minutes, and a stationary bar is indistinguishable from a hang.
+    ///
+    /// Read off the **segment** cut rather than the byte total, because a
+    /// resume with nothing left to fetch has a real plan and a zero byte
+    /// total; asking the byte total would report that run as still preparing
+    /// forever.
+    pub fn denominator_known(self) -> bool {
+        self.segments_total > 0
+    }
+
+    /// How full a bar over this run's bytes stands, `0.0..=1.0`, or `None`
+    /// while [`Self::denominator_known`] is false — never a fabricated
+    /// fraction over an unknown denominator.
+    ///
+    /// A planned run with nothing to fetch is full: every byte it set out to
+    /// transfer is transferred, which is what zero of zero means here.
+    pub fn byte_fraction(self) -> Option<f32> {
+        if !self.denominator_known() {
+            return None;
+        }
+        let total = self.bytes_total.bytes();
+        if total == 0 {
+            return Some(1.0);
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a bar's fill is a fraction of its width; the exact \
+                      figures are the labels beside it"
+        )]
+        Some((self.bytes_done.bytes() as f32 / total as f32).clamp(0.0, 1.0))
+    }
 }
 
 // ---------------------------------------------------------------------------

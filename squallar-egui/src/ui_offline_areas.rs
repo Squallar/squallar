@@ -18,12 +18,24 @@
 //!
 //! # A half-download is unrenderable as done
 //!
-//! An area whose segments the store no longer all holds draws **"3 of 7
-//! parts" in place of its size**. Not beside it: a size is what a finished
-//! area has, and printing one next to a part count would be the same claim the
-//! counts exist to refuse. The counts come from
-//! [`AreaMaintenance`](crate::basemap_areas::AreaMaintenance), recomputed off
-//! the store's own listing, never from a flag.
+//! An area the store no longer holds whole draws **"12 MB of 112 MB" in place
+//! of its size**. Not beside it: a bare size is what a finished area has, and
+//! printing one next to a held figure would be the same claim the pair exists
+//! to refuse. Both rows spend the same single label slot, which is what keeps
+//! "a partial never renders as complete" a property of the construction rather
+//! than of two branches agreeing.
+//!
+//! The held figure comes from
+//! [`AreaMaintenance`](crate::basemap_areas::AreaMaintenance), summed off the
+//! store's own listing every session, never from a flag. Its denominator is
+//! the stored artifacts' — see [`AreaFact`](crate::basemap_areas::AreaFact),
+//! which states what that costs.
+//!
+//! # Segments are not a user's vocabulary
+//!
+//! How an area is cut into segments is an implementation fact nothing here
+//! draws. Progress is bytes, held is bytes, and the exact byte figures stay on
+//! the glass beside the bar rather than collapsing into a percentage.
 //!
 //! # What is offline is these areas, not the app
 //!
@@ -33,8 +45,10 @@
 
 use egui::RichText;
 
-use crate::basemap_areas::{ActiveDownload, AreaMaintenance, detail_label, generation_note};
-use crate::basemap_download::{AreaSpec, AreaStatus, DownloadedArea};
+use crate::basemap_areas::{
+    ActiveDownload, AreaFact, AreaMaintenance, detail_label, generation_note,
+};
+use crate::basemap_download::{AreaSpec, DownloadedArea};
 
 const AREA_ROW_SPACING: f32 = 6.0;
 
@@ -93,14 +107,14 @@ impl super::Gui {
         let archive_max_zoom = self.download_size.ceiling();
         let mut command = None;
         for area in &self.downloaded_areas {
-            let status = self
+            let fact = self
                 .area_maintenance
                 .as_ref()
-                .and_then(|maintenance| maintenance.status(&area.spec.area_id));
+                .and_then(|maintenance| maintenance.fact(&area.spec.area_id));
             let asked = render_area(
                 ui,
                 area,
-                status,
+                fact,
                 &live_generation,
                 store_reachable,
                 archive_max_zoom,
@@ -119,46 +133,15 @@ impl super::Gui {
         }
     }
 
-    /// The in-flight run, if there is one: the engine's own counters, each
-    /// figure beside the denominator it is against.
+    /// The in-flight run, if there is one: a bar over the bytes, the exact
+    /// byte figures beside it, and — until the plan has answered with a
+    /// denominator — a preparing state rather than a bar at zero.
     fn render_active_download(&self, ui: &mut egui::Ui) {
         let Some(active) = self.active_download.as_ref() else {
             return;
         };
-        let progress = active.progress();
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(format!("Downloading {}", active.spec.area_id));
-        });
-        let fraction = if progress.bytes_total.bytes() == 0 {
-            0.0
-        } else {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "a bar's fill is a fraction of its width; the exact \
-                          figures are the labels below it"
-            )]
-            {
-                progress.bytes_done.bytes() as f32 / progress.bytes_total.bytes() as f32
-            }
-        };
-        ui.add(egui::ProgressBar::new(fraction).show_percentage());
-        ui.label(
-            RichText::new(format!(
-                "{} of {} parts stored",
-                progress.segments_done, progress.segments_total
-            ))
-            .small(),
-        );
-        ui.label(
-            RichText::new(format!(
-                "{} of {} fetched this run",
-                progress.bytes_done.label(),
-                progress.bytes_total.label()
-            ))
-            .small()
-            .weak(),
-        );
+        ui.label(format!("Downloading {}", active.spec.area_id));
+        crate::ui_download_area::render_download_progress(ui, active.progress());
         ui.add_space(AREA_ROW_SPACING);
     }
 
@@ -260,7 +243,7 @@ impl super::Gui {
 fn render_area(
     ui: &mut egui::Ui,
     area: &DownloadedArea,
-    status: Option<AreaStatus>,
+    fact: Option<AreaFact>,
     live_generation: &str,
     store_reachable: bool,
     // The live archive's own detail ceiling, once a header read has reported
@@ -274,7 +257,7 @@ fn render_area(
     // figure over the map beside it - measured, not feared.
     ui.horizontal(|ui| {
         ui.label(RichText::new(&area.spec.area_id).strong());
-        ui.label(size_or_parts(area, status));
+        ui.label(held_or_size(area, fact));
     });
     ui.label(
         RichText::new(detail_label(area.spec.max_zoom, archive_max_zoom))
@@ -289,7 +272,7 @@ fn render_area(
     // Resume and Update are the same start against a different shortfall, so a
     // row offers exactly one of them: an area missing segments needs those
     // before it needs a newer cut.
-    let incomplete = status.is_some_and(|status| !status.is_complete());
+    let incomplete = fact.is_some_and(|fact| !fact.status.is_complete());
     let updatable = note.is_some_and(|note| note.update_available);
     ui.add_enabled_ui(store_reachable, |ui| {
         ui.horizontal(|ui| {
@@ -307,16 +290,22 @@ fn render_area(
     command
 }
 
-/// The figure a row shows for how much of the area is here.
+/// The figure a row shows for how much of the area is here — **one slot,
+/// three states**.
 ///
-/// Three states, and the middle one is the whole point: a size **only** for an
-/// area the store holds whole, part counts **in place of** a size for one it
-/// does not, and neither for one it has not answered about.
-fn size_or_parts(area: &DownloadedArea, status: Option<AreaStatus>) -> String {
-    match status {
+/// The middle one is the whole point: a bare size **only** for an area the
+/// store holds whole, a held-of-asked pair **in place of** that size for one
+/// it does not, and neither for one it has not answered about. One slot, so a
+/// half-held area has nowhere to put a finished area's figure.
+///
+/// The two sides of the pair carry slightly different byte denominators —
+/// [`AreaFact`](crate::basemap_areas::AreaFact) states which and why. What the
+/// pair asserts is that this area is short, and by roughly how much.
+fn held_or_size(area: &DownloadedArea, fact: Option<AreaFact>) -> String {
+    match fact {
         None => CHECKING_NOTE.to_owned(),
-        Some(status) if status.is_complete() => area.bytes.label(),
-        Some(status) => format!("{} of {} parts", status.present, status.expected),
+        Some(fact) if fact.status.is_complete() => area.bytes.label(),
+        Some(fact) => format!("{} of {}", fact.held.label(), area.bytes.label()),
     }
 }
 

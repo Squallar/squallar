@@ -38,7 +38,7 @@ use crate::basemap_archive::ArchiveRangeSource;
 // reads a stored area's depth back through the same three names, and two
 // tables would be two answers.
 pub(crate) use crate::basemap_areas::{DETAIL_LEVELS, DetailLevel};
-use crate::basemap_download::{AreaSpec, OfflineQuota, area_tiles};
+use crate::basemap_download::{AreaSpec, DownloadProgress, OfflineQuota, area_tiles};
 use crate::pmt_index::{DownloadBytes, PmtIndex};
 use crate::tile_source::runtime;
 use crate::ui_region::DragBoundsKm;
@@ -548,6 +548,53 @@ pub(crate) fn shortfall_action_label(level: DetailLevel) -> String {
 /// Free space as `quota` reports it, or `None` when it does not.
 pub(crate) fn free_space(quota: Option<OfflineQuota>) -> Option<DataSize> {
     quota?.free()
+}
+
+// ---------------------------------------------------------------------------
+// The in-flight block
+// ---------------------------------------------------------------------------
+
+/// What the in-flight block says before there is anything to fill a bar with.
+///
+/// **The plan is cut before a byte moves** and that cut runs for minutes over
+/// a large area. A bar pinned at 0% through it is indistinguishable from a
+/// hang, and a fabricated percentage would be worse; this says which of the
+/// two states the run is in, and the spinner beside it says it is alive.
+pub(crate) const PREPARING_LABEL: &str = "Preparing download...";
+
+/// The exact byte counter that sits beside the bar.
+///
+/// **The figures stay on the glass, in full.** The bar is how far along the
+/// run is at a glance; these are what it is measuring, and a percentage is not
+/// a substitute for either. The denominator is this run's own work — a resume
+/// fetches only what is missing — which is why the line says so.
+pub(crate) fn progress_bytes_line(progress: DownloadProgress) -> String {
+    format!(
+        "{} of {} fetched this run",
+        progress.bytes_done.label(),
+        progress.bytes_total.label()
+    )
+}
+
+/// The one in-flight block both surfaces draw: the map panel's and the manage
+/// screen's.
+///
+/// One function rather than two call sites, so the two views of the *same*
+/// download cannot come to two answers about where it stands — and so the
+/// no-part-counts rule has one place to hold.
+pub(crate) fn render_download_progress(ui: &mut egui::Ui, progress: DownloadProgress) {
+    match progress.byte_fraction() {
+        Some(fraction) => {
+            ui.add(egui::ProgressBar::new(fraction).show_percentage());
+            ui.label(egui::RichText::new(progress_bytes_line(progress)).small());
+        }
+        None => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new(PREPARING_LABEL).small());
+            });
+        }
+    }
 }
 
 #[cfg(test)]
