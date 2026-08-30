@@ -159,7 +159,7 @@ fn archive_centre<S: super::ArchiveRangeSource>(archive: &BasemapArchive<S>) -> 
 /// [`super::archive_client`] cannot: it sets `https_only`, which is pinned by
 /// `the_archive_client_refuses_cleartext` below. Same split, and for the same
 /// reason, as `tile_source::tests::loopback_client`.
-pub(super) fn loopback_client() -> reqwest::Client {
+pub(crate) fn loopback_client() -> reqwest::Client {
     squallar_radar::tls::init();
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -168,7 +168,7 @@ pub(super) fn loopback_client() -> reqwest::Client {
 }
 
 /// Run `future` on a current-thread runtime.
-pub(super) fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -292,7 +292,7 @@ impl RangeSource for FailsAfterOpenSource {
 
 /// How the loopback server answers a known path.
 #[derive(Clone, Copy)]
-pub(super) enum Answer {
+pub(crate) enum Answer {
     /// `200` with a body, i.e. the whole resource — what a host that ignores
     /// `Range` does, and what 2 of 11 real requests did.
     WholeBody,
@@ -304,7 +304,7 @@ pub(super) enum Answer {
 
 /// One path's serving plan: `whole_body_first` requests answered `200`, then
 /// `then`.
-pub(super) struct PathPlan {
+pub(crate) struct PathPlan {
     body: Vec<u8>,
     whole_body_first: usize,
     then: Answer,
@@ -312,7 +312,7 @@ pub(super) struct PathPlan {
 
 impl PathPlan {
     /// A well-behaved ranged path.
-    pub(super) fn ranged(body: Vec<u8>) -> Self {
+    pub(crate) fn ranged(body: Vec<u8>) -> Self {
         Self {
             body,
             whole_body_first: 0,
@@ -340,7 +340,7 @@ pub(super) struct SeenRequest {
 /// `.part001`, …, and the monolith is the bare path. A path with no plan
 /// answers a clean `404`, which is itself load-bearing: it is what tells the
 /// probe an archive has no parts.
-pub(super) struct RangeServer {
+pub(crate) struct RangeServer {
     port: u16,
     seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
     #[expect(
@@ -351,7 +351,7 @@ pub(super) struct RangeServer {
 }
 
 /// The bare archive path every test serves under.
-pub(super) const ARCHIVE_PATH: &str = "/archive.pmtiles";
+pub(crate) const ARCHIVE_PATH: &str = "/archive.pmtiles";
 
 /// The path of part `index` under [`ARCHIVE_PATH`], per the publish contract.
 fn part_path(index: usize) -> String {
@@ -367,7 +367,7 @@ fn split_into_parts(body: &[u8], part_bytes: usize) -> Vec<Vec<u8>> {
 
 impl RangeServer {
     /// A server answering exactly `paths`, and `404` elsewhere.
-    pub(super) fn start(paths: std::collections::HashMap<String, PathPlan>) -> Self {
+    pub(crate) fn start(paths: std::collections::HashMap<String, PathPlan>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port should bind");
         let port = listener
             .local_addr()
@@ -394,7 +394,7 @@ impl RangeServer {
 
     /// The pre-split shape: one file at the bare path, no parts anywhere, so
     /// the probe's `404` selects monolith mode.
-    pub(super) fn monolith(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
+    pub(crate) fn monolith(body: Vec<u8>, whole_body_first: usize, then: Answer) -> Self {
         Self::start(std::collections::HashMap::from([(
             ARCHIVE_PATH.to_owned(),
             PathPlan {
@@ -409,7 +409,7 @@ impl RangeServer {
     /// paths, and **nothing at the bare path** — a request there answers
     /// `404`, so a reader that fell back to the monolith would fail loudly
     /// rather than pass by accident.
-    fn parted(body: &[u8], part_bytes: usize) -> Self {
+    pub(crate) fn parted(body: &[u8], part_bytes: usize) -> Self {
         Self::start(
             split_into_parts(body, part_bytes)
                 .into_iter()
@@ -419,7 +419,7 @@ impl RangeServer {
         )
     }
 
-    pub(super) fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         format!("http://127.0.0.1:{}{ARCHIVE_PATH}", self.port)
     }
 
@@ -432,7 +432,7 @@ impl RangeServer {
     }
 
     /// How many requests `path` has received.
-    pub(super) fn requests_to(&self, path: &str) -> usize {
+    pub(crate) fn requests_to(&self, path: &str) -> usize {
         self.seen()
             .iter()
             .filter(|request| request.path == path)

@@ -409,6 +409,11 @@ pub const TERRAIN_TILE_CACHE_ENTRIES: NonZeroUsize = TILE_CACHE_ENTRIES;
 /// sniffed rather than reported. The header names what the archive holds;
 /// [`decode_archive_tile`] obeys it.
 ///
+/// `pub(crate)` rather than `pub`: [`Self::TerrainRgb`] is a claim a *caller*
+/// makes about an archive whose header cannot carry the distinction, but the
+/// only thing that consumes such a claim is
+/// [`HttpsTiles::from_range_source`], which is itself `pub(crate)` — so no
+/// caller outside this crate could pass one even in principle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ArchiveTileKind {
     /// `tile_type = 1` (MVT): tessellated against the committed style via
@@ -421,6 +426,38 @@ pub(crate) enum ArchiveTileKind {
     /// terrain hillshade; a future plain-raster archive must add its own arm
     /// here rather than inherit the remap.
     Hillshade,
+    /// Packed elevation in a PNG body: the terrain-RGB archives
+    /// ([`crate::tiles::HEIGHT_ARCHIVE_URL`]). **Never reachable from
+    /// [`Self::from_tile_type`]** — `tile_type = 2` is PNG for both a
+    /// hillshade and an elevation grid, and no header field separates them —
+    /// so it is only ever a *declaration*, cross-checked against the header
+    /// at open (see [`serve_archive_continuously`]).
+    ///
+    /// It exists so that an elevation archive reaching a picture path fails
+    /// loudly. There is no image in these bodies: each pixel is a base-256
+    /// height triple, and a compositor handed one paints noise that looks
+    /// like terrain.
+    ///
+    /// **Nothing in the shipped build constructs it, and that is the design,
+    /// not an oversight.** The only consumer of a declaration is
+    /// [`HttpsTiles::from_range_source`], and the height reader deliberately
+    /// does not build an `HttpsTiles` at all — heights are read as bytes
+    /// through [`crate::tiles::height_range_source`]. So the arms that receive
+    /// this variant are the guard rail for the day something *does* route an
+    /// elevation archive at the picture path, and only the tests reach them
+    /// today. `expect` rather than `allow`, and only off the test cfg, so the
+    /// first production construction makes this attribute unfulfilled and asks
+    /// to be deleted.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "declared by callers of from_range_source; the height \
+                      reader deliberately builds no HttpsTiles, so only the \
+                      tests construct it until something does"
+        )
+    )]
+    TerrainRgb,
     /// `tile_type = 0`: the header declares nothing, so the body is sniffed
     /// exactly as a plain HTTP tile is. No archive this app opens says this;
     /// the arm keeps "unknown" behaving as the pre-seam code did instead of
@@ -454,6 +491,12 @@ pub(crate) fn decode_archive_tile(
                 Default::default(),
             )))
         }
+        ArchiveTileKind::TerrainRgb => Err(
+            "this archive carries packed elevation and has no picture in it: a \
+             terrain-RGB body is a base-256 height triple per pixel, so it is \
+             read as data and never decoded into a tile"
+                .to_owned(),
+        ),
         ArchiveTileKind::Undeclared => {
             Tile::new(bytes, style, zoom, ctx).map_err(|error| error.to_string())
         }
@@ -1615,9 +1658,9 @@ impl HttpsTiles {
     /// it cannot be reported here, because nothing has been asked for yet, so
     /// it is recorded on [`Self::fault`] instead of only in the log.
     /// `cache` is the persistent block cache's configuration, decided by the
-    /// caller because deriving it takes both archive URLs (the GC's live-
-    /// generation set) — `None` reads uncached, exactly as before the cache
-    /// existed. The basemap source is also the one that seeds: the z0–z5
+    /// caller because deriving it takes *every* archive URL the build reads
+    /// (the GC's live-generation set, from `tiles::live_archive_urls`) —
+    /// `None` reads uncached, exactly as before the cache existed. The basemap source is also the one that seeds: the z0–z5
     /// warm-up runs through this source's cache, once per generation.
     pub fn from_archive_url(
         url: &str,
@@ -1639,6 +1682,9 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TILE_CACHE_ENTRIES,
+            // The header says `tile_type = 1` and that is the whole truth
+            // about a vector archive; nothing here knows better.
+            None,
             ArchiveStores {
                 seed: cache,
                 offline,
@@ -1682,6 +1728,10 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TERRAIN_TILE_CACHE_ENTRIES,
+            // The hillshade is the app's only *pictorial* raster archive, so
+            // the header's `tile_type = 4` already routes it correctly. A
+            // declaration here would claim a fact the header carries.
+            None,
             ArchiveStores {
                 // No seed: the warm-up is the basemap's shallow zooms, not
                 // the hillshade's.
@@ -1700,12 +1750,19 @@ impl HttpsTiles {
     /// arguments, because they mean one thing — what this source consults
     /// before the network — and the archive kind is meaningless apart from the
     /// store it filters.
+    ///
+    /// `declared_kind` is what the caller claims the bodies are, for the one
+    /// case the header cannot say: `Some(ArchiveTileKind::TerrainRgb)` over a
+    /// PNG archive. It is verified against the header at open and is not a
+    /// pre-set answer — see [`ArchiveHeaderSlots::declared`]. `None` leaves
+    /// the header's word standing, which is what both published archives use.
     pub(crate) fn from_range_source<S, St>(
         source: S,
         style: Arc<Style>,
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
+        declared_kind: Option<ArchiveTileKind>,
         stores: ArchiveStores<St>,
     ) -> Self
     where
@@ -1760,6 +1817,7 @@ impl HttpsTiles {
                 max_zoom: Arc::clone(&max_zoom),
                 fault: Arc::clone(&fault),
                 kind: archive_kind,
+                declared: declared_kind,
             },
             request_rx,
             tile_tx,
@@ -1903,6 +1961,16 @@ struct ArchiveHeaderSlots {
     max_zoom: Arc<AtomicU8>,
     fault: Arc<OnceLock<String>>,
     kind: Arc<OnceLock<ArchiveTileKind>>,
+    /// What the *caller* says this archive holds, when the header cannot say
+    /// it — the only way [`ArchiveTileKind::TerrainRgb`] is ever reached.
+    ///
+    /// **A declaration, not a pre-set `OnceLock`.** `kind` is still written
+    /// once by the IO task at open, and writing it is what
+    /// [`serve_archive_continuously`] does *after* cross-checking this against
+    /// the header. Pre-setting `kind` from the constructor would make the
+    /// declaration unfalsifiable: a `TerrainRgb` sitting over an MVT archive
+    /// would decode nothing and report no fault.
+    declared: Option<ArchiveTileKind>,
 }
 
 impl ArchiveTileKind {
@@ -1915,6 +1983,22 @@ impl ArchiveTileKind {
             TileType::Mvt | TileType::Mlt => Self::Vector,
             TileType::Png | TileType::Jpeg | TileType::Webp | TileType::Avif => Self::Hillshade,
             TileType::Unknown => Self::Undeclared,
+        }
+    }
+
+    /// Whether a caller may declare an archive whose header says `tile_type`
+    /// to be this kind.
+    ///
+    /// [`Self::TerrainRgb`] is the whole reason declarations exist, and it is
+    /// the only kind the header cannot confirm: `tile_type = 2` is PNG for a
+    /// hillshade and for an elevation grid alike, so all this can check is
+    /// that the bodies are PNG at all. Every other kind is checkable exactly,
+    /// so it is checked exactly — a declaration nobody could falsify would be
+    /// a claim rather than a mechanism.
+    fn accepts_tile_type(self, tile_type: pmtiles::TileType) -> bool {
+        match self {
+            Self::TerrainRgb => tile_type == pmtiles::TileType::Png,
+            exact => exact == Self::from_tile_type(tile_type),
         }
     }
 }
@@ -1976,13 +2060,34 @@ async fn serve_archive_continuously<S, St>(
         }
     };
 
+    // The declaration, cross-checked against the header before anything is
+    // served. A declared kind the header contradicts is recorded and returned
+    // from exactly as an archive that would not open is: the composition is
+    // wrong about what it is reading, and serving bodies to the wrong decoder
+    // would put noise on the glass instead of saying so.
+    let kind = match slots.declared {
+        Some(declared) if !declared.accepts_tile_type(archive.tile_type()) => {
+            let reason = format!(
+                "the archive was opened as {declared:?}, but its header says \
+                 tile_type {:?}",
+                archive.tile_type()
+            );
+            log::error!("the basemap archive is not what it was declared to be: {reason}");
+            let _ = slots.fault.set(reason);
+            egui_ctx.request_repaint();
+            return;
+        }
+        // The caller knows something the header cannot carry.
+        Some(declared) => declared,
+        // Nobody claimed anything, so the header's word stands.
+        None => ArchiveTileKind::from_tile_type(archive.tile_type()),
+    };
+
     slots.max_zoom.store(archive.max_zoom(), Ordering::Relaxed);
-    // The header's word on what the bodies are, published before the first
-    // tile is served: on wasm32 the frame pump decodes, and this is how it
-    // knows which decoder the archive calls for.
-    let _ = slots
-        .kind
-        .set(ArchiveTileKind::from_tile_type(archive.tile_type()));
+    // What the bodies are, published before the first tile is served: on
+    // wasm32 the frame pump decodes, and this is how it knows which decoder
+    // the archive calls for.
+    let _ = slots.kind.set(kind);
     log::info!(
         "basemap archive open: zooms {}-{}, tiles {:?}, compression {:?}",
         archive.min_zoom(),
@@ -2032,7 +2137,7 @@ async fn serve_archive_continuously<S, St>(
         let completed = if outstanding.is_empty() {
             match request_rx.next().await {
                 Some(tile_id) => {
-                    outstanding.push(read_one(&archive, &styling, &egui_ctx, tile_id));
+                    outstanding.push(read_one(&archive, &styling, &egui_ctx, kind, tile_id));
                     continue;
                 }
                 None => break,
@@ -2042,7 +2147,7 @@ async fn serve_archive_continuously<S, St>(
                 Either::Left((Some(tile_id), pending)) => {
                     // Release the borrow of `outstanding` before pushing.
                     drop(pending);
-                    outstanding.push(read_one(&archive, &styling, &egui_ctx, tile_id));
+                    outstanding.push(read_one(&archive, &styling, &egui_ctx, kind, tile_id));
                     continue;
                 }
                 Either::Left((None, _)) => break,
@@ -2076,6 +2181,11 @@ async fn serve_archive_continuously<S, St>(
 /// too. Or skip the archive entirely: a tile whose parse is already in
 /// [`SharedParsedTiles`] is re-styled from it, which is the whole of what a
 /// theme flip or a detail toggle costs since [`HttpsTiles::set_style`].
+///
+/// `kind` is decided once, at open, by [`serve_archive_continuously`] —
+/// **not re-derived here**. On native this function is the decoding side, so a
+/// second derivation from the header would silently overrule a declaration and
+/// hand a terrain-RGB body to the hillshade decoder; see [`ArchiveTileKind`].
 ///
 /// `Ok(None)` is the archive positively holding nothing at that coordinate --
 /// an ocean tile at zoom 14 -- which is why
@@ -2123,15 +2233,13 @@ async fn read_one<S, O>(
         )
     )]
     egui_ctx: &Context,
+    kind: ArchiveTileKind,
     tile_id: TileId,
 ) -> Result<Option<(TileId, FetchPayload)>, String>
 where
     S: crate::basemap_archive::ArchiveRangeSource,
     O: crate::basemap_archive::ArchiveRangeSource,
 {
-    // The header's word, not the body's shape -- see [`ArchiveTileKind`].
-    let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
-
     // The restyle path: parsed geometry already held means the archive — and
     // the network and disk behind it — is not consulted at all. This is what
     // `HttpsTiles::set_style` turns a theme flip and a detail toggle into.

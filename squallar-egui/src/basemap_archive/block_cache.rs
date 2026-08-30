@@ -113,10 +113,11 @@ pub fn seed_marker() -> String {
 /// tests is the pin.
 ///
 /// Deliberately the *path only*, not the host: a local mirror of a published
-/// generation (`SQUALLAR_BASEMAP_ARCHIVE` pointing a plain HTTP server at the
-/// same archive path) serves byte-identical content, and sharing its cache is
-/// correct. Two *different* archives published under one path cannot exist,
-/// because the path is the generation.
+/// generation (`SQUALLAR_BASEMAP_ARCHIVE` pointing another host at the same
+/// archive path — over TLS, since the archive client is `https_only`) serves
+/// byte-identical content, and sharing its cache is correct. Two *different*
+/// archives published under one path cannot exist, because the path is the
+/// generation.
 ///
 /// The encoding keeps `[A-Za-z0-9.-]` and spells every other byte `_XX`
 /// (uppercase hex, `_` itself becomes `_5F`), so it is injective — no two
@@ -145,13 +146,14 @@ pub fn generation_for_url(url: &str) -> String {
 }
 
 /// Everything the cache needs to know, decided by the caller that knows the
-/// URLs — `tiles.rs`, which is where both archive URLs live.
+/// URLs — `tiles.rs`, which is where every archive URL lives and where
+/// `live_archive_urls` enumerates them.
 ///
 /// `live_generations` is every generation the *process* currently reads, not
-/// just this source's: basemap and terrain have different generations both
-/// alive at once, and the terrain source is built lazily, so a GC that only
-/// knew the opening source's generation would delete the other's cache at
-/// every launch.
+/// just this source's: the archives have different generations all alive at
+/// once and their sources are built lazily and in no fixed order, so a GC that
+/// only knew the opening source's generation would delete the others' caches
+/// at every launch.
 #[derive(Clone, Debug)]
 pub struct BlockCacheConfig {
     /// The cache root. Generation directories live directly under it.
@@ -244,9 +246,9 @@ mod native {
 
     /// The per-root shared state: one running byte total, one eviction
     /// index, one open walk — shared by every source over the same root
-    /// (basemap and terrain, and every rebuild across theme flips and layer
-    /// toggles), because two sources each keeping a private total would both
-    /// be wrong about the sum.
+    /// (every archive `tiles.rs` declares, and every rebuild across theme
+    /// flips and layer toggles), because two sources each keeping a private
+    /// total would both be wrong about the sum.
     pub(super) struct CacheShared {
         root: PathBuf,
         cap_bytes: u64,
@@ -349,8 +351,9 @@ mod native {
         /// The whole of invalidation: content within a generation is
         /// immutable, so the only thing that can ever be stale is a
         /// generation the process no longer reads. `live_generations` is the
-        /// full process-wide set (basemap *and* terrain), so the order the
-        /// two sources open in cannot cost either its cache.
+        /// full process-wide set — every archive `tiles.rs` declares, not the
+        /// one being opened — so the order the sources open in cannot cost any
+        /// of them its cache.
         fn gc_stale_generations(&self) {
             let Ok(entries) = std::fs::read_dir(&self.root) else {
                 return;

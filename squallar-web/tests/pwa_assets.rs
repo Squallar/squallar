@@ -67,6 +67,54 @@ fn js_string_list(src: &str, marker: &str) -> Vec<String> {
 /// themselves contain `//` — URLs. The cost is that a `//`-commented-out entry
 /// inside the brackets would still be read, so lists extracted this way must
 /// not carry line comments between the entries.
+/// `squallar-egui`'s `tiles.rs`, as source text.
+///
+/// The archive consts are read out of it rather than named here, so a fifth
+/// archive declared in that file and forgotten in `sw.js` reddens. A
+/// hand-kept list would have to be updated by the same person who forgot.
+const TILES_SOURCE: &str = include_str!("../../squallar-egui/src/tiles.rs");
+
+/// Every `pub const <NAME>_ARCHIVE_URL: &str = "https://…"` in [`TILES_SOURCE`].
+///
+/// The name must end in `_ARCHIVE_URL` exactly, which keeps the
+/// `*_ARCHIVE_URL_ENV` consts — environment variable names, not archives —
+/// out; the value must be an `https://` literal. `squallar-egui`'s own
+/// `tiles::tests` carries the twin of this scan for the block cache's live
+/// set, and each crate reads the same file for its own pin.
+fn declared_archive_url_consts() -> BTreeMap<String, String> {
+    const DECL: &str = "pub const ";
+    const TYPED: &str = ": &str =";
+
+    let mut found = BTreeMap::new();
+    for (at, _) in TILES_SOURCE.match_indices(DECL) {
+        let rest = &TILES_SOURCE[at + DECL.len()..];
+        let Some(end) = rest.find(';') else { continue };
+        let item = &rest[..end];
+
+        let Some(name_end) = item.find(TYPED) else {
+            continue;
+        };
+        let name = item[..name_end].trim();
+        if !name.ends_with("_ARCHIVE_URL") {
+            continue;
+        }
+
+        let value = &item[name_end + TYPED.len()..];
+        let Some(open) = value.find('"') else {
+            continue;
+        };
+        let after = &value[open + 1..];
+        let Some(close) = after.find('"') else {
+            continue;
+        };
+        let url = &after[..close];
+        if url.starts_with("https://") {
+            found.insert(name.to_owned(), url.to_owned());
+        }
+    }
+    found
+}
+
 fn js_url_list(src: &str, marker: &str) -> Vec<String> {
     let start = src
         .find(marker)
@@ -468,22 +516,56 @@ fn the_worker_names_the_same_basemap_archive_host_the_client_reads() {
 #[test]
 fn the_worker_block_caches_exactly_the_archives_the_client_reads() {
     let declared = js_url_list(SERVICE_WORKER, "const ARCHIVE_URLS = [");
-    let expected: BTreeSet<String> = [
-        squallar_egui::tiles::BASEMAP_ARCHIVE_URL.to_string(),
-        squallar_egui::tiles::TERRAIN_ARCHIVE_URL.to_string(),
-    ]
-    .into_iter()
-    .collect();
+
+    // **Enumerated from tiles.rs, not hand-listed.** A fifth archive const
+    // declared there and forgotten here is the failure this exists to catch,
+    // and a fixed list of four names is blind to exactly that.
+    let consts = declared_archive_url_consts();
+    let expected: BTreeSet<String> = consts.values().cloned().collect();
 
     let found: BTreeSet<String> = declared.iter().cloned().collect();
     assert_eq!(
-        found, expected,
-        "ARCHIVE_URLS in squallar-web/sw.js does not match the Rust archive \
-         consts (BASEMAP_ARCHIVE_URL, TERRAIN_ARCHIVE_URL). The block cache \
-         keeps exactly the generations this list names; a missing archive is \
-         wiped on every deploy, a stale one is retained forever."
+        found,
+        expected,
+        "ARCHIVE_URLS in squallar-web/sw.js does not match the archive consts \
+         squallar-egui/src/tiles.rs declares ({:?}). The block cache keeps \
+         exactly the generations this list names; a missing archive is wiped \
+         on every deploy, a stale one is retained forever.",
+        consts.keys().collect::<Vec<_>>()
     );
-    assert_eq!(declared.len(), 2, "ARCHIVE_URLS carries a duplicate entry");
+    assert_eq!(
+        declared.len(),
+        consts.len(),
+        "ARCHIVE_URLS carries a duplicate entry"
+    );
+
+    // Non-triviality floor: a scan that read nothing out of tiles.rs would
+    // make the comparison above an assertion that two empty sets are equal.
+    for (name, url) in [
+        (
+            "BASEMAP_ARCHIVE_URL",
+            squallar_egui::tiles::BASEMAP_ARCHIVE_URL,
+        ),
+        (
+            "TERRAIN_ARCHIVE_URL",
+            squallar_egui::tiles::TERRAIN_ARCHIVE_URL,
+        ),
+        (
+            "HEIGHT_ARCHIVE_URL",
+            squallar_egui::tiles::HEIGHT_ARCHIVE_URL,
+        ),
+        (
+            "CONUS_HEIGHT_ARCHIVE_URL",
+            squallar_egui::tiles::CONUS_HEIGHT_ARCHIVE_URL,
+        ),
+    ] {
+        assert_eq!(
+            consts.get(name).map(String::as_str),
+            Some(url),
+            "the source scan did not read {name} out of tiles.rs, so this test \
+             is comparing sw.js against nothing"
+        );
+    }
 
     // Every listed archive is on the host the block route owns; an entry on
     // any other host would name a cache no request can ever fill.
