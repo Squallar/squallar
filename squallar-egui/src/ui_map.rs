@@ -2084,7 +2084,11 @@ fn volume_pane_outcome(
     volume.camera.nudge(delta);
     let camera = volume.camera;
     let floor = !volume.hide_floor;
-    let accurate_light = !volume.readable_light;
+    let accurate_light = volume.sun_lighting;
+    // Cleared here and set again below only if this arm gets as far as
+    // building a frame, so a pane that ends up drawing an empty state does not
+    // leave its control claiming a light for a picture that is not there.
+    volume.shown_light = None;
 
     let Some(painter) = painter else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
@@ -2122,6 +2126,12 @@ fn volume_pane_outcome(
         crate::pane::volume_box_anchor(region, site_geo),
         crate::volume_view::unix_seconds_of(collected),
     );
+    // **Recorded, so the control reports the picture rather than deriving a
+    // second answer.** The two derivations diverged in two routine states -
+    // see `VolumePane::shown_light`.
+    if let Some(volume) = pane.volume_mut() {
+        volume.shown_light = Some(light);
+    }
     // **The level trigger, and the whole of it.** `volume_build_due` holds
     // all three refusals — not in Volume mode, playing a 3D loop, already
     // rendered for this target — and the arrival path asks the same function
@@ -2210,13 +2220,6 @@ pub(crate) fn render_volume_controls(
     drawing_nothing: Option<&str>,
 ) {
     let product = pane.selected_product();
-    // Read before the pane is borrowed mutably. The sun's own answer needs the
-    // site, and the site belongs to the pane rather than to its 3D half.
-    let site_geo =
-        squallar_radar::sites::get_radar_site(pane.site()).map(|site| squallar_geo::GeoPoint {
-            lat: site.lat,
-            lon: site.lon,
-        });
     let Some(volume) = pane.volume_mut() else {
         return;
     };
@@ -2320,7 +2323,7 @@ pub(crate) fn render_volume_controls(
             }
         }
 
-        let mut sunlight = !volume.readable_light;
+        let mut sunlight = volume.sun_lighting;
         if ui
             .checkbox(&mut sunlight, SUN_LIGHT_LABEL)
             .on_hover_text(
@@ -2333,41 +2336,39 @@ pub(crate) fn render_volume_controls(
             )
             .changed()
         {
-            volume.readable_light = !sunlight;
+            volume.sun_lighting = sunlight;
         }
-        // **What the picture is actually under, not what was asked for.** The
-        // arithmetic refuses a timestamp it cannot honour rather than
-        // answering a plausible night, and the pane then draws under the
-        // readable light. Saying so here is what stops that being a silent
-        // substitution; it is read off the volume the pane has ON SCREEN, so
-        // it describes the picture rather than the next one.
-        if let Some(collected) = volume.rendered_for.as_ref().map(|t| t.volume.collected) {
-            let light = crate::volume_view::volume_light(
-                sunlight,
-                crate::pane::volume_box_anchor(volume.region, site_geo),
-                crate::volume_view::unix_seconds_of(collected),
-            );
-            match light {
-                crate::volume_view::VolumeLight::Sun(sun) => {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Sun {:.1}\u{b0} {} the horizon.",
-                            sun.elevation_deg.abs(),
-                            if sun.elevation_deg >= 0.0 {
-                                "above"
-                            } else {
-                                "below"
-                            },
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                }
-                crate::volume_view::VolumeLight::Headlight if sunlight => {
-                    ui.label(egui::RichText::new(SUN_UNPLACEABLE_NOTE).small().weak());
-                }
-                crate::volume_view::VolumeLight::Headlight => {}
+        // **What the picture is actually under, read off the frame that drew
+        // it.** The arithmetic refuses a timestamp it cannot honour rather
+        // than answering a plausible night, and the pane then draws under the
+        // readable light; saying so here is what stops that being a silent
+        // substitution.
+        //
+        // `shown_light` and not a second derivation: the 3D arm records the
+        // light it actually sent the painter, so this reports the picture on
+        // the glass. Deriving it again here read a different instant - the
+        // target INSTALLED rather than the one asked for - which diverges
+        // through every loop and every rebuild.
+        match volume.shown_light {
+            Some(crate::volume_view::VolumeLight::Sun(sun)) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Sun {:.1}\u{b0} {} the horizon.",
+                        sun.elevation_deg.abs(),
+                        if sun.elevation_deg >= 0.0 {
+                            "above"
+                        } else {
+                            "below"
+                        },
+                    ))
+                    .small()
+                    .weak(),
+                );
             }
+            Some(crate::volume_view::VolumeLight::Headlight) if sunlight => {
+                ui.label(egui::RichText::new(SUN_UNPLACEABLE_NOTE).small().weak());
+            }
+            Some(crate::volume_view::VolumeLight::Headlight) | None => {}
         }
 
         let mut show_floor = !volume.hide_floor;

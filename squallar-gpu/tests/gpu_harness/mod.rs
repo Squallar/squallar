@@ -394,7 +394,6 @@ pub const UNLIT: SurfaceLight = SurfaceLight {
     direction: squallar_volumetric::uniform::DEFAULT_LIGHT_DIR,
     beam: [0.0, 0.0, 0.0],
     sky: [1.0, 1.0, 1.0],
-    wrap_floor: squallar_volumetric::uniform::DEFAULT_AMBIENT,
 };
 
 /// One orbit camera: `(yaw degrees, pitch degrees, standoff, vertical

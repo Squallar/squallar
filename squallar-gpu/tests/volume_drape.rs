@@ -41,6 +41,18 @@
 //! [`the_approximation_the_shader_rejects_lands_in_the_wrong_cell`] requires it
 //! to name a *different* cell at the box's corners. Without that, this file
 //! would be green against a shader that had thrown the spherical solution away.
+//!
+//! # Why the light is switched off here
+//!
+//! Every frame is rendered under `gpu_harness::UNLIT` — no beam, a unit white
+//! sky — so the mesh takes exactly the mirror's own colour whichever way it
+//! faces. That is the same neutralisation `ambient = 1.0` already performs for
+//! the march, and it is not optional: this file's oracle is a cell's *name*,
+//! and a directional term turns every comparison into a threshold. Left under
+//! the readable light for one commit, this suite passed at 251-252 against a
+//! 247 floor — four levels, on a criterion whose failure message says a
+//! basemap is sliding across the terrain. What the light does to the drape is
+//! `volume_light.rs`'s subject.
 #![cfg(not(target_arch = "wasm32"))]
 
 use egui_wgpu::wgpu;
@@ -284,6 +296,16 @@ fn uniform(cells: [u32; 3], view: &VolumeView) -> VolumeUniform {
     uniform.eye_in_box = view.eye_in_box;
     uniform.ambient = 1.0;
     uniform.gradient_shading = false;
+    // **And the mesh's own light neutralised, for the same reason.**
+    //
+    // This file reads the drape as a DISCRETE cell identity — 0 or 255, a
+    // checker cell's name and not a number with a tolerance — and C2 gave the
+    // mesh a normal, so under any directional light the white cells come back
+    // shaded. Left under `HEADLIGHT` this suite passed with 251-252 against a
+    // 247 floor: four levels of headroom, on a criterion whose failure message
+    // says a basemap is sliding across the terrain. A projection criterion
+    // must not be able to redden on an exposure change.
+    uniform.set_light(gpu_harness::UNLIT);
     let (uv, geo) = floor_lanes();
     uniform.floor_uv = uv;
     uniform.floor_geo = geo;
@@ -511,6 +533,12 @@ fn compare_where(
             let white = checker_is_white(lat, lon);
             let observed = frame.ground[at][0];
             let matches = if white { observed > 247 } else { observed < 8 };
+            // The window is a `Linear` filter's blur, not an exposure's: under
+            // `UNLIT` the mesh takes the mirror's texel unchanged, so a sample
+            // clear of a checker boundary reads 255 or 0 outright. C2 measured
+            // what a directional light costs here — 251-252 against this 247 —
+            // and that is why the fixture switches the light off rather than
+            // widening this.
             if !matches {
                 wrong.push((lat, lon, white, observed));
             }
@@ -901,6 +929,9 @@ fn a_placed_field_stands_where_the_lane_puts_it_and_still_covers_the_box() {
         uniform.eye_in_box = view.eye_in_box;
         uniform.ambient = 1.0;
         uniform.gradient_shading = false;
+        // See `uniform` above: this file's oracle is a cell's NAME, so the
+        // mesh's directional response has to be switched off here too.
+        uniform.set_light(gpu_harness::UNLIT);
         let (uv, geo) = floor_lanes();
         uniform.floor_uv = uv;
         uniform.floor_geo = geo;

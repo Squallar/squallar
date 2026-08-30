@@ -2902,7 +2902,47 @@ fn a_lone_3d_pane_still_gates_on_the_selection_it_has_now() {
     );
 }
 
-/// **The pane's light reaches the painter, and the toggle moves it.**
+// ---------------------------------------------------------------------------
+// C2: one light, two modes
+// ---------------------------------------------------------------------------
+
+/// Turn the sun on for the 3D pane and let the frame settle.
+fn light_by_the_sun(h: &mut InputHarness) {
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("a pane")
+        .volume_mut()
+        .expect("a 3D pane")
+        .sun_lighting = true;
+    h.frames_for(2, FRAME_DT);
+}
+
+/// **A fresh pane opens under the light the constant documents.**
+///
+/// The default is `false` today for a reason that is written down beside it —
+/// the ground mesh is unreachable, so accurate mode's only visible effect is
+/// an 83% drop on the flat map lid at night — and it is meant to be flipped
+/// the day a height field lands. This is the test that goes with that one
+/// line, so flipping the constant without flipping the picture is a red rather
+/// than a surprise.
+#[test]
+fn a_fresh_pane_opens_under_the_documented_default_light() {
+    let (h, painter) = volume_harness(StubVolumePainter::painting());
+    let light = last_seen(&painter).light;
+    assert_eq!(
+        light.is_sun(),
+        crate::pane::DEFAULT_SUN_LIGHTING,
+        "a fresh 3D pane was sent {light:?}, which is not what \
+         `DEFAULT_SUN_LIGHTING` says a fresh pane is lit by",
+    );
+    assert_eq!(
+        h.gui().pane(1).unwrap().volume().unwrap().sun_lighting,
+        crate::pane::DEFAULT_SUN_LIGHTING,
+        "and the pane's own stored answer has to be the same one",
+    );
+}
+
+/// **The pane's light reaches the painter, and the toggle moves it both ways.**
 ///
 /// The wire between the checkbox and the frame, which nothing else can see: a
 /// build that always sent the readable light would compile, draw a perfectly
@@ -2910,9 +2950,10 @@ fn a_lone_3d_pane_still_gates_on_the_selection_it_has_now() {
 #[test]
 fn the_pane_sends_the_painter_the_light_it_is_set_to() {
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    light_by_the_sun(&mut h);
     let light = last_seen(&painter).light;
     let crate::volume_view::VolumeLight::Sun(sun) = light else {
-        panic!("a fresh 3D pane at a placed site should be under the sun, not {light:?}");
+        panic!("a pane asking for the sun at a placed site was sent {light:?}");
     };
     assert!(
         sun.elevation_deg.is_finite(),
@@ -2924,7 +2965,7 @@ fn the_pane_sends_the_painter_the_light_it_is_set_to() {
         .expect("a pane")
         .volume_mut()
         .expect("a 3D pane")
-        .readable_light = true;
+        .sun_lighting = false;
     h.frames_for(2, FRAME_DT);
     assert_eq!(
         last_seen(&painter).light,
@@ -2944,7 +2985,8 @@ fn the_pane_sends_the_painter_the_light_it_is_set_to() {
 /// ground the box is about.
 #[test]
 fn the_sun_is_placed_over_the_box_at_the_volumes_own_moment() {
-    let (_h, painter) = volume_harness(StubVolumePainter::painting());
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    light_by_the_sun(&mut h);
     let frame = last_seen(&painter);
     let crate::volume_view::VolumeLight::Sun(sun) = frame.light else {
         panic!("the pane is not under the sun");
@@ -2963,5 +3005,124 @@ fn the_sun_is_placed_over_the_box_at_the_volumes_own_moment() {
         sun, expected,
         "the light the painter was sent is not the sun over this pane's own \
          box at this volume's own collection time",
+    );
+}
+
+/// **The light the pane records is the light it sent**, so the control below
+/// reports the picture rather than deriving a second answer.
+#[test]
+fn the_pane_records_the_light_it_was_drawn_under() {
+    let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+    light_by_the_sun(&mut h);
+    assert_eq!(
+        h.gui().pane(1).unwrap().volume().unwrap().shown_light,
+        Some(last_seen(&painter).light),
+        "the pane's recorded light is not the one the painter was handed, so \
+         the control is describing a different frame from the one on screen",
+    );
+
+    // And it is cleared when the pane stops drawing, so the control cannot go
+    // on naming a light for a picture that is not there.
+    h.gui_mut().clear_graphics_state();
+    h.frames_for(3, FRAME_DT);
+    assert_eq!(
+        h.volume_arms()[0].outcome.as_deref(),
+        Some(VOLUME_EMPTY_STATE),
+        "precondition: the pane is explaining itself instead of drawing",
+    );
+    assert_eq!(
+        h.gui().pane(1).unwrap().volume().unwrap().shown_light,
+        None,
+        "a pane drawing an empty state still claims a light",
+    );
+}
+
+/// **The Sunlight control says which light the picture is under.**
+///
+/// The whole of C2's answer to "a refused instant is not silent" is that this
+/// row reports what came back rather than what was asked for, and until this
+/// test the row had no gate at all — neither string was asserted anywhere.
+/// Written against the same `text_painted_in` convention
+/// [`the_map_floor_checkbox_says_when_there_is_no_floor_to_draw`] uses three
+/// constants away.
+#[test]
+fn the_sunlight_checkbox_says_which_light_the_picture_is_under() {
+    let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+
+    // The 3D pane is the one the sidebar is about; activated by a click on the
+    // pane itself, which is the user's own route.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(
+        h.active_pane_index(),
+        1,
+        "the 3D pane must be the active one"
+    );
+    h.open_pane_props();
+
+    let inspector = |h: &InputHarness| h.inspector_rect().expect("the inspector is open");
+    let row_drawn = |h: &InputHarness| h.text_painted_in(inspector(h), SUN_LIGHT_LABEL);
+    let note_drawn = |h: &InputHarness| h.text_painted_in(inspector(h), SUN_UNPLACEABLE_NOTE);
+    let elevation_drawn = |h: &InputHarness| h.text_painted_in(inspector(h), "the horizon");
+
+    assert!(row_drawn(&h), "precondition: the Sunlight row is on screen");
+    assert!(
+        !note_drawn(&h),
+        "a pane under the readable light by its own choice must not be told \
+         the sun could not be placed - it was never asked for",
+    );
+
+    // Ask for the sun over a placed site: the row reports where it is.
+    light_by_the_sun(&mut h);
+    h.warm_up();
+    assert!(
+        elevation_drawn(&h),
+        "a pane under the real sun does not say where the sun is, so nothing \
+         on screen distinguishes the two modes",
+    );
+    assert!(
+        !note_drawn(&h),
+        "a pane that got the sun is being told it could not be placed",
+    );
+
+    // Now give the pane a volume the arithmetic refuses to place a sun for.
+    //
+    // **A doctored collection time, because that is the refusal a user can
+    // actually arrive at.** The other two — a non-finite instant, a latitude
+    // that is not a place — cannot co-occur with a pane that is drawing: the
+    // anchor comes from the site table, and a pane cannot load a scan for a
+    // site the table does not place. A header carrying a year outside the
+    // theory's own +/-5 Julian centuries can, and it is exactly the class of
+    // input the `Option` was introduced for.
+    h.set_current_volume(
+        "KTLX",
+        Some(
+            chrono::NaiveDate::from_ymd_opt(9999, 6, 21)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        ),
+    );
+    h.frames_for(3, FRAME_DT);
+    h.warm_up();
+    assert_eq!(
+        h.volume_arms()[0].outcome,
+        None,
+        "precondition: the pane is still DRAWING. A note about which light a \
+         picture is under proves nothing if there is no picture",
+    );
+    assert!(
+        row_drawn(&h),
+        "the Sunlight row went away when the sun could not be placed",
+    );
+    assert!(
+        note_drawn(&h),
+        "a pane that asked for the sun, could not have it, and is drawing \
+         under the readable light instead says nothing about it. That silent \
+         substitution is the whole reason the fallback is defensible",
+    );
+    assert!(
+        !elevation_drawn(&h),
+        "and it must not also claim a solar elevation it does not have",
     );
 }
