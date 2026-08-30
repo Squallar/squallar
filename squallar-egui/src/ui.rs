@@ -107,6 +107,8 @@ pub(crate) use settings::LOCATION_DENIED_NOTE;
 #[cfg(test)]
 pub(crate) use settings::{DrawnSettingsRow, SETTINGS_ROWS};
 
+#[path = "ui_diagnostics.rs"]
+mod diagnostics;
 #[path = "ui_offline_areas.rs"]
 mod offline_areas;
 #[path = "gui/probes.rs"]
@@ -778,6 +780,14 @@ impl Gui {
         // that publishes an unchanged status re-states the same allocation.
         self.liveness = inputs.liveness.to_vec();
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
+        // Copies histograms only on the frame that closes a 2 s window, and
+        // only while the overlay is showing; every other frame this is a
+        // handful of compares.
+        self.diagnostics.observe(
+            self.diagnostics_panel,
+            inputs.frame_diagnostics.as_ref(),
+            web_time::Instant::now(),
+        );
     }
 
     // **The chunk feed's three switches used to live here** — `live_chunks`,

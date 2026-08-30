@@ -48,6 +48,7 @@ pub(crate) const SETTINGS_ROWS: &[&str] = &[
     "units.precip_rate",
     "units.hail_size",
     "interface.pin_controls",
+    "interface.diagnostics",
     "location",
     "gps.port",
     "gps.baud",
@@ -188,6 +189,18 @@ impl super::Gui {
                         "Unpinned, each pane's pill row idles translucent and \
                          wakes when the pointer is over the pane - or, \
                          on touch, on a first tap.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                true
+            }
+            "interface.diagnostics" => {
+                ui.checkbox(&mut self.diagnostics_panel, "Show frame diagnostics");
+                ui.label(
+                    egui::RichText::new(
+                        "An overlay of frame service and cadence percentiles \
+                         over a trailing two-second window.",
                     )
                     .small()
                     .weak(),

@@ -58,6 +58,7 @@ fn every_frame_input_surfaces_and_persists() {
         catalogue_pending: true,
         liveness: &liveness,
         floor_tile_zoom_bias: 2,
+        frame_diagnostics: None,
     });
 
     // Two frames, no re-application: the values must persist. Frame 1 lays the
@@ -152,6 +153,7 @@ fn a_none_gps_clears_the_fix() {
         catalogue_pending: false,
         liveness: &[],
         floor_tile_zoom_bias: 0,
+        frame_diagnostics: None,
     };
     h.gui_mut().apply_frame_inputs(base);
     assert!(
@@ -171,6 +173,7 @@ fn a_none_gps_clears_the_fix() {
         catalogue_pending: false,
         liveness: &[],
         floor_tile_zoom_bias: 0,
+        frame_diagnostics: None,
     });
     h.frame();
     assert!(

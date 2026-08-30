@@ -527,6 +527,19 @@ impl super::App {
     /// state the App owns and apply it — the one place the snapshot-shaped
     /// facts cross the Gui↔App seam.
     pub(super) fn push_frame_inputs(&mut self) {
+        // The overlay's gpu row: the sentence [`gpu_passes_line`] prints,
+        // rebuilt only when the probe has collected another frame. Where no
+        // probe is installed this stays `None` and the overlay shows its own
+        // absence text.
+        if let Some(report) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.egui_renderer.gpu_pass_report())
+            && self.gpu_passes_panel_frames != Some(report.frames)
+        {
+            self.gpu_passes_panel_frames = Some(report.frames);
+            self.gpu_passes_panel_line = Some(gpu_passes_line(&report));
+        }
         self.gui
             .apply_frame_inputs(squallar_egui::shell_api::FrameInputs {
                 safe_area_insets: self.safe_area_insets,
@@ -546,6 +559,10 @@ impl super::App {
                 catalogue_pending: self.catalogue_pending,
                 liveness: &self.liveness,
                 floor_tile_zoom_bias: self.mirror_rungs.tile_zoom_bias(),
+                frame_diagnostics: Some(squallar_egui::shell_api::FrameDiagnostics {
+                    gpu_passes: self.gpu_passes_panel_line.as_deref(),
+                    ..self.frame_ledger.diagnostics()
+                }),
             });
     }
 

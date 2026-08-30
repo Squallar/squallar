@@ -76,6 +76,9 @@ pub(in crate::ui) struct FrameProbes {
     /// per pane, and an `Option` keeping only the last would read exactly like
     /// the correct case.
     pub last_attribution: Vec<egui::Rect>,
+    /// The diagnostics-overlay rows the last frame drew, by row id, in draw
+    /// order — empty is the "panel off draws nothing" figure.
+    pub last_diagnostics_rows: Vec<&'static str>,
 }
 
 #[cfg(test)]
@@ -114,6 +117,7 @@ impl Default for FrameProbes {
             last_sheet: SheetProbe::default(),
             last_error_toast: None,
             last_attribution: Vec::new(),
+            last_diagnostics_rows: Vec::new(),
         }
     }
 }

@@ -472,6 +472,53 @@ fn a_config_written_before_the_light_toggle_comes_back_under_the_sun() {
     );
 }
 
+/// The frame-diagnostics overlay's switch survives a save and load — reopen
+/// is exactly 1:1, and a diagnostics readout is UI state like any other.
+#[test]
+fn the_diagnostics_panel_switch_survives_a_save_and_load() {
+    let store = MemoryKvStore::default();
+    let mut gui = crate::Gui::new();
+    assert!(
+        !gui.diagnostics_panel,
+        "precondition: a fresh session ships with the overlay hidden",
+    );
+    gui.diagnostics_panel = true;
+    gui.save_ui_config(&store);
+
+    let mut restored = crate::Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert!(
+        restored.diagnostics_panel,
+        "a session that showed the overlay must reopen showing it",
+    );
+
+    restored.diagnostics_panel = false;
+    restored.save_ui_config(&store);
+    let mut again = crate::Gui::new();
+    assert!(again.load_ui_config(&store));
+    assert!(
+        !again.diagnostics_panel,
+        "and hiding it persists the same way",
+    );
+}
+
+/// A config written before the overlay existed loads with it hidden — the
+/// oldest shape walks up untouched, no version bump and no migration step.
+#[test]
+fn a_config_written_before_the_diagnostics_panel_loads_it_hidden() {
+    let store = MemoryKvStore::default();
+    store
+        .store(UI_CONFIG_KEY, r#"{"site": "KDMX"}"#)
+        .expect("the memory store accepts a write");
+
+    let mut gui = crate::Gui::new();
+    assert!(gui.load_ui_config(&store));
+    assert!(
+        !gui.diagnostics_panel,
+        "an absent key must mean hidden, which is what those sessions were",
+    );
+}
+
 /// The derived-rung choice survives a save and load, both directions.
 #[test]
 fn the_storm_motion_fallback_survives_a_save_and_load() {
