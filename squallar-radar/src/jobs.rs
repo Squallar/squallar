@@ -1045,7 +1045,7 @@ mod tests {
             .expect("the voxels row owns VoxelJob, and the funnel finds the row by this type");
         assert_eq!(
             job.request,
-            crate::voxel::request_for(&a_handover(a_volume_input()))
+            crate::voxel::request_for(&a_handover(a_volume_input()), (35.0, -97.0))
                 .expect("the same context shapes the same request"),
             "the envelope carries the request the context names",
         );

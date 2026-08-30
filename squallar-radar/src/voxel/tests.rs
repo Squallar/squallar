@@ -3691,16 +3691,19 @@ fn ctx_for(
 /// sideways.
 #[test]
 fn the_reach_that_crosses_the_seam_keeps_east_east_and_north_north() {
-    let request = request_for(&ctx_for(
-        crate::fields::known::REFLECTIVITY,
-        squallar_geo::GeoPoint {
-            lat: 36.1,
-            lon: -98.4,
-        },
-        Some((12.5, 47.5)),
-        [128, 128, 32],
-        2048,
-    ))
+    let request = request_for(
+        &ctx_for(
+            crate::fields::known::REFLECTIVITY,
+            squallar_geo::GeoPoint {
+                lat: 36.1,
+                lon: -98.4,
+            },
+            Some((12.5, 47.5)),
+            [128, 128, 32],
+            2048,
+        ),
+        SITE,
+    )
     .expect("Reflectivity is a field this build registers");
     assert_eq!(
         request.half_extent_km,
@@ -3724,18 +3727,33 @@ fn the_reach_that_crosses_the_seam_keeps_east_east_and_north_north() {
 #[test]
 fn the_box_top_and_the_value_plane_are_decided_on_this_side_of_the_seam() {
     for extent in [None, Some((30.0, 30.0))] {
-        let request = request_for(&ctx_for(
-            crate::fields::known::VELOCITY,
-            squallar_geo::GeoPoint {
-                lat: 35.0,
-                lon: -97.0,
-            },
-            extent,
-            [128, 128, 32],
-            2048,
-        ))
+        let request = request_for(
+            &ctx_for(
+                crate::fields::known::VELOCITY,
+                squallar_geo::GeoPoint {
+                    lat: 35.0,
+                    lon: -97.0,
+                },
+                extent,
+                [128, 128, 32],
+                2048,
+            ),
+            SITE,
+        )
         .expect("Velocity is a field this build registers");
-        assert_eq!(request.base_km_msl, DEFAULT_BASE_KM_MSL);
+        // A mechanical re-point, not a moved value: the floor is still this
+        // side's answer and still unaimable from the context, but it is now
+        // derived from the ground rather than written down, so the assertion
+        // names the derivation instead of the constant. What that derivation
+        // answers is pinned in its own tests below, against a grid.
+        assert_eq!(
+            request.base_km_msl,
+            base_km_msl_for_box(
+                SITE,
+                (35.0, -97.0),
+                extent.map(|(east_km, north_km)| HalfExtentKm { east_km, north_km })
+            ),
+        );
         assert_eq!(request.top_km_msl, DEFAULT_TOP_KM_MSL);
         assert!(
             !request.values_wanted,
@@ -3761,32 +3779,38 @@ fn an_unregistered_field_shapes_no_request() {
          passes for the wrong reason",
     );
     assert!(
-        request_for(&ctx_for(
-            alien,
-            squallar_geo::GeoPoint {
-                lat: 35.0,
-                lon: -97.0,
-            },
-            None,
-            [128, 128, 32],
-            2048,
-        ))
+        request_for(
+            &ctx_for(
+                alien,
+                squallar_geo::GeoPoint {
+                    lat: 35.0,
+                    lon: -97.0,
+                },
+                None,
+                [128, 128, 32],
+                2048,
+            ),
+            SITE
+        )
         .is_none(),
     );
     // Control on the same walk: a registered id through the identical call
     // does shape one, so the `None` above is about the field and not about
     // the fixture.
     assert!(
-        request_for(&ctx_for(
-            crate::fields::known::REFLECTIVITY,
-            squallar_geo::GeoPoint {
-                lat: 35.0,
-                lon: -97.0,
-            },
-            None,
-            [128, 128, 32],
-            2048,
-        ))
+        request_for(
+            &ctx_for(
+                crate::fields::known::REFLECTIVITY,
+                squallar_geo::GeoPoint {
+                    lat: 35.0,
+                    lon: -97.0,
+                },
+                None,
+                [128, 128, 32],
+                2048,
+            ),
+            SITE
+        )
         .is_some(),
     );
 }
@@ -3799,16 +3823,19 @@ fn an_unregistered_field_shapes_no_request() {
 #[test]
 fn the_budget_is_spent_against_the_axis_the_device_reported() {
     let shape_at = |max_axis: u32| {
-        request_for(&ctx_for(
-            crate::fields::known::REFLECTIVITY,
-            squallar_geo::GeoPoint {
-                lat: 35.0,
-                lon: -97.0,
-            },
-            None,
-            [256, 256, 64],
-            max_axis,
-        ))
+        request_for(
+            &ctx_for(
+                crate::fields::known::REFLECTIVITY,
+                squallar_geo::GeoPoint {
+                    lat: 35.0,
+                    lon: -97.0,
+                },
+                None,
+                [256, 256, 64],
+                max_axis,
+            ),
+            SITE,
+        )
         .expect("Reflectivity is a field this build registers")
         .shape
     };
@@ -3823,5 +3850,914 @@ fn the_budget_is_spent_against_the_axis_the_device_reported() {
         shape_at(2048).cells() > small.cells(),
         "the ceiling has to actually bind, or the assertion above holds over \
          a shape the ceiling never touched",
+    );
+}
+
+// ── The box floor ───────────────────────────────────────────────────────
+
+use squallar_geo::min_elevation::{GRID_ASSET, MinElevationGrid, MinElevationGridBuilder};
+
+/// A grid holding exactly the cells named, and nothing published anywhere else.
+fn floor_cells(cells: &[(f64, f64, f64)]) -> Vec<u8> {
+    let mut b = MinElevationGridBuilder::new();
+    for (lat, lon, m) in cells {
+        assert!(b.observe(*lat, *lon, *m), "({lat},{lon}) is on the grid");
+    }
+    b.finish()
+}
+
+/// A grid publishing `plain_m` over a whole block, with the named cells
+/// written on top of it at their own heights.
+///
+/// The exceptions are written as raw bytes rather than observed, because
+/// `MinElevationGridBuilder::observe` keeps the LOWEST of everything it is
+/// shown and a cell meant to stand above the plain would be swallowed.
+fn floor_block(
+    lat: std::ops::Range<i32>,
+    lon: std::ops::Range<i32>,
+    plain_m: f64,
+    raised: &[(f64, f64, i16)],
+) -> Vec<u8> {
+    let mut b = MinElevationGridBuilder::new();
+    for lat_i in lat {
+        for lon_i in lon.clone() {
+            assert!(b.observe(f64::from(lat_i) + 0.5, f64::from(lon_i) + 0.5, plain_m));
+        }
+    }
+    let mut cells = b.finish();
+    for (lat_c, lon_c, m) in raised {
+        let at = (squallar_geo::min_elevation::row_of_lat(*lat_c)
+            * squallar_geo::min_elevation::GRID_COLS
+            + squallar_geo::min_elevation::col_of_lon(*lon_c))
+            * 2;
+        cells[at..at + 2].copy_from_slice(&m.to_be_bytes());
+    }
+    cells
+}
+
+/// The lowest ground published anywhere in the box, read by walking the
+/// **interior** of the site-frame rectangle on a dense lattice and asking the
+/// grid at each point.
+///
+/// The independence that matters is that this computes **no bbox at all**: the
+/// derivation under test walks a perimeter and reduces it to four numbers, and
+/// this walks the inside and never reduces anything. What the two do share — and
+/// must — is the construction of the box itself, [`horizontal_ranges_km`] plus
+/// `great_circle_destination` about the **site**, because that is exactly what
+/// `build_voxels` samples and what `VolumeGrid::footprint` reports. A previous
+/// revision's oracle projected about the *centre* instead, so checker and
+/// checked shared one wrong belief and the sweep could not see it.
+fn lowest_published_ground_m(
+    grid: MinElevationGrid<'_>,
+    site: (f64, f64),
+    centre: (f64, f64),
+    half: HalfExtentKm,
+) -> Option<f64> {
+    const STEPS: usize = 61;
+    let (x_range, y_range) = horizontal_ranges_km(centre, half, site.0, site.1);
+    let mut best: Option<f64> = None;
+    for i in 0..STEPS {
+        for j in 0..STEPS {
+            let t = |k: usize| (k as f64) / ((STEPS - 1) as f64);
+            let x = x_range.0 + (x_range.1 - x_range.0) * t(i);
+            let y = y_range.0 + (y_range.1 - y_range.0) * t(j);
+            let (lat, lon) = squallar_geo::great_circle_destination(
+                site.0,
+                site.1,
+                x.atan2(y).to_degrees().rem_euclid(360.0),
+                x.hypot(y),
+            );
+            if let Some(m) = grid.at(lat, squallar_geo::normalize_lon(lon)) {
+                best = Some(best.map_or(m, |b: f64| b.min(m)));
+            }
+        }
+    }
+    best
+}
+
+/// Whether a `(west, south, east, north)` holds a point, reading `west > east`
+/// as a box that wraps the antimeridian.
+fn bbox_holds(bbox: (f64, f64, f64, f64), lat: f64, lon: f64) -> bool {
+    let (west, south, east, north) = bbox;
+    if lat < south || lat > north {
+        return false;
+    }
+    let lon = squallar_geo::normalize_lon(lon);
+    if west <= east {
+        lon >= west && lon <= east
+    } else {
+        lon >= west || lon <= east
+    }
+}
+
+/// The bbox a square about the **centre** gives — the construction this
+/// derivation used before it was found wrong, kept only as the uncooperative
+/// control in
+/// `the_floor_query_covers_the_footprint_the_resampler_reports`.
+fn centre_frame_bbox(centre: (f64, f64), half: HalfExtentKm) -> (f64, f64, f64, f64) {
+    let at = |x: f64, y: f64| {
+        squallar_geo::great_circle_destination(
+            centre.0,
+            centre.1,
+            x.atan2(y).to_degrees().rem_euclid(360.0),
+            x.hypot(y),
+        )
+    };
+    let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut west, mut east) = (f64::INFINITY, f64::NEG_INFINITY);
+    for i in 0..17 {
+        let f = f64::from(i) / 16.0 * 2.0 - 1.0;
+        for (lat, lon) in [
+            at(f * half.east_km, -half.north_km),
+            at(f * half.east_km, half.north_km),
+            at(-half.east_km, f * half.north_km),
+            at(half.east_km, f * half.north_km),
+        ] {
+            south = south.min(lat);
+            north = north.max(lat);
+            west = west.min(lon);
+            east = east.max(lon);
+        }
+    }
+    (west, south, east, north)
+}
+
+/// **The floor is queried over the box the resampler actually builds.**
+///
+/// `build_voxels` places the box as an axis-aligned rectangle in the **site's**
+/// tangent frame, and `VolumeGrid::footprint` — written in another crate, at 65
+/// samples an edge — reports where that lands on the ground. So a real grid is
+/// built and its own reported footprint has to fall inside the bbox the floor
+/// query reads. Nothing here re-derives the box; it is asked.
+#[test]
+fn the_floor_query_covers_the_footprint_the_resampler_reports() {
+    let scan = six_moment_scan();
+    let mut checked = 0usize;
+    for centre in [
+        SITE,
+        (SITE.0, SITE.1 + 5.0),
+        (SITE.0 + 3.0, SITE.1 - 4.0),
+        (SITE.0 - 2.5, SITE.1 + 1.5),
+    ] {
+        for half in [
+            HalfExtentKm::square(20.0),
+            HalfExtentKm::square(230.0),
+            HalfExtentKm::square(MAX_HALF_WIDTH_KM),
+            HalfExtentKm {
+                east_km: 400.0,
+                north_km: 60.0,
+            },
+        ] {
+            let req = VoxelRequest {
+                centre,
+                half_extent_km: Some(half),
+                ..request(ODD)
+            };
+            let grid = build_voxels(&scan, &req, SITE.0, SITE.1).expect("a grid");
+            let bbox = floor_query_bbox(SITE, centre, half).expect("a real box has a bbox");
+            let foot = grid.footprint();
+            for (lat, lon) in [
+                (foot.min_lat, foot.min_lon),
+                (foot.min_lat, foot.max_lon),
+                (foot.max_lat, foot.min_lon),
+                (foot.max_lat, foot.max_lon),
+            ] {
+                assert!(
+                    bbox_holds(bbox, lat, lon),
+                    "the resampler's own footprint corner ({lat}, {lon}) is \
+                     outside the floor query {bbox:?} for centre {centre:?} \
+                     half {half:?}; the floor would be read off ground the box \
+                     does not stand on",
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 16);
+
+    // **The uncooperative control.** A square about the centre — what this
+    // derivation used to walk — does NOT cover the same footprint once the
+    // centre is offset from the site, so the assertions above are about the
+    // frame and not about a bbox so loose that anything falls inside it.
+    let centre = (SITE.0, SITE.1 + 5.0);
+    let half = HalfExtentKm::square(MAX_HALF_WIDTH_KM);
+    let req = VoxelRequest {
+        centre,
+        half_extent_km: Some(half),
+        ..request(ODD)
+    };
+    let grid = build_voxels(&scan, &req, SITE.0, SITE.1).expect("a grid");
+    let foot = grid.footprint();
+    let wrong = centre_frame_bbox(centre, half);
+    assert!(
+        [
+            (foot.min_lat, foot.min_lon),
+            (foot.min_lat, foot.max_lon),
+            (foot.max_lat, foot.min_lon),
+            (foot.max_lat, foot.max_lon),
+        ]
+        .into_iter()
+        .any(|(lat, lon)| !bbox_holds(wrong, lat, lon)),
+        "the centre-framed bbox {wrong:?} must MISS part of the footprint \
+         {foot:?}, or this test cannot tell the two frames apart",
+    );
+}
+
+/// **The one invariant the whole derivation exists to hold**: the box's bottom
+/// face is never above the ground inside it.
+///
+/// The sweep is deliberately awkward — offset centres, non-square extents, an
+/// extent wider than the regional square, a high-latitude site and a southern
+/// one — because a previous revision's sweep was all square, all mid-latitude
+/// and all centred on the site, which is exactly where the derivation it was
+/// checking happened to be exact.
+#[test]
+fn the_derived_floor_is_never_above_the_ground_inside_the_box() {
+    // A north-south mountain wall at 105W falling away either side, published
+    // over 20N..60N / 130W..80W and nowhere else, plus a southern block.
+    let mut b = MinElevationGridBuilder::new();
+    for lat_i in 20..60 {
+        for lon_i in -130..-80 {
+            let lon = f64::from(lon_i) + 0.5;
+            let h = (2000.0 - 200.0 * (lon + 105.0).abs()).max(-20.0);
+            assert!(b.observe(f64::from(lat_i) + 0.5, lon, h));
+        }
+    }
+    for lat_i in -45..-20 {
+        for lon_i in -80..-50 {
+            let lon = f64::from(lon_i) + 0.5;
+            let h = (1500.0 - 150.0 * (lon + 70.0).abs()).max(5.0);
+            assert!(b.observe(f64::from(lat_i) + 0.5, lon, h));
+        }
+    }
+    let raw = b.finish();
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+
+    let mut checked = 0usize;
+    let mut moved_off_default = 0usize;
+    for site in [
+        (35.33306, -97.2775),
+        (39.7867, -104.5458),
+        (57.0, -110.0),
+        (-33.0, -70.5),
+    ] {
+        for (dlat, dlon) in [(0.0, 0.0), (0.0, 4.0), (2.5, -3.0), (-1.5, 2.0)] {
+            let centre = (site.0 + dlat, site.1 + dlon);
+            for half in [
+                HalfExtentKm::square(20.0),
+                HalfExtentKm::square(120.0),
+                HalfExtentKm::square(MAX_HALF_WIDTH_KM),
+                HalfExtentKm {
+                    east_km: 660.0,
+                    north_km: 10.0,
+                },
+                HalfExtentKm {
+                    east_km: 30.0,
+                    north_km: 500.0,
+                },
+            ] {
+                let base_m = base_km_msl_for_box_in(Some(grid), site, centre, Some(half)) * 1000.0;
+                checked += 1;
+                let Some(truth) = lowest_published_ground_m(grid, site, centre, half.clamped())
+                else {
+                    // Nothing published under this box: the rule is the default
+                    // floor, which the fallback test below states on its own.
+                    continue;
+                };
+                assert!(
+                    base_m <= truth,
+                    "site {site:?} centre {centre:?} half {half:?} was floored \
+                     at {base_m} m over ground reaching down to {truth} m; a \
+                     floor above the ground clips it",
+                );
+                if base_m != DEFAULT_BASE_KM_MSL * 1000.0 {
+                    moved_off_default += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 80);
+    // The non-triviality floor: a sweep whose every answer was the default
+    // would pass without exercising the derivation at all.
+    assert!(
+        moved_off_default >= 40,
+        "only {moved_off_default} of {checked} boxes moved off the default \
+         floor; this sweep is not exercising the derivation",
+    );
+}
+
+/// The step is a **floor**, never a round, and a raised floor shortens the box
+/// it leaves.
+#[test]
+fn the_hundred_metre_step_floors_downward_and_shortens_the_span() {
+    let raw = floor_cells(&[(39.5, -104.5, 1650.0)]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+    let site = (39.5, -104.5);
+
+    let base = base_km_msl_for_box_in(Some(grid), site, site, Some(HalfExtentKm::square(20.0)));
+    assert_eq!(
+        base,
+        1600.0 / 1000.0,
+        "1650 m of ground floors DOWN to the 100 m step below it, never up to \
+         1700 m, which would stand above the ground",
+    );
+    assert!(
+        DEFAULT_TOP_KM_MSL - base < DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL,
+        "a raised floor shortens the span; the cell count is untouched, so \
+         every cell is finer in metres",
+    );
+}
+
+/// **The hysteresis, stated as the two outcomes that separate it from its
+/// absence.** A pick barely above its region keeps the region's floor; a pick
+/// that has genuinely climbed takes its own.
+#[test]
+fn a_pick_keeps_its_regions_floor_until_it_stands_a_band_above_it() {
+    let cells = floor_block(
+        30..48,
+        -120..-90,
+        500.0,
+        &[(39.5, -104.5, 620), (37.5, -101.5, 1500)],
+    );
+    let grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+
+    // Precondition: the two cells really do read what the raise wrote, or the
+    // two branches below are one branch.
+    assert_eq!(grid.at(39.5, -104.5), Some(620.0));
+    assert_eq!(grid.at(37.5, -101.5), Some(1500.0));
+
+    let small = Some(HalfExtentKm::square(20.0));
+    let inside_band = base_km_msl_for_box_in(Some(grid), (39.5, -104.5), (39.5, -104.5), small);
+    assert_eq!(
+        inside_band,
+        500.0 / 1000.0,
+        "620 m of ground stands {} m above its region's 500 m, inside the \
+         {BASE_HYSTERESIS_M} m band, so the box keeps the region's floor \
+         rather than flipping to its own",
+        620 - 500,
+    );
+
+    let past_band = base_km_msl_for_box_in(Some(grid), (37.5, -101.5), (37.5, -101.5), small);
+    assert_eq!(
+        past_band,
+        1500.0 / 1000.0,
+        "1500 m of ground stands a kilometre above its region and must take \
+         its own floor, or the hysteresis is just a constant",
+    );
+
+    // And the safety half, on both branches.
+    for (site, base) in [((39.5, -104.5), inside_band), ((37.5, -101.5), past_band)] {
+        let truth = lowest_published_ground_m(grid, site, site, HalfExtentKm::square(20.0))
+            .expect("published ground");
+        assert!(base * 1000.0 <= truth, "{base} km at {site:?} vs {truth} m");
+    }
+}
+
+/// **The regional square contains the pick**, for every extent
+/// `HalfExtentKm::clamped` admits.
+///
+/// A fixed `MAX_HALF_WIDTH_KM` square does not: `clamped` bounds the corner, so
+/// one axis may reach the whole diagonal. This is the property the hysteresis's
+/// regional term needs and the one an earlier revision asserted without holding.
+#[test]
+fn the_regional_square_contains_every_extent_a_request_can_carry() {
+    let mut widest_axis = 0.0f64;
+    for east in [10.0f64, 20.0, 230.0, 470.0, 660.0, 664.0, 10_000.0] {
+        for north in [10.0f64, 20.0, 230.0, 470.0, 660.0, 664.0, 10_000.0] {
+            let picked = HalfExtentKm {
+                east_km: east,
+                north_km: north,
+            }
+            .clamped();
+            let regional = regional_extent(picked);
+            assert!(
+                regional.east_km >= picked.east_km && regional.north_km >= picked.north_km,
+                "the regional square {regional:?} does not contain the pick {picked:?}",
+            );
+            assert!(regional.east_km >= MAX_HALF_WIDTH_KM);
+            widest_axis = widest_axis.max(picked.east_km.max(picked.north_km));
+        }
+    }
+    // The non-triviality floor: the sweep must actually reach past a fixed
+    // 470 km square, or it cannot tell the two rules apart.
+    assert!(
+        widest_axis > MAX_HALF_WIDTH_KM,
+        "no extent in this sweep exceeded {MAX_HALF_WIDTH_KM} km on an axis, \
+         so a fixed square would have passed",
+    );
+}
+
+/// **An extent the type admits but a 470 km square does not contain.**
+///
+/// `HalfExtentKm::clamped` bounds the **corner** at `MAX_HALF_DIAGONAL_KM`, so
+/// `(660, 10)` survives unscaled and reaches 190 km further east than
+/// `MAX_HALF_WIDTH_KM`. An earlier revision compared it against a fixed 470 km
+/// square, called that a superset, and handed the box a floor above its own
+/// ground. Reachable from a stored region, which is the path `clamped`'s own
+/// doc names.
+#[test]
+fn an_extent_wider_than_a_regional_square_still_gets_a_floor_below_its_ground() {
+    // Low ground only out at the long axis's reach, high ground under the
+    // centre: a regional square that stopped at 470 km would never see it.
+    let cells = floor_block(-4..5, -112..-97, 400.0, &[(0.5, -104.5, 900)]);
+    let grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+    let site = (0.0, -104.5);
+    let half = HalfExtentKm {
+        east_km: 660.0,
+        north_km: 10.0,
+    };
+    // Precondition: `clamped` really does leave this extent alone, or the test
+    // is about clamping rather than about containment.
+    assert_eq!(half.clamped(), half);
+
+    let base_m = base_km_msl_for_box_in(Some(grid), site, site, Some(half)) * 1000.0;
+    let truth = lowest_published_ground_m(grid, site, site, half).expect("published ground");
+    assert!(
+        base_m <= truth,
+        "a {half:?} box was floored at {base_m} m over ground reaching \
+         {truth} m",
+    );
+}
+
+/// A stored extent is **clamped before** the floor is derived, because
+/// `build_voxels` clamps before it builds.
+#[test]
+fn an_unclamped_stored_extent_is_clamped_before_the_floor_is_derived() {
+    // Deep ground far to the east, reachable only by an unclamped 10,000 km box.
+    let cells = floor_block(-6..7, -120..-20, 800.0, &[(0.5, -30.5, -300)]);
+    let grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+    let site = (0.0, -104.5);
+    let stored = HalfExtentKm {
+        east_km: 10_000.0,
+        north_km: 10.0,
+    };
+    // Precondition: clamping really does change this extent.
+    assert_ne!(stored.clamped(), stored);
+
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), site, site, Some(stored)),
+        base_km_msl_for_box_in(Some(grid), site, site, Some(stored.clamped())),
+        "the floor must be derived over the box the builder will build, which \
+         is the clamped one",
+    );
+    assert_ne!(
+        base_km_msl_for_box_in(Some(grid), site, site, Some(stored)),
+        -300.0 / 1000.0,
+        "an unclamped 10,000 km query would reach the deep cell at 30W, which \
+         no box this build resamples ever touches",
+    );
+}
+
+/// **A box holding a pole reaches latitude 90, and no boundary sample does.**
+///
+/// The pole is a strict interior extremum of the box, so "the bbox of the
+/// boundary is the bbox of the box" is false there. It is also where every
+/// meridian meets, so such a box covers the whole longitude range.
+#[test]
+fn a_box_holding_a_pole_reads_the_polar_rows() {
+    let cells = floor_block(80..90, -180..180, 3000.0, &[(89.5, 20.5, -400)]);
+    let grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+    let site = (88.0, 0.0);
+    let half = HalfExtentKm::square(MAX_HALF_WIDTH_KM);
+
+    // The precondition: the pole really is inside this box, 222 km in.
+    let (_, y_range) = horizontal_ranges_km(site, half, site.0, site.1);
+    let pole_km = (90.0 - site.0) * squallar_geo::KM_PER_DEGREE_LAT;
+    assert!(y_range.0 <= pole_km && pole_km <= y_range.1, "{y_range:?}");
+
+    let bbox = floor_query_bbox(site, site, half).expect("a bbox");
+    assert_eq!(bbox.3, 90.0, "a box holding the north pole reaches 90");
+    assert_eq!((bbox.0, bbox.2), (-180.0, 180.0), "and every meridian");
+
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), site, site, Some(half)),
+        -400.0 / 1000.0,
+        "the deep cell beyond 89N is inside the box and must be read",
+    );
+}
+
+/// **The axis crossings are sampled by name, not by an odd sample count.**
+///
+/// The latitude extremum of a site-framed box is where the *site's* meridian
+/// crosses its north edge — which is the edge midpoint only when the centre is
+/// due north or south of the site. With the centre offset east, an odd count
+/// lands nowhere near it.
+#[test]
+fn the_latitude_extremum_is_read_at_the_site_meridian_not_at_the_edge_midpoint() {
+    let site = (35.0, -97.0);
+    let centre = (37.4, -95.0);
+    let half = HalfExtentKm::square(300.0);
+
+    let (x_range, y_range) = horizontal_ranges_km(centre, half, site.0, site.1);
+    // Preconditions: the site's meridian crosses this box, and it is NOT the
+    // edge midpoint.
+    assert!(x_range.0 <= 0.0 && 0.0 <= x_range.1, "{x_range:?}");
+    let midpoint = 0.5 * (x_range.0 + x_range.1);
+    assert!(
+        midpoint.abs() > 100.0,
+        "the crossing must be far from the midpoint for this test to bite: \
+         midpoint {midpoint} km",
+    );
+
+    // The northernmost ground the box reaches, at the crossing rather than at
+    // a corner or a midpoint.
+    let at = |x: f64, y: f64| {
+        squallar_geo::great_circle_destination(
+            site.0,
+            site.1,
+            x.atan2(y).to_degrees().rem_euclid(360.0),
+            x.hypot(y),
+        )
+    };
+    let crossing_lat = at(0.0, y_range.1).0;
+    let corner_lat = at(x_range.1, y_range.1).0.max(at(x_range.0, y_range.1).0);
+    let mid_lat = at(midpoint, y_range.1).0;
+    assert!(
+        crossing_lat > corner_lat && crossing_lat > mid_lat,
+        "crossing {crossing_lat} must be north of both the corners \
+         {corner_lat} and the midpoint {mid_lat}",
+    );
+
+    let bbox = floor_query_bbox(site, centre, half).expect("a bbox");
+    assert!(
+        bbox.3 >= crossing_lat,
+        "the bbox stops at {} but the box reaches {crossing_lat}",
+        bbox.3,
+    );
+
+    // And it bites on the answer: a low cell that only the crossing's row
+    // reaches must be read.
+    let cells = floor_block(
+        30..44,
+        -104..-86,
+        900.0,
+        &[(
+            crossing_lat.floor() + 0.5,
+            at(0.0, y_range.1).1.floor() + 0.5,
+            -150,
+        )],
+    );
+    let grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+    let truth = lowest_published_ground_m(grid, site, centre, half).expect("published ground");
+    assert!(
+        base_km_msl_for_box_in(Some(grid), site, centre, Some(half)) * 1000.0 <= truth,
+        "the floor must sit under the ground the crossing row carries",
+    );
+}
+
+/// **The bbox is grown on every side**, so the perimeter walk's residue between
+/// samples cannot put an edge on the wrong side of a cell boundary.
+///
+/// The margin is measured against a 401-sample-per-edge walk, which is 25x the
+/// production spacing, so what is left over is the pad and not the residue.
+#[test]
+fn the_floor_query_bbox_is_padded_beyond_the_boxs_own_extremes() {
+    for (site, centre, half) in [
+        ((35.0, -97.0), (35.0, -97.0), HalfExtentKm::square(100.0)),
+        (
+            (35.0, -97.0),
+            (37.4, -95.0),
+            HalfExtentKm::square(MAX_HALF_WIDTH_KM),
+        ),
+        (
+            (-33.0, -70.5),
+            (-31.0, -68.0),
+            HalfExtentKm {
+                east_km: 660.0,
+                north_km: 10.0,
+            },
+        ),
+    ] {
+        let half = half.clamped();
+        let bbox = floor_query_bbox(site, centre, half).expect("a bbox");
+        let (x_range, y_range) = horizontal_ranges_km(centre, half, site.0, site.1);
+        let at = |x: f64, y: f64| {
+            squallar_geo::great_circle_destination(
+                site.0,
+                site.1,
+                x.atan2(y).to_degrees().rem_euclid(360.0),
+                x.hypot(y),
+            )
+        };
+        const DENSE: usize = 401;
+        let (mut south, mut north) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut west, mut east) = (f64::INFINITY, f64::NEG_INFINITY);
+        for i in 0..DENSE {
+            let t = (i as f64) / ((DENSE - 1) as f64);
+            let x = x_range.0 + (x_range.1 - x_range.0) * t;
+            let y = y_range.0 + (y_range.1 - y_range.0) * t;
+            for (lat, lon) in [
+                at(x, y_range.0),
+                at(x, y_range.1),
+                at(x_range.0, y),
+                at(x_range.1, y),
+            ] {
+                south = south.min(lat);
+                north = north.max(lat);
+                west = west.min(lon);
+                east = east.max(lon);
+            }
+        }
+        for (margin, name) in [
+            (bbox.3 - north, "north"),
+            (south - bbox.1, "south"),
+            (
+                squallar_geo::normalize_lon(bbox.2) - squallar_geo::normalize_lon(east),
+                "east",
+            ),
+            (
+                squallar_geo::normalize_lon(west) - squallar_geo::normalize_lon(bbox.0),
+                "west",
+            ),
+        ] {
+            assert!(
+                margin >= 0.5 * FLOOR_BBOX_PAD_DEG,
+                "the {name} edge at {site:?}/{centre:?} clears the box's own \
+                 extreme by only {margin} degrees, under half the \
+                 {FLOOR_BBOX_PAD_DEG} degree pad",
+            );
+            assert!(
+                margin <= 3.0 * FLOOR_BBOX_PAD_DEG,
+                "the {name} edge at {site:?}/{centre:?} is {margin} degrees \
+                 beyond the box; a pad that loose is buying slack, not safety",
+            );
+        }
+    }
+}
+
+/// **Ground below sea level is honoured, not clipped.** The measured GLO-30
+/// minimum over the Death Valley cell.
+#[test]
+fn ground_below_sea_level_puts_the_floor_below_sea_level() {
+    let raw = floor_cells(&[
+        (36.5, -116.5, -91.451),
+        (36.5, -117.5, 800.0),
+        (37.5, -116.5, 900.0),
+    ]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+    let site = (36.25, -116.83);
+
+    let base = base_km_msl_for_box_in(Some(grid), site, site, Some(HalfExtentKm::square(20.0)));
+    assert_eq!(
+        base,
+        -100.0 / 1000.0,
+        "the cell floors to -92 m and the 100 m step floors that to -100 m; \
+         anything at or above zero clips ground that legitimately exists below \
+         sea level",
+    );
+    assert!(base < DEFAULT_BASE_KM_MSL);
+}
+
+/// **A box over ground the grid does not publish keeps the DEFAULT floor** —
+/// never a distant land minimum, and never a sea-level zero standing in for
+/// absence.
+#[test]
+fn a_box_over_unpublished_ground_keeps_the_default_floor() {
+    // One land cell, and an ocean pick 300 km west of it.
+    let raw = floor_cells(&[(36.5, -116.5, 2000.0)]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+
+    let site = (36.5, -120.0);
+    let small = Some(HalfExtentKm::square(20.0));
+    // Precondition: the land cell IS inside this pick's regional square, so
+    // the fallback below is a decision and not an absence of one.
+    assert_eq!(
+        min_ground_m(
+            Some(grid),
+            site,
+            site,
+            HalfExtentKm::square(MAX_HALF_WIDTH_KM)
+        ),
+        Some(2000.0),
+    );
+    assert_eq!(
+        min_ground_m(Some(grid), site, site, HalfExtentKm::square(20.0)),
+        None,
+        "and it is NOT inside the pick itself",
+    );
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), site, site, small),
+        DEFAULT_BASE_KM_MSL,
+        "an unpublished pick must keep the default floor; adopting the \
+         region's 2000 m would clip the whole lower box over sea level",
+    );
+
+    // Mid-Pacific, where not even the region publishes anything.
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), (15.0, -140.0), (15.0, -140.0), None),
+        DEFAULT_BASE_KM_MSL,
+    );
+    // No grid at all, which is what every shipped build has.
+    assert_eq!(
+        base_km_msl_for_box_in(None, site, site, None),
+        DEFAULT_BASE_KM_MSL,
+    );
+    // The control: a pick that DOES stand on the land cell answers from it.
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), (36.5, -116.5), (36.5, -116.5), small),
+        2000.0 / 1000.0,
+    );
+}
+
+/// A box straddling the antimeridian reads the cells on both sides of it, and
+/// not the long way round the planet.
+///
+/// This is the trap `squallar_geo::great_circle_destination` sets by contract:
+/// it answers `site_lon + dlon` unwrapped, so a bbox derived from box corners
+/// arrives past 180 and a naive comparison reads the box inside out.
+#[test]
+fn a_box_straddling_the_antimeridian_reads_both_sides_and_not_the_long_way() {
+    let raw = floor_cells(&[
+        (0.5, 179.5, -300.0),
+        (0.5, -179.5, -700.0),
+        (0.5, 0.5, -5000.0),
+    ]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+    let site = (0.0, 179.9);
+    let half = HalfExtentKm::square(20.0);
+
+    // The control: the derived bbox really does wrap, so the assertion below
+    // is about the wrap and not about a box that never crossed.
+    let (west, _south, east, _north) =
+        floor_query_bbox(site, site, half).expect("a real box has a bbox");
+    assert!(
+        west > east,
+        "the box must straddle for this test to be about straddling: \
+         west {west}, east {east}",
+    );
+    assert!((-180.0..180.0).contains(&west) && (-180.0..180.0).contains(&east));
+
+    assert_eq!(
+        base_km_msl_for_box_in(Some(grid), site, site, Some(half)),
+        -700.0 / 1000.0,
+        "both sides of the meridian must be read",
+    );
+    assert_ne!(
+        base_km_msl_for_box_in(Some(grid), site, site, Some(half)),
+        -5000.0 / 1000.0,
+        "the -5000 m cell at 0.5E is on the far side of the planet; reading it \
+         means the walk went the long way round",
+    );
+}
+
+/// The span clamp is a guard against a corrupt asset and **is not binding on
+/// real ground** — Everest included.
+#[test]
+fn the_span_clamp_catches_an_impossible_cell_and_leaves_everest_alone() {
+    let site = (27.99, 86.92);
+    let small = Some(HalfExtentKm::square(20.0));
+
+    let everest = floor_cells(&[(27.5, 86.5, 8849.0)]);
+    let grid = MinElevationGrid::new(&everest).expect("a full-length grid");
+    let base = base_km_msl_for_box_in(Some(grid), site, site, small);
+    assert_eq!(base, 8800.0 / 1000.0);
+    assert!(
+        base < DEFAULT_TOP_KM_MSL - MIN_BOX_SPAN_KM,
+        "the highest ground on Earth must not reach the clamp, or the clamp is \
+         silently deciding real answers",
+    );
+
+    let absurd = floor_cells(&[(27.5, 86.5, 30_000.0)]);
+    let grid = MinElevationGrid::new(&absurd).expect("a full-length grid");
+    let base = base_km_msl_for_box_in(Some(grid), site, site, small);
+    assert_eq!(base, DEFAULT_TOP_KM_MSL - MIN_BOX_SPAN_KM);
+    assert!(
+        base < DEFAULT_TOP_KM_MSL,
+        "`build_voxels` refuses `top <= base`; a cell no DEM could publish must \
+         not be able to reach that refusal",
+    );
+}
+
+/// **The request reads the grid it is given**, which is the wiring nothing
+/// else can see while the compiled-in asset is absent.
+#[test]
+fn the_request_reads_the_floor_grid_it_is_given() {
+    let raw = floor_cells(&[(39.5, -104.5, 1650.0)]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+    let site = (39.5, -104.5);
+    let ctx = ctx_for(
+        crate::fields::known::REFLECTIVITY,
+        squallar_geo::GeoPoint {
+            lat: 39.5,
+            lon: -104.5,
+        },
+        Some((20.0, 20.0)),
+        [128, 128, 32],
+        2048,
+    );
+
+    let with_data = request_for_in(Some(grid), &ctx, site).expect("a registered field");
+    assert_eq!(
+        with_data.base_km_msl,
+        1600.0 / 1000.0,
+        "`request_for` must put the derived floor on the request",
+    );
+    let without = request_for_in(None, &ctx, site).expect("a registered field");
+    assert_eq!(
+        without.base_km_msl, DEFAULT_BASE_KM_MSL,
+        "and fall back with no grid, which is every build shipped today",
+    );
+
+    // **The site reaches the derivation, and it is the box's frame.** A wide
+    // box framed on its radar covers different ground than the same box framed
+    // on its own centre. Both the offset and the cell they disagree about are
+    // *searched for* rather than guessed, and the oracle is `min_over_bbox`
+    // itself — the very function the derivation reads through — so this cannot
+    // quietly stop biting through a geometry that drifted.
+    let wide = HalfExtentKm::square(MAX_HALF_WIDTH_KM);
+    let found = [2.0f64, 4.0, 6.0, 8.0]
+        .into_iter()
+        .flat_map(|dlon| [0.0f64, 2.0, -2.0].map(move |dlat| (dlat, dlon)))
+        .find_map(|(dlat, dlon)| {
+            let wide_site = (39.5, -104.5);
+            let wide_centre = (wide_site.0 + dlat, wide_site.1 + dlon);
+            let framed = floor_query_bbox(wide_site, wide_centre, wide)?;
+            let centre_framed = floor_query_bbox(wide_centre, wide_centre, wide)?;
+            let mark = (20..60)
+                .flat_map(|lat| {
+                    (-130..-80).map(move |lon| (f64::from(lat) + 0.5, f64::from(lon) + 0.5))
+                })
+                .find(|(lat, lon)| {
+                    let one = floor_cells(&[(*lat, *lon, -200.0)]);
+                    let g = MinElevationGrid::new(&one).expect("a full-length grid");
+                    let reads = |b: (f64, f64, f64, f64)| g.min_over_bbox(b.0, b.1, b.2, b.3);
+                    reads(framed) == Some(-200.0) && reads(centre_framed).is_none()
+                })?;
+            Some((wide_site, wide_centre, mark))
+        });
+    let (wide_site, wide_centre, (mark_lat, mark_lon)) = found.expect(
+        "no offset in the sweep produced a cell the site frame reads and the \
+         centre frame does not; this pin has stopped distinguishing the two",
+    );
+
+    let cells = floor_block(20..60, -130..-80, 1000.0, &[(mark_lat, mark_lon, -200)]);
+    let wide_grid = MinElevationGrid::new(&cells).expect("a full-length grid");
+    let wide_ctx = ctx_for(
+        crate::fields::known::REFLECTIVITY,
+        squallar_geo::GeoPoint {
+            lat: wide_centre.0,
+            lon: wide_centre.1,
+        },
+        Some((wide.east_km, wide.north_km)),
+        [128, 128, 32],
+        2048,
+    );
+    assert_eq!(
+        request_for_in(Some(wide_grid), &wide_ctx, wide_site)
+            .expect("a registered field")
+            .base_km_msl,
+        -200.0 / 1000.0,
+        "the box framed on its site reaches the low cell at ({mark_lat}, {mark_lon})",
+    );
+    assert_ne!(
+        request_for_in(Some(wide_grid), &wide_ctx, wide_centre)
+            .expect("a registered field")
+            .base_km_msl,
+        -200.0 / 1000.0,
+        "and a request handed the centre in place of the site does not, so the \
+         site parameter really is reaching the derivation",
+    );
+}
+
+/// **What a shipped build does today**, and the control that says why.
+///
+/// `GRID_ASSET` is `None` until the terrain builder's floor pass has run, so
+/// every box on Earth falls back. That is the only branch production takes, and
+/// it must be the tested one — with a control proving the fallback is the
+/// asset's absence and not a derivation that never reads a grid.
+#[test]
+fn with_no_compiled_in_grid_every_box_falls_back_to_the_default_floor() {
+    assert!(
+        GRID_ASSET.is_none(),
+        "an asset landed: this test's premise is gone, and \
+         `squallar_geo::min_elevation`'s own extremes pin should be un-ignored",
+    );
+    assert!(floor_grid().is_none());
+    for site in [
+        (39.7867, -104.5458),
+        (36.25, -116.83),
+        (35.3331, -97.2775),
+        (0.0, 179.9),
+        (15.0, -140.0),
+    ] {
+        for half in [None, Some(HalfExtentKm::square(20.0))] {
+            assert_eq!(
+                base_km_msl_for_box(site, site, half),
+                DEFAULT_BASE_KM_MSL,
+                "{site:?} at {half:?}",
+            );
+        }
+    }
+    // The control: the same code path with a grid in hand does not fall back.
+    let raw = floor_cells(&[(39.5, -104.5, 1650.0)]);
+    let grid = MinElevationGrid::new(&raw).expect("a full-length grid");
+    assert_ne!(
+        base_km_msl_for_box_in(
+            Some(grid),
+            (39.5, -104.5),
+            (39.5, -104.5),
+            Some(HalfExtentKm::square(20.0)),
+        ),
+        DEFAULT_BASE_KM_MSL,
     );
 }

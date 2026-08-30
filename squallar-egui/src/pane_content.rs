@@ -419,9 +419,76 @@ pub enum VolumeViewMode {
     Isosurface,
 }
 
+/// **Where the resampler will put the bottom of this pane's box, km MSL.**
+///
+/// The pane does not learn this from the grid it is shown; it derives it from
+/// the same pick the resampler will, through the same function
+/// (`squallar_radar::voxel::base_km_msl_for_box`). That is what stops the
+/// framing and the readout being right only once a built grid has answered.
+///
+/// **`site` is the box's frame, not just a fallback centre**, and both roles
+/// are load-bearing. `build_voxels` places the box as a rectangle along the
+/// *site's* axes, so the floor cannot be derived from a picked centre alone; a
+/// pane whose site is unplaced therefore keeps the default floor rather than
+/// guessing at a frame. The centre routing mirrors the app's own
+/// `volume_job_context` exactly: a picked region contributes its centre and its
+/// extent, while a pane with no region is the default box about the site and
+/// carries no extent at all, because the builder takes that width from the
+/// volume's own reach.
+pub fn volume_base_km_msl(region: Option<VolumeRegion>, site: Option<GeoPoint>) -> f64 {
+    base_km_msl_in(squallar_radar::voxel::floor_grid(), region, site)
+}
+
+/// [`volume_base_km_msl`] and [`box_size_km`]'s shared routing, against an
+/// explicit grid.
+fn base_km_msl_in(
+    grid: Option<squallar_geo::min_elevation::MinElevationGrid<'_>>,
+    region: Option<VolumeRegion>,
+    site: Option<GeoPoint>,
+) -> f64 {
+    let Some(site) = site else {
+        return squallar_radar::voxel::DEFAULT_BASE_KM_MSL;
+    };
+    let centre = region.map_or(site, VolumeRegion::centre);
+    squallar_radar::voxel::base_km_msl_for_box_in(
+        grid,
+        (site.lat, site.lon),
+        (centre.lat, centre.lon),
+        region.map(VolumeRegion::half_extent_km),
+    )
+}
+
 /// The box's full extent in kilometres along each axis for a pane showing
-/// `region` — **what the pane itself can work out**.
-pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
+/// `region` about `site` — **what the pane itself can work out**.
+///
+/// This is what the camera frames until a built grid answers, so its vertical
+/// has to be the vertical the resampler will build. It was
+/// `DEFAULT_TOP_KM_MSL - DEFAULT_BASE_KM_MSL` while every box stood on sea
+/// level; with a floor that follows the ground that spelling is long by the
+/// floor's offset on the first frame of every volume, and the framing pops when
+/// the grid lands.
+pub fn box_size_km(region: Option<VolumeRegion>, site: Option<GeoPoint>) -> [f32; 3] {
+    box_size_km_in(squallar_radar::voxel::floor_grid(), region, site)
+}
+
+/// [`box_size_km`] against an explicit floor grid.
+///
+/// The seam exists because the compiled-in grid is absent in every build
+/// today: without it the vertical is `DEFAULT_BASE_KM_MSL` for every box on
+/// Earth, and no test could tell this from the constant it replaced.
+pub fn box_size_km_in(
+    grid: Option<squallar_geo::min_elevation::MinElevationGrid<'_>>,
+    region: Option<VolumeRegion>,
+    site: Option<GeoPoint>,
+) -> [f32; 3] {
+    box_size_km_for_base(region, base_km_msl_in(grid, region, site))
+}
+
+/// [`box_size_km`] with the floor already in hand.
+///
+/// The 3D arm derives the floor once per pane per frame and needs it for the
+/// caption as well, and a second `box_size_km` call would derive it again.
+pub fn box_size_km_for_base(region: Option<VolumeRegion>, base_km_msl: f64) -> [f32; 3] {
     let half = region.map_or(
         squallar_radar::voxel::HalfExtentKm::square(BASE_HALF_WIDTH_KM),
         VolumeRegion::half_extent_km,
@@ -429,8 +496,7 @@ pub fn box_size_km(region: Option<VolumeRegion>) -> [f32; 3] {
     [
         (2.0 * half.east_km) as f32,
         (2.0 * half.north_km) as f32,
-        (squallar_radar::voxel::DEFAULT_TOP_KM_MSL - squallar_radar::voxel::DEFAULT_BASE_KM_MSL)
-            as f32,
+        (squallar_radar::voxel::DEFAULT_TOP_KM_MSL - base_km_msl) as f32,
     ]
 }
 

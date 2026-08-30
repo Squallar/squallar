@@ -1958,7 +1958,16 @@ fn volume_pane_outcome(
     else {
         return VolumeOutcome::empty_state(VOLUME_EMPTY_STATE.to_owned());
     };
-    let mut box_size_km = crate::pane::box_size_km(region);
+    // The site the box falls back to when no region is picked — the same
+    // fallback `volume_job_context` resolves on the app side, so the floor the
+    // pane frames and names is the floor the resampler will build.
+    let site_geo =
+        squallar_radar::sites::get_radar_site(pane.site()).map(|site| squallar_geo::GeoPoint {
+            lat: site.lat,
+            lon: site.lon,
+        });
+    let base_km_msl = crate::pane::volume_base_km_msl(region, site_geo);
+    let mut box_size_km = crate::pane::box_size_km_for_base(region, base_km_msl);
     if let Some(built) = pane
         .volume()
         .and_then(|v| v.rendered_for.as_ref())
@@ -2083,9 +2092,12 @@ fn volume_pane_outcome(
             let drawn_box_km = painter
                 .box_size_km(pane_idx, &target)
                 .unwrap_or(box_size_km);
-            let half = squallar_radar::voxel::HalfExtentKm {
-                east_km: 0.5 * f64::from(drawn_box_km[0]),
-                north_km: 0.5 * f64::from(drawn_box_km[1]),
+            let drawn = CaptionBox {
+                half: squallar_radar::voxel::HalfExtentKm {
+                    east_km: 0.5 * f64::from(drawn_box_km[0]),
+                    north_km: 0.5 * f64::from(drawn_box_km[1]),
+                },
+                base_km_msl: floor_of_drawn_box(drawn_box_km),
             };
             paint_volume_caption(
                 ui,
@@ -2095,7 +2107,7 @@ fn volume_pane_outcome(
                     &site_code,
                     collected,
                     base_started,
-                    half,
+                    drawn,
                     camera,
                     showing,
                     painter.grid_cells_across(pane_idx, &target),
@@ -2362,16 +2374,52 @@ fn map_pane_geo_from(
 /// this application already uses for heights.
 const KFT_PER_KM: f64 = 3.280_84;
 
+/// **The floor a drawn box stands on, km MSL** — its fixed top less its own
+/// vertical span.
+///
+/// The caption has to describe **one** box. While a stand-in grid is up the
+/// drawn box is the one that was BUILT and the pane's region is the one that
+/// was PICKED, so taking the horizontal from the drawn box and re-deriving the
+/// floor from the live region would caption a stale width beside a fresh
+/// height — the same lying readout this arm exists to stop.
+///
+/// Two facts license reading the floor back out of the span rather than asking
+/// the painter for it. `DrawnBox` never rescales the vertical: a cropped box
+/// carries `z_km_msl: settled.z_km_msl`, the held grid's own. And
+/// `request_for` writes `DEFAULT_TOP_KM_MSL` on every request it shapes, which
+/// `the_box_top_and_the_value_plane_are_decided_on_this_side_of_the_seam`
+/// pins. So the top is known and the span is measured, and the floor is the
+/// difference.
+fn floor_of_drawn_box(box_km: [f32; 3]) -> f64 {
+    squallar_radar::voxel::DEFAULT_TOP_KM_MSL - f64::from(box_km[2])
+}
+
+/// The box a caption describes: how far it reaches either side on the ground,
+/// and where its bottom face sits.
+///
+/// One parameter rather than two because the caption's vertical line is a
+/// *statement about this box*, and a floor that follows the ground can only be
+/// carried alongside the extent that chose it. Both halves come off the same
+/// pick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CaptionBox {
+    half: squallar_radar::voxel::HalfExtentKm,
+    /// Where the bottom face sits, km MSL — `crate::pane::volume_base_km_msl`
+    /// of the same pick the resampler is given.
+    base_km_msl: f64,
+}
+
 /// What the pane says about the picture it is showing, one line per fact.
 fn volume_caption(
     site: &str,
     newest: chrono::NaiveDateTime,
     base_started: Option<chrono::NaiveDateTime>,
-    half: squallar_radar::voxel::HalfExtentKm,
+    drawn: CaptionBox,
     camera: crate::pane::OrbitCamera,
     showing: crate::volume_view::Showing,
     cells: Option<usize>,
 ) -> Vec<String> {
+    let half = drawn.half;
     let mut lines = vec![format!(
         "{site} volume - newest data {}Z",
         newest.format("%H:%M")
@@ -2382,7 +2430,11 @@ fn volume_caption(
         None => lines.push("no complete volume yet - showing the tilts flown so far".to_owned()),
     }
 
-    let base = squallar_radar::voxel::DEFAULT_BASE_KM_MSL * KFT_PER_KM;
+    // **The floor is read, not assumed.** This line said "0" for every box on
+    // Earth while the resampler's floor followed the ground, which for a
+    // feature whose whole reason is being accurate about a slice of the earth
+    // is the one thing it may not do.
+    let base = drawn.base_km_msl * KFT_PER_KM;
     let top = squallar_radar::voxel::DEFAULT_TOP_KM_MSL * KFT_PER_KM;
     lines.push(format!(
         "{base:.0}-{top:.0} kft MSL - vertical exaggeration {:.1}×",

@@ -259,7 +259,18 @@ impl squallar_source::volume::VolumeCapable for RadarSource {
         &self,
         ctx: squallar_source::volume::VolumeJobContext,
     ) -> Option<squallar_source::job::DescribedJob> {
-        let request = crate::voxel::request_for(&ctx)?;
+        // **The site is read off the payload, not off the context**, and that
+        // is what makes the box's floor derivable at all. `build_voxels` places
+        // the box in the *site's* tangent frame, so the floor query needs the
+        // site; and `VoxelJob::run` takes it from `RenderInput::radar_lat` /
+        // `radar_lon`. Taking it from the same place here leaves one source of
+        // truth rather than two that agree by inspection - a `site_lat` on the
+        // context would be a second copy the frontend could get wrong.
+        let site = ctx
+            .payload
+            .downcast_ref::<crate::render_input::RenderInput>()
+            .map(|input| (input.radar_lat(), input.radar_lon()))?;
+        let request = crate::voxel::request_for(&ctx, site)?;
         let input = ctx
             .payload
             .downcast::<crate::render_input::RenderInput>()
