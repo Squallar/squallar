@@ -155,6 +155,7 @@ fn frame(target: &VolumeTarget) -> VolumeFrameState {
         iso_threshold: 18.0,
         light: squallar_egui::volume_view::VolumeLight::Headlight,
         heights: None,
+        buildings: None,
     }
 }
 

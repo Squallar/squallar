@@ -15,9 +15,9 @@
 //! | **total** | **37.75 MB** | **9.44 MB** |
 //!
 //! Both columns are arithmetic over [`PRISM_VERTEX_BYTES`],
-//! [`PRISM_INDEX_BYTES`] and the two ceilings, not measurements of a running
-//! app — nothing has drawn a building yet. What *is* measured is the shape the
-//! arithmetic stands on: see [`INDICES_PER_VERTEX_CEILING`].
+//! [`PRISM_INDEX_BYTES`] and the two ceilings. The shape the arithmetic stands
+//! on is measured — see [`INDICES_PER_VERTEX_CEILING`] — and so, now, is what
+//! a frame of it costs: see [`DEFAULT_PRISM_VRAM_BYTES`].
 //!
 //! # The ladder, and what it is actually searching
 //!
@@ -79,6 +79,12 @@ pub const PRISM_INDEX_BYTES: u64 = 4;
 /// Three is where a tessellation that needed Steiner points for a
 /// self-intersecting footprint still fits, and the mesh builder holds the real
 /// index count under its own ceiling anyway.
+///
+/// **A frame measurement does not bear on this one and D2 did not move it.**
+/// The plan asked for D2's timings to replace the ceilings D1 chose against
+/// arithmetic; this is a ratio between two properties of the tessellator's
+/// output topology, which a clock cannot see. It was already measured on the
+/// committed fixture when it was written, which is the evidence it needs.
 pub const INDICES_PER_VERTEX_CEILING: u64 = 3;
 
 /// The most vertices any rung allows: 1,048,576, which is about **1,200
@@ -132,13 +138,47 @@ pub const MIN_VERTEX_CEILING: u32 = 1 << 15;
 /// The VRAM row this crate asks for when the caller has no measured figure of
 /// its own: 16 MiB.
 ///
-/// **Chosen against the arithmetic above, and not measured** — the same
-/// posture `squallar_elevation::jobs`' `MAX_TILE_PX` records for itself, and
-/// the distinction is still live: nothing has drawn a building, so no frame
-/// has been timed. It fits the ladder at 262,144 vertices, which is 9.44 MB of
-/// buffers and **301 buildings** at [`MEASURED_VERTICES_PER_BUILDING`] — about
-/// seven tiles of downtown Monaco. A real figure should replace it the day
-/// something measures a frame.
+/// It fits the ladder at 262,144 vertices, which is 9.44 MB of buffers and
+/// **301 buildings** at [`MEASURED_VERTICES_PER_BUILDING`] — about seven tiles
+/// of downtown Monaco.
+///
+/// # A frame has now been timed, and the number stays where it was
+///
+/// D1 wrote "chosen against the arithmetic above, and not measured", and asked
+/// for a real figure the day something drew a building. D2 draws them, and
+/// `squallar-gpu/tests/volume_building_cost.rs` measures the **ground pass**
+/// — terrain grid and prisms in one pass, the raymarch pass not in the figure
+/// and never added to it — on a real city replicated in whole Monaco tiles:
+///
+/// | at 1440x900 | vertices | buffers | ground pass | the prisms' margin |
+/// |---|---:|---:|---:|---:|
+/// | terrain alone | 0 | 0 | 0.0373 ms | — |
+/// | 4 tiles | 149,828 | 4.61 MB | 0.0597 ms | 0.0223 ms |
+/// | 9 tiles | 337,104 | 10.36 MB | 0.0724 ms | 0.0351 ms |
+/// | 16 tiles | 599,296 | 18.42 MB | 0.1020 ms | 0.0646 ms |
+///
+/// Mean of 30 timed passes after 5 warm-ups, GPU timestamps bracketing the
+/// pass, **Vulkan on an NVIDIA RTX 3090, one machine, 2026-08-30**. "The
+/// prisms' margin" is a difference of two measurements rather than a
+/// measurement: the two draws share a depth buffer, so prisms that cover
+/// terrain make the terrain's own fragments cheaper and the difference is the
+/// *marginal* cost of adding the city.
+///
+/// **The 9-tile row already stands 29% past the vertex ceiling this constant
+/// fits to**, so on that machine the whole shipped rung costs under 0.035 ms of
+/// a 16.7 ms frame — a fifth of a percent — and the ceiling is nowhere near
+/// binding there.
+///
+/// **That is not a reason to raise it, and the caveat has a direction.** The
+/// hardware this row exists to protect is the one it has not been measured on:
+/// a WebGL2 browser and a mid-range phone, where the vertex rate, the buffer
+/// budget and the memory pressure are all different and none of them are
+/// inferable from a discrete desktop GPU. This repository's rule is that a
+/// scaled figure is never a measurement, so 16 MiB stays until somebody times
+/// the pass on one of those. The prediction that goes with it: the binding
+/// constraint there will be resident VRAM rather than the vertex rate, since
+/// the desktop figure grows sub-linearly in the vertex count (4x the vertices
+/// for 2.9x the margin) while the buffers grow exactly linearly.
 pub const DEFAULT_PRISM_VRAM_BYTES: u64 = 16 << 20;
 
 /// The ceilings a budget is fitted inside. Both are **runtime** figures.

@@ -105,6 +105,15 @@ struct Volume {
     // inside the cosine is zero everywhere the sun is down, which would make
     // every twilight and night colour unreachable. w: reserved, zero.
     sky_ambient: vec4<f32>,
+    // Where a building's kilometres land in the drawn box's unit square:
+    // `uv = building_box.xy * km + building_box.zw`, with `km` the prism
+    // mesh's own east/north kilometres from the site. The prisms are authored
+    // in SITE-relative kilometres rather than in box units, which is what lets
+    // a box change re-register the whole city by rewriting these four floats
+    // instead of re-uploading the mesh. The identity `(1, 1, 0, 0)` means
+    // "kilometres already are box units", which no real box is; it is what
+    // `VolumeUniform::new` writes before a box has been placed.
+    building_box: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
@@ -913,6 +922,189 @@ fn fs_ground(in: GroundVertex) -> GroundTargets {
     out.colour = vec4<f32>(
         lit(ground.rgb, ground_response(normalize(in.normal))),
         ground.a,
+    );
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Extruded buildings, standing on the ground pass's own surface.
+// ---------------------------------------------------------------------------
+
+// The albedo every prism is painted with, linear RGB: a light warm grey.
+//
+// **One colour for every building, and the vector-tile `colour` property is
+// deliberately not read.** The archive this workspace ships carries it on 22
+// of 126 `building` features, so a per-feature lane would be absent on 83% of
+// them and this constant would still be the answer wherever it was; the
+// per-feature value is a refinement of it rather than a replacement for it.
+// What reading it would cost is not small: the property is a STRING, so it
+// needs a colour parser somewhere, and the only place that may run is the
+// worker - which means a wider reply, a fourth tail, and either a fourth
+// vertex attribute (`squallar_buildings::PRISM_VERTEX_BYTES` 24 -> 28, a 17%
+// wider VRAM row) or a per-building instance lane this draw has no instancing
+// for. What would overturn this is a measurement that a single-albedo city
+// reads worse than a 17%-smaller one that is 17% coloured.
+const BUILDING_ALBEDO: vec3<f32> = vec3<f32>(0.62, 0.60, 0.58);
+
+// How far outside the unit cube a building fragment is still written.
+//
+// **The slack is what keeps `fs_building`'s clip from cutting its own rim.** A
+// vertex authored exactly at `z = 1` interpolates to 1.0000001 across a
+// triangle and a bare `> 1.0` test would punch a one-pixel hole along it. The
+// number is chosen against the bound it must not break rather than for
+// tidiness: `VolumeUniform::t_scale_for` reaches 1.05x the farthest unit-cube
+// corner, which is a margin of at least 0.05 box units on any camera outside
+// the box, and this slack widens the cube's half-diagonal by at most
+// 1e-4 * sqrt(3) = 1.7e-4. Five hundred times inside it.
+const BOX_CLIP_SLACK: f32 = 1e-4;
+
+// Which post-grid coordinate a box-unit position along one axis sits at:
+// the inverse of `box_axis` over the INTERIOR columns, clamped into the field.
+//
+// `box_axis` puts interior column `c` at `scale * ((c - 1) + 0.5) / posts +
+// offset` reading post `c - 1`, so post `p` sits at `scale * (p + 0.5) / posts
+// + offset` and this undoes exactly that. The clamp is what makes the APRON
+// exact rather than approximate: outside the outermost post the mesh is flat
+// at that post's own height (`box_axis` duplicates the rim post rather than
+// stretching it), and a coordinate clamped to 0 or `posts - 1` reads that same
+// post with a fraction of zero. So this function is not "close enough near the
+// edge" - it is the mesh's own surface there.
+fn ground_post_coord(u: f32, posts: u32, scale: f32, offset: f32) -> f32 {
+    // A degenerate placement would divide by zero and put every building at
+    // post 0; 1.0 is the identity that leaves `u` reading as a fraction of the
+    // box, which is where a caller that wrote no placement meant them.
+    let denom = select(scale, 1.0, abs(scale) < 1e-6);
+    let s = ((u - offset) / denom) * f32(posts) - 0.5;
+    return clamp(s, 0.0, f32(posts) - 1.0);
+}
+
+// The ground mesh's own surface height at an arbitrary point of the drawn
+// box's unit square.
+//
+// **The mesh's plane, not a bilinear interpolation of it**, and the difference
+// is the whole reason this function is not two lines. `vs_ground` emits two
+// triangles per cell split along the anti-diagonal - corners (0,0),(1,0),(0,1)
+// and (0,1),(1,0),(1,1) - so the drawn surface is piecewise PLANAR, and a
+// bilinear read of the same four posts disagrees with it by the cell's twist
+// everywhere off the diagonals. A building standing at the bilinear height on
+// a twisted cell hovers or sinks by exactly that much, which is the defect
+// this unit exists not to have. Picking the triangle by `f.x + f.y <= 1.0` and
+// evaluating its own plane makes "the building stands on the terrain" true by
+// construction rather than to a tolerance.
+//
+// `raymarch::ground_surface_at` is the Rust mirror, and `volume_buildings.rs`
+// drives the two against each other.
+fn ground_surface_at(uv: vec2<f32>) -> f32 {
+    let posts = ground_posts();
+    let s = vec2<f32>(
+        ground_post_coord(uv.x, posts.x, volume.ground_box.x, volume.ground_box.z),
+        ground_post_coord(uv.y, posts.y, volume.ground_box.y, volume.ground_box.w),
+    );
+    // The cell's low corner, held one short of the last post so the `+ 1`
+    // below stays inside the field. `ground_height` clamps too, but a clamp
+    // there would fold the cell onto itself and flatten the last row.
+    let last = vec2<f32>(max(vec2<i32>(posts) - vec2<i32>(2), vec2<i32>(0)));
+    let base = clamp(floor(s), vec2<f32>(0.0), last);
+    let f = s - base;
+    let i0 = vec2<i32>(base);
+    let h00 = ground_height(i0);
+    let h10 = ground_height(vec2<i32>(i0.x + 1, i0.y));
+    let h01 = ground_height(vec2<i32>(i0.x, i0.y + 1));
+    let h11 = ground_height(i0 + vec2<i32>(1));
+    if f.x + f.y <= 1.0 {
+        return h00 + f.x * (h10 - h00) + f.y * (h01 - h00);
+    }
+    return h11 + (1.0 - f.x) * (h01 - h11) + (1.0 - f.y) * (h10 - h11);
+}
+
+struct BuildingVertex {
+    @builtin(position) clip_position: vec4<f32>,
+    // The surface point in box space, for the same reason `GroundVertex`
+    // carries one: `t` is a norm and is not affine across a triangle.
+    @location(0) box_p: vec3<f32>,
+    // The face's outward normal. A prism's faces are flat and its vertices
+    // unshared across them, so this is constant over each face and the
+    // interpolation is exact; it is re-normalised in the fragment only because
+    // a wall quad's two triangles are one plane and rounding is not.
+    @location(1) normal: vec3<f32>,
+}
+
+// One prism vertex, lifted onto the terrain.
+//
+// **The mesh arrives in kilometres above the GROUND**, never above the box
+// floor, which is what makes this stage the only place a building learns where
+// it stands. `squallar_buildings` has never seen a height field - it is
+// another crate's answer arriving on another job - so a prism at `z = 0` is a
+// prism whose ground has not been added yet. Adding it here rather than on the
+// host is what lets one uploaded mesh survive a new height field, a new box
+// and a new exaggeration without a byte of it being rewritten.
+//
+// The vertical exaggeration is not applied here and must not be: the mesh is
+// authored in the same box space `vs_ground` is, and the camera is framed
+// against the exaggerated box, so both surfaces are stretched by one factor in
+// one place. A building stretched here would be stretched twice.
+@vertex
+fn vs_building(@location(0) km: vec3<f32>, @location(1) normal: vec3<f32>) -> BuildingVertex {
+    let uv = vec2<f32>(
+        km.x * volume.building_box.x + volume.building_box.z,
+        km.y * volume.building_box.y + volume.building_box.w,
+    );
+    // The height is read at the CLAMPED position while the vertex stays where
+    // it is: a building straddling the box edge is kept whole rather than
+    // clipped (`squallar_buildings::BoxFrame::overlaps` is deliberately the
+    // permissive arm), and the rim post's height is the same nearest
+    // extrapolation the mesh's own apron makes there.
+    let ground = ground_surface_at(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
+    // Metres were divided by kilometres on the worker; this is the one
+    // division of kilometres by the box, and `box_size_km.z` is the drawn
+    // box's own vertical span.
+    let z = ground + km.z / max(volume.box_size_km.z, 1e-6);
+    let p = vec3<f32>(uv, z);
+    var out: BuildingVertex;
+    out.clip_position = volume.clip_from_box * vec4<f32>(p, 1.0);
+    out.box_p = p;
+    out.normal = normal;
+    return out;
+}
+
+// A prism fragment: the same packed `t` the terrain writes, and one albedo.
+//
+// **The clip is what keeps `t_scale` an over-estimate**, and that is a
+// correctness argument rather than a tidiness one. `VolumeUniform::t_scale_for`
+// bounds `t` by the farthest UNIT-CUBE corner from the eye, and that bound
+// holds for the terrain because every post is clamped into the cube. A prism
+// is not: it stands on the terrain and reaches above it, and a footprint may
+// lie outside the drawn box entirely. A written fragment past the cube would
+// saturate the packing and decode to `t_scale` - past everything - so the
+// march would stop clipping against the very building it was painting. Every
+// fragment this writes is inside the cube by `BOX_CLIP_SLACK`, so `t /
+// t_scale` cannot reach 1 and the packing cannot saturate.
+//
+// Discarding rather than clamping the vertex, because clamping shears a
+// footprint that straddles the edge into a smear along the box wall; a clip
+// cuts it cleanly at the wall, which is also where the terrain under it stops.
+@fragment
+fn fs_building(in: BuildingVertex) -> GroundTargets {
+    let lo = vec3<f32>(-BOX_CLIP_SLACK);
+    let hi = vec3<f32>(1.0 + BOX_CLIP_SLACK);
+    if any(in.box_p < lo) || any(in.box_p > hi) {
+        discard;
+    }
+    let t = length(in.box_p - volume.eye_in_box.xyz);
+    var out: GroundTargets;
+    out.occluder = vec4<f32>(pack24(t / max(volume.occluder.x, 1e-6)), 1.0);
+    // **`ground_response`, the same directional term the terrain and the flat
+    // lid take**, off the same one light. A building is an opaque surface like
+    // the ground is, and giving prisms a response of their own is how a city
+    // comes to be lit by a light the terrain under it does not have.
+    //
+    // Coverage is 1 and not the mirror's, unlike the drape: the terrain is
+    // absent where the basemap is, because the terrain IS the basemap draped
+    // over relief, but a building is a solid and is there whether or not a map
+    // tile has arrived under it.
+    out.colour = vec4<f32>(
+        lit(BUILDING_ALBEDO, ground_response(normalize(in.normal))),
+        1.0,
     );
     return out;
 }

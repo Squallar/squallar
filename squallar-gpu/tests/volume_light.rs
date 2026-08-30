@@ -504,7 +504,7 @@ fn render_field(
     );
     let mut encoder = device.create_command_encoder(&Default::default());
     if heights.is_some() {
-        pipelines.encode_ground(&mut encoder, &target, &volume, Some(mirror), heights);
+        pipelines.encode_ground(&mut encoder, &target, &volume, Some(mirror), heights, None);
     }
     pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(mirror));
     queue.submit(Some(encoder.finish()));
@@ -637,7 +637,14 @@ struct Scene {
 
 fn scene(wgsl: &str) -> Scene {
     let (device, queue) = device();
-    let pipelines = VolumePipelines::from_shader_source(&device, attachments(SURFACE), wgsl);
+    // **Without the prism pipeline**, because one caller hands in
+    // [`PRE_C2_SHADER`] — a byte-identical copy of this shader as it stood
+    // before C2, which has no `vs_building`, no `fs_building` and no `fn lit`
+    // for one to call. Building it would fail pipeline creation and retire a
+    // light pin because a building landed. Nothing here draws a prism, so the
+    // pipeline this skips would never have been bound.
+    let pipelines =
+        VolumePipelines::from_shader_source_without_prisms(&device, attachments(SURFACE), wgsl);
     // **The march draws through a vertex buffer and the ground pass does not.**
     // Without this the ground attachment fills and the offscreen comes back
     // empty at every camera, which reads as "the light changed nothing".

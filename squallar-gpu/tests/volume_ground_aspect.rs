@@ -198,7 +198,14 @@ fn render(
         },
     );
     let mut encoder = device.create_command_encoder(&Default::default());
-    pipelines.encode_ground(&mut encoder, &target, &volume, Some(mirror), Some(heights));
+    pipelines.encode_ground(
+        &mut encoder,
+        &target,
+        &volume,
+        Some(mirror),
+        Some(heights),
+        None,
+    );
     pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(mirror));
     queue.submit(Some(encoder.finish()));
 

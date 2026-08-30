@@ -71,6 +71,13 @@ fn the_dependency_ceiling_holds() {
                     | "pollster"
                     | "squallar-volumetric"
                     | "squallar-radar"
+                    // D2: the prism suites render a REAL city rather than a
+                    // synthetic block of boxes, so they call `read_footprints`
+                    // and `extrude` over the committed Monaco tile. The
+                    // buildings crate links neither egui nor wgpu by charter,
+                    // which is exactly why this edge may only ever be a
+                    // dev-dependency.
+                    | "squallar-buildings"
                     | "nexrad-model"
                     | "chrono"
                     | "squallar-geo"
@@ -110,6 +117,7 @@ fn the_dependency_ceiling_holds() {
     for (kind, name) in [
         ("dev", "serde_json"),
         ("dev", "squallar-volumetric"),
+        ("dev", "squallar-buildings"),
         ("normal", "squallar-egui"),
         ("normal", "squallar-device-profile"),
     ] {

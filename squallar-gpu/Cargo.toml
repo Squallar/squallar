@@ -186,4 +186,17 @@ squallar-geo = { workspace = true }
 # so on that target the dependency would be built and then used by nothing.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 naga = { workspace = true }
+# `tests/volume_buildings.rs` and `tests/volume_building_cost.rs` render a REAL
+# city: `read_footprints` + `extrude` over the committed Monaco tile, through
+# the same `PrismBudget` the worker fits. A synthetic block of boxes would have
+# measured a frame cost of something this app never draws -- the archive's real
+# footprints carry 175.6 ring vertices each, not four -- and the whole reason
+# the buildings crate exists is that it links neither egui nor wgpu, so this
+# edge may only ever be a dev-dependency. Same legality as the
+# squallar-volumetric one above: dev-deps never enter the normal graph.
+#
+# Target-gated with naga and syn for the same reason: both test files are
+# `#![cfg(not(target_arch = "wasm32"))]`, so on the wasm clippy row a plain
+# `[dev-dependencies]` entry would be built and then used by nothing.
+squallar-buildings = { workspace = true }
 syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }

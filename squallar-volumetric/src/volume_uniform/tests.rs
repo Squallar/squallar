@@ -57,23 +57,25 @@ fn distinct() -> VolumeUniform {
         ground_box: [1401.0, 1402.0, 1403.0, 1404.0],
         sun_beam: [1501.0, 1502.0, 1503.0],
         sky_ambient: [1601.0, 1602.0, 1603.0],
+        building_box: [1701.0, 1702.0, 1703.0, 1704.0],
     }
 }
 
-/// The block is exactly 352 bytes, and the shader declares the same.
+/// The block is exactly 368 bytes, and the shader declares the same.
 #[test]
-fn the_block_is_two_mat4s_and_fourteen_vec4s_on_both_sides() {
-    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 14 * 16);
-    assert_eq!(OFFSET_SKY_AMBIENT + 16, VOLUME_UNIFORM_BYTES);
+fn the_block_is_two_mat4s_and_fifteen_vec4s_on_both_sides() {
+    assert_eq!(VOLUME_UNIFORM_BYTES, 2 * 64 + 15 * 16);
+    assert_eq!(OFFSET_BUILDING_BOX + 16, VOLUME_UNIFORM_BYTES);
     // The growth is append-only: every offset that existed before the ground
-    // pass is still where it was, which is what let the block grow three times
-    // — 224 to 304 at B1, 304 to 320 at B3, 320 to 352 at C2 — without a
-    // single lane of the march moving.
+    // pass is still where it was, which is what let the block grow four times
+    // — 224 to 304 at B1, 304 to 320 at B3, 320 to 352 at C2, 352 to 368 at
+    // D2 — without a single lane of the march moving.
     assert_eq!(OFFSET_GRID_FROM_BOX_B + 16, OFFSET_CLIP_FROM_BOX);
     assert_eq!(OFFSET_CLIP_FROM_BOX + 64, OFFSET_OCCLUDER);
     assert_eq!(OFFSET_OCCLUDER + 16, OFFSET_GROUND_BOX);
     assert_eq!(OFFSET_GROUND_BOX + 16, OFFSET_SUN_BEAM);
     assert_eq!(OFFSET_SUN_BEAM + 16, OFFSET_SKY_AMBIENT);
+    assert_eq!(OFFSET_SKY_AMBIENT + 16, OFFSET_BUILDING_BOX);
 
     let source = include_str!("../volume.wgsl");
     let declaration = source
@@ -86,7 +88,7 @@ fn the_block_is_two_mat4s_and_fourteen_vec4s_on_both_sides() {
     let vec4s = declaration.matches("vec4<f32>").count();
     assert_eq!(
         (mat4s, vec4s),
-        (2, 14),
+        (2, 15),
         "volume.wgsl's uniform block is {mat4s} mat4x4 and {vec4s} vec4, \
              which is {} bytes, not the {VOLUME_UNIFORM_BYTES} this file packs. \
              A block smaller than the buffer is legal, so nothing would report \
@@ -156,7 +158,7 @@ fn every_lane_lands_at_its_std140_offset() {
     );
 
     // The offsets themselves, as literals.
-    // An array rather than a tuple: sixteen members is past the arity `Debug`
+    // An array rather than a tuple: seventeen members is past the arity `Debug`
     // is implemented for, and a failure that cannot print the two sides is a
     // failure a reader cannot act on.
     assert_eq!(
@@ -177,9 +179,10 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_GROUND_BOX,
             OFFSET_SUN_BEAM,
             OFFSET_SKY_AMBIENT,
+            OFFSET_BUILDING_BOX,
         ],
         [
-            0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288, 304, 320, 336
+            0, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 288, 304, 320, 336, 352
         ],
         "the std140 offsets have moved. They are the layout the WGSL's \
              `struct Volume` declares, in its declaration order, and nothing \
@@ -240,6 +243,11 @@ fn every_lane_lands_at_its_std140_offset() {
             OFFSET_SKY_AMBIENT,
             [1601.0, 1602.0, 1603.0, 0.0],
             "sky_ambient + a reserved zero",
+        ),
+        (
+            OFFSET_BUILDING_BOX,
+            [1701.0, 1702.0, 1703.0, 1704.0],
+            "building_box",
         ),
     ] {
         let lane = offset / 4;
@@ -699,7 +707,10 @@ fn neither_surface_can_be_lit_by_a_light_the_other_does_not_have() {
     );
 
     // And every response really does go through it, rather than one of them
-    // quietly keeping a vector of its own by another spelling.
+    // quietly keeping a vector of its own by another spelling. `fs_building`
+    // is not in this list and does not need to be: it takes `ground_response`
+    // rather than a response of its own, which is exactly the property that
+    // stops a city being lit by a light the terrain under it does not have.
     for name in ["ground_response", "shading", "iso_shading"] {
         let body = body_of(name);
         assert!(
@@ -723,12 +734,12 @@ fn neither_surface_can_be_lit_by_a_light_the_other_does_not_have() {
         .count()
         - shader.matches("fn lit(").count();
     assert_eq!(
-        calls, 4,
-        "`lit` is called {calls} times, not by all four things that carry \
-         colour: the mesh's fragment, the map lid, the march's accumulation \
-         and the isosurface. A surface that stopped calling it would keep its \
-         geometry and lose its light, which is what \
-         `volume_light.rs`'s own control constructs",
+        calls, 5,
+        "`lit` is called {calls} times, not by all five things that carry \
+         colour: the terrain mesh's fragment, the building prisms', the map \
+         lid, the march's accumulation and the isosurface. A surface that \
+         stopped calling it would keep its geometry and lose its light, which \
+         is what `volume_light.rs`'s own control constructs",
     );
 }
 

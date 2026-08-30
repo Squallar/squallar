@@ -1991,6 +1991,34 @@ fn pane_ground_heights(
     None
 }
 
+/// The extruded buildings standing on `pane`'s terrain, or `None` for a pane
+/// drawing bare ground.
+///
+/// **`None` for every pane today, and for a reason that is upstream of this
+/// unit rather than a shrug.** A prism is a height *above the ground*, so it
+/// draws only in a frame that has a height field — and
+/// [`pane_ground_heights`] answers `None` for every pane, because the archive
+/// its scheduler would fetch from is not published. There is no configuration
+/// of the shipped app in which this returning a mesh would put a building on
+/// screen, so returning one would be dead weight rather than a feature waiting
+/// to be switched on. D2 built the renderer path whole and proved it against
+/// GPU fixtures (`squallar-gpu/tests/volume_buildings.rs`); what it did not
+/// build is a scheduler for data that does not exist.
+///
+/// **This is also where the 3D-buildings control lands**, which
+/// `squallar_buildings`' module doc decided belongs here rather than on
+/// `sl:building`. It is not built either, and deliberately: a toggle whose
+/// every setting draws the same picture is a control the user cannot act on,
+/// and this repository's rule is to show the quantity rather than the apology.
+/// Whoever wires the terrain scheduler wires this body and that switch
+/// together, because until then neither has anything to govern.
+fn pane_building_prisms(
+    _pane: &crate::pane::PaneState,
+    _pane_idx: usize,
+) -> Option<std::sync::Arc<crate::volume_view::BuildingPrismMesh>> {
+    None
+}
+
 /// The 3D arm's decision, with the painting left to its caller so that every
 /// path out of it is a `return` of a reason rather than a `return` plus a call
 /// somebody can forget to make.
@@ -2169,6 +2197,7 @@ fn volume_pane_outcome(
         light,
         iso_threshold: iso_thresholds.get(&product),
         heights: pane_ground_heights(pane, pane_idx),
+        buildings: pane_building_prisms(pane, pane_idx),
     }) {
         VolumePaint::Callback { payload, showing } => {
             ui.painter()

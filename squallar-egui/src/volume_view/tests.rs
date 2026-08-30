@@ -398,6 +398,7 @@ fn the_stub_payload_is_the_kind_egui_wgpu_discards_in_silence() {
         iso_threshold: 18.0,
         light: crate::volume_view::VolumeLight::Headlight,
         heights: None,
+        buildings: None,
     };
     let VolumePaint::Callback { payload, .. } = painter.paint(&frame) else {
         panic!("the painting stub must paint");

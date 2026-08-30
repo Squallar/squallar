@@ -284,6 +284,47 @@ pub struct VolumeFrameState {
     /// height field has landed for it — in which case the pane draws the flat
     /// map floor at box `z = 0`, exactly as it always has.
     pub heights: Option<Arc<GroundHeightField>>,
+    /// The extruded buildings standing on that terrain, or `None` for a pane
+    /// drawing bare ground.
+    ///
+    /// **Read only alongside [`Self::heights`]**, and that is a property of
+    /// the picture rather than a convenience: a prism is authored as a height
+    /// *above the ground*, so a building with no height field under it has
+    /// nowhere to stand. The renderer drops it rather than putting it at sea
+    /// level.
+    pub buildings: Option<Arc<BuildingPrismMesh>>,
+}
+
+/// An extruded building mesh, as the renderer needs it.
+///
+/// **A plain carrier, not `squallar_buildings::BuildingMesh`**, for the reason
+/// [`GroundHeightField`] is not `squallar_elevation::HeightField`: neither this
+/// crate nor `squallar-volumetric` declares `squallar-buildings`, and the
+/// latter's charter pins the normal dependency set by name. The buildings crate
+/// links neither egui nor wgpu on purpose — all of it runs inside the offload
+/// worker — so what crosses is the numbers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildingPrismMesh {
+    /// Distinguishes one mesh from the next on the GPU, where the box's `f64`
+    /// ranges cannot go. Equality is what says "this is the mesh already
+    /// uploaded".
+    pub id: u64,
+    /// The site the mesh's kilometres are measured from, degrees north and
+    /// east — the same anchor the volume grid carries.
+    ///
+    /// **Checked rather than assumed by the renderer.** The prisms are
+    /// site-relative, which is what lets one upload survive a box change; the
+    /// one thing that must not change under them is the site, and a mesh built
+    /// around a different one would put every building somewhere plausible and
+    /// wrong.
+    pub site: (f64, f64),
+    /// Box kilometres: east, north, and **height above the ground beneath**,
+    /// which is the frame `squallar_buildings::prism` authors in.
+    pub positions: Vec<[f32; 3]>,
+    /// One unit outward normal per position.
+    pub normals: Vec<[f32; 3]>,
+    /// Triangles, counter-clockwise seen from outside the solid.
+    pub indices: Vec<u32>,
 }
 
 /// A resampled height field, as the renderer needs it.
