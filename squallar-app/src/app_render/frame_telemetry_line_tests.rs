@@ -50,12 +50,8 @@ fn pattern(name: &str) -> String {
 /// escaped parens; everything else regexy failing the leftover check below
 /// is what keeps the substitution honest.
 fn rendered(pattern: &str, groups: &[&str]) -> String {
-    const GROUP_SPELLINGS: [&str; 4] = [
-        r"(\d+|none|over)",
-        r"(\d+)",
-        r"([0-9,]+)",
-        r"([a-z0-9-]+)",
-    ];
+    const GROUP_SPELLINGS: [&str; 4] =
+        [r"(\d+|none|over)", r"(\d+)", r"([0-9,]+)", r"([a-z0-9-]+)"];
     let mut out = String::new();
     let mut rest = pattern;
     let mut values = groups.iter();
@@ -283,7 +279,9 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
         super::frame_segments_line(&s, &acquire),
         rendered(
             &pattern("segments_re"),
-            &["106", "211", "595", "1190", "2379", "4757", "2", "3364", "5657"],
+            &[
+                "106", "211", "595", "1190", "2379", "4757", "2", "3364", "5657"
+            ],
         ),
         "the `frame segments` line and the rig's probe have drifted",
     );
@@ -373,6 +371,63 @@ fn the_rig_scans_for_the_absence_sentence_verbatim() {
 #[test]
 fn the_frame_telemetry_key_is_pinned() {
     assert_eq!(super::FRAME_TELEMETRY_KEY, "frame_telemetry");
+}
+
+/// The rig launchers, read at compile time the way [`DRIVE_PY`] is.
+const RUN_TIER2: &str = include_str!("../../../.github/browser-rig/run_tier2.sh");
+const RUN_MEASURE: &str = include_str!("../../../.github/browser-rig/run_measure.sh");
+
+/// **Both rig launchers seed the key that makes the frame lines loud.**
+///
+/// Same seam as the raster switch's
+/// `the_rig_seeds_the_key_that_makes_the_lines_loud`: the frame lines are
+/// `debug` unseeded and `console_log` boots at `Info`, so without this seed
+/// the Tier-2 gesture leg's count assert and every run_measure.sh window
+/// read the interact family as never-written.
+#[test]
+fn the_rig_seeds_the_key_that_makes_the_frame_lines_loud() {
+    let seeded = format!("\"squallar.{}\": \"1\"", super::FRAME_TELEMETRY_KEY);
+    for (name, text) in [("run_tier2.sh", RUN_TIER2), ("run_measure.sh", RUN_MEASURE)] {
+        assert!(
+            text.contains(&seeded),
+            "{name} no longer seeds {seeded}, so the app writes every frame \
+             line at `debug`, the console ring never hears them, and the \
+             interact count reads as never-written",
+        );
+    }
+}
+
+/// **run_measure.sh arms only scripts this build knows.** The seed key is
+/// [`super::GESTURE_SCRIPT_KEY`]'s `localStorage` spelling, and each name it
+/// seeds must resolve through the player's own vocabulary — a renamed script
+/// on either side would leave a scene silently unarmed, which the rows would
+/// only reveal as a missing gesture window.
+#[test]
+fn the_measure_rig_arms_scripts_this_build_knows() {
+    use squallar_egui::gesture_player::GestureScript;
+
+    let key = format!("\"squallar.{}\": \"", super::GESTURE_SCRIPT_KEY);
+    let mut seeded = Vec::new();
+    for at in RUN_MEASURE
+        .match_indices(&key)
+        .map(|(at, _)| at + key.len())
+    {
+        let rest = &RUN_MEASURE[at..];
+        let end = rest.find('"').expect("the seed value is quoted");
+        seeded.push(&rest[..end]);
+    }
+    assert!(
+        !seeded.is_empty(),
+        "run_measure.sh no longer seeds {key}…, so no scene arms the player \
+         and every row loses its gesture window",
+    );
+    for name in &seeded {
+        assert!(
+            GestureScript::from_name(name).is_some(),
+            "run_measure.sh seeds gesture script {name:?}, which this build \
+             does not know; that scene boots with a disarmed player",
+        );
+    }
 }
 
 /// Only a stored `"1"` makes the frame lines loud — the same one-value

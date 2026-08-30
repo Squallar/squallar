@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # run_tier2.sh -- the Tier-2 browser gate: serve the built squallar-web bundle
-# on a fresh port and drive the full PWA in Chromium and Firefox. Two passes
-# per browser:
+# on a fresh port and drive the full PWA in Chromium and Firefox. THREE
+# passes per browser (the roster grew at WO-5; any report quoting the old
+# "4/4" leg count predates the gesture leg):
 #
 #   live      the app against LIVE network; asserts boot, canvas non-blank,
 #             rAF sane, zero panics/errors, AND the worker wire: >=1
@@ -14,6 +15,14 @@
 #             logs "rasterization worker is a different build", terminates,
 #             and >=1000 ms later (first backoff rung) attaches the REAL
 #             refetched worker (m5), and then the m4 round-trip on top.
+#   gesture   a short leg of REAL input through the driver's W3C /actions
+#             endpoint (pointer drags + wheel notches, ~4 s), asserting
+#             --expect-interaction-frames: the app's own scraped
+#             `frame service (interact)` count STRICTLY INCREASED. A count
+#             assert and nothing else -- no ms figure gates here or anywhere
+#             in this gate. This is WO-1's deferred mechanical non-vacuity
+#             check: driven frames really tag as interaction, end to end
+#             through the browser's input pipeline.
 #
 # Network posture (campaign-resolved): LIVE network, one auto-retry per pass
 # as the flake-quarantine policy -- the app's own backoff machinery is part of
@@ -180,7 +189,13 @@ PY=python3
 # `raster_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_lines_loud`,
 # which reads this file: a renamed key on either side is a build failure rather
 # than a rig leg that reports the overlay path as `null`.
-SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1"}'
+#
+# `squallar.frame_telemetry` is the frame instrument's own switch, seeded for
+# the same reason and pinned the same way
+# (`frame_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_frame_lines_loud`):
+# without it the gesture leg's --expect-interaction-frames reads the interact
+# count as never-written and fails naming the missing seed.
+SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
@@ -325,35 +340,45 @@ if [ ${#EXTRA[@]} -gt 0 ]; then
   echo "drive.py extra args: ${EXTRA[*]}"
 fi
 
-# run_pass <browser> <tag> <doctored 0|1>: one server + one drive.py run.
+# run_pass <browser> <tag> <leg live|doctored|gesture>: one server + one
+# drive.py run.
 run_pass() {
-  local browser="$1" tag="$2" doctored="$3"
+  local browser="$1" tag="$2" leg="$3"
   local driver server_args=() drive_args=()
   case "$browser" in
     chromium) driver="$CHROMEDRIVER" ;;
     firefox)  driver="$GECKODRIVER" ;;
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
-  drive_args+=(--expect-worker-round-trip --expect-timeout "$EXPECT_TIMEOUT")
-  # WS3b: the worker's rayon pool really came up. 2 and not the requested
-  # count -- see wait_rayon_pool in drive.py; the request is
-  # hardwareConcurrency-derived and so is a property of the box, while 2 is
-  # the smallest number that cannot be the fallback.
-  drive_args+=(--expect-rayon-threads "$EXPECT_RAYON_THREADS")
-  # WS3c: the replies really arrived as views into the worker's own
-  # SharedArrayBuffer rather than as copies of it. The negative control is
-  # this same run with serve.py's --coep dropped from SERVE_EXTRA.
-  if [ "$EXPECT_ZERO_COPY" -eq 1 ]; then
-    drive_args+=(--expect-zero-copy-replies)
+  if [ "$leg" = gesture ]; then
+    # The short leg: real W3C-actions input, and ONE assert -- the interact
+    # COUNT grew. None of the worker-wire waits ride here (the live leg owns
+    # them); boot, canvas, rAF and zero-panics still gate inside drive.py.
+    drive_args+=(--expect-interaction-frames
+                 --w3c-gesture pan+wheel --gesture-seconds 4
+                 --settle 3 --data-window 4)
+  else
+    drive_args+=(--expect-worker-round-trip --expect-timeout "$EXPECT_TIMEOUT")
+    # WS3b: the worker's rayon pool really came up. 2 and not the requested
+    # count -- see wait_rayon_pool in drive.py; the request is
+    # hardwareConcurrency-derived and so is a property of the box, while 2 is
+    # the smallest number that cannot be the fallback.
+    drive_args+=(--expect-rayon-threads "$EXPECT_RAYON_THREADS")
+    # WS3c: the replies really arrived as views into the worker's own
+    # SharedArrayBuffer rather than as copies of it. The negative control is
+    # this same run with serve.py's --coep dropped from SERVE_EXTRA.
+    if [ "$EXPECT_ZERO_COPY" -eq 1 ]; then
+      drive_args+=(--expect-zero-copy-replies)
+    fi
+    # WS2: the whole-picture overlay path really ran in this browser. The
+    # negative control is the every-layer-off seed described beside SEED_LS
+    # above -- NOT merely dropping the seeded layer, which the two default-on
+    # texture overlays cover for.
+    if [ "$EXPECT_OVERLAY_RASTERS" -eq 1 ]; then
+      drive_args+=(--expect-overlay-rasters)
+    fi
   fi
-  # WS2: the whole-picture overlay path really ran in this browser. The
-  # negative control is the every-layer-off seed described beside SEED_LS
-  # above -- NOT merely dropping the seeded layer, which the two default-on
-  # texture overlays cover for.
-  if [ "$EXPECT_OVERLAY_RASTERS" -eq 1 ]; then
-    drive_args+=(--expect-overlay-rasters)
-  fi
-  if [ "$doctored" -eq 1 ]; then
+  if [ "$leg" = doctored ]; then
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)
   fi
@@ -372,23 +397,23 @@ run_pass() {
 overall=0
 TAGS=""
 for browser in $BROWSERS; do
-  for leg in live doctored; do
-    if [ "$leg" = doctored ]; then
-      tag="$browser.doctored"; doctored=1
+  for leg in live doctored gesture; do
+    if [ "$leg" = live ]; then
+      tag="$browser"
     else
-      tag="$browser"; doctored=0
+      tag="$browser.$leg"
     fi
     TAGS="$TAGS $tag"
     echo
     echo "================ $tag ================"
-    if run_pass "$browser" "$tag" "$doctored"; then
+    if run_pass "$browser" "$tag" "$leg"; then
       continue
     fi
     # Retry-once quarantine (live-network flake policy): a fresh server, a
     # fresh port, a fresh browser profile. A second failure fails the leg.
     echo "$tag FAILED; one quarantine retry (live-network flake policy)" >&2
     echo "================ $tag (retry) ================"
-    if ! run_pass "$browser" "$tag" "$doctored"; then
+    if ! run_pass "$browser" "$tag" "$leg"; then
       echo "$tag failed twice" >&2
       overall=1
     fi
@@ -416,16 +441,25 @@ for tag in sys.argv[2:]:
     sh = r.get("screenshots") or {}
     wrt = r.get("worker_round_trip")
     dr = r.get("doctored_respawn")
+    ifr = r.get("interaction_frames")
     def tri(x):
         return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
     print("%-18s %s  boot=%s canvas=%sx%s raf[%s] canvas_blank=%s "
-          "errors=%s panics=%s round_trip=%s respawn=%s"
+          "errors=%s panics=%s round_trip=%s respawn=%s interact=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
              v.get("booted"), b.get("clientWidth"), b.get("clientHeight"),
              raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
-             tri(wrt), tri(dr)))
+             tri(wrt), tri(dr), tri(ifr)))
+    if ifr is not None:
+        # The gesture leg's own figure: a COUNT, and the only thing the leg
+        # gates on. The wheel route is named because a synthesized fallback
+        # skipped the browser's input pipeline and the two are not the same
+        # measurement.
+        print("%-18s   interaction frames %s -> %s (wheel via %s)"
+              % ("", ifr.get("before"), ifr.get("after"),
+                 (r.get("w3c_gesture") or {}).get("wheel_source")))
     wg = env.get("webgpu") or {}
     if wg.get("gpu_object") is None and not wg.get("probe_error"):
         webgpu = "-"
