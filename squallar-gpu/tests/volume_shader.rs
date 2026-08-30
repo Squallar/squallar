@@ -6,10 +6,10 @@ use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use squallar_volumetric::raymarch::{
     BINDING_BLIT_SAMPLER, BINDING_BLIT_TEXTURE, BINDING_FLOOR_SAMPLER, BINDING_FLOOR_TEXTURE,
-    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_GROUND_TEXTURE, BINDING_JITTER_TEXTURE,
-    BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE, BINDING_OCCLUDER_TEXTURE, BINDING_UNIFORM,
-    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_GROUND, ENTRY_FS_RAYMARCH, ENTRY_POINTS,
-    ENTRY_VS_BLIT, ENTRY_VS_GROUND, ENTRY_VS_RAYMARCH, GROUND_POSTS, ShaderStage,
+    BINDING_GRID_SAMPLER, BINDING_GRID_TEXTURE, BINDING_GROUND_TEXTURE, BINDING_HEIGHT_TEXTURE,
+    BINDING_JITTER_TEXTURE, BINDING_LUT_SAMPLER, BINDING_LUT_TEXTURE, BINDING_OCCLUDER_TEXTURE,
+    BINDING_UNIFORM, ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, ENTRY_FS_GROUND, ENTRY_FS_RAYMARCH,
+    ENTRY_POINTS, ENTRY_VS_BLIT, ENTRY_VS_GROUND, ENTRY_VS_RAYMARCH, ShaderStage,
     VOLUME_SHADER_WGSL,
 };
 
@@ -49,10 +49,15 @@ const RAYMARCH_LAYOUT: Layout = &[
     (2, BINDING_GROUND_TEXTURE, BindingKind::Texture),
 ];
 
-/// The ground pipeline's, which is group 0 alone — its two stages read the
-/// camera out of the shared uniform block and nothing else. Required as its own
-/// row because `layout_for` **panics** on an entry point it has no layout for,
-/// and appending the occluder to `RAYMARCH_LAYOUT` would not have supplied one.
+/// The ground pipeline's: groups 0, 1 and 3, with a deliberate hole at 2.
+///
+/// Its stages read the camera out of the shared uniform block (0), drape
+/// themselves from the same pane mirror the march's lid arm samples (1), and
+/// stand on the height field (3). Group 2 is where the march reads this pass's
+/// own two attachments back, and one WGSL module cannot spell the same
+/// `@group @binding` pair twice — so the pipeline layout skips it rather than
+/// renumbering. Required as its own row because `layout_for` **panics** on an
+/// entry point it has no layout for.
 const GROUND_LAYOUT: Layout = &[
     (0, BINDING_UNIFORM, BindingKind::UniformBuffer),
     (0, BINDING_GRID_TEXTURE, BindingKind::Texture),
@@ -60,6 +65,9 @@ const GROUND_LAYOUT: Layout = &[
     (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
     (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
     (0, BINDING_JITTER_TEXTURE, BindingKind::Texture),
+    (1, BINDING_FLOOR_TEXTURE, BindingKind::Texture),
+    (1, BINDING_FLOOR_SAMPLER, BindingKind::Sampler),
+    (3, BINDING_HEIGHT_TEXTURE, BindingKind::Texture),
 ];
 
 /// The blit's, whose counters restart at zero — which is the whole reason the
@@ -554,9 +562,14 @@ fn the_order_rule_rejects_every_way_the_clamp_can_slip_past_the_step() {
 /// every pixel of every 3D frame in a browser. Deleting the clamp is
 /// byte-identical on a desktop Vulkan adapter, which is why nothing but this
 /// notices.
-fn group_two_fetches_are_clamped(shader: &str) -> Result<(), String> {
+fn unchecked_fetches_are_clamped(shader: &str) -> Result<(), String> {
     let source = without_comments(shader);
-    for name in ["occluder_at", "ground_colour_at"] {
+    // `ground_height` joined the list at B3. Its coordinate is derived from
+    // `@builtin(vertex_index)` and the texture's own dimensions, so it is in
+    // range by construction — but "by construction" is what every unchecked
+    // fetch in this shader was until it was not, and this one runs in a VERTEX
+    // stage where an undefined fetch moves geometry rather than a pixel.
+    for name in ["occluder_at", "ground_colour_at", "ground_height"] {
         let at = source.find(&format!("fn {name}(")).ok_or_else(|| {
             format!("`{name}` is gone; re-anchor this rule rather than deleting it")
         })?;
@@ -567,7 +580,10 @@ fn group_two_fetches_are_clamped(shader: &str) -> Result<(), String> {
         if !body.contains("textureLoad(") {
             return Err(format!("`{name}` no longer loads a texel at all"));
         }
-        if !body.contains("clamp(") {
+        // `clamp(vec2<i32>(`, not a bare `clamp(`: `ground_height` clamps its
+        // decoded VALUE into the unit cube as well, and a rule that could not
+        // tell the two apart accepted the coordinate clamp's deletion.
+        if !body.contains("clamp(vec2<i32>(") {
             return Err(format!(
                 "`{name}` reaches a texel with no `clamp`. The march calls it \
                  before it knows whether a ground pass ran, and the placeholder \
@@ -599,8 +615,8 @@ fn group_two_fetches_are_clamped(shader: &str) -> Result<(), String> {
 }
 
 #[test]
-fn every_group_two_fetch_is_clamped_into_its_own_texture() {
-    if let Err(why) = group_two_fetches_are_clamped(VOLUME_SHADER_WGSL) {
+fn every_unchecked_fetch_is_clamped_into_its_own_texture() {
+    if let Err(why) = unchecked_fetches_are_clamped(VOLUME_SHADER_WGSL) {
         panic!("{why}");
     }
 }
@@ -609,7 +625,7 @@ fn every_group_two_fetch_is_clamped_into_its_own_texture() {
 #[test]
 fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
     // (name, from, to, must be rejected)
-    let mutants: [(&str, &str, &str, bool); 3] = [
+    let mutants: [(&str, &str, &str, bool); 4] = [
         (
             "the occluder's clamp deleted, which is byte-identical on a desktop \
              adapter and undefined on GLES",
@@ -630,6 +646,13 @@ fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
             "clamp(vec2<i32>(px), vec2<i32>(0, 0), dims - vec2<i32>(1, 1))",
             false,
         ),
+        (
+            "the height field's clamp deleted, in a VERTEX stage where an \
+             undefined fetch moves geometry rather than a pixel",
+            "    let at = clamp(vec2<i32>(post), vec2<i32>(0), dims - vec2<i32>(1));\n    let raw = f32(textureLoad(height_texture, at, 0).r);",
+            "    let raw = f32(textureLoad(height_texture, vec2<i32>(post), 0).r);",
+            true,
+        ),
     ];
 
     for (name, from, to, must_reject) in mutants {
@@ -639,24 +662,34 @@ fn the_clamp_rule_rejects_an_unguarded_texel_fetch() {
              anything — re-anchor it rather than deleting it",
         );
         let mutated = VOLUME_SHADER_WGSL.replacen(from, to, 1);
-        match (group_two_fetches_are_clamped(&mutated), must_reject) {
+        match (unchecked_fetches_are_clamped(&mutated), must_reject) {
             (Err(_), true) | (Ok(()), false) => {}
             (Ok(()), true) => panic!("{name}: the rule accepted an unguarded fetch"),
             (Err(why), false) => panic!("{name}: the rule rejected a correct shader: {why}"),
         }
     }
 }
-/// The ground grid's post count is one number, not two that agree by
-/// inspection: the draw's vertex count is derived from the Rust one.
+/// The ground grid's post count is one number rather than two that agree by
+/// inspection: **the height texture's own size**, read by the shader through
+/// `textureDimensions` and by the draw through `GroundHeights::posts`.
+///
+/// B1 pinned a `const GROUND_POSTS` on both sides. B3 removed the pair rather
+/// than re-pinning it, because a field arrives at whatever size it was fitted
+/// to and a constant would have to be edited to draw it — the mismatch drawing
+/// as terrain shifted sideways rather than as an error.
 #[test]
-fn the_shader_and_the_ground_post_count_agree() {
-    let expected = format!("const GROUND_POSTS: u32 = {GROUND_POSTS}u;");
+fn the_ground_grid_is_laid_out_from_the_height_textures_own_dimensions() {
     assert!(
-        VOLUME_SHADER_WGSL.contains(&expected),
-        "volume.wgsl does not declare `{expected}`, so the grid the vertex \
-         stage lays out and the vertex count the draw issues describe different \
-         meshes — the tail of the grid would simply not be drawn, or the last \
-         row would wrap"
+        VOLUME_SHADER_WGSL.contains("return vec2<u32>(textureDimensions(height_texture));"),
+        "`ground_posts` no longer reads the height texture's own dimensions, so \
+         the grid the vertex stage lays out and the field it samples can \
+         describe different meshes"
+    );
+    assert!(
+        !VOLUME_SHADER_WGSL.contains("const GROUND_POSTS"),
+        "volume.wgsl declares a post-count constant again. Two numbers that \
+         have to agree is exactly what the 1:1 post-to-texel invariant exists \
+         to remove"
     );
 }
 
@@ -955,6 +988,188 @@ fn frame_uniform_arm(shader: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// **A frame holds one ground, and choosing which is frame-uniform.**
+///
+/// The rule over `map_t`, so it can be aimed at a mutant.
+///
+/// B1 shipped `let map_t = select(-1.0, floor_hit(...), volume.flags.w > 0.5);`
+/// and measured what it costs beside a mesh: at every pixel where the ray
+/// crosses `z = 0` inside the unit square but leaves the box without meeting
+/// the mesh, `floor_t` fell back to the lid, and the frame's own `floor_fade`
+/// and arm - both true because a ground pass ran - composited that lid behind
+/// the march at full opacity while the eye was under it. 76, 74 and 33 pixels
+/// at the three below-floor cameras, at alpha above 200.
+///
+/// The fix could not go in the fade or the arm: the honest per-pixel spelling
+/// is `ground_covered(...)`, which `frame_uniform_arm` forbids by name and
+/// forbids for a good reason. So it goes here, on the same two frame-uniform
+/// lanes, at the one place the two grounds are already chosen between.
+///
+/// **This rule runs on the default row, and that is the point.** B3 first
+/// shipped the guard with its only gate an `#[ignore]`d GPU test - so the one
+/// thing in the tree naming the sentinel was that test's own mutation anchor,
+/// on a target the default `cargo test` never executes. Every neighbouring
+/// invariant in this shader has a source rule here for exactly that reason.
+fn one_ground_a_frame(shader: &str) -> Result<(), String> {
+    let source = without_comments(shader);
+    let (expression, _) = sole_binding(&source, "map_t")?;
+    // Whole dotted paths, for the same reason the arm rule uses them: the
+    // per-pixel `occluder_texel.x` is one deleted word from `volume.occluder.x`
+    // and would read as a frame lane to any word-level check.
+    const ALLOWED: [&str; 6] = [
+        "select",
+        "floor_hit",
+        "eye",
+        "direction",
+        "volume.flags.w",
+        "volume.occluder.x",
+    ];
+    for path in paths(expression) {
+        if !ALLOWED.contains(&path.as_str()) {
+            return Err(format!(
+                "the lid is chosen by `{expression}`, which reads `{path}`. \
+                 Which ground a frame holds is a property of the frame; asking \
+                 it of a per-pixel quantity is the same defect the composite's \
+                 arm rule pins one binding below",
+            ));
+        }
+    }
+    if !expression.contains("volume.flags.w") {
+        return Err(format!(
+            "the lid is chosen by `{expression}`, which does not read whether \
+             the pane asked for a map floor at all",
+        ));
+    }
+    if !expression.contains("volume.occluder.x") {
+        return Err(format!(
+            "the lid is chosen by `{expression}`, which does not read whether a \
+             ground pass ran. A frame that draws a mesh has no lid - the mesh \
+             IS the ground - and holding both paints the lid behind the march \
+             at full opacity wherever a ray crosses z = 0 without meeting the \
+             mesh: 76, 74 and 33 pixels at the three below-floor cameras, \
+             measured, at alpha above 200",
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn the_lid_is_never_drawn_beside_a_mesh() {
+    if let Err(why) = one_ground_a_frame(VOLUME_SHADER_WGSL) {
+        panic!("{why}");
+    }
+}
+
+/// **The lid rule's own mutants.** Re-anchor rather than delete.
+#[test]
+fn the_lid_rule_rejects_every_way_the_second_ground_can_come_back() {
+    /// The guard as the shader spells it.
+    const GUARD: &str = "    let map_t = select(\n\
+                         \x20       -1.0,\n\
+                         \x20       floor_hit(eye, direction),\n\
+                         \x20       volume.flags.w > 0.5 && volume.occluder.x <= 0.0,\n\
+                         \x20   );";
+
+    // (name, from, to, must be rejected)
+    let mutants: [(&str, &str, &str, bool); 5] = [
+        (
+            "B1's guard, exactly: the lid drawn beside the mesh",
+            GUARD,
+            "    let map_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);",
+            true,
+        ),
+        (
+            "the sentinel swapped for the per-pixel texel, which is legal WGSL \
+             one word away and makes the whole frame's second ground a \
+             per-pixel decision",
+            GUARD,
+            "    let map_t = select(\n        -1.0,\n        floor_hit(eye, direction),\n        volume.flags.w > 0.5 && occluder_texel.a <= 0.0,\n    );",
+            true,
+        ),
+        (
+            // The exact spelling the review named: per-pixel, and B1's defect
+            // back in a form that reads as a fix.
+            "the per-pixel coverage in place of the frame's own sentinel",
+            GUARD,
+            "    let map_t = select(\n        -1.0,\n        floor_hit(eye, direction),\n        volume.flags.w > 0.5 && !ground_covered(occluder_texel),\n    );",
+            true,
+        ),
+        (
+            "the lid's own flag dropped, so a pane that never asked for a floor \
+             gets one",
+            GUARD,
+            "    let map_t = select(\n        -1.0,\n        floor_hit(eye, direction),\n        volume.occluder.x <= 0.0,\n    );",
+            true,
+        ),
+        (
+            "CONTROL: the two conjuncts swapped, which is the same shader",
+            GUARD,
+            "    let map_t = select(\n        -1.0,\n        floor_hit(eye, direction),\n        volume.occluder.x <= 0.0 && volume.flags.w > 0.5,\n    );",
+            false,
+        ),
+    ];
+
+    for (name, from, to, must_reject) in mutants {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(from),
+            "{name}: the anchor `{from}` is gone, so this mutant is not being \
+             applied to anything - re-anchor it rather than deleting it",
+        );
+        let mutated = VOLUME_SHADER_WGSL.replacen(from, to, 1);
+        match (one_ground_a_frame(&mutated), must_reject) {
+            (Err(_), true) | (Ok(()), false) => {}
+            (Ok(()), true) => panic!("{name}: the rule accepted a frame holding two grounds"),
+            (Err(why), false) => panic!("{name}: the rule rejected a correct shader: {why}"),
+        }
+    }
+}
+
+/// **The mesh drapes itself through the same reprojection the lid does.**
+///
+/// The plan asked for the reprojection in a snippet `include_str!`d into two
+/// shader files so the two could not drift. There is one module here, so the
+/// two entry points call the same function - which is stronger, and this is
+/// what holds it: neither reader may carry arithmetic of its own.
+#[test]
+fn the_lid_and_the_mesh_reproject_through_one_body() {
+    let source = without_comments(VOLUME_SHADER_WGSL);
+    let body = |name: &str| -> String {
+        let at = source.find(&format!("fn {name}(")).unwrap_or_else(|| {
+            panic!("`{name}` is gone; re-anchor this rule rather than deleting it")
+        });
+        let rest = &source[at..];
+        rest[..rest.find("\n}").expect("a closing brace")].to_owned()
+    };
+
+    // Exactly one function does the spherical work, and it is neither reader.
+    for (name, forbidden) in [
+        ("floor_colour", "mercator_y_from_sin"),
+        ("fs_ground", "mercator_y_from_sin"),
+        ("floor_colour", "volume.floor_uv"),
+        ("fs_ground", "volume.floor_uv"),
+    ] {
+        assert!(
+            !body(name).contains(forbidden),
+            "`{name}` reads `{forbidden}` directly, so it carries a \
+             reprojection of its own. Two derivations are two things that can \
+             disagree, and a drape misregistered against the lid is exactly \
+             what having one body prevents",
+        );
+    }
+    for name in ["floor_colour", "fs_ground"] {
+        assert!(
+            body(name).contains("map_colour_at_km("),
+            "`{name}` no longer goes through `map_colour_at_km`",
+        );
+    }
+    // And the mesh samples at its OWN surface point, not at where the ray met
+    // the plane - the two are 3 km apart on a 3 km peak seen at 45 degrees.
+    assert!(
+        body("fs_ground").contains("map_colour_at_km(box_x_km(in.box_p.x), box_y_km(in.box_p.y))"),
+        "the mesh no longer drapes at its own interpolated surface point",
+    );
 }
 
 #[test]

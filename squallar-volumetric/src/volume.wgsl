@@ -8,13 +8,14 @@
 //   * `RAYMARCH_STEP_CEILING` stays `const` so the loop bound folds to a literal.
 //   * One sampler per texture per pipeline; group/binding pairs unique across the
 //     whole module, whether or not one entry point sees both (raymarch 0..4 and 7,
-//     blit 5..6, the ground pass's two outputs read back at group 2);
+//     blit 5..6, the ground pass's two outputs read back at group 2, the height
+//     field the ground pass stands on at group 3);
 //     `textureNumLevels` unreachable on WebGL2, so used nowhere.
 
-// Two `mat4x4<f32>` plus eleven `vec4<f32>`: 128 + 176 = 304 bytes, std140-clean.
+// Two `mat4x4<f32>` plus twelve `vec4<f32>`: 128 + 192 = 320 bytes, std140-clean.
 // Every member is `f32`, including the conceptually-integer (`grid_dims`) and
 // conceptually-bool (`flags`) ones: mixing integer and float members in a std140
-// block is where driver bugs live. `volume_uniform.rs` writes those 304 bytes by
+// block is where driver bugs live. `volume_uniform.rs` writes those 320 bytes by
 // hand and pins every offset; `REQUIRED_UNIFORM_BINDING_SIZE` is 512.
 //
 // **One block, three entry points.** The ground pass reads its camera from this
@@ -74,9 +75,23 @@ struct Volume {
     // read it as that same sentinel — a march clipped against ground has the
     // ground behind it, whichever side of z = 0 the eye is on. y: the ground
     // surface's greatest box z, reserved by B1 for the arm and NOT used by it;
-    // see the arm's own comment for the measurement that ruled it out. z:
-    // amplitude of the analytic stand-in ridge, in box z. w: reserved, zero.
+    // see the arm's own comment for the measurement that ruled it out. zw: the
+    // affine that turns one raw `R16Uint` height sample into box z,
+    // `z = raw * occluder.z + occluder.w`. Composed host-side out of the
+    // field's own quantum and base and the DRAWN box's z range, so the metres
+    // and the kilometres are divided once, in `f64`, where a post's height and
+    // the box it stands in are both in hand.
     occluder: vec4<f32>,
+    // Where the height field's own footprint sits in the drawn box's unit
+    // square: `p.xy = ground_box.xy * uv + ground_box.zw`, with `uv` the post
+    // grid's own 0-1 coordinate. The identity `(1, 1, 0, 0)` is the settled
+    // case — a field built for the box being drawn — and it is a multiply by
+    // one and an add of zero. It is NOT the identity while a field for an
+    // older box is standing in, which is the state that keeps the pane drawn
+    // instead of blank: the mesh is then laid over the box the field actually
+    // covers, which is where its heights are true, rather than stretched over
+    // a box it was never resampled for.
+    ground_box: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> volume: Volume;
@@ -130,6 +145,23 @@ const JITTER_TILE_MASK: i32 = 63;
 // browser leg of this build selects the GL backend.
 @group(2) @binding(0) var occluder_texture: texture_2d<f32>;
 @group(2) @binding(1) var ground_texture: texture_2d<f32>;
+
+// The height field the ground mesh stands on, at **group 3**, read by the
+// ground pass's vertex stage alone.
+//
+// `R16Uint`, and that choice is load-bearing rather than a saving: an integer
+// format is `textureLoad`-only by construction — WGSL has no sampler for one —
+// so the **1:1 post-to-texel invariant** cannot be lost to a filter. One texel
+// is one post of `squallar_elevation::HeightField`, and
+// `textureDimensions(height_texture)` is therefore the post count itself,
+// which is what the grid below lays itself out from. Nothing here has a
+// sampler, no filterability question arises on WebGL2, and a field of a
+// different size needs no constant changed anywhere.
+//
+// Group 3 and not group 1: the mirror at group 1 is frame-wide and shared by
+// every pane, while a height field belongs to one pane's own drawn box. Group
+// 2 is impossible — the ground pass WRITES those two as attachments.
+@group(3) @binding(0) var height_texture: texture_2d<u32>;
 
 // sRGB transfer functions, character-for-character egui's own, `egui-wgpu-0.35.0/src/egui.wgsl:44-57`.
 
@@ -445,36 +477,199 @@ fn unpack24(c: vec3<f32>) -> f32 {
     return dot(round(c * 255.0), vec3<f32>(65536.0, 256.0, 1.0)) * (1.0 / 16777215.0);
 }
 
-// Posts along each axis of the ground grid. `const` for the same naga reason as
-// RAYMARCH_STEP_CEILING, and mirrored by `raymarch::GROUND_POSTS`, which is what
-// the draw's vertex count is computed from — pinned by
-// `the_shader_and_the_ground_post_count_agree`.
-const GROUND_POSTS: u32 = 512u;
+// ---------------------------------------------------------------------------
+// The drape: one reprojection, read by the map lid and by the ground mesh.
+// ---------------------------------------------------------------------------
+//
+// **This body sits above BOTH readers on purpose, and that is the registration
+// argument.** The plan asked for it in a snippet `include_str!`'d into two
+// shader files so that the mesh's colour and the lid's could not drift apart.
+// There is one shader module here, not two, so the sharing is stronger than
+// the plan's: the two entry points call the *same function*, and a divergence
+// is not a stale include, it is impossible to write.
 
-// Width of the analytic stand-in ridge, as a fraction of the box's east-west
-// extent. A Gaussian rather than a cone so the surface has no crease for the
-// occluder's `t` to interpolate across discontinuously.
-const GROUND_RIDGE_SIGMA: f32 = 0.12;
+// `squallar_radar::types::KM_PER_DEGREE_LAT` (`EARTH_RADIUS_KM * pi/180`). WGSL
+// cannot read a Rust constant; `volume_uniform::tests::
+// the_shaders_km_per_degree_is_the_radar_crates_own` pins the literal to it.
+const KM_PER_DEGREE_LAT: f32 = 111.194927;
 
-// The stand-in ground's straight LINEAR RGB, which is what the composite arms
-// expect. Mirrored by `raymarch::GROUND_STAND_IN_COLOUR`. B3 replaces this with
-// the map drape, reprojected by the same body `floor_colour` uses.
-const GROUND_STAND_IN_COLOUR: vec3<f32> = vec3<f32>(0.35, 0.22, 0.10);
+// Web Mercator's y: `ln(tan(pi/4 + phi/2))`, the projection's definition.
+fn mercator_y(lat_rad: f32) -> f32 {
+    return log(tan(0.78539816 + lat_rad * 0.5));
+}
 
-// The stand-in height field: one ridge running north across the box, peaked at
-// its middle, `occluder.z` tall. Zero amplitude is flat ground, which is what
-// registration test (a) reads against a host-side `floor_hit`.
-fn ground_height(uv: vec2<f32>) -> f32 {
-    let d = (uv.x - 0.5) / GROUND_RIDGE_SIGMA;
-    // **Clamped INTO the unit cube, here in the code and not in a test's
-    // precondition.** `t_scale_for`'s bound is the farthest cube CORNER, and
-    // that bound is only sound while every post is inside the cube; the
-    // amplitude arrives in a plain `f32` lane a caller can set to anything.
-    // A post past the cube saturates the packing and decodes SHORT of where it
-    // is, so the march would clip early while the composite painted terrain at
-    // the wrong depth — a failure that looks like a rendering bug and is a
-    // uniform-lane bug.
-    return clamp(volume.occluder.z * exp(-0.5 * d * d), 0.0, 1.0);
+// The same y from `sin phi`, by `ln(tan(pi/4 + phi/2)) == atanh(sin phi)`: the
+// reprojection below produces latitude as a sine, and going through the angle
+// would mean an `asin` undone by a `tan`.
+fn mercator_y_from_sin(sin_lat: f32) -> f32 {
+    return 0.5 * log((1.0 + sin_lat) / (1.0 - sin_lat));
+}
+
+// A box-space x, as kilometres east of the site. `floor_geo.y` is the box's
+// west edge; `box_size_km.x` is its width.
+fn box_x_km(p_x: f32) -> f32 {
+    return volume.floor_geo.y + p_x * volume.box_size_km.x;
+}
+
+// A box-space y, as kilometres north of the site.
+fn box_y_km(p_y: f32) -> f32 {
+    return volume.floor_geo.z + p_y * volume.box_size_km.y;
+}
+
+// The map's colour at a point given in kilometres east and north of the site:
+// STRAIGHT (un-premultiplied) linear RGB with the mirror's own alpha, which is
+// what the composite arms and the ground pass's colour target both expect.
+//
+// It reprojects rather than indexing the mirror directly: the mirror is Web
+// Mercator and the box is a tangent plane in km east/north of the site, so a
+// scale and translate is off by 7.6 km across and 3.7 km down at the corners of
+// the shipped 460 km box (see `VolumeUniform::floor_uv`). `build_voxels` makes
+// the box a site-centred azimuthal-equidistant tangent plane
+// (`range = hypot(x, y)`, `azimuth = atan2(x, y)`), so this is the direct
+// spherical problem from the site,
+// `squallar_radar::beam::great_circle_destination` — where the raster's own
+// gates are painted. An equirectangular approximation differs by ~15 km at the
+// corners, which `volume_drape.rs` measures as landing in the wrong cell of a
+// one-degree checkerboard.
+fn map_colour_at_km(x_km: f32, y_km: f32) -> vec4<f32> {
+    let site_lat_deg = volume.floor_geo.x;
+    let site_lat_rad = radians(site_lat_deg);
+    let sin_phi0 = sin(site_lat_rad);
+    let cos_phi0 = cos(site_lat_rad);
+
+    // The angle this box point subtends at the earth's centre, as
+    // `radians(km / KM_PER_DEGREE_LAT)`, so the radius is never written twice.
+    let range_km = length(vec2<f32>(x_km, y_km));
+    let delta = radians(range_km / KM_PER_DEGREE_LAT);
+    let sd = sin(delta);
+    let cd = cos(delta);
+    // The bearing's sine and cosine without a trig call: `(x, y)/range` is already
+    // `(sin az, cos az)`. Zero at the site, where `sd` is zero too.
+    let inv = select(0.0, 1.0 / range_km, range_km > 0.0);
+    let sin_az = x_km * inv;
+    let cos_az = y_km * inv;
+
+    let sin_lat = clamp(sin_phi0 * cd + cos_phi0 * sd * cos_az, -1.0, 1.0);
+    if abs(sin_lat) > 0.999999 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    let d_lon_deg = degrees(atan2(sin_az * sd * cos_phi0, cd - sin_phi0 * sin_lat));
+    let d_merc = mercator_y_from_sin(sin_lat) - mercator_y(site_lat_rad);
+
+    let uv = vec2<f32>(
+        volume.floor_uv.x + d_lon_deg * volume.floor_uv.z,
+        volume.floor_uv.y + d_merc * volume.floor_uv.w,
+    );
+    // Off the mirror is ground the pane is not showing; clamping would smear its
+    // border across the box.
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    let sample = textureSampleLevel(floor_texture, floor_sampler, uv, 0.0);
+    if sample.a <= 0.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+    // egui premultiplies in GAMMA space, so the un-premultiply must be too, in BOTH
+    // arms. `egui-wgpu-0.35.0/src/egui.wgsl` writes `gamma(C) * A` for a non-sRGB
+    // swapchain and `linear_from_gamma_rgb(gamma(C) * A)` for an sRGB one — an
+    // encoding of an already-premultiplied gamma value. Dividing the linear texel
+    // by `A` returns 0.428 where 1.0 is correct at `C = 1, A = 0.5`.
+    let gamma_premultiplied = select(
+        gamma_from_linear_rgb(sample.rgb),
+        sample.rgb,
+        volume.floor_geo.w > 0.5,
+    );
+    let linear = linear_from_gamma_rgb(gamma_premultiplied / sample.a);
+    return vec4<f32>(linear, sample.a);
+}
+
+// ---------------------------------------------------------------------------
+// The ground pass.
+// ---------------------------------------------------------------------------
+
+// **The post count is the height texture's own size, never a constant.**
+//
+// That is the 1:1 post-to-texel invariant, held by construction rather than by
+// two numbers agreeing: one texel is one post, so the grid the vertex stage
+// lays out cannot be a different grid from the one the field was resampled
+// onto. B1 declared a post count as a module constant here, with a Rust twin
+// beside it; the pair is gone because a field arrives at whatever size
+// `HeightPlan` fitted it to, and the draw's vertex count comes from these same
+// dimensions (`raymarch::ground_vertex_count`).
+fn ground_posts() -> vec2<u32> {
+    return vec2<u32>(textureDimensions(height_texture));
+}
+
+// One post's height, in box z.
+//
+// `raw * occluder.z + occluder.w` — the field's own quantum and base folded
+// with the drawn box's z range host-side, in `f64`, so nothing here divides
+// metres by kilometres.
+//
+// **Clamped INTO the unit cube, here in the code and not in a test's
+// precondition.** `t_scale_for`'s bound is the farthest cube CORNER, and that
+// bound is only sound while every post is inside the cube; the affine arrives
+// in two plain `f32` lanes a caller can set to anything, and a real field
+// genuinely can reach above a box floored to a 100 m step below its minimum.
+// A post past the cube saturates the packing and decodes SHORT of where it is,
+// so the march would clip early while the composite painted terrain at the
+// wrong depth — a failure that looks like a rendering bug and is a uniform-lane
+// bug.
+//
+// The `clamp` on the coordinate is the same rule the group-2 fetches obey:
+// `BoundsCheckPolicy` is `Unchecked` on GLES, so an out-of-range `texelFetch`
+// is undefined, and the placeholder bound when no field has landed is 1x1.
+fn ground_height(post: vec2<u32>) -> f32 {
+    let dims = vec2<i32>(textureDimensions(height_texture));
+    let at = clamp(vec2<i32>(post), vec2<i32>(0), dims - vec2<i32>(1));
+    let raw = f32(textureLoad(height_texture, at, 0).r);
+    return clamp(raw * volume.occluder.z + volume.occluder.w, 0.0, 1.0);
+}
+
+// Which post grid column `column` samples, and where that column sits along its
+// axis in the **DRAWN box's** own unit square.
+//
+// **The grid has `posts + 2` columns for `posts` posts.** The interior ones sit
+// at the post centres the field was measured at — `HeightField` samples at
+// `(i + 0.5) / posts`, the resampler's own `post_center_km` convention, so
+// laying them out at `i / (posts - 1)` would shift them half a post sideways —
+// mapped into the drawn box through `ground_box`. The two outer ones are the rim
+// posts **duplicated** at the box's own edge.
+//
+// Duplicating rather than stretching is the whole point, and B3 got it wrong
+// first. Pulling the rim POST out to the edge leaves the outermost cell 1.5
+// widths wide and interpolating across all of it, so at the rim post's own
+// measured location the mesh reads `h0 + (h1 - h0) / 3` — nowhere flat, and off
+// by a third of the local gradient at the very post whose height it is meant to
+// carry. On a 920 km box at 512 posts that is about 60 m at a 10% grade. A
+// duplicated post is a genuine **nearest** extrapolation: the apron is flat at
+// the rim post's own height, and every interior post keeps the exact position
+// its height was measured at.
+//
+// **It is also what makes the mesh cover the WHOLE drawn box**, which is not a
+// tidiness property — it is what lets the composite suppress the flat lid
+// frame-uniformly. A field placed over a sub-rectangle (`ground_box` not the
+// identity, which is how a field for an older box stands in) would otherwise
+// leave the footprint outside it with no mesh and no lid: volume over nothing,
+// measured at 8 of 11 cameras before this. And it could not be fixed by putting
+// the lid back, because then one frame holds two grounds on opposite sides of
+// the march — the mesh behind it, the lid in front of it from below — and the
+// composite's arm is frame-uniform by rule. One ground a frame is the invariant;
+// the apron is how a partial field keeps it.
+fn box_axis(column: u32, posts: u32, scale: f32, offset: f32) -> f32 {
+    if column == 0u {
+        return 0.0;
+    }
+    if column >= posts + 1u {
+        return 1.0;
+    }
+    return scale * ((f32(column - 1u) + 0.5) / f32(posts)) + offset;
+}
+
+// The post a grid column reads: the rim columns repeat their neighbour's.
+fn post_of_column(column: u32, posts: u32) -> u32 {
+    return clamp(column, 1u, max(posts, 1u)) - 1u;
 }
 
 struct GroundVertex {
@@ -497,19 +692,32 @@ struct GroundVertex {
 // the box the camera was framed against and cannot drift from the volume's.
 @vertex
 fn vs_ground(@builtin(vertex_index) vid: u32) -> GroundVertex {
-    let cells = GROUND_POSTS - 1u;
+    let posts = ground_posts();
+    // One cell more than there are posts on each axis: the apron ring.
+    let cells = posts + vec2<u32>(1u);
     let quad = vid / 6u;
     let corner = vid % 6u;
-    let i = quad % cells;
-    let j = quad / cells;
+    let i = quad % cells.x;
+    let j = quad / cells.x;
     // Two triangles, (0,0)-(1,0)-(0,1) and (0,1)-(1,0)-(1,1). Spelled as
     // comparisons rather than an indexed table: WGSL only lets a non-const index
     // reach an array through a memory view, so a literal table would need a
     // `var` and the initialisation that comes with it every invocation.
     let dx = select(0u, 1u, corner == 1u || corner == 4u || corner == 5u);
     let dy = select(0u, 1u, corner == 2u || corner == 3u || corner == 5u);
-    let uv = vec2<f32>(f32(i + dx), f32(j + dy)) / f32(cells);
-    let p = vec3<f32>(uv.x, uv.y, ground_height(uv));
+    let column = vec2<u32>(i + dx, j + dy);
+    let post = vec2<u32>(
+        post_of_column(column.x, posts.x),
+        post_of_column(column.y, posts.y),
+    );
+    // The field's own footprint placed in the drawn box, the apron carrying it
+    // out to the box's edge. The placement is the identity while the two are
+    // the same box, which is every settled frame.
+    let p = vec3<f32>(
+        box_axis(column.x, posts.x, volume.ground_box.x, volume.ground_box.z),
+        box_axis(column.y, posts.y, volume.ground_box.y, volume.ground_box.w),
+        ground_height(post),
+    );
 
     var out: GroundVertex;
     out.clip_position = volume.clip_from_box * vec4<f32>(p, 1.0);
@@ -530,9 +738,20 @@ fn fs_ground(in: GroundVertex) -> GroundTargets {
     // `t` IS box-space distance from the eye — already the parameterisation the
     // composite consumes.
     let t = length(in.box_p - volume.eye_in_box.xyz);
+    // **The drape, at this fragment's OWN surface point.** Not at where the ray
+    // would have met z = 0, which is a different place on the ground the moment
+    // the surface has any height at all: a 3 km peak seen at 45 degrees puts
+    // the two 3 km apart. `box_x_km`/`box_y_km` are the same two lines
+    // `floor_colour` uses, and `map_colour_at_km` is the same body, so the
+    // mesh's colour is registered to its own geometry by construction.
+    let ground = map_colour_at_km(box_x_km(in.box_p.x), box_y_km(in.box_p.y));
     var out: GroundTargets;
     out.occluder = vec4<f32>(pack24(t / max(volume.occluder.x, 1e-6)), 1.0);
-    out.colour = vec4<f32>(GROUND_STAND_IN_COLOUR, 1.0);
+    // Alpha is the MIRROR's, not 1: off the mirror there is no map to drape
+    // with, and painting an opaque untextured sheet there would be a wall of
+    // flat colour across ground the pane is not showing. It is the same answer
+    // `map_colour_at_km` gives the lid in the same place.
+    out.colour = ground;
     return out;
 }
 
@@ -589,89 +808,18 @@ fn floor_hit(eye: vec3<f32>, direction: vec3<f32>) -> f32 {
     return t;
 }
 
-// `squallar_radar::types::KM_PER_DEGREE_LAT` (`EARTH_RADIUS_KM * pi/180`). WGSL
-// cannot read a Rust constant; `volume_uniform::tests::
-// the_shaders_km_per_degree_is_the_radar_crates_own` pins the literal to it.
-const KM_PER_DEGREE_LAT: f32 = 111.194927;
-
-// Web Mercator's y: `ln(tan(pi/4 + phi/2))`, the projection's definition.
-fn mercator_y(lat_rad: f32) -> f32 {
-    return log(tan(0.78539816 + lat_rad * 0.5));
-}
-
-// The same y from `sin phi`, by `ln(tan(pi/4 + phi/2)) == atanh(sin phi)`: the
-// reprojection below produces latitude as a sine, and going through the angle
-// would mean an `asin` undone by a `tan`.
-fn mercator_y_from_sin(sin_lat: f32) -> f32 {
-    return 0.5 * log((1.0 + sin_lat) / (1.0 - sin_lat));
-}
-
-// The floor's colour where the ray lands: STRAIGHT (un-premultiplied) linear RGB
-// with the mirror's own alpha, which is what the composite arms below expect. It
-// reprojects rather than indexing the mirror directly: the mirror is Web Mercator
-// and the box is a tangent plane in km east/north of the site, so a scale and
-// translate is off by 7.6 km across and 3.7 km down at the corners of the shipped
-// 460 km box (see `VolumeUniform::floor_uv`). `build_voxels` makes the box a
-// site-centred azimuthal-equidistant tangent plane (`range = hypot(x, y)`,
-// `azimuth = atan2(x, y)`), so this is the direct spherical problem from the site,
-// `squallar_radar::beam::great_circle_destination` — where the raster's own gates
-// are painted. An equirectangular approximation differs by ~15 km at the corners.
+// The floor's colour where the ray lands, through the same reprojection the
+// MESH's own fragments drape themselves with — `map_colour_at_km`, one body
+// above, called by both.
+//
+// The two lines below are the whole of what this arm adds: a ray parameter
+// turned into a box point, and that box point turned into kilometres. The mesh
+// does the same from its own interpolated surface position. Neither carries a
+// projection of its own, so there is no second derivation to disagree with the
+// first, and the lid and the terrain cannot be registered differently.
 fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     let hit = eye + direction * t;
-
-    let x_km = volume.floor_geo.y + hit.x * volume.box_size_km.x;
-    let y_km = volume.floor_geo.z + hit.y * volume.box_size_km.y;
-
-    let site_lat_deg = volume.floor_geo.x;
-    let site_lat_rad = radians(site_lat_deg);
-    let sin_phi0 = sin(site_lat_rad);
-    let cos_phi0 = cos(site_lat_rad);
-
-    // The angle this box point subtends at the earth's centre, as
-    // `radians(km / KM_PER_DEGREE_LAT)`, so the radius is never written twice.
-    let range_km = length(vec2<f32>(x_km, y_km));
-    let delta = radians(range_km / KM_PER_DEGREE_LAT);
-    let sd = sin(delta);
-    let cd = cos(delta);
-    // The bearing's sine and cosine without a trig call: `(x, y)/range` is already
-    // `(sin az, cos az)`. Zero at the site, where `sd` is zero too.
-    let inv = select(0.0, 1.0 / range_km, range_km > 0.0);
-    let sin_az = x_km * inv;
-    let cos_az = y_km * inv;
-
-    let sin_lat = clamp(sin_phi0 * cd + cos_phi0 * sd * cos_az, -1.0, 1.0);
-    if abs(sin_lat) > 0.999999 {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-    let d_lon_deg = degrees(atan2(sin_az * sd * cos_phi0, cd - sin_phi0 * sin_lat));
-    let d_merc = mercator_y_from_sin(sin_lat) - mercator_y(site_lat_rad);
-
-    let uv = vec2<f32>(
-        volume.floor_uv.x + d_lon_deg * volume.floor_uv.z,
-        volume.floor_uv.y + d_merc * volume.floor_uv.w,
-    );
-    // Off the mirror is ground the pane is not showing; clamping would smear its
-    // border across the box.
-    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-
-    let sample = textureSampleLevel(floor_texture, floor_sampler, uv, 0.0);
-    if sample.a <= 0.0 {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-    // egui premultiplies in GAMMA space, so the un-premultiply must be too, in BOTH
-    // arms. `egui-wgpu-0.35.0/src/egui.wgsl` writes `gamma(C) * A` for a non-sRGB
-    // swapchain and `linear_from_gamma_rgb(gamma(C) * A)` for an sRGB one — an
-    // encoding of an already-premultiplied gamma value. Dividing the linear texel
-    // by `A` returns 0.428 where 1.0 is correct at `C = 1, A = 0.5`.
-    let gamma_premultiplied = select(
-        gamma_from_linear_rgb(sample.rgb),
-        sample.rgb,
-        volume.floor_geo.w > 0.5,
-    );
-    let linear = linear_from_gamma_rgb(gamma_premultiplied / sample.a);
-    return vec4<f32>(linear, sample.a);
+    return map_colour_at_km(box_x_km(hit.x), box_y_km(hit.y));
 }
 
 // The ground this ray lands on: the MESH's own colour where it drew, and the
@@ -729,9 +877,38 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // The mesh's hit wins over the flat map floor's: it IS the ground wherever
-    // it drew, so there is no double-ground to order.
-    let map_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
+    // **The lid is drawn only by a frame with no mesh in it, and that is a
+    // FRAME-uniform condition, not a per-pixel one.**
+    //
+    // `flags.w` says the pane wants a map floor; `occluder.x` says a ground
+    // pass ran. B1 measured what happens when both are true: at every pixel
+    // where the ray crosses z = 0 inside the unit square but leaves the box
+    // without meeting the mesh — the silhouette's outside edge — `floor_t` fell
+    // back to the lid, and the frame's own `floor_fade` and arm then composited
+    // that lid BEHIND the march at full opacity while the eye was under it.
+    // Misordered and un-faded, which is the defect B2 removed for the mesh,
+    // surviving on the other surface. Probed at the three below-floor cameras:
+    // 76, 74 and 33 pixels painted where the mesh never drew, at alpha > 200.
+    //
+    // B3 closes it here rather than in the fade or the arm. The honest
+    // per-pixel spelling — `ground_covered(...)` in both — is what the
+    // frame-uniform arm rule forbids by name, and it would be forbidden for a
+    // good reason: a fade and an order that vary per pixel are how one frame
+    // came to composite its floor two ways in two pixels. So the choice is
+    // made once, on two frame-uniform lanes, at the one place the two grounds
+    // are already chosen between: **the mesh IS the ground, so a frame that
+    // has one has no lid at all.**
+    //
+    // `volume_bridge` holds `map_floor = false` whenever it turns the ground
+    // pass on, so the pair is honest as well as harmless. This line is what
+    // makes the picture right even if a uniform lies —
+    // `the_lid_is_never_drawn_beside_a_mesh` pins it and its mutant measures
+    // the defect coming back.
+    let map_t = select(
+        -1.0,
+        floor_hit(eye, direction),
+        volume.flags.w > 0.5 && volume.occluder.x <= 0.0,
+    );
     let floor_t = select(map_t, ground_t, ground_t >= 0.0);
 
     // How much of the ground the composite paints — **the lid's dissolve, and
@@ -747,27 +924,14 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // a fade and an order derived from different numbers describe different
     // frames. `the_floor_composites_arm_is_a_property_of_the_frame` pins it.
     //
-    // **A CONSTRAINT ON B3, and it is a real hole the moment the ground pass
-    // ships.** "The lid's alone" is true of every frame this tree can render
-    // and is NOT true in general. `floor_t` falls back to the lid at any pixel
-    // where the ray crosses z = 0 inside the unit square but leaves the box
-    // without meeting the mesh — the silhouette's outside edge, and any
-    // footprint the height field does not cover. In a frame that HAS a ground
-    // pass those pixels get `floor_fade = 1.0` and an arm of `true`, so the lid
-    // composites BEHIND the march at full opacity while the eye is under it:
-    // misordered and un-faded, exactly the defect this unit removed for the
-    // mesh. Probed at the three below-floor cameras: 76, 74 and 33 pixels
-    // painted where the mesh never drew, at alpha > 200.
-    //
-    // It is unreachable today only by accident — `aim_occluder` is test-only
-    // and `volume_bridge`'s `map_floor = floor.is_some()` never coincides with
-    // a ground pass — and every test in `volume_occluder.rs` hardcodes
-    // `map_floor = false`, so nothing would notice. **B3 must either hold
-    // `map_floor = false` whenever the mesh draws, or make the coverage
-    // per-pixel.** The honest per-pixel spelling is `ground_covered(...)` in
-    // both the fade and the arm, which the frame-uniform arm rule forbids by
-    // name — so taking that route means re-deriving that rule with a reason,
-    // not deleting it.
+    // **"The lid's alone" is now true by construction, and B1's constraint on
+    // B3 is discharged above rather than here.** It used to be true only by
+    // accident: `floor_t` fell back to the lid wherever the ray crossed z = 0
+    // without meeting the mesh, and in a frame that had a ground pass those
+    // pixels took a fade of 1 and an arm of `true`. `map_t`'s own guard is what
+    // stops a frame ever holding both surfaces at once, so the only frame that
+    // reaches this line with a lid is a frame with no mesh — and then
+    // `occluder.x` is zero and the dissolve is the one it always was.
     let floor_fade = select(
         clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0),
         1.0,

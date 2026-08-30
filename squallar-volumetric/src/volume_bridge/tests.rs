@@ -1095,7 +1095,7 @@ fn the_ground_pass_is_encoded_before_the_march_it_occludes() {
     let body = &body[..end];
 
     let ground = body
-        .find("pipelines.encode_ground(egui_encoder, target, textures);")
+        .find("pipelines.encode_ground(\n            egui_encoder,")
         .expect(
             "`prepare` no longer records the ground pass into egui's encoder, so \
              a pane with height attachments would draw an occluder nothing reads",
@@ -1153,12 +1153,41 @@ fn the_uniform_takes_the_forward_camera_from_the_view_that_made_the_backward_one
 #[test]
 fn the_fit_and_the_target_agree_about_the_ground_pass() {
     let source = include_str!("../volume_bridge.rs");
+    // **B3 turned this from a constant into a decision, and re-pinned it here
+    // rather than widening it away.** The fit prices the ground pass's three
+    // extra attachments — 16 bytes a pixel against 4 — so it has to be told
+    // whether one runs, and the answer is now whether a height field could be
+    // placed in the box being drawn.
+    let start = source
+        .find("        let fitted = self.quality.fit(")
+        .expect("the offscreen fit is no longer where this test looks for it");
+    let call = &source[start..];
+    let call = &call[..call.find(");").expect("the fit call has no end")];
+    for term in [
+        "frame.size_px",
+        "self.offscreen_bytes",
+        "ground.is_some()",
+        "GroundPass::On",
+        "GroundPass::Off",
+    ] {
+        assert!(
+            call.contains(term),
+            "the offscreen fit no longer names `{term}`. It is what prices the \
+             three extra attachments a ground pass costs, and a fit that \
+             priced the wrong one over-commits every ceiling in `quality.rs` \
+             or leaves a pane's terrain unbudgeted. Call was: {call}",
+        );
+    }
+    // And the decision really is downstream of the box: a fit made before the
+    // drawn box is resolved cannot know whether a field fits in it.
+    let drawn = source
+        .find("let Some(drawn) = DrawnBox::for_lookup(")
+        .expect("the drawn box is no longer resolved in `paint`");
     assert!(
-        source.contains(".fit(frame.size_px, self.offscreen_bytes, GroundPass::Off)"),
-        "the offscreen fit no longer names the ground pass it is pricing. \
-         While no height source exists this is `Off` and the argument is what \
-         says so; when B3 makes it a decision, this is where that decision has \
-         to be re-pinned rather than silently widened",
+        drawn < start,
+        "the offscreen is fitted before the drawn box is resolved, so the \
+         ground pass is priced against a box that is not the one it would be \
+         drawn in",
     );
     assert!(
         source.contains("OffscreenPlan::of(fitted)"),
@@ -1517,4 +1546,188 @@ fn a_hidden_pane_still_marked_a_set_holder_is_named_so_the_mark_goes_too() {
     store.release(1);
     assert!(!store.holds_set(1), "the release did not take the mark");
     assert!(store.hidden_holders(1).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Where a height field stands in the box being drawn: B3's three states.
+// ---------------------------------------------------------------------------
+
+/// The Colorado front range, and the anchor every fixture below shares.
+const ANCHOR: (f64, f64) = (39.0, -106.0);
+
+/// A drawn box of `x_km` by `y_km`, floored at sea level and 18 km tall.
+fn drawn_box(x_km: (f64, f64), y_km: (f64, f64)) -> DrawnBox {
+    DrawnBox {
+        x_km,
+        y_km,
+        z_km_msl: (0.0, 18.0),
+        scale: crate::uniform::IDENTITY_GRID_FROM_BOX.0,
+        offset: crate::uniform::IDENTITY_GRID_FROM_BOX.1,
+        bounded: false,
+    }
+}
+
+/// A field over `x_km` by `y_km`, in the shipped `HeightField` encoding, whose
+/// highest post is `max_m`.
+fn field(
+    x_km: (f64, f64),
+    y_km: (f64, f64),
+    max_m: f64,
+) -> squallar_egui::volume_view::GroundHeightField {
+    squallar_egui::volume_view::GroundHeightField {
+        id: 1,
+        site: ANCHOR,
+        x_km,
+        y_km,
+        posts: [4, 4],
+        samples: std::sync::Arc::new(vec![0u16; 16]),
+        base_m: -500.0,
+        quantum_m: 0.25,
+        range_m: (0.0, max_m),
+    }
+}
+
+/// **State one: the field is for the box being drawn, so the placement is the
+/// identity** — a multiply by one and an add of zero, which is what every
+/// settled frame gets.
+#[test]
+fn a_field_for_the_drawn_box_places_at_the_identity() {
+    let drawn = drawn_box((-460.0, 460.0), (-460.0, 460.0));
+    let placed = GroundPlacement::for_box(
+        &field((-460.0, 460.0), (-460.0, 460.0), 4400.0),
+        &drawn,
+        ANCHOR,
+    )
+    .expect("a field for the box being drawn is placeable");
+    assert_eq!(
+        placed.ground_box,
+        crate::uniform::IDENTITY_GROUND_BOX,
+        "the settled case is not the identity, so every ordinary frame pays an \
+         affine that does nothing and any drift in it moves the terrain",
+    );
+    // 4400 m of 18 km, measured from a box floored at sea level.
+    assert!(
+        (placed.max_z - (4.4 / 18.0)).abs() < 1e-5,
+        "the ceiling lane reads {}, not the field's own highest post in box z",
+        placed.max_z,
+    );
+}
+
+/// **State two: a field for an older, smaller box is drawn over its OWN
+/// footprint**, not stretched over the box that has replaced it.
+///
+/// `DrawnBox::for_target`'s own argument: one pop when the real thing lands
+/// beats a blank pane every volume. Stretching instead would put every height
+/// somewhere it was not measured, which is a wrong picture rather than a stale
+/// one.
+#[test]
+fn a_field_for_an_older_box_is_laid_over_the_footprint_it_covers() {
+    // The pane has zoomed out; the field in hand is the middle quarter.
+    let drawn = drawn_box((-400.0, 400.0), (-400.0, 400.0));
+    let placed =
+        GroundPlacement::for_box(&field((-200.0, 200.0), (0.0, 400.0), 0.0), &drawn, ANCHOR)
+            .expect("a field inside the box being drawn is placeable");
+    let [scale_x, scale_y, offset_x, offset_y] = placed.ground_box;
+    assert!((scale_x - 0.5).abs() < 1e-6, "east-west scale is {scale_x}");
+    assert!(
+        (scale_y - 0.5).abs() < 1e-6,
+        "north-south scale is {scale_y}"
+    );
+    assert!(
+        (offset_x - 0.25).abs() < 1e-6,
+        "east-west offset is {offset_x}"
+    );
+    assert!(
+        (offset_y - 0.5).abs() < 1e-6,
+        "north-south offset is {offset_y}"
+    );
+    // The affine really does land the field's corners where its kilometres
+    // say, which is the property the numbers above are only a spelling of.
+    let at = |uv: f32, scale: f32, offset: f32| scale * uv + offset;
+    assert!((at(0.0, scale_x, offset_x) - 0.25).abs() < 1e-6);
+    assert!((at(1.0, scale_x, offset_x) - 0.75).abs() < 1e-6);
+    assert!((at(0.0, scale_y, offset_y) - 0.5).abs() < 1e-6);
+    assert!((at(1.0, scale_y, offset_y) - 1.0).abs() < 1e-6);
+}
+
+/// **State three: no usable field, and the pane draws today's picture.**
+///
+/// Each refusal is a wrong picture avoided rather than a tidiness rule, and
+/// each is listed on `GroundPlacement::for_box`.
+#[test]
+fn an_unplaceable_field_is_refused_rather_than_drawn_wrong() {
+    let drawn = drawn_box((-400.0, 400.0), (-400.0, 400.0));
+
+    assert_eq!(
+        GroundPlacement::for_box(
+            &field((-500.0, 500.0), (-400.0, 400.0), 0.0),
+            &drawn,
+            ANCHOR
+        ),
+        None,
+        "a field reaching outside the drawn box was placed. Every post would \
+         then not be inside the unit cube, and `t_scale_for`'s bound is the \
+         farthest cube CORNER: a vertex past it saturates the packing and \
+         decodes SHORT of where it is, so the march clips early while the \
+         composite paints terrain at the wrong depth",
+    );
+    assert_eq!(
+        GroundPlacement::for_box(
+            &field((-400.0, 400.0), (-400.0, 400.0), 0.0),
+            &drawn,
+            (40.0, -106.0),
+        ),
+        None,
+        "a field resampled around a different site was placed. Its kilometres \
+         are measured from its own site's tangent plane, so drawing them here \
+         puts the terrain somewhere it is not",
+    );
+    let flat = DrawnBox {
+        z_km_msl: (18.0, 18.0),
+        ..drawn
+    };
+    assert_eq!(
+        GroundPlacement::for_box(&field((-400.0, 400.0), (-400.0, 400.0), 0.0), &flat, ANCHOR),
+        None,
+        "a box with no vertical extent was divided by; the quotient reaches \
+         the GPU as an infinity and the matrix after it as NaN",
+    );
+
+    // The non-triviality half: the very same field IS placeable in a box that
+    // contains it, so these three are refusing the property they name rather
+    // than refusing everything.
+    assert!(
+        GroundPlacement::for_box(
+            &field((-400.0, 400.0), (-400.0, 400.0), 0.0),
+            &drawn,
+            ANCHOR
+        )
+        .is_some(),
+    );
+}
+
+/// A field turns the ground pass on, and nothing else in `paint` does.
+#[test]
+fn the_ground_pass_is_turned_on_by_a_placeable_field_and_by_nothing_else() {
+    let source = include_str!("../volume_bridge.rs");
+    let start = source
+        .find("        let ground = frame")
+        .expect("the placement decision is no longer where this test looks for it");
+    let decision = &source[start..];
+    let decision = &decision[..decision.find(";\n").expect("the decision has no end")];
+    assert!(
+        decision.contains("GroundPlacement::for_box"),
+        "the ground pass is decided by something other than whether a field \
+         can be placed in the box being drawn: {decision}",
+    );
+    // And aiming the occluder is what clears the lid, which is the whole of
+    // B3's answer to the two-grounds fork.
+    assert!(
+        source.contains(
+            "uniform.aim_occluder(ground.max_z, ground.height_scale, ground.height_offset);"
+        ),
+        "`paint` no longer aims the occluder through the blessed setter. It is \
+         what derives the packing scale from THIS uniform's eye and what puts \
+         the flat lid out, and a hand-set pair does neither",
+    );
 }

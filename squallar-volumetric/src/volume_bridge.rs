@@ -652,15 +652,13 @@ impl VolumePainter for BridgeVolumePainter {
             return VolumePaint::Empty(why);
         }
 
-        // No height source exists yet, so no pane asks for the ground pass and
-        // every offscreen is fitted against the colour target alone. B3 turns
-        // this on for a pane whose height field has landed; `fit` is what holds
-        // the four attachments to the one budget when it does.
-        let fitted = self
-            .quality
-            .fit(frame.size_px, self.offscreen_bytes, GroundPass::Off);
         // The box the pane asked for, which is the grid's own whenever the
         // build for it has landed.
+        //
+        // **Resolved BEFORE the fit, and that ordering is B3's.** The ground
+        // pass is what makes an offscreen cost 16 bytes a pixel instead of 4,
+        // and whether it runs is a question about the DRAWN box — so the box
+        // has to be in hand before the budget is spent, not after.
         let Some(drawn) = DrawnBox::for_lookup(&found, &frame.target, &grid) else {
             // A stand-in whose target's box cannot be placed — see
             // `DrawnBox::for_target`. Blank rather than draw a picture over
@@ -671,6 +669,30 @@ impl VolumePainter for BridgeVolumePainter {
             ));
         };
         let box_size_km = drawn.size_km();
+
+        // **The three states this unit owes, and they are decided here.**
+        //
+        // * A field for the box being drawn: the identity placement, and the
+        //   normal case once a scheduler exists.
+        // * A field for an OLDER box while a newer one is in flight: drawn
+        //   over its own footprint, by `DrawnBox::for_target`'s own argument —
+        //   one pop when the real thing lands beats a blank pane every volume.
+        // * No usable field at all: `None`, and the pane draws the flat map
+        //   lid exactly as it always has. That is today's picture, unchanged,
+        //   and it is what every pane gets until the archive is published.
+        let ground = frame
+            .heights
+            .as_ref()
+            .and_then(|field| GroundPlacement::for_box(field, &drawn, grid.anchor()));
+        let fitted = self.quality.fit(
+            frame.size_px,
+            self.offscreen_bytes,
+            if ground.is_some() {
+                GroundPass::On
+            } else {
+                GroundPass::Off
+            },
+        );
         let aspect = fitted.size[0] as f32 / fitted.size[1] as f32;
         let Some(view) = view_for(frame.camera, box_size_km, aspect) else {
             // Reached by a pane collapsed to nothing by a divider drag, and by a
@@ -746,6 +768,19 @@ impl VolumePainter for BridgeVolumePainter {
         });
         uniform.map_floor = floor.is_some();
 
+        // **The mesh IS the ground, so a frame with one has no lid.**
+        // `aim_occluder` is what clears `map_floor`, and it is called after the
+        // line above rather than instead of it so that the mirror's own lanes
+        // are still filled in: the drape samples the same texture the lid
+        // would have, at its own surface point, so a mesh with no mirror
+        // bound would be an untextured sheet. B1 measured what the pair costs
+        // when both are on — 76, 74 and 33 pixels of misordered lid at the
+        // three below-floor cameras — and the shader refuses it independently.
+        if let Some(ground) = ground {
+            uniform.aim_occluder(ground.max_z, ground.height_scale, ground.height_offset);
+            uniform.ground_box = ground.ground_box;
+        }
+
         // What the adaptive mirror rung is chosen from. Recorded only when a
         // floor is actually resolved, so a pane with the floor hidden — or one
         // whose source map has not said where it is — asks for no texels.
@@ -776,6 +811,9 @@ impl VolumePainter for BridgeVolumePainter {
             grid_id: found.id,
             grid,
             floor,
+            // Carried only when a placement resolved, so `prepare` cannot
+            // upload a field the uniform was not aimed at.
+            heights: ground.and(frame.heights.clone()),
             // The Volume Alpha curve rides to `prepare`, which owns the LUT
             // upload — the one seam the curve is applied at.
             alpha: frame.alpha.clone(),
@@ -958,6 +996,92 @@ impl DrawnBox {
     }
 }
 
+/// Where a height field stands in the box a pane is drawing, and how its raw
+/// samples become box `z`.
+///
+/// Resolving one is what turns the ground pass on. `None` means the field
+/// cannot be drawn in this box, and then the pane draws the flat map lid —
+/// today's picture, which is the state every pane is in until an archive is
+/// published.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GroundPlacement {
+    /// `VolumeUniform::ground_box`.
+    ground_box: [f32; 4],
+    /// `VolumeUniform::height_scale`.
+    height_scale: f32,
+    /// `VolumeUniform::height_offset`.
+    height_offset: f32,
+    /// The field's highest post, in box `z`.
+    max_z: f32,
+}
+
+/// How far apart two sites may be and still be called the same one, in
+/// degrees. A field is resampled from one site's own tangent plane, so drawing
+/// it around a different site would put every height in the wrong place; the
+/// tolerance exists only because the anchor makes a `f64` round trip through
+/// the box request, not to admit a neighbouring radar.
+const SAME_SITE_DEG: f64 = 1e-6;
+
+impl GroundPlacement {
+    /// Place `field` in `drawn`, or refuse it.
+    ///
+    /// Three refusals, and each is a picture that would be wrong rather than a
+    /// tidiness rule:
+    ///
+    /// * **A different site.** The field's kilometres are measured from its own
+    ///   site's tangent plane; drawing them around another puts the terrain
+    ///   somewhere it is not.
+    /// * **A footprint reaching outside the drawn box.** Every post would then
+    ///   not be inside the unit cube, and
+    ///   [`VolumeUniform::t_scale_for`](crate::uniform::VolumeUniform::t_scale_for)'s
+    ///   bound is the farthest cube CORNER — a vertex past it saturates the
+    ///   packing and decodes SHORT of where it is, so the march clips early
+    ///   while the composite paints terrain at the wrong depth.
+    /// * **A box with no vertical extent**, which would reach the GPU as an
+    ///   infinity.
+    fn for_box(
+        field: &squallar_egui::volume_view::GroundHeightField,
+        drawn: &DrawnBox,
+        anchor: (f64, f64),
+    ) -> Option<Self> {
+        if (field.site.0 - anchor.0).abs() > SAME_SITE_DEG
+            || (field.site.1 - anchor.1).abs() > SAME_SITE_DEG
+        {
+            return None;
+        }
+        let axis = |field: (f64, f64), box_km: (f64, f64)| -> Option<(f32, f32)> {
+            let span = box_km.1 - box_km.0;
+            if !span.is_finite() || span <= 0.0 {
+                return None;
+            }
+            let scale = (field.1 - field.0) / span;
+            let offset = (field.0 - box_km.0) / span;
+            // Inside the unit square, inclusively, with a hair of slack for the
+            // f64 round trip a box makes through the request.
+            const SLACK: f64 = 1e-9;
+            if scale <= 0.0 || offset < -SLACK || offset + scale > 1.0 + SLACK {
+                return None;
+            }
+            Some((scale as f32, offset as f32))
+        };
+        let (scale_x, offset_x) = axis(field.x_km, drawn.x_km)?;
+        let (scale_y, offset_y) = axis(field.y_km, drawn.y_km)?;
+        let (height_scale, height_offset) = crate::uniform::VolumeUniform::height_affine(
+            field.base_m,
+            field.quantum_m,
+            drawn.z_km_msl,
+        )?;
+        let span_km = drawn.z_km_msl.1 - drawn.z_km_msl.0;
+        let max_z = ((field.range_m.1 / 1000.0 - drawn.z_km_msl.0) / span_km).clamp(0.0, 1.0);
+        Some(Self {
+            ground_box: [scale_x, scale_y, offset_x, offset_y],
+            height_scale,
+            height_offset,
+            max_z: max_z as f32,
+        })
+    }
+}
+
 /// Kilometres across one horizontal cell of `grid`, east–west and north–south
 /// — the resolution the picture on screen really has, which is not the
 /// requested region's while a stand-in is up. `None` for a grid with no cells
@@ -1057,9 +1181,23 @@ pub struct VolumeResources {
     /// The pane mirror: one frame-sized copy of the 2D panes' own render,
     /// shared by every 3D pane.
     mirror: Option<crate::raymarch::PaneMirror>,
+    /// One uploaded height field per pane, keyed by pane and remembering which
+    /// field it holds. Per pane and not per grid: a field belongs to the box a
+    /// pane is drawing, which a stand-in grid does not fix.
+    heights: HashMap<usize, HeldHeights>,
     /// The host memory every grid upload widens its index plane into, held
     /// across uploads instead of allocated inside each one.
     staging: VolumeStaging,
+}
+
+/// One pane's uploaded height field, and which field it is.
+struct HeldHeights {
+    /// [`squallar_egui::volume_view::GroundHeightField::id`] of what is on the
+    /// GPU. A field is 512 KiB and does not change between frames; re-uploading
+    /// one per frame is exactly the kind of cost this repository puts off the
+    /// frame thread, so the id is what says "already there".
+    id: u64,
+    held: crate::raymarch::GroundHeights,
 }
 
 /// One grid's GPU upload, and which Volume Alpha curve its colour table was
@@ -1085,6 +1223,7 @@ impl VolumeResources {
             targets: HashMap::new(),
             uploads: HashMap::new(),
             mirror: None,
+            heights: HashMap::new(),
             // Empty, not pre-sized: the shape is not known until the first
             // upload, and a machine that never opens a 3D pane must pay nothing
             // — the same rule the mirror above follows.
@@ -1095,7 +1234,47 @@ impl VolumeResources {
     /// Free everything `pane_idx` was the only user of.
     pub fn release_pane(&mut self, pane_idx: usize, live_ids: &[u64]) {
         self.targets.remove(&pane_idx);
+        self.heights.remove(&pane_idx);
         self.retain_uploads(live_ids);
+    }
+
+    /// Make `pane_idx`'s height field resident, uploading only when the field
+    /// on the GPU is not the one asked for, and answer whether one is in hand.
+    ///
+    /// A pane that stops asking for terrain gives its field back in the same
+    /// call: `None` drops the entry rather than leaving half a megabyte
+    /// resident behind a pane that turned the floor off.
+    pub fn ensure_pane_heights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pane_idx: usize,
+        field: Option<&squallar_egui::volume_view::GroundHeightField>,
+    ) -> bool {
+        let Some(field) = field else {
+            self.heights.remove(&pane_idx);
+            return false;
+        };
+        if self
+            .heights
+            .get(&pane_idx)
+            .is_some_and(|held| held.id == field.id)
+        {
+            return true;
+        }
+        let Some(held) = self
+            .pipelines
+            .upload_heights(device, queue, field.posts, &field.samples)
+        else {
+            // `upload_heights` has already logged which invariant it refused
+            // on. The pane draws with no ground pass rather than with a field
+            // that is not there.
+            self.heights.remove(&pane_idx);
+            return false;
+        };
+        self.heights
+            .insert(pane_idx, HeldHeights { id: field.id, held });
+        true
     }
 
     /// Keep the uploads `live_ids` names and drop the rest.
@@ -1191,7 +1370,12 @@ impl VolumeResources {
             .values()
             .map(|upload| upload.textures.texture_bytes())
             .sum();
-        offscreens.saturating_add(uploads)
+        let heights: usize = self
+            .heights
+            .values()
+            .map(|held| held.held.texture_bytes())
+            .sum();
+        offscreens.saturating_add(uploads).saturating_add(heights)
     }
 
     /// Give the pane mirror back, for a frame on which nothing wants a floor.
@@ -1248,6 +1432,11 @@ struct VolumeCallback {
     /// a floor and its source map has said where it is. `uniform.map_floor` is
     /// true exactly when this is `Some`.
     floor: Option<FloorSource>,
+    /// The height field this pane's ground mesh stands on, or `None` for a
+    /// pane drawing the flat map lid. `Some` exactly when `paint` aimed the
+    /// occluder, which is what keeps the uniform and the texture describing
+    /// one surface.
+    heights: Option<Arc<squallar_egui::volume_view::GroundHeightField>>,
     /// The Volume Alpha curve the LUT must be uploaded through, or `None` for
     /// the grid's own table, bit-exactly. `prepare` compares this against
     /// what the upload cache holds and rewrites the 1 KiB table only on
@@ -1309,6 +1498,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen) {
             return Vec::new();
         }
+        // Before the borrow below, and unconditional: `None` is how a pane
+        // that stopped asking for terrain gives its field back.
+        let has_heights =
+            resources.ensure_pane_heights(device, queue, self.pane_idx, self.heights.as_deref());
         let shape = self.grid.dims();
         if !resources.ensure_upload(
             device,
@@ -1340,6 +1533,7 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             targets,
             uploads,
             mirror,
+            heights,
             // The upload above is the only reader, and it has already run —
             // including the staging ring's own submit, so nothing here is
             // waiting on a plane that has not been handed to the queue.
@@ -1357,6 +1551,22 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
 
         // The floor.
         let mut uniform = self.uniform;
+        // **A half-succeeded round must not read as a whole one.** `paint`
+        // aimed the occluder against a field it had in hand; if that field
+        // could not be uploaded — a post count past this adapter's texture
+        // ceiling is the realistic way — the mesh will not draw, and a uniform
+        // still claiming a ground pass would leave the pane with no ground at
+        // all: the lid suppressed, the mesh absent, the clip still cutting.
+        // Standing the aim down puts the pane back on exactly today's picture.
+        if uniform.occluder_t_scale > 0.0 && !has_heights {
+            log::warn!(
+                "3D volume view: pane {} has a height field the GPU refused;                  drawing the flat map floor instead",
+                self.pane_idx,
+            );
+            uniform.occluder_t_scale = 0.0;
+            uniform.ground_max_z = 0.0;
+            uniform.map_floor = self.floor.is_some();
+        }
         let floor_texture = match (self.floor.as_ref(), mirror.as_ref()) {
             (Some(source), Some(mirror)) => {
                 let (uv, geo) =
@@ -1381,7 +1591,19 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // attachment-to-sampled barrier between two passes in one encoder. It
         // is a no-op for a target carrying no ground attachments, which is
         // every target until B3 gives a pane a height field.
-        pipelines.encode_ground(egui_encoder, target, textures);
+        // The ground pass takes the SAME mirror the march's own lid arm does,
+        // so the drape and the lid cannot be sampling two pictures — and the
+        // height field, without which it is not encoded at all.
+        pipelines.encode_ground(
+            egui_encoder,
+            target,
+            textures,
+            floor_texture,
+            has_heights
+                .then(|| heights.get(&self.pane_idx))
+                .flatten()
+                .map(|held| &held.held),
+        );
         pipelines.encode_raymarch_with_floor(egui_encoder, target, textures, floor_texture);
 
         Vec::new()

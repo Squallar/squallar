@@ -941,3 +941,12 @@ mod tests;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod height_tests;
+
+/// Archive bytes to real Colorado heights, end to end over a served fixture
+/// archive holding the committed real Terrain-RGB tile. Separate from
+/// [`height_tests`] because it is about the bytes rather than about the URL
+/// override, and so needs no child process.
+#[path = "tiles/real_terrain_tests.rs"]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod real_terrain_tests;

@@ -248,6 +248,7 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
         (1, BINDING_FLOOR_SAMPLER, "floor_sampler"),
         (2, BINDING_OCCLUDER_TEXTURE, "occluder_texture"),
         (2, BINDING_GROUND_TEXTURE, "ground_texture"),
+        (3, BINDING_HEIGHT_TEXTURE, "height_texture"),
     ] {
         let expected = format!("@group({group}) @binding({binding}) var");
         let line = VOLUME_SHADER_WGSL
@@ -262,8 +263,8 @@ fn the_shaders_bindings_are_the_ones_the_layouts_declare() {
 
     let bindings = shader_code().matches("@binding(").count();
     assert_eq!(
-        bindings, 12,
-        "volume.wgsl declares {bindings} bindings; this file names 12, and a \
+        bindings, 13,
+        "volume.wgsl declares {bindings} bindings; this file names 13, and a \
              binding the layouts do not declare fails pipeline creation"
     );
 }
@@ -291,19 +292,30 @@ fn each_sampled_texture_has_exactly_one_sampler() {
     let code = shader_code();
     let textures = code.matches(": texture_").count();
     let samplers = code.matches(": sampler;").count();
+    // Eight textures and four samplers: the height field is the eighth
+    // texture and takes no sampler, because `R16Uint` has none to take — WGSL
+    // declares no sampler for an integer texture at all, which is what holds
+    // the 1:1 post-to-texel invariant by construction.
     assert_eq!(
         (textures, samplers),
-        (7, 4),
+        (8, 4),
         "volume.wgsl declares {textures} textures and {samplers} samplers; \
              naga refuses a texture sampled through two samplers in one entry \
              point"
     );
-    // The three unsampled ones are the jitter tile and the ground pass's two
-    // outputs, and each is unsampled *because* it is loaded: the jitter tile is
-    // indexed by pixel, and the other two are read at a 1:1 texel-to-pixel
-    // invariant, which is what keeps the WebGL2 float-filterability question
-    // from ever arising.
-    for loaded in ["jitter_texture", "occluder_texture", "ground_texture"] {
+    // The four unsampled ones are the jitter tile, the ground pass's two
+    // outputs and the height field, and each is unsampled *because* it is
+    // loaded: the jitter tile is indexed by pixel, the two targets are read at
+    // a 1:1 texel-to-pixel invariant, and the height field at a 1:1
+    // post-to-texel one — which is what keeps the WebGL2 float-filterability
+    // question from ever arising. The height field could not carry a sampler
+    // even if someone wanted it to: `R16Uint` has none in WGSL at all.
+    for loaded in [
+        "jitter_texture",
+        "occluder_texture",
+        "ground_texture",
+        "height_texture",
+    ] {
         assert!(
             code.contains(&format!("textureLoad({loaded}")),
             "nothing loads `{loaded}`; it is one of the textures that carries no sampler, so if \
@@ -313,8 +325,8 @@ fn each_sampled_texture_has_exactly_one_sampler() {
     }
     assert_eq!(
         code.matches("textureLoad(").count(),
-        3,
-        "volume.wgsl has more `textureLoad`s than the three textures bound without a sampler, \
+        4,
+        "volume.wgsl has more `textureLoad`s than the four textures bound without a sampler, \
          so one is either a texture that lost its sampler or a sampled read written as a load",
     );
 }
@@ -1044,7 +1056,8 @@ fn the_packing_floors_to_a_code_across_the_whole_code_space() {
 /// it to 255 on every drawn texel — **8 of the 24 bits gone** — and the GPU
 /// registration oracle moves by too little to notice.
 ///
-/// A text pin, in the style of `the_shader_and_the_ground_post_count_agree`,
+/// A text pin, in the style of
+/// `the_shader_decodes_a_height_sample_through_the_lanes_this_file_writes`,
 /// because the two copies are in two languages and only their source can be
 /// compared. It is deliberately whole lines: a partial match would accept the
 /// mutation that motivated it.
@@ -1126,76 +1139,294 @@ fn the_byte_decode_and_the_float_decode_are_one_function() {
     }
 }
 
-/// **The shader's height field and this file's mirror are one arithmetic,
+/// **The shader's height decode and this file's mirror are one arithmetic,
 /// clamp included.**
 ///
 /// The clamp is not tidiness: [`crate::uniform::VolumeUniform::t_scale_for`]
 /// bounds the packing by the farthest corner of the **unit cube**, and that is
 /// only an upper bound on a post while the field cannot leave the cube. The
-/// amplitude arrives in a plain public lane, so a shader whose copy lost the
-/// clamp would put posts outside, saturate the packing and decode them SHORT —
-/// the march clipping early while the composite paints terrain at the wrong
-/// depth. The host sweep below proves that of the mirror; only this proves the
-/// shader still agrees with it.
+/// affine arrives in two plain public lanes and a real field genuinely can
+/// reach above a box floored 100 m under its minimum, so a shader whose decode
+/// lost the clamp would put posts outside, saturate the packing and decode them
+/// SHORT — the march clipping early while the composite paints terrain at the
+/// wrong depth.
 #[test]
-fn the_shader_and_this_files_ground_height_are_one_arithmetic() {
+fn the_shader_decodes_a_height_sample_through_the_lanes_this_file_writes() {
     for line in [
-        "    let d = (uv.x - 0.5) / GROUND_RIDGE_SIGMA;",
-        "    return clamp(volume.occluder.z * exp(-0.5 * d * d), 0.0, 1.0);",
+        "    let raw = f32(textureLoad(height_texture, at, 0).r);",
+        "    return clamp(raw * volume.occluder.z + volume.occluder.w, 0.0, 1.0);",
     ] {
         assert!(
             VOLUME_SHADER_WGSL.contains(line),
-            "volume.wgsl no longer contains `{line}`. Its height field has \
-             drifted from this file's mirror, so the host oracle predicts a \
-             surface the GPU does not draw — and if it is the clamp that went, \
-             `t_scale_for`'s corner bound has stopped being an upper bound at \
-             all",
+            "volume.wgsl no longer contains `{line}`. Either the decode has \
+             drifted from the two lanes `VolumeUniform::height_affine` composes, \
+             or the clamp has gone — and if it is the clamp, `t_scale_for`'s \
+             corner bound has stopped being an upper bound at all",
         );
     }
-    let sigma = format!("const GROUND_RIDGE_SIGMA: f32 = {GROUND_RIDGE_SIGMA};");
+}
+
+/// **The grid the vertex stage lays out is the height texture's own size.**
+///
+/// That is the 1:1 post-to-texel invariant, and it is held by there being one
+/// number rather than two that agree. B1 had a `const GROUND_POSTS` in both the
+/// shader and this crate and a test pinning the pair; a field arrives at
+/// whatever size it was fitted to, so the pair is gone and what is pinned
+/// instead is that the shader asks the texture.
+#[test]
+fn the_ground_grid_is_laid_out_from_the_height_textures_own_dimensions() {
+    let stage = VOLUME_SHADER_WGSL
+        .split_once("fn vs_ground(")
+        .and_then(|(_, rest)| rest.split_once("\n}").map(|(body, _)| body))
+        .expect("volume.wgsl no longer declares `vs_ground`");
     assert!(
-        VOLUME_SHADER_WGSL.contains(&sigma),
-        "volume.wgsl does not declare `{sigma}`, so the two ridges are \
-         different shapes",
+        stage.contains("let posts = ground_posts();"),
+        "`vs_ground` no longer takes its post count from `ground_posts`, which \
+         is `textureDimensions(height_texture)`. A grid laid out from anything \
+         else is a grid that can differ from the field it samples, and the \
+         mismatch draws as terrain shifted sideways rather than as an error. \
+         Stage was: {stage}",
+    );
+    assert!(
+        VOLUME_SHADER_WGSL.contains("return vec2<u32>(textureDimensions(height_texture));"),
+        "`ground_posts` no longer reads the texture's own dimensions",
+    );
+    assert!(
+        !VOLUME_SHADER_WGSL.contains("const GROUND_POSTS"),
+        "volume.wgsl has a post-count constant again. Two numbers that have to \
+         agree is exactly what the 1:1 invariant exists to remove",
     );
 }
 
-/// The vertex count and the grid the vertex stage lays out are one arithmetic.
+/// The vertex count and the grid the vertex stage lays out are one arithmetic,
+/// at whatever size the field arrived.
 #[test]
 fn the_draw_issues_exactly_the_grids_two_triangles_a_cell() {
-    let cells = GROUND_POSTS - 1;
-    assert_eq!(ground_vertex_count(), 6 * cells * cells);
-    // Every vertex index the draw issues must land inside the grid: the last
-    // one's quad is the last cell, not one past it.
-    let last_quad = (ground_vertex_count() - 1) / 6;
-    assert_eq!(last_quad % cells, cells - 1);
-    assert_eq!(last_quad / cells, cells - 1);
+    // Non-square on purpose: B4 reaches a 66:1 box, and a count derived from
+    // one axis reads correct on every square fixture.
+    for posts in [[2u32, 2], [512, 512], [171, 512], [640, 3]] {
+        // One cell MORE than there are posts on each axis: the apron ring.
+        let cells = [posts[0] + 1, posts[1] + 1];
+        let count = ground_vertex_count(posts).expect("a drawable grid");
+        assert_eq!(count, 6 * cells[0] * cells[1]);
+        // Every vertex index the draw issues must land inside the grid: the
+        // last one's quad is the last cell, not one past it.
+        let last_quad = (count - 1) / 6;
+        assert_eq!(last_quad % cells[0], cells[0] - 1, "posts {posts:?}");
+        assert_eq!(last_quad / cells[0], cells[1] - 1, "posts {posts:?}");
+    }
 }
 
-/// The stand-in height field is a ridge, not a step or a plane.
+/// **A grid that cannot be drawn is refused rather than wrapped.**
+///
+/// `RenderPass::draw` takes a `u32` and the count is `6 * (px + 1) * (py + 1)`,
+/// so a square field past 26754 posts a side overflows it. B3 shipped this
+/// missing: `upload_heights` bounded the posts by `max_texture_dimension_2d`
+/// alone, which is 32768 on a real driver, and `6 * 32769 * 32769` wraps to a
+/// small number - a draw that silently renders a fraction of the mesh.
 #[test]
-fn the_stand_in_ridge_peaks_in_the_middle_and_falls_away_on_both_sides() {
-    let amplitude = 0.25f32;
-    assert_eq!(ground_height([0.5, 0.5], amplitude), amplitude);
-    assert_eq!(ground_height([0.5, 0.5], 0.0), 0.0);
-    let mut previous = 0.0f32;
-    // Offsets either side of the crest, `0.5 ± d` rather than `u` and `1 - u`:
-    // the pair must be exact mirrors in `f32` or the asymmetry measured is the
-    // test's own inputs.
-    for step in (0..=50).rev() {
-        let d = 0.5 * step as f32 / 64.0;
-        let h = ground_height([0.5 - d, 0.5], amplitude);
-        assert!(h >= previous, "the ridge is not monotone up to its crest");
+fn a_grid_too_large_for_a_u32_draw_is_refused() {
+    assert_eq!(
+        ground_vertex_count([MAX_POSTS_PER_AXIS, MAX_POSTS_PER_AXIS]),
+        Some(6 * (MAX_POSTS_PER_AXIS + 1) * (MAX_POSTS_PER_AXIS + 1)),
+        "the declared ceiling is not itself drawable, so it is the wrong ceiling",
+    );
+    assert_eq!(
+        ground_vertex_count([32768, 32768]),
+        None,
+        "a field at `max_texture_dimension_2d` on a real driver was accepted; \
+         its count is 6 * 32769^2, which does not fit a `u32`",
+    );
+    // The non-triviality half: the count really does exceed a `u32`, so the
+    // refusal above is the arithmetic being done wide enough to see it rather
+    // than a bound that happens to reject.
+    let wide = 6u64 * 32769 * 32769;
+    assert!(
+        wide > u64::from(u32::MAX),
+        "32769 posts a side does not overflow a `u32` at all, so this test is \
+         not measuring the thing it names",
+    );
+}
+
+/// **Posts sit where their heights were measured, and the apron ring holds the
+/// rim post's height flat out to the box's edge.**
+///
+/// `HeightField` samples at `(i + 0.5) / posts` - cell centres, the resampler's
+/// own `post_center_km` convention - so `i / (posts - 1)` would move every post
+/// off the fraction its height was measured at, by up to 234 m at the rims of a
+/// 240 km box at 512 posts and by nothing at the centre.
+///
+/// **The apron is a duplicated post, not a stretched one, and B3 shipped the
+/// stretch first.** Pulling post 0 out to the box edge leaves the outermost
+/// cell 1.5 widths wide and interpolating across all of it, so at post 0's own
+/// location the mesh reads `h0 + (h1 - h0) / 3` - off by a third of the local
+/// gradient at the very post whose height it is meant to carry. Duplicating it
+/// gives what a nearest extrapolation gives: flat.
+#[test]
+fn the_grid_is_post_centres_with_a_flat_apron_to_the_box_edge() {
+    const POSTS: u32 = 512;
+    let axis = |column: u32| box_axis(column, POSTS, 1.0, 0.0);
+
+    // The apron columns are the box's own edges.
+    assert_eq!(axis(0), 0.0);
+    assert_eq!(axis(POSTS + 1), 1.0);
+    // And they read the rim posts, so the outer cell is flat.
+    assert_eq!(post_of_column(0, POSTS), 0);
+    assert_eq!(post_of_column(1, POSTS), 0);
+    assert_eq!(post_of_column(POSTS, POSTS), POSTS - 1);
+    assert_eq!(post_of_column(POSTS + 1, POSTS), POSTS - 1);
+
+    // Interior columns are at their post's own centre, exactly.
+    for index in [0u32, 1, 254, 255, 511] {
         assert_eq!(
-            h,
-            ground_height([0.5 + d, 0.5], amplitude),
-            "the ridge is not symmetric about the box's middle at ±{d}"
+            axis(index + 1),
+            post_center_fraction(index, POSTS),
+            "post {index} is not at the fraction its height was measured at",
         );
-        previous = h;
     }
-    // It must actually be near zero at the box's edges, or the "ridge" is a
-    // plateau and the control below would be measuring a lift, not a shape.
-    assert!(ground_height([0.0, 0.5], amplitude) < amplitude * 1e-3);
+
+    // Monotone, so no cell is inverted and no triangle is wound backwards.
+    let mut previous = -1.0f32;
+    for column in 0..=POSTS + 1 {
+        let at = axis(column);
+        assert!(
+            at > previous,
+            "column {column} at {at} does not advance past {previous}",
+        );
+        previous = at;
+    }
+
+    // The non-triviality half, twice over. This is NOT the corner-registered
+    // layout...
+    assert_ne!(
+        post_center_fraction(1, POSTS),
+        1.0 / (POSTS - 1) as f32,
+        "the grid is corner-registered after all, so every post is off the \
+         fraction its height was measured at",
+    );
+    // ...and the apron really is flat rather than a ramp. The stretched
+    // version B3 shipped first reads a third of the way from `h0` to `h1` at
+    // post 0's own location; a duplicated post reads `h0` there and everywhere
+    // outward of it, which is what a nearest extrapolation means.
+    let post = |column: u32| post_of_column(column, POSTS);
+    assert_eq!(
+        post(0),
+        post(1),
+        "the apron column reads a different post from the rim it duplicates, \
+         so the outer cell interpolates a gradient across ground the field has \
+         no data for",
+    );
+    assert_eq!(post(POSTS + 1), post(POSTS));
+
+    // A degenerate field must not divide by zero or wrap.
+    assert_eq!(box_axis(0, 0, 1.0, 0.0), 0.0);
+    assert_eq!(post_of_column(0, 0), 0);
+    assert_eq!(post_center_fraction(0, 0), 0.5);
+}
+
+/// **The placement lane really moves the grid**, in the mirror as in the
+/// shader: a field over a sub-rectangle is laid over that sub-rectangle, with
+/// the apron carrying it to the box's edge.
+#[test]
+fn a_placed_field_covers_its_own_footprint_and_the_apron_covers_the_rest() {
+    const POSTS: u32 = 8;
+    // The middle quarter, which is what a field for an older box looks like
+    // after the pane has zoomed out by two.
+    let axis = |column: u32| box_axis(column, POSTS, 0.5, 0.25);
+
+    assert_eq!(axis(0), 0.0, "the apron does not reach the box's west edge");
+    assert_eq!(
+        axis(POSTS + 1),
+        1.0,
+        "the apron does not reach the box's east edge",
+    );
+    // The first and last posts sit inside the placed footprint, not at the box
+    // edge - which is the whole difference between placing a field and
+    // stretching it.
+    assert_eq!(axis(1), 0.5 * post_center_fraction(0, POSTS) + 0.25);
+    assert_eq!(
+        axis(POSTS),
+        0.5 * post_center_fraction(POSTS - 1, POSTS) + 0.25
+    );
+    assert!(axis(1) > 0.25 && axis(POSTS) < 0.75);
+
+    // The non-triviality half: the identity placement is NOT this, so a shader
+    // that ignored `ground_box` would put every post somewhere else.
+    for column in 1..=POSTS {
+        assert_ne!(
+            axis(column),
+            box_axis(column, POSTS, 1.0, 0.0),
+            "column {column} lands in the same place placed and unplaced, so \
+             this fixture cannot tell a shader that reads the lane from one \
+             that ignores it",
+        );
+    }
+}
+
+/// The shader and this file lay the grid out with one arithmetic.
+#[test]
+fn the_shader_and_this_files_box_axis_are_one_arithmetic() {
+    for line in [
+        "    if column == 0u {\n        return 0.0;\n    }",
+        "    if column >= posts + 1u {\n        return 1.0;\n    }",
+        "    return scale * ((f32(column - 1u) + 0.5) / f32(posts)) + offset;",
+        "    return clamp(column, 1u, max(posts, 1u)) - 1u;",
+    ] {
+        assert!(
+            VOLUME_SHADER_WGSL.contains(line),
+            "volume.wgsl's grid layout no longer contains `{line}`, so the mesh \
+             stands at fractions of the box this file's mirror does not predict",
+        );
+    }
+}
+
+/// **The post-centre convention is the resampler's own, across the crate
+/// boundary.**
+///
+/// The whole grid rests on `HeightField` sampling at `(i + 0.5) / posts`, and
+/// until this test that agreement was **prose only** - `post_center_km` appears
+/// in this half of the tree exactly once, in a doc comment. `squallar-elevation`
+/// is not a dependency of this crate and must not become one (the resample runs
+/// inside the offload worker, which is what that crate exists for), so the pin
+/// is on its source text, through the same
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "/..")` idiom A1 used to pin the
+/// Terrain-RGB constants across a workspace boundary.
+///
+/// A divergence here fails nothing else: the field would be resampled at one
+/// set of locations and drawn at another, half a post apart, and the terrain
+/// would draw perfectly well and simply not line up with the map under it.
+#[test]
+fn the_post_centre_convention_is_the_resamplers_own() {
+    let resample = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../squallar-elevation/src/resample.rs"
+    ));
+    let body = resample
+        .split_once("pub fn post_center_km(")
+        .and_then(|(_, rest)| rest.split_once("\n}").map(|(body, _)| body))
+        .expect(
+            "`squallar_elevation::resample::post_center_km` is gone; re-anchor \
+             this pin on whatever names the post-centre convention now, rather \
+             than deleting it - it is the only thing joining the two halves",
+        );
+    for half in ["(f64::from(i) + 0.5)", "(f64::from(j) + 0.5)"] {
+        assert!(
+            body.contains(half),
+            "the resampler no longer measures a post at `{half} / posts`. This \
+             crate's `post_center_fraction` and the grid built on it would then \
+             put every post half a cell from where its height was measured, and \
+             nothing else in the tree would notice: the terrain would draw, and \
+             it would not line up with the map. Body was:\n{body}",
+        );
+    }
+    // And the mirror on this side really is that fraction, checked numerically
+    // rather than by reading its own source.
+    for (index, posts) in [(0u32, 8u32), (1, 8), (7, 8), (255, 512), (511, 512)] {
+        assert_eq!(
+            post_center_fraction(index, posts),
+            (index as f32 + 0.5) / posts as f32,
+        );
+    }
 }
 
 /// An upload whose shapes disagree is refused, and one that agrees is not.

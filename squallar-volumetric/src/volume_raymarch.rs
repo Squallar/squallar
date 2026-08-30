@@ -137,37 +137,102 @@ pub const GROUND_COLOUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8
 /// depth, which two pin tests scrape for.
 pub const GROUND_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Posts along each axis of the procedural ground grid.
+/// The height field's binding, in **group 3** of the ground pipeline.
 ///
-/// Must equal the shader's own `GROUND_POSTS`, pinned by
-/// `the_shader_and_the_ground_post_count_agree`. Fixed here; B4's level of
-/// detail makes it a rung and re-fits the field to the camera's footprint.
-pub const GROUND_POSTS: u32 = 512;
+/// Group 3 and not group 1: the mirror at group 1 is frame-wide and shared by
+/// every pane, while a height field belongs to one pane's own drawn box, so
+/// binding them together would tie a per-pane texture's lifetime to a
+/// frame-wide bind group. Group 2 is impossible — the ground pass *writes*
+/// those two as attachments. Four groups is exactly what
+/// `downlevel_webgl2_defaults()` guarantees.
+pub const BINDING_HEIGHT_TEXTURE: u32 = 0;
 
-/// The stand-in ground's straight **linear** RGB, mirroring the shader's
-/// `GROUND_STAND_IN_COLOUR`. B3 replaces it with the map drape.
-pub const GROUND_STAND_IN_COLOUR: [f32; 3] = [0.35, 0.22, 0.10];
-
-/// Width of the analytic stand-in ridge, as a fraction of the box's east-west
-/// extent. Mirrors the shader's `GROUND_RIDGE_SIGMA`.
-pub const GROUND_RIDGE_SIGMA: f32 = 0.12;
-
-/// The stand-in height field, in box `z`, mirroring the shader's
-/// `ground_height` so a host oracle can predict what the mesh drew.
+/// The format a height field is uploaded as: one `u16` per post, decoded by
+/// `z = raw * height_scale + height_offset`.
 ///
-/// **Clamped into the unit cube, as the shader's copy is.** See the comment
-/// there: [`VolumeUniform::t_scale_for`]'s corner bound is only sound while
-/// every post is inside the cube, and the amplitude is a plain lane.
-pub fn ground_height(uv: [f32; 2], amplitude: f32) -> f32 {
-    let d = (uv[0] - 0.5) / GROUND_RIDGE_SIGMA;
-    (amplitude * (-0.5 * d * d).exp()).clamp(0.0, 1.0)
+/// **`R16Uint` is `textureLoad`-only by construction** — WGSL has no sampler
+/// for an integer texture — which is exactly what is wanted. One texel is one
+/// post, the **1:1 post-to-texel invariant** cannot be lost to a filter, and
+/// the WebGL2 float-filterability question never arises. Two bytes a post is
+/// also the field's own transport encoding
+/// (`squallar_elevation::HeightField::samples`), so nothing is re-quantised
+/// between the resampler and the GPU.
+pub const HEIGHT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Uint;
+
+/// The most posts an axis of a height field may carry.
+///
+/// **Derived from the draw, not chosen.** The vertex count is
+/// `6 * (px + 1) * (py + 1)` and `RenderPass::draw` takes a `u32`, so a square
+/// field past 26754 posts a side cannot be drawn at all. 8192 is the same
+/// ceiling `squallar_elevation::jobs` refuses a request at — a post every 112 m
+/// over a 920 km box — and it leaves the vertex count at 402 million, three
+/// times inside the `u32`. B3 shipped this check missing: `upload_heights`
+/// admitted anything under `max_texture_dimension_2d`, which is 32768 on a real
+/// driver, and `6 * 32769^2` overflows.
+pub const MAX_POSTS_PER_AXIS: u32 = 8192;
+
+/// Vertices the ground draw issues for a field of `posts` posts a side: two
+/// triangles per cell of a `(px + 1) x (py + 1)` grid, from
+/// `@builtin(vertex_index)` alone.
+///
+/// **One cell more than there are posts on each axis**, because the grid
+/// carries an apron ring: the rim posts duplicated at the drawn box's own edge.
+/// See the shader's `box_axis` for why that is a nearest extrapolation rather
+/// than a stretch, and for why the mesh has to cover the whole box at all.
+///
+/// **Derived from the field's own dimensions, never from a constant.** B1 had a
+/// `GROUND_POSTS` here and a twin in the shader; the pair is gone because the
+/// shader lays its grid out from `textureDimensions(height_texture)`, so the one
+/// number both read is the texture's size.
+///
+/// `None` for a field whose grid cannot be expressed in a `u32` draw — see
+/// [`MAX_POSTS_PER_AXIS`].
+pub fn ground_vertex_count(posts: [u32; 2]) -> Option<u32> {
+    let cells_x = u64::from(posts[0]) + 1;
+    let cells_y = u64::from(posts[1]) + 1;
+    u32::try_from(6 * cells_x * cells_y).ok()
 }
 
-/// Vertices the ground draw issues: two triangles per cell of a
-/// [`GROUND_POSTS`]-square grid, from `@builtin(vertex_index)` alone.
-pub fn ground_vertex_count() -> u32 {
-    let cells = GROUND_POSTS - 1;
-    6 * cells * cells
+/// Which post grid column `column` reads: the rim columns repeat their
+/// neighbour's. The Rust mirror of the shader's `post_of_column`.
+pub fn post_of_column(column: u32, posts: u32) -> u32 {
+    column.clamp(1, posts.max(1)) - 1
+}
+
+/// Where grid column `column` sits along its axis, in the **drawn box's** unit
+/// square, for a field of `posts` posts placed at `(scale, offset)` — the Rust
+/// mirror of the shader's `box_axis`.
+///
+/// Post centres for the interior columns, and the rim posts duplicated at the
+/// box's own edge for the two outer ones. See the shader's copy for why the rim
+/// is duplicated rather than pulled out, and for what the apron is load-bearing
+/// for.
+pub fn box_axis(column: u32, posts: u32, scale: f32, offset: f32) -> f32 {
+    if column == 0 {
+        return 0.0;
+    }
+    // `> posts`, where the shader spells the same test `>= posts + 1u`: WGSL
+    // has no `u32` overflow to worry about at `posts == u32::MAX` and Rust
+    // does, and clippy names the difference. The two are the same predicate.
+    if column > posts {
+        return 1.0;
+    }
+    scale * ((column - 1) as f32 + 0.5) / posts as f32 + offset
+}
+
+/// Where post `index` of `posts` was measured, as a 0-1 fraction of the
+/// **field's own** footprint: `(i + 0.5) / posts`.
+///
+/// The convention `squallar_elevation::resample::post_center_km` samples at,
+/// and the one [`box_axis`]'s interior columns place. Spelled once here so a
+/// fixture that synthesises a field and the grid that draws it cannot disagree
+/// about it, and pinned across the crate boundary by
+/// `the_post_centre_convention_is_the_resamplers_own`.
+pub fn post_center_fraction(index: u32, posts: u32) -> f32 {
+    if posts == 0 {
+        return 0.5;
+    }
+    (index as f32 + 0.5) / posts as f32
 }
 
 /// A 0-1 value across 24 bits of an `Rgba8Unorm`'s RGB, most significant first
@@ -258,6 +323,7 @@ pub struct VolumePipelines {
     volume_layout: wgpu::BindGroupLayout,
     floor_layout: wgpu::BindGroupLayout,
     occluder_layout: wgpu::BindGroupLayout,
+    height_layout: wgpu::BindGroupLayout,
     blit_layout: wgpu::BindGroupLayout,
     quad: wgpu::Buffer,
     grid_sampler: wgpu::Sampler,
@@ -418,6 +484,24 @@ impl VolumePipelines {
             ],
         });
 
+        // One integer texture, no sampler and none possible: WGSL has no
+        // sampler for `texture_2d<u32>`, which is what holds the 1:1
+        // post-to-texel invariant by construction. Visible to the VERTEX stage
+        // — this is the only texture in this crate that is.
+        let height_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&label("height.layout")),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: BINDING_HEIGHT_TEXTURE,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&label("blit.layout")),
             entries: &[
@@ -517,11 +601,21 @@ impl VolumePipelines {
                 ],
                 immediate_size: 0,
             });
-        // Group 0 alone: the ground stages read the uniform and nothing else.
+        // Groups 0, 1 and 3, with a deliberate hole at 2. The ground stages
+        // read the camera out of the shared uniform (0), drape themselves from
+        // the same pane mirror the lid uses (1), and stand on the height field
+        // (3). Group 2 is skipped rather than renumbered because it is where
+        // the march reads this pass's own two attachments back, and one WGSL
+        // module cannot spell the same `@group @binding` pair twice.
         let ground_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&label("ground.pipeline_layout")),
-                bind_group_layouts: &[Some(&volume_layout)],
+                bind_group_layouts: &[
+                    Some(&volume_layout),
+                    Some(&floor_layout),
+                    None,
+                    Some(&height_layout),
+                ],
                 immediate_size: 0,
             });
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -654,6 +748,7 @@ impl VolumePipelines {
             volume_layout,
             floor_layout,
             occluder_layout,
+            height_layout,
             blit_layout,
             quad,
             grid_sampler,
@@ -1015,6 +1110,8 @@ impl VolumePipelines {
         encoder: &mut wgpu::CommandEncoder,
         target: &OffscreenTarget,
         volume: &VolumeTextures,
+        floor: Option<&PaneMirror>,
+        heights: Option<&GroundHeights>,
     ) {
         let Some(ground) = target.ground.as_ref() else {
             return;
@@ -1057,11 +1154,99 @@ impl VolumePipelines {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        // **No field, no mesh — but the pass is still opened.** The clears
+        // above are the point: a target carrying ground attachments that were
+        // never written holds whatever was in them, and the march reads the
+        // alpha channel of one of them on every pixel. Returning before
+        // `begin_render_pass` would make "the upload failed" and "the terrain
+        // is transparent here" indistinguishable at the only place that can
+        // tell them apart.
+        let Some(heights) = heights else {
+            return;
+        };
         pass.set_pipeline(&self.ground);
         pass.set_bind_group(0, &volume.bind_group, &[]);
+        // The same mirror the march's own lid arm samples, bound to the same
+        // group, so the drape and the lid cannot be reading two pictures.
+        pass.set_bind_group(1, &floor.unwrap_or(&self.empty_floor).bind_group, &[]);
+        pass.set_bind_group(3, &heights.bind_group, &[]);
         // No vertex buffer, and none is bound: every position comes from
         // `@builtin(vertex_index)`.
-        pass.draw(0..ground_vertex_count(), 0..1);
+        // Answered rather than unwrapped: this runs on the frame thread, where
+        // on wasm a panic aborts the application. `upload_heights` already
+        // refused a field whose count does not fit, so a `None` here would be
+        // one that reached the GPU another way.
+        let Some(vertices) = ground_vertex_count(heights.posts) else {
+            return;
+        };
+        pass.draw(0..vertices, 0..1);
+    }
+
+    /// Upload a height field as a [`HEIGHT_FORMAT`] texture, one texel a post.
+    ///
+    /// `None` for a field whose `samples` length is not `posts.x * posts.y`,
+    /// whose posts pass [`MAX_POSTS_PER_AXIS`] or the adapter's own
+    /// `max_texture_dimension_2d`, or whose grid would not fit a `u32` draw —
+    /// all answered rather than panicked because this runs on the frame thread,
+    /// where on wasm a panic aborts the application.
+    pub fn upload_heights(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        posts: [u32; 2],
+        samples: &[u16],
+    ) -> Option<GroundHeights> {
+        let expected = (posts[0] as usize).checked_mul(posts[1] as usize)?;
+        if posts[0] < 2 || posts[1] < 2 || expected != samples.len() {
+            log::error!(
+                "3D volume view: refusing a {posts:?} height field carrying {} samples",
+                samples.len(),
+            );
+            return None;
+        }
+        let limit = device
+            .limits()
+            .max_texture_dimension_2d
+            .min(MAX_POSTS_PER_AXIS);
+        if posts[0] > limit || posts[1] > limit {
+            log::error!(
+                "3D volume view: refusing a {posts:?} height field; the ceiling here is {limit}"
+            );
+            return None;
+        }
+        // **Unreachable while `MAX_POSTS_PER_AXIS` holds, and kept anyway.**
+        // `a_grid_too_large_for_a_u32_draw_is_refused` asserts that the ceiling
+        // is itself drawable, so this `?` cannot fire today — deleting it kills
+        // no test, and that is stated rather than left to be discovered. It is
+        // here because the ceiling and the draw's width are two different
+        // facts: raise the one and this refuses, where without it the count
+        // would wrap and the draw would silently render a fraction of the mesh.
+        ground_vertex_count(posts)?;
+        let held = create_height_texture(device, &self.height_layout, posts);
+        // `u16` to bytes with an explicit endianness rather than a transmute of
+        // the slice: the wire encoding this came off is big-endian, the texture
+        // is native-endian, and letting a cast decide which one this is would
+        // be right on x86 and wrong on nothing anybody would notice until it
+        // was not.
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_ne_bytes());
+        }
+        queue.write_texture(
+            held.texture.as_image_copy(),
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(posts[0] * 2),
+                rows_per_image: Some(posts[1]),
+            },
+            wgpu::Extent3d {
+                width: posts[0],
+                height: posts[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        Some(held)
     }
 
     /// Record the raymarch into `target`.
@@ -1395,6 +1580,78 @@ pub fn mirror_is_gamma_encoded(format: wgpu::TextureFormat) -> bool {
     !format.is_srgb()
 }
 
+/// A height field on the GPU: one `R16Uint` texel per post, plus the bind group
+/// the ground pass's vertex stage reads it through at group 3.
+///
+/// **The posts are the texture's own dimensions**, kept here only so the draw
+/// can compute its vertex count without asking the texture; the shader reads
+/// them straight off `textureDimensions`, so the two cannot describe different
+/// grids.
+pub struct GroundHeights {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    posts: [u32; 2],
+}
+
+impl GroundHeights {
+    /// Posts along each axis.
+    pub fn posts(&self) -> [u32; 2] {
+        self.posts
+    }
+
+    /// GPU bytes this field occupies: two per post.
+    pub fn texture_bytes(&self) -> usize {
+        (self.posts[0] as usize).saturating_mul(self.posts[1] as usize) * 2
+    }
+
+    /// The texture itself, for tests that read it back.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+}
+
+/// A [`HEIGHT_FORMAT`] texture of `posts` texels and its bind group, with
+/// nothing written into it. WebGPU zero-initialises, so an un-uploaded field
+/// reads as the encoding's own floor everywhere — which is why the ground pass
+/// is not encoded at all without a real one rather than drawn from this.
+fn create_height_texture(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    posts: [u32; 2],
+) -> GroundHeights {
+    let posts = [posts[0].max(1), posts[1].max(1)];
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&label("height")),
+        size: wgpu::Extent3d {
+            width: posts[0],
+            height: posts[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HEIGHT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&label("height.bind_group")),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: BINDING_HEIGHT_TEXTURE,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+    GroundHeights {
+        texture,
+        bind_group,
+        posts,
+    }
+}
+
 /// A mirror of `size` texels and its bind group. No upload: WebGPU
 /// zero-initialises, so an undrawn mirror is transparent — which reads as "no
 /// ground here", exactly what a floor with no pane behind it should be.
@@ -1493,6 +1750,27 @@ impl VolumeTextures {
             uniform.eye_in_box,
             VolumeUniform::t_scale_for(uniform.eye_in_box),
         );
+        // The second coupled pair, at the same seam - and a `log::error!`
+        // rather than a `debug_assert!`, deliberately. The shader refuses the
+        // two grounds on its own (`map_t`'s guard), so this is not what makes
+        // the picture right; it is what TELLS a caller that built the pair. A
+        // debug assertion would say nothing in release and nothing at all on
+        // the shipped web build, which is where a wiring mistake would
+        // actually reach a user - and it would abort
+        // `the_lid_is_never_painted_where_the_mesh_did_not_draw`, which builds
+        // this exact pair on purpose to prove the shader survives it. That one
+        // is `#[ignore]`d (it needs a real adapter); run it with
+        // `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
+        // The default-row gate on the same guard is
+        // `the_lid_is_never_drawn_beside_a_mesh` in `volume_shader.rs`.
+        if !uniform.ground_is_one_surface() {
+            log::error!(
+                "3D volume view: this uniform asks for the flat map lid and a ground pass at \
+                 once. The mesh IS the ground, so a frame with one has no lid; aim the ground \
+                 pass through `VolumeUniform::aim_occluder`, which puts the lid out as it aims. \
+                 The shader draws the mesh alone regardless",
+            );
+        }
         queue.write_buffer(&self.uniform, 0, &uniform.to_bytes());
     }
 

@@ -115,6 +115,50 @@ pub struct VolumeFrameState {
     /// means). Read only in isosurface mode; the renderer translates it into
     /// index space against the grid's own ramp.
     pub iso_threshold: f32,
+    /// The terrain this pane's ground should be drawn as, or `None` while no
+    /// height field has landed for it — in which case the pane draws the flat
+    /// map floor at box `z = 0`, exactly as it always has.
+    pub heights: Option<Arc<GroundHeightField>>,
+}
+
+/// A resampled height field, as the renderer needs it.
+///
+/// **A plain carrier, not `squallar_elevation::HeightField`**, and the reason
+/// is a dependency rather than a preference: this crate does not declare
+/// `squallar-elevation` and `squallar-volumetric`'s charter forbids it
+/// declaring one (`squallar-volumetric/tests/charter.rs` pins the normal
+/// dependency set by name). The encoding travels **as data** — `base_m` and
+/// `quantum_m` ride here rather than being re-spelled — so there is still
+/// exactly one definition of what a `u16` sample means, and it is the
+/// elevation crate's. Whoever fills this in is where that is asserted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroundHeightField {
+    /// Distinguishes one field from the next on the GPU, where the box's
+    /// `f64` ranges cannot go. Monotonic per producer; equality is what says
+    /// "this is the field already uploaded".
+    pub id: u64,
+    /// The site the box's kilometres are measured from, degrees north and
+    /// east — the same anchor the volume grid carries.
+    pub site: (f64, f64),
+    /// The field's own footprint, kilometres east of the site.
+    pub x_km: (f64, f64),
+    /// The field's own footprint, kilometres north of the site.
+    pub y_km: (f64, f64),
+    /// Posts along each axis. `samples.len()` is their product.
+    pub posts: [u32; 2],
+    /// One `u16` per post, row-major from the south-west post:
+    /// `height_m = base_m + sample * quantum_m`.
+    pub samples: Arc<Vec<u16>>,
+    /// The encoding's zero, metres.
+    pub base_m: f64,
+    /// The encoding's step, metres.
+    pub quantum_m: f64,
+    /// The lowest and highest metres in `samples`, computed **where the field
+    /// was built** rather than per frame: the maximum is what the box's ceiling
+    /// lane wants, and folding a quarter of a million samples on the frame
+    /// thread to find it is exactly the kind of "it runs rarely" this
+    /// repository does not accept.
+    pub range_m: (f64, f64),
 }
 
 /// What the painter answered.

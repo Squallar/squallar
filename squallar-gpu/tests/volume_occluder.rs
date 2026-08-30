@@ -43,13 +43,142 @@ use squallar_egui::pane::OrbitCamera;
 use squallar_egui::volume_view::{VolumeView, view_for};
 use squallar_volumetric::raymarch::staging::VolumeStaging;
 use squallar_volumetric::raymarch::{
-    GROUND_POSTS, GROUND_STAND_IN_COLOUR, OffscreenPlan, VolumePipelines, ground_height,
-    unpack24_bytes,
+    GroundHeights, OffscreenPlan, PaneMirror, VOLUME_SHADER_WGSL, VolumePipelines,
+    post_center_fraction, unpack24_bytes,
 };
 use squallar_volumetric::uniform::VolumeUniform;
 
 mod gpu_harness;
-use gpu_harness::{attachments, device, gpu_lock, opaque_white_lut, read_back};
+use gpu_harness::{
+    MIRROR_FORMAT, attachments, device, gpu_lock, opaque_white_lut, planted_mirror, read_back,
+};
+
+/// Posts a side in the fixture height field.
+///
+/// **Not a production constant.** B3 removed the shader's post-count constant
+/// and its Rust twin: the grid is laid out from
+/// `textureDimensions(height_texture)`, so this is only the size *this file's*
+/// fixture happens to be. 512 is what B1 drew, kept so the discretisation of
+/// the analytic ridge below stays far under every tolerance here — linear
+/// interpolation of a Gaussian of amplitude 0.25 and sigma 0.12 over a post
+/// spacing of 1/512 is under 1e-5 in box z.
+const POSTS: u32 = 512;
+
+/// Width of the fixture ridge, as a fraction of the box's east-west extent.
+///
+/// A Gaussian rather than a cone so the surface has no crease for the
+/// occluder's `t` to interpolate across discontinuously.
+const RIDGE_SIGMA: f32 = 0.12;
+
+/// The fixture height field, in box `z`: one ridge running north across the
+/// box, peaked at its middle. **Clamped into the unit cube**, because
+/// `VolumeUniform::t_scale_for`'s bound is the farthest cube CORNER and is only
+/// an upper bound on a post while every post is inside.
+fn ridge_height(uv: [f32; 2], amplitude: f32) -> f32 {
+    let d = (uv[0] - 0.5) / RIDGE_SIGMA;
+    (amplitude * (-0.5 * d * d).exp()).clamp(0.0, 1.0)
+}
+
+/// The height encoding this file's fixtures use, chosen so that box `z` maps to
+/// a raw sample linearly with no offset: `z = raw / (POSTS_MAX)`.
+///
+/// Real fields arrive at `squallar_elevation`'s `HEIGHT_BASE_M` / 0.25 m
+/// encoding and `VolumeUniform::height_affine` composes the lanes from it; that
+/// composition has its own test. What this file needs is a field whose decoded
+/// box `z` is exactly the analytic ridge to within the encoding's own quantum,
+/// so the host oracle predicts the surface the GPU actually draws.
+const HEIGHT_SCALE: f32 = 1.0 / 65_535.0;
+
+/// The fixture field's samples for a ridge of `amplitude`, one `u16` a post.
+fn ridge_samples(amplitude: f32) -> Vec<u16> {
+    let mut samples = Vec::with_capacity((POSTS * POSTS) as usize);
+    for j in 0..POSTS {
+        for i in 0..POSTS {
+            let uv = [
+                post_center_fraction(i, POSTS),
+                post_center_fraction(j, POSTS),
+            ];
+            let z = ridge_height(uv, amplitude);
+            samples.push((z / HEIGHT_SCALE).round().clamp(0.0, 65_535.0) as u16);
+        }
+    }
+    samples
+}
+
+/// The fixture field on the GPU.
+fn heights(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    amplitude: f32,
+) -> GroundHeights {
+    pipelines
+        .upload_heights(device, queue, [POSTS, POSTS], &ridge_samples(amplitude))
+        .expect("the fixture height field was refused")
+}
+
+/// The mirror byte every texel of this file's drape carries.
+///
+/// **B3 replaced the ground's flat stand-in colour with the map drape**, so
+/// "the mesh's colour" is now whatever the pane mirror holds under the mesh's
+/// own surface point. Every criterion here that reads a colour wants that
+/// colour to be one thing across the whole footprint, so the mirror is painted
+/// flat: what these tests are about is *where* the mesh is and *whether* its
+/// colour survives the march, and `volume_drape.rs` is where the registration
+/// of a varying drape is measured.
+const MIRROR_BYTE: u8 = 180;
+
+/// A mirror painted flat at [`MIRROR_BYTE`], opaque.
+fn flat_mirror(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+) -> PaneMirror {
+    const EDGE: u32 = 64;
+    let rgba: Vec<u8> = std::iter::repeat_n(
+        [MIRROR_BYTE, MIRROR_BYTE, MIRROR_BYTE, 255],
+        (EDGE * EDGE) as usize,
+    )
+    .flatten()
+    .collect();
+    planted_mirror(device, queue, pipelines, [EDGE, EDGE], &rgba)
+}
+
+/// The floor lanes this file's box is drawn with: a site at the equator on the
+/// prime meridian, with the mirror's texture coordinates running slowly enough
+/// that the whole [`BOX_KM`] footprint lands well inside it.
+///
+/// The box is 240 km a side, which is +-1.079 degrees at the equator; at
+/// `0.37` of a mirror per degree that is `u` in roughly 0.1 to 0.9. Nothing
+/// here samples the mirror's border, so the flat paint above is the answer at
+/// every surface point and "off the mirror" — which reads as no ground at all —
+/// cannot be reached by accident.
+fn floor_lanes() -> ([f32; 4], [f32; 4]) {
+    // The box's own half-extents in degrees at the equator, then the rate that
+    // puts its full span across `FOOTPRINT` of the mirror. Derived rather than
+    // written down, so a reader can see where the numbers came from and a
+    // change to `BOX_KM` carries them.
+    const FOOTPRINT: f64 = 0.8;
+    let half_deg = f64::from(BOX_KM[0] / 2.0) / f64::from(gpu_harness::DEGREE_BOX_KM);
+    let half_north_deg = f64::from(BOX_KM[1] / 2.0) / f64::from(gpu_harness::DEGREE_BOX_KM);
+    let u_per_degree = FOOTPRINT / (2.0 * half_deg);
+    // v grows downward through the mirror and Mercator y grows north, so the
+    // rate is negative.
+    let v_per_mercator_y = -FOOTPRINT
+        / (gpu_harness::mercator_y(half_north_deg) - gpu_harness::mercator_y(-half_north_deg));
+    (
+        [0.5, 0.5, u_per_degree as f32, v_per_mercator_y as f32],
+        [
+            0.0,
+            -BOX_KM[0] / 2.0,
+            -BOX_KM[1] / 2.0,
+            // `MIRROR_FORMAT` is `Rgba8Unorm`, which is not sRGB, so the mirror
+            // holds gamma-encoded texels — the lane the shader un-premultiplies
+            // through.
+            if MIRROR_FORMAT.is_srgb() { 0.0 } else { 1.0 },
+        ],
+    )
+}
 
 /// The offscreen every frame here is rendered at. Small enough that the host
 /// oracle's per-pixel ray cast is cheap, large enough that "under one pixel"
@@ -76,55 +205,11 @@ type Camera = (f32, f32, f32, f32);
 /// `z = 0` at about pitch −0.9° and the crest at about −1.6°, so a
 /// positive-pitch fixture certifies one half of one axis and every camera in
 /// B1's set was in the outermost region of three.
-const CAMERAS: [Camera; 11] = [
-    // -- Above the crest. B1's six, unchanged. --
-    // The original fixture: obliquely down from the south-west.
-    (215.0, 28.0, 2.2, 1.0),
-    // The other side, closer, low enough that rays cross the ridge at a slant.
-    (35.0, 12.0, 1.0, 1.0),
-    // Steep and vertically exaggerated — the shipped default look.
-    (140.0, 60.0, 0.8, 3.0),
-    // Grazing: eye z ~ 3.1.
-    (300.0, 8.0, 2.2, 1.0),
-    // Near-overhead, where the ridge's silhouette is at its smallest.
-    (0.0, 85.0, 1.5, 1.0),
-    // Inside the box at the zoom stop, eye z ~ 0.70 — above the crest, but only
-    // just, and with the near plane much closer than anywhere else here.
-    (75.0, 28.0, 0.05, 1.0),
-    // -- Between the crest and the box floor: the eye is UNDER the terrain and
-    // over the plane, which is the region the plan named for B2. The clip is
-    // what makes it work — every accumulated sample is in front of the mesh —
-    // and `the_terrain_composites_behind_volume_standing_in_front_of_it` is
-    // what proves the arm that would "fix" it is the one that breaks it. It is
-    // `#[ignore]`d like everything else here; run it with
-    // `cargo test -p squallar-gpu --test volume_occluder -- --ignored`. --
-    //
-    // Eye z 0.056 against a 0.25 crest: just clear of the plane and deep under
-    // the ridge, which stands more than four times the eye's own height.
-    (300.0, -5.0, 0.6, 1.0),
-    // Eye z 0.204, exaggerated 3x and further off — a hair under the crest
-    // rather than far under it, so the region is sampled at both its edges.
-    (35.0, -6.0, 1.0, 3.0),
-    // Both are close standoffs deliberately. The band is only about 1.6° of
-    // pitch wide at `distance 2.2`, and a level camera that far out sees the
-    // box edge-on: measured, `(215, -1, 2.2, 1)` is in the band and the mesh
-    // covers 220 of 40960 pixels, which is too thin for any criterion here to
-    // be measuring a picture.
-    // -- Under the box floor. B1's three pinned-hole cameras, promoted whole:
-    // `the_ground_is_opaque_from_below_the_box_floor` re-selects exactly these
-    // by `eye.z < 0` rather than repeating them, so the two cannot drift. That
-    // one is `#[ignore]`d like everything else here; run it with
-    // `cargo test -p squallar-gpu --test volume_occluder -- --ignored`. --
-    //
-    // The reviewer's own camera: eye z −5.27.
-    (215.0, -18.0, 2.2, 1.0),
-    // Deeper and from the other side: eye z −11.50.
-    (35.0, -40.0, 2.2, 1.0),
-    // Straight up at the clamp stop, `MAX_PITCH_DEG` all the way over: the mesh
-    // fills the frame, and every one of the 40960 pixels it drew composited to
-    // alpha 0 before B2.
-    (140.0, -89.0, 1.0, 1.0),
-];
+///
+/// The list itself lives in `gpu_harness` because `volume_drape.rs` reads it
+/// too; the region split below is this file's own, because it is a property of
+/// this file's box and ridge.
+const CAMERAS: [Camera; 11] = gpu_harness::ORBIT_CAMERAS;
 
 /// The three cameras of [`CAMERAS`] that put the eye under the box floor,
 /// selected by the property rather than relisted.
@@ -192,24 +277,35 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
     // function of the geometry rather than of a normal.
     uniform.ambient = 1.0;
     uniform.gradient_shading = false;
-    // Held constant across every pair below: with the mirror out of the picture,
-    // the only ground in the frame is the mesh's own.
+    // **The mirror is bound in every frame here, and `map_floor` is on.**
     //
-    // **It is also what hides a defect from every test in this file, and that
-    // is recorded rather than left to be rediscovered.** With `map_floor` on
-    // *and* a ground pass, the pixels where the ray meets z = 0 but never meets
-    // the mesh fall back to the lid, and the composite then paints the lid
-    // behind the march at full coverage from underneath — misordered and
-    // un-faded. Probed at the three below-floor cameras: 76, 74 and 33 such
-    // pixels at alpha > 200. `volume.wgsl`'s `floor_fade` comment carries the
-    // constraint that B3 has to satisfy; a fixture here that turns the mirror
-    // on with the occluder on is what would start measuring it.
-    uniform.map_floor = false;
+    // B1 held the mirror out of the picture and hardcoded `map_floor = false`
+    // in every test in this file, which is what hid the lid-beside-a-mesh
+    // defect from all of them: with both on, the pixels where a ray meets
+    // z = 0 but never meets the mesh fell back to the lid, and the composite
+    // painted it behind the march at full coverage from underneath. 76, 74 and
+    // 33 such pixels at the three below-floor cameras, at alpha above 200.
+    //
+    // The mesh now takes its colour FROM the mirror — B3's drape — so holding
+    // it out is no longer even possible: an unbound mirror is an invisible
+    // terrain. Asking for the lid here and letting `aim_occluder` take it away
+    // again is what makes this file exercise the defect's own configuration
+    // rather than route around it.
+    let (uv, geo) = floor_lanes();
+    uniform.floor_uv = uv;
+    uniform.floor_geo = geo;
+    uniform.map_floor = true;
     if occluder {
         // Through the blessed setter, which derives the scale from THIS
         // uniform's eye — the two are independent lanes and a scale from
-        // another eye mis-clips every ray.
-        uniform.aim_occluder(ridge, ridge);
+        // another eye mis-clips every ray — and which puts the lid out,
+        // because the mesh IS the ground.
+        uniform.aim_occluder(ridge, HEIGHT_SCALE, 0.0);
+        assert!(
+            !uniform.map_floor,
+            "`aim_occluder` left the lid on beside a mesh, which is the pair \
+             B1 measured and B3 closed",
+        );
     } else {
         // The mesh still DRAWS — that is what makes the control below a
         // control — but the march is told no ground pass ran. The ceiling is
@@ -221,7 +317,14 @@ fn uniform(cells: [u32; 3], view: &VolumeView, ridge: f32, occluder: bool) -> Vo
         // through; no such guard has ever existed, and the one that lives there
         // checks the scale against the eye and never looks at the ceiling. If
         // B3 or B4 gives the ceiling a reader, that is the moment to write one.
-        uniform.ground_ridge_amplitude = ridge;
+        //
+        // The decode lanes stay set: the mesh still has to stand at the same
+        // heights, or the control below would be comparing two shapes rather
+        // than two composites. The lid stays on for the same reason it is on
+        // above — this is the frame with no ground pass, which is the only
+        // frame that may have one.
+        uniform.height_scale = HEIGHT_SCALE;
+        uniform.height_offset = 0.0;
         uniform.ground_max_z = 0.0;
         uniform.occluder_t_scale = 0.0;
     }
@@ -259,6 +362,13 @@ struct Frame {
     ground: Vec<[u8; 4]>,
 }
 
+/// One frame, with a height field of `amplitude` under the mesh and the flat
+/// mirror bound for its drape.
+///
+/// The field and the mirror are built per call rather than hoisted: a 512-post
+/// field is half a megabyte and these suites render a few dozen frames, and
+/// building them here is what lets every call site name the amplitude it means
+/// beside the uniform that describes it.
 fn render(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -266,7 +376,10 @@ fn render(
     cells: [u32; 3],
     indices: &[u8],
     uniform: &VolumeUniform,
+    amplitude: f32,
 ) -> Frame {
+    let mirror = flat_mirror(device, queue, pipelines);
+    let field = heights(device, queue, pipelines, amplitude);
     let volume = pipelines
         .upload_volume(
             device,
@@ -294,8 +407,8 @@ fn render(
     );
 
     let mut encoder = device.create_command_encoder(&Default::default());
-    pipelines.encode_ground(&mut encoder, &target, &volume);
-    pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, None);
+    pipelines.encode_ground(&mut encoder, &target, &volume, Some(&mirror), Some(&field));
+    pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&mirror));
     queue.submit(Some(encoder.finish()));
 
     Frame {
@@ -388,7 +501,7 @@ fn along(eye: [f32; 3], direction: [f32; 3], t: f32) -> [f32; 3] {
 fn surface_crossings(eye: [f32; 3], direction: [f32; 3], amplitude: f32) -> Vec<f32> {
     let height_above = |t: f32| {
         let p = along(eye, direction, t);
-        p[2] - ground_height([p[0], p[1]], amplitude)
+        p[2] - ridge_height([p[0], p[1]], amplitude)
     };
     let inside = |t: f32| {
         let p = along(eye, direction, t);
@@ -458,17 +571,19 @@ fn luminance(pixel: [u8; 4]) -> f32 {
     0.2126 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.0722 * f32::from(pixel[2])
 }
 
-/// The ground's straight linear colour as the offscreen must hold it:
-/// gamma-encoded and premultiplied by a coverage of exactly 1.
+/// The drape's colour as the offscreen must hold it: gamma-encoded and
+/// premultiplied by a coverage of exactly 1.
+///
+/// The mirror is painted flat at [`MIRROR_BYTE`] and opaque, so the shader
+/// un-premultiplies by 1, decodes to linear, the composite re-encodes to
+/// gamma and multiplies by a coverage of 1 — which is the mirror's own byte
+/// back again, to within the two 8-bit round trips between. That identity is
+/// asserted rather than assumed by
+/// `the_grounds_own_colour_reaches_the_screen`'s tolerance — which is
+/// `#[ignore]`d like everything else here; run it with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
 fn expected_ground_pixel() -> [u8; 3] {
-    GROUND_STAND_IN_COLOUR.map(|linear| {
-        let gamma = if linear <= 0.003_130_8 {
-            linear * 12.92
-        } else {
-            1.055 * linear.powf(1.0 / 2.4) - 0.055
-        };
-        (gamma * 255.0).round() as u8
-    })
+    [MIRROR_BYTE; 3]
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +614,7 @@ fn the_occluder_decodes_to_the_ray_parameter_the_march_would_solve() {
         // Flat: amplitude zero, so the mesh and `floor_hit` describe one surface.
         let uniform = uniform(cells, &view, 0.0, true);
         let t_scale = uniform.occluder_t_scale;
-        let frame = render(&device, &queue, &pipelines, cells, &indices, &uniform);
+        let frame = render(&device, &queue, &pipelines, cells, &indices, &uniform, 0.0);
 
         let mut gpu_mask = vec![false; (SIZE[0] * SIZE[1]) as usize];
         let mut host_mask = vec![false; (SIZE[0] * SIZE[1]) as usize];
@@ -699,6 +814,7 @@ fn a_ridge_removes_volume_from_every_ray_it_changes_and_adds_none() {
             cells,
             &indices,
             &semi_transparent(0.0),
+            0.0,
         );
         let ridged = render(
             &device,
@@ -707,6 +823,7 @@ fn a_ridge_removes_volume_from_every_ray_it_changes_and_adds_none() {
             cells,
             &indices,
             &semi_transparent(RIDGE_AMPLITUDE),
+            RIDGE_AMPLITUDE,
         );
 
         let mut common = 0usize;
@@ -781,7 +898,7 @@ fn with_the_occluder_off_the_same_ridge_changes_nothing() {
             u.extinction_per_km = 0.15;
             u
         };
-        let flat = render(&device, &queue, &pipelines, cells, &indices, &off(0.0));
+        let flat = render(&device, &queue, &pipelines, cells, &indices, &off(0.0), 0.0);
         let ridged = render(
             &device,
             &queue,
@@ -789,6 +906,7 @@ fn with_the_occluder_off_the_same_ridge_changes_nothing() {
             cells,
             &indices,
             &off(RIDGE_AMPLITUDE),
+            RIDGE_AMPLITUDE,
         );
         assert_eq!(
             flat.offscreen, ridged.offscreen,
@@ -831,9 +949,34 @@ fn the_grounds_own_colour_reaches_the_screen() {
     for camera in CAMERAS {
         let view = view_at(camera);
         let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
-        let dark = uniform(cells, &view, RIDGE_AMPLITUDE, false);
-        let lit = render(&device, &queue, &pipelines, cells, &indices, &lit);
-        let dark = render(&device, &queue, &pipelines, cells, &indices, &dark);
+        let mut dark = uniform(cells, &view, RIDGE_AMPLITUDE, false);
+        // **The control is a frame with NO ground in it at all**, not merely
+        // one whose occluder is off. B3 made the mesh's colour the map drape,
+        // and `uniform` therefore binds the mirror and asks for the lid in
+        // every frame; `aim_occluder` takes the lid away again wherever a mesh
+        // draws. So an occluder-off frame still paints ground — the lid — and
+        // 11299 of its pixels are opaque, measured. Turning the lid off here
+        // as well is what puts the control back on the question it asks:
+        // whether the colour above had to come from the mesh.
+        dark.map_floor = false;
+        let lit = render(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &indices,
+            &lit,
+            RIDGE_AMPLITUDE,
+        );
+        let dark = render(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &indices,
+            &dark,
+            RIDGE_AMPLITUDE,
+        );
 
         // **Inside the silhouette**, which is what the criterion says. The
         // rasteriser's coverage rule and the march's own `slab_entry_exit`
@@ -883,11 +1026,123 @@ fn the_grounds_own_colour_reaches_the_screen() {
         let opaque = dark.offscreen.iter().filter(|p| p[3] > 0).count();
         assert_eq!(
             opaque, 0,
-            "{camera:?}: {opaque} pixels are opaque with the occluder off over \
+            "{camera:?}: {opaque} pixels are opaque with no ground at all over \
              an empty grid, so the colour asserted above did not have to come \
              from the mesh"
         );
     }
+}
+
+/// **A frame holds ONE ground: the lid is never painted where the mesh did not
+/// draw.**
+///
+/// B1 handed this forward in writing, in `volume.wgsl`'s own `floor_fade`
+/// comment. `floor_t` fell back to the flat lid at every pixel where a ray
+/// crossed `z = 0` inside the unit square but left the box without meeting the
+/// mesh — the silhouette's outside edge — and in a frame that HAD a ground pass
+/// those pixels took `floor_fade = 1.0` and an arm of `true`, so the lid
+/// composited behind the march at full opacity while the eye was under it.
+/// B1 probed it at the three below-floor cameras and measured **76, 74 and 33
+/// pixels at alpha above 200**.
+///
+/// **The uniform here is deliberately the pair `aim_occluder` refuses.** The
+/// type will not build it — `aim_occluder` clears `map_floor`, and
+/// `aiming_the_occluder_puts_the_map_lid_out` pins that — so this test puts the
+/// lid back on afterwards, which is the one order that reaches the defect. That
+/// is the point: the shader must be right even when the uniform lies, because
+/// "the caller is careful" is not a property anything can measure.
+///
+/// The non-triviality half is not an argument, it is a second render: the same
+/// scene through B1's own guard, substituted into the WGSL and built through
+/// `from_shader_source`, which must paint lid pixels where the shipped one
+/// paints none.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_lid_is_never_painted_where_the_mesh_did_not_draw() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let attachments = attachments(wgpu::TextureFormat::Rgba8Unorm);
+    let shipped = VolumePipelines::new(&device, attachments);
+    shipped.upload_quad(&queue);
+
+    /// The shipped guard, and B1's, which is the shipped one with the
+    /// ground-pass sentinel deleted.
+    const SHIPPED: &str = "        volume.flags.w > 0.5 && volume.occluder.x <= 0.0,";
+    const B1: &str = "        volume.flags.w > 0.5,";
+    assert_eq!(
+        VOLUME_SHADER_WGSL.matches(SHIPPED).count(),
+        1,
+        "the lid's guard has moved; re-anchor this mutant rather than deleting it",
+    );
+    let regressed = VolumePipelines::from_shader_source(
+        &device,
+        attachments,
+        &VOLUME_SHADER_WGSL.replacen(SHIPPED, B1, 1),
+    );
+    regressed.upload_quad(&queue);
+
+    let (cells, indices) = empty_grid();
+    let mut regressions = 0usize;
+    for camera in CAMERAS {
+        let view = view_at(camera);
+        let mut lying = uniform(cells, &view, RIDGE_AMPLITUDE, true);
+        assert!(
+            !lying.map_floor,
+            "`aim_occluder` no longer clears the lid, so this fixture is not \
+             restoring the pair — it is being handed it",
+        );
+        lying.map_floor = true;
+
+        // Pixels the mesh never covered, in the frame's own occluder alpha —
+        // the same channel `ground_covered` reads, so this is the very set the
+        // composite falls back to the lid on.
+        let count_lid = |frame: &Frame| -> usize {
+            (0..(SIZE[0] * SIZE[1]) as usize)
+                .filter(|&at| frame.ground[at][3] == 0 && frame.offscreen[at][3] > 200)
+                .count()
+        };
+
+        let held = render(
+            &device,
+            &queue,
+            &shipped,
+            cells,
+            &indices,
+            &lying,
+            RIDGE_AMPLITUDE,
+        );
+        assert_eq!(
+            count_lid(&held),
+            0,
+            "{camera:?}: the flat lid painted where the mesh never drew. A \
+             frame holds one ground; the lid composited there is behind the \
+             march at full opacity with the eye under it, which is the defect \
+             B2 removed for the mesh surviving on the other surface",
+        );
+
+        regressions += count_lid(&render(
+            &device,
+            &queue,
+            &regressed,
+            cells,
+            &indices,
+            &lying,
+            RIDGE_AMPLITUDE,
+        ));
+    }
+
+    // **The non-triviality half.** B1's guard has to paint some of those
+    // pixels somewhere in the set, or the assertion above is true of a build
+    // that cannot fail it — and this whole criterion would be a check that
+    // cannot fail.
+    assert!(
+        regressions > 0,
+        "B1's own guard painted no lid pixels at any of the eleven cameras, so \
+         the assertion above is not measuring anything. Either the fixture has \
+         drifted off the configuration that reaches the defect — the lid on \
+         beside an aimed occluder, seen from under the box floor — or the \
+         mutant is no longer the guard it replaces",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -984,7 +1239,7 @@ fn the_ground_is_opaque_from_below_the_box_floor() {
 
         let (cells, indices) = empty_grid();
         let lit = uniform(cells, &view, relief, true);
-        let frame = render(&device, &queue, &pipelines, cells, &indices, &lit);
+        let frame = render(&device, &queue, &pipelines, cells, &indices, &lit, relief);
 
         let drew = (0..(SIZE[0] * SIZE[1]) as usize)
             .filter(|at| frame.ground[*at][3] == 255)
@@ -1110,7 +1365,15 @@ fn the_mesh_walls_the_volume_off_from_below_and_the_lid_does_not() {
     let painted_with_volume = |occluder: bool| {
         let mut aimed = uniform(cells, &view, RIDGE_AMPLITUDE, occluder);
         aimed.extinction_per_km = 0.15;
-        let frame = render(&device, &queue, &pipelines, cells, &indices, &aimed);
+        let frame = render(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &indices,
+            &aimed,
+            RIDGE_AMPLITUDE,
+        );
         let ground_only = expected_ground_pixel();
         let (mut painted, mut carrying) = (0usize, 0usize);
         for pixel in &frame.offscreen {
@@ -1245,8 +1508,24 @@ fn the_terrain_composites_behind_volume_standing_in_front_of_it() {
         let z = view.eye_in_box[2];
         let mut aimed = uniform(cells, &view, RIDGE_AMPLITUDE, true);
         aimed.extinction_per_km = 0.15;
-        let with_shipped = render(&device, &queue, &shipped, cells, &indices, &aimed);
-        let with_crest = render(&device, &queue, &crest, cells, &indices, &aimed);
+        let with_shipped = render(
+            &device,
+            &queue,
+            &shipped,
+            cells,
+            &indices,
+            &aimed,
+            RIDGE_AMPLITUDE,
+        );
+        let with_crest = render(
+            &device,
+            &queue,
+            &crest,
+            cells,
+            &indices,
+            &aimed,
+            RIDGE_AMPLITUDE,
+        );
 
         let ground_mask: Vec<bool> = (0..(SIZE[0] * SIZE[1]) as usize)
             .map(|at| with_shipped.ground[at][3] == 255)
@@ -1326,7 +1605,15 @@ fn the_mesh_stands_at_the_height_the_analytic_field_gives_it() {
         let view = view_at(camera);
         let uniform = uniform(cells, &view, RIDGE_AMPLITUDE, true);
         let t_scale = uniform.occluder_t_scale;
-        let frame = render(&device, &queue, &pipelines, cells, &indices, &uniform);
+        let frame = render(
+            &device,
+            &queue,
+            &pipelines,
+            cells,
+            &indices,
+            &uniform,
+            RIDGE_AMPLITUDE,
+        );
 
         let mut checked = 0usize;
         let mut worst = 0.0f32;
@@ -1339,15 +1626,15 @@ fn the_mesh_stands_at_the_height_the_analytic_field_gives_it() {
                 let texel = frame.occluder[at];
                 let t = unpack24_bytes([texel[0], texel[1], texel[2]]) * t_scale;
                 let p = along(view.eye_in_box, ray(&view, column, row), t);
-                worst = worst.max((p[2] - ground_height([p[0], p[1]], RIDGE_AMPLITUDE)).abs());
+                worst = worst.max((p[2] - ridge_height([p[0], p[1]], RIDGE_AMPLITUDE)).abs());
                 checked += 1;
             }
         }
         assert!(checked > (SIZE[0] * SIZE[1]) as usize / 20);
-        // One cell of the grid is `1 / (GROUND_POSTS - 1)` across, and a chord
+        // One cell of the grid is `1 / (POSTS - 1)` across, and a chord
         // of a Gaussian across one cell departs from it by at most the
         // curvature over that span — orders under the bound at 512 posts.
-        let cell = 1.0 / (GROUND_POSTS - 1) as f32;
+        let cell = 1.0 / (POSTS - 1) as f32;
         eprintln!(
             "ground silhouette {camera:?}: {checked} texels, worst height error \
              {worst:.3e} box units against a {cell:.3e} cell"
@@ -1380,7 +1667,7 @@ fn the_ground_pass_keeps_the_nearest_surface_where_one_hides_another() {
     // Steep in world terms — the box's 20 km stretched by 3 — and looked at
     // from just above the crest, which is what makes one flank hide the other.
     //
-    // **The yaw is load-bearing.** `ground_height` varies in `u` alone, so a
+    // **The yaw is load-bearing.** `ridge_height` varies in `u` alone, so a
     // ray travelling along `v` crosses a constant height and never meets the
     // surface twice however steep it is. Yaw 90 puts the eye due east and the
     // rays across the ridge's profile, which is the only direction in which
@@ -1394,7 +1681,9 @@ fn the_ground_pass_keeps_the_nearest_surface_where_one_hides_another() {
     let (cells, indices) = empty_grid();
     let uniform = uniform(cells, &view, AMPLITUDE, true);
     let t_scale = uniform.occluder_t_scale;
-    let frame = render(&device, &queue, &pipelines, cells, &indices, &uniform);
+    let frame = render(
+        &device, &queue, &pipelines, cells, &indices, &uniform, AMPLITUDE,
+    );
 
     let mut hidden = 0usize;
     let mut wrong = Vec::new();

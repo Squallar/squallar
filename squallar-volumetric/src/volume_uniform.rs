@@ -2,13 +2,16 @@
 
 use squallar_device_profile::constants::VOLUME_LUT_BYTES;
 
-/// Bytes in the uniform block. Two `mat4x4<f32>` + eleven `vec4<f32>`.
+/// Bytes in the uniform block. Two `mat4x4<f32>` + twelve `vec4<f32>`.
 ///
 /// **Append-only.** The ground pass shares this one block with the raymarch
 /// rather than carrying its own, which is what makes it structurally
 /// impossible for the mesh and the march to disagree about the camera. Growing
-/// it at the end is what keeps every `OFFSET_*` below where it already was.
-pub const VOLUME_UNIFORM_BYTES: usize = 304;
+/// it at the end is what keeps every `OFFSET_*` below where it already was —
+/// B1 grew it 224 to 304 for `clip_from_box` and the occluder, B3 grew it 304
+/// to 320 for [`OFFSET_GROUND_BOX`], and neither moved anything before it.
+/// `REQUIRED_UNIFORM_BINDING_SIZE` is 512 and did not have to move either.
+pub const VOLUME_UNIFORM_BYTES: usize = 320;
 
 /// `f32` lanes in the uniform block.
 pub const VOLUME_UNIFORM_LANES: usize = VOLUME_UNIFORM_BYTES / 4;
@@ -28,6 +31,7 @@ pub const OFFSET_GRID_FROM_BOX_A: usize = 192;
 pub const OFFSET_GRID_FROM_BOX_B: usize = 208;
 pub const OFFSET_CLIP_FROM_BOX: usize = 224;
 pub const OFFSET_OCCLUDER: usize = 288;
+pub const OFFSET_GROUND_BOX: usize = 304;
 
 /// Extinction per kilometre at a palette entry whose alpha is 1.
 pub const DEFAULT_EXTINCTION_PER_KM: f32 = 1.0;
@@ -156,12 +160,29 @@ pub struct VolumeUniform {
     /// flip the frame's composite on the terrain's content. The arm reads
     /// [`Self::occluder_t_scale`] as its sentinel instead. Rides `occluder.y`.
     pub ground_max_z: f32,
-    /// Amplitude of the analytic stand-in ridge, in box `z`, or zero for flat
-    /// ground. B3 replaces it with a sampled height field; until then it is
-    /// what gives the first increment real heights to occlude with, which the
-    /// plan requires — a flat ground drawn as geometry provably clips nothing.
-    /// Rides `occluder.z`.
-    pub ground_ridge_amplitude: f32,
+    /// One raw `R16Uint` height sample turned into box `z`:
+    /// `z = raw * height_scale + height_offset`. Rides `occluder.z`.
+    ///
+    /// Composed by [`Self::height_affine`] out of the field's own quantum and
+    /// base and the drawn box's z range, in `f64`, so metres are divided by
+    /// kilometres once and on the host. The shader clamps the result into the
+    /// unit cube, which is what keeps [`Self::t_scale_for`]'s corner bound
+    /// sound against a field whose peaks reach above the box.
+    pub height_scale: f32,
+    /// See [`Self::height_scale`]. Rides `occluder.w`.
+    pub height_offset: f32,
+    /// Where the height field's own footprint sits in the drawn box's unit
+    /// square: `(scale_x, scale_y, offset_x, offset_y)`, applied as
+    /// `p.xy = scale * uv + offset`.
+    ///
+    /// [`IDENTITY_GROUND_BOX`] is the settled case — a field resampled for the
+    /// box being drawn — and it is a multiply by one and an add of zero. It is
+    /// not the identity while a field built for an older box stands in, which
+    /// is what keeps a pane drawn rather than blank while a newer field is in
+    /// flight: the mesh is laid over the box the field actually covers, where
+    /// its heights are true, instead of being stretched over a box it was
+    /// never resampled for. Rides `ground_box`.
+    pub ground_box: [f32; 4],
 }
 
 /// The lit-volume sentinel for [`VolumeUniform::iso_threshold`] and the
@@ -171,6 +192,10 @@ pub const ISO_OFF: f32 = -1.0;
 /// `(scale, offset)` for a box that **is** the grid — the ordinary case. See
 /// [`VolumeUniform::grid_from_box_scale`].
 pub const IDENTITY_GRID_FROM_BOX: ([f32; 3], [f32; 3]) = ([1.0; 3], [0.0; 3]);
+
+/// A height field whose footprint **is** the drawn box — the settled case.
+/// See [`VolumeUniform::ground_box`].
+pub const IDENTITY_GROUND_BOX: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
 
 impl VolumeUniform {
     /// A uniform with the defaults above, an identity transform and no camera.
@@ -206,8 +231,30 @@ impl VolumeUniform {
             // for anything but its own zeroed alpha.
             occluder_t_scale: 0.0,
             ground_max_z: 0.0,
-            ground_ridge_amplitude: 0.0,
+            height_scale: 0.0,
+            height_offset: 0.0,
+            ground_box: IDENTITY_GROUND_BOX,
         }
+    }
+
+    /// The `(scale, offset)` that turns one raw `R16Uint` height sample into
+    /// box `z`, for a field encoded at `base_m`/`quantum_m` standing in a box
+    /// whose z runs `z_km_msl.0 ..= z_km_msl.1`.
+    ///
+    /// **One derivation, in `f64`.** The field's encoding is metres and the
+    /// box's is kilometres MSL; doing that division per post, or in `f32` on
+    /// the GPU, is how a terrain ends up a few metres out everywhere for no
+    /// visible reason. `None` for a box with no vertical extent, which
+    /// `build_voxels` does not produce and which would reach the GPU as an
+    /// infinity.
+    pub fn height_affine(base_m: f64, quantum_m: f64, z_km_msl: (f64, f64)) -> Option<(f32, f32)> {
+        let span_km = z_km_msl.1 - z_km_msl.0;
+        if !span_km.is_finite() || span_km <= 0.0 {
+            return None;
+        }
+        let scale = quantum_m / 1000.0 / span_km;
+        let offset = (base_m / 1000.0 - z_km_msl.0) / span_km;
+        (scale.is_finite() && offset.is_finite()).then_some((scale as f32, offset as f32))
     }
 
     /// The `t` scale to pack an occluder against for this camera: **1.05 times
@@ -234,7 +281,8 @@ impl VolumeUniform {
         T_SCALE_MARGIN * farthest
     }
 
-    /// Turn the occluder on **for this uniform's own eye**.
+    /// Turn the occluder on **for this uniform's own eye**, and put the lid
+    /// out.
     ///
     /// The one blessed way to set the scale. `occluder_t_scale` is derived from
     /// `eye_in_box`, and the two are independent public fields, so a scale
@@ -242,10 +290,35 @@ impl VolumeUniform {
     /// the frame — the picture would look plausible and be wrong.
     /// `VolumeTextures::write_uniform` re-checks the pair under
     /// `debug_assertions`, at the one seam a uniform reaches the GPU through.
-    pub fn aim_occluder(&mut self, ground_max_z: f32, ridge_amplitude: f32) {
+    ///
+    /// **It clears `map_floor`, and that is not a convenience.** The mesh *is*
+    /// the ground, so a frame that draws one has no flat lid at z = 0 to draw
+    /// as well; holding both painted the lid behind the march at full opacity
+    /// wherever the ray crossed z = 0 without meeting the mesh, which B1
+    /// measured at 76, 74 and 33 pixels at the three below-floor cameras. The
+    /// shader refuses the pair on its own — see `map_t`'s guard in
+    /// `volume.wgsl` — so this is the pair being *honest* rather than the pair
+    /// being *harmless*, and each is worth having without the other.
+    pub fn aim_occluder(&mut self, ground_max_z: f32, height_scale: f32, height_offset: f32) {
         self.occluder_t_scale = Self::t_scale_for(self.eye_in_box);
         self.ground_max_z = ground_max_z;
-        self.ground_ridge_amplitude = ridge_amplitude;
+        self.height_scale = height_scale;
+        self.height_offset = height_offset;
+        self.map_floor = false;
+    }
+
+    /// Whether this uniform asks for the flat map lid and a ground mesh at
+    /// once — the pair the shader's own `map_t` guard refuses.
+    ///
+    /// Read by `VolumeTextures::write_uniform`, at the one seam a uniform
+    /// reaches the GPU through and beside the same check on
+    /// [`Self::occluder_is_aimed_at_its_own_eye`] - but as a `log::error!`
+    /// rather than a `debug_assert!`, because a wiring mistake reaching a user
+    /// reaches them on a release web build where a debug assertion says
+    /// nothing. The shader is what makes the picture right; this is what tells
+    /// a caller that built the pair.
+    pub fn ground_is_one_surface(&self) -> bool {
+        !(self.map_floor && self.occluder_t_scale > 0.0)
     }
 
     /// Whether the occluder's scale is the one **this** uniform's eye implies.
@@ -261,7 +334,7 @@ impl VolumeUniform {
                 <= 1e-3 * self.occluder_t_scale
     }
 
-    /// The 304 bytes the GPU reads, little-endian.
+    /// The 320 bytes the GPU reads, little-endian.
     pub fn to_bytes(&self) -> [u8; VOLUME_UNIFORM_BYTES] {
         let mut out = [0u8; VOLUME_UNIFORM_BYTES];
 
@@ -332,10 +405,11 @@ impl VolumeUniform {
             [
                 self.occluder_t_scale,
                 self.ground_max_z,
-                self.ground_ridge_amplitude,
-                0.0,
+                self.height_scale,
+                self.height_offset,
             ],
         );
+        write_vec4(&mut out, OFFSET_GROUND_BOX, self.ground_box);
 
         out
     }
