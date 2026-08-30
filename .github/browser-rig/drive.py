@@ -1115,7 +1115,10 @@ var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied ou
 // radar included. A single "bytes uploaded" figure over the union would
 // describe neither, and would move when the mix moved.
 var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded/;
-var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B unbanded, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
+// `whole` is a routing subset of `blocking` (a whole delta moves through a
+// blocking write_texture on the frame's own queue); the GPU total is the
+// disjoint pair staged + blocking. Never add whole to anything.
+var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B whole, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
 var rasters = null, uploads = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -1153,7 +1156,7 @@ for (var i = 0; i < C.length; i++) {
   var um = uploads_re.exec(m);
   if (um) uploads = { deltas: parseInt(um[1], 10),
                       bytes: parseInt(um[2], 10),
-                      unbanded_bytes: parseInt(um[3], 10),
+                      whole_bytes: parseInt(um[3], 10),
                       bands: parseInt(um[4], 10),
                       staged_bytes: parseInt(um[5], 10),
                       blocking_bytes: parseInt(um[6], 10) };
@@ -2369,11 +2372,13 @@ def run_smoke(args):
                  ort.get("superseded")))
     tut = result.get("texture_upload_totals")
     if tut:
+        # `whole` is a routing subset of `blocking`, never added to it; the
+        # GPU total is the disjoint pair staged + blocking.
         print("[%s] SUMMARY texture upload totals [EVERY egui texture on this "
               "renderer, radar and font atlas included]: %s deltas, %s B to "
-              "the GPU, %s B unbanded, %s bands, %s B staged, %s B blocking"
+              "the GPU, %s B whole, %s bands, %s B staged, %s B blocking"
               % (tag, tut.get("deltas"), tut.get("bytes"),
-                 tut.get("unbanded_bytes"), tut.get("bands"),
+                 tut.get("whole_bytes"), tut.get("bands"),
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
     rm = result.get("rasterization_ms")
     if rm and rm.get("by_kind"):

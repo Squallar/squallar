@@ -298,13 +298,20 @@ fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
 
 /// The `texture uploads:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value.
+///
+/// Two of the figures overlap by design and are never added: `whole` is a
+/// routing subset of `blocking` (a whole delta goes through
+/// `Renderer::update_texture`, which is a blocking `write_texture` on the
+/// frame's own queue). The GPU total is `staged + blocking` — those two are
+/// the disjoint pair. `blocking` is classified by the path the bytes took,
+/// never by the 8 MiB band straddle; see `UploadTotals::blocking_bytes`.
 fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTotals) -> String {
     format!(
-        "texture uploads: {} deltas, {} B to the GPU, {} B unbanded, \
+        "texture uploads: {} deltas, {} B to the GPU, {} B whole, \
          {} bands, {} B staged, {} B blocking",
         u.deltas,
         u.bytes(),
-        u.unbanded_bytes,
+        u.whole_bytes,
         u.bands,
         u.staged_bytes,
         u.blocking_bytes,

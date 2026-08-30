@@ -240,6 +240,73 @@ fn an_idle_frame_is_told_there_is_nothing_new_to_report() {
     );
 }
 
+/// **The band straddle does not decide what a ringless device's bytes are
+/// called.**
+///
+/// Spike B's pair (2026-08-30): Firefox's ~8.51 MB pictures banded and were
+/// counted ~13 GB blocking, Chromium's ~7.57 MB went whole and were counted
+/// ~0.1 GB — identical ringless traffic, opposite classifications, flipped by
+/// 32 px of canvas width. Every byte of both moves through a blocking
+/// `write_texture` on the frame thread, so the ledger must call every byte of
+/// both blocking. Driven through the seams that share their arithmetic with
+/// `file` and `drain` (`count_whole_write` / `count_band`); the same property
+/// on the real path on a real adapter is
+/// `a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle`
+/// in `tests/raster_upload_gpu.rs`, which was run RED against the size-straddle
+/// classification before this arithmetic replaced it.
+#[test]
+fn the_band_straddle_does_not_decide_what_a_ringless_byte_is_called() {
+    // Chromium's side: 7 570 000 B, under the band, moved whole.
+    let under = 7_570_000u64;
+    let mut a = TextureUploads::without_device();
+    a.note_whole_delta_for_test(under);
+    let a = a.totals();
+    assert_eq!(a.bytes(), under);
+    assert_eq!(a.whole_bytes, under);
+    assert_eq!(a.banded_bytes(), 0);
+
+    // Firefox's side: 8 510 000 B, over the band, moved as bands — and a
+    // ringless device never stages one.
+    let over = 8_510_000u64;
+    let mut b = TextureUploads::without_device();
+    b.note_band_for_test(UPLOAD_BAND_BYTES as u64, false);
+    b.note_band_for_test(over - UPLOAD_BAND_BYTES as u64, false);
+    let b = b.totals();
+    assert_eq!(b.bytes(), over);
+    assert_eq!(b.whole_bytes, 0);
+    assert_eq!(b.banded_bytes(), over);
+
+    // The property: on both sides of the straddle, every byte is blocking.
+    for (name, t) in [("under", a), ("over", b)] {
+        assert_eq!(
+            t.blocking_bytes,
+            t.bytes(),
+            "the {name}-the-band traffic moved wholly through blocking \
+             `write_texture` on the frame thread and the ledger called {} of \
+             {} B blocking",
+            t.blocking_bytes,
+            t.bytes(),
+        );
+    }
+}
+
+/// The whole-delta route counts once into each of its two figures: `whole`
+/// as the routing, `blocking` as the frame time — and `bytes()` does not
+/// double-count the overlap.
+#[test]
+fn a_whole_delta_is_whole_and_blocking_and_counted_once() {
+    let mut uploads = TextureUploads::without_device();
+    uploads.note_whole_delta_for_test(100);
+    uploads.note_band_for_test(7, true);
+    let t = uploads.totals();
+    assert_eq!(t.deltas, 1);
+    assert_eq!(t.whole_bytes, 100);
+    assert_eq!(t.blocking_bytes, 100);
+    assert_eq!(t.staged_bytes, 7);
+    assert_eq!(t.bytes(), 107, "the whole bytes were added twice");
+    assert_eq!(t.banded_bytes(), 7);
+}
+
 /// A freed id stops being delivered, which is what bounds the set.
 #[test]
 fn freeing_an_id_takes_it_back_out_of_the_delivered_set() {

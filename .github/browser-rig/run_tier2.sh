@@ -499,11 +499,13 @@ for tag in sys.argv[2:]:
               "overlay raster ever moved)" % "")
     tut = r.get("texture_upload_totals")
     if tut:
+        # `whole` is a routing subset of the blocking figure, never added to
+        # it; the GPU total is the disjoint pair staged + blocking.
         print("%-18s   texture uploads [EVERY egui texture] %s deltas, %s B "
-              "to the GPU (%s B unbanded; %s bands, %s B staged, %s B "
+              "to the GPU (%s B whole; %s bands, %s B staged, %s B "
               "blocking the frame)"
               % ("", tut.get("deltas"), tut.get("bytes"),
-                 tut.get("unbanded_bytes"), tut.get("bands"),
+                 tut.get("whole_bytes"), tut.get("bands"),
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
     else:
         print("%-18s   texture uploads - (the line was never written)" % "")
