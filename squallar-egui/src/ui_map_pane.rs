@@ -46,6 +46,68 @@ impl PaneSurfaces {
     }
 }
 
+/// Whether a pane's ground is a **3D mesh** rather than flat map pixels: the
+/// floor strip's half of the question `VolumeFrameState::heights` is the
+/// renderer's half of. Both are answered by `ui_map::pane_ground_heights`, so
+/// the drape and the mesh cannot disagree about which ground is being drawn.
+///
+/// **A newtype and not a `bool`, and that is load-bearing.** Its field is
+/// private to this module, so no caller outside `ui::map::pane_render` can
+/// write `GroundIsMesh(true)`; the only two ways to obtain one are
+/// [`PLAN_VIEW`](Self::PLAN_VIEW) and
+/// [`from_height_field`](Self::from_height_field), and the latter answers
+/// `true` only when handed the field the ground would actually be drawn
+/// from. A `bool` here was compatible with a caller composing the answer out
+/// of some belief of its own -- `|| pane.volume().is_some()` is one line, is
+/// `true` for every 3D pane, and would strip the hillshade off every 3D
+/// floor for ever while no mesh ever drew. That line does not typecheck
+/// against this type, and `GroundHeightField` has no other production
+/// construction to fabricate.
+///
+/// **What it does NOT mean is "the mesh drew".** The strip is drawn before
+/// the volume painter runs -- it has to be, it is the mirror that painter
+/// samples -- so this can only be "the pane has a field to draw ground
+/// from". The renderer stands down from the mesh at two further points the
+/// strip cannot wait for, and both leave a flat lid under a strip that has
+/// already dropped its hillshade:
+///
+/// * `GroundPlacement::for_box` declining to place the field over the drawn
+///   box (`volume_bridge.rs`). How often that happens is a property of a
+///   scheduler that does not exist yet, so this unit states no frequency for
+///   it -- it is undetermined, not rare.
+/// * `ensure_pane_heights` returning false because `upload_heights` refused
+///   the field, which sets `map_floor` back on. That refusal is
+///   `posts > min(max_texture_dimension_2d, MAX_POSTS_PER_AXIS)`: a
+///   deterministic function of the adapter and the field, so it is refused
+///   every frame, for ever, not transiently. `downlevel_webgl2_defaults()`
+///   guarantees only **2048**, and the browser rig's legs select `Gl` -- so
+///   on the target CLAUDE.md says governs, an over-large field means a
+///   permanently unshaded ground. **Bounding the posts by the adapter's real
+///   limit is B4's `HeightPlan::fit`**, and that is where the fix belongs;
+///   naming it here is the declaration, not the remedy.
+///
+/// Closing either from this side needs the *previous* frame's outcome fed
+/// back, which buys a transient with a permanent one-frame lag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct GroundIsMesh(bool);
+
+impl GroundIsMesh {
+    /// A pane drawing its map in plan: no mesh, no second light, nothing to
+    /// ask. The only answer a 2D pane can be given, because the other one
+    /// needs a height field and the plan view never has one.
+    pub(super) const PLAN_VIEW: Self = Self(false);
+
+    /// The only route to `true`, and it demands the field itself.
+    pub(super) fn from_height_field(field: Option<&crate::volume_view::GroundHeightField>) -> Self {
+        Self(field.is_some())
+    }
+
+    /// Whether the ground is a mesh.
+    const fn yes(self) -> bool {
+        self.0
+    }
+}
+
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
     pub pane_idx: usize,
@@ -91,29 +153,11 @@ pub(super) struct PaneRenderCtx<'a> {
     /// Which halves of the pane's content this pass is for. See
     /// [`PaneSurfaces`].
     pub surfaces: PaneSurfaces,
-    /// Whether the pane this pass belongs to draws its ground as a **lit 3D
-    /// mesh** rather than as flat map pixels.
-    ///
-    /// It is the floor strip's half of one question, and the renderer's half
-    /// is `VolumeFrameState::heights`; both read the same answer, so the
-    /// drape and the mesh cannot disagree about which ground is being drawn.
-    /// See [`PaneRenderCtx::double_shades`] for what it suppresses and why,
-    /// and `ui_map::pane_ground_heights` for where the answer comes from.
-    ///
-    /// `false` for every 2D pane by construction: a pane drawing its map in
-    /// plan has no mesh and no second light.
-    ///
-    /// **The one gap, declared.** The strip is drawn *before* the volume
-    /// painter runs -- it has to be, it is the mirror that painter samples --
-    /// so this is "the pane has a field to draw ground from", not "the mesh
-    /// drew". The renderer takes one further step the strip cannot wait for:
-    /// a field whose footprint cannot be placed over the drawn box falls back
-    /// to the flat lid. Such a frame gets an unshaded lid rather than a
-    /// double-shaded mesh, which is the safe side of the two, and it is the
-    /// stand-in case that `DrawnBox::for_target` already treats as transient.
-    /// Closing it would need the *previous* frame's outcome fed back, which
-    /// trades a rare transient for a permanent one-frame lag.
-    pub draws_3d_ground: bool,
+    /// Whether the pane this pass belongs to draws its ground as a 3D mesh
+    /// rather than as flat map pixels. See [`GroundIsMesh`], which is a
+    /// newtype rather than a `bool` for a reason this field is the whole
+    /// point of.
+    pub draws_3d_ground: GroundIsMesh,
     /// Whether this frame's color scale bars run along the bottom edge
     /// (`true`) or the right edge (`false`). Resolved once per map panel.
     pub horizontal_color_scale: bool,
@@ -158,8 +202,22 @@ impl PaneRenderCtx<'_> {
     /// the second light. And only `TERRAIN` carries baked shading -- the base
     /// tiles beneath it are unlit colour and must keep drawing, or the mesh
     /// has nothing to wear.
+    ///
+    /// **THE SECOND SUN ARRIVES WITH C2, AND IS NOT IN THIS TREE.** Read the
+    /// paragraph above as what this suppression is for, not as a description
+    /// of today: `fs_ground` currently ends `out.colour = ground` -- the raw
+    /// drape, with no light vector, no normal and no lambert term -- and
+    /// `VolumeUniform`'s light lanes reach only the volume's own gradient
+    /// shading. B3's drape oracle depends on exactly that, requiring the
+    /// ground attachment to carry the checker cell's exact channel value,
+    /// which no shading term would survive. So until C2 lights the mesh this
+    /// condition *removes* shading from a 3D floor rather than
+    /// de-duplicating it. The plan orders it this way on purpose -- C3
+    /// depends on B3, not on C2 -- and C2 is what makes the picture whole.
     fn double_shades(&self, id: &LayerId) -> bool {
-        self.surfaces == PaneSurfaces::GroundOnly && self.draws_3d_ground && *id == known::TERRAIN
+        self.surfaces == PaneSurfaces::GroundOnly
+            && self.draws_3d_ground.yes()
+            && *id == known::TERRAIN
     }
 }
 
