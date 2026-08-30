@@ -1571,6 +1571,10 @@ mod archive {
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
             None,
+            // No downloaded areas: these read the committed fixture over a
+            // bare source, and the composition's own suite is what covers
+            // the local-first walk.
+            None::<crate::basemap_download::PlatformSegmentStore>,
         ))
     }
 
@@ -1833,6 +1837,10 @@ mod archive {
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
             None,
+            // No downloaded areas: these read the committed fixture over a
+            // bare source, and the composition's own suite is what covers
+            // the local-first walk.
+            None::<crate::basemap_download::PlatformSegmentStore>,
         );
         Some((tiles, reads, dead))
     }
@@ -2029,6 +2037,10 @@ mod archive {
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
             None,
+            // No downloaded areas: these read the committed fixture over a
+            // bare source, and the composition's own suite is what covers
+            // the local-first walk.
+            None::<crate::basemap_download::PlatformSegmentStore>,
         );
 
         let fault = pump_until(DEFAULT_TIMEOUT, || {

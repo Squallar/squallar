@@ -154,6 +154,33 @@ fn archive_block_cache(
     None
 }
 
+/// The store the downloaded areas on this device are read back through, or
+/// `None` when this platform has nowhere to keep them.
+///
+/// The same selection-of-a-body split as [`archive_block_cache`] and
+/// [`archive_url`]: native reads plain files out of the basemap directory the
+/// bridge chose; the web store is the service worker's route, and until that
+/// route exists there is nothing to read back. Neither arm branches inside a
+/// body — each *is* the body its target selects.
+#[cfg(not(target_arch = "wasm32"))]
+fn offline_store(
+    basemap_dir: Option<&std::path::Path>,
+) -> Option<crate::basemap_download::PlatformSegmentStore> {
+    Some(crate::basemap_download::FsSegmentStore::new(
+        basemap_dir?.to_path_buf(),
+    ))
+}
+
+/// The wasm32 arm of [`offline_store`]. The service-worker routes the store
+/// would read through are not built yet, and a store pointed at a route that
+/// does not answer would spend a request per launch to be told so.
+#[cfg(target_arch = "wasm32")]
+fn offline_store(
+    _basemap_dir: Option<&std::path::Path>,
+) -> Option<crate::basemap_download::PlatformSegmentStore> {
+    None
+}
+
 /// The credit the hillshade's elevation data requires.
 ///
 /// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
@@ -209,6 +236,7 @@ fn base_source(
     is_dark: bool,
     disabled_source_layers: &std::collections::BTreeSet<String>,
     ctx: &egui::Context,
+    basemap_dir: Option<&std::path::Path>,
 ) -> Option<HttpsTiles> {
     let url = archive_url();
 
@@ -225,6 +253,7 @@ fn base_source(
         attribution,
         ctx.to_owned(),
         archive_block_cache(&url),
+        offline_store(basemap_dir),
     ) {
         Ok(tiles) => Some(tiles),
         Err(error) => {
@@ -313,6 +342,16 @@ pub struct MapTileState {
     /// nothing, said once at `error!`. Cleared by [`Self::clear`], because a
     /// resume is a plausible moment for the network to be back.
     terrain_failed: bool,
+
+    /// Where this device keeps downloaded offline areas, or `None` when the
+    /// platform has nowhere for them.
+    ///
+    /// Handed over once, at `Gui` construction (`Gui::with_basemap_dir`),
+    /// never through a per-frame argument: the path is constant for the
+    /// process, and `ensure_base_tiles` is called from a frame. A source
+    /// built while this is `None` reads everything from the network, which is
+    /// the state every test that does not opt in is in.
+    basemap_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for MapTileState {
@@ -329,11 +368,22 @@ impl Default for MapTileState {
             #[cfg(test)]
             base_restyles: 0,
             terrain_failed: false,
+            basemap_dir: None,
         }
     }
 }
 
 impl MapTileState {
+    /// Point the base slot at this device's downloaded basemap areas.
+    ///
+    /// Called once, from `Gui::with_basemap_dir`, before any frame. Not a
+    /// per-frame argument and not a re-buildable setting: a source already
+    /// built keeps the store it was built with, and the next rebuild — a
+    /// theme flip is not one — picks this up.
+    pub(crate) fn set_basemap_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.basemap_dir = dir;
+    }
+
     /// Ensure the base-map tiles for the current theme and detail set are
     /// initialized, and retire a source that has reported itself unusable.
     ///
@@ -409,7 +459,12 @@ impl MapTileState {
                     ctx.to_owned(),
                 ))
             } else {
-                base_source(is_dark, disabled_source_layers, ctx)
+                base_source(
+                    is_dark,
+                    disabled_source_layers,
+                    ctx,
+                    self.basemap_dir.as_deref(),
+                )
             };
             // A URL that will not parse yields no source and never will this
             // session: latch, exactly as the terrain slot does, so the

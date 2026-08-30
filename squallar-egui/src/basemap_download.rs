@@ -455,6 +455,52 @@ pub type PlatformSegmentStore = HttpSegmentStore;
 fn assert_store_bounds<St: SegmentStore>() {}
 const _: fn() = assert_store_bounds::<PlatformSegmentStore>;
 
+/// The read-back half of a store: what it holds, opened as range sources.
+///
+/// Separate from [`SegmentStore`] because the two halves have separate
+/// consumers — the download engine only ever publishes, the map only ever
+/// reads — and a store that could do one but not the other is a thing this
+/// crate should be able to express. Both real stores do both.
+///
+/// The `Send` split per target is [`SegmentStore`]'s, for its reason.
+///
+/// **Completeness stays a store fact.** What this enumerates is what the
+/// store holds *published*, by the same rule `existing_segments` answers by;
+/// there is no flag anywhere saying a segment is finished, so there is none
+/// to go stale.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait OfflineSegments: Send + Sync + 'static {
+    /// The range source this store's artifacts are read through.
+    type Source: ArchiveRangeSource;
+
+    /// Every complete segment the store holds, labelled and opened.
+    ///
+    /// **Returns no error, by design.** A store that cannot be listed, or an
+    /// artifact that will not open, contributes nothing and is logged; the
+    /// tiles it would have served come from the network, which is what the
+    /// caller does with an empty answer anyway. There is nothing for a user
+    /// to act on and so nothing to put on the glass.
+    fn open_all(&self) -> impl Future<Output = Vec<(String, Self::Source)>> + Send;
+}
+
+/// See the native arm above.
+#[cfg(target_arch = "wasm32")]
+pub trait OfflineSegments: 'static {
+    /// The range source this store's artifacts are read through.
+    type Source: ArchiveRangeSource;
+    /// See the native arm above.
+    fn open_all(&self) -> impl Future<Output = Vec<(String, Self::Source)>>;
+}
+
+/// The suffix a published segment carries. The store's naming contract, in
+/// one place, read by the listing as well as written by the publish.
+const SEGMENT_SUFFIX: &str = ".pmtiles";
+
+/// Instantiating this proves the per-target alias reads back on whichever
+/// target is being built — [`assert_store_bounds`]'s construction.
+fn assert_readback_bounds<St: OfflineSegments>() {}
+const _: fn() = assert_readback_bounds::<PlatformSegmentStore>;
+
 /// Segments as plain files: `{area_id}.{seg}.pmtiles` in one directory.
 ///
 /// Native only — a `cfg` selecting a *dependency* (`std::fs`), which wasm32
@@ -488,9 +534,61 @@ impl FsSegmentStore {
     fn segment_of(name: &str, area_id: &str) -> Option<u32> {
         name.strip_prefix(area_id)?
             .strip_prefix('.')?
-            .strip_suffix(".pmtiles")?
+            .strip_suffix(SEGMENT_SUFFIX)?
             .parse()
             .ok()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OfflineSegments for FsSegmentStore {
+    type Source = crate::basemap_archive::FileRangeSource;
+
+    /// Every `*.pmtiles` in the directory, in name order.
+    ///
+    /// **Not filtered to areas this device recorded**, on purpose: a segment
+    /// hand-placed in the basemap directory is a segment, and the persisted
+    /// area list is a later step's concern. The directory listing is the one
+    /// authority on what is here, so nothing can be listed and missing or
+    /// missing and listed. A `.part` is not matched, which is the whole of
+    /// what keeps a half-written artifact out of the map.
+    async fn open_all(&self) -> Vec<(String, Self::Source)> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            // A directory nothing has published into holds nothing; absence
+            // of it is that, not a fault.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                log::warn!(
+                    "the downloaded basemap directory {} will not list, so the map reads \
+                     everything from the network: {error}",
+                    self.dir.display()
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut named: Vec<(String, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                name.ends_with(SEGMENT_SUFFIX).then(|| (name, entry.path()))
+            })
+            .collect();
+        named.sort();
+
+        let mut opened = Vec::with_capacity(named.len());
+        for (name, path) in named {
+            match Self::Source::open(&path) {
+                Ok(source) => opened.push((name, source)),
+                Err(error) => log::warn!(
+                    "the downloaded basemap segment {} will not open, so its tiles come from \
+                     the network instead: {error}",
+                    path.display()
+                ),
+            }
+        }
+        opened
     }
 }
 
@@ -502,7 +600,7 @@ impl SegmentStore for FsSegmentStore {
             .map_err(|error| StoreError::Io(format!("create {}: {error}", self.dir.display())))?;
 
         let part = self.artifact(area_id, seg, ".part");
-        let published = self.artifact(area_id, seg, ".pmtiles");
+        let published = self.artifact(area_id, seg, SEGMENT_SUFFIX);
         std::fs::write(&part, &bytes)
             .map_err(|error| StoreError::Io(format!("write {}: {error}", part.display())))?;
         std::fs::rename(&part, &published).map_err(|error| {
@@ -553,7 +651,7 @@ impl SegmentStore for FsSegmentStore {
             let ours = name
                 .strip_prefix(area_id)
                 .and_then(|rest| rest.strip_prefix('.'))
-                .is_some_and(|rest| rest.ends_with(".pmtiles") || rest.ends_with(".part"));
+                .is_some_and(|rest| rest.ends_with(SEGMENT_SUFFIX) || rest.ends_with(".part"));
             if ours {
                 std::fs::remove_file(entry.path()).map_err(|error| {
                     StoreError::Io(format!("remove {}: {error}", entry.path().display()))
@@ -594,6 +692,31 @@ impl HttpSegmentStore {
             .join(&format!("{OFFLINE_BASE_PATH}/{tail}"))
             .map_err(|error| StoreError::Transport(format!("building a store URL: {error}")))
     }
+
+    /// The `__list__` route's whole answer.
+    ///
+    /// One request, shared by the two readers — the per-area completeness
+    /// count and the read-back enumeration — so they can never come to two
+    /// answers about what the store holds.
+    async fn list_rows(&self) -> Result<Vec<ListedSegment>, StoreError> {
+        let response = self
+            .client
+            .get(self.url("__list__")?)
+            .send()
+            .await
+            .map_err(|error| StoreError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(StoreError::Status {
+                action: "listing segments",
+                status: response.status().as_u16(),
+            });
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| StoreError::Transport(error.to_string()))?;
+        serde_json::from_slice(&body).map_err(|error| StoreError::Listing(error.to_string()))
+    }
 }
 
 /// One row of the service worker's `__list__` answer. `bytes` is in the
@@ -603,10 +726,62 @@ struct ListedSegment {
     url: String,
 }
 
+impl OfflineSegments for HttpSegmentStore {
+    type Source = crate::basemap_archive::HttpRangeSource;
+
+    /// The `__list__` route's whole answer, every row that names a segment,
+    /// opened as a monolith range source.
+    ///
+    /// Monolith without probing: the service worker holds one response per
+    /// segment and a segment is [`SEGMENT_BYTES`], so the `.part000` probe
+    /// could only ever spend one request per segment being told what the
+    /// publish side already guarantees — see
+    /// [`crate::basemap_archive::HttpRangeSource::monolith`].
+    async fn open_all(&self) -> Vec<(String, Self::Source)> {
+        let listed = match self.list_rows().await {
+            Ok(listed) => listed,
+            Err(error) => {
+                log::warn!(
+                    "the downloaded basemap store will not list, so the map reads everything \
+                     from the network: {error}"
+                );
+                return Vec::new();
+            }
+        };
+
+        let needle = format!("{OFFLINE_BASE_PATH}/");
+        let mut tails: Vec<String> = listed
+            .into_iter()
+            .filter_map(|row| {
+                let at = row.url.rfind(&needle)?;
+                let tail = &row.url[at + needle.len()..];
+                tail.ends_with(SEGMENT_SUFFIX).then(|| tail.to_owned())
+            })
+            .collect();
+        tails.sort();
+
+        let mut opened = Vec::with_capacity(tails.len());
+        for tail in tails {
+            let built = self.url(&tail).and_then(|url| {
+                Self::Source::monolith(self.client.clone(), url.as_str())
+                    .map_err(|error| StoreError::Transport(error.to_string()))
+            });
+            match built {
+                Ok(source) => opened.push((tail, source)),
+                Err(error) => log::warn!(
+                    "the downloaded basemap segment {tail} will not open, so its tiles come \
+                     from the network instead: {error}"
+                ),
+            }
+        }
+        opened
+    }
+}
+
 impl SegmentStore for HttpSegmentStore {
     async fn publish(&self, area_id: &str, seg: u32, bytes: Vec<u8>) -> Result<(), StoreError> {
         valid_area_id(area_id)?;
-        let url = self.url(&format!("{area_id}/{seg}.pmtiles"))?;
+        let url = self.url(&format!("{area_id}/{seg}{SEGMENT_SUFFIX}"))?;
         let response = self
             .client
             .put(url)
@@ -625,31 +800,14 @@ impl SegmentStore for HttpSegmentStore {
 
     async fn existing_segments(&self, area_id: &str) -> Result<BTreeSet<u32>, StoreError> {
         valid_area_id(area_id)?;
-        let response = self
-            .client
-            .get(self.url("__list__")?)
-            .send()
-            .await
-            .map_err(|error| StoreError::Transport(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(StoreError::Status {
-                action: "listing segments",
-                status: response.status().as_u16(),
-            });
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| StoreError::Transport(error.to_string()))?;
-        let listed: Vec<ListedSegment> = serde_json::from_slice(&body)
-            .map_err(|error| StoreError::Listing(error.to_string()))?;
+        let listed = self.list_rows().await?;
 
         let needle = format!("{OFFLINE_BASE_PATH}/{area_id}/");
         let mut segments = BTreeSet::new();
         for row in listed {
             if let Some(at) = row.url.rfind(&needle)
                 && let Some(seg) = row.url[at + needle.len()..]
-                    .strip_suffix(".pmtiles")
+                    .strip_suffix(SEGMENT_SUFFIX)
                     .and_then(|stem| stem.parse().ok())
             {
                 segments.insert(seg);

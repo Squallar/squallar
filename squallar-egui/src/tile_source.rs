@@ -1625,6 +1625,7 @@ impl HttpsTiles {
         attribution: Attribution,
         egui_ctx: Context,
         cache: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+        offline: Option<crate::basemap_download::PlatformSegmentStore>,
     ) -> Result<Self, crate::basemap_archive::RangeError> {
         use crate::basemap_archive::{HttpRangeSource, archive_client, block_cache};
 
@@ -1639,6 +1640,7 @@ impl HttpsTiles {
             egui_ctx,
             TILE_CACHE_ENTRIES,
             cache,
+            offline,
         ))
     }
 
@@ -1679,22 +1681,27 @@ impl HttpsTiles {
             // No seed: the warm-up is the basemap's shallow zooms, not the
             // hillshade's.
             None,
+            // And no downloaded areas: what a download stores is the basemap
+            // and the static reference layers, never the hillshade.
+            None::<crate::basemap_download::PlatformSegmentStore>,
         ))
     }
 
     /// [`Self::from_archive_url`] with the range source and the cache bound
     /// supplied. Crate-private, for the tests, which read the committed Monaco
     /// fixture off disk rather than over a network.
-    pub(crate) fn from_range_source<S>(
+    pub(crate) fn from_range_source<S, St>(
         source: S,
         style: Arc<Style>,
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
         seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+        offline: Option<St>,
     ) -> Self
     where
         S: crate::basemap_archive::ArchiveRangeSource + 'static,
+        St: crate::basemap_download::OfflineSegments,
     {
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
@@ -1748,7 +1755,7 @@ impl HttpsTiles {
             request_rx,
             tile_tx,
             egui_ctx,
-            seed,
+            ArchiveStores { seed, offline },
         ));
 
         Self {
@@ -1856,6 +1863,23 @@ struct ArchiveStyling {
     parsed_tiles: SharedParsedTiles,
 }
 
+/// What this device already holds of the archive, and where.
+///
+/// One parameter rather than two because they are the same kind of fact —
+/// bytes on the device rather than on the wire — and because the archive loop
+/// does the same thing with both: consults them before the network, once, at
+/// open. The block cache is a *tier* under the reads; a downloaded area is a
+/// *source* in front of them.
+struct ArchiveStores<St> {
+    /// The persistent block cache to seed with the shallow zooms, or `None`
+    /// for a source that must not seed (terrain) or a target with no
+    /// filesystem.
+    seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+    /// The downloaded offline areas to put in front of the live archive, or
+    /// `None` when this device holds none.
+    offline: Option<St>,
+}
+
 /// The slots the IO task fills for the frame side once the archive header
 /// is read — created by [`HttpsTiles::from_range_source`], written exactly
 /// once by [`serve_archive_continuously`] at open. One parameter rather than
@@ -1904,20 +1928,21 @@ impl ArchiveTileKind {
 /// reads and bounded nothing about the tessellations, so filling a fresh
 /// 54-tile viewport was ~1.34 s of CPU serialized behind itself while the
 /// fetches and the tessellations starved each other.
-async fn serve_archive_continuously<S>(
+async fn serve_archive_continuously<S, St>(
     source: S,
     styling: ArchiveStyling,
     slots: ArchiveHeaderSlots,
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
-    seed: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
+    stores: ArchiveStores<St>,
 ) where
     S: crate::basemap_archive::ArchiveRangeSource,
+    St: crate::basemap_download::OfflineSegments,
 {
-    use crate::basemap_archive::BasemapArchive;
+    use crate::basemap_archive::BasemapArchives;
 
-    let archive = match BasemapArchive::open(source).await {
+    let mut archive = match BasemapArchives::open(source).await {
         Ok(archive) => archive,
         Err(error) => {
             // **Recorded, not only logged.** Returning here drops `request_rx`,
@@ -1954,6 +1979,25 @@ async fn serve_archive_continuously<S>(
     // UI to ask for it.
     egui_ctx.request_repaint();
 
+    // Downloaded areas go in front of the live archive **after** the header
+    // is published and the repaint asked for, so opening them can never delay
+    // first paint. Each is local storage, not the network; a store that will
+    // not list, and a segment that will not open, are logged inside and leave
+    // the composition serving from the live archive alone.
+    if let Some(store) = stores.offline {
+        for (label, source) in store.open_all().await {
+            archive.attach_offline(label, source).await;
+        }
+        if archive.offline_count() > 0 {
+            // The ceiling can only have risen, and `Tiles::at` reads it.
+            slots.max_zoom.store(archive.max_zoom(), Ordering::Relaxed);
+            log::info!(
+                "{} downloaded basemap segments serve before the network",
+                archive.offline_count()
+            );
+        }
+    }
+
     // In an `Arc` so the seed below can hold the archive while this loop
     // serves from it; costs nothing when there is no seed.
     let archive = Arc::new(archive);
@@ -1962,7 +2006,10 @@ async fn serve_archive_continuously<S>(
     // same runtime — after the header is published and the repaint is asked
     // for, so the seed can never delay first paint. A no-op when `seed` is
     // `None` (terrain, no cache dir) and on wasm32 (a cfg-selected body).
-    crate::basemap_archive::block_cache::maybe_seed(&archive, seed);
+    // **The live archive's**: the seed is what fills the persistent block
+    // cache for the remote generation, and a downloaded segment is already
+    // resident by definition.
+    crate::basemap_archive::block_cache::maybe_seed(archive.live(), stores.seed);
 
     let mut outstanding = FuturesUnordered::new();
 
@@ -2050,8 +2097,8 @@ async fn serve_archive_continuously<S>(
 /// graphics reset. The inline spelling had a wait of the same order for the
 /// same reason, so this is not believed to be a regression; neither figure has
 /// been measured. The wasm32 arm never reaches `spawn_blocking` at all.
-async fn read_one<S>(
-    archive: &crate::basemap_archive::BasemapArchive<S>,
+async fn read_one<S, O>(
+    archive: &crate::basemap_archive::BasemapArchives<S, O>,
     styling: &ArchiveStyling,
     #[cfg_attr(
         target_arch = "wasm32",
@@ -2065,6 +2112,7 @@ async fn read_one<S>(
 ) -> Result<Option<(TileId, FetchPayload)>, String>
 where
     S: crate::basemap_archive::ArchiveRangeSource,
+    O: crate::basemap_archive::ArchiveRangeSource,
 {
     // The header's word, not the body's shape -- see [`ArchiveTileKind`].
     let kind = ArchiveTileKind::from_tile_type(archive.tile_type());
