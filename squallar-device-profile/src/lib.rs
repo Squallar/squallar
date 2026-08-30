@@ -10,12 +10,18 @@
 //! * the runtime resolver in [`budget`] — a pure function from a
 //!   [`budget::DeviceProfile`] to one immutable [`budget::Budgets`], with no
 //!   `cfg!` in its body, so every configuration is reachable from a host test.
+//! * the fixed-shape latency histogram in [`hist`] — pure integer arithmetic
+//!   over a compile-time bin layout. It sits here, under both the UI and the
+//!   wgpu boundary, because both sides read one: the recorder fills on the
+//!   frame thread and the diagnostics panel diffs snapshots of it, and this is
+//!   the one crate both already stand on without a cycle.
 //!
 //! Data and policy only, denominated in `squallar-radar`'s size vocabulary.
 //! Nothing here renders, allocates, or touches a device.
 
 pub mod budget;
 pub mod constants;
+pub mod hist;
 /// The rule behind the `mobile` cfg. Compiled only for tests — the production
 /// copy is `include!`d by `build.rs`.
 #[cfg(test)]
