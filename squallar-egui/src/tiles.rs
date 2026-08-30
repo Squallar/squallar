@@ -77,9 +77,9 @@ pub(crate) fn archive_url() -> String {
 /// Published as parts (`.part000`..): `HttpRangeSource` probes `<url>.part000`
 /// at open and selects parts mode on its own, so this names the logical
 /// archive and nothing here knows parts exist. The generation
-/// (`4ca64469750e-20260829`) is compiled in, like the basemap's.
+/// (`7c94bc6966ab-20260829`) is compiled in, like the basemap's.
 pub const TERRAIN_ARCHIVE_URL: &str =
-    "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles";
+    "https://tiles.squallar.app/terrain/7c94bc6966ab-20260829/squallar-terrain-hillshade.pmtiles";
 
 /// An archive URL that replaces [`TERRAIN_ARCHIVE_URL`] when it is set.
 /// Native only, for the reason [`BASEMAP_ARCHIVE_URL_ENV`] is: the draw seam

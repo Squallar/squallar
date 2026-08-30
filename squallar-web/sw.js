@@ -193,7 +193,7 @@ const BASEMAP_ARCHIVE_HOST = "tiles.squallar.app";
  */
 const ARCHIVE_URLS = [
   "https://tiles.squallar.app/basemap/omt-20260828.pmtiles",
-  "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles",
+  "https://tiles.squallar.app/terrain/7c94bc6966ab-20260829/squallar-terrain-hillshade.pmtiles",
 ];
 
 /*
@@ -329,7 +329,7 @@ function parseSingleRange(value) {
 /**
  * The generation one archive file belongs to: its URL path with any `.partNNN`
  * suffix stripped, so a part and its monolith share a generation. The path
- * carries the publish date (`omt-20260828`, `4ca64469750e-20260829`), so a
+ * carries the publish date (`omt-20260828`, `7c94bc6966ab-20260829`), so a
  * regenerated archive IS a new generation — a wrong key here would silently
  * serve one generation's bytes as another's.
  */

@@ -148,14 +148,14 @@ impl RangeSource for MemorySource {
 fn generation_keys_are_derived_from_the_path() {
     let basemap = generation_for_url("https://tiles.squallar.app/basemap/omt-20260828.pmtiles");
     let terrain = generation_for_url(
-        "https://tiles.squallar.app/terrain/4ca64469750e-20260829/squallar-terrain-hillshade.pmtiles",
+        "https://tiles.squallar.app/terrain/7c94bc6966ab-20260829/squallar-terrain-hillshade.pmtiles",
     );
 
     // The two real archives never share a directory, and each key carries
     // its distinguishing segment.
     assert_ne!(basemap, terrain);
     assert!(basemap.contains("omt-20260828"), "{basemap}");
-    assert!(terrain.contains("4ca64469750e-20260829"), "{terrain}");
+    assert!(terrain.contains("7c94bc6966ab-20260829"), "{terrain}");
 
     // Two URLs differing only in generation never share.
     assert_ne!(

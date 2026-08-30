@@ -11,7 +11,7 @@
 //! # Why no TTLs, no revalidation, no versioning
 //!
 //! The archives are **immutable and generation-keyed**: a publish is a new
-//! path (`basemap/omt-20260828.pmtiles`, `terrain/4ca64469750e-20260829/…`),
+//! path (`basemap/omt-20260828.pmtiles`, `terrain/7c94bc6966ab-20260829/…`),
 //! never a rewrite of an old one. So the bytes at `(generation, offset)` can
 //! never change, a cached block is correct forever, and invalidation is
 //! exactly one operation: delete generation directories that are no longer
@@ -106,7 +106,7 @@ pub fn seed_marker() -> String {
 ///
 /// **The generation is the URL's path, injectively encoded** — for the
 /// published archives that path carries the distinguishing segment
-/// (`omt-20260828`, `4ca64469750e-20260829`), so two generations can never
+/// (`omt-20260828`, `7c94bc6966ab-20260829`), so two generations can never
 /// map to one directory, which is the property that makes a disk hit safe to
 /// serve without revalidation. A wrong key here silently serves stale bytes
 /// across generations; `generation_keys_are_derived_from_the_path` in the

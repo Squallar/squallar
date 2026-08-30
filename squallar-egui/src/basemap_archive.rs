@@ -398,7 +398,7 @@ impl RangeSource for HttpRangeSource {
     /// The archive URL.
     ///
     /// A published archive's generation is *in its URL*
-    /// (`omt-20260828.pmtiles`, `4ca64469750e-20260829/...`), so a new
+    /// (`omt-20260828.pmtiles`, `7c94bc6966ab-20260829/...`), so a new
     /// generation is a new name and the promise [`RangeSource::archive_identity`]
     /// makes holds without anything here having to check a header or an ETag.
     /// The `.partNNN` suffix is derived from this URL rather than carried
