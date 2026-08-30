@@ -282,7 +282,7 @@ mod tests {
     /// One real tile out of the published archive: z10 224/395, flat Kansas
     /// farmland with a river valley through it — flat ground, shadow and lit
     /// slope in 666 bytes. Fetched 2026-08-29 from
-    /// `tiles.squallar.app/terrain/4ca64469750e-20260829/`.
+    /// `tiles.squallar.app/terrain/7c94bc6966ab-20260829/`.
     const FIXTURE: &[u8] = include_bytes!("../testdata/terrain-hillshade-z10-224-395.webp");
 
     fn decoded_fixture_grey() -> (usize, Vec<u8>) {
