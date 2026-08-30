@@ -576,5 +576,29 @@ pub fn install(bytes: Vec<u8>) -> Result<Arc<ZonePack>, PackError> {
     Ok(pack)
 }
 
+/// Serialises every test that writes the process-wide [`INSTALLED`] slot, from
+/// the install to the last assertion that reads it back.
+///
+/// [`install`] *replaces* one slot for the whole binary, so a test that
+/// installs and then asserts what a lookup answers is racing every other
+/// installer in it. The guard lives here, beside the slot, rather than inside
+/// one test module: installers exist in two (`zone_pack::tests` and
+/// `zone_pack_source::tests`), and a lock only one of them can name is not a
+/// lock. It was private to the latter, and the resulting race was a real
+/// intermittent red - reproduced once in 1500 runs with the suite pinned to
+/// two cores, as
+/// `a_missing_file_downloads_installs_and_keeps_the_pack_beside_the_cache`
+/// finding the *other* module's corpus installed over its own pack.
+///
+/// Any new test that calls [`install`], or that reads [`installed`] and
+/// expects a particular pack, must hold this.
+#[cfg(test)]
+pub(crate) fn hold_install_slot() -> std::sync::MutexGuard<'static, ()> {
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock means another installer test failed, not that this one
+    // cannot run.
+    INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests;
