@@ -70,26 +70,6 @@ const GROUND_LAYOUT: Layout = &[
     (3, BINDING_HEIGHT_TEXTURE, BindingKind::Texture),
 ];
 
-/// The building pipeline's: groups 0 and 3, with holes at 1 and 2.
-///
-/// One row shorter than [`GROUND_LAYOUT`] and that is the whole difference: the
-/// prisms read the camera and the placement out of the shared uniform block (0)
-/// and the terrain they stand on out of the height field (3), but they take no
-/// drape, so the mirror at group 1 is not bound for them. **Its own row and not
-/// a reuse of the ground's**, because the counters wgpu-hal assigns are a
-/// function of the whole pipeline layout: dropping the mirror's texture moves
-/// the height field's slot from 3 to 2, and compiling `vs_building` against the
-/// ground's map would hand a WebGL2 driver the wrong texture unit.
-const BUILDING_LAYOUT: Layout = &[
-    (0, BINDING_UNIFORM, BindingKind::UniformBuffer),
-    (0, BINDING_GRID_TEXTURE, BindingKind::Texture),
-    (0, BINDING_GRID_SAMPLER, BindingKind::Sampler),
-    (0, BINDING_LUT_TEXTURE, BindingKind::Texture),
-    (0, BINDING_LUT_SAMPLER, BindingKind::Sampler),
-    (0, BINDING_JITTER_TEXTURE, BindingKind::Texture),
-    (3, BINDING_HEIGHT_TEXTURE, BindingKind::Texture),
-];
-
 /// The blit's, whose counters restart at zero — which is the whole reason the
 /// two are kept apart.
 const BLIT_LAYOUT: Layout = &[
@@ -101,8 +81,16 @@ const BLIT_LAYOUT: Layout = &[
 fn layout_for(entry_point: &str) -> Layout {
     match entry_point {
         ENTRY_VS_RAYMARCH | ENTRY_FS_RAYMARCH => RAYMARCH_LAYOUT,
-        ENTRY_VS_GROUND | ENTRY_FS_GROUND => GROUND_LAYOUT,
-        ENTRY_VS_BUILDING | ENTRY_FS_BUILDING => BUILDING_LAYOUT,
+        // **The prism stages compile against the GROUND's layout, because that
+        // is the layout production builds them with.** They read only the
+        // uniform and the height field, so a narrower layout with no group 1
+        // would be the natural row here — and it would model a pipeline this
+        // workspace does not create, putting the height texture at unit 3 where
+        // production has it at unit 4. This file's whole subject is what a
+        // WebGL2 browser is actually handed, so it must be the shared one.
+        // `the_prisms_share_the_ground_passs_pipeline_layout` is what keeps the
+        // two from drifting apart.
+        ENTRY_VS_GROUND | ENTRY_FS_GROUND | ENTRY_VS_BUILDING | ENTRY_FS_BUILDING => GROUND_LAYOUT,
         ENTRY_VS_BLIT | ENTRY_FS_BLIT_GAMMA | ENTRY_FS_BLIT_LINEAR => BLIT_LAYOUT,
         other => panic!("no pipeline layout is declared for the entry point `{other}`"),
     }
@@ -112,24 +100,39 @@ fn layout_for(entry_point: &str) -> Layout {
 /// bilinear interpolation of the same four posts.**
 ///
 /// A mechanical source rule, in the mould of
-/// [`the_arm_rule_rejects_every_way_the_defect_can_come_back`], and it exists
-/// because the property is real and **no rendered fixture can see it**. That
-/// was measured rather than assumed: mutating `ground_surface_at` into the
-/// bilinear form survives every criterion in
-/// `squallar-gpu/tests/volume_buildings.rs`, because a smooth height field's
-/// per-cell twist is far under the registration tolerance a usable offscreen
-/// can defend. `squallar_volumetric::raymarch`'s Rust mirror is pinned against
-/// the same mutation by
-/// `a_building_stands_on_the_meshs_plane_and_not_on_a_bilinear_guess` — but the
-/// mirror is not the thing that draws, and this is what holds the twin.
+/// [`the_arm_rule_rejects_every_way_the_defect_can_come_back`]. What it
+/// requires: the function branches on the anti-diagonal `f.x + f.y`, which is
+/// where `vs_ground` splits its cell, and each arm names the three corners of
+/// one triangle and not all four. A bilinear form has no branch and touches all
+/// four in both halves, so it cannot satisfy either clause.
 ///
-/// What it requires: the function branches on the anti-diagonal `f.x + f.y`,
-/// which is where `vs_ground` splits its cell, and each arm names the three
-/// corners of one triangle and not all four. A bilinear form has no branch and
-/// touches all four in both halves, so it cannot satisfy either half.
+/// # It is the cheap half, and an earlier version of this doc mis-stated why
+///
+/// It used to claim that **no rendered fixture could see the difference**,
+/// because "a smooth height field's per-cell twist is far under the
+/// registration tolerance a usable offscreen can defend". That reason was
+/// wrong, and wrong in the direction that excused a hole. The governing
+/// quantity is the **post count**, not the offscreen size: the twist of a
+/// smooth field scales with the square of the post spacing, and the post count
+/// is a free fixture constant. `volume_buildings.rs` now draws its city on a
+/// 32-post field whose worst cell twist is 0.0045 box z against a 6e-4
+/// tolerance, and the bilinear mutant reds there outright.
+///
+/// Because the reason was stated wrong, the mitigation chosen was a rule about
+/// **spelling** — and a mutant that swaps the two arms' return expressions
+/// while keeping the branch and the three-of-four corner count satisfies this
+/// rule exactly while lifting from the wrong plane. That mutant is killed by
+/// the rendered criterion, not by this. This rule is kept because it is free
+/// and because it names the invariant in the one place a reader of the shader
+/// will look; it is **not** what certifies the property.
 #[test]
 fn the_ground_surface_lookup_evaluates_a_triangle_and_not_a_bilinear_cell() {
-    let body = ground_surface_body();
+    assert_triangle_rule(&ground_surface_body());
+}
+
+/// The rule above, applied to a body — so the rejection half below can run the
+/// real thing rather than assert something about a string it just wrote.
+fn assert_triangle_rule(body: &str) {
     assert!(
         body.contains("f.x + f.y <= 1.0"),
         "`ground_surface_at` no longer branches on the anti-diagonal that \
@@ -160,11 +163,13 @@ fn the_ground_surface_lookup_evaluates_a_triangle_and_not_a_bilinear_cell() {
     }
 }
 
-/// The rule above rejects the bilinear form it is written against.
+/// The rule above **runs against a bilinear body and rejects it**.
 ///
-/// Without this the rule could be satisfied by a function that no longer
-/// existed, or by one whose branch had drifted — the non-triviality half that
-/// `volume_shader.rs`'s other source rules each carry.
+/// An earlier version of this asserted that a string literal three lines above
+/// it did not contain a substring — it never called
+/// [`assert_triangle_rule`], never reached the corner-count clause, and could
+/// not have failed for any edit to either. This one drives the real rule and
+/// requires it to panic.
 #[test]
 fn the_triangle_rule_rejects_a_bilinear_lookup() {
     let bilinear = "\
@@ -174,11 +179,16 @@ fn ground_surface_at(uv: vec2<f32>) -> f32 {
     return a + f.y * (b - a);
 }
 ";
+    let verdict = std::panic::catch_unwind(|| assert_triangle_rule(bilinear));
     assert!(
-        !bilinear.contains("f.x + f.y <= 1.0"),
-        "the mutant this rule is written against would satisfy its own first \
-         clause, so the rule cannot reject it",
+        verdict.is_err(),
+        "the rule accepted a bilinear `ground_surface_at`, so it cannot reject \
+         the one mutation it exists to reject",
     );
+
+    // And it accepts the real one, so the rejection above is not the rule
+    // rejecting everything it is handed.
+    assert_triangle_rule(&ground_surface_body());
 }
 
 /// `ground_surface_at`'s body, from its signature to the closing brace at

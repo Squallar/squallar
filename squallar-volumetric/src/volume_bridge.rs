@@ -805,7 +805,31 @@ impl VolumePainter for BridgeVolumePainter {
             frame
                 .buildings
                 .as_ref()
-                .filter(|mesh| mesh.site == grid.anchor())
+                .filter(|mesh| {
+                    // **Not `==` on two `f64` pairs.** Both sides are anchors that
+                    // travelled through their own arithmetic, so exact equality
+                    // makes the mesh's fate turn on the last bit of a latitude —
+                    // and the failure mode is a city that silently never appears.
+                    // A metre is four orders of magnitude below the smallest box
+                    // this draws and four orders above any rounding either side
+                    // could carry, so it separates "the same site" from "a
+                    // different site" without separating a site from itself.
+                    let (mesh_lat, mesh_lon) = mesh.site;
+                    let (grid_lat, grid_lon) = grid.anchor();
+                    let same = (mesh_lat - grid_lat).abs() <= SITE_AGREEMENT_DEG
+                        && (mesh_lon - grid_lon).abs() <= SITE_AGREEMENT_DEG;
+                    if !same {
+                        // Louder than a filter, because "there are no buildings
+                        // here" and "the city was built around another site" are
+                        // the same observable at the glass.
+                        log::warn!(
+                            "3D volume view: dropping a building mesh built around \
+                         ({mesh_lat}, {mesh_lon}) for a grid anchored at \
+                         ({grid_lat}, {grid_lon})",
+                        );
+                    }
+                    same
+                })
                 .cloned()
         } else {
             None
@@ -1027,6 +1051,15 @@ impl DrawnBox {
         }
     }
 }
+
+/// How far a building mesh's site may sit from the grid's anchor and still be
+/// the same site: **a metre**, in degrees.
+///
+/// The prisms are authored in site-relative kilometres, which is what lets one
+/// upload survive a box change; the site is the one thing that must not move
+/// under them. Judged with a tolerance rather than with `==` because both sides
+/// are `f64` that reached here through their own arithmetic.
+const SITE_AGREEMENT_DEG: f64 = 1.0e-5;
 
 /// Where a height field stands in the box a pane is drawing, and how its raw
 /// samples become box `z`.
@@ -1346,7 +1379,16 @@ impl VolumeResources {
     /// the GPU is not the one asked for, and answer whether one is in hand.
     ///
     /// The twin of [`Self::ensure_pane_heights`], down to a pane that stops
-    /// asking giving its buffers back in the same call.
+    /// asking giving its buffers back in the same call — **except that it takes
+    /// several frames**, and answers `false` until the last of them.
+    ///
+    /// A whole city does not fit in a frame: interleaving and writing the
+    /// 10.36 MB a default-rung mesh occupies is 5.76 ms in a release build on a
+    /// fast desktop, against a 16.7 ms frame. So each call carries at most
+    /// [`crate::raymarch::BUILDING_UPLOAD_BYTES_PER_CALL`] and the mesh becomes
+    /// drawable when the last byte lands; until then the pane shows the terrain
+    /// with no city on it, which is the shape this repository's own rule names
+    /// — interaction is realtime, data may lag.
     pub fn ensure_pane_buildings(
         &mut self,
         device: &wgpu::Device,
@@ -1358,28 +1400,39 @@ impl VolumeResources {
             self.buildings.remove(&pane_idx);
             return false;
         };
-        if self
+        // A mesh already in flight or already whole keeps its buffers; only a
+        // different id starts over. Re-allocating per frame would restart the
+        // upload every frame and the city would never finish arriving.
+        if !self
             .buildings
             .get(&pane_idx)
             .is_some_and(|held| held.id == mesh.id)
         {
-            return true;
+            let Some(held) = self.pipelines.begin_buildings(
+                device,
+                &mesh.positions,
+                &mesh.normals,
+                &mesh.indices,
+            ) else {
+                // `begin_buildings` has already logged which invariant it
+                // refused on. The pane draws bare terrain rather than half a
+                // city.
+                self.buildings.remove(&pane_idx);
+                return false;
+            };
+            self.buildings
+                .insert(pane_idx, HeldBuildings { id: mesh.id, held });
         }
-        let Some(held) = self.pipelines.upload_buildings(
-            device,
+        let Some(entry) = self.buildings.get_mut(&pane_idx) else {
+            return false;
+        };
+        self.pipelines.advance_buildings(
             queue,
+            &mut entry.held,
             &mesh.positions,
             &mesh.normals,
             &mesh.indices,
-        ) else {
-            // `upload_buildings` has already logged which invariant it refused
-            // on. The pane draws bare terrain rather than half a city.
-            self.buildings.remove(&pane_idx);
-            return false;
-        };
-        self.buildings
-            .insert(pane_idx, HeldBuildings { id: mesh.id, held });
-        true
+        )
     }
 
     /// Keep the uploads `live_ids` names and drop the rest.
@@ -1611,18 +1664,22 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // that stopped asking for terrain gives its field back.
         let has_heights =
             resources.ensure_pane_heights(device, queue, self.pane_idx, self.heights.as_deref());
-        // Beside it and unconditional, for the same reason: `None` is how a
-        // pane that stopped asking for buildings gives its buffers back. A
-        // mesh with no field under it is dropped here rather than drawn at sea
-        // level — `paint` already refuses to carry one, and this is the second
-        // place that stays true if it ever stops.
-        let has_buildings = has_heights
-            && resources.ensure_pane_buildings(
-                device,
-                queue,
-                self.pane_idx,
-                self.buildings.as_deref(),
-            );
+        // **Unconditional, and it has to be**: `None` is how a pane that
+        // stopped asking for buildings gives its buffers back, and a pane whose
+        // height field went away is exactly such a pane. An earlier version
+        // short-circuited this on `has_heights` while its own comment claimed
+        // otherwise, which held megabytes of vertex and index buffer resident
+        // behind a pane drawing no ground until `release_pane` ran.
+        let resident = resources.ensure_pane_buildings(
+            device,
+            queue,
+            self.pane_idx,
+            self.buildings.as_deref(),
+        );
+        // A prism is a height above the GROUND, so a mesh with no field under
+        // it has nowhere to stand and is not drawn. `paint` already refuses to
+        // carry one; this is the second place that stays true if it ever stops.
+        let has_buildings = has_heights && resident;
         let shape = self.grid.dims();
         if !resources.ensure_upload(
             device,

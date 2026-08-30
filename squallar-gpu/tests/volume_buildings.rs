@@ -8,8 +8,14 @@
 //! cargo test -p squallar-gpu --test volume_buildings -- --ignored --nocapture
 //! ```
 //!
-//! `#[ignore]`d (CI's `gpu` job opts in on lavapipe), and the tests hold the
-//! shared process-wide GPU lock.
+//! `#[ignore]`d, and the tests hold the shared process-wide GPU lock.
+//!
+//! **No CI job runs this file.** `.github/workflows/test.yaml`'s `gpu` job
+//! names three suites explicitly — `volume_gpu`, `volume_silhouette`,
+//! `volume_shader_mutants` — and nothing else, so every criterion below is
+//! evidence a human ran on a real adapter and not a gate. Saying so is the
+//! point: an earlier version of this header claimed CI opted in on lavapipe,
+//! which was inherited from a sibling and was never true of any of them.
 //!
 //! # The city is real, and that is not decoration
 //!
@@ -91,7 +97,24 @@ const SIZE: [u32; 2] = [320, 200];
 
 /// Posts a side in the fixture height field. Not a production constant — the
 /// grid is laid out from `textureDimensions(height_texture)`.
-const POSTS: u32 = 256;
+///
+/// **32 and not 256, and the post count is the quantity that governs whether
+/// this suite can see which triangle a prism lifts from.** The two triangles of
+/// a cell disagree by that cell's twist, and the twist of a smooth field
+/// scales with the square of the post SPACING — so a fine grid drives the
+/// disagreement under any tolerance a rendered fixture can defend, and a
+/// coarse one lifts it clear. At 32 posts over [`BOX_KM`] the spacing is 62.5
+/// m, which is the order `squallar_elevation::plan`'s finest realistic rung
+/// gives over a dollied patch, so this is the production case rather than a
+/// pessimised one.
+///
+/// **An earlier version of this file said the offscreen size governed it and
+/// concluded no rendered fixture could ever see the difference. That was
+/// wrong, and it was wrong in the direction that excused a hole**: at 256 posts
+/// on a ridge with no north-south term the twist was exactly zero, and a mutant
+/// that swapped the two triangles' return expressions was byte-identical to
+/// five decimals at every camera.
+const POSTS: u32 = 32;
 
 /// Width of the fixture ridge, as a fraction of the box's east-west extent.
 const RIDGE_SIGMA: f32 = 0.18;
@@ -105,11 +128,28 @@ const RIDGE_SIGMA: f32 = 0.18;
 /// "extruded from z = 0" different pictures.
 const RIDGE_AMPLITUDE: f32 = 0.25;
 
-/// The fixture height field, in box `z`: one ridge running north across the
-/// box, peaked at its middle. A Gaussian rather than a cone, so the surface has
-/// no crease for a `t` to interpolate across discontinuously.
+/// How far the ridge leans out of the north-south axis.
+///
+/// **The whole reason this file can tell one triangle from the other**, and it
+/// is one term rather than a second landform. A ridge running due north is a
+/// function of `x` alone, so every cell of the field is a ruled surface whose
+/// twist — `h00 - h10 - h01 + h11` — is identically zero, and the two triangles
+/// of every cell lie in the SAME plane. Under such a field the choice of
+/// triangle is unobservable by construction: a mutant swapping the two return
+/// expressions of `ground_surface_at` renders byte-identically at all eleven
+/// cameras, which is exactly what the first version of this fixture measured
+/// without noticing.
+///
+/// Leaning the ridge is enough. It is still one Gaussian ridge, still smooth,
+/// still creaseless — merely rotated — and every cell now carries a real twist.
+const RIDGE_LEAN: f32 = 0.6;
+
+/// The fixture height field, in box `z`: one Gaussian ridge, leaning across the
+/// box rather than running due north. A Gaussian rather than a cone, so the
+/// surface has no crease for a `t` to interpolate across discontinuously, and
+/// [`RIDGE_LEAN`] rather than axis-aligned so that it has a twist at all.
 fn ridge_height(uv: [f32; 2]) -> f32 {
-    let d = (uv[0] - 0.5) / RIDGE_SIGMA;
+    let d = ((uv[0] - 0.5) + RIDGE_LEAN * (uv[1] - 0.5)) / RIDGE_SIGMA;
     (RIDGE_AMPLITUDE * (-0.5 * d * d).exp()).clamp(0.0, 1.0)
 }
 
@@ -409,15 +449,38 @@ fn interior_prism(frame: &Frame, at: usize) -> bool {
         .all(|neighbour| frame.prism_at(neighbour))
 }
 
+/// A mesh, uploaded to completion.
+///
+/// **The loop is what production does not do.** `advance_buildings` carries a
+/// bounded slice per call so the frame thread never pays for a whole city at
+/// once; a test wants the finished article, so it spins. That the loop
+/// terminates is itself part of the contract — `advance_buildings` answers
+/// `true` only when nothing is left.
 fn upload_prisms(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &VolumePipelines,
     mesh: &BuildingMesh,
 ) -> BuildingPrisms {
-    pipelines
-        .upload_buildings(device, queue, &mesh.positions, &mesh.normals, &mesh.indices)
-        .expect("the fixture prism mesh was refused")
+    let mut prisms = pipelines
+        .begin_buildings(device, &mesh.positions, &mesh.normals, &mesh.indices)
+        .expect("the fixture prism mesh was refused");
+    let mut calls = 0usize;
+    while !pipelines.advance_buildings(
+        queue,
+        &mut prisms,
+        &mesh.positions,
+        &mesh.normals,
+        &mesh.indices,
+    ) {
+        calls += 1;
+        assert!(
+            calls < 10_000,
+            "the upload has not finished after {calls} calls, so it is not \
+             making progress"
+        );
+    }
+    prisms
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +555,17 @@ fn render(
 /// extruded from `z = 0` — which is exactly the mutant this unit exists to
 /// distinguish from a correct build, and which no flat fixture could.
 fn box_position(km: [f32; 3], placement: [f32; 4], standing: bool) -> [f32; 3] {
+    box_position_in(km, placement, standing, IDENTITY_GROUND_BOX)
+}
+
+/// [`box_position`] over a height field placed somewhere other than the whole
+/// drawn box — the state a field built for an OLDER box is drawn in.
+fn box_position_in(
+    km: [f32; 3],
+    placement: [f32; 4],
+    standing: bool,
+    ground_box: [f32; 4],
+) -> [f32; 3] {
     let uv = [
         km[0] * placement[0] + placement[2],
         km[1] * placement[1] + placement[3],
@@ -500,7 +574,7 @@ fn box_position(km: [f32; 3], placement: [f32; 4], standing: bool) -> [f32; 3] {
         ground_surface_at(
             [uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)],
             [POSTS, POSTS],
-            IDENTITY_GROUND_BOX,
+            ground_box,
             post_height,
         )
     } else {
@@ -511,10 +585,21 @@ fn box_position(km: [f32; 3], placement: [f32; 4], standing: bool) -> [f32; 3] {
 
 /// Every triangle of `mesh` in box space, through [`box_position`].
 fn box_triangles(mesh: &BuildingMesh, placement: [f32; 4], standing: bool) -> Vec<[[f32; 3]; 3]> {
+    box_triangles_in(mesh, placement, standing, IDENTITY_GROUND_BOX)
+}
+
+/// [`box_triangles`] over a height field placed somewhere other than the whole
+/// drawn box.
+fn box_triangles_in(
+    mesh: &BuildingMesh,
+    placement: [f32; 4],
+    standing: bool,
+    ground_box: [f32; 4],
+) -> Vec<[[f32; 3]; 3]> {
     let positions: Vec<[f32; 3]> = mesh
         .positions
         .iter()
-        .map(|km| box_position(*km, placement, standing))
+        .map(|km| box_position_in(*km, placement, standing, ground_box))
         .collect();
     mesh.indices
         .chunks_exact(3)
@@ -638,6 +723,17 @@ fn the_vertex_stride_is_what_the_budget_prices() {
 #[test]
 fn the_fixture_city_is_real_and_the_ground_under_it_is_not_flat() {
     let footprints = real_footprints();
+    // **The registration criterion runs on `tallest(6)`, not on the whole
+    // city**, so the relief guarantee below is taken over that subset too. An
+    // earlier version measured the spread across all 43 footprints and quoted
+    // it as though it guarded the six, which is a figure whose denominator is
+    // not the thing it protects.
+    let mut by_height = footprints.clone();
+    by_height.sort_by(|a, b| {
+        b.height_m
+            .partial_cmp(&a.height_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     assert!(
         footprints.len() >= 20,
         "only {} footprints of the committed Monaco tile land in this box; the \
@@ -654,28 +750,58 @@ fn the_fixture_city_is_real_and_the_ground_under_it_is_not_flat() {
         mesh.indices.len(),
     );
 
-    // The ground under the city, at each footprint's own first ring vertex.
+    // The ground under the SIX the registration criterion draws, at each
+    // footprint's own first ring vertex.
     let placement = placement_lane();
+    let subset = &by_height[..REGISTRATION_FOOTPRINTS.min(by_height.len())];
     let (mut low, mut high) = (f32::MAX, f32::MIN);
-    for footprint in &footprints {
+    for footprint in subset {
         let p = footprint.rings[0].points[0];
         let z = box_position([p[0] as f32, p[1] as f32, 0.0], placement, true)[2];
         low = low.min(z);
         high = high.max(z);
     }
     let spread = high - low;
-    // The tallest building in this tile, as a fraction of the box.
-    let tallest_km = footprints.iter().map(|f| f.height_m).fold(0.0f64, f64::max) / 1000.0;
+    // The tallest of those six, as a fraction of the box.
+    let tallest_km = subset.iter().map(|f| f.height_m).fold(0.0f64, f64::max) / 1000.0;
     let tallest_box_z = tallest_km as f32 / BOX_KM[2];
+    // And the twist, which is what makes the two triangles of a cell different
+    // planes at all. Reported because `RIDGE_LEAN` is what supplies it and a
+    // fixture that lost the lean would leave every criterion here green.
+    let mut worst_twist = 0.0f32;
+    for j in 0..POSTS - 1 {
+        for i in 0..POSTS - 1 {
+            let twist = post_height(i, j) - post_height(i + 1, j) - post_height(i, j + 1)
+                + post_height(i + 1, j + 1);
+            worst_twist = worst_twist.max(twist.abs());
+        }
+    }
     println!(
-        "fixture city: {} footprints, {ring_vertices} ring vertices, {} mesh vertices, \
-         {} triangles; ground under them spans {spread:.4} box z ({:.1} m); tallest \
-         building {tallest_box_z:.4} box z ({:.1} m)",
+        "fixture city: {} footprints ({} drawn by the registration criterion), \
+         {ring_vertices} ring vertices, {} mesh vertices, {} triangles; ground under \
+         the drawn ones spans {spread:.4} box z ({:.1} m); tallest of them \
+         {tallest_box_z:.4} box z ({:.1} m); worst cell twist {worst_twist:.5} box z",
         footprints.len(),
+        subset.len(),
         mesh.positions.len(),
         mesh.indices.len() / 3,
         spread * BOX_KM[2] * 1000.0,
         tallest_km * 1000.0,
+    );
+    // **The twist is the fixture's whole ability to tell one triangle from the
+    // other**, and it is asserted rather than hoped for. A field that is a
+    // function of one axis alone has a twist of exactly zero in every cell, and
+    // under one the two triangles of a cell lie in the same plane — so swapping
+    // the two arms of `ground_surface_at` is unobservable. That is measured
+    // history, not a worry: this fixture had no north-south term and a
+    // triangle-swap mutant rendered byte-identically at all eleven cameras.
+    assert!(
+        worst_twist > REGISTRATION_TOLERANCE * 4.0,
+        "the worst cell twist in the fixture field is {worst_twist} box z, \
+         which is not clear of this file's own registration tolerance of \
+         {REGISTRATION_TOLERANCE}. The two triangles of a cell differ by \
+         exactly the twist, so under this field nothing here can see WHICH \
+         triangle a prism lifts from",
     );
     assert!(
         spread > tallest_box_z,
@@ -716,7 +842,7 @@ fn the_prisms_stand_on_the_terrain_and_not_on_the_box_floor() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
     pipelines.upload_quad(&queue);
 
-    let mesh = tallest(6);
+    let mesh = tallest(REGISTRATION_FOOTPRINTS);
     let prisms = upload_prisms(&device, &queue, &pipelines, &mesh);
     let (cells, indices) = empty_grid();
     let placement = placement_lane();
@@ -738,10 +864,17 @@ fn the_prisms_stand_on_the_terrain_and_not_on_the_box_floor() {
             Some(&prisms),
         );
 
-        // Every pixel a prism drew, then a bounded sample of them: the cast is
-        // linear in the triangle count and this runs in a debug build.
+        // **The interior of the prism footprint**, then a bounded sample of it:
+        // the cast is linear in the triangle count and this runs in a debug
+        // build. Interior and not merely covered, for the reason every other
+        // comparison here is: at a silhouette the host cast through the pixel
+        // CENTRE and the rasteriser's coverage rule can land on different
+        // triangles, and on a coarse field the two carry visibly different
+        // heights. Measured: including the rim pushes the worst disagreement
+        // to 7.0e-4 box units at the near-overhead camera, against 2.0e-4 for
+        // the interior at the same camera — the rim is the whole of it.
         let drawn: Vec<usize> = (0..(SIZE[0] * SIZE[1]) as usize)
-            .filter(|at| frame.prism_at(*at))
+            .filter(|at| interior_prism(&frame, *at))
             .collect();
         if drawn.len() < MIN_PRISM_PIXELS {
             // Legal: `ORBIT_CAMERAS` includes cameras under the box floor, and
@@ -831,13 +964,26 @@ fn the_prisms_stand_on_the_terrain_and_not_on_the_box_floor() {
              {REGISTRATION_TOLERANCE} tolerance. The prisms are not where the \
              shader's own surface lookup puts them",
         );
+        // **`flat_agreements` is reported and deliberately not asserted on.**
+        // It cannot be anything but zero once the two assertions above hold,
+        // and pretending otherwise would be a second measurement that is
+        // really the first one restated. The arithmetic: a pixel is counted as
+        // discriminating only when the two hypotheses are more than
+        // `10 * REGISTRATION_TOLERANCE` apart, and the assertion above puts the
+        // GPU within `REGISTRATION_TOLERANCE` of the standing one — so by the
+        // triangle inequality the flat one is at least `9 *
+        // REGISTRATION_TOLERANCE` away and can never be inside the tolerance
+        // that would count it as an agreement.
+        //
+        // What actually excludes the flat hypothesis is that deduction over a
+        // population the fixture is asserted to contain: `discriminating`
+        // here, and `discriminating_total` at the end. Those are the numbers to
+        // read, and the print below is what lets a reader check the deduction
+        // rather than take it.
         assert_eq!(
             flat_agreements, 0,
-            "camera {camera:?}: a mesh extruded from the BOX FLOOR explains \
-             {flat_agreements} of {compared} sampled pixels to inside this \
-             criterion's own tolerance. Either the fixture has drifted onto \
-             flat ground, or the build under test is ignoring the terrain and \
-             the half above is matching it for the wrong reason",
+            "the triangle inequality has stopped holding, which means one of \
+             the two constants above was edited into overlapping the other",
         );
     }
     assert!(
@@ -861,6 +1007,15 @@ fn the_prisms_stand_on_the_terrain_and_not_on_the_box_floor() {
          standing"
     );
 }
+
+/// How many of the tallest real footprints the registration criterion draws.
+///
+/// Named here rather than at the two call sites because
+/// [`the_fixture_city_is_real_and_the_ground_under_it_is_not_flat`] guarantees
+/// the relief over exactly this population, and a floor measured over a
+/// different set from the one it guards is a figure whose denominator is not
+/// the thing it protects.
+const REGISTRATION_FOOTPRINTS: usize = 6;
 
 /// Prism pixels sampled per camera for the host cast.
 const SAMPLED_PIXELS: usize = 24;
@@ -1176,7 +1331,7 @@ fn a_footprint_the_parse_dropped_reaches_no_pixel() {
             .partial_cmp(&a.height_m)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    footprints.truncate(6);
+    footprints.truncate(REGISTRATION_FOOTPRINTS);
 
     // The one the parse is imagined to have dropped: the tallest, so its
     // absence is the largest thing that can be absent.
@@ -1452,7 +1607,7 @@ fn a_prisms_walls_are_shaded_by_the_faces_they_are() {
 #[ignore = "needs a real wgpu adapter; see the module doc"]
 fn an_incoherent_mesh_is_refused_rather_than_uploaded() {
     let _guard = gpu_lock();
-    let (device, queue) = device();
+    let (device, _queue) = device();
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
 
     let mesh = extrude(
@@ -1461,13 +1616,7 @@ fn an_incoherent_mesh_is_refused_rather_than_uploaded() {
     );
     assert!(
         pipelines
-            .upload_buildings(
-                &device,
-                &queue,
-                &mesh.positions,
-                &mesh.normals,
-                &mesh.indices
-            )
+            .begin_buildings(&device, &mesh.positions, &mesh.normals, &mesh.indices)
             .is_some(),
         "the coherent fixture mesh was refused, so the refusal below proves \
          nothing",
@@ -1477,7 +1626,7 @@ fn an_incoherent_mesh_is_refused_rather_than_uploaded() {
     doctored[0] = mesh.positions.len() as u32;
     assert!(
         pipelines
-            .upload_buildings(&device, &queue, &mesh.positions, &mesh.normals, &doctored)
+            .begin_buildings(&device, &mesh.positions, &mesh.normals, &doctored)
             .is_none(),
         "a mesh whose first index reaches one past its {} vertices was \
          uploaded. That index is an out-of-bounds fetch on the GPU",
@@ -1485,16 +1634,248 @@ fn an_incoherent_mesh_is_refused_rather_than_uploaded() {
     );
     assert!(
         pipelines
-            .upload_buildings(
-                &device,
-                &queue,
-                &mesh.positions,
-                &mesh.normals[1..],
-                &mesh.indices
-            )
+            .begin_buildings(&device, &mesh.positions, &mesh.normals[1..], &mesh.indices)
             .is_none(),
         "a mesh with one fewer normal than positions was uploaded",
     );
+}
+
+/// **A prism reads the height field's own placement, not the whole drawn box.**
+///
+/// `ground_box` is not the identity while a field built for an OLDER box stands
+/// in — the state that keeps a pane drawn instead of blank while a newer field
+/// is in flight — and under it the mesh covers a sub-rectangle with an apron
+/// carrying its rim height out to the box edge. A prism that ignored the lane
+/// would read the terrain at the wrong footprint and stand on a height
+/// belonging to somewhere else entirely.
+///
+/// **This file's own header names "B3's identity `ground_box`" as a trap it was
+/// written against, and then left the identical hole in its own lane** — which
+/// the review caught: making `ground_surface_at` pass `1.0, 0.0` instead of
+/// `volume.ground_box.*` survived every criterion here. `volume_drape.rs` has
+/// carried the equivalent control for the terrain since B3; this is the prism
+/// twin of it.
+///
+/// Two halves, and the second is what makes the first mean anything: the GPU
+/// agrees with a host cast that uses the SAME placement, and the same scene
+/// rendered under the identity placement is a measurably different picture.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the module doc"]
+fn a_prism_stands_on_the_field_where_the_field_actually_is() {
+    let _guard = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mesh = tallest(REGISTRATION_FOOTPRINTS);
+    let prisms = upload_prisms(&device, &queue, &pipelines, &mesh);
+    let (cells, indices) = empty_grid();
+    let placement = placement_lane();
+
+    // A field covering a sub-rectangle of the drawn box, anisotropically and
+    // off-centre — so a lane read as the identity, an axis transposed, or an
+    // offset dropped are three different wrong answers rather than one.
+    const STAND_IN: [f32; 4] = [0.55, 0.35, 0.2, 0.45];
+
+    let camera: Camera = (140.0, 60.0, 0.8, 3.0);
+    let view = view_at(camera);
+
+    let mut placed_uniform = uniform(cells, &view);
+    placed_uniform.ground_box = STAND_IN;
+    let placed = render(
+        &device,
+        &queue,
+        &pipelines,
+        cells,
+        &indices,
+        &placed_uniform,
+        Some(&prisms),
+    );
+
+    let identity_uniform = uniform(cells, &view);
+    assert_eq!(
+        identity_uniform.ground_box, IDENTITY_GROUND_BOX,
+        "the control frame is not the identity placement, so the pair below          compares two stand-ins rather than a stand-in against the settled case"
+    );
+    let identity = render(
+        &device,
+        &queue,
+        &pipelines,
+        cells,
+        &indices,
+        &identity_uniform,
+        Some(&prisms),
+    );
+
+    // Half one: the GPU is on the placed hypothesis.
+    let standing = box_triangles_in(&mesh, placement, true, STAND_IN);
+    let drawn: Vec<usize> = (0..(SIZE[0] * SIZE[1]) as usize)
+        .filter(|at| interior_prism(&placed, *at))
+        .collect();
+    assert!(
+        drawn.len() > 100,
+        "the placed frame paints only {} interior prism pixels",
+        drawn.len(),
+    );
+    let step = (drawn.len() / SAMPLED_PIXELS).max(1);
+    let mut worst = 0.0f32;
+    let mut compared = 0usize;
+    for &at in drawn.iter().step_by(step) {
+        let (x, y) = ((at as u32) % SIZE[0], (at as u32) / SIZE[0]);
+        let direction = ray_at(&view, x, y);
+        let (Some(gpu_t), Some(host_t)) = (
+            placed.hit_t(at, placed_uniform.occluder_t_scale),
+            nearest_hit(view.eye_in_box, direction, &standing),
+        ) else {
+            continue;
+        };
+        compared += 1;
+        worst = worst.max((gpu_t - host_t).abs());
+    }
+    assert!(
+        compared >= 4,
+        "only {compared} of {} placed prism pixels could be cast at all",
+        drawn.len(),
+    );
+
+    // Half two: the placement lane is genuinely read.
+    let moved = (0..(SIZE[0] * SIZE[1]) as usize)
+        .filter(|at| placed.offscreen[*at] != identity.offscreen[*at])
+        .count();
+    println!(
+        "camera {camera:?}: under a {STAND_IN:?} placement the prisms match a host cast          using the same lane to {worst:.5} box z over {compared} pixels, and {moved}          pixels differ from the identity placement",
+    );
+    assert!(
+        worst <= REGISTRATION_TOLERANCE,
+        "under a non-identity `ground_box` the prisms sit {worst} box units          from where that placement puts the terrain, past the          {REGISTRATION_TOLERANCE} tolerance",
+    );
+    assert!(
+        moved > 500,
+        "only {moved} pixels differ between a {STAND_IN:?} placement and the          identity. A build whose prisms ignore `ground_box` renders the two          identically, which is exactly the mutant this criterion exists to          reject",
+    );
+}
+
+/// **A city arrives over several frames and is not drawn until it is whole.**
+///
+/// The frame thread's share of a building mesh is bounded — interleaving and
+/// writing a default-rung city measured **5.76 ms** in a release build on this
+/// box, against a 16.7 ms frame — so it goes over in slices of
+/// `BUILDING_UPLOAD_BYTES_PER_CALL`. Two things must hold and neither follows
+/// from the other:
+///
+/// * a mesh larger than one slice really does take more than one call, so the
+///   bound is doing something;
+/// * a half-written mesh **draws nothing at all**. Its buffers' tails are still
+///   zeroes, and a zeroed vertex is a degenerate triangle through the box
+///   origin — a fan of slivers across the pane, which is a far worse picture
+///   than a city that has not arrived.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the module doc"]
+fn a_city_lands_over_several_frames_and_draws_only_when_whole() {
+    let _guard = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mesh = city();
+    let bytes = mesh.bytes();
+    assert!(
+        bytes > squallar_volumetric::raymarch::BUILDING_UPLOAD_BYTES_PER_CALL,
+        "the fixture city is {bytes} bytes, inside one call's own budget, so it \
+         cannot show that the budget bounds anything",
+    );
+
+    let mut prisms = pipelines
+        .begin_buildings(&device, &mesh.positions, &mesh.normals, &mesh.indices)
+        .expect("the fixture prism mesh was refused");
+    assert!(
+        !prisms.is_complete(),
+        "a mesh reads as complete before a single byte has been carried over",
+    );
+
+    let (cells, indices) = empty_grid();
+    let camera: Camera = (140.0, 60.0, 0.8, 3.0);
+    let view = view_at(camera);
+    let uniform = uniform(cells, &view);
+
+    // Mid-flight: one slice in, and the pane must show terrain and nothing else.
+    let done = pipelines.advance_buildings(
+        &queue,
+        &mut prisms,
+        &mesh.positions,
+        &mesh.normals,
+        &mesh.indices,
+    );
+    assert!(
+        !done,
+        "a {bytes}-byte mesh finished in one call, so the per-call budget of {} \
+         is not bounding it",
+        squallar_volumetric::raymarch::BUILDING_UPLOAD_BYTES_PER_CALL,
+    );
+    let partial = render(
+        &device,
+        &queue,
+        &pipelines,
+        cells,
+        &indices,
+        &uniform,
+        Some(&prisms),
+    );
+    let bare = render(&device, &queue, &pipelines, cells, &indices, &uniform, None);
+    let partial_pixels = (0..(SIZE[0] * SIZE[1]) as usize)
+        .filter(|at| partial.prism_at(*at))
+        .count();
+    let differing = (0..(SIZE[0] * SIZE[1]) as usize)
+        .filter(|at| partial.offscreen[*at] != bare.offscreen[*at])
+        .count();
+
+    let mut calls = 1usize;
+    while !pipelines.advance_buildings(
+        &queue,
+        &mut prisms,
+        &mesh.positions,
+        &mesh.normals,
+        &mesh.indices,
+    ) {
+        calls += 1;
+        assert!(calls < 10_000, "the upload is not making progress");
+    }
+    calls += 1;
+    let whole = render(
+        &device,
+        &queue,
+        &pipelines,
+        cells,
+        &indices,
+        &uniform,
+        Some(&prisms),
+    );
+    let whole_pixels = (0..(SIZE[0] * SIZE[1]) as usize)
+        .filter(|at| whole.prism_at(*at))
+        .count();
+
+    println!(
+        "a {bytes}-byte city landed over {calls} calls; half-written it painted \
+         {partial_pixels} prism pixels and moved {differing} pixels off the bare \
+         terrain; whole it paints {whole_pixels}",
+    );
+    assert_eq!(
+        partial_pixels, 0,
+        "a half-written mesh painted {partial_pixels} prism pixels. Its \
+         buffers' tails are zeroes, so those triangles pass through the box \
+         origin",
+    );
+    assert_eq!(
+        differing, 0,
+        "a half-written mesh moved {differing} pixels off the frame the same \
+         scene draws with no mesh at all, so it is being drawn",
+    );
+    assert!(
+        whole_pixels > 100,
+        "the finished city paints only {whole_pixels} prism pixels, so the \
+         assertions above are about a mesh that never draws anyway",
+    );
+    assert!(calls > 1, "the whole city landed in {calls} call(s)");
 }
 
 /// A prism whose footprint lies outside the drawn box writes no fragment, and
