@@ -1570,11 +1570,14 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
-            None,
-            // No downloaded areas: these read the committed fixture over a
-            // bare source, and the composition's own suite is what covers
-            // the local-first walk.
-            None::<crate::basemap_download::PlatformSegmentStore>,
+            // No seed and no downloaded areas: these read the committed
+            // fixture over a bare source, and the composition's own suite is
+            // what covers the local-first walk.
+            crate::tile_source::ArchiveStores {
+                seed: None,
+                offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
         ))
     }
 
@@ -1836,11 +1839,14 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
-            None,
-            // No downloaded areas: these read the committed fixture over a
-            // bare source, and the composition's own suite is what covers
-            // the local-first walk.
-            None::<crate::basemap_download::PlatformSegmentStore>,
+            // No seed and no downloaded areas: these read the committed
+            // fixture over a bare source, and the composition's own suite is
+            // what covers the local-first walk.
+            crate::tile_source::ArchiveStores {
+                seed: None,
+                offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
         );
         Some((tiles, reads, dead))
     }
@@ -2036,11 +2042,14 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
-            None,
-            // No downloaded areas: these read the committed fixture over a
-            // bare source, and the composition's own suite is what covers
-            // the local-first walk.
-            None::<crate::basemap_download::PlatformSegmentStore>,
+            // No seed and no downloaded areas: these read the committed
+            // fixture over a bare source, and the composition's own suite is
+            // what covers the local-first walk.
+            crate::tile_source::ArchiveStores {
+                seed: None,
+                offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                offline_archive: crate::basemap_download::AreaArchive::Basemap,
+            },
         );
 
         let fault = pump_until(DEFAULT_TIMEOUT, || {

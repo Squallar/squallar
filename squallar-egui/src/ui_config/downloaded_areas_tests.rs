@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::Gui;
-use crate::basemap_download::{AreaSpec, AreaStatus, DownloadedArea};
+use crate::basemap_download::{AreaSpec, AreaStatus, DownloadedArea, TerrainHold};
 use squallar_kv::MemoryKvStore;
 use squallar_units::DataSize;
 
@@ -22,6 +22,11 @@ fn oklahoma(area_id: &str) -> DownloadedArea {
         segments_expected: 7,
         bytes: DataSize::from_bytes(112_345_678),
         generation: "basemap_2Fomt-20260828.pmtiles".to_owned(),
+        terrain: Some(TerrainHold {
+            segments_expected: 2,
+            bytes: DataSize::from_bytes(21_000_111),
+            generation: "terrain_2F4ca64469750e-20260829".to_owned(),
+        }),
     }
 }
 
@@ -32,10 +37,15 @@ fn downloaded_areas_round_trip_whole_and_reach_a_byte_identical_save() {
     let store = MemoryKvStore::default();
     let mut gui = Gui::new();
     gui.record_downloaded_area(oklahoma("ok-central"));
+    // The second record holds no terrain, so the file carries one area of each
+    // shape and the round trip proves both — an area with a hillshade and one
+    // without, which is what a device that downloaded before terrain existed
+    // has.
     gui.record_downloaded_area(DownloadedArea {
         segments_expected: 1,
         bytes: DataSize::from_bytes(3_900_000),
         generation: String::new(),
+        terrain: None,
         ..oklahoma("norman")
     });
     gui.save_ui_config(&store);
@@ -321,5 +331,154 @@ fn a_restored_record_is_startable_and_reconcilable() {
             .is_complete(),
         "an area three-sevenths on the device read as complete because it was \
          persisted",
+    );
+}
+
+/// **A record written before an area could hold terrain still loads, and reads
+/// as basemap-only** — which is exactly what such an area is.
+///
+/// Additive on `favorite_sites`' terms: no `CONFIG_VERSION` rung and no
+/// migration step, asserted here rather than described.
+#[test]
+fn a_basemap_only_record_loads_unchanged_and_needed_no_version_bump() {
+    let old = r#"{
+        "pane_count": 1,
+        "config_version": 5,
+        "downloaded_areas": [{
+            "area_id": "ok-central",
+            "west": -98.25, "south": 34.75, "east": -96.5, "north": 36.25,
+            "max_zoom": 12,
+            "segments": 7,
+            "bytes": 112345678,
+            "generation": "basemap_2Fomt-20260828.pmtiles"
+        }]
+    }"#;
+    let store = MemoryKvStore::default();
+    squallar_kv::KvStore::store(&store, crate::UI_CONFIG_KEY, old).expect("the store accepts it");
+    let mut gui = Gui::new();
+    assert!(
+        gui.load_ui_config(&store),
+        "a record predating the terrain half must still load"
+    );
+
+    let area = gui
+        .downloaded_area("ok-central")
+        .expect("the area is held")
+        .clone();
+    assert_eq!(area.segments_expected, 7, "the basemap half moved");
+    assert_eq!(area.bytes.bytes(), 112_345_678, "the byte figure moved");
+    assert_eq!(
+        area.terrain, None,
+        "an area with no terrain block claimed a hillshade it never fetched"
+    );
+
+    // No bump. If the terrain half had needed a rung, `CONFIG_VERSION` would
+    // have moved past the 5 that file names and this would fail.
+    assert_eq!(
+        migrate::CONFIG_VERSION,
+        5,
+        "the terrain half is additive on `favorite_sites`' terms - a moved \
+         CONFIG_VERSION means it was not",
+    );
+
+    // And it reconciles as an area with one half: the terrain listing is
+    // empty, and that must not make it read as short.
+    let whole: std::collections::BTreeSet<u32> = (0..7).collect();
+    assert!(
+        area.reconcile_all(&whole, &std::collections::BTreeSet::new())
+            .is_complete(),
+        "a basemap-only area read as incomplete because it holds no hillshade"
+    );
+
+    // Written back, the record gains no key: a device that never downloaded
+    // terrain writes the file its previous build wrote.
+    let saved: serde_json::Value =
+        serde_json::from_str(&gui.ui_config_json().expect("serializable")).expect("valid JSON");
+    assert!(
+        saved["downloaded_areas"][0]
+            .as_object()
+            .expect("an area is an object")
+            .get("terrain")
+            .is_none(),
+        "a basemap-only record grew a terrain key: {}",
+        saved["downloaded_areas"][0]
+    );
+    assert!(
+        saved["download_area"]
+            .as_object()
+            .expect("the selection is an object")
+            .get("terrain")
+            .is_none(),
+        "an untouched checkbox wrote a key: {}",
+        saved["download_area"]
+    );
+}
+
+/// A record that **does** hold terrain says so, with the terrain archive's own
+/// generation beside the basemap's — two cadences, two strings.
+#[test]
+fn a_terrain_holding_record_carries_its_own_cut_and_generation() {
+    let store = MemoryKvStore::default();
+    let mut gui = Gui::new();
+    gui.record_downloaded_area(oklahoma("ok-central"));
+    gui.save_ui_config(&store);
+
+    let written: serde_json::Value =
+        serde_json::from_str(&gui.ui_config_json().expect("serializable")).expect("valid JSON");
+    let terrain = &written["downloaded_areas"][0]["terrain"];
+    assert_eq!(terrain["segments"], 2);
+    assert_eq!(
+        terrain["bytes"], 21_000_111u64,
+        "the terrain half's exact byte count did not survive the file",
+    );
+    assert_eq!(terrain["generation"], "terrain_2F4ca64469750e-20260829");
+    assert_ne!(
+        terrain["generation"], written["downloaded_areas"][0]["generation"],
+        "one generation string was made to date both archives",
+    );
+
+    let mut restored = Gui::new();
+    assert!(restored.load_ui_config(&store));
+    assert_eq!(
+        restored.downloaded_area("ok-central"),
+        gui.downloaded_area("ok-central"),
+        "the terrain half did not come back whole",
+    );
+}
+
+/// A terrain block naming a cut of nothing costs the **hillshade**, never the
+/// rectangle: the area still restores, as basemap-only.
+///
+/// The same discipline `restore` already applies to the area itself — a
+/// nonsense block becomes no block rather than a bad one — one level down.
+#[test]
+fn a_nonsense_terrain_block_costs_the_hillshade_and_not_the_area() {
+    let broken = r#"{
+        "pane_count": 1,
+        "config_version": 5,
+        "downloaded_areas": [{
+            "area_id": "norman",
+            "west": -98.25, "south": 34.75, "east": -96.5, "north": 36.25,
+            "max_zoom": 12,
+            "segments": 4,
+            "bytes": 9000,
+            "generation": "basemap_2Fomt-20260828.pmtiles",
+            "terrain": { "segments": 0, "bytes": 5, "generation": "x" }
+        }]
+    }"#;
+    let store = MemoryKvStore::default();
+    squallar_kv::KvStore::store(&store, crate::UI_CONFIG_KEY, broken)
+        .expect("the store accepts it");
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store));
+
+    let area = gui.downloaded_area("norman").expect("the area survives");
+    assert_eq!(
+        area.segments_expected, 4,
+        "the rectangle was lost with the block"
+    );
+    assert_eq!(
+        area.terrain, None,
+        "a cut of zero segments would be a half nothing could ever fail to hold all of"
     );
 }

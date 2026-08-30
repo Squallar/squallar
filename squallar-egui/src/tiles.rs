@@ -202,6 +202,31 @@ pub(crate) fn archive_range_source()
     )
 }
 
+/// [`archive_range_source`] over the terrain hillshade archive, for the same
+/// two readers.
+///
+/// The terrain archive is published in parts and a bare `GET` of the logical
+/// name 404s **by design**; `HttpRangeSource` probes `<url>.part000` at open
+/// and selects parts mode itself, so nothing here or above knows parts exist.
+///
+/// # Errors
+///
+/// As [`archive_range_source`].
+pub(crate) fn terrain_range_source()
+-> Result<crate::basemap_archive::HttpRangeSource, crate::basemap_archive::RangeError> {
+    crate::basemap_archive::HttpRangeSource::new(
+        crate::basemap_archive::archive_client(),
+        &terrain_archive_url(),
+    )
+}
+
+/// The generation the terrain archive this build reads carries — the one
+/// derivation, so a record and the block cache cannot disagree about which
+/// hillshade a byte came from.
+pub(crate) fn terrain_generation() -> String {
+    crate::basemap_archive::block_cache::generation_for_url(&terrain_archive_url())
+}
+
 /// The credit the hillshade's elevation data requires.
 ///
 /// The DEM is `COP-DEM_GLO-30 Public, 2021 release` — see
@@ -216,7 +241,15 @@ pub const TERRAIN_ATTRIBUTION_TEXT: &str = "\u{a9} Copernicus DEM 2021";
 /// The terrain hillshade tile source, or `None` when the archive URL will not
 /// parse — the only failure visible at construction; the rest surface on
 /// `HttpsTiles::fault` inside the IO task.
-fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
+///
+/// `basemap_dir` is the same store the base source reads its downloaded areas
+/// out of: an area's two halves live side by side in it, and each source takes
+/// its own. A downloaded area's hillshade therefore draws with no network for
+/// the same reason its base map does, through the same composition.
+fn terrain_source(
+    ctx: &egui::Context,
+    basemap_dir: Option<&std::path::Path>,
+) -> Option<HttpsTiles> {
     let url = terrain_archive_url();
     let attribution = Attribution {
         text: TERRAIN_ATTRIBUTION_TEXT,
@@ -230,6 +263,7 @@ fn terrain_source(ctx: &egui::Context) -> Option<HttpsTiles> {
         attribution,
         ctx.to_owned(),
         archive_block_cache(&url),
+        offline_store(basemap_dir),
     ) {
         Ok(tiles) => Some(tiles),
         Err(error) => {
@@ -597,7 +631,7 @@ impl MapTileState {
                     ctx.to_owned(),
                 ))
             } else {
-                terrain_source(ctx)
+                terrain_source(ctx, self.basemap_dir.as_deref())
             };
             // A build with no archive reader, or a URL that will not parse,
             // yields no source and never will this session: latch, so the

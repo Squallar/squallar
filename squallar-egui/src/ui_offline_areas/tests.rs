@@ -94,6 +94,7 @@ fn area(area_id: &str, segments: u32, max_zoom: u8, generation: &str) -> Downloa
         segments_expected: segments,
         bytes: DataSize::from_bytes(COMPLETE_BYTES),
         generation: generation.to_owned(),
+        terrain: None,
     }
 }
 
@@ -751,6 +752,7 @@ fn the_progress_block_draws_a_byte_bar_and_the_exact_byte_figures() {
     let mut h = harness_over(&dir);
     let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
         BudgetedSource::over(MONACO, &budget),
+        None::<(crate::basemap_archive::FileRangeSource, String)>,
         store,
         monaco_spec(),
         live_generation(),
@@ -856,6 +858,7 @@ fn the_block_says_it_is_preparing_until_a_byte_denominator_exists() {
     let mut h = harness_over(&dir);
     let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
         BudgetedSource::over(MONACO, &budget),
+        None::<(crate::basemap_archive::FileRangeSource, String)>,
         crate::basemap_download::FsSegmentStore::new(dir.0.clone()),
         monaco_spec(),
         live_generation(),
@@ -947,6 +950,7 @@ fn a_finished_run_publishes_its_record_dated_to_the_archive_it_cut_from() {
     let engine = crate::basemap_areas::ActiveDownload::start_with_segment_bytes(
         crate::basemap_archive::FileRangeSource::open(std::path::Path::new(MONACO))
             .expect("the fixture opens"),
+        None::<(crate::basemap_archive::FileRangeSource, String)>,
         crate::basemap_download::FsSegmentStore::new(dir.0.clone()),
         monaco_spec(),
         live_generation(),
@@ -997,5 +1001,210 @@ fn a_finished_run_publishes_its_record_dated_to_the_archive_it_cut_from() {
         parts_vocabulary_on_the_glass(&h).is_empty(),
         "a complete download draws the segment vocabulary: {:?}",
         parts_vocabulary_on_the_glass(&h),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hillshade half on the glass
+// ---------------------------------------------------------------------------
+
+/// The terrain half's own cut and byte figure, distinct from the basemap's so
+/// no assertion below can pass on the wrong one.
+const TERRAIN_SEGMENTS: u32 = 3;
+const TERRAIN_BYTES: u64 = 21_000_111;
+
+/// The pair a whole two-archive area's byte figure must label as — the record
+/// carries both halves, so the size on the glass is both halves.
+fn both_halves_label() -> String {
+    DataSize::from_bytes(COMPLETE_BYTES + TERRAIN_BYTES).label()
+}
+
+/// [`area`] with a terrain half.
+fn area_with_terrain(
+    area_id: &str,
+    segments: u32,
+    max_zoom: u8,
+    generation: &str,
+) -> DownloadedArea {
+    let mut record = area(area_id, segments, max_zoom, generation);
+    record.bytes = DataSize::from_bytes(COMPLETE_BYTES + TERRAIN_BYTES);
+    record.terrain = Some(crate::basemap_download::TerrainHold {
+        segments_expected: TERRAIN_SEGMENTS,
+        bytes: DataSize::from_bytes(TERRAIN_BYTES),
+        generation: generation.to_owned(),
+    });
+    record
+}
+
+impl TempDir {
+    /// Publish `count` **terrain** segments of `area_id`, as the store's own
+    /// naming contract spells them — the infix is the only difference, which
+    /// is the point.
+    fn place_terrain_segments(&self, area_id: &str, count: u32) {
+        let payload = vec![0u8; usize::try_from(SEGMENT_PAYLOAD_BYTES).expect("fits a usize")];
+        for seg in 0..count {
+            std::fs::write(
+                self.0.join(format!("{area_id}.{seg}.terrain.pmtiles")),
+                &payload,
+            )
+            .expect("a terrain segment should be writable");
+        }
+    }
+}
+
+/// A whole two-archive area draws **one** size — both halves — and **one**
+/// extra line saying it holds the hillshade. Never a second entry, never a
+/// second byte figure, and never the segment vocabulary.
+#[test]
+fn an_area_that_holds_terrain_says_so_in_one_line_and_one_figure() {
+    let dir = TempDir::new("with-terrain");
+    dir.place_segments("ok-central", 7);
+    dir.place_terrain_segments("ok-central", TERRAIN_SEGMENTS);
+    let mut h = harness_over(&dir);
+    h.gui_mut()
+        .record_downloaded_area(area_with_terrain("ok-central", 7, 12, &live_generation()));
+    open_areas_screen(&mut h);
+    settle_statuses(&mut h, &["ok-central"]);
+    h.frame_after(1.0 / 60.0);
+
+    let text = row_text(&h);
+    assert!(
+        row_says(&h, super::TERRAIN_HELD_NOTE),
+        "an area holding the hillshade does not say so: {text:?}",
+    );
+    assert!(
+        row_says(&h, "Towns and main roads"),
+        "the terrain note replaced the depth rather than joining it: {text:?}",
+    );
+    // One area, one entry: the id is drawn once however many archives it holds.
+    assert_eq!(
+        text.iter()
+            .filter(|drawn| drawn.contains("ok-central"))
+            .count(),
+        1,
+        "the two-archive area drew more than one entry: {text:?}",
+    );
+    assert_eq!(
+        text.iter()
+            .filter(|drawn| drawn.contains(super::TERRAIN_HELD_NOTE))
+            .count(),
+        1,
+        "the terrain fact was drawn more than once: {text:?}",
+    );
+    assert!(
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "a two-archive area draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
+    );
+
+    // The byte figure is both halves, from the store's own listing of both.
+    let held = DataSize::from_bytes(u64::from(7 + TERRAIN_SEGMENTS) * SEGMENT_PAYLOAD_BYTES);
+    let fact = h
+        .gui()
+        .area_maintenance
+        .as_ref()
+        .and_then(|maintenance| maintenance.fact("ok-central"))
+        .expect("the store answered");
+    assert_eq!(
+        fact.held, held,
+        "the held figure counts one archive's segments, not the area's",
+    );
+    assert_eq!(
+        fact.status,
+        crate::basemap_download::AreaStatus {
+            present: 7 + TERRAIN_SEGMENTS,
+            expected: 7 + TERRAIN_SEGMENTS,
+        },
+        "the status is not both halves against both cuts",
+    );
+    assert!(
+        row_draws_label(&h, &both_halves_label()),
+        "a whole two-archive area does not draw its combined size {:?}: {text:?}",
+        both_halves_label(),
+    );
+}
+
+/// **An area whose hillshade went missing is a half-held area**, drawn as the
+/// held-of-asked pair — never as a finished area with a note.
+///
+/// This is the silent-partial-success shape the second archive introduces: the
+/// base map is all there, so a reconcile that only asked about the base map
+/// would draw this area as done while the map showed no shading.
+#[test]
+fn an_area_missing_only_its_hillshade_never_renders_as_done() {
+    let dir = TempDir::new("lost-terrain");
+    dir.place_segments("ok-central", 7);
+    dir.place_terrain_segments("ok-central", 1);
+    let mut h = harness_over(&dir);
+    h.gui_mut()
+        .record_downloaded_area(area_with_terrain("ok-central", 7, 12, &live_generation()));
+    open_areas_screen(&mut h);
+    settle_statuses(&mut h, &["ok-central"]);
+    h.frame_after(1.0 / 60.0);
+
+    let text = row_text(&h);
+    let held = DataSize::from_bytes(8 * SEGMENT_PAYLOAD_BYTES).label();
+    let pair = format!("{held} of {}", both_halves_label());
+    assert_ne!(
+        held,
+        both_halves_label(),
+        "the fixture's held and asked figures label the same, so this test could \
+         not tell the two apart",
+    );
+    assert!(
+        row_draws_label(&h, &pair),
+        "the area missing its hillshade does not draw {pair:?}: {text:?}",
+    );
+    assert!(
+        !row_draws_label(&h, &both_halves_label()),
+        "an area whose hillshade is gone drew its size alone - a half-download \
+         rendered as done: {text:?}",
+    );
+    assert!(
+        parts_vocabulary_on_the_glass(&h).is_empty(),
+        "the half-held area draws the segment vocabulary: {:?}",
+        parts_vocabulary_on_the_glass(&h),
+    );
+    assert!(
+        row_says(&h, "Resume"),
+        "an area short of a half offers no way to complete it: {text:?}",
+    );
+}
+
+/// A **basemap-only** area still draws exactly as it did: no terrain line, no
+/// terrain figure, and its own size. The device that downloaded before terrain
+/// existed sees no change.
+#[test]
+fn a_basemap_only_area_draws_no_terrain_fact() {
+    let dir = TempDir::new("no-terrain");
+    dir.place_segments("ok-central", 7);
+    // A terrain artifact belonging to a DIFFERENT area, in the same directory:
+    // the listing must not sweep it into this record's figures.
+    dir.place_terrain_segments("norman", 4);
+    let mut h = harness_over(&dir);
+    h.gui_mut()
+        .record_downloaded_area(area("ok-central", 7, 12, &live_generation()));
+    open_areas_screen(&mut h);
+    settle_statuses(&mut h, &["ok-central"]);
+    h.frame_after(1.0 / 60.0);
+
+    let text = row_text(&h);
+    assert!(
+        !row_says(&h, super::TERRAIN_HELD_NOTE),
+        "a basemap-only area claims a hillshade it does not hold: {text:?}",
+    );
+    assert!(
+        row_draws_label(&h, COMPLETE_SIZE_LABEL),
+        "a basemap-only area does not draw its own size: {text:?}",
+    );
+    assert_eq!(
+        h.gui()
+            .area_maintenance
+            .as_ref()
+            .and_then(|maintenance| maintenance.fact("ok-central"))
+            .expect("the store answered")
+            .held,
+        DataSize::from_bytes(7 * SEGMENT_PAYLOAD_BYTES),
+        "another area's terrain segments were counted into this one",
     );
 }

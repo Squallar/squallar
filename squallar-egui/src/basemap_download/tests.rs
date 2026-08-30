@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 use egui::Context;
 
 use super::{
-    AreaSpec, AreaStatus, BasemapDownload, DownloadOutcome, DownloadedArea, FsSegmentStore,
-    HttpSegmentStore, OFFLINE_BASE_PATH, SEGMENT_BYTES, SegmentStore, TileSpan, area_status,
-    area_tiles, coalesce, plan_area, valid_area_id,
+    AreaArchive, AreaSpec, AreaStatus, BasemapDownload, DownloadOutcome, DownloadedArea,
+    FsSegmentStore, HttpSegmentStore, OFFLINE_BASE_PATH, SEGMENT_BYTES, SegmentStore, TileSpan,
+    area_status, area_tiles, area_tiles_to, coalesce, plan_area, valid_area_id,
 };
 use crate::basemap_archive::{FileRangeSource, HttpRangeSource, RangeError, RangeSource};
 use crate::pmt_index::{PmtIndex, zxy_to_tile_id};
@@ -769,7 +769,8 @@ fn a_truncated_part_is_never_listed_and_its_own_header_convicts_it() {
     // (a) It is not listed: completeness is recomputed from .pmtiles files
     // only, so the stray .part cannot make segment 9 read as present.
     let store = FsSegmentStore::new(dir.0.clone());
-    let listed = block_on(store.existing_segments(&area.area_id)).expect("the listing reads");
+    let listed = block_on(store.existing_segments(&area.area_id, AreaArchive::Basemap))
+        .expect("the listing reads");
     assert!(
         !listed.contains(&9),
         "a .part must never be listed complete"
@@ -1034,6 +1035,7 @@ fn seven_segment_record(area_id: &str) -> DownloadedArea {
         segments_expected: 7,
         bytes: DataSize::from_bytes(112_000_000),
         generation: "basemap_2Fomt-20260828.pmtiles".to_owned(),
+        terrain: None,
     }
 }
 
@@ -1047,7 +1049,7 @@ fn a_record_whose_segments_are_missing_reads_as_incomplete_with_true_counts() {
     let area = seven_segment_record("reconcile-missing");
 
     for seg in [0u32, 3, 6] {
-        block_on(store.publish(&area.spec.area_id, seg, vec![0u8; 16]))
+        block_on(store.publish(&area.spec.area_id, AreaArchive::Basemap, seg, vec![0u8; 16]))
             .expect("the store accepts a segment");
     }
 
@@ -1074,7 +1076,7 @@ fn a_record_whose_segments_are_missing_reads_as_incomplete_with_true_counts() {
     // And the same record over a full store is complete — without which the
     // assertion above could pass on a reconciliation that never says yes.
     for seg in [1u32, 2, 4, 5] {
-        block_on(store.publish(&area.spec.area_id, seg, vec![0u8; 16]))
+        block_on(store.publish(&area.spec.area_id, AreaArchive::Basemap, seg, vec![0u8; 16]))
             .expect("the store accepts a segment");
     }
     let filled = block_on(area_status(&store, &area)).expect("the store lists its segments");
@@ -1520,4 +1522,362 @@ fn the_planners_leaf_reads_overlap_rather_than_queueing_one_at_a_time() {
         LEAFY_LEAVES,
         "overlapping the reads must not read a leaf twice"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The second archive
+// ---------------------------------------------------------------------------
+//
+// An area is one rectangle over two archives. What could go quietly wrong is
+// all in this section: the two halves colliding in the store, the terrain half
+// being cut past the depth its own archive stops at, and the byte figures
+// coming from anywhere but each archive's own directories.
+
+/// The committed raster mini archive: `tile_type = 4`, **`max_zoom = 10`**,
+/// one real hillshade tile at z10 224/395 over Kansas.
+///
+/// The ceiling is the point of using it: 10 is neither the basemap's 14 nor
+/// the shipped terrain build's 12, so an enumeration that hardcoded either
+/// fails here.
+pub(crate) const TERRAIN_MINI: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/testdata/terrain-hillshade-mini.pmtiles"
+);
+
+/// The one tile [`TERRAIN_MINI`] holds.
+const TERRAIN_MINI_TILE: (u8, u32, u32) = (10, 224, 395);
+
+/// A box around [`TERRAIN_MINI_TILE`], asked for at a depth **past** the mini
+/// archive's own ceiling — which is what makes the clamp observable.
+fn kansas_area(area_id: &str, max_zoom: u8) -> AreaSpec {
+    AreaSpec {
+        area_id: area_id.to_owned(),
+        west: -101.08,
+        south: 37.79,
+        east: -101.07,
+        north: 37.80,
+        max_zoom,
+    }
+}
+
+/// A standalone v3 **raster** archive holding every tile of `area` down to
+/// `max_zoom`, uncompressed, root directory only.
+///
+/// Blob lengths **vary per tile** on purpose: an archive of uniform bodies
+/// would let a byte figure computed as `tile_count x average` agree with the
+/// exact one, which is the estimate every figure in this feature is forbidden
+/// to be.
+///
+/// `tile_type = 4` and `max_zoom` are the header's own, so a reader that took
+/// either from anywhere else disagrees with this fixture rather than with a
+/// constant.
+pub(crate) fn raster_archive(area: &AreaSpec, max_zoom: u8) -> Vec<u8> {
+    let mut ids: Vec<u64> = super::area_tiles_to(area, max_zoom)
+        .into_iter()
+        .filter_map(|(z, x, y)| zxy_to_tile_id(z, x, y))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert!(
+        !ids.is_empty(),
+        "a raster fixture with no tiles proves nothing"
+    );
+
+    let mut rows: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(ids.len());
+    let mut at = 0u64;
+    for (nth, &id) in ids.iter().enumerate() {
+        let length = 4 + (nth as u64 % 7);
+        rows.push((id, 1, length, at));
+        at += length;
+    }
+    let tile_data_length = at;
+
+    let root = encode_directory(&rows);
+    let metadata = b"{}".to_vec();
+    let root_offset = crate::pmt_index::HEADER_BYTES as u64;
+    let metadata_offset = root_offset + root.len() as u64;
+    let leaf_offset = metadata_offset + metadata.len() as u64;
+    let tile_data_offset = leaf_offset;
+
+    let mut header = vec![0u8; crate::pmt_index::HEADER_BYTES];
+    header[0..7].copy_from_slice(b"PMTiles");
+    header[7] = 3;
+    header[8..16].copy_from_slice(&root_offset.to_le_bytes());
+    header[16..24].copy_from_slice(&(root.len() as u64).to_le_bytes());
+    header[24..32].copy_from_slice(&metadata_offset.to_le_bytes());
+    header[32..40].copy_from_slice(&(metadata.len() as u64).to_le_bytes());
+    header[40..48].copy_from_slice(&leaf_offset.to_le_bytes());
+    header[48..56].copy_from_slice(&0u64.to_le_bytes());
+    header[56..64].copy_from_slice(&tile_data_offset.to_le_bytes());
+    header[64..72].copy_from_slice(&tile_data_length.to_le_bytes());
+    header[72..80].copy_from_slice(&(ids.len() as u64).to_le_bytes());
+    header[80..88].copy_from_slice(&(ids.len() as u64).to_le_bytes());
+    header[88..96].copy_from_slice(&(ids.len() as u64).to_le_bytes());
+    header[96] = 1; // clustered
+    header[97] = 1; // internal_compression: none
+    header[98] = 1; // tile_compression: none
+    header[99] = 4; // tile_type: WebP, as the published hillshade is
+    header[100] = 0;
+    header[101] = max_zoom;
+    // Whole world, so the reader's own bbox never narrows what the
+    // directories say.
+    header[102..106].copy_from_slice(&(-1_800_000_000i32).to_le_bytes());
+    header[106..110].copy_from_slice(&(-850_000_000i32).to_le_bytes());
+    header[110..114].copy_from_slice(&1_800_000_000i32.to_le_bytes());
+    header[114..118].copy_from_slice(&850_000_000i32.to_le_bytes());
+
+    let mut archive = header;
+    archive.extend_from_slice(&root);
+    archive.extend_from_slice(&metadata);
+    for (nth, row) in rows.iter().enumerate() {
+        archive.extend(std::iter::repeat_n((nth & 0xff) as u8, row.2 as usize));
+    }
+    archive
+}
+
+/// **The ceiling is read, never assumed.** The terrain half of an area asked
+/// for at z14 is cut to the terrain archive's **own** `max_zoom`, off its
+/// header — and the fixture's is 10, so a hardcoded 12 (the shipped build's
+/// ceiling) or 14 (the basemap's) fails here.
+#[test]
+fn the_terrain_half_is_cut_to_the_terrain_archives_own_ceiling() {
+    let area = kansas_area("ceiling", 14);
+    let source = FileRangeSource::open(std::path::Path::new(TERRAIN_MINI))
+        .expect("the committed mini archive must open");
+
+    let (ceiling, plan) = block_on(async {
+        let index = PmtIndex::open(source)
+            .await
+            .expect("the mini archive opens");
+        let ceiling = index.header().max_zoom;
+        let plan = plan_area(&index, &area, SEGMENT_BYTES)
+            .await
+            .expect("the plan builds");
+        (ceiling, plan)
+    });
+
+    // The preconditions that make every assertion below falsifiable.
+    assert_eq!(ceiling, 10, "the committed fixture's ceiling moved");
+    assert_ne!(ceiling, 12, "a hardcoded 12 would have passed this");
+    assert_ne!(ceiling, area.max_zoom, "the area must ask past the ceiling");
+
+    let walked = plan.present_tiles + plan.absent_tiles;
+    assert_eq!(
+        walked,
+        area_tiles_to(&area, ceiling).len() as u64,
+        "the plan walked a different tile set than the archive's own ceiling names"
+    );
+    assert!(
+        walked < area_tiles(&area).len() as u64,
+        "the clamp did nothing: {walked} tiles is the whole unclamped enumeration, \
+         so this test cannot tell a clamp from its absence"
+    );
+
+    // And it is the RIGHT tiles: the one the fixture actually holds is in it.
+    let held: Vec<(u8, u32, u32)> = plan
+        .segments
+        .iter()
+        .flat_map(super::PlannedSegment::tile_coords)
+        .collect();
+    assert_eq!(
+        held,
+        vec![TERRAIN_MINI_TILE],
+        "the plan is not the mini archive's own contents"
+    );
+}
+
+/// The two halves are stored **apart**, and neither listing can see the
+/// other's segments — the whole of "an area holds two archives" at the store.
+///
+/// Read back through the store's own API rather than by reading filenames:
+/// what matters is that `existing_segments` for one archive never counts the
+/// other's, which is what makes each half reconcilable on its own.
+#[test]
+fn the_two_halves_of_an_area_never_appear_in_each_others_listing() {
+    const TEST: &str = "the_two_halves_of_an_area_never_appear_in_each_others_listing";
+    if monaco_bytes(TEST).is_none() {
+        return;
+    }
+    let dir = TempDir::new("halves");
+    let area = monaco_area("halves", 10);
+    let terrain = Arc::new(raster_archive(&area, 8));
+    let store = FsSegmentStore::new(dir.0.clone());
+
+    let engine = BasemapDownload::with_terrain_and_segment_bytes(
+        FileRangeSource::open(std::path::Path::new(MONACO)).expect("the fixture opens"),
+        Some(SegmentBytesSource(Arc::clone(&terrain))),
+        FsSegmentStore::new(dir.0.clone()),
+        area.clone(),
+        Context::default(),
+        20_000,
+    );
+    let outcome = wait_outcome(&engine, TEST);
+    assert!(
+        matches!(outcome, DownloadOutcome::Complete { .. }),
+        "the two-archive run must complete, got {outcome:?}"
+    );
+
+    let holdings = engine.holdings().expect("a finished run reports its cut");
+    let terrain_hold = holdings
+        .terrain
+        .expect("the run had a terrain source, so it has a terrain half");
+    assert!(
+        holdings.basemap.segments > 0 && terrain_hold.segments > 0,
+        "one half was cut into nothing, so the disjointness below is vacuous: \
+         {holdings:?}"
+    );
+
+    let basemap_listed =
+        block_on(store.existing_segments(&area.area_id, AreaArchive::Basemap)).expect("lists");
+    let terrain_listed =
+        block_on(store.existing_segments(&area.area_id, AreaArchive::Terrain)).expect("lists");
+    assert_eq!(
+        basemap_listed.len() as u32,
+        holdings.basemap.segments,
+        "the basemap listing counts something other than the basemap's own cut"
+    );
+    assert_eq!(
+        terrain_listed.len() as u32,
+        terrain_hold.segments,
+        "the terrain listing counts something other than the terrain's own cut"
+    );
+
+    // The record the run yields says which archives the area holds, each with
+    // its own generation.
+    let record = DownloadedArea::from_run(
+        area.clone(),
+        "basemap_2Fomt-20260828.pmtiles".to_owned(),
+        Some("terrain_2Fmini".to_owned()),
+        &outcome,
+        &holdings,
+    )
+    .expect("a complete run yields a record");
+    assert_eq!(record.segments_expected, holdings.basemap.segments);
+    let recorded = record
+        .terrain
+        .as_ref()
+        .expect("the record names its terrain");
+    assert_eq!(recorded.segments_expected, terrain_hold.segments);
+    assert_eq!(recorded.generation, "terrain_2Fmini");
+    assert_eq!(
+        record.bytes.bytes(),
+        holdings.bytes(),
+        "the record's byte figure is not both halves"
+    );
+
+    // Reconciled whole, both halves count; and losing only the terrain half
+    // makes the AREA read incomplete rather than the basemap read short.
+    let whole = record.reconcile_all(&basemap_listed, &terrain_listed);
+    assert!(
+        whole.is_complete(),
+        "a whole area read as incomplete: {whole:?}"
+    );
+    let lost_terrain = record.reconcile_all(&basemap_listed, &BTreeSet::new());
+    assert!(
+        !lost_terrain.is_complete(),
+        "an area whose hillshade is gone read as complete"
+    );
+    assert_eq!(
+        record.reconcile(&basemap_listed).present,
+        holdings.basemap.segments,
+        "the basemap half moved when only the terrain half did"
+    );
+
+    // And deleting the area takes both halves with it: the rectangle is what
+    // the user deletes, not one of its files.
+    block_on(store.remove_area(&area.area_id)).expect("the store removes an area");
+    for archive in [AreaArchive::Basemap, AreaArchive::Terrain] {
+        assert!(
+            block_on(store.existing_segments(&area.area_id, archive))
+                .expect("lists")
+                .is_empty(),
+            "{archive:?} segments outlived the delete: {:?}",
+            published_files(&dir.0)
+        );
+    }
+}
+
+/// **The combined figure is exact**: a two-archive run transfers exactly the
+/// two plans' quoted bytes, summed — each plan's own distinct
+/// `(offset, length)` total, and not one byte more.
+#[test]
+fn a_two_archive_run_transfers_exactly_the_two_quoted_totals() {
+    const TEST: &str = "a_two_archive_run_transfers_exactly_the_two_quoted_totals";
+    if monaco_bytes(TEST).is_none() {
+        return;
+    }
+    let dir = TempDir::new("two-exact");
+    let area = monaco_area("two-exact", 11);
+    let terrain = Arc::new(raster_archive(&area, 9));
+
+    let quoted_basemap = block_on(async {
+        let index = PmtIndex::open(
+            FileRangeSource::open(std::path::Path::new(MONACO)).expect("the fixture opens"),
+        )
+        .await
+        .expect("the fixture opens");
+        plan_area(&index, &area, 20_000)
+            .await
+            .expect("the plan builds")
+            .fetch_bytes
+    });
+    let quoted_terrain = block_on(async {
+        let index = PmtIndex::open(SegmentBytesSource(Arc::clone(&terrain)))
+            .await
+            .expect("the raster fixture opens");
+        plan_area(&index, &area, 20_000)
+            .await
+            .expect("the plan builds")
+            .fetch_bytes
+    });
+    assert!(
+        quoted_basemap > 0 && quoted_terrain > 0,
+        "a half quoting zero makes the sum below indistinguishable from the other \
+         half alone: {quoted_basemap} + {quoted_terrain}"
+    );
+
+    let engine = BasemapDownload::with_terrain_and_segment_bytes(
+        FileRangeSource::open(std::path::Path::new(MONACO)).expect("the fixture opens"),
+        Some(SegmentBytesSource(Arc::clone(&terrain))),
+        FsSegmentStore::new(dir.0.clone()),
+        area,
+        Context::default(),
+        20_000,
+    );
+    let outcome = wait_outcome(&engine, TEST);
+    let DownloadOutcome::Complete { bytes, .. } = outcome else {
+        panic!("the two-archive run must complete, got {outcome:?}");
+    };
+    assert_eq!(
+        bytes,
+        quoted_basemap + quoted_terrain,
+        "the run transferred something other than the two quoted totals \
+         ({quoted_basemap} + {quoted_terrain})"
+    );
+
+    let holdings = engine.holdings().expect("a finished run reports its cut");
+    assert_eq!(holdings.basemap.bytes, quoted_basemap);
+    assert_eq!(
+        holdings.terrain.expect("a terrain half").bytes,
+        quoted_terrain
+    );
+}
+
+/// A [`RangeSource`] over an in-memory archive — the terrain fixture's reader.
+#[derive(Clone)]
+pub(crate) struct SegmentBytesSource(pub(crate) Arc<Vec<u8>>);
+
+impl RangeSource for SegmentBytesSource {
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        let bytes = Arc::clone(&self.0);
+        async move {
+            let from = (offset as usize).min(bytes.len());
+            let to = from.saturating_add(length).min(bytes.len());
+            Ok(bytes[from..to].to_vec())
+        }
+    }
 }

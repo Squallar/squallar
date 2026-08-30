@@ -449,6 +449,7 @@ fn the_panels_in_flight_block_draws_bytes_and_never_a_part_count() {
             // short of finishing the run.
             budget: std::sync::atomic::AtomicI64::new(8),
         },
+        None::<(crate::basemap_archive::FileRangeSource, String)>,
         crate::basemap_download::FsSegmentStore::new(dir.clone()),
         monaco_run_spec(area_id),
         String::new(),
@@ -505,4 +506,170 @@ fn the_panels_in_flight_block_draws_bytes_and_never_a_part_count() {
 
     h.gui_mut().active_download = None;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The hillshade checkbox
+// ---------------------------------------------------------------------------
+
+/// The two halves' figures, chosen so their labels and their sum's label are
+/// three different strings — without which "the figure moved" could pass on a
+/// figure that did not.
+const BASEMAP_FIGURE: u64 = 47_000_000;
+const TERRAIN_FIGURE: u64 = 21_000_000;
+const BASEMAP_LABEL: &str = "47 MB";
+const COMBINED_LABEL: &str = "68 MB";
+
+/// A harness with a box picked and both halves' figures in hand.
+fn picked_with_both_figures() -> InputHarness {
+    let mut h = harness();
+    h.set_download_pick_armed(true);
+    h.warm_up();
+    let (centre, corner) = centre_and_corner(&h, 0, 60.0);
+    h.drag_download_area(centre, corner);
+    h.seed_download_size(
+        SEEDED_CEILING,
+        DetailLevel::TownsAndMainRoads,
+        BASEMAP_FIGURE,
+    );
+    h.seed_download_terrain_size(
+        SEEDED_CEILING,
+        DetailLevel::TownsAndMainRoads,
+        TERRAIN_FIGURE,
+    );
+    h.warm_up();
+    h
+}
+
+/// Everything the download panel drew, as one string.
+fn panel_text(h: &InputHarness) -> String {
+    h.painted_text_strings_in(panel_rect(h)).join("\n")
+}
+
+/// **The cost of the hillshade is visible before it is spent.** The panel
+/// carries a "Terrain shading" checkbox, and ticking it moves the level list's
+/// exact figures to the combined one — not by a factor, but by the terrain
+/// archive's own figure added.
+#[test]
+fn ticking_terrain_shading_moves_the_level_lists_exact_figure() {
+    let mut h = picked_with_both_figures();
+
+    assert!(
+        !h.download_terrain_wanted(),
+        "precondition: the terrain switch is off on a fresh map, so the checkbox \
+         starts clear and the click below is a real change",
+    );
+    let before = panel_text(&h);
+    assert!(
+        before.contains(BASEMAP_LABEL),
+        "the level list did not draw the basemap's own figure: {before}",
+    );
+    assert!(
+        !before.contains(COMBINED_LABEL),
+        "the level list drew the combined figure with the checkbox clear: {before}",
+    );
+    assert!(
+        before.contains(TERRAIN_INCLUDE_LABEL),
+        "the panel offers no way to ask for the hillshade: {before}",
+    );
+
+    let checkbox = panel_row(&h, TERRAIN_INCLUDE_LABEL);
+    h.mouse_click(checkbox.center());
+    h.warm_up();
+
+    assert!(
+        h.download_terrain_wanted(),
+        "the checkbox did not take the click",
+    );
+    let after = panel_text(&h);
+    assert!(
+        after.contains(COMBINED_LABEL),
+        "the figure did not move to the combined one when the checkbox was ticked, \
+         which is the tell for an estimate: {after}",
+    );
+    assert!(
+        !after.contains(BASEMAP_LABEL),
+        "the level list still draws the basemap figure alone after the checkbox was \
+         ticked: {after}",
+    );
+
+    // And back. Untick returns the basemap's own figure rather than a stale sum.
+    h.mouse_click(checkbox.center());
+    h.warm_up();
+    let cleared = panel_text(&h);
+    assert!(
+        cleared.contains(BASEMAP_LABEL) && !cleared.contains(COMBINED_LABEL),
+        "unticking kept the combined figure: {cleared}",
+    );
+}
+
+/// **The default is what the user is actually looking at.** With terrain
+/// shading switched on in the Base Map inspector, a box drawn afterwards
+/// starts with the checkbox ticked and quotes the combined figure — nobody has
+/// to remember to ask for what is already on the glass.
+#[test]
+fn the_checkbox_starts_where_the_terrain_switch_is() {
+    let mut h = harness();
+    h.set_terrain_from_basemap_inspector(true);
+    h.warm_up();
+
+    h.set_download_pick_armed(true);
+    h.warm_up();
+    let (centre, corner) = centre_and_corner(&h, 0, 60.0);
+    h.drag_download_area(centre, corner);
+    h.seed_download_size(
+        SEEDED_CEILING,
+        DetailLevel::TownsAndMainRoads,
+        BASEMAP_FIGURE,
+    );
+    h.seed_download_terrain_size(
+        SEEDED_CEILING,
+        DetailLevel::TownsAndMainRoads,
+        TERRAIN_FIGURE,
+    );
+    h.warm_up();
+
+    assert!(
+        h.download_terrain_wanted(),
+        "the download did not follow the terrain switch the user has on",
+    );
+    let drawn = panel_text(&h);
+    assert!(
+        drawn.contains(COMBINED_LABEL),
+        "the quoted figure does not include the shading the map is showing: {drawn}",
+    );
+}
+
+/// A ticked checkbox is a **choice**, and it reopens exactly as it was left —
+/// including against a terrain switch that says otherwise.
+#[test]
+fn the_terrain_choice_survives_a_reopen() {
+    let mut h = picked_with_both_figures();
+    let checkbox = panel_row(&h, TERRAIN_INCLUDE_LABEL);
+    h.mouse_click(checkbox.center());
+    h.warm_up();
+    assert!(
+        h.download_terrain_wanted(),
+        "the checkbox did not take the click"
+    );
+
+    let store = squallar_kv::MemoryKvStore::default();
+    h.gui_mut().save_ui_config(&store);
+
+    let mut reopened = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    assert!(
+        reopened.gui_mut().load_ui_config(&store),
+        "the saved config must load"
+    );
+    reopened.warm_up();
+    assert!(
+        reopened.download_terrain_wanted(),
+        "the hillshade choice did not survive a reopen, so the window did not reopen \
+         as it was left",
+    );
+    assert!(
+        !reopened.overlay_enabled_on(0, &known::TERRAIN),
+        "precondition: the terrain switch is off in the reopened window, so the true \
+         above is the CHOICE rather than the switch",
+    );
 }

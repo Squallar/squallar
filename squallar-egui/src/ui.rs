@@ -1576,6 +1576,30 @@ impl Gui {
         self.download_size.seed(ceiling, level, bytes);
     }
 
+    /// [`Self::seed_download_size`] for the hillshade half — the terrain
+    /// archive's own figure, which the combined one is this plus the basemap's.
+    #[cfg(test)]
+    pub(crate) fn seed_download_terrain_size(
+        &mut self,
+        ceiling: u8,
+        level: crate::ui_download_area::DetailLevel,
+        bytes: u64,
+    ) {
+        self.download_size.seed_archive(
+            ceiling,
+            level,
+            crate::basemap_download::AreaArchive::Terrain,
+            bytes,
+        );
+    }
+
+    /// Whether the download panel's checkbox is ticked right now — the
+    /// user's explicit choice if they made one, otherwise the terrain switch.
+    #[cfg(test)]
+    pub(crate) fn download_terrain_wanted(&self) -> bool {
+        self.download_wants_terrain()
+    }
+
     pub(crate) fn region_preview(&self, pane_idx: PaneId) -> Option<(squallar_geo::GeoPoint, f64)> {
         self.region_drag
             .filter(|drag| drag.pane_idx() == pane_idx)

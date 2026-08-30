@@ -123,6 +123,17 @@ pub struct Gui {
     /// Which detail level the level list has selected. Persisted; absence
     /// loads as [`crate::ui_download_area::DetailLevel::default`].
     pub(super) download_detail: crate::ui_download_area::DetailLevel,
+    /// Whether the download includes the terrain hillshade, once the user has
+    /// said — `None` meaning **follow the terrain switch**.
+    ///
+    /// Three states rather than a bool, because the honest default is not a
+    /// constant: a download should hold what the user actually looks at, so an
+    /// untouched checkbox tracks the Base Map inspector's "Terrain shading"
+    /// live rather than latching whatever it read the instant the box was
+    /// drawn. Persisted, so a deliberate choice reopens exactly as it was
+    /// left; absence loads as `None`, which reopens tracking the switch — and
+    /// the switch itself persists, so the checkbox is 1:1 either way.
+    pub(super) download_terrain: Option<bool>,
     /// The exact size figure for the picked box, measured off the frame
     /// thread. Derived, never persisted — it is the archive's answer, not the
     /// user's choice.
@@ -551,6 +562,7 @@ impl Gui {
             download_drag: None,
             download_pick: None,
             download_detail: crate::ui_download_area::DetailLevel::default(),
+            download_terrain: None,
             download_size: crate::ui_download_area::AreaSizeProbe::new(),
             download_quota: None,
             section_edit_drag: None,

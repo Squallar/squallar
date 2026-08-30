@@ -67,6 +67,9 @@ pub(crate) const AREAS_SCOPE_NOTE: &str = "A downloaded area holds the base map 
 /// What a row draws in the size slot while the store has not answered for it.
 pub(crate) const CHECKING_NOTE: &str = "Checking storage...";
 
+/// What a row appends to its depth when the area holds the hillshade as well.
+pub(crate) const TERRAIN_HELD_NOTE: &str = "with terrain shading";
+
 /// What the user asked a row's buttons to do, decided while the area list is
 /// borrowed and applied once it is not.
 enum AreaCommand {
@@ -74,7 +77,14 @@ enum AreaCommand {
     Delete(String),
     /// Fetch what this area is missing, or re-cut it at the current
     /// generation. One start either way: resume *is* the set difference.
-    Download(AreaSpec),
+    Download {
+        /// The area to (re-)cut.
+        spec: AreaSpec,
+        /// Whether to fetch the hillshade too — **read off the record**, so a
+        /// resume completes the area the user actually downloaded rather than
+        /// whatever the map panel's checkbox happens to say now.
+        terrain: bool,
+    },
 }
 
 impl super::Gui {
@@ -128,7 +138,9 @@ impl super::Gui {
 
         match command {
             Some(AreaCommand::Delete(area_id)) => self.delete_downloaded_area(&area_id),
-            Some(AreaCommand::Download(spec)) => self.start_area_download(spec, ui.ctx()),
+            Some(AreaCommand::Download { spec, terrain }) => {
+                self.start_area_download(spec, terrain, ui.ctx());
+            }
             None => {}
         }
     }
@@ -187,7 +199,12 @@ impl super::Gui {
     /// download on a metered connection is the exact opposite of what this
     /// feature is for. Resume needs no separate path — the engine skips the
     /// segments the store already holds, so a resume *is* a start.
-    pub(in crate::ui) fn start_area_download(&mut self, spec: AreaSpec, ctx: &egui::Context) {
+    pub(in crate::ui) fn start_area_download(
+        &mut self,
+        spec: AreaSpec,
+        terrain: bool,
+        ctx: &egui::Context,
+    ) {
         let Some(store) = crate::tiles::offline_store(self.basemap_dir.as_deref()) else {
             return;
         };
@@ -201,10 +218,26 @@ impl super::Gui {
                 return;
             }
         };
+        // The hillshade half, on the same terms. A terrain URL that will not
+        // parse costs the hillshade and not the base map: the run goes ahead
+        // without it and the record then says the area holds no terrain, which
+        // is true.
+        let terrain = terrain
+            .then(crate::tiles::terrain_range_source)
+            .and_then(|built| match built {
+                Ok(source) => Some((source, crate::tiles::terrain_generation())),
+                Err(error) => {
+                    log::error!(
+                        "the terrain archive is not a usable URL to download from, so the area                          is stored without its hillshade: {error}"
+                    );
+                    None
+                }
+            });
         let generation =
             crate::basemap_archive::block_cache::generation_for_url(&crate::tiles::archive_url());
         self.active_download = Some(ActiveDownload::start(
             source,
+            terrain,
             store,
             spec,
             generation,
@@ -227,9 +260,17 @@ impl super::Gui {
             return;
         };
         let area_id = active.spec.area_id.clone();
-        if let Some(record) =
-            DownloadedArea::from_outcome(active.spec.clone(), active.generation.clone(), &outcome)
-        {
+        // The run's own per-archive cut, never a caller's idea of it: a record
+        // and the run that produced it cannot disagree about which halves
+        // landed or what each cost.
+        let holdings = active.holdings().unwrap_or_default();
+        if let Some(record) = DownloadedArea::from_run(
+            active.spec.clone(),
+            active.generation.clone(),
+            active.terrain_generation.clone(),
+            &outcome,
+            &holdings,
+        ) {
             self.record_downloaded_area(record);
         }
         self.active_download = None;
@@ -260,7 +301,7 @@ fn render_area(
         ui.label(held_or_size(area, fact));
     });
     ui.label(
-        RichText::new(detail_label(area.spec.max_zoom, archive_max_zoom))
+        RichText::new(detail_line(area, archive_max_zoom))
             .small()
             .weak(),
     );
@@ -276,11 +317,18 @@ fn render_area(
     let updatable = note.is_some_and(|note| note.update_available);
     ui.add_enabled_ui(store_reachable, |ui| {
         ui.horizontal(|ui| {
+            let terrain = area.terrain.is_some();
             if incomplete && ui.button("Resume").clicked() {
-                command = Some(AreaCommand::Download(area.spec.clone()));
+                command = Some(AreaCommand::Download {
+                    spec: area.spec.clone(),
+                    terrain,
+                });
             }
             if !incomplete && updatable && ui.button("Update").clicked() {
-                command = Some(AreaCommand::Download(area.spec.clone()));
+                command = Some(AreaCommand::Download {
+                    spec: area.spec.clone(),
+                    terrain,
+                });
             }
             if ui.button("Delete").clicked() {
                 command = Some(AreaCommand::Delete(area.spec.area_id.clone()));
@@ -288,6 +336,24 @@ fn render_area(
         });
     });
     command
+}
+
+/// What the row says about what the area holds: its depth, and — only when it
+/// has one — that it holds the hillshade too.
+///
+/// **One line, appended to the depth**, not a second row and not a second
+/// entry. An area's two archives are one download to the user; what they need
+/// from this line is whether shading will draw offline, because that is what
+/// the Resume button will complete and what the map will show. An area without
+/// terrain says nothing extra: an absence stated is a warning about something
+/// the reader cannot act on from here.
+fn detail_line(area: &DownloadedArea, archive_max_zoom: Option<u8>) -> String {
+    let detail = detail_label(area.spec.max_zoom, archive_max_zoom);
+    if area.terrain.is_some() {
+        format!("{detail} \u{b7} {TERRAIN_HELD_NOTE}")
+    } else {
+        detail.to_owned()
+    }
 }
 
 /// The figure a row shows for how much of the area is here — **one slot,

@@ -149,8 +149,28 @@ pub struct AreaSpec {
 /// a polar area stores the tiles the map will ask for rather than a set off by
 /// one at the edges.
 pub fn area_tiles(area: &AreaSpec) -> Vec<(u8, u32, u32)> {
+    area_tiles_to(area, area.max_zoom)
+}
+
+/// [`area_tiles`] against an archive whose **own** header stops shallower than
+/// the area asks for.
+///
+/// The area's depth is chosen against the base map, and the two archives an
+/// area holds do not share a ceiling — the terrain build stops above the
+/// basemap's. Enumerating past an archive's own `max_zoom` would ask its
+/// directories for tiles it declares it does not have: every one absent, every
+/// one a lookup, and the exact figure and the download would still agree only
+/// by both wasting the same walk.
+///
+/// **The ceiling is always read off the archive's header** — `plan_area` and
+/// the size probe both pass `index.header().max_zoom` — so nothing here or
+/// above it names a depth. Over-zoom past the shallower ceiling is unchanged:
+/// the composition publishes the live archive's maximum
+/// (`BasemapArchives::max_zoom`) and the renderer stretches the deepest stored
+/// tile exactly as it does online, which is why there is no copy about this.
+pub fn area_tiles_to(area: &AreaSpec, archive_max_zoom: u8) -> Vec<(u8, u32, u32)> {
     let mut tiles = Vec::new();
-    for z in 0..=area.max_zoom {
+    for z in 0..=area.max_zoom.min(archive_max_zoom) {
         let x_range = lon_to_tile_x(area.west, z)..=lon_to_tile_x(area.east, z);
         let y_range = lat_to_tile_y(area.north, z)..=lat_to_tile_y(area.south, z);
         for x in x_range {
@@ -160,6 +180,59 @@ pub fn area_tiles(area: &AreaSpec) -> Vec<(u8, u32, u32)> {
         }
     }
     tiles
+}
+
+// ---------------------------------------------------------------------------
+// The two archives an area holds
+// ---------------------------------------------------------------------------
+
+/// Which archive a set of an area's segments was cut from.
+///
+/// An area is one rectangle over **two** archives — the vector base map and
+/// the terrain hillshade — and they are separate PMTiles files with separate
+/// generations, separate ceilings and separate body types. So a downloaded
+/// area holds one segment set per archive, namespaced apart in the store by
+/// [`Self::artifact_infix`], and either may be absent without the other
+/// noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AreaArchive {
+    /// The vector base map. Every area has this half.
+    Basemap,
+    /// The terrain hillshade. Opt-in per download, so an area may have none.
+    Terrain,
+}
+
+impl AreaArchive {
+    /// What a stored artifact carries between its segment number and
+    /// [`SEGMENT_SUFFIX`].
+    ///
+    /// **Empty for the base map, and that is the whole of the migration**: an
+    /// artifact published before terrain existed is named exactly as this
+    /// still names one, so a device's stored areas read back unchanged.
+    ///
+    /// The two namespaces cannot be confused in either direction, by
+    /// construction rather than by care. A terrain artifact
+    /// (`{id}.{seg}.terrain.pmtiles`) read as a basemap one leaves
+    /// `"{seg}.terrain"` where a segment number goes, which does not parse; and
+    /// a basemap artifact can never end in the terrain infix, because what sits
+    /// before `.pmtiles` is digits.
+    fn artifact_infix(self) -> &'static str {
+        match self {
+            Self::Basemap => "",
+            Self::Terrain => ".terrain",
+        }
+    }
+
+    /// Which archive the artifact named `name` belongs to — the one reading of
+    /// the naming rule above, used by both stores' read-back.
+    fn of_artifact(name: &str) -> Self {
+        let stem = name.strip_suffix(SEGMENT_SUFFIX).unwrap_or(name);
+        if stem.ends_with(Self::Terrain.artifact_infix()) {
+            Self::Terrain
+        } else {
+            Self::Basemap
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +273,32 @@ pub struct DownloadedArea {
     /// state "Downloaded September 2026 · update available" as a fact the user
     /// may act on, never as a warning and never as an automatic re-download.
     pub generation: String,
+    /// The terrain half, or `None` for an area that holds only the base map.
+    ///
+    /// **`None` is the honest reading of a record written before terrain was
+    /// downloadable**: such an area holds no hillshade, which is exactly what
+    /// this says. Nothing migrates and nothing is inferred.
+    pub terrain: Option<TerrainHold>,
+}
+
+/// What an area's terrain half holds — its own cut, its own bytes, its own
+/// generation.
+///
+/// Separate from the basemap figures rather than folded into them because the
+/// two archives are reconciled against the store independently: a terrain
+/// segment set that went missing must not read as basemap segments missing,
+/// and the terrain build has its own release cadence, so one generation string
+/// could never date both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerrainHold {
+    /// Segments the terrain plan cut this area into. **Requested, not
+    /// present** — [`DownloadedArea`]'s rule, for its reason.
+    pub segments_expected: u32,
+    /// Terrain tile bytes, the module's one byte denominator.
+    pub bytes: DataSize,
+    /// The terrain archive generation these segments were cut from, in
+    /// `generation_for_url`'s spelling.
+    pub generation: String,
 }
 
 impl DownloadedArea {
@@ -224,17 +323,86 @@ impl DownloadedArea {
             segments_expected: *segments,
             bytes: DataSize::from_bytes(*bytes),
             generation,
+            terrain: None,
         })
     }
 
-    /// This area's segments against what `present` holds — the store's own
-    /// listing, from [`SegmentStore::existing_segments`].
+    /// The record for a finished run over **both** archives, or `None` for one
+    /// that did not finish.
+    ///
+    /// [`Self::from_outcome`]'s rule — only `Complete` yields a record — with
+    /// the run's per-archive cut supplied, because the two halves are
+    /// reconciled independently and the outcome carries only the totals.
+    /// `terrain_generation` dates the terrain half; it is `None` exactly when
+    /// the run had no terrain source, which is what makes a basemap-only area
+    /// say so rather than claim a hillshade it never fetched.
+    pub fn from_run(
+        spec: AreaSpec,
+        generation: String,
+        terrain_generation: Option<String>,
+        outcome: &DownloadOutcome,
+        holdings: &AreaHoldings,
+    ) -> Option<Self> {
+        if !matches!(outcome, DownloadOutcome::Complete { .. }) {
+            return None;
+        }
+        Some(Self {
+            spec,
+            segments_expected: holdings.basemap.segments,
+            bytes: DataSize::from_bytes(holdings.bytes()),
+            generation,
+            terrain: holdings
+                .terrain
+                .as_ref()
+                .zip(terrain_generation)
+                .map(|(hold, generation)| TerrainHold {
+                    segments_expected: hold.segments,
+                    bytes: DataSize::from_bytes(hold.bytes),
+                    generation,
+                }),
+        })
+    }
+
+    /// This area's **basemap** segments against what `present` holds — the
+    /// store's own listing, from [`SegmentStore::existing_segments`].
     ///
     /// Segments at or past `segments_expected` are **not** counted: a store
     /// left holding a longer cut from an earlier plan would otherwise read as
     /// more complete than the area it is being reconciled against.
     pub fn reconcile(&self, present: &BTreeSet<u32>) -> AreaStatus {
-        let expected = self.segments_expected;
+        Self::against(self.segments_expected, present)
+    }
+
+    /// This area's **terrain** segments against what `present` holds, or
+    /// `None` for an area that holds no terrain — which is not the same as one
+    /// whose terrain is missing, and must never draw as it.
+    pub fn reconcile_terrain(&self, present: &BTreeSet<u32>) -> Option<AreaStatus> {
+        let hold = self.terrain.as_ref()?;
+        Some(Self::against(hold.segments_expected, present))
+    }
+
+    /// Both halves as one status: **every** segment this area asked for,
+    /// against every one the store holds of it.
+    ///
+    /// One pair rather than two, because the manage screen has one slot for
+    /// how much of an area is here and a second row per archive would be
+    /// spending the user's attention on which file a byte came out of. A
+    /// half-held terrain therefore reads as a half-held area, which is what it
+    /// is: the rectangle does not draw as it was downloaded.
+    pub fn reconcile_all(&self, basemap: &BTreeSet<u32>, terrain: &BTreeSet<u32>) -> AreaStatus {
+        let basemap = self.reconcile(basemap);
+        match self.reconcile_terrain(terrain) {
+            Some(terrain) => AreaStatus {
+                present: basemap.present.saturating_add(terrain.present),
+                expected: basemap.expected.saturating_add(terrain.expected),
+            },
+            None => basemap,
+        }
+    }
+
+    /// `present` counted against a cut of `expected` segments — the one
+    /// reading both halves are reconciled by.
+    fn against(expected: u32, present: &BTreeSet<u32>) -> AreaStatus {
         let present = present.iter().filter(|&&seg| seg < expected).count();
         AreaStatus {
             present: u32::try_from(present).unwrap_or(u32::MAX),
@@ -273,14 +441,28 @@ impl AreaStatus {
     }
 }
 
-/// [`DownloadedArea::reconcile`] against a live store — the launch-time
+/// [`DownloadedArea::reconcile_all`] against a live store — the launch-time
 /// question, asked of the store rather than of the record.
+///
+/// The terrain listing is asked for only when the record says the area has a
+/// terrain half: a basemap-only area must cost no listing for one, and a store
+/// that answered about a namespace nothing wrote would answer empty anyway.
 pub async fn area_status<St: SegmentStore>(
     store: &St,
     area: &DownloadedArea,
 ) -> Result<AreaStatus, StoreError> {
-    let present = store.existing_segments(&area.spec.area_id).await?;
-    Ok(area.reconcile(&present))
+    let basemap = store
+        .existing_segments(&area.spec.area_id, AreaArchive::Basemap)
+        .await?;
+    let terrain = match area.terrain {
+        Some(_) => {
+            store
+                .existing_segments(&area.spec.area_id, AreaArchive::Terrain)
+                .await?
+        }
+        None => BTreeSet::new(),
+    };
+    Ok(area.reconcile_all(&basemap, &terrain))
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +527,10 @@ pub struct DownloadPlan {
 /// Deterministic given the area and the archive: tiles are packed in tile-id
 /// order, greedily, deduplicating spans within each segment as it is packed.
 ///
+/// The enumeration stops at the **archive's own** `max_zoom`
+/// ([`area_tiles_to`]), never at the area's alone: the two archives an area
+/// holds do not share a ceiling, and the terrain build's is the shallower.
+///
 /// # Errors
 ///
 /// As [`PmtIndex::tile_span`], on the first tile that fails.
@@ -358,7 +544,7 @@ pub async fn plan_area<S: ArchiveRangeSource>(
     let mut distinct = HashSet::new();
     let mut fetch_bytes = 0u64;
 
-    let tiles = area_tiles(area);
+    let tiles = area_tiles_to(area, index.header().max_zoom);
     // The area's directory round trips, overlapped, before the walk below
     // asks for them one at a time. A prefetch only: it changes when the
     // bytes arrive, never which spans the walk resolves, so the plan stays
@@ -547,22 +733,32 @@ pub fn valid_area_id(area_id: &str) -> Result<(), StoreError> {
 /// without re-planning the area against the live archive, and re-planning is a
 /// network walk of every tile in the area. See
 /// [`AreaStatus`] for where the difference lands on the glass.
+/// # One area, two namespaces
+///
+/// Every method but [`Self::remove_area`] names an [`AreaArchive`] as well as
+/// an area, because an area's two archives are two independent segment sets
+/// that must not be able to collide, be counted together or be read as one
+/// another. `remove_area` names no archive on purpose: deleting an area
+/// deletes the rectangle, which is both halves and any artifact of them.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait SegmentStore: Send + Sync + 'static {
     /// Store one finished segment's bytes, atomically.
     fn publish(
         &self,
         area_id: &str,
+        archive: AreaArchive,
         seg: u32,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
-    /// The segments the store holds *complete* for `area_id`, each with the
-    /// bytes its artifact occupies. See the trait doc for the denominator.
+    /// The segments the store holds *complete* for `area_id`'s `archive` half,
+    /// each with the bytes its artifact occupies. See the trait doc for the
+    /// denominator.
     fn existing_segment_bytes(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> impl Future<Output = Result<BTreeMap<u32, u64>, StoreError>> + Send;
-    /// The segments the store holds *complete* for `area_id`.
+    /// The segments the store holds *complete* for `area_id`'s `archive` half.
     ///
     /// Derived from [`Self::existing_segment_bytes`] and never separately
     /// implemented, so the count and the sizes cannot come to two answers
@@ -570,16 +766,17 @@ pub trait SegmentStore: Send + Sync + 'static {
     fn existing_segments(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>> + Send {
         async move {
             Ok(self
-                .existing_segment_bytes(area_id)
+                .existing_segment_bytes(area_id, archive)
                 .await?
                 .into_keys()
                 .collect())
         }
     }
-    /// Remove every artifact of `area_id`, finished or not.
+    /// Remove every artifact of `area_id`, finished or not, **both archives**.
     fn remove_area(&self, area_id: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
@@ -591,6 +788,7 @@ pub trait SegmentStore: 'static {
     fn publish(
         &self,
         area_id: &str,
+        archive: AreaArchive,
         seg: u32,
         bytes: Vec<u8>,
     ) -> impl Future<Output = Result<(), StoreError>>;
@@ -598,21 +796,23 @@ pub trait SegmentStore: 'static {
     fn existing_segment_bytes(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> impl Future<Output = Result<BTreeMap<u32, u64>, StoreError>>;
     /// See the native arm above.
     fn existing_segments(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> impl Future<Output = Result<BTreeSet<u32>, StoreError>> {
         async move {
             Ok(self
-                .existing_segment_bytes(area_id)
+                .existing_segment_bytes(area_id, archive)
                 .await?
                 .into_keys()
                 .collect())
         }
     }
-    /// Remove every artifact of `area_id`, finished or not.
+    /// Remove every artifact of `area_id`, finished or not, **both archives**.
     fn remove_area(&self, area_id: &str) -> impl Future<Output = Result<(), StoreError>>;
 }
 
@@ -649,14 +849,24 @@ pub trait OfflineSegments: Send + Sync + 'static {
     /// The range source this store's artifacts are read through.
     type Source: ArchiveRangeSource;
 
-    /// Every complete segment the store holds, labelled and opened.
+    /// Every complete segment the store holds **of `archive`**, labelled and
+    /// opened.
+    ///
+    /// Filtered rather than returned whole because each archive's reader
+    /// composes only its own segments: handing a hillshade segment to the
+    /// vector reader would be refused at `attach_offline` on the tile type,
+    /// but only after opening it, which is a read per segment per launch to
+    /// learn what the name already says.
     ///
     /// **Returns no error, by design.** A store that cannot be listed, or an
     /// artifact that will not open, contributes nothing and is logged; the
     /// tiles it would have served come from the network, which is what the
     /// caller does with an empty answer anyway. There is nothing for a user
     /// to act on and so nothing to put on the glass.
-    fn open_all(&self) -> impl Future<Output = Vec<(String, Self::Source)>> + Send;
+    fn open_all(
+        &self,
+        archive: AreaArchive,
+    ) -> impl Future<Output = Vec<(String, Self::Source)>> + Send;
 }
 
 /// See the native arm above.
@@ -665,7 +875,7 @@ pub trait OfflineSegments: 'static {
     /// The range source this store's artifacts are read through.
     type Source: ArchiveRangeSource;
     /// See the native arm above.
-    fn open_all(&self) -> impl Future<Output = Vec<(String, Self::Source)>>;
+    fn open_all(&self, archive: AreaArchive) -> impl Future<Output = Vec<(String, Self::Source)>>;
 }
 
 /// The suffix a published segment carries. The store's naming contract, in
@@ -701,16 +911,33 @@ impl FsSegmentStore {
         Self { dir }
     }
 
-    /// `{area_id}.{seg}{suffix}` under the store's directory.
-    fn artifact(&self, area_id: &str, seg: u32, suffix: &str) -> std::path::PathBuf {
-        self.dir.join(format!("{area_id}.{seg}{suffix}"))
+    /// `{area_id}.{seg}{infix}{suffix}` under the store's directory, where the
+    /// infix is the archive's — empty for the base map, so an artifact this
+    /// writes is named exactly as one written before terrain existed.
+    fn artifact(
+        &self,
+        area_id: &str,
+        archive: AreaArchive,
+        seg: u32,
+        suffix: &str,
+    ) -> std::path::PathBuf {
+        self.dir.join(format!(
+            "{area_id}.{seg}{}{suffix}",
+            archive.artifact_infix()
+        ))
     }
 
-    /// The segment number of `name`, if it is `{area_id}.{seg}.pmtiles`.
-    fn segment_of(name: &str, area_id: &str) -> Option<u32> {
+    /// The segment number of `name`, if it is `archive`'s
+    /// `{area_id}.{seg}{infix}.pmtiles`.
+    ///
+    /// A name of the *other* archive falls out here rather than being filtered
+    /// beforehand: reading `{id}.{seg}.terrain.pmtiles` as a basemap artifact
+    /// leaves `"{seg}.terrain"` where the number goes, which does not parse.
+    fn segment_of(name: &str, area_id: &str, archive: AreaArchive) -> Option<u32> {
         name.strip_prefix(area_id)?
             .strip_prefix('.')?
             .strip_suffix(SEGMENT_SUFFIX)?
+            .strip_suffix(archive.artifact_infix())?
             .parse()
             .ok()
     }
@@ -724,11 +951,12 @@ impl OfflineSegments for FsSegmentStore {
     ///
     /// **Not filtered to areas this device recorded**, on purpose: a segment
     /// hand-placed in the basemap directory is a segment, and the persisted
-    /// area list is a later step's concern. The directory listing is the one
-    /// authority on what is here, so nothing can be listed and missing or
-    /// missing and listed. A `.part` is not matched, which is the whole of
-    /// what keeps a half-written artifact out of the map.
-    async fn open_all(&self) -> Vec<(String, Self::Source)> {
+    /// area list is a later step's concern. It *is* filtered to `archive`,
+    /// which is a property of the name rather than of any list. The directory
+    /// listing is the one authority on what is here, so nothing can be listed
+    /// and missing or missing and listed. A `.part` is not matched, which is
+    /// the whole of what keeps a half-written artifact out of the map.
+    async fn open_all(&self, archive: AreaArchive) -> Vec<(String, Self::Source)> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             // A directory nothing has published into holds nothing; absence
@@ -748,7 +976,8 @@ impl OfflineSegments for FsSegmentStore {
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_str()?.to_owned();
-                name.ends_with(SEGMENT_SUFFIX).then(|| (name, entry.path()))
+                (name.ends_with(SEGMENT_SUFFIX) && AreaArchive::of_artifact(&name) == archive)
+                    .then(|| (name, entry.path()))
             })
             .collect();
         named.sort();
@@ -770,13 +999,19 @@ impl OfflineSegments for FsSegmentStore {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SegmentStore for FsSegmentStore {
-    async fn publish(&self, area_id: &str, seg: u32, bytes: Vec<u8>) -> Result<(), StoreError> {
+    async fn publish(
+        &self,
+        area_id: &str,
+        archive: AreaArchive,
+        seg: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), StoreError> {
         valid_area_id(area_id)?;
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| StoreError::Io(format!("create {}: {error}", self.dir.display())))?;
 
-        let part = self.artifact(area_id, seg, ".part");
-        let published = self.artifact(area_id, seg, SEGMENT_SUFFIX);
+        let part = self.artifact(area_id, archive, seg, ".part");
+        let published = self.artifact(area_id, archive, seg, SEGMENT_SUFFIX);
         std::fs::write(&part, &bytes)
             .map_err(|error| StoreError::Io(format!("write {}: {error}", part.display())))?;
         std::fs::rename(&part, &published).map_err(|error| {
@@ -789,6 +1024,7 @@ impl SegmentStore for FsSegmentStore {
     async fn existing_segment_bytes(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> Result<BTreeMap<u32, u64>, StoreError> {
         valid_area_id(area_id)?;
         // A store nothing has published into holds no segments; absence of
@@ -811,7 +1047,7 @@ impl SegmentStore for FsSegmentStore {
             let Some(seg) = entry
                 .file_name()
                 .to_str()
-                .and_then(|name| Self::segment_of(name, area_id))
+                .and_then(|name| Self::segment_of(name, area_id, archive))
             else {
                 continue;
             };
@@ -834,6 +1070,9 @@ impl SegmentStore for FsSegmentStore {
         Ok(segments)
     }
 
+    /// Both archives and every `.part`: the sweep is `{area_id}.` followed by
+    /// anything ending in an artifact suffix, which is what every name either
+    /// half can carry.
     async fn remove_area(&self, area_id: &str) -> Result<(), StoreError> {
         valid_area_id(area_id)?;
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -999,7 +1238,7 @@ impl OfflineSegments for HttpSegmentStore {
     /// could only ever spend one request per segment being told what the
     /// publish side already guarantees — see
     /// [`crate::basemap_archive::HttpRangeSource::monolith`].
-    async fn open_all(&self) -> Vec<(String, Self::Source)> {
+    async fn open_all(&self, archive: AreaArchive) -> Vec<(String, Self::Source)> {
         let listed = match self.list_rows().await {
             Ok(listed) => listed,
             Err(error) => {
@@ -1017,7 +1256,8 @@ impl OfflineSegments for HttpSegmentStore {
             .filter_map(|row| {
                 let at = row.url.rfind(&needle)?;
                 let tail = &row.url[at + needle.len()..];
-                tail.ends_with(SEGMENT_SUFFIX).then(|| tail.to_owned())
+                (tail.ends_with(SEGMENT_SUFFIX) && AreaArchive::of_artifact(tail) == archive)
+                    .then(|| tail.to_owned())
             })
             .collect();
         tails.sort();
@@ -1041,9 +1281,21 @@ impl OfflineSegments for HttpSegmentStore {
 }
 
 impl SegmentStore for HttpSegmentStore {
-    async fn publish(&self, area_id: &str, seg: u32, bytes: Vec<u8>) -> Result<(), StoreError> {
+    async fn publish(
+        &self,
+        area_id: &str,
+        archive: AreaArchive,
+        seg: u32,
+        bytes: Vec<u8>,
+    ) -> Result<(), StoreError> {
         valid_area_id(area_id)?;
-        let url = self.url(&format!("{area_id}/{seg}{SEGMENT_SUFFIX}"))?;
+        // Both halves live under the SAME area directory, so the worker's
+        // `DELETE {area_id}/` prefix sweep removes the rectangle whole — the
+        // native store's own rule, arrived at the same way.
+        let url = self.url(&format!(
+            "{area_id}/{seg}{}{SEGMENT_SUFFIX}",
+            archive.artifact_infix()
+        ))?;
         let response = self
             .client
             .put(url)
@@ -1063,6 +1315,7 @@ impl SegmentStore for HttpSegmentStore {
     async fn existing_segment_bytes(
         &self,
         area_id: &str,
+        archive: AreaArchive,
     ) -> Result<BTreeMap<u32, u64>, StoreError> {
         valid_area_id(area_id)?;
         let listed = self.list_rows().await?;
@@ -1073,6 +1326,7 @@ impl SegmentStore for HttpSegmentStore {
             if let Some(at) = row.url.rfind(&needle)
                 && let Some(seg) = row.url[at + needle.len()..]
                     .strip_suffix(SEGMENT_SUFFIX)
+                    .and_then(|stem| stem.strip_suffix(archive.artifact_infix()))
                     .and_then(|stem| stem.parse().ok())
             {
                 segments.insert(seg, row.bytes);
@@ -1081,6 +1335,8 @@ impl SegmentStore for HttpSegmentStore {
         Ok(segments)
     }
 
+    /// Both archives: the worker's directory `DELETE` is a prefix sweep, and
+    /// both halves are published under the one area directory.
     async fn remove_area(&self, area_id: &str) -> Result<(), StoreError> {
         valid_area_id(area_id)?;
         let response = self
@@ -1194,6 +1450,43 @@ pub enum DownloadOutcome {
     },
 }
 
+/// What each archive's half of a run came to.
+///
+/// **Beside [`DownloadOutcome`] rather than inside it**, because the two
+/// answer different questions and only one of them is the run's verdict.
+/// `DownloadOutcome` states whether the area is now whole, over both archives
+/// summed; this is the bookkeeping a *record* needs, because the two halves
+/// are reconciled against the store independently and a combined segment count
+/// could not be split back apart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AreaHoldings {
+    /// The base map's half. Every run has one.
+    pub basemap: ArchiveHold,
+    /// The terrain half, or `None` for a run with no terrain source — which is
+    /// what a download the user did not ask terrain of is.
+    pub terrain: Option<ArchiveHold>,
+}
+
+impl AreaHoldings {
+    /// Tile bytes the run transferred across both archives — the same figure
+    /// [`DownloadOutcome::Complete`]'s `bytes` carries, summed the same way.
+    pub fn bytes(&self) -> u64 {
+        self.basemap.bytes + self.terrain.as_ref().map_or(0, |hold| hold.bytes)
+    }
+}
+
+/// One archive's half of a run: what it was cut into and what it cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArchiveHold {
+    /// Segments this archive's plan cut the area into — requested, not
+    /// present, [`DownloadedArea`]'s rule.
+    pub segments: u32,
+    /// Tile bytes transferred for this archive **this run**, distinct
+    /// `(offset, length)` pairs once each. Zero on a resume that found every
+    /// segment already stored, exactly as `Complete`'s figure is.
+    pub bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Progress
 // ---------------------------------------------------------------------------
@@ -1303,17 +1596,25 @@ impl DownloadProgress {
 /// [`BasemapDownload::start`] returns. Dropping it is cancellation.
 pub struct BasemapDownload {
     ledger: Arc<Ledger>,
-    outcome: Arc<OnceLock<DownloadOutcome>>,
+    ended: Arc<OnceLock<RunEnd>>,
     /// Owns the task. Dropped last, but named first here for the reader: the
     /// drop is the whole cancel protocol.
     _runtime: runtime::Runtime,
 }
 
+/// How a run finished: the verdict and each archive's own cut, set together in
+/// one `OnceLock` write so a reader can never see one without the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunEnd {
+    outcome: DownloadOutcome,
+    holdings: AreaHoldings,
+}
+
 impl BasemapDownload {
-    /// Download `area` from `source` into `store`, in [`SEGMENT_BYTES`]
-    /// segments. Returns immediately; the work runs on the engine's own
-    /// runtime, repainting `egui_ctx` as counters move and once more when the
-    /// outcome lands.
+    /// Download `area`'s base map from `source` into `store`, in
+    /// [`SEGMENT_BYTES`] segments. Returns immediately; the work runs on the
+    /// engine's own runtime, repainting `egui_ctx` as counters move and once
+    /// more when the outcome lands.
     pub fn start<S: ArchiveRangeSource, St: SegmentStore>(
         source: S,
         store: St,
@@ -1321,6 +1622,29 @@ impl BasemapDownload {
         egui_ctx: Context,
     ) -> Self {
         Self::with_segment_bytes(source, store, area, egui_ctx, SEGMENT_BYTES)
+    }
+
+    /// [`Self::start`] with the terrain archive as well, when the user asked
+    /// for the hillshade.
+    ///
+    /// **One run over two archives, not two runs.** The two are planned before
+    /// either fetches, so the byte denominator the bar fills against is the
+    /// whole download's from the first byte — a total that grew halfway would
+    /// send the bar backwards. `None` is exactly a basemap-only download and
+    /// takes the same path this call did before terrain existed.
+    pub fn start_with_terrain<S, T, St>(
+        source: S,
+        terrain: Option<T>,
+        store: St,
+        area: AreaSpec,
+        egui_ctx: Context,
+    ) -> Self
+    where
+        S: ArchiveRangeSource,
+        T: ArchiveRangeSource,
+        St: SegmentStore,
+    {
+        Self::with_terrain_and_segment_bytes(source, terrain, store, area, egui_ctx, SEGMENT_BYTES)
     }
 
     /// [`Self::start`] with the segment cap handed in — for the tests, which
@@ -1334,30 +1658,67 @@ impl BasemapDownload {
         egui_ctx: Context,
         segment_bytes: u64,
     ) -> Self {
+        Self::with_terrain_and_segment_bytes(
+            source,
+            None::<S>,
+            store,
+            area,
+            egui_ctx,
+            segment_bytes,
+        )
+    }
+
+    /// [`Self::start_with_terrain`] with the segment cap handed in — the one
+    /// body the other three constructors are spellings of.
+    pub(crate) fn with_terrain_and_segment_bytes<S, T, St>(
+        source: S,
+        terrain: Option<T>,
+        store: St,
+        area: AreaSpec,
+        egui_ctx: Context,
+        segment_bytes: u64,
+    ) -> Self
+    where
+        S: ArchiveRangeSource,
+        T: ArchiveRangeSource,
+        St: SegmentStore,
+    {
         let ledger = Arc::new(Ledger::default());
-        let outcome = Arc::new(OnceLock::new());
+        let ended = Arc::new(OnceLock::new());
 
         let task = {
             let ledger = Arc::clone(&ledger);
-            let outcome = Arc::clone(&outcome);
+            let ended = Arc::clone(&ended);
             async move {
-                let ended =
-                    match drive(source, store, &area, segment_bytes, &ledger, &egui_ctx).await {
-                        Ok(ended) => ended,
-                        Err(error) => DownloadOutcome::Failed {
+                let finished = match drive(
+                    source,
+                    terrain,
+                    store,
+                    &area,
+                    segment_bytes,
+                    &ledger,
+                    &egui_ctx,
+                )
+                .await
+                {
+                    Ok(finished) => finished,
+                    Err(error) => RunEnd {
+                        outcome: DownloadOutcome::Failed {
                             error: error.to_string(),
                         },
-                    };
+                        holdings: AreaHoldings::default(),
+                    },
+                };
                 // Set only here, so a second set is impossible rather than
                 // guarded against.
-                let _ = outcome.set(ended);
+                let _ = ended.set(finished);
                 egui_ctx.request_repaint();
             }
         };
 
         Self {
             ledger,
-            outcome,
+            ended,
             _runtime: runtime::spawn(task),
         }
     }
@@ -1376,101 +1737,148 @@ impl BasemapDownload {
         }
     }
 
-    /// How the download ended, once it has.
+    /// How the download ended, once it has. Both archives summed — see
+    /// [`Self::holdings`] for the split.
     pub fn outcome(&self) -> Option<DownloadOutcome> {
-        self.outcome.get().cloned()
+        self.ended.get().map(|ended| ended.outcome.clone())
+    }
+
+    /// What each archive's half of the run came to, once it has ended.
+    pub fn holdings(&self) -> Option<AreaHoldings> {
+        self.ended.get().map(|ended| ended.holdings.clone())
     }
 }
 
-/// Everything one download's segments share — bundled so the inner loop is
+/// Everything one archive's segments share — bundled so the inner loop is
 /// methods rather than a ten-argument call.
 struct Run<'a, S, St> {
     index: &'a PmtIndex<S>,
     header: IndexHeader,
     metadata: String,
     area: &'a AreaSpec,
+    archive: AreaArchive,
     store: &'a St,
     ledger: &'a Ledger,
     ctx: &'a Context,
 }
 
-/// The whole download, start to outcome.
-async fn drive<S: ArchiveRangeSource, St: SegmentStore>(
+/// One archive read, planned and diffed against the store, with nothing
+/// fetched yet.
+struct Planned<S> {
+    index: PmtIndex<S>,
+    header: IndexHeader,
+    metadata: String,
+    plan: DownloadPlan,
+    /// Indices into `plan.segments` the store does not already hold.
+    missing: Vec<usize>,
+    /// Segments the store already holds, of this archive's cut.
+    pre_existing: u32,
+    /// Tiles the missing segments hold.
+    run_tiles: u64,
+    /// Distinct span bytes across the missing segments.
+    run_bytes: u64,
+}
+
+impl<S> Planned<S> {
+    /// This archive's cut, as the record carries it.
+    fn segments(&self) -> u32 {
+        self.plan.segments.len() as u32
+    }
+}
+
+/// Open one archive, cut the area against it, and diff the cut against the
+/// store — everything up to the first byte of tile data.
+async fn prepare<S: ArchiveRangeSource, St: SegmentStore>(
     source: S,
-    store: St,
+    store: &St,
     area: &AreaSpec,
+    archive: AreaArchive,
     segment_bytes: u64,
-    ledger: &Ledger,
-    ctx: &Context,
-) -> Result<DownloadOutcome, DownloadError> {
+) -> Result<Planned<S>, DownloadError> {
     let index = PmtIndex::open(source).await?;
     let header = *index.header();
     let metadata = read_metadata(&index).await?;
     let plan = plan_area(&index, area, segment_bytes).await?;
     let existing = store
-        .existing_segments(&area.area_id)
+        .existing_segments(&area.area_id, archive)
         .await
         .map_err(DownloadError::Store)?;
 
     // Resume is this filter and nothing else: a set difference over
-    // segments, never a byte offset.
-    let missing: Vec<&PlannedSegment> = plan
+    // segments, never a byte offset. Per archive, so one half being whole
+    // says nothing about the other.
+    let missing: Vec<usize> = plan
         .segments
         .iter()
-        .filter(|segment| !existing.contains(&segment.seg))
+        .enumerate()
+        .filter(|(_, segment)| !existing.contains(&segment.seg))
+        .map(|(at, _)| at)
         .collect();
-    let pre_existing = plan
-        .segments
-        .iter()
-        .filter(|segment| existing.contains(&segment.seg))
-        .count() as u32;
+    let pre_existing = (plan.segments.len() - missing.len()) as u32;
 
-    // This run's denominators. Bytes: distinct spans across the missing
-    // segments, once each — the carry below is what makes the engine actually
-    // transfer that figure and not more.
+    // This archive's share of the run's denominators. Bytes: distinct spans
+    // across the missing segments, once each — the carry below is what makes
+    // the engine actually transfer that figure and not more.
     let mut run_spans = HashSet::new();
     let mut run_bytes = 0u64;
-    for segment in &missing {
-        for tile in &segment.tiles {
+    let mut run_tiles = 0u64;
+    for &at in &missing {
+        for tile in &plan.segments[at].tiles {
+            run_tiles += 1;
             if run_spans.insert(tile.span) {
                 run_bytes += tile.span.length;
             }
         }
     }
-    ledger
-        .tiles_total
-        .store(missing.iter().map(|s| s.tiles.len() as u64).sum(), Relaxed);
-    ledger.bytes_total.store(run_bytes, Relaxed);
-    ledger
-        .segments_total
-        .store(plan.segments.len() as u32, Relaxed);
-    ledger.segments_done.store(pre_existing, Relaxed);
-    ctx.request_repaint();
 
+    Ok(Planned {
+        index,
+        header,
+        metadata,
+        plan,
+        missing,
+        pre_existing,
+        run_tiles,
+        run_bytes,
+    })
+}
+
+/// Fetch and publish one archive's missing segments, answering how many of its
+/// cut the store now holds and the first thing that went wrong.
+async fn build_archive<S: ArchiveRangeSource, St: SegmentStore>(
+    planned: &Planned<S>,
+    area: &AreaSpec,
+    archive: AreaArchive,
+    store: &St,
+    ledger: &Ledger,
+    ctx: &Context,
+) -> (u32, Option<DownloadError>) {
     // A span two segments share is fetched at its first user and carried to
     // its last, so the run transfers each distinct span exactly once.
     let mut last_use: HashMap<TileSpan, usize> = HashMap::new();
-    for (at, segment) in missing.iter().enumerate() {
-        for tile in &segment.tiles {
-            last_use.insert(tile.span, at);
+    for (order, &at) in planned.missing.iter().enumerate() {
+        for tile in &planned.plan.segments[at].tiles {
+            last_use.insert(tile.span, order);
         }
     }
 
     let run = Run {
-        index: &index,
-        header,
-        metadata,
+        index: &planned.index,
+        header: planned.header,
+        metadata: planned.metadata.clone(),
         area,
-        store: &store,
+        archive,
+        store,
         ledger,
         ctx,
     };
     let mut held: HashMap<TileSpan, Vec<u8>> = HashMap::new();
     let mut held_bytes = 0u64;
     let mut first_error: Option<DownloadError> = None;
-    let mut done = pre_existing;
+    let mut done = planned.pre_existing;
 
-    for (at, segment) in missing.iter().enumerate() {
+    for (order, &at) in planned.missing.iter().enumerate() {
+        let segment = &planned.plan.segments[at];
         match run
             .build_and_publish(segment, &mut held, &mut held_bytes)
             .await
@@ -1493,7 +1901,7 @@ async fn drive<S: ArchiveRangeSource, St: SegmentStore>(
 
         // Spans whose last user has passed are dead weight.
         held.retain(|span, bytes| {
-            let keep = last_use.get(span).is_some_and(|&last| last > at);
+            let keep = last_use.get(span).is_some_and(|&last| last > order);
             if !keep {
                 held_bytes -= bytes.len() as u64;
             }
@@ -1502,9 +1910,90 @@ async fn drive<S: ArchiveRangeSource, St: SegmentStore>(
         ctx.request_repaint();
     }
 
-    let of = plan.segments.len() as u32;
+    (done, first_error)
+}
+
+/// The whole download, start to outcome — **both archives, planned before
+/// either fetches**.
+///
+/// The two phases are the reason this is not two calls of a one-archive
+/// engine: the bar's denominators are set once, from both cuts, so a run's
+/// total never grows under it. The archives then build in order, and a failure
+/// in one does not abandon the other — the same independence a segment has
+/// from the segment after it, one level up.
+async fn drive<S, T, St>(
+    source: S,
+    terrain: Option<T>,
+    store: St,
+    area: &AreaSpec,
+    segment_bytes: u64,
+    ledger: &Ledger,
+    ctx: &Context,
+) -> Result<RunEnd, DownloadError>
+where
+    S: ArchiveRangeSource,
+    T: ArchiveRangeSource,
+    St: SegmentStore,
+{
+    let basemap = prepare(source, &store, area, AreaArchive::Basemap, segment_bytes).await?;
+    // The terrain half planning is fallible on its own terms: a terrain
+    // archive that will not open must not lose the base map the user also
+    // asked for, so the error is carried into the verdict rather than
+    // returned.
+    let (terrain, mut first_error) = match terrain {
+        Some(source) => {
+            match prepare(source, &store, area, AreaArchive::Terrain, segment_bytes).await {
+                Ok(planned) => (Some(planned), None),
+                Err(error) => (None, Some(error)),
+            }
+        }
+        None => (None, None),
+    };
+
+    let terrain_tiles = terrain.as_ref().map_or(0, |half| half.run_tiles);
+    let terrain_bytes = terrain.as_ref().map_or(0, |half| half.run_bytes);
+    let terrain_segments = terrain.as_ref().map_or(0, Planned::segments);
+    let terrain_pre_existing = terrain.as_ref().map_or(0, |half| half.pre_existing);
+    ledger
+        .tiles_total
+        .store(basemap.run_tiles + terrain_tiles, Relaxed);
+    ledger
+        .bytes_total
+        .store(basemap.run_bytes + terrain_bytes, Relaxed);
+    ledger
+        .segments_total
+        .store(basemap.segments() + terrain_segments, Relaxed);
+    ledger
+        .segments_done
+        .store(basemap.pre_existing + terrain_pre_existing, Relaxed);
+    ctx.request_repaint();
+
+    let before = ledger.bytes_done.load(Relaxed);
+    let (basemap_done, basemap_error) =
+        build_archive(&basemap, area, AreaArchive::Basemap, &store, ledger, ctx).await;
+    let basemap_hold = ArchiveHold {
+        segments: basemap.segments(),
+        bytes: ledger.bytes_done.load(Relaxed) - before,
+    };
+    first_error = first_error.or(basemap_error);
+
+    let mut done = basemap_done;
+    let mut terrain_hold = None;
+    if let Some(half) = terrain.as_ref() {
+        let before = ledger.bytes_done.load(Relaxed);
+        let (terrain_done, terrain_error) =
+            build_archive(half, area, AreaArchive::Terrain, &store, ledger, ctx).await;
+        terrain_hold = Some(ArchiveHold {
+            segments: half.segments(),
+            bytes: ledger.bytes_done.load(Relaxed) - before,
+        });
+        done += terrain_done;
+        first_error = first_error.or(terrain_error);
+    }
+
+    let of = basemap.segments() + terrain_segments;
     let bytes = ledger.bytes_done.load(Relaxed);
-    Ok(match first_error {
+    let outcome = match first_error {
         None => DownloadOutcome::Complete {
             bytes,
             segments: of,
@@ -1517,6 +2006,13 @@ async fn drive<S: ArchiveRangeSource, St: SegmentStore>(
             of,
             bytes,
             first_error: error.to_string(),
+        },
+    };
+    Ok(RunEnd {
+        outcome,
+        holdings: AreaHoldings {
+            basemap: basemap_hold,
+            terrain: terrain_hold,
         },
     })
 }
@@ -1576,7 +2072,7 @@ impl<S: ArchiveRangeSource, St: SegmentStore> Run<'_, S, St> {
             Arc::try_unwrap(artifact).expect("the verifier dropped its clone of the artifact");
 
         self.store
-            .publish(&self.area.area_id, segment.seg, artifact)
+            .publish(&self.area.area_id, self.archive, segment.seg, artifact)
             .await
             .map_err(DownloadError::Store)
     }
@@ -1767,4 +2263,4 @@ async fn verify_segment(
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
-mod tests;
+pub(crate) mod tests;
