@@ -1645,6 +1645,14 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
+        // Cloned out (it is an `Arc` handle) before the `get_mut` below takes
+        // the whole map: present only where the install asked for the frame
+        // telemetry and the device can time a pass. `None` costs this frame
+        // nothing — both encode calls below take the same `None` the plain
+        // encoders always passed.
+        let probe = callback_resources
+            .get::<squallar_gpu::gpu_probe::GpuProbeHandle>()
+            .cloned();
         let Some(resources) = callback_resources.get_mut::<VolumeResources>() else {
             // The renderer was built without volume support, or the resources
             // were never inserted. Logged rather than silent because this is the
@@ -1773,7 +1781,20 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // The ground pass takes the SAME mirror the march's own lid arm does,
         // so the drape and the lid cannot be sampling two pictures — and the
         // height field, without which it is not encoded at all.
-        pipelines.encode_ground(
+        //
+        // The probe brackets are asked for only for passes that will really
+        // open: `encode_ground` opens no pass on a target without ground
+        // attachments (`plan().ground == Off`, today's every target), and a
+        // bracket claimed for a pass that never runs would resolve stale
+        // stamps as a sample. Each ask also counts the pass, so the ground
+        // family's count stays 0 until terrain wires in — and its first
+        // frame is a measured one.
+        let ground_runs = target.plan().ground == GroundPass::On;
+        let ground_stamps = probe
+            .as_ref()
+            .filter(|_| ground_runs)
+            .and_then(|p| p.pass_timestamps(squallar_gpu::gpu_probe::ProbedPass::Ground));
+        pipelines.encode_ground_with_timestamps(
             egui_encoder,
             target,
             textures,
@@ -1786,8 +1807,18 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
                 .then(|| buildings.get(&self.pane_idx))
                 .flatten()
                 .map(|held| &held.held),
+            ground_stamps,
         );
-        pipelines.encode_raymarch_with_floor(egui_encoder, target, textures, floor_texture);
+        let march_stamps = probe
+            .as_ref()
+            .and_then(|p| p.pass_timestamps(squallar_gpu::gpu_probe::ProbedPass::Raymarch));
+        pipelines.encode_raymarch_with_timestamps(
+            egui_encoder,
+            target,
+            textures,
+            floor_texture,
+            march_stamps,
+        );
 
         Vec::new()
     }

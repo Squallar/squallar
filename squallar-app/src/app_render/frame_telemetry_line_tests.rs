@@ -120,6 +120,45 @@ fn the_cadence_line_embeds_the_whole_histogram() {
     );
 }
 
+/// The gpu-passes line names every family with its own pass count and its
+/// own percentiles, distinct values in every position, and carries the
+/// collected-frames floor last. The raymarch `n` deliberately exceeds its
+/// sample count — six panes are six encoded passes but one bracketed sample
+/// per frame — so a formatter that conflated the two denominators could not
+/// pass. Edges derived by hand as above: 1 000 us -> 1190, 100 -> 106,
+/// 4 000 -> 4757.
+#[test]
+fn the_gpu_passes_line_reads_exactly_as_pinned() {
+    use squallar_gpu::gpu_probe::{GpuPassReport, ProbedPass};
+    let mut report = GpuPassReport {
+        hists: [Hist::new(); 4],
+        passes: [6, 0, 1, 2],
+        frames: 3,
+    };
+    report.hists[ProbedPass::Raymarch as usize].record(1_000);
+    report.hists[ProbedPass::Mirror as usize].record(100);
+    report.hists[ProbedPass::Main as usize].record(4_000);
+    report.hists[ProbedPass::Main as usize].record(4_000);
+    assert_eq!(
+        super::gpu_passes_line(&report),
+        "gpu passes: raymarch n=6, p50=1190 us, p99=1190 us; \
+         ground n=0, p50=none us, p99=none us; \
+         mirror n=1, p50=106 us, p99=106 us; \
+         main n=2, p50=4757 us, p99=4757 us; 3 frames",
+    );
+}
+
+/// The absence sentence, pinned verbatim: it is what every WebGL2 leg says
+/// in place of figures, and a probe scraping for it must find these exact
+/// words — an absence stated as one, never an extrapolation.
+#[test]
+fn the_gpu_passes_absence_line_is_pinned_verbatim() {
+    assert_eq!(
+        super::GPU_PASSES_UNAVAILABLE_LINE,
+        "gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)",
+    );
+}
+
 /// The key is the sentence's other half: a rig leg seeds the `localStorage`
 /// name derived from this literal, so a rename here mutes every frame line
 /// on the web with no error anywhere. Pinned the way the sentences are.

@@ -1095,13 +1095,13 @@ fn the_ground_pass_is_encoded_before_the_march_it_occludes() {
     let body = &body[..end];
 
     let ground = body
-        .find("pipelines.encode_ground(\n            egui_encoder,")
+        .find("pipelines.encode_ground_with_timestamps(\n            egui_encoder,")
         .expect(
             "`prepare` no longer records the ground pass into egui's encoder, so \
              a pane with height attachments would draw an occluder nothing reads",
         );
     let march = body
-        .find("pipelines.encode_raymarch_with_floor(egui_encoder,")
+        .find("pipelines.encode_raymarch_with_timestamps(\n            egui_encoder,")
         .expect("`prepare` no longer records the march");
     assert!(
         ground < march,
