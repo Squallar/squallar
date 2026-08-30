@@ -7,6 +7,11 @@ pub mod basemap_archive;
 /// citizen, and the per-source-layer toggle table.
 /// `tests/committed_styles_parse.rs` — an integration binary, which never sees
 /// `cfg(test)` items — pins the toggle table against the committed styles.
+/// The offline-area download engine: enumerates a bbox's tiles, fetches their
+/// byte ranges, and writes ~16 MB standalone `.pmtiles` segments through a
+/// per-target store. Headless — the selection UI and the read-back
+/// composition are later steps.
+pub mod basemap_download;
 pub mod basemap_layer;
 /// The two committed basemap styles, compiled in. The `include_str!` pair is
 /// 241 KB of JSON, carried by every build because every build renders the

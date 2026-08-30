@@ -78,6 +78,13 @@ pub struct IndexHeader {
     pub root_offset: u64,
     /// The root directory's byte length.
     pub root_length: u64,
+    /// Where the metadata JSON's bytes start. Compressed like the
+    /// directories; the download engine copies it into every segment it
+    /// writes, so a sub-archive carries the same `vector_layers` the parent
+    /// does.
+    pub metadata_offset: u64,
+    /// The metadata's byte length.
+    pub metadata_length: u64,
     /// Where the leaf-directory section starts. Leaf entries' offsets are
     /// relative to this.
     pub leaf_offset: u64,
@@ -410,8 +417,13 @@ fn find_entry(entries: &[DirEntry], tile_id: u64) -> Option<DirEntry> {
     }
 }
 
-/// Undo a directory's on-disk compression.
-fn decompress(bytes: Vec<u8>, compression: DirectoryCompression) -> Result<Vec<u8>, IndexError> {
+/// Undo a directory's on-disk compression. `pub(crate)` for
+/// [`crate::basemap_download`], whose metadata copy is compressed the same
+/// way — the header's `internal_compression` governs both.
+pub(crate) fn decompress(
+    bytes: Vec<u8>,
+    compression: DirectoryCompression,
+) -> Result<Vec<u8>, IndexError> {
     match compression {
         DirectoryCompression::None => Ok(bytes),
         DirectoryCompression::Gzip => {
@@ -452,6 +464,8 @@ fn parse_header(bytes: &[u8]) -> Result<IndexHeader, IndexError> {
     Ok(IndexHeader {
         root_offset: u64_at(8),
         root_length: u64_at(16),
+        metadata_offset: u64_at(24),
+        metadata_length: u64_at(32),
         leaf_offset: u64_at(40),
         leaf_length: u64_at(48),
         tile_data_offset: u64_at(56),
@@ -531,6 +545,14 @@ impl<S: ArchiveRangeSource> PmtIndex<S> {
     /// The archive's header.
     pub fn header(&self) -> &IndexHeader {
         &self.header
+    }
+
+    /// The source the index was opened over, so a caller that has measured a
+    /// set of tiles can fetch their bytes through the same seam — the
+    /// download engine, which must never grow a second connection to the
+    /// archive beside this one.
+    pub fn source(&self) -> &S {
+        &self.source
     }
 
     /// Where `z/x/y`'s bytes sit in the tile-data section, or `None` for a
