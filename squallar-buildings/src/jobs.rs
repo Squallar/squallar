@@ -28,15 +28,28 @@
 //!
 //! So the bytes go across and are parsed a second time. What that buys is that
 //! the second parse happens beside the tessellation, on the worker, instead of
-//! the tessellation happening beside the cache, on the frame thread. The
-//! measured size of what crosses: the busiest `building`-carrying tile in
-//! `squallar-egui/testdata/monaco.pmtiles` is 118,009 bytes decompressed, and
-//! a z14 cover of a dollied footprint is of order a hundred tiles, so a round
-//! is single-digit megabytes — the same bracket the height row already
-//! accounts for. Natively the bodies move behind an `Arc`; on web they are
-//! transferred when the page is cross-origin-isolated and copied once
-//! otherwise (`squallar_web::worker_port` tries `shared_loan::lend` and falls
-//! back to a whole-body copy before the transfer).
+//! the tessellation happening beside the cache, on the frame thread.
+//!
+//! **The size of what crosses, measured, and it is bigger than an earlier
+//! draft of this paragraph said.** `BuildingTile::mvt` is the **decompressed**
+//! body, and the five `building`-carrying z14 tiles of
+//! `squallar-egui/testdata/monaco.pmtiles` decompress to 8,394 / 60,331 /
+//! 60,854 / 88,953 / **185,182** bytes — a mean of 80,743 and a worst of
+//! 185,182. A z14 cover of a dollied footprint is of order a hundred tiles, so
+//! a round is **about 8 MB typical and up to 18.5 MB over downtown**. That is
+//! at and above the top of the 1-8 MB bracket the height row accounts for,
+//! not inside it.
+//!
+//! The earlier figure, "118,009 bytes decompressed", was the tile's
+//! **gzip-compressed** length as the PMTiles directory stores it — off by
+//! 1.57x, and in the direction that made the conclusion ("single-digit
+//! megabytes") true when it is not. `footprint::tests`' own fixture comment
+//! had the right number the whole time, so the tree contradicted itself.
+//!
+//! Natively the bodies move behind an `Arc`; on web they are transferred when
+//! the page is cross-origin-isolated and copied once otherwise
+//! (`squallar_web::worker_port` tries `shared_loan::lend` and falls back to a
+//! whole-body copy before the transfer).
 //!
 //! # Refusals happen in [`BuildingMeshJob::decode`]
 //!

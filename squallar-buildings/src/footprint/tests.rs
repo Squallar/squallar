@@ -460,6 +460,142 @@ fn the_hide_3d_key_is_honoured_though_no_shipped_archive_carries_it() {
     );
 }
 
+/// **Every numeric arm `hide_3d` can arrive in, truthy and falsy.**
+///
+/// The test above supplies `Bool(true)`, `Bool(false)` and `UInt(1)`, which
+/// leaves the `Int`/`SInt` arm never exercised and no *falsy* number tested at
+/// all -- so `Int|SInt(n) => *n != 0` inverted to `*n == 0`, and
+/// `UInt(n) => *n != 0` replaced by `=> true`, both survived. The doc's
+/// sentence about accepting integers beside booleans was prose with no gate
+/// under it.
+///
+/// **This is the one lane whose fixture is synthetic by necessity** -- no
+/// shipped archive carries the key at all -- so it is the lane where a missing
+/// gate has the least chance of being caught by something else.
+#[test]
+fn the_hide_3d_key_is_read_out_of_every_arm_it_can_arrive_in() {
+    // Each row: the value, and whether it should hide the building.
+    let arms: [(&str, Prop, bool); 9] = [
+        ("bool true", Prop::Bool(true), true),
+        ("bool false", Prop::Bool(false), false),
+        ("int 1", Prop::Int(1), true),
+        ("int 0", Prop::Int(0), false),
+        ("int -1", Prop::Int(-1), true),
+        ("sint 1", Prop::SInt(1), true),
+        ("sint 0", Prop::SInt(0), false),
+        ("uint 1", Prop::UInt(1), true),
+        ("uint 0", Prop::UInt(0), false),
+    ];
+    let mut hidden = 0;
+    let mut shown = 0;
+    for (name, prop, should_hide) in arms {
+        let mvt = buildings_tile(vec![building(
+            vec![(RENDER_HEIGHT, Prop::Int(30)), (HIDE_3D, prop)],
+            fixture::polygon(&[&exterior_square((2000, 2000), 100)]),
+        )]);
+        let found = read_footprints(REAL_TILE_ID, &mvt, &a_frame()).expect("the tile reads");
+        assert_eq!(
+            found.is_empty(),
+            should_hide,
+            "`hide_3d` as {name} {} the building",
+            if found.is_empty() {
+                "hid"
+            } else {
+                "did not hide"
+            },
+        );
+        if should_hide {
+            hidden += 1;
+        } else {
+            shown += 1;
+        }
+    }
+    // The falsifiability half: both outcomes are represented, so neither a
+    // reader that hides everything carrying the key nor one that hides nothing
+    // could pass.
+    assert_eq!((hidden, shown), (5, 4));
+
+    // A value that is not a boolean and not a number says nothing about 3D.
+    // Reading a string would make `"false"` truthy, which is the wrong
+    // direction for this to fail in.
+    for prop in [Prop::Str("true"), Prop::Str("false"), Prop::Float(1.0)] {
+        let mvt = buildings_tile(vec![building(
+            vec![(RENDER_HEIGHT, Prop::Int(30)), (HIDE_3D, prop)],
+            fixture::polygon(&[&exterior_square((2000, 2000), 100)]),
+        )]);
+        assert_eq!(
+            read_footprints(REAL_TILE_ID, &mvt, &a_frame())
+                .expect("the tile reads")
+                .len(),
+            1,
+            "a non-integer `hide_3d` hid the building",
+        );
+    }
+}
+
+/// A tile whose rings pass the ceiling is refused before the projection runs
+/// over them.
+///
+/// **Driven at a small ceiling, and that is deliberate**: a tile carrying
+/// [`MAX_RING_VERTICES_PER_TILE`] real vertices is four million forward
+/// geodetic solutions per run. The test below is why
+/// [`read_footprints_under`] exists, and the one after it is what keeps that
+/// from becoming a path production does not take.
+#[test]
+fn a_tile_whose_rings_pass_the_ceiling_is_refused_rather_than_projected() {
+    // Two four-vertex squares: eight ring vertices between them.
+    let mvt = buildings_tile(vec![
+        a_plain_building(30),
+        building(
+            vec![(RENDER_HEIGHT, Prop::Int(40))],
+            fixture::polygon(&[&exterior_square((2200, 2000), 100)]),
+        ),
+    ]);
+    assert_eq!(
+        read_footprints_under(REAL_TILE_ID, &mvt, &a_frame(), 8)
+            .expect("eight vertices is exactly the ceiling")
+            .len(),
+        2,
+        "the ceiling is exclusive at its own value, so the edge below is a \
+         real edge and not one off it",
+    );
+    assert_eq!(
+        read_footprints_under(REAL_TILE_ID, &mvt, &a_frame(), 7),
+        Err(BuildingsError::TooManyVertices { vertices: 8 }),
+    );
+    // And the real tile trips a ceiling below its own 7,551.
+    assert_eq!(
+        read_footprints_under(REAL_TILE_ID, REAL_BUILDING_TILE, &a_frame(), 100),
+        Err(BuildingsError::TooManyVertices { vertices: 155 }),
+        "the refusal reports the running total at the feature that crossed \
+         the line, not the tile's whole count -- the point of refusing is to \
+         stop before the rest is projected",
+    );
+}
+
+/// The public entry point hands over the ceiling this module declares.
+///
+/// Without this, [`read_footprints_under`]'s test would be exercising a
+/// ceiling production never passes, which is the "checker and checked came
+/// from the same belief" shape rather than a gate.
+#[test]
+fn the_public_reader_hands_over_the_ceiling_this_module_declares() {
+    let source = include_str!("../footprint.rs");
+    assert!(
+        source.contains("read_footprints_under(tile, mvt, frame, MAX_RING_VERTICES_PER_TILE)"),
+        "`read_footprints` no longer forwards `MAX_RING_VERTICES_PER_TILE`, \
+         so the ceiling the tests drive is not the ceiling production holds",
+    );
+    // And the constant is the one the doc's headroom arithmetic is over.
+    assert_eq!(MAX_RING_VERTICES_PER_TILE, 1 << 22);
+    assert_eq!(
+        MAX_RING_VERTICES_PER_TILE / 7_551,
+        555,
+        "the doc's `x555` headroom is over the confirmation tile's 7,551 ring \
+         vertices; one of the two moved",
+    );
+}
+
 /// A building whose height nobody knows is left flat on the basemap rather
 /// than given an invented one.
 #[test]

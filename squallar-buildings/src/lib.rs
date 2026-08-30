@@ -98,8 +98,8 @@ pub mod tile;
 
 pub use budget::{
     DEFAULT_PRISM_VRAM_BYTES, FINEST_VERTEX_CEILING, INDICES_PER_VERTEX_CEILING,
-    MIN_VERTEX_CEILING, PRISM_INDEX_BYTES, PRISM_VERTEX_BYTES, PrismBudget, PrismCeilings,
-    PrismLimit, PrismRung,
+    MEASURED_VERTICES_PER_BUILDING, MIN_VERTEX_CEILING, PRISM_INDEX_BYTES, PRISM_VERTEX_BYTES,
+    PrismBudget, PrismCeilings, PrismLimit, PrismRung,
 };
 pub use footprint::{
     BuildingFootprint, BuildingsError, HIDE_3D, RENDER_HEIGHT, RENDER_MIN_HEIGHT, SOURCE_LAYER,

@@ -429,6 +429,83 @@ fn a_building_that_does_not_fit_is_left_out_whole() {
     assert!(cut.is_coherent());
 }
 
+/// **The prefix rule itself, against the greedy variant it was chosen over.**
+///
+/// This is the unit's headline property and it had no gate: replacing the
+/// early return in [`extrude`] with `mesh.shed += 1; continue;` -- which *is*
+/// the "walk past the one that does not fit and pick up smaller ones behind
+/// it" that `shed_order`'s doc argues against -- survived the whole suite.
+/// All three of the shed tests above are blind to it, two because every
+/// building in them is the same size and the third because it puts the
+/// *smaller* footprint at the *taller* height, so nothing is ever skipped over.
+///
+/// The discriminating fixture is the one those lack: the **taller** building
+/// is also the **expensive** one, and the ceiling has room for the short cheap
+/// one but not for the tall costly one. A prefix answers nothing; a greedy
+/// walk answers the short building.
+///
+/// The behaviour under test is deliberately the *worse-looking* of the two --
+/// an emptier pane. It is chosen because it is monotone: a building being
+/// present implies every taller building is present, so the skyline does not
+/// gain and lose a tower as the camera moves and the footprint set changes
+/// underneath it.
+#[test]
+fn the_shed_keeps_a_prefix_and_does_not_walk_past_a_building_that_does_not_fit() {
+    // Tall and expensive: a 64-sided ring is 64 cap vertices and 64 wall quads.
+    let tall_and_costly = footprint(
+        vec![Ring {
+            points: (0..64)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * f64::from(i) / 64.0;
+                    [0.05 * a.cos(), 0.05 * a.sin()]
+                })
+                .collect(),
+            exterior: true,
+        }],
+        0.0,
+        120.0,
+    );
+    // Short and cheap: four sides.
+    let short_and_cheap = a_box([0.5, 0.0], 0.1, 5.0);
+
+    let costly_size = extrude(std::slice::from_ref(&tall_and_costly), &no_shed())
+        .positions
+        .len();
+    let cheap_size = extrude(std::slice::from_ref(&short_and_cheap), &no_shed())
+        .positions
+        .len();
+    assert!(
+        cheap_size < costly_size,
+        "the fixture is not discriminating: the cheap building costs \
+         {cheap_size} vertices and the costly one {costly_size}",
+    );
+
+    // Room for the cheap building and nowhere near the costly one.
+    let budget = PrismBudget {
+        max_vertices: cheap_size as u32,
+        max_indices: u32::MAX,
+        rung: full_rung(),
+        limit: crate::budget::PrismLimit::Vram,
+    };
+    let mesh = extrude(&[tall_and_costly, short_and_cheap], &budget);
+    assert_eq!(
+        (mesh.kept, mesh.shed),
+        (0, 2),
+        "the shed walked past the 120 m building it could not fit and picked \
+         up the 5 m one behind it. That is the greedy variant `shed_order` \
+         refuses: it makes the kept set depend on each footprint's tessellated \
+         size rather than on its height, so a tower appears and disappears as \
+         its neighbours change",
+    );
+    assert!(mesh.is_empty());
+
+    // The control, so the assertion above is not passing because the ceiling
+    // was too small for anything: one vertex more and the cheap building is
+    // kept, in a run where it is the only footprint.
+    let alone = extrude(&[a_box([0.5, 0.0], 0.1, 5.0)], &budget);
+    assert_eq!((alone.kept, alone.shed), (1, 0));
+}
+
 /// The index ceiling binds on its own, not only through the vertex one.
 #[test]
 fn the_index_ceiling_sheds_even_when_the_vertex_ceiling_does_not() {
@@ -448,6 +525,56 @@ fn the_index_ceiling_sheds_even_when_the_vertex_ceiling_does_not() {
     assert_eq!(cut.kept, 2);
     assert_eq!(cut.shed, 2);
     assert!(cut.indices.len() <= per_building * 2);
+}
+
+/// **`is_coherent`'s index bound is exclusive**, and the boundary is where it
+/// matters: `positions.len()` is one past the last addressable vertex, so `<`
+/// against `<=` is the difference between refusing an out-of-bounds read on
+/// the GPU and shipping it. The doc calls this the one check that is not
+/// merely defensive and it had no test at all.
+#[test]
+fn a_mesh_whose_index_is_one_past_its_last_vertex_is_incoherent() {
+    let sound = BuildingMesh {
+        positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: vec![[0.0, 0.0, 1.0]; 3],
+        indices: vec![0, 1, 2],
+        kept: 1,
+        shed: 0,
+        refused_tiles: 0,
+    };
+    assert!(sound.is_coherent(), "the control mesh must be coherent");
+
+    // Exactly one past the end. `<=` would accept this.
+    let one_past = BuildingMesh {
+        indices: vec![0, 1, 3],
+        ..sound.clone()
+    };
+    assert!(
+        !one_past.is_coherent(),
+        "index 3 addresses a fourth vertex of a three-vertex mesh",
+    );
+
+    // The other two arms of the same check, so a fixture sitting on one of
+    // them cannot stand in for the rest.
+    assert!(
+        !BuildingMesh {
+            normals: vec![[0.0, 0.0, 1.0]; 2],
+            ..sound.clone()
+        }
+        .is_coherent(),
+        "a mesh with fewer normals than positions is coherent",
+    );
+    assert!(
+        !BuildingMesh {
+            indices: vec![0, 1],
+            ..sound.clone()
+        }
+        .is_coherent(),
+        "two indices are not a whole number of triangles",
+    );
+    // And an empty mesh is coherent, so the check is not simply refusing
+    // everything.
+    assert!(BuildingMesh::default().is_coherent());
 }
 
 #[test]

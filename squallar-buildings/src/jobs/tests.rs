@@ -295,8 +295,12 @@ fn a_tile_with_no_buildings_is_not_a_refused_tile() {
 /// tile and the skyline becomes evenly spaced towers.
 #[test]
 fn the_budget_is_spent_across_the_whole_box_and_not_per_tile() {
+    // Sized so the fitted ceiling is 65,536 vertices: one tile's 37,457 fit
+    // whole and two tiles' 74,914 do not. That gap is the whole discrimination
+    // -- at a row where one tile does not fill the ceiling, a per-tile budget
+    // and a whole-box one answer the same thing and the test proves nothing.
     let tight = PrismCeilings {
-        vram_bytes: 40_000,
+        vram_bytes: 3 << 20,
         max_buffer_bytes: 1 << 28,
     };
     let one = BuildingMeshJob {
@@ -324,10 +328,15 @@ fn the_budget_is_spent_across_the_whole_box_and_not_per_tile() {
     let single = BuildingMeshJob::run(&one, &bare_geometry()).expect("answers");
     let doubled = BuildingMeshJob::run(&twice, &bare_geometry()).expect("answers");
 
+    assert_eq!(
+        single.shed, 0,
+        "one tile fits whole at this row, so the doubled run's shed is the \
+         budget being shared rather than one tile being too big on its own",
+    );
     assert!(
-        single.shed > 0,
-        "the tight row did not shed anything, so this test is not about the \
-         shed at all",
+        doubled.shed > 0,
+        "the doubled tile set did not shed, so nothing here is about one \
+         budget against two",
     );
     assert_eq!(
         doubled.kept + doubled.shed,
@@ -446,6 +455,112 @@ fn a_reply_this_row_did_not_write_is_refused() {
     assert!(
         BuildingMeshJob::decode_out(&head_for_two, partial).is_none(),
         "two indices decoded as a mesh",
+    );
+}
+
+/// **A truncated tail is refused, not decoded as a smaller mesh.**
+///
+/// The refusal test above cannot see this and the reason is worth stating: its
+/// mesh is three vertices and one triangle, so every truncation it can make
+/// leaves something `is_coherent` rejects on its own -- a partial triangle, or
+/// a normals count that no longer matches. Deleting the whole length check
+/// therefore survived it.
+///
+/// A mesh big enough to be truncated to a *smaller whole mesh* is where the
+/// check earns its place. Without it, a reply whose index tail was cut in
+/// transit decodes as a valid mesh with fewer triangles: the pane draws part
+/// of the city and nothing anywhere says a byte went missing. That is the
+/// silent-partial-success shape `refused_tiles` exists to prevent one layer up.
+#[test]
+fn a_tail_cut_to_a_smaller_whole_mesh_is_refused_rather_than_drawn() {
+    let mesh = BuildingMesh {
+        positions: (0..6).map(|i| [i as f32, 0.0, 1.0]).collect(),
+        normals: vec![[0.0, 0.0, 1.0]; 6],
+        indices: vec![0, 1, 2, 3, 4, 5],
+        kept: 2,
+        shed: 0,
+        refused_tiles: 0,
+    };
+    let mut head = Vec::new();
+    let mut tails = Vec::new();
+    BuildingMeshJob::encode_out(mesh.clone(), &mut head, &mut tails);
+    assert_eq!(
+        BuildingMeshJob::decode_out(&head, tails.clone()),
+        Some(mesh),
+        "the control reply must decode",
+    );
+
+    // One triangle cut off the index tail. The remainder is three indices,
+    // every one of them addressing a real vertex, so the survivor decodes as a
+    // one-triangle mesh: coherent, plausible, and half the building.
+    let mut cut_indices = tails.clone();
+    cut_indices[2].truncate(12);
+    assert!(
+        BuildingMeshJob::decode_out(&head, cut_indices).is_none(),
+        "a reply missing a triangle decoded as a smaller mesh",
+    );
+
+    // Two vertices cut off positions and normals together, with every index
+    // still inside the four that remain. Coherent again, and again wrong.
+    let mut cut_vertices = tails.clone();
+    cut_vertices[0].truncate(4 * 12);
+    cut_vertices[1].truncate(4 * 12);
+    let mut head_indices_in_range = Vec::new();
+    for term in [2u32, 0, 0, 6, 3] {
+        head_indices_in_range.extend_from_slice(&term.to_le_bytes());
+    }
+    let mut short_indices = tails.clone();
+    short_indices[0].truncate(4 * 12);
+    short_indices[1].truncate(4 * 12);
+    short_indices[2].truncate(12);
+    assert!(
+        BuildingMeshJob::decode_out(&head, cut_vertices).is_none(),
+        "a reply missing two vertices decoded as a smaller mesh",
+    );
+    assert!(
+        BuildingMeshJob::decode_out(&head_indices_in_range, short_indices).is_none(),
+        "a head and tails that agree with each other but not with what the \
+         encoder wrote decoded",
+    );
+
+    // And a tail that is LONGER than the head declares, which is the same
+    // disagreement from the other side.
+    let mut extra = tails;
+    extra[2].extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        BuildingMeshJob::decode_out(&head, extra).is_none(),
+        "a reply with an extra index decoded",
+    );
+}
+
+/// The tile-byte ceiling is **reachable in principle and unpinned in fact**,
+/// and saying so is better than a test that cannot fail.
+///
+/// [`MAX_TILE_BYTES_TOTAL`] only refuses a payload that carries more than
+/// 256 MiB of real bodies: below that, `Reader::take` runs off the end first
+/// and answers `None` for its own reason, so any fixture small enough to run
+/// in a test suite is refused with the ceiling deleted too. Removing the guard
+/// therefore survives every test that could be written under a sane fixture
+/// size, and this one does not pretend otherwise.
+///
+/// What it does pin is that the ceiling is not dead by construction — a tile
+/// count this row accepts, at body lengths a `u32` can spell, does exceed it —
+/// so it is a guard on a reachable state rather than a line nobody could ever
+/// cross.
+#[test]
+fn the_tile_byte_ceiling_is_reachable_but_only_by_a_payload_too_big_to_test() {
+    let widest_legal_payload = MAX_TILES as u64 * u64::from(u32::MAX);
+    assert!(
+        widest_legal_payload > MAX_TILE_BYTES_TOTAL,
+        "{MAX_TILES} tiles of u32::MAX bytes is {widest_legal_payload}, which \
+         does not reach the {MAX_TILE_BYTES_TOTAL} ceiling: the guard is dead \
+         code rather than a bound",
+    );
+    // And the ceiling is genuinely tighter than the tile-count ceiling, which
+    // is the reason both exist.
+    assert!(
+        MAX_TILE_BYTES_TOTAL < widest_legal_payload,
+        "the byte ceiling is not tighter than the count ceiling",
     );
 }
 
