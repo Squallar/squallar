@@ -772,6 +772,232 @@ fn part_boundary_edges_hold_at_the_last_part_and_at_an_exact_boundary_end() {
     assert_eq!(bytes, &body[2400..2500]);
 }
 
+/// A parted server whose `part000` is `part000_bytes` long instead of the
+/// `stride` the publish contract promises, with the later parts holding the
+/// bytes a correct publish would put in them.
+///
+/// The mid-sequence short part: a stride the publisher and [`PART_BYTES`]
+/// disagree on, or an upload that stopped early. Its shape is what the
+/// reader's `offset / stride` arithmetic has no way to see.
+fn server_with_a_short_first_part(body: &[u8], stride: usize, part000_bytes: usize) -> RangeServer {
+    let mut paths = std::collections::HashMap::new();
+    for (index, part) in split_into_parts(body, stride).into_iter().enumerate() {
+        let part = if index == 0 {
+            part[..part000_bytes].to_vec()
+        } else {
+            part
+        };
+        paths.insert(part_path(index), PathPlan::ranged(part));
+    }
+    RangeServer::start(paths)
+}
+
+/// **A part that is short in the middle of the sequence is an error, never a
+/// short `Ok`.**
+///
+/// The contract that only the final part is short is the publisher's word and
+/// nothing in the bytes carries it, so the reader checks it rather than
+/// assuming it. Before the check, `read_range(950, 100)` over a `part000`
+/// holding 900 of its 1000 bytes answered `Ok` with **zero** bytes, and
+/// `read_range(0, 2500)` answered `Ok` with 900 of 2500 — the whole of
+/// `part001` and `part002` silently dropped though both serve. Every terminal
+/// consumer does check its own lengths, so that landed as "the archive is
+/// truncated" rather than as the publish fault it is — and
+/// [`super::block_cache::BlockCachedSource`] writes the short answer to disk,
+/// which makes one bad publish durable for the generation.
+#[test]
+fn a_short_mid_sequence_part_is_an_error_rather_than_a_short_read() {
+    let body = pattern(2500);
+    let server = server_with_a_short_first_part(&body, 1000, 900);
+    let source = parted_source(&server, 1000);
+
+    // Straddling the boundary out of the short part: the 50 bytes at
+    // `part001[0..50]` are there and the old code answered with none of them.
+    let error = block_on(source.read_range(950, 100))
+        .expect_err("a part that ran short with a later part present is not the archive ending");
+    assert!(
+        matches!(
+            error,
+            RangeError::ShortPart {
+                part: 0,
+                got: 0,
+                wanted: 50,
+                stride: 1000,
+            }
+        ),
+        "the error should name the part, what it answered and the stride it broke: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("part001"),
+        "the message should name the later part that proves the archive did not end: {error}"
+    );
+
+    // A read wholly inside the short part's own hole, which is one span and
+    // so never planned a later part: still not the archive ending.
+    let error = block_on(source.read_range(500, 500))
+        .expect_err("a single-span read out of a short mid-sequence part errors too");
+    assert!(
+        matches!(error, RangeError::ShortPart { part: 0, .. }),
+        "{error:?}"
+    );
+
+    // And the whole-archive read that dropped 1600 bytes in silence.
+    let error = block_on(source.read_range(0, 2500))
+        .expect_err("the whole-archive read must not answer 900 of 2500 bytes as success");
+    assert!(
+        matches!(error, RangeError::ShortPart { part: 0, .. }),
+        "{error:?}"
+    );
+
+    // A read that never touches the short part is unaffected: the check costs
+    // correct reads nothing.
+    let bytes = block_on(source.read_range(1000, 100)).expect("part001 is whole and reads");
+    assert_eq!(bytes, &body[1000..1100]);
+}
+
+/// The other half of the same branch: the archive really ending inside its
+/// final part is still a clamped `Ok`, and the verdict costs **one** request
+/// for the source's whole life.
+///
+/// The over-correction guard. A check that turned every end-of-archive read
+/// into an error would pass the test above and break every tail read there
+/// is — [`super::block_cache`]'s last block among them.
+#[test]
+fn the_archive_ending_in_its_last_part_still_clamps_rather_than_erroring() {
+    // Parts of 1000, 1000, 500: the last part is short, as a real one is.
+    let body = pattern(2500);
+    let server = RangeServer::parted(&body, 1000);
+    let source = parted_source(&server, 1000);
+
+    let bytes = block_on(source.read_range(2400, 500)).expect("a read past the end clamps");
+    assert_eq!(bytes, &body[2400..2500]);
+    assert_eq!(
+        server.requests_to(&part_path(3)),
+        1,
+        "the end verdict is taken by asking whether the next part exists, exactly once"
+    );
+
+    // Every later short read reads the held verdict rather than the wire.
+    for _ in 0..3 {
+        let bytes = block_on(source.read_range(2400, 500)).expect("the clamp holds");
+        assert_eq!(bytes, &body[2400..2500]);
+    }
+    assert_eq!(
+        server.requests_to(&part_path(3)),
+        1,
+        "the verdict is held for the source's lifetime, not re-asked per short read"
+    );
+
+    // A short read straddling into the final part clamps the same way.
+    let bytes = block_on(source.read_range(1990, 600)).expect("a straddle past the end clamps");
+    assert_eq!(bytes, &body[1990..2500]);
+}
+
+/// A source that answers every read one byte short, behind the real reader.
+///
+/// The refutation's own gate: the claim that a short read cannot reach a
+/// decoder as plausible data rests on `pmtiles`' `AsyncBackend::read_exact`
+/// default, which [`super::RangeBackend`] deliberately does not override.
+/// Override it — or swap the reader for one that calls `read` — and this
+/// reddens instead of a truncated directory or tile body being decoded.
+struct ShortByOneSource {
+    inner: FileRangeSource,
+}
+
+impl RangeSource for ShortByOneSource {
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        let read = self.inner.read_range(offset, length);
+        async move {
+            let mut bytes = read.await?;
+            bytes.pop();
+            Ok(bytes)
+        }
+    }
+}
+
+/// **A short read is never decoded.** The reader asks for structures whose
+/// lengths it knows, so one byte missing is an error at the seam rather than
+/// a directory or a tile body handed to a decoder a byte light.
+#[test]
+fn a_source_answering_one_byte_short_fails_rather_than_decoding_the_truncation() {
+    const TEST: &str =
+        "a_source_answering_one_byte_short_fails_rather_than_decoding_the_truncation";
+    let Some(inner) = open_archive_file(TEST) else {
+        return;
+    };
+
+    // The opening read is `pmtiles`' one deliberate "up to" read — a byte
+    // short of 16 KiB still holds the whole prelude, so the open succeeds,
+    // and that is correct rather than a hole.
+    block_on(BasemapArchive::open(ShortByOneSource { inner }))
+        .expect("a byte short of the opening read still holds the header and root directory");
+
+    // Every read after it is held to a length the archive itself declared, so
+    // a tile body a byte short is an error rather than bytes handed on.
+    let Some(inner) = open_archive_file(TEST) else {
+        return;
+    };
+    let archive = block_on(BasemapArchive::open(ShortAfterOpenSource { inner }))
+        .expect("the opening read is served whole, so the archive opens");
+    let z = archive.max_zoom();
+    let (lon, lat) = archive_centre(&archive);
+    let (x, y) = (
+        squallar_geo::lon_to_tile_x(lon, z),
+        squallar_geo::lat_to_tile_y(lat, z),
+    );
+
+    // `warm_tile` and not `tile`, deliberately: `tile` decompresses, and a
+    // gzip stream a byte short fails in the DECOMPRESSOR whether or not the
+    // length was ever checked — so asserting on it would pass with
+    // `read_exact` overridden away and gate nothing. `warm_tile` drops the
+    // bytes undecompressed, which leaves the length check as the only thing
+    // that can turn this read into an error.
+    let error = block_on(archive.warm_tile(z, x, y))
+        .expect_err("a tile body a byte short is a failure, never truncated bytes");
+    assert!(
+        matches!(error, ArchiveError::Tile(_)),
+        "the short body surfaces as a tile failure: {error}"
+    );
+
+    // And the decompressing path is an error too, for whichever of the two
+    // reasons comes first.
+    assert!(
+        block_on(archive.tile(z, x, y)).is_err(),
+        "the decompressing read of a short body is a failure as well"
+    );
+}
+
+/// [`ShortByOneSource`] that serves the read at offset zero whole, so the
+/// archive opens and only the reads *after* the open are truncated.
+///
+/// Keyed on the offset rather than on a read count, because a count would
+/// silently start truncating the wrong read on an archive whose open costs a
+/// different number of them.
+struct ShortAfterOpenSource {
+    inner: FileRangeSource,
+}
+
+impl RangeSource for ShortAfterOpenSource {
+    fn read_range(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, RangeError>> + Send {
+        let read = self.inner.read_range(offset, length);
+        async move {
+            let mut bytes = read.await?;
+            if offset != 0 {
+                bytes.pop();
+            }
+            Ok(bytes)
+        }
+    }
+}
+
 /// **The differential, over the whole fixture.** Every coordinate the
 /// fixture's bounding box holds, at every zoom it declares, read from the
 /// monolith and from a 7-part split of the same bytes — and the present
