@@ -567,6 +567,27 @@ impl VolumeGrid {
     /// A consumer that needs the box's *placement* reads
     /// [`anchor`](Self::anchor) and the kilometre ranges. This is the
     /// geographic summary, and it is never fed back the other way.
+    ///
+    /// # A box straddling the antimeridian lands OUT OF RANGE, deliberately
+    ///
+    /// `squallar_geo::great_circle_destination` returns `site_lon + Δlon` and
+    /// does not wrap — a documented contract of that function, not an
+    /// oversight — so a straddling box's eastern samples come back past +180
+    /// and the min/max fold keeps them. The resulting `max_lon > 180` fails
+    /// [`squallar_geo::GeoPoint::is_on_earth`], which is a loud rejection.
+    ///
+    /// **That is the better of the two available answers and is not to be
+    /// "fixed" by normalising.** `GeoBounds` is a plain min/max pair with no way
+    /// to spell a wrapped box; normalising each sample first would fold a
+    /// straddling footprint into `min_lon ≈ −180, max_lon ≈ +180` — a
+    /// world-spanning box that every downstream check accepts and that is
+    /// silently, enormously wrong. A loud out-of-range value beats a quiet
+    /// wrong one. `a_straddling_footprint_stays_out_of_range_rather_than_spanning_the_world`
+    /// pins it, and `squallar_geo::normalize_lon` is what a caller that
+    /// genuinely wants the wrap reaches for.
+    ///
+    /// No current NEXRAD reaches this: the reasoning is checked, the situation
+    /// is not reachable from the shipped site table.
     pub fn footprint(&self) -> GeoBounds {
         let at = |x_km: f64, y_km: f64| {
             let bearing_deg = x_km.atan2(y_km).to_degrees().rem_euclid(360.0);
