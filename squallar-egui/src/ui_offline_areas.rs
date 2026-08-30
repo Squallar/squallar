@@ -44,17 +44,11 @@ pub(crate) const DOWNLOADED_AREAS_HEADING: &str = "Downloaded areas";
 /// What the screen draws when this device holds none.
 pub(crate) const NO_AREAS_NOTE: &str = "No downloaded areas.";
 
-/// The one header note, carrying both things that must be said once rather
-/// than per row: what a downloaded area actually makes available, and the
-/// denominator every size below is in.
-///
-/// **Decimal MB and GB (10⁶ / 10⁹)** — [`DataSize`](squallar_units::DataSize)'s
-/// denominator, and what a phone's storage screen counts in. Named here, never
-/// re-derived on a row.
+/// The one header note: what a downloaded area actually makes available, said
+/// once rather than per row.
 pub(crate) const AREAS_SCOPE_NOTE: &str = "A downloaded area holds the base map \
     and the static reference layers for that rectangle, so they draw without a \
-    connection. Radar, alerts and forecasts are always fetched live. Sizes are \
-    decimal MB and GB - what your device's storage screen counts in.";
+    connection. Radar, alerts and forecasts are always fetched live.";
 
 /// What a row draws in the size slot while the store has not answered for it.
 pub(crate) const CHECKING_NOTE: &str = "Checking storage...";

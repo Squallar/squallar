@@ -199,8 +199,13 @@ fn the_level_list_draws_three_depths_with_the_exact_figure_beside_each() {
         );
     }
     assert!(
-        drawn.contains(DETAIL_LEVEL_HEADING) && drawn.contains(DECIMAL_SIZES_NOTE),
-        "the list drew sizes without naming the denominator once above them"
+        drawn.contains(DETAIL_LEVEL_HEADING),
+        "the level list drew its figures without a heading over them"
+    );
+    // Users know what MB means. The panel states sizes, never their base.
+    assert!(
+        !drawn.contains("1,000,000") && !drawn.contains("decimal"),
+        "the panel explained its byte denominator; drawn:\n{drawn}"
     );
 }
 

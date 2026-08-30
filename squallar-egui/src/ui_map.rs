@@ -1426,12 +1426,7 @@ impl super::Gui {
                 super::shell::chrome_frame(&ctx.global_style()).show(ui, |ui| {
                     ui.set_width(DOWNLOAD_PANEL_WIDTH);
                     ui.label(egui::RichText::new(DOWNLOAD_PANEL_TITLE).strong());
-                    // The denominator, named once for the whole list rather
-                    // than re-derived on every row.
-                    ui.label(format!(
-                        "{:.0} km across - {DECIMAL_SIZES_NOTE}",
-                        picked.across_km()
-                    ));
+                    ui.label(format!("{:.0} km across", picked.across_km()));
                     ui.separator();
                     ui.label(DETAIL_LEVEL_HEADING);
                     for level in DETAIL_LEVELS {
@@ -2529,10 +2524,6 @@ const DOWNLOAD_PANEL_WIDTH: f32 = 260.0;
 
 /// The download panel's title.
 pub(crate) const DOWNLOAD_PANEL_TITLE: &str = "Make available offline";
-
-/// The size denominator, stated once for the whole list rather than on every
-/// row — `DataSize`'s own rule.
-pub(crate) const DECIMAL_SIZES_NOTE: &str = "sizes in decimal MB, 1,000,000 bytes";
 
 /// The heading over the three depths.
 pub(crate) const DETAIL_LEVEL_HEADING: &str = "Detail level";
