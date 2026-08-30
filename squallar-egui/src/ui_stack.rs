@@ -551,6 +551,17 @@ impl super::Gui {
                     } else {
                         format!("Show {name}")
                     });
+                // A UiSweep target: the sweep toggles every eye it can see.
+                if crate::gesture_player::click_registry::collecting() {
+                    crate::gesture_player::click_registry::register(
+                        &format!(
+                            "{}{}",
+                            crate::gesture_player::ui_sweep::EYE_PREFIX,
+                            kind.as_str()
+                        ),
+                        eye.rect,
+                    );
+                }
                 if eye.clicked() {
                     // Both halves plus the enable-fetch rule, through the
                     // one helper the inspector's Show toggle and the

@@ -120,6 +120,12 @@ impl super::Gui {
                         {
                             probe.inspector_toggle = (inspector.rect, insp_open);
                         }
+                        // A UiSweep target: the sweep opens the inspector here
+                        // and closes it by its own × button.
+                        crate::gesture_player::click_registry::register(
+                            crate::gesture_player::ui_sweep::INSPECTOR_TOGGLE,
+                            inspector.rect,
+                        );
                         if inspector.clicked() {
                             self.insp_open = !insp_open;
                         }
@@ -382,6 +388,11 @@ impl super::Gui {
                             .widget_id_probes
                             .push(("layers_toggle", layers.id));
                     }
+                    // A UiSweep target: the sweep closes and reopens the panel.
+                    crate::gesture_player::click_registry::register(
+                        crate::gesture_player::ui_sweep::LAYERS_TOGGLE,
+                        layers.rect,
+                    );
                     if layers.clicked() {
                         if self.layout.width.has_persistent_sidebar() {
                             self.stack_open = Some(!layers_open);

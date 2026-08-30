@@ -318,6 +318,33 @@ fn the_input_rewrites_run_before_begin_pass() {
     }
 }
 
+/// The injection seam's whole value is its position: appended before both
+/// normalizers (a scripted Line notch gets the web rewrite) and before the
+/// interaction scan (a scripted frame tags interact with no special case).
+/// Only this file says so.
+#[test]
+fn injected_events_land_before_the_rewrites_and_the_interaction_scan() {
+    let body = begin_frame_body();
+    let inject = body
+        .find("events.extend(extra_events)")
+        .expect("begin_frame no longer appends extra_events");
+    for later in [
+        "normalize_touch_devices(",
+        "normalize_wheel_units(",
+        "input_carries_interaction(",
+        "begin_pass(",
+    ] {
+        let at = body
+            .find(later)
+            .unwrap_or_else(|| panic!("begin_frame no longer calls {later}"));
+        assert!(
+            inject < at,
+            "extra_events lands after {later}, so an injected event skips \
+             the treatment every real event gets there"
+        );
+    }
+}
+
 /// The wheel rewrite must be *reachable*, and reachable on the web only.
 #[test]
 fn the_wheel_rewrite_is_gated_on_wasm32_and_nothing_else() {

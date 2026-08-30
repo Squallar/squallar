@@ -80,7 +80,10 @@ fn the_restore_runs_from_inside_the_frame_and_not_from_the_state_that_built_it()
         body.find(needle)
             .unwrap_or_else(|| panic!("{needle} is no longer in setup_egui_frame"))
     };
-    let opened = at("egui_renderer.begin_frame(");
+    // The receiver sits on its own line since WO-4 grew the call a third
+    // argument past rustfmt's chain width; the method name alone is still
+    // unique in this body.
+    let opened = at(".begin_frame(");
     let restore = at("self.restore_cached_render(");
     // Split the way `arch_ratchets.rs` and `gui_seam_ratchet_tests.rs` split
     // theirs, and for their reason: spelled whole, the needle is itself one

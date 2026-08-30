@@ -252,6 +252,11 @@ pub struct App {
     /// composed at, so the sentence is rebuilt only when a figure can have
     /// moved rather than allocated every frame.
     gpu_passes_panel_frames: Option<u64>,
+    /// The scripted-input player, armed at construction by the
+    /// `gesture_script` key or the `SQUALLAR_GESTURE_SCRIPT` variable — see
+    /// [`render::gesture_player_from`]. `None` on every shipping install,
+    /// and everything it costs is behind the `Option`.
+    gesture_player: Option<squallar_egui::gesture_player::GesturePlayer>,
     /// The last predictive-back claim pushed to the platform, so the push is
     /// edge-triggered. `false` at construction because nothing is open on the
     /// first frame — which is also what the platform assumes until told
@@ -531,6 +536,10 @@ impl App {
         // frame and a config read is not a per-frame cost.
         let raster_telemetry_loud = render::raster_telemetry_is_loud(platform.kv().as_deref());
         let frame_telemetry_loud = render::frame_telemetry_is_loud(platform.kv().as_deref());
+        let gesture_player = render::gesture_player_from(
+            std::env::var("SQUALLAR_GESTURE_SCRIPT").ok(),
+            platform.kv().as_deref(),
+        );
 
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool_memo =
@@ -580,6 +589,7 @@ impl App {
             frame_telemetry_said: None,
             gpu_passes_panel_line: None,
             gpu_passes_panel_frames: None,
+            gesture_player,
             back_claimed: false,
             exit_requested: false,
             autosave: AutosaveState {
@@ -731,6 +741,9 @@ impl App {
             || self.chunk_feeds.any_in_flight()
             || self.chunk_notify.handshake_pending()
             || squallar_worker::offload::has_deferred_drops()
+            // An armed gesture player is a hand that never lifts: its next
+            // frame's events exist only if a next frame comes.
+            || self.gesture_player.is_some()
         {
             notify_redraw(&self.window);
         }

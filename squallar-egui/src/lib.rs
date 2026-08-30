@@ -22,6 +22,14 @@ pub mod basemap_layer;
 /// vector basemap from it.
 pub mod basemap_style;
 pub(crate) mod field_facts;
+/// The scripted-input player: deterministic gesture scripts injected into the
+/// renderer's raw input, and the click registry the UiSweep script drives real
+/// widgets through. Dormant unless armed by the `gesture_script` config key or
+/// the `SQUALLAR_GESTURE_SCRIPT` environment variable.
+pub mod gesture_player;
+/// The one copy of the integration-faithful event sequences, emitted by both
+/// the headless input harness and the gesture player.
+pub(crate) mod input_fidelity;
 pub(crate) mod legend_ramp;
 pub mod overlay_cache;
 pub mod pane;

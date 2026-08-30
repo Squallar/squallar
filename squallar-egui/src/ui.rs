@@ -503,12 +503,22 @@ fn render_control_item(
                 if *logarithmic {
                     slider = slider.logarithmic(true);
                 }
-                ui.add(slider);
+                ui.add(slider)
             });
+            // A UiSweep target: the sweep drags the first registered slider
+            // out and back. The inner response is the rail itself, so the
+            // scripted press lands on the slider and not the label.
+            if crate::gesture_player::click_registry::collecting() {
+                crate::gesture_player::click_registry::register(
+                    &format!(
+                        "{}{kind:?}_{id}",
+                        crate::gesture_player::ui_sweep::SLIDER_PREFIX
+                    ),
+                    row.inner.rect,
+                );
+            }
             #[cfg(test)]
             probe.record_item(kind, DrawnControlKind::Slider, label, row.response.rect);
-            #[cfg(not(test))]
-            let _ = row;
             if (val - original).abs() > f64::EPSILON {
                 updates.push((
                     kind.clone(),
