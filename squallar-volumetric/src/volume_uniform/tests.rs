@@ -488,14 +488,34 @@ fn an_occluder_scale_from_another_eye_is_recognised_as_one() {
 
 /// The shader reads the scale off the lane this file writes it to, and treats
 /// zero as "no ground pass".
+///
+/// **Anchored inside `ground_covered`, not on a bare `contains` of the
+/// comparison.** B2 gave the composite two more readers of the same lane — the
+/// coverage and the arm — so a whole-file `contains` went from one occurrence
+/// to three and stopped fencing its own defect: measured, deleting
+/// `volume.occluder.x > 0.0 && ` from `ground_covered` left this test and the
+/// entire default `cargo test` row green, caught only by the `#[ignore]`d GPU
+/// suites the default row skips. The gate a default row cannot fail is not a
+/// gate.
 #[test]
 fn the_shader_gates_the_occluder_on_the_scale_lane_being_positive() {
     let shader = include_str!("../volume.wgsl");
+    let covered = shader
+        .split_once("fn ground_covered(")
+        .and_then(|(_, rest)| rest.split_once('}').map(|(body, _)| body))
+        .expect(
+            "the march no longer decides ground coverage in `ground_covered`; \
+             re-anchor this on wherever that moved to rather than widening it \
+             back to a whole-file search",
+        );
     assert!(
-        shader.contains("volume.occluder.x > 0.0"),
-        "the shader no longer gates the occluder read on a positive scale, so \
-         every pane would read the group-2 placeholder as though a ground pass \
-         had run",
+        covered.contains("volume.occluder.x > 0.0"),
+        "`ground_covered` no longer gates the occluder read on a positive \
+         scale, so every pane would read the group-2 placeholder as though a \
+         ground pass had run. The composite's coverage and arm read the same \
+         lane, so a whole-file search for it stays green through exactly this \
+         deletion — the body is what has to carry the test. Body was: \
+         {covered}",
     );
     assert!(
         shader.contains("span.y = min(span.y, ground_t);"),

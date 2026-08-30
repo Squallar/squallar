@@ -1095,8 +1095,13 @@ static MUTANTS: &[Mutant] = &[
     Mutant {
         name: "the below-floor fade is deleted and the ground is always at full coverage",
         class: "floor",
-        pattern: "let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);",
-        replacement: "let floor_fade = 1.0;",
+        // Re-anchored at B2, which made the fade the flat LID's alone: a ground
+        // mesh is what the march is clipped against and is opaque from every
+        // side, so the dissolve is now selected on the ground-pass sentinel.
+        // `FLOOR_FROM_BELOW` carries no ground pass, so it still walks the
+        // shipped `clamp` arm and this still deletes the fade it sees.
+        pattern: "        clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0),",
+        replacement: "        1.0,",
         occurrences: 1,
         probe: &FLOOR_FROM_BELOW,
     },
@@ -1260,8 +1265,13 @@ static MUTANTS: &[Mutant] = &[
     Mutant {
         name: "the composite's plane is the box top rather than its bottom face",
         class: "geometry",
-        pattern: "let eye_above_plane = eye.z >= 0.0;",
-        replacement: "let eye_above_plane = eye.z >= 1.0;",
+        // Re-anchored at B2, which generalised the arm past the flat lid. The
+        // probe carries no ground pass, so the SCALE lane `occluder.x` is at
+        // its zero sentinel and the second term is dead in it — this still
+        // mutates exactly the lid's own plane. The lane is `x`, not the ceiling
+        // `y`: nothing reads the ceiling.
+        pattern: "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0;",
+        replacement: "let ground_behind_the_march = eye.z >= 1.0 || volume.occluder.x > 0.0;",
         occurrences: 1,
         probe: &FLOOR_ARM,
     },

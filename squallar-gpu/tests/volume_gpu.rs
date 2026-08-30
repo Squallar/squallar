@@ -2217,7 +2217,14 @@ fn the_floor_composites_on_one_arm_per_frame() {
 
     /// The one line the two forced builds replace. Asserted to match, because a
     /// battery whose anchor has moved is a green test that proves nothing.
-    const ARM: &str = "let eye_above_plane = eye.z >= 0.0;";
+    ///
+    /// Re-anchored at B2. This scene runs with no ground pass, so the SCALE
+    /// lane `occluder.x` is at its zero sentinel and the arm here reduces to
+    /// the lid's own `eye.z >= 0.0` exactly — which is what makes it still the
+    /// right question to force. The lane is `x`, not the ceiling `y`: nothing
+    /// reads the ceiling, and confusing the two is what `occluder_texel` and
+    /// the dotted-path arm rule exist to make impossible.
+    const ARM: &str = "let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0;";
 
     let _serialised = gpu_lock();
     let (device, queue) = device();
@@ -2228,7 +2235,7 @@ fn the_floor_composites_on_one_arm_per_frame() {
          forcing something that does not exist",
     );
     let forced =
-        |on: bool| VOLUME_SHADER_WGSL.replace(ARM, &format!("let eye_above_plane = {on};"));
+        |on: bool| VOLUME_SHADER_WGSL.replace(ARM, &format!("let ground_behind_the_march = {on};"));
 
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let shipped = VolumePipelines::new(&device, attachments(format));

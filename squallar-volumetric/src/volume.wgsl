@@ -69,10 +69,13 @@ struct Volume {
     // by inverting box_from_clip above.
     clip_from_box: mat4x4<f32>,
     // x: the ray parameter a saturated occluder texel decodes to, in box units,
-    // and ZERO when no ground pass ran — the march tests this to decide whether
-    // to read the occluder at all. y: the ground surface's greatest box z,
-    // written for the composite's arm and read by nothing yet. z: amplitude of
-    // the analytic stand-in ridge, in box z. w: reserved, zero.
+    // and ZERO when no ground pass ran. The march tests it to decide whether to
+    // read the occluder at all, and the composite's arm and `floor_fade` both
+    // read it as that same sentinel — a march clipped against ground has the
+    // ground behind it, whichever side of z = 0 the eye is on. y: the ground
+    // surface's greatest box z, reserved by B1 for the arm and NOT used by it;
+    // see the arm's own comment for the measurement that ruled it out. z:
+    // amplitude of the analytic stand-in ridge, in box z. w: reserved, zero.
     occluder: vec4<f32>,
 }
 
@@ -695,8 +698,13 @@ fn surface_colour(
 fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     let eye = volume.eye_in_box.xyz;
     let direction = normalize(unproject(in.ndc, 1.0) - eye);
-    let occluder = occluder_at(in.clip_position.xy);
-    let ground_t = ground_hit_t(occluder);
+    // `occluder_texel`, never `occluder`: `volume.occluder` is a frame-uniform
+    // vec4 and this is a per-pixel one, and `occluder.y` would be legal WGSL
+    // naming the packed `t`'s green channel under either reading. The arm rule
+    // in `volume_shader.rs` refuses whole dotted PATHS for that reason, and
+    // carries the mutant.
+    let occluder_texel = occluder_at(in.clip_position.xy);
+    let ground_t = ground_hit_t(occluder_texel);
 
     // **The march CLIPS against the ground; it does not merely depth-test.**
     // This must be here, before `jitter` and `dt` are derived below, because
@@ -707,7 +715,17 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     if ground_t >= 0.0 {
         span.y = min(span.y, ground_t);
     }
-    if span.y <= span.x {
+    // An empty span is a reason to march nothing, **not** a reason to draw
+    // nothing: the ground under this pixel is still there and still opaque. The
+    // clip can empty the span on its own — a flat mesh seen from under the box
+    // floor stands exactly on the bottom face, so `ground_t` IS the box entry —
+    // and the rasteriser's coverage rule can disagree with `slab_entry_exit`
+    // about the silhouette's outermost pixel. Both used to return transparent
+    // over ground the mesh had drawn, which is the defect B2 exists to close,
+    // in its last two corners. The loop below is a no-op on an empty span
+    // (`t = span.x >= span.y` breaks at once), so the composite runs on a
+    // transmittance of 1 and paints the surface alone.
+    if span.y <= span.x && ground_t < 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
@@ -715,7 +733,46 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
     // it drew, so there is no double-ground to order.
     let map_t = select(-1.0, floor_hit(eye, direction), volume.flags.w > 0.5);
     let floor_t = select(map_t, ground_t, ground_t >= 0.0);
-    let floor_fade = clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0);
+
+    // How much of the ground the composite paints — **the lid's dissolve, and
+    // the lid's alone**. A flat plane at z = 0 seen from under it is
+    // featureless and walls the pane off with nothing behind it to look at,
+    // which is what FLOOR_BELOW_FADE fades. Ground GEOMETRY is not that: it has
+    // a silhouette and an edge to see past, and it is what the march is CLIPPED
+    // against, so fading it out would leave the hole the clip cut with nothing
+    // in it — measured, before this, as 40960 of 40960 pixels the mesh drew
+    // compositing to alpha 0 at pitch −89°. Terrain is opaque from below.
+    //
+    // The same two numbers the arm below reads, and that is the invariant:
+    // a fade and an order derived from different numbers describe different
+    // frames. `the_floor_composites_arm_is_a_property_of_the_frame` pins it.
+    //
+    // **A CONSTRAINT ON B3, and it is a real hole the moment the ground pass
+    // ships.** "The lid's alone" is true of every frame this tree can render
+    // and is NOT true in general. `floor_t` falls back to the lid at any pixel
+    // where the ray crosses z = 0 inside the unit square but leaves the box
+    // without meeting the mesh — the silhouette's outside edge, and any
+    // footprint the height field does not cover. In a frame that HAS a ground
+    // pass those pixels get `floor_fade = 1.0` and an arm of `true`, so the lid
+    // composites BEHIND the march at full opacity while the eye is under it:
+    // misordered and un-faded, exactly the defect this unit removed for the
+    // mesh. Probed at the three below-floor cameras: 76, 74 and 33 pixels
+    // painted where the mesh never drew, at alpha > 200.
+    //
+    // It is unreachable today only by accident — `aim_occluder` is test-only
+    // and `volume_bridge`'s `map_floor = floor.is_some()` never coincides with
+    // a ground pass — and every test in `volume_occluder.rs` hardcodes
+    // `map_floor = false`, so nothing would notice. **B3 must either hold
+    // `map_floor = false` whenever the mesh draws, or make the coverage
+    // per-pixel.** The honest per-pixel spelling is `ground_covered(...)` in
+    // both the fade and the arm, which the frame-uniform arm rule forbids by
+    // name — so taking that route means re-deriving that rule with a reason,
+    // not deleting it.
+    let floor_fade = select(
+        clamp(1.0 + eye.z / FLOOR_BELOW_FADE, 0.0, 1.0),
+        1.0,
+        volume.occluder.x > 0.0,
+    );
 
     // Cells this ray crosses per unit of `t`, in the grid's anisotropic cell metric
     // — the same "direction inside the length" shape as `step_length_km`, so the step
@@ -781,26 +838,56 @@ fn fs_raymarch(in: RaymarchVertex) -> @location(0) vec4<f32> {
         t = t + dt;
     }
 
-    // Which side of the bottom plane the EYE is on decides the composite order, and
-    // must be the same function of the same number as `floor_fade` or one frame
-    // composites its floor two ways in two pixels (measured: the per-pixel
-    // `floor_t > span.x` this replaced left 68 of 175 swept cameras non-uniform).
-    // `>= 0.0`, not `> 0.0`: an eye exactly on the plane has no floor hit at all.
-    let eye_above_plane = eye.z >= 0.0;
+    // **Is the ground behind the march?** The frame's own verdict, and the only
+    // thing that decides the composite's order. It must be the same function of
+    // the same numbers as `floor_fade` above, or one frame composites its floor
+    // two ways in two pixels (measured: the per-pixel `floor_t > span.x` an
+    // earlier version of this used left 68 of 175 swept cameras non-uniform).
+    //
+    // The ground is behind whenever the march was CLIPPED against it. That is
+    // what `span.y = min(span.y, ground_t)` at the top of this function buys:
+    // every accumulated sample then lies in front of the surface, at every
+    // pixel and at every eye height, because the mesh is authored inside the
+    // unit cube and `slab_entry_exit` floors its entry at 0, so a clipped span
+    // can never end short of where it began. A frame with a ground pass —
+    // `occluder.x`, the same sentinel `ground_covered` reads — therefore
+    // answers yes outright, from underneath the terrain as much as from over it.
+    //
+    // With no ground pass the only surface is the flat map lid at z = 0, which
+    // nothing clips against, and then the eye's own side of that plane decides:
+    // the shipped predicate, unchanged, for the shipped case. `>= 0.0`, not
+    // `> 0.0`, because an eye exactly on the plane has no floor hit at all.
+    //
+    // **This is not the number the plan reserved, and the plan's own is wrong
+    // twice over.** It asked for "the eye is above the ground's maximum
+    // height", `occluder.y`, on the reasoning that a camera under a ridge
+    // composites terrain under an accumulation it is in front of. The clip
+    // above is what makes that false: measured on this hardware, that predicate
+    // loses EVERY pixel carrying volume in FRONT of the terrain at all five
+    // cameras below the crest — 10817, 13911, 2849, 5947 and 26994 of the same
+    // counts, none kept. And
+    // the ceiling is a knife edge where the sentinel is not — a mesh that
+    // happens to be flat has `occluder.y == 0` and would flip the whole frame's
+    // composite on the terrain's content rather than on whether it was drawn.
+    // `occluder.y` is consequently still read by nothing. See
+    // `volume_occluder::the_terrain_composites_behind_volume_standing_in_front_of_it`,
+    // which forces the plan's predicate and measures what it costs.
+    let ground_behind_the_march = eye.z >= 0.0 || volume.occluder.x > 0.0;
 
-    // The floor behind the volume: an eye above the plane meets it at the box
-    // exit, so unabsorbed light lands on ground and composites under the
-    // accumulation. Coverage is the floor's alpha times the fade, 1 above.
+    // The floor behind the volume: unabsorbed light lands on ground and
+    // composites under the accumulation. Coverage is the floor's alpha times
+    // the fade, and the fade is 1 for anything but a lid seen from under it.
     var transmitted = transmittance;
-    if floor_t >= 0.0 && eye_above_plane {
-        let ground = surface_colour(in.clip_position.xy, occluder, eye, direction, floor_t);
+    if floor_t >= 0.0 && ground_behind_the_march {
+        let ground = surface_colour(in.clip_position.xy, occluder_texel, eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = accumulated + transmittance * cover * ground.rgb;
         transmitted = transmittance * (1.0 - cover);
     } else if floor_t >= 0.0 && floor_fade > 0.0 {
-        // The floor in front: an eye under the plane meets it at (or before) the
-        // box entry, so the faded ground composites OVER the march.
-        let ground = surface_colour(in.clip_position.xy, occluder, eye, direction, floor_t);
+        // The lid in front: an eye under the plane meets it at (or before) the
+        // box entry, so the faded lid composites OVER the march. Reachable only
+        // with no standing ground, which is what makes the fade the lid's own.
+        let ground = surface_colour(in.clip_position.xy, occluder_texel, eye, direction, floor_t);
         let cover = ground.a * floor_fade;
         accumulated = ground.rgb * cover + accumulated * (1.0 - cover);
         transmitted = transmitted * (1.0 - cover);
