@@ -598,9 +598,15 @@ tile's answer is appended as it lands and a re-run skips what is recorded. It
 refuses to write a grid unless every cell in the pinned tile list is accounted
 for.
 
-Two cells, measured 2026-08-30 with `gdalinfo -mm` over `/vsis3/`, are the pins
-the app-side reader carries: `N36_00_W117_00` (Death Valley) −91.451 m and
-`N31_00_E035_00` (the Dead Sea) −427.834 m.
+Three cells, measured 2026-08-30 with `gdalinfo -mm` over `/vsis3/`:
+
+| cell | measured minimum | note |
+|---|---:|---|
+| `N36_00_W117_00` | −91.451 m | Death Valley. **Not** Badwater's surveyed −86 m — this is the lowest pixel in a whole degree cell of a surface model. |
+| `N31_00_E035_00` | −427.834 m | The Dead Sea. |
+| `N39_00_W106_00` | 1552.236 m | Colorado. Note the denominator: the committed z10 fixture tile over the same cell reads 2396.2 m, because it covers about a fortieth of it. A tile minimum is not a cell minimum. |
+
+The first two are the pins the app-side reader carries.
 
 Knobs (all environment, all listed by `squallar-terrain --help`):
 `WORK` `OUT` `TMP` `JOBS` `DEM_BUCKET` `CHUNK_DEG` `SUPERCELL`
