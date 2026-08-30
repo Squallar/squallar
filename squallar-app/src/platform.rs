@@ -259,6 +259,22 @@ pub trait PlatformBridge {
 
     fn basemap_cache_dir(&self) -> Option<&std::path::Path>;
 
+    /// Where downloaded offline basemap areas persist, or `None` on a
+    /// platform with no filesystem for them — the download feature then has
+    /// no home and stays disabled. [`basemap_cache_dir`](Self::basemap_cache_dir)'s
+    /// durable sibling: that one is an evictable block cache, this one holds
+    /// bytes the user asked to keep.
+    ///
+    /// The Gui learns this once, at construction, and there is deliberately
+    /// no Gui setter to push it through afterwards — a bridge that will ever
+    /// answer `Some` must be populated before `App::new` (Android sets it on
+    /// the bridge in `android_main`, *before* handing the bridge over, unlike
+    /// its two late-set siblings). The directory may not exist yet; creating
+    /// it is the download engine's job, not the bridge's.
+    fn set_basemap_dir(&mut self, dir: std::path::PathBuf);
+
+    fn basemap_dir(&self) -> Option<&std::path::Path>;
+
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
     /// Where this platform persists small blobs, or `None` if the platform has not

@@ -138,6 +138,15 @@ fn android_main(app: AndroidApp) {
 
     let android_config_dir = app.internal_data_path().map(|p| p.join("config"));
 
+    // Downloaded offline basemap areas, under the durable files root beside
+    // `config` — NOT under `getCacheDir()` with the two caches above, because
+    // "Clear cache" is advertised as safe and the OS sheds cache under
+    // storage pressure, either of which would silently delete a download the
+    // user made precisely to avoid re-fetching it.
+    let android_basemap_dir = app
+        .internal_data_path()
+        .map(|p| p.join("basemap-downloads"));
+
     // winit permits **one `EventLoop` per process** and answers
     // `EventLoopError::RecreationAttempt` for a second one. That is reachable:
     // this process outlives a backgrounded Activity, and anything that then
@@ -164,10 +173,17 @@ fn android_main(app: AndroidApp) {
         }
     };
 
-    let mut platform_app = squallar_app::app::App::new(
-        Box::new(crate::platform::create_platform()),
-        crate::platform::create_location(),
-    );
+    // Unlike the zone and block-cache paths below, the download store must be
+    // on the bridge *before* `App::new`: the Gui learns `basemap_dir` once at
+    // construction, and there is deliberately no setter to push it through
+    // afterwards.
+    let mut platform = crate::platform::create_platform();
+    if let Some(dir) = android_basemap_dir {
+        squallar_app::platform::PlatformBridge::set_basemap_dir(&mut platform, dir);
+    }
+
+    let mut platform_app =
+        squallar_app::app::App::new(Box::new(platform), crate::platform::create_location());
 
     // The legacy route's minimise — the only delivery below API 33 — and the
     // safety net above it: a press that reaches `resolve_back_press` with

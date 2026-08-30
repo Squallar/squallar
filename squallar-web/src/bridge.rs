@@ -75,6 +75,15 @@ impl PlatformBridge for WebPlatform {
         None
     }
 
+    /// No filesystem for downloaded areas either: the web build's offline
+    /// store is the service-worker cache route, which never surfaces as a
+    /// directory. Answering `None` keeps the Gui's copy `None` on wasm.
+    fn set_basemap_dir(&mut self, _dir: std::path::PathBuf) {}
+
+    fn basemap_dir(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Inert, not an oversight: `localStorage` is available from the first frame.
     fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
 
