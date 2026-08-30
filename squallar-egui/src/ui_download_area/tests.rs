@@ -7,11 +7,13 @@
 //! against a fixture whose `max_zoom` is **10**, so a hardcoded 14 fails here;
 //! and the frame-facing entry point does no archive work at all.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 use squallar_units::DataSize;
 
 use super::*;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::basemap_archive::FileRangeSource;
 
 // ---------------------------------------------------------------------------
@@ -19,11 +21,13 @@ use crate::basemap_archive::FileRangeSource;
 // ---------------------------------------------------------------------------
 
 /// The committed Monaco build: `max_zoom` 14, both dedup mechanisms live.
+#[cfg(not(target_arch = "wasm32"))]
 const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
 
 /// The hand-built raster mini archive. **`max_zoom` is 10, not 14** — which is
 /// the whole reason it is here: a level table that hardcoded the shipped
 /// archive's ceiling would pass against Monaco and fail against this.
+#[cfg(not(target_arch = "wasm32"))]
 const TERRAIN_MINI: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/testdata/terrain-hillshade-mini.pmtiles"
@@ -38,6 +42,7 @@ const MONACO_CENTRE: squallar_geo::GeoPoint = squallar_geo::GeoPoint {
 
 /// Run `future` on a current-thread runtime — `pmt_index::tests`' helper, for
 /// the oracle half of the exactness test.
+#[cfg(not(target_arch = "wasm32"))]
 fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -46,6 +51,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn source(path: &str) -> FileRangeSource {
     FileRangeSource::open(Path::new(path))
         .unwrap_or_else(|error| panic!("the committed fixture {path} must open: {error}"))
@@ -54,6 +60,7 @@ fn source(path: &str) -> FileRangeSource {
 /// How long a probe is given to land every figure it was asked for. Generous
 /// on purpose: the work is a real file read on a real IO thread, and a tight
 /// budget here would make an unrelated slow machine look like a defect.
+#[cfg(not(target_arch = "wasm32"))]
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Drive `probe` until `done` answers true, or fail saying what it was still
@@ -62,6 +69,7 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// `terrain` is the archive the probe reads the hillshade half out of. A probe
 /// with the checkbox clear never reaches it — which is itself the pin that a
 /// basemap-only download opens no terrain archive.
+#[cfg(not(target_arch = "wasm32"))]
 fn pump(
     probe: &mut AreaSizeProbe,
     path: &str,
@@ -83,11 +91,13 @@ fn pump(
 
 /// A probe pointed at `path` with `picked` in hand, driven until all three
 /// levels have their figure.
+#[cfg(not(target_arch = "wasm32"))]
 fn measured(path: &'static str, picked: PickedBox) -> AreaSizeProbe {
     measured_over(path, MONACO, picked)
 }
 
 /// [`measured`] with the terrain archive named too — for the combined figure.
+#[cfg(not(target_arch = "wasm32"))]
 fn measured_over(path: &str, terrain: &str, picked: PickedBox) -> AreaSizeProbe {
     let mut probe = AreaSizeProbe::new();
     probe.set_box(Some(picked));
@@ -225,6 +235,7 @@ fn one_box_at_two_depths_is_two_areas() {
 
 /// **The ceiling is the archive's, and the fixture's is 10.** A table that
 /// hardcoded the shipped archive's 14 passes against Monaco and fails here.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_deepest_level_stores_to_the_archives_own_ceiling() {
     let header_ceiling = block_on(async {
@@ -329,6 +340,7 @@ fn a_levels_token_round_trips_and_an_unknown_one_is_dropped() {
 /// not `tile_count x average` — and the three figures are three *different*
 /// numbers. A figure that did not move with the level would pass an equality
 /// test against a cached first answer while telling the user nothing.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_live_figure_is_pmt_indexs_exact_figure_and_moves_with_the_level() {
     let picked = PickedBox::new(MONACO_CENTRE, 8.0).expect("a 16 km box over Monaco");
@@ -372,6 +384,7 @@ fn the_live_figure_is_pmt_indexs_exact_figure_and_moves_with_the_level() {
 
 /// The probe does not blank what it has already measured while it measures
 /// something else, and it stops working on a box nobody is looking at.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn measured_figures_survive_a_box_being_dropped_and_picked_up_again() {
     let picked = PickedBox::new(MONACO_CENTRE, 8.0).expect("a box");
@@ -578,6 +591,7 @@ fn free_space_is_never_invented() {
 }
 
 /// Nothing above depends on a path that does not exist.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_fixtures_this_suite_reads_are_committed() {
     for path in [MONACO, TERRAIN_MINI] {
@@ -600,8 +614,10 @@ fn the_fixtures_this_suite_reads_are_committed() {
 /// to cover the same ground the basemap fixture does (or the terrain half
 /// would quote zero and the sum would be indistinguishable from the basemap
 /// alone) and stop at a ceiling that is neither 12 nor 14.
+#[cfg(not(target_arch = "wasm32"))]
 struct TerrainFixture(PathBuf);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TerrainFixture {
     fn new(test: &str, spec: &AreaSpec, max_zoom: u8) -> Self {
         let mut path = std::env::temp_dir();
@@ -622,6 +638,7 @@ impl TerrainFixture {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for TerrainFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -631,11 +648,13 @@ impl Drop for TerrainFixture {
 /// The ceiling the terrain fixture stops at. **Neither 12 (the shipped
 /// hillshade build's) nor 14 (the basemap's)**, so a figure enumerated against
 /// either constant disagrees with this fixture.
+#[cfg(not(target_arch = "wasm32"))]
 const PROBE_TERRAIN_CEILING: u8 = 9;
 
 /// `pmt_index`'s own figure for `spec` out of the archive at `path`, clamped
 /// to **that archive's own** header ceiling — the oracle, computed the way the
 /// engine enumerates and by a path that shares no arithmetic with the probe.
+#[cfg(not(target_arch = "wasm32"))]
 fn oracle(path: &str, spec: &AreaSpec) -> crate::pmt_index::DownloadBytes {
     block_on(async {
         let index = crate::pmt_index::PmtIndex::open(source(path))
@@ -659,6 +678,7 @@ fn oracle(path: &str, spec: &AreaSpec) -> crate::pmt_index::DownloadBytes {
 /// Moves: the same box with the checkbox clear quotes the basemap's figure
 /// alone. A figure that did not move is the tell for an estimate — and it
 /// would also be the tell for a sum that silently dropped the second archive.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_combined_figure_is_both_archives_exact_totals_and_moves_with_the_checkbox() {
     const TEST: &str = "the_combined_figure_is_both_archives_exact_totals_and_moves";
@@ -759,6 +779,7 @@ fn the_combined_figure_is_both_archives_exact_totals_and_moves_with_the_checkbox
 
 /// Clearing the checkbox gives the basemap figure **back**, not a stale sum —
 /// and it costs no second read, because both halves are still remembered.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn clearing_the_checkbox_returns_the_basemap_figure_alone() {
     const TEST: &str = "clearing_the_checkbox_returns_the_basemap_figure_alone";

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::input_harness::InputHarness;
 use crate::ui::SETTINGS_ROWS;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::ui_download_area::PREPARING_LABEL;
 use squallar_units::DataSize;
 
@@ -594,6 +595,7 @@ fn delete_removes_the_segments_and_the_record_and_survives_a_reopen() {
 /// A generous bbox around Monaco, matching the download engine's own suite:
 /// the engine enumerates from the bbox and counts what the archive does not
 /// hold as absent, so this covers the fixture rather than tracing it.
+#[cfg(not(target_arch = "wasm32"))]
 fn monaco_spec() -> AreaSpec {
     AreaSpec {
         area_id: "monaco".to_owned(),
@@ -607,10 +609,12 @@ fn monaco_spec() -> AreaSpec {
 
 /// A cap small enough to cut the 419 KB fixture into several segments, so a
 /// run can be caught genuinely mid-download rather than already finished.
+#[cfg(not(target_arch = "wasm32"))]
 const MONACO_SEGMENT_BYTES: u64 = 120_000;
 
 /// The shouted skip the sibling suites use — straight at stderr, because
 /// libtest swallows `eprintln!` on a passing test.
+#[cfg(not(target_arch = "wasm32"))]
 fn skipped(test: &str) {
     use std::io::Write as _;
     let mut stderr = std::io::stderr().lock();
@@ -637,11 +641,13 @@ fn skipped(test: &str) {
 /// The budget is a shared cell rather than a constructor argument so a test can
 /// **top it up**: that is how the same run is caught first with no plan and
 /// then with one, which is the before/after the preparing state is about.
+#[cfg(not(target_arch = "wasm32"))]
 struct BudgetedSource {
     inner: crate::basemap_archive::FileRangeSource,
     budget: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BudgetedSource {
     fn over(path: &str, budget: &std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
         Self {
@@ -652,6 +658,7 @@ impl BudgetedSource {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl crate::basemap_archive::RangeSource for BudgetedSource {
     async fn read_range(
         &self,
@@ -685,18 +692,21 @@ impl crate::basemap_archive::RangeSource for BudgetedSource {
 /// planned the whole run (`segments_total: 4`) and there was no preparing
 /// state left to catch. Opening the index is the first thing `drive` does and
 /// it is squarely inside the phase this label is for.
+#[cfg(not(target_arch = "wasm32"))]
 const READS_BEFORE_A_PLAN: i64 = 1;
 
 /// Enough to plan and land some tile bytes, and short of finishing the run —
 /// the sibling suite's figure, for its reason: the run has to still be in
 /// flight when the glass is read, or the frame settles it away and there is no
 /// block left to assert about.
+#[cfg(not(target_arch = "wasm32"))]
 const READS_TO_A_PLAN_AND_SOME_BYTES: i64 = 8;
 
 /// Freeze `engine` mid-run and answer with the state it is frozen in.
 ///
 /// "Frozen" is proved rather than assumed: two readings a beat apart that
 /// agree. What the glass is then compared against is one state, not two.
+#[cfg(not(target_arch = "wasm32"))]
 fn frozen_mid_run(
     engine: &crate::basemap_areas::ActiveDownload,
     what: &str,
@@ -735,6 +745,7 @@ fn frozen_mid_run(
 /// too, because that is the only thing on the glass that carries the
 /// *fraction*: it is what proves the bar is filled from the ledger's bytes
 /// rather than parked at some constant.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_progress_block_draws_a_byte_bar_and_the_exact_byte_figures() {
     const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
@@ -845,6 +856,7 @@ fn the_progress_block_draws_a_byte_bar_and_the_exact_byte_figures() {
 /// are asserted on one run — the preparing state while the plan is out, and
 /// its replacement by the real bar once the denominator lands — so a block
 /// that simply always said "preparing" would fail the second half.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn the_block_says_it_is_preparing_until_a_byte_denominator_exists() {
     const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
@@ -937,6 +949,7 @@ fn the_block_says_it_is_preparing_until_a_byte_denominator_exists() {
 /// A finished run publishes its record and the engine is let go of — on the
 /// frame, not on the screen, because a download completes whether or not
 /// anyone is watching it.
+#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_finished_run_publishes_its_record_dated_to_the_archive_it_cut_from() {
     const MONACO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/monaco.pmtiles");
