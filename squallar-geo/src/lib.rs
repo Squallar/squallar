@@ -73,6 +73,30 @@ pub fn site_bearing_range_km(site_lat: f64, site_lon: f64, lat: f64, lon: f64) -
 ///
 /// Distance is a **ground** range; a caller holding a slant range applies
 /// `beam::ground_range_km` first.
+///
+/// # The returned longitude is deliberately NOT normalised
+///
+/// That is a contract, not an accident.
+///
+/// This returns `site_lon + Δlon`, so a destination past the antimeridian comes
+/// back as 184.03° rather than as −175.97°. It is **not** an oversight and it
+/// must not be "fixed": callers decide, because they do not want the same thing
+/// and one of them detects the wrap by exactly this means.
+/// [`the_destination_longitude_is_never_normalised`] pins it.
+///
+/// The three policies in this workspace, so a fourth caller picks deliberately:
+///
+/// * `squallar_elevation::resample::cover_for` **depends on the raw value** —
+///   an out-of-range longitude is how it tells a box straddling the
+///   antimeridian from one that does not, and normalising here would make that
+///   guard silently stop firing while its test still passed.
+/// * `squallar_source::volume::VolumeGrid::footprint` also keeps the raw
+///   value, for a different reason: `GeoBounds` is a plain min/max pair with no
+///   way to spell a wrapped box, so a straddling footprint deliberately lands
+///   out of range and is rejected by [`GeoPoint::is_on_earth`] rather than
+///   folded into a bbox spanning the whole planet.
+/// * A caller that genuinely wants a wrapped longitude calls
+///   [`normalize_lon`].
 pub fn great_circle_destination(
     site_lat: f64,
     site_lon: f64,
@@ -89,6 +113,29 @@ pub fn great_circle_destination(
     let dlon = (sin_az * sin_d * cos_lat1).atan2(cos_d - sin_lat1 * sin_lat2);
 
     (sin_lat2.asin().to_degrees(), site_lon + dlon.to_degrees())
+}
+
+/// Wrap a longitude into `[-180, 180)`, however many laps it is out by.
+///
+/// The one place that spelling lives. `great_circle_destination` deliberately
+/// does not do this (see its contract); a caller that wants a wrapped longitude
+/// asks for one here.
+///
+/// **`rem_euclid`, not a single `±360` correction.** The open-coded form in
+/// `squallar-egui`'s `ui_section_edit::destination` subtracts 360 once, which is
+/// correct for one lap and wrong for two — reachable by a long-range
+/// destination or a caller that already added an offset. That site is the
+/// obvious adoption candidate and is deliberately left alone here, because
+/// changing it is a different crate's gate.
+///
+/// `180.0` wraps to `-180.0`: they are the same meridian, and picking one end
+/// keeps the range half-open so a value cannot be spelled two ways.
+#[inline]
+pub fn normalize_lon(lon: f64) -> f64 {
+    if !lon.is_finite() {
+        return lon;
+    }
+    (lon + 180.0).rem_euclid(360.0) - 180.0
 }
 
 // Refuse on `hav`, not on `sin d`, with a threshold derived from the
@@ -342,6 +389,63 @@ mod tests {
             }
         }
         ordered(a).abs_diff(ordered(b))
+    }
+
+    /// [`great_circle_destination`] hands back `site_lon + Δlon` and never wraps
+    /// it, because a caller detects the antimeridian by exactly that.
+    ///
+    /// This is a **contract test, not a description**: `squallar-elevation`'s
+    /// tile-cover guard reads an out-of-range longitude as "this box straddles
+    /// the antimeridian". Normalising inside the function would leave that
+    /// guard's own test green while the guard stopped firing, so the property
+    /// is pinned at its source.
+    #[test]
+    fn the_destination_longitude_is_never_normalised() {
+        // Due east from 179.9°E, far enough to cross: the raw answer is past
+        // +180 and must stay there.
+        let (_, lon) = great_circle_destination(0.0, 179.9, 90.0, 460.0);
+        assert!(
+            lon > 180.0,
+            "crossing eastward gave {lon}, which has been wrapped; \
+             squallar-elevation's antimeridian guard reads this value raw",
+        );
+        // And westward, past −180.
+        let (_, lon) = great_circle_destination(0.0, -179.9, 270.0, 460.0);
+        assert!(
+            lon < -180.0,
+            "crossing westward gave {lon}, which has been wrapped",
+        );
+        // Control: an ordinary destination that does not cross is in range, so
+        // the two assertions above are about the wrap and not about the
+        // function always answering out of range.
+        let (_, lon) = great_circle_destination(39.0, -106.0, 90.0, 460.0);
+        assert!((-180.0..=180.0).contains(&lon), "control gave {lon}");
+    }
+
+    /// [`normalize_lon`] is the wrap, and it survives more than one lap.
+    #[test]
+    fn a_longitude_wraps_into_the_half_open_range_however_many_laps_it_is_out() {
+        for (raw, want) in [
+            (0.0_f64, 0.0_f64),
+            (179.9, 179.9),
+            (-179.9, -179.9),
+            (180.0, -180.0),
+            (-180.0, -180.0),
+            (184.03, -175.97),
+            (-184.03, 175.97),
+            // Two laps: the single `±360` correction spelled elsewhere in the
+            // tree gets these wrong.
+            (544.03, -175.97),
+            (-544.03, 175.97),
+        ] {
+            let got = normalize_lon(raw);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "normalize_lon({raw}) = {got}, wanted {want}"
+            );
+            assert!((-180.0..180.0).contains(&got), "{got} left the range");
+        }
+        assert!(normalize_lon(f64::NAN).is_nan());
     }
 
     /// [`mercator_y_to_lat_rad`] inverts [`lat_rad_to_mercator_y`] to within 4 ulps.

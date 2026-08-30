@@ -195,6 +195,69 @@ fn a_footprint_covers_the_whole_curved_perimeter() {
     assert_eq!(grid.x_range_km().0.to_bits(), x.0.to_bits());
 }
 
+/// A box straddling the antimeridian leaves the footprint OUT OF RANGE, and
+/// that is the intended answer rather than a defect to normalise away.
+///
+/// `squallar_geo::great_circle_destination` deliberately does not wrap its
+/// longitude — a contract pinned in that crate by
+/// `the_destination_longitude_is_never_normalised` — so the eastern samples
+/// come back past +180 and the min/max fold keeps them. `GeoBounds` cannot
+/// spell a wrapped box, so the two available answers are "out of range and
+/// loudly rejected" or "spanning the whole planet and quietly accepted". This
+/// pins the first.
+///
+/// **This is the cross-crate coupling made testable.** Until this test the only
+/// record of it was a comment, and a well-meaning "fix" that normalised inside
+/// `great_circle_destination` would have moved this behaviour, broken
+/// `squallar-elevation`'s antimeridian guard, and left every suite green.
+///
+/// Not reachable from the shipped site table: the fixture's anchor is a
+/// synthetic Aleutian position, not a NEXRAD.
+#[test]
+fn a_straddling_footprint_stays_out_of_range_rather_than_spanning_the_world() {
+    let x = (-325.0_f64, 325.0_f64);
+    let y = (-325.0_f64, 325.0_f64);
+    let mut p = parts(x, y);
+    // West of the antimeridian, far enough that the box's east edge crosses it.
+    p.anchor = (51.88, 176.65);
+    let grid = VolumeGrid::from_parts(p);
+    let footprint = grid.footprint();
+
+    assert!(
+        footprint.max_lon > 180.0,
+        "the east edge came back at {}, which means the longitude was wrapped \
+         somewhere; squallar-elevation's antimeridian guard reads exactly this",
+        footprint.max_lon,
+    );
+    assert!(
+        !GeoPoint {
+            lat: footprint.max_lat,
+            lon: footprint.max_lon,
+        }
+        .is_on_earth(),
+        "the out-of-range corner must fail is_on_earth, which is what makes \
+         this a loud rejection rather than a silent wrong bbox",
+    );
+    // It is a NARROW box that ran off the end, not a world-spanning one. The
+    // normalising alternative would give ~360 here.
+    assert!(
+        footprint.max_lon - footprint.min_lon < 20.0,
+        "the footprint spans {} degrees of longitude; a normalised fold would \
+         give about 360, which is the failure this test exists to exclude",
+        footprint.max_lon - footprint.min_lon,
+    );
+
+    // Control: the same box west of the crossing stays in range, so the
+    // assertions above are about the meridian and not about the latitude.
+    let mut q = parts(x, y);
+    q.anchor = (51.88, 170.0);
+    let ok = VolumeGrid::from_parts(q).footprint();
+    assert!(
+        ok.max_lon <= 180.0 && ok.min_lon >= -180.0,
+        "the control footprint is {ok:?}",
+    );
+}
+
 /// The two facts the table measures off its own bytes are measured, not
 /// guessed — and they move when the bytes move.
 #[test]
