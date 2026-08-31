@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1437	1062
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1873	1562
+squallar-app/src/app_fetch.rs	1873	1572
 squallar-app/src/app_render.rs	3018	2447
 squallar-app/src/app_state.rs	76	0
 squallar-app/src/budget_arms.rs	17	17
@@ -31,7 +31,7 @@ squallar-app/src/volume_fixture.rs	57	57
 squallar-app/src/volume_inventory.rs	321	313
 squallar-buildings/src/budget.rs	71	71
 squallar-buildings/src/footprint.rs	179	164
-squallar-buildings/src/jobs.rs	169	167
+squallar-buildings/src/jobs.rs	173	171
 squallar-buildings/src/prism.rs	152	148
 squallar-buildings/src/tile.rs	40	40
 squallar-device-profile/src/budget.rs	221	185
@@ -56,7 +56,7 @@ squallar-egui/src/gui/probes.rs	78	78
 squallar-egui/src/gui/state.rs	172	169
 squallar-egui/src/gui/sync.rs	234	229
 squallar-egui/src/input_fidelity.rs	138	138
-squallar-egui/src/input_harness.rs	1431	1421
+squallar-egui/src/input_harness.rs	1437	1426
 squallar-egui/src/legend_ramp.rs	146	146
 squallar-egui/src/overlay_cache.rs	328	320
 squallar-egui/src/overlay_cache/ledger.rs	74	47
@@ -71,9 +71,9 @@ squallar-egui/src/sources.rs	346	332
 squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	105	102
 squallar-egui/src/tile_mesh/ledger.rs	71	41
-squallar-egui/src/tile_source.rs	742	678
-squallar-egui/src/tiles.rs	274	227
-squallar-egui/src/ui.rs	1292	1190
+squallar-egui/src/tile_source.rs	783	718
+squallar-egui/src/tiles.rs	292	245
+squallar-egui/src/ui.rs	1295	1193
 squallar-egui/src/ui_catalog.rs	499	493
 squallar-egui/src/ui_config.rs	1025	976
 squallar-egui/src/ui_config/migrate.rs	190	176
@@ -84,8 +84,8 @@ squallar-egui/src/ui_glyphs.rs	218	206
 squallar-egui/src/ui_input.rs	352	352
 squallar-egui/src/ui_inspector.rs	295	289
 squallar-egui/src/ui_layout.rs	257	257
-squallar-egui/src/ui_map.rs	2136	2037
-squallar-egui/src/ui_map_overlays.rs	983	960
+squallar-egui/src/ui_map.rs	2148	2049
+squallar-egui/src/ui_map_overlays.rs	983	957
 squallar-egui/src/ui_map_pane.rs	1970	1810
 squallar-egui/src/ui_menu.rs	406	372
 squallar-egui/src/ui_offline_areas.rs	178	132
@@ -106,7 +106,7 @@ squallar-egui/src/volume_alpha.rs	182	180
 squallar-egui/src/volume_iso.rs	94	94
 squallar-egui/src/volume_view.rs	355	343
 squallar-elevation/src/height.rs	87	87
-squallar-elevation/src/jobs.rs	165	163
+squallar-elevation/src/jobs.rs	167	165
 squallar-elevation/src/plan.rs	325	311
 squallar-elevation/src/resample.rs	470	433
 squallar-elevation/src/trgb.rs	10	10
@@ -185,7 +185,7 @@ squallar-overlays/src/render/handlers/labels.rs	76	58
 squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	505	366
 squallar-overlays/src/render/handlers/mod.rs	53	52
-squallar-overlays/src/render/handlers/model.rs	2495	2358
+squallar-overlays/src/render/handlers/model.rs	2495	2356
 squallar-overlays/src/render/handlers/mrms.rs	605	535
 squallar-overlays/src/render/handlers/outlook.rs	1427	1351
 squallar-overlays/src/render/handlers/reports.rs	627	563
@@ -211,7 +211,7 @@ squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	163
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
-squallar-radar/src/chunks.rs	975	799
+squallar-radar/src/chunks.rs	975	795
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	311	294
 squallar-radar/src/dpprep.rs	1022	956
@@ -264,7 +264,7 @@ squallar-source/src/origins.rs	276	270
 squallar-source/src/product.rs	91	61
 squallar-source/src/time.rs	322	280
 squallar-source/src/tls.rs	32	32
-squallar-source/src/volume.rs	302	287
+squallar-source/src/volume.rs	308	293
 squallar-source/src/wire.rs	134	134
 squallar-units/src/data_size.rs	90	90
 squallar-units/src/distance.rs	21	19
@@ -317,7 +317,7 @@ vendor/bzip2-rs/src/decoder/parallel/reader.rs	25	25
 vendor/bzip2-rs/src/decoder/parallel/scanner/iter.rs	33	33
 vendor/bzip2-rs/src/decoder/parallel/scanner/linear.rs	57	57
 vendor/bzip2-rs/src/decoder/parallel/scanner/threaded.rs	54	54
-vendor/bzip2-rs/src/decoder/parallel/util.rs	10	10
+vendor/bzip2-rs/src/decoder/parallel/util.rs	10	7
 vendor/bzip2-rs/src/decoder/reader.rs	25	25
 vendor/bzip2-rs/src/header/error.rs	9	0
 vendor/bzip2-rs/src/header/mod.rs	37	33
