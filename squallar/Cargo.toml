@@ -151,7 +151,7 @@ jni-typecheck = ["dep:jni", "squallar-location/jni-typecheck"]
 # (`src/android/theme.rs`). iOS is excluded
 # because `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally *and*
 # returns `Mode`, not `Result<Mode>`, so it does not even typecheck here.
-dark-light = "=2.0.0"
+dark-light = "=3.0.0"
 # `serialport` links IOKit, which iOS does not have -- that fails the link, not
 # the compile, so only the .app build would have caught it. Features are
 # additive across the graph, so this also keeps the port picker off mobile.
