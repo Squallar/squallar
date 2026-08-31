@@ -363,6 +363,25 @@ That is a different question from this one.
   is no raster tile provider — an unreachable archive draws nothing and says so
   in the credit corner.
 
+### 3.9 `TileMeshPainter` — a tile's fills, drawn from the GPU
+
+* **`TileMeshPainter`** (`squallar-egui/src/tile_mesh.rs`) is §3.7's shape for
+  the 2D map: the UI hands over a description of one fill run at one placement
+  and gets back the opaque `Arc<dyn Any>` `egui_wgpu` downcasts, so the UI
+  crate still names no wgpu. Installed through `GuiEvent::TileMeshPainter`;
+  absent, every fill takes the CPU placement path unchanged.
+* **`TileMeshStore`** (`squallar-gpu/src/tile_mesh.rs`) is the renderer half:
+  per-tile buffers written once per tile lifetime, keyed on `TileMeshes::id`,
+  released by a `Weak` handle to the buffers the tile cache owns — so
+  residency ends exactly when a tile leaves the LRU or a restyle replaces it.
+* **The floor strip is deliberately not on this path.**
+  `EguiRenderer::render_mirror` swaps every `Primitive::Callback` for an empty
+  mesh before it draws the strip into the mirror, so a callback tile would
+  reach the 3D floor with no ground in it.
+  `PaneRenderCtx::ground_mesh_painter` is where that cut is made, once.
+* **Pin**: `squallar-gpu/tests/tile_mesh_gpu.rs` — the same tile through both
+  paths is a byte-identical readback on both gamma conventions.
+
 ---
 
 ## 4. Binding runtime rules
