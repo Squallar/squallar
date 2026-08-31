@@ -519,7 +519,7 @@ pub(crate) fn decode_archive_tile(
     zoom: u8,
     ctx: &Context,
 ) -> Result<Tile, String> {
-    match kind {
+    let tile = match kind {
         ArchiveTileKind::Vector => {
             Tile::from_mvt(bytes, style, zoom).map_err(|error| error.to_string())
         }
@@ -540,6 +540,27 @@ pub(crate) fn decode_archive_tile(
         ArchiveTileKind::Undeclared => {
             Tile::new(bytes, style, zoom, ctx).map_err(|error| error.to_string())
         }
+    }?;
+    note_archive_decode(kind);
+    Ok(tile)
+}
+
+/// Tell [`crate::basemap_ledger`] that one archive body of `kind` decoded.
+///
+/// **Called only where a decode returned `Ok`**, and by both decoders, so the
+/// ledger's denominator is exactly "bodies that became a [`Tile`]". The kind
+/// is the archive header's word and never the bytes', which is the same rule
+/// [`decode_archive_tile`] itself obeys — a ledger that sniffed would be
+/// answering a different question from the decoder it is measuring.
+///
+/// [`ArchiveTileKind::TerrainRgb`] has no arm because it has no `Ok`: an
+/// elevation body is refused, so nothing to count ever reaches here.
+fn note_archive_decode(kind: ArchiveTileKind) {
+    match kind {
+        ArchiveTileKind::Vector => crate::basemap_ledger::note_vector_tile(),
+        ArchiveTileKind::Hillshade => crate::basemap_ledger::note_raster_tile(),
+        ArchiveTileKind::Undeclared => crate::basemap_ledger::note_sniffed_tile(),
+        ArchiveTileKind::TerrainRgb => {}
     }
 }
 
@@ -571,6 +592,9 @@ fn decode_archive_tile_remembering(
                 .lock()
                 .expect("the parsed-tile cache is not poisoned")
                 .put(tile_id, Arc::clone(&parsed));
+            // The vector arm does not delegate, so it counts for itself; the
+            // raster arms are counted inside `decode_archive_tile`.
+            note_archive_decode(ArchiveTileKind::Vector);
             Ok(styled_tile(&parsed, style, tile_id.zoom))
         }
         raster => decode_archive_tile(bytes, raster, style, tile_id.zoom, ctx),

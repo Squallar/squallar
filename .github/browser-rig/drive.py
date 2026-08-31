@@ -1190,7 +1190,16 @@ var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictur
 // blocking write_texture on the frame's own queue); the GPU total is the
 // disjoint pair staged + blocking. Never add whole to anything.
 var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B whole, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
-var rasters = null, uploads = null;
+// A THIRD denominator, and it is added to neither of the two above. These
+// count archive tile BODIES DECODED, split by the archive header's declared
+// tile_type: `vector` is the self-hosted basemap's MVT, `raster` the terrain
+// hillshade, `sniffed` an archive that declared nothing (no archive this app
+// opens does, so non-zero there is the finding). A vector decode uploads no
+// texture at all and so appears in neither raster figure; a raster decode is
+// one egui texture and is therefore INSIDE `uploads`, a subset of it and never
+// a term to add to it. Running totals, so the LAST match wins here too.
+var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
+var rasters = null, uploads = null, basemap = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -1232,11 +1241,15 @@ for (var i = 0; i < C.length; i++) {
                       bands: parseInt(um[4], 10),
                       staged_bytes: parseInt(um[5], 10),
                       blocking_bytes: parseInt(um[6], 10) };
+  var bm = basemap_re.exec(m);
+  if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
+                      raster_tiles: parseInt(bm[2], 10),
+                      sniffed_tiles: parseInt(bm[3], 10) };
 }
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
-         console_total: C.length };
+         basemap: basemap, console_total: C.length };
 """
 
 # The frame timing lines, written by App::report_frame_telemetry every 2 s
@@ -1973,6 +1986,89 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
     return out
 
 
+def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
+    """The self-hosted VECTOR BASEMAP really decoded tiles in THIS browser.
+
+    THE HOLE THIS CLOSES, and it is not hypothetical. A `usize`->`u64` offset
+    widening in the vendored PMTiles reader made the basemap serve ZERO tiles
+    in a browser for as long as that build shipped, and this rig passed every
+    leg throughout. Nothing here read the basemap: a page with no ground under
+    the map still boots, still reports a non-blank canvas (the overlays paint),
+    still attaches its worker, still answers jobs off the frame, and still
+    satisfies all five conjuncts of `--expect-overlay-rasters` -- the basemap
+    is not in that dispatch, so its total is untouched by the basemap being
+    dead. The gate was green and the map was empty.
+
+    ONE CONJUNCT, deliberately, and it is a strict positive on the exact thing
+    the defect destroyed:
+
+      * `vector_tiles > 0` -- at least one MVT body out of the self-hosted
+                              archive was fetched, range-read and decoded into
+                              a tile. Not "the archive opened", not "a request
+                              was made": decoded.
+
+    A single conjunct is normally the shape that goes green vacuously (see
+    `wait_overlay_rasters`, which needs five because a byte total reads zero in
+    both the working-but-idle and the never-ran cases). It is safe here because
+    this reading has no idle state to be confused with a dead one: the basemap
+    is always on -- `BasemapTiles` ships `default_enabled() == true` -- and it
+    is the one layer that draws on every frame regardless of the weather, so a
+    live page ALWAYS decodes tiles. There is no configuration in which zero is
+    the correct answer.
+
+    Both failure shapes are red and they are distinguishable in the reading:
+    `null` means the `basemap tiles:` line was never written at all (either the
+    telemetry key was not seeded or not one archive body ever decoded), while
+    `0 vector` means the line was written and the counter never moved. The
+    error names which one it saw.
+
+    `raster_tiles` (the terrain hillshade) and `sniffed_tiles` are reported
+    beside it and NEVER gated on: terrain is a layer a user may have off, so
+    zero there is legitimate, and `sniffed` is expected to be zero on every
+    archive this app opens -- a non-zero reading there is a finding to look at,
+    not a pass/fail.
+
+    NEGATIVE CONTROL: revert the `usize`->`u64` offset widening in
+    `vendor/pmtiles` (the shipped defect itself). Measured behaviour of that
+    build is zero basemap tiles in both browsers with every other Tier-2
+    assertion green, which is the property -- this goes red, it goes red for
+    the reason it names, and it disturbs nothing else.
+
+    Accumulates across polls exactly as `wait_overlay_rasters` does: the
+    page-side console ring evicts, the totals are cumulative, and the newest
+    line seen at any poll is the whole answer.
+    """
+    t0 = time.monotonic()
+    best = None
+    while time.monotonic() - t0 < timeout:
+        sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        seen = sig.get("basemap")
+        if isinstance(seen, dict) and isinstance(seen.get("vector_tiles"), int):
+            if best is None or seen["vector_tiles"] >= best["vector_tiles"]:
+                best = seen
+        if best is not None and best.get("vector_tiles", 0) > 0:
+            out = dict(best)
+            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
+            return out
+        time.sleep(interval)
+    out = dict(best or {})
+    out.update({
+        "ok": False,
+        "waited_s": round(time.monotonic() - t0, 2),
+        "error": ("no vector basemap tile decoded within %.0fs: %s (wanted "
+                  "vector_tiles>0; %s). A basemap that decodes nothing passes "
+                  "boot, canvas, the worker wire and every conjunct of "
+                  "--expect-overlay-rasters -- which is how one shipped"
+                  % (timeout, best,
+                     "the `basemap tiles:` line was never written at all, so "
+                     "either squallar.raster_telemetry is unseeded or not one "
+                     "archive body ever decoded"
+                     if best is None else
+                     "the line was written and the vector counter never moved")),
+    })
+    return out
+
+
 def _overlay_rasters_ok(r):
     """The five conjuncts of `wait_overlay_rasters`, over one reading."""
     return (r.get("dispatched", 0) > 0
@@ -2462,6 +2558,11 @@ def run_smoke(args):
             result["overlay_rasters"] = wait_overlay_rasters(
                 session, timeout=args.expect_timeout)
             stage("overlay-rasters-done", **result["overlay_rasters"])
+        if args.expect_basemap_tiles:
+            stage("basemap-tiles-wait", timeout=args.expect_timeout)
+            result["basemap_tiles"] = wait_basemap_tiles(
+                session, timeout=args.expect_timeout)
+            stage("basemap-tiles-done", **result["basemap_tiles"])
 
         stage("settle", seconds=args.settle)
         time.sleep(args.settle)
@@ -2538,16 +2639,23 @@ def run_smoke(args):
         # nothing is gating on them, and `null` says the line was never
         # written -- which is "the path never ran", not "zero bytes".
         #
-        # Two records, never one. `overlay_raster_totals` is the whole-picture
-        # overlay dispatch alone; `texture_upload_totals` is every texture
-        # delta this renderer was shown, radar and font atlas included. They
-        # answer different questions and are never summed.
+        # Three records, never one. `overlay_raster_totals` is the
+        # whole-picture overlay dispatch alone; `texture_upload_totals` is
+        # every texture delta this renderer was shown, radar and font atlas
+        # included; `basemap_tile_totals` is archive tile BODIES DECODED, which
+        # is in neither -- a vector decode uploads no texture at all, and a
+        # raster decode is one egui texture and so is a subset of the upload
+        # figure rather than a term to add to it. They answer three different
+        # questions and are never summed.
         result["overlay_raster_totals"] = _sig.get("rasters")
         if result["overlay_raster_totals"]:
             stage("overlay-rasters", **result["overlay_raster_totals"])
         result["texture_upload_totals"] = _sig.get("uploads")
         if result["texture_upload_totals"]:
             stage("texture-uploads", **result["texture_upload_totals"])
+        result["basemap_tile_totals"] = _sig.get("basemap")
+        if result["basemap_tile_totals"]:
+            stage("basemap-tiles", **result["basemap_tile_totals"])
 
         # The frame-telemetry readout: the newest cumulative reading per
         # family, the count assert, and the gesture-window bin-diff when
@@ -2666,11 +2774,13 @@ def run_smoke(args):
         rp = result.get("rayon_pool")
         zc = result.get("zero_copy")
         ovr = result.get("overlay_rasters")
+        bmt = result.get("basemap_tiles")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
                      and (dr is None or bool(dr.get("ok")))
                      and (rp is None or bool(rp.get("ok")))
                      and (zc is None or bool(zc.get("ok")))
-                     and (ovr is None or bool(ovr.get("ok"))))
+                     and (ovr is None or bool(ovr.get("ok")))
+                     and (bmt is None or bool(bmt.get("ok"))))
         # The count assert (--expect-interaction-frames) and any requested
         # console waits. Counts and presence only; no ms figure is in here.
         ifr = result.get("interaction_frames")
@@ -2936,6 +3046,12 @@ def run_smoke(args):
         print("[%s] SUMMARY overlay rasters: %s%s"
               % (tag, "OK" if ovr.get("ok") else "FAILED",
                  "" if ovr.get("ok") else "; " + str(ovr.get("error"))))
+    bmt = result.get("basemap_tiles")
+    if bmt is not None:
+        print("[%s] SUMMARY basemap tiles: %s%s"
+              % (tag, "OK" if bmt.get("ok") else "FAILED",
+                 (" (%s vector bodies decoded)" % bmt.get("vector_tiles"))
+                 if bmt.get("ok") else "; " + str(bmt.get("error"))))
     # The WS2 baseline, printed whether or not it was gated, and per browser --
     # never pooled, for the same reason the per-kind medians are not.
     ort = result.get("overlay_raster_totals")
@@ -2957,6 +3073,16 @@ def run_smoke(args):
               % (tag, tut.get("deltas"), tut.get("bytes"),
                  tut.get("whole_bytes"), tut.get("bands"),
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
+    bmtt = result.get("basemap_tile_totals")
+    if bmtt:
+        # A THIRD denominator, added to neither figure above: bodies DECODED,
+        # not rasters dispatched and not texture deltas. A vector body uploads
+        # no texture at all; a raster body is one egui texture and so is a
+        # subset of the upload figure, never a term to add to it.
+        print("[%s] SUMMARY basemap tile totals [archive tile BODIES DECODED, "
+              "in neither figure above]: %s vector, %s raster, %s sniffed"
+              % (tag, bmtt.get("vector_tiles"), bmtt.get("raster_tiles"),
+                 bmtt.get("sniffed_tiles")))
     # The frame-telemetry readout. Cumulative rows are labelled cumulative
     # and the gesture-window rows are labelled with their bracket, because
     # the spike showed cumulative-from-boot p99s are boot-contaminated and
@@ -3110,6 +3236,24 @@ def main(argv=None):
                          "CONTROL: the every-layer-off seed written out beside "
                          "SEED_LS; dropping RadarSites alone is NOT a control, "
                          "the two default-on texture overlays cover for it")
+    ap.add_argument("--expect-basemap-tiles", action="store_true",
+                    help="fail unless the self-hosted VECTOR BASEMAP really "
+                         "decoded tiles in this browser: vector_tiles>0 within "
+                         "--expect-timeout. One conjunct, because the basemap "
+                         "ships enabled and draws every frame regardless of "
+                         "the weather, so there is no configuration in which "
+                         "zero is correct. THE HOLE THIS CLOSES: a usize->u64 "
+                         "offset widening in vendor/pmtiles made the basemap "
+                         "serve zero tiles for as long as that build shipped "
+                         "and this rig passed every leg -- an empty map still "
+                         "boots, still paints a non-blank canvas, still "
+                         "attaches its worker and still satisfies every "
+                         "conjunct of --expect-overlay-rasters, which does not "
+                         "include the basemap. NEGATIVE CONTROL: revert that "
+                         "widening; measured zero in both browsers with every "
+                         "other assertion green. Needs "
+                         "squallar.raster_telemetry seeded, as "
+                         "--expect-overlay-rasters does")
     ap.add_argument("--expect-doctored-respawn", action="store_true",
                     help="fail unless the console shows the doctored-token "
                          "refusal and then, >=1000 ms later, a clean attach "

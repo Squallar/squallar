@@ -9,7 +9,10 @@
 #             rAF sane, zero panics/errors, AND the worker wire: >=1
 #             "rasterization worker attached" plus >=1 "took N ms off the
 #             frame" job reply within 180 s (m4 -- a booted page with a dead
-#             wire passes every weaker check).
+#             wire passes every weaker check), AND the self-hosted vector
+#             basemap: >=1 archive tile body DECODED (--expect-basemap-tiles;
+#             a page whose basemap decodes nothing passes every one of the
+#             above, which is how one shipped).
 #   doctored  serve.py --doctor-first-worker hands the FIRST /worker.js
 #             request a stub posting a doctored build token; asserts the page
 #             logs "rasterization worker is a different build", terminates,
@@ -66,15 +69,30 @@
 #   RIG_EXPECT_OVERLAY_RASTERS  1 (default) to fail a leg where the
 #                     whole-picture overlay path never completed; 0 to report
 #                     the totals without gating
+#   RIG_EXPECT_BASEMAP_TILES  1 (default) to fail the LIVE leg where the
+#                     self-hosted vector basemap decoded no tile; 0 to report
+#                     the totals without gating
 #
-# WS2 BASELINE: every leg prints two raster figures, and they are never added
-# together because their denominators differ. `overlay rasters` is the
-# whole-picture overlay dispatch alone -- radar's own pipeline and the loop
-# frames are not in it. `texture uploads` is what the device was then made to
-# move for EVERY egui texture, radar, basemap tiles and font atlas included.
-# These are the numbers a world-anchored tile grid will be judged against, so
-# they are reported whether or not anything gated on them, per browser, and
-# never pooled across browsers.
+# WS2 BASELINE: every leg prints THREE tile/raster figures, and no two of them
+# are ever added together, because they have three different denominators.
+# `overlay rasters` is the whole-picture overlay dispatch alone -- radar's own
+# pipeline and the loop frames are not in it. `texture uploads` is what the
+# device was then made to move for EVERY egui texture, radar, basemap tiles and
+# font atlas included. `basemap tiles` is archive tile BODIES DECODED, which is
+# in neither of the other two: a vector body uploads no texture at all, and a
+# raster body is one egui texture and so is a SUBSET of `texture uploads`
+# rather than a term to add to it. These are the numbers a world-anchored tile
+# grid will be judged against, so they are reported whether or not anything
+# gated on them, per browser, and never pooled across browsers.
+#
+# WHY THE BASEMAP HAS ITS OWN GATE. A `usize`->`u64` offset widening in the
+# vendored PMTiles reader made the self-hosted basemap serve ZERO tiles in a
+# browser for as long as that build shipped, and this rig passed every leg the
+# whole time. Nothing here read the basemap: a page with no ground under the
+# map still boots, still reports a non-blank canvas (the overlays paint), still
+# attaches its worker, still answers jobs off the frame, and still satisfies
+# all five conjuncts of --expect-overlay-rasters, which does not include the
+# basemap. --expect-basemap-tiles is the missing reading.
 #
 # WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
 # launched with --coep on every pass, because the shipped app needs a
@@ -200,6 +218,11 @@ SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enab
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
 EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
+# Set to 0 to report the basemap tile totals without gating on them -- same
+# terms. The `basemap tiles:` line rides the same `squallar.raster_telemetry`
+# seed above, so a rename there breaks this gate too and is caught from the
+# Rust side by the same seam test.
+EXPECT_BASEMAP_TILES="${RIG_EXPECT_BASEMAP_TILES:-1}"
 
 SKIP_BUILD=0
 for arg in "$@"; do
@@ -378,6 +401,15 @@ run_pass() {
       drive_args+=(--expect-overlay-rasters)
     fi
   fi
+  # The self-hosted vector basemap really decoded tiles. LIVE ONLY: the archive
+  # is fetched by range over the real network, and the doctored leg spends its
+  # first seconds terminating and refetching a worker while the gesture leg is
+  # four seconds long -- neither is the place to put a network read's floor.
+  # The negative control is the shipped `usize`->`u64` offset defect itself,
+  # described in the header above.
+  if [ "$leg" = live ] && [ "$EXPECT_BASEMAP_TILES" -eq 1 ]; then
+    drive_args+=(--expect-basemap-tiles)
+  fi
   if [ "$leg" = doctored ]; then
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)
@@ -442,16 +474,18 @@ for tag in sys.argv[2:]:
     wrt = r.get("worker_round_trip")
     dr = r.get("doctored_respawn")
     ifr = r.get("interaction_frames")
+    bmg = r.get("basemap_tiles")
     def tri(x):
         return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
     print("%-18s %s  boot=%s canvas=%sx%s raf[%s] canvas_blank=%s "
-          "errors=%s panics=%s round_trip=%s respawn=%s interact=%s"
+          "errors=%s panics=%s round_trip=%s respawn=%s interact=%s "
+          "basemap=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
              v.get("booted"), b.get("clientWidth"), b.get("clientHeight"),
              raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
-             tri(wrt), tri(dr), tri(ifr)))
+             tri(wrt), tri(dr), tri(ifr), tri(bmg)))
     if ifr is not None:
         # The gesture leg's own figure: a COUNT, and the only thing the leg
         # gates on. The wheel route is named because a synthesized fallback
@@ -543,6 +577,22 @@ for tag in sys.argv[2:]:
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
     else:
         print("%-18s   texture uploads - (the line was never written)" % "")
+    # The THIRD denominator: bodies DECODED, in neither figure above. `vector`
+    # is the self-hosted basemap and is the one gated on; `raster` is the
+    # terrain hillshade (legitimately zero with terrain off) and `sniffed` is
+    # an archive that declared no tile_type, which none of ours does.
+    bmtt = r.get("basemap_tile_totals")
+    if bmtt:
+        print("%-18s   basemap tiles [archive BODIES DECODED, in neither "
+              "figure above] %s vector, %s raster, %s sniffed"
+              % ("", bmtt.get("vector_tiles"), bmtt.get("raster_tiles"),
+                 bmtt.get("sniffed_tiles")))
+    else:
+        print("%-18s   basemap tiles - (the line was never written: no "
+              "archive body ever decoded)" % "")
+    bmt = r.get("basemap_tiles")
+    if bmt is not None and not bmt.get("ok"):
+        print("%-18s   basemap tiles EXPECT FAILED: %s" % ("", bmt.get("error")))
     for d in (wrt, dr):
         if d and not d.get("ok"):
             print("%-18s   %s" % ("", d.get("error")))
