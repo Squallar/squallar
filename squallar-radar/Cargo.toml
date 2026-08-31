@@ -14,6 +14,10 @@ test-support = []
 
 [dependencies]
 chrono = { workspace = true }
+# The pixel type wire-decoded frame replies materialize into (`RasterImage::
+# Pixels`), so the consumer's `ColorImage` takes the buffer by move. A colour
+# data crate, not a UI one; egui already pulls this exact version via epaint.
+ecolor = { workspace = true }
 # The chunk-notification WebSocket in `chunk_notify` (WO-RF1; the dep moved
 # here with the module from the frontend). Plain rather than target-gated:
 # ewebsock's reader lives on its own thread natively and on the browser's

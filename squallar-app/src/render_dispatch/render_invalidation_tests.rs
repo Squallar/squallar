@@ -14,7 +14,7 @@ fn gated_render() -> (mpsc::Sender<()>, squallar_worker::offload::Job) {
             held.recv().expect("every gated render is released");
             Some(squallar_source::job::DescribedOut(Box::new(
                 squallar_radar::frame::RenderedFrame {
-                    image: Vec::new(),
+                    image: squallar_radar::frame::RasterImage::Bytes(Vec::new()),
                     max_range_km: 230.0,
                     polar: Default::default(),
                     nyquist_ms: None,
