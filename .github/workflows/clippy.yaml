@@ -14,24 +14,70 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # `cargo fmt --all -- --check`, which nothing enforced until now.
+  # rustfmt, applied and committed back -- the same shape as `clippy` below.
   #
   # Its absence was not theoretical: `main` accumulated 68 unformatted hunks
   # across 16 files and no row ever went red, because Build, Clippy and Test
-  # between them never ran rustfmt. Kept as its own job rather than a step on
-  # `clippy` below: that one autofixes and can push, so a formatting failure
-  # there would be entangled with a commit-back path this check has no business
-  # touching. This one only ever reads.
+  # between them never ran rustfmt. It used to only ever read and fail; now it
+  # writes, on the grounds that a machine-decidable fix a human has to make by
+  # hand is a chore, not a gate.
+  #
+  # AFTER `clippy`, NOT BESIDE IT, and for two reasons. `cargo clippy --fix`
+  # rewrites source and its output is not necessarily formatted, so formatting
+  # has to come second or it formats a tree that is about to change. And both
+  # jobs push to `main`: run in parallel they race, and the loser's push is
+  # rejected as non-fast-forward. `if: always()` so a clippy failure does not
+  # also suppress formatting -- the dependency is for ordering, not for
+  # success.
+  #
+  # ON `--all`, which the project rule forbids for a write: that rule is about
+  # a developer's machine, where a workspace-wide format pulls another
+  # worktree's in-flight files into the tree. A CI runner has one clean
+  # checkout of one commit and no other worktrees, so the hazard the rule names
+  # cannot occur here. This is also the only spelling that formats every member.
   fmt:
     name: Format
+    needs: [clippy]
+    if: always()
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      # See zone-pack.yaml: `secrets` is not available in a step-level `if:`.
+      AUTOCOMMIT_CLIENT_ID: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
     steps:
+      # `main`'s ruleset refuses GITHUB_TOKEN; the app is a bypass actor.
+      - name: Generate GitHub App Token
+        if: env.AUTOCOMMIT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
+          private-key: ${{ secrets.SQUALLAR_AUTOCOMMIT_PRIVATE_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          # Whatever `clippy` just pushed, not the commit that started the run.
+          ref: ${{ github.event_name == 'pull_request' && github.ref || github.ref_name }}
       # `rustup show` installs the toolchain rust-toolchain.toml pins, which is
       # what makes this reproducible: rustfmt's output is version-dependent, so
       # a check running some other rustfmt would disagree with a developer's.
       - name: Install Rust
         run: rustup show
+      - name: Apply rustfmt
+        run: cargo fmt --all
+      # Not on pull_request: that event checks out the detached merge ref, so
+      # there is no branch to commit to. Same rule as `clippy`.
+      - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
+        if: github.event_name != 'pull_request'
+        with:
+          commit_message: "chore: Apply rustfmt"
+          commit_user_name: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || 'github-actions[bot]' }}
+          commit_user_email: ${{ steps.app-token.outputs.app-slug && '323064949+squallar-autocommit[bot]@users.noreply.github.com' || '41898282+github-actions[bot]@users.noreply.github.com' }}
+      # The tripwire. After a successful write this passes trivially; it earns
+      # its place when rustfmt cannot normalise something it also refuses to
+      # fail on, which would otherwise leave the tree unformatted and the job
+      # green.
       - name: Check formatting
         run: cargo fmt --all -- --check
 
