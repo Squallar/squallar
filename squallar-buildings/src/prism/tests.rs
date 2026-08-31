@@ -80,7 +80,9 @@ fn a_box_with_a_courtyard(
 /// Every triangle's own geometric normal, from its winding.
 fn geometric_normals(mesh: &BuildingMesh) -> Vec<[f64; 3]> {
     mesh.indices
-        .as_chunks::<3>().0.iter()
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|t| {
             let p = |i: u32| {
                 let v = mesh.positions[i as usize];
