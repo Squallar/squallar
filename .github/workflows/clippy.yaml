@@ -41,23 +41,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Generate GitHub App Token
-        # Fork PRs run without secrets, so minting would fail here before
-        # clippy ever ran. Skip the mint for them; checkout below falls back to
-        # the default GITHUB_TOKEN. The auto-commit step is skipped on every
-        # pull_request event anyway (see below), so nothing on a fork PR needs
-        # push credentials.
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
-          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      # NO GITHUB APP. This used to mint a token from AUTO_COMMIT_APP_ID/KEY to
+      # get push credentials; the app was installed on the old personal account
+      # and did not survive the move to the Squallar org, so every run failed at
+      # the mint before clippy ever ran. The job already declares
+      # `contents: write`, and `actions/checkout` persists GITHUB_TOKEN, so the
+      # auto-commit below pushes on that.
+      #
+      # THE ONE THING THAT CHANGES: a push made with GITHUB_TOKEN does not
+      # trigger workflows. An autofix commit therefore lands without starting a
+      # Build, Test or Web run of its own -- which for this repository is the
+      # better default, because it also means an autofix cannot deploy. The
+      # fixed tree is still verified: the gating `Run Clippy` below runs in this
+      # same job, after the commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # A skipped mint step yields an empty string, so `||` selects the
-          # default token on fork PRs.
-          token: ${{ steps.app-token.outputs.token || github.token }}
       # The cross-targets are named here rather than in rust-toolchain.toml,
       # which no longer carries a `targets` list -- see the note in that file.
       # This job verifies the autofixed tree on both arms below, so it needs
@@ -180,9 +177,12 @@ jobs:
         if: github.event_name != 'pull_request'
         with:
           commit_message: "chore: Apply clippy fixes"
-          commit_user_name: usa-reddragon-auto-commit[bot]
-          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
-          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
+          # The canonical Actions bot, since GITHUB_TOKEN is what pushes now.
+          # 41898282 is github-actions[bot]'s own user id; the previous pair
+          # named a bot from the old account that no longer authors anything.
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
       # The gating run. `-D warnings` goes here and not on the `--fix` step, so
       # the bot still autofixes what it can and the build fails only on the rest.
       #

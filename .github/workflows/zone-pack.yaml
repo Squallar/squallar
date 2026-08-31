@@ -67,23 +67,18 @@ jobs:
       # The summary comment on a PR run.
       pull-requests: write
     steps:
-      - name: Generate GitHub App Token
-        # Fork PRs run without secrets, so minting would fail here before
-        # anything was checked. Skip the mint for them; checkout below falls back
-        # to the default GITHUB_TOKEN, and the commit-back step is skipped on
-        # fork PRs anyway. Note this condition reads `github.*` only -- the
-        # `secrets` context is not available in a step-level `if:`.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
-          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      # NO GITHUB APP -- see the same note in clippy.yaml. The app was installed
+      # on the old personal account and did not survive the move to the Squallar
+      # org. The job declares `contents: write`, and `actions/checkout` persists
+      # GITHUB_TOKEN, which is what the commit-back below now pushes on.
+      #
+      # ONE REAL LOSS, AND IT IS THIS WORKFLOW'S: a push made with GITHUB_TOKEN
+      # does not trigger workflows, so a regenerated pack committed onto a PR
+      # branch no longer starts a fresh run on that PR. The commit lands and the
+      # PR's checks keep whatever conclusion they had. Push an empty commit, or
+      # re-run the PR's checks, to see the pack verified.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A skipped mint step yields an empty string, so `||` selects the
-          # default token on fork PRs.
-          token: ${{ steps.app-token.outputs.token || github.token }}
           # `pull_request` checks out the detached PR merge ref by default, which
           # is not a branch: a commit made on it goes nowhere. This is the lesson
           # clippy.yaml learned by skipping the event entirely; here the whole
@@ -239,16 +234,17 @@ jobs:
           # The identity `.github/renovate.json` lists under `gitIgnoredAuthors`,
           # so a commit pushed onto a Renovate branch does not make Renovate treat
           # the branch as human-edited and stop maintaining it.
-          commit_user_name: usa-reddragon-auto-commit[bot]
-          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
-          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
+          # The canonical Actions bot, since GITHUB_TOKEN is what pushes now.
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
 
       # Says on the PR what landed on it, because the commit itself is a 3.9 MB
       # binary whose diff shows nothing at all.
       - name: Comment on the PR
         if: github.event_name == 'pull_request' && steps.mode.outputs.commit == 'true' && steps.regen.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           SHA256: ${{ steps.regen.outputs.sha256 }}
           BYTES: ${{ steps.regen.outputs.bytes }}
