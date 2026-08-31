@@ -43,8 +43,23 @@
 # Make one certificate, once, and keep using it:
 #
 #   rcodesign generate-self-signed-certificate \
+#       --algorithm rsa \
 #       --person-name squallar --validity-days 3650 \
 #       --p12-file squallar-signing.p12 --p12-password "$$PW"
+#
+# `--algorithm rsa` is load-bearing and is checked below. Apple's
+# Security.framework verifies only RSA and ECDSA code signatures; it has no
+# Ed25519 code-signing path at all. An Ed25519 key still *signs* — rcodesign
+# emits a well-formed CodeDirectory, binds the Info.plist and seals resources
+# exactly as it does for RSA — but macOS cannot verify the CMS blob, so it
+# reports the whole signature as "invalid signature (code or signature have
+# been modified)" and `syspolicy_check` calls it a Fatal codesign error. That
+# is strictly worse than the ad-hoc fallback: a merely-untrusted app is
+# "unidentified developer", which the user can override with right-click →
+# Open, whereas an unverifiable one reads as damaged and cannot be overridden
+# at all. Measured on macOS 26.4.1/arm64 against the real CI artifact: an
+# Ed25519-signed bundle failed `codesign --verify --deep --strict`, and the
+# byte-identical bundle re-signed RSA (and ECDSA) passed.
 #
 # Then either point this Makefile at it —
 #
@@ -254,6 +269,37 @@ build:
 	  $(RCODESIGN) sign "$$APP"
 	  echo "    NOTE: ad-hoc. This app will launch, and macOS will ask for"
 	  echo "    location permission again after every rebuild."
+	fi
+
+	# ---- the guard the signing identity exists for ----
+	# Reads the algorithm out of the signature that was just written, not out
+	# of the certificate we think we passed in. Apple verifies only RSA and
+	# ECDSA; an Ed25519 key produces a structurally perfect signature that
+	# every Linux-side tool accepts and macOS rejects outright, so nothing on
+	# this side of the build notices without an explicit check.
+	#
+	# It must be this check and not `rcodesign verify`: that subcommand does
+	# not accept bundles at all, and — measured with 0.29.0 — it prints its
+	# refusal and still exits 0, so gating on it would gate on nothing.
+	#
+	# An ad-hoc signature carries no certificate, hence no algorithm. That is
+	# the labelled fallback above and must pass.
+	if command -v $(RCODESIGN) >/dev/null 2>&1; then
+	  SIGALGO="$$($(RCODESIGN) print-signature-info "$$APP" 2>/dev/null \
+	    | sed -n 's/^ *key_algorithm: *//p' | head -1)"
+	  case "$$SIGALGO" in
+	    "")          echo "    signature carries no certificate (ad-hoc)" ;;
+	    RSA|ECDSA*)  echo "    signature algorithm: $$SIGALGO (macOS can verify this)" ;;
+	    *)
+	      echo "ERROR: the shipped signature uses $$SIGALGO, which macOS cannot verify."
+	      echo "       Apple's Security.framework has no code-signing path for it, so"
+	      echo "       'codesign --verify' reports the app as modified and Gatekeeper"
+	      echo "       treats it as damaged -- a state the user cannot click through."
+	      echo "       Regenerate the signing certificate with --algorithm rsa and"
+	      echo "       replace the MACOS_SIGNING_P12 secret; see the note at the top"
+	      echo "       of this file."
+	      exit 1 ;;
+	  esac
 	fi
 
 	if [ -n "$(ARCHIVE)" ]; then
