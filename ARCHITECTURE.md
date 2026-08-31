@@ -151,14 +151,22 @@ as a **dev**-dependency only, for its own test targets. Cargo's normal-dep graph
 is acyclic. Read dependency questions off `cargo metadata`, per kind, the way
 the charters do.
 
-**Vendored members.** `vendor/nexrad-decode`, `vendor/nexrad-data` and
-`vendor/bzip2-rs` are workspace members rather than `exclude`d, deliberately:
-their own upstream test targets are the behaviour pin that our decode patches
-must leave untouched, and they only run if `cargo test --workspace` selects
-them. The first two are patched over the registry copies by `[patch.crates-io]`
-in the root `Cargo.toml`; `bzip2-rs` is not patched — nothing else in the graph
-resolves that name, so `vendor/nexrad-data` depends on it by path. Each carries
-a `VENDORED.md` saying what was changed and why.
+**Vendored members.** Seven directories under `vendor/` are workspace members
+rather than `exclude`d: `nexrad-decode`, `nexrad-data`, `bzip2-rs`, `walkers`,
+`nexrad-model`, `pmtiles` and `mvt-reader`. Six of the seven are members
+deliberately, because their own upstream test targets are the behaviour pin that
+our patches must leave untouched, and those only run if `cargo test --workspace`
+selects them. All but `bzip2-rs` are patched over the registry copies by
+`[patch.crates-io]` in the root `Cargo.toml`; `bzip2-rs` is not patched —
+nothing else in the graph resolves that name, so `vendor/nexrad-data` depends on
+it by path. Each carries a `VENDORED.md` saying what was changed and why.
+
+`mvt-reader` is the exception to the "inherited pin" reason and its `VENDORED.md`
+leads with that: the published tarball carries **no test target at all**, so
+membership buys no upstream coverage and the pin on the patched function
+(`src/peak_allocation_tests.rs`) is written locally. Membership is still what
+makes the patch possible — cargo cannot patch a crate the workspace does not
+build.
 
 **Version pins.** Every external dependency is pinned exactly (`=x.y.z`) in
 `[workspace.dependencies]` in the root `Cargo.toml`. That section is the source

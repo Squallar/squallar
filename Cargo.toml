@@ -94,6 +94,24 @@ members = [
     # for the wasm-gate reason spelled out in vendor/pmtiles/Cargo.toml.
     # See vendor/pmtiles/VENDORED.md and `[patch.crates-io]` below.
     "vendor/pmtiles",
+    # The seventh vendored crates.io crate, and the FIRST whose membership is
+    # not a behaviour pin: the published tarball carries no test target at all
+    # (`autotests = false`, and its fixture submodules are outside `include`),
+    # so there is nothing here for `cargo test --workspace` to select and this
+    # entry buys no upstream coverage. It is a member because the workspace
+    # cannot patch a crate it does not build, and the patch is not optional:
+    # `parse_geometry` reserved the whole feature's command-integer count for
+    # EVERY ring of that feature, making one feature's decode peak
+    # `rings x commands`. On wasm32 that is an infallible allocation against a
+    # 1 GiB module ceiling, and it aborted the shipped web build on an ordinary
+    # basemap tile -- the freeze this copy exists to fix.
+    #
+    # The pin that replaces upstream's absent one is written here rather than
+    # inherited: `src/peak_allocation_tests.rs` counts the decode's peak with a
+    # measuring global allocator against a synthetic many-ringed feature, and
+    # it fails on the pre-patch expression. See vendor/mvt-reader/VENDORED.md
+    # and `[patch.crates-io]` below.
+    "vendor/mvt-reader",
 ]
 
 [workspace.package]
@@ -347,6 +365,7 @@ nexrad-data = { path = "vendor/nexrad-data" }
 nexrad-model = { path = "vendor/nexrad-model" }
 walkers = { path = "vendor/walkers" }
 pmtiles = { path = "vendor/pmtiles" }
+mvt-reader = { path = "vendor/mvt-reader" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
@@ -426,6 +445,16 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.walkers]
+opt-level = 2
+
+# And the crate walkers' tile parse is actually spent in: `parse_geometry` runs
+# once per feature of every layer of every basemap tile, and it is a byte loop
+# over the tile's command integers. Same story as the entries above -- it was
+# covered by the `"*"` override until it became a member, and naming it here
+# puts it back where it was as a plain dependency.
+#
+# Delete this together with `[patch.crates-io]`'s entry above.
+[profile.dev.package.mvt-reader]
 opt-level = 2
 
 # The model every decoded radial lands in: `MomentData::values` and
