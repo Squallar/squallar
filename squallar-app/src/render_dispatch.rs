@@ -338,6 +338,20 @@ pub struct RenderDispatcher {
     /// (WO-M13a).
     last_overlay_dispatch:
         HashMap<(usize, squallar_source::id::LayerId), crate::app::fetch::OverlayRenderRequest>,
+    /// **The offload job id of the raster last dispatched per `(pane, layer)`
+    /// destination** — the handle WO-8's supersede seam withdraws by — and the
+    /// destinations each of those jobs still serves, kept inverse to each
+    /// other by [`note_overlay_job`](Self::note_overlay_job).
+    ///
+    /// Bounded by construction rather than garbage-collected: every
+    /// destination names at most one job and every job here holds only
+    /// destinations that name it back, so neither map outgrows
+    /// `panes × texture layers` however long the session runs. An entry whose
+    /// job has already answered is inert — withdrawing a finished id is a
+    /// no-op at the registry — and is displaced by the next dispatch.
+    overlay_job_at: HashMap<(usize, squallar_source::id::LayerId), u64>,
+    /// See [`overlay_job_at`](Self::overlay_job_at).
+    overlay_job_serves: HashMap<u64, Vec<(usize, squallar_source::id::LayerId)>>,
     /// **The loop-frame granules a non-radar layer has been asked for and has
     /// not answered yet**, as `(layer, the instant the frame depicts)`.
     ///
@@ -563,6 +577,8 @@ impl RenderDispatcher {
             plan_view_extractions: std::cell::Cell::new(0),
             speculative_in_flight: false,
             last_overlay_dispatch: HashMap::new(),
+            overlay_job_at: HashMap::new(),
+            overlay_job_serves: HashMap::new(),
             loop_frame_fetches: std::collections::HashSet::new(),
         }
     }
@@ -963,6 +979,46 @@ impl RenderDispatcher {
     ) {
         self.last_overlay_dispatch
             .insert((pane_idx, id.clone()), req);
+    }
+
+    /// Record that job `job` is the raster on its way to `(pane, id)` for
+    /// every pane in `panes`, and answer the jobs that supersession just
+    /// orphaned: each returned id has **no** destination left that wants its
+    /// answer, so the caller withdraws it at the offload registry
+    /// (`squallar_worker::offload::cancel_job`) — WO-8's supersede seam.
+    ///
+    /// A job some destination still serves is never returned: a grouped
+    /// dispatch is one job for several panes, and a supersede on one of them
+    /// must not starve the rest.
+    pub(crate) fn note_overlay_job(
+        &mut self,
+        panes: &[usize],
+        id: &squallar_source::id::LayerId,
+        job: u64,
+    ) -> Vec<u64> {
+        let mut orphaned = Vec::new();
+        for &pane_idx in panes {
+            let destination = (pane_idx, id.clone());
+            let Some(old) = self.overlay_job_at.insert(destination.clone(), job) else {
+                continue;
+            };
+            if old == job {
+                continue;
+            }
+            let Some(serves) = self.overlay_job_serves.get_mut(&old) else {
+                continue;
+            };
+            serves.retain(|d| *d != destination);
+            if serves.is_empty() {
+                self.overlay_job_serves.remove(&old);
+                orphaned.push(old);
+            }
+        }
+        self.overlay_job_serves
+            .entry(job)
+            .or_default()
+            .extend(panes.iter().map(|&pane_idx| (pane_idx, id.clone())));
+        orphaned
     }
 
     /// **What this pane's live raster of `id` was last asked for**, or `None`

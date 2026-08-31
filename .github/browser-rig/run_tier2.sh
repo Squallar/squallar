@@ -523,11 +523,11 @@ for tag in sys.argv[2:]:
     if ort:
         print("%-18s   overlay rasters [overlay dispatch only] "
               "%s dispatched -> %s arrived -> %s pictures / %s B; "
-              "%s shown, %s promoted, %s dropped, %s superseded"
+              "%s shown, %s promoted, %s dropped, %s superseded, %s cancelled"
               % ("", ort.get("dispatched"), ort.get("arrived"),
                  ort.get("pictures"), ort.get("picture_bytes"),
                  ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
-                 ort.get("superseded")))
+                 ort.get("superseded"), ort.get("cancelled")))
     else:
         print("%-18s   overlay rasters - (the line was never written: no "
               "overlay raster ever moved)" % "")

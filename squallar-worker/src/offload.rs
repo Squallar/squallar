@@ -465,6 +465,15 @@ fn pending() -> std::sync::MutexGuard<'static, HashMap<u64, Pending>> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether job `id` is still owed an answer — the claim [`pool::lane_job`]
+/// makes at the last instant before running a queued job. Native-only because
+/// the pool is; the browser transport has no pre-run seam on this side of the
+/// port.
+#[cfg(not(target_arch = "wasm32"))]
+fn job_is_owed(id: u64) -> bool {
+    pending().contains_key(&id)
+}
+
 /// Job ids, unique across the process because [`PENDING`] is.
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -797,11 +806,22 @@ pub fn install_test_worker(port: Box<dyn JobSink>) -> InstalledTestWorker {
 /// That keeps `PaneRenderState::want_result`'s pruning honest: it treats
 /// `Arc::strong_count(flag) > 1` as "still stoppable", and the second reference
 /// is the one `deliver` holds for as long as the job is outstanding.
-pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult) + Send + 'static) {
+///
+/// Answers the id [`cancel_job`] withdraws by, for the described jobs — the
+/// only ones a registry entry is owed for. `None` is a job with no such
+/// handle: the answer-is-known arm and the test instrument.
+pub fn offload_job(
+    name: &'static str,
+    job: Job,
+    deliver: impl FnOnce(JobResult) + Send + 'static,
+) -> Option<u64> {
     let request = match job {
         Job::Described(request) => request,
         // The answer is known; `deliver` is what unwinds the caller's marks.
-        Job::Nothing => return deliver(None),
+        Job::Nothing => {
+            deliver(None);
+            return None;
+        }
         // The test instrument: a thread of its own, not a pool lane, and inline
         // only if the spawn itself fails. The `Option` lets that arm still run
         // it — `spawn` consumes its closure, so there is no value handed back.
@@ -823,16 +843,21 @@ pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult)
                     f()
                 }
             }
-            return;
+            return None;
         }
     };
-    dispatch(name, request, Box::new(deliver));
+    Some(dispatch(name, request, Box::new(deliver)))
 }
 
 /// [`offload_job`]'s described half, over an already-boxed delivery. Split out
 /// for [`hand_waiting_jobs_to_the_sink`], which holds boxed deliveries and has
 /// to put them back through the same registry, id space and fallthrough.
-fn dispatch(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(JobResult) + Send>) {
+/// Answers the job's id — the handle [`cancel_job`] withdraws by.
+fn dispatch(
+    name: &'static str,
+    request: JobRequest,
+    deliver: Box<dyn FnOnce(JobResult) + Send>,
+) -> u64 {
     // Resolved once, ahead of the send: the row rides the pending entry so the
     // reply is decoded through what THIS dispatch resolved (see `Pending::row`).
     let row = row_for(&request.job);
@@ -884,6 +909,7 @@ fn dispatch(name: &'static str, request: JobRequest, deliver: Box<dyn FnOnce(Job
             }
         }
     }
+    id
 }
 
 /// What [`offload_job`] learned by offering the job to this thread's sink.
@@ -921,6 +947,36 @@ pub fn deliver_job_reply(id: u64, result: JobResult) {
         job.started.elapsed().as_millis()
     );
     (job.deliver)(result);
+}
+
+/// Withdraw job `id`: the caller that dispatched it has moved past its answer,
+/// so the answer must not be waited for — its `deliver` runs with "nothing"
+/// now, on this thread, and whatever the transport still produces for the id
+/// is refused at the registry like any other late reply.
+///
+/// `true` is "the job was still owed and is withdrawn". Whether it also never
+/// *runs* depends on where it was: the native pool claims each queued job
+/// against this registry at the last instant before `execute`
+/// (`pool::lane_job`), so a job withdrawn while it queued is dropped whole —
+/// pre-run is the only cancellation there is, because `execute` has no yield
+/// point. One already executing runs to completion and its reply is ignored;
+/// on the browser transport the worker likewise finishes what it already
+/// holds, and the withdrawal saves the page-side decode and delivery instead.
+///
+/// `false` — already answered, already failed, or never registered (a job the
+/// funnel ran inline) — obliges nothing: its `deliver` has run or will run
+/// elsewhere, exactly once either way.
+pub fn cancel_job(id: u64) -> bool {
+    let Some(job) = pending().remove(&id) else {
+        return false;
+    };
+    log::debug!(
+        "{}: job {id} withdrawn {} ms after dispatch; delivering nothing",
+        job.kind,
+        job.started.elapsed().as_millis(),
+    );
+    (job.deliver)(None);
+    true
 }
 
 /// [`deliver_job_reply`] for a reply that arrived as bytes — the browser's

@@ -1185,7 +1185,7 @@ var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied ou
 // every texture delta the renderer was shown -- font atlas, basemap tiles and
 // radar included. A single "bytes uploaded" figure over the union would
 // describe neither, and would move when the mix moved.
-var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded/;
+var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded, (\d+) cancelled/;
 // `whole` is a routing subset of `blocking` (a whole delta moves through a
 // blocking write_texture on the frame's own queue); the GPU total is the
 // disjoint pair staged + blocking. Never add whole to anything.
@@ -1223,7 +1223,8 @@ for (var i = 0; i < C.length; i++) {
                        shown: parseInt(rm2[5], 10),
                        promoted: parseInt(rm2[6], 10),
                        dropped: parseInt(rm2[7], 10),
-                       superseded: parseInt(rm2[8], 10) };
+                       superseded: parseInt(rm2[8], 10),
+                       cancelled: parseInt(rm2[9], 10) };
   var um = uploads_re.exec(m);
   if (um) uploads = { deltas: parseInt(um[1], 10),
                       bytes: parseInt(um[2], 10),
@@ -2915,11 +2916,11 @@ def run_smoke(args):
     if ort:
         print("[%s] SUMMARY overlay raster totals [whole-picture overlay "
               "dispatch only]: %s dispatched, %s arrived, %s pictures of %s B, "
-              "%s shown, %s promoted, %s dropped, %s superseded"
+              "%s shown, %s promoted, %s dropped, %s superseded, %s cancelled"
               % (tag, ort.get("dispatched"), ort.get("arrived"),
                  ort.get("pictures"), ort.get("picture_bytes"),
                  ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
-                 ort.get("superseded")))
+                 ort.get("superseded"), ort.get("cancelled")))
     tut = result.get("texture_upload_totals")
     if tut:
         # `whole` is a routing subset of `blocking`, never added to it; the

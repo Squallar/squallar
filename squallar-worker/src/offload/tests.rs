@@ -1508,6 +1508,105 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
     detach();
 }
 
+/// The withdrawal contract: a cancelled job delivers "nothing" exactly once,
+/// leaves the registry, and a reply the worker still produces for it is
+/// refused — the same late-reply door every retired job goes through.
+#[test]
+fn a_cancelled_job_delivers_nothing_once_and_its_late_reply_is_refused() {
+    let posted = attach(true);
+    let (tx, rx) = mpsc::channel();
+    let id = offload_job("test", Job::Described(a_job()), move |result| {
+        let _ = tx.send(result.is_some());
+    })
+    .expect("a described job answers the id it was filed under");
+    assert_eq!(
+        id,
+        posted.lock().unwrap()[0].0,
+        "the id offload_job answers must be the id the sink was handed, or a \
+         caller cancels some other job",
+    );
+    assert_eq!(jobs_in_worker(), 1);
+
+    assert!(cancel_job(id), "an owed job must be withdrawable");
+    assert_eq!(
+        rx.try_recv(),
+        Ok(false),
+        "withdrawing must run deliver with nothing, now",
+    );
+    assert_eq!(jobs_in_worker(), 0, "a withdrawn job is no longer owed");
+    assert!(!cancel_job(id), "a job can be withdrawn only once");
+
+    deliver_job_reply(
+        id,
+        Some(DescribedOut(Box::new(RenderedFrame {
+            image: vec![0; 4],
+            max_range_km: 230.0,
+            polar: Default::default(),
+            nyquist_ms: None,
+            melting_layer_source: None,
+            storm_motion: None,
+        }))),
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the worker's late answer for a withdrawn job must not deliver a \
+         second response",
+    );
+    detach();
+}
+
+/// The pool's half of the withdrawal: a queued job whose registry entry is
+/// gone is skipped whole — the lane never calls `execute` for it.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_job_withdrawn_while_queued_is_skipped_by_the_lane() {
+    let posted = attach(true);
+    let (tx, rx) = mpsc::channel();
+    let sender = tx.clone();
+    let live = offload_job("test", Job::Described(a_job()), move |result| {
+        let _ = sender.send(result.is_some());
+    })
+    .expect("a described job answers an id");
+
+    // Positive control: the same lane body, on a job still owed, runs it and
+    // delivers its real answer — so the skip below is a decision, not a lane
+    // that stopped running anything.
+    let request = JobRequest::from_bytes(&posted.lock().unwrap()[0].1)
+        .expect("the posted job survives its wire form");
+    pool::lane_job((live, request.clone()));
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(true),
+        "an owed job on the lane must execute and deliver its answer",
+    );
+
+    // The job again, withdrawn while "queued": deliver runs with nothing at
+    // the withdrawal, and the lane then skips it. The skip counter is the
+    // never-ran observable — a lane that executed anyway would have its
+    // answer refused at the registry, which no channel can distinguish, so
+    // the counter is taken beside the delivery assertions rather than
+    // instead of them. `>=`, not `==`: the counter is process-wide.
+    let withdrawn = offload_job("test", Job::Described(a_job()), move |result| {
+        let _ = tx.send(result.is_some());
+    })
+    .expect("a described job answers an id");
+    let skipped_before = pool::withdrawn_before_run();
+    assert!(cancel_job(withdrawn));
+    assert_eq!(rx.try_recv(), Ok(false), "the withdrawal delivers nothing");
+
+    pool::lane_job((withdrawn, request));
+    assert!(
+        pool::withdrawn_before_run() > skipped_before,
+        "the lane ran a job whose registry entry was withdrawn: pool time \
+         spent on an answer the registry must refuse",
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a skipped job must not deliver anything further",
+    );
+    detach();
+}
+
 /// A worker that dies owes replies that will never come.
 #[test]
 fn losing_the_worker_fails_every_job_it_owed() {

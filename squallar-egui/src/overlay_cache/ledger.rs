@@ -61,6 +61,8 @@ static SHOWN: AtomicU64 = AtomicU64::new(0);
 static PROMOTED: AtomicU64 = AtomicU64::new(0);
 /// Uploads discarded mid-flight by a newer picture for the same destination.
 static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+/// Dispatches withdrawn at the supersede seam before their answer was used.
+static CANCELLED: AtomicU64 = AtomicU64::new(0);
 
 /// A reading of the counters below, taken together.
 ///
@@ -103,6 +105,15 @@ pub struct Totals {
     /// is the quantity the `PAN_REBUILD_THRESHOLD` sweep calls a discarded
     /// hold, and the one a world-anchored tile grid is meant to make rare.
     pub superseded: u64,
+    /// Of [`Self::dispatched`], those withdrawn at the supersede seam (WO-8)
+    /// before their answer was used: a newer dispatch replaced every
+    /// destination the raster was for, so the job was cancelled at the
+    /// offload registry — unrun where it had not started, its answer refused
+    /// where it had. Each one still **arrives** (the withdrawal delivers
+    /// "nothing", which the arrival path drops), so
+    /// [`Self::arrivals_balance`] holds unchanged; what this figure names is
+    /// raster work the pipeline declined to spend, not a fourth arrival exit.
+    pub cancelled: u64,
 }
 
 impl Totals {
@@ -128,7 +139,7 @@ impl Totals {
     /// How far along this ledger is, as one number, so a caller can tell
     /// "nothing has happened since I last looked" in a single compare.
     fn progress(&self) -> u64 {
-        self.dispatched + self.arrived + self.on_screen() + self.superseded
+        self.dispatched + self.arrived + self.on_screen() + self.superseded + self.cancelled
     }
 }
 
@@ -168,9 +179,14 @@ pub fn note_superseded() {
     SUPERSEDED.fetch_add(1, Relaxed);
 }
 
+/// Record a dispatch withdrawn before its answer was used.
+pub fn note_cancelled() {
+    CANCELLED.fetch_add(1, Relaxed);
+}
+
 /// Read every counter.
 ///
-/// Eight [`Relaxed`] loads, and they are **not** an atomic snapshot: a
+/// Nine [`Relaxed`] loads, and they are **not** an atomic snapshot: a
 /// concurrent increment can land between two of them. That is deliberate and
 /// harmless — every one of these is written from the frame thread, and a
 /// reader that has to lock to be exactly right would be paying for a
@@ -185,6 +201,7 @@ pub fn totals() -> Totals {
         shown: SHOWN.load(Relaxed),
         promoted: PROMOTED.load(Relaxed),
         superseded: SUPERSEDED.load(Relaxed),
+        cancelled: CANCELLED.load(Relaxed),
     }
 }
 
@@ -195,7 +212,7 @@ static REPORTED: AtomicU64 = AtomicU64::new(0);
 /// was asked — so a caller can write the line on a frame where the pipeline
 /// moved and stay silent on one where it did not.
 ///
-/// An idle frame costs eight relaxed loads and one compare-exchange that
+/// An idle frame costs nine relaxed loads and one compare-exchange that
 /// fails.
 pub fn totals_if_moved() -> Option<Totals> {
     let totals = totals();
@@ -224,6 +241,7 @@ pub fn reset_for_test() {
         &SHOWN,
         &PROMOTED,
         &SUPERSEDED,
+        &CANCELLED,
         &REPORTED,
     ] {
         counter.store(0, Relaxed);
