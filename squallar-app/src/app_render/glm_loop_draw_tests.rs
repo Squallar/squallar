@@ -423,6 +423,93 @@ fn overlay_pass(
     Some((token, drew))
 }
 
+/// Play one whole loop at `fps` and report, per frame, which strikes the
+/// picture on the glass drew. The pipeline is the synchronous one
+/// [`overlay_pass`] drives — the regime the content-arm brake must leave
+/// exactly alone, at every speed.
+fn lit_at_speed(fps: f32) -> (Vec<i64>, Vec<(i64, Vec<i64>)>) {
+    let ctx = egui::Context::default();
+    let jobs = Jobs::default();
+    let seen = Arc::clone(&jobs.seen);
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(jobs));
+
+    let mut app = satellite_loop_with_lightning();
+    fill_transport(&mut app, &ctx);
+    {
+        let pane = app.gui.pane_mut(0).expect("pane 0");
+        pane.transport_state_mut().phase = squallar_egui::pane::LoopPhase::Playing;
+        pane.time.speed_fps = fps;
+        pane.set_time_mode(squallar_egui::pane::TimeMode::AsOf(hour(0)));
+    }
+    let _ = poll_lightning(&mut app);
+
+    let mut lit = Vec::new();
+    let mut drawn = Vec::new();
+    let mut by_token: std::collections::HashMap<u64, Vec<i64>> = std::collections::HashMap::new();
+    for k in 0..FRAMES {
+        if let Some((token, drew)) = overlay_pass(&mut app, &ctx, &seen, k as f64) {
+            by_token.insert(token, drew);
+        }
+        let pane = app.gui.pane(0).expect("pane 0");
+        let on_screen = pane
+            .overlay_texture_on_screen(&known::LIGHTNING)
+            .map(|tex| tex.data_generation)
+            .and_then(|token| by_token.get(&token).cloned())
+            .unwrap_or_default();
+        if on_screen.contains(&k) {
+            lit.push(k);
+        }
+        drawn.push((k, on_screen));
+        app.gui
+            .pane_mut(0)
+            .expect("pane 0")
+            .transport_state_mut()
+            .last_advance = None;
+        app.advance_loop_playback();
+    }
+    (lit, drawn)
+}
+
+/// **The per-frame contract at all three speeds the Speed slider offers.**
+///
+/// The slider is 1.0–30.0 fps (`ui_timeline.rs`), and those ends are where a
+/// brake keyed on delivery could behave differently: at 1 fps a tick is a
+/// second and any pipeline lands inside it, at 30 fps a tick is 33 ms and a
+/// slow one cannot. The content arm's brake is keyed on *delivery* and never
+/// on rate precisely so that the answer is the same at all three, and this is
+/// the fixture that says so.
+///
+/// **Non-vacuity is the `return false` tamper**: making the brake
+/// unconditional reds this at every speed, which is the direction the previous
+/// attempt on this card failed in. The `return true` tamper leaves it green,
+/// and correctly — a synchronous pipeline is never braked either way, and
+/// claiming otherwise would be this fixture measuring itself.
+#[test]
+fn the_per_frame_contract_holds_at_every_speed_the_slider_offers() {
+    for fps in [1.0f32, 10.0, 30.0] {
+        let (lit, drawn) = lit_at_speed(fps);
+        assert_eq!(
+            lit.len() as i64,
+            FRAMES,
+            "at {fps} fps only {} of {FRAMES} frames drew their own strikes. \
+             The brake is keyed on delivery, so a pipeline that answers inside \
+             a tick must be untouched at every speed. Lit {lit:?}; each \
+             frame's picture drew {drawn:?}",
+            lit.len(),
+        );
+        // Floor A, re-asserted per speed: widening what is HELD may never
+        // widen what a frame DRAWS.
+        for (k, drew) in &drawn {
+            assert!(
+                !(*k == FRAMES - 1 && drew.contains(&0)),
+                "at {fps} fps the newest frame's picture drew the oldest \
+                 frame's strike, twelve hours outside its {GLM_WINDOW_SECS}s \
+                 window: {drew:?}",
+            );
+        }
+    }
+}
+
 /// **Premise census (temporary instrument).** How many rasters does a playing
 /// loop really spend on a `TimeAxis::EventLifetime` layer when the pipeline
 /// answers after `latency` ticks rather than instantly? Runs BOTH halves of

@@ -449,11 +449,30 @@ fn a_first_picture_over_an_empty_pane_asks_once_and_then_waits() {
     );
 }
 
-/// The brake is the coverage arm's alone. A hold that is stale in *content* is
-/// still superseded, however many have been superseded before it — otherwise a
-/// pane that flung once would stop taking new data.
+/// **The content arm brakes too, and what bounds it is one upload.**
+///
+/// This fixture used to assert the opposite — that the brake was the coverage
+/// arm's alone — on the stated ground that "new data would never reach a pane
+/// that had flung once". That ground was the overstatement: the brake needs
+/// *both* a superseded hold and one still in flight, and
+/// [`OverlayTextureCache::take_held_if_delivered`] clears both together, so a
+/// braked pane is waiting for one upload and not for an event that may never
+/// come. `releasing_a_hold_releases_the_brake` below pins the other three ways
+/// out.
+///
+/// What paid for the reversal is a native scene E2 leg (1 pane KTLX, 10 fps,
+/// full stack, 100 s, interleaved arms): **91.5% of a playing loop's
+/// superseded uploads were attributable to the as-of half of the token** —
+/// 1419 discarded uploads per 100 s against 120 with that half frozen, and 44%
+/// of every picture the pane rasterized thrown away before a band of it was
+/// drawn. That is the coverage arm's own pathology, measured on the content
+/// arm. The full figures are in `needs_rerender_with_policy`'s content note.
+///
+/// So the property pinned here is now the bound rather than the exemption:
+/// braked while the upload is in flight, dispatching again the moment it
+/// lands.
 #[test]
-fn the_brake_never_holds_back_a_hold_that_is_stale_in_content() {
+fn a_content_stale_hold_is_braked_only_until_its_upload_lands() {
     let ctx = egui::Context::default();
     let texture = a_texture(&ctx);
     let here = viewport_at(0.0);
@@ -469,10 +488,25 @@ fn the_brake_never_holds_back_a_hold_that_is_stale_in_content() {
         "fixture: the brake must be engaged, or the token below proves nothing",
     );
     assert!(
+        !cache.needs_rerender(TOKEN + 1, ZOOM, T0, &here, &plan()),
+        "a pane that had already thrown away one upload, and was still \
+         waiting on its replacement, spent another raster the moment the \
+         content moved. Under a playing loop the content moves every tick, so \
+         this is the fling with no exit: 44% of the pictures the measured leg \
+         rasterized were discarded mid-upload exactly here",
+    );
+
+    // ...and the bound: the upload lands, both clauses clear together, and
+    // the moved content is dispatched for. This is the half the old
+    // exemption was really protecting, and it survives without it.
+    let landed = cache
+        .take_held_if_delivered(|_| true)
+        .expect("the hold is delivered");
+    cache.show(landed.data);
+    assert!(
         cache.needs_rerender(TOKEN + 1, ZOOM, T0, &here, &plan()),
-        "a hold rendered for content the pane has moved on from was kept \
-         because an earlier hold had been superseded: new data would never \
-         reach a pane that had flung once",
+        "the content brake outlived the upload that set it: new data really \
+         would never reach a pane that had flung once",
     );
 
     // Same for the size arm, which no hold may answer either.
