@@ -915,22 +915,14 @@ pub(super) fn render_pane_map_content(
             // it — a second whole map render plus the mirror pass, per pane,
             // per frame.
             //
-            // Under a playing loop that used to be every frame, for ever.
-            // Measured: a native E3 leg (KTLX volume loop at 10 fps under
-            // orbit, 1920x1080, 75 s) read `964 paints, 964 incomplete`
-            // against 964 frames, so WO-7's skip never fired once. A raster
-            // was owed on every frame there because the pane clock sweeps its
-            // whole window at the playback rate and every
+            // Under a playing loop that is every frame, for ever. Measured:
+            // a native E3 leg (KTLX volume loop at 10 fps under orbit,
+            // 1920x1080, 75 s) read `964 paints, 964 incomplete` against 964
+            // frames, so WO-7's skip never fired once. A raster is owed on
+            // every frame there because the pane clock sweeps its whole
+            // window at the playback rate and every
             // `TimeAxis::EventLifetime` layer re-tokenizes per as-of bucket,
             // a 60 s quantum against a tick worth ~5 min.
-            //
-            // **The latch is no longer re-armed by that.** `needs_rerender`
-            // now answers `false` — not "true but refused" — for a swept token
-            // on a pane that has demonstrated it discards uploads, so `stale`
-            // is false on those frames and this `|=` does not fire. See
-            // `OverlayTextureCache::sweep_discarded`. What still latches is
-            // what always should have: a raster the pane genuinely wants and
-            // could not ask for.
             //
             // A dispatch that was REFUSED has no arrival to wait for and
             // nothing else would ever re-ask, so that one still latches --

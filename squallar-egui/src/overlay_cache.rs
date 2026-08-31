@@ -63,25 +63,6 @@ pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_
 /// reports its phases). So the whole path fits, on both.
 pub const SETTLE_QUIET_FRAMES: u8 = 2;
 
-/// **How long the cache token must stand still before it stops counting as
-/// swept.**
-///
-/// Frames and not a duration, for the reason [`SETTLE_QUIET_FRAMES`] is: the
-/// quantity being judged is *pipeline depth*, and the pipeline is counted in
-/// frames. The question this window answers is "will the token move again
-/// before a raster asked for now can land", and the deepest pipeline the tree
-/// models is a 2-frame raster into a 5-frame upload — 7 frames. Eight is the
-/// first value above it, so a token that moves twice inside one round trip is
-/// a sweep and one that does not is a nudge.
-///
-/// **Frame-rate independent in the sense that matters.** At 60 Hz a 10 fps
-/// loop crosses an as-of bucket every 6 frames and reads as a sweep; at 250 Hz
-/// the same loop crosses one every 25 frames and reads as a nudge — and it is
-/// one, because there the raster lands three times over before the next bucket
-/// is owed and no upload is ever discarded. The classification and the
-/// pathology move together.
-const SWEEP_QUIET_FRAMES: u8 = 8;
-
 /// Whether the map's zoom is being driven this frame.
 ///
 /// **The state the settle used to infer from a clock.** The question the settle
@@ -643,34 +624,6 @@ pub struct OverlayTextureCache {
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
     /// how it notices the zoom moving and re-arms [`Self::settle_owed_frames`].
     last_seen_zoom: Option<f64>,
-    /// The cache token [`Self::needs_rerender`] was asked about last time —
-    /// the zoom field's twin on the content axis, and how this cache notices
-    /// that the token is *moving* rather than that it has moved.
-    last_seen_token: Option<u64>,
-    /// Frames the token has stood still for, saturating at
-    /// [`SWEEP_QUIET_FRAMES`]. Reset by every move.
-    token_still_frames: u8,
-    /// **Whether the token is being swept rather than nudged**: it moved, and
-    /// the move before it was inside [`SWEEP_QUIET_FRAMES`].
-    ///
-    /// A playing loop sweeps it — every
-    /// [`TimeAxis::EventLifetime`](squallar_source::time::TimeAxis::EventLifetime)
-    /// layer re-tokenizes per as-of bucket and the pane clock crosses buckets
-    /// continuously — and so does a dragged scrubber. Data arriving, a theme
-    /// flip and a filter change do not.
-    token_sweeping: bool,
-    /// Whether an upload has been thrown away *during the current sweep*.
-    ///
-    /// **[`Self::hold_superseded`] cannot answer this and that is the whole
-    /// reason this field exists.** That flag is cleared by every delivery, so
-    /// a pane under a sweeping clock re-learns the same lesson once per
-    /// promotion for ever: dispatch, discard, brake, land, unbrake, dispatch,
-    /// discard. Measured on the rig in `clock_sweep_tests`, that is **one
-    /// discarded upload per picture promoted** — 150 discards against 150
-    /// promotions over 600 frames at one bucket per frame, a 3-frame upload
-    /// and a 1-frame raster. This one is not cleared by delivery; it is
-    /// cleared when the sweep ends.
-    sweep_discarded: bool,
     /// Frames of rest still owed before the zoom counts as settled. Re-armed
     /// to [`SETTLE_QUIET_FRAMES`] by any live [`ZoomDrive`] or any zoom
     /// movement, decremented by one per frame the pane asks, and the settle
@@ -692,12 +645,6 @@ impl OverlayTextureCache {
             hold_superseded: false,
             renders: RendersInFlight::default(),
             last_seen_zoom: None,
-            last_seen_token: None,
-            // Full, so the first token this cache is ever asked about reads as
-            // a move that follows nothing — a fresh cache is not mid-sweep.
-            token_still_frames: SWEEP_QUIET_FRAMES,
-            token_sweeping: false,
-            sweep_discarded: false,
             settle_owed_frames: 0,
         }
     }
@@ -717,13 +664,7 @@ impl OverlayTextureCache {
     pub fn hold(&mut self, data: OverlayTextureData, data_time: Option<chrono::NaiveDateTime>) {
         // Replacing a hold discards an upload that had already started, and the
         // coverage arm is not allowed to do that twice running.
-        let discarding = self.held.is_some();
-        self.hold_superseded |= discarding;
-        // Recorded here rather than read off `hold_superseded` at the gate,
-        // because that flag is cleared by a delivery that may fall between two
-        // asks and the discard would then never be seen at all. See
-        // [`Self::sweep_discarded`].
-        self.sweep_discarded |= discarding;
+        self.hold_superseded |= self.held.is_some();
         self.held = Some(HeldOverlayTexture { data, data_time });
     }
 
@@ -752,7 +693,6 @@ impl OverlayTextureCache {
         self.current = None;
         self.held = None;
         self.hold_superseded = false;
-        self.sweep_discarded = false;
     }
 
     /// Let go of a held picture without showing it.
@@ -827,24 +767,6 @@ impl OverlayTextureCache {
         }
         let settled = self.settle_owed_frames == 0;
 
-        // The same shape one axis over: is the *token* moving, and not merely
-        // has it moved. Unconditional and above every early return below, for
-        // the reason the settle countdown is — one call is one frame, and a
-        // frame this cache skipped is a frame the sweep never sees.
-        if self.last_seen_token != Some(token) {
-            self.token_sweeping = self.token_still_frames < SWEEP_QUIET_FRAMES;
-            self.last_seen_token = Some(token);
-            self.token_still_frames = 0;
-        } else {
-            self.token_still_frames = self.token_still_frames.saturating_add(1);
-            if self.token_still_frames >= SWEEP_QUIET_FRAMES {
-                // The sweep is over, and with it the lesson it taught: the
-                // next one is judged on its own pipeline, not on this one's.
-                self.token_sweeping = false;
-                self.sweep_discarded = false;
-            }
-        }
-
         // The newest picture this cache has — see the doc note. A held picture
         // outranks the one on screen for every question below about *what the
         // next picture should be*: it is what a dispatch would supersede. The
@@ -904,30 +826,6 @@ impl OverlayTextureCache {
         // and later dispatch into a pane that has *demonstrated* it cannot
         // land the first.
         if tex.data_generation != token {
-            // **A sweeping token is not the same event as a token that moved
-            // once**, and the difference is what a dispatch can possibly
-            // achieve. A one-shot move — data arrived, the theme flipped, a
-            // filter changed — is finished: the raster asked for now is the
-            // last one this stimulus owes, and pipelining it into a pane that
-            // is still landing a picture gets it on the glass a cycle sooner.
-            // A sweep owes another raster on the next frame and the frame
-            // after; a dispatch into a pending hold can only *replace* that
-            // hold when it comes back, and its own replacement is owed before
-            // it lands. That is the fling with no exit, run by the clock
-            // instead of by a finger.
-            //
-            // The refusal is narrower than "never overlap a hold", because
-            // overlapping is only wrong where it really does throw an upload
-            // away. A pipeline whose raster lands exactly as the hold
-            // delivers never discards anything, and it keeps every dispatch
-            // it had: measured on `clock_sweep_tests`' rig, a 2-frame raster
-            // into a 2-frame upload at one bucket per frame spends 300
-            // rasters, discards 0 and promotes 300, and it does so under this
-            // rule too. What is refused is the pane that has *demonstrated* a
-            // discard during this sweep — see [`Self::sweep_discarded`].
-            if self.token_sweeping && self.sweep_discarded {
-                return self.held.is_none();
-            }
             return !(self.hold_superseded && self.held.is_some());
         }
         // The texture is no longer the size this pane would ask for. Nothing
@@ -1259,12 +1157,6 @@ mod coverage_dispatch_tests;
 /// is still waiting on its replacement, and nothing else.
 #[cfg(test)]
 mod content_brake_tests;
-
-/// What a sweeping pane clock costs the whole-picture dispatch: how many
-/// rasters it spends, how many of those uploads it throws away, and how far
-/// behind the clock the picture on the glass runs.
-#[cfg(test)]
-mod clock_sweep_tests;
 
 /// The deadband on the coverage trigger: a pan too small to move a texel must
 /// not re-rasterise the overlay, and must not be able to stall one either.
