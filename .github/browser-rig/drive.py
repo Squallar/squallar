@@ -49,9 +49,10 @@ sources; a driver that refuses the wheel source falls back to a synthesized
 WheelEvent, recorded per browser). `--expect-interaction-frames` is the one
 gate built on any of it, and it is a COUNT assert: the interact family
 strictly grew. `--wait-console-regex` is the generic wait-until-console-line
-primitive. `--android` (chromedriver + androidPackage + adb reverse) and
-`--browser safari` (safaridriver) are implemented per spec but NOT
-device-tested from this box; they say so where they run.
+primitive. `--android` (BOTH engines: chromedriver + goog:chromeOptions or
+geckodriver + moz:firefoxOptions, each carrying androidPackage, plus `adb
+reverse`) and `--browser safari` (safaridriver) are implemented per spec but
+NOT device-tested from this box; they say so where they run.
 
 Two arms, selected with --arm, NEVER merged:
 
@@ -87,6 +88,7 @@ import base64
 import errno
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -705,11 +707,153 @@ FIREFOX_HARDWARE_PREFS = {
 }
 
 
-def firefox_capabilities(binary, window, headless=True, extra_prefs=None):
+# --------------------------------------------------------------------------
+# Android: BOTH engines, because one engine is not "web"
+# --------------------------------------------------------------------------
+#
+# Until 2026-08-31 `--android` accepted chromium and nothing else, so every
+# Android figure this campaign holds is Blink's. Firefox governs the web
+# target here and runs roughly 2x Chromium's service time on the desktop, so a
+# Blink-only Android column reports the engine that tends to win and calls the
+# result "web". That is the defect these two capability builders exist to
+# close, and `the_android_mode_is_not_one_engine` in drive.py's selftest is
+# what keeps it closed.
+#
+# THE GECKODRIVER CONTRACT BELOW WAS READ OUT OF THE PINNED BINARY -- the
+# geckodriver 0.37.1 that ensure-geckodriver.sh provisions -- not taken on
+# trust from documentation:
+#
+#   * `moz:firefoxOptions` accepts androidPackage, androidActivity,
+#     androidDeviceSerial and androidIntentArguments. There is NO
+#     `androidStorage` CAPABILITY: `--android-storage` is a (deprecated)
+#     geckodriver command-line flag and appears nowhere in the capability
+#     parser.
+#   * "androidPackage and binary are mutual exclusive" is a literal error
+#     string in that binary. The desktop path ALWAYS sends `binary`, so the
+#     Android path must not -- and getting this wrong fails at session
+#     creation, on the phone, three minutes into a leg.
+#   * "Cannot use a named profile on Android".
+#   * androidPackage is validated against
+#     ^([a-zA-Z][a-zA-Z0-9_]*\.){1,}([a-zA-Z][a-zA-Z0-9_]*)$ -- at least one
+#     dot, and NO hyphens. Rejection message: "Not a valid androidPackage
+#     name".
+#   * androidActivity "should not contain '/'": geckodriver composes
+#     `am start -S -W -n <package>/<activity>` itself.
+#   * geckodriver carries default activities for the packages it ships with
+#     (org.mozilla.fenix.IntentReceiverActivity for the Firefox/Fenix family,
+#     org.mozilla.focus.activity.IntentReceiverActivity for Focus/Klar), so
+#     androidActivity is optional for a release Firefox and is exposed here
+#     only for a build geckodriver does not know.
+#   * prefs reach the app through a GeckoView configuration YAML that
+#     geckodriver pushes to the device and arms with `am set-debug-app` -- not
+#     through a profile. So the rig's prefs still apply, but whether they
+#     LANDED is a device question, not a host one (see the pre-flight
+#     checklist: `privacy.reduceTimerPrecision` is the one that decides
+#     whether the rAF percentiles are integers or microseconds).
+#
+# NOT VALIDATED AGAINST HARDWARE. No phone was attached when this landed. What
+# is exercised from this box is the argument validation and the capability
+# shape; every device-side answer is enumerated in the checklist rather than
+# guessed at here.
+
+ANDROID_BROWSERS = ("chromium", "firefox")
+
+# The package each engine means by "the browser on the phone". Resolved from
+# the browser rather than defaulted on the flag, because one default cannot be
+# right for two engines -- and a Chrome package silently handed to geckodriver
+# would fail with a package-not-found on the device rather than at the CLI.
+ANDROID_DEFAULT_PACKAGE = {
+    "chromium": "com.android.chrome",
+    "firefox": "org.mozilla.firefox",
+}
+
+# geckodriver's own androidPackage validator, verbatim. Applied at the CLI so
+# a typo costs milliseconds instead of a device session. Firefox only: the
+# chromium path predates this and stays exactly as it was.
+ANDROID_PACKAGE_RE = re.compile(
+    r"^([a-zA-Z][a-zA-Z0-9_]*\.){1,}([a-zA-Z][a-zA-Z0-9_]*)$")
+
+# The packages the pinned geckodriver knows a default activity for. Not a
+# restriction -- any package is accepted -- but one this rig can WARN about,
+# because an unknown package needs --android-activity and the failure without
+# it happens on the phone.
+GECKODRIVER_KNOWN_PACKAGES = (
+    "org.mozilla.firefox",
+    "org.mozilla.firefox_beta",
+    "org.mozilla.fenix",
+    "org.mozilla.fenix.debug",
+    "org.mozilla.reference.browser",
+    "org.mozilla.focus",
+    "org.mozilla.focus.debug",
+    "org.mozilla.klar",
+    "org.mozilla.klar.debug",
+)
+
+
+def validate_android_args(browser, package, activity, adb_present=True):
+    """Is this `--android` invocation drivable? Returns the reason it is not,
+    or None.
+
+    Pure and side-effect-free ON PURPOSE: the mode cannot be smoke-tested
+    without a device, so the validator is the only part of it this box can
+    exercise, and it can only be exercised if it does not need a parser, a
+    driver or a phone to run. `main()` funnels every `--android` refusal
+    through here and the selftest drives the same function over the whole
+    matrix."""
+    if browser not in ANDROID_BROWSERS:
+        return ("--android drives %s on the device; --browser %s has no "
+                "Android path (chromium: chromedriver + "
+                "goog:chromeOptions.androidPackage; firefox: geckodriver + "
+                "moz:firefoxOptions.androidPackage)"
+                % (" and ".join(ANDROID_BROWSERS), browser))
+    if not adb_present:
+        return "--android needs adb on PATH (for `adb reverse`)"
+    if browser == "firefox":
+        if package is not None and not ANDROID_PACKAGE_RE.match(package):
+            return ("--android-package %r is not a valid androidPackage name: "
+                    "geckodriver requires dot-separated segments of "
+                    "[A-Za-z][A-Za-z0-9_]* (no hyphens, at least one dot)"
+                    % package)
+        if activity and "/" in activity:
+            return ("--android-activity must not contain '/': geckodriver "
+                    "composes `am start -n <package>/<activity>` itself")
+    elif activity:
+        return ("--android-activity is a geckodriver capability; the chromium "
+                "Android path drives the package's launcher activity and does "
+                "not take one")
+    return None
+
+
+def chromium_android_capabilities(package):
+    """chromedriver + the phone's own Chrome. Extracted VERBATIM from the
+    inline literal that used to live in `launch()`; it is a pure move, so the
+    selftest can pin the Blink shape beside the Gecko one and prove the second
+    did not disturb the first."""
+    return {"capabilities": {"alwaysMatch": {
+        "browserName": "chrome",
+        "acceptInsecureCerts": True,
+        "goog:chromeOptions": {"androidPackage": package},
+        "goog:loggingPrefs": {"browser": "ALL"},
+    }}}
+
+
+def firefox_capabilities(binary, window, headless=True, extra_prefs=None,
+                         android_package=None, android_activity=None,
+                         android_serial=None):
+    """The desktop and Android capability shapes from ONE builder.
+
+    With `android_package` set, three things change and nothing else does:
+    `binary` is omitted (geckodriver refuses both together), the window/
+    headless args are dropped (a phone has neither), and the android
+    capabilities are added. The prefs -- including the timer-precision
+    override every frame percentile depends on -- are shared, which is the
+    reason this is an extension and not a second builder."""
+    android = android_package is not None
     args = []
-    if headless:
-        args.append("-headless")
-    args += ["-width", str(window[0]), "-height", str(window[1])]
+    if not android:
+        if headless:
+            args.append("-headless")
+        args += ["-width", str(window[0]), "-height", str(window[1])]
     prefs = {
         "browser.shell.checkDefaultBrowser": False,
         "datareporting.policy.dataSubmissionEnabled": False,
@@ -723,14 +867,23 @@ def firefox_capabilities(binary, window, headless=True, extra_prefs=None):
     }
     if extra_prefs:
         prefs.update(extra_prefs)
+    # Insertion order is preserved deliberately on the desktop arm: the dict
+    # below is serialised straight onto the wire, and this builder's job on
+    # that arm is to be byte-for-byte what it was before Android existed.
+    if android:
+        opts = {"androidPackage": android_package,
+                "args": args,
+                "prefs": prefs}
+        if android_activity:
+            opts["androidActivity"] = android_activity
+        if android_serial:
+            opts["androidDeviceSerial"] = android_serial
+    else:
+        opts = {"binary": binary, "args": args, "prefs": prefs}
     return {"capabilities": {"alwaysMatch": {
         "browserName": "firefox",
         "acceptInsecureCerts": True,
-        "moz:firefoxOptions": {
-            "binary": binary,
-            "args": args,
-            "prefs": prefs,
-        },
+        "moz:firefoxOptions": opts,
     }}}
 
 
@@ -738,7 +891,8 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
            window=(1280, 900), headless=True, tmp_root=None,
            ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
            display=None, chromium_args=(), android=False,
-           android_package="com.android.chrome"):
+           android_package=None, android_activity=None,
+           android_serial=None):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
@@ -761,6 +915,8 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
       headless  firefox -headless: boots and runs JS/rAF/network, but WebGL
                 context creation fails on this box, so the app panics at
                 surface creation and paints nothing (proven; see gotchas)"""
+    if android:
+        android_package = android_package or ANDROID_DEFAULT_PACKAGE[browser]
     port = free_port()
     log_path = os.path.join(out_dir, "%s.driver.log" % tag)
     pgid_file = os.path.join(out_dir, "%s.driver.pgid" % tag)
@@ -797,8 +953,17 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     # display lookup had failed. Safari also has no software arm to fall back
     # to (WebKit always reaches the real GPU), so the hardware arm needs no
     # display negotiation to be honest about what rendered.
+    #
+    # Firefox-on-Android is exempt for exactly Safari's reason: the phone's own
+    # compositor is what renders and there is no X display anywhere in the
+    # story, so recording this box's :0 on such a leg files a HOST fact as a
+    # leg fact. Chromium-on-Android is deliberately NOT exempted even though
+    # the same argument applies to it: it resolves and records the display
+    # today, the Blink Android rows already taken carry that field, and this
+    # change is additive. Fixing that is a separate, non-additive edit.
     host = None
-    if arm == "hardware" and browser != "safari":
+    if arm == "hardware" and browser != "safari" \
+            and not (android and browser == "firefox"):
         host = resolve_host_display(display)
 
     if browser == "chromium" and android:
@@ -811,12 +976,7 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         # Android device was attached when this landed; arg validation and
         # the wire shape are what is exercised.
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
-        caps = {"capabilities": {"alwaysMatch": {
-            "browserName": "chrome",
-            "acceptInsecureCerts": True,
-            "goog:chromeOptions": {"androidPackage": android_package},
-            "goog:loggingPrefs": {"browser": "ALL"},
-        }}}
+        caps = chromium_android_capabilities(android_package)
         argv = [driver_path, "--port=%d" % port, "--log-level=INFO"]
         info = {"android_package": android_package,
                 "driver_version": _version_of(driver_path),
@@ -840,6 +1000,46 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         info["gpu_mode"] = ("headed-host-display" if not chrome_headless
                             else ("headless-angle-egl" if arm == "hardware"
                                   else "headless-swiftshader"))
+    elif browser == "firefox" and android:
+        # geckodriver drives the phone's own Firefox over adb, the same way
+        # chromedriver drives its Chrome: the package IS the binary. See the
+        # contract block above for what was read out of the pinned binary --
+        # the load-bearing line is that `binary` and `androidPackage` are
+        # mutually exclusive, so DEFAULT_FIREFOX is never filled in here and
+        # ff_mode is not negotiated at all (there is no display to negotiate).
+        #
+        # FIREFOX_HARDWARE_PREFS are deliberately NOT applied. On the desktop
+        # they exist to defeat a graphics blocklist that would answer with
+        # llvmpipe; on the phone there is no llvmpipe to fall back to, and
+        # forcing webgl on would hide a real blocklist decision that a user
+        # would also be subject to. --require-hardware is what makes this arm
+        # able to fail, exactly as the desktop comment says.
+        #
+        # IMPLEMENTED PER THE PINNED DRIVER'S CONTRACT, NOT DEVICE-TESTED IN
+        # THIS TREE: no Android device was attached when this landed.
+        driver_path = driver_path or (shutil.which("geckodriver")
+                                      or DEFAULT_GECKODRIVER)
+        argv = [driver_path, "--port", str(port), "--log", "info"]
+        caps = firefox_capabilities(None, window, headless=False,
+                                    extra_prefs=ff_prefs,
+                                    android_package=android_package,
+                                    android_activity=android_activity,
+                                    android_serial=android_serial)
+        info = {"android_package": android_package,
+                "driver_version": _version_of(driver_path),
+                "gpu_mode": "android-device",
+                "ff_mode": "android"}
+        if android_activity:
+            info["android_activity"] = android_activity
+        else:
+            info["android_activity"] = (
+                "geckodriver default"
+                if android_package in GECKODRIVER_KNOWN_PACKAGES
+                else "UNKNOWN PACKAGE: geckodriver has no default activity "
+                     "for %r; pass --android-activity or the launch fails on "
+                     "the device" % android_package)
+        if android_serial:
+            info["android_device_serial"] = android_serial
     elif browser == "firefox":
         driver_path = driver_path or (shutil.which("geckodriver")
                                       or DEFAULT_GECKODRIVER)
@@ -943,8 +1143,12 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
 
 def adb_reverse(port, serial=None):
     """Map the device's 127.0.0.1:<port> back to this host over adb, so the
-    served rig URL works unchanged inside the phone's Chrome. Part of the
-    --android mode; see the launch() branch for its device-untested status."""
+    served rig URL works unchanged inside the phone's browser -- and, because
+    127.0.0.1 is a secure context by definition, so does cross-origin
+    isolation, with no TLS to provision. Engine-agnostic: geckodriver does its
+    own `adb forward` for Marionette but nothing forwards the SERVED port, so
+    this is needed identically on both. See the launch() branches for the
+    device-untested status."""
     adb = shutil.which("adb")
     if not adb:
         raise WebDriverError("--android needs adb on PATH for `adb reverse`")
@@ -2629,8 +2833,184 @@ def _png_encode_test(w, h, ch, px, filter_of_row):
             + chunk(b"IDAT", zlib.compress(bytes(scan))) + chunk(b"IEND", b""))
 
 
+# The desktop Firefox capability payload, pinned as the SERIALISED STRING it
+# goes onto the wire as -- shape, contents and key order. Its whole job is to
+# be the additive proof for the Android work: `firefox_capabilities` now has
+# an Android arm, and if adding that arm moved so much as a key on the desktop
+# arm, every Firefox figure this rig has ever taken was taken through a
+# different browser configuration than the next one will be.
+#
+# Recorded 2026-08-31 from the builder as it stood BEFORE the Android
+# parameters were added. If this ever has to change, the change is a
+# deliberate re-pin and every desktop Firefox row predating it is a row from a
+# different configuration.
+PINNED_DESKTOP_FIREFOX_CAPS = (
+    '{"capabilities": {"alwaysMatch": {"browserName": "firefox", '
+    '"acceptInsecureCerts": true, "moz:firefoxOptions": '
+    '{"binary": "/usr/bin/firefox", '
+    '"args": ["-headless", "-width", "1280", "-height", "900"], '
+    '"prefs": {"browser.shell.checkDefaultBrowser": false, '
+    '"datareporting.policy.dataSubmissionEnabled": false, '
+    '"app.update.disabledForTesting": true, '
+    '"browser.sessionstore.resume_from_crash": false, '
+    '"privacy.reduceTimerPrecision": false}}}}}')
+
+# The Blink Android payload, pinned the same way and for the same reason: the
+# dict used to be an inline literal inside `launch()` and is now a function,
+# and a pure move has to be provable rather than asserted. Every Android
+# figure this campaign holds came out of this exact shape.
+PINNED_CHROMIUM_ANDROID_CAPS = (
+    '{"capabilities": {"alwaysMatch": {"browserName": "chrome", '
+    '"acceptInsecureCerts": true, '
+    '"goog:chromeOptions": {"androidPackage": "com.android.chrome"}, '
+    '"goog:loggingPrefs": {"browser": "ALL"}}}}')
+
+
+def selftest_android():
+    """The Android mode's only host-side gate.
+
+    THE MODE CANNOT BE SMOKE-TESTED WITHOUT A PHONE, so what is checkable from
+    this box is the argument validation and the capability shape -- and those
+    are exactly where the defect this closes lived: `--android` refused
+    Firefox outright, so every Android figure the campaign holds is Blink's,
+    reported as "web".
+
+    Every check below is a COUNT or an IDENTITY. Nothing here times anything.
+    """
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    # ---- the defect itself: an Android mode that is one engine ----------
+    #
+    # The assertion that would have gone red on the tree before this landed.
+    # Stated as "firefox is accepted", not as "the accept-list contains
+    # firefox": a list the validator no longer consults would satisfy the
+    # second and not the first.
+    check(validate_android_args("firefox", None, None) is None,
+          "validate_android_args refuses --browser firefox with --android. "
+          "That is the Blink-only Android column this work exists to end: "
+          "Firefox governs the web target and runs ~2x Chromium's service "
+          "time on the desktop, so an Android figure taken only on Blink "
+          "reports the engine that tends to win and calls it web")
+    check(validate_android_args("chromium", None, None) is None,
+          "validate_android_args refuses --browser chromium with --android, "
+          "which is the path every Android figure already taken came through")
+    accepted = [b for b in ("chromium", "firefox", "safari")
+                if validate_android_args(b, None, None) is None]
+    check(accepted == ["chromium", "firefox"],
+          "the set of engines --android drives is %r, not both and only both. "
+          "A THIRD engine appearing here without a launch() branch would fail "
+          "on the device; a missing one is a silently single-engine column"
+          % (accepted,))
+    check(validate_android_args("safari", None, None) is not None,
+          "--android accepts --browser safari, which has no Android path at "
+          "all: safaridriver drives iOS, not Android, and the leg would die "
+          "at session creation")
+
+    # ---- adb, and the rest of the refusals ------------------------------
+    check(validate_android_args("firefox", None, None, adb_present=False)
+          is not None,
+          "--android no longer requires adb on PATH, so `adb reverse` fails "
+          "after the session is up and 127.0.0.1 on the phone is the phone")
+
+    # geckodriver's own package regex, exercised on both sides. The invalid
+    # cases are the ones a human actually types.
+    for bad in ("org.mozilla.fire-fox", "firefox", "org..mozilla", ""):
+        check(validate_android_args("firefox", bad, None) is not None,
+              "--android-package %r is accepted for firefox; geckodriver "
+              "answers 'Not a valid androidPackage name' on the device "
+              "instead" % (bad,))
+    for good in GECKODRIVER_KNOWN_PACKAGES:
+        check(ANDROID_PACKAGE_RE.match(good),
+              "%r is in this rig's known-package list but fails geckodriver's "
+              "own androidPackage regex, so the rig would refuse a package it "
+              "advertises" % (good,))
+        check(validate_android_args("firefox", good, None) is None,
+              "--android-package %r refused for firefox" % (good,))
+
+    check(validate_android_args("firefox", None, "org.mozilla.fenix/Act")
+          is not None,
+          "--android-activity is allowed to contain '/', which geckodriver "
+          "refuses ('androidActivity should not contain /') because it "
+          "composes `am start -n <package>/<activity>` itself")
+    check(validate_android_args("firefox", None, "IntentReceiverActivity")
+          is None,
+          "a plain --android-activity is refused for firefox")
+    check(validate_android_args("chromium", None, "Whatever") is not None,
+          "--android-activity is accepted for chromium, whose Android path "
+          "does not take one -- it would be silently dropped")
+
+    # ---- the two engines default to their own browser -------------------
+    check(ANDROID_DEFAULT_PACKAGE["chromium"] == "com.android.chrome",
+          "the chromium Android default package moved off com.android.chrome; "
+          "every Blink Android figure already taken is a figure for that "
+          "package")
+    check(ANDROID_DEFAULT_PACKAGE["firefox"] == "org.mozilla.firefox",
+          "the firefox Android default package is not the release Firefox")
+    check(sorted(ANDROID_DEFAULT_PACKAGE) == sorted(ANDROID_BROWSERS),
+          "an engine --android accepts has no default package, so it would "
+          "KeyError in launch() instead of driving")
+
+    # ---- the Gecko capability shape -------------------------------------
+    ff = firefox_capabilities(None, (1280, 900), headless=False,
+                              android_package="org.mozilla.firefox")
+    opts = ff["capabilities"]["alwaysMatch"]["moz:firefoxOptions"]
+    check(opts.get("androidPackage") == "org.mozilla.firefox",
+          "the firefox Android capabilities carry no androidPackage, so "
+          "geckodriver would look for a desktop binary")
+    # THE ONE THAT FAILS ON THE PHONE. Read verbatim out of the pinned
+    # geckodriver 0.37.1: "androidPackage and binary are mutual exclusive".
+    check("binary" not in opts,
+          "the firefox Android capabilities still carry `binary`; the pinned "
+          "geckodriver rejects the session with 'androidPackage and binary "
+          "are mutual exclusive' and the leg dies three minutes in, on the "
+          "device, having measured nothing")
+    check(opts.get("args") == [],
+          "the firefox Android capabilities carry window/headless args (%r). "
+          "A phone has neither a window size nor a headless mode, and "
+          "-headless on Android is not a thing geckodriver passes through"
+          % (opts.get("args"),))
+    check(opts.get("prefs", {}).get("privacy.reduceTimerPrecision") is False,
+          "the firefox Android capabilities lost the timer-precision "
+          "override, so every rAF delta comes back quantised to 1 ms and the "
+          "percentiles are integers -- unusable, and silently so")
+    check("androidActivity" not in opts and "androidDeviceSerial" not in opts,
+          "the firefox Android capabilities carry an activity or a serial "
+          "that nobody asked for; geckodriver's own default activity is what "
+          "a release Firefox needs")
+    ff2 = firefox_capabilities(None, (1280, 900), headless=False,
+                               android_package="org.example.custom",
+                               android_activity="MyActivity",
+                               android_serial="RFCY61M5WAT")
+    opts2 = ff2["capabilities"]["alwaysMatch"]["moz:firefoxOptions"]
+    check(opts2.get("androidActivity") == "MyActivity"
+          and opts2.get("androidDeviceSerial") == "RFCY61M5WAT",
+          "--android-activity / --adb-serial do not reach "
+          "moz:firefoxOptions, so a multi-device host drives whichever phone "
+          "adb happens to list first")
+
+    # ---- the additive proof ---------------------------------------------
+    got = json.dumps(firefox_capabilities("/usr/bin/firefox", (1280, 900)))
+    check(got == PINNED_DESKTOP_FIREFOX_CAPS,
+          "the DESKTOP firefox capability payload changed shape:\n"
+          "  pinned %s\n  got    %s\nAdding the Android arm was supposed to "
+          "be additive; a moved key here means every desktop Firefox row this "
+          "rig has taken was taken through a different configuration than the "
+          "next one will be" % (PINNED_DESKTOP_FIREFOX_CAPS, got))
+    got = json.dumps(chromium_android_capabilities("com.android.chrome"))
+    check(got == PINNED_CHROMIUM_ANDROID_CAPS,
+          "the chromium Android capability payload changed when it was moved "
+          "out of launch() into a function:\n  pinned %s\n  got    %s"
+          % (PINNED_CHROMIUM_ANDROID_CAPS, got))
+    return fails
+
+
 def selftest():
     failures = []
+    failures += selftest_android()
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -2744,7 +3124,9 @@ def run_smoke(args):
             tmp_root=tmp_root, ff_prefs=parse_kv(args.ff_pref, json_values=True),
             extra_env=parse_kv(args.env), ff_mode=args.ff_mode, arm=args.arm,
             display=args.display, chromium_args=args.chromium_arg,
-            android=args.android, android_package=args.android_package)
+            android=args.android, android_package=args.android_package,
+            android_activity=args.android_activity,
+            android_serial=args.adb_serial)
         if args.android:
             # Before navigate, or 127.0.0.1 on the phone is the phone.
             port_ = urllib.parse.urlsplit(args.url).port
@@ -3886,19 +4268,30 @@ def main(argv=None):
                          "generic wait-until-console-line primitive")
     ap.add_argument("--wait-console-timeout", type=float, default=60.0)
     ap.add_argument("--android", action="store_true",
-                    help="drive the phone's own Chrome over adb: chromedriver "
-                         "with goog:chromeOptions.androidPackage, plus `adb "
+                    help="drive the phone's own browser over adb, plus `adb "
                          "reverse tcp:P tcp:P` before navigating so the "
-                         "served URL works unchanged on the device. Requires "
-                         "--browser chromium and adb on PATH. IMPLEMENTED "
-                         "BUT NOT DEVICE-TESTED: no Android device was "
-                         "attached when this landed")
-    ap.add_argument("--android-package", default="com.android.chrome",
-                    help="Android package for --android (default "
-                         "com.android.chrome)")
+                         "served URL works unchanged on the device. BOTH "
+                         "engines: --browser chromium goes through "
+                         "chromedriver + goog:chromeOptions.androidPackage, "
+                         "--browser firefox through geckodriver + "
+                         "moz:firefoxOptions.androidPackage. Needs adb on "
+                         "PATH. IMPLEMENTED BUT NOT DEVICE-TESTED: no Android "
+                         "device was attached when either engine landed")
+    ap.add_argument("--android-package", default=None,
+                    help="Android package for --android. Default is resolved "
+                         "from --browser: com.android.chrome for chromium, "
+                         "org.mozilla.firefox for firefox (Beta is "
+                         "org.mozilla.firefox_beta, Nightly org.mozilla.fenix)")
+    ap.add_argument("--android-activity", default=None,
+                    help="moz:firefoxOptions.androidActivity for a Firefox "
+                         "build geckodriver has no default for; must not "
+                         "contain '/'. Firefox only -- the chromium Android "
+                         "path takes no activity")
     ap.add_argument("--adb-serial", default=None,
                     help="adb device serial for --android (default: the one "
-                         "attached device)")
+                         "attached device). Used for `adb reverse` on both "
+                         "engines, and additionally passed to geckodriver as "
+                         "moz:firefoxOptions.androidDeviceSerial")
     ap.add_argument("--no-second-raf", action="store_true")
     ap.add_argument("--headed", action="store_true",
                     help="disable headless flags (debugging only)")
@@ -3967,14 +4360,20 @@ def main(argv=None):
     if args.android:
         # Arg-validated here, loudly, because the mode cannot be smoke-tested
         # without a device: a wrong invocation must fail at the CLI, not
-        # three minutes into a phone session.
-        if args.browser != "chromium":
-            ap.error("--android drives Chrome over chromedriver; pass "
-                     "--browser chromium")
-        if not shutil.which("adb"):
-            ap.error("--android needs adb on PATH (for `adb reverse`)")
+        # three minutes into a phone session. Every rule lives in
+        # validate_android_args() so the selftest drives the same code the CLI
+        # does, over the whole matrix, with no device and no parser.
+        err = validate_android_args(
+            args.browser, args.android_package, args.android_activity,
+            adb_present=bool(shutil.which("adb")))
+        if err:
+            ap.error(err)
+        args.android_package = (args.android_package
+                                or ANDROID_DEFAULT_PACKAGE[args.browser])
     if args.adb_serial and not args.android:
         ap.error("--adb-serial is only meaningful with --android")
+    if args.android_activity and not args.android:
+        ap.error("--android-activity is only meaningful with --android")
     return run_smoke(args)
 
 
