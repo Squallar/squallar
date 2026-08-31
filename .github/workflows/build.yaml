@@ -786,9 +786,16 @@ jobs:
       # Generate them once, on any machine with rcodesign:
       #
       #   rcodesign generate-self-signed-certificate \
+      #     --algorithm rsa \
       #     --person-name squallar --validity-days 3650 \
       #     --p12-file squallar-signing.p12 --p12-password "$PW"
       #   base64 -w0 squallar-signing.p12   # -> MACOS_SIGNING_P12
+      #
+      # `--algorithm rsa` is not decoration. macOS verifies only RSA and ECDSA
+      # code signatures; an Ed25519 key signs cleanly on this side and is
+      # rejected as "code or signature have been modified" on a Mac. The
+      # packaging Makefile fails the build if the signature it just wrote uses
+      # anything else, so this cannot ship silently again.
       #
       # **The same certificate must be reused for every run, forever.** macOS
       # remembers a location grant against the app's *designated requirement*,
