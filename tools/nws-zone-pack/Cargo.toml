@@ -34,7 +34,7 @@ squallar-overlays = { path = "../../squallar-overlays" }
 squallar-source = { path = "../../squallar-source" }
 # Gzip, for the "on the wire" column of the size table. Same pin as the
 # workspace uses.
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 # `--compare-cache` only: the app's on-disk zone cache is JSON, and comparing
 # the pack against it is how "the shapefile draws the same shape the app draws
 # today" stops being an assumption. Same pin as the workspace uses.

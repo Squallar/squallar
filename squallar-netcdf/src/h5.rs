@@ -324,16 +324,64 @@ fn var_type(dtype: &DType) -> Option<VarType> {
 /// Normalize an `hdf5_pure` attribute into the backend-neutral form.
 ///
 /// `None` for attribute types CF never uses, so they read as absent.
+///
+/// **Every numeric width is spelled out, and that is the point.** `AttrValue`
+/// is `#[non_exhaustive]`, so the wildcard below cannot be removed and a
+/// variant added upstream arrives here as an attribute that silently is not
+/// there. hdf5-pure 0.42 did exactly that: it split the numeric variants by
+/// width and stopped promoting a stored `float` to `F64`, so GLM's
+/// `scale_factor` — a float32 — became `F32`, fell through the wildcard, and
+/// every flash value unpacked against an implied scale of 1. Nothing failed to
+/// compile. The three GLM golden tests are what caught it, and they are the
+/// gate that keeps catching it.
+///
+/// So: match a width because it exists, not because a file in hand uses it.
 fn convert_attr(v: &AttrValue) -> Option<CfAttr> {
+    /// The widths where `f64` is lossless, so the widening needs no comment.
+    fn widen<T: Copy + Into<f64>>(xs: &[T]) -> CfAttr {
+        CfAttr::Nums(xs.iter().map(|&x| x.into()).collect())
+    }
+
     Some(match v {
+        AttrValue::F32(x) => CfAttr::Nums(vec![f64::from(*x)]),
         AttrValue::F64(x) => CfAttr::Nums(vec![*x]),
-        AttrValue::F64Array(x) => CfAttr::Nums(x.clone()),
+        AttrValue::I8(x) => CfAttr::Nums(vec![f64::from(*x)]),
+        AttrValue::I16(x) => CfAttr::Nums(vec![f64::from(*x)]),
         AttrValue::I32(x) => CfAttr::Nums(vec![f64::from(*x)]),
-        AttrValue::I64(x) => CfAttr::Nums(vec![*x as f64]),
-        AttrValue::I64Array(x) => CfAttr::Nums(x.iter().map(|&v| v as f64).collect()),
+        AttrValue::U8(x) => CfAttr::Nums(vec![f64::from(*x)]),
+        AttrValue::U16(x) => CfAttr::Nums(vec![f64::from(*x)]),
         AttrValue::U32(x) => CfAttr::Nums(vec![f64::from(*x)]),
+        AttrValue::F32Array(x) => widen(x),
+        AttrValue::F64Array(x) => CfAttr::Nums(x.clone()),
+        AttrValue::I8Array(x) => widen(x),
+        AttrValue::I16Array(x) => widen(x),
+        AttrValue::I32Array(x) => widen(x),
+        AttrValue::U8Array(x) => widen(x),
+        AttrValue::U16Array(x) => widen(x),
+        AttrValue::U32Array(x) => widen(x),
+
+        // 64-bit integers are the one width `f64` cannot hold exactly. Rounding
+        // them is what this reader has always done, and CF's own numeric
+        // attributes — scale_factor, add_offset, _FillValue, valid_range — are
+        // float or narrow integer, never a count near `i64::MAX`.
+        AttrValue::I64(x) => CfAttr::Nums(vec![*x as f64]),
         AttrValue::U64(x) => CfAttr::Nums(vec![*x as f64]),
-        AttrValue::String(s) | AttrValue::AsciiString(s) => CfAttr::Str(s.clone()),
+        AttrValue::I64Array(x) => CfAttr::Nums(x.iter().map(|&v| v as f64).collect()),
+        AttrValue::U64Array(x) => CfAttr::Nums(x.iter().map(|&v| v as f64).collect()),
+
+        // Charset, storage width and whether the value lives in a global heap
+        // are the file's business; CF reads a string. `..` on the sized forms
+        // because those variants are sealed upstream.
+        AttrValue::String(s)
+        | AttrValue::AsciiString(s)
+        | AttrValue::VarLenString(s)
+        | AttrValue::VarLenAsciiString(s) => CfAttr::Str(s.clone()),
+        AttrValue::StringSized { value, .. } | AttrValue::AsciiStringSized { value, .. } => {
+            CfAttr::Str(value.clone())
+        }
+
+        // Arrays of strings have no `CfAttr` shape to land in, and no CF
+        // attribute this reader consults is one.
         _ => return None,
     })
 }
