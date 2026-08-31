@@ -5286,6 +5286,12 @@ fn render_already_queued<'a>(
 #[cfg(test)]
 mod raster_telemetry_line_tests;
 
+/// The native rig seeds the keys this app reads, into the filenames its store
+/// opens — one scene's path through shell, python and two rust crates.
+#[path = "app_render/native_seed_pin_tests.rs"]
+#[cfg(test)]
+mod native_seed_pin_tests;
+
 /// The five frame timing sentences, pinned word for word, and the key that
 /// makes them loud.
 #[path = "app_render/frame_telemetry_line_tests.rs"]
