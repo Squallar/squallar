@@ -149,7 +149,8 @@ pub(super) struct StripResolution {
     tiles_exact: bool,
     /// Some texture overlay wants a raster this viewport **could not ask
     /// for**: `needs_rerender` said yes and the render slot refused, or a
-    /// settle re-raster is pending (`zoom_is_stale`). While true the strip
+    /// settle countdown is still running (`settle_is_counting_down`). While
+    /// true the strip
     /// must keep repainting, because nothing else would re-ask.
     ///
     /// **Not "a raster is in flight".** A dispatch that went out carries its
@@ -852,13 +853,14 @@ pub(super) fn render_pane_map_content(
         // texel per `ppp²` physical pixels.
         let tex_plan =
             plan_overlay_texture(screen_rect, max_texture_side, ui.ctx().pixels_per_point());
-        // The frame's clock, for the settle test: `needs_rerender` calls the
-        // gesture settled once the zoom has been still for `SETTLE_REPAINT_DELAY`.
-        let now = ui.input(|i| i.time);
+        // Whether a gesture is moving the zoom on this frame — the settle
+        // test's whole input. Read once for the window, because egui's input
+        // is the window's; see `ZoomDrive`.
+        let zoom_drive = ui.input(crate::overlay_cache::ZoomDrive::of);
 
-        // Whether any overlay on this pane is showing a texture rasterised at a
-        // zoom other than the map's — i.e. whether a settle render is still owed.
-        let mut settle_owed = false;
+        // Whether any overlay on this pane still has settle frames to count
+        // down — i.e. whether the pane must ask for another frame to run them.
+        let mut settle_counting = false;
 
         // The live theme, read once per frame and mixed into every overlay's
         // cache token below — a theme flip re-rasterizes on the next frame.
@@ -886,7 +888,7 @@ pub(super) fn render_pane_map_content(
             // `render_in_flight`: a skipped frame is missing from the settle clock.
             let stale = enabled
                 && has_data
-                && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
+                && cache.needs_rerender(token, zoom, zoom_drive, &viewport_bounds, &tex_plan);
             let dispatched = stale
                 && cache
                     .renders
@@ -927,21 +929,34 @@ pub(super) fn render_pane_map_content(
             // this is the `request_once` retry, kept.
             resolution.overlay_work_owed |= stale && !dispatched;
             // `enabled && has_data` and not just `enabled`. A repaint asked for
-            // on a frame that cannot dispatch anything is a 10 Hz wakeup nothing
-            // can satisfy.
-            if enabled && has_data && cache.zoom_is_stale(zoom) {
-                settle_owed = true;
+            // on a frame that cannot dispatch anything is a wakeup nothing can
+            // satisfy.
+            if enabled && has_data && cache.settle_is_counting_down() {
+                settle_counting = true;
             }
             if !enabled {
                 cache.clear();
             }
         }
 
-        // Ask for one more frame while any overlay is still at the wrong zoom.
-        if settle_owed {
+        // **Ask for the frames the countdown needs, and only those.** The
+        // settle is counted in frames now, and the frames it counts are not
+        // all free: egui asks for its own while a wheel notch's smoothing
+        // still has something to apply, and stops the moment it drains —
+        // which is before it calls the scroll action over. This bridges that
+        // gap, and closes as soon as the countdown reaches zero and the
+        // dispatch above has gone out.
+        //
+        // Immediate, and not a delay, because the countdown is frames: a
+        // duration here would put the wall clock back into the settle by the
+        // other door. It is bounded — `SETTLE_QUIET_FRAMES` frames past the
+        // end of a gesture, plus whatever of egui's own 150 ms end-of-scroll
+        // window is left after the smoothing drained — and it never runs while
+        // the picture is already right, because `settle_is_counting_down` is
+        // false once the countdown has expired.
+        if settle_counting {
             resolution.overlay_work_owed = true;
-            ui.ctx()
-                .request_repaint_after(crate::overlay_cache::SETTLE_REPAINT_DELAY);
+            ui.ctx().request_repaint();
         }
     }
 

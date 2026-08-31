@@ -222,9 +222,21 @@ fn re_enabling_asks_for_a_fresh_render() {
 
     {
         let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&KIND);
-        cache.needs_rerender(TOKEN, ZOOM, 100.0, &viewport(), &plan());
+        cache.needs_rerender(
+            TOKEN,
+            ZOOM,
+            crate::overlay_cache::ZoomDrive::AT_REST,
+            &viewport(),
+            &plan(),
+        );
         assert!(
-            !cache.needs_rerender(TOKEN, ZOOM, 100.5, &viewport(), &plan()),
+            !cache.needs_rerender(
+                TOKEN,
+                ZOOM,
+                crate::overlay_cache::ZoomDrive::AT_REST,
+                &viewport(),
+                &plan()
+            ),
             "premise: the parked texture must satisfy the gate for these exact \
              arguments, or the assertion below would pass without any toggle",
         );
@@ -235,7 +247,13 @@ fn re_enabling_asks_for_a_fresh_render() {
 
     let cache = gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&KIND);
     assert!(
-        cache.needs_rerender(TOKEN, ZOOM, 101.0, &viewport(), &plan()),
+        cache.needs_rerender(
+            TOKEN,
+            ZOOM,
+            crate::overlay_cache::ZoomDrive::AT_REST,
+            &viewport(),
+            &plan()
+        ),
         "a re-enabled layer is not asking for its picture back: the cache is \
          empty and the gate still says no, so the layer would stay blank",
     );

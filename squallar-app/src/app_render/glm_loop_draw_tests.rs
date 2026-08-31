@@ -374,7 +374,6 @@ fn overlay_pass(
     app: &mut crate::app::App,
     ctx: &egui::Context,
     seen: &Arc<Mutex<Vec<squallar_source::job::DescribedJob>>>,
-    now: f64,
 ) -> Option<(u64, Vec<i64>)> {
     let token = {
         let pane = app.gui.pane(0).expect("pane 0");
@@ -383,7 +382,13 @@ fn overlay_pass(
     let stale = {
         let pane = app.gui.pane_mut(0).expect("pane 0");
         let cache = pane.overlay_cache_mut(&known::LIGHTNING);
-        cache.needs_rerender(token, 5.0, now, &bounds(), &plan()) && cache.renders.is_empty()
+        cache.needs_rerender(
+            token,
+            5.0,
+            squallar_egui::overlay_cache::ZoomDrive::AT_REST,
+            &bounds(),
+            &plan(),
+        ) && cache.renders.is_empty()
     };
     if !stale {
         return None;
@@ -447,7 +452,7 @@ fn lit_at_speed(fps: f32) -> (Vec<i64>, Vec<(i64, Vec<i64>)>) {
     let mut drawn = Vec::new();
     let mut by_token: std::collections::HashMap<u64, Vec<i64>> = std::collections::HashMap::new();
     for k in 0..FRAMES {
-        if let Some((token, drew)) = overlay_pass(&mut app, &ctx, &seen, k as f64) {
+        if let Some((token, drew)) = overlay_pass(&mut app, &ctx, &seen) {
             by_token.insert(token, drew);
         }
         let pane = app.gui.pane(0).expect("pane 0");
@@ -579,7 +584,13 @@ fn treadmill_census(latency: usize, cycles: i64) -> String {
         let go = {
             let pane = app.gui.pane_mut(0).expect("pane 0");
             let cache = pane.overlay_cache_mut(&known::LIGHTNING);
-            let stale = cache.needs_rerender(token, 5.0, t as f64, &bounds(), &plan());
+            let stale = cache.needs_rerender(
+                token,
+                5.0,
+                squallar_egui::overlay_cache::ZoomDrive::AT_REST,
+                &bounds(),
+                &plan(),
+            );
             stale
                 && cache
                     .renders
@@ -771,7 +782,7 @@ fn every_frame_of_a_satellite_loop_draws_its_own_lightning() {
     let mut by_token: std::collections::HashMap<u64, Vec<i64>> = std::collections::HashMap::new();
 
     for k in 0..FRAMES {
-        if let Some((token, drew)) = overlay_pass(&mut app, &ctx, &seen, k as f64) {
+        if let Some((token, drew)) = overlay_pass(&mut app, &ctx, &seen) {
             by_token.insert(token, drew);
         }
         let pane = app.gui.pane(0).expect("pane 0");
