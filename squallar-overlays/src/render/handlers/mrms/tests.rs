@@ -1435,3 +1435,68 @@ fn a_retained_frame_set_offers_the_dropped_granules_to_the_staging_pool() {
     );
     assert_eq!(POOL.totals().reused, 1);
 }
+
+/// **The live path recycles too, and it only does because of the order.**
+///
+/// A live mosaic is held twice — by `cached_grids` and by `state.data` — so
+/// the two-minute poll's replacement has a second owner at the moment the
+/// cache hands it back, and `Arc::into_inner` answers `None`. Letting `state`
+/// go first leaves the cache the sole owner. One granule every 120 s is not
+/// what killed the page, but it is 98 MB back to an allocator that can only
+/// grow, on the layer whose block size is the whole problem.
+///
+/// **Floor — `cache_first`:** restore
+/// `cached_grids.insert(...); state.set_data(Some(arc));`; the pool then
+/// reports the replacement declined and the take below allocates.
+#[test]
+fn the_live_mosaic_a_poll_replaces_is_offered_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    let mut h = MrmsHandler::with_staging(&POOL);
+    let product = MrmsProduct::ReflectivityComposite;
+    h.defaults.enabled = true;
+    h.defaults.selected_product = product;
+
+    let valid = chrono::NaiveDate::from_ymd_opt(2026, 8, 31)
+        .expect("a real date")
+        .and_hms_opt(0, 0, 0)
+        .expect("a real time");
+    h.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(mosaic_grid(product, valid)))),
+        &PaneRef::across(&[]),
+    );
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "premise: the first mosaic replaces nothing",
+    );
+
+    // The next poll of the same product, two minutes later.
+    h.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(mosaic_grid(
+            product,
+            valid + chrono::Duration::seconds(120),
+        )))),
+        &PaneRef::across(&[]),
+    );
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "the replaced mosaic's buffer must have reached the pool rather than \
+         the allocator",
+    );
+    assert_eq!(
+        POOL.take(staging::STAGING_POINTS)
+            .expect("the slot is full")
+            .capacity(),
+        staging::STAGING_POINTS,
+    );
+    assert_eq!(POOL.totals().reused, 1);
+}

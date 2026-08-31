@@ -44,6 +44,15 @@
 //! passes through on its way to becoming one, and `prepare_job` reads
 //! `ctx.frame` before the pane's selection so an unstaged frame describes
 //! **no job** rather than another stamp's picture.
+//!
+//! **And the staging area is one *buffer*, not just one slot.** Both stores
+//! offer every granule they let go of to [`crate::mrms::staging`], which
+//! retains the block for the next decode: the frame cache's byte-budget
+//! eviction on every arriving loop frame, and the live cache's replacement on
+//! every two-minute poll. Dropping them instead is what made the browser build
+//! take a fresh 98 MB block per granule and fragment its 1 GiB heap until a
+//! 98 MB request could not be served out of a free pool twice its size. That
+//! module carries the measurement.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -912,8 +921,18 @@ impl OverlayHandler for MrmsHandler {
                 let product = grid.product;
                 let arc = Arc::new(grid);
                 let pinned = self.pinned_products(pane);
-                self.cached_grids.insert(product, arc.clone(), &pinned);
-                self.state.set_data(Some(arc));
+                // **`set_data` first, and the order is the whole of what lets
+                // the live path recycle.** The mosaic being replaced is held
+                // twice — by this cache and by `state.data` — so a cache
+                // insert made while `state` still points at it hands back an
+                // `Arc` with a second owner, `Arc::into_inner` answers `None`,
+                // and 98 MB goes back to an allocator that on wasm32 can only
+                // grow. Letting `state` go first leaves the cache as the sole
+                // owner, and the eviction inside `insert` reclaims the buffer
+                // for the next decode. Nothing between these two lines reads
+                // either of them; `pinned_products` is already taken above.
+                self.state.set_data(Some(arc.clone()));
+                self.cached_grids.insert(product, arc, &pinned);
                 self.last_error = None;
             }
             Err(e) => {
