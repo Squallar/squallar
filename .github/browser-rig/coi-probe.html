@@ -1,0 +1,79 @@
+<title>squallar rig: platform probe</title>
+<!--
+  A no-automation platform probe. Serve it with serve.py (which supplies the
+  COOP/COEP headers) and open it by hand:
+
+      python3 .github/browser-rig/serve.py --dir squallar-web --port 0 --coep
+      # then open http://127.0.0.1:<port>/coi-probe.html
+
+  It exists because the questions it answers decide whether a row is VALID at
+  all, and on some platforms there is no driver to ask them through. Safari
+  needs `sudo safaridriver --enable` plus a Settings checkbox before WebDriver
+  works, and on iOS there is no local driver at all -- but a phone can always
+  be pointed at a URL and read. Every figure here is one a human can read off
+  the glass and type into a row.
+
+  What it answers, and why each matters:
+
+    crossOriginIsolated / SharedArrayBuffer / wasm shared memory
+        Without all three there is no worker pool, the app falls back to
+        `run_here` ON THE PAGE THREAD, and the row describes a threading
+        configuration the app never ships in. A row taken without checking
+        these is not comparable to one taken with them.
+    hardwareConcurrency
+        The size the rayon pool will reach for.
+    devicePixelRatio + screen
+        The canvas buffer denominator. Do not assume 2 on a Mac: an external
+        non-Retina panel reports 1, and the buffer is then CSS pixels.
+    webgl2 / renderer / MAX_TEXTURE_SIZE
+        Caps are properties of the ADAPTER, not the browser. MAX_TEXTURE_SIZE
+        reads 16384 on both Mesa llvmpipe and Apple GPU, so it cannot be used
+        to tell engines apart.
+    OBSERVED rAF median
+        What the page is ACTUALLY painted at, which is not what the panel can
+        do and not what a settings checkbox claims. Measured 6.00 ms (~167 Hz)
+        in Safari 26.4 on a 175 Hz panel, so quote the observed figure.
+
+  The UA line is printed as a trap-avoidance note: Safari reports
+  "Intel Mac OS X 10_15_7" on arm64 Apple silicon. Never read the arch off it.
+-->
+<body style="font:22px monospace;padding:18px;background:#fff;color:#000">
+<div id="o">running...</div>
+<script>
+var L = [];
+function P(k, v) {
+  L.push(k + " = " + v);
+  document.getElementById("o").innerHTML = L.join("<br>");
+}
+P("crossOriginIsolated", self.crossOriginIsolated);
+P("SharedArrayBuffer", typeof SharedArrayBuffer);
+P("wasm shared memory", (function () {
+  try { new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }); return "SUPPORTED"; }
+  catch (e) { return "NO: " + e; }
+})());
+P("hardwareConcurrency", navigator.hardwareConcurrency);
+P("devicePixelRatio", window.devicePixelRatio);
+P("screen", screen.width + "x" + screen.height);
+var c = document.createElement("canvas"), gl = c.getContext("webgl2");
+P("webgl2", gl ? "yes" : "NO");
+if (gl) {
+  var d = gl.getExtension("WEBGL_debug_renderer_info");
+  P("renderer", d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : "masked");
+  P("MAX_TEXTURE_SIZE", gl.getParameter(gl.MAX_TEXTURE_SIZE));
+}
+P("UA (frozen; never read arch off it)", navigator.userAgent.slice(0, 90));
+// Observed refresh: the median of 149 rAF deltas. The median, not the mean,
+// because a single boot hitch would drag a mean and misreport the cadence.
+var deltas = [], last = 0, n = 0;
+function raf(ts) {
+  if (last) { deltas.push(ts - last); }
+  last = ts;
+  if (++n < 150) { requestAnimationFrame(raf); }
+  else {
+    deltas.sort(function (a, b) { return a - b; });
+    var m = deltas[Math.floor(deltas.length / 2)];
+    P("OBSERVED rAF median", m.toFixed(2) + " ms => " + (1000 / m).toFixed(1) + " Hz");
+  }
+}
+requestAnimationFrame(raf);
+</script>
