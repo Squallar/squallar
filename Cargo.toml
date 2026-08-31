@@ -70,6 +70,30 @@ members = [
     # only runs if `cargo test --workspace` selects it. See
     # vendor/nexrad-model/VENDORED.md and `[patch.crates-io]` below.
     "vendor/nexrad-model",
+    # The sixth vendored crates.io crate. It is here for the reason the other
+    # five are -- upstream's own test suite is the behaviour pin on the code
+    # this copy changes, and it only runs if `cargo test --workspace` selects
+    # it -- but the pin is unusually direct: the thing being changed is the
+    # type of an archive offset, and upstream's reader tests are the only
+    # thing in this tree that drives a leaf-directory hop end to end against a
+    # real archive.
+    #
+    # Arming them took a source change, and it is worth knowing about before
+    # reading VENDORED.md: as published, all 25 of those test cases are behind
+    # `#[cfg(feature = "mmap-async-tokio")]`, i.e. behind `fmmap`. This copy
+    # replaces that backend with an in-memory one and drops the gate, so they
+    # run under a plain `cargo test` at no dependency cost.
+    #
+    # One of the 41 is not upstream's: `src/wide_offset_tests.rs` is the pin on
+    # the offset width, and it is written to run on `i686-unknown-linux-gnu` as
+    # well as the host, because a 64-bit builder cannot tell the defect from
+    # its absence. See its module doc for the measured control.
+    #
+    # Measured, `cargo test -p pmtiles --lib`: 41 unit tests, plus 7 doctests.
+    # 27 of the 41 are native-only by `#[cfg(not(target_arch = "wasm32"))]`,
+    # for the wasm-gate reason spelled out in vendor/pmtiles/Cargo.toml.
+    # See vendor/pmtiles/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/pmtiles",
 ]
 
 [workspace.package]
@@ -172,8 +196,12 @@ log = "=0.4.34"
 # `dep:fmmap`, and fmmap is memmap2, which has no meaning on wasm32.
 #
 # `default-features = false` is load-bearing for the same reason and not
-# tidiness: pmtiles' `default` is `__all_non_conflicting`, and that list names
-# `mmap-async-tokio` among eleven others.
+# tidiness. It was written when pmtiles' `default` was upstream's
+# `__all_non_conflicting`, a list of twelve naming `mmap-async-tokio`. The
+# vendored copy's `default` is three (`__async`, `iter-async`, `write`) and no
+# longer names a backend at all, so this line now buys less than it did -- but
+# it still buys the thing it was written for, which is that this pin names what
+# it wants rather than inheriting whatever upstream's default becomes.
 #
 # `__async` is the crate's own name for the async core every backend feature
 # turns on -- double-underscored as "not a backend you pick", not as unstable.
@@ -298,11 +326,27 @@ rustls = { version = "=0.23.43", default-features = false, features = ["ring", "
 # it replaces. Visible in Cargo.lock as the walkers entry losing its `source`
 # and `checksum` lines. `cargo tree -i walkers` must keep printing exactly one
 # node, and that node must name the path.
+#
+# pmtiles is vendored for a reason none of the others share: a live,
+# user-visible defect that only exists on a 32-bit target. Its
+# `AsyncBackend::read` took `offset: usize`, and `usize` is 32 bits on wasm32,
+# so every archive offset above 4 GiB was silently truncated mod 2**32. The
+# published basemap archive is 83.8 GB with `leaf_offset = 83_785_884_629`,
+# its root directory is 2917 leaf pointers and zero direct tiles, and the
+# result was that NO basemap tile was reachable in a browser, ever. Native was
+# never affected. `0.24.0` has the same signature, so a version bump is not a
+# fix. See vendor/pmtiles/VENDORED.md.
+#
+# Same `[patch]` mechanics as the four above: the `=0.23.0` pin in
+# `[workspace.dependencies]` stays, and the vendored `package.version` stays
+# exactly `0.23.0`. `cargo tree -i pmtiles` must keep printing exactly one
+# node, and that node must name the path.
 [patch.crates-io]
 nexrad-decode = { path = "vendor/nexrad-decode" }
 nexrad-data = { path = "vendor/nexrad-data" }
 nexrad-model = { path = "vendor/nexrad-model" }
 walkers = { path = "vendor/walkers" }
+pmtiles = { path = "vendor/pmtiles" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
@@ -391,6 +435,15 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.nexrad-model]
+opt-level = 2
+
+# And the same story once more. pmtiles is squarely on the frame path -- every
+# basemap and terrain tile is a directory walk plus a gzip inflate through this
+# crate -- and it was covered by the `"*"` override until it became a member.
+# Naming it here puts it back where it was as a plain dependency.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.pmtiles]
 opt-level = 2
 
 [profile.release]
