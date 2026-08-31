@@ -28,11 +28,16 @@
 //! [`start`] builds all three lanes together, so the thread count is
 //! `2 × concurrent_renders + 1`.
 //!
-//! In-flight cancellation is not here: `super::execute` has no yield point, and
-//! `PaneRenderState::want_result`'s flag lives inside the `deliver` closure the
-//! registry holds, not in the request.
+//! Cancellation here is **pre-run only**: `super::execute` has no yield point,
+//! so the one seam is the claim [`lane_job`] makes against the pending
+//! registry at the last instant before running — a job withdrawn by
+//! [`super::cancel_job`] while it queued is dropped whole, and one already
+//! executing runs to completion with its reply refused at the registry.
+//! `PaneRenderState::want_result`'s flag is a different, later gate: it lives
+//! inside the `deliver` closure the registry holds, not in the request.
 
 use super::{JobRequest, JobResult, JobSink};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 /// The pool's three queues, started once per process. Which lane a job rides is
@@ -66,17 +71,12 @@ fn start() -> Pool {
     .max(1);
 
     let (described, described_rx) = mpsc::channel();
-    lane("rd-job", threads, described_rx, |(id, request)| {
-        // Delivered on this thread. See `super::deliver_job_reply`.
-        super::deliver_job_reply(id, run(super::JobRequest::kind(&request), &request));
-    });
+    lane("rd-job", threads, described_rx, lane_job);
 
     // The same body as the described lane's, on the queue with the interactive
     // deadline: the lane a job rides must never change what running it means.
     let (interactive, interactive_rx) = mpsc::channel();
-    lane("rd-opaque", threads, interactive_rx, |(id, request)| {
-        super::deliver_job_reply(id, run(super::JobRequest::kind(&request), &request));
-    });
+    lane("rd-opaque", threads, interactive_rx, lane_job);
 
     // One thread, deliberately: frees serialise on the allocator.
     let (free, free_rx) = mpsc::channel();
@@ -141,6 +141,37 @@ fn lane<T: Send + 'static>(name: &'static str, threads: usize, rx: mpsc::Receive
             log::error!("could not start {name}-{n} ({e}); the lane is one thread short");
         }
     }
+}
+
+/// Queued jobs the lanes dropped because they were withdrawn before they ran —
+/// the counted "never executed" half of a [`super::cancel_job`]. Diagnostics
+/// and tests; nothing gates on it.
+static WITHDRAWN_BEFORE_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// How many queued jobs the lanes have skipped unrun. See [`lane_job`].
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn withdrawn_before_run() -> u64 {
+    WITHDRAWN_BEFORE_RUN.load(Relaxed)
+}
+
+/// One queued job, both lanes' shared body: claim it against the registry,
+/// then run and deliver.
+///
+/// The claim is asked at the last instant before [`super::execute`], which has
+/// no yield point — pre-run is the only cancellation there is. A job whose
+/// registry entry is gone was withdrawn ([`super::cancel_job`]) or failed
+/// (`super::abandon_worker`) while it queued; its `deliver` has already run,
+/// so running the job now could only spend the lane's time on an answer the
+/// registry would refuse.
+pub(super) fn lane_job((id, request): (u64, JobRequest)) {
+    let kind = JobRequest::kind(&request);
+    if !super::job_is_owed(id) {
+        WITHDRAWN_BEFORE_RUN.fetch_add(1, Relaxed);
+        log::debug!("{kind}: job {id} was withdrawn while it queued; never ran");
+        return;
+    }
+    // Delivered on this thread. See `super::deliver_job_reply`.
+    super::deliver_job_reply(id, run(kind, &request));
 }
 
 /// Run a described job, answering `None` for one that panicked.

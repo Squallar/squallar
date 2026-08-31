@@ -1252,7 +1252,10 @@ impl super::App {
                     side_ceiling_px: 0,
                 };
                 let request = squallar_worker::offload::JobRequest { geometry, job };
-                squallar_worker::offload::offload_job(
+                // Kept for the supersede seam below — `pane_indices` itself
+                // rides out inside the response.
+                let destinations = pane_indices.clone();
+                let job_id = squallar_worker::offload::offload_job(
                     row.label,
                     squallar_worker::offload::Job::Described(request),
                     Self::overlay_job_deliver(
@@ -1277,6 +1280,24 @@ impl super::App {
                         window,
                     ),
                 );
+                // **The supersede seam (WO-8).** The `record` above already
+                // replaced these destinations' tickets, so a raster that was
+                // still on its way for any of them can only arrive to be
+                // refused at retire. Withdraw every job that supersession
+                // left with no destination at all: unrun if it had not
+                // started — the pool claims each queued job against the
+                // registry right before `execute` — and refused-at-reply if
+                // it had. A loop frame's raster is not a destination here;
+                // its mark lives on the frame stamp.
+                if frame.is_none()
+                    && let Some(job_id) = job_id
+                {
+                    for orphaned in self.render.note_overlay_job(&destinations, id, job_id) {
+                        if squallar_worker::offload::cancel_job(orphaned) {
+                            squallar_egui::overlay_cache::ledger::note_cancelled();
+                        }
+                    }
+                }
             }
             // **Everything else — and it is NOT "the five non-texture layers".**
             // Four of those five never reach this match at all: `Metar`
@@ -3521,6 +3542,12 @@ mod melting_layer_dispatch_tests;
 #[cfg(test)]
 #[path = "app_fetch/sites_wire_tests.rs"]
 mod sites_wire_tests;
+
+/// A dispatch that supersedes a destination's outstanding raster withdraws
+/// the superseded job before it runs (WO-8's cancel seam).
+#[cfg(test)]
+#[path = "app_fetch/overlay_cancel_tests.rs"]
+mod overlay_cancel_tests;
 
 /// The three polygon overlay dispatches are described jobs that reach the installed
 /// sink — each carrying its own kind's input.

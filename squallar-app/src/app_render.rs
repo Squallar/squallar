@@ -284,7 +284,7 @@ fn say_telemetry(loud: bool, line: &str) {
 fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
     format!(
         "overlay rasters: {} dispatched, {} arrived, {} pictures of {} B, \
-         {} shown, {} promoted, {} dropped, {} superseded",
+         {} shown, {} promoted, {} dropped, {} superseded, {} cancelled",
         t.dispatched,
         t.arrived,
         t.pictures,
@@ -293,6 +293,7 @@ fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
         t.promoted,
         t.dropped,
         t.superseded,
+        t.cancelled,
     )
 }
 
@@ -1096,7 +1097,7 @@ impl super::App {
     ///
     /// One monotonic clock read, and on all but one frame in
     /// [`RASTER_TELEMETRY_PERIOD`] nothing else — the ledgers are not even
-    /// loaded. On the frame that is due and moved nothing: eight relaxed loads
+    /// loaded. On the frame that is due and moved nothing: nine relaxed loads
     /// and a failed compare-exchange for the first ledger, one `u64` add and
     /// one compare for the second, and no formatting, because both
     /// `*_if_moved` calls answer `None`. Nothing here takes a lock. The

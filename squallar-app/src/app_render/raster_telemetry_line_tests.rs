@@ -98,12 +98,13 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         promoted: 66,
         dropped: 77,
         superseded: 88,
+        cancelled: 99,
     };
     assert_eq!(
         super::overlay_raster_line(&rasters),
         rendered(
             &pattern("rasters_re"),
-            &[11, 22, 33, 44_000_000, 55, 66, 77, 88],
+            &[11, 22, 33, 44_000_000, 55, 66, 77, 88, 99],
         ),
         "the `overlay rasters:` line and the rig's own probe for it have \
          drifted. The rig will report the overlay reading as null, which is \
@@ -138,7 +139,7 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
 #[test]
 fn a_line_that_drifted_by_one_space_is_not_accepted() {
     let rasters = ledger::Totals::default();
-    let good = rendered(&pattern("rasters_re"), &[0; 8]);
+    let good = rendered(&pattern("rasters_re"), &[0; 9]);
     assert_eq!(super::overlay_raster_line(&rasters), good);
 
     let drifted = good.replacen(" B, ", " B,  ", 1);
