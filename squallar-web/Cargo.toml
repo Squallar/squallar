@@ -101,7 +101,7 @@ wasm-bindgen-rayon = { version = "=1.3.0", default-features = false, features = 
 # one that got built would not be the one being used.
 rayon = "=1.12.0"
 wasm-bindgen-futures = "=0.4.76"
-js-sys = "=0.3.103"
+js-sys = "=0.3.104"
 console_error_panic_hook = "=0.1.7"
 console_log = "=1.1.0"
 
