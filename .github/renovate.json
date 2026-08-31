@@ -4,7 +4,8 @@
     "local>USA-RedDragon/renovate-configs"
   ],
   "gitIgnoredAuthors": [
-      "234130638+github-actions[bot]@users.noreply.github.com"
+    "41898282+github-actions[bot]@users.noreply.github.com",
+    "234130638+github-actions[bot]@users.noreply.github.com"
   ],
   "ignorePaths": [
     "**/node_modules/**",
