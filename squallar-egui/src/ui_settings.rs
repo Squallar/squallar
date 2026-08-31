@@ -221,7 +221,10 @@ impl super::Gui {
                 ui.add_space(SETTINGS_SMALL_SPACING);
                 ui.horizontal(|ui| {
                     ui.label("Port:");
-                    let ports = gps_port_options(squallar_nmea_serial::detect_gps_ports());
+                    // The scanner, never `detect_gps_ports` directly: that walk
+                    // is 25 ms of udev on a desktop, and this row draws every
+                    // frame the pane is open.
+                    let ports = gps_port_options(self.gps_ports.ports());
                     let selected = gps_port_label(&ports, self.serial_config.port_path.as_deref());
                     egui::ComboBox::from_id_salt("gps_port")
                         .selected_text(selected)

@@ -1970,6 +1970,13 @@ impl Gui {
         &self.inspector_sel
     }
 
+    /// How many times this `Gui`'s GPS settings row has walked the serial
+    /// bus. The figure the per-frame-scan gate counts.
+    #[cfg(all(test, feature = "gps-serial"))]
+    pub(crate) fn gps_port_scans_for_test(&self) -> usize {
+        self.gps_ports.scans_started()
+    }
+
     #[cfg(test)]
     pub(crate) fn catalog_for_test(&self) -> &CatalogProbe {
         &self.probes.last_catalog

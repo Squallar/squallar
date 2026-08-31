@@ -415,6 +415,11 @@ pub struct Gui {
     pub preferences: UserPreferences,
     /// Serial GPS configuration (port, baud).
     pub serial_config: squallar_nmea_serial::SerialConfig,
+    /// The serial-port list the GPS settings row offers, scanned off the
+    /// frame thread. Owned per `Gui` rather than kept in a `static`, so two
+    /// of them in one process cannot read each other's scans.
+    #[cfg(feature = "gps-serial")]
+    pub(super) gps_ports: squallar_nmea_serial::GpsPortScanner,
     /// How the directional heading is determined.
     pub heading_source: squallar_location::HeadingSource,
     /// Storm motion the user typed in, overriding the RPG's SCIT average on
@@ -643,6 +648,8 @@ impl Gui {
             interaction: InteractionState::default(),
             preferences: UserPreferences::default(),
             serial_config: squallar_nmea_serial::SerialConfig::default(),
+            #[cfg(feature = "gps-serial")]
+            gps_ports: squallar_nmea_serial::GpsPortScanner::new(),
             heading_source: squallar_location::HeadingSource::default(),
             storm_motion_override: StormMotionOverride::default(),
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
