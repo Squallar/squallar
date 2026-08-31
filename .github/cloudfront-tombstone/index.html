@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>squallar has moved</title>
+    <title>Squallar has moved</title>
 
     <!--
       Three redirects, because each one reaches a reader the others do not.
@@ -13,9 +13,11 @@
       off. `location.replace()` is for everyone else, and is the fastest of the
       three.
 
-      GitHub Pages serves static files and nothing else -- there is no way to
-      set a `Location` header from here, so no real 301 is possible. This is the
-      ceiling for the origin.
+      This origin is CloudFront, which could send a real 301 from the edge --
+      but a blanket one would break the service-worker tombstone (see sw.js:
+      a redirect on /sw.js makes the out-of-band worker update fail, stranding
+      exactly the installed clients this deploy exists to reach). Client-side
+      is the safe ceiling, so it is what ships.
 
       Note who this file is NOT for: anyone with the old service worker still
       registered never sees it, because that worker answers navigations from its
@@ -63,7 +65,7 @@
   </head>
   <body>
     <main>
-      <h1>squallar has moved</h1>
+      <h1>Squallar has moved</h1>
       <p>
         It now lives at
         <a href="https://squallar.app/">squallar.app</a>.

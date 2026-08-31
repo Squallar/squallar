@@ -1,29 +1,33 @@
 /*
- * The tombstone service worker for https://squallar.github.io/squallar/.
+ * The tombstone service worker for https://rustdar.mcswain.dev/.
  *
- * squallar now lives at https://squallar.app/. A redirecting index.html on
- * the old origin, on its own, reaches almost nobody who ever used the site:
- * `squallar-web/sw.js` answers a top-level navigation out of the cache before any
- * network traffic happens. A returning visitor is handed the frozen shell, it
- * works, it works offline, and nothing in it can ever mention that the site
- * moved. Left alone that lasts until the browser evicts the origin's storage --
- * which for an installed PWA is close to never.
+ * Squallar now lives at https://squallar.app/. A redirecting index.html on the
+ * old origin, on its own, reaches almost nobody who ever used the site:
+ * `squallar-web/sw.js` answers a top-level navigation out of the cache before
+ * any network traffic happens. A returning visitor is handed the frozen shell,
+ * it works, it works offline, and nothing in it can ever mention that the site
+ * moved.
  *
  * The registration is the one thing on that origin that can still be revoked.
  * The worker script itself is never served through the worker: the browser
  * re-fetches it out of band on navigation, compares bytes, and installs a
  * replacement. So the way to reach every one of those clients is to publish
- * different bytes at the same path -- this file.
+ * different bytes at the same path -- this file, at /sw.js, where the app's
+ * worker lived.
  *
- * install   skipWaiting(), so this does not sit in `waiting` behind a controller
- *           that a frozen page never releases.
+ * install   skipWaiting(), so this does not sit in `waiting` behind a
+ *           controller that a frozen page never releases.
  * activate  delete every cache, claim the clients, send each one to the new
  *           origin, and only then unregister.
- * fetch     redirect any navigation, covering the window between activating and
- *           a client actually leaving.
+ * fetch     redirect any navigation, covering the window between activating
+ *           and a client actually leaving.
  *
- * GitHub Pages cannot send a 301 -- it is static hosting with no header control
- * -- so a client-side bounce is the ceiling and this is it.
+ * Same mechanism as `.github/pages-tombstone/`, which retired the GitHub Pages
+ * origin the same way -- see its comments for the full argument. One
+ * difference: this origin is CloudFront, which COULD also send a real 301 from
+ * the edge. Deliberately not blanket-enabled: a redirect on /sw.js would make
+ * the out-of-band worker update fail, and the installed clients -- the whole
+ * audience of this file -- would keep their frozen shell forever.
  *
  * This deploy is permanent. It only does anything for someone who comes back,
  * and there is no way to observe that the last one has.

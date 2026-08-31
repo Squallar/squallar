@@ -111,7 +111,7 @@ done
 #   --shared-memory   marks the memory `shared`, which is what makes a
 #                     `SharedArrayBuffer` out of it (and what needs the
 #                     COOP/COEP isolation the CloudFront Response Headers
-#                     Policy on rustdar.mcswain.dev emits).
+#                     Policy on squallar.app emits).
 #   --import-memory   moves the memory from the module's own Memory section to
 #                     its Import section, so every extra instantiation is
 #                     *given* the first one's memory instead of making its own.
