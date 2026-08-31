@@ -1,6 +1,22 @@
-# Edition 2024 requires Rust 1.85+
+# Edition 2024 requires Rust 1.85+.
+#
+# PINNED, NOT `stable`. It was `stable`, which pins nothing: every six weeks a
+# release lands, clippy gains lints, and `cargo clippy -- -D warnings` reds the
+# board on a commit that changed none of the code it fails on. That is exactly
+# what 1.98 did -- `chunks_exact_to_as_chunks` fires on 60 call sites across 35
+# files, all of them correct and none of them new.
+#
+# It also made a claim in clippy.yaml false. That workflow says `rustup show`
+# "installs the toolchain rust-toolchain.toml pins, which is what makes this
+# reproducible: rustfmt's output is version-dependent". The reasoning is right
+# and it is why this file exists; `stable` simply was not a pin, so CI and a
+# developer's machine could and did run different rustfmt and clippy.
+#
+# Bumping this is a deliberate PR: the new release's lint fallout is fixed in
+# the same change that adopts it, on a branch, instead of arriving on main
+# unannounced. Renovate has a rust-toolchain manager and will open that PR.
 [toolchain]
-channel = "stable"
+channel = "1.97.1"
 components = ["clippy"]
 
 # No `targets` list. The Android and iOS rows build in the rust-cross container,
