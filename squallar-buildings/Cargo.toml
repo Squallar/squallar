@@ -40,7 +40,7 @@ geo-types = "=0.7.20"
 # The tessellator. `lyon_path` is NOT declared beside it: `lyon_tessellation`
 # re-exports the whole of it as `lyon_tessellation::path`, so one line buys
 # both and the charter carries one entry instead of two.
-lyon_tessellation = "=1.0.20"
+lyon_tessellation = "=1.0.21"
 
 # The projection pair. `mercator_y_to_lat_rad` and `site_bearing_range_km` are
 # the exact inverses of the two functions `squallar-elevation` builds the
