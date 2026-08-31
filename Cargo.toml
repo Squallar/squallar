@@ -194,7 +194,7 @@ nexrad-model = "=1.0.0-rc.2"
 
 chrono = "=0.4.45"
 iana-time-zone = "=0.1.65"
-flate2 = "=1.1.9"
+flate2 = "=1.1.10"
 
 jni = "=0.22.4"
 log = "=0.4.34"
