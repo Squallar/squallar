@@ -20,9 +20,18 @@
 //! # What it does not carry
 //!
 //! Storm-based warnings only — the polygon products. Zone-based watches and
-//! advisories live behind a different IEM service, so a scrubbed pane draws the
-//! warnings and not the watches. That is a smaller picture than the live layer
-//! shows, and it is named here rather than left for someone to notice.
+//! advisories live behind a different IEM service, so this module's answer is a
+//! far smaller picture than the live layer's: measured 2026-08-31, **21 rows
+//! against `/alerts/active`'s 466**, and at one swept instant **3**.
+//!
+//! **Which is why nothing substitutes this for the live feed.** It used to:
+//! `create_fetch_tasks` returned the archive task *instead of* the live one
+//! past `ARCHIVE_CUTOFF_MINUTES`, and a pane playing a loop over the default
+//! 4 h lookback sits behind that line at every sample — so a user with the
+//! radar playing read `3 shown` on a day with 466 alerts in force. The layer
+//! now takes the **union** of the two, and what this module is for is the one
+//! thing the live feed genuinely cannot supply: storm-based warnings that have
+//! since expired. See `NwsAlertHandler::create_fetch_tasks`.
 
 use super::alert::NwsAlert;
 use super::fetch::ActiveAlerts;

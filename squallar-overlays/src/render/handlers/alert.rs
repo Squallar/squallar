@@ -20,19 +20,93 @@ use squallar_source::time::TimeAxis;
 
 /// `pub`, not `pub(crate)`: `squallar-app`'s described-job dispatch tests
 /// construct this type directly.
-/// How far behind the wall clock a pane's instant must be before its warnings
-/// are fetched from the archive rather than the live feed.
+/// How far behind the wall clock a pane's instant must be before the archive
+/// is asked **as well as** the live feed.
 ///
-/// Generous on purpose. A live pane's `as_of` is the frame's clock and lags by
-/// seconds to minutes; a pane genuinely parked in the past is parked by hours at
-/// least. Anything in between is served by the live feed, which is the safer
-/// wrong answer of the two -- it carries watches and advisories that the
-/// storm-based-warning archive does not.
+/// A live pane's `as_of` is the frame's clock and lags by seconds to minutes,
+/// and asking IEM for an instant the live feed already answers is bytes for
+/// nothing. Past that, the archive holds storm-based warnings that have since
+/// expired and the live feed does not.
+///
+/// **It is not a switch, and the reason is measured.** It used to select the
+/// archive *instead of* `/alerts/active`, on the premise that "a pane genuinely
+/// parked in the past is parked by hours at least". A playing loop is not:
+/// arming one over the default 4 h lookback sweeps the pane clock across the
+/// whole window, so every sample sits behind this line and the layer lived on
+/// the archive for as long as playback ran. And the archive is
+/// `sbw.geojson` — **storm-based polygon warnings only, no watches, no
+/// advisories, no zone-based products at all**. Measured 2026-08-31 on one
+/// binary, one machine, two pane clocks, everything else held equal:
+///
+/// | pane clock            | source        | status line   |
+/// |-----------------------|---------------|---------------|
+/// | `as_of` = now         | `/alerts/active` | **466 shown** |
+/// | `as_of` swept by loop | IEM `sbw`     | **3 shown**   |
+///
+/// So the substitution, not the threshold, was the defect: the two sources
+/// answer different questions and the union is what the pane depicts.
 pub(crate) const ARCHIVE_CUTOFF_MINUTES: i64 = 30;
 
 pub struct NwsAlertFetchResult(
     pub Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
 );
+
+/// **One round out of two sources, as a set union keyed on the alert id.**
+///
+/// The live feed wins a collision: its copy went through
+/// [`resolve_zone_geometries`](crate::nws::zones::resolve_zone_geometries) and
+/// carries the `features` the archive's translation of the same product need
+/// not have, and [`ZoneResolution`](crate::nws::zones::ZoneResolution) travels
+/// with it so the coverage report still describes the half that has one.
+///
+/// **A half that failed is reported, not swallowed.** Returning `Ok` with one
+/// source missing is a partial success, and a partial success that says nothing
+/// stamps a fresh clock over a thinner map. The round therefore errors when
+/// *both* halves failed — there is no data — and warns by name when exactly one
+/// did, so the log says which half of the picture is absent rather than leaving
+/// the count to be discovered on the glass.
+fn union_of_feed_and_archive(
+    live: Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
+    archived: Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError>,
+) -> Result<crate::nws::fetch::ActiveAlerts, crate::fetch_policy::FetchError> {
+    match (live, archived) {
+        (Ok(mut live), Ok(archived)) => {
+            let held: HashSet<&str> = live.alerts.iter().map(|a| a.id.as_str()).collect();
+            let added: Vec<NwsAlert> = archived
+                .alerts
+                .into_iter()
+                .filter(|a| !held.contains(a.id.as_str()))
+                .collect();
+            log::info!(
+                "NWS alerts for a depicted past: {} from the live feed, {} more from the archive",
+                live.alerts.len(),
+                added.len()
+            );
+            live.alerts.extend(added);
+            Ok(live)
+        }
+        (Ok(live), Err(e)) => {
+            log::warn!(
+                "the storm-based-warning archive did not answer ({e}); \
+                 showing the {} alert(s) still in force and none that have expired",
+                live.alerts.len()
+            );
+            Ok(live)
+        }
+        (Err(e), Ok(archived)) => {
+            log::warn!(
+                "the live alerts feed did not answer ({e}); showing the {} archived \
+                 storm-based warning(s) and no watches, advisories or zone-based products",
+                archived.alerts.len()
+            );
+            Ok(archived)
+        }
+        (Err(live), Err(archived)) => {
+            log::error!("both alert sources failed; the archive said: {archived}");
+            Err(live)
+        }
+    }
+}
 
 /// [`Assembled`]: the national alert feed is one request, and the UGC zone
 /// boundaries most alerts reference are one request **each** — a thousand or
@@ -683,7 +757,8 @@ impl OverlayHandler for NwsAlertHandler {
         let sources = ctx.sources.clone();
         let zone_cache = ctx.zone_cache_dir.clone();
 
-        // THE ARCHIVE, FOR A PANE THAT IS NOT LOOKING AT NOW.
+        // THE ARCHIVE, FOR A PANE THAT IS NOT LOOKING AT NOW — **BESIDE THE
+        // LIVE FEED, NEVER INSTEAD OF IT.**
         //
         // `/alerts/active` answers with what is in force at the moment it is
         // asked and has no archive at all, so a pane scrubbed to a storm years
@@ -693,10 +768,16 @@ impl OverlayHandler for NwsAlertHandler {
         // "a source whose archive is addressable by time reads this to choose
         // *which* archive objects to ask for".
         //
-        // The threshold is a tolerance, not a policy: a live pane's `as_of` is
-        // the wall clock and arrives a little stale, so anything inside the last
-        // few minutes is still "now" and takes the live feed, which is the one
-        // that carries watches and advisories as well as polygons.
+        // **The two sources answer different questions and neither contains
+        // the other.** `/alerts/active` holds every product class — watches,
+        // advisories, marine, zone-based — for everything still in force, and
+        // the as-of filter in `paint_input` keeps the ones whose window covers
+        // the depicted instant. IEM's `sbw.geojson` holds *storm-based polygon
+        // warnings only*, and it is the sole source of the ones that have
+        // since expired. Substituting one for the other threw away whichever
+        // half the pane was not asking about, which under a playing loop was
+        // the larger half by two orders of magnitude — see
+        // [`ARCHIVE_CUTOFF_MINUTES`] for the measurement.
         let archived_before = ctx.as_of
             < chrono::Utc::now().naive_utc() - chrono::Duration::minutes(ARCHIVE_CUTOFF_MINUTES);
         if archived_before {
@@ -704,8 +785,21 @@ impl OverlayHandler for NwsAlertHandler {
             return vec![FetchTask {
                 kind: known::NWS_ALERTS,
                 future: Box::pin(async move {
-                    let result = crate::nws::archive::fetch_archived_alerts(&sources, at).await;
-                    Box::new(NwsAlertFetchResult(result)) as FetchPayload
+                    // Sequential rather than joined: this is the same shape
+                    // `fetch_active_alerts` already has (pack install, then
+                    // zone resolution), it is the shape that compiles on wasm
+                    // without pulling an executor in, and a scrubbed pane is
+                    // by definition not waiting on the wall clock.
+                    let live = crate::nws::fetch::fetch_active_alerts(
+                        &client,
+                        &sources,
+                        zone_cache.as_deref(),
+                    )
+                    .await;
+                    let archived = crate::nws::archive::fetch_archived_alerts(&sources, at).await;
+                    Box::new(NwsAlertFetchResult(union_of_feed_and_archive(
+                        live, archived,
+                    ))) as FetchPayload
                 }),
             }];
         }
@@ -2073,3 +2167,10 @@ mod tests {
         );
     }
 }
+
+/// Native-only: the loopback stub is a `std::net::TcpListener` and a real
+/// thread. Nothing it exercises is gated — the code under test is the same on
+/// both targets.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "alert/depicted_past_tests.rs"]
+mod depicted_past_tests;
