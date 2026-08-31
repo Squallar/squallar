@@ -368,6 +368,62 @@ pub struct RenderDispatcher {
     /// with nothing on the glass and nothing in flight.
     loop_frame_fetches:
         std::collections::HashSet<(squallar_source::id::LayerId, chrono::NaiveDateTime)>,
+    /// **The re-ask ladder for each owed loop-frame granule**, keyed exactly as
+    /// [`loop_frame_fetches`](Self::loop_frame_fetches) is.
+    ///
+    /// The in-flight mark above bounds the asks while a granule is *travelling*.
+    /// It does nothing at all once the granule has arrived carrying nothing:
+    /// the mark clears on every answer, success or failure — deliberately, so a
+    /// transient failure stays survivable — and the frame is owed its data
+    /// exactly as much as before, so the next `Dispatch` pass asks again, and
+    /// the next. Against a condition that cannot clear on its own that is a
+    /// retry storm: **120 attempts in 3.3 seconds, measured in the field on
+    /// 2026-08-31**, burning the frame time and the memory the failure was
+    /// about. Entries live only while their frame is owed — see
+    /// [`retain_loop_frame_retries`](Self::retain_loop_frame_retries).
+    loop_frame_retries: HashMap<(squallar_source::id::LayerId, chrono::NaiveDateTime), FrameRetry>,
+}
+
+/// One owed granule's place on the re-ask ladder.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FrameRetry {
+    /// Re-asks made for this granule since it became owed.
+    attempts: u32,
+    /// `Dispatch` passes still to sit out before the next one.
+    wait_passes: u32,
+}
+
+/// **How many passes to wait after the `attempts`-th re-ask.**
+///
+/// Counted in `Dispatch` passes rather than milliseconds because the pass is
+/// what the re-ask is paced by: this runs once per pass, so a ladder in passes
+/// is a property of the code, where one in wall-clock would make the retry rate
+/// an artefact of how loaded the box is.
+///
+/// **The first re-ask is immediate**, and that is the half that must not be
+/// traded away: a granule that passed through a one-at-a-time staging area
+/// unrasterized is owed again through no fault of the network, and it is the
+/// ordinary case, not the failure. What is bounded is the *second* re-ask
+/// onward — 0, 4, 16, 64, then 256 for ever — so a fetch that will not succeed
+/// settles to roughly one ask every four seconds instead of one every frame,
+/// and one that starts succeeding is back at full speed the moment its granule
+/// lands (the ladder is dropped as soon as the frame stops being owed).
+///
+/// A hard stop was considered and refused. It would make one failed fetch
+/// terminal for that frame for the life of the loop, which is precisely the
+/// defect `a_satellite_loop_asks_again_for_the_granules_it_could_not_yet_draw`
+/// exists to prevent.
+fn loop_frame_retry_wait(attempts: u32) -> u32 {
+    /// Widening factor per rung.
+    const BASE: u32 = 4;
+    /// ~4.3 s at 60 fps — the rate a hopeless frame settles at.
+    const MAX_WAIT: u32 = 256;
+    if attempts <= 1 {
+        return 0;
+    }
+    BASE.checked_pow(attempts - 1)
+        .unwrap_or(MAX_WAIT)
+        .min(MAX_WAIT)
 }
 
 /// The identity of one plan-view extraction — **today's tuple, exactly the
@@ -607,6 +663,7 @@ impl RenderDispatcher {
             overlay_job_at: HashMap::new(),
             overlay_job_serves: HashMap::new(),
             loop_frame_fetches: std::collections::HashSet::new(),
+            loop_frame_retries: HashMap::new(),
         }
     }
 
@@ -1097,6 +1154,50 @@ impl RenderDispatcher {
         valid: chrono::NaiveDateTime,
     ) {
         self.loop_frame_fetches.remove(&(id.clone(), valid));
+    }
+
+    /// **Whether this owed granule's rung has come round, advancing it if so.**
+    ///
+    /// Called once per `Dispatch` pass per owed frame, and only after the
+    /// caller's own guards have said the frame *could* be asked for: a pass on
+    /// which the pane cannot draw the layer, or on which the granule is already
+    /// travelling, is not a pass this frame sat out.
+    ///
+    /// [`loop_frame_retry_wait`] carries the ladder and why it is spelled in
+    /// passes.
+    pub(crate) fn loop_frame_retry_due(
+        &mut self,
+        id: &squallar_source::id::LayerId,
+        valid: chrono::NaiveDateTime,
+    ) -> bool {
+        let rung = self
+            .loop_frame_retries
+            .entry((id.clone(), valid))
+            .or_default();
+        if rung.wait_passes > 0 {
+            rung.wait_passes -= 1;
+            return false;
+        }
+        rung.attempts = rung.attempts.saturating_add(1);
+        rung.wait_passes = loop_frame_retry_wait(rung.attempts);
+        true
+    }
+
+    /// **Forget the ladder of every frame that is no longer owed.**
+    ///
+    /// A frame stops being owed the moment its granule is staged, so this is
+    /// what puts a recovering frame straight back at full speed: the next time
+    /// it is owed — the ordinary case of a granule evicted from a
+    /// one-at-a-time staging area before anything rasterized it — it starts at
+    /// rung one, which is immediate. Only a frame that is owed *without
+    /// interruption* climbs, and that is exactly the persistent failure the
+    /// ladder is for.
+    pub(crate) fn retain_loop_frame_retries(
+        &mut self,
+        owed: &[(squallar_source::id::LayerId, chrono::NaiveDateTime)],
+    ) {
+        self.loop_frame_retries
+            .retain(|key, _| owed.iter().any(|o| o.0 == key.0 && o.1 == key.1));
     }
 
     /// Every pane holding a record for `id`, with what it was asked for.

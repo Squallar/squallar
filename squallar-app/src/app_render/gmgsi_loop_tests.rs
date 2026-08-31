@@ -847,3 +847,129 @@ fn live_a_satellite_pane_plays_its_loop_end_to_end() {
         ls.frames.len(),
     );
 }
+
+/// Drain the wire, count the GMGSI frame asks on it, and hand **every** event
+/// back so the app still takes delivery of it.
+///
+/// The ask is read off the production wire — the `SourceEvent::FrameReady` each
+/// spawned fetch answers with — rather than off the dispatcher's own bookkeeping,
+/// which is the thing under test and would agree with itself. Re-sending is what
+/// lets the same pass both be counted and clear its in-flight mark, which is the
+/// state a *failing* fetch leaves and the state the storm lives in.
+fn count_asks_and_return(app: &crate::app::App, seen: &mut Vec<chrono::NaiveDateTime>) {
+    let mut batch = Vec::new();
+    while let Ok(event) = app.channels.overlay_fetch_receiver.try_recv() {
+        batch.push(event);
+    }
+    for event in batch {
+        if let SourceEvent::FrameReady { id, stamp, .. } = &event
+            && *id == known::GMGSI
+        {
+            seen.push(stamp.valid);
+        }
+        app.channels
+            .overlay_fetch_sender
+            .send(event)
+            .expect("the receiver is alive");
+    }
+}
+
+/// **A fetch that keeps failing is asked again on a ladder, not on every frame
+/// of the pump.**
+///
+/// The other side of `a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run`.
+/// That one pins the guard while a granule is *travelling*; this one pins what
+/// happens once it has arrived and carried nothing. The in-flight mark clears on
+/// every answer, success or failure — deliberately, so a transient failure is
+/// survivable — so a frame whose fetch cannot succeed was re-asked on the very
+/// next pass, and the next, for the life of the loop.
+///
+/// Measured in the field on 2026-08-31: **120 attempts in 3.3 seconds** against
+/// a condition that could not clear on its own, burning the frame time and the
+/// memory the failure was about. That is the shape this bounds.
+///
+/// **Passes, not seconds.** The pass is what the re-ask is paced by — this runs
+/// once per `Dispatch` phase — so a ceiling in passes is a property of the code,
+/// where a ceiling in milliseconds would red-gate this branch whenever the box
+/// is loaded.
+#[test]
+fn a_fetch_that_keeps_failing_is_re_asked_on_a_ladder_not_every_pass() {
+    let ctx = egui::Context::default();
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(DescribedJobs::default()));
+    let mut app = satellite_app();
+    build_loop(&mut app);
+
+    // The listing's own burst, taken delivery of, so the wire is quiet and
+    // every mark it set is cleared before the window opens.
+    let burst = distinct_asks(&app);
+    deliver_fetch_answers(&mut app, &burst);
+    assert_eq!(
+        burst.len(),
+        FRAMES as usize,
+        "premise: the listing put one fetch per frame on the wire",
+    );
+
+    // The pane's live raster, which is what lets the loop ask at all.
+    app.spawn_overlay_render(vec![0], known::GMGSI, a_render_request(), None);
+
+    /// 120 `Dispatch` passes — the field's own window, at the ~36 fps it was
+    /// measured at.
+    const PASSES: usize = 120;
+    /// The ladder's waits are 0, 4, 16, 64 and then 256 passes, so its rungs
+    /// fall on passes 0, 1, 6, 23 and 88 — **five** re-asks per frame inside
+    /// this window, and 6 * FRAMES is that with a rung of headroom for a box
+    /// slow enough to answer a fetch late.
+    ///
+    /// **Observed red on the unmodified tree (`e02086ad`): 303.** The
+    /// arithmetic ceiling with no ladder at all is `PASSES * FRAMES` = 1560;
+    /// what stopped it reaching that is the answer latency of the failing
+    /// fetches, which is a property of the box and not a guard. Observed green
+    /// on this tree: **65**, which is the five rungs exactly.
+    const CEILING: usize = 6 * FRAMES as usize;
+
+    let mut asks: Vec<chrono::NaiveDateTime> = Vec::new();
+    for _ in 0..PASSES {
+        app.run_frame_pump(crate::app::frame_pump::PumpPhase::Dispatch, Some(&ctx));
+        // The spawned fetches fail against a client that cannot connect; this
+        // is the room they need to answer, and it is why the assertion is a
+        // ceiling rather than an equality — a slower box simply asks less.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        count_asks_and_return(&app, &mut asks);
+        app.poll_overlay_fetch_results();
+    }
+    // The stragglers, so nothing dispatched inside the window is missed.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    count_asks_and_return(&app, &mut asks);
+    app.poll_overlay_fetch_results();
+
+    assert!(
+        asks.len() <= CEILING,
+        "{PASSES} passes over {FRAMES} frames whose fetches all fail asked \
+         {} times. A condition that will not clear on its own must be re-asked \
+         on a widening ladder: asking again on every pass is a retry storm that \
+         burns the very frame time and memory the failure is about",
+        asks.len(),
+    );
+
+    // ── Non-triviality: the ladder is a ladder, not a stop ────────────────
+    // A guard that had simply switched the re-ask off would reach the ceiling
+    // green and leave one failed fetch terminal for that frame — the exact
+    // defect `a_satellite_loop_asks_again_for_the_granules_it_could_not_yet_draw`
+    // exists to prevent.
+    assert!(
+        asks.len() >= FRAMES as usize,
+        "every frame must have been asked for at least once across the window; \
+         only {} asks were seen, so the ceiling above is being met by not \
+         asking at all",
+        asks.len(),
+    );
+    let mut once_each = asks.clone();
+    once_each.sort_unstable();
+    once_each.dedup();
+    assert_eq!(
+        once_each,
+        (0..FRAMES).map(hour).collect::<Vec<_>>(),
+        "and the asks must span the whole frame list rather than one frame \
+         being asked for repeatedly while the rest were dropped",
+    );
+}

@@ -3760,17 +3760,44 @@ impl super::App {
     ///   `a_frame_owed_its_granule_is_asked_for_once_however_many_passes_run`,
     ///   which is the floor that stands under it.
     ///
+    /// **And a third, for the case neither of those covers**: a fetch that
+    /// *answers* and carries nothing. The mark clears on every answer, so a
+    /// granule whose fetch cannot succeed was re-asked on the very next pass,
+    /// and the next — 120 attempts in 3.3 seconds, measured in the field on
+    /// 2026-08-31, against a condition that could not clear on its own and
+    /// burning the frame time and memory the failure was about.
+    /// [`crate::render_dispatch::RenderDispatcher::loop_frame_retry_due`] is
+    /// the widening ladder that bounds it, and its first rung is immediate so
+    /// the ordinary "staged, evicted before it could be drawn" case is
+    /// unslowed.
+    ///
     /// The layer still has the last word: `fetch_frame` answers `None` for a
     /// stamp no listing of its own named and for one it already holds.
     fn refetch_owed_loop_frames(
         &mut self,
         owed: Vec<(usize, squallar_source::id::LayerId, chrono::NaiveDateTime)>,
     ) {
+        // Over the WHOLE owed set, before any of it is spent: a ladder is
+        // dropped the moment its frame stops being owed, and doing that as the
+        // walk goes would drop every rung the walk had not reached yet.
+        let still_owed: Vec<(squallar_source::id::LayerId, chrono::NaiveDateTime)> = owed
+            .iter()
+            .map(|(_, id, valid)| (id.clone(), *valid))
+            .collect();
+        self.render.retain_loop_frame_retries(&still_owed);
+
         let config = self.fetch_config();
         for (pane_idx, id, valid) in owed {
+            // The two guards below come first on purpose: a pass on which the
+            // pane cannot draw this layer, or on which the granule is already
+            // travelling, is not a pass this frame sat out, and burning a rung
+            // for it would slow the loading case the ladder is not about.
             if self.render.overlay_record(pane_idx, &id).is_none()
                 || self.render.loop_frame_fetch_in_flight(&id, valid)
             {
+                continue;
+            }
+            if !self.render.loop_frame_retry_due(&id, valid) {
                 continue;
             }
             let stamp = squallar_source::time::FrameStamp { valid, run: None };
