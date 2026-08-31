@@ -82,6 +82,28 @@ fn flat() -> std::sync::Arc<tile_mesh::TileMeshes> {
     std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, &fills()))))
 }
 
+/// Held for the length of a test, so only one talks to the GPU at a time —
+/// the convention `volume_silhouette.rs` and `volume_shader_mutants.rs`
+/// already carry, and this suite needs it for the same reason.
+///
+/// **Not tidiness: without it this suite hangs, and the rate was measured.**
+/// Each test builds its own `Instance`, `Device` and `Queue`, and every
+/// readback ends in `Device::poll(wait_indefinitely)`. Three of those alive on
+/// three threads against one adapter deadlock: on the RTX 3090, with the box
+/// otherwise idle, **5 of 12 runs failed to finish inside 45 s without this
+/// lock and 0 of 12 with it** (the passing run takes 0.65 s). A suite that
+/// hangs is worse than one that fails — the derived `gpu` job in `test.yaml`
+/// would wait out its timeout with nothing to read — and it hangs *sometimes*,
+/// which is worse again: the first three runs of this file all passed.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the GPU lock, ignoring poisoning — an earlier failure reports itself.
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
+}
+
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -324,6 +346,7 @@ fn painted(pixels: &[u8]) -> usize {
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
+    let _serialised = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("SKIPPED: no wgpu adapter");
         return;
@@ -393,6 +416,7 @@ fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn a_static_viewport_uploads_each_tile_once_however_many_frames_it_draws() {
+    let _serialised = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("SKIPPED: no wgpu adapter");
         return;
@@ -443,6 +467,7 @@ fn a_static_viewport_uploads_each_tile_once_however_many_frames_it_draws() {
 #[test]
 #[ignore = "needs a real wgpu adapter"]
 fn a_tile_the_cache_let_go_of_stops_being_resident_and_its_bytes_come_back() {
+    let _serialised = gpu_lock();
     let Some((device, queue)) = device() else {
         eprintln!("SKIPPED: no wgpu adapter");
         return;
