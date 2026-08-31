@@ -198,6 +198,16 @@ pub struct App {
     /// The rung the pane mirror is drawn at, and the hysteresis that governs when it may
     /// move.
     mirror_rungs: squallar_gpu::egui_renderer::MirrorRungs,
+    /// The plan the mirror texture was last actually sized and rendered to.
+    /// Compared against every frame's observed plan: on a held (clean-skip)
+    /// frame the two disagreeing means a realloc is owed, and the realloc is
+    /// deferred behind [`Self::mirror_plan_stamp`] so it lands on a frame
+    /// whose primitives carry every strip.
+    mirror_plan_applied: Option<squallar_gpu::egui_renderer::MirrorPlan>,
+    /// Bumped when a plan change is deferred off a held frame; travels to the
+    /// Gui in `FrameInputs`, where it forces the strip repaint the realloc
+    /// needs.
+    mirror_plan_stamp: u64,
     /// Every per-target number this build spends, resolved once from a
     /// [`squallar_device_profile::budget::DeviceProfile`] and threaded from here.
     budgets: squallar_device_profile::budget::Budgets,
@@ -566,6 +576,8 @@ impl App {
             liveness: Vec::new(),
             volume_painter: None,
             mirror_rungs: squallar_gpu::egui_renderer::MirrorRungs::default(),
+            mirror_plan_applied: None,
+            mirror_plan_stamp: 0,
             budgets,
             device_profile,
             loop_pool,

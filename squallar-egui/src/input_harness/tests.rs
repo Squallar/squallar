@@ -6364,7 +6364,7 @@ fn a_3d_panes_floor_is_ground_and_a_hidden_floor_is_not() {
     let mut on_a_floor = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
     on_a_floor.make_pane_volume(0);
     assert_eq!(
-        on_a_floor.gui_mut().mirror_source_rects().len(),
+        on_a_floor.gui_mut().mirror_source_rects().rects().len(),
         1,
         "precondition: a shown floor asks for a strip to draw into"
     );
@@ -6383,7 +6383,11 @@ fn a_3d_panes_floor_is_ground_and_a_hidden_floor_is_not() {
         .expect("a 3D pane has volume state")
         .hide_floor = true;
     assert!(
-        floor_hidden.gui_mut().mirror_source_rects().is_empty(),
+        floor_hidden
+            .gui_mut()
+            .mirror_source_rects()
+            .rects()
+            .is_empty(),
         "precondition: a hidden floor must not be asking for a strip",
     );
     assert!(

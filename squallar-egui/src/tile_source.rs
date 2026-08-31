@@ -928,6 +928,13 @@ pub struct HttpsTiles {
     /// pass, against the tens of [`Tiles::at`] calls the same layer makes.
     pumps: u64,
 
+    /// Cache puts that changed what this source can draw — one per **tile**
+    /// landing in the cache, never per pending or failed marker. Per source
+    /// because the basemap and the terrain are separate [`HttpsTiles`], each
+    /// with its own arrivals; see [`Self::put_generation`], which the
+    /// floor-strip content key reads.
+    put_generation: u64,
+
     /// Declared last so it drops last: the channels above must close first, which
     /// is what tells the fetch loop to exit.
     #[expect(dead_code, reason = "owned for its Drop; shuts the IO task down")]
@@ -1093,6 +1100,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             archive_kind: None,
             io_task_gone_reported: false,
+            put_generation: 0,
             pumps: 0,
             runtime,
         }
@@ -1178,6 +1186,19 @@ impl HttpsTiles {
         self.pumps
     }
 
+    /// How many tiles have landed in this source's cache since it was built —
+    /// the "did the ground change" input of the floor-strip content key.
+    ///
+    /// Moves on every put that carries a **tile**: an arrival on either
+    /// target's drain, and the seam tests' direct puts. It deliberately does
+    /// not move for a pending or failed marker ([`Self::request_once`]'s
+    /// `tile: None` slots) or a restyle re-stamp — neither changes any pixel
+    /// this source can currently serve, and a key input that moved on an ask
+    /// would repaint every floor strip once per requested tile.
+    pub(crate) fn put_generation(&self) -> u64 {
+        self.put_generation
+    }
+
     /// Native: move at most [`NATIVE_TILE_UPLOADS_PER_PUMP`] already-decoded
     /// tiles into the cache. [`fetch_one`] did the decode and the upload on the
     /// IO thread, so this is a queue move and nothing more.
@@ -1190,6 +1211,7 @@ impl HttpsTiles {
             tile_rx,
             io_task_gone_reported,
             style_epoch,
+            put_generation,
             ..
         } = self;
         let current = *style_epoch;
@@ -1203,6 +1225,7 @@ impl HttpsTiles {
                 // [`Self::request_once`] re-asks under the current one, which
                 // the IO side answers from the parsed cache.
                 if epoch == current {
+                    *put_generation += 1;
                     cache.put(
                         tile_id,
                         CachedTile {
@@ -1234,6 +1257,7 @@ impl HttpsTiles {
             parsed,
             io_task_gone_reported,
             style_epoch,
+            put_generation,
             ..
         } = self;
         let style: &Style = style;
@@ -1279,6 +1303,7 @@ impl HttpsTiles {
                 };
                 match decoded {
                     Ok(tile) => {
+                        *put_generation += 1;
                         cache.put(
                             tile_id,
                             CachedTile {
@@ -1446,6 +1471,9 @@ impl HttpsTiles {
     #[cfg(test)]
     pub(crate) fn put_for_test(&mut self, tile_id: TileId, tile: Tile) {
         let epoch = self.style_epoch;
+        // The generation moves exactly as it does for a real arrival, so a
+        // fixture's put is a tile-arrival staleness event for the strip key.
+        self.put_generation += 1;
         self.cache.put(
             tile_id,
             CachedTile {
@@ -1857,6 +1885,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             archive_kind: Some(frame_archive_kind),
             io_task_gone_reported: false,
+            put_generation: 0,
             pumps: 0,
             runtime,
         }
@@ -1908,6 +1937,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             archive_kind: None,
             io_task_gone_reported: false,
+            put_generation: 0,
             pumps: 0,
             runtime: runtime::inert(),
         }

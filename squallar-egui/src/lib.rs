@@ -22,6 +22,8 @@ pub mod basemap_layer;
 /// vector basemap from it.
 pub mod basemap_style;
 pub(crate) mod field_facts;
+/// The 3D floor path's always-on counters: strips painted, mirrors rendered.
+pub mod floor_ledger;
 /// The scripted-input player: deterministic gesture scripts injected into the
 /// renderer's raw input, and the click registry the UiSweep script drives real
 /// widgets through. Dormant unless armed by the `gesture_script` config key or
@@ -80,5 +82,5 @@ mod ui_glyphs;
 pub use radar_layer::CurrentVolumeStamp;
 pub use ui::config::{UI_CONFIG_BACKUP_KEY, UI_CONFIG_KEY, back_up_pre_slot_config};
 pub use ui::map::pane_render::overlay_cache_token;
-pub use ui::{Gui, StormMotionOverride};
+pub use ui::{Gui, MirrorSources, StormMotionOverride};
 pub use ui_input::{normalize_touch_devices, normalize_wheel_units};

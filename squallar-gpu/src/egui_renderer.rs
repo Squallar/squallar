@@ -445,6 +445,11 @@ impl EguiRenderer {
     ) {
         use egui::epaint::Primitive;
 
+        // The mirror half of the floor ledger: one per pass encoded, counted
+        // at the thing itself so a skipped frame cannot be miscounted at the
+        // seam that decided to skip it.
+        squallar_egui::floor_ledger::note_mirror_render();
+
         // Everything the window below changes, to be put back after it.
         let saved: Vec<(egui::Rect, Option<Primitive>)> = tris
             .iter_mut()

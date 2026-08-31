@@ -80,6 +80,12 @@ pub struct FrameInputs<'a> {
     /// so the UI always read it a frame late; composed at the top of the next
     /// frame it has the identical observable timing.
     pub floor_tile_zoom_bias: u8,
+    /// Moves when the shell's mirror plan changed on a frame whose strips
+    /// were **held** (the clean skip): the realloc the new plan needs would
+    /// destroy the picture the floors are sampling, so the shell defers it
+    /// and this stamp makes the Gui repaint every strip first. A rung flip
+    /// mid-orbit reaches the strips through here.
+    pub mirror_plan_stamp: u64,
     /// The frame instrument's histograms, when the shell has them — the
     /// diagnostics overlay's input. `None` from a caller with no ledger (the
     /// test harness); the overlay then shows itself still collecting.

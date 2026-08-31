@@ -108,6 +108,204 @@ impl GroundIsMesh {
     }
 }
 
+/// What one `GroundOnly` pass left unresolved — the completeness half of the
+/// floor-strip cache's skip decision.
+///
+/// Constructible only by [`render_pane_map_content`]: the fields are private
+/// to this module, so the caller can read [`complete`](Self::complete) but
+/// cannot mint a "resolved" answer out of a belief — the `GroundIsMesh`
+/// rule, applied to the value that licenses skipping repaints.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StripResolution {
+    /// Every tile arm that ran answered its whole span with exact tiles.
+    tiles_exact: bool,
+    /// Some texture overlay still owes this viewport a raster: a dispatch
+    /// went out or was owed (`needs_rerender`), or a settle re-raster is
+    /// pending (`zoom_is_stale`). While true the strip must keep repainting,
+    /// so the dispatch loop keeps asking until the raster lands.
+    overlay_work_owed: bool,
+}
+
+impl StripResolution {
+    /// Whether the pass drew everything it could ever draw for its current
+    /// inputs — the latch that allows the strip cache to skip. Pending tiles
+    /// and owed rasters both hold it open, which is what keeps
+    /// `request_once` re-asking and the settle machinery ticking.
+    pub(super) fn complete(self) -> bool {
+        self.tiles_exact && !self.overlay_work_owed
+    }
+}
+
+/// Everything [`ground_content_key`] reads that is not on the pane itself.
+pub(super) struct GroundKeyInputs<'a> {
+    pub overlays: &'a OverlayRegistry,
+    pub preferences: &'a UserPreferences,
+    pub pane: &'a PaneState,
+    pub pane_idx: usize,
+    /// The off-screen rect the strip draws into.
+    pub strip: egui::Rect,
+    /// What the strip is centred on — [`super::floor_frame_for`]'s answer.
+    pub centre: walkers::Position,
+    /// The owned viewport the strip is drawn through. Its zoom (and, on the
+    /// fallback arm, its detached position) is what places every pixel.
+    pub memory: &'a walkers::MapMemory,
+    /// The basemap source's tile put-generation, `None` while the slot is
+    /// released. Per source: the terrain slot has its own.
+    pub basemap_generation: Option<u64>,
+    /// The terrain source's tile put-generation, likewise.
+    pub terrain_generation: Option<u64>,
+    pub tile_zoom_bias: u8,
+    pub is_dark: bool,
+    pub user_location: Option<(f64, f64)>,
+    pub user_heading: Option<f32>,
+    /// Presence only: the strip's paint reads the fix for a hover tooltip,
+    /// and no pointer can hover an off-screen rect.
+    pub user_fix_present: bool,
+}
+
+/// One degree quantized to ~0.55 m of latitude — fine enough that a walking
+/// user's marker moves on the floor, coarse enough that GPS jitter at rest
+/// does not repaint the strip every fix.
+fn quantized_degrees(v: f64) -> i64 {
+    (v * 200_000.0).round() as i64
+}
+
+/// The content key one 3D pane's floor strip is cached under: it moves
+/// exactly when the strip's *pixels* would differ, and nothing else may move
+/// it — a camera orbit leaves every input below untouched, which is the whole
+/// lever.
+///
+/// The walk mirrors [`render_pane_map_content`]'s dispatch conditions arm for
+/// arm: enabled, handled, `Surface::Ground`, and the hillshade suppression
+/// for a mesh ground. Each drawn layer contributes its
+/// [`overlay_cache_token`] (the ask — a data bump must repaint so the
+/// dispatch loop runs) **and** the identity of the picture it would put on
+/// the strip (the have — an arriving raster and a moving loop playhead must
+/// repaint even though the token already moved a frame ago).
+///
+/// The day `ui_map::pane_ground_heights` stops returning `None`,
+/// `GroundHeightField::id` joins these inputs with its own staleness fixture
+/// — the terrain-wiring tripwire.
+pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMesh) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let h = &mut hasher;
+
+    // The viewport: the strip rect, what it is centred on, and the zoom it is
+    // framed at (plus the detached position on the fallback arm, where the
+    // pane's own memory places the strip).
+    for bits in [
+        input.strip.min.x.to_bits(),
+        input.strip.min.y.to_bits(),
+        input.strip.max.x.to_bits(),
+        input.strip.max.y.to_bits(),
+    ] {
+        bits.hash(h);
+    }
+    input.centre.x().to_bits().hash(h);
+    input.centre.y().to_bits().hash(h);
+    input.memory.zoom().to_bits().hash(h);
+    if let Some(detached) = input.memory.detached() {
+        detached.x().to_bits().hash(h);
+        detached.y().to_bits().hash(h);
+    }
+    input.tile_zoom_bias.hash(h);
+    input.is_dark.hash(h);
+    ground.yes().hash(h);
+    // Units and timezone reach the per-frame point arms' labels.
+    input.preferences.hash(h);
+
+    let draw_order = input.pane.draw_order_vec();
+    for id in &draw_order {
+        if !input.pane.is_overlay_enabled(id) {
+            continue;
+        }
+        let Some(handler) = input.overlays.handler_by_id(id) else {
+            continue;
+        };
+        // The strip paints ground only; a mesh ground suppresses the
+        // hillshade (`PaneRenderCtx::double_shades`).
+        if !matches!(handler.surface(), Surface::Ground) {
+            continue;
+        }
+        if ground.yes() && *id == known::TERRAIN {
+            continue;
+        }
+        id.hash(h);
+        overlay_cache_token(
+            input.overlays,
+            input.pane_idx,
+            input.pane,
+            id,
+            input.is_dark,
+        )
+        .hash(h);
+
+        match id {
+            id if *id == known::RADAR => {
+                // The draw fork's two arms, keyed by which arm and which
+                // picture: the loop's playhead frame while animating (a loop
+                // tick is a new texture id — without this the floor freezes
+                // mid-loop while the volume animates), the live raster
+                // otherwise (an arriving radar render is a new id too).
+                let animating = input.pane.time_state(&known::RADAR).is_active();
+                animating.hash(h);
+                if animating {
+                    input
+                        .pane
+                        .active_image()
+                        .map(|img| img.texture.id())
+                        .hash(h);
+                } else {
+                    input
+                        .pane
+                        .overlay_cache(id)
+                        .and_then(|c| c.current())
+                        .map(|tex| tex.texture.id())
+                        .hash(h);
+                }
+            }
+            id if *id == known::BASEMAP_TILES => {
+                input.basemap_generation.hash(h);
+            }
+            id if *id == known::TERRAIN => {
+                input.terrain_generation.hash(h);
+            }
+            id if *id == known::CITY_LABELS => {
+                // The names are deferred out of the basemap tiles, so their
+                // identity is the tiles'.
+                input.basemap_generation.hash(h);
+            }
+            id if *id == known::USER_LOCATION => {
+                input
+                    .user_location
+                    .map(|(lat, lon)| (quantized_degrees(lat), quantized_degrees(lon)))
+                    .hash(h);
+                // Half-degree steps: the wedge is 45 degrees wide, so finer
+                // heading noise never moves a visible pixel.
+                input
+                    .user_heading
+                    .map(|deg| (f64::from(deg) * 2.0).round() as i64)
+                    .hash(h);
+                input.user_fix_present.hash(h);
+            }
+            _ => {
+                // Texture layers: the raster the draw fork would put on the
+                // strip. Per-frame point layers have no texture and answer
+                // `None` here; their pictures move with the content
+                // signature already hashed above and the preferences.
+                input
+                    .pane
+                    .overlay_texture_on_screen(id)
+                    .map(|tex| tex.texture.id())
+                    .hash(h);
+            }
+        }
+    }
+
+    hasher.finish()
+}
+
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
     pub pane_idx: usize,
@@ -223,12 +421,21 @@ impl PaneRenderCtx<'_> {
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
 /// city labels, radar sites, user location).
+///
+/// Answers what the pass left unresolved — the floor-strip cache's
+/// completeness input. The plan-view caller discards it: a 2D pane repaints
+/// whenever egui runs it, so it has no skip to license.
 pub(super) fn render_pane_map_content(
     ui: &mut egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
-) {
+) -> StripResolution {
+    let mut resolution = StripResolution {
+        tiles_exact: true,
+        overlay_work_owed: false,
+    };
+
     ctx.pane.hydrate_layer_states(ctx.overlays, ctx.pane_idx);
 
     // Cleared every frame and re-set by the radar arm below. That arm is the
@@ -364,6 +571,7 @@ pub(super) fn render_pane_map_content(
                     // the layer's weight (1) is the lowest in the registry.
                     if let Some(tiles) = ctx.basemap_tiles.as_deref_mut() {
                         let paint = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        resolution.tiles_exact &= paint.coverage.complete();
                         ctx.basemap_labels = paint.labels;
                     }
                 }
@@ -372,7 +580,8 @@ pub(super) fn render_pane_map_content(
                     // carries text, so the returned list is empty by
                     // construction and there is nothing to keep.
                     if let Some(tiles) = ctx.terrain_tiles.as_deref_mut() {
-                        let _ = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        let paint = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        resolution.tiles_exact &= paint.coverage.complete();
                     }
                 }
                 id if *id == known::CITY_LABELS => {
@@ -593,6 +802,10 @@ pub(super) fn render_pane_map_content(
             let stale = enabled
                 && has_data
                 && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
+            // Owed whether or not the dispatch is admitted this frame: an
+            // in-flight raster resolves the debt only when it lands, and the
+            // strip must keep repainting (and so keep asking) until then.
+            resolution.overlay_work_owed |= stale;
             if stale
                 && cache
                     .renders
@@ -620,6 +833,7 @@ pub(super) fn render_pane_map_content(
 
         // Ask for one more frame while any overlay is still at the wrong zoom.
         if settle_owed {
+            resolution.overlay_work_owed = true;
             ui.ctx()
                 .request_repaint_after(crate::overlay_cache::SETTLE_REPAINT_DELAY);
         }
@@ -660,6 +874,8 @@ pub(super) fn render_pane_map_content(
             );
         }
     }
+
+    resolution
 }
 
 /// The token a texture overlay's cached raster is keyed by: it moves exactly

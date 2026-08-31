@@ -142,6 +142,9 @@ struct FrameFactsForTest {
     /// composes what the App composes (WO-E8c).
     radar_liveness: crate::radar_layer::RadarLiveness,
     floor_tile_zoom_bias: u8,
+    /// The shell's mirror-plan stamp; a fixture bumps it to stand in for a
+    /// rung/plan/size change deferred off a clean frame.
+    mirror_plan_stamp: u64,
 }
 
 impl Default for FrameFactsForTest {
@@ -160,6 +163,7 @@ impl Default for FrameFactsForTest {
             catalogue_pending: false,
             radar_liveness: crate::radar_layer::RadarLiveness::default(),
             floor_tile_zoom_bias: 0,
+            mirror_plan_stamp: 0,
         }
     }
 }
@@ -453,6 +457,7 @@ impl InputHarness {
             catalogue_pending: self.facts.catalogue_pending,
             liveness: &liveness,
             floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
+            mirror_plan_stamp: self.facts.mirror_plan_stamp,
             frame_diagnostics: None,
         });
     }
@@ -504,6 +509,27 @@ impl InputHarness {
     pub(crate) fn set_loop_frame_budget(&mut self, frames: usize) {
         self.facts.loop_frame_budget = frames;
         self.apply_facts();
+    }
+
+    /// Bump the shell's mirror-plan stamp, as `present_frame` does when a
+    /// rung/plan/size change is deferred off a held frame. No warm-up: the
+    /// staleness fixtures count the very next frames themselves.
+    pub(crate) fn set_mirror_plan_stamp(&mut self, stamp: u64) {
+        self.facts.mirror_plan_stamp = stamp;
+        self.apply_facts();
+    }
+
+    /// State the floor tile zoom bias, as `present_frame` pushes it from the
+    /// last mirror plan. No warm-up, as above.
+    pub(crate) fn set_floor_tile_zoom_bias(&mut self, bias: u8) {
+        self.facts.floor_tile_zoom_bias = bias;
+        self.apply_facts();
+    }
+
+    /// The harness's own egui context — for fixtures that must mint textures
+    /// or tile sources against the context the frames actually run on.
+    pub(crate) fn egui_ctx(&self) -> egui::Context {
+        self.ctx.clone()
     }
 
     /// Whether egui has a real widget registered under `id` from the last
