@@ -1298,10 +1298,19 @@ var segments_re = /frame segments \(interact, p99 us\): pre=(\d+|none|over), pum
 var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply, (\d+) us mirror, (\d+) us buffers and callbacks/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// Scene E's denominators. `listed` is frame SLOTS across every animating
+// layer of every pane; `resident`, `in flight` and `failed` are DISJOINT
+// SUBSETS of it and are never added to it -- a slot may be none of the three.
+// `allowed`/`cap`/`held` are ceilings on frames TEXTURED, a different
+// denominator from slots. Bytes: `share` is one loop's slice, `pool` the
+// application's whole allowance, and floor/ceiling the tier's bracket -- a
+// pool below the value it booted at is `LoopPool::back_off` having fired.
+var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us/;
 var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
-var cadence = null, gpu_unavailable = false;
+var cadence = null, gpu_unavailable = false, loop_state = null;
+var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
@@ -1345,6 +1354,27 @@ for (var i = 0; i < C.length; i++) {
                 hist: x[4] };
     cadence_all.push(cadence);
   }
+  x = loop_state_re.exec(m);
+  if (x) {
+    // A LEVEL, not a running total: every field is what the loops hold at
+    // the moment of the reading, so the last one inside a window is the
+    // reading, and there is nothing here to bin-diff.
+    loop_state = { t: t, panes: parseInt(x[1], 10),
+                   layers: parseInt(x[2], 10), listed: parseInt(x[3], 10),
+                   resident: parseInt(x[4], 10),
+                   in_flight: parseInt(x[5], 10), failed: parseInt(x[6], 10),
+                   allowed_plan: parseInt(x[7], 10),
+                   allowed_section: parseInt(x[8], 10),
+                   allowed_volume: parseInt(x[9], 10),
+                   allowed_overlay: parseInt(x[10], 10),
+                   cap: parseInt(x[11], 10), held: parseInt(x[12], 10),
+                   share_bytes: parseInt(x[13], 10),
+                   pool_bytes: parseInt(x[14], 10),
+                   floor_bytes: parseInt(x[15], 10),
+                   ceiling_bytes: parseInt(x[16], 10),
+                   advance_us: parseInt(x[17], 10) };
+    loop_state_all.push(loop_state);
+  }
   x = gesture_begin_re.exec(m);
   if (x) begins.push({ t: t, script: x[1] });
   x = gesture_loop_re.exec(m);
@@ -1352,6 +1382,7 @@ for (var i = 0; i < C.length; i++) {
 }
 return { interact: interact, idle: idle, segments: segments, prep: prep,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
+         loop_state: loop_state, loop_state_all: loop_state_all,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
          gesture_begins: begins, gesture_loops: loops,
@@ -1482,7 +1513,7 @@ class FrameLineWatcher:
         return rs
 
 
-def gesture_window_stats(watcher):
+def gesture_window_stats(watcher, quiet_settle_s=None):
     """The gesture-window bin-diff: percentiles over ONLY the frames between
     the first `gesture script ... begin` marker and the last
     `... loop complete` marker, for the interact and cadence families.
@@ -1496,19 +1527,53 @@ def gesture_window_stats(watcher):
 
     Returns None when no marker was ever seen -- an unarmed leg has no
     window, and inventing one from wall clock would put boot frames back into
-    the tail."""
+    the tail.
+
+    `quiet_settle_s` is the ONE exception, and it exists for scene E1: a leg
+    that deliberately arms no gesture (a loop playing with nobody touching
+    it) still has a figure of merit, and it is the idle family after boot has
+    finished. The window is then `first reading + quiet_settle_s` to the
+    newest reading, and the basis says so -- it is a WEAKER bracket than a
+    marker pair, cut on wall clock rather than on the app's own signal, and
+    a row carrying it must not be compared to a marker-bracketed one. It is
+    used only when no marker was seen at all; an armed leg always prefers its
+    markers."""
     begins = sorted(watcher.begins.values(), key=lambda r: r.get("t") or 0)
     loops = sorted(watcher.loops.values(), key=lambda r: r.get("t") or 0)
     if not begins and not loops:
-        return None
+        if quiet_settle_s is None:
+            return None
+        # The first histogram-bearing reading of any family anchors the
+        # settle cut, so all three families are diffed over one window.
+        firsts = [rs[0]["t"] for rs in
+                  (watcher.readings(f) for f in
+                   ("interact", "idle", "cadence")) if rs]
+        if not firsts:
+            return None
+        return _window_stats(
+            watcher, min(firsts) + float(quiet_settle_s) * 1000.0, None,
+            {"script": "none (unarmed: loop playing, no gesture)",
+             "loops_completed": 0,
+             "basis": "quiet leg: first-reading+%gs settle to newest reading "
+                      "(wall-clock cut, NOT a marker bracket -- never compare "
+                      "to a gestured row)" % float(quiet_settle_s)})
     t0 = begins[0]["t"] if begins else None
     if loops:
         t1, basis = loops[-1]["t"], "first-begin-to-last-loop-marker"
     else:
         t1, basis = None, "first-begin-to-newest-reading (no loop completed)"
-    out = {"script": (begins[0].get("script") if begins
-                      else loops[-1].get("script")),
-           "t0": t0, "t1": t1, "loops_completed": len(loops), "basis": basis}
+    return _window_stats(
+        watcher, t0, t1,
+        {"script": (begins[0].get("script") if begins
+                    else loops[-1].get("script")),
+         "loops_completed": len(loops), "basis": basis})
+
+
+def _window_stats(watcher, t0, t1, out):
+    """Bin-diff every family between the bracket `t0`..`t1`. Split out of
+    `gesture_window_stats` only so the quiet-leg bracket and the marker
+    bracket cannot drift into two different diffs."""
+    out = dict(out, t0=t0, t1=t1)
     # `idle` in a gesture window is the settle-burst family: the input-free
     # frames of the scripted quiet phases, which is where WO-8 moved the
     # post-gesture re-raster. Its max is the burst's worst frame.
@@ -2753,8 +2818,8 @@ def run_smoke(args):
         result["frame_lines"] = {
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
                                         "prep", "gpu", "gpu_unavailable",
-                                        "cadence")}
-        gw = gesture_window_stats(frames_watch)
+                                        "cadence", "loop_state")}
+        gw = gesture_window_stats(frames_watch, args.quiet_window)
         if gw is not None:
             result["gesture_window"] = gw
             stage("gesture-window",
@@ -3199,6 +3264,25 @@ def run_smoke(args):
         print("[%s] SUMMARY [%s] frame cadence [cumulative from boot]: "
               "n=%s p50=%s us p99=%s us"
               % (tag, alabel, c.get("n"), c.get("p50"), c.get("p99")))
+    if fl.get("loop_state"):
+        s = fl["loop_state"]
+        # A LEVEL at the end of the leg, not a total over it. `resident`,
+        # `in flight` and `failed` are disjoint subsets of `listed` and are
+        # never added to it; `allowed`/`cap`/`held` bound frames TEXTURED,
+        # which is a different denominator from the slots `listed` counts.
+        print("[%s] SUMMARY [%s] loop state [level, end of leg]: %s panes, "
+              "%s layers animating, %s frames listed, %s resident "
+              "(%s in flight, %s failed); allowed plan=%s section=%s "
+              "volume=%s overlay=%s, cap %s, held %s; share %s B, pool %s B "
+              "in [%s, %s]; advance %s us"
+              % (tag, alabel, s.get("panes"), s.get("layers"),
+                 s.get("listed"), s.get("resident"), s.get("in_flight"),
+                 s.get("failed"), s.get("allowed_plan"),
+                 s.get("allowed_section"), s.get("allowed_volume"),
+                 s.get("allowed_overlay"), s.get("cap"), s.get("held"),
+                 s.get("share_bytes"), s.get("pool_bytes"),
+                 s.get("floor_bytes"), s.get("ceiling_bytes"),
+                 s.get("advance_us")))
     gw = result.get("gesture_window")
     if gw:
         print("[%s] SUMMARY [%s] gesture window (%s, %s loops, %s):"
@@ -3337,6 +3421,16 @@ def main(argv=None):
                     help="seconds for the worker-wire assertions (default "
                          "180; Tier 2 runs against LIVE network, so the first "
                          "job reply waits on a real volume fetch)")
+    ap.add_argument("--quiet-window", type=float, default=None,
+                    metavar="SECS",
+                    help="for a leg that arms NO gesture (scene E1: a loop "
+                         "playing with nobody touching it), bin-diff the "
+                         "frame families over `first reading + SECS` to the "
+                         "newest reading instead of returning no window. A "
+                         "WALL-CLOCK bracket, not the app's own markers: the "
+                         "basis string says so and such a row is never "
+                         "compared to a gestured one. Ignored entirely on a "
+                         "leg whose markers appeared.")
     ap.add_argument("--expect-interaction-frames", action="store_true",
                     help="fail unless the scraped `frame service (interact)` "
                          "count STRICTLY INCREASED over the leg -- the count "

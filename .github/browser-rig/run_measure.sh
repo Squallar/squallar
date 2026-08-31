@@ -28,6 +28,22 @@
 #      worst case.
 #   D  scene A's layer stack driven by ui-sweep -- the UI-responsiveness
 #      scenario (toggles, panels, slider) through the click registry.
+#   E1 scene A's layer stack with the pane's loop seeded PLAYING and no
+#      gesture -- the loop's own per-frame cost, idle. Scenes A..D all run
+#      with loops OFF, and looping is the heaviest texture consumer the app
+#      has, so E is the coverage gap the campaign had.
+#   E2 the same, with pan-zoom-2d armed -- a user panning while the data
+#      animates, which is the realistic worst case.
+#   E3 a volume pane looping, orbit-3d -- MAX_LOOP_VOLUME_BUILDS_PER_FRAME
+#      is 1 and a resident grid set is the largest thing the app holds.
+#
+# Every E row needs denominators A..D do not: how many layers were really
+# looping, frames RESIDENT against frames LISTED (a loop that lists fourteen
+# and holds three animates three while every phase reads healthy), the pool
+# against its floor/ceiling, and the playback interval. Those come off the
+# app's own `loop state:` line, which `drive.py`'s FRAME_LINE_PROBE scrapes
+# and the per-leg summary prints -- they are NOT derivable from the A..D
+# denominator set, and an E row without them is not comparable to anything.
 #
 # Every row prints its full denominator set: scene, browser, arm, adapter,
 # app-selected backend, canvas buffer resolution, dpr, observed refresh
@@ -136,7 +152,9 @@
 #   RIG_GECKODRIVER   geckodriver        (default: $(ensure-geckodriver.sh))
 #   RIG_BROWSERS      "firefox chromium" (default; firefox governs, runs and
 #                     reports first; never merged)
-#   RIG_SCENES        "A B C D" (default), or a subset
+#   RIG_SCENES        "A B C D" (default), or a subset, or any of the loop
+#                     scenes E1/E2/E3 (not in the default set: they are a
+#                     separate lane and they cost a settle each)
 #   RIG_SETTLE        seconds before the warm rAF sample (default 6)
 #   RIG_MEASURE_WINDOW  seconds of scripted time after settle (default 46 --
 #                     at least two full 20 s script loops, so the window is
@@ -193,6 +211,16 @@ if [ "$PANEL" = on ]; then
   PANEL_SEED='\"diagnostics_panel\":true,'
 fi
 
+# Scene E's loop posture, spelled once. Both figures are the app's own
+# defaults today (`UiConfig::default`) and are written into the seed anyway,
+# because they are DENOMINATORS: an E row's cost is a function of how much
+# weather the loop keeps ready and how fast it steps, and a row measured on
+# whatever the defaults happened to be that week is not comparable to one
+# measured after they move. `loop_speed_fps` also comes back on the row as
+# `advance us` off the app's own `loop state:` line, so the seed and what the
+# app really did are checkable against each other rather than assumed equal.
+LOOP_SEED='\"loop_lookback_secs\":3600,\"loop_speed_fps\":10.0,'
+
 # scene_seed <scene>: the localStorage seed JSON; scene_script <scene>: the
 # gesture script the seed arms (also the row's script= denominator).
 scene_seed() {
@@ -201,14 +229,18 @@ scene_seed() {
     B) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
     C) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"},{\"site\":\"KTLX\"},{\"site\":\"KINX\",\"render\":\"Volume\"},{\"site\":\"KINX\"},{\"site\":\"KVNX\",\"render\":\"Volume\"},{\"site\":\"KVNX\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     D) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "ui-sweep"}' ;;
+    E1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
+    E2) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    E3) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\",\"loop_playback\":\"playing\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
     *) return 1 ;;
   esac
 }
 scene_script() {
   case "$1" in
-    A|C) echo pan-zoom-2d ;;
-    B)   echo orbit-3d ;;
-    D)   echo ui-sweep ;;
+    A|C|E2) echo pan-zoom-2d ;;
+    B|E3)   echo orbit-3d ;;
+    D)      echo ui-sweep ;;
+    E1)     echo none ;;
   esac
 }
 
@@ -406,6 +438,16 @@ run_leg() {
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
   seed="$(scene_seed "$scene")" || { echo "unknown scene: $scene" >&2; return 1; }
+  # Scene E1 arms no gesture on purpose -- its whole question is what a
+  # playing loop costs a frame NOBODY is touching. It therefore has no
+  # interact family to assert on and no marker pair to bracket, so it takes
+  # the wall-clock quiet window instead and drops the count assert. Every
+  # other leg keeps both: --expect-interaction-frames is the row-validity
+  # check that a hollow row cannot pass.
+  local arm_args=(--expect-interaction-frames)
+  if [ "$(scene_script "$scene")" = none ]; then
+    arm_args=(--quiet-window "$SETTLE")
+  fi
   start_server "$seed" || return 1
   # Hardware arm, headed, --require-hardware: a leg that fell back to a
   # software rasteriser must refuse to report rather than mislabel. The
@@ -418,7 +460,7 @@ run_leg() {
       --driver "$driver" --frames "$FRAMES" \
       --settle "$SETTLE" --data-window "$MEASURE_WINDOW" \
       --arm hardware --require-hardware \
-      --expect-interaction-frames \
+      "${arm_args[@]}" \
       ${EXTRA[@]+"${EXTRA[@]}"}
   local rc=$?
   stop_server
@@ -478,9 +520,24 @@ for tag in sys.argv[5:]:
                        "configuration the app never ships in" % coi)
     if v.get("hardware_ok") is False:
         invalid.append("adapter is %s, not a GPU" % ad.get("renderer"))
-    if not ifr.get("ok"):
-        invalid.append("interact count never grew (player not armed, or "
-                       "telemetry not loud)")
+    # E1 is unarmed BY DESIGN (a loop playing, nobody touching it), so it
+    # carries no interact assert and its window is the wall-clock quiet
+    # bracket. Its OWN validity check is that the loop actually ran: a row
+    # reporting zero animating layers measured a still picture, whatever its
+    # frame figures say.
+    if scene == "E1":
+        ls = (r.get("frame_lines") or {}).get("loop_state") or {}
+        if not ls:
+            invalid.append("no `loop state` line scraped; the loop "
+                           "denominators are missing and the row is not an "
+                           "E row")
+        elif not ls.get("layers"):
+            invalid.append("0 layers animating: the seeded loop never armed, "
+                           "so this measured a still picture")
+    else:
+        if not ifr.get("ok"):
+            invalid.append("interact count never grew (player not armed, or "
+                           "telemetry not loud)")
     if not gw:
         invalid.append("no gesture window (no marker lines scraped)")
 
@@ -531,8 +588,45 @@ for tag in sys.argv[5:]:
     if ct and not ct.get("met"):
         print("ROW   canvas target %s asked, %s got: this row is NOT "
               "cross-comparable" % (ct.get("asked"), ct.get("got")))
-    if scene == "B":
+    # E3 is a volume pane too, so it carries the terrain-campaign columns for
+    # the same reason scene B does: without them a post-wiring row silently
+    # becomes incomparable to every row before it.
+    if scene in ("B", "E3"):
         print("ROW   %s" % scene_b_cols)
+    if scene.startswith("E"):
+        # The E-only denominators. Without these an E row is not an E row:
+        # `layers` is how many loops were really running, and `resident` vs
+        # `listed` is the silent-under-fill check -- a loop that lists its
+        # whole cap and holds three frames animates three while every phase
+        # reads healthy. `resident`/`in flight`/`failed` are disjoint SUBSETS
+        # of `listed` and are never added to it; `allowed`/`cap`/`held` bound
+        # frames TEXTURED, a different denominator from the slots `listed`
+        # counts; a `pool` below what the tier boots at is a back-off.
+        ls = (r.get("frame_lines") or {}).get("loop_state") or {}
+        if ls:
+            mib = lambda b: ("%.1f" % (b / 1048576.0)) if b is not None else "?"
+            print("ROW   loop %s panes, %s layers animating, %s frames "
+                  "listed, %s resident (%s in flight, %s failed); allowed "
+                  "plan=%s section=%s volume=%s overlay=%s, cap=%s held=%s; "
+                  "share=%s MiB pool=%s MiB floor=%s MiB ceiling=%s MiB; "
+                  "advance=%s us"
+                  % (ls.get("panes"), ls.get("layers"), ls.get("listed"),
+                     ls.get("resident"), ls.get("in_flight"), ls.get("failed"),
+                     ls.get("allowed_plan"), ls.get("allowed_section"),
+                     ls.get("allowed_volume"), ls.get("allowed_overlay"),
+                     ls.get("cap"), ls.get("held"),
+                     mib(ls.get("share_bytes")), mib(ls.get("pool_bytes")),
+                     mib(ls.get("floor_bytes")), mib(ls.get("ceiling_bytes")),
+                     ls.get("advance_us")))
+        else:
+            print("ROW   loop UNKNOWN: no `loop state` line scraped -- the E "
+                  "denominators are missing and this row is not comparable")
+        # MB/picture is NOT printed again here. It is on the ROW line above,
+        # beside `viewport=`/`px=`/`cross=`, where `685a806e` put it -- and
+        # that is the right place, because the picture size is a pure function
+        # of the surface and the two belong on one line. A second copy down
+        # here would be a figure with the same name and no surface beside it,
+        # which is exactly the incomparable pair that commit exists to stop.
     # `idle` here is the window's input-free frames -- the scripted quiet
     # phases, where the post-gesture settle re-raster lands (WO-8). Its max
     # is the settle burst's worst frame, printed so the cost moved out of the
