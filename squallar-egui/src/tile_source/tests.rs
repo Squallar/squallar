@@ -13,9 +13,9 @@ use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 use super::{
     DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, DecodeBudget, HttpsTiles,
     MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
-    PARSED_TILE_CACHE_ENTRIES, TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES,
-    WASM_TILE_CACHE_ENTRIES, WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom,
-    tile_client, tile_id_is_valid,
+    PARSED_TILE_CACHE_ENTRIES, ReadFailureRun, SUSTAINED_READ_FAILURES, TILE_CACHE_ENTRIES,
+    WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES, WASM_TILE_DECODES_PER_PUMP,
+    drain_up_to, interpolate_from_lower_zoom, tile_client, tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -2181,6 +2181,422 @@ mod archive {
             before,
             "a dead source must not burn cache slots on tiles it will never fetch"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // An archive that opens and then answers nothing
+    // -----------------------------------------------------------------------
+
+    /// **The rule itself, with no archive and no clock: a whole cohort of
+    /// failures raises the verdict, and any single answer ends it.**
+    ///
+    /// Driven directly because the end-to-end tests below cannot pin it. They
+    /// sample the verdict once per frame, so a rule that raised on one failure
+    /// would raise and clear between two samples and go unnoticed; here every
+    /// transition is observed at the moment it happens.
+    #[test]
+    fn the_failure_run_needs_a_whole_cohort_and_any_answer_ends_it() {
+        assert_eq!(
+            SUSTAINED_READ_FAILURES, MAX_PARALLEL_DOWNLOADS,
+            "the run is a cohort of concurrently-issued reads; if the two \
+             numbers part, the const's own reasoning no longer holds"
+        );
+
+        let failing = Arc::new(AtomicBool::new(false));
+        let mut run = ReadFailureRun::new(Arc::clone(&failing));
+
+        // One short of the rule, over and over, each stretch ended by an
+        // answer: the transient, and it never reaches the glass.
+        for round in 0..20 {
+            for step in 0..SUSTAINED_READ_FAILURES - 1 {
+                assert!(!run.failed(), "round {round} step {step}: verdict moved");
+                assert!(
+                    !failing.load(Ordering::SeqCst),
+                    "round {round} step {step}: {} consecutive failures were \
+                     reported as an archive that is not drawing",
+                    step + 1,
+                );
+            }
+            assert!(
+                !run.answered(),
+                "round {round}: an answer after a run that never raised the \
+                 verdict is not a recovery"
+            );
+        }
+
+        // The rule's own step is the one that raises it, and it says so once.
+        for step in 0..SUSTAINED_READ_FAILURES - 1 {
+            assert!(!run.failed(), "step {step}: raised early");
+        }
+        assert!(
+            run.failed(),
+            "the {SUSTAINED_READ_FAILURES}th consecutive failure is the rule, \
+             and it must be the step that raises the verdict"
+        );
+        assert!(
+            failing.load(Ordering::SeqCst),
+            "the verdict is not published"
+        );
+        assert!(
+            !run.failed(),
+            "a run already reported must not report itself again; the line and \
+             the repaint are per run, not per failed tile"
+        );
+
+        // And one answer is the whole of the recovery.
+        assert!(run.answered(), "the recovery is not reported");
+        assert!(
+            !failing.load(Ordering::SeqCst),
+            "a read answered and the archive is still called unreachable"
+        );
+        assert!(!run.answered(), "a second answer is not a second recovery");
+    }
+
+    /// `count` tile ids at `zoom` the committed fixture **provably holds**,
+    /// read off the archive rather than guessed from the extract's bbox.
+    ///
+    /// The distinction is load-bearing for every test below. A coordinate the
+    /// archive does not hold is answered `Absent` out of the root directory
+    /// the `HashMapCache` has held since `open`, with no range read at all —
+    /// so a killed source answers it *successfully*, and a failure rule that
+    /// counts answers would have its run reset by exactly the tiles it was
+    /// supposed to notice. Ids the archive holds cost a data read every time,
+    /// which is what a killed source can fail.
+    fn held_fixture_tiles(count: usize, zoom: u8) -> Vec<TileId> {
+        let west = squallar_geo::lon_to_tile_x(MONACO_LON, zoom);
+        let north = squallar_geo::lat_to_tile_y(MONACO_LAT, zoom);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let archive = crate::basemap_archive::BasemapArchive::open(
+                FileRangeSource::open(&fixture_path()).expect("the fixture opens"),
+            )
+            .await
+            .expect("the fixture is a PMTiles archive");
+
+            let mut held = Vec::new();
+            for dy in 0..16u32 {
+                for dx in 0..16u32 {
+                    if held.len() == count {
+                        return held;
+                    }
+                    let (x, y) = (west + dx, north + dy);
+                    let present = archive
+                        .tile(zoom, x, y)
+                        .await
+                        .is_ok_and(|bytes| bytes.into_bytes().is_some());
+                    if present {
+                        held.push(TileId { x, y, zoom });
+                    }
+                }
+            }
+            held
+        })
+    }
+
+    /// Enough held ids for a failure run and a recovery run with margin: the
+    /// rule needs [`MAX_PARALLEL_DOWNLOADS`] failures to raise, and each half
+    /// below asks for far more than that.
+    const HELD_IDS: usize = 48;
+
+    /// Drive `state` for one frame's worth of tile work: the pump the drawing
+    /// code runs once per layer, the `at` it runs per grid cell, and the
+    /// per-frame `ensure_base_tiles` the panel runs before both.
+    fn drive_frame(state: &mut crate::tiles::MapTileState, ids: &[TileId], ctx: &Context) {
+        if let Some(tiles) = state.tiles.as_mut() {
+            tiles.pump(false);
+            for id in ids {
+                let _ = tiles.at(*id);
+            }
+        }
+        state.ensure_base_tiles(true, &std::collections::BTreeSet::new(), ctx);
+    }
+
+    /// A source over the committed fixture, in a `MapTileState`, with its
+    /// header read and one real tile drawn — the state every test below
+    /// starts from, so that none of them is testing the open-failure path.
+    ///
+    /// Answers the kill switch and the held ids beside the state.
+    fn a_serving_basemap(
+        test: &str,
+        ctx: &Context,
+    ) -> Option<(crate::tiles::MapTileState, Arc<AtomicBool>, Vec<TileId>)> {
+        let (tiles, _reads, dead) =
+            counted_fixture_tiles(test, ctx, crate::basemap_style::committed(true))?;
+        let mut state = crate::tiles::MapTileState::default();
+        state.tiles = Some(tiles);
+
+        let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
+            let tiles = state.tiles.as_mut().expect("the slot holds the source");
+            tiles.pump(false);
+            tiles.source_max_zoom()
+        })
+        .expect("the archive header never arrived");
+        assert_eq!(
+            max_zoom, FIXTURE_MAX_ZOOM,
+            "the fixture's own depth, or the ids below are for another archive"
+        );
+
+        let ids = held_fixture_tiles(HELD_IDS, FIXTURE_MAX_ZOOM);
+        assert_eq!(
+            ids.len(),
+            HELD_IDS,
+            "non-vacuity: the fixture yielded only {} tiles the archive holds, \
+             so the runs below would be shorter than they read",
+            ids.len(),
+        );
+
+        pump_until(DEFAULT_TIMEOUT, || {
+            draw_one(
+                state.tiles.as_mut().expect("the slot holds the source"),
+                ids[0],
+            )
+        })
+        .expect("the archive never served a tile, so it never opened");
+        state.ensure_base_tiles(true, &std::collections::BTreeSet::new(), ctx);
+
+        assert!(
+            !state.base_archive_is_unreachable(),
+            "control: an archive that is serving tiles must not read unreachable"
+        );
+        assert!(
+            state.tiles.as_ref().and_then(HttpsTiles::fault).is_none(),
+            "control: the archive opened, so the open-failure latch is not what \
+             any assertion below is about"
+        );
+
+        Some((state, dead, ids))
+    }
+
+    /// **The headline: an archive that opens and then fails every tile read
+    /// says so, instead of leaving a blank map under an OpenStreetMap credit.**
+    ///
+    /// The open-failure path was the only one that ever raised
+    /// `base_archive_is_unreachable`, and per-tile read errors took a
+    /// `log::warn!` and set nothing — so the credit corner kept naming a
+    /// provider whose bytes were not on the glass. That is the state the web
+    /// build was actually in: the header and the root directory fit inside the
+    /// opening read, so the archive logged as healthily open and then answered
+    /// nothing.
+    ///
+    /// What the panel paints off this is gated in `input_harness`; this is the
+    /// bit it reads.
+    #[test]
+    fn an_archive_that_answers_no_tile_read_reports_the_basemap_unreachable() {
+        let ctx = Context::default();
+        let Some((mut state, dead, ids)) = a_serving_basemap(
+            "an_archive_that_answers_no_tile_read_reports_the_basemap_unreachable",
+            &ctx,
+        ) else {
+            return;
+        };
+
+        dead.store(true, Ordering::SeqCst);
+
+        let latched = pump_until(DEFAULT_TIMEOUT, || {
+            drive_frame(&mut state, &ids[1..HELD_IDS / 2], &ctx);
+            state.base_archive_is_unreachable().then_some(())
+        });
+        assert!(
+            latched.is_some(),
+            "every tile read failed and the session still claims a reachable \
+             basemap, so the credit corner is naming a provider that is not \
+             drawing"
+        );
+        assert!(
+            state.tiles.as_ref().and_then(HttpsTiles::fault).is_none(),
+            "non-vacuity: the open-failure latch raised this, not the read \
+             failures it is supposed to be about"
+        );
+    }
+
+    /// **Recovery is automatic: reads that answer again take the credit back.**
+    ///
+    /// The ids asked for after the revival are ones this source has never
+    /// been asked for, because a failed tile keeps its cache slot and is never
+    /// re-requested (see `HttpsTiles::cache`). That is not a hole in the
+    /// recovery: while nothing re-asks, nothing draws either, so the notice
+    /// stays true for exactly as long as the map stays blank. A pan, a zoom
+    /// or an eviction is what supplies the new ids in the field.
+    #[test]
+    fn a_basemap_that_answers_again_takes_its_credit_back() {
+        let ctx = Context::default();
+        let Some((mut state, dead, ids)) =
+            a_serving_basemap("a_basemap_that_answers_again_takes_its_credit_back", &ctx)
+        else {
+            return;
+        };
+
+        dead.store(true, Ordering::SeqCst);
+        pump_until(DEFAULT_TIMEOUT, || {
+            drive_frame(&mut state, &ids[1..HELD_IDS / 2], &ctx);
+            state.base_archive_is_unreachable().then_some(())
+        })
+        .expect("the read failures never raised the notice, so there is nothing to recover from");
+
+        dead.store(false, Ordering::SeqCst);
+        let cleared = pump_until(DEFAULT_TIMEOUT, || {
+            drive_frame(&mut state, &ids[HELD_IDS / 2..], &ctx);
+            (!state.base_archive_is_unreachable()).then_some(())
+        });
+        assert!(
+            cleared.is_some(),
+            "the archive is answering again and the credit corner is still \
+             calling it unreachable"
+        );
+
+        // And it is drawing, not merely quiet: the notice cleared because
+        // tiles arrived.
+        assert!(
+            pump_until(DEFAULT_TIMEOUT, || draw_one(
+                state.tiles.as_mut().expect("the slot holds the source"),
+                ids[HELD_IDS / 2]
+            ))
+            .is_some(),
+            "non-vacuity: the recovered source never drew a tile"
+        );
+    }
+
+    /// A source over the committed fixture that fails a fixed window of range
+    /// reads and serves every other one — a transient, not a dead host.
+    ///
+    /// The window is counted in **range** reads, so it fails *at most* that
+    /// many tile reads: a tile costs one data read after its directories are
+    /// cached, and the first failure aborts the tile rather than retrying
+    /// inside it. At most is the direction the control needs.
+    struct FlakyRangeSource {
+        inner: FileRangeSource,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        window: std::ops::Range<usize>,
+        fired: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::basemap_archive::RangeSource for FlakyRangeSource {
+        async fn read_range(
+            &self,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, crate::basemap_archive::RangeError> {
+            let nth = self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.window.contains(&nth) {
+                self.fired.fetch_add(1, Ordering::SeqCst);
+                return Err(crate::basemap_archive::RangeError::Transport(
+                    "one read went missing".to_owned(),
+                ));
+            }
+            self.inner.read_range(offset, length).await
+        }
+    }
+
+    /// **The cry-wolf control: a few failed tiles among neighbours that are
+    /// drawing is not an unreachable archive.**
+    ///
+    /// Both windows are shorter than the run the rule asks for, and the window
+    /// starts after the reads `open` costs, so the archive is open and serving
+    /// throughout — this is the transient the product rule refuses to
+    /// apologise for, not a dead host. It passes on the tree that had no rule
+    /// at all, which is the point: it is the property the fix must not break.
+    ///
+    /// **It cannot pin the threshold, and it is not what does.** The verdict is
+    /// sampled once per frame, so a rule that raised on one failure would raise
+    /// and clear again between two samples and this would still read green —
+    /// measured 2026-08-30 by setting `SUSTAINED_READ_FAILURES` to 1, which
+    /// left this test passing. The threshold's own gate is
+    /// [`the_failure_run_needs_a_whole_cohort_and_any_answer_ends_it`], which
+    /// drives the rule directly and has no clock in it.
+    #[test]
+    fn a_few_failed_tiles_among_neighbours_that_draw_is_not_unreachable() {
+        for width in [1, MAX_PARALLEL_DOWNLOADS - 1] {
+            let ctx = Context::default();
+            let path = fixture_path();
+            let Ok(inner) = FileRangeSource::open(&path) else {
+                eprintln!(
+                    "SKIPPED a_few_failed_tiles_among_neighbours_that_draw_is_not_unreachable: \
+                     {} would not open. It is committed; `git status` on it.",
+                    path.display()
+                );
+                return;
+            };
+
+            // Far enough in that `open`'s own reads are behind it, so the
+            // archive is open and the window falls on tile reads.
+            let first_bad = 8;
+            let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tiles = HttpsTiles::from_range_source(
+                FlakyRangeSource {
+                    inner,
+                    reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    window: first_bad..first_bad + width,
+                    fired: Arc::clone(&fired),
+                },
+                crate::basemap_style::committed(true),
+                Attribution {
+                    text: "test",
+                    url: "https://example.invalid/",
+                    logo_light: None,
+                    logo_dark: None,
+                },
+                ctx.clone(),
+                NonZeroUsize::new(64).expect("64 is not zero"),
+                None,
+                crate::tile_source::ArchiveStores {
+                    seed: None,
+                    offline: None::<crate::basemap_download::PlatformSegmentStore>,
+                    offline_archive: crate::basemap_download::AreaArchive::Basemap,
+                },
+            );
+
+            let mut state = crate::tiles::MapTileState::default();
+            state.tiles = Some(tiles);
+
+            pump_until(DEFAULT_TIMEOUT, || {
+                let tiles = state.tiles.as_mut().expect("the slot holds the source");
+                tiles.pump(false);
+                tiles.source_max_zoom()
+            })
+            .expect("the archive header never arrived");
+
+            let ids = held_fixture_tiles(HELD_IDS, FIXTURE_MAX_ZOOM);
+            assert_eq!(ids.len(), HELD_IDS, "non-vacuity: too few held ids");
+
+            // Ask for the whole set until the window has fired and the
+            // neighbours are drawing, then keep watching for SETTLE.
+            let drew = pump_until(DEFAULT_TIMEOUT, || {
+                drive_frame(&mut state, &ids, &ctx);
+                let drawn = ids
+                    .iter()
+                    .filter(|id| {
+                        state
+                            .tiles
+                            .as_mut()
+                            .expect("the slot holds the source")
+                            .at(**id)
+                            .is_some()
+                    })
+                    .count();
+                (fired.load(Ordering::SeqCst) == width && drawn >= HELD_IDS / 2).then_some(drawn)
+            });
+            assert!(
+                drew.is_some(),
+                "non-vacuity for width {width}: the window fired {} times and \
+                 the neighbours never drew, so nothing was under test",
+                fired.load(Ordering::SeqCst),
+            );
+
+            let deadline = Instant::now() + SETTLE;
+            while Instant::now() < deadline {
+                drive_frame(&mut state, &ids, &ctx);
+                assert!(
+                    !state.base_archive_is_unreachable(),
+                    "width {width}: {} failed reads among neighbours that are \
+                     drawing was reported as an unreachable archive",
+                    fired.load(Ordering::SeqCst),
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
 }
 

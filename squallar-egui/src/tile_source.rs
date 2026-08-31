@@ -31,7 +31,7 @@
 //! before its grid loop, and never from [`Tiles::at`] — see
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -47,6 +47,26 @@ use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 /// Tile providers throttle or ban clients that exceed their limits, so this is
 /// a term of use rather than a performance dial.
 pub const MAX_PARALLEL_DOWNLOADS: usize = 6;
+
+/// Consecutive tile reads that must fail, with none answering in between,
+/// before an archive source reports that it is not drawing the map.
+///
+/// [`MAX_PARALLEL_DOWNLOADS`], because that is how many reads
+/// [`serve_archive_continuously`] can have outstanding at once: a run this
+/// long means a whole cohort of concurrently-issued reads failed with not one
+/// of them answering, which is the smallest observation this loop can make
+/// that is about the *source* rather than about the particular tiles it was
+/// asked for. One dead tile among live neighbours ends the run at 1, because
+/// the cohort completes in arbitrary order and any answer resets it.
+///
+/// A read *answers* with a body or with the archive's authoritative "no tile
+/// at this coordinate", so a viewport of open ocean is not a fault.
+const SUSTAINED_READ_FAILURES: usize = MAX_PARALLEL_DOWNLOADS;
+
+/// Said once per run, when [`ReadFailureRun::answered`] ends one. Named
+/// because both arms of the serve loop's success path say it.
+const RECOVERED: &str = "the archive is answering tile reads again, so it draws and is credited \
+                         again";
 
 /// Tiles retained in one source's in-memory cache before LRU eviction starts.
 ///
@@ -910,6 +930,22 @@ pub struct HttpsTiles {
     /// and per-request, and a 404 on one tile says nothing about the next.
     fault: Arc<OnceLock<String>>,
 
+    /// Whether this source's tile reads have been failing in an unbroken run
+    /// of [`SUSTAINED_READ_FAILURES`] — set and cleared by the archive IO
+    /// task, read every frame.
+    ///
+    /// **Not [`Self::fault`], and the difference is recovery.** A fault is
+    /// permanent by construction — a `OnceLock`, and the slot that acts on it
+    /// drops the source — which is right for an archive that will not open and
+    /// wrong for reads that fail. This is the state a *per-tile* failure mode
+    /// leaves the map in: a network that went, a corrupt downloaded part, an
+    /// expired generation, an offset a 32-bit target cannot address. Each of
+    /// them blanks the map while the archive itself logs as healthily open,
+    /// because the header and the root directory fit inside the opening read.
+    /// The frame side reads it so the credit corner can stop naming a provider
+    /// whose bytes are not on the glass; a read that answers clears it.
+    reads_failing: Arc<AtomicBool>,
+
     /// Set when the request channel has been found disconnected.
     ///
     /// **This is a latch, and it exists to bound a log flood.** A disconnected
@@ -1144,7 +1180,11 @@ impl HttpsTiles {
             max_zoom,
             // A raster source has no single failure that ends it: each tile is
             // its own request, and a 404 on one says nothing about the next.
+            // The run of failed reads is the archive loop's own count, and
+            // `fetch_continuously` does not keep one, so this stays down for a
+            // raster source rather than reading half of a rule.
             fault: Arc::new(OnceLock::new()),
+            reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
             cache: LruCache::new(cache_entries),
             style_epoch: RASTER_STYLE_EPOCH,
@@ -1553,6 +1593,29 @@ impl HttpsTiles {
         self.fault.get().map(String::as_str)
     }
 
+    /// Whether this source's tile reads have been failing long enough that it
+    /// is not putting the map on the glass — [`SUSTAINED_READ_FAILURES`] of
+    /// them in a row with none answering.
+    ///
+    /// **Read it every frame; never latch it.** Unlike [`Self::fault`] it
+    /// clears itself the moment a read answers, which is the whole point: the
+    /// conditions that raise it are the ones a later frame can undo.
+    pub fn reads_are_failing(&self) -> bool {
+        self.reads_failing.load(Ordering::Relaxed)
+    }
+
+    /// Report this source's reads as failing, with no transport to fail them.
+    ///
+    /// For the credit-composition tests, which need the *live-source* degraded
+    /// state — the one [`crate::tiles::MapTileState::latch_base_unreachable_for_test`]
+    /// cannot produce, because it empties the slot. What those tests prove is
+    /// therefore the composition given the state, not the state's own raising;
+    /// that is `tile_source::tests::archive`'s.
+    #[cfg(test)]
+    pub(crate) fn fail_reads_for_test(&self) {
+        self.reads_failing.store(true, Ordering::Relaxed);
+    }
+
     /// Tiles currently held, including pending and failed markers. Exposed for
     /// the eviction test; gated off wasm32 with `mod tests`, its only caller.
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1878,7 +1941,7 @@ impl HttpsTiles {
     /// `declared_kind` is what the caller claims the bodies are, for the one
     /// case the header cannot say: `Some(ArchiveTileKind::TerrainRgb)` over a
     /// PNG archive. It is verified against the header at open and is not a
-    /// pre-set answer — see [`ArchiveHeaderSlots::declared`]. `None` leaves
+    /// pre-set answer — see [`ArchiveSlots::declared`]. `None` leaves
     /// the header's word standing, which is what both published archives use.
     pub(crate) fn from_range_source<S, St>(
         source: S,
@@ -1898,6 +1961,7 @@ impl HttpsTiles {
 
         let max_zoom = Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN));
         let fault: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let reads_failing = Arc::new(AtomicBool::new(false));
         // How this archive's bodies decode -- filled in by the IO task from
         // the header, at open, before it serves a tile. See [`ArchiveTileKind`].
         let archive_kind: Arc<OnceLock<ArchiveTileKind>> = Arc::new(OnceLock::new());
@@ -1937,9 +2001,10 @@ impl HttpsTiles {
                 style: style_slot,
                 parsed_tiles: parsed,
             },
-            ArchiveHeaderSlots {
+            ArchiveSlots {
                 max_zoom: Arc::clone(&max_zoom),
                 fault: Arc::clone(&fault),
+                reads_failing: Arc::clone(&reads_failing),
                 kind: archive_kind,
                 declared: declared_kind,
             },
@@ -1959,6 +2024,7 @@ impl HttpsTiles {
             tile_size: crate::tiles::TILE_SIDE_POINTS as u32,
             max_zoom,
             fault,
+            reads_failing,
             requests_closed: false,
             cache: LruCache::new(cache_entries),
             style_epoch: RASTER_STYLE_EPOCH,
@@ -2013,6 +2079,7 @@ impl HttpsTiles {
             tile_size: crate::tiles::TILE_SIDE_POINTS as u32,
             max_zoom: Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN)),
             fault: Arc::new(OnceLock::new()),
+            reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
             cache: LruCache::new(TILE_CACHE_ENTRIES),
             // An inert source never restyles and never parses -- the same
@@ -2081,13 +2148,21 @@ pub(crate) struct ArchiveStores<St> {
     pub(crate) offline_archive: crate::basemap_download::AreaArchive,
 }
 
-/// The slots the IO task fills for the frame side once the archive header
-/// is read — created by [`HttpsTiles::from_range_source`], written exactly
-/// once by [`serve_archive_continuously`] at open. One parameter rather than
-/// three, because they travel together and mean the same moment.
-struct ArchiveHeaderSlots {
+/// What the IO task publishes to the frame side — created by
+/// [`HttpsTiles::from_range_source`], filled in by
+/// [`serve_archive_continuously`]. One parameter rather than four, because
+/// they are the same kind of fact: what the frame may ask this source for, and
+/// whether it is answering.
+///
+/// All but one are written exactly once, at open. [`Self::reads_failing`] is
+/// the exception and says so on itself: it is a *condition*, raised and
+/// dropped by the serve loop for as long as the source lives.
+struct ArchiveSlots {
     max_zoom: Arc<AtomicU8>,
     fault: Arc<OnceLock<String>>,
+    /// [`HttpsTiles::reads_failing`]'s far end — the only slot here the serve
+    /// loop writes more than once, and the only one that can go back down.
+    reads_failing: Arc<AtomicBool>,
     kind: Arc<OnceLock<ArchiveTileKind>>,
     /// What the *caller* says this archive holds, when the header cannot say
     /// it — the only way [`ArchiveTileKind::TerrainRgb`] is ever reached.
@@ -2158,7 +2233,7 @@ impl ArchiveTileKind {
 async fn serve_archive_continuously<S, St>(
     source: S,
     styling: ArchiveStyling,
-    slots: ArchiveHeaderSlots,
+    slots: ArchiveSlots,
     mut request_rx: Receiver<TileId>,
     mut tile_tx: Sender<(TileId, FetchPayload)>,
     egui_ctx: Context,
@@ -2260,6 +2335,7 @@ async fn serve_archive_continuously<S, St>(
     crate::basemap_archive::block_cache::maybe_seed(archive.live(), stores.seed);
 
     let mut outstanding = FuturesUnordered::new();
+    let mut failures = ReadFailureRun::new(slots.reads_failing);
 
     loop {
         let completed = if outstanding.is_empty() {
@@ -2290,19 +2366,93 @@ async fn serve_archive_continuously<S, St>(
         match result {
             // The archive positively holds no tile there. Not an error and not
             // a retry: the `None` the cache already carries under this id is
-            // the right answer forever.
-            Ok(None) => {}
+            // the right answer forever. It is also the archive *answering*,
+            // which is why it ends a failure run — a viewport of open ocean
+            // must not read as an archive that is not there.
+            Ok(None) => {
+                if failures.answered() {
+                    log::info!("{RECOVERED}");
+                    // An absent tile has nothing to arrive, so without this the
+                    // recovered credit would wait for whatever asked next.
+                    egui_ctx.request_repaint();
+                }
+            }
             Ok(Some(fetched)) => {
+                if failures.answered() {
+                    log::info!("{RECOVERED}");
+                }
                 if tile_tx.send(fetched).await.is_err() {
                     break;
                 }
                 egui_ctx.request_repaint();
             }
-            Err(error) => log::warn!("{error}"),
+            Err(error) => {
+                log::warn!("{error}");
+                if failures.failed() {
+                    log::error!(
+                        "{} tile reads in a row failed with none answering, so this archive is \
+                         drawing nothing; the credit corner says so until one answers",
+                        failures.len(),
+                    );
+                    // Nothing else would wake the UI to repaint the credit: a
+                    // failed read has no tile to arrive.
+                    egui_ctx.request_repaint();
+                }
+            }
         }
     }
 
     log::debug!("archive tile loop finished");
+}
+
+/// The unbroken run of failed tile reads, and the verdict it publishes to the
+/// frame side through [`HttpsTiles::reads_failing`].
+///
+/// **A type rather than three statements inside the serve loop**, because the
+/// rule is the whole of what keeps a map drawing nothing from being credited
+/// to a provider, and a rule spelled inline can only ever be exercised through
+/// a real archive on a real clock — which is the one shape that cannot pin a
+/// threshold: a run that raises the verdict and a read that clears it can both
+/// land between two frames, so an end-to-end observation misses an over-eager
+/// rule instead of reddening on it.
+///
+/// Recovery lives here too, and it is [`Self::answered`] and nothing else: no
+/// session-lifetime latch stands between a read that answers and the credit
+/// coming back. **What supplies that read is the frame side, not this loop.**
+/// A tile whose read failed keeps its cache slot and is never asked for again
+/// (see [`HttpsTiles::cache`]), so the reads that clear the verdict come from
+/// ids the source has not been asked for — a pan, a zoom, an eviction. That is
+/// not a gap: while nothing re-asks, nothing draws either, so the notice stays
+/// true for exactly as long as the map stays blank.
+struct ReadFailureRun {
+    run: usize,
+    failing: Arc<AtomicBool>,
+}
+
+impl ReadFailureRun {
+    fn new(failing: Arc<AtomicBool>) -> Self {
+        Self { run: 0, failing }
+    }
+
+    /// A read answered — with a body, or with the archive's authoritative "no
+    /// tile at this coordinate". Answers whether that *changed* the verdict,
+    /// so the caller says the recovery once per run rather than once per tile.
+    fn answered(&mut self) -> bool {
+        self.run = 0;
+        self.failing.swap(false, Ordering::Relaxed)
+    }
+
+    /// A read failed. Answers whether that changed the verdict, which is at
+    /// most once per run for the same reason.
+    fn failed(&mut self) -> bool {
+        self.run += 1;
+        self.run >= SUSTAINED_READ_FAILURES && !self.failing.swap(true, Ordering::Relaxed)
+    }
+
+    /// How long the current run is, for the line that reports it.
+    fn len(&self) -> usize {
+        self.run
+    }
 }
 
 /// Read one tile out of the archive -- and on native, tessellate and upload it

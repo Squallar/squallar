@@ -1848,6 +1848,12 @@ impl Gui {
         self.map_tiles.latch_base_unreachable_for_test();
     }
 
+    /// See [`crate::tiles::MapTileState::fail_reads_for_test`].
+    #[cfg(test)]
+    pub(crate) fn fail_reads_for_test(&mut self, base: bool) -> bool {
+        self.map_tiles.fail_reads_for_test(base)
+    }
+
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
         &self.probes.widget_id_probes

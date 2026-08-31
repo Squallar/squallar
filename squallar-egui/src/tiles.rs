@@ -511,6 +511,20 @@ pub struct MapTileState {
     /// plausible moment for a network to have come back.
     base_unreachable: bool,
 
+    /// What the live base source last said about its own tile reads, sampled
+    /// once per frame by [`Self::ensure_base_tiles`] — see
+    /// [`HttpsTiles::reads_are_failing`].
+    ///
+    /// **Sampled rather than read through, and the reason is ownership**: the
+    /// panel hands the source out of the slot for the whole pane loop
+    /// (`ui_map`'s `take_base_tiles`), and the credit is composed inside it, so
+    /// [`Self::tiles`] is empty at exactly the moment the question is asked.
+    ///
+    /// Distinct from [`Self::base_unreachable`] in the direction that matters:
+    /// that one is latched for the session because the archive will never
+    /// open, this one goes back down on its own when the reads answer again.
+    base_reads_failing: bool,
+
     /// Never build a tile source: the test harnesses' switch, set through
     /// [`Self::go_offline_for_tests`]. Distinct from
     /// [`Self::base_unreachable`], which is a *found* degraded state and
@@ -562,6 +576,7 @@ impl Default for MapTileState {
             terrain: None,
             current_theme_is_dark: true,
             base_unreachable: false,
+            base_reads_failing: false,
             offline: false,
             base_disabled_source_layers: std::collections::BTreeSet::new(),
             #[cfg(test)]
@@ -672,14 +687,29 @@ impl MapTileState {
             // per-frame cost of an unbuildable source is one bool read.
             self.base_unreachable = self.tiles.is_none();
         }
+
+        // The other half of the health question, and the half the archive can
+        // only answer after it has opened: a source that opened and then
+        // answered nothing. Sampled here, where the slot is still full — the
+        // panel empties it for the pane loop before it composes the credit.
+        self.base_reads_failing = self
+            .tiles
+            .as_ref()
+            .is_some_and(HttpsTiles::reads_are_failing);
     }
 
-    /// Whether the archive has been found unreachable this session, so the
-    /// base slot is deliberately empty. The panel reads this to paint
-    /// [`UNREACHABLE_ATTRIBUTION_TEXT`] instead of a provider credit: the
-    /// degraded state must be on the glass, not only in the log.
+    /// Whether the basemap archive is not putting tiles on the glass, so the
+    /// panel must paint [`UNREACHABLE_ATTRIBUTION_TEXT`] instead of a provider
+    /// credit: the degraded state has to be on the glass, not only in the log.
+    ///
+    /// Two states, because there are two ways to draw nothing and the credit
+    /// lies in both. The archive that will not open is latched for the session
+    /// and leaves the slot empty. A source that opened and then failed every
+    /// tile read keeps its slot, keeps its IO task, and recovers on its own —
+    /// so this can go back down, and the caller must ask every frame rather
+    /// than remembering the answer.
     pub fn base_archive_is_unreachable(&self) -> bool {
-        self.base_unreachable
+        self.base_unreachable || self.base_reads_failing
     }
 
     /// Put the base slot in the state a dead archive leaves it in: latched
@@ -691,6 +721,30 @@ impl MapTileState {
     pub(crate) fn latch_base_unreachable_for_test(&mut self) {
         self.base_unreachable = true;
         self.tiles = None;
+    }
+
+    /// Put a slot in the state a source that opened and then answered nothing
+    /// leaves it in: the source still there, still its own IO task, reporting
+    /// its reads as failing. Answers whether there was a source to say it of,
+    /// so a caller can refuse to assert on an empty slot.
+    ///
+    /// The distinction from [`Self::latch_base_unreachable_for_test`] is the
+    /// whole point: that one empties the slot, so a credit composed from it
+    /// never exercises the arm where a live source's own attribution is the
+    /// thing that must be overruled.
+    #[cfg(test)]
+    pub(crate) fn fail_reads_for_test(&mut self, base: bool) -> bool {
+        let slot = if base {
+            self.tiles.as_ref()
+        } else {
+            self.terrain.as_ref()
+        };
+        let Some(tiles) = slot else { return false };
+        tiles.fail_reads_for_test();
+        if base {
+            self.base_reads_failing = true;
+        }
+        true
     }
 
     /// Whether this instance is building only inert sources.
@@ -733,8 +787,14 @@ impl MapTileState {
     /// layer costs zero network, and the accepted cost is a re-download if it
     /// comes back. The unreachable latch survives, exactly as the terrain
     /// failure latch does: a release is not a network recovery.
+    ///
+    /// The *read-failure* sample does not survive, because it is not a latch:
+    /// it describes a source, and there is no longer one. Left standing it
+    /// would have a layer the user switched off reported as an unreachable
+    /// archive — the same lie in the other direction.
     pub fn release_base_tiles(&mut self) {
         self.tiles = None;
+        self.base_reads_failing = false;
     }
 
     /// Temporarily take the base tiles out of self for per-pane rendering.
@@ -810,6 +870,7 @@ impl MapTileState {
     /// failed open if it is not.
     pub fn clear(&mut self) {
         self.base_unreachable = false;
+        self.base_reads_failing = false;
         self.tiles = None;
         self.terrain = None;
         self.terrain_failed = false;
