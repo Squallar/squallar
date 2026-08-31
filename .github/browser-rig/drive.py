@@ -2852,6 +2852,61 @@ def run_smoke(args):
                     "means the leg did not seed squallar.frame_telemetry"
                     % (interact_before, n_now))
             stage("interaction-frames-done", **result["interaction_frames"])
+
+        # Liveness by PROGRESS, not by pixels. A frame loop that dies mid-leg
+        # leaves every cheap signal green -- the canvas holds its last painted
+        # frame, rAF keeps firing at display rate, fetches keep resolving --
+        # so the only thing that can see it is the app's own frame counter
+        # still climbing at the END of the leg. Two ways to fail, both real:
+        # no reading arrived recently (the emitter is gone), or readings
+        # arrived and the count did not move (the loop is idle, not drawing).
+        if args.expect_frame_progress:
+            frames_watch.poll()
+            span_ms = args.expect_frame_progress * 1000.0
+            rs = frames_watch.readings("cadence")
+            now_ms = session.execute("return Date.now();")
+            fp = {"ok": False, "window_s": args.expect_frame_progress,
+                  "readings": len(rs)}
+            if not rs:
+                fp["error"] = (
+                    "no `frame cadence` reading was ever scraped: either the "
+                    "leg did not seed squallar.frame_telemetry, or the frame "
+                    "loop died before the first 2 s emission")
+            else:
+                newest = rs[-1]
+                inside = [r for r in rs if newest["t"] - r["t"] <= span_ms]
+                fp.update(newest_t=newest["t"], newest_n=newest["n"],
+                          stale_ms=(None if now_ms is None
+                                    else int(now_ms - newest["t"])),
+                          in_window=len(inside),
+                          first_n=(inside[0]["n"] if inside else None))
+                stale_bad = (now_ms is not None
+                             and now_ms - newest["t"] > span_ms)
+                if stale_bad:
+                    fp["error"] = (
+                        "the newest `frame cadence` reading is %d ms old at "
+                        "the end of the leg (the line is written every 2 s "
+                        "while frames are being produced). The frame loop "
+                        "stopped and the page kept its last painted frame"
+                        % (now_ms - newest["t"]))
+                elif len(inside) < 2:
+                    fp["error"] = (
+                        "only %d `frame cadence` reading landed in the last "
+                        "%.0f s, so nothing can be diffed; a live loop writes "
+                        "one every 2 s" % (len(inside),
+                                           args.expect_frame_progress))
+                elif inside[-1]["n"] <= inside[0]["n"]:
+                    fp["error"] = (
+                        "the cumulative `frame cadence` count did not move "
+                        "over the last %.0f s (%d -> %d across %d readings): "
+                        "the loop is alive but produced no frame"
+                        % (args.expect_frame_progress, inside[0]["n"],
+                           inside[-1]["n"], len(inside)))
+                else:
+                    fp["ok"] = True
+                    fp["gained"] = inside[-1]["n"] - inside[0]["n"]
+            result["frame_progress"] = fp
+            stage("frame-progress", **fp)
         fl_last = frames_watch.last or {}
         result["frame_lines"] = {
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
@@ -2925,6 +2980,19 @@ def run_smoke(args):
         rig_errors = (result["rig_signal"] or {}).get("errors") or []
         panics = [e for e in rig_errors
                   if "panicked at" in str(e.get("msg", ""))]
+        # A wasm TRAP is not a panic and carries no `panicked at` line: this
+        # target is `panic-strategy: abort`, so an allocation failure or an
+        # `abort()` reaches the console as a bare `RuntimeError: unreachable
+        # executed` (or, from a Rust future, an unhandled rejection carrying
+        # only a wasm stack). Counted separately and gated the same way,
+        # because a trapped module is a dead module: nothing unwinds, so every
+        # RefCell borrow held at the trap stays held for the life of the page.
+        traps = [e for e in rig_errors
+                 if any(m in str(e.get("msg", ""))
+                        for m in ("unreachable executed", "RuntimeError",
+                                  "memory access out of bounds",
+                                  "Out of bounds memory access",
+                                  "wasm-function["))]
         raf_ok = bool((result.get("raf_warm") or {}).get("ok"))
         booted = bool(boot and boot.get("booted"))
         canvas_blank = shots.get("canvas", {}).get("blank")
@@ -2992,8 +3060,11 @@ def run_smoke(args):
                     "fix the GPU flags rather than reporting this figure"
                     % (adapter_label(adapter), adapter.get("renderer")))
 
+        fp_ok = (result.get("frame_progress") is None
+                 or bool((result.get("frame_progress") or {}).get("ok")))
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
+                          and not traps and fp_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and hw_ok is not False)
@@ -3011,6 +3082,11 @@ def run_smoke(args):
             "rig_error_count": len(rig_errors),
             "panic_count": len(panics),
             "first_panic": (str(panics[0].get("msg"))[:300] if panics else None),
+            "wasm_trap_count": len(traps),
+            "first_wasm_trap": (str(traps[0].get("msg"))[:300]
+                                if traps else None),
+            "frame_progress_ok": (None if result.get("frame_progress") is None
+                                  else bool(result["frame_progress"]["ok"])),
             "page_blank": shots["page"].get("blank"),
             "canvas_blank": canvas_blank,
             "worker_round_trip_ok": (None if wrt is None
@@ -3488,6 +3564,19 @@ def main(argv=None):
                          "non-vacuity). Needs the squallar.frame_telemetry "
                          "seed; a leg that never wrote the line fails with "
                          "that stated. Count only -- no ms figure gates")
+    ap.add_argument("--expect-frame-progress", type=float, default=None,
+                    metavar="SECONDS",
+                    help="LIVENESS BY PROGRESS. Fail unless the app's own "
+                         "cumulative `frame cadence` count was still STRICTLY "
+                         "INCREASING over the last SECONDS of the leg, and a "
+                         "reading landed inside it. This is the only "
+                         "assertion in this file that can see a frame loop "
+                         "that DIED partway: the canvas keeps its last "
+                         "painted frame, requestAnimationFrame keeps firing "
+                         "at display rate, async tasks keep logging, and "
+                         "every screenshot and rAF check still passes. Needs "
+                         "the squallar.frame_telemetry seed; a leg that never "
+                         "wrote the line fails with that stated")
     ap.add_argument("--w3c-gesture", choices=("pan", "wheel", "pan+wheel"),
                     default=None,
                     help="drive real input through the driver's W3C /actions "
