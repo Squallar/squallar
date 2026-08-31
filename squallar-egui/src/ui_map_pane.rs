@@ -363,8 +363,8 @@ pub(super) fn render_pane_map_content(
                     // for the `CityLabels` arm — this arm runs first because
                     // the layer's weight (1) is the lowest in the registry.
                     if let Some(tiles) = ctx.basemap_tiles.as_deref_mut() {
-                        ctx.basemap_labels =
-                            draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        let paint = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        ctx.basemap_labels = paint.labels;
                     }
                 }
                 id if *id == known::TERRAIN => {
@@ -372,7 +372,7 @@ pub(super) fn render_pane_map_content(
                     // carries text, so the returned list is empty by
                     // construction and there is nothing to keep.
                     if let Some(tiles) = ctx.terrain_tiles.as_deref_mut() {
-                        draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        let _ = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
                     }
                 }
                 id if *id == known::CITY_LABELS => {

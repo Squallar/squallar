@@ -136,8 +136,57 @@ impl<'a> OverlayDrawContext<'a> {
     }
 }
 
+/// What one [`draw_tile_layer`] pass produced: the labels it deferred, and
+/// whether the span it walked was fully answered.
+pub(super) struct TileLayerPaint {
+    /// The labels the tiles carried, deferred for the `CityLabels` arm.
+    pub(super) labels: Vec<walkers::Text>,
+    /// Whether every cell was answered with its exact tile. See
+    /// [`TileCoverage`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the floor-strip cache is this seam's production consumer and \
+                      lands in the next commit; the signature lands first because \
+                      WO-8 shares this file"
+        )
+    )]
+    pub(super) coverage: TileCoverage,
+}
+
+/// Whether one tile pass answered **every** cell of its span with the exact
+/// tile at the requested zoom — no hole, no ancestor stretched over a gap, no
+/// archive still waiting on its header.
+///
+/// A newtype over a private `bool`, in the shape of `GroundIsMesh` and for
+/// the same reason: the only way to obtain a *complete* answer is to have
+/// [`draw_tile_layer`] walk the span and measure it. A caller-composed
+/// `true` — "the source exists, so it must be resolved" — is exactly the
+/// belief that would freeze a 3D floor on stretched ancestors for ever, and
+/// it does not typecheck against this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct TileCoverage(bool);
+
+impl TileCoverage {
+    /// Whether the pass answered its whole span at the requested zoom.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "see `TileLayerPaint::coverage` — same consumer")
+    )]
+    pub(super) fn complete(self) -> bool {
+        self.0
+    }
+}
+
+/// The `uv` window of a tile that was answered by *itself* rather than by an
+/// ancestor: the whole texture. `interpolate_from_lower_zoom` at the tile's
+/// own zoom produces exactly these bounds, so the compare is bit-exact.
+const FULL_TILE_UV: egui::Rect =
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+
 /// Draw one slippy-map tile layer through the pane's own projector, and hand
-/// back the labels it deferred.
+/// back the labels it deferred plus whether the span was fully answered.
 ///
 /// **The ground is painted here; the labels are not.** A vector tile carries
 /// both, but they belong at different heights in the pane: the ground is the
@@ -150,7 +199,7 @@ pub(super) fn draw_tile_layer(
     zoom: f64,
     tiles: &mut HttpsTiles,
     zoom_bias: u8,
-) -> Vec<walkers::Text> {
+) -> TileLayerPaint {
     // Once for the layer, before the grid loop. `HttpsTiles::at` does not drain,
     // so this is the only thing that moves finished fetches into the cache --
     // and doing it per cell would repeat it once per tile in the span below.
@@ -161,9 +210,12 @@ pub(super) fn draw_tile_layer(
     // seed `0/0/0` into the LRU and leave it there as the session's fallback
     // ancestor -- see `tile_source::MAX_ZOOM_UNKNOWN`. Drawing nothing for a
     // frame is the whole cost of not doing that; the IO task repaints when the
-    // header lands.
+    // header lands. Incomplete, not vacuously complete: nothing was answered.
     let Some(source_max_zoom) = tiles.source_max_zoom() else {
-        return Vec::new();
+        return TileLayerPaint {
+            labels: Vec::new(),
+            coverage: TileCoverage(false),
+        };
     };
 
     let tile_zoom = (zoom.round() as u8)
@@ -176,6 +228,11 @@ pub(super) fn draw_tile_layer(
     // makes is one test against the whole pane; see [`paint_labels`].
     let mut labels: Vec<walkers::Text> = Vec::new();
 
+    // Falsified per cell below; `tile_zoom` is already clamped to the
+    // source's deepest level, so an inexact answer is a tile that has not
+    // arrived, never one the source cannot serve.
+    let mut exact = true;
+
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
             let tile_id = TileId {
@@ -184,7 +241,11 @@ pub(super) fn draw_tile_layer(
                 zoom: tile_zoom,
             };
 
-            if let Some(twuv) = tiles.at(tile_id) {
+            let answered = tiles.at(tile_id);
+            exact &= answered
+                .as_ref()
+                .is_some_and(|twuv| twuv.uv == FULL_TILE_UV);
+            if let Some(twuv) = answered {
                 // Affine, not geographic. This used to spell the tile's two corners as
                 // latitudes and longitudes and hand them to `geo_corner_rect`, which
                 // projected them straight back: `tile_to_lat` is `sinh`/`atan` and
@@ -207,7 +268,10 @@ pub(super) fn draw_tile_layer(
         }
     }
 
-    labels
+    TileLayerPaint {
+        labels,
+        coverage: TileCoverage(exact),
+    }
 }
 
 /// The rect the *whole* tile would occupy, given the rect a `uv` sub-rectangle
@@ -646,7 +710,7 @@ mod tests {
         let rect = projector.tile_rect(tile_id);
 
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0).labels;
             // The pane's `CityLabels` arm, which is where the deferred labels
             // are painted; without it this pass draws ground and no names.
             paint_labels(ui.painter(), labels);
@@ -1348,5 +1412,100 @@ mod tests {
             "…and only because of the layer: with no dialog open the same point \
              is ordinary map"
         );
+    }
+
+    /// **The coverage answer is a measurement of the span, not a belief about
+    /// the source.** Complete only when every cell was answered by its exact
+    /// tile: a hole, a stretched ancestor and a header still on its way are
+    /// three different pending states and each must read incomplete — the
+    /// floor-strip cache skips repaints on this answer, and a false `complete`
+    /// freezes a 3D floor on whatever was on it.
+    #[test]
+    fn coverage_is_complete_only_when_every_cell_is_answered_exactly() {
+        squallar_radar::tls::init();
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(512.0, 512.0));
+        let zoom = 6.0;
+        let mut memory = walkers::MapMemory::default();
+        memory.set_zoom(zoom).expect("zoom 6 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+
+        let mut tiles = crate::tile_source::HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+
+        let tile_zoom = zoom.round() as u8;
+        let span = crate::tiles::tile_span(&projector, canvas, tile_zoom);
+
+        // Nothing answered yet: incomplete.
+        let empty = shapes_of_one_pass(&ctx, canvas, |ui| {
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            assert!(
+                !paint.coverage.complete(),
+                "an unanswered span read complete; the strip cache would freeze \
+                 an empty floor"
+            );
+        });
+        drop(empty);
+
+        // Every cell but one: still incomplete.
+        let mut cells: Vec<TileId> = Vec::new();
+        for ty in span.north..=span.south {
+            for tx in span.west..=span.east {
+                cells.push(TileId {
+                    x: tx,
+                    y: ty,
+                    zoom: tile_zoom,
+                });
+            }
+        }
+        assert!(
+            cells.len() > 1,
+            "fixture: the span must hold more than one cell, or the hole case \
+             and the empty case are the same case"
+        );
+        for cell in &cells[1..] {
+            tiles.put_for_test(*cell, extent_spanning_tile());
+        }
+        shapes_of_one_pass(&ctx, canvas, |ui| {
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            assert!(
+                !paint.coverage.complete(),
+                "a span with one hole read complete"
+            );
+        });
+
+        // The hole answered by a stretched ancestor: still incomplete. The
+        // ancestor keeps the glass populated, which is exactly why coverage
+        // must not read it as the answer.
+        let ancestor = TileId {
+            x: cells[0].x / 2,
+            y: cells[0].y / 2,
+            zoom: tile_zoom - 1,
+        };
+        tiles.put_for_test(ancestor, extent_spanning_tile());
+        shapes_of_one_pass(&ctx, canvas, |ui| {
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            assert!(
+                !paint.coverage.complete(),
+                "a span answered through a stretched ancestor read complete"
+            );
+        });
+
+        // The last exact tile lands: complete.
+        tiles.put_for_test(cells[0], extent_spanning_tile());
+        shapes_of_one_pass(&ctx, canvas, |ui| {
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            assert!(
+                paint.coverage.complete(),
+                "a fully answered span read incomplete; the strip cache could \
+                 never skip and the whole lever is dead"
+            );
+        });
     }
 }
