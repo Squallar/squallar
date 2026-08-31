@@ -423,6 +423,209 @@ fn overlay_pass(
     Some((token, drew))
 }
 
+/// **Premise census (temporary instrument).** How many rasters does a playing
+/// loop really spend on a `TimeAxis::EventLifetime` layer when the pipeline
+/// answers after `latency` ticks rather than instantly? Runs BOTH halves of
+/// the production dispatch predicate — `needs_rerender` and
+/// `RendersInFlight::admits` — which is the pair `ui_map_pane` evaluates.
+fn treadmill_census(latency: usize, cycles: i64) -> String {
+    let ctx = egui::Context::default();
+    let jobs = Jobs::default();
+    let _seen = Arc::clone(&jobs.seen);
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(jobs));
+
+    let mut app = satellite_loop_with_lightning();
+    fill_transport(&mut app, &ctx);
+    {
+        let pane = app.gui.pane_mut(0).expect("pane 0");
+        pane.transport_state_mut().phase = squallar_egui::pane::LoopPhase::Playing;
+        pane.set_time_mode(squallar_egui::pane::TimeMode::AsOf(hour(0)));
+    }
+    let _ = poll_lightning(&mut app);
+    squallar_egui::overlay_cache::ledger::reset_for_test();
+
+    let limit = squallar_device_profile::constants::MAX_CONCURRENT_RENDERS;
+    let ticks = (FRAMES * cycles) as usize;
+    let mut dispatches = 0usize;
+    let mut tokens_dispatched: std::collections::HashSet<u64> = Default::default();
+    let mut tokens_seen: std::collections::HashSet<u64> = Default::default();
+    let mut inflight: Vec<(usize, u64)> = Vec::new();
+
+    let mut land = |app: &mut crate::app::App, token: u64| {
+        app.channels
+            .overlay_render_sender
+            .send(crate::channels::OverlayRenderResponse {
+                image: Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                    [1, 1],
+                    &[255, 255, 255, 255],
+                ))),
+                geo_bounds: bounds(),
+                overlay_kind: known::LIGHTNING,
+                generation: token,
+                pane_indices: vec![0],
+                zoom: 160,
+                hit_map: None,
+                frame: None,
+            })
+            .expect("the receiver lives on the App");
+        app.poll_overlay_render_results(&ctx);
+        app.deliver_held_rasters();
+    };
+
+    for t in 0..ticks {
+        let due: Vec<u64> = inflight
+            .iter()
+            .filter(|(at, _)| *at <= t)
+            .map(|(_, tok)| *tok)
+            .collect();
+        inflight.retain(|(at, _)| *at > t);
+        for token in due {
+            land(&mut app, token);
+        }
+
+        let token = {
+            let pane = app.gui.pane(0).expect("pane 0");
+            squallar_egui::overlay_cache_token(&app.gui.overlays, 0, pane, &known::LIGHTNING, false)
+        };
+        tokens_seen.insert(token);
+
+        let go = {
+            let pane = app.gui.pane_mut(0).expect("pane 0");
+            let cache = pane.overlay_cache_mut(&known::LIGHTNING);
+            let stale = cache.needs_rerender(token, 5.0, t as f64, &bounds(), &plan());
+            stale
+                && cache
+                    .renders
+                    .admits(squallar_egui::overlay_cache::RenderSlot::WHOLE, limit)
+        };
+        if go {
+            dispatches += 1;
+            tokens_dispatched.insert(token);
+            app.spawn_overlay_render(
+                vec![0],
+                known::LIGHTNING,
+                crate::app::fetch::OverlayRenderRequest {
+                    geo_bounds: bounds(),
+                    texture: plan(),
+                    data_generation: token,
+                    zoom: 160,
+                },
+                None,
+            );
+            if latency == 0 {
+                land(&mut app, token);
+            } else {
+                inflight.push((t + latency, token));
+            }
+        }
+
+        app.gui
+            .pane_mut(0)
+            .expect("pane 0")
+            .transport_state_mut()
+            .last_advance = None;
+        app.advance_loop_playback();
+    }
+    let led = squallar_egui::overlay_cache::ledger::totals();
+    format!(
+        "latency={latency} ticks={ticks}: dispatches={dispatches} distinct_dispatched={} \
+         distinct_seen={} frames={FRAMES} | ledger dispatched={} arrived={} pictures={} \
+         MB={:.1} on_screen={} superseded={} dropped={} cancelled={}",
+        tokens_dispatched.len(),
+        tokens_seen.len(),
+        led.dispatched,
+        led.arrived,
+        led.pictures,
+        led.picture_bytes as f64 / (1024.0 * 1024.0),
+        led.on_screen(),
+        led.superseded,
+        led.dropped,
+        led.cancelled,
+    )
+}
+
+/// **Pricing probe (temporary).** What residency would really cost, from the
+/// tree's own constants and its own frame-byte model — not scaled arithmetic.
+#[test]
+#[ignore = "instrument, not a gate: prints its census by panicking"]
+fn residency_pricing_probe() {
+    use squallar_device_profile::constants as c;
+    let frame_bytes = crate::loop_pool::nominal_overlay_frame_bytes();
+    let mut rows = Vec::new();
+    for (name, floor, ceiling) in [
+        (
+            "wasm",
+            c::WASM_LOOP_POOL_FLOOR_BYTES,
+            c::WASM_LOOP_POOL_CEILING_BYTES,
+        ),
+        (
+            "mobile",
+            c::MOBILE_LOOP_POOL_FLOOR_BYTES,
+            c::MOBILE_LOOP_POOL_CEILING_BYTES,
+        ),
+        (
+            "desktop",
+            c::DESKTOP_LOOP_POOL_FLOOR_BYTES,
+            c::DESKTOP_LOOP_POOL_CEILING_BYTES,
+        ),
+    ] {
+        // One pane, radar + one EventLifetime layer animating: `layer_share`
+        // divides the pane's whole share by the animating count, in bytes.
+        for (which, pool) in [("floor", floor), ("ceiling", ceiling)] {
+            for animating in [2usize, 3] {
+                let frames = ((pool / animating) / frame_bytes).max(c::MIN_LOOP_FRAMES_PER_PANE);
+                rows.push(format!(
+                    "{name:8} {which:8} animating={animating} pool={:5} MiB -> {frames:3} frames \
+                     resident of a 13-frame loop",
+                    pool / (1024 * 1024),
+                ));
+            }
+        }
+    }
+    panic!(
+        "PRICING (frame_bytes={frame_bytes} = {:.2} MB)\n{}",
+        frame_bytes as f64 / (1024.0 * 1024.0),
+        rows.join("\n"),
+    );
+}
+
+/// **Disqualifier probe (temporary).** What does a loop frame with no image
+/// draw? If `overlay_texture_on_screen` answers `None`, residency that cannot
+/// afford every frame reproduces the reported defect on the frames it missed.
+#[test]
+#[ignore = "instrument, not a gate: prints its census by panicking"]
+fn an_imageless_loop_frame_draws_nothing() {
+    let ctx = egui::Context::default();
+    let jobs = Jobs::default();
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(jobs));
+    let mut app = satellite_loop_with_lightning();
+    fill_transport(&mut app, &ctx);
+
+    let pane = app.gui.pane_mut(0).expect("pane 0");
+    // The satellite transport is active and every frame HAS an image.
+    let with_image = pane.overlay_texture_on_screen(&known::GMGSI).is_some();
+    // Now blank the frame under the playhead, leaving the timeline active.
+    let ls = pane.time_state_mut(&known::GMGSI);
+    for f in ls.frames.iter_mut() {
+        f.image = None;
+    }
+    let without_image = pane.overlay_texture_on_screen(&known::GMGSI).is_some();
+    panic!(
+        "FALLBACK PROBE: active timeline with images -> on_screen={with_image}; \
+         same timeline with every image cleared -> on_screen={without_image}",
+    );
+}
+
+#[test]
+#[ignore = "instrument, not a gate: prints its census by panicking"]
+fn treadmill_premise_census() {
+    let mut out = Vec::new();
+    for latency in [0usize, 1, 2, 3, 6] {
+        out.push(treadmill_census(latency, 3));
+    }
+    panic!("CENSUS\n{}", out.join("\n"));
+}
+
 /// **The acceptance.** Play the loop once and read, for every frame, what
 /// `overlay_texture_on_screen` hands the painter and which strikes that
 /// picture drew.
