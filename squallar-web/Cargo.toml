@@ -106,7 +106,7 @@ console_error_panic_hook = "=0.1.7"
 console_log = "=1.1.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.103"
+version = "=0.3.104"
 # web-sys gates every interface behind its own feature. Listing them explicitly
 # rather than taking a blanket set keeps the generated glue to what is used.
 features = [
@@ -176,7 +176,7 @@ squallar-source = { workspace = true }
 squallar-geo = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies.web-sys]
-version = "=0.3.103"
+version = "=0.3.104"
 # Additive on top of the [dependencies] list (web-sys features unify across
 # the graph): only what the Tier-1 tests need beyond the app itself -- a real
 # `MessageChannel` transfer.

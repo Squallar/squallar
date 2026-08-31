@@ -200,7 +200,7 @@ wasm-bindgen-futures = { version = "=0.4.76", optional = true }
 js-sys = { version = "=0.3.103", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.103"
+version = "=0.3.104"
 optional = true
 # web-sys gates every interface behind its own feature; exactly the
 # geolocation/permission surface src/web.rs asks the browser for.
