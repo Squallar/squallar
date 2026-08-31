@@ -55,118 +55,36 @@ jobs:
       # fixed tree is still verified: the gating `Run Clippy` below runs in this
       # same job, after the commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The cross-targets are named here rather than in rust-toolchain.toml,
-      # which no longer carries a `targets` list -- see the note in that file.
-      # This job verifies the autofixed tree on both arms below, so it needs
-      # both stds.
+      # HOST ONLY. The cross stds and cargo-ndk went with the verify rows that
+      # used them -- nothing left in this job compiles for wasm32 or Android, so
+      # installing their toolchains was pure runner time (cargo-ndk builds from
+      # source). build.yaml still covers both arms. The binary cache went too:
+      # it existed to hold cargo-ndk, and `rust-cache` below now has no reason
+      # to keep `cache-bin` off.
       - name: Install Rust
-        run: |
-          rustup show
-          rustup target add wasm32-unknown-unknown aarch64-linux-android
+        run: rustup show
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev
-      # rust-cache does cache `${CARGO_HOME}/bin`, but its key hashes every
-      # Cargo.lock, so a dependency bump would rebuild cargo-ndk from source.
-      # This key names only the tool and its version. `cache-bin` is off below
-      # so the two do not store the same directory twice.
-      - name: Cache cargo-installed binaries
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargobin-clippy-cargo-ndk-4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: clippy
-          cache-bin: "false"
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked --version ^4
       - name: Apply Clippy autofixes
         run: cargo clippy --all-targets --all-features --fix || true
 
-      # The gate on the autofix. Nothing below this runs if it fails, and that
-      # includes the commit+push.
+      # NO VERIFY BETWEEN THE AUTOFIX AND THE COMMIT. There used to be three
+      # rows here -- host, threaded wasm32 and Android arm64-v8a -- gating the
+      # push on the rewritten tree still compiling. They are gone by explicit
+      # decision (2026-08-31), with the risk accepted: `--fix` only sees the
+      # host cfg arms but edits shared source the other targets compile, so a
+      # rewrite CAN reach main having broken an arm nothing here built.
       #
-      # This bot pushes straight to main, and previously committed
-      # unconditionally, re-running clippy only *after* the push -- so a rewrite
-      # that broke the build was already on main before anything noticed.
-      #
-      # The cross arms are checked too, not just the host. `--fix` only sees the
-      # host cfg arms but edits shared source that the Android and wasm arms also
-      # compile, so a "redundant" clone it drops can break a call site behind
-      # `#[cfg(target_os = "android")]` invisibly.
-      - name: Verify the autofixed tree still builds (host)
-        run: cargo build --workspace --all-targets --all-features
-      # Every workspace member, every target. `--all-targets` only expands the
-      # *selected* packages, so this was `-p squallar-web -p squallar-app`
-      # until the three crates below stopped blocking `--workspace`.
-      #
-      # What it took: tokio is a target-gated dev-dependency in squallar-radar,
-      # squallar-overlays and squallar-egui (`rt-multi-thread` is not a feature
-      # tokio accepts on wasm), which leaves `#[tokio::test]` unresolvable
-      # there; and those crates' test modules also call reqwest APIs wasm does
-      # not have (`ClientBuilder::timeout`, `Error::is_connect`) plus
-      # `squallar_radar::tls::default_is_ring`, itself `cfg(not(wasm32))`. Both
-      # are handled by gating the modules on
-      # `cfg(all(test, not(target_arch = "wasm32")))` -- the pattern
-      # squallar-radar/src/tls.rs already uses -- in 7 files across 3 crates:
-      # archive.rs, level3.rs and srm.rs in squallar-radar; hrrr/fetch.rs,
-      # metar/fetch.rs and glm/fetch.rs in squallar-overlays; tile_source.rs in
-      # squallar-egui. A new `#[tokio::test]` or reqwest-native call in an
-      # ungated test module of those crates fails this row; put it behind the
-      # same cfg.
-      #
-      # No `--all-features` here: that enables squallar-nmea-serial/serial, which links
-      # IOKit.
-      #
-      # Note `--all-targets` also compiles squallar-web/tests/{pwa_assets,
-      # sw_behaviour}.rs and squallar-gpu/tests/wgpu_guard.rs here, so a
-      # future host-only integration test in either crate would fail this row
-      # spuriously -- gate any such test on `cfg(not(target_arch = "wasm32"))`.
-      # Through wasm-threads.sh since WS3b. The workspace's wasm32 arm is the
-      # THREADED one now -- squallar-web pulls wasm-bindgen-rayon, which carries
-      # a `compile_error!` on a wasm32 target built without `+atomics` -- so a
-      # plain `cargo check --target wasm32-unknown-unknown` no longer describes
-      # a configuration that ships. The wrapper is a per-command
-      # `RUSTUP_TOOLCHAIN` override; the rest of this workflow, and every other
-      # row in it, stays on the pinned stable.
-      - name: Verify the autofixed tree still builds (wasm32, threaded)
-        run: .github/scripts/wasm-threads.sh cargo check --workspace --all-targets --target wasm32-unknown-unknown
-      - name: Verify the autofixed tree still builds (Android arm64-v8a)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Read in the shell: GitHub's `env` context does not carry runner OS
-          # variables, so `${{ env.ANDROID_NDK_LATEST_HOME }}` is empty.
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
-          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
-            echo "::error::No Android NDK on this runner. Refusing to auto-commit a tree whose Android arm was never compiled."
-            exit 1
-          fi
-          # `-P` is the NDK link platform and has to equal the Gradle build's
-          # minSdk: a lower level's sysroot is missing symbols the graphics/JNI
-          # stack links against, so a mismatch here checks a target the app is
-          # never built for. It used to be a literal `28` kept in step by hand.
-          # build.yaml's Android rows lost theirs by handing the whole cargo-ndk
-          # invocation to Gradle, which reads minSdk itself; this step lints
-          # rather than packages, so it stays a direct `cargo ndk` call and
-          # reads the number out of the same file instead.
-          #
-          # `|| true` because `set -e` aborts on an assignment whose command
-          # substitution failed -- without it a pattern that stopped matching
-          # would end the step on grep's bare exit 1 and the `::error::` below
-          # would never print.
-          gradle_kts=packaging/android/app/build.gradle.kts
-          min_sdk=$(grep -oP '^\s*minSdk\s*=\s*\K[0-9]+' "$gradle_kts" || true)
-          if [ -z "$min_sdk" ]; then
-            echo "::error::could not read minSdk out of $gradle_kts. Refusing to guess the NDK platform level."
-            exit 1
-          fi
-          cargo ndk -t arm64-v8a -P "$min_sdk" check -p squallar --lib
+      # What still catches it, one push later rather than zero: build.yaml's
+      # matrix compiles every one of those arms, and `Run Clippy` below still
+      # gates this job on `-D warnings`. The cost of being wrong is a red board
+      # and a revert, not a bad deploy -- a GITHUB_TOKEN push starts no Build,
+      # so an autofix commit cannot deploy itself.
 
       # Not on pull_request: that event checks out the detached PR merge ref,
       # so there is no branch here to commit to — the push either fails or
