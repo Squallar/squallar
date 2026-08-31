@@ -1490,7 +1490,7 @@ fn a_reply_to_an_abandoned_render_is_not_delivered() {
     deliver_job_reply(
         id,
         Some(DescribedOut(Box::new(RenderedFrame {
-            image: vec![0; 4],
+            image: squallar_radar::frame::RasterImage::Bytes(vec![0; 4]),
             max_range_km: 230.0,
             polar: Default::default(),
             nyquist_ms: None,
@@ -1539,7 +1539,7 @@ fn a_cancelled_job_delivers_nothing_once_and_its_late_reply_is_refused() {
     deliver_job_reply(
         id,
         Some(DescribedOut(Box::new(RenderedFrame {
-            image: vec![0; 4],
+            image: squallar_radar::frame::RasterImage::Bytes(vec![0; 4]),
             max_range_km: 230.0,
             polar: Default::default(),
             nyquist_ms: None,
@@ -2062,7 +2062,7 @@ fn the_radar_render_is_byte_identical_direct_and_via_the_wire() {
         .and_then(|out| out.take::<RenderedFrame>())
         .expect("the fixture sweep renders");
     assert!(
-        !direct.image.is_empty() && painted(&direct.image) > 0,
+        !direct.image.is_empty() && painted(&direct.image.to_bytes()) > 0,
         "the fixture painted nothing, so byte-identity would be vacuous",
     );
 
@@ -3415,7 +3415,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
             .expect("the literal polar block decodes")
     };
     let full = RenderedFrame {
-        image: vec![10, 20, 30, 40, 50, 60, 70, 80],
+        image: squallar_radar::frame::RasterImage::Bytes(vec![10, 20, 30, 40, 50, 60, 70, 80]),
         max_range_km: 230.0,
         polar,
         nyquist_ms: Some(26.4),
@@ -3427,7 +3427,7 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
         }),
     };
     let bare = RenderedFrame {
-        image: vec![1, 2, 3, 4],
+        image: squallar_radar::frame::RasterImage::Bytes(vec![1, 2, 3, 4]),
         max_range_km: 460.0,
         polar: Default::default(),
         nyquist_ms: None,

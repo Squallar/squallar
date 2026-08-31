@@ -401,11 +401,23 @@ pub(crate) fn speculative_render_allowed(web: bool, concurrent_renders: usize) -
 }
 
 /// One rendered frame's trip into the shape the frame thread applies.
+///
+/// Which arm the image arrives in decides the cost here: a `Bytes` frame is
+/// the pooled native path and keeps copying (this closure runs off-frame
+/// there); a `Pixels` frame was materialized at wire decode and its buffer
+/// becomes the `ColorImage`'s by move — no copy on the thread the reply
+/// lands on, which on wasm is the page thread.
 fn rendered_image_from(
     frame: squallar_radar::frame::RenderedFrame,
 ) -> Option<crate::channels::RenderedImage> {
-    let picture = plan_view_image(&frame.image);
-    squallar_radar::render::recycle_image(frame.image);
+    let picture = match frame.image {
+        squallar_radar::frame::RasterImage::Bytes(bytes) => {
+            let picture = plan_view_image(&bytes);
+            squallar_radar::render::recycle_image(bytes);
+            picture
+        }
+        squallar_radar::frame::RasterImage::Pixels(pixels) => plan_view_image_owned(pixels),
+    };
     Some(crate::channels::RenderedImage {
         image: Arc::new(picture?),
         max_range_km: frame.max_range_km,
@@ -528,6 +540,21 @@ fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
         [side, side],
         rgba,
     ))
+}
+
+/// [`plan_view_image`] for a raster already in egui's layout: the same size
+/// refusal, and the buffer moves into the image instead of being copied.
+fn plan_view_image_owned(pixels: Vec<egui::Color32>) -> Option<egui::ColorImage> {
+    let Some(side) =
+        squallar_device_profile::constants::raster_side_from_rgba_len(pixels.len() * 4)
+    else {
+        log::error!(
+            "a radar render produced {} pixels, which is no raster size this build makes",
+            pixels.len(),
+        );
+        return None;
+    };
+    Some(egui::ColorImage::new([side, side], pixels))
 }
 
 impl Default for RenderDispatcher {

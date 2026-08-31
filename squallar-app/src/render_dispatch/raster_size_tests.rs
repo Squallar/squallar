@@ -3,6 +3,58 @@
 
 use super::*;
 
+/// A frame decoded off the worker wire hands its buffer to the `ColorImage`
+/// **by move**: the pixels vec IS the vec the decode materialized, and its
+/// content is byte-for-byte what the copying constructor produces. On wasm
+/// the deliver runs on the page thread, which is what makes the copy this
+/// pins away worth pinning away.
+#[test]
+fn a_wire_decoded_frame_gives_its_buffer_to_the_image_without_a_copy() {
+    use squallar_radar::frame::{RasterImage, RenderedFrame};
+
+    let side = squallar_radar::types::IMAGE_SIZE;
+    let rgba: Vec<u8> = (0..side * side * 4).map(|i| (i % 251) as u8).collect();
+    let frame = RenderedFrame {
+        image: RasterImage::Bytes(rgba.clone()),
+        max_range_km: 230.0,
+        polar: Default::default(),
+        nyquist_ms: None,
+        melting_layer_source: None,
+        storm_motion: None,
+    };
+
+    // Encoded exactly as the frame reply codec writes it, decoded through the
+    // same `from_parts` the wire path runs.
+    let mut head = Vec::new();
+    frame.write_head(&mut head);
+    let tails = vec![frame.polar.to_bytes(), rgba.clone()];
+    let decoded = RenderedFrame::from_parts(&head, tails).expect("the frame reply decodes");
+
+    let RasterImage::Pixels(pixels) = &decoded.image else {
+        panic!(
+            "a wire-decoded frame arrived as bytes, not as egui's layout — \
+             the consumer's ColorImage will copy it on the thread the reply \
+             lands on"
+        );
+    };
+    let decode_ptr = pixels.as_ptr();
+
+    let expected = egui::ColorImage::from_rgba_premultiplied([side, side], &rgba);
+    let image = rendered_image_from(decoded)
+        .expect("the frame becomes an image")
+        .image;
+    assert_eq!(image.size, expected.size);
+    assert_eq!(
+        image.pixels, expected.pixels,
+        "the moved buffer is not the picture the copying constructor makes",
+    );
+    assert!(
+        std::ptr::eq(image.pixels.as_ptr(), decode_ptr),
+        "the image's pixels vec is not the decode's vec: a copy happened \
+         between decode and image",
+    );
+}
+
 /// Every side a render can come back at converts, and each is read at its own side rather
 /// than at a constant.
 #[test]

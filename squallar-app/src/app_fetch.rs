@@ -2231,7 +2231,21 @@ impl super::App {
             // A failed render still has to be sent, so render_in_flight gets cleared.
             let (image, max_range_km, nyquist_ms, describes, polar) = match frame {
                 Some(mut frame) => {
-                    let converted = match loop_frame_image(&frame.image) {
+                    let image_len = frame.image.len_bytes();
+                    // A `Bytes` frame is the pooled native path and keeps
+                    // copying; a `Pixels` frame was materialized at wire
+                    // decode and moves into the image without a copy here.
+                    let picture = match frame.image {
+                        squallar_radar::frame::RasterImage::Bytes(bytes) => {
+                            let picture = loop_frame_image(&bytes);
+                            squallar_radar::render::recycle_image(bytes);
+                            picture
+                        }
+                        squallar_radar::frame::RasterImage::Pixels(pixels) => {
+                            loop_frame_image_owned(pixels)
+                        }
+                    };
+                    let converted = match picture {
                         Some(image) => (
                             Some(image),
                             frame.max_range_km,
@@ -2244,14 +2258,13 @@ impl super::App {
                         None => {
                             log::error!(
                                 "Loop render for pane {pane_idx} produced {} bytes, expected {}",
-                                frame.image.len(),
+                                image_len,
                                 LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE * 4
                             );
                             (None, 0.0, None, FrameProvenance::default())
                         }
                     };
                     frame.polar.strip_values();
-                    squallar_radar::render::recycle_image(frame.image);
                     let (image, max_range_km, nyquist_ms, describes) = converted;
                     (image, max_range_km, nyquist_ms, describes, frame.polar)
                 }
@@ -2651,6 +2664,18 @@ fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::from_rgba_premultiplied(
         [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
         rgba,
+    ))
+}
+
+/// [`loop_frame_image`] for a raster already in egui's layout: the same size
+/// refusal, and the buffer moves into the image instead of being copied.
+fn loop_frame_image_owned(pixels: Vec<egui::Color32>) -> Option<egui::ColorImage> {
+    if pixels.len() != LOOP_IMAGE_SIZE * LOOP_IMAGE_SIZE {
+        return None;
+    }
+    Some(egui::ColorImage::new(
+        [LOOP_IMAGE_SIZE, LOOP_IMAGE_SIZE],
+        pixels,
     ))
 }
 

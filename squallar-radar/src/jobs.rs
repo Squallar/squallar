@@ -31,7 +31,7 @@ macro_rules! frame_reply_codec {
                 head.reserve_exact(29);
                 v.write_head(head);
                 tails.push(v.polar.to_bytes());
-                tails.push(v.image);
+                tails.push(v.image.into_bytes());
             }
 
             fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RenderedFrame> {
@@ -741,7 +741,7 @@ mod tests {
         // round-trips through the erased row exactly as through the type.
         for row in &JOB_CODECS[..3] {
             let frame = crate::frame::RenderedFrame {
-                image: vec![9, 8, 7, 6],
+                image: crate::frame::RasterImage::Bytes(vec![9, 8, 7, 6]),
                 max_range_km: 230.0,
                 polar: crate::render::polar::PolarField::default(),
                 nyquist_ms: Some(8.5),

@@ -69,7 +69,7 @@ fn a_real_plan_view_render_lands_on_the_same_picture() {
         .expect("the same job through the funnel draws the same sweep");
 
     assert_eq!(
-        ColorImage::from_rgba_premultiplied([side, side], &frame.image),
+        ColorImage::from_rgba_premultiplied([side, side], &frame.image.to_bytes()),
         ColorImage::from_rgba_unmultiplied([side, side], &straight),
         "a real plan-view render is not the picture it was before the \
          premultiply moved into `execute`",

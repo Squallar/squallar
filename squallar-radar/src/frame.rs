@@ -1,11 +1,82 @@
 //! The frame reply type — what a rasterizing job produces — beside the
 //! renderer that fills it, and its wire form.
 
+/// One rendered raster, in whichever of the two layouts its path produced.
+///
+/// Which arm a frame carries is provenance, not target: the renderer's own
+/// output is [`Bytes`](Self::Bytes) — pooled, recycled, premultiplied in
+/// place at the job boundary — and a frame decoded off the worker wire is
+/// [`Pixels`](Self::Pixels), egui's own layout materialized once at decode so
+/// the consumer's `ColorImage` can take the buffer by move instead of copying
+/// megabytes of texture on the thread the reply lands on.
+///
+/// Equality is content equality: the same raster in the two layouts is the
+/// same raster, which is what keeps the codec round-trip a round-trip.
+#[derive(Debug, Clone)]
+pub enum RasterImage {
+    /// Straight from a renderer, RGBA bytes.
+    Bytes(Vec<u8>),
+    /// Materialized from a wire reply at decode time, premultiplied.
+    Pixels(Vec<ecolor::Color32>),
+}
+
+impl RasterImage {
+    /// The raster as pixels, from premultiplied RGBA bytes — the decode-side
+    /// materialization. `None` for a length that is not whole pixels, per the
+    /// job boundary's refusal contract.
+    pub fn pixels_from_premultiplied(rgba: &[u8]) -> Option<Self> {
+        if !rgba.len().is_multiple_of(4) {
+            return None;
+        }
+        Some(Self::Pixels(
+            rgba.chunks_exact(4)
+                .map(|px| ecolor::Color32::from_rgba_premultiplied(px[0], px[1], px[2], px[3]))
+                .collect(),
+        ))
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Pixels(pixels) => pixels.len() * 4,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len_bytes() == 0
+    }
+
+    /// The raster as owned RGBA bytes — the encode side. A `Pixels` arm pays
+    /// a conversion here, which no shipped path does: only a renderer's own
+    /// `Bytes` output is ever encoded onto the wire.
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Pixels(pixels) => pixels.into_iter().flat_map(|px| px.to_array()).collect(),
+        }
+    }
+
+    /// [`into_bytes`](Self::into_bytes), borrowing.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.clone().into_bytes()
+    }
+}
+
+impl PartialEq for RasterImage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            (Self::Pixels(a), Self::Pixels(b)) => a == b,
+            (mixed_a, mixed_b) => mixed_a.to_bytes() == mixed_b.to_bytes(),
+        }
+    }
+}
+
 /// What a rasterizing job produces: the RGBA texture, the half-width it was
 /// projected at, and the per-pixel value grid (`NAN` where no gate landed).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedFrame {
-    pub image: Vec<u8>,
+    pub image: RasterImage,
     pub max_range_km: f64,
     /// The gates behind the pixels, at the resolution the radar measured them.
     pub polar: crate::render::polar::PolarField,
@@ -31,7 +102,7 @@ impl From<crate::render::SweepRender> for RenderedFrame {
     fn from(render: crate::render::SweepRender) -> Self {
         crate::render::recycle_values(render.values);
         Self {
-            image: render.image,
+            image: RasterImage::Bytes(render.image),
             max_range_km: render.max_range_km,
             polar: render.polar,
             nyquist_ms: render.nyquist_ms,
@@ -56,8 +127,16 @@ impl squallar_source::job::JobOut for RenderedFrame {
 
     /// The texture is the one raster here, and the rasterizers write it in
     /// straight alpha; the polar grid carries measurements, not pixels.
+    ///
+    /// Only the renderer's own `Bytes` output can be straight: a `Pixels`
+    /// frame exists only past a wire decode, and the wire carries
+    /// premultiplied rasters by contract (the premultiply moved to the
+    /// producer), so it reports nothing to fix.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]> {
-        vec![&mut self.image]
+        match &mut self.image {
+            RasterImage::Bytes(bytes) => vec![bytes],
+            RasterImage::Pixels(_) => Vec::new(),
+        }
     }
 }
 
@@ -125,6 +204,9 @@ impl RenderedFrame {
             return None;
         }
         let polar = crate::render::polar::PolarField::from_bytes(&polar_bytes)?;
+        // The one decode-time materialization: the reply's bytes become the
+        // pixel vec the consumer's `ColorImage` will take by move.
+        let image = RasterImage::pixels_from_premultiplied(&image)?;
         Some(Self {
             image,
             max_range_km,
@@ -233,7 +315,7 @@ mod tests {
     /// provenance codes and the Nyquist all ride the wire.
     fn a_full_frame() -> RenderedFrame {
         RenderedFrame {
-            image: vec![10, 20, 30, 40, 50, 60, 70, 80],
+            image: RasterImage::Bytes(vec![10, 20, 30, 40, 50, 60, 70, 80]),
             max_range_km: 230.0,
             polar: a_polar_field(),
             nyquist_ms: Some(26.4),
@@ -251,7 +333,7 @@ mod tests {
     /// gates carries.
     fn a_bare_frame() -> RenderedFrame {
         RenderedFrame {
-            image: vec![1, 2, 3, 4],
+            image: RasterImage::Bytes(vec![1, 2, 3, 4]),
             max_range_km: 460.0,
             polar: crate::render::polar::PolarField::default(),
             nyquist_ms: None,
@@ -267,7 +349,7 @@ mod tests {
     fn encode_parts(frame: &RenderedFrame) -> (Vec<u8>, Vec<Vec<u8>>) {
         let mut head = Vec::new();
         frame.write_head(&mut head);
-        (head, vec![frame.polar.to_bytes(), frame.image.clone()])
+        (head, vec![frame.polar.to_bytes(), frame.image.to_bytes()])
     }
 
     #[test]
