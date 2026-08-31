@@ -32,10 +32,6 @@ use crate::{Fix, LocationPermission};
 
 use super::{OsLocationProvider, OsLocationSink};
 
-/// Altitude's "unknown" sentinel: `ashpd` spells it `-f64::MAX`, this file
-/// [`f64::MIN`]. The same number; a test pins that.
-const ALTITUDE_UNKNOWN: f64 = f64::MIN;
-
 /// The portal location provider: a sink to talk back through, and a session
 /// when one is running. Bringing it up cannot call anything, because the first
 /// call that would answer "may we?" is also the one that can put a dialog in
@@ -443,25 +439,26 @@ fn fix_from_reading(reading: &Reading) -> Option<Fix> {
 }
 
 /// Altitude, unless it is the sentinel `ashpd` should already have removed.
-/// Compared with `==` and not `<`: a negative altitude is an ordinary reading,
-/// the Dead Sea shore being about -430 m.
+///
+/// The band and not an equality against the sentinel: `-G_MAXDOUBLE` is one
+/// spelling of "unknown" and a portal backend answering with another is the
+/// same reading. A negative altitude is still an ordinary one — the Dead Sea
+/// shore is about -430 m — which is why the band's floor is below it.
 fn decode_altitude(raw: f64) -> Option<f64> {
-    (raw != ALTITUDE_UNKNOWN && raw.is_finite()).then_some(raw)
+    crate::plausible::altitude_m(raw)
 }
 
 /// Speed, unless it is meaningless.
 fn decode_speed(raw: f64) -> Option<f64> {
-    // A negative ground speed is meaningless and a zero carries nothing a
-    // consumer can act on — `HeadingSource::Auto` reads speed to decide whether
-    // a bearing is trustworthy.
-    (raw > 0.0 && raw.is_finite()).then_some(raw)
+    // Stricter than the shared floor by one value: a zero carries nothing a
+    // consumer can act on here — `HeadingSource::Auto` reads this field to
+    // decide whether a bearing is trustworthy.
+    crate::plausible::speed_mps(raw).filter(|&speed| speed > 0.0)
 }
 
 /// Heading, unless it is off the compass.
 fn decode_heading(raw: f64) -> Option<f64> {
-    // Zero is *inside* the range: due north is the one bearing a truthiness
-    // test would delete.
-    (0.0..=360.0).contains(&raw).then_some(raw)
+    crate::plausible::heading_deg(raw)
 }
 
 /// The 68% confidence radius in metres. No documented sentinel, so the only

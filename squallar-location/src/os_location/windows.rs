@@ -156,6 +156,10 @@ pub fn reference_value<R, T, E>(
 /// Build a [`Fix`] from what a `Geocoordinate` reports. Separate from the WinRT
 /// reads because a swapped latitude and longitude here is silently valid.
 /// `satellites`, `hdop` and `timestamp` stay `None`.
+///
+/// A null `IReference` is how this API says "unknown" and [`reference_value`]
+/// has already turned that into `None`; [`crate::plausible`] is the floor under
+/// a driver that answers with a number instead.
 pub fn fix_from_coordinate(
     latitude: f64,
     longitude: f64,
@@ -166,9 +170,9 @@ pub fn fix_from_coordinate(
     position_source: i32,
 ) -> Fix {
     Fix {
-        altitude_m,
-        speed_mps,
-        heading_deg,
+        altitude_m: altitude_m.and_then(crate::plausible::altitude_m),
+        speed_mps: speed_mps.and_then(crate::plausible::speed_mps),
+        heading_deg: heading_deg.and_then(crate::plausible::heading_deg),
         accuracy_m: Some(accuracy_m),
         fix_quality: fix_quality_from_position_source(position_source),
         ..Fix::from_device_position(latitude, longitude)

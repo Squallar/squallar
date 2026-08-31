@@ -101,9 +101,13 @@ fn fix_from_components(c: LocationComponents) -> Option<Fix> {
     let horizontal_accuracy_m = valid_component(c.horizontal_accuracy_m)?;
     Some(Fix {
         // Gated on `verticalAccuracy`; the altitude's own sign says nothing.
-        altitude_m: valid_component(c.vertical_accuracy_m).map(|_| c.altitude_m),
-        speed_mps: valid_component(c.speed_mps),
-        heading_deg: valid_component(c.course_deg),
+        // `plausible` is the floor under that gate, not a second opinion on it:
+        // a valid vertical accuracy beside an impossible altitude is not a
+        // reading either.
+        altitude_m: valid_component(c.vertical_accuracy_m)
+            .and_then(|_| crate::plausible::altitude_m(c.altitude_m)),
+        speed_mps: valid_component(c.speed_mps).and_then(crate::plausible::speed_mps),
+        heading_deg: valid_component(c.course_deg).and_then(crate::plausible::heading_deg),
         accuracy_m: Some(horizontal_accuracy_m),
         // `CLLocation::timestamp` is when the fix was *measured*; the settings
         // pane times fix age from arrival instead.

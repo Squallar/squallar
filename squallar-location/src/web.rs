@@ -14,6 +14,12 @@ use crate::{Fix, LocationPermission};
 /// `heading` and `speed` stay `None` when the device is stationary rather than
 /// defaulting to zero, which would rotate a heading-up map to a fabricated
 /// bearing. `accuracy` is non-nullable in the browser's API and always carried.
+///
+/// Every nullable field is decoded through [`crate::plausible`] rather than
+/// trusted. `null` is the *only* way this API can say "unknown", so a browser
+/// whose own location backend has a numeric sentinel has nowhere to put it but
+/// the value — and one does reach the app: an altitude of `-f64::MAX`, the
+/// number geoclue and the XDG portal use for "unknown".
 pub fn fix_from_coords(
     latitude: f64,
     longitude: f64,
@@ -23,9 +29,9 @@ pub fn fix_from_coords(
     heading_deg: Option<f64>,
 ) -> Fix {
     Fix {
-        altitude_m,
-        speed_mps,
-        heading_deg,
+        altitude_m: altitude_m.and_then(crate::plausible::altitude_m),
+        speed_mps: speed_mps.and_then(crate::plausible::speed_mps),
+        heading_deg: heading_deg.and_then(crate::plausible::heading_deg),
         accuracy_m: Some(accuracy_m),
         ..Fix::from_device_position(latitude, longitude)
     }
@@ -510,6 +516,25 @@ mod tests {
         assert_eq!(fix.altitude_m, Some(390.0));
         assert_eq!(fix.speed_mps, Some(12.5));
         assert_eq!(fix.heading_deg, Some(275.0));
+    }
+
+    /// The defect this decoding exists for, from the map tooltip that showed
+    /// it: a browser handed over `-f64::MAX` — geoclue's "unknown altitude" —
+    /// where the API's only word for unknown is `null`, and 309 digits of it
+    /// went on the glass.
+    #[test]
+    fn an_unknown_altitude_smuggled_in_as_a_number_is_still_unknown() {
+        let fix = fix_from_coords(35.4689, -97.5195, 25_000.0, Some(f64::MIN), None, None);
+        assert_eq!(fix.altitude_m, None);
+    }
+
+    /// Speed and heading share geoclue's other sentinel, and a `-1°` course
+    /// would point the heading-up map at nothing.
+    #[test]
+    fn a_negative_speed_or_bearing_is_not_carried_either() {
+        let fix = fix_from_coords(35.25, -97.5, 30.0, None, Some(-1.0), Some(-1.0));
+        assert_eq!(fix.speed_mps, None);
+        assert_eq!(fix.heading_deg, None);
     }
 
     #[test]

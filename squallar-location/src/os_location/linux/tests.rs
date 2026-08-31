@@ -8,6 +8,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// Test-only, because `ashpd` strips it.
 const SPEED_HEADING_UNKNOWN: f64 = -1.0;
 
+/// Altitude's, in the same payload: `ashpd` spells it `-f64::MAX`, the
+/// interface XML `-1.7976931348623157e+308` and Rust [`f64::MIN`]. Test-only
+/// for the same reason, and because [`decode_altitude`] now judges a band
+/// rather than this one number.
+const ALTITUDE_UNKNOWN: f64 = f64::MIN;
+
 /// The application id: the basename of the shipped `.desktop` file, the iOS
 /// bundle id and the Android `applicationId`, which are one string.
 const APP_ID: &str = "app.squallar";
