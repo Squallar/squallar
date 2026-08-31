@@ -854,9 +854,9 @@ jobs:
 
   # The production web deploy: S3 behind CloudFront at https://squallar.app/.
   #
-  # `push` to `main` only, for the same reason `deploy-pages` is: `id-token: write`
-  # mints an OIDC token that assumes an AWS role with write access to the live
-  # site, and `pull_request` runs for forks.
+  # `push` to `main` only: `id-token: write` mints an OIDC token that assumes an
+  # AWS role with write access to the live site, and `pull_request` runs for
+  # forks.
   #
   # Nothing is rebuilt here. `web-wasm32` staged and gated `dist/`; this job
   # downloads exactly those bytes. A failed build is the whole gate; a red test
@@ -975,9 +975,8 @@ jobs:
   # squallar.app. See both files' comments for why each half is needed.
   #
   # `needs: [deploy-cloudfront]`: the tombstone never publishes unless the new
-  # origin just deployed, so there is no window where the old origin points at
-  # a squallar.app that is not serving. Same ordering property deploy-pages has
-  # always had with its own tombstone.
+  # origin just deployed AND its isolation headers verified, so there is no
+  # window where the old origin points at a squallar.app that is not serving.
   #
   # `--delete` wipes the old app from the bucket -- shell, wasm, zones.pack,
   # everything. Nothing shipped against that origin outside this repo's own
@@ -1105,87 +1104,3 @@ jobs:
       # came from and where it goes to be checked.
       - name: Invalidate the CloudFront cache
         run: aws cloudfront create-invalidation --distribution-id E1D9T0MUVYI8FD --paths "/*"
-
-  # The Pages tree is no longer a build output. `.github/pages-tombstone/` is two
-  # hand-written files that send the old origin's visitors to the new one and
-  # take the old service-worker registration apart; read that directory's `sw.js`
-  # header for why an `index.html` redirect alone reaches nobody.
-  #
-  # Gated on every event, in its own job with no elevated permissions, so a pull
-  # request proves the tombstone is well formed -- the property `deploy-pages`
-  # used to get from the build matrix uploading `dist` on every run.
-  pages-tombstone:
-    name: Gate the Pages tombstone
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # The only gate the tombstone gets. It is not the `web-wasm32` row's
-      # SHELL_PATHS check, and not skipping it is not a convenience: that check
-      # reads `squallar-web/sw.js` and asserts every path the real worker
-      # precaches was staged. The tombstone worker precaches nothing, so against
-      # this tree it has no subject and would pass on an empty file. The inverse
-      # is the invariant here, and these three greps assert it instead.
-      #
-      # The worker is the ONLY thing that reaches an already-installed client:
-      # its cached shell means `index.html` is never fetched, so the redirects in
-      # the page never run for exactly the visitors the tombstone exists for. A
-      # truncated `sw.js` therefore fails invisibly and unrecoverably -- Pages
-      # still serves, the page still redirects, and every returning PWA user
-      # stays pinned to the frozen old build with no second chance to reach them.
-      # Each pattern is the fully-qualified call, which appears in the code and
-      # not in the prose above it.
-      - name: Gate the tombstone
-        shell: bash
-        run: |
-          sw=.github/pages-tombstone/sw.js
-          for call in 'self.clients.claim()' 'self.registration.unregister()' 'client.navigate('; do
-            grep -qF "$call" "$sw" \
-              || { echo "::error::$sw does not call $call; an installed worker would never be replaced"; exit 1; }
-          done
-          if grep -qF 'addAll(' "$sw"; then
-            echo "::error::$sw precaches; a tombstone must cache nothing"; exit 1
-          fi
-          echo "ok: the tombstone worker claims, navigates, unregisters and precaches nothing"
-
-  # `push` to `main` only: `pull_request` runs for forks, and `pages: write` /
-  # `id-token: write` must not be reachable from an untrusted branch. Its own job
-  # only for those permissions and the environment. Pages is enabled by hand --
-  # there is no `actions/configure-pages` -- so if it ever gets disabled, this
-  # 404s and the tombstone silently stops being served.
-  #
-  # `needs: deploy-cloudfront` is the sequencing, not a formality. This job takes
-  # the app off the old origin; if the new one has not just been published
-  # successfully, it must not run, or the site is nowhere.
-  deploy-pages:
-    name: Deploy the tombstone to GitHub Pages
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [pages-tombstone, deploy-cloudfront]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    # Not the workflow-level group, which cancels in progress. Cancelling a
-    # deployment mid-flight half-publishes the site; queue instead.
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: .github/pages-tombstone
-
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
