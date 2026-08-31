@@ -195,12 +195,12 @@ objc2-core-location = { version = "=0.3.2", default-features = false, features =
 # not line up; these move when that stack moves (they mirror squallar-web's
 # pins — keep them in step).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "=0.2.126", optional = true }
-wasm-bindgen-futures = { version = "=0.4.76", optional = true }
-js-sys = { version = "=0.3.103", optional = true }
+wasm-bindgen = { version = "=0.2.127", optional = true }
+wasm-bindgen-futures = { version = "=0.4.77", optional = true }
+js-sys = { version = "=0.3.104", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.103"
+version = "=0.3.104"
 optional = true
 # web-sys gates every interface behind its own feature; exactly the
 # geolocation/permission surface src/web.rs asks the browser for.

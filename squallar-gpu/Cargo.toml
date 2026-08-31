@@ -134,8 +134,8 @@ egui-winit = { workspace = true, features = ["links"] }
 # the second path works rather than merely compiles.
 #
 # `squallar-gpu/src/lib.rs` asserts at COMPILE TIME that both backends really are
-# in the build; the workspace pin resolves one `wasm-bindgen` (0.2.126) and one
-# `web-sys` (0.3.103), and wgpu's WebGPU backend carries its own `webgpu_sys`
+# in the build; the workspace pin resolves one `wasm-bindgen` (0.2.127) and one
+# `web-sys` (0.3.104), and wgpu's WebGPU backend carries its own `webgpu_sys`
 # bindings rather than web-sys's, so the binding duplication that once broke
 # `wasm-bindgen` outright does not recur -- `cargo tree -d` is the check.
 #
