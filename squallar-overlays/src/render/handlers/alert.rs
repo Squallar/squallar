@@ -192,6 +192,11 @@ pub(crate) struct NwsAlertHandler {
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: AlertPaneState,
+    signature_memo: crate::render::signature_memo::SignatureMemo,
+    /// How many items [`Self::content_signature`]'s fold has walked, for the
+    /// memo gate: an unchanged (generation, view) call must add zero.
+    #[cfg(test)]
+    pub(crate) sig_item_visits: std::cell::Cell<u64>,
 }
 
 impl NwsAlertHandler {
@@ -200,6 +205,9 @@ impl NwsAlertHandler {
             state: OverlayState::new(),
             hidden_alerts: HashSet::new(),
             defaults: AlertPaneState::new(true),
+            signature_memo: crate::render::signature_memo::SignatureMemo::new(),
+            #[cfg(test)]
+            sig_item_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -476,21 +484,43 @@ impl OverlayHandler for NwsAlertHandler {
     /// `features.len()` is in the fold as well as the id: a **zone-based** alert
     /// legitimately draws nothing on one poll and its counties on the next under
     /// the same id, so an id-only fold left the warning invisible.
+    /// Memoized on (generation, view key): the fold below is O(alerts) and its
+    /// callers ask per pane per layer per frame, while its inputs move only on
+    /// a poll or a toggle. The view key is the two filter inputs a caller can
+    /// change without a generation bump — the pane's category set and the
+    /// dismissed ids — folded order-free, O(categories + dismissed) per ask.
     fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let view = self.view(pane);
-        let mut folded = 0u64;
-        let mut visible = 0u64;
-        for item in &self.state.data {
-            if self.is_drawn(view, item) {
-                let mut hasher = DefaultHasher::new();
-                item.alert.id.hash(&mut hasher);
-                item.alert.features.len().hash(&mut hasher);
-                folded ^= hasher.finish();
-                visible += 1;
-            }
+        let mut view_key = 0u64;
+        for category in &view.enabled_categories {
+            let mut hasher = DefaultHasher::new();
+            category.hash(&mut hasher);
+            view_key ^= hasher.finish();
         }
-        folded ^ visible.rotate_left(32)
+        for id in &self.hidden_alerts {
+            let mut hasher = DefaultHasher::new();
+            id.hash(&mut hasher);
+            // Rotated so a dismissed id and a category cannot cancel.
+            view_key ^= hasher.finish().rotate_left(1);
+        }
+        self.signature_memo
+            .get_or_compute(self.state.data_generation, view_key, || {
+                let mut folded = 0u64;
+                let mut visible = 0u64;
+                for item in &self.state.data {
+                    #[cfg(test)]
+                    self.sig_item_visits.set(self.sig_item_visits.get() + 1);
+                    if self.is_drawn(view, item) {
+                        let mut hasher = DefaultHasher::new();
+                        item.alert.id.hash(&mut hasher);
+                        item.alert.features.len().hash(&mut hasher);
+                        folded ^= hasher.finish();
+                        visible += 1;
+                    }
+                }
+                folded ^ visible.rotate_left(32)
+            })
     }
 
     fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
@@ -1059,6 +1089,55 @@ mod tests {
             handler.content_signature(&PaneRef::bare(0)),
             b_only,
             "disabling the category must move it",
+        );
+    }
+
+    /// The fold's inputs move on a poll or a toggle, but its callers ask per
+    /// pane per layer per frame — so a repeat ask must not walk the items.
+    #[test]
+    fn an_unchanged_generation_and_view_never_revisits_the_items() {
+        let handler = handler_with(vec![
+            alert("a", "Tornado Warning"),
+            alert("b", "Severe Thunderstorm Warning"),
+        ]);
+        let first = handler.content_signature(&PaneRef::bare(0));
+        let warmed = handler.sig_item_visits.get();
+        assert!(
+            warmed > 0,
+            "fixture: the first call really folded the items"
+        );
+
+        let second = handler.content_signature(&PaneRef::bare(0));
+        assert_eq!(second, first);
+        assert_eq!(
+            handler.sig_item_visits.get(),
+            warmed,
+            "an unchanged generation and view walked the items again",
+        );
+    }
+
+    /// One recompute per data move, however many panes ask: three calls after
+    /// a poll walk the two items exactly once between them.
+    #[test]
+    fn a_generation_bump_refolds_exactly_once() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        handler.content_signature(&PaneRef::bare(0));
+
+        handler.apply_fetch_result(
+            whole(vec![
+                alert("a", "Tornado Warning"),
+                alert("b", "Severe Thunderstorm Warning"),
+            ]),
+            &PaneRef::across(&[]),
+        );
+        let before = handler.sig_item_visits.get();
+        for _ in 0..3 {
+            handler.content_signature(&PaneRef::bare(0));
+        }
+        assert_eq!(
+            handler.sig_item_visits.get() - before,
+            2,
+            "three asks after one poll must fold the two items exactly once",
         );
     }
 

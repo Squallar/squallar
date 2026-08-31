@@ -95,6 +95,11 @@ pub(crate) struct SpcDiscussionHandler {
     pub enabled: bool,
     /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per frame.
     labels: Vec<OverlayLabel>,
+    signature_memo: crate::render::signature_memo::SignatureMemo,
+    /// How many items [`Self::content_signature`]'s fold has walked, for the
+    /// memo gate: an unchanged (generation, view) call must add zero.
+    #[cfg(test)]
+    pub(crate) sig_item_visits: std::cell::Cell<u64>,
 }
 
 impl SpcDiscussionHandler {
@@ -103,6 +108,9 @@ impl SpcDiscussionHandler {
             state: OverlayState::new(),
             enabled: true,
             labels: Vec::new(),
+            signature_memo: crate::render::signature_memo::SignatureMemo::new(),
+            #[cfg(test)]
+            sig_item_visits: std::cell::Cell::new(0),
         }
     }
 
@@ -221,23 +229,32 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.data_generation
     }
 
+    /// Memoized on the generation alone: the fold below is O(discussions) and
+    /// its callers ask per pane per layer per frame, while the set moves only
+    /// on a poll. The layer's one view input is the toggle, and the off arm
+    /// answers before the memo — every enabled view folds the same set.
     fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         if !self.is_enabled(pane) {
             return 0;
         }
-        let mut folded = 0u64;
-        let mut visible = 0u64;
-        for item in &self.state.data {
-            if item.md.polygon.is_empty() {
-                continue;
-            }
-            let mut hasher = DefaultHasher::new();
-            item.md.number.hash(&mut hasher);
-            folded ^= hasher.finish();
-            visible += 1;
-        }
-        folded ^ visible.rotate_left(32)
+        self.signature_memo
+            .get_or_compute(self.state.data_generation, 0, || {
+                let mut folded = 0u64;
+                let mut visible = 0u64;
+                for item in &self.state.data {
+                    #[cfg(test)]
+                    self.sig_item_visits.set(self.sig_item_visits.get() + 1);
+                    if item.md.polygon.is_empty() {
+                        continue;
+                    }
+                    let mut hasher = DefaultHasher::new();
+                    item.md.number.hash(&mut hasher);
+                    folded ^= hasher.finish();
+                    visible += 1;
+                }
+                folded ^ visible.rotate_left(32)
+            })
     }
 
     fn has_data(&self, _pane: &PaneRef<'_>) -> bool {
@@ -605,6 +622,49 @@ mod tests {
             text,
             vec!["MD 102".to_string(), "MD 104".to_string()],
             "a refetch must replace the labels, not accumulate them",
+        );
+    }
+
+    /// The fold's inputs move on a poll or the toggle, but its callers ask per
+    /// pane per layer per frame — so a repeat ask must not walk the items.
+    #[test]
+    fn an_unchanged_generation_and_view_never_revisits_the_items() {
+        let handler = handler_with(vec![md(101), md(102)]);
+        let first = handler.content_signature(&PaneRef::bare(0));
+        let warmed = handler.sig_item_visits.get();
+        assert!(
+            warmed > 0,
+            "fixture: the first call really folded the items"
+        );
+
+        let second = handler.content_signature(&PaneRef::bare(0));
+        assert_eq!(second, first);
+        assert_eq!(
+            handler.sig_item_visits.get(),
+            warmed,
+            "an unchanged generation and view walked the items again",
+        );
+    }
+
+    /// One recompute per data move, however many panes ask: three calls after
+    /// a refetch walk the two items exactly once between them.
+    #[test]
+    fn a_generation_bump_refolds_exactly_once() {
+        let mut handler = handler_with(vec![md(101)]);
+        handler.content_signature(&PaneRef::bare(0));
+
+        handler.apply_fetch_result(
+            Box::new(SpcDiscussionFetchResult(Ok(vec![md(101), md(102)]))),
+            &PaneRef::across(&[]),
+        );
+        let before = handler.sig_item_visits.get();
+        for _ in 0..3 {
+            handler.content_signature(&PaneRef::bare(0));
+        }
+        assert_eq!(
+            handler.sig_item_visits.get() - before,
+            2,
+            "three asks after one refetch must fold the two items exactly once",
         );
     }
 

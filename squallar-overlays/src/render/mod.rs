@@ -9,4 +9,5 @@ mod hatch;
 pub mod jobs;
 pub mod overlay_state;
 pub mod rasterize;
+mod signature_memo;
 pub mod station_model;
