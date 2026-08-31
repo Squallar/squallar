@@ -278,10 +278,24 @@ pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMe
         match id {
             id if *id == known::RADAR => {
                 // The draw fork's two arms, keyed by which arm and which
-                // picture: the loop's playhead frame while animating (a loop
-                // tick is a new texture id — without this the floor freezes
-                // mid-loop while the volume animates), the live raster
-                // otherwise (an arriving radar render is a new id too).
+                // picture: the loop's playhead frame while animating, the
+                // live raster otherwise (an arriving radar render is a new
+                // id too).
+                //
+                // **`active_image()` answers for a PLAN-VIEW loop only**, and
+                // the difference matters to anything reasoning about what
+                // moves this key. It narrows through
+                // [`LoopFrameImage::plan_view`], so a `LoopFrameImage::Volume`
+                // frame — a *named* resident grid, not a texture — reads
+                // `None`, and a playing **volume** loop therefore hashes the
+                // same constant on every tick. The floor still repaints per
+                // tick under one, but it is the `overlay_cache_token` above
+                // doing it: every `TimeAxis::EventLifetime` layer on the pane
+                // re-tokenizes as the clock sweeps (a 60 s as-of quantum
+                // against a tick worth minutes). Read
+                // `a_playing_volume_loop_repaints_the_floor_per_tick_not_per_frame`
+                // with that in mind — its non-vacuity rides on that layer, not
+                // on this arm.
                 let animating = input.pane.time_state(&known::RADAR).is_active();
                 animating.hash(h);
                 if animating {
