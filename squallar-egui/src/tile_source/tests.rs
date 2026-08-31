@@ -636,7 +636,14 @@ fn a_pump_already_over_its_time_budget_still_takes_one_completion() {
         // The pass has taken nothing yet, so it still owes its one free take.
         true,
         &mut reported,
-        |value| taken.push(value),
+        |value| {
+            taken.push(value);
+            // A governor fixture, not a real tile: it stands in for the native
+            // arm's drain, whose every take is a `Put`. Deliberately not
+            // `Restyle` -- `take_ledger`'s own tests rely on that family being
+            // untouched by anything else in this binary.
+            super::take_ledger::TakeKind::Put
+        },
     );
 
     assert_eq!(
@@ -668,7 +675,14 @@ fn a_pump_inside_its_time_budget_empties_the_queue() {
         Instant::now() + Duration::from_secs(60),
         true,
         &mut reported,
-        |value| taken.push(value),
+        |value| {
+            taken.push(value);
+            // A governor fixture, not a real tile: it stands in for the native
+            // arm's drain, whose every take is a `Put`. Deliberately not
+            // `Restyle` -- `take_ledger`'s own tests rely on that family being
+            // untouched by anything else in this binary.
+            super::take_ledger::TakeKind::Put
+        },
     );
 
     assert_eq!(count, 4, "the pump did not empty a queue it had budget for");
@@ -1697,6 +1711,9 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
                     .expect("the fixture PNG should decode");
                 drop(tile);
                 decoded.push(tile_id);
+                // `Tile::new` sniffed the body: no archive header declared
+                // anything here, which is exactly what `Sniffed` names.
+                super::take_ledger::TakeKind::Sniffed
             },
         )
     };

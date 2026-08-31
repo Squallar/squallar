@@ -1366,12 +1366,33 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // application's whole allowance, and floor/ceiling the tier's bracket -- a
 // pool below the value it booted at is `LoopPool::back_off` having fired.
 var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us/;
+// The two WINDOWABLE families, both `<prefix> (<name>):` with the same
+// payload. `n` and `sum` are running totals and both subtract, so a windowed
+// mean is exact: (sum_b - sum_a) / (n_b - n_a). `hist` is the same 42-slot
+// shape every other hist-bearing line carries.
+//
+// `frame segment (...)` is the per-segment spelling of `frame segments
+// (interact, p99 us): ...`, which stays exactly as it was. The old line is
+// p99 CUMULATIVE FROM BOOT with no bins, so no windowed per-segment figure
+// was obtainable from it at all; these carry the bins that make one a
+// subtraction. Same denominator as the old line -- interact frames only, six
+// contiguous cuts of one frame's service, acquire NOT among them.
+//
+// `tile take (...)` is per TAKE -- one completion moved off a tile source's
+// channel and handled to completion (decode/tessellate/put). Never per tile
+// requested, per tile drawn, per frame or per pass, and never added to
+// `basemap tiles` (decodes: excludes restyles and failures), to `overlay
+// rasters`, to `texture uploads`, or to any frame segment. Several takes can
+// share one `frame segment (pump)` sample.
+var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
+var frame_segment_all = [], tile_take_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -1435,6 +1456,14 @@ for (var i = 0; i < C.length; i++) {
                    advance_us: parseInt(x[17], 10) };
     loop_state_all.push(loop_state);
   }
+  x = frame_segment_re.exec(m);
+  if (x) frame_segment_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                                  sum: parseInt(x[3], 10), p50: x[4],
+                                  p90: x[5], p99: x[6], hist: x[7] });
+  x = tile_take_re.exec(m);
+  if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                              sum: parseInt(x[3], 10), p50: x[4],
+                              p90: x[5], p99: x[6], hist: x[7] });
   x = gesture_begin_re.exec(m);
   if (x) begins.push({ t: t, script: x[1] });
   x = gesture_loop_re.exec(m);
@@ -1445,6 +1474,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          loop_state: loop_state, loop_state_all: loop_state_all,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
+         frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          gesture_begins: begins, gesture_loops: loops,
          console_total: C.length };
 """
@@ -1537,6 +1567,13 @@ class FrameLineWatcher:
         self.interact = {}
         self.idle = {}
         self.cadence = {}
+        # The named families, one dict per name seen: "frame segment (pump)"
+        # keys as "segment:pump", "tile take (vector)" as "take:vector". Kept
+        # by name rather than in a fixed list because which tile-take families
+        # appear is a property of the ARM (`put` is native-only; `sniffed` and
+        # `restyle` need a plain-HTTP source and a theme flip), and a rig that
+        # hard-coded them would report an absent arm as a broken one.
+        self.named = {}
         self.begins = {}
         self.loops = {}
         self.last = {}
@@ -1549,12 +1586,22 @@ class FrameLineWatcher:
             self.idle[(r.get("t"), r.get("n"))] = r
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
+        for prefix, key in (("frame_segment_all", "segment"),
+                            ("tile_take_all", "take")):
+            for r in sig.get(prefix) or []:
+                family = "%s:%s" % (key, r.get("name"))
+                self.named.setdefault(family, {})[(r.get("t"), r.get("n"))] = r
         for r in sig.get("gesture_begins") or []:
             self.begins[(r.get("t"), r.get("script"))] = r
         for r in sig.get("gesture_loops") or []:
             self.loops[(r.get("t"), r.get("frames"))] = r
         self.last = sig
         return sig
+
+    def named_families(self):
+        """Every `segment:<name>` / `take:<name>` family a reading was seen
+        for, in a stable order."""
+        return sorted(self.named)
 
     def interact_n(self):
         """The newest cumulative interact-frame count, or None when the line
@@ -1567,8 +1614,9 @@ class FrameLineWatcher:
         return best
 
     def readings(self, family):
-        rs = list({"interact": self.interact, "idle": self.idle,
-                   "cadence": self.cadence}[family].values())
+        by_name = {"interact": self.interact, "idle": self.idle,
+                   "cadence": self.cadence}
+        rs = list((by_name.get(family) or self.named.get(family) or {}).values())
         rs.sort(key=lambda r: (r.get("t") or 0, r.get("n") or 0))
         return rs
 
@@ -1652,7 +1700,12 @@ def _window_stats(watcher, t0, t1, out):
     # `idle` in a gesture window is the settle-burst family: the input-free
     # frames of the scripted quiet phases, which is where WO-8 moved the
     # post-gesture re-raster. Its max is the burst's worst frame.
-    for family in ("interact", "idle", "cadence"):
+    #
+    # The named families come off the watcher rather than from a list, so an
+    # arm that never produced a `tile take (put)` reading simply has no such
+    # key -- an absence, not a zero, and the two must stay tellable apart.
+    for family in ("interact", "idle", "cadence") + tuple(
+            watcher.named_families()):
         rs = [r for r in watcher.readings(family)
               if hist_parse(r.get("hist")) is not None]
         if not rs:
@@ -1676,8 +1729,46 @@ def _window_stats(watcher, t0, t1, out):
         stats = hist_stats(d)
         stats["bracket_a_t"] = a["t"] if a is not None else None
         stats["bracket_b_t"] = b["t"]
+        # The EXACT windowed mean, where the line carries a running sum.
+        # Both `n` and `sum` subtract, so this is arithmetic and not an
+        # estimate -- which matters because the bins are four per octave, one
+        # bin apart is 0%-19%, and every true ratio between 1.68x and 2.38x
+        # reads as exactly 2.00x off the percentiles alone. Read it AGAINST
+        # p90/p99, never instead of them: a per-take cost is bimodal and its
+        # mean describes none of its samples.
+        stats["mean_us"] = _window_mean_us(a, b)
+        # The diffed bins themselves, not just the five figures read off them.
+        # A per-take cost is bimodal -- trivial tiles and content tiles are
+        # different populations sharing one histogram -- and no percentile
+        # shows that shape. Kept in the artifact so a distribution question
+        # can be asked of a finished run without re-measuring it.
+        stats["bins"] = d
         out[family] = stats
     return out
+
+
+def watcher_named_in(gw):
+    """The `segment:*` / `take:*` keys a finished gesture-window dict carries,
+    in a stable order. Read off the result rather than off a fixed list, so a
+    family the arm never produced is an ABSENCE and not a zero."""
+    return sorted(k for k in (gw or {})
+                  if isinstance(k, str)
+                  and (k.startswith("segment:") or k.startswith("take:")))
+
+
+def _window_mean_us(a, b):
+    """(sum_b - sum_a) / (n_b - n_a) in whole us, or None when the line
+    carries no running sum (the interact/idle/cadence families do not) or the
+    window holds no samples."""
+    if b is None or b.get("sum") is None:
+        return None
+    n = b.get("n", 0) - (a.get("n", 0) if a is not None else 0)
+    if n <= 0:
+        return None
+    total = b["sum"] - (a.get("sum", 0) if a is not None else 0)
+    if total < 0:
+        return None
+    return total // n
 
 
 # ---- W3C actions gestures ----------------------------------------------
@@ -3519,6 +3610,33 @@ def run_smoke(args):
                       "p90=%s us p99=%s us"
                       % (tag, alabel, family, d.get("n"), d.get("p50_us"),
                          d.get("p90_us"), d.get("p99_us")))
+        # The windowed per-segment and per-take families. Printed with their
+        # exact mean because that is the figure the bins cannot give: four
+        # bins per octave means any true ratio from 1.68x to 2.38x prints as
+        # 2.00x. `mean` is read AGAINST p90/p99, never instead of them.
+        #
+        # A `take` figure's denominator is ONE TAKE -- one completion moved
+        # off a tile source's channel and handled to completion. It is not per
+        # frame, not per pass, and is never added to any `segment` figure: a
+        # `segment pump` sample is a whole frame's pump phase and can contain
+        # several takes or none.
+        for family in watcher_named_in(gw):
+            d = gw.get(family) or {}
+            if d.get("error"):
+                print("[%s] SUMMARY [%s]   window %s: %s"
+                      % (tag, alabel, family, d["error"]))
+            elif d.get("n"):
+                print("[%s] SUMMARY [%s]   window %s: n=%s mean=%s us "
+                      "p50=%s us p90=%s us p99=%s us max=%s us"
+                      % (tag, alabel, family, d.get("n"), d.get("mean_us"),
+                         d.get("p50_us"), d.get("p90_us"), d.get("p99_us"),
+                         d.get("max_us")))
+            else:
+                # A family with a reading but no samples IN the window. Said
+                # out loud: "nothing happened here" is a figure, and it is a
+                # different fact from a family that was never reported at all.
+                print("[%s] SUMMARY [%s]   window %s: n=0 (reported, no "
+                      "samples in the window)" % (tag, alabel, family))
     ifr = result.get("interaction_frames")
     if ifr is not None:
         print("[%s] SUMMARY interaction frames: %s (interact n %s -> %s%s)"

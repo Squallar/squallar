@@ -1257,7 +1257,7 @@ fn drain_up_to<T>(
     deadline: web_time::Instant,
     first_take_free: bool,
     reported: &mut bool,
-    mut take: impl FnMut(T),
+    mut take: impl FnMut(T) -> take_ledger::TakeKind,
 ) -> usize {
     let mut taken = 0;
     while taken < budget {
@@ -1272,7 +1272,15 @@ fn drain_up_to<T>(
         }
         match rx.try_recv() {
             Ok(item) => {
-                take(item);
+                // The take, bracketed. This span is exactly what
+                // [`PUMP_TIME_BUDGET`] cannot see inside — the deadline above
+                // is checked between takes and never during one, so a frame
+                // pays the budget plus one whole unbounded pass through here.
+                // See [`take_ledger`] for the denominator and the families.
+                let began = web_time::Instant::now();
+                let kind = take(item);
+                let cost = web_time::Instant::now().duration_since(began);
+                take_ledger::note_take(kind, cost.as_micros().min(u128::from(u32::MAX)) as u32);
                 taken += 1;
             }
             Err(TryRecvError::Empty) => break,
@@ -1524,6 +1532,12 @@ impl HttpsTiles {
                     *put_generation += 1;
                     cache.put(tile_id, slot);
                 }
+                // The whole native take, whether or not the slot survived its
+                // epoch check: a dropped restyle still cost the frame the
+                // move off the channel. See [`take_ledger::TakeKind::Put`] —
+                // on this arm the decode already happened on the IO thread,
+                // which is why one family covers the arm.
+                take_ledger::TakeKind::Put
             },
         );
         *takes += taken as u64;
@@ -1568,6 +1582,30 @@ impl HttpsTiles {
             allowance.first_take_free,
             io_task_gone_reported,
             |(tile_id, payload): (TileId, FetchPayload)| {
+                // The family this take belongs to, decided before the work
+                // rather than after it, so a decode that FAILS is still
+                // charged to what it attempted. Classified by the archive
+                // header's declared kind and never by the bytes — the rule
+                // [`decode_archive_tile`] itself obeys.
+                let kind = match (&payload, archive_kind) {
+                    (FetchPayload::Parsed(_), _) => take_ledger::TakeKind::Restyle,
+                    // A plain HTTP source has no header to declare anything;
+                    // its body goes through `Tile::new`'s sniff.
+                    (FetchPayload::Bytes(_), None) => take_ledger::TakeKind::Sniffed,
+                    (FetchPayload::Bytes(_), Some(declared)) => {
+                        match declared
+                            .get()
+                            .copied()
+                            .unwrap_or(ArchiveTileKind::Undeclared)
+                        {
+                            ArchiveTileKind::Vector => take_ledger::TakeKind::Vector,
+                            ArchiveTileKind::Hillshade | ArchiveTileKind::TerrainRgb => {
+                                take_ledger::TakeKind::Raster
+                            }
+                            ArchiveTileKind::Undeclared => take_ledger::TakeKind::Sniffed,
+                        }
+                    }
+                };
                 let decoded = match payload {
                     // A restyle served from the parsed cache: no bytes were
                     // fetched, only the styling is owed — still under this
@@ -1603,6 +1641,7 @@ impl HttpsTiles {
                     }
                     Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
                 }
+                kind
             },
         );
         pump_budget.record(taken);
@@ -2802,6 +2841,8 @@ fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64) {
     let slot = slot.read().expect("the style slot is not poisoned");
     (Arc::clone(&slot.style), slot.epoch)
 }
+
+pub mod take_ledger;
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),
 // `ClientBuilder::timeout` and `Error::is_connect`, which reqwest's wasm arm

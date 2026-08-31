@@ -490,3 +490,256 @@ fn only_the_seeded_value_makes_the_frame_lines_loud() {
         "the one value that turns the frame lines on did not",
     );
 }
+
+// ── The two windowable families ────────────────────────────────────────────
+//
+// `frame segment (<name>)` and `tile take (<name>)` share one formatter
+// (`named_hist_line`) and therefore one sentence shape, pinned here at both
+// ends like the five above it.
+
+/// The `frame segment (…)` sentence, pinned as a literal.
+///
+/// 100 us sits in [88 388, 105 112) ns — geometric bin slot 3, upper edge
+/// 106 us — derived from the documented edge formula, not read back from the
+/// code under test. `sum` is the exact arithmetic sum of what was recorded,
+/// and it is deliberately NOT any percentile: 3 × 100 = 300, while every
+/// percentile answers the bin's 106 us upper edge. A line that printed a
+/// percentile where the sum belongs would still look plausible.
+#[test]
+fn the_frame_segment_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame segment", "pump", &h),
+        format!(
+            "frame segment (pump): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// **The sum is not derivable from the bins, which is the whole point.**
+///
+/// Two histograms with identical bin contents and different true costs: at
+/// four bins per octave a bin is ≈19% wide, so 90 us and 105 us are the same
+/// bin and every percentile of the two is byte-identical. Only the sum tells
+/// them apart. This is the non-triviality floor under `sum=`: without it, a
+/// formatter that printed a percentile there would pass every other test in
+/// this file.
+#[test]
+fn the_sum_separates_two_histograms_the_bins_cannot() {
+    let (mut low, mut high) = (Hist::new(), Hist::new());
+    for _ in 0..4 {
+        low.record(90);
+        high.record(105);
+    }
+    assert_eq!(
+        low.counts(),
+        high.counts(),
+        "the two samples landed in different bins, so this test is not about \
+         what it says it is about",
+    );
+    assert_eq!(
+        low.percentile_upper_micros(0.99),
+        high.percentile_upper_micros(0.99)
+    );
+    assert_ne!(
+        low.sum_micros(),
+        high.sum_micros(),
+        "two histograms the bins cannot separate also have equal sums, so the \
+         running sum buys nothing",
+    );
+    assert_eq!((low.sum_micros(), high.sum_micros()), (360, 420));
+    assert_ne!(
+        super::named_hist_line("frame segment", "ui", &low),
+        super::named_hist_line("frame segment", "ui", &high),
+        "the two lines are identical, so a 17% cost difference is invisible \
+         to every reader of this instrument",
+    );
+}
+
+/// All six segments are emitted, under their own names, every tick.
+///
+/// A count and an identity: six lines, six distinct names, each naming the
+/// segment whose histogram it carries. The `n` conjunct is what stops a
+/// mis-wired call from reading green — `pre` carrying `ui`'s histogram would
+/// keep the names right and the figures wrong.
+#[test]
+fn every_frame_segment_is_reported_under_its_own_name() {
+    let mut segments = crate::frame_ledger::SegmentHists::default();
+    // A different sample count per segment, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut segments.pre,
+        &mut segments.pump,
+        &mut segments.ui,
+        &mut segments.prepare,
+        &mut segments.finish,
+        &mut segments.post,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_segment_lines(&segments);
+    let names = ["pre", "pump", "ui", "prepare", "finish", "post"];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame segment ({name}): n={}, ", slot + 1)),
+            "segment {slot} reported as {line:?}, which is not {name}'s line \
+             carrying {name}'s histogram",
+        );
+    }
+}
+
+/// The `tile take (…)` sentence, pinned as a literal, and only for a family
+/// that has samples.
+///
+/// The five families are never added to each other and none of them is added
+/// to `overlay rasters`, `texture uploads`, `basemap tiles` or any frame
+/// segment — see `squallar_egui::tile_source::take_ledger`, which states the
+/// denominator in full. The unit here is ONE TAKE.
+#[test]
+fn the_tile_take_line_reads_exactly_as_pinned() {
+    use squallar_egui::tile_source::take_ledger::{TakeKind, Totals};
+
+    let mut families = [Hist::new(); 5];
+    for _ in 0..3 {
+        families[1].record(100);
+    }
+    let totals = Totals { families };
+    assert_eq!(
+        totals.family(TakeKind::Raster).total(),
+        3,
+        "the fixture did not populate the raster family, so the pin below \
+         would be pinning a line about a different family",
+    );
+
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::tile_take_lines(&totals),
+        vec![format!(
+            "tile take (raster): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}"
+        )],
+        "a family with no takes was reported, or the one with takes was not",
+    );
+}
+
+/// **An empty ledger says nothing, and a moved one says exactly what moved.**
+///
+/// The tile families differ from the frame segments deliberately: three of the
+/// five are structurally empty on any one arm (`put` is native-only; `sniffed`
+/// and `restyle` need a plain-HTTP source and a theme flip), so emitting them
+/// at `n=0` forever would be console the reader steps over — and the ring the
+/// rig scrapes holds 1200 entries and evicts. The frame segments, which are
+/// never structurally absent, are emitted unconditionally instead.
+#[test]
+fn a_tile_family_with_no_takes_is_not_reported() {
+    use squallar_egui::tile_source::take_ledger::{FAMILIES, TakeKind, Totals};
+
+    let empty = Totals {
+        families: [Hist::new(); 5],
+    };
+    assert!(
+        super::tile_take_lines(&empty).is_empty(),
+        "an app that has taken no tiles wrote a line about every family",
+    );
+
+    // One take in each family: five lines, in the declared family order, each
+    // naming its own family exactly once.
+    let mut families = [Hist::new(); 5];
+    for hist in &mut families {
+        hist.record(1_000);
+    }
+    let lines = super::tile_take_lines(&Totals { families });
+    assert_eq!(lines.len(), FAMILIES.len());
+    for (line, kind) in lines.iter().zip(FAMILIES) {
+        assert!(
+            line.starts_with(&format!("tile take ({}): n=1, ", kind.label())),
+            "the take families are not reported in their declared order: \
+             {line:?} is not {}'s line",
+            kind.label(),
+        );
+    }
+    assert_ne!(
+        lines.len(),
+        super::tile_take_lines(&empty).len(),
+        "the populated and empty ledgers produced the same number of lines, \
+         so this test could not have failed",
+    );
+    assert_eq!(TakeKind::Vector.label(), "vector");
+}
+
+/// Both new sentences, held against the rig's own patterns rather than
+/// against a second copy of the literal — the seam that actually breaks when
+/// one end moves.
+#[test]
+fn the_rig_reads_the_two_windowable_families_the_app_actually_writes() {
+    use squallar_egui::tile_source::take_ledger::Totals;
+
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let hist = counts_string(&h);
+
+    let segments = crate::frame_ledger::SegmentHists {
+        pump: h,
+        ..Default::default()
+    };
+    assert_eq!(
+        super::frame_segment_lines(&segments)[1],
+        rendered(
+            &pattern("frame_segment_re"),
+            &["pump", "3", "300", "106", "106", "106", &hist],
+        ),
+        "the `frame segment (…):` line and the rig's probe have drifted",
+    );
+
+    let mut families = [Hist::new(); 5];
+    families[0] = h;
+    assert_eq!(
+        super::tile_take_lines(&Totals { families })[0],
+        rendered(
+            &pattern("tile_take_re"),
+            &["vector", "3", "300", "106", "106", "106", &hist],
+        ),
+        "the `tile take (…):` line and the rig's probe have drifted",
+    );
+}
+
+/// The floor under the seam test above, in the shape
+/// `a_frame_line_that_drifted_by_one_space_is_not_accepted` already uses:
+/// without it, a `pattern` returning the sentence itself would hold the
+/// equality whatever the app wrote.
+#[test]
+fn a_windowable_line_that_drifted_by_one_space_is_not_accepted() {
+    let hist = counts_string(&Hist::new());
+    let good = rendered(
+        &pattern("frame_segment_re"),
+        &["pre", "0", "0", "none", "none", "none", &hist],
+    );
+    assert_eq!(
+        super::named_hist_line("frame segment", "pre", &Hist::new()),
+        good,
+    );
+    let drifted = good.replacen(" us", "  us", 1);
+    assert_ne!(drifted, good, "the perturbation perturbed nothing");
+    assert_ne!(
+        super::named_hist_line("frame segment", "pre", &Hist::new()),
+        drifted,
+        "a line with one extra space compared equal to the real one, so the \
+         seam test above cannot fail",
+    );
+}

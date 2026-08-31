@@ -542,6 +542,104 @@ fn frame_segments_line(
     )
 }
 
+/// One named histogram, whole: its count, its **exact** running sum, three
+/// conservative percentiles and its 42 raw bins.
+///
+/// # Why the sum and not the mean
+///
+/// The mean is what a reader wants and the sum is what a *window* needs. `n`
+/// and `sum` both subtract between two readings, so a windowed mean is
+/// `(sum_b - sum_a) / (n_b - n_a)` and is **exact**; a mean printed directly
+/// would be a cumulative-from-boot average that cannot be un-mixed from the
+/// window inside it. Same division of labour the `frame prep costs:` line
+/// already uses — "cost per pass is the figure divided by the pass count of
+/// the same reading".
+///
+/// # Why this shape exists, when `frame segments` already reports the segments
+///
+/// Because a percentile does not subtract and a histogram does. The
+/// `frame segments` line answers p99 **cumulative from boot**, so the only
+/// question it can answer is "since boot, boot frames and the first volume
+/// build included" — and the question anyone actually has about a gesture is
+/// "what did this segment cost *during the gesture*". No windowed per-segment
+/// figure was obtainable from the shipping instrument at all; a lane that
+/// needed one had to build a private one on a branch, and the figures it
+/// produced named segments that do not exist here and had to be retracted.
+///
+/// `hist=` is what closes that: two readings of this line, subtracted bin by
+/// bin (`Hist::diff`, which `.github/browser-rig/drive.py` implements as
+/// `hist_diff`), are the window. The mean is carried beside the bins because
+/// the bins are four per octave — one bin apart is anywhere from 0% to 19%,
+/// and every true ratio between 1.68x and 2.38x prints as exactly `2.00x`. A
+/// windowed mean is exact and a windowed percentile is not.
+///
+/// The `frame segments` line is deliberately left exactly as it was: it is
+/// pinned by three things that move together, and this is additive.
+fn named_hist_line(prefix: &str, name: &str, h: &squallar_device_profile::hist::Hist) -> String {
+    format!(
+        "{prefix} ({name}): n={}, sum={} us, p50={} us, p90={} us, p99={} us, hist={}",
+        h.total(),
+        h.sum_micros(),
+        pctl_us(h, 0.50),
+        pctl_us(h, 0.90),
+        pctl_us(h, 0.99),
+        hist_counts(h),
+    )
+}
+
+/// The six `frame segment (<name>):` lines — the windowable spelling of
+/// [`frame_segments_line`].
+///
+/// Denominator: interact frames only, the same as `frame segments`, and the
+/// six are **contiguous cuts of one frame's service**, so their sum telescopes
+/// to it. The acquire is not among them and is not a service segment; it stays
+/// on the `frame segments` line where it already is.
+///
+/// All six are emitted every tick, `n=0` included — the same choice
+/// [`super::App::report_frame_telemetry`] already makes for the interact
+/// family, and for the same reason: "nobody touched the window" has to be
+/// readable as a figure rather than as an absence.
+fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
+    [
+        named_hist_line("frame segment", "pre", &s.pre),
+        named_hist_line("frame segment", "pump", &s.pump),
+        named_hist_line("frame segment", "ui", &s.ui),
+        named_hist_line("frame segment", "prepare", &s.prepare),
+        named_hist_line("frame segment", "finish", &s.finish),
+        named_hist_line("frame segment", "post", &s.post),
+    ]
+}
+
+/// The `tile take (<family>):` lines — what one tile take costs the thread
+/// that performs it.
+///
+/// Denominator: **one completion moved off a source's tile channel and handled
+/// to completion** — see `squallar_egui::tile_source::take_ledger`, which
+/// states it in full along with why the five families are never added to each
+/// other, and never to `overlay rasters`, `texture uploads`, `basemap tiles`
+/// or any frame segment.
+///
+/// This is the figure `PUMP_TIME_BUDGET`'s own doc has to reason about in
+/// prose — "a multi-millisecond tessellation" — because the budget is checked
+/// **between** takes and never during one, so a frame pays that budget plus
+/// one whole unbounded take and nothing measured the second half.
+///
+/// Unlike the frame segments, a family is emitted **only when it has samples**.
+/// A family with `n=0` has no window to diff and nothing to say, and three of
+/// the five are structurally empty on any given arm (`put` is the native arm's
+/// only family and never appears on the browser; `sniffed` and `restyle` need
+/// a plain-HTTP source and a theme flip respectively). Six frame-segment lines
+/// every tick is a floor worth paying; five permanently-zero tile lines beside
+/// them is console the reader has to step over, and the console ring the rig
+/// scrapes holds 1200 entries and evicts.
+fn tile_take_lines(t: &squallar_egui::tile_source::take_ledger::Totals) -> Vec<String> {
+    squallar_egui::tile_source::take_ledger::FAMILIES
+        .into_iter()
+        .filter(|&kind| t.family(kind).total() > 0)
+        .map(|kind| named_hist_line("tile take", kind.label(), t.family(kind)))
+        .collect()
+}
+
 /// The `frame prep costs:` running-total line.
 ///
 /// Denominator: every egui pass this renderer ended, presented or not — see
@@ -1250,6 +1348,19 @@ impl super::App {
             loud,
             &frame_segments_line(ledger.segments(), ledger.acquire()),
         );
+        // The windowable spelling of the line above: same six segments, same
+        // denominator, with the bins that make a gesture window a subtraction
+        // rather than a percentile of the whole run.
+        for line in frame_segment_lines(ledger.segments()) {
+            say_telemetry(loud, &line);
+        }
+        // What one tile take cost, per family. Read unconditionally rather
+        // than through an `_if_moved` arm, for the same reason the frame
+        // families are: this runs at the end of a frame and the window a
+        // reader brackets has to have a reading at each end of it.
+        for line in tile_take_lines(&squallar_egui::tile_source::take_ledger::totals()) {
+            say_telemetry(loud, &line);
+        }
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
             // The GPU pass family: real figures where a probe is installed,
