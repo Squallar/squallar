@@ -149,9 +149,19 @@
 #   SQUALLAR_WEB_DIR  dir to serve       (default <repo>/squallar-web)
 #   RIG_OUT_DIR       output dir         (default <rig>/out-measure)
 #   RIG_CHROMEDRIVER  chromedriver       (default: chromedriver on PATH)
-#   RIG_GECKODRIVER   geckodriver        (default: $(ensure-geckodriver.sh))
+#   RIG_GECKODRIVER   geckodriver        (default: $(ensure-geckodriver.sh);
+#                     only bootstrapped when firefox is actually requested)
+#   RIG_SAFARIDRIVER  safaridriver       (default: safaridriver on PATH, then
+#                     /usr/bin/safaridriver -- Apple ships it in the OS)
 #   RIG_BROWSERS      "firefox chromium" (default; firefox governs, runs and
-#                     reports first; never merged)
+#                     reports first; never merged). `safari` is accepted and
+#                     is macOS-only: it needs no X display and no downloaded
+#                     driver, so both of those steps are scoped to the
+#                     browsers actually asked for. A Safari row is a THIRD
+#                     engine (WebKit) and is never merged with either of the
+#                     other two. Its prerequisites are one-time and manual:
+#                     `sudo safaridriver --enable` and Safari's Develop menu
+#                     -> "Allow Remote Automation".
 #   RIG_SCENES        "A B C D" (default), or a subset, or any of the loop
 #                     scenes E1/E2/E3 (not in the default set: they are a
 #                     separate lane and they cost a settle each)
@@ -188,6 +198,7 @@ REPO_ROOT="$(cd -- "$RIG_DIR/../.." && pwd)"
 WEB_DIR="${SQUALLAR_WEB_DIR:-$REPO_ROOT/squallar-web}"
 OUT_DIR="${RIG_OUT_DIR:-$RIG_DIR/out-measure}"
 CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chromedriver)}"
+SAFARIDRIVER="${RIG_SAFARIDRIVER:-$(command -v safaridriver || echo /usr/bin/safaridriver)}"
 BROWSERS="${RIG_BROWSERS:-firefox chromium}"
 SCENES="${RIG_SCENES:-A B C D}"
 SETTLE="${RIG_SETTLE:-6}"
@@ -292,7 +303,22 @@ SCENE_B_COLS="ground_pass=$GROUND_PASS heights=$HEIGHTS_STATE sun_lighting_defau
 echo "commit=$COMMIT scenes=[$SCENES] browsers=[$BROWSERS] panel=$PANEL tls=$TLS canvas=${CANVAS:-unpinned}"
 echo "scene B denominator columns: $SCENE_B_COLS"
 
+# Which of the requested browsers need an X display and a downloaded driver.
+# Safari needs neither: it is macOS-only, Quartz is the compositor, and Apple
+# ships safaridriver in the OS. Both checks below are therefore scoped to the
+# browsers that were actually asked for -- a safari-only run on a Mac must not
+# die on a display it will never open, and must not reach for geckodriver.
+NEEDS_X11=0
+NEEDS_GECKO=0
+for _br in $BROWSERS; do
+  case "$_br" in
+    firefox)  NEEDS_X11=1; NEEDS_GECKO=1 ;;
+    chromium) NEEDS_X11=1 ;;
+  esac
+done
+
 # ------------------------------------------------------- display check ----
+if [ "$NEEDS_X11" = 1 ]; then
 DISPLAY_INFO="$("$PY" - "$RIG_DIR" "${RIG_DISPLAY:-}" <<'EOF'
 import importlib.util, json, os, sys
 rig = sys.argv[1]
@@ -309,6 +335,10 @@ if [ -z "$DISPLAY_INFO" ] || ! echo "$DISPLAY_INFO" | grep -q '"display": ":'; t
   exit 1
 fi
 echo "measurement arm display: $DISPLAY_INFO"
+else
+  DISPLAY_INFO='{"display": null, "why": "not needed: no X11 browser requested"}'
+  echo "measurement arm display: skipped (browsers=[$BROWSERS] need no X display)"
+fi
 
 SKIP_BUILD=0
 for arg in "$@"; do
@@ -318,13 +348,13 @@ for arg in "$@"; do
   esac
 done
 
-if [ -z "${RIG_GECKODRIVER:-}" ]; then
+if [ -z "${RIG_GECKODRIVER:-}" ] && [ "$NEEDS_GECKO" = 1 ]; then
   RIG_GECKODRIVER="$(bash "$RIG_DIR/ensure-geckodriver.sh")" || {
     echo "FATAL: ensure-geckodriver.sh failed" >&2
     exit 1
   }
 fi
-GECKODRIVER="$RIG_GECKODRIVER"
+GECKODRIVER="${RIG_GECKODRIVER:-}"
 
 mkdir -p "$OUT_DIR"
 
@@ -485,6 +515,7 @@ run_leg() {
   case "$browser" in
     chromium) driver="$CHROMEDRIVER" ;;
     firefox)  driver="$GECKODRIVER" ;;
+    safari)   driver="$SAFARIDRIVER" ;;
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
   seed="$(scene_seed "$scene")" || { echo "unknown scene: $scene" >&2; return 1; }

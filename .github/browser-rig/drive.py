@@ -789,8 +789,16 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     # also reach the driver headless (ANGLE over EGL/GBM), so a display is
     # optional there and mandatory for firefox, whose headless widget backend
     # has no GL provider on this box at all.
+    #
+    # Safari is exempt: it runs on macOS, where there is no X display to
+    # resolve and Quartz is the only compositor. Probing /tmp/.X11-unix there
+    # answers {"display": None, "why": ...}, which is not a fact about the
+    # leg -- it would be recorded as `host_display` and read as though a
+    # display lookup had failed. Safari also has no software arm to fall back
+    # to (WebKit always reaches the real GPU), so the hardware arm needs no
+    # display negotiation to be honest about what rendered.
     host = None
-    if arm == "hardware":
+    if arm == "hardware" and browser != "safari":
         host = resolve_host_display(display)
 
     if browser == "chromium" and android:
