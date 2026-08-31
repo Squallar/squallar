@@ -737,18 +737,24 @@ pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
 #[cfg(test)]
 pub(crate) fn hrrr_conus_grid() -> Template3_30 {
     use grib::def::grib2::template::param_set;
+
+    // The transcribed zeros. grib 0.18 pairs each scale factor with its scaled
+    // value in one `ScaledValue` instead of six flat fields; the bytes this
+    // stands for are unchanged.
+    let unscaled = || param_set::ScaledValue {
+        scale_factor: 0,
+        scaled_value: 0,
+    };
+
     Template3_30 {
         earth_shape: param_set::EarthShape {
             // Code Table 3.2 value 6 = "spherical, radius 6,371,229.0 m".
             // The radius is implied by the code; the explicit radius
             // fields are all zero in the file, as transcribed here.
             shape: 6,
-            spherical_earth_radius_scale_factor: 0,
-            spherical_earth_radius_scaled_value: 0,
-            major_axis_scale_factor: 0,
-            major_axis_scaled_value: 0,
-            minor_axis_scale_factor: 0,
-            minor_axis_scaled_value: 0,
+            spherical_earth_radius: unscaled(),
+            major_axis: unscaled(),
+            minor_axis: unscaled(),
         },
         ni: 1799,
         nj: 1059,

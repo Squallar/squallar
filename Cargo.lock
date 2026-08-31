@@ -1832,9 +1832,9 @@ dependencies = [
 
 [[package]]
 name = "grib"
-version = "0.17.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "254b62f71457ff33f5281036e2a432688393196f451dfca20610086c83edc270"
+checksum = "3def1ec9770b70aafbe8b14fe6b39d1b547b412ea92ddb2a79c7d3b50b36c951"
 dependencies = [
  "chrono",
  "grib-build",
@@ -1858,21 +1858,21 @@ dependencies = [
 
 [[package]]
 name = "grib-template-derive"
-version = "0.1.6"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14aeea4f64eb9b82998a74f90166e452a0a2074472164ec3a41108a3656253d9"
+checksum = "8968550dfe4ab69cb1a19a06d5d62c2744249b7375c8c9c8b51b07e87601e905"
 dependencies = [
  "grib-template-helpers",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
 name = "grib-template-helpers"
-version = "0.1.4"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbca98416a815503c311d5d9f3e711b7351ad2c7f8c4d6fc0642e171dd3d9b9e"
+checksum = "34e9487852f3e60a194016b52c98654e9f0df4056786289214343d4c2090f802"
 
 [[package]]
 name = "guillotiere"
