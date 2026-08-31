@@ -80,7 +80,7 @@ winit = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated
 # bindings do not line up; these move when that stack moves.
-wasm-bindgen = "=0.2.126"
+wasm-bindgen = "=0.2.127"
 # The pool behind `squallar_radar::par` on this target (WS3b). `no-bundler` is
 # the `--target web` arm: the bundler arm's `workerHelpers.js` expects a
 # bundler to rewrite `new Worker(new URL(...))`, and nothing rewrites anything
