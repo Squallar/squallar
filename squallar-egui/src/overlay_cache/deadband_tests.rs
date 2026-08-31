@@ -17,9 +17,6 @@ const TOKEN: u64 = 4242;
 /// mid-gesture band arm can never be what answers.
 const ZOOM: f64 = 7.0;
 
-/// A wall-clock origin far from zero, in the unit the clock parameter uses.
-const T0: f64 = 100.0;
-
 /// A pane at the WebGL2 floor: 2048 texels on a side is what a texture gets once
 /// the viewport alone fills the limit, and it is where the overdraw goes to zero.
 const SIDE: u32 = 2048;
@@ -81,8 +78,13 @@ fn asks_over(overdraw: f32, frames: u32, offset: impl Fn(u32) -> f64) -> u32 {
 
     let mut asked = 0;
     for f in 0..frames {
-        let now = T0 + f as f64 / 60.0;
-        if cache.needs_rerender(TOKEN, ZOOM, now, &viewport_at(offset(f)), &plan(overdraw)) {
+        if cache.needs_rerender(
+            TOKEN,
+            ZOOM,
+            ZoomDrive::AT_REST,
+            &viewport_at(offset(f)),
+            &plan(overdraw),
+        ) {
             asked += 1;
         }
     }
@@ -226,8 +228,9 @@ impl ZeroBandRig {
                 self.in_flight = None;
             }
 
-            let now = T0 + f as f64 / 60.0;
-            if self.cache.needs_rerender(TOKEN, ZOOM, now, &vp, &plan(0.0))
+            if self
+                .cache
+                .needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &vp, &plan(0.0))
                 && self.in_flight.is_none()
             {
                 self.in_flight = Some((f + 1, vp));

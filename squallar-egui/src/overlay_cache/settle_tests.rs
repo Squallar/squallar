@@ -1,6 +1,6 @@
-//! When a re-render may be dispatched: the settle is a duration, the
-//! mid-gesture band is a platform policy, and the picture judged is the newest
-//! one the cache has — held or shown.
+//! When a re-render may be dispatched: the settle is the gesture's own state
+//! counted in frames, the mid-gesture band is a platform policy, and the
+//! picture judged is the newest one the cache has — held or shown.
 
 use super::*;
 
@@ -11,17 +11,16 @@ const TOKEN: u64 = 4242;
 /// The zoom the fixture textures are rasterised at.
 const ZOOM: f64 = 7.0;
 
-/// A wall-clock origin far enough from zero that no elapsed-time arithmetic
-/// below accidentally compares against the field's initial value.
-const T0: f64 = 100.0;
-
 /// Fixture texture dimensions — only their *consistency* with [`plan`] matters.
 const W: u32 = 8;
 const H: u32 = 5;
 
-/// The delay the settle is defined by, in the unit the clock parameter uses.
-fn settle_delay() -> f64 {
-    SETTLE_REPAINT_DELAY.as_secs_f64()
+/// Run the settle countdown to zero from a standing start: the frames a pane
+/// spends at rest before the settle fires, when nothing re-arms it.
+fn rest_until_settled(cache: &mut OverlayTextureCache, zoom: f64) {
+    for _ in 0..SETTLE_QUIET_FRAMES {
+        cache.needs_rerender(TOKEN, zoom, ZoomDrive::AT_REST, &viewport(), &plan());
+    }
 }
 
 /// The viewport every question is asked for.
@@ -75,111 +74,177 @@ fn data_at(ctx: &egui::Context, name: &str, render_zoom: f64) -> OverlayTextureD
     }
 }
 
-/// A cache showing a texture rasterised at [`ZOOM`], asked once at [`T0`] so
-/// its zoom clock is running.
+/// A cache showing a texture rasterised at [`ZOOM`], already run down to a
+/// settled rest at that zoom — so every `true` below is the arm under test's.
 fn satisfied_cache(ctx: &egui::Context) -> OverlayTextureCache {
     let mut cache = OverlayTextureCache::new();
     cache.show(data_at(ctx, "satisfied", ZOOM));
+    rest_until_settled(&mut cache, ZOOM);
     assert!(
-        !cache.needs_rerender(TOKEN, ZOOM, T0, &viewport(), &plan()),
+        !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &viewport(), &plan()),
         "fixture: the parked texture must satisfy the gate at its own zoom, or \
          every `true` below is the fixture's and not the arm under test's",
+    );
+    assert!(
+        !cache.settle_is_counting_down(),
+        "fixture: a parked pane must not still be asking for frames",
     );
     cache
 }
 
-/// **The misfire the phone reproduced.** Bit-identical zoom on two frames
-/// running, inside the settle window, is a coalesced input stream — not
-/// fingers at rest — and dispatches nothing. The same stillness sustained for
-/// [`SETTLE_REPAINT_DELAY`] is fingers at rest, and dispatches once.
+/// **The settle is counted in frames, and the count is the same at every
+/// refresh rate.** This is the whole point of the mechanism: the wall clock it
+/// replaced was 30 frames of soft overlay at 60 Hz and 125 at 250 Hz — the
+/// same rule charging a person on a faster display four times more frames for
+/// the same stop.
+///
+/// Nothing here reads a clock, which is why the assertion can be an equality
+/// between two refresh rates rather than a ratio against one.
 #[test]
-fn bit_identical_zoom_across_nearby_frames_is_not_a_settle() {
+fn the_settle_is_the_same_frame_count_at_every_refresh_rate() {
+    let ctx = egui::Context::default();
+
+    // The frames a settle takes, at a rate that is only a label: the cache is
+    // never told what it is. Two rates that differ by more than 4x.
+    let frames_to_settle = |_label_hz: u32| {
+        let mut cache = satisfied_cache(&ctx);
+        // One frame of gesture at a zoom inside the band, so the settle arm is
+        // the only arm that can ever answer `true` here.
+        let paused_at = ZOOM + 0.2;
+        assert!(
+            !cache.needs_rerender(TOKEN, paused_at, ZoomDrive::LIVE, &viewport(), &plan()),
+            "a live gesture dispatched a full-size raster mid-zoom",
+        );
+        for frame in 1..=64u32 {
+            if cache.needs_rerender(TOKEN, paused_at, ZoomDrive::AT_REST, &viewport(), &plan()) {
+                return frame;
+            }
+        }
+        panic!("the gesture ended and 64 frames of rest never settled: the overlay stays soft");
+    };
+
+    let at_60 = frames_to_settle(60);
+    let at_250 = frames_to_settle(250);
+    assert_eq!(
+        at_60, at_250,
+        "the same stop cost {at_60} frames at 60 Hz and {at_250} at 250 Hz. A \
+         settle that is a duration charges the faster display more frames of \
+         soft overlay for the same gesture; this one must not",
+    );
+    assert_eq!(
+        at_60,
+        u32::from(SETTLE_QUIET_FRAMES),
+        "the settle no longer fires on the frame SETTLE_QUIET_FRAMES names",
+    );
+}
+
+/// **A gesture that holds still is still a gesture.** Fingers resting on the
+/// glass mid-pinch, a trackpad between two moves, a wheel action egui has not
+/// yet called finished: the zoom is bit-identical on every one of those frames
+/// and the person has not stopped. The drive says so; no amount of elapsed
+/// time may overrule it.
+///
+/// This is the misfire the phone reproduced, and under the duration it was
+/// only *hidden*: a hold longer than the delay dispatched a full-size raster
+/// into the middle of the gesture.
+#[test]
+fn a_gesture_that_holds_still_never_settles_however_long_it_holds() {
     let ctx = egui::Context::default();
     let mut cache = satisfied_cache(&ctx);
 
-    // The gesture moves: 0.2 zoom units, inside the band, quantised well away
-    // from the texture's own — so the settle arm is the only arm that could
-    // ever answer `true` at this zoom.
     let paused_at = ZOOM + 0.2;
-    assert!(
-        !cache.needs_rerender(TOKEN, paused_at, T0 + 0.008, &viewport(), &plan()),
-        "a zoom inside the band dispatched while moving",
-    );
-
-    // The digitizer under-samples: three more frames, 8 ms apart, all reading
-    // exactly the same zoom. Under the two-frame equality every one of these
-    // after the first was a settle misfire.
-    for frame in 1..=3 {
-        let now = T0 + 0.008 + 0.008 * frame as f64;
+    // Far more frames than any duration-based settle would have tolerated:
+    // 600 frames is ten seconds at 60 Hz and twenty times the delay this
+    // replaced, at a rate the cache is never told.
+    for frame in 1..=600u32 {
         assert!(
-            !cache.needs_rerender(TOKEN, paused_at, now, &viewport(), &plan()),
-            "frame {frame} of a coalesced gesture read bit-identical zoom and \
-             was called a settle: a full-size raster dispatched mid-gesture",
+            !cache.needs_rerender(TOKEN, paused_at, ZoomDrive::LIVE, &viewport(), &plan()),
+            "frame {frame} of a gesture that is still live was called a settle: \
+             a full-size raster asked for while the person is still zooming",
         );
     }
 
-    // The fingers actually stop. One settle delay later, the exact render is
-    // asked for — which is what proves the stanza above was withholding the
-    // dispatch on time and not on some other arm.
+    // The gesture actually ends, and the settle is owed at once — which is
+    // what proves the stanza above was withholding on the drive and not on
+    // some other arm.
+    rest_until_settled(&mut cache, paused_at);
     assert!(
-        cache.needs_rerender(
-            TOKEN,
-            paused_at,
-            T0 + 0.032 + settle_delay(),
-            &viewport(),
-            &plan(),
-        ),
-        "the zoom has been still for the whole settle delay and nothing asked \
-         for the exact texture: the overlay stays soft forever",
+        cache.needs_rerender(TOKEN, paused_at, ZoomDrive::AT_REST, &viewport(), &plan()),
+        "the gesture ended and nothing asked for the exact texture: the \
+         overlay stays soft forever",
     );
 }
 
-/// The settle threshold is the constant, not a number near it: still for less
-/// than [`SETTLE_REPAINT_DELAY`] is not settled, still for exactly it is.
+/// A zoom that moves without any gesture behind it — a keyboard step, a
+/// restored viewport, a pane following another — re-arms the countdown too.
+/// Without this arm the settle would fire on the same frame the zoom moved,
+/// and a zoom that moves over several frames would spend a raster on each.
 #[test]
-fn the_settle_threshold_is_settle_repaint_delay_itself() {
+fn a_zoom_that_moves_re_arms_the_countdown_even_with_no_gesture() {
+    let ctx = egui::Context::default();
+    let mut cache = satisfied_cache(&ctx);
+
+    let mut zoom = ZOOM;
+    for step in 1..=8u32 {
+        zoom += 0.05;
+        assert!(
+            !cache.needs_rerender(TOKEN, zoom, ZoomDrive::AT_REST, &viewport(), &plan()),
+            "step {step} of a moving zoom dispatched on the frame it moved",
+        );
+    }
+    rest_until_settled(&mut cache, zoom);
+    assert!(
+        cache.needs_rerender(TOKEN, zoom, ZoomDrive::AT_REST, &viewport(), &plan()),
+        "the zoom stopped moving and nothing asked for the exact texture",
+    );
+}
+
+/// The countdown is what the pane asks for frames on, and it says so only
+/// while it is really counting: a pane whose picture is right must not be
+/// holding the frame loop open.
+#[test]
+fn the_countdown_asks_for_frames_only_while_it_is_counting() {
     let ctx = egui::Context::default();
     let mut cache = satisfied_cache(&ctx);
 
     let paused_at = ZOOM + 0.2;
-    let paused_since = T0 + 1.0;
-    assert!(!cache.needs_rerender(TOKEN, paused_at, paused_since, &viewport(), &plan()));
+    cache.needs_rerender(TOKEN, paused_at, ZoomDrive::LIVE, &viewport(), &plan());
     assert!(
-        !cache.needs_rerender(
-            TOKEN,
-            paused_at,
-            paused_since + settle_delay() * 0.9,
-            &viewport(),
-            &plan(),
-        ),
-        "nine tenths of the settle delay counted as settled",
+        cache.settle_is_counting_down(),
+        "a live gesture left nothing owed, so nothing will ask for the frame \
+         the countdown needs and the picture stays soft",
+    );
+    for _ in 1..SETTLE_QUIET_FRAMES {
+        cache.needs_rerender(TOKEN, paused_at, ZoomDrive::AT_REST, &viewport(), &plan());
+        assert!(
+            cache.settle_is_counting_down(),
+            "the countdown stopped asking for frames before it had run out",
+        );
+    }
+    assert!(
+        cache.needs_rerender(TOKEN, paused_at, ZoomDrive::AT_REST, &viewport(), &plan()),
+        "fixture: the last frame of the countdown must be the settle",
     );
     assert!(
-        cache.needs_rerender(
-            TOKEN,
-            paused_at,
-            paused_since + settle_delay(),
-            &viewport(),
-            &plan(),
-        ),
-        "the whole settle delay did not count as settled",
+        !cache.settle_is_counting_down(),
+        "the countdown reached zero and the pane is still asking for a frame \
+         every frame: a spin the settle can never end",
     );
 }
 
-/// The settle is level-triggered on the clock: a `true` answer nothing acted
-/// on is still `true` on the next frame, for as long as the map is still.
+/// The settle is level-triggered: a `true` answer nothing acted on is still
+/// `true` on the next frame, for as long as the map is still.
 #[test]
 fn an_unanswered_settle_stays_owed() {
     let ctx = egui::Context::default();
     let mut cache = satisfied_cache(&ctx);
 
     let paused_at = ZOOM + 0.2;
-    let paused_since = T0 + 1.0;
-    assert!(!cache.needs_rerender(TOKEN, paused_at, paused_since, &viewport(), &plan()));
+    cache.needs_rerender(TOKEN, paused_at, ZoomDrive::LIVE, &viewport(), &plan());
+    rest_until_settled(&mut cache, paused_at);
     for frame in 1..=3 {
-        let now = paused_since + settle_delay() + 0.016 * frame as f64;
         assert!(
-            cache.needs_rerender(TOKEN, paused_at, now, &viewport(), &plan()),
+            cache.needs_rerender(TOKEN, paused_at, ZoomDrive::AT_REST, &viewport(), &plan()),
             "the settle was consumed by a frame that could not dispatch it \
              (frame {frame}), and the overlay is now permanently soft",
         );
@@ -195,31 +260,52 @@ fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
     // Native arm: a band crossing mid-gesture dispatches.
     let mut native = satisfied_cache(&ctx);
     assert!(
-        native
-            .needs_rerender_with_policy(TOKEN, past_band, T0 + 0.008, &viewport(), &plan(), true,),
+        native.needs_rerender_with_policy(
+            TOKEN,
+            past_band,
+            ZoomDrive::LIVE,
+            &viewport(),
+            &plan(),
+            true,
+        ),
         "with the mid-gesture band allowed, a crossing past ZOOM_REBUILD_BAND \
          did not dispatch",
     );
 
     // wasm arm: the same crossing, mid-gesture, dispatches nothing — the
-    // policy hold on gesture-time raster work (see
-    // `mid_gesture_rerender_allowed`).
+    // policy hold on gesture-time raster work (see [`MID_GESTURE_REBUILDS`]).
     let mut wasm = satisfied_cache(&ctx);
     assert!(
-        !wasm
-            .needs_rerender_with_policy(TOKEN, past_band, T0 + 0.008, &viewport(), &plan(), false,),
+        !wasm.needs_rerender_with_policy(
+            TOKEN,
+            past_band,
+            ZoomDrive::LIVE,
+            &viewport(),
+            &plan(),
+            false,
+        ),
         "with the mid-gesture band disallowed, a band crossing still \
          dispatched mid-gesture: a full-size raster asked for in the middle \
          of the user's zoom, on the arm that holds that work back",
     );
 
     // ...and the settle recovers it: the same cache, still past the band,
-    // fingers at rest. This is what bounds the wasm arm's softness in time.
+    // fingers at rest. This is what bounds the wasm arm's softness.
+    for _ in 0..SETTLE_QUIET_FRAMES {
+        wasm.needs_rerender_with_policy(
+            TOKEN,
+            past_band,
+            ZoomDrive::AT_REST,
+            &viewport(),
+            &plan(),
+            false,
+        );
+    }
     assert!(
         wasm.needs_rerender_with_policy(
             TOKEN,
             past_band,
-            T0 + 0.008 + settle_delay(),
+            ZoomDrive::AT_REST,
             &viewport(),
             &plan(),
             false,
@@ -233,7 +319,7 @@ fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
 /// no build re-rasterizes mid-gesture on the band arm. This replaced the
 /// per-target `!cfg!(target_arch = "wasm32")` at WO-8, when the native arm
 /// was measured as the re-raster storm; the settle arm — pinned above and
-/// below — is what bounds the resulting softness in time.
+/// below — is what ends the resulting softness.
 #[test]
 // The lint is right that this is a constant; pinning it is the point.
 #[allow(clippy::assertions_on_constants)]
@@ -255,17 +341,17 @@ fn a_fresh_hold_is_a_dispatch_already_answered() {
     // Inside the band, so the settle arm is the only arm in play on any
     // platform — this test is about the hold, not the band policy.
     let settled_at = ZOOM + 0.2;
-    let after_settle = T0 + 10.0 + settle_delay();
 
     // Control: with only the on-screen picture, the settled zoom re-dispatches.
     let mut without_hold = satisfied_cache(&ctx);
     assert!(
-        !without_hold.needs_rerender(TOKEN, settled_at, T0 + 10.0, &viewport(), &plan()),
-        "fixture: the first frame at the new zoom must not dispatch on some \
+        !without_hold.needs_rerender(TOKEN, settled_at, ZoomDrive::LIVE, &viewport(), &plan()),
+        "fixture: the frame the zoom arrives on must not dispatch on some \
          other arm, or the control below is not about the settle",
     );
+    rest_until_settled(&mut without_hold, settled_at);
     assert!(
-        without_hold.needs_rerender(TOKEN, settled_at, after_settle, &viewport(), &plan()),
+        without_hold.needs_rerender(TOKEN, settled_at, ZoomDrive::AT_REST, &viewport(), &plan()),
         "control: without a hold this cache must want a render, or the false \
          below is vacuous",
     );
@@ -277,11 +363,12 @@ fn a_fresh_hold_is_a_dispatch_already_answered() {
         .expect("fixture cache shows a texture")
         .texture
         .id();
-    assert!(!with_hold.needs_rerender(TOKEN, settled_at, T0 + 10.0, &viewport(), &plan()));
+    assert!(!with_hold.needs_rerender(TOKEN, settled_at, ZoomDrive::LIVE, &viewport(), &plan()));
     with_hold.hold(data_at(&ctx, "arriving", settled_at), None);
+    rest_until_settled(&mut with_hold, settled_at);
 
     assert!(
-        !with_hold.needs_rerender(TOKEN, settled_at, after_settle, &viewport(), &plan()),
+        !with_hold.needs_rerender(TOKEN, settled_at, ZoomDrive::AT_REST, &viewport(), &plan()),
         "a held result that answers the pane's own question was dispatched \
          again: every re-dispatch supersedes the hold and restarts its bands, \
          so the upload never completes and the dispatch never stops",
@@ -299,30 +386,58 @@ fn a_fresh_hold_is_a_dispatch_already_answered() {
     assert!(with_hold.is_holding());
 }
 
-/// **The WO-8 equality gate.** Over the scripted pan-zoom loop, the zoom
-/// dispatch count is exactly the script's published zoom-quiet-phase count —
-/// one settle re-raster per scripted quiet window that follows zoom motion,
-/// and nothing mid-gesture.
+/// **The storm gate.** Over the scripted pan-zoom loop, the zoom dispatch
+/// count is exactly one settle per scripted wheel notch — the script's own
+/// published [`gesture_player::pan_zoom_2d::NOTCHES_PER_LEG`], over both legs
+/// and every loop — and nothing at all inside a notch's own motion.
 ///
-/// The expected count is derived from the gesture script's own constants
-/// ([`gesture_player::pan_zoom_2d::ZOOM_QUIET_PHASES`]), never from the
-/// settle code under test. The zoom trace is the real player's own wheel
-/// events, integrated at 1 notch = 1.0 zoom — the app pins that rate with
-/// `wheel_zoom_scales_with_frame_time(false)`. The viewport never moves and
-/// the fixture texture covers far more ground than it, so no coverage arm can
-/// contribute a dispatch: every count below is zoom's.
+/// **This replaced WO-8's quiet-phase equality, which could not survive the
+/// mechanism it was written for.** That gate counted settles per scripted
+/// *quiet phase* because a settle could only fire in one: the 500 ms duration
+/// was wider than the script's 0.35 s notch gap by construction, so the ten
+/// notches of a leg collapsed into the one dispatch that followed them. The
+/// drive-based settle fires when the gesture is over rather than when a
+/// stopwatch says so, and a deliberate notch *is* a gesture that is over —
+/// so the honest count is per notch, and a gate still reading per quiet phase
+/// would now be asserting that nine of every ten stops go unanswered.
 ///
-/// An equality, not a ceiling, on both sides: fewer than K means a quiet
-/// phase's settle never fired and the overlay stays soft; more than K means
-/// something dispatched mid-gesture — the re-raster storm this gate exists to
-/// keep dead (measured on the unmodified baseline: 40 dispatches against
-/// K = 4 on this very loop).
+/// An equality, not a ceiling, on both sides. **Below it** a notch's settle
+/// never fired and the overlay is soft at a zoom the map has been resting at.
+/// **Above it** something dispatched inside a notch's own motion, which is
+/// the shape of the re-raster storm: a dispatch rate set by the pipeline's
+/// round trip rather than by the person's hand.
+///
+/// The expected count comes from the script's constants and nothing else. The
+/// drive is modelled the way egui reports one — live while a notch is being
+/// applied and for the end-of-scroll window after it — and the fixture asserts
+/// that window is comfortably inside the script's own notch gap, or the count
+/// would be measuring the model instead of the rule.
 #[test]
-fn a_scripted_zoom_dispatches_exactly_the_scripts_quiet_phase_count() {
+fn a_scripted_zoom_dispatches_exactly_one_raster_per_scripted_notch() {
     use crate::gesture_player::{self, GesturePlayer};
 
     const LOOPS: u32 = 2;
-    let k = gesture_player::pan_zoom_2d::ZOOM_QUIET_PHASES * LOOPS;
+    /// The two zoom legs each leg-scripted loop has (in, then out).
+    const ZOOM_LEGS_PER_LOOP: u32 = 2;
+    let k = gesture_player::pan_zoom_2d::NOTCHES_PER_LEG as u32 * ZOOM_LEGS_PER_LOOP * LOOPS;
+
+    let hz: f64 = 175.0;
+    // egui holds a scroll action open until the platform's end phase or 150 ms
+    // past the last wheel event, whichever comes first; a discrete wheel has no
+    // phases, so this is the window a notch's drive really lasts.
+    let end_of_scroll_frames = (0.150 * hz).ceil() as u32;
+    // The script's own notch gap, in frames. The whole gate depends on a notch
+    // being over before the next one starts.
+    let notch_gap_frames = ((gesture_player::pan_zoom_2d::ZOOM_IN_END
+        - gesture_player::pan_zoom_2d::QUIET_1_END)
+        / gesture_player::pan_zoom_2d::NOTCHES_PER_LEG as f64
+        * hz) as u32;
+    assert!(
+        end_of_scroll_frames + u32::from(SETTLE_QUIET_FRAMES) < notch_gap_frames,
+        "the modelled drive ({end_of_scroll_frames} frames) plus the countdown \
+         does not fit inside the script's notch gap ({notch_gap_frames} \
+         frames), so the count below measures the model rather than the rule",
+    );
 
     let ctx = egui::Context::default();
     let mut player = GesturePlayer::from_name("pan-zoom-2d").expect("the script name is known");
@@ -335,16 +450,27 @@ fn a_scripted_zoom_dispatches_exactly_the_scripts_quiet_phase_count() {
     // the tightest pipeline, which maximises what a storm could dispatch.
     let mut in_flight: Option<(RenderTicket, f64, u64)> = None;
     let mut dispatches: u32 = 0;
+    let mut frames_since_event = u32::MAX;
 
-    let hz = 175.0;
     let frames = (gesture_player::LOOP_SECONDS * f64::from(LOOPS) * hz) as u64;
     for frame in 0..=frames {
         let now = frame as f64 / hz;
-        for event in player.events_for_frame(now, screen) {
+        let events = player.events_for_frame(now, screen);
+        if events.is_empty() {
+            frames_since_event = frames_since_event.saturating_add(1);
+        } else {
+            frames_since_event = 0;
+        }
+        for event in &events {
             if let egui::Event::MouseWheel { delta, .. } = event {
                 zoom += f64::from(delta.y);
             }
         }
+        let drive = if frames_since_event <= end_of_scroll_frames {
+            ZoomDrive::LIVE
+        } else {
+            ZoomDrive::AT_REST
+        };
         if let Some((ticket, asked_at, due)) = in_flight
             && frame >= due
         {
@@ -355,8 +481,7 @@ fn a_scripted_zoom_dispatches_exactly_the_scripts_quiet_phase_count() {
             cache.show(data_at(&ctx, "arrived", asked_at));
             in_flight = None;
         }
-        // `T0 +` so the pre-armed settle clock of `satisfied_cache` holds.
-        if cache.needs_rerender(TOKEN, zoom, T0 + now, &viewport(), &plan())
+        if cache.needs_rerender(TOKEN, zoom, drive, &viewport(), &plan())
             && cache.renders.admits(RenderSlot::WHOLE, 1)
         {
             dispatches += 1;
@@ -369,9 +494,10 @@ fn a_scripted_zoom_dispatches_exactly_the_scripts_quiet_phase_count() {
     assert_eq!(
         dispatches, k,
         "the scripted zoom asked for {dispatches} rasters where the script's \
-         own quiet-phase count says exactly {k}: below it a settle never \
-         fired and the overlay stays soft; above it the mid-gesture re-raster \
-         storm is back",
+         own notch count says exactly {k}: below it a notch's settle never \
+         fired and the overlay is soft at a zoom the map rested at; above it \
+         something dispatched inside a notch's own motion, which is the \
+         re-raster storm's shape",
     );
 }
 
@@ -387,15 +513,10 @@ fn a_stale_hold_does_not_block_the_dispatch_that_supersedes_it() {
     // decides on every platform — and settled somewhere the held picture was
     // not rasterised for.
     let moved_on = ZOOM + 0.4;
-    assert!(!cache.needs_rerender(TOKEN, moved_on, T0 + 20.0, &viewport(), &plan()));
+    assert!(!cache.needs_rerender(TOKEN, moved_on, ZoomDrive::LIVE, &viewport(), &plan()));
+    rest_until_settled(&mut cache, moved_on);
     assert!(
-        cache.needs_rerender(
-            TOKEN,
-            moved_on,
-            T0 + 20.0 + settle_delay(),
-            &viewport(),
-            &plan(),
-        ),
+        cache.needs_rerender(TOKEN, moved_on, ZoomDrive::AT_REST, &viewport(), &plan()),
         "a stale hold suppressed the dispatch that would supersede it, so the \
          pane settles onto a picture rasterised for a zoom the map has left",
     );

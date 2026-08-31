@@ -13250,6 +13250,79 @@ fn every_zoom_the_map_offers_reaches_a_cache_that_is_satisfied() {
     }
 }
 
+/// The harness frame rate every settle count below is stated at. Named
+/// because a frame count is only a figure beside the rate it was counted at.
+const SETTLE_HZ: f64 = 120.0;
+
+/// Frames of rest the settle may take after the zoom stops moving, at
+/// [`SETTLE_HZ`], before the pane is soft for longer than it has any excuse
+/// to be.
+///
+/// **Every term is somebody's published behaviour, none is this test's.** egui
+/// holds a discrete wheel's scroll action open for 150 ms past the last wheel
+/// event (`egui::input_state::wheel_state`, which has no phase events to end
+/// it on), and `ZoomDrive` reads that state rather than second-guessing it;
+/// then `SETTLE_QUIET_FRAMES` of hysteresis run down. Nothing else may sit in
+/// between: the wall clock this replaced put 500 ms there, which is 60 frames
+/// at this rate and 125 at 250 Hz.
+fn settle_frame_budget() -> usize {
+    // The window, the frame the wheel event itself is delivered on, and the
+    // countdown.
+    (0.150 * SETTLE_HZ).ceil() as usize + 1 + usize::from(crate::overlay_cache::SETTLE_QUIET_FRAMES)
+}
+
+/// The zoom the pane's own map is at — not [`InputHarness::zoom`], which reads
+/// the harness's memory rather than the pane's.
+fn pane_zoom(h: &mut InputHarness) -> f64 {
+    h.gui_mut().panes_mut()[0].map_memory.zoom()
+}
+
+/// Drive frames until `kind` asks for a raster, and answer **how many frames
+/// the pane's zoom had already been at rest** when it did.
+///
+/// This is the figure the complaint is about, and the only one that is a
+/// property of the settle rather than of the gesture: a wheel notch's own zoom
+/// animation is egui draining ~22 frames of smoothing at [`SETTLE_HZ`], and
+/// the map is genuinely still moving through all of it. What the settle owns
+/// is the gap between the map stopping and the picture being asked for.
+fn frames_at_rest_when_settled(
+    h: &mut InputHarness,
+    kind: &LayerId,
+    budget: usize,
+) -> Option<usize> {
+    let mut at_rest = 0usize;
+    let mut last = pane_zoom(h);
+    for _ in 0..budget {
+        h.frame_after(1.0 / SETTLE_HZ);
+        let now = pane_zoom(h);
+        if now == last {
+            at_rest += 1;
+        } else {
+            at_rest = 0;
+            last = now;
+        }
+        if rasterizes_requested(h, kind) > 0 {
+            return Some(at_rest);
+        }
+    }
+    None
+}
+
+/// A wheel notch that zooms **in**, for the tests that want the settle arm and
+/// nothing else. Zooming out grows the viewport past the ground the parked
+/// texture covers, and the coverage arm dispatches for reasons that have
+/// nothing to do with a gesture ending.
+const SETTLE_NOTCH_LINES: f32 = 3.0;
+
+/// Run [`SETTLE_HZ`] frames until `kind` asks for a raster, and answer how many
+/// it took. `None` when `budget` frames went by without one.
+fn frames_until_rasterize(h: &mut InputHarness, kind: &LayerId, budget: usize) -> Option<usize> {
+    (1..=budget).find(|_| {
+        h.frame_after(1.0 / SETTLE_HZ);
+        rasterizes_requested(h, kind) > 0
+    })
+}
+
 /// Walk the zoom by `step` for `frames` frames, one 120 Hz frame per step, and
 /// return how many rasterizes were asked for along the way.
 fn zoom_gesture(h: &mut InputHarness, from: f64, step: f64, frames: usize) -> usize {
@@ -13300,18 +13373,90 @@ fn a_zoom_past_the_band_stays_quiet_until_the_settle() {
          still moving: the mid-gesture re-raster storm is back",
     );
 
-    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
+    let took = frames_until_rasterize(&mut h, &known::NWS_ALERTS, settle_frame_budget())
+        .unwrap_or_else(|| {
+            panic!(
+                "the gesture ended more than a band off its texture and \
+                 {} frames of rest never asked for the exact render; past the \
+                 band the overlay is more than a factor of two off its own \
+                 scale, forever",
+                settle_frame_budget()
+            )
+        });
     assert_eq!(
-        rasterizes_requested(&h, &known::NWS_ALERTS),
-        1,
-        "the gesture ended more than a band off its texture and nothing asked \
-         for the exact render; past the band the overlay is more than a \
-         factor of two off its own scale, forever",
+        took,
+        usize::from(crate::overlay_cache::SETTLE_QUIET_FRAMES),
+        "the zoom stopped with nothing driving it and the settle still took \
+         {took} frames; the countdown is the only thing that may sit between \
+         a stop and the raster",
     );
     assert_eq!(
         requested_render_zoom(&h, &known::NWS_ALERTS),
         crate::overlay_cache::current_quantized_zoom(stopped_at),
         "the settle render was keyed at a zoom the map is not at"
+    );
+}
+
+/// **The complaint, at the layer a person feels it.** A real wheel notch over
+/// the map, and then: once the map has stopped moving, how many frames before
+/// the overlay is asked to be right again.
+///
+/// The answer must be the countdown and nothing else. What it replaced was a
+/// 500 ms wall clock — 60 frames of stretched overlay at this rate, 125 on a
+/// 250 Hz display, after every single stop.
+#[test]
+fn a_wheel_notch_settles_the_frame_the_countdown_names_after_the_map_stops() {
+    const Z0: f64 = 7.0;
+    let mut h = settled_alert_pane(Z0);
+    let centre = h.pane_rects()[0].center();
+    let before = pane_zoom(&mut h);
+
+    h.wheel_notch(centre, egui::MouseWheelUnit::Line, SETTLE_NOTCH_LINES);
+    // Generous: the notch's own zoom animation is inside this and is not the
+    // settle's to answer for. What is asserted is the figure below it.
+    let budget = 8 * settle_frame_budget();
+    let at_rest =
+        frames_at_rest_when_settled(&mut h, &known::NWS_ALERTS, budget).unwrap_or_else(|| {
+            panic!(
+                "a wheel notch landed and {budget} frames later nothing had \
+                 asked for the picture at the zoom it left the map on: the \
+                 overlay is stretched and stays stretched"
+            )
+        });
+    let after = pane_zoom(&mut h);
+    assert!(
+        after != before,
+        "fixture: the notch must have moved the map, or the frames counted \
+         above are counting nothing"
+    );
+    assert_eq!(
+        at_rest,
+        usize::from(crate::overlay_cache::SETTLE_QUIET_FRAMES),
+        "the map came to rest and the overlay was soft for {at_rest} more \
+         frames. Only the countdown may sit between a person stopping and the \
+         picture being asked for",
+    );
+    assert_eq!(
+        requested_render_zoom(&h, &known::NWS_ALERTS),
+        crate::overlay_cache::current_quantized_zoom(after),
+        "the settle render was keyed at a zoom the map is not at"
+    );
+
+    // …and the pane goes quiet again once the raster lands, so the immediate
+    // repaint the countdown asks for is a countdown and not a spin.
+    settle_overlay_cache(&mut h, &known::NWS_ALERTS);
+    let mut quiet = false;
+    for _ in 0..60 {
+        h.frame_after(1.0 / SETTLE_HZ);
+        if h.repaint_delay() == std::time::Duration::MAX {
+            quiet = true;
+            break;
+        }
+    }
+    assert!(
+        quiet,
+        "the settle landed and the pane is still asking for a frame every \
+         frame: the countdown's immediate repaint became a spin nothing ends"
     );
 }
 
@@ -13326,20 +13471,21 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     assert_eq!(asked, 0, "fixture: the gesture itself must be free");
     let stopped_at = Z0 + 0.6;
 
-    h.frame_after(1.0 / 120.0);
+    h.frame_after(1.0 / SETTLE_HZ);
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
-        "one 120 Hz frame of stillness was called a settle; on a coalesced \
-         touch stream that fires in the middle of the gesture"
+        "the frame the zoom last moved on was called a settle: a full-size \
+         raster dispatched on a map that is still going somewhere"
     );
 
-    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
+    let took = frames_until_rasterize(&mut h, &known::NWS_ALERTS, settle_frame_budget())
+        .expect("the gesture ended and nothing asked for the texture this zoom wants");
     assert_eq!(
-        rasterizes_requested(&h, &known::NWS_ALERTS),
-        1,
-        "the gesture ended and nothing asked for the texture this zoom wants; \
-         the overlay stays soft until something else invalidates it"
+        took,
+        usize::from(crate::overlay_cache::SETTLE_QUIET_FRAMES) - 1,
+        "the stop cost {took} frames of rest beyond the first; only the \
+         countdown may sit here",
     );
     assert_eq!(
         requested_render_zoom(&h, &known::NWS_ALERTS),
@@ -13366,42 +13512,53 @@ fn a_zoom_that_stops_inside_the_band_settles_exactly_once() {
     );
 }
 
-/// **The misfire that hid the alert layer on a phone.**
+/// **The misfire that hid the alert layer on a phone**, asked of the input
+/// that causes it rather than of a zoom moved by hand.
+///
+/// A wheel gesture is a train of notches with the zoom bit-identical between
+/// them, and it is *one gesture*: egui holds the scroll action open across the
+/// gap. The old rule could only tell that apart from a stop by out-waiting the
+/// gap, so the pause it tolerated had to be wider than any pause a person
+/// makes — and every stop paid that width. `ZoomDrive` reads the state
+/// instead, which is why the pause below is a real notch cadence rather than
+/// four frames.
 #[test]
-fn a_zoom_pause_shorter_than_the_settle_delay_is_not_a_settle() {
+fn a_pause_inside_a_live_wheel_gesture_is_not_a_settle() {
     const Z0: f64 = 7.0;
     let mut h = settled_alert_pane(Z0);
+    let centre = h.pane_rects()[0].center();
 
-    set_pane_zoom(&mut h, Z0 + 0.2);
-    h.frame_after(1.0 / 120.0);
-    assert_eq!(
-        rasterizes_requested(&h, &known::NWS_ALERTS),
-        0,
-        "fixture: a zoom inside the band must be free while it moves",
-    );
-    for frame in 0..4 {
-        h.frame_after(1.0 / 120.0);
+    h.wheel_notch(centre, egui::MouseWheelUnit::Line, SETTLE_NOTCH_LINES);
+    // Long enough to be a real pause between two notches, short enough that
+    // egui still calls the scroll action live — the window the old rule could
+    // only cover by out-waiting it.
+    let pause_frames = (0.100 * SETTLE_HZ) as usize;
+    for frame in 0..pause_frames {
+        h.frame_after(1.0 / SETTLE_HZ);
         assert_eq!(
             rasterizes_requested(&h, &known::NWS_ALERTS),
             0,
-            "frame {frame} of a coalesced pause dispatched a raster \
-             mid-gesture: the settle misfire, back again",
+            "frame {frame} of a pause inside a live wheel gesture dispatched a \
+             full-size raster: the settle misfire, back again",
         );
     }
-    set_pane_zoom(&mut h, Z0 + 0.4);
-    h.frame_after(1.0 / 120.0);
+
+    // The train resumes. Nothing may have been spent on the gap.
+    h.wheel_notch(centre, egui::MouseWheelUnit::Line, SETTLE_NOTCH_LINES);
+    h.frame_after(1.0 / SETTLE_HZ);
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
         0,
         "the gesture resumed and the resume frame itself dispatched",
     );
 
-    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
-    assert_eq!(
-        rasterizes_requested(&h, &known::NWS_ALERTS),
-        1,
-        "control: a real stop no longer settles, so the zeros above prove \
-         nothing",
+    // Control: the gesture really ends, and the settle really fires — so the
+    // zeros above are a hold rather than a cache that stopped listening.
+    let budget = 8 * settle_frame_budget();
+    assert!(
+        frames_at_rest_when_settled(&mut h, &known::NWS_ALERTS, budget).is_some(),
+        "control: {budget} frames after the last notch nothing settled, so the \
+         zeros above prove nothing",
     );
 }
 
@@ -13426,13 +13583,15 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
                 max_lon: -96.0,
             },
         ));
-    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64() + 0.01);
-    assert_eq!(
-        rasterizes_requested(&h, &known::NWS_ALERTS),
-        0,
-        "fixture: an in-flight render must suppress the dispatch, or this test \
-         is not about what it says"
-    );
+    for _ in 0..=usize::from(crate::overlay_cache::SETTLE_QUIET_FRAMES) {
+        h.frame_after(1.0 / SETTLE_HZ);
+        assert_eq!(
+            rasterizes_requested(&h, &known::NWS_ALERTS),
+            0,
+            "fixture: an in-flight render must suppress the dispatch, or this \
+             test is not about what it says"
+        );
+    }
 
     h.gui_mut().panes_mut()[0]
         .overlay_cache_mut(&known::NWS_ALERTS)
@@ -13447,7 +13606,12 @@ fn a_settle_frame_lost_to_an_in_flight_render_is_not_a_settle_lost() {
     );
 }
 
-/// And the frame the settle needs is *asked for*, rather than left to arrive.
+/// And the frame the settle needs is *asked for*, rather than left to arrive
+/// — **at once**, because the countdown is counted in frames.
+///
+/// A delay here is the wall clock coming back by the other door: a settle owed
+/// two frames that is woken in half a second is a half-second settle whatever
+/// the countdown says. The old rule asked for exactly that.
 #[test]
 fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
     const Z0: f64 = 7.0;
@@ -13463,11 +13627,13 @@ fn a_stale_zoom_asks_for_the_frame_its_settle_needs() {
 
     set_pane_zoom(&mut h, Z0 + 0.05);
     h.frame();
-    assert!(
-        h.repaint_delay() <= crate::overlay_cache::SETTLE_REPAINT_DELAY,
-        "the overlay is at a zoom the map is not at and nothing asked for \
-         another frame; on a reactive UI the settle render is then waiting for \
-         an input event that may never come — got {:?}",
+    assert_eq!(
+        h.repaint_delay(),
+        std::time::Duration::ZERO,
+        "the overlay is at a zoom the map is not at and the frame its \
+         countdown needs was scheduled rather than asked for. On a reactive UI \
+         that delay IS the settle's latency, whatever the countdown is counted \
+         in — got {:?}",
         h.repaint_delay(),
     );
 }

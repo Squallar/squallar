@@ -11,9 +11,6 @@ const TOKEN: u64 = 4242;
 /// the mid-gesture band arm can never be what answers.
 const ZOOM: f64 = 7.0;
 
-/// A wall-clock origin far from zero, in the unit the clock parameter uses.
-const T0: f64 = 100.0;
-
 /// Fixture texture dimensions — only their consistency with [`plan`] matters.
 const W: u32 = 8;
 const H: u32 = 5;
@@ -214,8 +211,9 @@ impl PanRig {
             // The gate is asked every frame the overlay is live, exactly as
             // `ui_map_pane` asks it, and only the dispatch is gated on the
             // in-flight mark.
-            let now = T0 + f as f64 / 60.0;
-            let needs = self.cache.needs_rerender(TOKEN, ZOOM, now, &vp, &plan());
+            let needs = self
+                .cache
+                .needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &vp, &plan());
             if needs && self.cache.renders.admits(RenderSlot::WHOLE, self.limit) {
                 self.cache
                     .renders
@@ -349,7 +347,7 @@ fn a_hold_short_of_margin_does_not_dispatch_while_the_shown_picture_has_room() {
     let mut cache = OverlayTextureCache::new();
     cache.show(data_for(&texture, &here));
     assert!(
-        !cache.needs_rerender(TOKEN, ZOOM, T0, &here, &plan()),
+        !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &here, &plan()),
         "fixture: a picture rasterised for this very viewport must satisfy the \
          gate, or nothing below is about the hold",
     );
@@ -359,14 +357,14 @@ fn a_hold_short_of_margin_does_not_dispatch_while_the_shown_picture_has_room() {
     let mut control = OverlayTextureCache::new();
     control.show(data_for(&texture, &viewport_at(0.2)));
     assert!(
-        control.needs_rerender(TOKEN, ZOOM, T0, &here, &plan()),
+        control.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &here, &plan()),
         "control: a picture rasterised 0.2 degrees away must be short of margin \
          here, or the hold below is not short of margin either",
     );
 
     cache.hold(data_for(&texture, &viewport_at(0.2)), None);
     assert!(
-        !cache.needs_rerender(TOKEN, ZOOM, T0, &here, &plan()),
+        !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &here, &plan()),
         "the gate dispatched on the margin of a picture the viewer cannot see \
          yet while the one on screen still had room: the raster that comes back \
          replaces the upload in progress, so the pane shows neither",
@@ -392,7 +390,7 @@ fn nothing_held_leaves_the_coverage_answer_exactly_where_it_was() {
         let vp = viewport_at(east);
         let mut cache = OverlayTextureCache::new();
         cache.show(data_for(&texture, &here));
-        let asked = cache.needs_rerender(TOKEN, ZOOM, T0, &vp, &plan());
+        let asked = cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &vp, &plan());
         let expected = pan_exceeds_coverage(&tex_bounds, &vp);
         assert_eq!(
             asked, expected,
@@ -423,7 +421,7 @@ fn a_first_picture_over_an_empty_pane_asks_once_and_then_waits() {
     assert!(cache.current().is_none(), "fixture: nothing is on screen");
 
     assert!(
-        cache.needs_rerender(TOKEN, ZOOM, T0, &far, &plan()),
+        cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &far, &plan()),
         "the only picture this pane has does not reach the viewport, and there \
          is nothing on screen behind it: the first ask stands",
     );
@@ -432,7 +430,7 @@ fn a_first_picture_over_an_empty_pane_asks_once_and_then_waits() {
     // would throw away the only picture the pane has ever had.
     cache.hold(data_for(&texture, &viewport_at(0.5)), None);
     assert!(
-        !cache.needs_rerender(TOKEN, ZOOM, T0, &far, &plan()),
+        !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &far, &plan()),
         "an empty pane asked for a second raster against a hold it had already \
          replaced once: every arrival restarts the upload, so the pane never \
          draws anything at all",
@@ -444,7 +442,7 @@ fn a_first_picture_over_an_empty_pane_asks_once_and_then_waits() {
         .expect("the hold is delivered");
     cache.show(held.data);
     assert!(
-        cache.needs_rerender(TOKEN, ZOOM, T0, &far, &plan()),
+        cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &far, &plan()),
         "the brake outlived the picture that set it",
     );
 }
@@ -484,11 +482,11 @@ fn a_content_stale_hold_is_braked_only_until_its_upload_lands() {
 
     // The brake is set and a hold is pending: coverage cannot dispatch.
     assert!(
-        !cache.needs_rerender(TOKEN, ZOOM, T0, &viewport_at(0.2), &plan()),
+        !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &viewport_at(0.2), &plan()),
         "fixture: the brake must be engaged, or the token below proves nothing",
     );
     assert!(
-        !cache.needs_rerender(TOKEN + 1, ZOOM, T0, &here, &plan()),
+        !cache.needs_rerender(TOKEN + 1, ZOOM, ZoomDrive::AT_REST, &here, &plan()),
         "a pane that had already thrown away one upload, and was still \
          waiting on its replacement, spent another raster the moment the \
          content moved. Under a playing loop the content moves every tick, so \
@@ -504,7 +502,7 @@ fn a_content_stale_hold_is_braked_only_until_its_upload_lands() {
         .expect("the hold is delivered");
     cache.show(landed.data);
     assert!(
-        cache.needs_rerender(TOKEN + 1, ZOOM, T0, &here, &plan()),
+        cache.needs_rerender(TOKEN + 1, ZOOM, ZoomDrive::AT_REST, &here, &plan()),
         "the content brake outlived the upload that set it: new data really \
          would never reach a pane that had flung once",
     );
@@ -516,7 +514,7 @@ fn a_content_stale_hold_is_braked_only_until_its_upload_lands() {
         ..plan()
     };
     assert!(
-        cache.needs_rerender(TOKEN, ZOOM, T0, &here, &denser),
+        cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &here, &denser),
         "a hold at the old display density was kept by the coverage brake",
     );
 }
@@ -535,13 +533,13 @@ fn releasing_a_hold_releases_the_brake() {
         cache.hold(data_for(&texture, &here), None);
         cache.hold(data_for(&texture, &here), None);
         assert!(
-            !cache.needs_rerender(TOKEN, ZOOM, T0, &away, &plan()),
+            !cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &away, &plan()),
             "fixture: the brake must be engaged before it can be released",
         );
     };
     let asks_again = |cache: &mut OverlayTextureCache, how: &str| {
         assert!(
-            cache.needs_rerender(TOKEN, ZOOM, T0, &away, &plan()),
+            cache.needs_rerender(TOKEN, ZOOM, ZoomDrive::AT_REST, &away, &plan()),
             "the brake survived {how}, so this pane will never rebuild for a \
              pan again",
         );

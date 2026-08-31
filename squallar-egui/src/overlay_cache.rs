@@ -22,24 +22,98 @@ fn quantize_zoom(zoom: f64) -> i32 {
 /// before the texture is re-rasterized mid-gesture.
 pub const ZOOM_REBUILD_BAND: f64 = 1.0;
 
-/// How long a zoom must be still before the gesture counts as settled — and so
-/// also how long after it stops before the settle render is asked for.
+/// How long input must be still before an *interaction* counts as over.
 ///
-/// **The value is bounded on both sides by what a wheel gesture is.** A wheel
-/// zoom has no held-button signal: between notches the zoom is bit-identical
-/// and the input stream is empty, exactly like fingers at rest, so this
-/// duration is the only thing separating "paused between notches" from
-/// "stopped". Below a notch gap the settle fires inside the gesture — one
-/// full-size raster per notch, which with [`MID_GESTURE_REBUILDS`] false is
-/// the whole re-raster storm readmitted through the settle arm. A deliberate
-/// notch-at-a-time zoom runs at ~2–3 notches/s (the scripted deliberate legs
-/// in `crate::gesture_player` put their gaps at 0.35–0.4 s), so half a second
-/// clears it with margin. Above it sits the scripted quiet floor
-/// (`gesture_player::QUIET_MIN_SECONDS`, 1.5 s): a real stop must settle well
-/// inside one quiet phase, or the equality gate in `settle_tests` —
-/// dispatches per scripted loop == the script's published zoom-quiet-phase
-/// count — cannot hold from either side.
+/// **This is no longer the overlay settle.** Until 2026-08-31 the zoom settle
+/// was this duration on a wall clock, and the value was picked to sit above a
+/// deliberate wheel gesture's notch gap (~0.35–0.4 s) and below the scripted
+/// quiet floor (`gesture_player::QUIET_MIN_SECONDS`, 1.5 s) — a window chosen
+/// so a scripted equality gate could hold from either side. What it cost the
+/// person zooming was half a second of stretched overlay after their last
+/// notch, every time. The settle now reads the gesture's own state instead;
+/// see [`ZoomDrive`] and [`SETTLE_QUIET_FRAMES`].
+///
+/// What still uses it is the work that genuinely wants "the interaction is
+/// over, resume the background spend": the tile pump's quiet latch
+/// (`crate::ui::map::gesture_quiet`) and the loop refill's throttle
+/// (`squallar_app::loop_refill`). Both are budget decisions about a shared
+/// thread rather than a question about what is on the glass, and neither is
+/// in the path between a person stopping and the picture being right.
 pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Frames of rest a zoom must show before the settle re-raster is asked for.
+///
+/// **Frames, not milliseconds, and small.** The wall clock this replaced was
+/// 30 frames at 60 Hz and 125 at 250 Hz — the same rule costing a person on a
+/// faster display four times more frames of soft overlay. A count is the same
+/// rule everywhere.
+///
+/// The number is not the settle's latency: [`ZoomDrive`] already answers "is
+/// the zoom still being driven", so by the time this counts down the gesture
+/// is over by egui's own reckoning. This is hysteresis on that answer, and two
+/// frames is what one dropped or coalesced input frame costs — a trackpad that
+/// reports no movement on a single frame while the fingers are still on it, a
+/// digitizer that under-samples. One frame would let that misfire; more than
+/// two buys nothing, because a gesture that is really over stays over.
+///
+/// The perceptual budget it has to fit inside is ~100 ms — the point where a
+/// response stops reading as instant. Two frames is 33 ms at 60 Hz and 8 ms at
+/// 250 Hz, and the drive signal ahead of it is bounded by egui's own
+/// end-of-scroll (150 ms for a discrete wheel, immediate for a trackpad that
+/// reports its phases). So the whole path fits, on both.
+pub const SETTLE_QUIET_FRAMES: u8 = 2;
+
+/// Whether the map's zoom is being driven this frame.
+///
+/// **The state the settle used to infer from a clock.** The question the settle
+/// arm really asks is "is the person still zooming", and every input that could
+/// answer it is on the frame's own [`egui::InputState`] — a scroll action egui
+/// has not yet called finished, a pinch, fingers on the glass, a drag. Elapsed
+/// time was a proxy for all of them, and a proxy that had to be wider than the
+/// widest gesture it was standing in for.
+///
+/// **Whole-window, not per-pane, and deliberately.** egui's input is the
+/// window's; a pane cannot be told apart from its neighbour in it. The same
+/// choice `crate::ui::map::gesture_quiet` makes, for the same reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ZoomDrive(bool);
+
+impl ZoomDrive {
+    /// Nothing is moving the zoom this frame.
+    pub const AT_REST: Self = Self(false);
+
+    /// A live gesture is moving the zoom this frame.
+    pub const LIVE: Self = Self(true);
+
+    /// Read the frame's drive off egui's own input state.
+    ///
+    /// **`is_scrolling` leads because it is the only term that knows a wheel
+    /// gesture is unfinished while nothing is arriving.** egui holds a scroll
+    /// action open from the first notch until either the platform's own end
+    /// phase (a trackpad, exactly) or 150 ms past the last wheel event (a
+    /// discrete wheel, which reports no phases). Between the notch's smoothing
+    /// draining and that verdict the deltas below are all zero and the gesture
+    /// is still running; without this term the settle would fire inside it.
+    ///
+    /// The rest are the gestures egui does not route through the wheel: a
+    /// pinch (`zoom_delta`), fingers down at all (`any_touches` —
+    /// `multi_touch` is `None` for a single finger, and a one-finger drag-zoom
+    /// is a gesture this app has), and a drag.
+    pub fn of(input: &egui::InputState) -> Self {
+        Self(
+            input.is_scrolling()
+                || input.smooth_scroll_delta != egui::Vec2::ZERO
+                || input.zoom_delta() != 1.0
+                || input.any_touches()
+                || input.pointer.is_decidedly_dragging(),
+        )
+    }
+
+    /// Whether a gesture is moving the zoom this frame.
+    pub fn is_live(self) -> bool {
+        self.0
+    }
+}
 
 /// Overdraw the renderer *asks* for, as a fraction of the viewport dimension,
 /// on each side of the viewport.
@@ -548,12 +622,13 @@ pub struct OverlayTextureCache {
     /// could afford; see [`RendersInFlight`] and [`RenderSlot`].
     pub renders: RendersInFlight,
     /// The zoom [`Self::needs_rerender`] was asked about last time, which is
-    /// how it notices the zoom moving and re-stamps [`Self::zoom_still_since`].
+    /// how it notices the zoom moving and re-arms [`Self::settle_owed_frames`].
     last_seen_zoom: Option<f64>,
-    /// When [`Self::last_seen_zoom`] last changed, in the caller's clock
-    /// (`egui::InputState::time`, seconds). The gesture has settled once `now`
-    /// is [`SETTLE_REPAINT_DELAY`] past this.
-    zoom_still_since: f64,
+    /// Frames of rest still owed before the zoom counts as settled. Re-armed
+    /// to [`SETTLE_QUIET_FRAMES`] by any live [`ZoomDrive`] or any zoom
+    /// movement, decremented by one per frame the pane asks, and the settle
+    /// fires at zero. See [`Self::settle_is_counting_down`].
+    settle_owed_frames: u8,
 }
 
 impl Default for OverlayTextureCache {
@@ -570,7 +645,7 @@ impl OverlayTextureCache {
             hold_superseded: false,
             renders: RendersInFlight::default(),
             last_seen_zoom: None,
-            zoom_still_since: f64::NEG_INFINITY,
+            settle_owed_frames: 0,
         }
     }
 
@@ -632,18 +707,35 @@ impl OverlayTextureCache {
             .is_some_and(|tex| tex.render_zoom != quantize_zoom(zoom))
     }
 
+    /// Whether this cache is still running the settle countdown down.
+    ///
+    /// **The pane must ask for another frame while this is true.** The
+    /// countdown is counted in frames, and egui stops asking for frames of its
+    /// own accord as soon as a wheel notch's smoothing has drained — which is
+    /// before it calls the scroll action finished. Without a frame the
+    /// countdown does not run, and the picture stays soft for as long as
+    /// nothing else happens to wake the app.
+    pub fn settle_is_counting_down(&self) -> bool {
+        self.settle_owed_frames > 0
+    }
+
+    /// Whether a raster is owed for this frame's viewport, zoom and content.
+    ///
+    /// **One call is one frame.** The settle countdown moves here, so asking
+    /// twice for the same frame spends two frames of it and a frame the pane
+    /// skipped is a frame the countdown never sees.
     pub fn needs_rerender(
         &mut self,
         token: u64,
         zoom: f64,
-        now: f64,
+        drive: ZoomDrive,
         viewport_bounds: &GeoBounds,
         plan: &OverlayTexturePlan,
     ) -> bool {
         self.needs_rerender_with_policy(
             token,
             zoom,
-            now,
+            drive,
             viewport_bounds,
             plan,
             MID_GESTURE_REBUILDS,
@@ -655,21 +747,25 @@ impl OverlayTextureCache {
         &mut self,
         token: u64,
         zoom: f64,
-        now: f64,
+        drive: ZoomDrive,
         viewport_bounds: &GeoBounds,
         plan: &OverlayTexturePlan,
         mid_gesture_band: bool,
     ) -> bool {
-        if self.last_seen_zoom != Some(zoom) {
+        // Two things re-arm the countdown and they refuse different frames.
+        // The drive is the gesture still running — a wheel action egui has not
+        // called finished, fingers on the glass — and it covers the frames
+        // where the zoom is bit-identical because the input was coalesced or
+        // the smoothing has drained. The zoom moving covers everything that
+        // moves the zoom without a gesture at all: a keyboard step, a restored
+        // viewport, a pane following another.
+        if drive.is_live() || self.last_seen_zoom != Some(zoom) {
             self.last_seen_zoom = Some(zoom);
-            self.zoom_still_since = now;
+            self.settle_owed_frames = SETTLE_QUIET_FRAMES;
+        } else {
+            self.settle_owed_frames = self.settle_owed_frames.saturating_sub(1);
         }
-        // `now >= since + delay` rather than `now - since >= delay`: the two
-        // differ only in the last ulp, but `(t + delay) - t` rounds below
-        // `delay` for most `t`, so the subtraction form calls a frame that
-        // arrives exactly one delay later — the frame the settle repaint
-        // schedules — not yet settled and costs it another repaint cycle.
-        let settled = now >= self.zoom_still_since + SETTLE_REPAINT_DELAY.as_secs_f64();
+        let settled = self.settle_owed_frames == 0;
 
         // The newest picture this cache has — see the doc note. A held picture
         // outranks the one on screen for every question below about *what the
@@ -826,7 +922,10 @@ impl OverlayTextureCache {
 /// raster itself runs on the worker on every target. What the band arm bought
 /// was sharpness *during* the gesture, and what it cost was the frame the
 /// gesture is judged by — so the gesture now draws the picture it has,
-/// stretched, and [`SETTLE_REPAINT_DELAY`] bounds the softness in time.
+/// stretched, and the settle arm is what ends the softness. How soon it ends
+/// is [`ZoomDrive`]'s answer, not a duration's: the picture is right again
+/// [`SETTLE_QUIET_FRAMES`] frames after the gesture stops, wherever that
+/// falls on the clock.
 ///
 /// The machinery stays parameterized
 /// ([`OverlayTextureCache::needs_rerender_with_policy`]) so the band arm's own

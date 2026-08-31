@@ -62,9 +62,10 @@ fn viewport() -> GeoBounds {
     }
 }
 
-/// The pane's whole question, at a still zoom the pictures were rendered at.
-fn asks(cache: &mut OverlayTextureCache, token: u64, now: f64) -> bool {
-    cache.needs_rerender(token, 0.0, now, &viewport(), &plan())
+/// The pane's whole question, at a still zoom the pictures were rendered at,
+/// with no gesture driving it — the content arm is what these tests ask about.
+fn asks(cache: &mut OverlayTextureCache, token: u64) -> bool {
+    cache.needs_rerender(token, 0.0, ZoomDrive::AT_REST, &viewport(), &plan())
 }
 
 /// Land whatever is being held, the way a delivered upload does.
@@ -90,7 +91,7 @@ fn a_pipeline_that_keeps_up_is_never_braked() {
 
     for token in 1..=10u64 {
         assert!(
-            asks(&mut cache, token, token as f64),
+            asks(&mut cache, token),
             "instant {token} was refused a picture by a pane with nothing in \
              flight. The brake is a statement about delivery; a pane that has \
              landed everything it asked for has proved the opposite",
@@ -116,7 +117,7 @@ fn a_pane_that_discarded_an_upload_stops_asking_until_one_lands() {
     // instant is still dispatched — this is the ask that becomes the discard.
     cache.hold(data(&ctx, "first", 1), None);
     assert!(
-        asks(&mut cache, 2, 1.0),
+        asks(&mut cache, 2),
         "a pane holding its FIRST picture must still dispatch: one hold in \
          flight is a pipeline keeping up, not one falling behind",
     );
@@ -124,7 +125,7 @@ fn a_pane_that_discarded_an_upload_stops_asking_until_one_lands() {
     // That dispatch lands on a cache still holding, which is the discard.
     cache.hold(data(&ctx, "second", 2), None);
     assert!(
-        !asks(&mut cache, 3, 2.0),
+        !asks(&mut cache, 3),
         "the pane threw away an upload and is still waiting on its \
          replacement, and was asked to spend a third raster on a fourth \
          instant. This is the fling, on the content arm: spend, discard, \
@@ -135,7 +136,7 @@ fn a_pane_that_discarded_an_upload_stops_asking_until_one_lands() {
     // free to follow the clock again.
     lands(&mut cache);
     assert!(
-        asks(&mut cache, 4, 3.0),
+        asks(&mut cache, 4),
         "a picture landed and cleared both clauses, but the pane stayed \
          braked. The brake would be permanent, and the layer would never \
          raster again",
@@ -155,11 +156,11 @@ fn a_paused_clock_still_gets_its_own_picture() {
     // would, then let the pipeline drain the way a released scrubber does.
     cache.hold(data(&ctx, "a", 1), None);
     cache.hold(data(&ctx, "b", 2), None);
-    assert!(!asks(&mut cache, 3, 1.0), "premise: the pane is braked");
+    assert!(!asks(&mut cache, 3), "premise: the pane is braked");
     lands(&mut cache);
 
     assert!(
-        asks(&mut cache, 99, 2.0),
+        asks(&mut cache, 99),
         "a pane parked on one instant, with nothing in flight, was refused \
          that instant's picture",
     );
@@ -175,7 +176,7 @@ fn a_live_pane_that_retokenizes_once_is_unaffected() {
     cache.show(data(&ctx, "boot", 7));
 
     assert!(
-        asks(&mut cache, 8, 0.0),
+        asks(&mut cache, 8),
         "a live pane whose content signature moved once, holding nothing, was \
          refused a raster",
     );
@@ -188,7 +189,7 @@ fn a_live_pane_that_retokenizes_once_is_unaffected() {
 fn a_pane_holding_nothing_always_dispatches() {
     let mut cache = OverlayTextureCache::new();
     assert!(
-        asks(&mut cache, 1, 0.0),
+        asks(&mut cache, 1),
         "a cache with neither a current picture nor a hold refused to \
          dispatch, so the layer would never draw at all",
     );
