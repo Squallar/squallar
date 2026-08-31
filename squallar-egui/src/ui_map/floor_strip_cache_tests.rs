@@ -617,6 +617,17 @@ fn a_dirty_second_pane_defers_one_frame_and_then_both_repaint() {
 /// continuously. That is a real ask and it is left alone; what this pins is
 /// that an ask which *went out* no longer repaints the floor for the whole
 /// flight.
+///
+/// **The `NWS_ALERTS` layer below is the whole of the non-vacuity, and the
+/// volume frames are none of it.** `ground_content_key`'s radar arm hashes
+/// `PaneState::active_image()`, which narrows through
+/// `LoopFrameImage::plan_view` and so answers `None` for every
+/// `LoopFrameImage::Volume` frame this fixture builds — a constant on every
+/// tick. So the key below moves because the alerts layer re-tokenizes per
+/// as-of bucket, and the `painted > 0` floor is counting *that* layer's
+/// rasters. Anything that stops an `EventLifetime` layer re-rasterizing per
+/// tick takes this fixture's premise with it, and the assertion to re-derive
+/// then is `painted > 0`, not the bound above it.
 #[test]
 fn a_playing_volume_loop_repaints_the_floor_per_tick_not_per_frame() {
     use crate::pane::{
