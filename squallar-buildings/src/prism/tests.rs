@@ -80,7 +80,7 @@ fn a_box_with_a_courtyard(
 /// Every triangle's own geometric normal, from its winding.
 fn geometric_normals(mesh: &BuildingMesh) -> Vec<[f64; 3]> {
     mesh.indices
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|t| {
             let p = |i: u32| {
                 let v = mesh.positions[i as usize];
@@ -101,7 +101,7 @@ fn geometric_normals(mesh: &BuildingMesh) -> Vec<[f64; 3]> {
 /// The signed area of every triangle at height `z`, projected onto the ground.
 fn cap_area_km2(mesh: &BuildingMesh, z: f32) -> f64 {
     let mut area = 0.0;
-    for t in mesh.indices.chunks_exact(3) {
+    for t in mesh.indices.as_chunks::<3>().0 {
         let p: Vec<[f32; 3]> = t.iter().map(|&i| mesh.positions[i as usize]).collect();
         if p.iter().any(|v| (v[2] - z).abs() > 1e-9) {
             continue;
@@ -304,7 +304,7 @@ fn every_triangle_is_wound_to_agree_with_its_own_normal() {
     );
     let geometric = geometric_normals(&mesh);
     assert!(!geometric.is_empty());
-    for (triangle, normal) in mesh.indices.chunks_exact(3).zip(&geometric) {
+    for (triangle, normal) in mesh.indices.as_chunks::<3>().0.iter().zip(&geometric) {
         let stored = mesh.normals[triangle[0] as usize];
         let dot = f64::from(stored[0]) * normal[0]
             + f64::from(stored[1]) * normal[1]

@@ -348,7 +348,7 @@ fn row_for(job: &squallar_source::job::DescribedJob) -> &'static squallar_source
 /// 256 × 256 pairs. In place, because the buffer is a pooled texture or plane —
 /// 206.75 MiB at the 7362 px desktop ceiling.
 fn premultiply_raster(rgba: &mut [u8]) {
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let converted =
             egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3]);
         pixel.copy_from_slice(&converted.to_array());

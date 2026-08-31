@@ -365,7 +365,7 @@ impl JobOutCodec for BuildingMeshJob {
             positions: triples(&raw_positions),
             normals: triples(&raw_normals),
             indices: raw_indices
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                 .collect(),
             kept,
@@ -386,10 +386,10 @@ fn u64_le(r: &mut Reader<'_>) -> Option<u64> {
 
 /// A flat little-endian `f32` buffer as triples.
 fn triples(raw: &[u8]) -> Vec<[f32; 3]> {
-    raw.chunks_exact(12)
+    raw.as_chunks::<12>().0.iter()
         .map(|chunk| {
             let mut out = [0.0f32; 3];
-            for (axis, word) in chunk.chunks_exact(4).enumerate() {
+            for (axis, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
                 out[axis] = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
             }
             out
