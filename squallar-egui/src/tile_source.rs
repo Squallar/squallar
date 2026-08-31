@@ -655,22 +655,56 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// only.
 ///
 /// On native the IO thread decodes and uploads off the frame thread. On wasm
-/// `spawn_local` runs the fetch loop on the page itself, so before this bound a
-/// pan exposing a fresh row of tiles paid up to [`MAX_PARALLEL_DOWNLOADS`]
-/// decode+upload rounds *per live source* on the very thread the gesture runs on.
+/// `spawn_local` runs the fetch loop on the page itself, so a pan exposing a
+/// fresh row of tiles pays the decode+upload on the very thread the gesture
+/// runs on.
 ///
-/// Every [`HttpsTiles`] owns its own [`DecodeBudget`] and the standard
-/// configuration drives two live sources a pass, so a typical frame gets **4**
-/// rounds, not 2; a second pass doubles it again, since the budget keys on
-/// `Context::cumulative_pass_nr`. Against the pre-fix 12 across base + labels
-/// that is still a 3× cut, and it keeps each source filling at ~120 tiles a
-/// second at 60 fps. [`HttpsTiles::pump`] requests a repaint whenever it uses
-/// its whole allowance, so a backlog drains over idle frames.
+/// **The count is a backstop; [`PUMP_TIME_BUDGET`] is the governor.** `tile_rx`
+/// is `channel(MAX_PARALLEL_DOWNLOADS)` with a single sender, so the queue
+/// cannot hold more than [`MAX_PARALLEL_DOWNLOADS`] and this value means
+/// "whatever is queued" rather than a throttle — the same figure and the same
+/// meaning as [`NATIVE_TILE_UPLOADS_PER_PUMP`], because after the time bound
+/// went in the two arms want the same rule.
+///
+/// It was 2, unconditionally, and that was the wrong shape in both directions.
+/// A frame whose takes are cheap was held to 2 when the queue held 6, so a
+/// zoom filled at a quarter of the rate the network was delivering; a frame
+/// whose takes are expensive still paid *two* multi-millisecond tessellations,
+/// because a count cannot see what a take costs. The time bound cuts the
+/// expensive case to one take and lets the cheap case empty the queue.
 ///
 /// Deliberately **capped inline, not offloaded**: tile PNGs behind the overlay
 /// worker's job round-trip would trade a bounded per-pass cost for seconds of
-/// blank basemap.
-pub const WASM_TILE_DECODES_PER_PUMP: usize = 2;
+/// blank basemap. Bounding a *single* take below the frame budget is what that
+/// offload (C5p2) would buy and this cannot.
+pub const WASM_TILE_DECODES_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
+
+/// The wall time one [`HttpsTiles::pump`] may spend taking completions off the
+/// channel.
+///
+/// **This is the governor the gesture latch used to be.** Until WO-10 the pump
+/// took *nothing* while a map gesture was live and resumed only after a 500 ms
+/// wall clock, so a zoom that ended left the map unchanged for half a second
+/// before the first tile could even be put. The cost that latch was dodging is
+/// real — on wasm32 a take is a PNG decode and a texture upload, on native a
+/// cache put — but it is a cost per take, and a count bound cannot see it.
+/// A time bound can, and it needs no notion of a gesture at all: the frame
+/// budget governs whether the map moves or not.
+///
+/// Checked *before* each take and never mid-take, so the true worst case is
+/// this plus one take. Bounding one take's own cost is not something this
+/// constant can do — that is the deferred worker-side decode (C5p2).
+///
+/// **A pump always takes at least one completion**, however far past the
+/// deadline the frame already is. A budget that can round down to zero work
+/// stalls the map exactly when the machine is busiest, which is the failure
+/// this replaces rather than a different spelling of it.
+///
+/// 2 ms against a 16.7 ms frame at 60 Hz. The pump runs once per layer and a
+/// standard configuration draws two, so the worst case a frame carries is
+/// 4 ms plus two takes — under a third of the frame, and the layers share one
+/// [`DecodeBudget`] per source so a second pass cannot re-bill it.
+const PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
 
 /// Completed fetches one [`HttpsTiles::pump`] moves into the cache, native
 /// only.
@@ -1107,11 +1141,18 @@ impl DecodeBudget {
 fn drain_up_to<T>(
     rx: &mut Receiver<T>,
     budget: usize,
+    deadline: web_time::Instant,
     reported: &mut bool,
     mut take: impl FnMut(T),
 ) -> usize {
     let mut taken = 0;
     while taken < budget {
+        // `taken > 0`: the first take of a pump is unconditional, so a frame
+        // already over budget still moves the map forward by one tile rather
+        // than stalling it. See [`PUMP_TIME_BUDGET`].
+        if taken > 0 && web_time::Instant::now() >= deadline {
+            break;
+        }
         match rx.try_recv() {
             Ok(item) => {
                 take(item);
@@ -1279,21 +1320,19 @@ impl HttpsTiles {
     /// and never arrive. Nothing does today — both `Map::new` sites in `ui_map`
     /// pass `None` for tiles and the app draws its own tile layers — and nothing
     /// plans to.
-    /// `quiet` is the gesture latch (WO-9e): while a map gesture is live —
-    /// judged still only after [`crate::overlay_cache::SETTLE_REPAINT_DELAY`],
-    /// the same clock the overlay settle reads — the drain takes **nothing**,
-    /// on both targets. On wasm the take is the PNG decode and the texture
-    /// upload on the page thread, which is the frame the gesture is judged
-    /// by; on native it is a cache put whose `put_generation` bump repaints
-    /// the floor strip. Ancestors keep drawing meanwhile: interaction is
-    /// realtime, data may lag. Nothing is lost — the completions sit in the
-    /// channel and the settle frame's pump takes them under the ordinary
-    /// budget.
-    pub fn pump(&mut self, quiet: bool) {
+    /// **The pump does not know whether a gesture is running, and must not.**
+    /// WO-9e gated this on a gesture latch that read
+    /// [`crate::overlay_cache::SETTLE_REPAINT_DELAY`]: the drain took nothing
+    /// while map input was live and resumed only 500 ms after it stopped. That
+    /// bought a frame budget with half a second of a map that does not change
+    /// — the black screen a zoom-out settles into, and the stretched ancestor a
+    /// zoom-in sits on, both waited on that clock before a single tile could be
+    /// put. What the latch was really dodging is the per-take cost, and
+    /// [`PUMP_TIME_BUDGET`] bounds that directly, so the drain now runs on
+    /// every frame whether the map is moving or not. Filling the map while the
+    /// user moves *is* minimizing data latency.
+    pub fn pump(&mut self) {
         self.pumps += 1;
-        if quiet {
-            return;
-        }
         self.drain_completed_fetches();
     }
 
@@ -1348,6 +1387,7 @@ impl HttpsTiles {
         let taken = drain_up_to(
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
+            web_time::Instant::now() + PUMP_TIME_BUDGET,
             io_task_gone_reported,
             |(tile_id, slot): (TileId, FetchPayload)| {
                 // A tile styled under a generation a restyle has replaced is
@@ -1397,6 +1437,7 @@ impl HttpsTiles {
         let taken = drain_up_to(
             tile_rx,
             budget,
+            web_time::Instant::now() + PUMP_TIME_BUDGET,
             io_task_gone_reported,
             |(tile_id, payload): (TileId, FetchPayload)| {
                 let decoded = match payload {
