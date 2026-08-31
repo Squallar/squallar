@@ -1,0 +1,501 @@
+//! A tile's fills drawn through the GPU path put the **same bytes on the
+//! screen** as the CPU placement path they replace.
+//!
+//! This is the gate the whole mechanism turns on. The two paths reach the same
+//! render pass through two different pipelines: egui's, which samples the font
+//! atlas at `WHITE_UV` and applies one of two gamma conventions chosen off the
+//! target's sRGB-ness, and `squallar_gpu::tile_mesh`'s, which multiplies by a
+//! constant one and mirrors the same choice. Everything either of them could
+//! get wrong — the entry point, the dither, the blend state, the vertex
+//! colour unpack, the clip-space map — shows up as different pixels, so the
+//! comparison is a byte compare of two readbacks and not a tolerance.
+//!
+//! # Why the placement is a power of two
+//!
+//! `ShapeOrText::placed` computes `scaling * p + translation` in `f32` on the
+//! CPU; the shader computes the same expression on the GPU, where a driver may
+//! contract the multiply and the add into one FMA and round once instead of
+//! twice. At a tile side of 256 points the scale is `256/4096 = 1/16` — an
+//! exact power of two, so `scaling * p` is exact whatever the rounding mode
+//! and both spellings agree bit for bit. That is also the shipping-typical
+//! case (a whole zoom step at tile zoom bias 0), so the gate is not measuring
+//! an artificial arrangement; it is measuring the one where a difference can
+//! only be the shader's.
+//!
+//! # Both gamma conventions
+//!
+//! Every case below runs twice, on an sRGB target and a non-sRGB one, because
+//! that bit is what picks egui's fragment entry point and therefore what this
+//! shader has to mirror. The two readbacks are asserted to **differ from each
+//! other**, which is the interleaved control: it proves the comparison can see
+//! a gamma difference at all, so a pass on either arm is a real agreement
+//! rather than a byte compare of two identically-wrong pictures.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use egui_wgpu::wgpu;
+use squallar_egui::tile_mesh::{self, TileMeshPainter};
+use squallar_gpu::egui_renderer::{AttachmentConfig, EGUI_DITHERING};
+use squallar_gpu::tile_mesh::{TileMeshBridge, TileMeshStore};
+
+/// The canvas, in points and (at one point per pixel) in texels.
+const SIDE: u32 = 256;
+
+/// The MVT extent every styled tile's geometry is in.
+const EXTENT: f32 = 4096.0;
+
+/// The tile's piece on screen: origin at zero, 256 points across, so the
+/// placement is `1/16 * p + 0` — see the module doc.
+fn piece() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIDE as f32, SIDE as f32))
+}
+
+/// The tile's fills: overlapping translucent quads in several colours, so the
+/// blend state is exercised rather than only the shader's arithmetic, and so a
+/// dither difference has gradients to show up in.
+fn fills() -> egui::epaint::Mesh {
+    let mut mesh = egui::epaint::Mesh::default();
+    for (i, colour) in [
+        egui::Color32::from_rgba_premultiplied(200, 30, 40, 255),
+        egui::Color32::from_rgba_premultiplied(20, 120, 60, 160),
+        egui::Color32::from_rgba_premultiplied(70, 70, 200, 90),
+        egui::Color32::from_rgba_premultiplied(11, 13, 17, 200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = i as f32 * 400.0;
+        mesh.add_rect_with_uv(
+            egui::Rect::from_min_size(
+                egui::pos2(at, at * 0.5),
+                egui::vec2(EXTENT * 0.6, EXTENT * 0.4),
+            ),
+            egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+            colour,
+        );
+    }
+    mesh
+}
+
+/// The fixture's fills, through the map's own flattener.
+fn flat() -> std::sync::Arc<tile_mesh::TileMeshes> {
+    std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, &fills()))))
+}
+
+fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("tile-mesh"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        memory_hints: wgpu::MemoryHints::default(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        trace: wgpu::Trace::Off,
+    }))
+    .ok()?;
+    Some((device, queue))
+}
+
+fn target(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tile-mesh target"),
+        size: wgpu::Extent3d {
+            width: SIDE,
+            height: SIDE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {
+    let row = SIDE as usize * 4;
+    let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tile-mesh readback"),
+        size: (padded * SIDE as usize) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded as u32),
+                rows_per_image: Some(SIDE),
+            },
+        },
+        wgpu::Extent3d {
+            width: SIDE,
+            height: SIDE,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("the readback drains");
+    let view = buffer.slice(..).get_mapped_range();
+    let mut out = Vec::with_capacity(row * SIDE as usize);
+    for y in 0..SIDE as usize {
+        out.extend_from_slice(&view[y * padded..y * padded + row]);
+    }
+    drop(view);
+    buffer.unmap();
+    out
+}
+
+/// One frame: `shapes` painted into `piece()`'s clip, tessellated by egui,
+/// drawn by egui's renderer into a fresh target, read back.
+///
+/// Both paths go through this, so the pass, the clear, the descriptor and the
+/// tessellator are shared and the only difference is what is in `shapes`.
+fn frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    format: wgpu::TextureFormat,
+    shapes: Vec<egui::Shape>,
+) -> Vec<u8> {
+    let ctx = egui::Context::default();
+    let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIDE as f32, SIDE as f32));
+    ctx.begin_pass(egui::RawInput {
+        screen_rect: Some(canvas),
+        ..Default::default()
+    });
+    ctx.layer_painter(egui::LayerId::background())
+        .with_clip_rect(piece())
+        .extend(shapes);
+    let output = ctx.end_pass();
+    let tris = ctx.tessellate(output.shapes, 1.0);
+
+    // egui's own mesh arm looks its texture up by id and silently draws
+    // nothing without it, so the atlas has to be uploaded or the CPU arm of
+    // the comparison would be an empty picture agreeing with nothing.
+    for (id, delta) in &output.textures_delta.set {
+        renderer.update_texture(device, queue, *id, delta);
+    }
+
+    let descriptor = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [SIDE, SIDE],
+        pixels_per_point: 1.0,
+    };
+    let texture = target(device, format);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    let user = renderer.update_buffers(device, queue, &mut encoder, &tris, &descriptor);
+    {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("tile-mesh pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        renderer.render(&mut pass.forget_lifetime(), &tris, &descriptor);
+    }
+    let mut buffers = user;
+    buffers.push(encoder.finish());
+    queue.submit(buffers);
+
+    read_back(device, queue, &texture)
+}
+
+/// The CPU path's shape: the flattened fills placed by
+/// `scale * p + translation`, which is `ShapeOrText::placed`'s mesh arm.
+///
+/// **Built from the same flat buffers the callback path draws**, so the two
+/// arms cannot be comparing different geometry. That this arithmetic really is
+/// `placed`'s is pinned in `squallar-egui`, by
+/// `tile_mesh::tests::the_flat_buffers_placed_by_hand_are_what_placed_answers`
+/// — this crate must not depend on `walkers`, and the equivalence is that
+/// test's to hold rather than this one's to assume.
+fn cpu_shape(meshes: &tile_mesh::TileMeshes) -> Vec<egui::Shape> {
+    let place = tile_mesh::Placement::of(piece());
+    let mut mesh = egui::epaint::Mesh::default();
+    for i in 0..meshes.vertex_count() as usize {
+        let vertex = meshes.vertex(i).expect("the vertex is in range");
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(
+                place.scale * vertex.pos[0] + place.translation[0],
+                place.scale * vertex.pos[1] + place.translation[1],
+            ),
+            uv: egui::epaint::WHITE_UV,
+            color: egui::Color32::from_rgba_premultiplied(
+                vertex.color.to_ne_bytes()[0],
+                vertex.color.to_ne_bytes()[1],
+                vertex.color.to_ne_bytes()[2],
+                vertex.color.to_ne_bytes()[3],
+            ),
+        });
+    }
+    for i in 0..meshes.index_count() as usize {
+        mesh.indices
+            .push(meshes.index(i).expect("the index is in range"));
+    }
+    vec![egui::Shape::Mesh(mesh.into())]
+}
+
+/// The callback path's shapes: one paint callback per fill run, at the same
+/// placement, exactly as `paint_vector_tile` emits them.
+fn callback_shapes(
+    meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
+    pass_nr: u64,
+) -> Vec<egui::Shape> {
+    let bridge = TileMeshBridge;
+    (0..meshes.runs().len())
+        .map(|run| {
+            egui::Shape::Callback(egui::epaint::PaintCallback {
+                rect: piece(),
+                callback: bridge
+                    .payload(tile_mesh::GroundDraw {
+                        meshes,
+                        run,
+                        place: tile_mesh::Placement::of(piece()),
+                        pass_nr,
+                    })
+                    .expect("the bridge always answers for a run it was given"),
+            })
+        })
+        .collect()
+}
+
+fn renderer_for(device: &wgpu::Device, format: wgpu::TextureFormat) -> egui_wgpu::Renderer {
+    let mut renderer = egui_wgpu::Renderer::new(
+        device,
+        format,
+        egui_wgpu::RendererOptions {
+            depth_stencil_format: None,
+            msaa_samples: 1,
+            dithering: EGUI_DITHERING,
+            ..Default::default()
+        },
+    );
+    renderer.callback_resources.insert(TileMeshStore::new(
+        device,
+        AttachmentConfig {
+            color_format: format,
+            depth_format: None,
+            msaa_samples: 1,
+        },
+        EGUI_DITHERING,
+    ));
+    renderer
+}
+
+/// How many texels are not the transparent clear — the floor under every
+/// comparison below. A pair of empty pictures matches perfectly and proves
+/// nothing.
+fn painted(pixels: &[u8]) -> usize {
+    pixels
+        .chunks_exact(4)
+        .filter(|p| p != &[0, 0, 0, 0])
+        .count()
+}
+
+/// **The gate.** Same tile, two paths, byte-identical readback — on both
+/// gamma conventions, with the two conventions shown to differ from each
+/// other so the compare is known to be sensitive to the thing being tested.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let meshes = flat();
+    assert_eq!(meshes.runs().len(), 1, "the fixture is one coalesced run");
+
+    let mut readings = Vec::new();
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ] {
+        let mut renderer = renderer_for(&device, format);
+        let cpu = frame(&device, &queue, &mut renderer, format, cpu_shape(&meshes));
+        let gpu = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            callback_shapes(&meshes, 1),
+        );
+
+        let drew = painted(&cpu);
+        assert!(
+            drew > (SIDE * SIDE / 4) as usize,
+            "{format:?}: the CPU path painted only {drew} texels, so a match \
+             would be two nearly-empty pictures agreeing"
+        );
+        assert_eq!(
+            painted(&gpu),
+            drew,
+            "{format:?}: the two paths covered different areas"
+        );
+
+        let differing = cpu
+            .chunks_exact(4)
+            .zip(gpu.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "{format:?}: {differing} of {} texels differ between CPU \
+             placement and the callback path — the shader's gamma, dither, \
+             blend or colour unpack does not match egui's",
+            SIDE * SIDE
+        );
+        readings.push(cpu);
+    }
+
+    // The interleaved control: the two target formats really do produce
+    // different pictures, so the byte compares above were capable of failing
+    // on exactly the difference this gate exists to catch.
+    assert_ne!(
+        readings[0], readings[1],
+        "the sRGB and non-sRGB targets read back identically, so this suite \
+         cannot see a gamma convention at all and both passes above are vacuous"
+    );
+}
+
+/// **One buffer write per tile lifetime, not one per frame.**
+///
+/// Baseline behaviour is the thing this replaces: the CPU path re-places,
+/// re-tessellates and re-stages every vertex on every frame, so the honest
+/// control here is the draw count — `N` frames really did draw the tile `N`
+/// times while the upload happened once.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_static_viewport_uploads_each_tile_once_however_many_frames_it_draws() {
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    const FRAMES: u64 = 12;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+    let meshes = flat();
+
+    for pass_nr in 0..FRAMES {
+        let _ = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            callback_shapes(&meshes, pass_nr),
+        );
+    }
+
+    let store = renderer
+        .callback_resources
+        .get::<TileMeshStore>()
+        .expect("the store is installed");
+    assert_eq!(
+        store.resident_tiles(),
+        1,
+        "one tile drawn {FRAMES} times is resident more than once"
+    );
+    assert_eq!(
+        store.uploads(),
+        (1, meshes.bytes()),
+        "one tile drawn {FRAMES} times did not upload exactly once, for \
+         exactly its own buffers"
+    );
+    assert_eq!(
+        store.resident_bytes(),
+        meshes.bytes(),
+        "the store's byte account does not equal what it is holding"
+    );
+}
+
+/// **Residency ends with the tile, and the bytes come back.**
+///
+/// The tile cache owns the flattened buffers; the store holds a weak handle
+/// and nothing else. Dropping the `Arc` is what a tile leaving the LRU (or a
+/// restyle replacing it) does, and the next frame's sweep must give the GPU
+/// buffers back rather than accumulate them across a zoom sweep.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_tile_the_cache_let_go_of_stops_being_resident_and_its_bytes_come_back() {
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+
+    // A zoom sweep in miniature: twenty tiles, each drawn once and then let
+    // go of, one after another. Without the sweep the store would hold all
+    // twenty; with it, it holds what the cache still owns.
+    const TILES: usize = 20;
+    let mut peak_tiles = 0;
+    let mut peak_bytes = 0;
+    let mut one_tile_bytes = 0;
+    for pass_nr in 0..TILES {
+        let meshes = flat();
+        one_tile_bytes = meshes.bytes();
+        let _ = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            // A frame of its own, which is what makes the store sweep: the
+            // sweep is once per egui pass, not once per callback.
+            callback_shapes(&meshes, pass_nr as u64),
+        );
+        let store = renderer
+            .callback_resources
+            .get::<TileMeshStore>()
+            .expect("the store is installed");
+        peak_tiles = peak_tiles.max(store.resident_tiles());
+        peak_bytes = peak_bytes.max(store.resident_bytes());
+        // The tile cache lets go. The previous frame's callback still holds a
+        // clone until its `tris` are dropped, which is why the sweep is a
+        // frame behind and the peak below is two rather than one.
+        drop(meshes);
+    }
+
+    assert!(
+        peak_tiles <= 2,
+        "{TILES} tiles drawn one at a time left {peak_tiles} resident: the \
+         store is accumulating instead of sweeping"
+    );
+    assert!(
+        peak_bytes <= 2 * one_tile_bytes,
+        "the byte account peaked at {peak_bytes} for a working set of one \
+         tile ({one_tile_bytes} B)"
+    );
+
+    // Non-triviality: the store really was holding something, so the bound
+    // above is not "nothing was ever uploaded".
+    assert!(
+        peak_tiles >= 1 && peak_bytes >= one_tile_bytes,
+        "nothing was ever resident, so the eviction bound is vacuous"
+    );
+}
