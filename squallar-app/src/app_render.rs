@@ -1267,31 +1267,37 @@ impl super::App {
             }
         }
         say_telemetry(loud, &frame_cadence_line(ledger.cadence()));
-        say_telemetry(loud, &crate::loop_telemetry::loop_state_line(&self.loop_state()));
+        say_telemetry(
+            loud,
+            &crate::loop_telemetry::loop_state_line(&self.loop_state()),
+        );
     }
 
     /// One reading of what this application's loops hold — see
     /// [`crate::loop_telemetry`], which owns the counting and the sentence.
-    /// Assembled here because the allocation, the budgets and the playback
-    /// interval have no other common owner.
+    ///
+    /// **The pane walk is not here**, and that is deliberate rather than
+    /// awkward: this file's reaches into the `Gui` sit on a permanent ceiling
+    /// (`gui_seam_ratchet_tests`) that may only fall, so a new reading may not
+    /// buy itself two new reaches. [`Self::loop_demand`] already walks every
+    /// pane once a frame for the pool's sake; it counts these on the same walk
+    /// and parks the result, and this assembles the halves that are the App's
+    /// own — the allocation in force, the resolved budgets and the pool.
     fn loop_state(&self) -> crate::loop_telemetry::LoopState {
-        let mut state = crate::loop_telemetry::LoopState::gather(
-            self.gui.panes().iter(),
-            self.loop_allocation(),
-            &self.budgets,
-            // Every pane carries the same copy of the posture — see
-            // `Gui::set_loop_speed_fps` — so the first one is the setting.
-            loop_interval(
-                self.gui
-                    .panes()
-                    .first()
-                    .map_or(squallar_egui::pane::DEFAULT_LOOP_SPEED_FPS, |pane| {
-                        pane.time.speed_fps
-                    }),
-            ),
-        );
-        state.pool_bytes = self.loop_pool.bytes();
-        state
+        let allocation = self.loop_allocation();
+        crate::loop_telemetry::LoopState {
+            allowed_plan: allocation.plan_view_frames,
+            allowed_section: allocation.section_frames,
+            allowed_volume: allocation.volume_frames,
+            allowed_overlay: allocation.overlay_frames,
+            share_bytes: allocation.share_bytes,
+            cap: self.budgets.loop_render_budget,
+            held: self.budgets.loop_frames_held,
+            floor_bytes: self.budgets.loop_pool_floor_bytes,
+            ceiling_bytes: self.budgets.loop_pool_ceiling_bytes,
+            pool_bytes: self.loop_pool.bytes(),
+            ..self.loop_counts
+        }
     }
 
     /// Promote every held raster, as the frame after the last band lands does.
@@ -3427,14 +3433,35 @@ impl super::App {
 
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
-    fn loop_demand(&self) -> LoopDemand {
+    ///
+    /// **Also counts what the loops are holding**, for
+    /// [`crate::loop_telemetry`]. Not a second concern bolted on: this is the
+    /// one walk over every pane the frame already makes for the pool's sake,
+    /// and the alternative is two more reaches into the `Gui` in a file whose
+    /// coupling ceiling is permanent and already at its measured value. The
+    /// counting is a handful of integer reads over the layers this walk is
+    /// touching anyway.
+    fn loop_demand(&self) -> (LoopDemand, crate::loop_telemetry::LoopState) {
         let mut demand = LoopDemand::default();
+        let mut counts = crate::loop_telemetry::LoopState {
+            // Every pane carries the same copy of the posture — see
+            // `Gui::set_loop_speed_fps` — so whichever pane the walk sees
+            // first is the setting.
+            advance_us: 0,
+            ..crate::loop_telemetry::LoopState::default()
+        };
         let mut seen: Vec<(
             String,
             squallar_radar::types::RadarProduct,
             Option<squallar_egui::pane::VolumeLoopKey>,
         )> = Vec::new();
         for pane in self.gui.panes() {
+            if counts.advance_us == 0 {
+                counts.advance_us = loop_interval(pane.time.speed_fps)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+            }
+            counts.count_pane(pane);
             let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
                 // **A pane looping something other than radar is a share
@@ -3470,13 +3497,14 @@ impl super::App {
             };
             demand.add(ls.view, already);
         }
-        demand
+        (demand, counts)
     }
 
     /// The division of the pool in force, after the dwell and the dead band
     /// have had their say.
     pub(super) fn observe_loop_demand(&mut self) -> LoopAllocation {
-        let demand = self.loop_demand();
+        let (demand, counts) = self.loop_demand();
+        self.loop_counts = counts;
         self.loop_pool_state.observe(
             self.loop_pool,
             LoopFrameModel::from_budgets(&self.budgets),

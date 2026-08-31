@@ -196,6 +196,9 @@ FRAMES="${RIG_FRAMES:-240}"
 PANEL="${RIG_PANEL:-off}"
 CANVAS="${RIG_CANVAS:-}"
 TLS="${RIG_TLS:-0}"
+# Scripted loops treated as settle for the SECOND, narrower window every
+# gestured leg now also reports. `GesturePlayer::LOOP_SECONDS` is 20 s.
+SKIP_LOOPS="${RIG_SKIP_LOOPS:-2}"
 PY=python3
 
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -448,6 +451,13 @@ run_leg() {
   if [ "$(scene_script "$scene")" = none ]; then
     arm_args=(--quiet-window "$SETTLE")
   fi
+  # The `begin` marker is logged at the player's construction -- boot -- so
+  # the default window holds the boot burst. Ask for the settled window
+  # beside it on every gestured leg; it is additive and the default is still
+  # printed, so nothing measured before this moves.
+  if [ "$(scene_script "$scene")" != none ]; then
+    arm_args+=(--window-skip-loops "$SKIP_LOOPS")
+  fi
   start_server "$seed" || return 1
   # Hardware arm, headed, --require-hardware: a leg that fell back to a
   # software rasteriser must refuse to report rather than mislabel. The
@@ -631,15 +641,23 @@ for tag in sys.argv[5:]:
     # phases, where the post-gesture settle re-raster lands (WO-8). Its max
     # is the settle burst's worst frame, printed so the cost moved out of the
     # interact window stays a figure instead of vanishing between families.
-    for family in ("interact", "idle", "cadence"):
-        d = gw.get(family) or {}
-        if d and not d.get("error"):
-            note = " [settle burst]" if family == "idle" else ""
-            print("ROW   window %-8s n=%-6s p50=%s us p90=%s us p99=%s us "
-                  "max=%s us [%s loops, %s]%s"
-                  % (family, d.get("n"), d.get("p50_us"), d.get("p90_us"),
-                     d.get("p99_us"), d.get("max_us"),
-                     gw.get("loops_completed"), gw.get("basis"), note))
+    # Two windows over the same readings, NEVER merged and never averaged:
+    # the default one starts at the `begin` marker, which the player logs at
+    # construction -- boot -- so it contains the boot burst; the settled one
+    # is whole scripted loops with boot excluded. A row quoting one must say
+    # which.
+    for label, w in (("", gw), ("settled ", gw.get("settled") or {})):
+        if not w:
+            continue
+        for family in ("interact", "idle", "cadence"):
+            d = w.get(family) or {}
+            if d and not d.get("error"):
+                note = " [settle burst]" if family == "idle" else ""
+                print("ROW   %swindow %-8s n=%-6s p50=%s us p90=%s us "
+                      "p99=%s us max=%s us [%s loops, %s]%s"
+                      % (label, family, d.get("n"), d.get("p50_us"),
+                         d.get("p90_us"), d.get("p99_us"), d.get("max_us"),
+                         w.get("loops_completed"), w.get("basis"), note))
     fl = r.get("frame_lines") or {}
     idle = fl.get("idle") or {}
     if idle:

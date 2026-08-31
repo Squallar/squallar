@@ -938,7 +938,14 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
         "premise: exactly one layer, and it is not radar's",
     );
 
-    let demand = app.loop_demand();
+    // `loop_demand` counts the loop-telemetry level on the same walk; this
+    // test is about the pool's demand, which is the first half.
+    let (demand, counts) = app.loop_demand();
+    assert_eq!(
+        counts.layers, 1,
+        "the same walk's telemetry half must see the one animating layer this \
+         test premised, or the two halves are reading different panes",
+    );
     assert_eq!(
         demand.overlay_loops, 1,
         "the pane's model loop did not reach the pool's demand at all",

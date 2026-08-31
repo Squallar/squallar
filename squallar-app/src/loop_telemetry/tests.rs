@@ -61,14 +61,6 @@ fn rendered(pattern: &str, groups: &[&str]) -> String {
     out
 }
 
-/// The budgets the compiled target resolves to — the same figures the running
-/// app would put on the line, rather than a hand-picked arm.
-fn target_budgets() -> squallar_device_profile::budget::Budgets {
-    squallar_device_profile::budget::resolve(
-        &squallar_device_profile::budget::DeviceProfile::for_target(),
-    )
-}
-
 /// A reading with a distinct value in every position, so a transposed pair
 /// cannot read as a correct line.
 fn distinct() -> LoopState {
@@ -119,8 +111,23 @@ fn the_rig_reads_the_loop_line_the_app_actually_writes() {
         rendered(
             &pattern("loop_state_re"),
             &[
-                "2", "5", "61", "47", "6", "3", "14", "28", "4", "9", "36", "60", "29360128",
-                "58720256", "60817408", "3221225472", "100000",
+                "2",
+                "5",
+                "61",
+                "47",
+                "6",
+                "3",
+                "14",
+                "28",
+                "4",
+                "9",
+                "36",
+                "60",
+                "29360128",
+                "58720256",
+                "60817408",
+                "3221225472",
+                "100000",
             ],
         ),
         "the `loop state:` line and the rig's probe have drifted",
@@ -135,8 +142,23 @@ fn a_loop_line_that_drifted_by_one_space_is_not_accepted() {
     let good = rendered(
         &pattern("loop_state_re"),
         &[
-            "2", "5", "61", "47", "6", "3", "14", "28", "4", "9", "36", "60", "29360128",
-            "58720256", "60817408", "3221225472", "100000",
+            "2",
+            "5",
+            "61",
+            "47",
+            "6",
+            "3",
+            "14",
+            "28",
+            "4",
+            "9",
+            "36",
+            "60",
+            "29360128",
+            "58720256",
+            "60817408",
+            "3221225472",
+            "100000",
         ],
     );
     assert_eq!(loop_state_line(&distinct()), good);
@@ -195,22 +217,8 @@ fn resident_counts_only_the_frames_that_hold_a_picture() {
             },
         ];
     }
-    let budgets = target_budgets();
-    let allocation = crate::loop_pool::LoopPool::new(
-        budgets.loop_pool_floor_bytes,
-        crate::loop_pool::LoopPoolLimits::from_budgets(&budgets),
-    )
-    .plan(
-        crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
-        crate::loop_pool::LoopDemand::default(),
-    );
-    let panes = [pane];
-    let state = LoopState::gather(
-        panes.iter(),
-        allocation,
-        &budgets,
-        std::time::Duration::from_millis(100),
-    );
+    let mut state = LoopState::default();
+    state.count_pane(&pane);
 
     assert_eq!(state.panes, 1, "one pane is animating");
     assert_eq!(state.layers, 1, "one layer is animating");
@@ -227,9 +235,22 @@ fn resident_counts_only_the_frames_that_hold_a_picture() {
         "the three subsets summed to the whole, so one of them is not the \
          subset the line says it is",
     );
-    assert_eq!(state.advance_us, 100_000, "10 fps is a 100 ms step");
-    assert_eq!(state.held, budgets.loop_frames_held);
-    assert_eq!(state.cap, budgets.loop_render_budget);
+}
+
+/// **10 fps is a 100 000 us step**, and the line reports the interval the
+/// transport actually advances on rather than the fps the config spells —
+/// `loop_interval` clamps, so the two can disagree and only one of them is
+/// what the loop did.
+#[test]
+fn the_advance_is_the_interval_the_transport_steps_on() {
+    use squallar_egui::pane::DEFAULT_LOOP_SPEED_FPS;
+    assert_eq!(DEFAULT_LOOP_SPEED_FPS, 10.0);
+    assert_eq!(
+        std::time::Duration::from_secs_f32(1.0 / DEFAULT_LOOP_SPEED_FPS).as_micros(),
+        100_000,
+        "the scene E seeds pin loop_speed_fps=10.0 and every row reads back \
+         `advance 100000 us`; if this moves, the rows and the seed disagree",
+    );
 }
 
 /// A pane animating nothing contributes nothing — the control that makes the
@@ -238,22 +259,8 @@ fn resident_counts_only_the_frames_that_hold_a_picture() {
 fn a_pane_with_no_loop_is_not_counted() {
     use squallar_egui::pane::PaneState;
 
-    let budgets = target_budgets();
-    let allocation = crate::loop_pool::LoopPool::new(
-        budgets.loop_pool_floor_bytes,
-        crate::loop_pool::LoopPoolLimits::from_budgets(&budgets),
-    )
-    .plan(
-        crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
-        crate::loop_pool::LoopDemand::default(),
-    );
-    let panes = [PaneState::new()];
-    let state = LoopState::gather(
-        panes.iter(),
-        allocation,
-        &budgets,
-        std::time::Duration::from_millis(100),
-    );
+    let mut state = LoopState::default();
+    state.count_pane(&PaneState::new());
     assert_eq!((state.panes, state.layers, state.listed), (0, 0, 0));
 }
 
@@ -265,9 +272,9 @@ fn a_pane_with_no_loop_is_not_counted() {
 #[test]
 fn every_e_scene_seed_asks_for_the_lines_that_denominate_it() {
     for scene in ["E1)", "E2)", "E3)"] {
-        let at = RUN_MEASURE.find(scene).unwrap_or_else(|| {
-            panic!("run_measure.sh no longer defines scene {scene} at all")
-        });
+        let at = RUN_MEASURE
+            .find(scene)
+            .unwrap_or_else(|| panic!("run_measure.sh no longer defines scene {scene} at all"));
         let line_end = RUN_MEASURE[at..]
             .find(";;")
             .map(|end| at + end)
