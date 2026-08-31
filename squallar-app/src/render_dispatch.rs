@@ -1192,12 +1192,16 @@ impl RenderDispatcher {
     /// rung one, which is immediate. Only a frame that is owed *without
     /// interruption* climbs, and that is exactly the persistent failure the
     /// ladder is for.
+    /// **A set and not a slice**, because this runs on the frame thread every
+    /// `Dispatch` pass and both collections are sized by frames x layers x
+    /// panes. A `LayerId` is a `Cow<str>`, so the linear spelling of this walk
+    /// is hundreds of thousands of string comparisons per frame at a full
+    /// six-pane board — heavy work on the one thread that may not carry any.
     pub(crate) fn retain_loop_frame_retries(
         &mut self,
-        owed: &[(squallar_source::id::LayerId, chrono::NaiveDateTime)],
+        owed: &std::collections::HashSet<(squallar_source::id::LayerId, chrono::NaiveDateTime)>,
     ) {
-        self.loop_frame_retries
-            .retain(|key, _| owed.iter().any(|o| o.0 == key.0 && o.1 == key.1));
+        self.loop_frame_retries.retain(|key, _| owed.contains(key));
     }
 
     /// Every pane holding a record for `id`, with what it was asked for.
