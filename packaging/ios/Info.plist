@@ -33,6 +33,10 @@
     <string>$(SDK_NAME)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <!-- iPhone presentation clamps to 60 Hz on ProMotion panels without this
+         key; iPads are exempt. -->
+    <key>CADisableMinimumFrameDurationOnPhone</key>
+    <true/>
     <key>MinimumOSVersion</key>
     <string>14.0</string>
     <!-- 1 = iPhone/iPod, 2 = iPad. Absent, this defaults to iPhone-only, which

@@ -123,6 +123,10 @@ build:
 	    packaging/ios/Info.plist > "$$APP/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }
+	# iPhone presentation clamps to 60 Hz on ProMotion panels without this key;
+	# iPads are exempt.
+	grep -A1 '<key>CADisableMinimumFrameDurationOnPhone</key>' "$$APP/Info.plist" | grep -q '<true/>' \
+	    || { echo "ERROR: CADisableMinimumFrameDurationOnPhone is not true in the bundled Info.plist"; exit 1; }
 	echo ""
 	if [ "$$SDK" = iphonesimulator ]; then
 	  echo "App: $(ROOT)/$$APP  (simulator, arm64)"
