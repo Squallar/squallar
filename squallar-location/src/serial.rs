@@ -9,11 +9,14 @@ use std::sync::mpsc;
 /// What the parser said, as the app's fix model. `accuracy_m` is `None` because
 /// NMEA has no accuracy field: GGA and GSA give HDOP, a geometry factor rather
 /// than metres, and converting needs a UERE the receiver does not report.
+///
+/// The three measured fields go through [`crate::plausible`] like every other
+/// arm's: a well-formed sentence carrying a garbage number parses fine.
 fn fix_from(parsed: ParsedFix) -> Fix {
     Fix {
-        altitude_m: parsed.altitude_m,
-        speed_mps: parsed.speed_mps,
-        heading_deg: parsed.heading_deg,
+        altitude_m: parsed.altitude_m.and_then(crate::plausible::altitude_m),
+        speed_mps: parsed.speed_mps.and_then(crate::plausible::speed_mps),
+        heading_deg: parsed.heading_deg.and_then(crate::plausible::heading_deg),
         satellites: parsed.satellites,
         fix_quality: quality_from(parsed.quality),
         hdop: parsed.hdop,

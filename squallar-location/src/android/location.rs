@@ -124,6 +124,9 @@ fn fix_from_location(
         return None;
     }
 
+    // `hasAltitude()` is the platform's own word for "absent", and
+    // `crate::plausible` is the floor under it: a `Location` may answer `true`
+    // and still carry a number no receiver is at.
     let altitude_m = env
         .call_method(location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
         .and_then(|v| v.d())
@@ -132,7 +135,8 @@ fn fix_from_location(
             env.call_method(location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
                 .and_then(|v| v.z())
                 .unwrap_or(false)
-        });
+        })
+        .and_then(crate::plausible::altitude_m);
 
     let speed_mps = env
         .call_method(location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
@@ -143,7 +147,8 @@ fn fix_from_location(
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         })
-        .map(|s| s as f64);
+        .map(|s| s as f64)
+        .and_then(crate::plausible::speed_mps);
 
     let heading_deg = env
         .call_method(location, jni_str!("getBearing"), jni_sig!("()F"), &[])
@@ -154,7 +159,8 @@ fn fix_from_location(
                 .and_then(|v| v.z())
                 .unwrap_or(false)
         })
-        .map(|b| b as f64);
+        .map(|b| b as f64)
+        .and_then(crate::plausible::heading_deg);
 
     // Guarded by `hasAccuracy()`: a `Location` without one returns 0.0, and
     // 0 m would read as a perfect fix rather than an absent field.

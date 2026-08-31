@@ -30,6 +30,9 @@ mod hint;
 #[cfg(feature = "os-providers")]
 pub mod os_location;
 mod permission;
+/// The floor every arm decodes onto: what a platform number has to look like to
+/// be a reading at all.
+pub mod plausible;
 mod provider;
 #[cfg(feature = "serial")]
 pub mod serial;
