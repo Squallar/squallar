@@ -168,6 +168,19 @@ fn only_meshes_are_flattened() {
     assert_eq!(flat.bytes(), 0);
 }
 
+/// **An empty mesh is not a run.** It would draw nothing and ask the renderer
+/// for a zero-length buffer, which wgpu refuses rather than treating as an
+/// empty draw. The non-triviality half is the same call with one quad in it.
+#[test]
+fn a_mesh_with_no_triangles_is_not_a_run() {
+    let empty = egui::epaint::Mesh::default();
+    assert!(
+        flatten(&[ShapeOrText::Shape(egui::Shape::Mesh(empty.into()))]).is_empty(),
+        "an empty mesh became a run with zero-length buffers behind it"
+    );
+    assert_eq!(flatten(&[mesh(1)]).runs().len(), 1);
+}
+
 /// Identities are minted, never derived: the renderer keys residency on them,
 /// and two tiles sharing a key would draw each other's geography.
 #[test]

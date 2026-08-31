@@ -221,6 +221,13 @@ pub fn flatten_meshes<'a>(
     let mut runs: Vec<MeshRun> = Vec::new();
 
     for (shape_index, mesh) in meshes {
+        // A run with no triangles in it draws nothing and would ask the
+        // renderer for a zero-length buffer, which is a validation error
+        // rather than an empty draw. There is nothing to keep for the CPU
+        // path either, so it is simply not a run.
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            continue;
+        }
         if mesh.texture_id != egui::TextureId::default()
             || mesh
                 .vertices
