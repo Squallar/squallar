@@ -17,7 +17,14 @@
 # unannounced. Renovate has a rust-toolchain manager and will open that PR.
 [toolchain]
 channel = "1.97.1"
-components = ["clippy"]
+# BOTH, and rustfmt is here because pinning exposed that it was missing. On
+# `channel = "stable"` rustup resolved to the runner's preinstalled toolchain,
+# which already carried rustfmt, so an incomplete list worked by accident. A
+# pinned channel materialises a fresh toolchain with exactly these components
+# and nothing else -- `cargo fmt` then fails with "'cargo-fmt' is not installed
+# for the toolchain '1.97.1'". Anything a workflow invokes through cargo has to
+# be named here; `test.yaml` adds llvm-tools itself at the point of use.
+components = ["clippy", "rustfmt"]
 
 # No `targets` list. The Android and iOS rows build in the rust-cross container,
 # which ships those stds; the host rows `rustup target add` what they need.
