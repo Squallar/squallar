@@ -1513,7 +1513,7 @@ class FrameLineWatcher:
         return rs
 
 
-def gesture_window_stats(watcher, quiet_settle_s=None):
+def gesture_window_stats(watcher, quiet_settle_s=None, skip_loops=0):
     """The gesture-window bin-diff: percentiles over ONLY the frames between
     the first `gesture script ... begin` marker and the last
     `... loop complete` marker, for the interact and cadence families.
@@ -1562,11 +1562,26 @@ def gesture_window_stats(watcher, quiet_settle_s=None):
         t1, basis = loops[-1]["t"], "first-begin-to-last-loop-marker"
     else:
         t1, basis = None, "first-begin-to-newest-reading (no loop completed)"
-    return _window_stats(
+    # `begin` is logged ONCE, at the player's construction -- which is boot.
+    # So the default bracket above starts before the app has settled, and the
+    # boot burst is inside every window it cuts. `skip_loops` moves the left
+    # edge to the Nth COMPLETED loop instead: a whole number of scripted
+    # loops, none of them the first. It is a strictly narrower window on the
+    # same readings, reported BESIDE the default rather than replacing it,
+    # because every row taken before this existed used the default and the
+    # two must stay tellable apart.
+    script = begins[0].get("script") if begins else loops[-1].get("script")
+    out = _window_stats(
         watcher, t0, t1,
-        {"script": (begins[0].get("script") if begins
-                    else loops[-1].get("script")),
-         "loops_completed": len(loops), "basis": basis})
+        {"script": script, "loops_completed": len(loops), "basis": basis})
+    if skip_loops and len(loops) > skip_loops:
+        out["settled"] = _window_stats(
+            watcher, loops[skip_loops - 1]["t"], t1,
+            {"script": script,
+             "loops_completed": len(loops) - skip_loops,
+             "basis": "loop-%d-complete to last-loop-marker (whole scripted "
+                      "loops, boot excluded)" % skip_loops})
+    return out
 
 
 def _window_stats(watcher, t0, t1, out):
@@ -2819,7 +2834,8 @@ def run_smoke(args):
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
                                         "prep", "gpu", "gpu_unavailable",
                                         "cadence", "loop_state")}
-        gw = gesture_window_stats(frames_watch, args.quiet_window)
+        gw = gesture_window_stats(frames_watch, args.quiet_window,
+                                  args.window_skip_loops)
         if gw is not None:
             result["gesture_window"] = gw
             stage("gesture-window",
@@ -3421,6 +3437,16 @@ def main(argv=None):
                     help="seconds for the worker-wire assertions (default "
                          "180; Tier 2 runs against LIVE network, so the first "
                          "job reply waits on a real volume fetch)")
+    ap.add_argument("--window-skip-loops", type=int, default=0,
+                    metavar="N",
+                    help="report a SECOND, narrower window beside the default "
+                         "one, bracketed from the Nth completed scripted loop "
+                         "instead of from the `begin` marker. The begin marker "
+                         "is logged at the player's construction -- boot -- so "
+                         "the default window contains the boot burst; this one "
+                         "is whole scripted loops with boot excluded. Additive: "
+                         "the default window is still reported unchanged, so "
+                         "rows taken before this existed stay comparable.")
     ap.add_argument("--quiet-window", type=float, default=None,
                     metavar="SECS",
                     help="for a leg that arms NO gesture (scene E1: a loop "

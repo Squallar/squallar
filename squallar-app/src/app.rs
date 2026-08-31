@@ -222,6 +222,12 @@ pub struct App {
     loop_pool_state: crate::loop_pool::LoopPoolState,
     /// Whether [`Self::loop_pool`] is already the answer for this machine.
     loop_pool_sized: bool,
+    /// **What the loops were holding at the last pool observation** — the pane
+    /// half of [`crate::loop_telemetry`]'s reading, counted on
+    /// `App::loop_demand`'s existing walk rather than on one of its own, and
+    /// parked here for `report_frame_telemetry` to pick up. A LEVEL, not a
+    /// total: it is overwritten every frame.
+    loop_counts: crate::loop_telemetry::LoopState,
     /// The site-keyed decoded volumes: what each pane's static render draws, and
     /// each site's merge base. One owner, asked by name rather than indexed —
     /// see [`crate::volume_inventory`].
@@ -590,6 +596,7 @@ impl App {
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             loop_pool_sized: loop_pool_memo.is_some(),
+            loop_counts: crate::loop_telemetry::LoopState::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
             input,
             channels,

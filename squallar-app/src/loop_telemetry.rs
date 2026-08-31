@@ -80,50 +80,34 @@ pub(crate) struct LoopState {
 }
 
 impl LoopState {
-    /// Walk the panes and count. The allocation, the bracket and the interval
-    /// are read by the caller, which is the only place they all exist.
-    pub(crate) fn gather<'a>(
-        panes: impl Iterator<Item = &'a PaneState>,
-        allocation: crate::loop_pool::LoopAllocation,
-        budgets: &squallar_device_profile::budget::Budgets,
-        advance: std::time::Duration,
-    ) -> Self {
-        let mut out = Self {
-            allowed_plan: allocation.plan_view_frames,
-            allowed_section: allocation.section_frames,
-            allowed_volume: allocation.volume_frames,
-            allowed_overlay: allocation.overlay_frames,
-            share_bytes: allocation.share_bytes,
-            cap: budgets.loop_render_budget,
-            held: budgets.loop_frames_held,
-            floor_bytes: budgets.loop_pool_floor_bytes,
-            ceiling_bytes: budgets.loop_pool_ceiling_bytes,
-            advance_us: advance.as_micros().min(u128::from(u64::MAX)) as u64,
-            ..Self::default()
-        };
-        for pane in panes {
-            let mut animating = false;
-            for slot in pane.animating_layers() {
-                animating = true;
-                out.layers += 1;
-                for frame in &slot.time.frames {
-                    out.listed += 1;
-                    if frame.image.is_some() {
-                        out.resident += 1;
-                    }
-                    if frame.render_in_flight {
-                        out.in_flight += 1;
-                    }
-                    if frame.render_failed {
-                        out.failed += 1;
-                    }
+    /// Fold one pane's loops into the counts.
+    ///
+    /// **Called from `App::loop_demand`'s walk**, not from a walk of its own:
+    /// `app_render.rs` sits on a permanent `self.gui.` coupling ceiling that
+    /// may only fall, so a new reading does not get to buy itself new reaches
+    /// — it rides the pane walk the frame already makes. That is also why this
+    /// takes one pane rather than an iterator.
+    pub(crate) fn count_pane(&mut self, pane: &PaneState) {
+        let mut animating = false;
+        for slot in pane.animating_layers() {
+            animating = true;
+            self.layers += 1;
+            for frame in &slot.time.frames {
+                self.listed += 1;
+                if frame.image.is_some() {
+                    self.resident += 1;
+                }
+                if frame.render_in_flight {
+                    self.in_flight += 1;
+                }
+                if frame.render_failed {
+                    self.failed += 1;
                 }
             }
-            if animating {
-                out.panes += 1;
-            }
         }
-        out
+        if animating {
+            self.panes += 1;
+        }
     }
 }
 
