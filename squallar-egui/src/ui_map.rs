@@ -589,35 +589,48 @@ impl super::Gui {
                 // `Tiles::attribution` rather than a second const beside it —
                 // a hardcoded string here is how the painted credit comes to
                 // name a provider the client never contacts. A frame with no
-                // base source falls back to the archive's credit, or — when
-                // the archive has been found unreachable this session — to the
-                // line that says so: the honest degraded state has to be on
-                // the glass, not only in the log.
-                let base_credit = tiles_owned.as_ref().map_or(
+                // base source falls back to the archive's credit.
+                //
+                // **The unreachable line is decided before the source's own
+                // credit is read, not only when there is no source to read
+                // one from.** An archive that will not open empties the slot,
+                // so those two orders agree; a source that opened and then
+                // failed every tile read keeps its slot and would otherwise
+                // hand over an OpenStreetMap credit for a map drawing nothing.
+                // `base_archive_is_unreachable` covers both, and is asked
+                // every frame because the second one recovers on its own.
+                let base_credit = if self.map_tiles.base_archive_is_unreachable() {
                     walkers::sources::Attribution {
-                        text: if self.map_tiles.base_archive_is_unreachable() {
-                            crate::tiles::UNREACHABLE_ATTRIBUTION_TEXT
-                        } else {
-                            crate::tiles::ARCHIVE_ATTRIBUTION_TEXT
-                        },
+                        text: crate::tiles::UNREACHABLE_ATTRIBUTION_TEXT,
                         url: crate::tiles::ATTRIBUTION_URL,
                         logo_light: None,
                         logo_dark: None,
-                    },
-                    walkers::Tiles::attribution,
-                );
+                    }
+                } else {
+                    tiles_owned.as_ref().map_or(
+                        walkers::sources::Attribution {
+                            text: crate::tiles::ARCHIVE_ATTRIBUTION_TEXT,
+                            url: crate::tiles::ATTRIBUTION_URL,
+                            logo_light: None,
+                            logo_dark: None,
+                        },
+                        walkers::Tiles::attribution,
+                    )
+                };
                 // The Terrain layer's credit joins the same notice — still
                 // one per panel — while the terrain slot holds a source. The
                 // slot is not a second source of truth for "is Terrain on":
                 // it is built and released at the top of this function off
                 // the one sanctioned read (a visible pane drawing the layer),
-                // plus the health latch — so `terrain_owned` is `Some`
-                // exactly while Copernicus pixels can reach the glass. A
-                // layer switched off, or one whose archive is dead so the
-                // layer draws nothing, keeps its credit off the glass too: an
-                // idle credit is clutter that dilutes the required ones, the
-                // same rule `UNREACHABLE_ATTRIBUTION_TEXT` follows in owing
-                // no copyright sign. The two archives are separate hosts, so
+                // plus the health latch and the source's own report on its
+                // reads — so `terrain_owned` names a credit exactly while
+                // Copernicus pixels can reach the glass. A layer switched
+                // off, one whose archive would not open, and one whose
+                // archive opened and then answered no tile read all keep
+                // their credit off the glass: an idle credit is clutter that
+                // dilutes the required ones, the same rule
+                // `UNREACHABLE_ATTRIBUTION_TEXT` follows in owing no
+                // copyright sign. The two archives are separate hosts, so
                 // every base state — the source's own credit, the fallback,
                 // the unreachable line — composes with the terrain credit
                 // independently. The text is the drawn source's own, read off
@@ -625,7 +638,11 @@ impl super::Gui {
                 // hyperlink still, and it keeps the base credit's target —
                 // ODbL wants its notice reachable, and the Copernicus
                 // obligation is the visible words.
-                let credit_text = match terrain_owned.as_ref().map(walkers::Tiles::attribution) {
+                let terrain_credit = terrain_owned
+                    .as_ref()
+                    .filter(|tiles| !tiles.reads_are_failing())
+                    .map(walkers::Tiles::attribution);
+                let credit_text = match terrain_credit {
                     Some(terrain_credit) => std::borrow::Cow::Owned(format!(
                         "{} \u{b7} {}",
                         base_credit.text, terrain_credit.text

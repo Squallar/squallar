@@ -1876,6 +1876,22 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Report the base or terrain source's tile reads as failing, as an
+    /// archive that opened and then answered nothing would. **The source stays
+    /// in its slot**, which is what separates this from
+    /// [`Self::latch_base_unreachable`] and what the credit has to survive.
+    ///
+    /// Panics when the slot is empty: an assertion about a credit composed
+    /// from a source that was never there proves nothing.
+    pub(crate) fn fail_tile_reads(&mut self, base: bool) {
+        assert!(
+            self.gui.fail_reads_for_test(base),
+            "the {} slot held no source to fail the reads of",
+            if base { "base" } else { "terrain" },
+        );
+        self.warm_up();
+    }
+
     /// Pan pane `idx` until `site`'s icon is drawn at `target`, as dragging the
     /// map there does.
     pub(crate) fn place_site_at(&mut self, idx: usize, site: &str, target: egui::Pos2) {

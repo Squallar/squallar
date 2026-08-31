@@ -15576,6 +15576,79 @@ fn the_credit_corner_names_every_source_actually_painting() {
     }
 }
 
+/// 66c-ii. **A source that opened and then answered no tile read loses the
+///          provider credit too, even though it is still in the slot.**
+///
+/// 66c drives its degraded rows through `latch_base_unreachable`, which empties
+/// the slot — so every one of them composes the credit from *no* source, and
+/// none of them reaches the arm where a live source's own attribution is what
+/// has to be overruled. That arm was the defect: per-tile read errors set
+/// nothing, so a map drawing nothing kept an OpenStreetMap credit in the corner
+/// it had already earned, on a web build whose archive logged as healthily
+/// open. The state's own raising is gated in `tile_source::tests::archive`;
+/// this is what the panel does with it, on both archives, which are separate
+/// hosts and fail independently.
+#[test]
+fn a_source_that_answers_no_tile_read_loses_its_credit_while_still_in_the_slot() {
+    use crate::tiles::{
+        ARCHIVE_ATTRIBUTION_TEXT, TERRAIN_ATTRIBUTION_TEXT, UNREACHABLE_ATTRIBUTION_TEXT,
+    };
+
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_terrain_from_basemap_inspector(true);
+    h.frame();
+    let panel = h.map_panel_rect();
+
+    // Control: both slots hold a source and both are credited, so what
+    // changes below is the reads failing and nothing else.
+    let both = format!("{ARCHIVE_ATTRIBUTION_TEXT} \u{b7} {TERRAIN_ATTRIBUTION_TEXT}");
+    assert!(
+        h.text_painted_in(panel, &both),
+        "control: two live sources owe two credits; the notice reads {:?}",
+        h.painted_text_rects()
+            .into_iter()
+            .filter(|(rect, _)| h.attribution_rects().iter().any(|c| c.intersects(*rect)))
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+    );
+
+    // The terrain archive alone: its credit leaves, the base's stays.
+    h.fail_tile_reads(false);
+    h.frame();
+    assert!(
+        h.text_painted_in(panel, ARCHIVE_ATTRIBUTION_TEXT),
+        "the base archive is still drawing and still owes its credit",
+    );
+    assert!(
+        !h.text_painted_in(panel, "Copernicus"),
+        "the hillshade answers no tile read, so no Copernicus pixels are on \
+         the glass and the credit is clutter",
+    );
+
+    // The base archive too: the notice becomes the line that says so.
+    h.fail_tile_reads(true);
+    h.frame();
+    assert!(
+        h.text_painted_in(panel, UNREACHABLE_ATTRIBUTION_TEXT),
+        "a basemap source answering no tile read must paint the unreachable \
+         notice; the credit runs are {:?}",
+        h.painted_text_rects()
+            .into_iter()
+            .filter(|(rect, _)| h.attribution_rects().iter().any(|c| c.intersects(*rect)))
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        !h.text_painted_in(panel, "OpenStreetMap"),
+        "a provider credit over a map drawing nothing is the defect itself",
+    );
+    assert_eq!(
+        h.attribution_rects().len(),
+        1,
+        "one notice per panel, in every base x terrain state",
+    );
+}
+
 /// 66d. **The Copernicus credit follows the Terrain layer's own switch —
 ///      on and off through the Base Map inspector's "Terrain shading"
 ///      toggle — and the wider composed notice still clears the bottom
