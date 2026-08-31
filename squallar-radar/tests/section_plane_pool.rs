@@ -160,7 +160,9 @@ fn same(got: &Planes, want: &Planes, what: &str) {
 fn painted(section: &CrossSection) -> usize {
     section
         .image()
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[3] != 0)
         .count()
 }
