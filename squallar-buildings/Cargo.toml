@@ -35,7 +35,7 @@ mvt-reader = "=2.4.0"
 # `mvt_reader::feature::Feature::geometry` is a `geo_types::Geometry<T>`, so
 # reading a footprint means naming the type it arrives in. Same version
 # walkers and mvt-reader already agree on; no new package.
-geo-types = "=0.7.19"
+geo-types = "=0.7.20"
 
 # The tessellator. `lyon_path` is NOT declared beside it: `lyon_tessellation`
 # re-exports the whole of it as `lyon_tessellation::path`, so one line buys
