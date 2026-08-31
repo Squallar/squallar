@@ -148,6 +148,32 @@ pub(crate) fn decode_hillshade_tile(bytes: &[u8]) -> Result<egui::ColorImage, St
 // The handler
 // ---------------------------------------------------------------------------
 
+/// **What the Base Map inspector says beside the inert "Terrain shading"
+/// switch**, on a pane whose ground is a 3D mesh rather than flat map pixels.
+///
+/// The switch is disabled there and not hidden. Hiding it would leave the
+/// pane's persisted terrain state on the config with nothing on screen that
+/// can see or reach it, which "reopen is exactly 1:1" makes worse rather than
+/// better: the state would still be there, still decide what a 2D pane draws,
+/// and be unreachable from the pane in front of the user.
+///
+/// **The wording names the mechanism in effect, and that is what makes a note
+/// beside a dead control defensible at all.** This is not an apology for a
+/// switch that stopped working -- the shading did not go away, it moved to a
+/// light that moves with the camera and the sun instead of being baked into
+/// tiles by one frozen in map space. "The scene light" and not "the sun":
+/// the pane's own Sunlight control decides which light that is, and the
+/// sentence has to stay true with it either way.
+///
+/// A visible label rather than a hover tooltip, for a reason the target
+/// settles: this app ships to phones, where there is no hover, so a tooltip
+/// would put the explanation out of reach on exactly the surface where a dead
+/// control is hardest to interpret. Its two neighbours in this chrome
+/// (`MAP_FLOOR_INERT_NOTE`, `SUN_UNPLACEABLE_NOTE`) are visible weak labels
+/// under their control for the same reason.
+pub(crate) const TERRAIN_SUPERSEDED_NOTE: &str =
+    "This pane's ground is 3D, and its shading is provided by the scene light.";
+
 /// Toggle state only: the tiles are fetched, remapped and drawn by this
 /// crate's own tile machinery (`tiles::MapTileState::terrain`, the `Terrain`
 /// arm of `ui_map_pane`'s layer walk).
@@ -205,6 +231,13 @@ impl SourceHandler for TerrainHandler {
     /// just follows its own persisted state meanwhile. Chosen over coupling
     /// terrain to the host's visibility because the coupling would make the
     /// host's eye a second, implicit terrain switch.
+    ///
+    /// **The other declared edge: on a pane whose ground is a 3D mesh the
+    /// switch is drawn INERT**, with [`TERRAIN_SUPERSEDED_NOTE`] under it,
+    /// because the floor strip refuses to drape a baked hillshade over a
+    /// surface the scene light already shades. The per-pane state underneath
+    /// is untouched and still governs every other pane; it is the control
+    /// that stands down, never the state.
     fn surfaced_through(&self) -> Option<SurfacedControl> {
         Some(SurfacedControl {
             host: known::BASEMAP_TILES,

@@ -10,14 +10,15 @@
 //! So the strip of a pane whose ground is a mesh skips `known::TERRAIN`, and
 //! nothing else about it changes -- least of all what a 2D pane draws.
 //!
-//! **Why the evidence is here and not in the app harness.** The answer to
-//! "does this pane draw 3D ground" is `ui_map::pane_ground_heights`, and it is
-//! `None` for every pane in the shipped build: the height archive B3's path
-//! reads is not published, so no scheduler asks for a field. Driving the app
-//! can therefore only ever exercise the *false* arm, which is exactly the
-//! vacuous half of this test. `render_pane_map_content` is the seam where both
-//! answers are constructible, and it is the seam the suppression lives at, so
-//! it is where both directions are asserted.
+//! **Why the evidence is here and not in the app harness.** Not because the
+//! answer cannot be forced -- `ui_map::test_ground_fields` stands the missing
+//! scheduler in and the Base Map inspector's inert switch is proven through
+//! the real chrome that way -- but because **no floor strip is observable
+//! through the app harness at all**: nothing pushes the strip's paint order,
+//! so there is no probe to read whichever answer the pane was given (see
+//! [`dispatched`]). `render_pane_map_content` is the seam the suppression
+//! lives at and the seam both answers are constructible at, so it is where
+//! both directions are asserted.
 
 use super::*;
 use crate::pane::PaneState;
@@ -247,12 +248,11 @@ fn squeezed(src: &str) -> String {
 /// **The wiring, pinned in source, because it cannot be pinned in behaviour
 /// and this unit's other two tests cannot see it.**
 ///
-/// `pane_ground_heights` answers `None` for every pane while the height
-/// archive is unpublished, so the strip's flag reads "plan view" whether it
-/// comes from that function or from a literal, and no test that drives the
-/// app could tell. And the strip is not observable through the app harness at
-/// all -- see [`dispatched`]. Closing this behaviourally needs *two* edits
-/// this unit does not own: a scheduler, and a probe.
+/// The strip is not observable through the app harness at all -- see
+/// [`dispatched`] -- so no test that drives the app can read which flag the
+/// strip was handed, whatever `pane_ground_heights` answers. Closing this
+/// behaviourally still needs an edit this unit does not own: a probe on the
+/// strip's own paint order.
 ///
 /// **What it holds, and what a previous version of it did not.** The first
 /// spelling asserted only that the pinned line *existed*, which a mutant
@@ -272,9 +272,11 @@ fn squeezed(src: &str) -> String {
 /// `PLAN_VIEW`, which would silently disable the suppression for ever the day
 /// a scheduler lands.
 ///
-/// **Delete it the day a scheduler fills `pane_ground_heights` in and the
-/// strip gains a probe**, because from that day the join is reachable
-/// behaviourally and a source pin is the weaker statement.
+/// **Delete it the day the strip gains a probe on its own paint order**,
+/// because from that day the join is reachable behaviourally and a source pin
+/// is the weaker statement. The scheduler stand-in is not enough on its own:
+/// it can put a pane on the mesh side, but nothing can then read what the
+/// strip drew.
 #[test]
 fn the_strips_flag_and_the_renderers_heights_are_read_from_one_function() {
     let ui_map = squeezed(MAP_MODULES[0].1);
@@ -326,15 +328,30 @@ fn the_strips_flag_and_the_renderers_heights_are_read_from_one_function() {
          plan-view walk asserted below"
     );
 
+    // **The one expression moved into a named seam, and that is the whole
+    // point of it.** The Base Map inspector's "Terrain shading" switch has to
+    // ask the same question the strip asks -- it goes inert exactly when the
+    // strip drops the layer -- and it lives outside `ui::map`, where
+    // `GroundIsMesh`'s constructors are not visible. So the expression is now
+    // `pane_draws_3d_ground`'s body, the strip calls it, and the two counts
+    // below are unchanged because the seam did not add a reader of
+    // `pane_ground_heights`, it renamed the one the strip already was.
     assert_eq!(
         ui_map
             .matches(
-                "let draws_3d_ground = pane_render::GroundIsMesh::from_height_field( pane_ground_heights(pane, pane_idx).as_deref(), );"
+                "pub(in crate::ui) fn pane_draws_3d_ground( pane: &crate::pane::PaneState, pane_idx: usize, ) -> pane_render::GroundIsMesh { pane_render::GroundIsMesh::from_height_field(pane_ground_heights(pane, pane_idx).as_deref()) }"
             )
             .count(),
         1,
-        "the floor strip must ask `pane_ground_heights` and nothing else, in \
-         one expression with no room between the call and the flag"
+        "the seam must ask `pane_ground_heights` and nothing else, in one \
+         expression with no room between the call and the flag"
+    );
+    assert_eq!(
+        ui_map
+            .matches("let draws_3d_ground = pane_draws_3d_ground(pane, pane_idx);")
+            .count(),
+        1,
+        "the floor strip must take its flag off the seam, not compose one"
     );
     assert_eq!(
         ui_map

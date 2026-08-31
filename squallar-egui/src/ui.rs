@@ -2381,6 +2381,11 @@ mod storm_motion_override_tests;
 #[cfg(test)]
 mod wake_schedule_tests;
 
+/// The layers surfaced through another layer's inspector, and what happens to
+/// one whose work the pane's own render has taken over.
+#[cfg(test)]
+mod surfaced_control_tests;
+
 #[cfg(test)]
 mod overlay_retry_tests;
 

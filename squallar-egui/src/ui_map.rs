@@ -1665,15 +1665,14 @@ impl super::Gui {
         let mut map_memory = map_memory;
         let map_memory = &mut map_memory;
 
-        // Read before the closure takes `pane`, and read from the same
-        // function the renderer's own `heights` comes from -- see
-        // `pane_ground_heights`. One expression, and the only binding of this
-        // name in the module: a second one composing the answer out of
-        // something else is what `GroundIsMesh` and the source pin in
+        // Read before the closure takes `pane`, and read through the same
+        // seam the Base Map inspector's inert "Terrain shading" switch reads
+        // -- see `pane_draws_3d_ground`, which is where the one expression
+        // now lives. The only binding of this name in the module: a second
+        // one composing the answer out of something else is what
+        // `GroundIsMesh` and the source pin in
         // `ui_map_pane/floor_strip_shading_tests.rs` exist to refuse.
-        let draws_3d_ground = pane_render::GroundIsMesh::from_height_field(
-            pane_ground_heights(pane, pane_idx).as_deref(),
-        );
+        let draws_3d_ground = pane_draws_3d_ground(pane, pane_idx);
 
         // The strip cache's skip decision. The key moves exactly when the
         // strip's pixels would; a clean, complete strip for every floor pane
@@ -2159,19 +2158,124 @@ impl VolumeOutcome {
 /// pane asks for one, because the archive A2 would fetch from is not
 /// published: `HEIGHT_ARCHIVE_URL` still carries `UNPUBLISHED-GENERATION`, so
 /// a wired request would 404 on every tile and the pane would draw exactly
-/// this `None` anyway. **So it answers `None` for every pane today**, which is
-/// why nothing that gates on it can be proven by driving the app: the
-/// two-directional evidence for the suppression is at
-/// `render_pane_map_content`'s own seam, where both answers are constructible
-/// (`ui_map_pane/floor_strip_shading_tests.rs`).
+/// this `None` anyway. **So the production body answers `None` for every pane
+/// today**, and the false arm of every gate built on it is the only arm the
+/// shipped app can reach.
 ///
-/// Whoever wires the scheduler fills in this body, and both readers flip
-/// together because there is only the one.
+/// **Which is why there are two bodies.** Under `cfg(test)` the answer comes
+/// from [`test_ground_fields`], the scheduler's stand-in: without it a test
+/// over anything that gates on 3D ground would exercise only the arm every
+/// pane is on, which is the definition of vacuous for those units. The strip's
+/// own suppression is still pinned at `render_pane_map_content`'s seam, where
+/// both answers are constructible without a whole app
+/// (`ui_map_pane/floor_strip_shading_tests.rs`), because no floor strip is
+/// observable through the app harness at all.
+///
+/// Whoever wires the scheduler fills in the production body, and every reader
+/// flips together because there is only the one.
+#[cfg(not(test))]
 fn pane_ground_heights(
     _pane: &crate::pane::PaneState,
     _pane_idx: usize,
 ) -> Option<std::sync::Arc<crate::volume_view::GroundHeightField>> {
     None
+}
+
+/// The same function with the scheduler stood in for -- see
+/// [`test_ground_fields`], which is the only thing that can make it answer.
+#[cfg(test)]
+fn pane_ground_heights(
+    _pane: &crate::pane::PaneState,
+    pane_idx: usize,
+) -> Option<std::sync::Arc<crate::volume_view::GroundHeightField>> {
+    test_ground_fields::get(pane_idx)
+}
+
+/// **Whether `pane` draws its ground as a 3D mesh** -- the one producer of
+/// that answer, and the only door out of `ui::map` for it.
+///
+/// Two consumers, one expression. The floor strip reads it to decide whether
+/// its drape may carry a baked hillshade
+/// ([`pane_render::scene_light_supersedes`]); the Base Map inspector reads it
+/// to decide whether the "Terrain shading" switch is still governing anything.
+/// They cannot disagree, because there is nothing else to ask: the
+/// [`pane_render::GroundIsMesh`] constructors are `pub(super)` to `ui::map`,
+/// so the inspector can hold one of these but cannot mint one, and the
+/// mutation that would (`pane.volume().is_some()` -- true for every 3D pane,
+/// mesh or not) does not typecheck against the type it would have to return.
+pub(in crate::ui) fn pane_draws_3d_ground(
+    pane: &crate::pane::PaneState,
+    pane_idx: usize,
+) -> pane_render::GroundIsMesh {
+    pane_render::GroundIsMesh::from_height_field(pane_ground_heights(pane, pane_idx).as_deref())
+}
+
+/// **The terrain scheduler this build does not have, stood in for by a test.**
+///
+/// Everything that gates on "does this pane draw 3D ground" is unreachable in
+/// the shipped app -- the height archive is unpublished, so the production
+/// [`pane_ground_heights`] answers `None` for every pane and every such gate
+/// sits on its false arm. A test that only ever exercised that arm would be
+/// vacuous for the units built on top of it, so this is the one lever that
+/// puts a pane on the other side, and it moves the strip, the renderer and
+/// the inspector together because all three read the one function.
+///
+/// Thread-local, and [`crate::input_harness::InputHarness`] clears it as it
+/// builds, so no test can inherit another's ground -- libtest is free to run
+/// tests on the main thread at `--test-threads=1`, which a bare thread-local
+/// would let leak.
+#[cfg(test)]
+pub(crate) mod test_ground_fields {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::volume_view::GroundHeightField;
+
+    thread_local! {
+        static FIELDS: RefCell<HashMap<usize, Arc<GroundHeightField>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// A minimal well-formed field: 2x2 posts over an 80 km box at KTLX. Its
+    /// numbers do not matter to anything that gates on presence, and nothing
+    /// that reads its samples runs without a GPU.
+    fn a_field() -> Arc<GroundHeightField> {
+        Arc::new(GroundHeightField {
+            id: 1,
+            site: (35.3331, -97.2778),
+            x_km: (-40.0, 40.0),
+            y_km: (-40.0, 40.0),
+            posts: [2, 2],
+            samples: Arc::new(vec![0, 1, 2, 3]),
+            base_m: 300.0,
+            quantum_m: 1.0,
+            range_m: (300.0, 303.0),
+        })
+    }
+
+    pub(crate) fn get(pane_idx: usize) -> Option<Arc<GroundHeightField>> {
+        FIELDS.with_borrow(|fields| fields.get(&pane_idx).cloned())
+    }
+
+    /// Give pane `pane_idx` a height field, or take its field away.
+    ///
+    /// The parameter is `on` and not the obvious `draws_3d_ground` because
+    /// the source pin in `ui_map_pane/floor_strip_shading_tests.rs` counts
+    /// that spelling across this whole file, comments included.
+    pub(crate) fn set(pane_idx: usize, on: bool) {
+        FIELDS.with_borrow_mut(|fields| {
+            if on {
+                fields.insert(pane_idx, a_field());
+            } else {
+                fields.remove(&pane_idx);
+            }
+        });
+    }
+
+    pub(crate) fn clear() {
+        FIELDS.with_borrow_mut(HashMap::clear);
+    }
 }
 
 /// The extruded buildings standing on `pane`'s terrain, or `None` for a pane
