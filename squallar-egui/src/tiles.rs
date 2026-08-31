@@ -909,6 +909,51 @@ pub fn tiles_resident_for(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usi
     tiles_resident_at_tile_scale(rect, zoom_bias, layers, MIN_TILE_SCALE)
 }
 
+/// How far out of the drawn level the always-resident ancestor net sits, in
+/// whole zoom steps.
+///
+/// **This is what stands between a zoom-out and a black screen.**
+/// `HttpsTiles::cached_or_interpolated` answers a missing tile with a cached
+/// *ancestor*, walking towards zoom 0 and never towards the leaves, so the
+/// tiles a zoom-out was just looking at — which are its descendants — can never
+/// answer for it. Nothing else requested a shallower level either:
+/// `HttpsTiles::ground_at` asks only for the level being drawn. So a session
+/// that had only ever been deep held nothing at all for a shallow viewport, and
+/// drew nothing, until the network answered.
+///
+/// One tile this many steps out covers `2^steps` of the drawn level on a side,
+/// so the net is a whole viewport's ancestry for a handful of entries: at 4
+/// steps a 1920x1200-point canvas keeps **4** of them beside the 96 it draws.
+///
+/// Four rather than one because one is unaffordable and four is free. The
+/// immediate parent level would be the sharpest net, but its span is a quarter
+/// of the drawn span plus its boundary — 35 more entries at 1920x1200, taking
+/// the wasm working set to 131, whose vector worst case is 322 MiB against
+/// `squallar-device-profile`'s 288 MiB whole-application texture budget. Four
+/// steps costs 8 entries at the bound below and overruns nothing. What it gives
+/// up is sharpness in the covering ancestor, which is a stretched tile either
+/// way and is replaced the moment the real one lands.
+pub const WARM_ANCESTOR_STEPS: u8 = 4;
+
+/// How many tiles a rect keeps resident once the [`WARM_ANCESTOR_STEPS`] net is
+/// kept warm beside the level being drawn — **the sizing answer for any cache
+/// behind `ui_map_overlays::draw_tile_layer`**, which requests both.
+///
+/// The net's span is the drawn span shifted right by [`WARM_ANCESTOR_STEPS`],
+/// and a shift can only ever land a range of `n` indices on `n / 2^steps + 1`
+/// of them; the `+ 1` beyond that is the grid phase, exactly as in
+/// [`tiles_resident_at_tile_scale`]. So this is a bound rather than a
+/// measurement, and `tests::the_warm_net_is_never_larger_than_its_bound` holds
+/// the real `tile_span` sweep under it.
+pub fn tiles_resident_with_warm_net(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
+    let (across, down) = tiles_resident_grid(rect, zoom_bias, MIN_TILE_SCALE);
+    let net = |n: usize| n.saturating_sub(1) / (1 << WARM_ANCESTOR_STEPS) + 2;
+    across
+        .saturating_mul(down)
+        .saturating_add(net(across).saturating_mul(net(down)))
+        .saturating_mul(layers)
+}
+
 /// How many tiles a rect keeps resident at a **whole** zoom, where a tile is
 /// drawn exactly [`TILE_SIDE_POINTS`] across. Never larger than
 /// [`tiles_resident_for`], and not a cache size.
@@ -931,13 +976,21 @@ fn tiles_resident_at_tile_scale(
     layers: usize,
     scale: f32,
 ) -> usize {
+    let (across, down) = tiles_resident_grid(rect, zoom_bias, scale);
+    across.saturating_mul(down).saturating_mul(layers)
+}
+
+/// The resident grid's two dimensions, before they are multiplied out. Shared
+/// so [`tiles_resident_with_warm_net`] shifts the same figures the drawn count
+/// is built from and the two can never drift.
+fn tiles_resident_grid(rect: egui::Rect, zoom_bias: u8, scale: f32) -> (usize, usize) {
     let side = TILE_SIDE_POINTS * scale / 2f32.powi(i32::from(zoom_bias));
     if side <= 0.0 || !rect.width().is_finite() || !rect.height().is_finite() {
-        return 0;
+        return (0, 0);
     }
     let across = (rect.width().max(0.0) / side).ceil() as usize + 1;
     let down = (rect.height().max(0.0) / side).ceil() as usize + 1;
-    across.saturating_mul(down).saturating_mul(layers)
+    (across, down)
 }
 
 /// The tile indices one viewport covers at one tile zoom, both ends inclusive.

@@ -56,10 +56,11 @@ fn whole_tile_uv() -> egui::Rect {
 
 /// The tuning values, restated as literals.
 const EXPECTED_CACHE_ENTRIES: usize = 256;
-const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 96;
+const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 100;
 /// Not a fraction of the desktop figure: the worst-case working set of a
-/// 1920x1200-point canvas, which `tiles::tests` measures at exactly this.
-const EXPECTED_WASM_CACHE_ENTRIES: usize = 96;
+/// 1920x1200-point canvas — the 96 tiles it draws plus the 4-tile bound on the
+/// `WARM_ANCESTOR_STEPS` net it keeps resident beside them.
+const EXPECTED_WASM_CACHE_ENTRIES: usize = 100;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 /// Re-pointed at WO-10, when the time budget became the governor and the count
 /// became a backstop: the value is the channel's own capacity plus one, so it
@@ -672,6 +673,122 @@ fn a_pump_inside_its_time_budget_empties_the_queue() {
 
 // ---------------------------------------------------------------------------
 
+/// **The zoom-out black screen, and the net that fills it.**
+///
+/// `cached_or_interpolated` walks towards zoom 0 and never towards the leaves,
+/// so the tiles a zoom-out was just looking at — its *descendants* — can never
+/// answer for it. Nothing asked for a shallower level either, so a session that
+/// had only ever been deep drew a hole for every cell of a shallow viewport.
+///
+/// This drives the sequence the user reported: sit deep, then zoom out. The
+/// first half is the mechanism, asserted directly — a deep tile resident, its
+/// own shallow parent still a hole. The second half is the fix: once the net
+/// has been warmed, as `draw_tile_layer` warms it every frame, the same shallow
+/// ask is answered without a single new byte over the network.
+#[test]
+fn a_zoom_out_past_the_cached_level_has_an_ancestor_to_draw() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles(&server, &ctx);
+
+    // Where the user has been sitting: one deep tile, on the glass.
+    let deep = TileId {
+        x: 1 << 10,
+        y: 1 << 10,
+        zoom: 14,
+    };
+    tile_eventually(&mut tiles, deep);
+
+    // Every question below goes through `cached_or_interpolated` and never
+    // through `at`. `at` is `ground_at`, which *requests* the tile it is asked
+    // for — so polling with it would fetch the very tiles the net is supposed
+    // to be the reason for, and every assertion here would hold with the net
+    // ripped out. What is being asked is only ever "what could this frame
+    // draw", which is what the user sees.
+    let net_zoom = deep.zoom - crate::tiles::WARM_ANCESTOR_STEPS;
+    let ancestor_of = |steps: u8| TileId {
+        x: deep.x >> steps,
+        y: deep.y >> steps,
+        zoom: deep.zoom - steps,
+    };
+
+    // The mechanism. Every step of a zoom-out from where the user was sitting
+    // is a hole: the walk runs from the asked-for zoom towards 0 and the only
+    // thing cached is *below* all of them.
+    for steps in 1..=crate::tiles::WARM_ANCESTOR_STEPS {
+        assert!(
+            tiles.cached_or_interpolated(ancestor_of(steps)).is_none(),
+            "zooming out {steps} step(s) could already draw something before \
+             the net existed, so the hole this test is about is not the hole \
+             being reproduced",
+        );
+    }
+
+    // The fix: warm the net, as `draw_tile_layer` does after every draw.
+    let net = ancestor_of(crate::tiles::WARM_ANCESTOR_STEPS);
+    tiles.warm(net);
+    assert!(
+        pump_until(DEFAULT_TIMEOUT, || {
+            tiles.pump();
+            tiles.cached_or_interpolated(net)
+        })
+        .is_some(),
+        "the warmed net tile never arrived",
+    );
+
+    // ...and now every one of those steps draws, stretched, off the net alone —
+    // no fetch of its own was ever started for any of them.
+    for steps in 1..=crate::tiles::WARM_ANCESTOR_STEPS {
+        assert!(
+            tiles.cached_or_interpolated(ancestor_of(steps)).is_some(),
+            "zooming out {steps} step(s) still had no ancestor to stretch with \
+             the net resident: the zoom-out is a black screen for every cell",
+        );
+    }
+    assert_eq!(
+        net.zoom, net_zoom,
+        "the net is asked for at the depth WARM_ANCESTOR_STEPS names",
+    );
+}
+
+/// The net is requested at the depth it claims, and only where the source can
+/// serve it. A net deeper than the source, or below zoom 0, is not a net.
+#[test]
+fn the_ancestor_net_is_never_asked_for_past_what_the_source_serves() {
+    let server = TileServer::start(Behaviour::Hang);
+    let ctx = Context::default();
+    let shallow = HttpsTiles::with_client(
+        LoopbackSource::new(&server.base_url).with_max_zoom(3),
+        ctx.clone(),
+        loopback_client(),
+    );
+    let mut shallow = shallow;
+
+    let too_deep = TileId {
+        x: 0,
+        y: 0,
+        zoom: 9,
+    };
+    shallow.warm(too_deep);
+    assert!(
+        !shallow.tile_is_cached(too_deep),
+        "the net asked for a level the source cannot serve, which is the \
+         `0/0/0` seeding MAX_ZOOM_UNKNOWN exists to prevent in another guise",
+    );
+
+    let servable = TileId {
+        x: 1,
+        y: 1,
+        zoom: 2,
+    };
+    shallow.warm(servable);
+    assert!(
+        shallow.tile_is_cached(servable),
+        "control: a net tile the source can serve must be asked for, or the \
+         refusal above is vacuous",
+    );
+}
+
 /// **The proof that tiles actually render.**
 #[test]
 fn a_fetched_tile_reaches_an_egui_texture_with_the_pixels_that_were_served() {
@@ -1057,13 +1174,16 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     );
     assert_eq!(
         WASM_TILE_CACHE_ENTRIES.get(),
-        crate::tiles::tiles_resident_for(
+        crate::tiles::tiles_resident_with_warm_net(
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1200.0)),
             0,
             1,
         ),
         "the wasm arm must stay derived from what a viewport actually keeps \
-         resident, worst case over the whole zoom range"
+         resident, worst case over the whole zoom range — and that is the \
+         drawn level plus the ancestor net, since `draw_tile_layer` asks for \
+         both. An arm sized for the drawn level alone lets the net evict the \
+         glass"
     );
     assert!(
         WASM_TILE_CACHE_ENTRIES.get() <= MOBILE_TILE_CACHE_ENTRIES.get()
@@ -1200,10 +1320,16 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     // draws on wasm32`, so it is in the loop above rather than exempt from it.
     // Its raster derivation is still pinned, because the terrain slot holds
     // raster entries and the arm has to be right for it too.
+    //
+    // 24 -> 25 MiB at WO-10: the count is derived from the working set and the
+    // byte figure follows it, so this moved because the working set gained the
+    // `WARM_ANCESTOR_STEPS` net (96 -> 100), not because a byte budget was
+    // relaxed. See `WASM_TILE_CACHE_ENTRIES`, which prices the vector arm — the
+    // binding one — against `WASM_APP_TEXTURE_BUDGET_BYTES`.
     assert_eq!(
         WASM_TILE_CACHE_ENTRIES.get() * super::RASTER_TILE_BYTES,
-        24 * 1024 * 1024,
-        "the wasm arm's derivation is against the raster entry and moved"
+        25 * 1024 * 1024,
+        "the wasm arm's raster cost is not what its entry count implies"
     );
     #[cfg(all(
         not(target_arch = "wasm32"),

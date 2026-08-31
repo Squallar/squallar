@@ -218,6 +218,33 @@ pub(super) fn draw_tile_layer(
 
     let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
 
+    // The ancestor net, and **before** the grid loop rather than after it.
+    // These tiles are not drawn this frame; they are what
+    // `cached_or_interpolated` stretches over the frame a zoom-out lands on,
+    // and without them that frame is a hole in every cell -- see
+    // `HttpsTiles::warm` and `tiles::WARM_ANCESTOR_STEPS`.
+    //
+    // The order is the whole of it. `request_once` sends on a
+    // `channel(MAX_PARALLEL_DOWNLOADS)` and drops what will not fit, retrying
+    // next frame; the span below is tens of cells against six slots, so it
+    // fills the queue on every frame it has anything left to ask for. Asked
+    // afterwards, the net -- four tiles -- was refused every time and never
+    // arrived at all. Asked first it costs the visible level one frame of
+    // delay on four of its tiles, which it was already going to spend, since
+    // 84 asks never fit six slots either way.
+    if let Some(net_zoom) = tile_zoom.checked_sub(crate::tiles::WARM_ANCESTOR_STEPS) {
+        let step = crate::tiles::WARM_ANCESTOR_STEPS;
+        for ty in (span.north >> step)..=(span.south >> step) {
+            for tx in (span.west >> step)..=(span.east >> step) {
+                tiles.warm(TileId {
+                    x: tx,
+                    y: ty,
+                    zoom: net_zoom,
+                });
+            }
+        }
+    }
+
     // egui's own frame counter, so the renderer can tell one frame's ground
     // draws from the next without a clock or a frame callback of its own.
     let pass_nr = ui.ctx().cumulative_pass_nr();
@@ -750,6 +777,95 @@ mod tests {
             drains, 1,
             "a layer of {cells} cells drained {drains} times; one layer is one \
              drain, and {cells} is what a per-cell drain would have cost"
+        );
+    }
+
+    /// **Drawing a layer asks for the ancestor net, and the net is small.**
+    ///
+    /// The call-site half of `HttpsTiles::warm`'s gate. Without this, a draw
+    /// pass could stop requesting the net and only `tile_source`'s own suite —
+    /// which calls `warm` by hand — would still be green, so the map would go
+    /// black on a zoom-out with every test passing.
+    ///
+    /// Both halves are asserted because both can fail on their own: that every
+    /// net tile covering the span was asked for (too few is a hole the
+    /// zoom-out falls through), and that the net's size is the bound
+    /// `tiles::tiles_resident_with_warm_net` sizes the LRU against (too many
+    /// and the net evicts the glass it exists to back up).
+    #[test]
+    fn a_drawn_layer_asks_for_the_ancestor_net_and_no_more_than_its_bound() {
+        squallar_radar::tls::init();
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let zoom = 6.0;
+
+        let mut memory = walkers::MapMemory::default();
+        memory.set_zoom(zoom).expect("zoom 6 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+
+        let mut tiles = crate::tile_source::HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+
+        let tile_zoom = zoom.round() as u8;
+        let step = crate::tiles::WARM_ANCESTOR_STEPS;
+        let net_zoom = tile_zoom
+            .checked_sub(step)
+            .expect("fixture: the drawn zoom must be deeper than the net");
+        let span = crate::tiles::tile_span(&projector, canvas, tile_zoom);
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(canvas),
+            ..Default::default()
+        });
+        let ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("draw_tile_layer_warm_net"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(canvas),
+        );
+        draw_tile_layer(&ui, &projector, zoom, &mut tiles, 0, None);
+        let _ = ctx.end_pass();
+
+        // Every net tile the drawn span sits under was asked for. The source
+        // never answers, so a hit here is the *request* -- which is the thing
+        // that has to happen ahead of the zoom-out, not the arrival.
+        let mut net_tiles = 0_usize;
+        for ty in (span.north >> step)..=(span.south >> step) {
+            for tx in (span.west >> step)..=(span.east >> step) {
+                net_tiles += 1;
+                let net = TileId {
+                    x: tx,
+                    y: ty,
+                    zoom: net_zoom,
+                };
+                assert!(
+                    tiles.tile_is_cached(net),
+                    "the draw pass did not ask for {net:?}, so a zoom-out over \
+                     that cell has no ancestor to stretch and draws a hole",
+                );
+            }
+        }
+        assert!(
+            net_tiles > 0,
+            "fixture: the net must name at least one tile, or the loop above \
+             asserted nothing"
+        );
+
+        // The net stays inside what the LRU was sized for. The bound counts
+        // the drawn level too, so subtract what the span actually named.
+        let bound = crate::tiles::tiles_resident_with_warm_net(canvas, 0, 1)
+            - crate::tiles::tiles_resident_for(canvas, 0, 1);
+        assert!(
+            net_tiles <= bound,
+            "the net asked for {net_tiles} tiles where the cache is sized for \
+             {bound}: the net now evicts the glass it exists to back up",
         );
     }
 
