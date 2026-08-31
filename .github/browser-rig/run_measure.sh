@@ -32,11 +32,98 @@
 # Every row prints its full denominator set: scene, browser, arm, adapter,
 # app-selected backend, canvas buffer resolution, dpr, observed refresh
 # (from the idle rAF sample), crossOriginIsolated, diagnostics panel state,
-# script, commit. A row with coi!=true is stamped INVALID -- without
-# cross-origin isolation there is no SharedArrayBuffer, the worker pool is
-# the one-thread fallback, and the row describes a threading configuration
-# the app never ships in. Firefox and Chromium rows are never merged;
-# Firefox governs and runs first.
+# script, commit, and the whole-picture overlay raster SIZE. A row with
+# coi!=true is stamped INVALID -- without cross-origin isolation there is no
+# SharedArrayBuffer, the worker pool is the one-thread fallback, and the row
+# describes a threading configuration the app never ships in. Firefox and
+# Chromium rows are never merged; Firefox governs and runs first.
+#
+# ---- Pixels and MB/picture are denominators, not details ------------------
+#
+# Scene A's interact p99 tracks the size of the whole-picture overlay raster.
+# That size is a pure function of the surface the app was given -- the canvas
+# on the web, the window on native -- and not of the build:
+#
+#     picture bytes = (W * 1.5) * ((H - 40) * 1.5) * 4
+#
+# (the 1.5 is `OVERDRAW_FRACTION` 0.25 spent on both sides, the 40 is the top
+# bar in points, the 4 is RGBA). Verified exact at three surfaces on
+# 2026-08-31: native 1920x1080 -> 17,971,200 B; firefox canvas 1280x779 ->
+# 8,509,440 B; chromium canvas 1248x714 -> 7,570,368 B.
+#
+# Three ways that has already produced an incomparable pair:
+#
+#   * **Native leg vs native leg.** A window-manager fullscreen request that
+#     raced on some runs and landed on others: 17,971,200 B a picture at the
+#     app's own 1920x1080 default, 43,344,000 B at a 3440x1440 fullscreen
+#     window -- 2.4x -- between two runs of "the same protocol".
+#   * **Firefox vs chromium.** One `--window 1280x900` gives the two browsers
+#     canvases of 1280x779 and 1248x714: 1.00M vs 0.89M pixels, a 12%
+#     difference between the two rows the campaign reads side by side.
+#   * **Native vs web.** 1920x1080 is 2.07M pixels against the rig's ~1.0M --
+#     2.1x. A native p99 quoted beside a web p99 without this stated is a
+#     comparison of two viewport sizes.
+#
+# So: **a pair whose viewport pixels differ is not a comparison.** Every row
+# prints `viewport=`, `px=`, `dpr=`, `pictures=` and `MB/picture=`.
+#
+# ---- The cross-target rule: match the pixels, or do not compare ------------
+#
+# MATCHING IS CHOSEN over a "not cross-comparable" marker, because matching is
+# cheap and a marker only tells you afterwards that the run was wasted:
+#
+#   * Web: `RIG_CANVAS=WxH` passes `--canvas` to drive.py, which corrects the
+#     window until the canvas DRAWING BUFFER is exactly that, and records
+#     whether it got there (`canvas met=`). Same pixels in both browsers.
+#   * Native: run the window at the same WxH (the runner's `--geom`), which
+#     produces the identical picture -- the formula above has no target in it.
+#
+# The marker is kept as the fallback, because an unmet target must not read as
+# a met one: a row whose `--canvas` was not requested, or was requested and
+# missed, prints `cross=no` and may not be quoted beside a row from another
+# target. `cross=yes` means the buffer is exactly the asked-for size.
+#
+# ---- Basemap state is a denominator too -----------------------------------
+#
+# Every web leg measured before `a7465238` (2026-08-31) drew NO basemap: the
+# pmtiles offsets were truncated to 32 bits, so no vector tile ever resolved
+# on wasm32 and the web legs skipped tile placement, tessellation and tile
+# uploads entirely while the native legs did all of it. Rows now print
+# `basemap=<decoded>/<placed>` off two independent counters, so a pre-fix row
+# can never again be quoted beside a post-fix one:
+#
+#   * DECODED is `basemap tiles:` -- archive tile bodies that came back. A leg
+#     on the wrong side of the truncation reads `none-decoded`.
+#   * PLACED is `ground tiles:` -- what the ground phase then put on the frame
+#     thread. A leg can decode tiles and place nothing, which is why this is
+#     not folded into the first. `placed` alone is NOT the test here: the
+#     fills went to the GPU, so a drawing pane is legitimately zero in that
+#     one field and positive in stroke points, labels, draws and uploads.
+#
+# ---- The native protocol ---------------------------------------------------
+#
+# There is no native runner in the tree (campaign instruments live on harness
+# branches). What a native leg must do, so a later lane can reproduce a row:
+#
+#   1. Release binary, fresh XDG_CONFIG_HOME, the scene's ui.json seeded into
+#      $XDG_CONFIG_HOME/squallar/ui.json with the same shape as scene_seed
+#      below, plus frame_telemetry=1 and raster_telemetry=1.
+#   2. SQUALLAR_GESTURE_SCRIPT=<the scene's script> in the environment.
+#   3. **Pin the window size and VERIFY it.** The app requests
+#      RENDER_WIDTH x RENDER_HEIGHT (1920x1080) at create and persists no
+#      geometry, so a leg that touches no window manager is already pinned;
+#      a leg that wants another size must resize BY WINDOW ID (`xdotool
+#      search --pid`, never by title -- `wmctrl -r Squallar` matches any
+#      window whose title contains the string) and then read the geometry
+#      back. A leg that cannot show the size it asked for is INVALID.
+#   4. Settle 30 s, then bracket exactly two WHOLE script loops using the
+#      player's own `gesture script <name> loop complete` markers, and diff
+#      the embedded histograms across the bracket. Percentiles do not
+#      difference; histograms do.
+#   5. Diff `overlay rasters:` across the SAME bracket and report
+#      `picture_bytes / pictures` as the row's MB/picture. Cumulative-from-
+#      boot folds in whatever was drawn before the window settled.
+#   6. Two runs; a third when they diverge by more than 15%.
 #
 # Usage: run_measure.sh [--skip-build]
 #   --skip-build      serve squallar-web as-is (default: wasm-pack build
@@ -58,6 +145,12 @@
 #   RIG_DISPLAY       X display (default: $DISPLAY, then :0)
 #   RIG_PANEL         "on" seeds the diagnostics panel visible (default off);
 #                     printed as the panel= denominator either way
+#   RIG_CANVAS        WxH the canvas drawing buffer is corrected to before
+#                     the window opens (default: unset, each browser keeps
+#                     whatever its chrome leaves). Set it on any leg whose row
+#                     will be read beside another browser's or beside a native
+#                     row, and give the native leg the same WxH window. Only a
+#                     row whose target was MET prints cross=yes.
 #   RIG_TLS           1 = serve https with a self-signed pair and drive at
 #                     RIG_HOST (the TLS/COI smoke; a phone-shaped posture on
 #                     this box). Default 0 = plain 127.0.0.1
@@ -83,6 +176,7 @@ SETTLE="${RIG_SETTLE:-6}"
 MEASURE_WINDOW="${RIG_MEASURE_WINDOW:-46}"
 FRAMES="${RIG_FRAMES:-240}"
 PANEL="${RIG_PANEL:-off}"
+CANVAS="${RIG_CANVAS:-}"
 TLS="${RIG_TLS:-0}"
 PY=python3
 
@@ -160,7 +254,7 @@ else
 fi
 SCENE_B_COLS="ground_pass=$GROUND_PASS heights=$HEIGHTS_STATE sun_lighting_default=$SUN_DEFAULT grid_asset=$GRID_ASSET_STATE height_archive=$HEIGHT_ARCHIVE_GEN buildings=$BUILDINGS_STATE"
 
-echo "commit=$COMMIT scenes=[$SCENES] browsers=[$BROWSERS] panel=$PANEL tls=$TLS"
+echo "commit=$COMMIT scenes=[$SCENES] browsers=[$BROWSERS] panel=$PANEL tls=$TLS canvas=${CANVAS:-unpinned}"
 echo "scene B denominator columns: $SCENE_B_COLS"
 
 # ------------------------------------------------------- display check ----
@@ -294,6 +388,9 @@ print(m.lan_ip() or '127.0.0.1')")}"
 }
 
 EXTRA=()
+if [ -n "$CANVAS" ]; then
+  EXTRA+=(--canvas "$CANVAS")
+fi
 if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
   # shellcheck disable=SC2206
   EXTRA+=($RIG_DRIVE_EXTRA)
@@ -387,14 +484,53 @@ for tag in sys.argv[5:]:
     if not gw:
         invalid.append("no gesture window (no marker lines scraped)")
 
+    # The whole-picture overlay raster size. Cumulative from boot, and said so
+    # -- a windowed figure would need the raster line kept per reading the way
+    # the frame lines are. It is a DENOMINATOR: a before/after pair that does
+    # not match here is comparing two surfaces, not two builds. See the
+    # MB/picture note in this script's header.
+    ort = r.get("overlay_raster_totals") or {}
+    pics = ort.get("pictures") or 0
+    mbpp = ("%.2f" % (ort.get("picture_bytes", 0) / pics / 1e6)) if pics else "-"
+
+    # Viewport PIXELS, not a resolution string: pixels are what the picture is
+    # sized from, and two rows at 1280x779 and 1248x714 look alike written out
+    # and are 12% apart counted.
+    bw, bh = b.get("bufferWidth") or 0, b.get("bufferHeight") or 0
+    ct = r.get("canvas_target") or {}
+    cross = "yes" if ct.get("met") else "no"
+
+    # Did the basemap draw at all? Two independent readings, and the decode
+    # one leads because it is the direct answer: a leg on the wrong side of
+    # the pmtiles 32-bit truncation (`a7465238`) decodes zero vector tiles.
+    # The ground counters are the second half -- a leg can decode tiles and
+    # still place nothing -- and `placed` alone is not the test there, because
+    # the fills went to the GPU and a drawing pane reads 0 in that one.
+    bt = r.get("basemap_tile_totals")
+    g = r.get("ground_tile_totals")
+    decoded = None if not bt else (bt.get("vector_tiles", 0)
+                                   + bt.get("raster_tiles", 0))
+    placed = None if not g else (g.get("stroke_points", 0) or g.get("labels", 0)
+                                 or g.get("draws", 0) or g.get("uploads", 0))
+    if decoded is None and placed is None:
+        basemap = "unknown(no basemap or ground line)"
+    else:
+        basemap = "%s-decoded/%s-placed" % (
+            "some" if decoded else ("none" if decoded == 0 else "?"),
+            "some" if placed else ("none" if placed == 0 else "?"))
+
     # The denominator row. One leg, one line, never merged with any other.
     print("ROW scene=%s browser=%s arm=%s adapter=%s:%s backend=%s "
-          "res=%sx%s dpr=%s hz~%s coi=%s panel=%s script=%s commit=%s%s"
+          "viewport=%sx%s px=%s dpr=%s cross=%s hz~%s coi=%s panel=%s "
+          "script=%s basemap=%s pictures=%s MB/picture=%s commit=%s%s"
           % (scene, r.get("browser"), r.get("arm"), ad.get("class"),
              ad.get("renderer"), backend,
-             b.get("bufferWidth"), b.get("bufferHeight"), env.get("dpr"),
-             hz, coi, panel, gw.get("script") or "-", commit,
-             "" if not invalid else "  ** INVALID **"))
+             bw, bh, bw * bh, env.get("dpr"), cross,
+             hz, coi, panel, gw.get("script") or "-", basemap, pics, mbpp,
+             commit, "" if not invalid else "  ** INVALID **"))
+    if ct and not ct.get("met"):
+        print("ROW   canvas target %s asked, %s got: this row is NOT "
+              "cross-comparable" % (ct.get("asked"), ct.get("got")))
     if scene == "B":
         print("ROW   %s" % scene_b_cols)
     # `idle` here is the window's input-free frames -- the scripted quiet

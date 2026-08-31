@@ -1199,7 +1199,17 @@ var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B who
 // one egui texture and is therefore INSIDE `uploads`, a subset of it and never
 // a term to add to it. Running totals, so the LAST match wins here too.
 var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
-var rasters = null, uploads = null, basemap = null;
+// A FOURTH, and it is not the third restated: `basemap` counts tile bodies
+// DECODED, this counts what the ground phase then PLACED on the frame thread.
+// The two come apart exactly where it matters -- a leg can decode tiles and
+// place nothing -- and together they are what makes a row comparable across
+// the pmtiles 32-bit truncation fix (`a7465238`, 2026-08-31), before which no
+// vector tile resolved on wasm32 at all while every native leg did the whole
+// placement, tessellation and upload. `placed` alone is not the test: the
+// fills went to the GPU, so a drawing pane reads 0 there and positive in the
+// other three.
+var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered/;
+var rasters = null, uploads = null, basemap = null, ground = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -1245,11 +1255,20 @@ for (var i = 0; i < C.length; i++) {
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
                       sniffed_tiles: parseInt(bm[3], 10) };
+  var gm = ground_re.exec(m);
+  if (gm) ground = { placed: parseInt(gm[1], 10),
+                     stroke_points: parseInt(gm[2], 10),
+                     labels: parseInt(gm[3], 10),
+                     draws: parseInt(gm[4], 10),
+                     uploads: parseInt(gm[5], 10),
+                     upload_bytes: parseInt(gm[6], 10),
+                     resident_bytes: parseInt(gm[8], 10),
+                     unrendered: parseInt(gm[9], 10) };
 }
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
-         basemap: basemap, console_total: C.length };
+         basemap: basemap, ground: ground, console_total: C.length };
 """
 
 # The frame timing lines, written by App::report_frame_telemetry every 2 s
@@ -1781,6 +1800,39 @@ def wait_boot(session, timeout=90.0, interval=0.4):
             return probe, time.monotonic() - t0, False
         time.sleep(interval)
     return probe, time.monotonic() - t0, True
+
+
+def fit_canvas(session, target, window, attempts=5):
+    """Resize the browser window until the canvas DRAWING BUFFER is `target`.
+
+    The window is not the viewport. Firefox and Chromium eat different amounts
+    of it for chrome -- measured on this box at one `--window 1280x900`,
+    firefox gave a 1280x779 canvas and chromium a 1248x714, a 12% difference
+    in pixels between two rows that were being read side by side. And the
+    native window is a third size again. Pixels are what the overlay picture
+    is sized from, so two legs at two canvas sizes are two measurements.
+
+    Chrome height is constant for a session, so the correction converges in
+    one step; the loop exists for the window manager that rounds. Returns what
+    was asked, what was got, and whether they agree -- an unmet target is
+    reported, never silently accepted.
+    """
+    got = session.execute(BOOT_PROBE) or {}
+    w, h = window
+    for _ in range(attempts):
+        have = (got.get("bufferWidth", 0), got.get("bufferHeight", 0))
+        if have == target:
+            break
+        if have == (0, 0):
+            break
+        w += target[0] - have[0]
+        h += target[1] - have[1]
+        session.set_window_rect(w, h)
+        time.sleep(0.6)
+        got = session.execute(BOOT_PROBE) or {}
+    have = (got.get("bufferWidth", 0), got.get("bufferHeight", 0))
+    return {"asked": "%dx%d" % target, "got": "%dx%d" % have,
+            "window": "%dx%d" % (w, h), "met": have == target}
 
 
 def wait_worker_round_trip(session, timeout=180.0, interval=2.0):
@@ -2471,6 +2523,11 @@ def run_smoke(args):
                          and boot.get("clientHeight", 0) > 0)
         result["canvas_ok"] = canvas_ok
 
+        if args.canvas:
+            result["canvas_target"] = fit_canvas(
+                session, tuple(int(v) for v in args.canvas.split("x")), window)
+            stage("canvas-target", **result["canvas_target"])
+
         result["env"] = session.execute(ENV_PROBE)
         try:
             result["env"]["webgpu"] = session.execute_async(WEBGPU_PROBE)
@@ -2639,14 +2696,16 @@ def run_smoke(args):
         # nothing is gating on them, and `null` says the line was never
         # written -- which is "the path never ran", not "zero bytes".
         #
-        # Three records, never one. `overlay_raster_totals` is the
+        # Four records, never one. `overlay_raster_totals` is the
         # whole-picture overlay dispatch alone; `texture_upload_totals` is
         # every texture delta this renderer was shown, radar and font atlas
         # included; `basemap_tile_totals` is archive tile BODIES DECODED, which
         # is in neither -- a vector decode uploads no texture at all, and a
         # raster decode is one egui texture and so is a subset of the upload
-        # figure rather than a term to add to it. They answer three different
-        # questions and are never summed.
+        # figure rather than a term to add to it; `ground_tile_totals` is what
+        # the ground phase PLACED once those bodies had decoded, which is a
+        # different question again -- a leg can decode tiles and place nothing.
+        # They answer four different questions and are never summed.
         result["overlay_raster_totals"] = _sig.get("rasters")
         if result["overlay_raster_totals"]:
             stage("overlay-rasters", **result["overlay_raster_totals"])
@@ -2656,6 +2715,9 @@ def run_smoke(args):
         result["basemap_tile_totals"] = _sig.get("basemap")
         if result["basemap_tile_totals"]:
             stage("basemap-tiles", **result["basemap_tile_totals"])
+        result["ground_tile_totals"] = _sig.get("ground")
+        if result["ground_tile_totals"]:
+            stage("ground-tiles", **result["ground_tile_totals"])
 
         # The frame-telemetry readout: the newest cumulative reading per
         # family, the count assert, and the gesture-window bin-diff when
@@ -3190,6 +3252,12 @@ def main(argv=None):
                          "then %s)" % (DEFAULT_CHROMEDRIVER, DEFAULT_GECKODRIVER))
     ap.add_argument("--binary", default=None, help="browser binary override")
     ap.add_argument("--window", default="1280x900")
+    ap.add_argument("--canvas", default=None,
+                    help="target canvas DRAWING BUFFER size WxH; the window "
+                         "is corrected until the buffer matches, and the row "
+                         "records whether it did. Pixels, not the window, are "
+                         "what the overlay picture is sized from, so this is "
+                         "what makes two legs comparable")
     ap.add_argument("--frames", type=int, default=120,
                     help="rAF deltas per sample (default 120)")
     ap.add_argument("--settle", type=float, default=6.0,
