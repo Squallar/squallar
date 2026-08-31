@@ -1,0 +1,36 @@
+[package]
+name = "mvt-reader"
+version = "2.4.0"
+description = "A library for decoding and reading mapbox vector tiles in Rust and WebAssembly"
+authors = ["Paul Lange <paul.lange@data-experts.de>"]
+repository = "https://github.com/codeart1st/mvt-reader"
+keywords = ["rust", "webassembly", "wasm", "pbf", "mvt"]
+include = ["/src", "/LICENSE", "/build.rs", "vector_tile.proto"]
+license = "MIT"
+edition = "2024"
+
+# `crate-type = ["cdylib", "rlib"]` upstream. The `cdylib` served the `wasm`
+# feature's JS package, which is gone below; a workspace member that declares
+# one makes every host `cargo build --workspace` link a shared object nobody
+# loads. See VENDORED.md.
+[lib]
+crate-type = ["rlib"]
+
+# Upstream declares three optional features -- `wasm` (a JS/TS package built
+# with wasm-bindgen), `protoc` and `protoc-generated` (regenerate the protobuf
+# bindings with prost-build at build time). All three are gone, with the
+# optional dependencies and the `build.rs` that only existed to serve them.
+#
+# This is not tidiness, it is the lockfile: cargo locks a workspace MEMBER's
+# optional dependencies whether or not anything enables them, so keeping the
+# declarations would have added twelve packages to `Cargo.lock` -- geojson,
+# serde-wasm-bindgen, js-sys, prost-build and its own tree, including a SECOND
+# major of prost (0.14 beside the 0.13 this crate decodes with) -- for three
+# features this workspace does not build. The generated bindings this crate
+# ships in `src/generated/` are what the decode uses either way. See
+# VENDORED.md.
+[dependencies]
+thiserror = { version = "2.0", default-features = false }
+geo-types = { version = "0.7", default-features = false }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+prost = { version = "0.13", default-features = false, features = ["prost-derive", "std"] }

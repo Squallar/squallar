@@ -269,14 +269,23 @@ fn geometry_heap_bytes(geometry: &Geometry<f32>) -> usize {
 
 /// Give back the decode's slack, ring by ring.
 ///
-/// `mvt-reader` grows every ring's coordinate vector with
+/// `mvt-reader` opens a feature's first ring with
 /// `Vec::with_capacity(geometry_data.len())` — the **whole feature's**
-/// command-integer count, re-allocated at full size for every ring
-/// (`mvt-reader-2.4.0/src/lib.rs:361,379,414`). Measured on the committed
-/// Monaco fixture's z14 city-core tile, 2026-08-29: 28,128,896 bytes of
-/// geometry capacity where the shrunk content is 1,113,224 — a 25× slack. A
-/// parsed tile is cached, not transient, so one shrink pass per feature is
-/// the same trade [`tessellate_polygon`] makes for the same reason.
+/// command-integer count. Measured on the committed Monaco fixture's z14
+/// city-core tile, 2026-08-29: 28,128,896 bytes of geometry capacity where the
+/// shrunk content is 1,113,224 — a 25× slack. A parsed tile is cached, not
+/// transient, so one shrink pass per feature is the same trade
+/// [`tessellate_polygon`] makes for the same reason.
+///
+/// **That reservation used to be repeated at full size for every ring, and
+/// this pass could never have fixed it.** Every ring of a feature is alive at
+/// once inside `parse_geometry`, so the *peak* was `rings × commands` while
+/// this runs afterwards, on what survived. On wasm32 the peak is an infallible
+/// allocation against a 1 GiB module ceiling: it aborted the web build on an
+/// ordinary low-zoom tile, and nothing unwinds through a wasm trap. Fixed in
+/// `vendor/mvt-reader` on 2026-08-31 — see its `VENDORED.md`. The 25× figure
+/// above is unaffected and still measured on the same fixture: it is about the
+/// slack that survives the decode, which is what this function is for.
 ///
 /// The `interiors` and `MultiLineString` outer vectors grow by ordinary
 /// doubling (at most 2×) and `interiors_mut` exposes only a slice, so the

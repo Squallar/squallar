@@ -2,9 +2,10 @@
 #
 # run_tier2.sh -- the Tier-2 browser gate: serve the built squallar-web bundle
 # on a fresh port and drive the full PWA in Chromium and Firefox. FOUR
-# passes per browser (the roster grew at WO-5 and again on 2026-08-31; a
-# report quoting the old "4/4" leg count predates the gesture leg, and one
-# quoting "three passes" predates the long leg):
+# passes per browser -- FIVE since the `wide` leg landed on 2026-08-31 (the
+# roster grew at WO-5 and twice on 2026-08-31; a report quoting the old "4/4"
+# leg count predates the gesture leg, one quoting "three passes" predates the
+# long leg, and one quoting four predates `wide`):
 #
 #   live      the app against LIVE network; asserts boot, canvas non-blank,
 #             rAF sane, zero panics/errors, AND the worker wire: >=1
@@ -47,6 +48,13 @@
 #             executed`, or an unhandled rejection carrying a wasm stack),
 #             which on this target is a DIFFERENT signal from a panic and was
 #             gated nowhere before.
+#   wide      The same `--expect-frame-progress` assertion at the USER'S canvas
+#             -- 2878x1651, world zoom, every radar site on the glass -- on ONE
+#             overlay and 60 s. A user-reported freeze ("zooming out quite a
+#             bit can freeze it up") reproduced 4 of 4 there and 0 of 2 at this
+#             rig's default 1280x900, so `long` above could not see it and did
+#             not: the driver is the tile SPAN a wide viewport asks for, not
+#             the layer count or the elapsed time. See WIDE_SEED_LS.
 #
 # Network posture (campaign-resolved): LIVE network, one auto-retry per pass
 # as the flake-quarantine policy -- the app's own backoff machinery is part of
@@ -262,6 +270,54 @@ LONG_SETTLE="${RIG_LONG_SETTLE:-10}"
 LONG_WINDOW="${RIG_LONG_WINDOW:-140}"
 LONG_PROGRESS_WINDOW="${RIG_LONG_PROGRESS_WINDOW:-20}"
 
+# The `wide` leg's scene, and its whole point is the WINDOW rather than the
+# layers. Reported by a user as "zooming out quite a bit can freeze it up",
+# with a screenshot of a 2878x1736 window at world zoom and every radar site on
+# the glass. Reproduced 4 of 4 at that canvas and 0 of 2 at this rig's default
+# 1280x900, on a scene with ONE overlay -- so the `long` leg above, which is
+# seventeen layers at the default window, cannot see it and did not.
+#
+# What the size actually drives is the tile span: a 2878-point-wide viewport
+# asks for tiles the 1280 one never requests, and one of them was a low-zoom
+# vector tile whose `landcover` layer is a few features of hundreds of rings
+# each. `mvt-reader` reserved the whole feature's command-integer count for
+# EVERY ring (see vendor/mvt-reader/VENDORED.md), so that feature's decode
+# peaked at `rings x commands`, and on wasm32 that is an infallible allocation
+# against the 1 GiB module ceiling this workspace links at. Measured 2026-08-31,
+# Firefox: the module held 332 MB of 1024 when a 172 KB tile asked for the rest.
+#
+# **Nothing unwinds through a wasm trap**, which is why the leg has to assert
+# what it asserts. `handle_alloc_error` aborts inside the frame's
+# requestAnimationFrame callback with winit's `Shared::runner` RefCell mutably
+# borrowed, and that borrow is never released: every later event panics
+# `RefCell already borrowed` and the frame loop is over. rAF stayed at 17.06 ms
+# p50 and the canvas kept its last painted frame throughout, so a rAF check, a
+# non-blank-canvas check and a screenshot ALL read healthy over a dead app.
+# `--expect-frame-progress` against the app's own cumulative `frame cadence`
+# count is the only reading that moved.
+#
+# Zoom 3 and a centre, not a wheel script: the pane's zoom and centre persist
+# (`squallar.ui`, `panes[].zoom` / `panes[].center`), so the scene is seeded
+# rather than driven. NO input at all, for the `long` leg's reason -- the freeze
+# does not need any, and a leg that needed input would be testing the harness.
+WIDE_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":3.0,\"center\":[39.83,-98.58],\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+
+# The user's window, and the leg is nothing without it: the same scene at the
+# rig default survives. drive.py corrects the window until the canvas DRAWING
+# BUFFER matches, and records whether it did, so the figure that reproduces is
+# the one the leg is held to rather than a window size the chrome ate into.
+WIDE_WINDOW="${RIG_WIDE_WINDOW:-2878x1651}"
+WIDE_CANVAS="${RIG_WIDE_CANVAS:-2878x1566}"
+
+# 10 + 50 = 60 s. Measured on the unfixed bundle at this canvas, the abort
+# landed 14.4 to 15.7 s after boot over four legs, so 60 s is four times the
+# slowest reproduction rather than a round number. It is deliberately much
+# shorter than the `long` leg's 150: that one is waiting for a granule loop to
+# accumulate, this one only has to draw a wide viewport once.
+WIDE_SETTLE="${RIG_WIDE_SETTLE:-10}"
+WIDE_WINDOW_S="${RIG_WIDE_WINDOW_S:-50}"
+WIDE_PROGRESS_WINDOW="${RIG_WIDE_PROGRESS_WINDOW:-20}"
+
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
 EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
@@ -429,6 +485,15 @@ run_pass() {
     SEED="$LONG_SEED_LS"
     drive_args+=(--settle "$LONG_SETTLE" --data-window "$LONG_WINDOW"
                  --expect-frame-progress "$LONG_PROGRESS_WINDOW")
+  elif [ "$leg" = wide ]; then
+    # The `long` leg's assertion at the USER'S canvas on the user's scene. Same
+    # one thing gated -- the app's own frame counter still climbing -- because
+    # the same nothing-unwinds trap is what stops it. See WIDE_SEED_LS above
+    # for why the window is the leg.
+    SEED="$WIDE_SEED_LS"
+    drive_args+=(--window "$WIDE_WINDOW" --canvas "$WIDE_CANVAS"
+                 --settle "$WIDE_SETTLE" --data-window "$WIDE_WINDOW_S"
+                 --expect-frame-progress "$WIDE_PROGRESS_WINDOW")
   elif [ "$leg" = gesture ]; then
     # The short leg: real W3C-actions input, and ONE assert -- the interact
     # COUNT grew. None of the worker-wire waits ride here (the live leg owns
@@ -485,7 +550,7 @@ run_pass() {
 overall=0
 TAGS=""
 for browser in $BROWSERS; do
-  for leg in live doctored gesture long; do
+  for leg in live doctored gesture long wide; do
     if [ "$leg" = live ]; then
       tag="$browser"
     else
