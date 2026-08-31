@@ -1267,6 +1267,31 @@ impl super::App {
             }
         }
         say_telemetry(loud, &frame_cadence_line(ledger.cadence()));
+        say_telemetry(loud, &crate::loop_telemetry::loop_state_line(&self.loop_state()));
+    }
+
+    /// One reading of what this application's loops hold — see
+    /// [`crate::loop_telemetry`], which owns the counting and the sentence.
+    /// Assembled here because the allocation, the budgets and the playback
+    /// interval have no other common owner.
+    fn loop_state(&self) -> crate::loop_telemetry::LoopState {
+        let mut state = crate::loop_telemetry::LoopState::gather(
+            self.gui.panes().iter(),
+            self.loop_allocation(),
+            &self.budgets,
+            // Every pane carries the same copy of the posture — see
+            // `Gui::set_loop_speed_fps` — so the first one is the setting.
+            loop_interval(
+                self.gui
+                    .panes()
+                    .first()
+                    .map_or(squallar_egui::pane::DEFAULT_LOOP_SPEED_FPS, |pane| {
+                        pane.time.speed_fps
+                    }),
+            ),
+        );
+        state.pool_bytes = self.loop_pool.bytes();
+        state
     }
 
     /// Promote every held raster, as the frame after the last band lands does.

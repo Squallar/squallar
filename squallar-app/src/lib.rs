@@ -23,6 +23,7 @@ pub mod input;
 pub mod location_hint;
 pub mod loop_pool;
 pub(crate) mod loop_refill;
+pub(crate) mod loop_telemetry;
 pub mod platform;
 /// The [`PlatformBridge`](platform::PlatformBridge) test double.
 #[cfg(test)]

@@ -151,3 +151,44 @@ fn an_unknown_spelling_reads_as_no_loop() {
         "non-triviality floor: a spelling this DOES know must still parse",
     );
 }
+
+/// **The measurement rig's scene E seeds really ask for a playing loop.**
+///
+/// The tolerance the test above pins is exactly what makes this one
+/// necessary. `loop_arm_from_config` reads anything it does not recognise as
+/// *no loop at all* — silently, by design — so a typo in the launcher's seed
+/// fails nothing anywhere: it produces a scene E leg that measures scene A
+/// and files the row as E. The rig's spelling is therefore checked against
+/// this module's own vocabulary rather than restated in the launcher's
+/// language, which is the same seam `raster_telemetry_line_tests` holds for
+/// the console sentences.
+#[test]
+fn the_measure_rig_seeds_a_loop_this_build_recognises() {
+    const RUN_MEASURE: &str = include_str!("../../../.github/browser-rig/run_measure.sh");
+
+    // The seed is JSON inside a shell single-quoted string inside JSON, so
+    // the key arrives backslash-escaped: \"loop_playback\":\"playing\".
+    let key = "\\\"loop_playback\\\":\\\"";
+    let seeded: Vec<&str> = RUN_MEASURE
+        .match_indices(key)
+        .map(|(at, _)| {
+            let rest = &RUN_MEASURE[at + key.len()..];
+            let end = rest.find('\\').expect("the seeded value is closed");
+            &rest[..end]
+        })
+        .collect();
+    assert!(
+        !seeded.is_empty(),
+        "run_measure.sh no longer seeds `loop_playback` anywhere, so every \
+         scene E leg measures a still picture and reports it as a loop",
+    );
+    for value in seeded {
+        assert_eq!(
+            loop_arm_from_config(Some(value)),
+            Some(LoopArm { playing: true }),
+            "run_measure.sh seeds loop_playback={value:?}, which this build \
+             reads as no armed-and-playing loop — a scene E leg armed with \
+             it measures no loop at all",
+        );
+    }
+}
