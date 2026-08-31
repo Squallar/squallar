@@ -155,6 +155,62 @@ fn view_at((yaw, pitch, distance, exaggeration): OrbitFixture) -> VolumeView {
     view_for(camera, BOX_KM, SIZE[0] as f32 / SIZE[1] as f32).expect("a view")
 }
 
+/// The cameras of [`ORBIT_CAMERAS`] that see the terrain's TOP, selected by the
+/// property rather than relisted.
+///
+/// **Every colour criterion in this file is about the drape, and the drape is
+/// not drawn from under the box floor.** `fs_ground` paints `UNDERSIDE_ALBEDO`
+/// there — a flat material with no map on it, because a top-down basemap raster
+/// on the underside of the ground is a wrong-side texture. So a checkerboard
+/// oracle asked at a below-floor camera is not measuring a misregistered drape,
+/// it is measuring the absence of one, and it read 960 of 960 points wrong at
+/// `(300, -5, 0.6, 1)` for exactly that reason.
+///
+/// **Which cameras those are is a property of THIS file's box**, not of the
+/// shared list: `view_for` puts the eye somewhere different in a 920 km box than
+/// in `volume_occluder`'s 240 km one, and `(300, -5, 0.6, 1)` is above the floor
+/// in that file and below it here. So it is filtered by the property and the
+/// count is asserted, never relisted.
+///
+/// **It costs five of eleven cameras, and that is stated rather than glossed.**
+/// This box is 920 km across and 20 km tall, so the eye dips under the floor at
+/// about a degree of downward pitch and nearly half the set is below it. What
+/// is NOT lost is the geometry half of what these criteria run on: the
+/// occluder's decoded points are checked against the analytic surface at all
+/// eleven cameras by
+/// `volume_occluder::the_mesh_stands_at_the_height_the_analytic_field_gives_it`
+/// (`#[ignore]`d; `cargo test -p squallar-gpu --test volume_occluder --
+/// --ignored`), so what narrows here is only the claim that has no subject
+/// below the floor — which cell of the checkerboard the drape landed in.
+fn topside_cameras() -> Vec<OrbitFixture> {
+    ORBIT_CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] >= 0.0)
+        .collect()
+}
+
+/// **The set really does still straddle the box floor**, asserted rather than
+/// assumed, because [`topside_cameras`] is a filter and a filter that kept
+/// everything would be invisible.
+///
+/// If the whole list drifted above the floor this file would go on passing with
+/// the underside never rendered at all, and the narrowing above would read as a
+/// no-op rather than as the deliberate exclusion of a region where the drape is
+/// not drawn. The underside's own criteria live in `volume_occluder.rs`
+/// (`the_underside_is_its_own_shade_and_the_topside_is_untouched`, `#[ignore]`d
+/// for a real adapter like everything there; run it with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`).
+#[test]
+fn the_camera_set_still_straddles_the_box_floor() {
+    let topside = topside_cameras();
+    assert_eq!(
+        (topside.len(), ORBIT_CAMERAS.len() - topside.len()),
+        (6, 5),
+        "this box no longer puts 6 of the eleven cameras above its floor and 5 \
+         below: {topside:?}",
+    );
+}
+
 /// A box point's kilometres east and north of the site, the two lines
 /// `volume.wgsl`'s `box_x_km` and `box_y_km` are.
 fn km_at(uv: [f32; 2]) -> (f64, f64) {
@@ -576,7 +632,7 @@ fn the_drape_lands_in_the_cell_the_forward_projection_names() {
 
     let mut compared_total = 0usize;
     let mut off_surface_total = 0usize;
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let uniform = uniform([8, 8, 8], &view);
         let t_scale = uniform.occluder_t_scale;
@@ -609,7 +665,8 @@ fn the_drape_lands_in_the_cell_the_forward_projection_names() {
     }
     assert!(
         compared_total >= 3000,
-        "only {compared_total} points were compared across all eleven cameras",
+        "only {compared_total} points were compared across the cameras that show \
+         the drape",
     );
     // A few rim pixels genuinely reconstruct off the analytic surface — the
     // rasteriser's coverage rule reaches half a pixel past the mesh's own edge
@@ -685,7 +742,8 @@ fn the_oracle_notices_the_approximation_in_the_shader() {
     let mut compared_total = 0usize;
     let mut wrong_total = 0usize;
     let mut cameras_that_noticed = 0usize;
-    for camera in ORBIT_CAMERAS {
+    let examined = topside_cameras().len();
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let uniform = uniform([8, 8, 8], &view);
         let frame = render(&device, &queue, &pipelines, &uniform, &heights, &mirror);
@@ -708,7 +766,8 @@ fn the_oracle_notices_the_approximation_in_the_shader() {
     assert!(
         cameras_that_noticed >= 4 && wrong_total >= 100,
         "the scale-and-translate approximation was noticed at only \
-         {cameras_that_noticed} of eleven cameras, on {wrong_total} of \
+         {cameras_that_noticed} of the {examined} cameras that show the \
+         drape, on {wrong_total} of \
          {compared_total} compared points. The oracle above is then green \
          against a shader that threw the spherical solution away, which is the \
          one thing it exists to refuse",
@@ -1228,7 +1287,9 @@ fn patch_edge_evidence(view: &VolumeView, t_scale: f32, frame: &Frame) -> (f32, 
 /// The **answer to B4's open sub-question: what the patch edge does under
 /// orbit.**
 ///
-/// It does three things, and this measures all three at all eleven cameras:
+/// It does three things, and this measures all three at every camera that
+/// shows the drape — six of the eleven in this box, the rest being under its
+/// floor where there is no drape to be about (see `topside_cameras`):
 ///
 /// 1. **It stands still.** The mesh is authored in box space and `ground_box`
 ///    is a box-space affine, so the surface — crease included — is a function
@@ -1279,7 +1340,8 @@ fn the_patch_edge_stands_still_under_orbit_and_keeps_its_drape() {
     let mut cameras_with_relief = 0usize;
     let mut discriminating_total = 0usize;
     let mut worst_surface_error = 0.0f32;
-    for camera in ORBIT_CAMERAS {
+    let examined = topside_cameras().len();
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let mut placed = uniform([8, 8, 8], &view);
         placed.ground_box = REFIT;
@@ -1337,12 +1399,13 @@ fn the_patch_edge_stands_still_under_orbit_and_keeps_its_drape() {
     // The apron is where nearly every pixel is at this placement, so a run that
     // compared few of them would be a run that had measured the interior and
     // called it the edge. Measured on this hardware: 9215 apron points
-    // compared across the eleven cameras, worst surface residual 4.8e-4 against
+    // compared across the eleven cameras before the underside narrowed this to
+    // the six that show the drape, worst surface residual 4.8e-4 against
     // a 4e-3 tolerance.
     assert!(
         apron_compared_total >= 3000,
-        "only {apron_compared_total} apron points were compared across all \
-         eleven cameras",
+        "only {apron_compared_total} apron points were compared across the \
+         cameras that show the drape",
     );
     // **The surface criterion is discriminating on the apron.** Measured on
     // this hardware: **158,896** of the reconstructed apron points sit where
@@ -1371,7 +1434,8 @@ fn the_patch_edge_stands_still_under_orbit_and_keeps_its_drape() {
     // there is no edge to have a question about. Measured: 10 of 11.
     assert!(
         cameras_with_relief >= 3,
-        "only {cameras_with_relief} of eleven cameras reconstructed any relief \
+        "only {cameras_with_relief} of the {examined} cameras that show the drape \
+         reconstructed any relief \
          INSIDE the re-fitted patch, so 'the apron is flat and the interior is \
          not' is measuring one half of a comparison",
     );
@@ -1426,7 +1490,8 @@ fn the_patch_edge_criterion_notices_a_drape_clamped_to_the_field() {
     let mut noticed = 0usize;
     let mut wrong_total = 0usize;
     let mut compared_total = 0usize;
-    for camera in ORBIT_CAMERAS {
+    let examined = topside_cameras().len();
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let mut placed = uniform([8, 8, 8], &view);
         placed.ground_box = REFIT;
@@ -1450,7 +1515,8 @@ fn the_patch_edge_criterion_notices_a_drape_clamped_to_the_field() {
     assert!(
         noticed >= 6,
         "a shader that drapes the apron with the field's rim colour was \
-         noticed at only {noticed} of eleven cameras ({wrong_total} wrong of \
+         noticed at only {noticed} of the {examined} cameras that show the drape \
+         ({wrong_total} wrong of \
          {compared_total} compared). The apron would then be an untested lane \
          covering nearly the whole box whenever the camera is dollied in",
     );

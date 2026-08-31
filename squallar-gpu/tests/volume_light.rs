@@ -220,6 +220,60 @@ fn view_at((yaw, pitch, distance, exaggeration): OrbitFixture) -> VolumeView {
 }
 
 /// The fixture height field in box `z`, a north-south ridge.
+/// The cameras of [`ORBIT_CAMERAS`] that see the terrain's TOP, selected by the
+/// property rather than relisted.
+///
+/// **Every directional criterion in this file is about the mesh's own normal,
+/// and from under the box floor there is no normal to be about.** `fs_ground`
+/// paints `UNDERSIDE_ALBEDO` at a level response there — one flat material,
+/// deliberately not lit by the underside's own cosine, because
+/// `ground_response` of a downward normal clamps to zero and `HEADLIGHT` has
+/// `sky = 0`, so a cosine-lit underside would be pure BLACK under the light the
+/// pane ships with. A criterion that asks "does a west-facing slope prefer a
+/// western sun" of that surface is asking about a slope the renderer is
+/// deliberately not drawing.
+///
+/// **Which cameras those are is a property of THIS file's box.** In a 920 km
+/// box 20 km tall the eye crosses `z = 0` at about a degree of downward pitch,
+/// and five of the eleven are below it — including `(300, -5, 0.6, 1)`, which is
+/// *above* the floor in `volume_occluder`'s 240 km box. So it is filtered by the
+/// property and the count is asserted, never relisted.
+///
+/// What the narrowing does not cost: the underside is not left unmeasured, it
+/// is measured for the property it actually has, by
+/// [`the_underside_reads_under_every_light`] at the five cameras this drops —
+/// `#[ignore]`d like everything here; run it with
+/// `cargo test -p squallar-gpu --test volume_light -- --ignored`.
+fn topside_cameras() -> Vec<OrbitFixture> {
+    ORBIT_CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] >= 0.0)
+        .collect()
+}
+
+/// The complement of [`topside_cameras`]: where the eye is under the box floor.
+fn underside_cameras() -> Vec<OrbitFixture> {
+    ORBIT_CAMERAS
+        .into_iter()
+        .filter(|camera| view_at(*camera).eye_in_box[2] < 0.0)
+        .collect()
+}
+
+/// **The set really does still straddle the box floor**, asserted rather than
+/// assumed: both filters above are filters, and one that kept everything would
+/// leave its criterion running over a region it never reaches while reading as
+/// though it had been narrowed for a reason.
+#[test]
+fn the_camera_set_still_straddles_the_box_floor() {
+    let (topside, underside) = (topside_cameras(), underside_cameras());
+    assert_eq!(
+        (topside.len(), underside.len()),
+        (6, 5),
+        "this box no longer puts 6 of the eleven cameras above its floor and 5 \
+         below: topside {topside:?}, underside {underside:?}",
+    );
+}
+
 fn ridge_height(uv: [f32; 2]) -> f32 {
     let d = (uv[0] - 0.5) / RIDGE_SIGMA;
     (RIDGE * (-0.5 * d * d).exp()).clamp(0.0, 1.0)
@@ -744,8 +798,9 @@ impl Move {
 /// colour* rather than merely some light.
 ///
 /// A twentieth, against a beam whose own red-minus-blue at 2 degrees is 0.74
-/// of full scale before any albedo. Measured over the eleven cameras the
-/// ground warms by 0.086 to 0.249 and the volume by 0.242, so the margin runs
+/// of full scale before any albedo. Measured over the eleven cameras, before
+/// the underside narrowed the directional criteria to the six that show the
+/// drape (see `topside_cameras`), the ground warms by 0.086 to 0.249 and the volume by 0.242, so the margin runs
 /// from 1.7x at the tightest camera to about 5x — and a build whose beam never
 /// reaches the GPU warms by the sky's own difference alone, which is under a
 /// hundredth.
@@ -782,8 +837,11 @@ fn both_moved(scene: &Scene, camera: OrbitFixture) -> (Move, Move) {
 
 /// **C2's done-when, first half: both surfaces change together.**
 ///
-/// At every one of the eleven cameras, swapping the readable light for a
-/// sunset must move the ground's colour *and* the volume's. One surface moving
+/// At every camera that shows the terrain's TOP — six of the eleven in this
+/// box, the rest being under its floor where `fs_ground` paints one flat
+/// material at a level response rather than a lit slope (see
+/// [`topside_cameras`]) — swapping the readable light for a sunset must move
+/// the ground's colour *and* the volume's. One surface moving
 /// is the two-composited-pictures failure, and it is what
 /// [`the_criterion_rejects_a_build_where_only_one_surface_takes_the_tint`]
 /// constructs — `#[ignore]`d beside this one, and run by the same invocation
@@ -793,7 +851,7 @@ fn both_moved(scene: &Scene, camera: OrbitFixture) -> (Move, Move) {
 fn both_surfaces_change_together_under_the_sun() {
     let _lock = gpu_lock();
     let scene = scene(VOLUME_SHADER_WGSL);
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let (ground, volume) = both_moved(&scene, camera);
         println!(
             "{camera:?}: ground moved {:.4} and warmed {:+.4}, volume moved \
@@ -839,8 +897,15 @@ fn the_criterion_rejects_a_build_where_only_one_surface_takes_the_tint() {
         (
             "the ground fragment bypasses `lit`, so the terrain stays neutral \
              under a sunset-tinted storm",
-            "    out.colour = vec4<f32>(\n        lit(ground.rgb, ground_response(normalize(in.normal))),\n        ground.a,\n    );",
-            "    out.colour = ground;",
+            // Re-anchored when the underside landed: `fs_ground` now chooses
+            // its albedo, its response and its coverage before the one `lit`
+            // call. The replacement keeps all three choices and drops only the
+            // light, which is what this control is about — and over
+            // `topside_cameras` the `select`s take their false arms, so the
+            // mutant is the same "the ground fragment bypasses `lit`" build it
+            // has always been.
+            "    out.colour = vec4<f32>(\n        lit(\n            select(ground.rgb, UNDERSIDE_ALBEDO, underside),\n            select(\n                ground_response(normalize(in.normal)),\n                level_response(),\n                underside,\n            ),\n        ),\n        select(ground.a, 1.0, underside),\n    );",
+            "    out.colour = vec4<f32>(\n        select(ground.rgb, UNDERSIDE_ALBEDO, underside),\n        select(ground.a, 1.0, underside),\n    );",
             true,
         ),
     ];
@@ -859,7 +924,7 @@ fn the_criterion_rejects_a_build_where_only_one_surface_takes_the_tint() {
         );
         let scene = scene(&mutated);
         let mut failed_somewhere = false;
-        for camera in ORBIT_CAMERAS {
+        for camera in topside_cameras() {
             let (ground, volume) = both_moved(&scene, camera);
             println!(
                 "CONTROL {name}\n  {camera:?}: ground {:.4}/{:+.4}, volume {:.4}/{:+.4}",
@@ -1229,6 +1294,18 @@ fn the_ramp_reddens_the_basemap_as_the_sun_drops() {
 /// whole camera set: the mesh covers the drawn box, so every camera that can
 /// see the box can see it — including the five that have no lid in frame at
 /// all.
+///
+/// **Two of its three assertions take all eleven and the third takes six, and
+/// the split is the point rather than an exemption.** "Never black" and "never
+/// bright" are claims about the sky term reaching a pixel, and the sky term
+/// reaches the underside exactly as it reaches the drape — so those hold
+/// wherever the eye is, and running them under the box floor is what keeps the
+/// underside inside the night criterion instead of outside it. "Blue" is a
+/// claim about the ALBEDO the sky is multiplying: the drape's is neutral, so a
+/// blue sky comes back blue, and `UNDERSIDE_ALBEDO` is deliberately warm so
+/// that it cannot be mistaken for a map. A warm surface under a blue sky is
+/// not blue, and asserting otherwise would be asserting that the underside is
+/// the drape.
 #[test]
 #[ignore = "needs a GPU"]
 fn night_is_dim_but_never_black_on_the_terrain() {
@@ -1236,6 +1313,8 @@ fn night_is_dim_but_never_black_on_the_terrain() {
     let scene = scene(VOLUME_SHADER_WGSL);
     let night = sun_at(-20.0);
     let twilight = sun_at(-3.0);
+    let topside = topside_cameras();
+    let mut blue_cameras = 0usize;
     for camera in ORBIT_CAMERAS {
         for (light, what) in [(night, "night"), (twilight, "civil twilight")] {
             let (ground, _) = readings(&scene, camera, light);
@@ -1254,6 +1333,10 @@ fn night_is_dim_but_never_black_on_the_terrain() {
                 "{camera:?}: the terrain reads {ground:?} at {what}, which is \
                  not a night",
             );
+            if !topside.contains(&camera) {
+                continue;
+            }
+            blue_cameras += 1;
             assert!(
                 ground[2] > ground[0],
                 "{camera:?}: the terrain is not blue at {what}, where the beam \
@@ -1261,10 +1344,160 @@ fn night_is_dim_but_never_black_on_the_terrain() {
             );
         }
     }
+    // The hue half really did run somewhere. Without this the `continue` above
+    // could swallow the whole set and the criterion would keep its name while
+    // asserting only that nothing is black.
+    assert_eq!(
+        blue_cameras,
+        topside.len() * 2,
+        "the hue half ran at {blue_cameras} camera-lights rather than the \
+         {} it should, so the topside filter is eating cameras it should keep",
+        topside.len() * 2,
+    );
 }
 
-/// **Ground and volume are lit from the same side**, at every camera — the
-/// criterion that makes a second light visible rather than merely unwritable.
+/// **The underside reads under every light the pane can be in.**
+///
+/// The criterion that keeps the five below-floor cameras inside this file after
+/// the directional ones narrowed off them, and the one that pins the reason
+/// `UNDERSIDE_ALBEDO` takes `level_response` rather than its own surface's
+/// cosine.
+///
+/// **That reason is a black pane, and it is the DEFAULT mode it would happen
+/// in.** The underside's own normal points down; `ground_response` of it is
+/// negative under any light above the horizon and clamps to zero; and
+/// `lit(albedo, 0)` is `albedo * sky`, which under [`HEADLIGHT`] — where
+/// `sky` is exactly zero and which is what ships, because
+/// `DEFAULT_SUN_LIGHTING` is false — is exactly black. The terrain would go
+/// from a wrong-side texture to a void, at the same cameras, in the same drag.
+/// So the shade is read here under the headlight, a high sun, a sunset and a
+/// night, and it must be a visible material in all four.
+///
+/// **It must also stay distinguishable from the drape under all four**, which
+/// is the property the whole change exists for and which a light could quietly
+/// take away. The comparison is against the same scene's own topside reading
+/// under the same light, so no constant is written down here.
+///
+/// **What is compared is the separation, not the warmth**, and the correction
+/// is measured rather than argued: under a sunset the drape comes back *warmer*
+/// than the underside — `+0.1455` against `+0.0627` — because the beam is deep
+/// red and the drape is the brighter albedo, so it has more red to gain. Warmth
+/// is what makes the shade read as a material at the palette level; it is not
+/// the invariant that survives every light, and asserting it here would have
+/// pinned an accident of the headlight. What does survive is that the two
+/// surfaces do not come back the same colour, by a margin far above
+/// [`MIN_SHIFT`].
+#[test]
+#[ignore = "needs a GPU"]
+fn the_underside_reads_under_every_light() {
+    let _lock = gpu_lock();
+    let scene = scene(VOLUME_SHADER_WGSL);
+    let underside = underside_cameras();
+    let topside = topside_cameras();
+    assert_eq!(
+        (underside.len(), topside.len()),
+        (5, 6),
+        "the regions this criterion compares are no longer the ones it was \
+         written against: {underside:?} under the floor, {topside:?} over it",
+    );
+
+    // `daylight` is whether there is a BEAM: at night both `level_response`
+    // and a downward normal's response are zero, so the two designs this
+    // criterion tells apart coincide there and it must not pretend otherwise.
+    // What survives the night is the weaker pair — not exactly black, and still
+    // not the drape.
+    let lights = [
+        ("the headlight", HEADLIGHT, true),
+        ("a high sun", sun_at(55.0), true),
+        ("a sunset", sunset(), true),
+        ("night", sun_at(-20.0), false),
+    ];
+    for (what, light, daylight) in lights {
+        // The drape's own reading under this same light, averaged over the
+        // cameras that show it — the thing the underside has to be unlike.
+        let drape: Vec<[f64; 3]> = topside
+            .iter()
+            .map(|camera| readings(&scene, *camera, light).0)
+            .collect();
+        // A mean rather than a per-camera pairing, because no below-floor
+        // camera has a topside twin: what is compared is two MATERIALS under
+        // one light, not two views of one material.
+        let mut mean_drape = [0.0f64; 3];
+        for reading in &drape {
+            for lane in 0..3 {
+                mean_drape[lane] += reading[lane] / drape.len() as f64;
+            }
+        }
+
+        for camera in &underside {
+            let (ground, _) = readings(&scene, *camera, light);
+            let apart = shift(ground, mean_drape);
+            println!(
+                "underside {camera:?} under {what}: [{:.4}, {:.4}, {:.4}] \
+                 against a drape of [{:.4}, {:.4}, {:.4}], {apart:.4} apart",
+                ground[0], ground[1], ground[2], mean_drape[0], mean_drape[1], mean_drape[2],
+            );
+            // **Never EXACTLY black**, under every light including night —
+            // and exactly black is the signature of the design this rejects:
+            // `lit(albedo, 0)` is `albedo * sky`, and `HEADLIGHT`'s sky is
+            // zero, so a cosine-lit underside is 0.0000 in all three lanes
+            // under the mode that ships.
+            assert!(
+                ground.iter().all(|c| *c > 0.0),
+                "{camera:?}: the underside is exactly black under {what}. \
+                 `ground_response` of a DOWNWARD normal clamps to zero and the \
+                 headlight has no sky term, so this is what lighting the \
+                 underside by its own cosine looks like",
+            );
+            assert!(
+                ground.iter().all(|c| *c < 0.9),
+                "{camera:?}: the underside reads {ground:?} under {what}, \
+                 which is a wall of light rather than a surface",
+            );
+            if !daylight {
+                // At night the pane is dark everywhere and the underside is at
+                // the bottom of it — measured at 1 of 255 in every lane against
+                // the drape's 5 to 9. Recorded rather than asserted away: it is
+                // what a 0.16 albedo under a 0.02 sky comes to, the drape is
+                // barely visible itself, and a floor here would be a floor on
+                // the sky rather than on this shade.
+                assert!(
+                    apart > MIN_SHIFT,
+                    "{camera:?}: at night the underside {ground:?} and the drape \
+                     {mean_drape:?} are only {apart:.4} apart, under the four \
+                     8-bit levels this file calls a reading",
+                );
+                continue;
+            }
+            // With a beam in the sky it is a MATERIAL, not a trace. The
+            // tightest of the three is the sunset, which measures 0.0235 in
+            // its darkest lane against this 0.02.
+            assert!(
+                ground.iter().all(|c| *c > 0.02),
+                "{camera:?}: the underside reads {ground:?} under {what}, \
+                 which is a hole in the pane rather than the stuff the ground \
+                 is made of",
+            );
+            // And it does not come back the same colour the drape does under
+            // that same light, which is the distinction the user reads. Ten
+            // times `MIN_SHIFT` rather than a hair over it: "distinguishable"
+            // is a claim about a person looking at a pane, not about a
+            // comparison surviving quantisation.
+            assert!(
+                apart > 10.0 * MIN_SHIFT,
+                "{camera:?}: the underside reads {ground:?} and the drape \
+                 {mean_drape:?} under {what}, only {apart:.4} apart. Under this \
+                 light the two surfaces are not telling the user which side of \
+                 the ground they are on",
+            );
+        }
+    }
+}
+
+/// **Ground and volume are lit from the same side**, at every camera that
+/// shows the terrain's top — the criterion that makes a second light visible
+/// rather than merely unwritable. (Under the box floor the mesh has no lit
+/// slope to prefer a side with; see [`topside_cameras`].)
 ///
 /// C2 shipped for one commit with the march's `shading` normalising its own
 /// copy of the direction lane. Negating that copy lit the raymarched storm
@@ -1289,7 +1522,7 @@ fn both_surfaces_are_lit_from_the_same_side() {
     let (west, east) = grazing_pair(10.0);
     let field = westward_field();
 
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let read = |light: SurfaceLight| -> (f64, f64) {
             let lit_ground = render_field(
@@ -1454,7 +1687,7 @@ fn a_field_standing_in_over_part_of_the_box_is_lit_at_its_own_slope() {
     // toward a western sun.
     let half = [0.5, 1.0, 0.25, 0.0];
 
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let read = |ground_box: [f32; 4]| -> f64 {
             let frame = render(
@@ -1593,7 +1826,7 @@ fn the_mesh_is_lit_by_the_shape_it_is_drawn_as() {
         reading[1]
     };
 
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let west = read(camera, from_west, 1.0);
         let east = read(camera, from_east, 1.0);
         println!(
@@ -1655,7 +1888,7 @@ fn a_slope_toward_a_low_sun_is_brighter_than_one_turned_away() {
     let morning = sun_on_side(10.0, true);
     let evening = sun_on_side(10.0, false);
 
-    for camera in ORBIT_CAMERAS {
+    for camera in topside_cameras() {
         let view = view_at(camera);
         let cells = [8u32, 8, 8];
         let mut frames = Vec::new();
