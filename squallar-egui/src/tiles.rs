@@ -943,8 +943,11 @@ pub const WARM_ANCESTOR_STEPS: u8 = 4;
 /// and a shift can only ever land a range of `n` indices on `n / 2^steps + 1`
 /// of them; the `+ 1` beyond that is the grid phase, exactly as in
 /// [`tiles_resident_at_tile_scale`]. So this is a bound rather than a
-/// measurement, and `tests::the_warm_net_is_never_larger_than_its_bound` holds
-/// the real `tile_span` sweep under it.
+/// measurement. `ui_map_overlays`'
+/// `tests::a_drawn_layer_asks_for_the_ancestor_net_and_no_more_than_its_bound`
+/// holds one measured `tile_span` under it — a 1920x1080 canvas at zoom 6 —
+/// against the net a real `draw_tile_layer` pass asked for. That is a single
+/// point, not a sweep: no test walks the zoom range against this bound.
 pub fn tiles_resident_with_warm_net(rect: egui::Rect, zoom_bias: u8, layers: usize) -> usize {
     let (across, down) = tiles_resident_grid(rect, zoom_bias, MIN_TILE_SCALE);
     let net = |n: usize| n.saturating_sub(1) / (1 << WARM_ANCESTOR_STEPS) + 2;

@@ -1642,8 +1642,8 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
 /// backstop the queue can never make binding — so reading it here would make
 /// the cap unobservable and the ordering claims below vacuous. What the
 /// production value is stays pinned by
-/// [`the_tuning_values_are_what_the_doc_comments_say`]; what this holds is that
-/// the drain caps and orders correctly *given* a binding count.
+/// [`the_tuning_constants_are_the_written_figures_on_every_tier`]; what this
+/// holds is that the drain caps and orders correctly *given* a binding count.
 #[test]
 fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
     let ctx = Context::default();
