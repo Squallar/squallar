@@ -491,8 +491,10 @@ pub fn rasterize_radar_coverage(
     }
 
     if let Some(path) = pb.finish() {
-        let mut paint = Paint::default();
-        paint.anti_alias = true;
+        let mut paint = Paint {
+            anti_alias: true,
+            ..Default::default()
+        };
 
         // The wash. Faint on purpose: this draws over the whole eastern half of
         // the country at continental zoom, and anything a reader has to see
