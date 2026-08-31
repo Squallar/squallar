@@ -110,8 +110,15 @@ serde_json = { workspace = true }
 # `zbus/async-io` plus `async-fs`, `async-net` and `futures-util/io`. The
 # provider drives its own futures with `futures_lite::future::block_on`; the
 # `async-io` reactor those calls need starts itself on first use.
-ashpd = { version = "=0.10.3", default-features = false, features = [
-    "async-std",
+ashpd = { version = "=0.13.13", default-features = false, features = [
+    # Renamed from `async-std` in 0.13; it selects the same async-io runtime
+    # underneath, which is the one zbus already brings.
+    "async-io",
+    # 0.13 puts each portal behind its own feature, so `desktop::location` --
+    # the only portal this crate opens -- has to be asked for by name. Without
+    # it the module is configured out and the import fails, which is the whole
+    # point of naming portals: nothing else in ashpd is compiled.
+    "location",
 ], optional = true }
 # `block_on` and `StreamExt::next` for the session thread, and `oneshot` for
 # the cancellation the thread parks on. Both are already in the Linux app
