@@ -61,7 +61,10 @@ const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 96;
 /// 1920x1200-point canvas, which `tiles::tests` measures at exactly this.
 const EXPECTED_WASM_CACHE_ENTRIES: usize = 96;
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
-const EXPECTED_WASM_DECODES_PER_PUMP: usize = 2;
+/// Re-pointed at WO-10, when the time budget became the governor and the count
+/// became a backstop: the value is the channel's own capacity plus one, so it
+/// means "whatever is queued" rather than a throttle. It was 2.
+const EXPECTED_WASM_DECODES_PER_PUMP: usize = 7;
 /// The 1920x1200 worst-case working set, the same derivation as the wasm
 /// styled arm's: the common canvas restyles wholly from the parsed cache.
 const EXPECTED_DESKTOP_PARSED_ENTRIES: usize = 96;
@@ -356,7 +359,7 @@ fn pump_until<T>(timeout: Duration, mut step: impl FnMut() -> Option<T>) -> Opti
 /// waits for a tile to *arrive* has to go through the pump the drawing code
 /// goes through.
 fn draw_one(tiles: &mut HttpsTiles, tile_id: TileId) -> Option<TilePiece> {
-    tiles.pump(false);
+    tiles.pump();
     tiles.at(tile_id)
 }
 
@@ -540,14 +543,23 @@ fn tile_ids_outside_their_zoom_grid_are_invalid() {
 
 // ---------------------------------------------------------------------------
 
-/// **A live gesture takes nothing off the decode drain, and the settle frame
-/// loses none of it** (WO-9e). The takes ledger is the counted quantity: a
-/// quiet pump records zero takes however many completions are queued, the
-/// first ordinary pump after the gesture takes the queued completion within
-/// its one-pump budget, and the total across the gesture is exactly the
-/// completions that arrived — nothing double-taken, nothing dropped.
+/// **A queued completion is taken by the very next pump, and nothing is lost
+/// doing it.**
+///
+/// The quantity is a count of pumps, never a duration. WO-9e made the drain
+/// refuse every pump while a map gesture was live and resume only 500 ms after
+/// the last input, so the number of pumps a queued tile waited through was
+/// bounded by a wall clock and nothing else — at 175 Hz, 87 of them. The pump
+/// now consults no gesture state at all, so the bound is one: from the pump
+/// that finds the completion queued, the tile is drawable, and the ledger
+/// records exactly the one take that moved it.
+///
+/// WO-9e's conservation property is the second half and is unchanged: takes are
+/// conserved across the whole exercise — one completion arrived, one take is
+/// recorded, and the tile is on the glass. Fewer is a lost tile, more is a
+/// double count.
 #[test]
-fn a_live_gesture_takes_no_tiles_and_the_settle_frame_loses_none() {
+fn a_queued_tile_is_taken_by_the_next_pump_and_the_takes_ledger_conserves() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
     let ctx = Context::default();
     let mut tiles = loopback_tiles(&server, &ctx);
@@ -557,39 +569,105 @@ fn a_live_gesture_takes_no_tiles_and_the_settle_frame_loses_none() {
         zoom: 3,
     };
 
-    // Ask, then hold the gesture: only quiet pumps run while the fetch
-    // completes and its payload queues.
     assert!(tiles.at(tile_id).is_none(), "fixture: nothing cached yet");
-    let gesture = Instant::now() + SETTLE;
-    while Instant::now() < gesture {
-        tiles.pump(true);
+    assert_eq!(tiles.takes(), 0, "fixture: nothing taken before the ask");
+
+    // Frames, not seconds: pump exactly as `draw_tile_layer` does, once per
+    // frame, and count them. Every one of these is a frame a real gesture
+    // would have been moving through.
+    let mut pumps_waited = 0_u64;
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    while tiles.at(tile_id).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the tile never arrived across {pumps_waited} pumps",
+        );
+        // The take is recorded by the pump, and `at` is what puts it on the
+        // glass. They must happen on the *same* frame: a take that needs a
+        // later frame to become drawable is the latch in another spelling.
         assert_eq!(
             tiles.takes(),
             0,
-            "a quiet pump took a completion off the drain mid-gesture",
+            "a take was recorded on pump {pumps_waited} and the tile was still \
+             not drawable on that same frame",
         );
+        tiles.pump();
+        pumps_waited += 1;
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(
-        tiles.at(tile_id).is_none(),
-        "the tile appeared without a take being recorded, so the ledger is \
-         not counting what the drain moves",
-    );
 
-    // The settle: ONE ordinary pump yields the tile. That it does is also
-    // what proves the completion sat queued through the whole quiet phase —
-    // the zeroes above were a refusal, not an empty channel.
-    tiles.pump(false);
-    assert!(
-        tiles.at(tile_id).is_some(),
-        "the settle frame's pump did not deliver the queued completion",
-    );
     assert_eq!(
         tiles.takes(),
         1,
-        "one completion arrived across the gesture and the ledger must say \
-         exactly one take: fewer is a lost tile, more is a double count",
+        "one completion arrived and the ledger must say exactly one take: \
+         fewer is a lost tile, more is a double count",
     );
+    assert_eq!(
+        tiles.pumps(),
+        pumps_waited,
+        "the pump ledger must count every frame the loop drove, or the count \
+         above is not the quantity it claims to be",
+    );
+}
+
+/// **The pump takes what is queued however busy the frame already is.**
+///
+/// [`super::PUMP_TIME_BUDGET`] governs how much one pump spends, and a budget
+/// that can round down to zero would stall the map exactly when the machine is
+/// busiest — the WO-9e failure in a different spelling. The first take of a
+/// pump is therefore unconditional. Driven with the deadline already in the
+/// past, which is the strongest form of "over budget" the loop can be shown.
+#[test]
+fn a_pump_already_over_its_time_budget_still_takes_one_completion() {
+    let mut reported = false;
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<u32>(MAX_PARALLEL_DOWNLOADS);
+    for value in 0..4 {
+        tx.try_send(value).expect("the fixture queue has room");
+    }
+
+    let mut taken = Vec::new();
+    let count = super::drain_up_to(
+        &mut rx,
+        MAX_PARALLEL_DOWNLOADS + 1,
+        // Already elapsed: every deadline test after the first take fails.
+        Instant::now() - Duration::from_millis(1),
+        &mut reported,
+        |value| taken.push(value),
+    );
+
+    assert_eq!(
+        count, 1,
+        "a pump whose budget was already spent took {count} completions: the \
+         first take is unconditional and every later one is the deadline's",
+    );
+    assert_eq!(taken, vec![0], "the take was not the queue's head");
+}
+
+/// The whole queue moves in one pump when the takes are cheap.
+///
+/// The counterpart of the test above, and what makes that one non-vacuous: the
+/// bound really is the deadline rather than a hard-coded one-per-pump. With
+/// budget left, a pump empties what the channel holds — which is at most
+/// [`MAX_PARALLEL_DOWNLOADS`], the channel's own capacity.
+#[test]
+fn a_pump_inside_its_time_budget_empties_the_queue() {
+    let mut reported = false;
+    let (mut tx, mut rx) = futures::channel::mpsc::channel::<u32>(MAX_PARALLEL_DOWNLOADS);
+    for value in 0..4 {
+        tx.try_send(value).expect("the fixture queue has room");
+    }
+
+    let mut taken = Vec::new();
+    let count = super::drain_up_to(
+        &mut rx,
+        MAX_PARALLEL_DOWNLOADS + 1,
+        Instant::now() + Duration::from_secs(60),
+        &mut reported,
+        |value| taken.push(value),
+    );
+
+    assert_eq!(count, 4, "the pump did not empty a queue it had budget for");
+    assert_eq!(taken, vec![0, 1, 2, 3], "the queue moved out of order");
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +1005,7 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
 
     let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
     let mut ask = || {
-        tiles.pump(false);
+        tiles.pump();
         for x in 0..wanted {
             tiles.at(TileId { x, y: 0, zoom: 8 });
         }
@@ -994,7 +1072,15 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
     );
     assert_eq!(
         WASM_TILE_DECODES_PER_PUMP, EXPECTED_WASM_DECODES_PER_PUMP,
-        "the decode allowance is two tiles per source per pass"
+        "the decode allowance is the channel's capacity plus one — 'whatever \
+         is queued', with PUMP_TIME_BUDGET as the actual governor"
+    );
+    assert_eq!(
+        WASM_TILE_DECODES_PER_PUMP,
+        MAX_PARALLEL_DOWNLOADS + 1,
+        "the count backstop must stay derived from the channel's own capacity: \
+         a smaller number is a throttle nothing measured, and a larger one \
+         cannot be reached because the queue cannot hold it"
     );
 
     // The two arms that can hold a vector entry must be derived against the
@@ -1324,7 +1410,7 @@ fn the_tile_cache_is_bounded() {
     let attempts = capacity as u32 + 64;
 
     let reached = pump_until(DEFAULT_TIMEOUT, || {
-        tiles.pump(false);
+        tiles.pump();
         for x in 0..attempts {
             tiles.at(TileId { x, y: 0, zoom: 10 });
         }
@@ -1354,7 +1440,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // The counter moves before any bound is near: three ids are three
         // entries, exactly.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             for x in 0..3 {
                 tiles.at(id(x));
             }
@@ -1369,7 +1455,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // Fill to exactly the cap. Below-or-at the bound nothing may be
         // evicted, so the exact count doubles as total membership.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             for x in 0..capacity as u32 {
                 tiles.at(id(x));
             }
@@ -1393,7 +1479,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // One insert at the cap: admitted, and paid for by exactly the LRU id.
         let new = id(capacity as u32);
         let admitted = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.at(new);
             tiles.tile_is_cached(new).then_some(())
         });
@@ -1424,16 +1510,27 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
 // ---------------------------------------------------------------------------
 
 /// One pump decodes at most the budget; the rest wait their turn, in order.
+///
+/// The count is handed in rather than read off [`WASM_TILE_DECODES_PER_PUMP`].
+/// That constant became the channel's own capacity plus one at WO-10 — a
+/// backstop the queue can never make binding — so reading it here would make
+/// the cap unobservable and the ordering claims below vacuous. What the
+/// production value is stays pinned by
+/// [`the_tuning_values_are_what_the_doc_comments_say`]; what this holds is that
+/// the drain caps and orders correctly *given* a binding count.
 #[test]
 fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
     let ctx = Context::default();
     let png = fixture_png();
     let id = |x: u32| TileId { x, y: 0, zoom: 3 };
 
+    /// A count small enough to bind against the backlog below.
+    const FIXTURE_BUDGET: usize = 2;
+
     // More completed fetches than one pump may take, or the cap is untested.
     let queued: u32 = 5;
     assert!(
-        (queued as usize) > WASM_TILE_DECODES_PER_PUMP,
+        (queued as usize) > FIXTURE_BUDGET,
         "the backlog must exceed the budget for the cap to be observable"
     );
 
@@ -1455,9 +1552,11 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
                 reported: &mut bool| {
         drain_up_to(
             rx,
-            WASM_TILE_DECODES_PER_PUMP,
+            FIXTURE_BUDGET,
+            // Far enough out that the count is the only thing that can bind.
+            Instant::now() + Duration::from_secs(60),
             reported,
-            |(tile_id, bytes)| {
+            |(tile_id, bytes): (TileId, Vec<u8>)| {
                 // `Style::default()` for the reason `fetch_one` gives.
                 #[allow(
                     clippy::default_constructed_unit_structs,
@@ -1697,7 +1796,7 @@ mod archive {
         );
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -1780,7 +1879,7 @@ mod archive {
             };
 
             let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-                tiles.pump(false);
+                tiles.pump();
                 tiles.source_max_zoom()
             })
             .expect("the archive header never arrived");
@@ -1824,7 +1923,7 @@ mod archive {
         };
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -2004,7 +2103,7 @@ mod archive {
         };
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -2140,7 +2239,7 @@ mod archive {
         );
 
         let fault = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.fault().map(str::to_owned)
         })
         .expect("the source never reported why it serves nothing");
@@ -2163,7 +2262,7 @@ mod archive {
         // suppressing only a repeat within one.
         let before = tiles.cached_entries();
         for _ in 0..10 {
-            tiles.pump(false);
+            tiles.pump();
             for x in 0..54u32 {
                 assert!(
                     tiles.at(TileId { x, y: 0, zoom: 14 }).is_none(),
@@ -2306,7 +2405,7 @@ mod archive {
     /// per-frame `ensure_base_tiles` the panel runs before both.
     fn drive_frame(state: &mut crate::tiles::MapTileState, ids: &[TileId], ctx: &Context) {
         if let Some(tiles) = state.tiles.as_mut() {
-            tiles.pump(false);
+            tiles.pump();
             for id in ids {
                 let _ = tiles.at(*id);
             }
@@ -2330,7 +2429,7 @@ mod archive {
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
             let tiles = state.tiles.as_mut().expect("the slot holds the source");
-            tiles.pump(false);
+            tiles.pump();
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -2553,7 +2652,7 @@ mod archive {
 
             pump_until(DEFAULT_TIMEOUT, || {
                 let tiles = state.tiles.as_mut().expect("the slot holds the source");
-                tiles.pump(false);
+                tiles.pump();
                 tiles.source_max_zoom()
             })
             .expect("the archive header never arrived");
@@ -2888,7 +2987,7 @@ mod archive_decode {
         // finished with the header. Waiting on only one of the two would make
         // the timeout the assertion.
         pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles
                 .fault()
                 .map(|fault| Some(fault.to_owned()))
@@ -2969,7 +3068,7 @@ mod archive_decode {
         );
 
         pump_until(LOCAL_ARCHIVE_TIMEOUT, || {
-            tiles.pump(false);
+            tiles.pump();
             tiles.at(TileId {
                 x: 0,
                 y: 0,
