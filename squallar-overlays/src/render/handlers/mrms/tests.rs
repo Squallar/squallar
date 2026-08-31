@@ -73,7 +73,7 @@ fn pane_state(product: MrmsProduct) -> Box<MrmsPaneState> {
 #[test]
 fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
     // Room for exactly one 100-value grid (400 bytes).
-    let mut cache = MrmsGridCache::new(400);
+    let mut cache = MrmsGridCache::new(400, staging::global());
     let a = Arc::new(sized(MrmsProduct::ReflectivityComposite, 100));
     assert_eq!(a.resident_bytes(), 400);
     cache.insert(MrmsProduct::ReflectivityComposite, a, &[]);
@@ -85,7 +85,7 @@ fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
 /// entry count anywhere in the decision.
 #[test]
 fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
-    let mut cache = MrmsGridCache::new(400);
+    let mut cache = MrmsGridCache::new(400, staging::global());
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -106,7 +106,7 @@ fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
 /// the *budget*, not a hidden entry cap.
 #[test]
 fn a_wider_budget_holds_both_grids() {
-    let mut cache = MrmsGridCache::new(800);
+    let mut cache = MrmsGridCache::new(800, staging::global());
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -126,7 +126,7 @@ fn a_wider_budget_holds_both_grids() {
 /// re-ask, which is worse than the memory.
 #[test]
 fn the_cache_never_evicts_a_pinned_product() {
-    let mut cache = MrmsGridCache::new(400);
+    let mut cache = MrmsGridCache::new(400, staging::global());
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -152,7 +152,7 @@ fn the_cache_never_evicts_a_pinned_product() {
 /// A refetch replaces its own key rather than growing the cache.
 #[test]
 fn a_refetch_of_a_resident_product_replaces_its_own_key() {
-    let mut cache = MrmsGridCache::new(400);
+    let mut cache = MrmsGridCache::new(400, staging::global());
     let p = MrmsProduct::ReflectivityComposite;
     cache.insert(p, Arc::new(sized(p, 100)), &[]);
     cache.insert(p, Arc::new(sized(p, 100)), &[]);
@@ -686,7 +686,7 @@ fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
     file_listing(&mut h, product, 13, true);
     // A staging area with room for both, so what is asserted is the LOOKUP and
     // not the eviction policy, which has its own test below.
-    h.frame_grids = MrmsFrameCache::new(4 * 8 * 4);
+    h.frame_grids = MrmsFrameCache::new(4 * 8 * 4, staging::global());
     file_frame(&mut h, product, 3, 8);
     file_frame(&mut h, product, 9, 8);
 
@@ -1306,4 +1306,132 @@ fn a_listing_carries_the_mosaic_the_window_opened_after() {
         "mosaic 6 depicts an instant later than anything the window reaches, \
          so it is not one of its frames",
     );
+}
+
+// ── The retained staging buffer ─────────────────────────────────────────────
+
+/// A mosaic-shaped grid: `resident_bytes()` is a real 98 MB and its buffer is
+/// exactly what [`staging::StagingPool`] retains.
+///
+/// The other grids in this file are one row wide, because the budgets they
+/// exercise have to be overflowable. This one cannot be: what it is here to
+/// exercise **is** the mosaic capacity rule, and a 400-byte grid would be
+/// declined by the pool for exactly the reason the pool declines one in
+/// production.
+fn mosaic_grid(product: MrmsProduct, valid: chrono::NaiveDateTime) -> MrmsGrid {
+    let mut values: Vec<f32> = Vec::new();
+    values
+        .try_reserve_exact(staging::STAGING_POINTS)
+        .expect("a mosaic buffer fits on a test host");
+    values.resize(staging::STAGING_POINTS, 45.0);
+    let mut grid = grid_of(product, values);
+    grid.valid = valid;
+    grid
+}
+
+/// **The eviction that feeds the pool.** `MrmsFrameCache::insert` is the hot
+/// path of a playing loop — one eviction per arriving granule — and it is where
+/// the retained buffer comes from. Before this, the victim was dropped and the
+/// next granule allocated a fresh 98 MB block; that churn is what fragmented
+/// the browser's 1 GiB heap until a 98 MB request failed with 192 MB free.
+///
+/// Driven against a pool this test owns rather than the process-wide slot, for
+/// the reason [`MrmsFrameCache::staging`] records: this binary also decodes the
+/// `decode` fixtures through the global pool, and a filtered run here is not
+/// self-contained.
+///
+/// **Floor — `drop_the_victim`:** restore a bare `self.entries.remove(&victim);`
+/// with no `recycle`; the pool then reports nothing recycled and the take below
+/// allocates.
+#[test]
+fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    // One mosaic of budget, which is the shipped `FRAME_STAGING_BYTES` — this
+    // is the one frame-cache test that can afford the real figure.
+    let mut h = MrmsHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    let product = MrmsProduct::ReflectivityComposite;
+    let stamp = |m: u32| {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 31)
+            .expect("a real date")
+            .and_hms_opt(0, m, 0)
+            .expect("a real time")
+    };
+
+    h.frame_grids.insert(
+        FrameKey {
+            product,
+            valid: stamp(0),
+        },
+        mosaic_grid(product, stamp(0)),
+    );
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "premise: one granule fits the budget, so nothing has been evicted yet",
+    );
+
+    // The second arrival puts the store over one mosaic and evicts the first.
+    h.frame_grids.insert(
+        FrameKey {
+            product,
+            valid: stamp(2),
+        },
+        mosaic_grid(product, stamp(2)),
+    );
+    assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
+
+    let staged = POOL
+        .take(staging::STAGING_POINTS)
+        .expect("the slot is full");
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 1,
+            declined: 0
+        },
+        "the evicted granule's buffer must have reached the pool, so the next \
+         mosaic decode is handed it instead of taking a fresh 98 MB block off \
+         an allocator that can only grow",
+    );
+    assert_eq!(staged.capacity(), staging::STAGING_POINTS);
+    assert!(staged.is_empty(), "and it arrives with nothing in it");
+}
+
+/// And the other door out of the store — `retain_frames`, the [`FrameSource`]
+/// eviction authority — feeds the same pool.
+#[test]
+fn a_retained_frame_set_offers_the_dropped_granules_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    let mut h = MrmsHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    let product = MrmsProduct::ReflectivityComposite;
+    let valid = chrono::NaiveDate::from_ymd_opt(2026, 8, 31)
+        .expect("a real date")
+        .and_hms_opt(0, 0, 0)
+        .expect("a real time");
+    h.frame_grids
+        .insert(FrameKey { product, valid }, mosaic_grid(product, valid));
+
+    h.retain_frames(&PaneRef::across(&[]), &[]);
+    assert_eq!(h.frame_grids.len(), 0, "premise: the granule was dropped");
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "and its buffer went to the pool rather than back to the allocator",
+    );
+    assert_eq!(
+        POOL.take(staging::STAGING_POINTS)
+            .expect("the slot is full")
+            .capacity(),
+        staging::STAGING_POINTS,
+    );
+    assert_eq!(POOL.totals().reused, 1);
 }

@@ -52,7 +52,7 @@ use std::sync::Arc;
 use crate::fetch_policy::Whole;
 use crate::mrms::{
     FRAME_STAGING_BYTES, GRID_CACHE_BYTES, MrmsFetchResult, MrmsFrameFetch, MrmsGrid, MrmsListing,
-    MrmsProduct,
+    MrmsProduct, staging,
 };
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
@@ -108,14 +108,23 @@ struct MrmsFrameCache {
     /// Injected for the same reason [`MrmsGridCache::budget`] is: the shipped
     /// budget is one 98 MB mosaic and no test can afford to overflow it.
     budget: usize,
+    /// **Where an evicted granule's buffer goes** — [`staging::global`] on
+    /// every shipped path.
+    ///
+    /// Injected for a reason the budget's own injection does not cover: the
+    /// shipped slot is process-wide, so a suite reading its counters inside a
+    /// test binary that also decodes fixtures cannot tell its own eviction
+    /// from another test's. A pool of the suite's own can.
+    staging: &'static staging::StagingPool,
 }
 
 impl MrmsFrameCache {
-    fn new(budget: usize) -> Self {
+    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            staging,
         }
     }
 
@@ -142,9 +151,16 @@ impl MrmsFrameCache {
     /// granule *kept* past the budget costs 98 MB on an arm that has already
     /// said it cannot spare it. The live cache makes the opposite trade
     /// because a pane with no live granule has nothing that will re-ask.
+    ///
+    /// **Every granule that leaves here is offered to [`staging`].** This is
+    /// the hot eviction of the whole layer — one per arriving loop frame — and
+    /// it is where the retained mosaic buffer comes from: dropping the victim
+    /// instead is what made the browser build allocate a fresh 98 MB block per
+    /// granule and fragment its 1 GiB heap to death.
     fn insert(&mut self, key: FrameKey, grid: MrmsGrid) {
-        if self.entries.insert(key, grid).is_some() {
+        if let Some(replaced) = self.entries.insert(key, grid) {
             self.touch(key);
+            self.staging.recycle(replaced);
         } else {
             self.recency.borrow_mut().push(key);
         }
@@ -160,13 +176,28 @@ impl MrmsFrameCache {
                 };
                 recency.remove(pos)
             };
-            self.entries.remove(&victim);
+            if let Some(evicted) = self.entries.remove(&victim) {
+                self.staging.recycle(evicted);
+            }
         }
     }
 
     /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
+    ///
+    /// The dropped granules go to [`staging`] for the same reason
+    /// [`Self::insert`]'s victims do.
     fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
-        self.entries.retain(|key, _| keep(*key));
+        let dropped: Vec<FrameKey> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|key| !keep(*key))
+            .collect();
+        for key in dropped {
+            if let Some(grid) = self.entries.remove(&key) {
+                self.staging.recycle(grid);
+            }
+        }
         self.recency.borrow_mut().retain(|key| keep(*key));
     }
 
@@ -197,14 +228,17 @@ struct MrmsGridCache {
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
+    /// See [`MrmsFrameCache::staging`].
+    staging: &'static staging::StagingPool,
 }
 
 impl MrmsGridCache {
-    fn new(budget: usize) -> Self {
+    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            staging,
         }
     }
 
@@ -245,9 +279,18 @@ impl MrmsGridCache {
     /// than a refetch — `prepare_job` answers `None` and the pane goes on
     /// drawing its last texture with nothing that will re-ask — so the pin is
     /// what keeps a visible pane drawn when an arrival lands mid-cycle.
+    /// The two-minute poll replaces this product's mosaic here, and the
+    /// displaced one is offered to [`staging`] — with `Arc::into_inner`
+    /// deciding, so a granule another pane's raster job is still reading is
+    /// never taken out from under it. On the live path that usually declines,
+    /// because `OverlayState::data` holds a second `Arc` on the pane's own
+    /// picture; the frame cache is where the pool is really fed. Offering it
+    /// anyway costs a refcount read and catches every case where it is the last
+    /// reference.
     fn insert(&mut self, product: MrmsProduct, grid: Arc<MrmsGrid>, pinned: &[MrmsProduct]) {
-        if self.entries.insert(product, grid).is_some() {
+        if let Some(replaced) = self.entries.insert(product, grid) {
             self.touch(product);
+            self.staging.recycle_shared(replaced);
         } else {
             self.recency.borrow_mut().push(product);
         }
@@ -265,7 +308,9 @@ impl MrmsGridCache {
                 };
                 recency.remove(pos)
             };
-            self.entries.remove(&victim);
+            if let Some(evicted) = self.entries.remove(&victim) {
+                self.staging.recycle_shared(evicted);
+            }
         }
     }
 
@@ -316,14 +361,23 @@ pub(crate) struct MrmsHandler {
 
 impl MrmsHandler {
     pub fn new() -> Self {
+        Self::with_staging(staging::global())
+    }
+
+    /// The shipped handler against an explicit staging pool.
+    ///
+    /// One constructor rather than a `cfg`: the pool is a **value** this
+    /// handler is given, exactly as its two budgets are, and the shipped path
+    /// gives it [`staging::global`].
+    fn with_staging(pool: &'static staging::StagingPool) -> Self {
         Self {
             state: OverlayState::new(),
             defaults: MrmsPaneState::new(false),
-            cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES),
+            cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES, pool),
             last_error: None,
             frame_keys: HashMap::new(),
             covered: HashMap::new(),
-            frame_grids: MrmsFrameCache::new(FRAME_STAGING_BYTES),
+            frame_grids: MrmsFrameCache::new(FRAME_STAGING_BYTES, pool),
             frame_gate: Arc::new(futures::lock::Mutex::new(())),
         }
     }
@@ -336,8 +390,18 @@ impl MrmsHandler {
     #[cfg(test)]
     fn with_frame_budget(bytes: usize) -> Self {
         Self {
-            frame_grids: MrmsFrameCache::new(bytes),
+            frame_grids: MrmsFrameCache::new(bytes, staging::global()),
             ..Self::new()
+        }
+    }
+
+    /// [`Self::with_frame_budget`] against a pool the caller owns, so a suite
+    /// can read the counters without racing every other decode in the binary.
+    #[cfg(test)]
+    fn with_frame_budget_and_staging(bytes: usize, pool: &'static staging::StagingPool) -> Self {
+        Self {
+            frame_grids: MrmsFrameCache::new(bytes, pool),
+            ..Self::with_staging(pool)
         }
     }
 
