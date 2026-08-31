@@ -1494,10 +1494,11 @@ impl super::App {
     /// layer goes back to drawing live, which is what it did before it was
     /// armed.
     /// `autoplay` starts the loop the moment it becomes playable, for a loop
-    /// restored from a config that was written while it played. It rides in
-    /// here rather than in a method of its own because this already holds the
-    /// pane borrow it needs, and a second door into `Gui` for one boolean is a
-    /// coupling this crate's ceiling does not have room for.
+    /// restored from a config that was written while it played. The flag is
+    /// written **after** a successful arm, because arming replaces the
+    /// transport's whole `LayerTimeState` — a flag set before
+    /// [`begin_loop_for_pane`] was wiped by that replacement and the restored
+    /// loop came back paused.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64, autoplay: bool) {
         // One clock reading for both halves of the range, so a forward-reaching
         // rail's past and future cannot be anchored a tick apart.
@@ -1506,8 +1507,11 @@ impl super::App {
         // layer's listing task inside it — see `begin_loop_for_pane`.
         let config = self.fetch_config();
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
-        if let Some(pane) = panes.get_mut(pane_idx).filter(|_| autoplay) {
-            pane.transport_state_mut().autoplay_on_ready = true;
+        // Every outcome below consumes the pane's parked wish; the
+        // not-ready arm re-parks it. Cleared here rather than arm by arm so
+        // no path can leave a spent request behind for a second acting.
+        if let Some(pane) = panes.get_mut(pane_idx) {
+            pane.loop_arm_pending = None;
         }
         let dispatch = begin_loop_for_pane(
             panes,
@@ -1522,6 +1526,18 @@ impl super::App {
             // Nothing was armed and nothing was running: the same silent
             // return this made before it armed more than one layer.
             LoopScanDispatch::NoLoop => {}
+            // The scan the loop must anchor on has not arrived — data may
+            // lag. The request is parked in both of its homes: on the pane,
+            // so a config save made during the wait still writes the loop
+            // back, and on the retry queue `hydrate_parked_panes` drains,
+            // whose next pass is the redraw the scan's own arrival notifies.
+            LoopScanDispatch::TransportNotReady => {
+                let arm = squallar_egui::pane::LoopArm { playing: autoplay };
+                if let Some(pane) = panes.get_mut(pane_idx) {
+                    pane.loop_arm_pending = Some(arm);
+                }
+                self.loop_arm_pending.push((pane_idx, arm, lookback_secs));
+            }
             LoopScanDispatch::TransportUnlistable => {
                 log::warn!(
                     "Loop: pane {pane_idx}'s transport could not build a frame \
@@ -1530,6 +1546,9 @@ impl super::App {
                 self.handle_disable_loop(pane_idx);
             }
             LoopScanDispatch::Armed(tasks) => {
+                if let Some(pane) = panes.get_mut(pane_idx).filter(|_| autoplay) {
+                    pane.transport_state_mut().autoplay_on_ready = true;
+                }
                 for task in tasks {
                     self.spawn_frame_list_task(task);
                 }
@@ -1650,7 +1669,12 @@ impl super::App {
     /// action on the next click. It then reset the transport's slot alone,
     /// which was the whole answer only while a pane armed one timeline.
     fn handle_disable_loop(&mut self, pane_idx: usize) {
+        // A disable also cancels a wish still waiting for its first scan, in
+        // both places it is parked — otherwise the retry queue would rebuild
+        // the loop this call tears down.
+        self.loop_arm_pending.retain(|(idx, _, _)| *idx != pane_idx);
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
+            pane.loop_arm_pending = None;
             // **Every timeline the pane armed, not the transport's alone.**
             // `handle_enable_loop` arms one per frame-series layer, so
             // clearing the transport would leave the others holding frames
@@ -1688,8 +1712,10 @@ impl super::App {
     /// they used to be two `Gui::apply` pushes here with the clock missing
     /// entirely, which is why a step on a pane holding no radar scan moved
     /// nothing (WO-T3.10). See [`GuiEvent::PaneTimeSelected`].
-    /// **Ask for the data a restored pane is already parked on.** Drained once,
-    /// on the first redraw, and a no-op on every frame after.
+    /// **Ask for the data a restored pane is already parked on.** The parked
+    /// seeks drain once, on the first redraw; the loop re-arms below drain
+    /// until each one's transport can be anchored, and the pass is a no-op on
+    /// every frame after.
     ///
     /// This is the reload half of a scrub. `handle_navigate_time` moves the
     /// clock and then fetches; restoring `as_of` from the config did only the
@@ -1721,6 +1747,13 @@ impl super::App {
         // After the parked seek, not before: a loop is built around the instant
         // its pane depicts, and arming one against a clock that is about to move
         // would list the wrong window.
+        //
+        // Not once: a radar loop cannot arm before the site's first scan has
+        // landed, and the restore reliably beats it. An entry whose transport
+        // is not ready comes back onto this queue (`TransportNotReady` in
+        // `handle_enable_loop`) and is retried here on a later redraw -- the
+        // scan's own arrival notifies one -- so the checks per pass stay a
+        // few field reads, never a poll of anything remote.
         for (pane_idx, arm, lookback) in std::mem::take(&mut self.loop_arm_pending) {
             self.handle_enable_loop(pane_idx, lookback, arm.playing);
         }
@@ -2620,14 +2653,22 @@ struct LoopScanRequest {
 
 /// What [`begin_loop_for_pane`] did, and what the caller therefore owes.
 ///
-/// Three outcomes and not an `Option<Vec<_>>`, because "this pane cannot loop"
-/// and "this pane's transport could not be listed" are answered differently:
-/// the first armed nothing and there is nothing to retire, the second is a
-/// half-built loop the caller has to take back down.
+/// Four outcomes and not an `Option<Vec<_>>`, because "this pane cannot
+/// loop", "this pane's transport cannot be anchored yet" and "this pane's
+/// transport could not be listed" are answered differently: the first armed
+/// nothing and there is nothing to retire, the second is a request to park
+/// and retry when the scan lands, the third is a half-built loop the caller
+/// has to take back down.
 pub(super) enum LoopScanDispatch {
     /// The pane cannot carry a loop at all — no such pane, or a view that does
     /// not animate. **Nothing was armed.**
     NoLoop,
+    /// The transport is radar and the pane holds no scan *yet*, so the anchor
+    /// the loop's window ends at has not arrived — a listing that cannot be
+    /// built **yet**, not one that cannot exist. **Nothing was armed and
+    /// nothing was torn down**; the caller parks the request and retries when
+    /// a scan lands.
+    TransportNotReady,
     /// The transport layer could not produce a frame listing, so the pane has
     /// no timeline for playback to walk. **Nothing was armed**, and any loop
     /// that was already running is the caller's to retire.
@@ -2690,6 +2731,14 @@ fn begin_loop_for_pane(
         return LoopScanDispatch::NoLoop;
     }
     let transport = pane.transport_layer().clone();
+    // A radar loop is anchored on the scan the pane is showing, and a restore
+    // runs before the site's first volume has landed. That is a listing that
+    // cannot be built YET — data may lag — not one that cannot exist, so it
+    // must not fall through to `arm_layer_loop`'s scan gate and read as
+    // `TransportUnlistable`. A pure "not yet": nothing armed, nothing cleared.
+    if transport == known::RADAR && pane.scan_info.is_none() {
+        return LoopScanDispatch::TransportNotReady;
+    }
     // Every enabled layer that comes in stamped frames, the transport first:
     // it is the one whose failure retires the whole loop, so it is answered
     // before anything else is armed.
@@ -3515,3 +3564,9 @@ mod reinit_active_tests;
 #[path = "app_fetch/step_button_tests.rs"]
 #[cfg(test)]
 mod step_button_tests;
+
+/// A pane restored with a playing loop boots before its first scan arrives,
+/// and the loop must defer and resume rather than be dropped.
+#[cfg(test)]
+#[path = "app_fetch/loop_restore_race_tests.rs"]
+mod loop_restore_race_tests;

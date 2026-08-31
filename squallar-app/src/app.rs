@@ -144,18 +144,20 @@ fn parked_panes(gui: &Gui) -> Vec<(usize, String, chrono::NaiveDateTime)> {
 /// **Every pane restored wanting a loop**, as `(index, request)`.
 ///
 /// The sibling of [`parked_panes`], and collected the same way: read off the
-/// panes once at startup, acted on when the reload is hydrated. The request is
-/// taken from the pane here rather than left on it, so nothing can act on it
-/// twice.
+/// panes once at startup, acted on when the reload is hydrated. The request
+/// is read rather than taken: the pane's copy is what a config save made
+/// while the arm is still waiting for its first scan writes back, and
+/// `handle_enable_loop` is what consumes it when the wish resolves — so
+/// nothing acts on it twice.
 /// The lookback is read here, beside the panes, because it is the same
 /// persisted setting the timeline's own Enable-loop action carries — a restored
 /// loop must span what the user left the slider on, not a fresh default.
-fn looping_panes(gui: &mut Gui) -> Vec<(usize, squallar_egui::pane::LoopArm, u64)> {
+fn looping_panes(gui: &Gui) -> Vec<(usize, squallar_egui::pane::LoopArm, u64)> {
     let lookback = gui.loop_lookback_secs;
-    gui.panes_mut()
-        .iter_mut()
+    gui.panes()
+        .iter()
         .enumerate()
-        .filter_map(|(idx, pane)| pane.loop_arm_pending.take().map(|arm| (idx, arm, lookback)))
+        .filter_map(|(idx, pane)| pane.loop_arm_pending.map(|arm| (idx, arm, lookback)))
         .collect()
 }
 
@@ -320,6 +322,8 @@ pub struct App {
     /// `spawn_fetch` needs the built `App`.
     parked_fetch_pending: Vec<(usize, String, chrono::NaiveDateTime)>,
     /// Panes restored with a loop armed, drained by `hydrate_parked_panes`.
+    /// An entry whose transport has no scan yet to anchor on is re-parked by
+    /// `handle_enable_loop` and drained again on a later redraw.
     loop_arm_pending: Vec<(usize, squallar_egui::pane::LoopArm, u64)>,
     /// The map extent most recently asked for on screen.
     last_viewport: Option<squallar_geo::GeoBounds>,
@@ -528,7 +532,7 @@ impl App {
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
         // Before `gui` moves into the struct literal below.
         let parked_fetch_pending = parked_panes(&gui);
-        let loop_arm_pending = looping_panes(&mut gui);
+        let loop_arm_pending = looping_panes(&gui);
         let site_positions = crate::site_positions::SitePositions::load(platform.kv().as_deref());
         let site_catalogue = crate::site_catalogue::load(platform.kv().as_deref());
         let table =

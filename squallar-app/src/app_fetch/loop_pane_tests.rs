@@ -322,6 +322,82 @@ fn beginning_a_loop_clears_the_panes_pending_downloads() {
     );
 }
 
+/// **"No scan yet" is a deferral, not a refusal.** A radar transport with no
+/// scan to anchor on answers `TransportNotReady`, and the answer is a pure
+/// "not yet": nothing armed, nothing already queued torn down. The refusal
+/// twin below is what holds `TransportUnlistable` in place beside it.
+#[test]
+fn a_scanless_radar_transport_defers_rather_than_refuses() {
+    let mut panes = [PaneState::with_site("KTLX".to_string())];
+    assert!(
+        panes[0].scan_info.is_none(),
+        "precondition: no scan has landed on this pane",
+    );
+    let mut mgr = LoopDownloadManager::new();
+    // Work queued for a loop that already exists must survive a deferral —
+    // the not-ready return sits BEFORE the pending-download clear.
+    mgr.insert_pending(
+        0,
+        squallar_radar::loop_downloads::PendingDownloads {
+            site: "KOUN".to_string(),
+            queue: [ts(5)].into_iter().collect(),
+        },
+    );
+    let mut reg = registry();
+
+    assert!(
+        matches!(
+            begin_loop_for_pane(
+                &mut panes,
+                &mut reg,
+                &mut mgr,
+                &a_fetch_config(),
+                0,
+                ts(0),
+                600,
+            ),
+            LoopScanDispatch::TransportNotReady,
+        ),
+        "a scanless radar transport is a listing that cannot be built YET, \
+         not one that cannot exist",
+    );
+    assert!(
+        !panes[0].time_state(&known::RADAR).is_active(),
+        "nothing was armed",
+    );
+    assert!(!mgr.is_pane_done(0), "and nothing was cleared");
+}
+
+/// The refusal, untouched: a transport whose handler cannot build a listing
+/// task — which no arriving scan can fix — still answers
+/// `TransportUnlistable`, with the half-built arm put back.
+#[test]
+fn a_transport_that_cannot_list_is_still_refused_not_deferred() {
+    let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
+    let mut mgr = LoopDownloadManager::new();
+    let mut reg = no_handlers();
+
+    assert!(
+        matches!(
+            begin_loop_for_pane(
+                &mut panes,
+                &mut reg,
+                &mut mgr,
+                &a_fetch_config(),
+                0,
+                ts(0),
+                600,
+            ),
+            LoopScanDispatch::TransportUnlistable,
+        ),
+        "the scan is here; what fails is the listing itself",
+    );
+    assert!(
+        !panes[0].time_state(&known::RADAR).is_active(),
+        "the half-built arm was put back, not left in FetchingScanList",
+    );
+}
+
 #[test]
 fn a_polled_scan_only_reaches_loops_on_its_own_site() {
     let ktlx = site("KTLX", 35.33, -97.27);

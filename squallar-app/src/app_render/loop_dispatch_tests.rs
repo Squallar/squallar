@@ -464,6 +464,33 @@ fn a_loop_with_no_radar_geometry_still_reaches_ready() {
     assert_eq!(ls.phase, LoopPhase::Ready);
 }
 
+/// **The other end of the restored-loop chain**: a timeline still carrying
+/// its play request starts PLAYING at the first settle with a showable frame,
+/// and the request is spent as it fires. `loop_restore_race_tests` proves the
+/// request survives arming and the listing's landing; this is the readiness
+/// pass that converts it.
+#[test]
+fn a_loop_restored_playing_starts_the_moment_a_frame_can_show() {
+    let ctx = egui::Context::default();
+    let mut ls = loop_on(&ctx, "KTLX", &[1]);
+    ls.autoplay_on_ready = true;
+
+    assert!(
+        !settle_loop_phase(0, &mut ls, |_| true, |_| false),
+        "a loop with a frame to show is promoted, not switched off",
+    );
+    assert_eq!(
+        ls.phase,
+        LoopPhase::Playing,
+        "the restored play request must fire here, at the first moment \
+         'play' means anything",
+    );
+    assert!(
+        !ls.autoplay_on_ready,
+        "and be spent as it fires — a pause afterwards stays paused",
+    );
+}
+
 /// **The correctness pin of WI-2.** A non-radar loop whose frames are still
 /// loading must survive the readiness pass with its timeline intact.
 ///
