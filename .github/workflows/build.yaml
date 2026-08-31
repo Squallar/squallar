@@ -852,7 +852,7 @@ jobs:
           echo "build matrix: $RESULT"
           test "$RESULT" = success || { echo "::error::the build matrix concluded '$RESULT'."; exit 1; }
 
-  # The production web deploy: S3 behind CloudFront at https://rustdar.mcswain.dev/.
+  # The production web deploy: S3 behind CloudFront at https://squallar.app/.
   #
   # `push` to `main` only, for the same reason `deploy-pages` is: `id-token: write`
   # mints an OIDC token that assumes an AWS role with write access to the live
@@ -901,23 +901,17 @@ jobs:
           echo "ok: $n file(s) staged"
           find dist -type f | sort | sed 's/^/  /'
 
-      # STILL THE RUSTDAR ROLE, DELIBERATELY. This job deploys the rustdar
-      # stack -- the bucket and distribution below are that stack's -- and these
-      # four literals are one set that moves together at cutover, not
-      # individually. The product rename left this one behind by accident and it
-      # was put back: a role named for the new product that does not exist yet
-      # fails the deploy at `configure-aws-credentials`, before anything
-      # downstream gets a chance to be wrong in a more informative way.
-      #
-      # At cutover, all four change at once: this ARN to
-      # github-actions-squallar, the sync target to s3://squallar-app-origin/,
-      # the distribution id to squallar.app's, and the region only if it moves.
-      # A fifth literal moves with them: squallar::platform::ZONE_PACK_URL,
-      # which is where native builds download the zones.pack this job stages.
+      # THE SQUALLAR STACK, CUT OVER 2026-08-30. These literals are one set
+      # that moved together -- role, bucket, distribution -- and a fifth moved
+      # with them: squallar::platform::ZONE_PACK_URL, where native builds
+      # download the zones.pack this job stages. The values come from
+      # `terraform output` in ../terraform/infra/squallar and go stale only if
+      # that stack is rebuilt; the old rustdar stack now serves the tombstone
+      # (`deploy-tombstone` below) and nothing else.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
-          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-squallar
           aws-region: us-east-1
 
       # No second pass to fix up `Content-Type`. The AWS CLI takes it from
@@ -940,13 +934,90 @@ jobs:
       # the new deploy replaces: `squallar_web.js` and `squallar_web_bg.wasm` keep
       # their names across builds, so those are overwrites, not delete-then-add.
       - name: Sync to S3
-        run: aws s3 sync --delete dist/ s3://rustdar.mcswain.dev/
+        run: aws s3 sync --delete dist/ s3://squallar-app-origin/
 
       # Whole-distribution, not a path list. The shell's filenames are stable,
       # so a targeted invalidation would have to name every one of them, and
       # missing one serves a mixed shell. AWS gives 1000 free invalidation paths
       # a month and `/*` counts as one.
       - name: Invalidate the CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id E3S5Y0QOVJFRNZ --paths "/*"
+
+      # NOTHING ELSE CATCHES A MISSING HEADERS POLICY. The Tier-2 rig supplies
+      # COOP/COEP itself (`serve.py`), so it stays green against an origin that
+      # sends neither -- and without them `crossOriginIsolated` is false, rayon
+      # collapses to one thread and the worker wire never comes up, silently.
+      # So the deploy is not done until the real origin is seen sending both.
+      #
+      # Retried because an invalidation is not instantaneous: the first request
+      # after one can race the edge. Ten tries over ~100 s is far past any
+      # observed settling time; a failure after that is a real missing policy.
+      - name: Verify the isolation headers on the live origin
+        run: |
+          for i in $(seq 1 10); do
+            headers=$(curl -sSI --max-time 15 https://squallar.app/ || true)
+            coop=$(printf '%s' "$headers" | grep -ci '^cross-origin-opener-policy: same-origin' || true)
+            coep=$(printf '%s' "$headers" | grep -ci '^cross-origin-embedder-policy: require-corp' || true)
+            if [ "$coop" -ge 1 ] && [ "$coep" -ge 1 ]; then
+              echo "ok: both isolation headers present (attempt $i)"
+              exit 0
+            fi
+            echo "attempt $i: COOP=$coop COEP=$coep; waiting"
+            sleep 10
+          done
+          echo "::error::https://squallar.app/ is not sending COOP+COEP; the app will boot single-threaded"
+          exit 1
+
+  # Retire https://rustdar.mcswain.dev/: publish the tombstone over the old
+  # origin. `.github/cloudfront-tombstone/` is two files -- a redirecting
+  # index.html for fresh visitors, and a service worker at /sw.js (the path the
+  # app's worker lived at) that unregisters installed clients and sends them to
+  # squallar.app. See both files' comments for why each half is needed.
+  #
+  # `needs: [deploy-cloudfront]`: the tombstone never publishes unless the new
+  # origin just deployed, so there is no window where the old origin points at
+  # a squallar.app that is not serving. Same ordering property deploy-pages has
+  # always had with its own tombstone.
+  #
+  # `--delete` wipes the old app from the bucket -- shell, wasm, zones.pack,
+  # everything. Nothing shipped against that origin outside this repo's own
+  # dev builds, and those degrade gracefully (zone resolution falls back to
+  # HTTP; the pack URL moved to squallar.app in the same change).
+  deploy-tombstone:
+    name: Tombstone the old origin
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [deploy-cloudfront]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: cloudfront-tombstone
+      cancel-in-progress: false
+    steps:
+      - name: Check out the tombstone
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/cloudfront-tombstone
+          sparse-checkout-cone-mode: false
+
+      - name: Refuse to sync an empty tree
+        run: |
+          test -f .github/cloudfront-tombstone/index.html || { echo "::error::tombstone index.html missing"; exit 1; }
+          test -f .github/cloudfront-tombstone/sw.js || { echo "::error::tombstone sw.js missing"; exit 1; }
+          grep -q "https://squallar.app/" .github/cloudfront-tombstone/sw.js || { echo "::error::sw.js does not point at squallar.app"; exit 1; }
+
+      # The OLD stack's role: this job is the one thing that still writes to it.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
+          aws-region: us-east-1
+
+      - name: Sync the tombstone over the old origin
+        run: aws s3 sync --delete .github/cloudfront-tombstone/ s3://rustdar.mcswain.dev/
+
+      - name: Invalidate the old distribution
         run: aws cloudfront create-invalidation --distribution-id E2GQ1TB8D9TCQB --paths "/*"
 
   # The marketing site at squallar.com. Nothing is built: `www/` is hand-written
@@ -962,7 +1033,12 @@ jobs:
   # move, so this runs before the rename as well as after.
   deploy-www:
     name: Deploy marketing site to CloudFront
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # HELD BACK, DELIBERATELY (2026-08-30): the site content is not ready to be
+    # public, and the app's move to squallar.app does not wait for it. `false &&`
+    # rather than deleting the job, so un-holding it is a one-word change and
+    # everything below stays reviewed and current. The squallar.com bucket and
+    # distribution stay applied and empty meanwhile.
+    if: false && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -985,19 +1061,30 @@ jobs:
           echo "ok: $n file(s)"
           find www -type f | sort | sed 's/^/  /'
 
-      # The page references screenshots by name. A missing one is a broken image
-      # on the landing page rather than a build failure, which is exactly the
-      # kind of thing nobody notices until someone else does -- so name them.
-      - name: Warn on screenshots the page references but the tree lacks
+      # The page references screenshots by name, and a missing one is a broken
+      # image or a dead video on the landing page.
+      #
+      # THIS FAILS THE BUILD, and it used to warn. A warning is invisible on a
+      # green run, which is exactly the wrong shape for "the marketing site is
+      # publicly broken". It also matched only `.png` while the page has never
+      # referenced a single one: every shot is `.webp` and every loop is
+      # `.mp4`, so the check had nothing to say no matter what was missing.
+      - name: Refuse to publish a page referencing assets the tree lacks
         run: |
           missing=0
-          for ref in $(grep -oE 'screenshots/[A-Za-z0-9._-]+\.png' www/index.html | sort -u); do
+          checked=0
+          for ref in $(grep -oE 'screenshots/[A-Za-z0-9._-]+\.(png|webp|mp4|jpg|svg)' www/index.html | sort -u); do
+            checked=$((checked + 1))
             if [ ! -f "www/$ref" ]; then
-              echo "::warning::www/index.html references $ref, which is not in the tree"
+              echo "::error::www/index.html references $ref, which is not in the tree"
               missing=$((missing + 1))
             fi
           done
-          echo "$missing referenced screenshot(s) missing"
+          # A zero-reference answer means the pattern stopped matching, not that
+          # the page is clean -- the failure mode this check just came out of.
+          test "$checked" -ge 1 || { echo "::error::no screenshot references found; the check is broken"; exit 1; }
+          echo "checked $checked referenced asset(s)"
+          test "$missing" -eq 0 || exit 1
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -1005,6 +1092,10 @@ jobs:
           role-to-assume: arn:aws:iam::803205869942:role/github-actions-squallar
           aws-region: us-east-1
 
+      # `--delete`, so a screenshot dropped from the tree leaves the bucket too.
+      # Content types come from the extension; `.mp4` and `.webp` are both known
+      # to the CLI's table, and a video served as `application/octet-stream`
+      # would download instead of play.
       - name: Sync to S3
         run: aws s3 sync --delete www/ s3://squallar-com-origin/
 

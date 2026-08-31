@@ -43,7 +43,7 @@ init()
      * Rayon's threads (WS3b). `initThreadPool` spawns `squallarRayonThreads()`
      * NESTED Workers over this worker's own shared linear memory, which needs
      * cross-origin isolation -- the CloudFront Response Headers Policy on
-     * rustdar.mcswain.dev emits COOP `same-origin` + COEP `require-corp`.
+     * squallar.app emits COOP `same-origin` + COEP `require-corp`.
      *
      * The failure arm is a fallback and not a `fatal`. `squallar_radar::par` is
      * rayon on every target now, so a worker with NO global pool panics on the

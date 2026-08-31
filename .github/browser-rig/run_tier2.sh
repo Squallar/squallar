@@ -79,7 +79,7 @@
 # WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
 # launched with --coep on every pass, because the shipped app needs a
 # SharedArrayBuffer to put rayon's pool on and production serves the headers
-# (CloudFront Response Headers Policy on rustdar.mcswain.dev). The gate then
+# (CloudFront Response Headers Policy on squallar.app). The gate then
 # asserts the pool exists -- `--expect-rayon-threads 2` -- which is what keeps
 # the header honest: the app degrades to a one-thread pool silently, and every
 # other assertion here passes in that state.
@@ -220,7 +220,7 @@ GECKODRIVER="$RIG_GECKODRIVER"
 # `--coep` is a DEFAULT as of WS3b, not an opt-in. The shipped app needs
 # cross-origin isolation to have a `SharedArrayBuffer` to build rayon's pool
 # on, and production supplies it (CloudFront Response Headers Policy on
-# rustdar.mcswain.dev, COOP `same-origin` + COEP `require-corp`). A rig that
+# squallar.app, COOP `same-origin` + COEP `require-corp`). A rig that
 # served the bundle WITHOUT the headers would be gating a configuration this
 # app is never deployed in, and -- worse -- one it degrades into silently:
 # every other Tier-2 assertion passes against the one-thread fallback. Paired

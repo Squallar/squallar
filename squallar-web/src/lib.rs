@@ -27,7 +27,7 @@
 //! `SharedArrayBuffer`, so `squallar_web::rayon_pool` falls back to one thread
 //! and the app runs — just at the speed the table below calls "before".
 //! `python3 -m http.server` sends no such headers. Production does (CloudFront
-//! Response Headers Policy on rustdar.mcswain.dev).
+//! Response Headers Policy on squallar.app).
 //!
 //! Measure in `--release`: workspace code is `opt-level = 0` in dev and radar
 //! rasterization is ~2.5x slower there.

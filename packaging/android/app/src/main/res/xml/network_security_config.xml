@@ -139,9 +139,10 @@
 
     <!-- The web deploy, which native fetches exactly one asset from: the NWS
          zone-geometry pack (squallar::platform::ZONE_PACK_URL), downloaded
-         once and kept beside the zone cache. Moves at the squallar.app
-         cutover with build.yaml's deploy-cloudfront literals. -->
+         once and kept beside the zone cache. Moved here from
+         rustdar.mcswain.dev at the 2026-08-30 cutover, in the same change as
+         build.yaml's deploy-cloudfront literals. -->
     <domain-config cleartextTrafficPermitted="false">
-        <domain includeSubdomains="true">rustdar.mcswain.dev</domain>
+        <domain includeSubdomains="true">squallar.app</domain>
     </domain-config>
 </network-security-config>

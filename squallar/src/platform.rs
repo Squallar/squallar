@@ -14,13 +14,13 @@ type InsetsQuerier = fn() -> (f32, f32, f32, f32);
 /// (`squallar-web/zones.pack`, staged beside `index.html` by `build.yaml`'s
 /// `web-wasm32` row). Native targets download it from here once, keep it
 /// beside the zone cache, and read the file thereafter; the web build resolves
-/// the same asset relative to its own page instead. Verified serving 2026-08-29
-/// (200, 3,865,522 bytes — the committed pack, byte for byte).
+/// the same asset relative to its own page instead.
 ///
-/// A fifth literal for the squallar.app cutover: `deploy-cloudfront` in
-/// `build.yaml` names the four that move together, and this one moves with
-/// them.
-pub const ZONE_PACK_URL: &str = "https://rustdar.mcswain.dev/zones.pack";
+/// The fifth literal of the squallar.app cutover (2026-08-30): it moved in the
+/// same change as `deploy-cloudfront`'s role, bucket and distribution, because
+/// a native build that downloads its pack from an origin the deploy no longer
+/// writes would pin users to whatever bytes the tombstone leaves behind.
+pub const ZONE_PACK_URL: &str = "https://squallar.app/zones.pack";
 
 /// Point zone resolution at the deployed pack — the native mirror of
 /// `squallar-web`'s `name_the_zone_pack`. Called once by each entry point,
