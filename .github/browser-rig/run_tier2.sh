@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # run_tier2.sh -- the Tier-2 browser gate: serve the built squallar-web bundle
-# on a fresh port and drive the full PWA in Chromium and Firefox. THREE
-# passes per browser (the roster grew at WO-5; any report quoting the old
-# "4/4" leg count predates the gesture leg):
+# on a fresh port and drive the full PWA in Chromium and Firefox. FOUR
+# passes per browser (the roster grew at WO-5 and again on 2026-08-31; a
+# report quoting the old "4/4" leg count predates the gesture leg, and one
+# quoting "three passes" predates the long leg):
 #
 #   live      the app against LIVE network; asserts boot, canvas non-blank,
 #             rAF sane, zero panics/errors, AND the worker wire: >=1
@@ -26,6 +27,26 @@
 #             in this gate. This is WO-1's deferred mechanical non-vacuity
 #             check: driven frames really tag as interaction, end to end
 #             through the browser's input pipeline.
+#   long      A HUNDRED AND FIFTY seconds of scripted time with an overlay
+#             LOOP playing and
+#             NO input at all, asserting --expect-frame-progress: the app's own
+#             cumulative `frame cadence` count was still climbing over the last
+#             20 s of the leg. Every other leg here is under 30 s and every
+#             other liveness check is a pixel or a rAF delta, and that
+#             combination hid a shipped freeze for the length of a campaign. A
+#             98 MB infallible allocation in the MRMS decoder aborted the
+#             module against wasm32's 1 GiB memory ceiling, and because this
+#             target is `panic-strategy = "abort"` nothing unwound: winit's web
+#             event loop kept its own `RefCell` borrowed for the life of the
+#             page. The frame loop stopped for good while the canvas held its
+#             last painted frame, rAF kept firing at display rate and the
+#             network kept resolving, so Tier-2 read panics=0 on all six legs
+#             of the build that did it. THE ONLY THING THAT CAN SEE THAT IS
+#             THE APP'S OWN COUNTER STILL MOVING -- a screenshot cannot and
+#             neither can rAF. The leg also fails on a wasm TRAP (`unreachable
+#             executed`, or an unhandled rejection carrying a wasm stack),
+#             which on this target is a DIFFERENT signal from a panic and was
+#             gated nowhere before.
 #
 # Network posture (campaign-resolved): LIVE network, one auto-retry per pass
 # as the flake-quarantine policy -- the app's own backoff machinery is part of
@@ -215,6 +236,32 @@ PY=python3
 # count as never-written and fails naming the missing seed.
 SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
+# The `long` leg's scene, and every part of it is load-bearing. `Mrms` is the
+# layer whose decoder held the 98 MB infallible allocation; `Gmgsi` is 60 MB a
+# granule and rides the same 1 GiB ceiling; `loop_playback: playing` is what
+# asks for granule after granule with nobody touching the page, which is all it
+# takes to reach that ceiling. NO gesture script and no W3C actions: the freeze
+# this leg exists to catch does not need input, and a leg that needed input
+# would have said the defect belonged to the harness.
+#
+# ALL SEVENTEEN LAYERS, and that is measured rather than thorough-by-habit. A
+# five-layer version of this same scene (Radar/Mrms/Gmgsi/BasemapTiles/
+# RadarSites) at 90 s was run against the unfixed bundle on both browsers on
+# 2026-08-31 and PASSED both, with the frame counter gaining 724 and 775 frames
+# over its last 20 s -- a green leg over a defect that was live in the build it
+# was driving. The seventeen-layer scene reached the abort on 4 of 4 legs. A
+# gate is the scene that fails, not the scene that is tidy.
+LONG_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{\"ModelData\":true,\"SpcOutlook\":true,\"Radar\":true,\"SpcDiscussions\":true,\"NwsAlerts\":true,\"StormReports\":true,\"Lightning\":true,\"Metar\":true,\"CityLabels\":true,\"RadarSites\":true,\"UserLocation\":true,\"ColorScale\":true,\"SpcFireOutlook\":true,\"Mrms\":true,\"Gmgsi\":true,\"Terrain\":true,\"BasemapTiles\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+
+# Scripted seconds in the `long` leg, and the window its progress assert diffs
+# over. 10 + 140 = 150 s, and the 140 is measured too: on the unfixed bundle
+# the abort landed 121.8 s (Firefox) and 122.1 s (Chromium) after boot on this
+# scene, so a 90 s leg stops before the thing it is looking for happens. The
+# spread over other scenes ran from 7.3 s upward; 150 s clears the top of it.
+LONG_SETTLE="${RIG_LONG_SETTLE:-10}"
+LONG_WINDOW="${RIG_LONG_WINDOW:-140}"
+LONG_PROGRESS_WINDOW="${RIG_LONG_PROGRESS_WINDOW:-20}"
+
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
 EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
@@ -323,7 +370,7 @@ start_server() {
   : > "$ready_file"
   "$PY" "$RIG_DIR/serve.py" --dir "$WEB_DIR" --port 0 \
       --log "$OUT_DIR/serve.log" \
-      --seed-local-storage "$SEED_LS" \
+      --seed-local-storage "${SEED:-$SEED_LS}" \
       "$@" ${SERVE_EXTRA[@]+"${SERVE_EXTRA[@]}"} \
       > "$ready_file" 2>> "$OUT_DIR/serve.stderr" &
   SERVER_PID=$!
@@ -363,17 +410,26 @@ if [ ${#EXTRA[@]} -gt 0 ]; then
   echo "drive.py extra args: ${EXTRA[*]}"
 fi
 
-# run_pass <browser> <tag> <leg live|doctored|gesture>: one server + one
+# run_pass <browser> <tag> <leg live|doctored|gesture|long>: one server + one
 # drive.py run.
 run_pass() {
   local browser="$1" tag="$2" leg="$3"
-  local driver server_args=() drive_args=()
+  local driver server_args=() drive_args=() SEED=""
   case "$browser" in
     chromium) driver="$CHROMEDRIVER" ;;
     firefox)  driver="$GECKODRIVER" ;;
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
-  if [ "$leg" = gesture ]; then
+  if [ "$leg" = long ]; then
+    # Ninety seconds, an overlay loop, nobody touching the page, and one
+    # assert: the app's own frame counter was still moving at the end of it.
+    # The worker-wire waits stay on the live leg -- this leg asks whether the
+    # frame loop is ALIVE after a minute and a half, and stacking the boot-time
+    # assertions onto it would only make a slow leg slower.
+    SEED="$LONG_SEED_LS"
+    drive_args+=(--settle "$LONG_SETTLE" --data-window "$LONG_WINDOW"
+                 --expect-frame-progress "$LONG_PROGRESS_WINDOW")
+  elif [ "$leg" = gesture ]; then
     # The short leg: real W3C-actions input, and ONE assert -- the interact
     # COUNT grew. None of the worker-wire waits ride here (the live leg owns
     # them); boot, canvas, rAF and zero-panics still gate inside drive.py.
@@ -429,7 +485,7 @@ run_pass() {
 overall=0
 TAGS=""
 for browser in $BROWSERS; do
-  for leg in live doctored gesture; do
+  for leg in live doctored gesture long; do
     if [ "$leg" = live ]; then
       tag="$browser"
     else
@@ -475,17 +531,33 @@ for tag in sys.argv[2:]:
     dr = r.get("doctored_respawn")
     ifr = r.get("interaction_frames")
     bmg = r.get("basemap_tiles")
+    fp = r.get("frame_progress")
     def tri(x):
         return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
     print("%-18s %s  boot=%s canvas=%sx%s raf[%s] canvas_blank=%s "
-          "errors=%s panics=%s round_trip=%s respawn=%s interact=%s "
-          "basemap=%s"
+          "errors=%s panics=%s traps=%s round_trip=%s respawn=%s interact=%s "
+          "basemap=%s frames_live=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
              v.get("booted"), b.get("clientWidth"), b.get("clientHeight"),
              raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
-             tri(wrt), tri(dr), tri(ifr), tri(bmg)))
+             v.get("wasm_trap_count"),
+             tri(wrt), tri(dr), tri(ifr), tri(bmg), tri(fp)))
+    if fp is not None:
+        # The long leg's own figure, and the only thing it gates on: how many
+        # frames the app's own counter gained over the last window, and how
+        # stale its newest reading was when the leg ended. A frozen page
+        # reports gained=None and a stale_ms in the tens of thousands.
+        print("%-18s   frames gained %s over the last %ss "
+              "(newest reading %s ms old, %s readings in window)"
+              % ("", fp.get("gained"), fp.get("window_s"),
+                 fp.get("stale_ms"), fp.get("in_window")))
+        if fp.get("error"):
+            print("%-18s   frame progress: %s" % ("", fp["error"]))
+    if v.get("first_wasm_trap"):
+        print("%-18s   first wasm trap: %s"
+              % ("", str(v["first_wasm_trap"]).splitlines()[0][:160]))
     if ifr is not None:
         # The gesture leg's own figure: a COUNT, and the only thing the leg
         # gates on. The wheel route is named because a synthesized fallback
