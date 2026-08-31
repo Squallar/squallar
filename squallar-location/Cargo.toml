@@ -196,7 +196,7 @@ objc2-core-location = { version = "=0.3.2", default-features = false, features =
 # pins — keep them in step).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "=0.2.126", optional = true }
-wasm-bindgen-futures = { version = "=0.4.76", optional = true }
+wasm-bindgen-futures = { version = "=0.4.77", optional = true }
 js-sys = { version = "=0.3.103", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]

@@ -100,7 +100,7 @@ wasm-bindgen-rayon = { version = "=1.3.0", default-features = false, features = 
 # installs a global pool for -- two rayons would mean two global pools and the
 # one that got built would not be the one being used.
 rayon = "=1.12.0"
-wasm-bindgen-futures = "=0.4.76"
+wasm-bindgen-futures = "=0.4.77"
 js-sys = "=0.3.103"
 console_error_panic_hook = "=0.1.7"
 console_log = "=1.1.0"
