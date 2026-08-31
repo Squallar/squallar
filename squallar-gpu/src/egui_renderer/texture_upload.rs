@@ -574,7 +574,9 @@ impl TextureUploads {
     /// does, with no device to move it with — the host-test seam for the
     /// classification. Calls the same [`UploadTotals::count_whole_write`] the
     /// real arm calls; the real path on a real adapter is
-    /// `a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle`.
+    /// `a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle`,
+    /// which is `#[ignore]`d because it needs an adapter -- run it with
+    /// `cargo test -p squallar-gpu --test raster_upload_gpu -- --ignored`.
     #[cfg(test)]
     pub fn note_whole_delta_for_test(&mut self, bytes: u64) {
         self.totals.deltas += 1;

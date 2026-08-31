@@ -253,7 +253,9 @@ fn an_idle_frame_is_told_there_is_nothing_new_to_report() {
 /// on the real path on a real adapter is
 /// `a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle`
 /// in `tests/raster_upload_gpu.rs`, which was run RED against the size-straddle
-/// classification before this arithmetic replaced it.
+/// classification before this arithmetic replaced it. That one is `#[ignore]`d
+/// because it needs an adapter, so the default row does not carry it -- run it
+/// with `cargo test -p squallar-gpu --test raster_upload_gpu -- --ignored`.
 #[test]
 fn the_band_straddle_does_not_decide_what_a_ringless_byte_is_called() {
     // Chromium's side: 7 570 000 B, under the band, moved whole.
