@@ -603,6 +603,22 @@ for tag in sys.argv[5:]:
     # becomes incomparable to every row before it.
     if scene in ("B", "E3"):
         print("ROW   %s" % scene_b_cols)
+        # The 3D floor path's own row, on the two scenes that draw a floor.
+        # `paints` is per pane per frame the strip drew and `mirror renders`
+        # per mirror pass encoded -- two denominators, never added, and
+        # neither is a term of `pictures` or of any upload figure. The causes
+        # overlap `paints` and each other: `key moves` is what the floor's
+        # content asked for, so paints far above it is a floor repainting for
+        # a reason that is not its content.
+        fl = r.get("floor_strip_totals")
+        if fl:
+            print("ROW   floor %s paints, %s mirror renders; asked %s key "
+                  "moves, %s on a stable key, %s incomplete"
+                  % (fl.get("paints"), fl.get("mirror_renders"),
+                     fl.get("key_moves"), fl.get("paints_on_stable_key"),
+                     fl.get("incomplete_paints")))
+        else:
+            print("ROW   floor unknown(no floor strips line)")
     if scene.startswith("E"):
         # The E-only denominators. Without these an E row is not an E row:
         # `layers` is how many loops were really running, and `resident` vs

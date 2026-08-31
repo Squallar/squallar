@@ -533,6 +533,15 @@ impl InputHarness {
         self.apply_facts();
     }
 
+    /// State the device's concurrent-render budget, as `present_frame` pushes
+    /// it from `Budgets`. `0` is the saturated device: every whole-picture
+    /// dispatch is refused, which is the arm the floor strip's completeness
+    /// latch exists for and the only way to reach it deterministically.
+    pub(crate) fn set_concurrent_renders(&mut self, limit: usize) {
+        self.facts.concurrent_renders = limit;
+        self.apply_facts();
+    }
+
     /// The harness's own egui context — for fixtures that must mint textures
     /// or tile sources against the context the frames actually run on.
     pub(crate) fn egui_ctx(&self) -> egui::Context {

@@ -1716,6 +1716,15 @@ impl super::Gui {
             user_fix_present: user_fix.is_some(),
         };
         let key = pane_render::ground_content_key(&key_inputs, draws_3d_ground);
+        // Read before `decide` writes it — the same comparison the ledger's
+        // cause counters make, kept per instance because the statics are
+        // process-global and the suites run in parallel.
+        #[cfg(test)]
+        let key_moved = self.floor_strips.asked_key(pane_idx) != Some(key);
+        #[cfg(test)]
+        if key_moved {
+            self.probes.strip_key_moves += 1;
+        }
         if !self.floor_strips.decide(pane_idx, key, ctx) {
             // The skip reuses the cached affine: nothing about the viewport
             // moved, or the key would have.
@@ -1802,6 +1811,12 @@ impl super::Gui {
         #[cfg(test)]
         {
             self.probes.strip_paints += 1;
+            if !key_moved {
+                self.probes.strip_paints_on_stable_key += 1;
+            }
+            if !complete {
+                self.probes.strip_incomplete_paints += 1;
+            }
         }
 
         self.map_pane_geo.get(&pane_idx).copied()
@@ -1870,6 +1885,12 @@ pub(super) struct FloorStrips {
     /// incomplete paint is permanently dirty, which is the latch that keeps
     /// a strip with pending tiles or owed rasters repainting.
     committed: std::collections::HashMap<usize, (u64, bool)>,
+    /// Per pane: the content key the strip was last *asked* under, written on
+    /// every frame the pane is reached — skipped frames included. Not
+    /// [`Self::committed`]'s key, which only moves on a frame that painted:
+    /// telling "the content is moving" from "something else is repainting
+    /// this" needs the ask, and the commit cannot answer it.
+    asked: std::collections::HashMap<usize, u64>,
     /// Repaint regardless of keys on the next frame: raised at birth, by
     /// `Gui::clear_graphics_state` (the mirror texture died with the
     /// device), by a mirror-plan change (the texture is about to be
@@ -1906,6 +1927,7 @@ impl Default for FloorStrips {
     fn default() -> Self {
         Self {
             committed: std::collections::HashMap::new(),
+            asked: std::collections::HashMap::new(),
             // The first frame has nothing committed and must paint.
             force: true,
             mode: StripFrameMode::Undecided,
@@ -1924,12 +1946,32 @@ impl FloorStrips {
         self.any_skipped = false;
         self.committed
             .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
+        self.asked
+            .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
     }
 
     /// Whether pane `pane_idx`'s strip paints this frame, under the
     /// all-or-nothing protocol. `ctx` is asked for a repaint on the deferral
     /// arm, so the forced frame actually arrives on a quiet app.
+    ///
+    /// **Also the one place the floor ledger's cause counters are written**,
+    /// because this is the only site that holds both the key the content
+    /// asked for and the verdict the cache reached; deriving either at the
+    /// paint site would need the other passed down beside it.
     fn decide(&mut self, pane_idx: usize, key: u64, ctx: &egui::Context) -> bool {
+        let key_moved = self.asked.insert(pane_idx, key) != Some(key);
+        if key_moved {
+            crate::floor_ledger::note_key_move();
+        }
+        let paints = self.decide_inner(pane_idx, key, ctx);
+        if paints && !key_moved {
+            crate::floor_ledger::note_paint_on_stable_key();
+        }
+        paints
+    }
+
+    /// [`Self::decide`] without the bookkeeping — the protocol itself.
+    fn decide_inner(&mut self, pane_idx: usize, key: u64, ctx: &egui::Context) -> bool {
         if self.mode == StripFrameMode::Repainting {
             return true;
         }
@@ -1954,6 +1996,9 @@ impl FloorStrips {
     /// Record what a painted strip painted under.
     fn commit(&mut self, pane_idx: usize, key: u64, complete: bool) {
         self.committed.insert(pane_idx, (key, complete));
+        if !complete {
+            crate::floor_ledger::note_incomplete_paint();
+        }
     }
 
     /// End the frame: publish whether the strips' primitives are in this
@@ -1968,6 +2013,13 @@ impl FloorStrips {
     /// Whether the pass that just ended painted the strips.
     pub(super) fn painted_this_pass(&self) -> bool {
         self.painted_this_pass
+    }
+
+    /// The key pane `pane_idx` was last asked under, for the per-instance
+    /// twin of the ledger's cause counters.
+    #[cfg(test)]
+    fn asked_key(&self, pane_idx: usize) -> Option<u64> {
+        self.asked.get(&pane_idx).copied()
     }
 
     /// Repaint everything on the next frame, whatever the keys say.

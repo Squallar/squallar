@@ -8,13 +8,13 @@
 //! languages, in two directories, and neither one's test suite compiles the
 //! other.
 //!
-//! Three of the four sentences are scraped and are pinned here. The
-//! `basemap tiles:` one is the only one the rig **gates** on with a single
-//! conjunct (`--expect-basemap-tiles`, `vector_tiles > 0`), so a drift there
-//! is not merely a `null` in a report: it is a gate that reads
-//! "the basemap decoded nothing" for every run until someone notices. The
-//! fourth, `floor strips:`, has no rig probe and so has nothing to be pinned
-//! against; if one is ever added, it is added here in the same shape.
+//! All four sentences are scraped and are pinned here. The `basemap tiles:`
+//! one is the only one the rig **gates** on with a single conjunct
+//! (`--expect-basemap-tiles`, `vector_tiles > 0`), so a drift there is not
+//! merely a `null` in a report: it is a gate that reads "the basemap decoded
+//! nothing" for every run until someone notices. `floor strips:` was the one
+//! with no rig probe and so nothing to be pinned against; it gained one with
+//! the floor cause counters, and is pinned here in the same shape.
 //!
 //! **This exact seam has already broken once during this work**, and in the
 //! worst possible way: a line-continuation backslash was eaten while writing
@@ -157,6 +157,25 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
          drifted. --expect-basemap-tiles will then read the basemap as \
          null, which it reports identically to a basemap that decoded \
          nothing -- the exact defect this gate was added for",
+    );
+
+    // Five more distinct values. The last three overlap `paints` and each
+    // other by construction, so a transposition here reads as a plausible
+    // line rather than an impossible one -- which is exactly why every
+    // position gets a value no other position could hold.
+    let floor = squallar_egui::floor_ledger::Totals {
+        strip_paints: 101,
+        mirror_renders: 202,
+        key_moves: 303,
+        paints_on_stable_key: 404,
+        incomplete_paints: 505,
+    };
+    assert_eq!(
+        super::floor_strip_line(&floor),
+        rendered(&pattern("floor_re"), &[101, 202, 303, 404, 505]),
+        "the `floor strips:` line and the rig's own probe for it have \
+         drifted. The rig reports the floor reading as unknown, which is \
+         what it also reports when no 3D floor was ever drawn",
     );
 }
 
