@@ -714,11 +714,52 @@ pub const WASM_TILE_DECODES_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
 /// stalls the map exactly when the machine is busiest, which is the failure
 /// this replaces rather than a different spelling of it.
 ///
-/// 2 ms against a 16.7 ms frame at 60 Hz. The pump runs once per layer and a
-/// standard configuration draws two, so the worst case a frame carries is
-/// 4 ms plus two takes — under a third of the frame, and the layers share one
-/// [`DecodeBudget`] per source so a second pass cannot re-bill it.
-const PUMP_TIME_BUDGET: Duration = Duration::from_millis(2);
+/// **1 ms, and the value is chosen for wasm32, because that is the only
+/// target it binds on.** The pump runs once per layer and a standard
+/// configuration draws two, so a frame's worst case is twice this plus two
+/// takes; the layers share one [`DecodeBudget`] per source, so a second pass
+/// cannot re-bill it.
+///
+/// A native take is an `LruCache::put` costing microseconds, so neither 1 ms
+/// nor 2 ms is ever reached there and the count is what bounds a native pump.
+/// A wasm32 take is a PNG decode and a texture upload costing milliseconds, so
+/// this is the bound that actually fires — and halving it halves the worst
+/// case on the target that needs it most.
+///
+/// **What the value governs is bursts, not steady state**, because the first
+/// take is unconditional. A pump runs once per layer and a standard
+/// configuration draws two, so every frame moves at least two tiles however
+/// small this is — of the order of what [`MAX_PARALLEL_DOWNLOADS`] concurrent
+/// fetches deliver, so in steady state the floor is already keeping up and
+/// this bound is not what the map is waiting on. It binds only against a
+/// backlog, and `tile_rx` holds at most [`MAX_PARALLEL_DOWNLOADS`] of those:
+/// at one take per pump — which is what 1 ms means when a take is a
+/// multi-millisecond tessellation — a full queue clears in six frames, 100 ms
+/// at 60 Hz. That is the whole cost of the smaller number, and against it the
+/// frame carries 1 ms per layer instead of 2.
+///
+/// **Measured, and it is not the whole story.** Native scene A interact p50
+/// sits one histogram bin above the pre-WO-10 build: 26,909 us against
+/// 32,000 us, base 3/3 and this build 2/2 across legs under loadavg 10,
+/// counterbalanced base/head/head/base, viewport 1920x1080 verified by pid at
+/// 17.97 MB/picture on every row. That gap did **not** move when this constant
+/// went 2 ms -> 1 ms, which is what proves it is not this value's: on native
+/// the bound never binds. What the gap is, is the pump draining on every frame
+/// at all where WO-9e had it draining on none — up to
+/// [`NATIVE_TILE_UPLOADS_PER_PUMP`] puts per layer per frame, each bumping
+/// `put_generation` and so repainting the floor strip. The `pump` frame
+/// segment carries it: p99 median 6,728 us base against 9,514 us here, the
+/// same one bin.
+///
+/// **This is the receipt for worker-side tile decode (C5p2), which was
+/// deferred as measurement-conditional and now has its measurement.** The bin
+/// is buyable back, and only one way: by making a *take* cheaper. It cannot be
+/// tuned away from here, because the bound this constant sets is never the one
+/// that binds on the arm the regression was measured on — a smaller number
+/// changes nothing, which is the experiment above. Off-thread decode is the
+/// change that would, and a future reader should find this note rather than
+/// re-derive it.
+const PUMP_TIME_BUDGET: Duration = Duration::from_millis(1);
 
 /// Completed fetches one [`HttpsTiles::pump`] moves into the cache, native
 /// only.
