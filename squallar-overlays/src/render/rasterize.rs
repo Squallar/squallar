@@ -1541,21 +1541,57 @@ pub fn rasterize_gridded(
     }
     let win_w = win.i1 - win.i0;
 
-    // Pre-project once: the cell loop reads each neighbour several times.
-    let mut px_coords: Vec<(f32, f32)> = Vec::with_capacity(win_w * (win.j1 - win.j0));
-    for j in win.j0..win.j1 {
+    // One row of the window, projected. The cell loop reads each neighbour
+    // several times, so the row it is on and the two beside it are pre-projected
+    // rather than recomputed per read.
+    let project_row = |j: usize, row: &mut Vec<(f32, f32)>| {
+        row.clear();
+        row.reserve(win_w);
         for i in win.i0..win.i1 {
             match coords.at(j * ni + i) {
-                Some((lat, lon)) => px_coords.push(mb.project(lat, lon, w, h)),
-                None => px_coords.push((f32::NAN, f32::NAN)),
+                Some((lat, lon)) => row.push(mb.project(lat, lon, w, h)),
+                None => row.push((f32::NAN, f32::NAN)),
             }
         }
-    }
-    // Every read below is inside `win`; `interior` is what guarantees it.
-    let at = |i: usize, j: usize| px_coords[(j - win.j0) * win_w + (i - win.i0)];
+    };
+
+    // **Three rows, never the window.** Sizing a cell reads `(i±1, j)` and
+    // `(i, j±1)` and nothing else, so row `j` needs `j-1` and `j+1` beside it
+    // and no more. Holding the whole window instead cost a `(f32, f32)` per
+    // grid point, and the window is what *zoom* moves: a tight view over one
+    // state projects a few thousand points, a view zoomed out until a CONUS
+    // mosaic fits projects all 24 500 000 of them — 196 MB in one infallible
+    // `Vec::with_capacity`, which on wasm32 is `handle_alloc_error` against the
+    // 1 GiB module ceiling and a trap that nothing unwinds. The band is 168 KB
+    // at that same width. Gated by `tests/gridded_projection_band.rs`.
+    //
+    // `band[j % 3]` holds grid row `j`: the loop advances one row at a time and
+    // the three live rows are consecutive, so their residues never collide.
+    let mut band: [Vec<(f32, f32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut projected_to: Option<usize> = None;
 
     let draw = win.interior(ni, nj);
     for j in draw.j0..draw.j1 {
+        // Every read below is inside `win`; `interior` is what guarantees it,
+        // and it is what bounds this range to rows the window really carries.
+        let lo = j.saturating_sub(1).max(win.j0);
+        let hi = (j + 1).min(win.j1 - 1);
+        let first = match projected_to {
+            Some(done) if done + 1 > lo => done + 1,
+            _ => lo,
+        };
+        for row in first..=hi {
+            project_row(row, &mut band[row % 3]);
+        }
+        projected_to = Some(hi);
+
+        let here = &band[j % 3];
+        // `j - 1` and `j + 1` modulo three, read behind the same `j > 0` and
+        // `j + 1 < nj` guards the whole-window buffer was read behind.
+        let above = &band[(j + 2) % 3];
+        let below = &band[(j + 1) % 3];
+        let at = |i: usize| here[i - win.i0];
+
         for i in draw.i0..draw.i1 {
             let Some(value) = input.value_at(i, j) else {
                 continue;
@@ -1565,7 +1601,7 @@ pub fn rasterize_gridded(
                 continue;
             }
 
-            let (cx, cy) = at(i, j);
+            let (cx, cy) = at(i);
             if cx.is_nan() || cy.is_nan() {
                 continue;
             }
@@ -1573,31 +1609,31 @@ pub fn rasterize_gridded(
             // Half-extents from neighbour spacing. 0.55, not 0.50: a slight
             // overlap hides seams between adjacent cells.
             let dx_left = if i > 0 {
-                let (nx, _) = at(i - 1, j);
+                let (nx, _) = at(i - 1);
                 ((cx - nx).abs() * 0.55).max(0.5)
             } else if i + 1 < ni {
-                let (nx, _) = at(i + 1, j);
+                let (nx, _) = at(i + 1);
                 ((nx - cx).abs() * 0.55).max(0.5)
             } else {
                 1.0
             };
             let dx_right = if i + 1 < ni {
-                let (nx, _) = at(i + 1, j);
+                let (nx, _) = at(i + 1);
                 ((nx - cx).abs() * 0.55).max(0.5)
             } else {
                 dx_left
             };
             let dy_up = if j > 0 {
-                let (_, ny) = at(i, j - 1);
+                let (_, ny) = above[i - win.i0];
                 ((cy - ny).abs() * 0.55).max(0.5)
             } else if j + 1 < nj {
-                let (_, ny) = at(i, j + 1);
+                let (_, ny) = below[i - win.i0];
                 ((ny - cy).abs() * 0.55).max(0.5)
             } else {
                 1.0
             };
             let dy_down = if j + 1 < nj {
-                let (_, ny) = at(i, j + 1);
+                let (_, ny) = below[i - win.i0];
                 ((ny - cy).abs() * 0.55).max(0.5)
             } else {
                 dy_up
