@@ -196,10 +196,24 @@ pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
 /// The wasm32 arm of [`TILE_CACHE_ENTRIES`]. All three arms are named outside
 /// the cascade because this workspace runs `cargo test` on one arm, so the other
 /// two are only reachable from a test if they have names.
-pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(96).expect("96 is not zero");
+///
+/// **96 -> 100 at WO-10**, when `draw_tile_layer` started keeping the
+/// [`crate::tiles::WARM_ANCESTOR_STEPS`] net resident beside the level it
+/// draws. The working set is the drawn count plus the net's, and at 1920x1200
+/// — the canvas this arm is quoted against — that is 96 + 4. The arm had been
+/// sitting exactly on 96, so leaving it there would have made the net evict the
+/// glass, which is the broken-cache failure `6345952f` fixed and not a smaller
+/// version of it. 100 costs 61.5 MiB of vector worst case per source against
+/// the old 59.0, so the four-live-source figure the budget note below prices is
+/// 245.8 MiB against `WASM_APP_TEXTURE_BUDGET_BYTES`' 288 MiB: still under, by
+/// less than it was. The full parent level was the alternative and it is the
+/// reason the net is four steps out rather than one — 131 entries, 322 MiB,
+/// over the budget.
+pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(100).expect("100 is not zero");
 /// The mobile arm — the largest handheld working set, not a fraction of the
-/// desktop figure. See [`WASM_TILE_CACHE_ENTRIES`].
-pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(96).expect("96 is not zero");
+/// desktop figure. See [`WASM_TILE_CACHE_ENTRIES`], including the WO-10 move.
+pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(100).expect("100 is not zero");
 /// The desktop arm — pinned from below at 242 by `squallar_gpu`'s
 /// `MIRROR_SCALE_MAX`, not by the byte budget. See [`WASM_TILE_CACHE_ENTRIES`].
 pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
@@ -1609,6 +1623,44 @@ impl HttpsTiles {
         self.cached_or_interpolated(tile_id)
     }
 
+    /// Ask for `tile_id` without drawing it — the ancestor net.
+    ///
+    /// [`Self::ground_at`] asks only for the level it is drawing, and
+    /// [`Self::cached_or_interpolated`] can only answer a miss with something
+    /// *shallower* than the tile asked for. Together those two mean a zoom-out
+    /// has nothing to draw: the tiles it was just looking at are descendants of
+    /// what it now wants, no shallower level was ever requested, and the walk
+    /// runs to zoom 0 finding nothing. The pane draws a hole for every cell —
+    /// the black screen — until the network answers.
+    ///
+    /// So the shallow level is requested too, every frame, by
+    /// `ui_map_overlays::draw_tile_layer`. It is prediction rather than repair:
+    /// the fetch is off-thread on both targets, and by the time a zoom-out
+    /// arrives the net is already resident and every cell has an ancestor to
+    /// stretch. See [`crate::tiles::WARM_ANCESTOR_STEPS`] for why the net sits
+    /// four steps out rather than one.
+    ///
+    /// Cheap to call every frame by construction: [`Self::request_once`]
+    /// returns on an LRU hit at the current style generation, so a warm tile
+    /// costs one probe after its first fetch — and the probe is what keeps the
+    /// net's recency fresh, which is what stops the LRU evicting the one thing
+    /// standing between the user and a hole.
+    pub(crate) fn warm(&mut self, tile_id: TileId) {
+        if !tile_id_is_valid(tile_id) {
+            return;
+        }
+        // A net deeper than the source goes is not a net; the drawn level is
+        // already clamped to this and the net is shallower still, so this only
+        // ever fires for a source whose header has not landed.
+        if self
+            .source_max_zoom()
+            .is_none_or(|deepest| tile_id.zoom > deepest)
+        {
+            return;
+        }
+        self.request_once(tile_id);
+    }
+
     /// The source's deepest zoom, so a consumer picking its own zoom level
     /// (`ui_map_overlays`' tile pass, when a zoom bias asks for a level deeper
     /// than the pane's own) can clamp to what this source can serve.
@@ -1666,9 +1718,15 @@ impl HttpsTiles {
 
     /// Whether `tile_id` currently occupies a slot, pending and failed markers
     /// included. A peek, not a use: `LruCache::contains` leaves the recency
-    /// order alone. Test-gated like [`Self::cached_entries`].
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    fn tile_is_cached(&self, tile_id: TileId) -> bool {
+    /// order alone.
+    ///
+    /// `cfg(test)` alone, NOT the `all(test, not(wasm32))` its neighbour
+    /// [`Self::cached_entries`] carries, and for the reason
+    /// [`Self::put_for_test`] gives: `ui_map_overlays`' seam tests read it to
+    /// hold the ancestor net's request at the call site, and that module's
+    /// tests compile on the wasm32 test target too. The body is portable.
+    #[cfg(test)]
+    pub(crate) fn tile_is_cached(&self, tile_id: TileId) -> bool {
         self.cache.contains(&tile_id)
     }
 
