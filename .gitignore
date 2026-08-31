@@ -29,4 +29,8 @@
 # The hardware arm's, same rule. Its default is out-gpu/, and RIG_OUT_DIR
 # names variants (out-gpu-webgpu/ and so on), so the whole family is ignored.
 /.github/browser-rig/out-gpu*/
+# The measurement arm's, same rule again. run_measure.sh defaults to
+# out-measure/ and this was simply missing -- a default-invocation run left its
+# per-leg JSON, screenshots and driver logs staged as untracked files.
+/.github/browser-rig/out-measure*/
 /.github/browser-rig/__pycache__/

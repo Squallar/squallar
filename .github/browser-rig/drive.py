@@ -84,6 +84,7 @@ Typical use (see run_smoke.sh for the orchestrated version):
 
 import argparse
 import base64
+import errno
 import json
 import os
 import shutil
@@ -99,6 +100,40 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections import Counter
+
+# ---------------------------------------------------------------------------
+# EXIT CODES, and the reason there are four of them rather than two
+# ---------------------------------------------------------------------------
+#
+# A wrapper reading only "zero or not" cannot tell "the leg ran and the app
+# failed" from "this process never got as far as opening a browser", and that
+# is not a theoretical distinction: on 2026-08-31 a rebase dropped the commit
+# that added `--expect-frame-progress`, argparse rejected the flag, twelve legs
+# died in under a second each, and the launcher went on to read whatever JSON
+# was already on disk and reported all twelve as PASS. A usage error and a red
+# leg both exited 2, so nothing downstream could have told them apart.
+#
+# 64 and 69 are sysexits.h's EX_USAGE and EX_UNAVAILABLE. They are outside the
+# range any assertion in here produces, so a wrapper can switch on them.
+EXIT_PASS = 0
+# The leg ran and something it asserts on was false, or the driver wire broke
+# mid-leg. A RESULT EXISTS; read the JSON for which assertion it was.
+EXIT_LEG_FAILED = 2
+# The command line was wrong -- an unknown flag, a missing required pair, a
+# mode that needs a tool that is not installed. NOTHING RAN and no result was
+# written. This is fatal to the whole run, not to one leg: every other leg is
+# about to be handed the same argument list and die the same way.
+EXIT_USAGE = 64
+# The BOX failed, not the app: no space left, quota exceeded. Also nothing
+# usable ran, but the distinction from EXIT_USAGE matters because the repair is
+# somewhere else entirely.
+EXIT_INFRA = 69
+
+# The errnos that mean "the filesystem, not the code". EDQUOT is the one that
+# actually fired: a full disk raised `OSError: [Errno 122] Disk quota exceeded`
+# from inside a `print()` during teardown, escaped as an unhandled traceback,
+# and was reported as a failed leg.
+INFRA_ERRNOS = (errno.ENOSPC, errno.EDQUOT)
 
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 DEFAULT_CHROMEDRIVER = "/usr/bin/chromedriver"
@@ -1899,6 +1934,22 @@ def wait_boot(session, timeout=90.0, interval=0.4):
     return probe, time.monotonic() - t0, True
 
 
+def _buffer_size(result):
+    """The canvas DRAWING BUFFER this leg actually rendered at, as `WxH`.
+
+    The buffer and not `clientWidth`: CSS pixels are what the page was laid out
+    in, device pixels are what was rasterized, and on a DPR that is not 1 they
+    are different numbers. Every per-leg figure -- raster bytes, texture
+    uploads, frame times -- is a figure PER THIS SIZE, so it travels in the
+    verdict rather than being recoverable only by digging through the probe.
+    """
+    b = (result.get("canvas_final")
+         or (result.get("boot") or {}).get("probe") or {})
+    if not b or not b.get("bufferWidth"):
+        return None
+    return "%sx%s" % (b.get("bufferWidth"), b.get("bufferHeight"))
+
+
 def fit_canvas(session, target, window, attempts=5):
     """Resize the browser window until the canvas DRAWING BUFFER is `target`.
 
@@ -2548,6 +2599,11 @@ def run_smoke(args):
 
     result = {
         "tag": tag, "browser": args.browser, "url": args.url,
+        # Beside the tag, because it is the tag's missing half. The tag says
+        # WHICH leg this is; the run id says WHICH RUN OF IT, and only the
+        # second one can distinguish this file from the one the last run left
+        # behind under the same name.
+        "run_id": args.run_id,
         # First field after the tag on purpose. Every cap below is a property
         # of the adapter this arm reached, and a reader who does not know
         # which arm ran cannot use any of them.
@@ -3062,11 +3118,38 @@ def run_smoke(args):
 
         fp_ok = (result.get("frame_progress") is None
                  or bool((result.get("frame_progress") or {}).get("ok")))
+        # THE CANVAS THIS LEG ACTUALLY GOT, asserted rather than requested.
+        # `fit_canvas` has always returned `met`, and until 2026-08-31 nothing
+        # read it: a leg could ask for 2878x1651, be handed 1280x815 because
+        # the window manager or the Xvfb screen would not go that big, and
+        # report PASS while its row implied a size it never rendered at. A
+        # size-specific defect -- and there is one: the app dies on a winit
+        # `RefCell already borrowed` panic at 2878x1651 and survives at
+        # 1280x815 -- is invisible to a leg that quietly ran small.
+        ct = result.get("canvas_target")
+        cv_ok = None
+        if args.expect_canvas:
+            if ct is None:
+                cv_ok = False
+                result["canvas_expect"] = {
+                    "ok": False,
+                    "error": "--expect-canvas without --canvas: there is no "
+                             "target to have met"}
+            else:
+                cv_ok = bool(ct.get("met"))
+                result["canvas_expect"] = {
+                    "ok": cv_ok, "asked": ct.get("asked"), "got": ct.get("got"),
+                    "error": (None if cv_ok else
+                              "canvas drawing buffer is %s, not the %s this "
+                              "leg asked for -- every figure and every verdict "
+                              "on this row describes the WRONG SIZE"
+                              % (ct.get("got"), ct.get("asked")))}
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
                           and not traps and fp_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
+                          and cv_ok is not False
                           and hw_ok is not False)
         result["verdict"] = {
             "arm": args.arm,
@@ -3087,6 +3170,13 @@ def run_smoke(args):
                                 if traps else None),
             "frame_progress_ok": (None if result.get("frame_progress") is None
                                   else bool(result["frame_progress"]["ok"])),
+            # The SIZE this row's every other number is a figure for. A leg
+            # that passed at 1280x815 and one that passed at 2878x1651 are not
+            # the same evidence, and a summary that does not say which is which
+            # cannot be read.
+            "canvas_buffer": _buffer_size(result),
+            "canvas_target_met": (None if ct is None else bool(ct.get("met"))),
+            "canvas_ok_expected": cv_ok,
             "page_blank": shots["page"].get("blank"),
             "canvas_blank": canvas_blank,
             "worker_round_trip_ok": (None if wrt is None
@@ -3111,9 +3201,17 @@ def run_smoke(args):
             # on it, and `null` distinguishes "never observed" from "one".
             "rayon_threads": (None if rp is None else rp.get("threads")),
         }
-        exit_code = 0 if result["pass"] else 2
+        exit_code = EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
 
     except Exception as e:
+        # A full disk is the BOX failing, not the app, and it is re-raised
+        # rather than filed here: what this leg was asserting is UNKNOWN, it
+        # neither passed nor failed, and `_run_cli` turns it into EXIT_INFRA so
+        # the launcher can say so. Filing it as a leg failure (which is what
+        # happened on 2026-08-31) sends a reader hunting a rendering bug that
+        # does not exist.
+        if isinstance(e, OSError) and e.errno in INFRA_ERRNOS:
+            raise
         result["failed_stage"] = (result["stages"][-1]["stage"]
                                   if result["stages"] else "init")
         result["exception"] = "".join(
@@ -3438,14 +3536,56 @@ def run_smoke(args):
     return exit_code
 
 
+class LoudArgumentParser(argparse.ArgumentParser):
+    """An argument parser whose refusal is impossible to scroll past.
+
+    argparse's own `error()` prints a twenty-five line usage block and then one
+    line naming the problem, and exits 2 -- the same code this rig uses for "the
+    leg ran and failed". Both halves of that were load-bearing in the 2026-08-31
+    incident: the wrapper could not tell the two apart by exit code, and a human
+    reading the log saw eight usage dumps and one real sentence buried in each.
+
+    So: the sentence comes FIRST, in a banner, with the exit code that says
+    which kind of failure this is; the usage block follows for whoever needs it.
+    """
+
+    def error(self, message):
+        sys.stderr.write(
+            "\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            "drive.py REFUSED ITS COMMAND LINE -- nothing ran, no result was\n"
+            "written, and no artefact on disk describes this invocation.\n"
+            "\n"
+            "  %s\n"
+            "\n"
+            "The usual cause is a rig commit that went missing: the launcher\n"
+            "passes a flag this copy of drive.py does not declare. Check that\n"
+            "run_tier2.sh and drive.py are from the SAME commit before\n"
+            "believing anything else in this log.\n"
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            "\n" % message)
+        self.print_usage(sys.stderr)
+        sys.exit(EXIT_USAGE)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(
+    ap = LoudArgumentParser(
         description="headless WebDriver smoke/measurement rig for squallar-web")
     ap.add_argument("--browser", choices=("chromium", "firefox", "safari"))
     ap.add_argument("--url")
     ap.add_argument("--out-dir", default="out")
     ap.add_argument("--tag", default=None, help="output file prefix "
                     "(default: browser name)")
+    ap.add_argument("--run-id", default=None,
+                    help="opaque token identifying THIS invocation. It is "
+                         "copied verbatim into the result JSON as `run_id`, "
+                         "and a launcher that passed one is expected to refuse "
+                         "any artefact that does not carry it back. Without "
+                         "it, nothing on disk ties a verdict to the run that "
+                         "produced it: a leg that never started leaves the "
+                         "previous run's JSON in place and every reader -- the "
+                         "summary block, a comparison script, a human -- reads "
+                         "the stale verdict as this run's")
     ap.add_argument("--driver", default=None,
                     help="driver binary (default: %s / geckodriver on PATH "
                          "then %s)" % (DEFAULT_CHROMEDRIVER, DEFAULT_GECKODRIVER))
@@ -3457,6 +3597,15 @@ def main(argv=None):
                          "records whether it did. Pixels, not the window, are "
                          "what the overlay picture is sized from, so this is "
                          "what makes two legs comparable")
+    ap.add_argument("--expect-canvas", action="store_true",
+                    help="FAIL the leg if --canvas was not met. Without this "
+                         "the target is a request: `met` is recorded and "
+                         "nothing reads it, so a leg that could not be made "
+                         "that big -- a window manager that refused, an Xvfb "
+                         "screen smaller than the target -- passes while every "
+                         "figure on its row silently describes a different "
+                         "size. Pass it on any leg whose whole point is the "
+                         "size it runs at")
     ap.add_argument("--frames", type=int, default=120,
                     help="rAF deltas per sample (default 120)")
     ap.add_argument("--settle", type=float, default=6.0,
@@ -3690,5 +3839,39 @@ def main(argv=None):
     return run_smoke(args)
 
 
+def _run_cli():
+    """`main()` with the box's own failures separated from the app's.
+
+    A full disk raises `OSError: [Errno 122] Disk quota exceeded` from wherever
+    the process next touches the filesystem -- which, observed on 2026-08-31,
+    was inside a `print()` during teardown, long after every assertion had
+    already passed. That escaped as an unhandled traceback and the launcher
+    filed it as a failed leg, sending a reader to look for a rendering bug that
+    was never there.
+
+    The message is best-effort and the EXIT CODE is not: if stderr is on the
+    same full filesystem the write fails too, and the code is then the only
+    thing that survives to say what happened.
+    """
+    try:
+        return main()
+    except OSError as e:
+        if e.errno not in INFRA_ERRNOS:
+            raise
+        try:
+            os.write(2, (
+                "\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "INFRASTRUCTURE FAILURE, not a leg failure: %s\n"
+                "The BOX ran out of room. Whatever this leg was asserting is\n"
+                "UNKNOWN -- it neither passed nor failed. Free space and run\n"
+                "it again; do not read this as a defect in the app.\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                % e).encode("utf-8", "replace"))
+        except OSError:
+            pass
+        return EXIT_INFRA
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run_cli())

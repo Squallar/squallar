@@ -328,6 +328,40 @@ GECKODRIVER="$RIG_GECKODRIVER"
 
 mkdir -p "$OUT_DIR"
 
+# --------------------------------------------------- binding the figures ----
+#
+# The same seam, and the same repair, as `run_tier2.sh` -- see the long block
+# beside its own `LEDGER=` for the incident. This summary had the identical
+# shape: `os.path.isfile(out/<tag>.json)` and then print that file's numbers,
+# with NOTHING tying the file to the run that just happened. A leg that died
+# before writing left the previous run's JSON under the same name and its
+# figures were reported as this run's.
+#
+# It matters MORE here than in the gate, not less. A stale verdict at least
+# looks like a verdict and a reader may sanity-check it; a stale FIGURE is a
+# plausible number in a comparison table, and the A/B lane that found this was
+# doing exactly that -- twelve legs, twelve reads of one file, every one
+# reporting `total_s=179.18`. Nothing about a row like that looks wrong. It was
+# caught because twelve identical three-minute timings are impossible, which is
+# not a mechanism.
+#
+# Same three mechanisms: a per-attempt run id the driver copies into the JSON
+# and this summary re-checks, artefacts wiped before the leg writes them, and
+# the driver's exit code recorded so "never ran" is not read as "ran".
+MEASURE_LEDGER="$OUT_DIR/measure-legs.tsv"
+: > "$MEASURE_LEDGER"
+
+new_run_id() {
+  local u=""
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+  fi
+  if [ -z "$u" ]; then
+    u="$(date -u +%Y%m%dT%H%M%S%N)-$$-${RANDOM}${RANDOM}"
+  fi
+  printf 'measure-%s' "$u"
+}
+
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
   echo "building squallar-web (wasm-pack, CARGO_BUILD_JOBS=4)"
@@ -432,9 +466,22 @@ if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
 fi
 
 # run_leg <browser> <scene>
+#
+# Sets LAST_RUN_ID / LAST_RC for the caller, which records one ledger row per
+# leg; the summary refuses any artefact that does not carry the id back.
+LAST_RUN_ID=""
+LAST_RC=0
 run_leg() {
   local browser="$1" scene="$2"
   local tag="$scene.$browser" driver seed
+  LAST_RUN_ID="$(new_run_id)"
+  LAST_RC=0
+  # Everything this tag can write goes first, so a missing file means this leg
+  # wrote nothing rather than "an older run's file is still here".
+  rm -f "$OUT_DIR/$tag.json" \
+        "$OUT_DIR/$tag.page.png" "$OUT_DIR/$tag.canvas.png" \
+        "$OUT_DIR/$tag.fail.png" "$OUT_DIR/$tag.driver.log" \
+        "$OUT_DIR/$tag.xvfb.log"
   case "$browser" in
     chromium) driver="$CHROMEDRIVER" ;;
     firefox)  driver="$GECKODRIVER" ;;
@@ -466,42 +513,71 @@ run_leg() {
   # whole loops inside it.
   "$PY" "$RIG_DIR/drive.py" \
       --browser "$browser" --url "$URL" \
-      --out-dir "$OUT_DIR" --tag "$tag" \
+      --out-dir "$OUT_DIR" --tag "$tag" --run-id "$LAST_RUN_ID" \
       --driver "$driver" --frames "$FRAMES" \
       --settle "$SETTLE" --data-window "$MEASURE_WINDOW" \
       --arm hardware --require-hardware \
       "${arm_args[@]}" \
       ${EXTRA[@]+"${EXTRA[@]}"}
   local rc=$?
+  LAST_RC="$rc"
   stop_server
   return "$rc"
 }
 
 overall=0
-TAGS=""
 for browser in $BROWSERS; do
   for scene in $SCENES; do
     echo
     echo "================ scene $scene / $browser ================"
-    TAGS="$TAGS $scene.$browser"
     run_leg "$browser" "$scene" || overall=1
+    printf '%s\t%s\t%s\n' "$scene.$browser" "$LAST_RUN_ID" "$LAST_RC" \
+        >> "$MEASURE_LEDGER"
   done
 done
 
 # -------------------------------------------------------------- summary ----
 echo
 echo "================ measure summary (NOT A GATE; no figure here gates) ================"
-"$PY" - "$OUT_DIR" "$COMMIT" "$PANEL" "$SCENE_B_COLS" $TAGS <<'EOF'
+"$PY" - "$OUT_DIR" "$COMMIT" "$PANEL" "$SCENE_B_COLS" "$MEASURE_LEDGER" <<'EOF'
 import json, os, sys
-out, commit, panel, scene_b_cols = sys.argv[1:5]
+out, commit, panel, scene_b_cols, ledger_path = sys.argv[1:6]
 
-for tag in sys.argv[5:]:
+legs = []
+with open(ledger_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        while len(parts) < 3:
+            parts.append("")
+        legs.append(dict(zip(("tag", "run_id", "rc"), parts)))
+
+for leg in legs:
+    tag, want = leg["tag"], leg["run_id"]
     p = os.path.join(out, tag + ".json")
     scene = tag.split(".", 1)[0]
     if not os.path.isfile(p):
-        print("ROW %-12s NO RESULT (%s missing)" % (tag, p))
+        print("ROW %-12s NO RESULT (%s missing; driver rc=%s). This leg "
+              "produced no figures -- it is not a row with bad numbers, it is "
+              "the absence of a row." % (tag, p, leg["rc"]))
         continue
-    r = json.load(open(p))
+    try:
+        r = json.load(open(p))
+    except Exception as e:
+        print("ROW %-12s NO RESULT (%s is unreadable: %s)" % (tag, p, e))
+        continue
+    got = r.get("run_id")
+    if got != want:
+        # THE STALE READ. Every number below would have been printed as this
+        # run's; in a comparison table nothing about them looks wrong.
+        print("ROW %-12s NO RESULT -- STALE ARTEFACT: %s carries run_id %r, "
+              "this leg was launched as %r. It was left by an EARLIER run "
+              "(started_utc=%s, total_s=%s) and its figures describe nothing "
+              "that happened just now."
+              % (tag, p, got, want, r.get("started_utc"), r.get("total_s")))
+        continue
     env = r.get("env") or {}
     ad = r.get("adapter") or {}
     v = r.get("verdict") or {}
