@@ -1746,26 +1746,35 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
 
     assert!(resources.ensure_pane_offscreen(&device, 0, OffscreenPlan::native(KEPT_PANE_PX)));
     assert!(resources.ensure_pane_offscreen(&device, 1, OffscreenPlan::native(GONE_PANE_PX)));
-    assert!(resources.ensure_upload(
-        &device,
-        &queue,
-        KEPT_ID,
-        kept_cells,
-        &kept_indices,
-        &lut,
-        None,
-        CoarseLevel::Omitted,
-    ));
-    assert!(resources.ensure_upload(
-        &device,
-        &queue,
-        GONE_ID,
-        gone_cells,
-        &gone_indices,
-        &lut,
-        None,
-        CoarseLevel::Omitted,
-    ));
+    // Both fixtures are one band, so each lands in the call that opens it.
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            0,
+            KEPT_ID,
+            kept_cells,
+            &kept_indices,
+            &lut,
+            None,
+            CoarseLevel::Omitted,
+        ),
+        Some(KEPT_ID),
+    );
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            1,
+            GONE_ID,
+            gone_cells,
+            &gone_indices,
+            &lut,
+            None,
+            CoarseLevel::Omitted,
+        ),
+        Some(GONE_ID),
+    );
 
     let kept_pane = offscreen_bytes(KEPT_PANE_PX, GroundPass::Off);
     let gone_pane = offscreen_bytes(GONE_PANE_PX, GroundPass::Off);
@@ -1804,6 +1813,240 @@ fn release_pane_frees_that_panes_offscreen_and_the_uploads_the_store_let_go_of()
         resources.resident_bytes(),
         0,
         "closing the last 3D pane left GPU memory behind for the session",
+    );
+}
+
+/// A grid too big for one band, and the number of calls its walk must take —
+/// derived from the shipped cap, so a swept cap moves the expectation with it
+/// rather than reddening this file.
+///
+/// 512x512 is a 1.00 MiB depth plane against a 4.00 MiB band: four planes a
+/// call, ten planes deep, and a coarse level walked two planes a call because
+/// each of those reads two fine ones.
+const FILL_CELLS: [u32; 3] = [512, 512, 10];
+
+fn fill_indices() -> Vec<u8> {
+    let count = (FILL_CELLS[0] * FILL_CELLS[1] * FILL_CELLS[2]) as usize;
+    // Not a constant: a grid of one index would upload correctly even if a band
+    // landed at the wrong depth.
+    (0..count).map(|i| (i * 31 % 251) as u8).collect()
+}
+
+/// Calls the walk of [`FILL_CELLS`] takes, from the cap alone.
+fn fill_calls() -> usize {
+    let band = squallar_device_profile::constants::BLOCKING_BAND_BYTES as u64;
+    let plane =
+        u64::from(FILL_CELLS[0]) * u64::from(FILL_CELLS[1]) * u64::from(GRID_BYTES_PER_CELL);
+    let planes = (band / plane).max(1) as u32;
+    let coarse_depth = (FILL_CELLS[2] / 2).max(1);
+    (FILL_CELLS[2].div_ceil(planes) + coarse_depth.div_ceil((planes / 2).max(1))) as usize
+}
+
+/// **A grid crosses a band a frame, and the pane sees it only when it is
+/// whole.**
+///
+/// The two halves of the seam, in one walk: the fill takes exactly the number
+/// of calls its size asks for, and every call before the last answers with the
+/// grid the pane was already painting — never the half-written one, and never
+/// nothing.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn a_grid_crosses_a_band_a_frame_and_swaps_in_only_on_the_last_one() {
+    use squallar_volumetric::bridge::VolumeResources;
+    use squallar_volumetric::raymarch::resident_grid_bytes_at;
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let mut resources = VolumeResources::new(
+        &device,
+        attachments(wgpu::TextureFormat::Bgra8Unorm),
+        &queue,
+    );
+    let lut = grey_ramp_lut();
+
+    // The grid the pane is already painting, and it lands in the one call that
+    // opens it: 8x8x4 is far inside a band.
+    const HELD_ID: u64 = 3;
+    const ARRIVING_ID: u64 = 4;
+    let (held_cells, held_indices) = slab_ramp(&[10, 20, 30, 40]);
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            0,
+            HELD_ID,
+            held_cells,
+            &held_indices,
+            &lut,
+            None,
+            CoarseLevel::Omitted,
+        ),
+        Some(HELD_ID),
+    );
+
+    let indices = fill_indices();
+    let expected_calls = fill_calls();
+    assert!(
+        expected_calls > 1,
+        "precondition: {FILL_CELLS:?} crosses in {expected_calls} call, so this \
+         test would pass over an upload that still moves everything at once",
+    );
+
+    // The store shed the held grid the moment the new build landed, so
+    // `live_ids` names the arriving one alone — and `prepare` prunes on every
+    // frame, which is what makes the stand-in's survival a decision rather
+    // than an accident.
+    let held_bytes = resident_grid_bytes_at(held_cells, CoarseLevel::Omitted).expect("a tiny grid");
+    let filling_bytes = resident_grid_bytes_at(FILL_CELLS, CoarseLevel::Built).expect("the fill");
+    let mut calls = 0;
+    let drawn = loop {
+        calls += 1;
+        let drawn = resources
+            .ensure_upload(
+                &device,
+                &queue,
+                0,
+                ARRIVING_ID,
+                FILL_CELLS,
+                &indices,
+                &lut,
+                None,
+                CoarseLevel::Built,
+            )
+            .expect("the fill answered with nothing to draw at all");
+        resources.retain_uploads(&[ARRIVING_ID]);
+        if drawn == ARRIVING_ID {
+            break calls;
+        }
+        assert_eq!(
+            drawn, HELD_ID,
+            "call {calls} of the fill answered with neither the grid the pane \
+             held nor the one arriving",
+        );
+        assert_eq!(
+            resources.resident_bytes(),
+            held_bytes + filling_bytes,
+            "call {calls}: the grid the pane is painting and the one filling \
+             are not both resident, so the pane is being shown something the \
+             device no longer has",
+        );
+        assert!(
+            calls < expected_calls,
+            "the fill is still not whole after {calls} calls, past the \
+             {expected_calls} its size asks for",
+        );
+    };
+    assert_eq!(
+        drawn,
+        expected_calls,
+        "the grid became visible on call {drawn}, not the {expected_calls} a \
+         {} B band over a {FILL_CELLS:?} grid asks for — a swap one call early \
+         is a half-written grid on screen, and one call late is a frame of the \
+         old picture nobody needed",
+        squallar_device_profile::constants::BLOCKING_BAND_BYTES,
+    );
+
+    // And the price of the swap being invisible is paid back the moment it is
+    // over: the stand-in is spared for the length of the fill and no longer.
+    assert_eq!(
+        resources.resident_bytes(),
+        filling_bytes,
+        "the held grid outlived the fill it was standing in for",
+    );
+}
+
+/// **A fill evicted mid-flight is retired with its target**, and takes the
+/// picture it was standing in for with it.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_eviction_mid_fill_gives_back_the_half_written_grid() {
+    use squallar_volumetric::bridge::VolumeResources;
+    use squallar_volumetric::raymarch::resident_grid_bytes_at;
+
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let mut resources = VolumeResources::new(
+        &device,
+        attachments(wgpu::TextureFormat::Bgra8Unorm),
+        &queue,
+    );
+    let lut = grey_ramp_lut();
+
+    const HELD_ID: u64 = 11;
+    const ARRIVING_ID: u64 = 12;
+    let (held_cells, held_indices) = slab_ramp(&[10, 20, 30, 40]);
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            0,
+            HELD_ID,
+            held_cells,
+            &held_indices,
+            &lut,
+            None,
+            CoarseLevel::Omitted,
+        ),
+        Some(HELD_ID),
+    );
+
+    let indices = fill_indices();
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            0,
+            ARRIVING_ID,
+            FILL_CELLS,
+            &indices,
+            &lut,
+            None,
+            CoarseLevel::Built,
+        ),
+        Some(HELD_ID),
+        "precondition: one call finished the fill, so there is no mid-flight \
+         state for the eviction below to find",
+    );
+    let held_bytes = resident_grid_bytes_at(held_cells, CoarseLevel::Omitted).expect("a tiny grid");
+    let filling_bytes = resident_grid_bytes_at(FILL_CELLS, CoarseLevel::Built).expect("the fill");
+    assert_eq!(
+        resources.resident_bytes(),
+        held_bytes + filling_bytes,
+        "precondition: the fill's textures and the grid standing in for it are \
+         not both resident, so the release below gives back nothing",
+    );
+
+    // What `VolumeStore::enforce_budget` produces: the id stops being named.
+    resources.retain_uploads(&[]);
+    assert_eq!(
+        resources.resident_bytes(),
+        0,
+        "an eviction mid-fill left the half-written grid resident for the life \
+         of the pane",
+    );
+
+    // And the fill starts over rather than resuming into a texture nothing
+    // else knows about.
+    assert_eq!(
+        resources.ensure_upload(
+            &device,
+            &queue,
+            0,
+            ARRIVING_ID,
+            FILL_CELLS,
+            &indices,
+            &lut,
+            None,
+            CoarseLevel::Built,
+        ),
+        None,
+        "the restarted fill answered with a grid to draw, but the eviction took \
+         the stand-in too",
+    );
+    assert_eq!(
+        resources.resident_bytes(),
+        filling_bytes,
+        "the restarted fill is not holding exactly its own textures",
     );
 }
 

@@ -1985,3 +1985,154 @@ mod budget_agreement {
         );
     }
 }
+
+/// How many [`VolumePipelines::advance_volume`] calls a shape's fine and coarse
+/// phases take, and the widest band either one moves — the arithmetic the
+/// banded upload is, with no device in it.
+fn band_walk(cells: [u32; 3], coarse: CoarseLevel) -> (usize, usize, u64) {
+    let plane = u64::from(cells[0]) * u64::from(cells[1]) * u64::from(GRID_BYTES_PER_CELL);
+    let fine_planes = band_planes(cells);
+    let fine_calls = cells[2].div_ceil(fine_planes) as usize;
+    let mut widest = u64::from(fine_planes.min(cells[2])) * plane;
+
+    let coarse_total = if grid_mip_levels(cells, coarse) > 1 {
+        coarse_cells(cells)[2]
+    } else {
+        0
+    };
+    let mut coarse_calls = 0;
+    if coarse_total > 0 {
+        let step = coarse_band_planes(cells);
+        coarse_calls = coarse_total.div_ceil(step) as usize;
+        // Priced by the fine planes the walk READS, which is the cost the cap
+        // is bounding — the coarse texels written are a quarter of it.
+        widest = widest.max(u64::from(step.min(coarse_total)) * 2 * plane);
+    }
+    (fine_calls, coarse_calls, widest)
+}
+
+/// **A grid crosses in `ceil(bytes / band)` calls, and no call moves more than
+/// a band.**
+///
+/// The shipped rungs first, where the band divides the plane exactly and the
+/// figure is the plain quotient; then shapes chosen so it does not.
+#[test]
+fn a_grid_crosses_one_band_at_a_time_and_takes_as_many_calls_as_that_needs() {
+    let band = squallar_device_profile::constants::BLOCKING_BAND_BYTES as u64;
+
+    for cells in [
+        squallar_device_profile::constants::WASM_VOLUME_GRID_CELLS,
+        squallar_device_profile::constants::MOBILE_VOLUME_GRID_CELLS,
+        squallar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS,
+    ] {
+        let fine_bytes = grid_bytes(cells).expect("a shipped rung fits") as u64;
+        let (fine_calls, coarse_calls, widest) = band_walk(cells, CoarseLevel::Built);
+        assert_eq!(
+            fine_calls,
+            fine_bytes.div_ceil(band) as usize,
+            "{cells:?}: mip 0 is {fine_bytes} B and crossed in {fine_calls} \
+             calls, not the {} a {band} B band needs — either a call is \
+             carrying more than the cap or the walk is taking more frames than \
+             the grid costs",
+            fine_bytes.div_ceil(band),
+        );
+        assert!(
+            widest <= band,
+            "{cells:?}: one call moves {widest} B, past the {band} B cap that \
+             is the whole bound on what a frame pays",
+        );
+        let _ = coarse_calls;
+    }
+
+    // The non-vacuity floor: the two rungs a desktop and a phone actually get
+    // are several bands, so the assertion above is not being satisfied by
+    // "one call moves everything", which is exactly the shape being replaced.
+    // The wasm rung is 4.00 MiB — one band exactly — and stays one call.
+    assert_eq!(
+        band_walk(
+            squallar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS,
+            CoarseLevel::Built,
+        ),
+        (8, 8, 4 << 20),
+    );
+    assert_eq!(
+        band_walk(
+            squallar_device_profile::constants::MOBILE_VOLUME_GRID_CELLS,
+            CoarseLevel::Built,
+        )
+        .0,
+        4,
+    );
+    assert_eq!(
+        band_walk(
+            squallar_device_profile::constants::WASM_VOLUME_GRID_CELLS,
+            CoarseLevel::Built,
+        )
+        .0,
+        1,
+    );
+
+    // A plane already past the cap still moves one plane a call: the band
+    // cannot go below a whole depth layer, and not finishing is not an option.
+    let wide = [4096u32, 4096, 3];
+    let (fine_calls, _, widest) = band_walk(wide, CoarseLevel::Omitted);
+    assert_eq!(band_planes(wide), 1);
+    assert_eq!(fine_calls, 3);
+    assert!(
+        widest > band,
+        "precondition: {wide:?} was picked because one of its planes is past \
+         the cap, and it is not",
+    );
+
+    // An upload told to leave the coarse level out does no coarse calls at all.
+    for cells in [[16u32, 16, 16], [1, 1, 1]] {
+        assert_eq!(band_walk(cells, CoarseLevel::Omitted).1, 0);
+    }
+    assert_eq!(band_walk([1, 1, 1], CoarseLevel::Built).1, 0);
+}
+
+/// The coarse band reads half a fine band's planes, so the two phases cost the
+/// same walk of the index plane.
+#[test]
+fn the_coarse_band_is_half_the_fine_one_because_it_reads_twice_as_deep() {
+    for cells in [
+        squallar_device_profile::constants::WASM_VOLUME_GRID_CELLS,
+        squallar_device_profile::constants::MOBILE_VOLUME_GRID_CELLS,
+        squallar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS,
+    ] {
+        assert_eq!(coarse_band_planes(cells) * 2, band_planes(cells));
+    }
+    // And it never reaches zero, whatever the shape.
+    assert_eq!(coarse_band_planes([4096, 4096, 8]), 1);
+}
+
+/// The banded coarse walk writes the same bytes as the whole-grid one, band
+/// boundary and all.
+#[test]
+fn the_coarse_bands_join_up_into_the_level_the_whole_walk_builds() {
+    let cells = [8u32, 6, 10];
+    let count = (cells[0] * cells[1] * cells[2]) as usize;
+    let indices: Vec<u8> = (0..count).map(|i| (i * 7 % 251) as u8).collect();
+
+    let (coarse, whole) = downsampled_grid(cells, &indices);
+    assert!(
+        whole.iter().any(|&b| b != 0),
+        "precondition: the fixture's coarse level is all zeroes, so a walk that \
+         built nothing would compare equal",
+    );
+
+    for step in 1..=coarse[2] {
+        let mut joined = Vec::new();
+        let mut z = 0;
+        while z < coarse[2] {
+            let planes = step.min(coarse[2] - z);
+            joined.extend_from_slice(&downsampled_band(cells, &indices, z, planes));
+            z += planes;
+        }
+        assert_eq!(
+            joined, whole,
+            "the coarse level built {step} planes at a time is not the one built \
+             in one pass, so a band boundary is losing or duplicating a plane",
+        );
+    }
+}

@@ -340,9 +340,10 @@ pub const MOBILE_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_POOL_FLOO
 pub const DESKTOP_VOLUME_LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_POOL_FLOOR_BYTES;
 
 /// How many voxel grids a 3D loop may *dispatch* in one frame. The resample
-/// (~89 ms) is off the frame thread; `raymarch::upload_volume_at` is not, and
-/// runs once per grid that becomes resident. Its cost is bimodal on the card's
-/// host-visible BAR occupancy, so no single end-to-end figure describes it.
+/// (~89 ms) is off the frame thread; `raymarch::advance_volume` is not, and
+/// runs once per frame per grid becoming resident. That call is bounded — one
+/// [`BLOCKING_BAND_BYTES`] band — so what this constant now holds down is the
+/// number of *fills* competing for the frame thread, not the size of one.
 pub const MAX_LOOP_VOLUME_BUILDS_PER_FRAME: usize = 1;
 
 /// Ceiling on the GPU texture memory the **whole application** budgets, in
