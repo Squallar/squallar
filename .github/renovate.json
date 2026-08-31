@@ -46,7 +46,8 @@
         "nexrad-decode",
         "nexrad-model",
         "pmtiles",
-        "walkers"
+        "walkers",
+        "mvt-reader"
       ],
       "enabled": false
     }
