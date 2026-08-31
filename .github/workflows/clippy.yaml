@@ -40,21 +40,36 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      # See zone-pack.yaml: `secrets` is not available in a step-level `if:`.
+      AUTOCOMMIT_CLIENT_ID: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
     steps:
-      # NO GITHUB APP. This used to mint a token from AUTO_COMMIT_APP_ID/KEY to
-      # get push credentials; the app was installed on the old personal account
-      # and did not survive the move to the Squallar org, so every run failed at
-      # the mint before clippy ever ran. The job already declares
-      # `contents: write`, and `actions/checkout` persists GITHUB_TOKEN, so the
-      # auto-commit below pushes on that.
+      # THE AUTOFIX PUSH NEEDS THE APP, for the same reason the coverage push
+      # does: `main` carries a ruleset (pull_request plus
+      # required_status_checks) and this bot pushes straight to it, so a
+      # GITHUB_TOKEN push is refused with GH013. The Squallar-autocommit app is
+      # a bypass actor on that ruleset.
       #
-      # THE ONE THING THAT CHANGES: a push made with GITHUB_TOKEN does not
-      # trigger workflows. An autofix commit therefore lands without starting a
-      # Build, Test or Web run of its own -- which for this repository is the
-      # better default, because it also means an autofix cannot deploy. The
-      # fixed tree is still verified: the gating `Run Clippy` below runs in this
-      # same job, after the commit.
+      # A CONSEQUENCE WORTH KNOWING: unlike GITHUB_TOKEN, an app push DOES
+      # trigger workflows, so an autofix commit now starts a Build of its own --
+      # and a Build on main deploys. The autofix is therefore back to being able
+      # to reach production without a human in between, which is exactly what
+      # the three "verify the autofixed tree" rows used to guard and which was
+      # dropped by decision. `Run Clippy -D warnings` below still gates this
+      # job, and build.yaml's matrix compiles every arm on that new run.
+      #
+      # Skipped when the app is not configured, and on fork PRs, which get no
+      # secrets. The commit step is skipped on every pull_request anyway.
+      - name: Generate GitHub App Token
+        if: env.AUTOCOMMIT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
+          private-key: ${{ secrets.SQUALLAR_AUTOCOMMIT_PRIVATE_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
       # HOST ONLY. The cross stds and cargo-ndk went with the verify rows that
       # used them -- nothing left in this job compiles for wasm32 or Android, so
       # installing their toolchains was pure runner time (cargo-ndk builds from
@@ -95,12 +110,12 @@ jobs:
         if: github.event_name != 'pull_request'
         with:
           commit_message: "chore: Apply clippy fixes"
-          # The canonical Actions bot, since GITHUB_TOKEN is what pushes now.
-          # 41898282 is github-actions[bot]'s own user id; the previous pair
-          # named a bot from the old account that no longer authors anything.
-          commit_user_name: github-actions[bot]
-          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
-          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          # Matches whichever credential pushed, and both are in
+          # renovate.json's gitIgnoredAuthors -- an author Renovate does not
+          # recognise on one of its branches makes it treat that branch as
+          # human-edited and stop maintaining it.
+          commit_user_name: ${{ steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || 'github-actions[bot]' }}
+          commit_user_email: ${{ steps.app-token.outputs.app-slug && '323064949+squallar-autocommit[bot]@users.noreply.github.com' || '41898282+github-actions[bot]@users.noreply.github.com' }}
       # The gating run. `-D warnings` goes here and not on the `--fix` step, so
       # the bot still autofixes what it can and the build fails only on the rest.
       #

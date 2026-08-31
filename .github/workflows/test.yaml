@@ -224,19 +224,38 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      # Read into `env` so the step below can branch on it: the `secrets`
+      # context is not available in a step-level `if:`, but `env` is.
+      AUTOCOMMIT_CLIENT_ID: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
     steps:
-      # NO GITHUB APP -- see the same note in clippy.yaml. The app was installed
-      # on the old personal account and did not survive the move to the Squallar
-      # org, so this step failed before a single test ran. The job declares
-      # `contents: write`, and `actions/checkout` persists GITHUB_TOKEN, which
-      # is what the coverage push at the end of this job now uses.
+      # THE COVERAGE PUSH NEEDS THE APP, AND NOT FOR THE USUAL REASON.
       #
-      # A push made with GITHUB_TOKEN does not trigger workflows, so the
-      # coverage commit no longer starts a run of its own. That is what should
-      # happen: the baseline is a record of the run that produced it, and a
-      # build triggered by writing it down would be building nothing new.
+      # `main` carries a ruleset -- pull_request plus required_status_checks --
+      # and the coverage baseline is pushed straight to it. GITHUB_TOKEN is not
+      # a bypass actor on that ruleset, so the push is refused with GH013
+      # ("Changes must be made through a pull request"), five times, after every
+      # test in the workspace has already passed. The Squallar-autocommit app is
+      # a bypass actor; this mints its token so the push is made as it.
+      #
+      # Note what this is NOT for: triggering. A baseline records the run that
+      # produced it, and a build started by writing it down would build nothing
+      # new. An app push does trigger workflows, which here is a side effect to
+      # be aware of rather than the point.
+      #
+      # Skipped when the app is not configured, and on fork PRs, which get no
+      # secrets -- checkout then falls back to GITHUB_TOKEN and a read-only run
+      # is unaffected. See zone-pack.yaml for the same guard.
+      - name: Generate GitHub App Token
+        if: env.AUTOCOMMIT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.SQUALLAR_AUTOCOMMIT_CLIENT_ID }}
+          private-key: ${{ secrets.SQUALLAR_AUTOCOMMIT_PRIVATE_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
       - name: Install system deps
         run: |

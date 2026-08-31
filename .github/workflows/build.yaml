@@ -870,7 +870,26 @@ jobs:
   # does not come up.
   deploy-cloudfront:
     name: Deploy web build to CloudFront
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # NOT ON A BOT'S OWN COMMIT, and this clause is load bearing.
+    #
+    # Clippy's autofix pushes as the Squallar-autocommit app, because `main`'s
+    # ruleset refuses GITHUB_TOKEN. Unlike GITHUB_TOKEN, an app push TRIGGERS
+    # workflows -- so without this the sequence is: bot rewrites source, bot
+    # pushes, that push starts a Build, and that Build deploys. Production
+    # changes with no human in the loop, on a tree no human read.
+    #
+    # That was tolerable while three "verify the autofixed tree still builds"
+    # rows gated the push; they were removed by decision on 2026-08-31, so this
+    # is what replaces them. The autofix still lands, still gets compiled by
+    # this run's matrix and still gets linted -- it just does not ship itself.
+    # The next human push carries it out.
+    #
+    # Matched on author email rather than name: `git-auto-commit-action` sets
+    # both, and the address is the identity `renovate.json` keys off too.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && github.event.head_commit.author.email != '323064949+squallar-autocommit[bot]@users.noreply.github.com'
+      && github.event.head_commit.author.email != '41898282+github-actions[bot]@users.noreply.github.com'
     needs: [build-success]
     runs-on: ubuntu-24.04
     permissions:
