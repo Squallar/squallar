@@ -928,6 +928,9 @@ pub struct HttpsTiles {
     /// pass, against the tens of [`Tiles::at`] calls the same layer makes.
     pumps: u64,
 
+    /// Completions the drain has taken off the channel — see [`Self::takes`].
+    takes: u64,
+
     /// Cache puts that changed what this source can draw — one per **tile**
     /// landing in the cache, never per pending or failed marker. Per source
     /// because the basemap and the terrain are separate [`HttpsTiles`], each
@@ -1102,6 +1105,7 @@ impl HttpsTiles {
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
+            takes: 0,
             runtime,
         }
     }
@@ -1171,8 +1175,21 @@ impl HttpsTiles {
     /// and never arrive. Nothing does today — both `Map::new` sites in `ui_map`
     /// pass `None` for tiles and the app draws its own tile layers — and nothing
     /// plans to.
-    pub fn pump(&mut self) {
+    /// `quiet` is the gesture latch (WO-9e): while a map gesture is live —
+    /// judged still only after [`crate::overlay_cache::SETTLE_REPAINT_DELAY`],
+    /// the same clock the overlay settle reads — the drain takes **nothing**,
+    /// on both targets. On wasm the take is the PNG decode and the texture
+    /// upload on the page thread, which is the frame the gesture is judged
+    /// by; on native it is a cache put whose `put_generation` bump repaints
+    /// the floor strip. Ancestors keep drawing meanwhile: interaction is
+    /// realtime, data may lag. Nothing is lost — the completions sit in the
+    /// channel and the settle frame's pump takes them under the ordinary
+    /// budget.
+    pub fn pump(&mut self, quiet: bool) {
         self.pumps += 1;
+        if quiet {
+            return;
+        }
         self.drain_completed_fetches();
     }
 
@@ -1184,6 +1201,14 @@ impl HttpsTiles {
     /// at one per layer rather than one per tile.
     pub fn pumps(&self) -> u64 {
         self.pumps
+    }
+
+    /// Completions the drain has taken off the channel since this source was
+    /// built — an always-on ledger like [`Self::pumps`]. Each take is the
+    /// per-tile cost the gesture latch defers: decode + upload on wasm, the
+    /// cache put and its repaint-the-floor generation bump on native.
+    pub fn takes(&self) -> u64 {
+        self.takes
     }
 
     /// How many tiles have landed in this source's cache since it was built —
@@ -1212,10 +1237,11 @@ impl HttpsTiles {
             io_task_gone_reported,
             style_epoch,
             put_generation,
+            takes,
             ..
         } = self;
         let current = *style_epoch;
-        drain_up_to(
+        let taken = drain_up_to(
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
             io_task_gone_reported,
@@ -1236,6 +1262,7 @@ impl HttpsTiles {
                 }
             },
         );
+        *takes += taken as u64;
     }
 
     /// wasm32: decode, upload and cache at most this pass's remaining allowance
@@ -1258,6 +1285,7 @@ impl HttpsTiles {
             io_task_gone_reported,
             style_epoch,
             put_generation,
+            takes,
             ..
         } = self;
         let style: &Style = style;
@@ -1317,6 +1345,7 @@ impl HttpsTiles {
             },
         );
         decode_budget.record(taken);
+        *takes += taken as u64;
 
         if budget > 0 && taken == budget {
             // The whole allowance went, so more completions may be waiting.
@@ -1887,6 +1916,7 @@ impl HttpsTiles {
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
+            takes: 0,
             runtime,
         }
     }
@@ -1939,6 +1969,7 @@ impl HttpsTiles {
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
+            takes: 0,
             runtime: runtime::inert(),
         }
     }

@@ -15,6 +15,37 @@ pub(crate) mod section_render;
 #[path = "ui_volume_alpha.rs"]
 pub(crate) mod volume_alpha_editor;
 
+/// Whether a gesture is live this frame — the latch the tile pump goes quiet
+/// on (`HttpsTiles::pump`; WO-9e). "Live" is judged the way the overlay
+/// settle judges stillness: any drag, touch, zoom or scroll input stamps the
+/// frame's clock into the context, and the gesture counts as live until the
+/// input has been still for [`crate::overlay_cache::SETTLE_REPAINT_DELAY`] —
+/// the same 500 ms, reused rather than forked, so the tiles resume on the
+/// same settle frame the overlay re-raster fires on.
+///
+/// Deliberately whole-app rather than per-pane: the cost the latch defers is
+/// the shared frame thread's (decode + upload on wasm, cache put + floor
+/// repaint on native), and any live interaction owns that thread.
+pub(crate) fn gesture_quiet(ui: &egui::Ui) -> bool {
+    let now = ui.input(|i| i.time);
+    let live = ui.input(|i| {
+        i.pointer.is_decidedly_dragging()
+            || i.multi_touch().is_some()
+            || i.zoom_delta() != 1.0
+            || i.smooth_scroll_delta != egui::Vec2::ZERO
+    });
+    let id = egui::Id::new("tile-pump-gesture-quiet");
+    let last = ui.ctx().data_mut(|d| {
+        if live {
+            d.insert_temp(id, now);
+            now
+        } else {
+            d.get_temp::<f64>(id).unwrap_or(f64::NEG_INFINITY)
+        }
+    });
+    now - last < crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64()
+}
+
 /// What a cross-section pane says while it has nothing to show.
 pub(crate) const CROSS_SECTION_EMPTY_STATE: &str =
     "Draw a line on a map pane to cut a cross-section";

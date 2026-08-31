@@ -356,7 +356,7 @@ fn pump_until<T>(timeout: Duration, mut step: impl FnMut() -> Option<T>) -> Opti
 /// waits for a tile to *arrive* has to go through the pump the drawing code
 /// goes through.
 fn draw_one(tiles: &mut HttpsTiles, tile_id: TileId) -> Option<TilePiece> {
-    tiles.pump();
+    tiles.pump(false);
     tiles.at(tile_id)
 }
 
@@ -536,6 +536,60 @@ fn tile_ids_outside_their_zoom_grid_are_invalid() {
         y: 0,
         zoom: 32
     }));
+}
+
+// ---------------------------------------------------------------------------
+
+/// **A live gesture takes nothing off the decode drain, and the settle frame
+/// loses none of it** (WO-9e). The takes ledger is the counted quantity: a
+/// quiet pump records zero takes however many completions are queued, the
+/// first ordinary pump after the gesture takes the queued completion within
+/// its one-pump budget, and the total across the gesture is exactly the
+/// completions that arrived — nothing double-taken, nothing dropped.
+#[test]
+fn a_live_gesture_takes_no_tiles_and_the_settle_frame_loses_none() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles(&server, &ctx);
+    let tile_id = TileId {
+        x: 1,
+        y: 2,
+        zoom: 3,
+    };
+
+    // Ask, then hold the gesture: only quiet pumps run while the fetch
+    // completes and its payload queues.
+    assert!(tiles.at(tile_id).is_none(), "fixture: nothing cached yet");
+    let gesture = Instant::now() + SETTLE;
+    while Instant::now() < gesture {
+        tiles.pump(true);
+        assert_eq!(
+            tiles.takes(),
+            0,
+            "a quiet pump took a completion off the drain mid-gesture",
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        tiles.at(tile_id).is_none(),
+        "the tile appeared without a take being recorded, so the ledger is \
+         not counting what the drain moves",
+    );
+
+    // The settle: ONE ordinary pump yields the tile. That it does is also
+    // what proves the completion sat queued through the whole quiet phase —
+    // the zeroes above were a refusal, not an empty channel.
+    tiles.pump(false);
+    assert!(
+        tiles.at(tile_id).is_some(),
+        "the settle frame's pump did not deliver the queued completion",
+    );
+    assert_eq!(
+        tiles.takes(),
+        1,
+        "one completion arrived across the gesture and the ledger must say \
+         exactly one take: fewer is a lost tile, more is a double count",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -873,7 +927,7 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
 
     let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
     let mut ask = || {
-        tiles.pump();
+        tiles.pump(false);
         for x in 0..wanted {
             tiles.at(TileId { x, y: 0, zoom: 8 });
         }
@@ -1270,7 +1324,7 @@ fn the_tile_cache_is_bounded() {
     let attempts = capacity as u32 + 64;
 
     let reached = pump_until(DEFAULT_TIMEOUT, || {
-        tiles.pump();
+        tiles.pump(false);
         for x in 0..attempts {
             tiles.at(TileId { x, y: 0, zoom: 10 });
         }
@@ -1300,7 +1354,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // The counter moves before any bound is near: three ids are three
         // entries, exactly.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             for x in 0..3 {
                 tiles.at(id(x));
             }
@@ -1315,7 +1369,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // Fill to exactly the cap. Below-or-at the bound nothing may be
         // evicted, so the exact count doubles as total membership.
         let reached = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             for x in 0..capacity as u32 {
                 tiles.at(id(x));
             }
@@ -1339,7 +1393,7 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
         // One insert at the cap: admitted, and paid for by exactly the LRU id.
         let new = id(capacity as u32);
         let admitted = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.at(new);
             tiles.tile_is_cached(new).then_some(())
         });
@@ -1625,7 +1679,7 @@ mod archive {
         );
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -1702,7 +1756,7 @@ mod archive {
             };
 
             let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-                tiles.pump();
+                tiles.pump(false);
                 tiles.source_max_zoom()
             })
             .expect("the archive header never arrived");
@@ -1746,7 +1800,7 @@ mod archive {
         };
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -1926,7 +1980,7 @@ mod archive {
         };
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
@@ -2062,7 +2116,7 @@ mod archive {
         );
 
         let fault = pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.fault().map(str::to_owned)
         })
         .expect("the source never reported why it serves nothing");
@@ -2085,7 +2139,7 @@ mod archive {
         // suppressing only a repeat within one.
         let before = tiles.cached_entries();
         for _ in 0..10 {
-            tiles.pump();
+            tiles.pump(false);
             for x in 0..54u32 {
                 assert!(
                     tiles.at(TileId { x, y: 0, zoom: 14 }).is_none(),
@@ -2332,7 +2386,7 @@ mod archive_decode {
         // finished with the header. Waiting on only one of the two would make
         // the timeout the assertion.
         pump_until(DEFAULT_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles
                 .fault()
                 .map(|fault| Some(fault.to_owned()))
@@ -2413,7 +2467,7 @@ mod archive_decode {
         );
 
         pump_until(LOCAL_ARCHIVE_TIMEOUT, || {
-            tiles.pump();
+            tiles.pump(false);
             tiles.at(TileId {
                 x: 0,
                 y: 0,
