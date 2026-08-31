@@ -329,6 +329,52 @@ impl VolumeInventory {
     }
 }
 
+/// One deferred-drop payload out of a decoded volume.
+///
+/// `offload::drain_deferred_drops` frees **at least one payload per turn**
+/// whatever its budget says, so a whole volume filed as one payload is one
+/// frame paying its entire teardown. These are the pieces the eviction path
+/// can hand over owned instead.
+///
+/// The fields are never read on purpose: they exist to be *dropped*, on the
+/// drain's schedule, and `Drop` is the reader.
+#[allow(dead_code)]
+pub(crate) enum VolumeDropPart {
+    /// One sweep of a volume this process held the last reference to — a few
+    /// MiB, which is what makes the drain's minimum-one turn affordable.
+    Sweep(nexrad_model::data::Sweep),
+    /// A volume something else still holds. Dropping this reference is a
+    /// refcount decrement wherever it runs, so it travels whole.
+    Shared(Arc<Scan>),
+    /// The declared-Nyquist half of the pair.
+    Nyquist(Arc<DeclaredNyquist>),
+}
+
+/// Split evicted volumes at their sweep seam for the deferred-drop path.
+///
+/// Handed to `offload::discard_each`, which files every item separately: on
+/// wasm each part is its own queue entry, so one drain turn frees one sweep
+/// rather than one 46.8 MiB median / 58.3 MiB worst-case volume (measured;
+/// see [`MAX_RESIDENT_STILL_VOLUMES`]). The `Scan` shell left behind — site
+/// and coverage pattern, a few KiB — is dropped here, which is the price of
+/// upstream's model owning its sweeps.
+pub(crate) fn volume_drop_parts(
+    volumes: impl IntoIterator<Item = Still>,
+) -> impl Iterator<Item = VolumeDropPart> {
+    volumes.into_iter().flat_map(|(scan, nyquist)| {
+        let mut parts: Vec<VolumeDropPart> = match Arc::try_unwrap(scan) {
+            Ok(scan) => scan
+                .into_sweeps()
+                .into_iter()
+                .map(VolumeDropPart::Sweep)
+                .collect(),
+            Err(scan) => vec![VolumeDropPart::Shared(scan)],
+        };
+        parts.push(VolumeDropPart::Nyquist(nyquist));
+        parts
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +398,66 @@ mod tests {
     /// Everything wanted; the shape most of these tests install with.
     fn keep_all(_: &str, _: NaiveDateTime) -> bool {
         true
+    }
+
+    /// The drain frees at least one payload per turn whatever its budget, so
+    /// a volume that reaches the queue whole is a frame paying a whole
+    /// volume's teardown. One volume must arrive as several entries.
+    #[test]
+    fn one_evicted_volume_files_more_than_one_queue_entry() {
+        // The queue is thread-local; empty whatever an earlier test left.
+        while squallar_worker::offload::drain_deferred_drops(std::time::Duration::from_secs(30)) > 0
+        {
+        }
+
+        let volume: Still = (crate::volume_fixture::ready_scan(), Arc::default());
+        let sweeps = volume.0.sweeps().len();
+        assert!(
+            sweeps > 1,
+            "fixture: a one-sweep volume cannot prove a split"
+        );
+
+        // Filed exactly as wasm's `discard` files what `discard_each` hands
+        // it: one queue entry per item.
+        for part in volume_drop_parts(vec![volume]) {
+            squallar_worker::offload::defer_drop("evicted-scan", Box::new(part));
+        }
+        let mut entries = 0;
+        while squallar_worker::offload::drain_deferred_drops(std::time::Duration::ZERO) == 1 {
+            entries += 1;
+        }
+        assert!(
+            entries > 1,
+            "one {sweeps}-sweep volume reached the drop queue as {entries} \
+             entry(ies), so a single drain turn still frees a whole volume",
+        );
+        assert_eq!(
+            entries,
+            sweeps + 1,
+            "every sweep and the declared-Nyquist half, each its own entry",
+        );
+    }
+
+    /// The `Arc::try_unwrap` miss arm: a volume something else still holds
+    /// cannot be decomposed, and must still be handed over rather than lost.
+    #[test]
+    fn a_volume_still_held_elsewhere_travels_whole_and_is_not_lost() {
+        let scan = crate::volume_fixture::ready_scan();
+        let second_holder = Arc::clone(&scan);
+        let parts: Vec<VolumeDropPart> = volume_drop_parts(vec![(scan, Arc::default())]).collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "a shared volume is its reference plus the nyquist half",
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| matches!(part, VolumeDropPart::Shared(held)
+                    if Arc::ptr_eq(held, &second_holder))),
+            "the shared volume's reference was dropped on the spot instead of \
+             being handed over",
+        );
     }
 
     /// **The item.** Two panes on one site, parked at two moments, and each

@@ -1990,7 +1990,10 @@ impl super::App {
                 scan_info.timestamp,
                 (scan_arc, declared),
             );
-            squallar_worker::offload::discard_each("capped-still", forced);
+            squallar_worker::offload::discard_each(
+                "capped-still",
+                crate::volume_inventory::volume_drop_parts(forced),
+            );
 
             let local_ts =
                 chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();

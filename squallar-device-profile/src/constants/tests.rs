@@ -293,6 +293,28 @@ fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
 
 /// The eviction budget bounds memory, so it must be the smaller of the two: if
 /// it exceeded the frame cap, every held frame would stay textured.
+/// The drop budget prices the thread its drain runs on. Desktop's drain is a
+/// dead letter (discards ride the `rd-free` lane) so its 2 ms is free to be
+/// generous; wasm's drain runs on the page thread, whose whole service bar is
+/// 4 ms — a wasm arm as generous as desktop's is half that bar spent on
+/// teardown. Strictly less, so the tightening cannot silently revert.
+#[test]
+fn the_wasm_drop_budget_is_tighter_than_desktops() {
+    assert!(
+        WASM_DEFERRED_DROP_BUDGET_PER_FRAME < DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME,
+        "the wasm drop budget ({:?}) is not below desktop's ({:?}), so the \
+         page thread pays a native-sized teardown allowance out of its 4 ms bar",
+        WASM_DEFERRED_DROP_BUDGET_PER_FRAME,
+        DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME,
+    );
+    assert!(
+        MOBILE_DEFERRED_DROP_BUDGET_PER_FRAME < DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME,
+        "the mobile drop budget ({:?}) is not below desktop's ({:?})",
+        MOBILE_DEFERRED_DROP_BUDGET_PER_FRAME,
+        DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME,
+    );
+}
+
 #[test]
 fn the_render_budget_is_what_bounds_the_textured_frames() {
     for arm in arms() {
@@ -545,6 +567,9 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         "APP_TEXTURE_BUDGET_BYTES",
         // Three arms: how much supersampling a 3D floor is worth per target.
         "VOLUME_MIRROR_BYTES_MAX",
+        // The page-thread teardown allowance; wasm's arm is pinned below
+        // desktop's by `the_wasm_drop_budget_is_tighter_than_desktops`.
+        "DEFERRED_DROP_BUDGET_PER_FRAME",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be

@@ -2854,12 +2854,13 @@ dependencies = [
 [[package]]
 name = "nexrad-model"
 version = "1.0.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e2e15c56d3f5869b78eef326ca33debd6d144a4a3348ff4829e8579c6d2a9ea"
 dependencies = [
+ "chrono",
  "hex",
+ "serde",
  "sha2",
  "thiserror 2.0.20",
+ "uom",
 ]
 
 [[package]]

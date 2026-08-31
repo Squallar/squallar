@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Default width for the application window in pixels
 pub const RENDER_WIDTH: u32 = 1920;
 
@@ -219,9 +221,27 @@ pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 /// How long a frame keeps *starting* frees of what
 /// squallar-worker's `offload::discard` handed it. It paces; it does not bound
 /// the frame — `drain_deferred_drops` checks the clock *after* each free, so a
-/// frame's real spend is this budget plus one whole payload. Priced against the
-/// 16.7 ms frame, which is why it is not a cfg cascade.
-pub const DEFERRED_DROP_BUDGET_PER_FRAME: std::time::Duration = std::time::Duration::from_millis(2);
+/// frame's real spend is this budget plus one whole payload.
+///
+/// A cascade because the thread it prices differs by target. On native the
+/// discards ride the pool's `rd-free` lane and this budget is a dead letter —
+/// only the no-worker fallback ever queues — so desktop keeps the 2 ms it has
+/// always had. On wasm **every** discard queues on the page thread, the one
+/// the campaign holds to a 4 ms service bar, so its arm (and mobile's, whose
+/// frame is the scarcest) pays out in 500 µs slices instead. The overshoot
+/// half of the story is the payloads: `Scan::into_sweeps` splits a decoded
+/// volume at its sweep seam before it is filed, so the "plus one whole
+/// payload" term is one sweep, not one 47–69 MiB volume.
+#[cfg(target_arch = "wasm32")]
+pub const DEFERRED_DROP_BUDGET_PER_FRAME: Duration = WASM_DEFERRED_DROP_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const DEFERRED_DROP_BUDGET_PER_FRAME: Duration = MOBILE_DEFERRED_DROP_BUDGET_PER_FRAME;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const DEFERRED_DROP_BUDGET_PER_FRAME: Duration = DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME;
+
+pub const WASM_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const MOBILE_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_micros(500);
+pub const DESKTOP_DEFERRED_DROP_BUDGET_PER_FRAME: Duration = Duration::from_millis(2);
 
 /// The **whole application's** loop allowance on a device that can tell us
 /// nothing about itself, in bytes. One pool, divided among the loops that want
