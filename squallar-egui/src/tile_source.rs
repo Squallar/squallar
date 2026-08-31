@@ -709,16 +709,20 @@ pub const WASM_TILE_DECODES_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
 /// this plus one take. Bounding one take's own cost is not something this
 /// constant can do — that is the deferred worker-side decode (C5p2).
 ///
-/// **A pump always takes at least one completion**, however far past the
-/// deadline the frame already is. A budget that can round down to zero work
+/// **A pass always takes at least one completion per source**, however far past
+/// the deadline the frame already is. A budget that can round down to zero work
 /// stalls the map exactly when the machine is busiest, which is the failure
-/// this replaces rather than a different spelling of it.
+/// this replaces rather than a different spelling of it. The guarantee is the
+/// *pass's* and not each call's: see [`PumpBudget`], where spelling it per call
+/// is the defect that shape had.
 ///
 /// **1 ms, and the value is chosen for wasm32, because that is the only
-/// target it binds on.** The pump runs once per layer and a standard
-/// configuration draws two, so a frame's worst case is twice this plus two
-/// takes; the layers share one [`DecodeBudget`] per source, so a second pass
-/// cannot re-bill it.
+/// target it binds on.** A frame's worst case is one of these plus one take
+/// **per source** — two of each in a standard configuration, which draws the
+/// basemap and the terrain. It is not per *layer-draw*: a source drawn in six
+/// panes is pumped six times, and [`PumpBudget`] is what holds those six to
+/// the one budget, in time as well as in count. Before it did, the same
+/// sentence was true only of the single-pane layout it was written against.
 ///
 /// A native take is an `LruCache::put` costing microseconds, so neither 1 ms
 /// nor 2 ms is ever reached there and the count is what bounds a native pump.
@@ -727,16 +731,15 @@ pub const WASM_TILE_DECODES_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
 /// case on the target that needs it most.
 ///
 /// **What the value governs is bursts, not steady state**, because the first
-/// take is unconditional. A pump runs once per layer and a standard
-/// configuration draws two, so every frame moves at least two tiles however
-/// small this is — of the order of what [`MAX_PARALLEL_DOWNLOADS`] concurrent
-/// fetches deliver, so in steady state the floor is already keeping up and
-/// this bound is not what the map is waiting on. It binds only against a
-/// backlog, and `tile_rx` holds at most [`MAX_PARALLEL_DOWNLOADS`] of those:
-/// at one take per pump — which is what 1 ms means when a take is a
-/// multi-millisecond tessellation — a full queue clears in six frames, 100 ms
-/// at 60 Hz. That is the whole cost of the smaller number, and against it the
-/// frame carries 1 ms per layer instead of 2.
+/// take is unconditional. Every frame therefore moves at least one tile per
+/// source — two in a standard configuration — however small this is, which is
+/// of the order of what [`MAX_PARALLEL_DOWNLOADS`] concurrent fetches deliver:
+/// in steady state the floor is already keeping up and this bound is not what
+/// the map is waiting on. It binds only against a backlog, and `tile_rx` holds
+/// at most [`MAX_PARALLEL_DOWNLOADS`] of those: at one take per pass — which
+/// is what 1 ms means when a take is a multi-millisecond tessellation — a full
+/// queue clears in six frames, 100 ms at 60 Hz. That is the whole cost of the
+/// smaller number, and against it the frame carries 1 ms per source.
 ///
 /// **Measured, and it is not the whole story.** Native scene A interact p50
 /// sits one histogram bin above the pre-WO-10 build: 26,909 us against
@@ -1088,9 +1091,10 @@ pub struct HttpsTiles {
     /// owns the context's clone instead.
     #[cfg(target_arch = "wasm32")]
     egui_ctx: Context,
-    /// wasm32 only: what is left of [`WASM_TILE_DECODES_PER_PUMP`] this pass.
+    /// wasm32 only: what is left of [`WASM_TILE_DECODES_PER_PUMP`] and of
+    /// [`PUMP_TIME_BUDGET`] this pass — both bounds, both per pass.
     #[cfg(target_arch = "wasm32")]
-    decode_budget: DecodeBudget,
+    pump_budget: PumpBudget,
 
     /// wasm32 only: the style [`Tile::new`] renders a vector tile against.
     /// Empty for a raster source, which never reads it; the committed style for
@@ -1133,44 +1137,98 @@ pub struct HttpsTiles {
     runtime: runtime::Runtime,
 }
 
-/// One source's per-pass decode allowance, wasm32 only.
+/// One source's per-pass pump allowance, wasm32 only: the decodes it may still
+/// spend, and the wall-clock deadline those decodes share.
 ///
+/// **Both halves are per pass, and the time half is the one that was not.**
 /// [`HttpsTiles::pump`] runs once per layer, and one source is drawn as a layer
 /// in every pane that shows it plus the volume floor strip, so a per-*call*
-/// bound would still let a multi-pane layout bill one pass several times over.
-/// The pass number is what turns it per-pass: the first call of a new pass
-/// restores the full allowance. Per *source* because each [`HttpsTiles`] owns
-/// one.
+/// bound lets a multi-pane layout bill one pass several times over. The count
+/// half has been per-pass since it was written. The time half was computed as
+/// `Instant::now() + PUMP_TIME_BUDGET` inside each `drain_completed_fetches`
+/// call, so every pump of a pass opened a *fresh* budget and re-armed the
+/// unconditional first take with it: a frame's tile cost was
+/// `panes x (PUMP_TIME_BUDGET + one take)` per source, not `PUMP_TIME_BUDGET +
+/// one take`. With six panes and a take that is a multi-millisecond
+/// tessellation that is a twelvefold miss, and the constant's own note — "a
+/// frame's worst case is twice this plus two takes" — held only for the
+/// single-pane layout it was measured on.
 ///
-/// Compiled on native for the tests (`any(test, target_arch = "wasm32")`).
+/// The pass number is what turns both halves per-pass: the first call of a new
+/// pass restores the count and stamps one deadline that every later call in
+/// that pass shares. Per *source* because each [`HttpsTiles`] owns one, and the
+/// caches they fill are per source too.
+///
+/// **Fairness needs no arbitration**, because a source is app-level and its
+/// cache is shared by every pane that draws it: a take that lands for pane one
+/// is resident for panes two through six in the same pass. Bounding the pass
+/// rather than the call spends the budget on the *first* asker and serves all
+/// of them, which is why this cannot starve a later pane.
+///
+/// Compiled on native for the tests (`any(test, target_arch = "wasm32")`), as
+/// its predecessor was.
 #[cfg(any(test, target_arch = "wasm32"))]
-struct DecodeBudget {
-    /// The pass [`Self::spent`] counts within.
+struct PumpBudget {
+    /// The pass [`Self::spent`] and [`Self::deadline`] belong to.
     pass_nr: u64,
-    /// Decodes already performed in [`Self::pass_nr`].
+    /// Takes already performed in [`Self::pass_nr`].
     spent: usize,
+    /// When [`Self::pass_nr`]'s takes stop being free. Stamped once, by the
+    /// pass's first call.
+    deadline: web_time::Instant,
+}
+
+/// What one pump call may still spend of its pass — see [`PumpBudget::open`].
+#[cfg(any(test, target_arch = "wasm32"))]
+struct PassAllowance {
+    /// Takes still allowed in the pass.
+    budget: usize,
+    /// The deadline every take of the pass shares.
+    deadline: web_time::Instant,
+    /// Whether the pass has yet to take anything, and so still owes the
+    /// unconditional first take. See [`PUMP_TIME_BUDGET`].
+    first_take_free: bool,
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-impl DecodeBudget {
+impl PumpBudget {
     fn new() -> Self {
         Self {
             pass_nr: 0,
             spent: 0,
+            // Replaced before it is read: the first `open` of pass 0 is a
+            // fresh pass by `spent == 0`, and every later pass by `pass_nr`.
+            deadline: web_time::Instant::now(),
         }
     }
 
-    /// Decodes still allowed in `pass_nr`, resetting the count when the pass
-    /// has moved on since the last call.
-    fn remaining(&mut self, pass_nr: u64) -> usize {
+    /// Open (or continue) `pass_nr`, returning what is left of it.
+    ///
+    /// A new pass restores the count and stamps the deadline; a later call in
+    /// the same pass gets what is left of both. `first_take_free` is the
+    /// pass's, not the call's — the anti-stall guarantee is "a frame always
+    /// moves the map forward by one tile per source", and a per-call spelling
+    /// of it is the per-call budget wearing the count's clothes.
+    fn open(&mut self, pass_nr: u64) -> PassAllowance {
         if pass_nr != self.pass_nr {
             self.pass_nr = pass_nr;
             self.spent = 0;
         }
-        WASM_TILE_DECODES_PER_PUMP.saturating_sub(self.spent)
+        if self.spent == 0 {
+            // The budget starts when the spending does. A pass whose early
+            // layers found an empty queue must not have burnt its deadline on
+            // nothing before the layer with work reaches it — that would put
+            // the stall back, one pane further along.
+            self.deadline = web_time::Instant::now() + PUMP_TIME_BUDGET;
+        }
+        PassAllowance {
+            budget: WASM_TILE_DECODES_PER_PUMP.saturating_sub(self.spent),
+            deadline: self.deadline,
+            first_take_free: self.spent == 0,
+        }
     }
 
-    /// Record `taken` decodes performed against the allowance.
+    /// Record `taken` takes performed against the allowance.
     fn record(&mut self, taken: usize) {
         self.spent += taken;
     }
@@ -1197,15 +1255,19 @@ fn drain_up_to<T>(
     rx: &mut Receiver<T>,
     budget: usize,
     deadline: web_time::Instant,
+    first_take_free: bool,
     reported: &mut bool,
     mut take: impl FnMut(T),
 ) -> usize {
     let mut taken = 0;
     while taken < budget {
-        // `taken > 0`: the first take of a pump is unconditional, so a frame
-        // already over budget still moves the map forward by one tile rather
-        // than stalling it. See [`PUMP_TIME_BUDGET`].
-        if taken > 0 && web_time::Instant::now() >= deadline {
+        // The first take of the **pass** is unconditional, so a frame already
+        // over budget still moves the map forward by one tile per source
+        // rather than stalling it. `first_take_free` is the pass's answer and
+        // not this call's: spelling it `taken > 0` re-armed the exemption once
+        // per layer, which is how a six-pane frame paid six of them. See
+        // [`PumpBudget`] and [`PUMP_TIME_BUDGET`].
+        if !(first_take_free && taken == 0) && web_time::Instant::now() >= deadline {
             break;
         }
         match rx.try_recv() {
@@ -1294,7 +1356,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             egui_ctx: frame_ctx,
             #[cfg(target_arch = "wasm32")]
-            decode_budget: DecodeBudget::new(),
+            pump_budget: PumpBudget::new(),
             // A raster source. The wasm decode path passes this to `Tile::new`,
             // which only reads a style for a tile that is not an image.
             #[cfg(target_arch = "wasm32")]
@@ -1443,6 +1505,15 @@ impl HttpsTiles {
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
             web_time::Instant::now() + PUMP_TIME_BUDGET,
+            // Per call, and deliberately still per call: the pass-wide budget
+            // is [`PumpBudget`], and reaching it here would mean keeping a
+            // frame-side `Context` clone this arm does not otherwise have —
+            // the IO thread owns the only one — to read `cumulative_pass_nr`
+            // under two `RwLock`s once per layer. A native take is an
+            // `LruCache::put` costing microseconds, so `PUMP_TIME_BUDGET` is
+            // never reached on this arm at all and there is nothing here for
+            // a pass-wide spelling of it to bound. See [`PUMP_TIME_BUDGET`].
+            true,
             io_task_gone_reported,
             |(tile_id, slot): (TileId, FetchPayload)| {
                 // A tile styled under a generation a restyle has replaced is
@@ -1461,7 +1532,7 @@ impl HttpsTiles {
     /// wasm32: decode, upload and cache at most this pass's remaining allowance
     /// of fetched tiles.
     ///
-    /// [`DecodeBudget`] keeps a burst of completed fetches from billing one pass
+    /// [`PumpBudget`] keeps a burst of completed fetches from billing one pass
     /// for this source's whole backlog. The put is unconditional, exactly as a
     /// native tile arriving is: a `None` marker still means failed, do not ask
     /// again.
@@ -1471,7 +1542,7 @@ impl HttpsTiles {
             cache,
             tile_rx,
             egui_ctx,
-            decode_budget,
+            pump_budget,
             style,
             archive_kind,
             parsed,
@@ -1488,11 +1559,13 @@ impl HttpsTiles {
         // is current by construction.
         let epoch = *style_epoch;
 
-        let budget = decode_budget.remaining(egui_ctx.cumulative_pass_nr());
+        let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
+        let budget = allowance.budget;
         let taken = drain_up_to(
             tile_rx,
             budget,
-            web_time::Instant::now() + PUMP_TIME_BUDGET,
+            allowance.deadline,
+            allowance.first_take_free,
             io_task_gone_reported,
             |(tile_id, payload): (TileId, FetchPayload)| {
                 let decoded = match payload {
@@ -1532,7 +1605,7 @@ impl HttpsTiles {
                 }
             },
         );
-        decode_budget.record(taken);
+        pump_budget.record(taken);
         *takes += taken as u64;
 
         if budget > 0 && taken == budget {
@@ -2177,7 +2250,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             egui_ctx: frame_ctx,
             #[cfg(target_arch = "wasm32")]
-            decode_budget: DecodeBudget::new(),
+            pump_budget: PumpBudget::new(),
             // NOT the raster path's `Style::default()`: this is the committed
             // style, and it is what `Tile::new` renders the MVT body against.
             // An empty one would hand back a blank tile for every road and
@@ -2235,7 +2308,7 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             egui_ctx,
             #[cfg(target_arch = "wasm32")]
-            decode_budget: DecodeBudget::new(),
+            pump_budget: PumpBudget::new(),
             #[cfg(target_arch = "wasm32")]
             style: Arc::new(Style::default()),
             #[cfg(target_arch = "wasm32")]

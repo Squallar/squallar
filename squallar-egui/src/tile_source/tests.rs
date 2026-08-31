@@ -11,11 +11,12 @@ use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use super::{
-    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, DecodeBudget, HttpsTiles,
+    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles,
     MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
-    PARSED_TILE_CACHE_ENTRIES, ReadFailureRun, SUSTAINED_READ_FAILURES, TILE_CACHE_ENTRIES,
-    WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES, WASM_TILE_DECODES_PER_PUMP,
-    drain_up_to, interpolate_from_lower_zoom, tile_client, tile_id_is_valid,
+    PARSED_TILE_CACHE_ENTRIES, PumpBudget, ReadFailureRun, SUSTAINED_READ_FAILURES,
+    TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+    WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom, tile_client,
+    tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -632,6 +633,8 @@ fn a_pump_already_over_its_time_budget_still_takes_one_completion() {
         MAX_PARALLEL_DOWNLOADS + 1,
         // Already elapsed: every deadline test after the first take fails.
         Instant::now() - Duration::from_millis(1),
+        // The pass has taken nothing yet, so it still owes its one free take.
+        true,
         &mut reported,
         |value| taken.push(value),
     );
@@ -663,6 +666,7 @@ fn a_pump_inside_its_time_budget_empties_the_queue() {
         &mut rx,
         MAX_PARALLEL_DOWNLOADS + 1,
         Instant::now() + Duration::from_secs(60),
+        true,
         &mut reported,
         |value| taken.push(value),
     );
@@ -1681,6 +1685,7 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
             FIXTURE_BUDGET,
             // Far enough out that the count is the only thing that can bind.
             Instant::now() + Duration::from_secs(60),
+            true,
             reported,
             |(tile_id, bytes): (TileId, Vec<u8>)| {
                 // `Style::default()` for the reason `fetch_one` gives.
@@ -1730,30 +1735,136 @@ fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
 /// The allowance is per pass, not per call, and a new pass restores it.
 #[test]
 fn the_decode_allowance_is_per_pass_and_a_new_pass_restores_it() {
-    let mut budget = DecodeBudget::new();
+    let mut budget = PumpBudget::new();
 
     assert_eq!(
-        budget.remaining(1),
+        budget.open(1).budget,
         WASM_TILE_DECODES_PER_PUMP,
         "a fresh pass starts with the whole allowance"
     );
     budget.record(WASM_TILE_DECODES_PER_PUMP);
     assert_eq!(
-        budget.remaining(1),
+        budget.open(1).budget,
         0,
         "a later call in the same pass gets nothing once the allowance is spent"
     );
 
     assert_eq!(
-        budget.remaining(2),
+        budget.open(2).budget,
         WASM_TILE_DECODES_PER_PUMP,
         "the next pass restores the full allowance"
     );
     budget.record(1);
     assert_eq!(
-        budget.remaining(2),
+        budget.open(2).budget,
         WASM_TILE_DECODES_PER_PUMP - 1,
         "a partial spend leaves exactly the difference for the same pass"
+    );
+}
+
+/// **The time budget is the pass's, and every pump of that pass shares it.**
+///
+/// The count half of the allowance has been per-pass since it was written; the
+/// time half was not. Each `drain_completed_fetches` computed its own
+/// `Instant::now() + PUMP_TIME_BUDGET`, so a source drawn as a layer in six
+/// panes opened six budgets in one frame and the frame's tile cost was
+/// `panes x (budget + one take)` rather than `budget + one take`.
+///
+/// Asserted as an **identity**, never as a duration: the deadline two pumps of
+/// one pass are handed is the same `Instant`, and a new pass's is a different
+/// one. A wall-clock threshold here would be the "assert the property, not the
+/// clock" defect — the property is which budget the second call is spending,
+/// and that is an equality between two instants.
+#[test]
+fn the_pump_time_budget_is_the_passs_and_not_each_calls() {
+    let mut budget = PumpBudget::new();
+
+    // Nothing spent yet: an early layer that found an empty queue must not
+    // have burnt the pass's deadline before the layer with work reaches it.
+    let dry = budget.open(1);
+    assert!(
+        dry.first_take_free,
+        "a pass that has taken nothing still owes its one unconditional take"
+    );
+    budget.record(0);
+    assert!(
+        budget.open(1).first_take_free,
+        "a pump that took nothing must leave the pass's free take unspent, or \
+         a layout whose first layer has an empty queue stalls the one behind it"
+    );
+
+    // The pass spends its free take. From here every later call in the pass is
+    // the deadline's business.
+    let first = budget.open(1);
+    budget.record(1);
+
+    let second = budget.open(1);
+    assert_eq!(
+        second.deadline, first.deadline,
+        "the second pump of a pass opened a NEW time budget: a six-pane frame \
+         bills six of them, which is the defect this pins"
+    );
+    assert!(
+        !second.first_take_free,
+        "the second pump of a pass re-armed the unconditional first take, so \
+         the deadline above can never bind however far past it the frame is"
+    );
+
+    let third = budget.open(1);
+    assert_eq!(
+        third.deadline, second.deadline,
+        "the deadline must be stamped once per pass, not once per call after \
+         the first"
+    );
+
+    // A new pass is a new frame, and a new frame owes a fresh budget.
+    let next_pass = budget.open(2);
+    assert_ne!(
+        next_pass.deadline, first.deadline,
+        "a new pass reused the previous pass's deadline, so a frame inherits a \
+         budget another frame already spent"
+    );
+    assert!(
+        next_pass.first_take_free,
+        "a new pass must restore the unconditional take, or a busy frame can \
+         stall the map outright"
+    );
+}
+
+/// The count and the time halves bound the pass **together**: whichever runs
+/// out first stops it, and neither can be spent by re-entering.
+///
+/// The counterpart that keeps the test above non-vacuous. That one would pass
+/// on a budget that never lets anything through at all; this one pins that a
+/// pass with its allowance intact still hands out the whole of it.
+#[test]
+fn a_pass_hands_out_its_whole_allowance_across_however_many_pumps() {
+    let mut budget = PumpBudget::new();
+
+    // Spend the pass one take at a time, as a six-pane layout's six pumps do.
+    let mut handed = 0usize;
+    for _ in 0..WASM_TILE_DECODES_PER_PUMP {
+        let allowance = budget.open(7);
+        assert_eq!(
+            allowance.budget,
+            WASM_TILE_DECODES_PER_PUMP - handed,
+            "the count left to the pass must be the allowance minus what it \
+             has spent, however many calls spent it"
+        );
+        budget.record(1);
+        handed += 1;
+    }
+
+    assert_eq!(
+        handed, WASM_TILE_DECODES_PER_PUMP,
+        "the pass handed out {handed} takes where its whole allowance is \
+         {WASM_TILE_DECODES_PER_PUMP}: a bound that never lets the queue move \
+         is a worse bug than the one it replaced",
+    );
+    assert_eq!(
+        budget.open(7).budget,
+        0,
+        "the pass kept handing out takes past its own allowance"
     );
 }
 
