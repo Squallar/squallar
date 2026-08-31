@@ -110,7 +110,7 @@ serde_json = { workspace = true }
 # `zbus/async-io` plus `async-fs`, `async-net` and `futures-util/io`. The
 # provider drives its own futures with `futures_lite::future::block_on`; the
 # `async-io` reactor those calls need starts itself on first use.
-ashpd = { version = "=0.10.3", default-features = false, features = [
+ashpd = { version = "=0.13.13", default-features = false, features = [
     "async-std",
 ], optional = true }
 # `block_on` and `StreamExt::next` for the session thread, and `oneshot` for
