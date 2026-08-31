@@ -2,10 +2,12 @@
 #
 # run_tier2.sh -- the Tier-2 browser gate: serve the built squallar-web bundle
 # on a fresh port and drive the full PWA in Chromium and Firefox. FOUR
-# passes per browser -- FIVE since the `wide` leg landed on 2026-08-31 (the
-# roster grew at WO-5 and twice on 2026-08-31; a report quoting the old "4/4"
-# leg count predates the gesture leg, one quoting "three passes" predates the
-# long leg, and one quoting four predates `wide`):
+# passes per browser by default -- FIVE since the `wide` leg landed on
+# 2026-08-31 (the roster grew at WO-5 and twice on 2026-08-31; a report quoting
+# the old "4/4" leg count predates the gesture leg, one quoting "three passes"
+# predates the long leg, and one quoting four predates `wide` -- the default
+# count is 10), plus a SIXTH that is built and deliberately not in the default
+# roster yet:
 #
 #   live      the app against LIVE network; asserts boot, canvas non-blank,
 #             rAF sane, zero panics/errors, AND the worker wire: >=1
@@ -55,6 +57,41 @@
 #             rig's default 1280x900, so `long` above could not see it and did
 #             not: the driver is the tile SPAN a wide viewport asks for, not
 #             the layer count or the elapsed time. See WIDE_SEED_LS.
+#   huge      NOT IN THE DEFAULT ROSTER -- opt in with
+#             RIG_LEGS="live doctored gesture long wide huge". The `long` leg's
+#             scene at the CANVAS SIZE A USER ACTUALLY HAS -- 2878x1651,
+#             corrected for and then ASSERTED with --expect-canvas. 45 s with
+#             --expect-frame-progress. Every other leg here runs at the
+#             browser's default (measured on this box: 1280x757 chromium,
+#             1280x815 firefox), and a winit `RefCell already borrowed` freeze
+#             reproduces at 2878x1651 and not at the default, so the roster was
+#             structurally blind to it rather than unlucky.
+#
+#             IT IS HELD OUT ON PURPOSE AND THIS IS NOT AN OVERSIGHT. The leg
+#             works -- it reproduced that freeze on both browsers on both
+#             attempts the first time it ran -- and the defect it finds is
+#             live and owned by another lane. Putting it in the default roster
+#             now would redden this gate for every session in this tree over a
+#             bug none of them introduced. It goes into the default the moment
+#             the scene can go green, and at that point it is the thing that
+#             proves the fix. Same terms the `long` leg carried.
+#
+#             --expect-canvas is not decoration: without it a leg that could
+#             not be made that big (a virtual screen smaller than the target --
+#             see HUGE_WINDOW below) passes while claiming a size it never
+#             rendered at, which is the same "verdict the rig has not earned"
+#             this file's run-id binding exists to end.
+#
+# EVERY VERDICT IS BOUND TO THE RUN THAT PRODUCED IT (2026-08-31). Each attempt
+# mints a run id, hands it to drive.py, and the summary refuses any artefact
+# that does not carry it back; artefacts are wiped before a leg starts; the
+# driver's exit code separates "ran and failed" from "never started". Before
+# this, the summary printed whatever JSON happened to be on disk under the
+# leg's name, and a leg that died on an argparse error in under a second was
+# reported as PASS. See the block above `LEDGER=` for the full account -- it is
+# the reason this gate is a gate. The summary now prints FOUR numbers
+# (passed / failed / did-not-run / infrastructure) and only the first being
+# equal to the leg count is a green run.
 #
 # Network posture (campaign-resolved): LIVE network, one auto-retry per pass
 # as the flake-quarantine policy -- the app's own backoff machinery is part of
@@ -159,6 +196,17 @@ OUT_DIR="${RIG_OUT_DIR:-$RIG_DIR/out}"
 CHROMEDRIVER="${RIG_CHROMEDRIVER:-$(command -v chromedriver || echo /usr/bin/chromedriver)}"
 FRAMES="${RIG_FRAMES:-120}"
 BROWSERS="${RIG_BROWSERS:-chromium firefox}"
+# The legs each browser runs, and the DEFAULT is what "the Tier-2 gate" means.
+# `huge` exists and is not in it -- see the roster note in the header for why,
+# and opt in with RIG_LEGS="live doctored gesture long huge".
+#
+# This knob can SHRINK the roster as well as grow it, which is a hazard in its
+# own right: a run of one leg still prints a tally, and "1/1 PASS" is a
+# sentence somebody could quote. The summary therefore prints the roster it
+# actually ran and says so loudly when it was not the default -- a reduced run
+# is a debugging aid and is never the gate.
+DEFAULT_LEGS="live doctored gesture long wide"
+LEGS="${RIG_LEGS:-$DEFAULT_LEGS}"
 EXPECT_TIMEOUT="${RIG_EXPECT_TIMEOUT:-180}"
 # Set to 0 to report the pool without gating on it -- for bisecting a browser
 # that will not build one, never as a way past a red leg.
@@ -318,6 +366,46 @@ WIDE_SETTLE="${RIG_WIDE_SETTLE:-10}"
 WIDE_WINDOW_S="${RIG_WIDE_WINDOW_S:-50}"
 WIDE_PROGRESS_WINDOW="${RIG_WIDE_PROGRESS_WINDOW:-20}"
 
+# ---------------------------------------------------------------------------
+# THE `huge` LEG: the size the app is actually used at
+# ---------------------------------------------------------------------------
+#
+# Every web leg in this rig had run at the default window until 2026-08-31,
+# which lands a canvas of roughly 1280x815. A user-reported freeze was then
+# root-caused to a `RefCell already borrowed` panic in winit's web event-loop
+# runner that depends on CANVAS SIZE and nothing else:
+#
+#   2878x1651 (the reporting user's window)  dies 4 of 4, at +14-16 s
+#   1280x815  (this rig's default)           clean 2 of 2, through 46-53 s
+#
+# So the rig was not unlucky, it was STRUCTURALLY BLIND: no leg had ever been
+# run at a size that could reproduce it. And afterwards rAF stays at 17.06 ms
+# and the canvas holds its last painted frame, so -- exactly as with the MRMS
+# abort the `long` leg exists for -- every cheap liveness signal reports health
+# while the app is dead. The app's own frame counter is again the only witness,
+# which is why this leg carries --expect-frame-progress rather than a
+# screenshot.
+#
+# 45 s of window and not 140: the death is at +14-16 s on a scene that
+# reproduces, so this clears it by ~3x while keeping the leg affordable. If a
+# larger margin is ever wanted, RIG_HUGE_WINDOW is the knob -- but a leg that
+# has to run for two minutes to see a fourteen-second defect is a leg nobody
+# runs.
+#
+# --window is set ABOVE the target on purpose and is not decoration. fit_canvas
+# corrects the WINDOW until the BUFFER matches, and the Firefox arm's Xvfb
+# screen is sized from the initial --window (`screen=(window+400, window+150)`
+# in drive.py's launch): start this leg at the default 1280x900 and the virtual
+# screen is 1680x1050, the window can never grow past it, and the canvas
+# silently tops out around 1280 -- a leg claiming to test 2878 that tested
+# 1280. --expect-canvas is what turns that from a silent mislabel into a red
+# leg; see its help text in drive.py.
+HUGE_CANVAS="${RIG_HUGE_CANVAS:-2878x1651}"
+HUGE_WINDOW="${RIG_HUGE_WINDOW_SIZE:-3100x1900}"
+HUGE_SETTLE="${RIG_HUGE_SETTLE:-8}"
+HUGE_WINDOW_S="${RIG_HUGE_WINDOW:-45}"
+HUGE_PROGRESS_WINDOW="${RIG_HUGE_PROGRESS_WINDOW:-15}"
+
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
 EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
@@ -359,6 +447,84 @@ if [ -n "${RIG_SERVE_EXTRA:-}" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
+
+# --------------------------------------------------- binding the verdict ----
+#
+# WHY THIS EXISTS. Until 2026-08-31 the summary block below did exactly one
+# thing to decide a leg's verdict: `os.path.isfile(out/<tag>.json)`, then print
+# that file's `pass` field. NOTHING tied the file to the run. A leg that never
+# started left the PREVIOUS run's JSON sitting under the same name, and the
+# summary printed its verdict as this run's -- observed as
+# `firefox.long PASS ... frames_live=ok` for a leg whose driver had died on an
+# argparse error in under a second. A paired A/B lane hit the same shape and
+# came back with twelve "independent" three-minute runs all reporting
+# `total_s=179.18`, identical to the centisecond, because they were twelve
+# reads of one file.
+#
+# That is this repo's *vacuous verification* pattern -- a check that cannot
+# fail -- sitting in the landing gate rather than in a test. Every "tier-2 8/8
+# PASS" quoted from this summary rested on it.
+#
+# THREE MECHANISMS, and the reason it is three rather than one:
+#
+#   1. RUN ID (primary). Each attempt mints a token, passes it to drive.py,
+#      which copies it into the JSON as `run_id`; the summary demands an EXACT
+#      match. This is the only one of the three that cannot be defeated by a
+#      clock: not by a filesystem with one-second timestamps, not by a re-run
+#      inside the same second, not by an unrelated `touch`. It also travels
+#      WITH the artefact, so a comparison script that copies these files
+#      elsewhere -- which is what the A/B lane was doing -- can check it too.
+#   2. WIPE BEFORE START. Every artefact a tag can produce is deleted before
+#      each attempt, so "the file is missing" means this leg wrote nothing,
+#      rather than "some earlier run's file is still lying there". Belt to the
+#      run id's braces: it makes the stale case rare instead of merely
+#      detectable.
+#   3. DRIVER EXIT CODE. Recorded per leg so the summary can separate "ran and
+#      failed" from "never started". drive.py now spends four distinct codes
+#      (0 / 2 / 64 usage / 69 infrastructure) precisely so this is possible.
+#
+# A gate that passed only 3 would still be a gate; the run id alone is the one
+# that carries the property. The other two make the failure legible.
+LEDGER="$OUT_DIR/tier2-legs.tsv"
+: > "$LEDGER"
+
+# One token per ATTEMPT, not per leg: the quarantine retry is a different run
+# of the same leg and must not be able to satisfy the first attempt's check.
+new_run_id() {
+  local u=""
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    u="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
+  fi
+  if [ -z "$u" ]; then
+    # No uuid source. Nanoseconds + pid + two draws from $RANDOM, which is
+    # seeded per shell -- enough that two attempts in the same run cannot
+    # collide, which is all this has to guarantee.
+    u="$(date -u +%Y%m%dT%H%M%S%N)-$$-${RANDOM}${RANDOM}"
+  fi
+  printf 'tier2-%s' "$u"
+}
+
+# How drive.py's exit code should be read. The `infra` fallback grep is a
+# backstop for the case drive.py cannot classify itself -- it is the child
+# process that ran out of room, and if the disk filled while it was writing its
+# own stderr the code may not have made it out either.
+classify_rc() {
+  local rc="$1" errf="$2"
+  case "$rc" in
+    0)  printf ran ;;
+    64) printf usage ;;
+    69) printf infra ;;
+    *)
+      if [ -s "$errf" ] && grep -qE \
+          "Errno (28|122)|No space left on device|Disk quota exceeded" \
+          "$errf"; then
+        printf infra
+      else
+        printf ran
+      fi
+      ;;
+  esac
+}
 
 # ---------------------------------------------------------------- build ----
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -468,15 +634,45 @@ fi
 
 # run_pass <browser> <tag> <leg live|doctored|gesture|long>: one server + one
 # drive.py run.
+#
+# Sets three globals for the caller, and they are the whole binding contract:
+#   LAST_RUN_ID  the token this attempt minted and handed to drive.py
+#   LAST_RC      drive.py's exit code (or 70 if the server never came up, in
+#                which case drive.py was never execed at all)
+#   LAST_CLASS   ran | usage | infra | nostart -- see classify_rc
+LAST_RUN_ID=""
+LAST_RC=0
+LAST_CLASS=""
 run_pass() {
   local browser="$1" tag="$2" leg="$3"
   local driver server_args=() drive_args=() SEED=""
+  LAST_RUN_ID="$(new_run_id)"
+  LAST_RC=0
+  LAST_CLASS=""
+  # Mechanism 2. Everything this tag can write goes first, so a leg that dies
+  # before producing anything leaves an EMPTY slot rather than the last run's
+  # verdict wearing this run's name.
+  rm -f "$OUT_DIR/$tag.json" \
+        "$OUT_DIR/$tag.page.png" "$OUT_DIR/$tag.canvas.png" \
+        "$OUT_DIR/$tag.fail.png" "$OUT_DIR/$tag.driver.log" \
+        "$OUT_DIR/$tag.driver.stderr" "$OUT_DIR/$tag.xvfb.log"
   case "$browser" in
     chromium) driver="$CHROMEDRIVER" ;;
     firefox)  driver="$GECKODRIVER" ;;
     *) echo "unknown browser: $browser" >&2; return 1 ;;
   esac
-  if [ "$leg" = long ]; then
+  if [ "$leg" = huge ]; then
+    # The long leg's scene at the user's canvas. Same seventeen layers and the
+    # same playing loop -- the freeze reproduces on a scene that is drawing,
+    # and this leg differs from `long` in SIZE, which is the variable under
+    # test. --expect-canvas rides along so a leg that could not be made this
+    # big fails instead of quietly reporting a small one.
+    SEED="$LONG_SEED_LS"
+    drive_args+=(--canvas "$HUGE_CANVAS" --expect-canvas
+                 --window "$HUGE_WINDOW"
+                 --settle "$HUGE_SETTLE" --data-window "$HUGE_WINDOW_S"
+                 --expect-frame-progress "$HUGE_PROGRESS_WINDOW")
+  elif [ "$leg" = long ]; then
     # Ninety seconds, an overlay loop, nobody touching the page, and one
     # assert: the app's own frame counter was still moving at the end of it.
     # The worker-wire waits stay on the live leg -- this leg asks whether the
@@ -535,55 +731,180 @@ run_pass() {
     server_args+=(--doctor-first-worker)
     drive_args+=(--expect-doctored-respawn)
   fi
-  start_server ${server_args[@]+"${server_args[@]}"} || return 1
+  if ! start_server ${server_args[@]+"${server_args[@]}"}; then
+    # drive.py was never execed. This is emphatically NOT "the leg failed":
+    # nothing was asserted, and a summary that prints FAIL here would send a
+    # reader to look at the app.
+    LAST_RC=70
+    LAST_CLASS=nostart
+    return 1
+  fi
+  local errf="$OUT_DIR/$tag.driver.stderr"
+  : > "$errf"
+  # stderr is captured rather than streamed so classify_rc can read it, then
+  # replayed in full -- drive.py's own progress goes to stdout, so nothing a
+  # watcher relies on stops being live.
   "$PY" "$RIG_DIR/drive.py" \
       --browser "$browser" --url "$URL" \
-      --out-dir "$OUT_DIR" --tag "$tag" \
+      --out-dir "$OUT_DIR" --tag "$tag" --run-id "$LAST_RUN_ID" \
       --driver "$driver" --frames "$FRAMES" \
       "${drive_args[@]}" \
-      ${EXTRA[@]+"${EXTRA[@]}"}
+      ${EXTRA[@]+"${EXTRA[@]}"} 2>"$errf"
   local rc=$?
+  cat "$errf" >&2
+  LAST_RC="$rc"
+  LAST_CLASS="$(classify_rc "$rc" "$errf")"
   stop_server
   return "$rc"
 }
 
+# An argument drive.py refuses is fatal to the RUN, not to the leg. Every
+# remaining leg is about to be handed the same argument list and die the same
+# way, and eight copies of one usage dump is how the real sentence got lost the
+# first time. Retrying is worse than useless: a rejected flag is not a flake.
+abort_on_usage() {
+  local tag="$1"
+  [ "$LAST_CLASS" = usage ] || return 0
+  echo >&2
+  echo "################################################################" >&2
+  echo "FATAL: drive.py REFUSED THE ARGUMENTS run_tier2.sh passed it." >&2
+  echo "  leg: $tag" >&2
+  grep -m1 -E "^drive.py: error:|unrecognized arguments" \
+      "$OUT_DIR/$tag.driver.stderr" 2>/dev/null | sed 's/^/  /' >&2
+  echo >&2
+  echo "  NOTHING RAN. This is not a leg failure and not a flake, so there" >&2
+  echo "  is no retry and no further leg: the rest of the roster would die" >&2
+  echo "  the same way. The usual cause is run_tier2.sh and drive.py coming" >&2
+  echo "  from DIFFERENT commits -- a rebase that dropped one of them is" >&2
+  echo "  exactly how this was found." >&2
+  echo "################################################################" >&2
+  exit 64
+}
+
 overall=0
-TAGS=""
 for browser in $BROWSERS; do
-  for leg in live doctored gesture long wide; do
+  for leg in $LEGS; do
     if [ "$leg" = live ]; then
       tag="$browser"
     else
       tag="$browser.$leg"
     fi
-    TAGS="$TAGS $tag"
     echo
     echo "================ $tag ================"
     if run_pass "$browser" "$tag" "$leg"; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$tag" "$LAST_CLASS" "$LAST_RUN_ID" \
+          "$LAST_RC" 1 >> "$LEDGER"
       continue
     fi
+    abort_on_usage "$tag"
     # Retry-once quarantine (live-network flake policy): a fresh server, a
     # fresh port, a fresh browser profile. A second failure fails the leg.
-    echo "$tag FAILED; one quarantine retry (live-network flake policy)" >&2
+    echo "$tag FAILED (rc=$LAST_RC, $LAST_CLASS); one quarantine retry" \
+         "(live-network flake policy)" >&2
     echo "================ $tag (retry) ================"
     if ! run_pass "$browser" "$tag" "$leg"; then
-      echo "$tag failed twice" >&2
+      abort_on_usage "$tag"
+      echo "$tag failed twice (rc=$LAST_RC, $LAST_CLASS)" >&2
       overall=1
     fi
+    # The row describes the LAST attempt, which is the one whose artefacts are
+    # on disk -- the retry wiped the first attempt's before it started.
+    printf '%s\t%s\t%s\t%s\t%s\n' "$tag" "$LAST_CLASS" "$LAST_RUN_ID" \
+        "$LAST_RC" 2 >> "$LEDGER"
   done
 done
 
 # -------------------------------------------------------------- summary ----
 echo
 echo "================ tier2 summary ================"
-"$PY" - "$OUT_DIR" $TAGS <<'EOF'
+# The roster this run actually drove, printed beside its verdict. A tally
+# ("N/M PASS") describes whatever roster produced it, and without this line the
+# denominator is invisible -- which is the same defect as an unbound artefact,
+# one level up.
+echo "roster: [$LEGS] x [$BROWSERS]"
+if [ "$LEGS" != "$DEFAULT_LEGS" ]; then
+  echo "NOTE: RIG_LEGS replaced the default roster [$DEFAULT_LEGS]."
+  echo "      This run is a debugging aid, NOT the Tier-2 gate, and its tally"
+  echo "      must not be quoted as one."
+fi
+if [ "$BROWSERS" != "chromium firefox" ]; then
+  echo "NOTE: RIG_BROWSERS replaced the default [chromium firefox]. Web is two"
+  echo "      targets and one of them is missing from this run."
+fi
+"$PY" - "$OUT_DIR" "$LEDGER" <<'EOF'
+# THREE STATES, and the distinction between the last two is the whole point:
+#
+#   PASS         a JSON exists, it carries THIS attempt's run id, and its
+#                `pass` is true.
+#   FAIL         same binding, `pass` false. The leg ran; the app was wrong.
+#   DID NOT RUN  no JSON, an unreadable JSON, or -- the case this was written
+#                for -- a JSON carrying somebody else's run id. Nothing was
+#                asserted. It is NOT a pass and it is NOT a leg failure, and
+#                printing it as either is how a dead leg shipped as green.
+#   INFRA        the box ran out of room. Also nothing asserted, but the
+#                repair is somewhere else, so it does not hide among the
+#                did-not-runs.
+#
+# Every state except PASS makes this block exit non-zero, so the summary is
+# itself a gate rather than a report about one.
 import json, os, sys
-out = sys.argv[1]
-for tag in sys.argv[2:]:
+out, ledger_path = sys.argv[1], sys.argv[2]
+
+legs = []
+with open(ledger_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t")
+        while len(parts) < 5:
+            parts.append("")
+        legs.append(dict(zip(("tag", "cls", "run_id", "rc", "attempts"), parts)))
+
+states = []
+for leg in legs:
+    tag, cls, want = leg["tag"], leg["cls"], leg["run_id"]
     p = os.path.join(out, tag + ".json")
+
+    def dnr(why):
+        states.append((tag, "DID NOT RUN"))
+        print("%-18s DID NOT RUN  %s" % (tag, why))
+        print("%-18s   (rc=%s, driver outcome=%s). NOTHING WAS ASSERTED on "
+              "this leg -- it neither passed nor failed." % ("", leg["rc"], cls))
+
+    if cls == "nostart":
+        states.append((tag, "DID NOT RUN"))
+        print("%-18s DID NOT RUN  serve.py never came up; drive.py was never "
+              "started" % tag)
+        continue
+    if cls == "usage":
+        dnr("drive.py refused its arguments (exit 64)")
+        continue
+    if cls == "infra":
+        states.append((tag, "INFRA"))
+        print("%-18s INFRA FAIL   the box ran out of room (rc=%s). This is not "
+              "a verdict on the app." % (tag, leg["rc"]))
+        continue
     if not os.path.isfile(p):
-        print("%-18s NO RESULT (%s missing)" % (tag, p)); continue
-    r = json.load(open(p))
+        dnr("%s was never written" % p)
+        continue
+    try:
+        r = json.load(open(p))
+    except Exception as e:
+        dnr("%s is unreadable (%s)" % (p, e))
+        continue
+    got = r.get("run_id")
+    if got != want:
+        # THE STALE READ. Before 2026-08-31 this branch did not exist and the
+        # line below was printed as PASS.
+        dnr("%s is a STALE ARTEFACT -- it carries run_id %r, this attempt was "
+            "%r" % (p, got, want))
+        print("%-18s   the file on disk was left by an EARLIER run (it says "
+              "started_utc=%s, total_s=%s) and describes nothing that happened "
+              "just now." % ("", r.get("started_utc"), r.get("total_s")))
+        continue
+
+    states.append((tag, "PASS" if r.get("pass") else "FAIL"))
     v = r.get("verdict") or {}
     env = r.get("env") or {}
     b = r.get("canvas_final") or (r.get("boot") or {}).get("probe") or {}
@@ -599,16 +920,35 @@ for tag in sys.argv[2:]:
     fp = r.get("frame_progress")
     def tri(x):
         return "-" if x is None else ("ok" if x.get("ok") else "FAIL")
-    print("%-18s %s  boot=%s canvas=%sx%s raf[%s] canvas_blank=%s "
+    # THE SIZE, on the headline row and in DEVICE pixels. Every other figure on
+    # this row -- raster bytes, texture uploads, frame times, and the liveness
+    # verdict itself -- is a figure PER THIS SIZE. A leg that passed at
+    # 1280x815 and one that passed at 2878x1651 are not the same evidence, and
+    # a freeze that only reproduces above some size is invisible in a summary
+    # that does not say which one ran. `buf` is the drawing buffer, which is
+    # what was rasterized; the CSS box follows it in parentheses when they
+    # differ (a device pixel ratio other than 1).
+    ct = r.get("canvas_target") or {}
+    buf = (v.get("canvas_buffer")
+           or ("%sx%s" % (b.get("bufferWidth"), b.get("bufferHeight"))
+               if b.get("bufferWidth") else "?"))
+    css = "%sx%s" % (b.get("clientWidth"), b.get("clientHeight"))
+    size = buf if buf == css else "%s (css %s)" % (buf, css)
+    if ct:
+        size += " [asked %s, met=%s]" % (ct.get("asked"), ct.get("met"))
+    print("%-18s %s  boot=%s canvas=%s raf[%s] canvas_blank=%s "
           "errors=%s panics=%s traps=%s round_trip=%s respawn=%s interact=%s "
           "basemap=%s frames_live=%s"
           % (tag, "PASS" if r.get("pass") else "FAIL",
-             v.get("booted"), b.get("clientWidth"), b.get("clientHeight"),
+             v.get("booted"), size,
              raf(rw),
              (sh.get("canvas") or {}).get("blank"),
              v.get("rig_error_count"), v.get("panic_count"),
              v.get("wasm_trap_count"),
              tri(wrt), tri(dr), tri(ifr), tri(bmg), tri(fp)))
+    cve = r.get("canvas_expect")
+    if cve is not None and not cve.get("ok"):
+        print("%-18s   canvas EXPECT FAILED: %s" % ("", cve.get("error")))
     if fp is not None:
         # The long leg's own figure, and the only thing it gates on: how many
         # frames the app's own counter gained over the last window, and how
@@ -738,7 +1078,38 @@ for tag in sys.argv[2:]:
     if r.get("exception"):
         print("%-18s failed at stage %r: %s"
               % ("", r.get("failed_stage"), r.get("exception")))
+
+# ---- the tally, and the reason it is printed as four numbers -------------
+# "8/8 PASS" is the sentence this gate is quoted by, and it is only true if
+# the other three columns are zero. Printing them always means nobody can
+# quote the first number without the row that would contradict it.
+n = len(states)
+passed = sum(1 for _, s in states if s == "PASS")
+failed = sum(1 for _, s in states if s == "FAIL")
+dnrun = sum(1 for _, s in states if s == "DID NOT RUN")
+infra = sum(1 for _, s in states if s == "INFRA")
+print()
+print("tier2: %d/%d PASS   (%d failed, %d DID NOT RUN, %d infrastructure)"
+      % (passed, n, failed, dnrun, infra))
+if n == 0:
+    print("tier2 VERDICT: FAILURE -- no leg was recorded at all")
+    sys.exit(1)
+if passed != n:
+    print("tier2 VERDICT: FAILURE")
+    for tag, s in states:
+        if s != "PASS":
+            print("  %-18s %s" % (tag, s))
+    sys.exit(1)
+print("tier2 VERDICT: PASS -- every leg produced a result bound to this run")
 EOF
+summary_rc=$?
+# The summary is a gate, not a report about one. It can redden a run the leg
+# loop called green: the loop only knows drive.py's exit code, while this block
+# is the only thing that checks the artefact it left behind is actually this
+# run's.
+if [ "$summary_rc" -ne 0 ]; then
+  overall=1
+fi
 
 echo
 echo "artifacts in $OUT_DIR:"
