@@ -19,10 +19,16 @@
 //!
 //! `grib`'s PNG stage allocates the whole image buffer inside
 //! `read_image_buffer` — 24.5 M × 2 bytes ≈ **49 MB** here — and `dispatch()`
-//! hands back a **lazy** iterator over it. Streaming that into a
-//! `Vec::with_capacity(ni * nj)` puts the peak at 49 MB + 98 MB ≈ 147 MB, plus
-//! the ~1.4 MB of GRIB2 bytes. **Never `.collect()` an intermediate** and never
-//! grow the buffer from empty: either turns the peak into 49 + 98 + 98 = 245 MB.
+//! hands back a **lazy** iterator over it. Streaming that into a `Vec` reserved
+//! to `ni * nj` puts the peak at 49 MB + 98 MB ≈ 147 MB, plus the ~1.4 MB of
+//! GRIB2 bytes. **Never `.collect()` an intermediate** and never grow the
+//! buffer from empty: either turns the peak into 49 + 98 + 98 = 245 MB.
+//!
+//! The 98 MB half is reserved **fallibly**, and that is not tidiness: on wasm32
+//! the whole module lives in a memory capped at 1 GiB, an allocation failure
+//! there aborts without unwinding, and an abort inside a frame leaves winit's
+//! event loop permanently borrowed. [`parse_grib2_raw`] carries the full
+//! reasoning at the reserve itself.
 
 use std::io::Read;
 
@@ -389,7 +395,42 @@ pub fn parse_grib2_raw(bytes: &[u8], missing: &[f32]) -> Result<RawGrid, String>
     // **Pre-sized, and streamed.** `dispatch()` is lazy over grib's PNG image
     // buffer; `collect()` here would hold that buffer, a fresh 98 MB result and
     // the growth copies at once. See this module's header.
-    let mut values: Vec<f32> = Vec::with_capacity(ni * nj);
+    //
+    // `try_reserve_exact`, not `with_capacity`: this is the largest single
+    // allocation the app makes anywhere, and on wasm32 it is made against a
+    // memory with a **hard 1 GiB ceiling** (`--max-memory=1073741824`, set in
+    // `.github/scripts/wasm-threads.sh` because a shared memory has to declare
+    // one at link time). An infallible allocation the engine cannot serve calls
+    // `handle_alloc_error`, which aborts — and wasm32-unknown-unknown is
+    // `panic-strategy = "abort"`, so **nothing unwinds**: every `RefCell` guard
+    // live on the stack at that instant is never dropped. When the abort lands
+    // inside a frame, winit's web event-loop runner keeps its own `RefCell`
+    // borrowed for the life of the page (`web/event_loop/runner.rs:599` then
+    // panics `already borrowed` on the next timer wake), the frame loop stops
+    // for good, and the canvas keeps its last painted frame while
+    // `requestAnimationFrame`, the network and the workers all carry on — a
+    // silent freeze that every screenshot and rAF check reports as healthy.
+    // Measured 2026-08-31: a KTLX pane with the layer set enabled and a loop
+    // playing, no input at all, reached this abort inside 150 s on Firefox 154
+    // and Chromium 151 alike. A fallible reserve turns the identical condition
+    // into this layer's ordinary error path, which the fetch task already
+    // reports and the rest of the app already survives.
+    //
+    // `checked_mul` for the same reason `pmtiles` grew one: `usize` is 32 bits
+    // on this target, so a malformed section 3 could wrap `ni * nj` to a small
+    // capacity in release and hand the loop below a `Vec` that grows from
+    // nothing — the exact peak this module's header forbids.
+    let points = ni
+        .checked_mul(nj)
+        .ok_or_else(|| format!("MRMS: a {ni}×{nj} grid overflows this target's index width"))?;
+    let mut values: Vec<f32> = Vec::new();
+    values.try_reserve_exact(points).map_err(|_| {
+        format!(
+            "MRMS: cannot hold a {ni}×{nj} grid ({} MB of values) in this \
+             build's memory",
+            points.saturating_mul(size_of::<f32>()) / (1024 * 1024),
+        )
+    })?;
     for raw in decoder
         .dispatch()
         .map_err(|e| format!("MRMS decode error: {e}"))?
