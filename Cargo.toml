@@ -145,7 +145,7 @@ egui-winit = { version = "=0.35.0", default-features = false }
 # egui's pixel type, taken directly by the crates that materialize wire
 # replies in egui's own layout without being UI crates. Adds no package:
 # egui already pulls this exact version in through epaint.
-ecolor = { version = "=0.35.0", default-features = false }
+ecolor = { version = "=0.36.1", default-features = false }
 walkers = "=0.56.0"
 
 ewebsock = { version = "=0.8.0", default-features = false, features = ["tls"] }
