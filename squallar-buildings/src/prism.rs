@@ -292,7 +292,7 @@ fn push_cap_indices(
     caps: &VertexBuffers<[f32; 2], u32>,
     facing: CapFacing,
 ) {
-    for triangle in caps.indices.chunks_exact(3) {
+    for triangle in caps.indices.as_chunks::<3>().0 {
         let (a, b, c) = (
             caps.vertices[triangle[0] as usize],
             caps.vertices[triangle[1] as usize],

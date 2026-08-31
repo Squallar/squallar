@@ -153,7 +153,7 @@ impl TransferTable {
         iso_shape: IsoShape,
         default_iso_threshold: f32,
     ) -> Self {
-        let fade_band = match lut.chunks_exact(4).position(|entry| entry[3] != 0) {
+        let fade_band = match lut.as_chunks::<4>().0.iter().position(|entry| entry[3] != 0) {
             // Entry 0 is forced transparent, so the band under the first
             // opaque entry is `n − 1` wide.
             Some(n) => n.saturating_sub(1) as u8,
@@ -161,7 +161,7 @@ impl TransferTable {
             None => u8::MAX,
         };
         let see_through_indices = lut
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .skip(1)
             .filter(|entry| entry[3] <= SEE_THROUGH_ALPHA_CEILING)
             .count() as u16;

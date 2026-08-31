@@ -2640,7 +2640,7 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
          below is now comparing across a conversion",
     );
 
-    let painted = direct.rgba.chunks_exact(4).filter(|px| px[3] != 0).count();
+    let painted = direct.rgba.as_chunks::<4>().0.iter().filter(|px| px[3] != 0).count();
     assert!(
         painted > 0,
         "the fixture painted nothing, so byte-identity would be vacuous",
@@ -2679,7 +2679,7 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
 
 /// Painted pixels — the non-vacuity floor every parity test below stands on.
 fn painted(rgba: &[u8]) -> usize {
-    rgba.chunks_exact(4).filter(|px| px[3] != 0).count()
+    rgba.as_chunks::<4>().0.iter().filter(|px| px[3] != 0).count()
 }
 
 /// [`execute_bytes`] on an overlay job's own wire form, down to the raster.
@@ -2788,7 +2788,7 @@ fn the_outlooks_render_is_byte_identical_direct_and_via_the_wire() {
     // it approaches.
     let hatch_ink = direct
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .filter(|p| p[2] > 200 && p[0] < 60 && p[1] < 60)
         .count();
     assert!(

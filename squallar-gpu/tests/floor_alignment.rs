@@ -560,7 +560,7 @@ fn sample_grid(grid: &squallar_radar::voxel::VolumeGrid, thresh: f32) -> Mask {
 
 fn write_ppm_rgba(path: &str, side: usize, rgba: &[u8]) {
     let mut out = format!("P6\n{side} {side}\n255\n").into_bytes();
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         out.extend_from_slice(&px[..3]);
     }
     std::fs::write(path, out).unwrap_or_else(|e| panic!("writing {path}: {e}"));

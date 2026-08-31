@@ -229,7 +229,7 @@ fn render_a_real_volume_mask() {
             // happen here — in gamma space, which is where epaint does it — or
             // every faded gate at the palette's transparent end composites far too
             // bright.
-            for px in image.chunks_exact_mut(4) {
+            for px in image.as_chunks_mut::<4>().0 {
                 let alpha = u32::from(px[3]);
                 for channel in &mut px[..3] {
                     *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
