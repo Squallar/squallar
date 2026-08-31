@@ -47,6 +47,7 @@ use crate::render::gridded::ResidentGrid;
 pub mod decode;
 pub mod fetch;
 pub mod fields;
+pub mod staging;
 /// The 3D stack. Nothing draws it -- see the module doc.
 pub mod volume;
 
@@ -272,12 +273,23 @@ const _: () = assert!(CONUS_GRID_BYTES == 98_000_000);
 /// concurrent frame fetches would hold N x 147 MB inside the futures before
 /// any cache saw a byte. Thirty unthrottled fetches — one slider-default hour
 /// at the ~2-minute cadence — would be ~4.4 GB in flight.
+/// **And since 2026-08-31 it is one *allocation* as well as one slot.** The
+/// figure named a slot and nothing enforced the rest of what it says: each
+/// granule built a fresh 98 MB vector and freed the last one, so a playing loop
+/// put ~147 MB of large-block churn on a heap that only grows. [`staging`] holds
+/// the buffer between granules and refills it, which is what makes the code
+/// match this constant's claim; the freeze it fixes and why a wider budget
+/// would not have is written up there.
 pub const FRAME_STAGING_BYTES: usize = CONUS_GRID_BYTES;
 
 // The pipeline advances one granule at a time, so a staging area under one
 // grid settles empty and no frame is ever rasterized. Same reason the live
 // cache carries the same floor, and the same reason it is a **build** failure.
 const _: () = assert!(FRAME_STAGING_BYTES >= CONUS_GRID_BYTES);
+// The retained buffer is sized in points off this budget, so a budget that is
+// not a whole number of `f32` would silently round the staging grid down and
+// make every mosaic decode miss the pool.
+const _: () = assert!(FRAME_STAGING_BYTES.is_multiple_of(std::mem::size_of::<f32>()));
 
 /// **What one frame listing found**, carried back to `apply_frame_listing` as
 /// its scope.
