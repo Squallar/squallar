@@ -49,6 +49,8 @@ pub(crate) mod point_painter;
 /// other layer has.
 pub mod radar_layer;
 pub mod shell_api;
+/// A radar site's marker: sized in points, on glass, every frame.
+pub(crate) mod site_marker;
 /// The app's layer set, composed from the source crates that own the data.
 pub mod sources;
 pub(crate) mod terrain;

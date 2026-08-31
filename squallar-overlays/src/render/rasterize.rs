@@ -398,6 +398,35 @@ pub struct SitesInput {
 
 squallar_source::impl_job_input!(SitesInput);
 
+/// A WSR-88D's nominal coverage radius, 230 km, in degrees of latitude.
+///
+/// 230 km rather than the 460 km the long-range reflectivity sweep reaches:
+/// 230 is the range every base product shares, so it is the distance at which
+/// "is this storm inside a radar's coverage" has one answer instead of one per
+/// product.
+pub(crate) const COVERAGE_RADIUS_DEG_LAT: f64 = 230.0 / squallar_geo::KM_PER_DEGREE_LAT;
+
+/// The coverage ring's line width, in points.
+///
+/// It thins as the map pulls back because a continental view holds the whole
+/// network and 160 overlapping rings at a close-in weight is a mesh rather than
+/// a map. Unlike the ring's *radius*, this is a length on the display, so it is
+/// the one thing in this rasterizer that still needs the device scale.
+fn ring_stroke_width(zoom: f64) -> f32 {
+    ((zoom as f32 - 2.0) * 0.25).clamp(0.6, 1.6)
+}
+
+/// **The radar network's coverage, as ground.** Each station's 230 km ring, in
+/// the three fills that say which station the pane is on: blue for a station,
+/// red for the pane's own, purple for the one it is switching to.
+///
+/// **The station *marker* is not here.** A marker is sized in points from the
+/// live map zoom, and this raster is placed by its geographic corners, so a
+/// baked marker was stretched by every zoom gesture — four times its size two
+/// levels into a pinch, snapping back half a second after the zoom stopped.
+/// `squallar_egui::site_marker` paints it per frame instead. A coverage ring is
+/// the opposite kind of thing: 230 km is 230 km, so it *should* scale with the
+/// map, and it is drawn here because a raster is where ground belongs.
 pub fn rasterize_radar_sites(
     input: &SitesInput,
     bounds: &GeoBounds,
@@ -428,28 +457,37 @@ pub fn rasterize_radar_sites(
     let w = width as f32;
     let h = height as f32;
 
-    let zoom_f32 = zoom as f32;
-    let radius = ((5.0 + zoom_f32).clamp(4.0, 12.0)).max(1.0) * scale;
-    let stroke_w = (radius * 0.3).clamp(0.5 * scale, 2.0 * scale);
-
-    let text_bg = if is_dark {
-        Color::from_rgba8(0, 0, 0, 140)
-    } else {
-        Color::from_rgba8(255, 255, 255, 140)
-    };
+    // A ring is a hairline whatever the zoom, so its width is a length on the
+    // display and needs the density; its *radius* is ground and needs nothing.
+    let stroke_w = ring_stroke_width(zoom) * scale;
+    // Nothing is drawn in the theme's colours any more — the plate the station
+    // name sits on moved to the per-frame painter with the name itself.
+    let _ = is_dark;
 
     for site in sites {
         // Into the viewport's frame first: the catalogue folds longitude into
         // [-180, 180] while `bounds` is unfolded; 4 of 208 stations are east.
         let lon = mb.nearest_lon(site.lon);
         let (px, py) = mb.project(site.lat, lon, w, h);
-        // 50 points of slack so a site just off-texture still contributes its label.
-        let slack = 50.0 * scale;
+
+        // The ring's radius in texels, taken by projecting a point one coverage
+        // radius due north of the station and measuring. Web Mercator is
+        // conformal, so a circle this small comes back a circle rather than an
+        // ellipse, and the north offset is a faithful radius in every
+        // direction. Latitude scaling is therefore handled for free: the same
+        // 230 km is more texels at Nome than at Key West, which is what the
+        // ground actually looks like on this projection.
+        let (_, py_north) = mb.project(site.lat + COVERAGE_RADIUS_DEG_LAT, lon, w, h);
+        let ring_radius = (py - py_north).abs();
+
+        // Cull on the ring, not on the station: a radar whose antenna is off
+        // the texture still covers ground that is on it.
+        let slack = ring_radius + stroke_w;
         if px < -slack || px > w + slack || py < -slack || py > h + slack {
             continue;
         }
 
-        let fill = if site.is_loading {
+        let ink = if site.is_loading {
             Color::from_rgba8(160, 32, 240, 255) // purple
         } else if site.is_current {
             Color::from_rgba8(255, 100, 100, 255) // red
@@ -457,51 +495,23 @@ pub fn rasterize_radar_sites(
             Color::from_rgba8(100, 150, 255, 255) // blue
         };
 
+        // Below a couple of texels the ring is smaller than the marker drawn
+        // over it and reads as a smudge rather than as coverage.
+        if ring_radius < 2.0 * scale {
+            continue;
+        }
+
         let mut pb = PathBuilder::new();
-        pb.push_circle(px, py, radius);
+        pb.push_circle(px, py, ring_radius);
         if let Some(path) = pb.finish() {
             let mut paint = Paint::default();
-            paint.set_color(fill);
+            paint.set_color(ink);
             paint.anti_alias = true;
-            pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-
-            paint.set_color(Color::from_rgba8(255, 255, 255, 255));
             let stroke = Stroke {
                 width: stroke_w,
                 ..Stroke::default()
             };
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-        }
-
-        // tiny-skia cannot render text: only the background pill is baked in,
-        // and egui draws the label over it per frame.
-        if zoom >= 5.0 {
-            let label_w = (site.name.len() as f32 * 5.5 + 4.0) * scale;
-            let label_h = 10.0 * scale;
-            let lx = px - label_w / 2.0;
-            let ly = py + radius + 2.0 * scale;
-            let mut pb = PathBuilder::new();
-            if let Some(rect) = tiny_skia::Rect::from_xywh(lx, ly, label_w, label_h) {
-                pb.push_rect(rect);
-            }
-            if let Some(path) = pb.finish() {
-                let mut paint = Paint::default();
-                paint.set_color(text_bg);
-                paint.anti_alias = true;
-                pixmap.fill_path(
-                    &path,
-                    &paint,
-                    FillRule::Winding,
-                    Transform::identity(),
-                    None,
-                );
-            }
         }
     }
 

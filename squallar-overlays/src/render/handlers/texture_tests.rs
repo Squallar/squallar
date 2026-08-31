@@ -33,8 +33,9 @@ const BOUNDS: GeoBounds = GeoBounds {
     max_lon: -97.0,
 };
 
-/// The rasterize context a pane hands over: the light theme, in which the site
-/// plate's fill is bright enough for the two alpha conventions to disagree.
+/// The rasterize context a pane hands over: the light theme, in which the
+/// translucent fills are bright enough for the two alpha conventions to
+/// disagree.
 /// `now` is a real clock read, taken **once** per test and handed to both paths.
 fn rctx() -> RasterizeContext {
     // Live posture: one clock read, handed to both `now` and `as_of`, so every
@@ -368,11 +369,17 @@ fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
     }
 }
 
+/// **A station one coverage radius south of [`BOUNDS`].** What this layer draws
+/// is the 230 km ring, and 230 km is wider than this two-degree fixture box —
+/// so a station *inside* it puts its ring entirely outside and the texture comes
+/// back blank. Placed here, the ring's northern arc crosses the box, which is
+/// what the invariants below need: real pixels, some of them anti-aliased and
+/// therefore translucent.
 fn site_fixtures() -> rasterize::SitesInput {
     rasterize::SitesInput {
         sites: vec![RadarSiteInfo {
             name: "KTLX".into(),
-            lat: 35.0,
+            lat: 35.0 - rasterize::COVERAGE_RADIUS_DEG_LAT,
             lon: -98.0,
             is_current: false,
             is_loading: false,
@@ -466,10 +473,13 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
         // **Seeded like every other kind since WO-M10c**: the site table is
         // installed through the arrival door by the shell that owns it, so
         // this layer has data of its own and answers `prepare_job` from it.
+        // One coverage radius south of `BOUNDS`, for the reason `site_fixtures`
+        // gives: the ring is wider than this fixture box, so a station inside it
+        // draws entirely outside it and the walks below get a blank texture.
         id if *id == known::RADAR_SITES => Box::new(super::sites::RadarSitesFetchResult(vec![
             super::sites::SiteRow {
                 name: "KTLX".into(),
-                lat: 35.0,
+                lat: 35.0 - crate::render::rasterize::COVERAGE_RADIUS_DEG_LAT,
                 lon: -98.0,
             },
         ])),

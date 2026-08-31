@@ -70,12 +70,21 @@ impl OverlayHandler for RadarSitesHandler {
     fn display_name(&self) -> &str {
         "Radar Sites"
     }
+    /// **The rings, not the markers.** What this layer rasterizes is each
+    /// station's 230 km coverage — ground, which is right to scale with the
+    /// map. The station marker over it is sized in points from the live zoom
+    /// and is painted per frame by `squallar_egui::site_marker`; baked into
+    /// this raster it was stretched by every zoom gesture.
     fn render_mode(&self) -> RenderMode {
         RenderMode::Texture
     }
 
-    /// `is_dark` rides into the described job (`SitesInput`) and picks the
-    /// label plate colour (`text_bg`), so a cached raster is a raster in one theme.
+    /// **Retained, and no longer because of any ink.** `is_dark` still rides
+    /// into the described job, but the label plate it used to colour left this
+    /// raster with the marker; what stays is ground, and ground is the same in
+    /// either theme. Answering `false` would change when this layer
+    /// re-rasterizes and the token it is cached under, so it is left alone
+    /// rather than folded into a fix for something else.
     fn theme_sensitive(&self) -> bool {
         true
     }
