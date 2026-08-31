@@ -3780,7 +3780,10 @@ impl super::App {
         // Over the WHOLE owed set, before any of it is spent: a ladder is
         // dropped the moment its frame stops being owed, and doing that as the
         // walk goes would drop every rung the walk had not reached yet.
-        let still_owed: Vec<(squallar_source::id::LayerId, chrono::NaiveDateTime)> = owed
+        let still_owed: std::collections::HashSet<(
+            squallar_source::id::LayerId,
+            chrono::NaiveDateTime,
+        )> = owed
             .iter()
             .map(|(_, id, valid)| (id.clone(), *valid))
             .collect();
