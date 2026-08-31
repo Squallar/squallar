@@ -5,12 +5,13 @@
 //! `netcdf`/`netcdf-sys`/`hdf5-metno-sys` and their bundled C sources, which is
 //! what lets every consumer build for wasm32 and iOS.
 //!
-//! Does steps 1 and 2 of the CF rules in [`crate::cf`] — read in the declared
-//! width, bit-reinterpret through `_Unsigned` — and hands off to [`cf::unpack`].
+//! Does step 1 of the CF rules in [`crate::cf`] — read in the declared width,
+//! and *keep* it — and hands off to [`cf::unpack`], which widens one element at
+//! a time. See [`cf::RawValues`] for what a whole-array widening costs.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cf::{self, CfAttr, RawVar, VarType};
+use crate::cf::{self, CfAttr, RawValues, RawVar, VarType};
 use hdf5_pure::{AttrValue, DType};
 
 pub struct Granule {
@@ -160,7 +161,6 @@ impl Granule {
             .filter_map(|(k, v)| convert_attr(&v).map(|v| (k, v)))
             .collect();
 
-        // Step 2 first: it decides how the bits are read.
         let unsigned = attrs.get("_Unsigned").is_some_and(cf::attr_is_true);
 
         let dtype = ds
@@ -180,14 +180,14 @@ impl Granule {
         // elements it cannot produce is still an error.
         if count == 0 {
             return Ok(Some(RawVar {
-                raw: Vec::new(),
+                raw: empty_raw(&dtype, name)?,
                 vartype,
                 unsigned,
                 attrs,
             }));
         }
 
-        let raw = read_raw(&ds, name, &dtype, unsigned, span)?;
+        let raw = read_raw(&ds, name, &dtype, span)?;
         if raw.len() as u64 != count {
             return Err(format!(
                 "Variable {name} declares {count} elements but {} were read",
@@ -239,10 +239,14 @@ impl Span {
     }
 }
 
-/// One `Span::read_x` per width `read_raw` reads, each choosing between the
-/// whole-variable call and its windowed companion.
-macro_rules! span_readers {
-    ($($whole:ident / $windowed:ident -> $t:ty),* $(,)?) => {
+/// The one table pairing an HDF5 storage type with its [`RawValues`] variant
+/// and its two `hdf5_pure` readers.
+///
+/// One table rather than three parallel matches: a width added to the reader
+/// but not to the empty-variable arm, or bound to the wrong variant, is the
+/// kind of mistake that shows up as a wrong number on one code path only.
+macro_rules! raw_storage {
+    ($($dtype:ident / $variant:ident : $whole:ident / $windowed:ident -> $t:ty),* $(,)?) => {
         impl Span {
             $(
                 fn $whole(self, ds: &hdf5_pure::Dataset) -> Result<Vec<$t>, hdf5_pure::Error> {
@@ -253,115 +257,56 @@ macro_rules! span_readers {
                 }
             )*
         }
+
+        /// Read a variable's storage values **in the width the file declares**.
+        ///
+        /// The width must be the variable's *declared* one: reading a packed
+        /// `short` as `f32` and reinterpreting afterwards bakes the sign in.
+        /// It is also the width they stay in — `_Unsigned` and the widening to
+        /// the `f64` raw domain both happen per element in
+        /// [`cf::RawValues::map`], so the array is never materialised twice.
+        fn read_raw(
+            ds: &hdf5_pure::Dataset,
+            name: &str,
+            dtype: &DType,
+            span: Span,
+        ) -> Result<RawValues, String> {
+            match dtype {
+                $(
+                    DType::$dtype => span
+                        .$whole(ds)
+                        .map(RawValues::$variant)
+                        .map_err(|e| format!("Failed to read {name}: {e}")),
+                )*
+                other => Err(format!("Variable {name} has unsupported type {other:?}")),
+            }
+        }
+
+        /// An empty variable, in its declared width.
+        ///
+        /// Separate from [`read_raw`] because `hdf5_pure` errors on storage
+        /// that was never allocated, which is what a granule declaring
+        /// `number_of_flashes = 0` has.
+        fn empty_raw(dtype: &DType, name: &str) -> Result<RawValues, String> {
+            match dtype {
+                $(DType::$dtype => Ok(RawValues::$variant(Vec::new())),)*
+                other => Err(format!("Variable {name} has unsupported type {other:?}")),
+            }
+        }
     };
 }
 
-span_readers! {
-    read_f32 / read_f32_rows -> f32,
-    read_f64 / read_f64_rows -> f64,
-    read_i8 / read_i8_rows -> i8,
-    read_i16 / read_i16_rows -> i16,
-    read_i32 / read_i32_rows -> i32,
-    read_i64 / read_i64_rows -> i64,
-    read_u8 / read_u8_rows -> u8,
-    read_u16 / read_u16_rows -> u16,
-    read_u32 / read_u32_rows -> u32,
-    read_u64 / read_u64_rows -> u64,
-}
-
-/// Read a variable's values into the raw (pre-scale) domain as `f64`,
-/// reinterpreting the bits through `_Unsigned` where required.
-///
-/// The width must be the variable's *declared* one: reading a packed `short` as
-/// `f32` and reinterpreting afterwards bakes the sign in.
-fn read_raw(
-    ds: &hdf5_pure::Dataset,
-    name: &str,
-    dtype: &DType,
-    unsigned: bool,
-    span: Span,
-) -> Result<Vec<f64>, String> {
-    let err = |e: hdf5_pure::Error| format!("Failed to read {name}: {e}");
-    Ok(match dtype {
-        DType::F32 => span
-            .read_f32(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(f64::from)
-            .collect(),
-        DType::F64 => span.read_f64(ds).map_err(err)?,
-        // Signed storage: `_Unsigned` reinterprets the bits, and only here.
-        DType::I8 => span
-            .read_i8(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(|v| {
-                if unsigned {
-                    f64::from(v as u8)
-                } else {
-                    f64::from(v)
-                }
-            })
-            .collect(),
-        DType::I16 => span
-            .read_i16(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(|v| {
-                if unsigned {
-                    f64::from(v as u16)
-                } else {
-                    f64::from(v)
-                }
-            })
-            .collect(),
-        DType::I32 => span
-            .read_i32(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(|v| {
-                if unsigned {
-                    f64::from(v as u32)
-                } else {
-                    f64::from(v)
-                }
-            })
-            .collect(),
-        DType::I64 => span
-            .read_i64(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(|v| if unsigned { v as u64 as f64 } else { v as f64 })
-            .collect(),
-        // Already unsigned on disk: nothing to reinterpret.
-        DType::U8 => span
-            .read_u8(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(f64::from)
-            .collect(),
-        DType::U16 => span
-            .read_u16(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(f64::from)
-            .collect(),
-        DType::U32 => span
-            .read_u32(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(f64::from)
-            .collect(),
-        DType::U64 => span
-            .read_u64(ds)
-            .map_err(err)?
-            .into_iter()
-            .map(|v| v as f64)
-            .collect(),
-        other => {
-            return Err(format!("Variable {name} has unsupported type {other:?}"));
-        }
-    })
+raw_storage! {
+    F32 / F32: read_f32 / read_f32_rows -> f32,
+    F64 / F64: read_f64 / read_f64_rows -> f64,
+    I8 / I8: read_i8 / read_i8_rows -> i8,
+    I16 / I16: read_i16 / read_i16_rows -> i16,
+    I32 / I32: read_i32 / read_i32_rows -> i32,
+    I64 / I64: read_i64 / read_i64_rows -> i64,
+    U8 / U8: read_u8 / read_u8_rows -> u8,
+    U16 / U16: read_u16 / read_u16_rows -> u16,
+    U32 / U32: read_u32 / read_u32_rows -> u32,
+    U64 / U64: read_u64 / read_u64_rows -> u64,
 }
 
 fn var_type(dtype: &DType) -> Option<VarType> {

@@ -9,11 +9,14 @@
 //! Nothing here knows what product it is unpacking. Every constant comes out of
 //! the file's own attributes — see rule 6.
 //!
-//! Order matters. [`crate::h5`] does steps 1 and 2 — only the reader can ask
-//! its library for a specific width — and [`unpack`] does the rest:
+//! Order matters. [`crate::h5`] does step 1 — only the reader can ask its
+//! library for a specific width — and [`unpack`] does the rest, step 2
+//! included, one element at a time as it widens:
 //!
-//! 1. **Read the raw storage values in the variable's declared type.** Once a
-//!    `short` has been widened to `float` the sign bit is baked in.
+//! 1. **Read the raw storage values in the variable's declared type, and keep
+//!    them in it.** Once a `short` has been widened to `float` the sign bit is
+//!    baked in. [`RawValues`] is that declared type, not `f64`; see its doc for
+//!    why the array is never widened as a whole.
 //! 2. **Apply `_Unsigned`.** NOAA declares the variable `short` and attaches
 //!    `_Unsigned = "true"`, so a raw negative `i16` must be *bit-reinterpreted*,
 //!    not negated: `-13585_i16 as u16 == 51951`. On disk the datatype really is
@@ -52,13 +55,134 @@ pub enum CfAttr {
     Str(String),
 }
 
+/// A variable's storage values, in the width the file declares them at.
+///
+/// **Not a `Vec<f64>`.** The element count is a property of the variable and
+/// the width is a property of this container, so a widened array costs the
+/// difference for no gain: a GMGSI granule is 3000 x 5000 = 15,000,000 points
+/// stored as `float`, which is 60,000,000 B here and 120,000,000 B widened,
+/// and the only consumer of the wide form is [`Packing::apply`], which takes
+/// one element. So the widening happens per element, in a register, on the way
+/// into that call — [`RawValues::map`] is the one place it happens and the
+/// expressions there are the ones [`crate::h5`] used to run over the whole
+/// array.
+///
+/// Nothing narrows anywhere: `f64::from` is exact for every type below that
+/// has one, and the two that do not (`i64`, `u64`, which exceed `f64`'s
+/// 53-bit significand above 2^53) are cast with the same `as` they always
+/// were. Pinned across all ten widths by
+/// [`tests::every_storage_width_unpacks_to_the_same_bits_it_always_did`].
+///
+/// One GMGSI decode, measured 2026-08-31 with a tracking
+/// `#[global_allocator]` over `gmgsi::decode::decode` on the real
+/// `GLOBCOMPLIR_v3r0_blend` granule. **Two figures, two denominators, never
+/// added:**
+///
+/// | | widened | as stored |
+/// |---|---|---|
+/// | live bytes at the high-water mark | 180,070,822 | 125,265,534 |
+/// | largest single `alloc` request | 120,000,000 | 60,000,000 |
+///
+/// The first is every live byte the process holds at once; the second is one
+/// request. On wasm32 the second is the one that aborts — linear memory only
+/// grows and `dlmalloc` cannot coalesce across a live block, so what fails is
+/// a single large request against a fragmented heap, not the total.
+pub enum RawValues {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I8(Vec<i8>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl RawValues {
+    pub fn len(&self) -> usize {
+        match self {
+            RawValues::F32(v) => v.len(),
+            RawValues::F64(v) => v.len(),
+            RawValues::I8(v) => v.len(),
+            RawValues::I16(v) => v.len(),
+            RawValues::I32(v) => v.len(),
+            RawValues::I64(v) => v.len(),
+            RawValues::U8(v) => v.len(),
+            RawValues::U16(v) => v.len(),
+            RawValues::U32(v) => v.len(),
+            RawValues::U64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every element in the raw (post-`_Unsigned`, pre-scale) `f64` domain,
+    /// through `f`, into a `Vec` the iterator's exact length sizes in one go.
+    ///
+    /// `unsigned` is [`RawVar::unsigned`] and decides the signed arms exactly
+    /// as [`reinterpret_unsigned`] decides them for `_FillValue` and
+    /// `valid_range`; the two have to agree, which is why the widths line up
+    /// arm for arm with [`VarType::SignedInt`]'s.
+    fn map<T>(&self, unsigned: bool, mut f: impl FnMut(f64) -> T) -> Vec<T> {
+        match self {
+            RawValues::F32(v) => v.iter().map(|&x| f(f64::from(x))).collect(),
+            RawValues::F64(v) => v.iter().map(|&x| f(x)).collect(),
+            // Signed storage: `_Unsigned` reinterprets the bits, and only here.
+            RawValues::I8(v) => v
+                .iter()
+                .map(|&x| {
+                    f(if unsigned {
+                        f64::from(x as u8)
+                    } else {
+                        f64::from(x)
+                    })
+                })
+                .collect(),
+            RawValues::I16(v) => v
+                .iter()
+                .map(|&x| {
+                    f(if unsigned {
+                        f64::from(x as u16)
+                    } else {
+                        f64::from(x)
+                    })
+                })
+                .collect(),
+            RawValues::I32(v) => v
+                .iter()
+                .map(|&x| {
+                    f(if unsigned {
+                        f64::from(x as u32)
+                    } else {
+                        f64::from(x)
+                    })
+                })
+                .collect(),
+            RawValues::I64(v) => v
+                .iter()
+                .map(|&x| f(if unsigned { x as u64 as f64 } else { x as f64 }))
+                .collect(),
+            // Already unsigned on disk: nothing to reinterpret.
+            RawValues::U8(v) => v.iter().map(|&x| f(f64::from(x))).collect(),
+            RawValues::U16(v) => v.iter().map(|&x| f(f64::from(x))).collect(),
+            RawValues::U32(v) => v.iter().map(|&x| f(f64::from(x))).collect(),
+            RawValues::U64(v) => v.iter().map(|&x| f(x as f64)).collect(),
+        }
+    }
+}
+
 pub struct RawVar {
-    pub raw: Vec<f64>,
+    pub raw: RawValues,
     /// The declared storage type, needed to reinterpret `_FillValue` and
     /// `valid_range` into the same domain as `raw`.
     pub vartype: VarType,
-    /// Whether `_Unsigned` applied. Carried separately because `raw` has
-    /// already been reinterpreted but the *attributes* have not.
+    /// Whether `_Unsigned` applied. Carried separately because it is keyed on
+    /// the *attributes*, which are declared in the signed domain, while `raw`
+    /// carries the bits as stored.
     pub unsigned: bool,
     pub attrs: BTreeMap<String, CfAttr>,
 }
@@ -202,7 +326,7 @@ impl Packing {
 /// arithmetic at a quarter of the memory.
 pub fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
     let (packing, units) = Packing::read(var, name);
-    let values = var.raw.iter().copied().map(|r| packing.apply(r)).collect();
+    let values = var.raw.map(var.unsigned, |r| packing.apply(r));
     UnpackedVar { values, units }
 }
 
@@ -213,12 +337,9 @@ pub fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
 /// this one — see [`UnpackedF32`] for the size argument.
 pub fn unpack_f32(var: &RawVar, name: &str) -> UnpackedF32 {
     let (packing, units) = Packing::read(var, name);
-    let values = var
-        .raw
-        .iter()
-        .copied()
-        .map(|r| packing.apply(r).map_or(f32::NAN, |v| v as f32))
-        .collect();
+    let values = var.raw.map(var.unsigned, |r| {
+        packing.apply(r).map_or(f32::NAN, |v| v as f32)
+    });
     UnpackedF32 { values, units }
 }
 

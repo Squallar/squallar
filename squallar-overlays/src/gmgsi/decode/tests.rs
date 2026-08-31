@@ -480,6 +480,49 @@ fn the_planted_equator_reading_survives_the_decode() {
     assert!(lon.abs() < 0.1, "the prime column read {lon}");
 }
 
+/// Every bit of the decoded granule, so a change to how it is decoded has to
+/// be a change to what is decoded before it can pass.
+///
+/// The value was recorded on `b438a960`, **before** `squallar_netcdf`'s raw
+/// domain stopped being a `Vec<f64>`, and is unchanged by it — which is the
+/// whole claim that narrowing changes nothing on screen. It covers the raster
+/// and both axes because the raster alone would miss a coordinate regression,
+/// and it hashes `to_bits` because a NaN is not `==` itself and a fill cell is
+/// exactly what a comparison would drop.
+///
+/// **A moved digest is a decode that changed, not a pin to re-record.**
+#[test]
+fn the_decoded_granule_is_bit_for_bit_what_it_was() {
+    /// FNV-1a over the little-endian bytes. Chosen because it is four lines
+    /// and has no dependency; the property wanted is "any changed bit changes
+    /// the output", not cryptographic strength.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x100_0000_01b3;
+
+    let g = grid();
+    let (lat_axis, lon_axis) = axes(&g);
+
+    let mut h = OFFSET_BASIS;
+    let mut feed = |bits: u64| {
+        for byte in bits.to_le_bytes() {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    for v in &g.grid.values {
+        feed(u64::from(v.to_bits()));
+    }
+    for v in lat_axis.iter().chain(lon_axis.iter()) {
+        feed(v.to_bits());
+    }
+
+    assert_eq!(
+        h, 0xb4f6_9c0c_7031_beff,
+        "the committed granule decoded to different bits than it did on \
+         b438a960. That is a change to the decode, not a stale pin",
+    );
+}
+
 /// A grid whose latitude genuinely varies along a row cannot be described by
 /// one axis per dimension, and the failure is invisible: every method still
 /// answers. So it is refused.

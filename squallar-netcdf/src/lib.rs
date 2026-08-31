@@ -42,7 +42,7 @@ pub mod cf;
 pub mod h5;
 
 pub use cf::{
-    CfAttr, RawVar, TimeUnits, UnpackedF32, UnpackedVar, VarType, attr_is_true, parse_cf_epoch,
-    parse_time_units, reinterpret_unsigned, unpack, unpack_f32,
+    CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedVar, VarType, attr_is_true,
+    parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,
 };
 pub use h5::Granule;
