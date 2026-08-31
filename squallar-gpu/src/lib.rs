@@ -16,6 +16,9 @@ pub mod egui_renderer;
 /// `gpu passes:` telemetry line.
 pub mod gpu_probe;
 pub mod staging_ring;
+/// A vector tile's tessellated fills, uploaded once and placed by a uniform —
+/// the renderer half of [`squallar_egui::tile_mesh`].
+pub mod tile_mesh;
 
 /// Type alias for a reference-counted Window.
 pub type WindowRef = std::sync::Arc<winit::window::Window>;

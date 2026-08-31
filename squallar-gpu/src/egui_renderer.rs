@@ -40,6 +40,15 @@ pub struct AttachmentConfig {
     pub msaa_samples: u32,
 }
 
+/// Whether egui's fragment shader dithers its output down to eight bits.
+///
+/// `egui_wgpu::RendererOptions` defaults this to `true`, and `Renderer::new`
+/// below asks for it **by name** rather than through `..Default::default()`,
+/// because a second pipeline draws into the same pass and has to make the same
+/// choice: [`crate::tile_mesh::TileMeshStore`] reads this constant, and an
+/// undithered fill beside a dithered gradient is a seam in the map.
+pub const EGUI_DITHERING: bool = true;
+
 /// How large the mirror is drawn, and how often that is allowed to change.
 mod mirror;
 
@@ -203,6 +212,7 @@ impl EguiRenderer {
             egui_wgpu::RendererOptions {
                 depth_stencil_format: output_depth_format,
                 msaa_samples,
+                dithering: EGUI_DITHERING,
                 ..Default::default()
             },
         );
