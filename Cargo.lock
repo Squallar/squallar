@@ -258,6 +258,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ashpd"
+version = "0.13.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_repr",
+ "zbus",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1013,7 +1027,7 @@ version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18e1a09f280e29a8b00bc7e81eca5ac87dca0575639c9422a5fa25a07bb884b8"
 dependencies = [
- "ashpd",
+ "ashpd 0.10.3",
  "async-std",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
@@ -4766,7 +4780,7 @@ dependencies = [
 name = "squallar-location"
 version = "0.1.0"
 dependencies = [
- "ashpd",
+ "ashpd 0.13.13",
  "chrono",
  "futures-channel",
  "futures-lite",

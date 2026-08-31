@@ -23,7 +23,9 @@ use futures_channel::oneshot;
 use futures_lite::{Stream, StreamExt as _};
 
 use ashpd::desktop::ResponseError;
-use ashpd::desktop::location::{Accuracy, Location, LocationProxy};
+use ashpd::desktop::location::{
+    Accuracy, CreateSessionOptions, Location, LocationProxy, StartOptions,
+};
 
 /// `zbus` through `ashpd`'s re-export: named here only to classify errors.
 use ashpd::zbus;
@@ -127,8 +129,11 @@ async fn run_session(stopped: oneshot::Receiver<()>, out: &OsLocationSink) {
     // `Accuracy::Exact` is the top of the portal's 0–5 scale, a different enum
     // from GeoClue's non-contiguous 0–8 despite the overlapping numbers; both
     // layers clamp. Also where the lockdown refusal lands.
+    // The distance and time thresholds stay unset, which is what the two
+    // leading `None`s meant before 0.13 turned the argument list into a
+    // builder.
     let session = match proxy
-        .create_session(None, None, Some(Accuracy::Exact))
+        .create_session(CreateSessionOptions::default().set_accuracy(Accuracy::Exact))
         .await
     {
         Ok(session) => session,
@@ -168,7 +173,7 @@ async fn run_session(stopped: oneshot::Receiver<()>, out: &OsLocationSink) {
     // The call that can sit on a human. Two failures, not one: `start` itself
     // faults (the lockdown is checked again here), and the request's *response*
     // carries a refusal.
-    match proxy.start(&session, None).await {
+    match proxy.start(&session, None, StartOptions::default()).await {
         Ok(request) => {
             if let Err(e) = request.response() {
                 report(classify(&e));
@@ -204,7 +209,7 @@ async fn run_session(stopped: oneshot::Receiver<()>, out: &OsLocationSink) {
 /// Close the portal session, best effort. A session left open holds a GeoClue
 /// client alive inside the portal for the life of the process. On the refusal
 /// paths the portal has already closed it, hence `debug` and not `warn`.
-async fn close<T: ashpd::desktop::SessionPortal>(session: &ashpd::desktop::Session<'_, T>) {
+async fn close<T: ashpd::desktop::SessionPortal>(session: &ashpd::desktop::Session<T>) {
     if let Err(e) = session.close().await {
         log::debug!("closing the portal location session failed: {e}");
     }
@@ -237,9 +242,12 @@ impl Ending {
 /// session that only woke for locations would ignore a stop until the next fix,
 /// minutes away. Re-created per iteration, which is sound because all three are
 /// cancel-safe; the order is the priority, so ending outranks delivering.
-async fn watch(
+/// `closed`'s item type is generic because only the *arrival* is news: ashpd
+/// 0.13 started carrying the portal's response dictionary on that signal where
+/// 0.10 sent `()`, and this function has never read either.
+async fn watch<Shutdown>(
     mut updates: impl Stream<Item = Location> + Unpin,
-    mut closed: impl Stream<Item = ()> + Unpin,
+    mut closed: impl Stream<Item = Shutdown> + Unpin,
     mut stopped: oneshot::Receiver<()>,
     out: &OsLocationSink,
 ) -> Ending {
