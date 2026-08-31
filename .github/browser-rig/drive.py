@@ -1386,13 +1386,19 @@ var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) fram
 // share one `frame segment (pump)` sample.
 var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// One vector take opened up: `parse` (per source layer, at most sixteen) and
+// `style` (per feature, thousands). A DECOMPOSITION of `tile take (vector)`,
+// never a sixth take family and never added to one -- the two phases sum to a
+// vector take minus its cache put. Denominator: one vector BODY decoded. A
+// restyle records `style` and no `parse`, so the two n's differ by design.
+var tile_phase_re = /tile phase \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
-var frame_segment_all = [], tile_take_all = [];
+var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -1464,6 +1470,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
                               p90: x[5], p99: x[6], hist: x[7] });
+  x = tile_phase_re.exec(m);
+  if (x) tile_phase_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                               sum: parseInt(x[3], 10), p50: x[4],
+                               p90: x[5], p99: x[6], hist: x[7] });
   x = gesture_begin_re.exec(m);
   if (x) begins.push({ t: t, script: x[1] });
   x = gesture_loop_re.exec(m);
@@ -1475,6 +1485,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
+         tile_phase_all: tile_phase_all,
          gesture_begins: begins, gesture_loops: loops,
          console_total: C.length };
 """
@@ -1587,7 +1598,8 @@ class FrameLineWatcher:
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
-                            ("tile_take_all", "take")):
+                            ("tile_take_all", "take"),
+                            ("tile_phase_all", "phase")):
             for r in sig.get(prefix) or []:
                 family = "%s:%s" % (key, r.get("name"))
                 self.named.setdefault(family, {})[(r.get("t"), r.get("n"))] = r
@@ -1753,7 +1765,8 @@ def watcher_named_in(gw):
     family the arm never produced is an ABSENCE and not a zero."""
     return sorted(k for k in (gw or {})
                   if isinstance(k, str)
-                  and (k.startswith("segment:") or k.startswith("take:")))
+                  and (k.startswith("segment:") or k.startswith("take:")
+                       or k.startswith("phase:")))
 
 
 def _window_mean_us(a, b):

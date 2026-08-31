@@ -554,8 +554,15 @@ pub(crate) fn decode_archive_tile(
     ctx: &Context,
 ) -> Result<Tile, String> {
     let tile = match kind {
+        // `Tile::from_mvt` fuses the two halves (`render` IS `styled(parse())`),
+        // and this arm spells them separately for one reason: so that the
+        // phase ledger covers BOTH decode paths. A tile source with no parsed
+        // cache reaches here, and a split that only the remembering path
+        // recorded would report a figure whose denominator silently depended
+        // on which source served the tile.
         ArchiveTileKind::Vector => {
-            Tile::from_mvt(bytes, style, zoom).map_err(|error| error.to_string())
+            let parsed = timed_parse(bytes)?;
+            Ok(timed_styled(&parsed, style, zoom))
         }
         ArchiveTileKind::Hillshade => {
             let remapped = crate::terrain::decode_hillshade_tile(bytes)?;
@@ -600,7 +607,36 @@ fn note_archive_decode(kind: ArchiveTileKind) {
 
 /// Style a parsed tile into the value the tile cache holds.
 fn styled_tile(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> Tile {
-    Tile::Vector(Arc::new(walkers::mvt::styled(parsed, style, zoom)))
+    timed_styled(parsed, style, zoom)
+}
+
+/// Whole microseconds a closure took, saturating into the ledger's `u32`.
+fn micros_of<T>(work: impl FnOnce() -> T) -> (T, u32) {
+    let began = web_time::Instant::now();
+    let out = work();
+    let cost = web_time::Instant::now().duration_since(began);
+    (out, cost.as_micros().min(u128::from(u32::MAX)) as u32)
+}
+
+/// [`walkers::mvt::parse`], charged to [`take_ledger::VectorPhase::Parse`].
+///
+/// Two clock reads per vector **body**, not per layer and not per feature: a
+/// per-feature clock would be thousands of reads on the hot path and is a
+/// harness's job, not a ledger's.
+fn timed_parse(bytes: &[u8]) -> Result<walkers::mvt::ParsedTile, String> {
+    let (parsed, micros) = micros_of(|| walkers::mvt::parse(bytes));
+    // Charged whether or not it succeeded: a body that failed to parse cost
+    // the frame the same time, and excluding it would make a broken archive
+    // read as a fast one -- the same rule the take families follow.
+    take_ledger::note_vector_phase(take_ledger::VectorPhase::Parse, micros);
+    parsed.map_err(|error| error.to_string())
+}
+
+/// [`walkers::mvt::styled`], charged to [`take_ledger::VectorPhase::Style`].
+fn timed_styled(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> Tile {
+    let (shapes, micros) = micros_of(|| walkers::mvt::styled(parsed, style, zoom));
+    take_ledger::note_vector_phase(take_ledger::VectorPhase::Style, micros);
+    Tile::Vector(Arc::new(shapes))
 }
 
 /// [`decode_archive_tile`], with the parse half **remembered**: a vector
@@ -621,7 +657,7 @@ fn decode_archive_tile_remembering(
 ) -> Result<Tile, String> {
     match kind {
         ArchiveTileKind::Vector => {
-            let parsed = Arc::new(walkers::mvt::parse(bytes).map_err(|error| error.to_string())?);
+            let parsed = Arc::new(timed_parse(bytes)?);
             parsed_tiles
                 .lock()
                 .expect("the parsed-tile cache is not poisoned")
@@ -629,7 +665,7 @@ fn decode_archive_tile_remembering(
             // The vector arm does not delegate, so it counts for itself; the
             // raster arms are counted inside `decode_archive_tile`.
             note_archive_decode(ArchiveTileKind::Vector);
-            Ok(styled_tile(&parsed, style, tile_id.zoom))
+            Ok(timed_styled(&parsed, style, tile_id.zoom))
         }
         raster => decode_archive_tile(bytes, raster, style, tile_id.zoom, ctx),
     }

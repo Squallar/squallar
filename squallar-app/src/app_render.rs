@@ -640,6 +640,31 @@ fn tile_take_lines(t: &squallar_egui::tile_source::take_ledger::Totals) -> Vec<S
         .collect()
 }
 
+/// The `tile phase (parse|style):` lines — one vector take, opened up.
+///
+/// Denominator: **one vector body decoded**, one sample per phase — see
+/// `squallar_egui::tile_source::take_ledger::PhaseTotals`. A *decomposition*
+/// of `tile take (vector)`, never a sixth take family and never added to one:
+/// the two phases sum to a vector take minus its cache put. A restyle records
+/// a `style` sample and no `parse` sample, so the two `n`s legitimately differ.
+///
+/// Why the split is worth its two clock reads: the halves have **different
+/// resumability**. `parse` walks the tile's source layers, at most sixteen of
+/// them, and its finest unit is one layer; `style` walks the style's layers
+/// taking a lazy iterator of features, and its finest unit is one feature, of
+/// which a dense tile has thousands. Which half carries the cost is what
+/// decides how finely a take could be cut — so this line is the evidence under
+/// any claim about banding, rather than a number for its own sake.
+///
+/// Emitted only for phases with samples, on [`tile_take_lines`]' terms.
+fn tile_phase_lines(t: &squallar_egui::tile_source::take_ledger::PhaseTotals) -> Vec<String> {
+    squallar_egui::tile_source::take_ledger::PHASES
+        .into_iter()
+        .filter(|&phase| t.phase(phase).total() > 0)
+        .map(|phase| named_hist_line("tile phase", phase.label(), t.phase(phase)))
+        .collect()
+}
+
 /// The `frame prep costs:` running-total line.
 ///
 /// Denominator: every egui pass this renderer ended, presented or not — see
@@ -1359,6 +1384,11 @@ impl super::App {
         // families are: this runs at the end of a frame and the window a
         // reader brackets has to have a reading at each end of it.
         for line in tile_take_lines(&squallar_egui::tile_source::take_ledger::totals()) {
+            say_telemetry(loud, &line);
+        }
+        // One vector take opened up. Its two phases decompose `tile take
+        // (vector)` and are never added to it or to each other's take family.
+        for line in tile_phase_lines(&squallar_egui::tile_source::take_ledger::phase_totals()) {
             say_telemetry(loud, &line);
         }
         if let Some(state) = self.state.as_ref() {

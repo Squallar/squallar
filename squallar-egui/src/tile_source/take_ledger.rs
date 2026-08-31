@@ -209,6 +209,101 @@ pub fn totals() -> Totals {
     Totals { families }
 }
 
+// ── Inside one vector take ────────────────────────────────────────────────
+
+/// The two halves of a vector take, which is [`TakeKind::Vector`] opened up.
+///
+/// `walkers::mvt::render` **is** `styled(&parse(data)?, ...)`, and the two
+/// halves have different resumability, which is the only reason this split is
+/// worth its two clock reads:
+///
+/// * [`VectorPhase::Parse`] walks the tile's own source layers, calling
+///   `Reader::get_features` once per layer. Its finest unit is **one source
+///   layer**, of which a tile has at most sixteen.
+/// * [`VectorPhase::Style`] walks the *style's* layers, and per layer takes a
+///   **lazy** iterator of features, tessellating one feature at a time. Its
+///   finest unit is **one feature**, of which a dense tile has thousands.
+///
+/// So a take dominated by `Style` can in principle be cut far finer than one
+/// dominated by `Parse`, and "how finely can a take be banded" is answered by
+/// which of these two carries the cost. Nothing here decides that; it reports
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorPhase {
+    /// `walkers::mvt::parse`: proto decode, per source layer.
+    Parse,
+    /// `walkers::mvt::styled`: filter evaluation, paint expressions and lyon
+    /// tessellation, per feature.
+    Style,
+}
+
+/// The phases in report order, pinned by a test like [`FAMILIES`].
+pub const PHASES: [VectorPhase; 2] = [VectorPhase::Parse, VectorPhase::Style];
+
+impl VectorPhase {
+    const fn index(self) -> usize {
+        match self {
+            VectorPhase::Parse => 0,
+            VectorPhase::Style => 1,
+        }
+    }
+
+    /// The word this phase is called in the reported line — lowercase and
+    /// stable, because `.github/browser-rig/drive.py` matches on it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            VectorPhase::Parse => "parse",
+            VectorPhase::Style => "style",
+        }
+    }
+}
+
+static PHASE_COSTS: [AtomicHist; PHASES.len()] = [AtomicHist::new(), AtomicHist::new()];
+
+/// Record one vector body's `phase` at `micros`.
+pub fn note_vector_phase(phase: VectorPhase, micros: u32) {
+    PHASE_COSTS[phase.index()].record(micros);
+}
+
+/// A reading of both phases.
+///
+/// **Denominator: one vector body decoded** — one `parse` sample and one
+/// `style` sample each. It is a *decomposition* of [`TakeKind::Vector`], not a
+/// sixth family: the two are never added to the take figures, and their sum is
+/// a vector take minus its cache put and its parsed-cache insert. A restyle
+/// ([`TakeKind::Restyle`]) records a `style` sample and **no** `parse` sample,
+/// which is the whole point of remembering the parse — so the two `n`s do not
+/// match, and are not meant to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhaseTotals {
+    /// Indexed by [`VectorPhase::index`]; iterate with [`PHASES`].
+    pub phases: [Hist; PHASES.len()],
+}
+
+impl PhaseTotals {
+    pub fn phase(&self, phase: VectorPhase) -> &Hist {
+        &self.phases[phase.index()]
+    }
+
+    /// The windowed reading between two snapshots, phase by phase.
+    pub fn diff(&self, earlier: &PhaseTotals) -> PhaseTotals {
+        let mut out = *self;
+        for (slot, then) in out.phases.iter_mut().zip(earlier.phases.iter()) {
+            *slot = slot.diff(then);
+        }
+        out
+    }
+}
+
+/// Read both phases.
+pub fn phase_totals() -> PhaseTotals {
+    let mut phases = [Hist::new(); PHASES.len()];
+    for (slot, hist) in phases.iter_mut().zip(PHASE_COSTS.iter()) {
+        *slot = hist.snapshot();
+    }
+    PhaseTotals { phases }
+}
+
 /// The last [`Totals::takes`] a caller was handed by [`totals_if_moved`].
 static REPORTED: AtomicU64 = AtomicU64::new(0);
 

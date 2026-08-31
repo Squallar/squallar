@@ -743,3 +743,75 @@ fn a_windowable_line_that_drifted_by_one_space_is_not_accepted() {
          seam test above cannot fail",
     );
 }
+
+/// The `tile phase (…)` sentence, pinned at both ends, and the identity that
+/// keeps it a decomposition rather than a sixth take family.
+///
+/// The two phases have **different resumability** — `parse` is per source
+/// layer (at most sixteen), `style` is per feature (thousands) — which is the
+/// only reason the split earns its two clock reads, and the reason its
+/// denominator has to stay separate from the take families'.
+#[test]
+fn the_tile_phase_line_reads_exactly_as_pinned() {
+    use squallar_egui::tile_source::take_ledger::{PHASES, PhaseTotals, VectorPhase};
+
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let hist = counts_string(&h);
+
+    // An empty ledger says nothing, on `tile_take_lines`' terms.
+    assert!(
+        super::tile_phase_lines(&PhaseTotals {
+            phases: [Hist::new(); 2],
+        })
+        .is_empty(),
+        "an app that has decoded no vector body wrote a phase line anyway",
+    );
+
+    let only_style = PhaseTotals {
+        phases: [Hist::new(), h],
+    };
+    assert_eq!(
+        super::tile_phase_lines(&only_style),
+        vec![format!(
+            "tile phase (style): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={hist}"
+        )],
+        "a restyle records `style` and no `parse`, and the line has to be able \
+         to say exactly that",
+    );
+    assert_eq!(
+        super::tile_phase_lines(&only_style)[0],
+        rendered(
+            &pattern("tile_phase_re"),
+            &["style", "3", "300", "106", "106", "106", &hist],
+        ),
+        "the `tile phase (…):` line and the rig's probe have drifted",
+    );
+
+    // Both phases: two lines, in the declared order, each naming its own.
+    let both = PhaseTotals { phases: [h, h] };
+    let lines = super::tile_phase_lines(&both);
+    assert_eq!(lines.len(), PHASES.len());
+    for (line, phase) in lines.iter().zip(PHASES) {
+        assert!(
+            line.starts_with(&format!("tile phase ({}): n=3, ", phase.label())),
+            "the phases are not reported in their declared order: {line:?} is \
+             not {}'s line",
+            phase.label(),
+        );
+    }
+    assert_eq!(
+        (VectorPhase::Parse.label(), VectorPhase::Style.label()),
+        ("parse", "style"),
+    );
+    // The decomposition is NOT a take family: a phase reading carries no take
+    // count, and nothing here can be added to `tile take (vector)`.
+    assert_ne!(
+        VectorPhase::Parse.label(),
+        squallar_egui::tile_source::take_ledger::TakeKind::Vector.label(),
+        "a phase and a take family share a word, so a reader could add them",
+    );
+}

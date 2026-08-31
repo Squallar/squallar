@@ -3439,3 +3439,47 @@ mod archive_decode {
         }
     }
 }
+
+/// **Both halves of a vector decode are charged to the phase ledger.**
+///
+/// The count gate on the real path, and the companion to
+/// `take_ledger::tests::the_drain_charges_every_take_to_the_ledger`. Without
+/// it, deleting either `note_vector_phase` call left the whole suite green
+/// while the reported `tile phase (…)` line quietly became an empty figure
+/// that still reads as one — which is exactly the failure the phase split
+/// exists to make impossible.
+///
+/// **Asserted as `>= REPEATS`, not `== REPEATS`, and that is deliberate.** The
+/// histograms are process-global and the harness runs cases in parallel, so a
+/// concurrent vector decode can only ever ADD to the window. A lower bound is
+/// therefore sound where an equality would be a race, and it still fails hard
+/// when the recording is removed: the delta is then zero and `REPEATS` is not.
+/// The repeat count is the non-triviality floor — a single call could be
+/// masked by one concurrent decode, eight cannot be.
+#[test]
+fn both_halves_of_a_vector_decode_reach_the_phase_ledger() {
+    use crate::tile_source::take_ledger::{VectorPhase, phase_totals};
+
+    const REPEATS: u64 = 8;
+
+    // An empty body is a valid empty protobuf, so this exercises the real
+    // `walkers::mvt::parse` and `walkers::mvt::styled` rather than a stub,
+    // without needing a fixture whose content could drift.
+    let before = phase_totals();
+    for _ in 0..REPEATS {
+        let parsed = super::timed_parse(&[]).expect("an empty MVT body is an empty tile");
+        let _ = super::timed_styled(&parsed, &Style::default(), 0);
+    }
+    let window = phase_totals().diff(&before);
+
+    for phase in [VectorPhase::Parse, VectorPhase::Style] {
+        assert!(
+            window.phase(phase).total() >= REPEATS,
+            "{} decodes ran and the `{}` phase recorded only {} — a cost the \
+             frame paid that no figure can see",
+            REPEATS,
+            phase.label(),
+            window.phase(phase).total(),
+        );
+    }
+}
