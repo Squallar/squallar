@@ -13278,23 +13278,40 @@ fn a_zoom_inside_the_band_asks_for_nothing_while_it_moves() {
     );
 }
 
-/// …and the other half: past the band, it does re-rasterize, so the zero above is a
-/// tolerance and not a cache that has stopped listening.
+/// …and past the band the gesture is still free — the WO-8 policy: no zoom
+/// distance buys a mid-gesture raster — while the settle recovers the exact
+/// picture once the fingers stop, so the zeros are a hold and not a cache
+/// that has stopped listening.
 #[test]
-fn a_zoom_past_the_band_re_rasterizes_while_it_moves() {
+fn a_zoom_past_the_band_stays_quiet_until_the_settle() {
     const Z0: f64 = 7.0;
     let mut h = settled_alert_pane(Z0);
 
     let inside = zoom_gesture(&mut h, Z0, 0.05, 12);
     assert_eq!(inside, 0, "fixture: the first 0.6 must be free");
 
-    set_pane_zoom(&mut h, Z0 + crate::overlay_cache::ZOOM_REBUILD_BAND + 0.01);
+    let stopped_at = Z0 + crate::overlay_cache::ZOOM_REBUILD_BAND + 0.01;
+    set_pane_zoom(&mut h, stopped_at);
     h.frame();
     assert_eq!(
         rasterizes_requested(&h, &known::NWS_ALERTS),
+        0,
+        "a band crossing dispatched a full-size raster while the gesture was \
+         still moving: the mid-gesture re-raster storm is back",
+    );
+
+    h.frame_after(crate::overlay_cache::SETTLE_REPAINT_DELAY.as_secs_f64());
+    assert_eq!(
+        rasterizes_requested(&h, &known::NWS_ALERTS),
         1,
-        "a zoom past ZOOM_REBUILD_BAND left the pane on a texture more than a \
-         factor of two off its own scale"
+        "the gesture ended more than a band off its texture and nothing asked \
+         for the exact render; past the band the overlay is more than a \
+         factor of two off its own scale, forever",
+    );
+    assert_eq!(
+        requested_render_zoom(&h, &known::NWS_ALERTS),
+        crate::overlay_cache::current_quantized_zoom(stopped_at),
+        "the settle render was keyed at a zoom the map is not at"
     );
 }
 

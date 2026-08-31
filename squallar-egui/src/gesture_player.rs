@@ -8,7 +8,7 @@
 //! displacements cancel, the wheel/dolly/pinch legs zoom in exactly as much as
 //! they zoom back out, and the UI sweep re-toggles everything it toggled. Each
 //! loop also contains a scripted number of event-free *quiet phases* — long
-//! enough past `overlay_cache::SETTLE_REPAINT_DELAY` (100 ms) that a settle
+//! enough past `overlay_cache::SETTLE_REPAINT_DELAY` (500 ms) that a settle
 //! can fire — published per script as `QUIET_PHASES`/`ZOOM_QUIET_PHASES` so a
 //! later gate can derive expected settle counts from the script alone.
 //!
@@ -24,7 +24,8 @@ use crate::input_fidelity;
 pub const LOOP_SECONDS: f64 = 20.0;
 
 /// The floor under every scripted quiet phase, seconds. Chosen comfortably
-/// above the 100 ms settle delay so a quiet phase always outlives it.
+/// above the 500 ms settle delay so a quiet phase always outlives it — the
+/// upper bound `overlay_cache::SETTLE_REPAINT_DELAY`'s own note derives from.
 pub const QUIET_MIN_SECONDS: f64 = 1.5;
 
 /// The 2D map scenario: eight mirrored pairs of drag strokes, then a wheel

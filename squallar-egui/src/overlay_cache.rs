@@ -24,7 +24,22 @@ pub const ZOOM_REBUILD_BAND: f64 = 1.0;
 
 /// How long a zoom must be still before the gesture counts as settled — and so
 /// also how long after it stops before the settle render is asked for.
-pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+///
+/// **The value is bounded on both sides by what a wheel gesture is.** A wheel
+/// zoom has no held-button signal: between notches the zoom is bit-identical
+/// and the input stream is empty, exactly like fingers at rest, so this
+/// duration is the only thing separating "paused between notches" from
+/// "stopped". Below a notch gap the settle fires inside the gesture — one
+/// full-size raster per notch, which with [`MID_GESTURE_REBUILDS`] false is
+/// the whole re-raster storm readmitted through the settle arm. A deliberate
+/// notch-at-a-time zoom runs at ~2–3 notches/s (the scripted deliberate legs
+/// in `crate::gesture_player` put their gaps at 0.35–0.4 s), so half a second
+/// clears it with margin. Above it sits the scripted quiet floor
+/// (`gesture_player::QUIET_MIN_SECONDS`, 1.5 s): a real stop must settle well
+/// inside one quiet phase, or the equality gate in `settle_tests` —
+/// dispatches per scripted loop == the script's published zoom-quiet-phase
+/// count — cannot hold from either side.
+pub const SETTLE_REPAINT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Overdraw the renderer *asks* for, as a fraction of the viewport dimension,
 /// on each side of the viewport.
@@ -615,7 +630,7 @@ impl OverlayTextureCache {
             now,
             viewport_bounds,
             plan,
-            mid_gesture_rerender_allowed(),
+            MID_GESTURE_REBUILDS,
         )
     }
 
@@ -739,24 +754,21 @@ impl OverlayTextureCache {
 /// Whether a zoom that has drifted [`ZOOM_REBUILD_BAND`] from the texture's own
 /// may be re-rasterized while the gesture is still moving.
 ///
-/// **On wasm this is a policy hold, not a physical necessity.** The reason
-/// originally written here — that the raster would run inline on the frame
-/// thread — has been false since the overlay-worker slices landed 2026-08-14;
-/// see `squallar_worker::offload`'s own module doc, where the only inline
-/// execution left on wasm is the fallback for a thread that has no sink.
-/// A dispatched overlay raster goes to the worker.
+/// **One policy value, every target — the quiet the wasm build always kept.**
+/// Until WO-8 this was `!cfg!(target_arch = "wasm32")`: native re-rastered on
+/// every band crossing mid-gesture, and that arm was most of the measured
+/// re-raster storm — native scene A fed 14.5–15.6 whole-picture dispatches/s
+/// (~11 GB of pictures per 41 s window) into a 19–32 ms interact frame
+/// (WO-6 scoreboard, commit 222b666f). The hold is policy, not physics: the
+/// raster itself runs on the worker on every target. What the band arm bought
+/// was sharpness *during* the gesture, and what it cost was the frame the
+/// gesture is judged by — so the gesture now draws the picture it has,
+/// stretched, and [`SETTLE_REPAINT_DELAY`] bounds the softness in time.
 ///
-/// **The re-enable is measured-affordable, and flipping it is not this
-/// function's decision to record.** Measured 2026-08-18 on the A9 one-way
-/// settle: worker raster 23.2 ms off-thread, delivery 5.3 ms between frames,
-/// banding <= 5.2 ms/frame, cadence unbroken. But re-enabling mid-gesture
-/// rebuilds is the A9 compositor verdict's own stated re-open trigger, so the
-/// flip needs its own order and its own A9 re-run. Until one is done, the
-/// `false` stands as a deliberate hold on gesture-time work, and the settle
-/// arm is what bounds the resulting softness in time.
-fn mid_gesture_rerender_allowed() -> bool {
-    !cfg!(target_arch = "wasm32")
-}
+/// The machinery stays parameterized
+/// ([`OverlayTextureCache::needs_rerender_with_policy`]) so the band arm's own
+/// behaviour remains pinned; this value is the one production selection of it.
+const MID_GESTURE_REBUILDS: bool = false;
 
 /// [`pan_exceeds_coverage`] asked of the picture on screen, deadbanded by
 /// [`COVERAGE_DEADBAND_TEXELS`] of that picture's own texels.
