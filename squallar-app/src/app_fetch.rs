@@ -1408,6 +1408,28 @@ impl super::App {
             ) {
                 continue;
             }
+            // **And refused while a picture is still crossing to the GPU.**
+            //
+            // This is the second door into the dispatch and it does not go
+            // through
+            // [`OverlayTextureCache::needs_rerender`](squallar_egui::overlay_cache::OverlayTextureCache::needs_rerender),
+            // so neither of that gate's brakes has ever applied to it. The mark
+            // above says nothing about a hold: a raster arrives, is handed to
+            // the cache, retires its mark — and this path is then free to spend
+            // another one whose answer will *replace* that upload before a band
+            // of it is drawn. `hold` discards rather than queues, so the picture
+            // the pane paid for is thrown away and the viewer sees neither.
+            //
+            // **Nothing is lost by waiting.** The token this ask would carry is
+            // recomputed by the draw loop's own `needs_rerender` pass on every
+            // frame, and the app keeps painting while a hold is pending
+            // (`Gui::any_raster_held` is one of the terms that re-arms the
+            // redraw). So the frame after the upload lands, the draw loop asks
+            // for exactly this picture. What this removes is only the ask that
+            // could not have reached the screen.
+            if pane.overlay_cache_mut(&id).is_holding() {
+                continue;
+            }
             // **No hydrate here, and that is measured rather than assumed.**
             // The only caller is the `SourceEvent::Data` drain, and
             // `Gui::deliver_overlay_fetch` goes through `across_panes`, which
