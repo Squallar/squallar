@@ -12,13 +12,16 @@ fn body_of(source: &'static str, signature: &str) -> &'static str {
 }
 
 /// **`ctx.request_repaint()` from a background thread has to reach winit.**
+///
+/// The wake no longer happens on the requesting thread — `repaint_handoff`
+/// moved it off egui's context lock — so this waits for it under a bound
+/// instead of reading a counter the instant the request returns.
 #[test]
 fn an_off_frame_repaint_request_reaches_the_event_loop() {
+    let (woke, arrived) = std::sync::mpsc::channel();
     let ctx = egui::Context::default();
-    let woke = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = std::sync::Arc::clone(&woke);
     super::install_repaint_wake(&ctx, move || {
-        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = woke.send(());
     });
 
     let asking = ctx.clone();
@@ -26,31 +29,146 @@ fn an_off_frame_repaint_request_reaches_the_event_loop() {
         .join()
         .expect("the requesting thread panicked");
 
-    assert_eq!(
-        woke.load(std::sync::atomic::Ordering::SeqCst),
-        1,
+    assert!(
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok(),
         "a repaint asked for off-frame woke nothing, so whatever asked for it \
              is waiting for an unrelated event to draw its result"
     );
 }
 
+/// **Nothing egui's repaint callback runs may block on another thread.**
+///
+/// egui calls the callback installed by [`super::install_repaint_wake`] with
+/// the `Context`'s *write* lock held — `egui-0.35.0/src/context.rs:161-167`,
+/// reached from `Context::request_repaint_of` -> `self.write(..)`, and again
+/// at `:115-121` from `begin_pass`. Every other thread, the frame thread
+/// included, is locked out of the context for as long as that callback runs.
+///
+/// winit's macOS `Window::request_redraw` is not the non-blocking post its
+/// name suggests. `winit-0.30.13/src/window.rs:600` routes it through
+/// `maybe_queue_on_main`, and the macOS copy of that
+/// (`src/platform_impl/macos/window.rs:40-51`) says in its own comment that it
+/// deliberately does *not* queue: it is `MainThreadBound::get_on_main` ->
+/// `objc2_foundation::run_on_main` -> `dispatch::Queue::main().exec_sync`,
+/// which blocks the caller until the **main thread** services the queue.
+///
+/// So the stand-in wake here blocks until it is released, which is exactly
+/// what that platform call does while the main thread is inside a frame. The
+/// frame thread then asks for the context the way every frame does — `Gui::ui`
+/// -> `LayoutCtx::resolve` -> `ctx.content_rect()` -> `Context::input` ->
+/// `self.write()`. If the callback held the lock while it blocked, those two
+/// wait on each other forever and the app stops rendering.
+///
+/// The wait is bounded so that failure REDDENS rather than hanging the suite.
+#[test]
+fn an_off_frame_repaint_request_does_not_hold_the_context_against_the_frame() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
+
+    let ctx = egui::Context::default();
+
+    // Released only at the end, so the wake is still inside its "platform
+    // call" for the whole of the frame thread's attempt below.
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let entered = Arc::new(AtomicBool::new(false));
+
+    let held = Arc::clone(&gate);
+    let marked = Arc::clone(&entered);
+    super::install_repaint_wake(&ctx, move || {
+        marked.store(true, Ordering::SeqCst);
+        let (lock, cvar) = &*held;
+        let mut open = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*open {
+            open = cvar
+                .wait(open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    });
+
+    // Any of the off-frame `ctx.request_repaint()` producers — a tile decode, a
+    // basemap segment, an area reconcile.
+    let asking = ctx.clone();
+    let producer = std::thread::spawn(move || asking.request_repaint());
+
+    // The wake has to be *inside* the blocking call before the frame thread
+    // asks, or the test proves nothing about the overlap.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let wake_ran = entered.load(Ordering::SeqCst);
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let framing = ctx.clone();
+    let frame = std::thread::spawn(move || {
+        let _ = framing.content_rect();
+        let _ = done_tx.send(());
+    });
+    let reached = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+    // Release before asserting: a failed assertion that leaves threads parked
+    // turns a red into a hang, and the parked thread holds the very lock the
+    // message would have to read.
+    {
+        let (lock, cvar) = &*gate;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+    let _ = producer.join();
+    let _ = frame.join();
+
+    assert!(
+        wake_ran,
+        "the off-frame repaint never reached the wake at all, so this test \
+         never set up the overlap it is here to rule out"
+    );
+    assert!(
+        reached,
+        "an off-frame repaint request held egui's context write lock while its \
+         wake blocked, so the frame thread could not start a frame: this is the \
+         deadlock that stops the app rendering entirely"
+    );
+}
+
 /// …and a *timed* request must not, or every dwell becomes a busy loop.
+///
+/// Two things this has to survive now that the wake is asynchronous. "Nothing
+/// has arrived yet" is no longer evidence that nothing will, so the stray wake
+/// is given a window of its own to show up in; and that window has to sit
+/// *before* the zero-delay control, because `repaint_handoff` coalesces a burst
+/// into one call and would otherwise fold a stray into the control and read
+/// green with the bug present.
 #[test]
 fn a_timed_repaint_request_is_left_to_the_frames_own_schedule() {
+    let (woke, arrived) = std::sync::mpsc::channel();
     let ctx = egui::Context::default();
-    let woke = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = std::sync::Arc::clone(&woke);
     super::install_repaint_wake(&ctx, move || {
-        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = woke.send(());
     });
 
     ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    let stray = arrived.recv_timeout(std::time::Duration::from_millis(250));
 
-    assert_eq!(
-        woke.load(std::sync::atomic::Ordering::SeqCst),
-        0,
+    // The control, without which the check above passes on a dead wire.
+    ctx.request_repaint();
+    let live = arrived.recv_timeout(std::time::Duration::from_secs(5));
+
+    assert!(
+        stray.is_err(),
         "a request to repaint in a second was spent as a request to repaint \
              now"
+    );
+    assert!(
+        live.is_ok(),
+        "the zero-delay control never woke either, so the check above proves \
+             nothing about timed requests"
     );
 }
 

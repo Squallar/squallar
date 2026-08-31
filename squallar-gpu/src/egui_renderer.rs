@@ -152,12 +152,83 @@ fn clamp_to_sources(clip: egui::Rect, sources: &[egui::Rect]) -> egui::Rect {
 /// **Only a zero delay wakes.** A timed request is already carried out of the
 /// frame by `FullOutput`'s `repaint_delay` and scheduled by the app side;
 /// honouring it here too would turn it into a redraw per frame, forever.
+///
+/// **The wake is carried out off egui's context lock, and that is the whole
+/// reason [`repaint_handoff`] exists.** See it for the deadlock.
 pub(crate) fn install_repaint_wake(ctx: &Context, wake: impl Fn() + Send + Sync + 'static) {
+    let post = repaint_handoff(wake);
     ctx.set_request_repaint_callback(move |info| {
         if info.delay.is_zero() {
-            wake();
+            post();
         }
     });
+}
+
+/// Turn `wake` into something safe to call from inside egui's repaint
+/// callback.
+///
+/// **The invariant: nothing egui's repaint callback runs may block on another
+/// thread.** egui invokes that callback with the `Context`'s *write* lock
+/// held — `egui-0.35.0/src/context.rs:161-167`, reached from
+/// `Context::request_repaint_of` -> `self.write(..)`, and again at `:115-121`
+/// from `begin_pass`. For as long as the callback runs, every other thread is
+/// locked out of the context, the frame thread included.
+///
+/// That made a hard deadlock out of a call that reads like a post. winit's
+/// `Window::request_redraw` (`winit-0.30.13/src/window.rs:600`) goes through
+/// `maybe_queue_on_main`, and the macOS copy of that
+/// (`src/platform_impl/macos/window.rs:40-51`) says in its own comment that it
+/// deliberately does *not* queue — it is `MainThreadBound::get_on_main` ->
+/// `objc2_foundation::run_on_main` -> `dispatch::Queue::main().exec_sync`,
+/// which blocks the caller until the **main thread** services the queue. So a
+/// tile decode calling `ctx.request_repaint()` took egui's write lock, then
+/// waited for a main thread that was inside `App::handle_redraw` waiting for
+/// that same lock at the first `ctx.content_rect()` of `Gui::ui`. Neither ever
+/// moved again and the app stopped rendering entirely, in 2-35 s, on every
+/// overlay-heavy scene. The Linux backends pass `maybe_queue_on_main` straight
+/// through (`src/platform_impl/linux/mod.rs:307-313`), which is why only macOS
+/// ever showed it.
+///
+/// The fix is not to stop asking for redraws off-frame — the tile, basemap and
+/// area workers all legitimately do, and a dropped wake is a
+/// `ControlFlow::Wait` loop that sleeps through its own data arriving. The fix
+/// is that the asking no longer happens under the lock.
+#[cfg(not(target_arch = "wasm32"))]
+fn repaint_handoff(wake: impl Fn() + Send + Sync + 'static) -> impl Fn() + Send + Sync + 'static {
+    let (posted, wakes) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("squallar-redraw-wake".to_owned())
+        .spawn(move || {
+            // Ends when the context — and with it the callback holding the
+            // sender — is dropped.
+            while wakes.recv().is_ok() {
+                // Coalesce a burst into one platform call: the loop only needs
+                // telling once that a frame is due, and on macOS each call is a
+                // round trip to the main thread.
+                while wakes.try_recv().is_ok() {}
+                wake();
+            }
+        })
+        // Louder than the alternatives. Falling back to calling `wake` inline
+        // would put the deadlock back, and swallowing it would leave a loop on
+        // `ControlFlow::Wait` that never draws another off-frame arrival —
+        // which is the same stopped app, without the stack that explains it.
+        .expect("the redraw wake thread is what lets an off-frame repaint reach the event loop");
+    move || {
+        // Non-blocking: an unbounded `Sender` never waits on the receiver, so
+        // egui's write lock is released as soon as this returns.
+        let _ = posted.send(());
+    }
+}
+
+/// One thread, so there is nobody to block on and nothing to hand off.
+///
+/// The web build's wake is a `requestAnimationFrame`-shaped post, and wasm has
+/// no equivalent of the macOS main-thread rendezvous described on
+/// [`repaint_handoff`]'s native arm.
+#[cfg(target_arch = "wasm32")]
+fn repaint_handoff(wake: impl Fn() + Send + Sync + 'static) -> impl Fn() + Send + Sync + 'static {
+    wake
 }
 
 /// Whether one frame's raw input carried a hand on the app: at least one
