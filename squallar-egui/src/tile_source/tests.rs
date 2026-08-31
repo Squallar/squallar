@@ -1590,6 +1590,10 @@ mod archive {
     use super::*;
     use crate::basemap_archive::FileRangeSource;
 
+    /// The depth the committed Monaco extract declares in its own header.
+    /// Named once so the two assertions below cannot drift apart.
+    const FIXTURE_MAX_ZOOM: u8 = 14;
+
     fn fixture_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/monaco.pmtiles")
     }
@@ -1669,13 +1673,27 @@ mod archive {
             return;
         };
 
-        // The header is read by the IO task, so the depth is not known yet --
-        // and "not known" is `None`, not a number. See
+        // The header is read by the IO task, so the depth may not be known yet
+        // -- and "not known" is `None`, not a number. See
         // `tile_source::MAX_ZOOM_UNKNOWN` for what a stand-in zero drew.
-        assert_eq!(
-            tiles.source_max_zoom(),
-            None,
-            "before the header lands the source must claim nothing it cannot serve"
+        //
+        // **Not `assert_eq!(.., None)`, and the difference is a race.** The IO
+        // task is `runtime::spawn`ed by the constructor, so whether it has
+        // already read this 419 KB local file by the time the next line runs is
+        // a scheduling question, not a behavioural one. Asserting `None` here
+        // asserts that the task has NOT finished, which is true on a loaded
+        // machine and false on an idle one: it passed locally and failed in CI
+        // with `Some(14)`.
+        //
+        // What the source actually promises is that it never claims a depth it
+        // cannot serve. So both honest answers are allowed -- nothing yet, or
+        // the archive's own depth -- and the stand-in zero this guards against
+        // is neither.
+        let before = tiles.source_max_zoom();
+        assert!(
+            before.is_none_or(|zoom| zoom == FIXTURE_MAX_ZOOM),
+            "the source claimed depth {before:?}, which is neither \"not yet \
+             known\" nor the archive's own {FIXTURE_MAX_ZOOM}"
         );
 
         let max_zoom = pump_until(DEFAULT_TIMEOUT, || {
@@ -1683,6 +1701,12 @@ mod archive {
             tiles.source_max_zoom()
         })
         .expect("the archive header never arrived");
+        // The race above is only safe because the settled value is pinned here:
+        // if the depth were ever a stand-in, this is what would catch it.
+        assert_eq!(
+            max_zoom, FIXTURE_MAX_ZOOM,
+            "the committed Monaco extract is built to zoom {FIXTURE_MAX_ZOOM}"
+        );
 
         let tile_id = TileId {
             x: squallar_geo::lon_to_tile_x(MONACO_LON, max_zoom),
