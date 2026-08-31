@@ -12,7 +12,8 @@ fn no_band_carries_more_than_one_band_of_bytes() {
         let height = side as u32;
         let mut done = 0u32;
         while done < height {
-            let plan = BandPlan::of(side, height, done).expect("rows remain, so there is a plan");
+            let plan = BandPlan::of(side, height, done, UPLOAD_BAND_BYTES)
+                .expect("rows remain, so there is a plan");
             assert!(
                 plan.bytes() <= UPLOAD_BAND_BYTES,
                 "a {side}px raster planned {} rows from row {done} — {} bytes, over the \
@@ -32,7 +33,7 @@ fn the_bands_of_a_raster_cover_every_row_exactly_once() {
         let height = side as u32;
         let mut done = 0u32;
         let mut plans = 0u32;
-        while let Some(plan) = BandPlan::of(side, height, done) {
+        while let Some(plan) = BandPlan::of(side, height, done, UPLOAD_BAND_BYTES) {
             assert!(plan.rows > 0, "a {side}px raster planned an empty band");
             done += plan.rows;
             plans += 1;
@@ -55,7 +56,7 @@ fn the_bands_of_a_raster_cover_every_row_exactly_once() {
 #[test]
 fn a_row_too_wide_for_the_budget_still_makes_one_row_of_progress() {
     let side = UPLOAD_BAND_BYTES; // one row is four times the whole band
-    let plan = BandPlan::of(side, 4, 0).expect("there are rows to move");
+    let plan = BandPlan::of(side, 4, 0, UPLOAD_BAND_BYTES).expect("there are rows to move");
     assert_eq!(plan.rows, 1);
     assert!(plan.bytes() > UPLOAD_BAND_BYTES);
 }
@@ -63,15 +64,15 @@ fn a_row_too_wide_for_the_budget_still_makes_one_row_of_progress() {
 /// Nothing to move is `None`, not a band of zero rows.
 #[test]
 fn an_image_with_no_rows_left_has_no_plan() {
-    assert!(BandPlan::of(64, 4, 4).is_none());
-    assert!(BandPlan::of(64, 4, 9).is_none());
-    assert!(BandPlan::of(0, 4, 0).is_none());
+    assert!(BandPlan::of(64, 4, 4, UPLOAD_BAND_BYTES).is_none());
+    assert!(BandPlan::of(64, 4, 9, UPLOAD_BAND_BYTES).is_none());
+    assert!(BandPlan::of(0, 4, 0, UPLOAD_BAND_BYTES).is_none());
 }
 
 /// The staging stride is the copy alignment, and the widest cut really needs it.
 #[test]
 fn the_staging_stride_is_aligned_and_the_widest_cut_is_not() {
-    let plan = BandPlan::of(WIDEST, WIDEST as u32, 0).expect("a plan");
+    let plan = BandPlan::of(WIDEST, WIDEST as u32, 0, UPLOAD_BAND_BYTES).expect("a plan");
     assert_eq!(plan.row_bytes, WIDEST * 4);
     assert_eq!(plan.row_bytes, 29448);
     assert_eq!(plan.padded_row, 29696);
@@ -80,14 +81,14 @@ fn the_staging_stride_is_aligned_and_the_widest_cut_is_not() {
 
     // A power-of-two side pads by nothing, which is why the buffer for one is
     // exactly the band it was sized against.
-    let square = BandPlan::of(2048, 2048, 0).expect("a plan");
+    let square = BandPlan::of(2048, 2048, 0, UPLOAD_BAND_BYTES).expect("a plan");
     assert_eq!(square.padded_row as usize, square.row_bytes);
 }
 
 /// A ring slot is one band, and the pair is what the module claims it costs.
 #[test]
 fn the_ring_a_band_needs_is_two_slots_of_a_band() {
-    let plan = BandPlan::of(WIDEST, WIDEST as u32, 0).expect("a plan");
+    let plan = BandPlan::of(WIDEST, WIDEST as u32, 0, UPLOAD_BAND_BYTES).expect("a plan");
     let both = plan.staged_bytes() * crate::staging_ring::STAGING_RING_DEPTH as u64;
     assert!(
         both < 18 << 20,
@@ -119,6 +120,66 @@ fn the_frame_budget_follows_the_device_and_not_the_target() {
     assert_eq!(ringless.pending_bands(), 0);
 }
 
+/// **A web-picture-sized delta no longer blocks a ringless frame whole.**
+/// Spike B (2026-08-30) measured Firefox's whole-picture overlay raster at
+/// 8.51 MB; on a ringless device — all of web — that byte count used to
+/// cross in one blocking `write_texture` on the frame thread. It now files
+/// as bands of at most `BLOCKING_BAND_BYTES`, drained one per frame, and
+/// every byte lands in exactly one band.
+#[test]
+fn a_web_picture_bands_on_a_ringless_device_instead_of_blocking_whole() {
+    let cap = band_cap(false);
+    assert!(
+        cap < UPLOAD_BAND_BYTES,
+        "the ringless band cap ({cap} B) is not below the ring's \
+         ({UPLOAD_BAND_BYTES} B), so a blocking chunk costs a ring-sized \
+         stall on the one device class where every chunk is frame thread",
+    );
+
+    // The routing: spike B's Firefox picture goes whole on a ring device and
+    // bands on a ringless one.
+    let picture = 8_510_000usize;
+    assert!(
+        !goes_whole(false, picture),
+        "an 8.51 MB picture crosses whole on a ringless device: one blocking \
+         write_texture spends the frame it lands on",
+    );
+    assert!(
+        goes_whole(false, cap),
+        "a delta at the cap itself must still go whole — banding it buys a \
+         frame of latency for the same one write",
+    );
+
+    // The planner: a 1024px-wide picture of that byte count tiles into
+    // exactly ceil(size / cap) bands, none over the cap, every byte once.
+    let width = 1024usize;
+    let height = (picture / (width * 4)) as u32; // 2077 rows, 8.5 MB
+    let bytes = width * 4 * height as usize;
+    let expected = bytes.div_ceil(cap) as u32;
+    let mut done = 0u32;
+    let mut bands = 0u32;
+    let mut moved = 0usize;
+    while let Some(plan) = BandPlan::of(width, height, done, cap) {
+        assert!(plan.bytes() <= cap, "a band over its own cap");
+        done += plan.rows;
+        bands += 1;
+        moved += plan.bytes();
+        assert!(bands <= height, "not making progress");
+    }
+    assert_eq!(
+        bands, expected,
+        "a {bytes} B picture filed {bands} bands at a {cap} B cap",
+    );
+    assert_eq!(
+        moved, bytes,
+        "every byte of the picture in exactly one band"
+    );
+
+    // And the drain moves one band per frame there — the frame budget the
+    // sweep beside `BLOCKING_BAND_BYTES` priced its dry-frame rows against.
+    assert_eq!(TextureUploads::without_device().bands_per_frame(), 1);
+}
+
 /// A raster the app loaded `NEAREST` is bound `NEAREST`.
 #[test]
 fn the_sampler_says_what_the_texture_options_said() {
@@ -147,16 +208,20 @@ fn the_sampler_says_what_the_texture_options_said() {
     assert!(nearest.compare.is_none());
 }
 
-/// What the widest raster costs a frame, and how many frames it takes.
+/// What the widest raster costs a frame, and how many frames it takes, at
+/// each device shape's own band cap.
 #[test]
-fn the_widest_raster_takes_fourteen_frames_on_a_ring_and_twenty_six_without() {
-    for (bands, expected) in [(DMA_BANDS_PER_FRAME, 14u32), (1, 27)] {
+fn the_widest_raster_takes_fourteen_frames_on_a_ring_and_fifty_three_without() {
+    for (bands, cap, expected) in [
+        (DMA_BANDS_PER_FRAME, band_cap(true), 14u32),
+        (1, band_cap(false), 53),
+    ] {
         let height = WIDEST as u32;
         let mut done = 0u32;
         let mut frames = 0u32;
         while done < height {
             for _ in 0..bands {
-                let Some(plan) = BandPlan::of(WIDEST, height, done) else {
+                let Some(plan) = BandPlan::of(WIDEST, height, done, cap) else {
                     break;
                 };
                 done += plan.rows;
