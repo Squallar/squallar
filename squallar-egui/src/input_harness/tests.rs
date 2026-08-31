@@ -15803,3 +15803,38 @@ fn the_basemap_is_dispatched_at_the_bottom_while_on_and_not_at_all_while_off() {
         "switching the layer back on restores the ground at the bottom",
     );
 }
+
+/// **An open settings pane does not walk the serial bus once a frame.**
+///
+/// The GPS port row called `detect_gps_ports` inline, so every frame the
+/// inspector was open paid for a udev walk of every tty on the box:
+/// **24.9–25.6 ms of a 27.4 ms `ui` segment**, measured on native scene D
+/// (`ui-sweep`, 1920x1080, release) on 2026-08-31, which is what made the
+/// toggle frame's max 53.8 ms. The row now reads `GpsPortScanner`, which
+/// answers off the newest finished scan and starts at most one scan per
+/// `RESCAN_INTERVAL`.
+///
+/// Red against the shape this replaces: 60 frames of an open pane walked the
+/// bus 60 times. It is a count, not a clock — what moved is how many times
+/// the bus was walked, and that is what the frame was paying for.
+#[cfg(feature = "gps-serial")]
+#[test]
+fn an_open_settings_pane_walks_the_serial_bus_at_most_once() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.open_settings();
+    assert!(
+        h.settings_row("gps.port").is_some(),
+        "non-vacuity: this build drew no GPS port row, so a zero walk count \
+         below would say nothing about the row that stalls the frame",
+    );
+
+    for _ in 0..60 {
+        h.frame();
+    }
+    let walks = h.gui().gps_port_scans_for_test();
+    assert!(
+        walks <= 1,
+        "60 frames of an open settings pane walked the serial bus {walks} \
+         times; the scanner exists so that it is at most one",
+    );
+}

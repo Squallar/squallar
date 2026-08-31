@@ -15,4 +15,4 @@ pub use config::SerialConfig;
 pub use nmea_parser::{NmeaState, ParsedFix, ParsedQuality};
 
 #[cfg(feature = "serial")]
-pub use serial::{GpsPortInfo, SerialGpsReader, detect_gps_ports};
+pub use serial::{GpsPortInfo, GpsPortScanner, SerialGpsReader, detect_gps_ports};
