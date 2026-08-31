@@ -229,38 +229,21 @@ fn the_mid_gesture_band_is_platform_policy_and_the_settle_is_not() {
     );
 }
 
-/// The host build allows the mid-gesture band. The wasm side of this `cfg!` is
-/// deliberately not claimed by any test: it is covered by the
-/// `wasm32-unknown-unknown` type-check gate and by review of the one-line body.
-/// What that arm *is* — a policy hold rather than a physical necessity — is on
-/// `mid_gesture_rerender_allowed` itself.
-#[cfg(not(target_arch = "wasm32"))]
+/// The band policy is one value on every target, and that value is quiet:
+/// no build re-rasterizes mid-gesture on the band arm. This replaced the
+/// per-target `!cfg!(target_arch = "wasm32")` at WO-8, when the native arm
+/// was measured as the re-raster storm; the settle arm — pinned above and
+/// below — is what bounds the resulting softness in time.
 #[test]
-fn the_host_arm_of_the_band_policy_allows_mid_gesture_rerenders() {
-    assert!(mid_gesture_rerender_allowed());
-}
-
-/// The wasm arm of the policy cannot *execute* on the host — on this target
-/// `!cfg!(target_arch = "wasm32")` and a bare `true` are the same value — so
-/// its text is pinned instead, the way this workspace pins other facts no type
-/// can carry. This is a source assertion, stated as one: it proves the body
-/// still keys on the wasm target, and nothing about what a wasm build does
-/// with it. That behavior's coverage is the `wasm32-unknown-unknown`
-/// type-check gate plus review of the one-line body.
-#[test]
-fn the_band_policy_keys_on_the_wasm_target() {
-    let source = include_str!("../overlay_cache.rs");
-    let body = source
-        .split_once("fn mid_gesture_rerender_allowed() -> bool {")
-        .expect("the band policy function is gone from overlay_cache.rs")
-        .1;
-    let body = &body[..body.find('}').expect("the function body ends")];
+// The lint is right that this is a constant; pinning it is the point.
+#[allow(clippy::assertions_on_constants)]
+fn the_band_policy_is_one_quiet_value_on_every_target() {
     assert!(
-        body.contains(r#"!cfg!(target_arch = "wasm32")"#),
-        "the mid-gesture band policy no longer keys on the wasm target. That \
-         arm is a deliberate hold on gesture-time raster work, not a \
-         consequence of where the raster runs, and the host tests cannot \
-         catch its loss",
+        !MID_GESTURE_REBUILDS,
+        "the mid-gesture band re-raster came back on. That arm dispatches a \
+         full-size raster per band crossing while the user is still zooming \
+         — the measured storm WO-8 removed — and turning it back on is a \
+         re-measurement's decision, not a refactor's",
     );
 }
 
@@ -314,6 +297,82 @@ fn a_fresh_hold_is_a_dispatch_already_answered() {
          the promotion, not to the staleness question",
     );
     assert!(with_hold.is_holding());
+}
+
+/// **The WO-8 equality gate.** Over the scripted pan-zoom loop, the zoom
+/// dispatch count is exactly the script's published zoom-quiet-phase count —
+/// one settle re-raster per scripted quiet window that follows zoom motion,
+/// and nothing mid-gesture.
+///
+/// The expected count is derived from the gesture script's own constants
+/// ([`gesture_player::pan_zoom_2d::ZOOM_QUIET_PHASES`]), never from the
+/// settle code under test. The zoom trace is the real player's own wheel
+/// events, integrated at 1 notch = 1.0 zoom — the app pins that rate with
+/// `wheel_zoom_scales_with_frame_time(false)`. The viewport never moves and
+/// the fixture texture covers far more ground than it, so no coverage arm can
+/// contribute a dispatch: every count below is zoom's.
+///
+/// An equality, not a ceiling, on both sides: fewer than K means a quiet
+/// phase's settle never fired and the overlay stays soft; more than K means
+/// something dispatched mid-gesture — the re-raster storm this gate exists to
+/// keep dead (measured on the unmodified baseline: 40 dispatches against
+/// K = 4 on this very loop).
+#[test]
+fn a_scripted_zoom_dispatches_exactly_the_scripts_quiet_phase_count() {
+    use crate::gesture_player::{self, GesturePlayer};
+
+    const LOOPS: u32 = 2;
+    let k = gesture_player::pan_zoom_2d::ZOOM_QUIET_PHASES * LOOPS;
+
+    let ctx = egui::Context::default();
+    let mut player = GesturePlayer::from_name("pan-zoom-2d").expect("the script name is known");
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+
+    let mut zoom = ZOOM;
+    let mut cache = satisfied_cache(&ctx);
+
+    // One raster in flight at most, arriving one frame after its dispatch —
+    // the tightest pipeline, which maximises what a storm could dispatch.
+    let mut in_flight: Option<(RenderTicket, f64, u64)> = None;
+    let mut dispatches: u32 = 0;
+
+    let hz = 175.0;
+    let frames = (gesture_player::LOOP_SECONDS * f64::from(LOOPS) * hz) as u64;
+    for frame in 0..=frames {
+        let now = frame as f64 / hz;
+        for event in player.events_for_frame(now, screen) {
+            if let egui::Event::MouseWheel { delta, .. } = event {
+                zoom += f64::from(delta.y);
+            }
+        }
+        if let Some((ticket, asked_at, due)) = in_flight
+            && frame >= due
+        {
+            assert!(
+                cache.renders.retire(&ticket),
+                "the fixture retires only what it recorded"
+            );
+            cache.show(data_at(&ctx, "arrived", asked_at));
+            in_flight = None;
+        }
+        // `T0 +` so the pre-armed settle clock of `satisfied_cache` holds.
+        if cache.needs_rerender(TOKEN, zoom, T0 + now, &viewport(), &plan())
+            && cache.renders.admits(RenderSlot::WHOLE, 1)
+        {
+            dispatches += 1;
+            let ticket = RenderTicket::whole(TOKEN, covered());
+            cache.renders.record(ticket);
+            in_flight = Some((ticket, zoom, frame + 1));
+        }
+    }
+
+    assert_eq!(
+        dispatches, k,
+        "the scripted zoom asked for {dispatches} rasters where the script's \
+         own quiet-phase count says exactly {k}: below it a settle never \
+         fired and the overlay stays soft; above it the mid-gesture re-raster \
+         storm is back",
+    );
 }
 
 /// A hold that no longer describes what the pane wants does not block the
