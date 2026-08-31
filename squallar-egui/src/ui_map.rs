@@ -354,6 +354,7 @@ impl super::Gui {
                                             actions: &mut actions,
                                             pane_rect,
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
+                                            ground_meshes: self.tile_mesh_painter.as_ref(),
                                             // Not a lookup: the 3D ground is
                                             // drawn by the volume arm, which
                                             // this arm is not, and the type
@@ -1781,6 +1782,11 @@ impl super::Gui {
                     actions,
                     pane_rect: strip,
                     surfaces: pane_render::PaneSurfaces::GroundOnly,
+                    // Carried, not withheld: the cut is
+                    // `PaneRenderCtx::ground_mesh_painter`'s, in one place
+                    // with the reason written beside it, rather than a `None`
+                    // here that reads as an omission.
+                    ground_meshes: self.tile_mesh_painter.as_ref(),
                     draws_3d_ground,
                     horizontal_color_scale,
                     color_scale_floor,

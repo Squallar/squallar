@@ -431,6 +431,9 @@ pub struct Gui {
     /// Whatever can actually draw a 3D pane, or `None` on a machine or a frame
     /// where nothing can.
     pub(super) volume_painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
+    /// Whatever can draw a vector tile's fills from the GPU, or `None` on a
+    /// build or a frame where nothing can — see [`crate::tile_mesh`].
+    pub(super) tile_mesh_painter: Option<std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
     /// The user's Volume Alpha curves, one per edited product. See
     /// [`crate::volume_alpha`]: absence means "render through the palette's
     /// own alpha, bit-exactly", which is why this is a store of exceptions
@@ -645,6 +648,7 @@ impl Gui {
             srv_fallback: squallar_radar::srv::SrvFallback::default(),
             storm_motion_editing: false,
             volume_painter: None,
+            tile_mesh_painter: None,
             volume_alpha: crate::volume_alpha::AlphaCurves::default(),
             volume_iso: crate::volume_iso::IsoThresholds::default(),
             config_unknown_fields: serde_json::Map::new(),

@@ -185,6 +185,10 @@ pub enum GuiEvent {
     },
     /// Install what can draw 3D panes, or take it away.
     VolumePainter(Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>),
+    /// Install what can draw a vector tile's fills from the GPU, or take it
+    /// away. Absent, every fill takes the CPU placement path — see
+    /// [`crate::tile_mesh`].
+    TileMeshPainter(Option<std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>),
 }
 
 #[cfg(test)]

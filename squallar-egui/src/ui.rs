@@ -782,6 +782,9 @@ impl Gui {
             GuiEvent::VolumePainter(painter) => {
                 self.volume_painter = painter;
             }
+            GuiEvent::TileMeshPainter(painter) => {
+                self.tile_mesh_painter = painter;
+            }
         }
     }
 
@@ -2357,6 +2360,10 @@ impl Gui {
         // the release: the frontend installs a fresh one when the renderer comes
         // back, and until then every 3D pane says so.
         self.volume_painter = None;
+        // Same rule, same reason: the tile-mesh store's buffers, pipeline and
+        // bind groups all belong to the device that is going away, and the
+        // ground falls back to CPU placement until a fresh painter arrives.
+        self.tile_mesh_painter = None;
     }
 
     pub(crate) fn volume_painter(
