@@ -6,7 +6,7 @@ nexrad-level3/src/model/header.rs	219	217
 nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1438	1063
-squallar-app/src/app_chunks.rs	220	124
+squallar-app/src/app_chunks.rs	220	133
 squallar-app/src/app_fetch.rs	1873	1572
 squallar-app/src/app_render.rs	3062	2475
 squallar-app/src/app_state.rs	76	0
@@ -211,10 +211,10 @@ squallar-overlays/src/types.rs	24	24
 squallar-radar/src/archive.rs	249	222
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
-squallar-radar/src/catalogue.rs	174	163
+squallar-radar/src/catalogue.rs	174	160
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
-squallar-radar/src/chunks.rs	975	743
+squallar-radar/src/chunks.rs	975	759
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	311	294
 squallar-radar/src/dpprep.rs	1022	956
@@ -240,7 +240,7 @@ squallar-radar/src/render/polar.rs	264	260
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
-squallar-radar/src/scan.rs	374	211
+squallar-radar/src/scan.rs	374	212
 squallar-radar/src/site_position.rs	81	81
 squallar-radar/src/sites.rs	801	799
 squallar-radar/src/sounding.rs	234	207
@@ -327,6 +327,9 @@ vendor/bzip2-rs/src/header/mod.rs	37	33
 vendor/bzip2-rs/src/huffman.rs	85	81
 vendor/bzip2-rs/src/move_to_front.rs	76	75
 vendor/bzip2-rs/src/threadpool.rs	9	9
+vendor/mvt-reader/src/feature.rs	3	0
+vendor/mvt-reader/src/generated/vector_tile.rs	15	0
+vendor/mvt-reader/src/lib.rs	197	179
 vendor/nexrad-data/src/aws/archive/download_file.rs	1	0
 vendor/nexrad-data/src/aws/archive/identifier.rs	20	20
 vendor/nexrad-data/src/aws/archive/list_files.rs	6	0
