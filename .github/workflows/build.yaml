@@ -906,8 +906,8 @@ jobs:
       # with them: squallar::platform::ZONE_PACK_URL, where native builds
       # download the zones.pack this job stages. The values come from
       # `terraform output` in ../terraform/infra/squallar and go stale only if
-      # that stack is rebuilt; the old rustdar stack now serves the tombstone
-      # (`deploy-tombstone` below) and nothing else.
+      # that stack is rebuilt. The old rustdar stack now serves a static
+      # tombstone and has no deploy role at all.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
@@ -968,56 +968,17 @@ jobs:
           echo "::error::https://squallar.app/ is not sending COOP+COEP; the app will boot single-threaded"
           exit 1
 
-  # Retire https://rustdar.mcswain.dev/: publish the tombstone over the old
-  # origin. `.github/cloudfront-tombstone/` is two files -- a redirecting
-  # index.html for fresh visitors, and a service worker at /sw.js (the path the
-  # app's worker lived at) that unregisters installed clients and sends them to
-  # squallar.app. See both files' comments for why each half is needed.
+  # rustdar.mcswain.dev was retired on 2026-08-31 and the job that did it is
+  # gone. `.github/cloudfront-tombstone/` published a redirect page and a
+  # service worker at /sw.js -- the path the app's own worker lived at -- which
+  # unregisters installed clients and sends them to squallar.app. Verified
+  # serving: the page is 3,004 bytes of "Squallar has moved", /sw.js carries the
+  # unregistering worker, and the old shell and zones.pack are 404 gone.
   #
-  # `needs: [deploy-cloudfront]`: the tombstone never publishes unless the new
-  # origin just deployed AND its isolation headers verified, so there is no
-  # window where the old origin points at a squallar.app that is not serving.
-  #
-  # `--delete` wipes the old app from the bucket -- shell, wasm, zones.pack,
-  # everything. Nothing shipped against that origin outside this repo's own
-  # dev builds, and those degrade gracefully (zone resolution falls back to
-  # HTTP; the pack URL moved to squallar.app in the same change).
-  deploy-tombstone:
-    name: Tombstone the old origin
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [deploy-cloudfront]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
-    concurrency:
-      group: cloudfront-tombstone
-      cancel-in-progress: false
-    steps:
-      - name: Check out the tombstone
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: .github/cloudfront-tombstone
-          sparse-checkout-cone-mode: false
-
-      - name: Refuse to sync an empty tree
-        run: |
-          test -f .github/cloudfront-tombstone/index.html || { echo "::error::tombstone index.html missing"; exit 1; }
-          test -f .github/cloudfront-tombstone/sw.js || { echo "::error::tombstone sw.js missing"; exit 1; }
-          grep -q "https://squallar.app/" .github/cloudfront-tombstone/sw.js || { echo "::error::sw.js does not point at squallar.app"; exit 1; }
-
-      # The OLD stack's role: this job is the one thing that still writes to it.
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          role-to-assume: arn:aws:iam::803205869942:role/github-actions-rustdar
-          aws-region: us-east-1
-
-      - name: Sync the tombstone over the old origin
-        run: aws s3 sync --delete .github/cloudfront-tombstone/ s3://rustdar.mcswain.dev/
-
-      - name: Invalidate the old distribution
-        run: aws cloudfront create-invalidation --distribution-id E2GQ1TB8D9TCQB --paths "/*"
+  # The job and the IAM role it assumed were both removed rather than left
+  # idle: the tombstone is permanent and never needs republishing, and a role
+  # with write access to a live origin that nothing uses is a standing risk.
+  # Recover both from git history if that origin ever has to change.
 
   # The marketing site at squallar.com. Nothing is built: `www/` is hand-written
   # HTML, one stylesheet and the screenshots, so this job stages a directory and
