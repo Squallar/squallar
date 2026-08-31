@@ -1221,11 +1221,26 @@ fn visible_radar_sites(
     // take a click on the icon straddling the boundary.
     let near = ui.max_rect().expand(100.0);
     let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
+    // **The turn this pane is looking at.** `Projector::project` is linear in
+    // longitude and folds nothing, so a station written -165.30 seen from a map
+    // centred at 170E lands 335 degrees west of centre instead of 25 degrees
+    // east: off the canvas, culled, and missing from the map entirely. The
+    // width of one turn in points is measured from the projector rather than
+    // derived from the zoom, so it cannot disagree with it; two projections buy
+    // it for the whole 208-row table.
+    let world_width = crate::site_marker::world_width_in_points(projector);
+    let centre_x = near.center().x;
     visible_sites_in(
         squallar_radar::sites::radars(),
         near,
         icon_size,
-        |lat, lon| projector.project(walkers::lat_lon(lat, lon)).to_pos2(),
+        |lat, lon| {
+            let p = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+            egui::pos2(
+                crate::site_marker::fold_into_turn(p.x, centre_x, world_width),
+                p.y,
+            )
+        },
     )
 }
 
@@ -1253,7 +1268,15 @@ fn visible_sites_in(
     visible
 }
 
-/// Per-frame radar site label rendering and interaction detection.
+/// Per-frame radar site marker and label rendering, and interaction detection.
+///
+/// **The marker is drawn here, in points, and not baked into the layer's
+/// raster.** A raster is placed by its geographic corners, so everything in it
+/// scales with the map — right for a coastline, wrong for a station dot, whose
+/// own click target (`VisibleSite::icon_rect`) is sized in points from the live
+/// zoom. Baked, the dot left its hit box behind the moment a gesture started,
+/// ran up to four times its size two zoom levels in, and snapped back half a
+/// second after the zoom went still.
 fn handle_radar_site_interactions(
     ui: &egui::Ui,
     zoom: f64,
@@ -1290,19 +1313,35 @@ fn handle_radar_site_interactions(
         egui::Color32::BLACK
     };
 
+    // Read once, before the click arm below borrows `pane` mutably. Which
+    // station is current and which is loading is what the three marker fills
+    // say, and it is the only thing the marker needs from the pane.
+    let current_site = pane.site().to_string();
+    let loading_site = pane.loading_site.clone();
+
     for site in sites {
         let radar_site = site.site;
         let site_screen = site.screen;
         let icon_rect = site.icon_rect;
 
+        let role = if loading_site.as_deref() == Some(radar_site.name) {
+            crate::site_marker::MarkerRole::Loading
+        } else if current_site == radar_site.name {
+            crate::site_marker::MarkerRole::Current
+        } else {
+            crate::site_marker::MarkerRole::Ordinary
+        };
+        crate::site_marker::draw_site_marker(ui.painter(), site_screen, zoom, role);
+
         if zoom >= 5.0 {
             let text_pos = egui::pos2(site_screen.x, site_screen.y + icon_size / 2.0 + 3.0);
-            ui.painter().text(
+            crate::site_marker::draw_site_label(
+                ui.painter(),
                 text_pos,
-                egui::Align2::CENTER_TOP,
                 radar_site.name,
                 egui::FontId::monospace(font_size),
                 text_color,
+                is_dark,
             );
         }
 
