@@ -332,6 +332,34 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
     )
 }
 
+/// The `ground tiles:` running-total line. See [`overlay_raster_line`] for why
+/// this is a value.
+///
+/// **Five denominators, none of them added.** `placed` counts fill vertices
+/// the frame thread copied and `stroke pts` counts stroke points it copied —
+/// two halves of one tile's ground phase, reported apart because the fills go
+/// to the GPU and the strokes cannot (a `line-width` is in screen points).
+/// `labels` is the anchors the pass deferred, and is what makes a zero in the
+/// first figure readable: both zero is a tile pass that never ran. `draws` is
+/// paint callbacks pushed, per run per tile per frame. `uploads` counts buffer
+/// writes, once per tile lifetime rather than once per frame, and `resident`
+/// is a **level** — the only figure here that goes down.
+fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
+    format!(
+        "ground tiles: {} placed, {} stroke pts, {} labels, {} draws, \
+         {} uploads of {} B, {} evicted, {} B resident, {} unrendered",
+        t.mesh_vertices_placed,
+        t.path_points_placed,
+        t.label_anchors_placed,
+        t.mesh_draws,
+        t.mesh_uploads,
+        t.mesh_upload_bytes,
+        t.mesh_evictions,
+        t.mesh_resident_bytes,
+        t.mesh_store_missing,
+    )
+}
+
 /// What the shell does with the mirror on one frame — the two old states plus
 /// the strip cache's third.
 ///
@@ -1123,7 +1151,8 @@ impl super::App {
             .as_mut()
             .and_then(|state| state.egui_renderer.upload_totals_if_moved());
         let strips = squallar_egui::floor_ledger::totals_if_moved();
-        if rasters.is_none() && uploads.is_none() && strips.is_none() {
+        let ground = squallar_egui::tile_mesh::ledger::totals_if_moved();
+        if rasters.is_none() && uploads.is_none() && strips.is_none() && ground.is_none() {
             return;
         }
         // Stamped only where a line really went out, so a quiet pipeline does
@@ -1138,6 +1167,9 @@ impl super::App {
         }
         if let Some(s) = strips {
             say_telemetry(loud, &floor_strip_line(&s));
+        }
+        if let Some(g) = ground {
+            say_telemetry(loud, &ground_tile_line(&g));
         }
     }
 

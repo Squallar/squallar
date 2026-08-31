@@ -1059,7 +1059,28 @@ impl App {
             state.volume_support.clone(),
         ));
         self.volume_painter = Some(painter.clone());
-        self.gui.apply(GuiEvent::VolumePainter(Some(painter)));
+
+        // The ground-tile store, on every device: one pipeline over ordinary
+        // vertex and index buffers, with no limit a shipped adapter can fall
+        // short of. Installed before the painter that draws through it, so no
+        // frame can dispatch a ground callback into an empty slot.
+        let attachments = state.egui_renderer.attachment_config();
+        let ground = squallar_gpu::tile_mesh::TileMeshStore::new(
+            &state.device,
+            attachments,
+            squallar_gpu::egui_renderer::EGUI_DITHERING,
+        );
+        state.egui_renderer.callback_resources_mut().insert(ground);
+
+        // Both of the renderer's painters, published at one seam.
+        for installed in [
+            GuiEvent::VolumePainter(Some(painter)),
+            GuiEvent::TileMeshPainter(Some(std::sync::Arc::new(
+                squallar_gpu::tile_mesh::TileMeshBridge,
+            ))),
+        ] {
+            self.gui.apply(installed);
+        }
     }
 
     /// Dispatch the voxel build a 3D pane asked for, unless the volume is already in hand
