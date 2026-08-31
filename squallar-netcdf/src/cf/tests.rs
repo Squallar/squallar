@@ -562,6 +562,236 @@ fn a_non_finite_unpacked_value_is_missing_in_both_representations() {
     );
 }
 
+// ── The raw domain is the storage width, and loses nothing ───────────────
+
+/// Write one variable at a chosen storage width, optionally with an
+/// `add_offset`.
+///
+/// A macro rather than a generic function because `FileBuilder` names the
+/// width in the method (`with_u16_data`, `with_i64_data`, …) and there is no
+/// trait over them.
+macro_rules! typed_var_file {
+    ($writer:ident, $values:expr) => {
+        typed_var_file!($writer, $values, None)
+    };
+    ($writer:ident, $values:expr, $offset:expr) => {{
+        let mut w = hdf5_pure::FileBuilder::new();
+        let b = w.create_dataset("v");
+        b.$writer($values);
+        let offset: Option<f64> = $offset;
+        if let Some(o) = offset {
+            b.set_attr("add_offset", hdf5_pure::AttrValue::F64(o));
+        }
+        w.finish().expect("write the typed fixture")
+    }};
+}
+
+/// Both representations of a variable, against expectations written by hand.
+///
+/// `expected` is the raw domain: the values the CF rules say the file means,
+/// derived from the on-disk integers and the packing attributes rather than
+/// read back off this crate's own output. `to_bits` rather than `==`, so a
+/// value that is merely *close* is a failure and `-0.0` is not `0.0`.
+fn expect_exact(bytes: &[u8], expected: &[f64], what: &str) {
+    let raw = raw_of(bytes);
+    assert_eq!(
+        raw.raw.len(),
+        expected.len(),
+        "{what}: stored element count"
+    );
+
+    let wide = unpack(&raw, what).values;
+    for (i, (got, want)) in wide.iter().zip(expected).enumerate() {
+        let got = got.unwrap_or_else(|| panic!("{what}[{i}] came back missing"));
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{what}[{i}]: unpack gave {got:e}, the file means {want:e}"
+        );
+    }
+
+    let narrow = unpack_f32(&raw, what).values;
+    for (i, (got, want)) in narrow.iter().zip(expected).enumerate() {
+        assert_eq!(
+            got.to_bits(),
+            (*want as f32).to_bits(),
+            "{what}[{i}]: unpack_f32 gave {got:e}, the raw domain rounds to {:e}",
+            *want as f32
+        );
+    }
+}
+
+/// **Every storage width reaches the raw domain as the exact value on disk.**
+///
+/// The byte-exactness net under [`RawValues`]. Each row carries a value the
+/// width can hold and a *narrower* float cannot — `i32::MAX` and `u32::MAX`
+/// round up in `f32`, `2^24 + 1` rounds down, `1.0 + f64::EPSILON` collapses to
+/// `1.0` — so an implementation that widened through anything narrower than
+/// `f64` reddens here rather than on a granule.
+///
+/// Identity packing throughout: with no `scale_factor` or `add_offset` the
+/// expected value *is* the storage value, so nothing here is a re-recording of
+/// the unpacker's arithmetic.
+#[test]
+fn every_storage_width_unpacks_to_the_same_bits_it_always_did() {
+    expect_exact(
+        &typed_var_file!(with_f32_data, &[1.5f32, -2.25, -0.0, f32::MAX]),
+        &[1.5, -2.25, -0.0, f64::from(f32::MAX)],
+        "f32",
+    );
+    expect_exact(
+        &typed_var_file!(
+            with_f64_data,
+            &[
+                0.1f64,
+                1.0 + f64::EPSILON,
+                -1.234_567_890_123_456_7e300,
+                f64::MAX
+            ]
+        ),
+        &[
+            0.1,
+            1.0 + f64::EPSILON,
+            -1.234_567_890_123_456_7e300,
+            f64::MAX,
+        ],
+        "f64",
+    );
+    expect_exact(
+        &typed_var_file!(with_i8_data, &[i8::MIN, -1, 0, i8::MAX]),
+        &[-128.0, -1.0, 0.0, 127.0],
+        "i8",
+    );
+    expect_exact(
+        &typed_var_file!(with_i16_data, &[i16::MIN, -1, 0, i16::MAX]),
+        &[-32768.0, -1.0, 0.0, 32767.0],
+        "i16",
+    );
+    expect_exact(
+        &typed_var_file!(with_i32_data, &[i32::MIN, -1, 0, 16_777_217, i32::MAX]),
+        &[-2_147_483_648.0, -1.0, 0.0, 16_777_217.0, 2_147_483_647.0],
+        "i32",
+    );
+    // `2^53` is the last integer `f64` holds with its neighbour; above it the
+    // `as` cast rounds, exactly as it always has.
+    expect_exact(
+        &typed_var_file!(
+            with_i64_data,
+            &[-9_007_199_254_740_992i64, -1, 0, 9_007_199_254_740_992]
+        ),
+        &[-9_007_199_254_740_992.0, -1.0, 0.0, 9_007_199_254_740_992.0],
+        "i64",
+    );
+    expect_exact(
+        &typed_var_file!(with_u8_data, &[0u8, 1, 128, 255]),
+        &[0.0, 1.0, 128.0, 255.0],
+        "u8",
+    );
+    expect_exact(
+        &typed_var_file!(with_u16_data, &[0u16, 1, 32768, 65535]),
+        &[0.0, 1.0, 32768.0, 65535.0],
+        "u16",
+    );
+    expect_exact(
+        &typed_var_file!(with_u32_data, &[0u32, 16_777_217, u32::MAX]),
+        &[0.0, 16_777_217.0, 4_294_967_295.0],
+        "u32",
+    );
+    expect_exact(
+        &typed_var_file!(with_u64_data, &[0u64, 16_777_217, 9_007_199_254_740_992]),
+        &[0.0, 16_777_217.0, 9_007_199_254_740_992.0],
+        "u64",
+    );
+}
+
+/// **A source whose precision exceeds `f32` survives into the raster too.**
+///
+/// The gate that stops [`RawValues`] becoming a silent correctness regression.
+/// [`every_storage_width_unpacks_to_the_same_bits_it_always_did`] catches a
+/// narrowed raw domain in the `Option<f64>` form; this catches it in the `f32`
+/// form, which is the one a raster reads and the one where "the output is
+/// `f32` anyway" is the tempting wrong answer.
+///
+/// The construction is what makes it bite: the storage value needs more than
+/// `f32`'s 24-bit significand, and `add_offset` then subtracts the part that
+/// does not fit, so **the surviving difference is a small number `f32` holds
+/// perfectly**. Do the subtraction in the raw domain at full width and the
+/// raster reads it; narrow the raw domain first and the difference is gone
+/// before the subtraction can rescue it, and the raster reads `0`.
+#[test]
+fn a_wide_precision_source_survives_into_the_raster() {
+    // 2^24 + 1, the first integer `f32` cannot represent.
+    expect_exact(
+        &typed_var_file!(
+            with_i32_data,
+            &[16_777_217i32, 16_777_216],
+            Some(-16_777_216.0)
+        ),
+        &[1.0, 0.0],
+        "an i32 one above f32's last exact integer",
+    );
+
+    // 2^53 + 2, the same trap two widths up: exact in `f64`, and in `f32` not
+    // merely rounded but 2 away.
+    expect_exact(
+        &typed_var_file!(
+            with_f64_data,
+            &[9_007_199_254_740_994.0f64, 9_007_199_254_740_992.0],
+            Some(-9_007_199_254_740_992.0)
+        ),
+        &[2.0, 0.0],
+        "an f64 above f32's reach",
+    );
+
+    // And a fraction rather than an integer: `0.1` is not representable in
+    // either float, but `f64`'s error is 2^29 times smaller, so the difference
+    // from `f32`'s nearest value is a number `f32` can state exactly.
+    let narrowed = f64::from(0.1f32);
+    expect_exact(
+        &typed_var_file!(with_f64_data, &[0.1f64], Some(-narrowed)),
+        &[0.1 - narrowed],
+        "an f64 fraction against its f32 neighbour",
+    );
+    assert_ne!(
+        (0.1 - narrowed) as f32,
+        0.0,
+        "the fixture is vacuous unless the surviving difference is non-zero in f32"
+    );
+}
+
+/// An empty variable still knows how wide its storage is.
+///
+/// `hdf5_pure` errors on storage that was never allocated, so this arm cannot
+/// read the width off the data and takes it from the declared type instead —
+/// a second place the type table has to be right, and the only one no real
+/// granule exercises.
+#[test]
+fn an_empty_variable_keeps_its_declared_storage_width() {
+    let bytes = grid_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+    let past = file
+        .raw_var_rows("v", WIN_ROWS as u64 + 5, 2)
+        .expect("a window past the end is not an error")
+        .expect("variable present");
+    assert!(past.raw.is_empty());
+    assert!(
+        matches!(past.raw, RawValues::F32(_)),
+        "the 2-D fixture is `float` on disk, so its empty read must be too",
+    );
+
+    let bytes = typed_var_file!(with_u16_data, &[7u16, 8, 9]);
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+    let past = file
+        .raw_var_rows("v", 99, 2)
+        .expect("a window past the end is not an error")
+        .expect("variable present");
+    assert!(past.raw.is_empty());
+    assert!(
+        matches!(past.raw, RawValues::U16(_)),
+        "a `short` variable's empty read must stay `short`",
+    );
+}
+
 // ── Row-windowed reads ───────────────────────────────────────────────────
 
 /// Rows and columns of the 2-D fixture below.

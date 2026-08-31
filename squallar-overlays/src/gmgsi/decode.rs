@@ -85,10 +85,17 @@ pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String
     // its non-finite guard; encoding it as any in-domain number would paint it
     // as that number.
     //
-    // `read_unpacked_f32` rather than `read_unpacked` because the `Option`
-    // form of this variable is 240 MB against 60 MB -- see
-    // `squallar_netcdf::cf::UnpackedF32`. The old path built the 240 MB and then
-    // converted it, so peak was 300 MB for a 60 MB payload.
+    // `read_unpacked_f32` rather than `read_unpacked`: the `Option` form of
+    // this variable is 240 MB against 60 MB -- see
+    // `squallar_netcdf::cf::UnpackedF32`.
+    //
+    // Nothing in the decode may be larger than that 60,000,000 B raster, which
+    // is what `tests/gmgsi_decode_blocks.rs` counts. `data` is `float` on disk
+    // in both the real granule and the fixture, so the storage read is
+    // 60,000,000 B too and `squallar_netcdf::cf::RawValues` keeps it there
+    // rather than widening it. Measured 2026-08-31 over one decode of the real
+    // `GLOBCOMPLIR_v3r0_blend` granule: 125,265,534 live bytes at the
+    // high-water mark, largest single allocation 60,000,000 B.
     let data = granule
         .read_unpacked_f32("data")?
         .ok_or_else(|| "GMGSI granule has no `data` variable".to_string())?;
