@@ -19,6 +19,11 @@ grib = { version = "=0.18.2", default-features = false, features = [
     "png-unpack-with-png-crate",
     "time-calculation",
 ] }
+# **The same `png` grib's own 5.41 arm uses**, named directly so `mrms::decode`
+# can stream section 7 a row at a time instead of taking grib's whole-image
+# buffer. Equal to the version grib resolves, so the lock gains no package;
+# `decode::tests` pins that the two paths agree value for value.
+png = { version = "=0.18.1", default-features = false }
 squallar-units = { workspace = true }
 futures = "=0.3.34"
 # NetCDF4 reading and CF unpacking for the GLM and GMGSI granules, both of

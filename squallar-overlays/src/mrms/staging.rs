@@ -25,9 +25,15 @@
 //!
 //! Retaining the block removes the request rather than making room for it. Two
 //! 98 MB blocks end up permanently live in the steady state — the one a cache
-//! holds and the one waiting in the slot — and **neither is ever freed**, so
-//! the only large block still cycling is grib's PNG buffer, which is the same
-//! size every granule and therefore lands back in its own hole.
+//! holds and the one waiting in the slot — and **neither is ever freed**.
+//!
+//! That left grib's 49 MB PNG image buffer as the only large block still
+//! cycling. It has since stopped cycling too:
+//! [`decode_png_into`](super::decode) streams section 7 a row at a time instead
+//! of taking grib's whole-image `vec![0; n]`, so a warm decode's peak is
+//! **0.43 MB, measured**, with no block over 1 MiB in it
+//! (`tests/mrms_decode_image_buffer.rs`). The pool is still the fix for the
+//! 98 MB half; nothing here changes.
 //!
 //! Widening the *fallible* reserve across more of the decode was considered and
 //! refused: fallibility converts a hard failure into constant degradation, a

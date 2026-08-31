@@ -3,7 +3,9 @@
 //! Both templates MRMS uses are already in the `grib` feature set this crate
 //! pins: grid definition **3.0** is pure Rust, and data representation **5.41**
 //! (PNG) is covered by `png-unpack-with-png-crate`, which was already on. No new
-//! feature, no new dependency, no C.
+//! feature, no C, and **no new package in the lock**: `png` is named directly in
+//! this crate's manifest now, at the version `grib` already resolved, because
+//! [`decode_png_into`] reads section 7 itself.
 //!
 //! ## The grid is built from section 3, never from `latlons()`
 //!
@@ -17,21 +19,37 @@
 //!
 //! ## Peak memory of one decode
 //!
-//! `grib`'s PNG stage allocates the whole image buffer inside
-//! `read_image_buffer` — 24.5 M × 2 bytes ≈ **49 MB** here — and `dispatch()`
-//! hands back a **lazy** iterator over it. Streaming that into a `Vec` reserved
-//! to `ni * nj` puts the peak at 49 MB + 98 MB ≈ 147 MB, plus the ~1.4 MB of
-//! GRIB2 bytes. **Never `.collect()` an intermediate** and never grow the
-//! buffer from empty: either turns the peak into 49 + 98 + 98 = 245 MB.
+//! **Measured 2026-08-31 with a counting `#[global_allocator]`, denominator one
+//! `parse_grib2_raw_in` call over a committed granule:**
 //!
-//! The 98 MB half is not *allocated* per granule at all: it comes from
-//! [`super::staging`], the one retained mosaic buffer
-//! [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) has always described.
-//! That is the fix for the shipping freeze — a fresh 98 MB block per granule
-//! fragmented the browser's 1 GiB heap until a 98 MB request could not be
-//! served out of a free pool twice its size — and the *peak* above is unchanged
-//! by it: 49 MB + 98 MB is what one decode occupies either way, the difference
-//! being that the 98 MB half is now the same block every time.
+//! | | cold pool | warm pool |
+//! |---|---|---|
+//! | peak live | 98.4 MB | **0.43 MB** |
+//! | blocks ≥ 1 MiB | 1 (the values vector) | **0** |
+//!
+//! Neither half of the old 147 MB is left. The 98 MB values vector is not
+//! *allocated* per granule at all — it comes from [`super::staging`], the one
+//! retained mosaic buffer
+//! [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) has always described, so
+//! it is a once-per-process cost and the warm row is the steady state. And the
+//! 49 MB that used to sit beside it is gone rather than pooled: `grib`'s 5.41
+//! arm materialises the entire decompressed image in `read_image_buffer`'s
+//! `vec![0; output_buffer_size()]` — 24.5 M × 2 bytes = **49,000,000 B exactly,
+//! measured, per granule** — before it yields a value, and this module no
+//! longer asks it to. [`decode_png_into`] streams section 7 a PNG row at a
+//! time, 14,000 B at the mosaic's width, and `tests` pins it value for value
+//! against `grib`'s own decode.
+//!
+//! That buffer was `vec![0; n]`: **infallible**, on a target where an
+//! allocation failure traps and nothing unwinds. It is what the Tier-2
+//! `firefox.huge` leg caught trapping at 910 MiB of 1024, symbolising to
+//! `handle_alloc_error` under `Grib2SubmessageDecoder::dispatch`. Removing it
+//! removes a trap, not just some bytes — which is why the fallback arm below
+//! matters and is gated: a granule that quietly fell back to `grib` would be
+//! *correct* and would allocate 49 MB again.
+//!
+//! **Never `.collect()` an intermediate** and never grow the buffer from
+//! empty: either puts a second and third 98 MB block beside the first.
 //!
 //! On the arm that must still allocate — a cold pool, a contended slot, a grid
 //! that is not mosaic-shaped — the reserve is **fallible**, and that is not
@@ -44,7 +62,7 @@ use std::io::Read;
 
 use grib::{
     Grib2SubmessageDecoder, GridDefinitionTemplateValues, SubMessage,
-    def::grib2::template::param_set,
+    def::grib2::{DataRepresentationTemplate, template::param_set},
 };
 use squallar_geo::GeoBounds;
 
@@ -415,21 +433,17 @@ pub fn parse_grib2_raw_in(
         .parameter_category()
         .zip(submessage.prod_def().parameter_number());
 
-    // Read before the submessage is consumed by the decoder.
-    let decoder = Grib2SubmessageDecoder::from(submessage)
-        .map_err(|e| format!("MRMS decode init error: {e}"))?;
-
     // **Pre-sized, streamed, and — since the staging pool — usually not
-    // allocated at all.** `dispatch()` is lazy over grib's PNG image buffer;
-    // `collect()` here would hold that buffer, a fresh 98 MB result and the
-    // growth copies at once. See this module's header.
+    // allocated at all.** `collect()` here would hold a fresh 98 MB result and
+    // the growth copies at once. See this module's header.
     //
     // `super::staging` carries the full reasoning for the retained buffer, and
     // the short version is that a *fresh* 98 MB block per granule is what
     // killed the page. wasm32 linear memory only grows; ~147 MB of large-block
-    // churn per granule (this vector plus grib's 49 MB PNG buffer) fragments a
-    // 1 GiB heap until a 98 MB request cannot be served contiguously out of a
-    // free pool twice its size. Measured 2026-08-31: a pane with the layer set
+    // churn per granule — this vector, plus the 49 MB PNG image buffer the
+    // decode below no longer takes — fragmented a 1 GiB heap until a 98 MB
+    // request could not be served contiguously out of a free pool twice its
+    // size. Measured 2026-08-31: a pane with the layer set
     // enabled and a loop playing, no input at all, hit that at ~122 s on
     // Firefox 154 and Chromium 151 alike — 0.3 s apart, because dlmalloc is
     // compiled into the module and both engines run one allocator over one
@@ -467,11 +481,26 @@ pub fn parse_grib2_raw_in(
             points.saturating_mul(size_of::<f32>()) / (1024 * 1024),
         )
     })?;
-    for raw in decoder
-        .dispatch()
-        .map_err(|e| format!("MRMS decode error: {e}"))?
-    {
-        values.push(reading(missing, raw));
+    // **The image half of the decode never materialises either.** Every MRMS
+    // granule takes the first arm; the second is what a granule `grib` knows
+    // how to read and [`png_stream_plan`] does not would take, and it is the
+    // path this crate shipped until the row walk landed.
+    // Bound before the match so the borrow of `submessage` ends here: the
+    // fallback arm consumes it.
+    let plan = png_stream_plan(bytes, &submessage, points);
+    match plan {
+        Some(plan) => decode_png_into(&plan, points, missing, &mut values)?,
+        None => {
+            // Consumes the submessage, so it stays inside the arm that needs it.
+            let decoder = Grib2SubmessageDecoder::from(submessage)
+                .map_err(|e| format!("MRMS decode init error: {e}"))?;
+            for raw in decoder
+                .dispatch()
+                .map_err(|e| format!("MRMS decode error: {e}"))?
+            {
+                values.push(reading(missing, raw));
+            }
+        }
     }
 
     if values.is_empty() {
@@ -502,6 +531,208 @@ pub fn parse_grib2_raw_in(
         parameter,
         values,
     })
+}
+
+/// **What the streaming PNG path needs, when this granule is one it can read.**
+///
+/// `payload` is a slice of the caller's own GRIB2 bytes -- section 7 minus its
+/// five-octet header -- and `simple` is the packing section 5 declares.
+struct PngPlan<'b> {
+    payload: &'b [u8],
+    simple: param_set::SimplePacking,
+    /// `num_bits / 8`, and the reason the flat-buffer walk is a byte walk.
+    sample_bytes: usize,
+}
+
+/// A whole GRIB2 section, header and all, out of the caller's own buffer.
+///
+/// `SectionInfo`'s `offset` and `size` are public and are indices into exactly
+/// the bytes [`parse_grib2_raw_in`] was handed, so a section can be borrowed
+/// rather than read back out through `grib`'s reader -- which is `pub(crate)`
+/// anyway, and which for section 7 copies the whole ~1.3 MB compressed
+/// payload.
+fn section_bytes(bytes: &[u8], offset: usize, size: usize) -> Option<&[u8]> {
+    let end = offset.checked_add(size)?;
+    bytes.get(offset..end)
+}
+
+/// The same section without its five-octet header.
+///
+/// **Sections 5 and 7 want different halves of this and mixing them up decodes
+/// nothing.** `Section5::try_from_slice` parses the header as part of the
+/// section -- it reports `SectionHeader { len, sect_num }` -- so section 5 goes
+/// in whole; `Grib2SubmessageDecoder::sect7_payload` is `&sect7_bytes[5..]`, so
+/// section 7's data starts after it. Getting this backwards is silent: the
+/// template number reads as garbage, [`png_stream_plan`] answers `None`, and
+/// the decode falls back to `grib` and is *correct* — just still allocating the
+/// 49 MB buffer the fallback exists to avoid. That is what
+/// `tests::every_shipped_granule_is_streamable` is for.
+fn section_payload(bytes: &[u8], offset: usize, size: usize) -> Option<&[u8]> {
+    section_bytes(bytes, offset, size)?.get(5..)
+}
+
+/// **Whether this granule's values can be streamed off section 7 a PNG row at
+/// a time, and the three things that takes.**
+///
+/// `None` for anything at all unusual, and the caller then runs `grib`'s own
+/// `dispatch()`. This is a *narrowing*, never a reimplementation of GRIB2: the
+/// conditions below are exactly the ones under which `grib`'s 5.41 arm reduces
+/// to "walk the decompressed image as a flat array of big-endian samples", and
+/// `decode::tests` pins the two paths equal value for value on every committed
+/// fixture.
+///
+/// * **data representation template 5.41** with `orig_field_type == 0`, the
+///   only value of code table 5.1 `grib`'s own unpack arms accept either;
+/// * **`num_bits` a non-zero multiple of eight.** PNG only ever carries 1, 2,
+///   4, 8, 16, 24 or 32 bits a sample, and at a multiple of eight a sample is a
+///   whole number of bytes, so a row is `width` big-endian integers and no
+///   sample straddles a row boundary. `grib`'s `NBitwiseIterator` walks the
+///   image as one uninterrupted bit stream; the two agree **only** because of
+///   that alignment, which is why anything else falls back rather than being
+///   handled;
+/// * **no bitmap** -- section 6's indicator is 255 -- so every grid point is
+///   encoded, in order, and `num_encoded_points` is the whole grid. Every MRMS
+///   granule is bitmap-free (this module's header says so and
+///   `to_reading`'s doc explains what that costs), but a granule that grew one
+///   must go to `grib`, which knows how to expand it.
+fn png_stream_plan<'b, R>(
+    bytes: &'b [u8],
+    submessage: &SubMessage<'_, R>,
+    points: usize,
+) -> Option<PngPlan<'b>> {
+    let bitmap_indicator = *bytes.get(submessage.6.body.offset.checked_add(5)?)?;
+    if bitmap_indicator != 255 {
+        return None;
+    }
+
+    let sect5 = section_bytes(bytes, submessage.5.body.offset, submessage.5.body.size)?;
+    let sect7 = section_payload(bytes, submessage.7.body.offset, submessage.7.body.size)?;
+
+    // **`grib` parses section 5, not this module.** A `Grib2SubmessageDecoder`
+    // is the only public door to `Section5`, so one is built purely to read it
+    // and never dispatched. `num_points_total` is **0 on purpose**: it is used
+    // for exactly one thing inside `new` -- sizing the all-ones dummy bitmap a
+    // bitmap-free granule gets -- and at zero points that vector is empty. The
+    // real figure is `points`, which would allocate 3 MB here and 3 MB again in
+    // the `append` that grows section 6 onto it, for a bitmap this path has
+    // just established says nothing. Passing the true count and throwing the
+    // bitmap away would cost 6.1 MB a granule (measured) to learn four numbers.
+    let params =
+        Grib2SubmessageDecoder::new(0, sect5.to_vec(), vec![0, 0, 0, 0, 0, 255], Vec::new())
+            .ok()?;
+    let section5 = params.section5();
+    let DataRepresentationTemplate::_5_41(ref template) = section5.payload.template else {
+        return None;
+    };
+    if template.orig_field_type != 0 {
+        return None;
+    }
+    let simple = template.simple.clone();
+    if simple.num_bits == 0 || !simple.num_bits.is_multiple_of(8) {
+        return None;
+    }
+    // A bitmap-free granule encodes every point, so anything else means the
+    // sections disagree and `grib`'s own consistency check should be the one
+    // to say so.
+    if section5.payload.num_encoded_points as usize != points {
+        return None;
+    }
+
+    let sample_bytes = usize::from(simple.num_bits / 8);
+    Some(PngPlan {
+        payload: sect7,
+        simple,
+        sample_bytes,
+    })
+}
+
+/// **Stream `plan`'s PNG a row at a time into `values`, unscaled and
+/// sentinel-mapped.**
+///
+/// The whole point of this function, and the reason it exists beside a `grib`
+/// call that already works: `grib`'s 5.41 arm materialises the **entire**
+/// decompressed image before it yields a single value --
+/// `read_image_buffer`'s `vec![0; output_buffer_size()]`, which at MRMS's
+/// 7000x3500 16-bit mosaic is **49,000,000 B, measured, per granule** -- and
+/// then hands back a lazy iterator over it. That buffer is `vec![0; n]`:
+/// infallible, and on wasm32 an infallible allocation the engine cannot serve
+/// calls `handle_alloc_error` against a memory with a hard 1 GiB ceiling on a
+/// target where **nothing unwinds**. `staging`'s account of what that does to
+/// the page applies here unchanged; the difference is that the staging buffer
+/// could be retained and this one cannot, because `grib` allocates it inside a
+/// private function and moves it into the iterator.
+///
+/// A row is `width` samples and nothing else is live, so the same decode's
+/// image-side cost is **14,000 B** at the mosaic's width. The `png` reader is
+/// asked to fill a buffer this function owns (`read_row`) rather than its own
+/// (`next_row`), so there is one row buffer in the process and not two.
+///
+/// This is the decision `regular_grid` already makes one section earlier, for
+/// the same reason: `grib` will answer with a materialised whole, section 3's
+/// coordinates or section 7's values, and at 24.5 M points neither fits a
+/// budget the browser gives us. Reading the seven numbers, or the one row, is
+/// what fits.
+fn decode_png_into(
+    plan: &PngPlan<'_>,
+    points: usize,
+    missing: &[f32],
+    values: &mut Vec<f32>,
+) -> Result<(), String> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(plan.payload));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("MRMS PNG decode error: {e}"))?;
+
+    let width = reader.info().width as usize;
+    let line = reader
+        .output_line_size(reader.info().width)
+        .ok_or_else(|| "MRMS PNG: the image declares no line size".to_string())?;
+    // **The alignment the whole path rests on.** `grib` walks the flat image as
+    // one bit stream; this walks it row by row. They coincide exactly when a
+    // row is a whole number of whole samples and the image is the whole grid,
+    // so both are checked rather than assumed -- a mismatch here is a granule
+    // this path must not read, not one to read approximately.
+    if line != width * plan.sample_bytes {
+        return Err(format!(
+            "MRMS PNG: a {line}-byte row is not {width} samples of \
+             {} bytes",
+            plan.sample_bytes,
+        ));
+    }
+    let height = reader.info().height as usize;
+    if width.checked_mul(height) != Some(points) {
+        return Err(format!(
+            "MRMS PNG: a {width}x{height} image is not the {points} points \
+             section 3 declares",
+        ));
+    }
+
+    // Hoisted out of the sample loop, and this is not a rearrangement of the
+    // arithmetic: `grib`'s `NonZeroSimplePackingDecoder` computes exactly
+    // `(ref_val + encoded * 2^exp) * 10^-dec` in this order, and recomputes
+    // both powers per value. Same operands, same order, same rounding.
+    let two_pow = 2_f32.powi(i32::from(plan.simple.exp));
+    let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
+    let ref_val = plan.simple.ref_val;
+
+    let mut row = vec![0u8; line];
+    while reader
+        .read_row(&mut row)
+        .map_err(|e| format!("MRMS PNG row decode error: {e}"))?
+        .is_some()
+    {
+        for sample in row.chunks_exact(plan.sample_bytes) {
+            // Big-endian, most significant bit first -- the order
+            // `NBitwiseIterator` reads the same bytes in.
+            let mut encoded: u32 = 0;
+            for &byte in sample {
+                encoded = (encoded << 8) | u32::from(byte);
+            }
+            let raw = (ref_val + encoded as f32 * two_pow) * dig_factor;
+            values.push(reading(missing, raw));
+        }
+    }
+    Ok(())
 }
 
 /// Section 1's reference time, which for MRMS **is** the valid time: every

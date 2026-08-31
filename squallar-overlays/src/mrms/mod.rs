@@ -267,12 +267,12 @@ const _: () = assert!(CONUS_GRID_BYTES == 98_000_000);
 /// the handler's frame gate admits one fetch at a time so nothing else can ask
 /// for the slot in the meantime.
 ///
-/// The gate matters even more here than at GMGSI: one MRMS decode **peaks at
-/// ~147 MB transient** (`decode`'s own arithmetic — grib's PNG stage holds the
-/// whole 49 MB image buffer while the 98 MB values vector fills), so N
-/// concurrent frame fetches would hold N x 147 MB inside the futures before
-/// any cache saw a byte. Thirty unthrottled fetches — one slider-default hour
-/// at the ~2-minute cadence — would be ~4.4 GB in flight.
+/// The gate matters even more here than at GMGSI: **the slot is one grid, and
+/// only one decode can be handed it.** [`staging::StagingPool::take`] answers
+/// the retained buffer to whoever asks first and every other caller allocates
+/// its own 98 MB, so N concurrent frame fetches hold N x 98 MB inside the
+/// futures before any cache sees a byte. Thirty unthrottled fetches — one
+/// slider-default hour at the ~2-minute cadence — would be ~2.9 GB in flight.
 /// **And since 2026-08-31 it is one *allocation* as well as one slot.** The
 /// figure named a slot and nothing enforced the rest of what it says: each
 /// granule built a fresh 98 MB vector and freed the last one, so a playing loop
@@ -280,6 +280,11 @@ const _: () = assert!(CONUS_GRID_BYTES == 98_000_000);
 /// the buffer between granules and refills it, which is what makes the code
 /// match this constant's claim; the freeze it fixes and why a wider budget
 /// would not have is written up there.
+///
+/// The other 49 MB of that churn was `grib`'s whole-image PNG buffer, and
+/// since the row walk landed (`decode::decode_png_into`) there is no
+/// per-granule block left above 1 MiB at all: **measured, one warm decode peaks
+/// at 0.43 MB**.
 pub const FRAME_STAGING_BYTES: usize = CONUS_GRID_BYTES;
 
 // The pipeline advances one granule at a time, so a staging area under one

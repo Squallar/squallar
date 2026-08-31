@@ -983,10 +983,10 @@ fn retain_frames_drops_this_products_unkept_granules_and_no_others() {
 /// **The gate serialises, and it releases.** `MrmsHandler::fetch_frame`'s doc
 /// claims the whole render set may be dispatched at once while only one
 /// granule is ever in flight; this is the floor under that claim. The stakes
-/// are higher than GMGSI's: one MRMS decode peaks ~147 MB transient (49 MB
-/// PNG buffer + the 98 MB values vector), so thirty concurrent fetches — one
-/// slider-default hour — would be ~4.4 GB in flight before any cache saw a
-/// byte.
+/// are higher than GMGSI's: the staging slot holds one 98 MB values vector and
+/// every decode that misses it allocates its own, so thirty concurrent fetches
+/// — one slider-default hour — would be ~2.9 GB in flight before any cache saw
+/// a byte.
 ///
 /// Two fetch tasks are driven by hand inside one thread — `futures::poll!`
 /// with `yield_now` turns between, so "the second gets N chances" is a poll
@@ -1138,9 +1138,9 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
             in_flight, 1,
             "the second frame's GET was issued while the first granule was \
              still in flight ({in_flight} request lines recorded). \
-             Unserialised, a thirty-frame render set peaks at ~147 MB of \
-             transient decode EACH — ~4.4 GB in flight before any cache can \
-             evict anything.",
+             Unserialised, a thirty-frame render set holds a 98 MB values \
+             vector EACH — the staging slot can serve exactly one — so ~2.9 GB \
+             in flight before any cache can evict anything.",
         );
 
         // 3. Release the held response; A completes and drops the guard.
