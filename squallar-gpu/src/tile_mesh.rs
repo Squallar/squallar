@@ -44,10 +44,16 @@ use squallar_egui::tile_mesh::{
 /// Placements one frame may carry before the ring wraps onto a slot the same
 /// frame is still going to read.
 ///
-/// A pane at 3440x1440 spans at most 84 tiles, and a tile's style produces a
-/// handful of coalesced fill runs, so the six-pane worst case is a few
-/// thousand. 8192 slots is 256 KiB of uniform buffer at the 32-byte alignment
-/// every adapter this ships on reports, and the ring is allocated once.
+/// **Derived from three bounds, not chosen.** A pane spans at most 84 tiles
+/// (the 3440x1440 figure the campaign's scene A is measured at); the desktop
+/// layout caps at six panes; and only the basemap layer carries fills — the
+/// terrain hillshade is raster, and a raster tile flattens to no runs at all.
+/// Runs per tile are what `mvt::coalesce_adjacent_meshes` leaves, which is two
+/// on the committed Monaco fixture at z14 and is bounded by the number of
+/// fill layers a style interleaves with its line layers. At eight runs per
+/// tile — four times what the fixture produces — the worst case is
+/// 6 x 84 x 8 = 4,032, half of this. 8,192 slots is 2 MiB of uniform buffer at
+/// the 256-byte offset alignment a desktop adapter reports, allocated once.
 const RING_SLOTS: u32 = 8192;
 
 /// Bytes one [`Locals`] block occupies: `vec2 + vec2 + f32 + u32 + vec2`.
