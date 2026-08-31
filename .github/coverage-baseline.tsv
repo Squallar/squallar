@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1438	1063
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1873	1572
+squallar-app/src/app_fetch.rs	1876	1565
 squallar-app/src/app_render.rs	3062	2475
 squallar-app/src/app_state.rs	76	0
 squallar-app/src/budget_arms.rs	17	17
@@ -20,7 +20,7 @@ squallar-app/src/location_hint.rs	82	51
 squallar-app/src/loop_pool.rs	208	206
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	23	23
-squallar-app/src/platform.rs	279	231
+squallar-app/src/platform.rs	279	228
 squallar-app/src/platform_double.rs	276	263
 squallar-app/src/render_dispatch.rs	1177	1074
 squallar-app/src/render_key.rs	27	27
@@ -59,7 +59,7 @@ squallar-egui/src/gui/sync.rs	234	229
 squallar-egui/src/input_fidelity.rs	138	138
 squallar-egui/src/input_harness.rs	1441	1430
 squallar-egui/src/legend_ramp.rs	146	146
-squallar-egui/src/overlay_cache.rs	343	335
+squallar-egui/src/overlay_cache.rs	367	359
 squallar-egui/src/overlay_cache/ledger.rs	74	47
 squallar-egui/src/pane.rs	1635	1583
 squallar-egui/src/pane/layer_stack.rs	71	68
@@ -73,7 +73,7 @@ squallar-egui/src/sources.rs	346	332
 squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	105	102
 squallar-egui/src/tile_mesh/ledger.rs	71	41
-squallar-egui/src/tile_source.rs	796	730
+squallar-egui/src/tile_source.rs	811	742
 squallar-egui/src/tiles.rs	304	257
 squallar-egui/src/ui.rs	1298	1196
 squallar-egui/src/ui_catalog.rs	499	493
@@ -164,7 +164,7 @@ squallar-overlays/src/hrrr/mod.rs	1232	1197
 squallar-overlays/src/metar/fetch.rs	321	293
 squallar-overlays/src/metar/networks.rs	107	105
 squallar-overlays/src/metar/types.rs	42	16
-squallar-overlays/src/mrms/decode.rs	218	174
+squallar-overlays/src/mrms/decode.rs	307	241
 squallar-overlays/src/mrms/fetch.rs	413	244
 squallar-overlays/src/mrms/fields.rs	116	114
 squallar-overlays/src/mrms/mod.rs	87	86
