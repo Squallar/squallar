@@ -17,7 +17,9 @@
     {
       "description": [
         "The egui stack moves as one version or not at all. ecolor and emath were missing from this list and renovate opened PR #22 for ecolor alone: it resolved, and produced TWO ecolor (0.35.0 and 0.36.1) and TWO emath, because epaint 0.35 holds the older pair. A lone bump here is never mergeable.",
-        "egui-wgpu is what ties wgpu in -- 0.35 wants wgpu ^29, 0.36 wants ^30 -- so an egui bump and a wgpu bump are one upgrade, and separating them produces two PRs that each cannot resolve."
+        "egui-wgpu is what ties wgpu in -- 0.35 wants wgpu ^29, 0.36 wants ^30 -- so an egui bump and a wgpu bump are one upgrade, and separating them produces two PRs that each cannot resolve.",
+        "separateMajorMinor is off because grouping alone did NOT hold them together. renovate's default splits a major out of its own group, so naming these nine in one group still produced #8 (egui 0.35 -> 0.36.1, classified minor) and #11 (wgpu/naga 29 -> 30, classified major) as separate PRs -- and neither resolves alone, which is the exact failure the group exists to prevent. The split is on semver level, not membership, so membership could not fix it.",
+        "automerge is off for the same coupling. The inherited automerge-all-but-major preset turns it on for anything classified minor, which is what #8 was. An egui bump in this repo is never a merge button: vendor/walkers/Cargo.toml pins its own egui and renovate cannot reach inside vendor/ to raise it, so the port is hand work by construction."
       ],
       "groupName": "egui",
       "matchDatasources": [
@@ -33,12 +35,15 @@
         "naga",
         "walkers",
         "wgpu"
-      ]
+      ],
+      "separateMajorMinor": false,
+      "automerge": false
     },
     {
       "description": [
         "The wasm-bindgen family releases in lockstep and every pin here is exact, so each crate's requirement is unsatisfiable until its siblings move with it. Measured: PRs #3 #4 #5 #6 #7 each FAILED to resolve alone (`failed to select a version for js-sys`, and so on round the ring); the same five pins applied together resolve cleanly. Renovate reported this as `renovate/artifacts: Artifact file update failure`, which reads as a bot problem and is really this.",
-        "wasm-bindgen-test is in the group rather than beside it because squallar-web/Cargo.toml notes that the resolver picks the train satisfying the wasm-bindgen pin, and the workflow's `cargo tree -i wasm-bindgen` gate is what holds that single-versioned."
+        "wasm-bindgen-test is in the group rather than beside it because squallar-web/Cargo.toml notes that the resolver picks the train satisfying the wasm-bindgen pin, and the workflow's `cargo tree -i wasm-bindgen` gate is what holds that single-versioned.",
+        "separateMajorMinor is off for the reason it is off on the egui group: a group does not survive a major. These are all 0.x, so the day wasm-bindgen leaves 0.2 renovate would classify that member major, split it out, and hand back the five unmergeable PRs this group was written to replace."
       ],
       "groupName": "wasm-bindgen",
       "matchDatasources": [
@@ -50,7 +55,8 @@
         "wasm-bindgen-futures",
         "wasm-bindgen-test",
         "web-sys"
-      ]
+      ],
+      "separateMajorMinor": false
     },
     {
       "description": [
