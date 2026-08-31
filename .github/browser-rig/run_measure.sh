@@ -397,14 +397,19 @@ for tag in sys.argv[5:]:
              "" if not invalid else "  ** INVALID **"))
     if scene == "B":
         print("ROW   %s" % scene_b_cols)
-    for family in ("interact", "cadence"):
+    # `idle` here is the window's input-free frames -- the scripted quiet
+    # phases, where the post-gesture settle re-raster lands (WO-8). Its max
+    # is the settle burst's worst frame, printed so the cost moved out of the
+    # interact window stays a figure instead of vanishing between families.
+    for family in ("interact", "idle", "cadence"):
         d = gw.get(family) or {}
         if d and not d.get("error"):
+            note = " [settle burst]" if family == "idle" else ""
             print("ROW   window %-8s n=%-6s p50=%s us p90=%s us p99=%s us "
-                  "[%s loops, %s]"
+                  "max=%s us [%s loops, %s]%s"
                   % (family, d.get("n"), d.get("p50_us"), d.get("p90_us"),
-                     d.get("p99_us"), gw.get("loops_completed"),
-                     gw.get("basis")))
+                     d.get("p99_us"), d.get("max_us"),
+                     gw.get("loops_completed"), gw.get("basis"), note))
     fl = r.get("frame_lines") or {}
     idle = fl.get("idle") or {}
     if idle:
