@@ -190,7 +190,16 @@ pub(super) fn draw_tile_layer(
     // Once for the layer, before the grid loop. `HttpsTiles::at` does not drain,
     // so this is the only thing that moves finished fetches into the cache --
     // and doing it per cell would repeat it once per tile in the span below.
-    tiles.pump();
+    // Quiet while a gesture is live: the completions wait in the channel, the
+    // span below draws ancestors, and the settle frame takes them.
+    let quiet = crate::ui::map::gesture_quiet(ui);
+    tiles.pump(quiet);
+    if quiet {
+        // The app rests on `ControlFlow::Wait`, so the settle frame the drain
+        // resumes on has to be asked for.
+        ui.ctx()
+            .request_repaint_after(crate::overlay_cache::SETTLE_REPAINT_DELAY);
+    }
 
     // An archive source has not read its header yet on the first frames, so it
     // cannot say how deep it goes. Clamping to a stand-in number is what used to
