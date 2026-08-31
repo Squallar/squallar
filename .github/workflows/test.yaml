@@ -225,21 +225,18 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Generate GitHub App Token
-        # Fork PRs run without secrets, so minting would fail here before a
-        # single test ran. Skip the mint for them; checkout below falls back to
-        # the default GITHUB_TOKEN, which is all a read-only fork run needs.
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
-          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      # NO GITHUB APP -- see the same note in clippy.yaml. The app was installed
+      # on the old personal account and did not survive the move to the Squallar
+      # org, so this step failed before a single test ran. The job declares
+      # `contents: write`, and `actions/checkout` persists GITHUB_TOKEN, which
+      # is what the coverage push at the end of this job now uses.
+      #
+      # A push made with GITHUB_TOKEN does not trigger workflows, so the
+      # coverage commit no longer starts a run of its own. That is what should
+      # happen: the baseline is a record of the run that produced it, and a
+      # build triggered by writing it down would be building nothing new.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A skipped mint step yields an empty string, so `||` selects the
-          # default token on fork PRs.
-          token: ${{ steps.app-token.outputs.token || github.token }}
           fetch-depth: 0
       - name: Install system deps
         run: |
