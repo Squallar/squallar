@@ -256,7 +256,24 @@ impl<S> RangeBackend<S> {
 }
 
 impl<S: ArchiveRangeSource> AsyncBackend for RangeBackend<S> {
-    async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
+    /// `offset` is `u64` and is passed straight through.
+    ///
+    /// It used to be `usize`, and that was the whole of a defect that made the
+    /// self-hosted basemap unreachable in a browser for as long as it shipped.
+    /// `usize` is 32 bits on wasm32; the published archive is 83.8 GB with its
+    /// leaf directories at `leaf_offset = 83_785_884_629`; every leaf read was
+    /// truncated to `83_785_884_629 mod 2**32 = 2_181_506_005` and fetched
+    /// bytes from a quarter of the way into the archive, which are not a gzip
+    /// stream. Since the root directory is 2917 leaf pointers and zero direct
+    /// tiles, that was every tile. See `vendor/pmtiles/VENDORED.md` for the
+    /// whole account, and `four_gib_offset_tests` beside this file for the pin
+    /// — `the_seam_cannot_narrow` is the half a 64-bit builder cannot pass
+    /// vacuously.
+    ///
+    /// The narrowing was never this crate's: [`RangeSource::read_range`] has
+    /// taken a `u64` offset since it was written, and the `as u64` that used to
+    /// stand here was widening a value that had already lost its top bits.
+    async fn read(&self, offset: u64, length: usize) -> PmtResult<BackendResponse> {
         // The source's own error is preserved as the `io::Error`'s cause rather
         // than flattened to a string, so a caller three layers up can still
         // read why the bytes did not arrive. `PmtError` has no variant for "the
@@ -264,7 +281,7 @@ impl<S: ArchiveRangeSource> AsyncBackend for RangeBackend<S> {
         // feature is off on wasm32.
         let bytes = self
             .source
-            .read_range(offset as u64, length)
+            .read_range(offset, length)
             .await
             .map_err(|error| PmtError::Reading(std::io::Error::other(error)))?;
 
@@ -1467,3 +1484,13 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod archives_tests;
+
+/// The pin on offsets above 4 GiB — the defect that made the self-hosted
+/// basemap draw nothing at all in a browser. Its own file, and not folded into
+/// [`tests`], because half of it is a **compile-time** proof about the width of
+/// [`RangeBackend`]'s seam rather than a runtime assertion, and that half is
+/// the only part of it that a 64-bit builder cannot pass vacuously. Read its
+/// module doc before believing a green run.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod four_gib_offset_tests;

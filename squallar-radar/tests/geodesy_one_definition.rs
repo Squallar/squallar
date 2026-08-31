@@ -118,6 +118,30 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          also inert — nothing but that one criterion compiles it, and the \
          entry above is what keeps the live spelling honest.",
     ),
+    (
+        "vendor/pmtiles/src/header.rs",
+        "max_latitude: 85.051_129,",
+        "Upstream's `Header::default()`, and NOT a projection. It is the \
+         default bounding box of a PMTiles v3 archive — one of four `f64` \
+         fields (`min_longitude`, `min_latitude`, `max_longitude`, \
+         `max_latitude`) that are read out of the 127-byte header, written \
+         back into it, and set wholesale by `PmTilesWriter::bounds`. Nothing \
+         in the crate turns any of them into a distance or clamps a \
+         coordinate against them; grep `max_latitude` and every hit is a \
+         struct field, a serializer, or a test. It reads as the Web Mercator \
+         limit because a full-world web tileset's bbox is that limit, not \
+         because a projection is happening. \
+         \
+         Worth stating plainly since it is exactly the shape the band exists \
+         to catch: this literal is `MERCATOR_LAT_LIMIT_DEG` TRUNCATED to six \
+         decimals, the 125.51 m error the message warns about. That is \
+         harmless only because the value never leaves the header — and it \
+         stops being harmless the moment somebody clamps with it, which is \
+         what this entry is here to make somebody notice. It is upstream's \
+         line in a vendored crate (see vendor/pmtiles/VENDORED.md); changing \
+         it would be a local delta to third-party source for a scanner's \
+         benefit, which that file's whole discipline is against.",
+    ),
 ];
 
 /// Blank out comments and string/char literals, preserving byte offsets and
