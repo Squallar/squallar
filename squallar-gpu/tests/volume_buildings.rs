@@ -223,15 +223,29 @@ fn flat_mirror(
 }
 
 /// Whether a texel of the ground pass's colour attachment came from a prism
-/// rather than from the drape.
+/// rather than from the terrain under it.
 ///
 /// The drape is [`MIRROR_RGBA`] through `lit`, which scales all three channels
 /// by one number — so green and blue stay exactly zero however the light falls.
 /// A prism's albedo is near-neutral, so its green is a real fraction of its
-/// red. The test is therefore "did any light reach the green channel", which no
-/// drape pixel can pass and no lit prism pixel can fail.
+/// red.
+///
+/// **"Did any light reach the green channel" was that fraction stated loosely,
+/// and it stopped being enough when the terrain grew a second material.** From
+/// under the box floor `fs_ground` paints `UNDERSIDE_ALBEDO` rather than the
+/// drape, and that shade has green in it — 29 of 255 against the drape's zero —
+/// so a bare `green > 8` read 9505 pixels of terrain as prisms at
+/// `(215, -18, 2.2, 1)` and every criterion here that counts prisms counted
+/// terrain.
+///
+/// So the fraction is spelled as a fraction: green at least nine tenths of red.
+/// `lit` multiplies all three channels by one number, so the RATIO is invariant
+/// to the light in a way a level never was — which is the property the sentence
+/// above always claimed. It separates all three materials this attachment can
+/// hold, by a wide margin and in both directions: the drape is 0.00, the
+/// underside 0.71, a prism 0.97.
 fn is_prism_colour(texel: [u8; 4]) -> bool {
-    texel[3] > 0 && texel[1] > 8
+    texel[3] > 0 && texel[1] > 8 && u32::from(texel[1]) * 10 >= u32::from(texel[0]) * 9
 }
 
 /// The floor lanes this file's box is drawn with: the site at the Monaco

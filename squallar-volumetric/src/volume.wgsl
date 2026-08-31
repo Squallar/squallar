@@ -426,6 +426,21 @@ fn ground_response(normal: vec3<f32>) -> f32 {
     return clamp(dot(normal, l) / level, 0.0, SLOPE_RESPONSE_CEILING);
 }
 
+// The response a piece of LEVEL ground takes, which by `ground_response`'s own
+// construction is exactly one under any light above `LEVEL_COSINE_FLOOR`.
+//
+// Two surfaces read it — the flat map lid, and the terrain's UNDERSIDE — and
+// they read it through one function rather than each spelling the up vector,
+// because "the underside is as bright as the lid" is a claim that would
+// otherwise be prose in a comment with two independent derivations under it.
+// The night arm is the reason it matters: with the sun below the horizon the
+// numerator goes negative, the clamp floors it at zero, and both surfaces fall
+// to `sky` together. A second spelling could be given a floor and stop doing
+// that on its own.
+fn level_response() -> f32 {
+    return ground_response(vec3<f32>(0.0, 0.0, 1.0));
+}
+
 // The premultiplied channel alone — `coverage x index` — which the lit volume's
 // gradient is taken of, **not** the reconstructed index: at an echo edge this falls
 // continuously to zero while the index stays a real mean of real neighbours, so it is
@@ -893,6 +908,55 @@ struct GroundTargets {
     @location(1) colour: vec4<f32>,
 }
 
+// **What the ground is made of, seen from underneath**: straight linear RGB,
+// composited by the offscreen at gamma bytes `(112, 95, 83)`.
+//
+// A camera under the box floor is one small downward drag away — the eye
+// crosses `z = 0` at about −1 degree of pitch at the default standoff, and
+// `MAX_PITCH_DEG` allows −89 — and from there the terrain is opaque, because
+// the march has already been CLIPPED against it and fading it would leave the
+// hole the clip cut. That decision is B2's and is not revisited here. What is
+// left is that an opaque underside carrying the top-down map raster is a
+// wrong-side texture: the pane shows a basemap lying on a surface the user is
+// looking at the back of, which reads as a broken pane rather than as a place
+// the camera has gone.
+//
+// **There is no physically correct answer for the bottom face of a
+// heightfield** — it is not a surface, it is where the model stops — so this is
+// a design decision, argued rather than derived:
+//
+//   * **A material, not a map.** One flat albedo over the whole underside. The
+//     flatness is the signal: a cut face in a geological block diagram is a
+//     solid fill precisely because a fill says "this is the stuff, not a
+//     surface you are meant to read". Anything carrying map detail from below
+//     keeps the lie that made this a defect.
+//   * **Mid-value, and that is measured against the shipped styles rather than
+//     chosen for taste.** The dark style paints land `#0e0e0e` and the light
+//     one `#fafaf8`, so the drape is near-black in one theme and near-white in
+//     the other; a shade that only separated from one of them would read as the
+//     map in the other. Gamma 112/95/83 stands 69 to 98 bytes off the dark
+//     style's land and 138 to 165 off the light one's, per channel. It is
+//     also well clear of black, which is what "the pane broke" looks like.
+//   * **Unsaturated and warm**, at about 26% saturation. The pane's chrome and
+//     the dark basemap are neutral-to-cool, the light basemap is a cool green
+//     white, and the reflectivity ramp is a saturated green-yellow-red-magenta
+//     sweep with nothing in a dull brown. So the hue does not collide with any
+//     of the three things it will be seen beside, and it is the hue the ground
+//     under a boot actually is.
+//   * **Not an alert colour.** This is a weather instrument: red and magenta
+//     carry 55+ dBZ and a warning polygon's edge, and spending either on a
+//     camera position would be spending a scarce channel on a non-event.
+//
+// Deliberately NOT lit by the underside's own cosine. `ground_response` of a
+// downward normal is negative under any light above the horizon and clamps to
+// zero, so `lit` would return `albedo * sky` — and `HEADLIGHT`, the DEFAULT
+// mode, has `sky` exactly zero. The underside would be pure black under the
+// light the pane ships with, which is the failure this constant exists to
+// remove. It takes `level_response` instead, the flat map lid's own, so it is
+// as bright relative to the scene as level ground is in both modes and at
+// night falls to the sky term with everything else.
+const UNDERSIDE_ALBEDO: vec3<f32> = vec3<f32>(0.162, 0.112, 0.086);
+
 @fragment
 fn fs_ground(in: GroundVertex) -> GroundTargets {
     // `t` rather than depth, because `direction` is normalised in the march, so
@@ -919,9 +983,52 @@ fn fs_ground(in: GroundVertex) -> GroundTargets {
     // `map_colour_at_km` gives the lid in the same place. The light multiplies
     // the colour only, so an absent map stays absent rather than becoming a
     // dark map.
+    //
+    // **Unless the eye is under the box floor, and then all three inputs
+    // change together.** See `UNDERSIDE_ALBEDO` for what the shade is and why.
+    // Three things about the shape of this:
+    //
+    // **The condition is FRAME-uniform, and that is a decision rather than a
+    // convenience.** The honest per-fragment spelling is a backface test,
+    // `dot(normal, eye - box_p) <= 0`, and it is rejected on two grounds. It
+    // changes the picture at cameras that are ABOVE the floor — a steep slope
+    // turned away from a low eye is a backface while the user is standing on
+    // the right side of the ground — and this change may not cost the
+    // above-ground picture a byte. And a mixture of drape and substrate across
+    // one hillside is exactly what a rendering failure looks like, where the
+    // whole purpose here is one unmistakable reading: you have gone under the
+    // ground. A mode indication that is true of some pixels is not a mode
+    // indication.
+    //
+    // **`eye.z < 0.0` is the exact complement of the composite's own first
+    // disjunct** (`ground_behind_the_march = eye.z >= 0.0 || occluder.x > 0.0`,
+    // and `occluder.x > 0.0` is true wherever this shader runs). So the
+    // underside is painted on precisely the frames that reach the screen only
+    // because a ground pass ran. No new uniform lane, and no third arm in the
+    // composite: the arm rule is untouched, which is the signal that this
+    // belongs to the ground pass's material rather than to the composite's
+    // order.
+    //
+    // **Coverage is 1, not the mirror's.** From above, off the mirror there is
+    // no map and no ground is painted; from below there is still terrain there,
+    // because the height field and the pane's basemap coverage are different
+    // things. Letting a missing tile punch a hole through the underside would
+    // reintroduce the "the pane has broken" reading inside the fix for it.
+    //
+    // ONE `lit` call, not one per arm: `neither_surface_can_be_lit_by_a_light_
+    // the_other_does_not_have` counts the call sites, and two arms here would
+    // be two places a light could be dropped from.
+    let underside = volume.eye_in_box.z < 0.0;
     out.colour = vec4<f32>(
-        lit(ground.rgb, ground_response(normalize(in.normal))),
-        ground.a,
+        lit(
+            select(ground.rgb, UNDERSIDE_ALBEDO, underside),
+            select(
+                ground_response(normalize(in.normal)),
+                level_response(),
+                underside,
+            ),
+        ),
+        select(ground.a, 1.0, underside),
     );
     return out;
 }
@@ -1252,10 +1359,7 @@ fn floor_colour(eye: vec3<f32>, direction: vec3<f32>, t: f32) -> vec4<f32> {
     // `ground_response` of straight up is exactly one whenever the light is
     // above `LEVEL_COSINE_FLOOR`, so under the readable light this line is a
     // multiply by one and the lid is the lid this renderer always drew.
-    return vec4<f32>(
-        lit(map.rgb, ground_response(vec3<f32>(0.0, 0.0, 1.0))),
-        map.a,
-    );
+    return vec4<f32>(lit(map.rgb, level_response()), map.a);
 }
 
 // The ground this ray lands on: the MESH's own colour where it drew, and the

@@ -387,6 +387,46 @@ fn render(
     amplitude: f32,
 ) -> Frame {
     let mirror = flat_mirror(device, queue, pipelines);
+    render_scene(
+        device,
+        queue,
+        pipelines,
+        Scene {
+            cells,
+            indices,
+            uniform,
+            amplitude,
+            mirror: &mirror,
+        },
+    )
+}
+
+/// Everything one frame is drawn from, gathered into a struct so the mirror can
+/// vary without pushing [`render_scene`] past clippy's argument ceiling — and so
+/// the mirror-carrying call sites read as the scene they describe rather than as
+/// an eighth positional `f32`.
+struct Scene<'a> {
+    cells: [u32; 3],
+    indices: &'a [u8],
+    uniform: &'a VolumeUniform,
+    amplitude: f32,
+    mirror: &'a PaneMirror,
+}
+
+/// [`render`] with the drape's mirror chosen by the caller.
+fn render_scene(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+    scene: Scene<'_>,
+) -> Frame {
+    let Scene {
+        cells,
+        indices,
+        uniform,
+        amplitude,
+        mirror,
+    } = scene;
     let field = heights(device, queue, pipelines, amplitude);
     let volume = pipelines
         .upload_volume(
@@ -419,11 +459,11 @@ fn render(
         &mut encoder,
         &target,
         &volume,
-        Some(&mirror),
+        Some(mirror),
         Some(&field),
         None,
     );
-    pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(&mirror));
+    pipelines.encode_raymarch_with_floor(&mut encoder, &target, &volume, Some(mirror));
     queue.submit(Some(encoder.finish()));
 
     Frame {
@@ -599,6 +639,114 @@ fn luminance(pixel: [u8; 4]) -> f32 {
 /// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
 fn expected_ground_pixel() -> [u8; 3] {
     [MIRROR_BYTE; 3]
+}
+
+/// `volume.wgsl`'s `UNDERSIDE_ALBEDO`, read out of the shader rather than
+/// copied beside it.
+///
+/// **A Rust twin is what this deliberately is not.** B1 shipped a post count as
+/// a WGSL constant with a Rust one beside it and B3 deleted the pair; two
+/// spellings of one number are two things that can disagree, and here they
+/// would disagree silently — the expectation would follow the copy and the
+/// picture would follow the shader. Parsing the one definition is what makes a
+/// change to the shade a change to what this file asserts.
+fn underside_albedo() -> [f32; 3] {
+    const ANCHOR: &str = "const UNDERSIDE_ALBEDO: vec3<f32> = vec3<f32>(";
+    let at = VOLUME_SHADER_WGSL.find(ANCHOR).unwrap_or_else(|| {
+        panic!("`{ANCHOR}` is gone from volume.wgsl; re-anchor this rather than deleting it")
+    });
+    let rest = &VOLUME_SHADER_WGSL[at + ANCHOR.len()..];
+    let list = &rest[..rest.find(')').expect("the constant's closing bracket")];
+    let parsed: Vec<f32> = list
+        .split(',')
+        .map(|piece| {
+            piece
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("`{piece}` is not one of the shade's three lanes"))
+        })
+        .collect();
+    parsed
+        .try_into()
+        .expect("`UNDERSIDE_ALBEDO` is a `vec3` and so has three lanes")
+}
+
+/// The underside's shade as the offscreen must hold it, modelled through the
+/// two quantisations between the constant and the screen rather than written
+/// down as three bytes.
+///
+/// The path, and every step of it is a place a byte moves: the ground pass
+/// writes straight LINEAR RGB into an `Rgba8Unorm` attachment, so the albedo is
+/// quantised once there; `ground_colour_at` reads that byte back; the composite
+/// paints it at a coverage of exactly 1 over an air volume, so `accumulated`
+/// **is** that value and `alpha` is 1; and the offscreen holds `gamma(C) * A`,
+/// so it is encoded and quantised a second time.
+///
+/// The light does not appear here because it cannot: [`gpu_harness::UNLIT`] is
+/// `beam = 0, sky = 1`, so `lit(albedo, response) = albedo` whatever the
+/// response is. That is the same reason `expected_ground_pixel` is the mirror's
+/// own byte, and it is what lets both expectations be about the ALBEDO each
+/// surface chose rather than about the light. `volume_light.rs` is where the
+/// light is measured.
+fn expected_underside_pixel() -> [u8; 3] {
+    // `Rgba8Unorm` stores `round(v * 255)` and reads back `byte / 255`.
+    let quantised = |v: f32| f32::from((v.clamp(0.0, 1.0) * 255.0).round() as u8) / 255.0;
+    // `volume.wgsl`'s `gamma_from_linear_rgb`, which is egui's own.
+    let gamma = |linear: f32| {
+        if linear < 0.0031308 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    underside_albedo().map(|lane| (gamma(quantised(lane)) * 255.0).round() as u8)
+}
+
+/// The shade the ground under a pixel must composite to at this camera: the
+/// drape from above the box floor, the underside's own from below it.
+///
+/// **The two are chosen by the same number the shader chooses by**, `eye.z`,
+/// and this is the only place in the file that knows the rule. A criterion that
+/// asserted one of them everywhere would be asserting a shader that had lost
+/// the distinction at the three cameras that can see it.
+fn expected_surface_pixel(view: &VolumeView) -> [u8; 3] {
+    if view.eye_in_box[2] < 0.0 {
+        expected_underside_pixel()
+    } else {
+        expected_ground_pixel()
+    }
+}
+
+/// **The two shades are far apart in every channel.**
+///
+/// The non-triviality floor under every criterion below that compares a pixel
+/// against [`expected_surface_pixel`]. A shade that drifted onto the drape's own
+/// colour would satisfy all of them while drawing exactly the picture this
+/// feature exists to replace — the identity fixture, one constant at a time.
+///
+/// 40 bytes rather than a hair over the +-2 tolerance those criteria use,
+/// because "distinguishable" is a claim about a person looking at a pane, not
+/// about a comparison surviving quantisation.
+#[test]
+fn the_underside_shade_is_nowhere_near_the_drape() {
+    let drape = expected_ground_pixel();
+    let underside = expected_underside_pixel();
+    let apart = |lane: usize| i32::from(drape[lane]).abs_diff(i32::from(underside[lane]));
+    assert!(
+        (0..3).all(|lane| apart(lane) >= 40),
+        "the underside {underside:?} and the drape {drape:?} are only \
+         {:?} bytes apart. Every criterion in this file that reads a surface \
+         colour would still pass with the distinction gone, which is the \
+         vacuity a fixture sitting on a degenerate value always has",
+        [apart(0), apart(1), apart(2)],
+    );
+    // And it is a MATERIAL rather than a hole: the failure this shade exists to
+    // remove reads as a broken pane, and so does black.
+    assert!(
+        underside.iter().all(|lane| *lane > 48),
+        "the underside {underside:?} is dark enough to read as a hole in the \
+         pane rather than as the stuff the ground is made of",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -958,11 +1106,17 @@ fn the_grounds_own_colour_reaches_the_screen() {
     let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
     pipelines.upload_quad(&queue);
 
-    let expected = expected_ground_pixel();
     let (cells, indices) = empty_grid();
 
     for camera in CAMERAS {
         let view = view_at(camera);
+        // The ground's own colour is the DRAPE from above the box floor and the
+        // underside's own shade from below it, and this criterion is about
+        // whichever of the two the ground pass chose reaching the screen intact
+        // — not about which one it should have chosen, which is
+        // `the_underside_is_its_own_shade_and_the_topside_is_untouched`,
+        // `#[ignore]`d like this one and run by the same invocation.
+        let expected = expected_surface_pixel(&view);
         let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
         let mut dark = uniform(cells, &view, RIDGE_AMPLITUDE, false);
         // **The control is a frame with NO ground in it at all**, not merely
@@ -1208,10 +1362,16 @@ fn the_lid_is_never_painted_where_the_mesh_did_not_draw() {
 /// lands. It does **not** answer the user's report; that is recorded as an open
 /// item on the track that owns the clip.
 ///
-/// A second cost, recorded rather than glossed: from below, B3's drape is the
-/// top-down map raster painted on the underside of the terrain. That is a
-/// wrong-side texture and it wants a distinct underside shade, which is a
-/// D-track change to what the ground pass writes.
+/// A second cost was recorded here rather than glossed, and **it has since been
+/// paid**: from below, B3's drape was the top-down map raster painted on the
+/// underside of the terrain, a wrong-side texture that read as a broken pane
+/// rather than as a camera that had gone under the ground. `fs_ground` now
+/// paints `UNDERSIDE_ALBEDO` there, so the colour this pin compares against is
+/// the underside's own and not the mirror's — see
+/// [`the_underside_is_its_own_shade_and_the_topside_is_untouched`], which is
+/// where the choice between the two is measured and where the above-ground
+/// picture is proved unchanged. What this pin still uniquely carries is
+/// unaffected by that: opacity, and the relief-0 corner below.
 ///
 /// **What this pin uniquely certifies is narrower than its name.** The ridge
 /// half of it is now also covered by `the_grounds_own_colour_reaches_the_screen`
@@ -1245,12 +1405,23 @@ fn the_ground_is_opaque_from_below_the_box_floor() {
          `CAMERAS`, so it is measuring something else: {below:?}",
     );
 
-    let expected = expected_ground_pixel();
+    // Every camera here is under the box floor by the filter above, so this is
+    // the underside's shade at all six rows. Taken through
+    // `expected_surface_pixel` rather than named directly, so that a shader
+    // which stopped distinguishing the two sides reddens this pin as well as
+    // its own.
     for (camera, relief) in below
         .into_iter()
         .flat_map(|camera| [(camera, RIDGE_AMPLITUDE), (camera, 0.0)])
     {
         let view = view_at(camera);
+        let expected = expected_surface_pixel(&view);
+        assert_eq!(
+            expected,
+            expected_underside_pixel(),
+            "{camera:?} is in `below_the_box_floor` but does not take the \
+             underside's shade, so the two selectors disagree",
+        );
 
         let (cells, indices) = empty_grid();
         let lit = uniform(cells, &view, relief, true);
@@ -1389,7 +1560,18 @@ fn the_mesh_walls_the_volume_off_from_below_and_the_lid_does_not() {
             &aimed,
             RIDGE_AMPLITUDE,
         );
-        let ground_only = expected_ground_pixel();
+        // **The bare ground's colour in THIS frame, which the two arms do not
+        // agree about.** With no ground pass the only surface is the flat map
+        // lid, and a lid draws the drape from either side of itself. With one,
+        // the eye here is under the box floor and the mesh draws the
+        // underside's own shade. Hardcoding the drape for both read every mesh
+        // pixel as "carrying volume" and turned this pin's own measurement into
+        // 40960 of 40960.
+        let ground_only = if occluder {
+            expected_surface_pixel(&view)
+        } else {
+            expected_ground_pixel()
+        };
         let (mut painted, mut carrying) = (0usize, 0usize);
         for pixel in &frame.offscreen {
             if pixel[3] == 0 {
@@ -1498,7 +1680,6 @@ fn the_terrain_composites_behind_volume_standing_in_front_of_it() {
     // from one carrying ground alone — a saturated ray is white however far it
     // marched, and would hide the very difference this measures.
     let (cells, indices) = floor_slab(2);
-    let ground_only = expected_ground_pixel();
 
     // **Every camera the eye is below the crest at, which is both regions and
     // not just the band above the plane.** Under the box floor the crest
@@ -1550,6 +1731,14 @@ fn the_terrain_composites_behind_volume_standing_in_front_of_it() {
         // A pixel carries volume in front of the ground when the shipped
         // composite is not the bare ground colour there. Two codes of slack,
         // the same tolerance the non-invisibility criterion uses.
+        //
+        // **Per camera, not hoisted**, because the bare ground's colour is not
+        // one colour across this set: three of these five cameras are under the
+        // box floor, where the mesh draws the underside's shade rather than the
+        // drape. Hoisting the drape made every mesh pixel read as carrying
+        // volume in both builds, and the comparison then found no difference
+        // between two arms that genuinely differ.
+        let ground_only = expected_surface_pixel(&view);
         let carries_volume = |pixel: [u8; 4]| {
             (0..3).any(|lane| i32::from(pixel[lane]).abs_diff(i32::from(ground_only[lane])) > 2)
         };
@@ -1745,5 +1934,323 @@ fn the_ground_pass_keeps_the_nearest_surface_where_one_hides_another() {
          attachment is not doing its job",
         wrong.len(),
         &wrong[..wrong.len().min(4)],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (h) The underside: distinct from below, and identical from above.
+// ---------------------------------------------------------------------------
+
+/// `fs_ground`'s underside branch, as the shader spells it.
+///
+/// Substituted whole rather than switched off through its own condition. A
+/// mutant built by rewriting `< 0.0` to `false` would prove that the `select`s
+/// pick their false arms, which nobody doubts; substituting the block puts the
+/// **previous shader** on the adapter, so "the above-ground picture is
+/// unchanged" is measured against the picture that shipped rather than against
+/// a rearrangement of the new one.
+///
+/// Re-anchor rather than delete: [`without_the_underside`] refuses a source
+/// this no longer matches.
+const UNDERSIDE: &str = "\
+    let underside = volume.eye_in_box.z < 0.0;
+    out.colour = vec4<f32>(
+        lit(
+            select(ground.rgb, UNDERSIDE_ALBEDO, underside),
+            select(
+                ground_response(normalize(in.normal)),
+                level_response(),
+                underside,
+            ),
+        ),
+        select(ground.a, 1.0, underside),
+    );";
+
+/// The same lines the shader carried before the underside landed: the drape,
+/// the slope's own response, and the mirror's coverage, on whichever side of
+/// the mesh the camera is on.
+const DRAPE_ONLY: &str = "\
+    out.colour = vec4<f32>(
+        lit(ground.rgb, ground_response(normalize(in.normal))),
+        ground.a,
+    );";
+
+/// The shader with the underside branch removed — this file's uncooperative
+/// regressor, and the shader that shipped before this feature.
+fn without_the_underside() -> String {
+    assert_eq!(
+        VOLUME_SHADER_WGSL.matches(UNDERSIDE).count(),
+        1,
+        "`fs_ground`'s underside branch has moved; re-anchor this mutant \
+         rather than deleting it. A substitution that matches nothing builds \
+         the SHIPPED shader, and every assertion below would then be comparing \
+         a frame with itself",
+    );
+    VOLUME_SHADER_WGSL.replacen(UNDERSIDE, DRAPE_ONLY, 1)
+}
+
+/// **The terrain's underside is its own shade, and the picture from above the
+/// box floor is byte-for-byte the one that shipped.**
+///
+/// The product decision this measures: from under the box floor the terrain
+/// keeps the opacity B2 gave it — the march is clipped against the mesh and
+/// fading it would leave the hole the clip cut — but it stops carrying the
+/// top-down map raster on its back. A basemap painted on the underside of the
+/// ground is a wrong-side texture, and at pitch −89° it is a wrong-side texture
+/// across **40960 of 40960 pixels**: what the user sees is not "I have gone
+/// under the terrain", it is "the pane has broken".
+///
+/// **Both halves are asserted here, and the first is the one that had to be
+/// proved first.** Above the floor nothing may change at all, and "nothing"
+/// means the whole offscreen and the whole ground attachment compared
+/// byte-for-byte against the previous shader at all eight such cameras — not a
+/// sampled interior, not a tolerance. Below the floor the same comparison must
+/// come apart, and the pixels must carry the underside's shade where the old
+/// shader carried the mirror's.
+///
+/// **The camera split is asserted rather than assumed**, because the whole
+/// criterion is empty without it: a set that drifted entirely above the floor
+/// would satisfy the identity half at eleven cameras, find no below-floor
+/// camera to check, and read as green.
+///
+/// `#[ignore]`d for a real adapter; run it with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_underside_is_its_own_shade_and_the_topside_is_untouched() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let attachments = attachments(wgpu::TextureFormat::Rgba8Unorm);
+    let shipped = VolumePipelines::new(&device, attachments);
+    shipped.upload_quad(&queue);
+    let before =
+        VolumePipelines::from_shader_source(&device, attachments, &without_the_underside());
+    before.upload_quad(&queue);
+
+    let drape = expected_ground_pixel();
+    let underside = expected_underside_pixel();
+    let (cells, indices) = empty_grid();
+
+    let (mut above, mut below) = (0usize, 0usize);
+    for camera in CAMERAS {
+        let view = view_at(camera);
+        let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
+        let frame = |pipelines: &VolumePipelines| {
+            render(
+                &device,
+                &queue,
+                pipelines,
+                cells,
+                &indices,
+                &lit,
+                RIDGE_AMPLITUDE,
+            )
+        };
+        let now = frame(&shipped);
+        let then = frame(&before);
+
+        if view.eye_in_box[2] >= 0.0 {
+            above += 1;
+            assert_eq!(
+                now.offscreen, then.offscreen,
+                "{camera:?} at eye z {:.3} is ABOVE the box floor and its \
+                 composited picture moved. The underside may not cost a single \
+                 byte of the picture the user spends every session looking at; \
+                 a per-fragment backface test is the edit that does exactly \
+                 this, at the cameras where a steep slope faces away from a low \
+                 eye",
+                view.eye_in_box[2],
+            );
+            assert_eq!(
+                now.ground, then.ground,
+                "{camera:?} is above the box floor and the ground pass's own \
+                 colour attachment moved, so the drape itself changed even \
+                 where the composite happened to hide it",
+            );
+            continue;
+        }
+
+        below += 1;
+        // Inside the silhouette, where the rasteriser's coverage rule and the
+        // march's `slab_entry_exit` cannot disagree — the same margin every
+        // colour criterion in this file takes.
+        let drew: Vec<bool> = (0..(SIZE[0] * SIZE[1]) as usize)
+            .map(|at| now.ground[at][3] == 255)
+            .collect();
+        let well_inside = interior(&drew, 1);
+        let matches = |pixel: [u8; 4], want: [u8; 3]| {
+            pixel[3] == 255
+                && (0..3).all(|lane| i32::from(pixel[lane]).abs_diff(i32::from(want[lane])) <= 2)
+        };
+
+        let mut painted = 0usize;
+        let mut not_underside = Vec::new();
+        let mut then_not_drape = 0usize;
+        for (at, inside) in well_inside.iter().enumerate() {
+            if !inside {
+                continue;
+            }
+            painted += 1;
+            if !matches(now.offscreen[at], underside) {
+                not_underside.push((at, now.offscreen[at]));
+            }
+            if !matches(then.offscreen[at], drape) {
+                then_not_drape += 1;
+            }
+        }
+        eprintln!(
+            "underside {camera:?}: eye z {:.3}, {painted} pixels well inside \
+             the mesh, {then_not_drape} of them not the drape under the \
+             previous shader",
+            view.eye_in_box[2],
+        );
+        assert!(
+            painted > (SIZE[0] * SIZE[1]) as usize / 20,
+            "{camera:?}: only {painted} pixels are well inside the mesh, so \
+             this camera is asserting about almost nothing"
+        );
+        assert!(
+            not_underside.is_empty(),
+            "{camera:?}: {} of {painted} pixels under the mesh do not carry \
+             the underside's shade {underside:?} (first {:?}). From below the \
+             box floor the ground pass paints `UNDERSIDE_ALBEDO`, not the map \
+             raster",
+            not_underside.len(),
+            &not_underside[..not_underside.len().min(4)],
+        );
+        // **The regressor, and it is a render rather than an argument.** With
+        // the branch substituted out the very same pixels come back as the
+        // mirror's own byte — the wrong-side texture, reproduced on this
+        // adapter. Without this the assertion above could be satisfied by a
+        // shader that had never drawn the drape from below in the first place.
+        assert_eq!(
+            then_not_drape, 0,
+            "{camera:?}: {then_not_drape} of {painted} pixels do NOT carry the \
+             drape under the shader that predates this feature, so the shade \
+             asserted above did not have to displace anything and this \
+             criterion is measuring a difference that was already there"
+        );
+    }
+
+    assert_eq!(
+        (above, below),
+        (8, 3),
+        "the camera set no longer splits 8 above the box floor and 3 below it. \
+         Both halves of this criterion need their own region: with no \
+         below-floor camera the feature is invisible and this test passes on a \
+         build that does not have it, and with no above-floor camera the \
+         identity half certifies nothing",
+    );
+}
+
+/// A mirror opaque over its western half and fully TRANSPARENT over its
+/// eastern half: a pane holding a basemap for one side of the box and none for
+/// the other, which is an ordinary state at a box rim.
+fn half_mirror(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &VolumePipelines,
+) -> PaneMirror {
+    const EDGE: u32 = 64;
+    let mut rgba = Vec::with_capacity((EDGE * EDGE * 4) as usize);
+    for _ in 0..EDGE {
+        for column in 0..EDGE {
+            if column < EDGE / 2 {
+                rgba.extend_from_slice(&[MIRROR_BYTE, MIRROR_BYTE, MIRROR_BYTE, 255]);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    planted_mirror(device, queue, pipelines, [EDGE, EDGE], &rgba)
+}
+
+/// **The underside is opaque over ground the pane has no basemap for.**
+///
+/// The second lane the underside changes, and the reason it is not left as the
+/// mirror's. From above, a mesh over a part of the box the pane holds no map
+/// for paints nothing — correctly, because there is no map to drape and an
+/// opaque untextured sheet would be a wall of flat colour across ground the
+/// pane is not showing. From below there is no drape either way, and the
+/// terrain is there regardless of which basemap tiles happen to have landed:
+/// carrying the mirror's alpha through would punch the map's own gaps clean
+/// through the underside, which is the "the pane has broken" reading this whole
+/// change exists to remove, reintroduced inside the fix for it.
+///
+/// **The control is the same fixture from above**, and it is what makes this
+/// non-vacuous: it must find those holes. A mirror that covered everything
+/// would assert "the underside is opaque" over a mesh that was opaque anyway,
+/// at every camera, with the lane unread.
+///
+/// `#[ignore]`d for a real adapter; run it with
+/// `cargo test -p squallar-gpu --test volume_occluder -- --ignored`.
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn the_underside_is_opaque_where_the_pane_has_no_basemap() {
+    let _held = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Rgba8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mirror = half_mirror(&device, &queue, &pipelines);
+    let (cells, indices) = empty_grid();
+    let mut holes_from_above = 0usize;
+    let mut holes_from_below = 0usize;
+    let mut mesh_from_below = 0usize;
+    for camera in CAMERAS {
+        let view = view_at(camera);
+        let lit = uniform(cells, &view, RIDGE_AMPLITUDE, true);
+        let frame = render_scene(
+            &device,
+            &queue,
+            &pipelines,
+            Scene {
+                cells,
+                indices: &indices,
+                uniform: &lit,
+                amplitude: RIDGE_AMPLITUDE,
+                mirror: &mirror,
+            },
+        );
+        // Where the mesh drew — the occluder's hit flag, which `fs_ground`
+        // writes at 1 whatever the mirror holds — and the composite then
+        // painted nothing at all.
+        let drew = |at: usize| frame.occluder[at][3] > 127;
+        let holes = (0..(SIZE[0] * SIZE[1]) as usize)
+            .filter(|at| drew(*at) && frame.offscreen[*at][3] == 0)
+            .count();
+        if view.eye_in_box[2] < 0.0 {
+            mesh_from_below += (0..(SIZE[0] * SIZE[1]) as usize)
+                .filter(|at| drew(*at))
+                .count();
+            holes_from_below += holes;
+        } else {
+            holes_from_above += holes;
+        }
+    }
+
+    eprintln!(
+        "half-mirror: {holes_from_above} transparent mesh pixels from above, \
+         {holes_from_below} from below over {mesh_from_below} mesh pixels"
+    );
+    assert!(
+        holes_from_above > 0,
+        "the mesh composites opaque everywhere even from ABOVE, so this \
+         fixture's mirror is not actually missing over any ground the mesh drew \
+         and the assertion below is about nothing"
+    );
+    assert!(
+        mesh_from_below > (SIZE[0] * SIZE[1]) as usize / 20,
+        "only {mesh_from_below} pixels of mesh were drawn at the three cameras \
+         under the box floor, so this criterion has almost no underside to be \
+         about"
+    );
+    assert_eq!(
+        holes_from_below, 0,
+        "{holes_from_below} pixels the mesh drew composite to nothing from \
+         under the box floor. The underside takes a coverage of 1 rather than \
+         the mirror's, because the terrain is there whether or not the pane \
+         holds a basemap tile for it — a missing tile showing as a hole through \
+         the ground is the failure this shade exists to remove"
     );
 }
