@@ -37,7 +37,7 @@
 //! # Grids are a staging area; the loop holds textures
 //!
 //! The same design as [`super::gmgsi`], at a heavier weight: one CONUS grid
-//! is 98,000,000 B and one decode peaks ~147 MB transient, so
+//! is 98,000,000 B and the staging slot holds exactly one, so
 //! [`crate::mrms::FRAME_STAGING_BYTES`] stages **one** granule on every arm
 //! and [`MrmsHandler::frame_gate`] serialises the frame fetches. A loop frame
 //! is a rasterized *texture* held by the pane; the granule is what one frame
@@ -78,11 +78,15 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// **One frame's granule at a time, application-wide** — the same shape as
 /// GMGSI's gate, needed harder here: `dispatch_loop_frame_fetches` has no
-/// throttle of its own, and one MRMS decode peaks ~147 MB transient (49 MB
-/// PNG image buffer + the 98 MB values vector, `crate::mrms::decode`'s own
-/// arithmetic). Thirty unthrottled fetches — one slider-default hour at the
-/// ~2-minute cadence — would hold ~4.4 GB in flight before any cache saw a
-/// byte.
+/// throttle of its own, and `crate::mrms::staging`'s slot holds exactly one
+/// 98 MB values vector — every decode that does not get it allocates its own.
+/// Thirty unthrottled fetches — one slider-default hour at the ~2-minute
+/// cadence — would hold ~2.9 GB in flight before any cache saw a byte.
+///
+/// The figure was ~4.4 GB while a decode also held grib's 49 MB PNG image
+/// buffer; `crate::mrms::decode` streams section 7 a row at a time now. The
+/// gate is unaffected — what it bounds is the values vector, which is still
+/// 98 MB and still one per concurrent decode.
 ///
 /// Serialising costs almost no wall time: the bytes are the bottleneck either
 /// way, and FIFO fairness means granules arrive in render-set order, which is
@@ -583,7 +587,7 @@ impl FrameSource for MrmsHandler {
     /// throttle. The throttle is inside the task: it takes the gate before it
     /// touches the network, so the whole render set may be dispatched at once
     /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
-    /// own) while only one ~147 MB-peak decode exists at a time.
+    /// own) while only one 98 MB-peak decode exists at a time.
     fn fetch_frame(
         &self,
         ctx: &FetchConfig,

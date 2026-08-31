@@ -33,6 +33,108 @@ fn gz_for(product: MrmsProduct) -> &'static [u8] {
     }
 }
 
+/// **The streaming row walk decodes exactly what `grib`'s whole-image decode
+/// decodes**, on every committed granule.
+///
+/// The shipped path stopped calling `Grib2SubmessageDecoder::dispatch()` to
+/// avoid its 49,000,000 B image buffer (measured, per granule) and reads
+/// section 7 with the `png` crate a row at a time instead. That is only ever
+/// allowed to be an *allocation* change: the values must be the same values.
+///
+/// **The two sides are genuinely two decoders.** [`RAW`] is `grib`'s own
+/// `dispatch()`, materialised buffer and all, and it is the only thing in this
+/// file that still runs one; [`fixture`] is `parse_grib2`, which is the
+/// shipped row walk. The first version of this test compared `RAW` against a
+/// second `dispatch()` and would have passed with the row walk deleted.
+///
+/// **Bit patterns, not approximate equality** — `to_bits`, so a `NaN` that
+/// arrived by a different route is still a difference, and so is `-0.0`
+/// against `0.0`. Both products, because they carry different reserved codes
+/// and different packing parameters.
+///
+/// Non-triviality: the full 24.5 M points on both sides, and at least a
+/// million finite readings — two decoders that agreed because both returned
+/// nothing would pass everything.
+#[test]
+fn the_row_walk_decodes_what_grib_decodes() {
+    for &product in MrmsProduct::all() {
+        let missing = product.missing_codes();
+        let oracle = raw_for(product);
+        let shipped = &fixture(product).grid.values;
+
+        assert_eq!(
+            oracle.len(),
+            7000 * 3500,
+            "{}: grib decoded {} values, not the whole mosaic",
+            product.as_str(),
+            oracle.len(),
+        );
+        assert_eq!(
+            shipped.len(),
+            oracle.len(),
+            "{}: the row walk produced {} values against grib's {}",
+            product.as_str(),
+            shipped.len(),
+            oracle.len(),
+        );
+        assert!(
+            oracle.iter().filter(|v| v.is_finite()).count() > 1_000_000,
+            "{}: grib found almost no finite readings, so agreeing with it \
+             proves nothing",
+            product.as_str(),
+        );
+
+        // `reading` is applied to grib's side here rather than compared
+        // around, because it is the one step both paths share and the claim
+        // under test is about the values reaching it.
+        let differing = oracle
+            .iter()
+            .map(|&raw| reading(missing, raw))
+            .zip(shipped.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a.to_bits() != b.to_bits());
+        assert!(
+            differing.is_none(),
+            "{}: the row walk and grib's decode differ at {:?}",
+            product.as_str(),
+            differing.map(|(i, (a, b))| (i, a, *b)),
+        );
+    }
+}
+
+/// **Every shipped granule really takes the streaming arm.**
+///
+/// The fallback to `grib`'s `dispatch()` is correct and must stay, but a
+/// granule that quietly fell into it would allocate 49 MB again with every
+/// other test in this file still green — the identity check above passes
+/// either way, by construction. This is the check that cannot.
+#[test]
+fn every_shipped_granule_is_streamable() {
+    for &product in MrmsProduct::all() {
+        let bytes = gunzip(gz_for(product)).expect("gzip member");
+        let grib2 = grib::from_reader(std::io::Cursor::new(&bytes)).expect("GRIB2 parses");
+        let (_index, submessage) = grib2.iter().next().expect("one submessage");
+        let plan = png_stream_plan(&bytes, &submessage, 7000 * 3500);
+        let plan = plan.unwrap_or_else(|| {
+            panic!(
+                "{}: this granule falls back to grib's whole-image decode",
+                product.as_str(),
+            )
+        });
+        assert_eq!(
+            plan.sample_bytes,
+            2,
+            "{}: MRMS packs 16 bits a sample",
+            product.as_str(),
+        );
+        assert!(
+            !plan.payload.is_empty(),
+            "{}: an empty section 7 payload would decode to nothing",
+            product.as_str(),
+        );
+    }
+}
+
 /// The decoded composite, once for the whole file. Most tests below are about
 /// the grid rather than the values, and the two granules share every grid fact.
 static FIXTURE: LazyLock<MrmsGrid> = LazyLock::new(|| decoded(MrmsProduct::ReflectivityComposite));

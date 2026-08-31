@@ -252,12 +252,17 @@ pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * super::CONUS_GRID_BYTES;
 
 /// How many level GETs are in flight at once.
 ///
-/// A ceiling on **peak memory**, not on politeness. One decode peaks at ~147 MB
-/// transient (`super::decode`'s own arithmetic: grib's 49 MB PNG image buffer
-/// held while a 98 MB values vector fills), and the stack being filled is
-/// already [`CONUS_STACK_BYTES`], so the peak is
-/// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 147 MB` — ~3.8 GB at four,
-/// ~8.1 GB if all 33 ran at once.
+/// A ceiling on **peak memory**, not on politeness. Every level decode needs a
+/// 98 MB values vector and `super::staging`'s slot holds exactly one, so all
+/// but one of the concurrent decodes allocates its own; the stack being filled
+/// is already [`CONUS_STACK_BYTES`], so the peak is
+/// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 98 MB` — ~3.6 GB at four,
+/// ~6.4 GB if all 33 ran at once.
+///
+/// The figure was `× 147 MB` while `super::decode` also held grib's 49 MB PNG
+/// image buffer for the length of a decode. The row walk removed that half; it
+/// did **not** remove the values vector, which is what this constant really
+/// bounds.
 pub const STACK_FETCH_CONCURRENCY: usize = 4;
 
 /// How many level *listings* are in flight at once.

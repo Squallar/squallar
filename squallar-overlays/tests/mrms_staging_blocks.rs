@@ -16,11 +16,16 @@
 //!   could not tell its own reuse from a buffer another test happened to leave
 //!   behind. One binary, one test.
 //!
-//! 64 MiB is the threshold because it falls between the two large blocks one
-//! decode makes: grib's PNG image buffer is 24 500 000 x 2 = 49 MB and must
-//! **not** be counted — it is not what this fix touches, and being the same size
-//! every granule it lands back in its own hole — while a CONUS mosaic's values
-//! are 24 500 000 x 4 = 98 MB and must be.
+//! 64 MiB is the threshold because it falls between the two large blocks a
+//! decode made when this file was written: grib's PNG image buffer at
+//! 24 500 000 x 2 = 49 MB, which must **not** be counted because it is not what
+//! this fix touches, and a CONUS mosaic's values at 24 500 000 x 4 = 98 MB,
+//! which must. The 49 MB half no longer exists — `mrms::decode` streams
+//! section 7 a PNG row at a time, and `tests/mrms_decode_image_buffer.rs` gates
+//! that separately — so the gap under this bar is now wider still, and the bar
+//! **stays where it is**: what this file measures is the mosaic buffer, and
+//! moving a threshold because the thing below it went away is how a threshold
+//! stops meaning anything.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -129,9 +134,9 @@ fn granules_decode_through_one_retained_mosaic_block() {
         took, 0,
         "{GRANULES} granules decoded one at a time took {took} mosaic-sized \
          blocks off the allocator. Past the warm-up a staged granule's buffer \
-         IS the next granule's buffer: one slot, one block, and the only large \
-         allocation left in a playing loop is grib's own 49 MB PNG buffer, \
-         which is the same size every granule and lands back in its own hole",
+         IS the next granule's buffer: one slot, one block, and since the row \
+         walk landed there is no per-granule allocation over 1 MiB left in a \
+         playing loop at all",
     );
 
     // ── Non-triviality: the instrument can still count ────────────────────
