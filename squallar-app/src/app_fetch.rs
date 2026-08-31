@@ -3593,6 +3593,41 @@ mod melting_layer_dispatch_tests;
 #[path = "app_fetch/sites_wire_tests.rs"]
 mod sites_wire_tests;
 
+/// **The lock every test that can move `ledger::cancelled` must hold.**
+///
+/// [`ledger::note_cancelled`] writes a process-global `static`, and the only
+/// assertion on it is a *delta* — `overlay_cancel_tests` brackets its own two
+/// dispatches and asserts the counter moved by one. That reading is only true
+/// if nothing else in the binary withdraws a job inside the bracket, and the
+/// harness runs tests concurrently, so "nothing else" has to be arranged
+/// rather than hoped for. [`ledger::reset_for_test`]'s own doc already states
+/// the contract — take a reset *and a lock* — and the lock it means is this
+/// one: crate-wide, because the writers are spread across four test files.
+///
+/// **It was a file-private static in `overlay_cancel_tests` and that is what
+/// broke.** A file-private mutex excludes only that file's tests, so it
+/// excluded the two tests that were already inside the bracket and none of the
+/// ones that were not. Measured on this tree by tagging every
+/// `note_cancelled` with its thread name over a full `-p squallar-app --lib`
+/// run: **49 withdrawals, 47 of them from tests holding no lock at all** —
+/// `glm_loop_draw_tests` alone fires 35 in one test and 12 in another, and two
+/// `overlay_arrival_tests` cases fire one each. The delta assertion was
+/// therefore never sound; it passed because the bracket is narrow and the
+/// race is rarely hit, and it began failing when a fourth writer moved the
+/// odds rather than when anything about the seam changed.
+///
+/// **Not a performance concern worth trading correctness for.** Six tests take
+/// it; only the two `glm_loop_draw_tests` cases are long, and they serialize
+/// against four short ones.
+///
+/// A poisoned lock is another test's failure, not this one's, so the guard is
+/// taken through the panic.
+#[cfg(test)]
+pub(crate) fn overlay_ledger_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A dispatch that supersedes a destination's outstanding raster withdraws
 /// the superseded job before it runs (WO-8's cancel seam).
 #[cfg(test)]

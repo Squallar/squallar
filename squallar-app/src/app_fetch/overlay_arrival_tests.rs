@@ -496,6 +496,9 @@ fn an_arrival_is_refused_while_a_raster_is_already_in_flight() {
 /// replace.
 #[test]
 fn an_arrival_is_refused_while_a_picture_is_still_landing() {
+    // Withdraws a job, so it moves the process-global `cancelled` counter that
+    // `overlay_cancel_tests` asserts a delta on. See `overlay_ledger_lock`.
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let taken = Arc::new(Mutex::new(0usize));
     let _guard = squallar_worker::offload::install_test_worker(Box::new(CountingPort {
         taken: Arc::clone(&taken),
@@ -827,6 +830,9 @@ fn the_fresh_token_carries_the_theme_the_raster_will_be_drawn_in() {
 
 #[test]
 fn both_paths_write_the_record_and_reach_the_dispatch_through_one_entry() {
+    // Withdraws a job, so it moves the process-global `cancelled` counter that
+    // `overlay_cancel_tests` asserts a delta on. See `overlay_ledger_lock`.
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let taken = Arc::new(Mutex::new(0usize));
     let _guard = squallar_worker::offload::install_test_worker(Box::new(CountingPort {
         taken: Arc::clone(&taken),

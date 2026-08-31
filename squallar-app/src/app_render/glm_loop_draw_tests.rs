@@ -491,6 +491,11 @@ fn lit_at_speed(fps: f32) -> (Vec<i64>, Vec<(i64, Vec<i64>)>) {
 /// claiming otherwise would be this fixture measuring itself.
 #[test]
 fn the_per_frame_contract_holds_at_every_speed_the_slider_offers() {
+    // This test supersedes repeatedly, so it moves the process-global
+    // `cancelled` counter `overlay_cancel_tests` asserts a delta on -- 35 and
+    // 12 withdrawals measured across the two cases here. See
+    // `overlay_ledger_lock`.
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     for fps in [1.0f32, 10.0, 30.0] {
         let (lit, drawn) = lit_at_speed(fps);
         assert_eq!(
@@ -745,6 +750,11 @@ fn treadmill_premise_census() {
 /// the count assertion reads **1 of 13**.
 #[test]
 fn every_frame_of_a_satellite_loop_draws_its_own_lightning() {
+    // This test supersedes repeatedly, so it moves the process-global
+    // `cancelled` counter `overlay_cancel_tests` asserts a delta on -- 35 and
+    // 12 withdrawals measured across the two cases here. See
+    // `overlay_ledger_lock`.
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let jobs = Jobs::default();
     let seen = Arc::clone(&jobs.seen);
