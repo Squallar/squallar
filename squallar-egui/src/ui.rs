@@ -127,6 +127,33 @@ mod sync;
 
 use crate::ui_input::InteractionState;
 
+/// What [`Gui::mirror_source_rects`] answers: the strips the mirror pass
+/// would copy, and whether this pass's primitives actually carry them.
+///
+/// Both fields are private on purpose — the shell reads, and can neither
+/// invent a strip nor overrule the strip cache's repainted/held verdict.
+/// A forged `repainted: true` over a skipped pass renders the mirror from
+/// primitives with no strips in them and blanks every 3D floor; a forged
+/// `false` over a repainted pass freezes the floors stale.
+pub struct MirrorSources {
+    rects: Vec<egui::Rect>,
+    repainted: bool,
+}
+
+impl MirrorSources {
+    /// The strips, in points, all below the frame's bottom edge.
+    pub fn rects(&self) -> &[egui::Rect] {
+        &self.rects
+    }
+
+    /// Whether the pass that just ended painted the strips — the mirror must
+    /// be re-rendered exactly when this is true (and the rects are
+    /// non-empty).
+    pub fn repainted(&self) -> bool {
+        self.repainted
+    }
+}
+
 /// One pane-count button the picker drew, as it was drawn.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -790,6 +817,8 @@ impl Gui {
         // that publishes an unchanged status re-states the same allocation.
         self.liveness = inputs.liveness.to_vec();
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
+        self.floor_strips
+            .note_mirror_plan_stamp(inputs.mirror_plan_stamp);
         // Copies histograms only on the frame that closes a 2 s window, and
         // only while the overlay is showing; every other frame this is a
         // handful of compares.
@@ -1159,8 +1188,15 @@ impl Gui {
     }
 
     /// The off-screen strips this frame's 3D panes drew their own maps into,
-    /// as rects in **points**.
-    pub fn mirror_source_rects(&self) -> Vec<egui::Rect> {
+    /// as rects in **points** — plus whether this pass actually painted them.
+    ///
+    /// The `repainted` half is what the strip cache decided
+    /// (`map::FloorStrips`), and the app must obey it both ways: rendering
+    /// the mirror from a pass that skipped painting would clear every floor
+    /// to transparent, and keeping the mirror across a pass that repainted
+    /// would freeze it stale. The field is private so the answer cannot be
+    /// composed anywhere but here.
+    pub fn mirror_source_rects(&self) -> MirrorSources {
         let mut rects: Vec<egui::Rect> = Vec::new();
         for (idx, pane) in self.panes().iter().enumerate() {
             let Some(volume) = pane.volume() else {
@@ -1176,7 +1212,10 @@ impl Gui {
                 rects.push(geo.rect);
             }
         }
-        rects
+        MirrorSources {
+            rects,
+            repainted: self.floor_strips.painted_this_pass(),
+        }
     }
 
     /// How much of egui's coordinate space the mirror has to cover this frame,
@@ -2308,6 +2347,10 @@ impl Gui {
             pane.content.release_textures();
         }
         self.map_tiles.clear();
+        // The mirror texture died with the device: whatever the strip cache
+        // committed describes pixels that no longer exist, so the next frame
+        // repaints every strip whatever the keys say.
+        self.floor_strips.force_repaint();
         // The painter holds wgpu handles made by the device that is going away,
         // and every one of them — pipelines, the offscreen targets, the uploaded
         // grid — is invalid the moment it does. Dropping the whole painter is

@@ -318,6 +318,76 @@ fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTo
     )
 }
 
+/// The `floor strips:` running-total line. See [`overlay_raster_line`] for why
+/// this is a value. Two denominators, never added:
+/// [`squallar_egui::floor_ledger`]'s strip paints are per pane per painted
+/// frame, its mirror renders per mirror pass encoded. Orbit frames over a
+/// resolved floor move neither — which is the reading that proves the strip
+/// cache is skipping.
+fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
+    format!(
+        "floor strips: {} paints, {} mirror renders",
+        t.strip_paints, t.mirror_renders,
+    )
+}
+
+/// What the shell does with the mirror on one frame — the two old states plus
+/// the strip cache's third.
+///
+/// Reading it off `Gui::mirror_source_rects`'s verdict
+/// and nothing else is the correctness rule: rendering over a held pass
+/// blanks every floor (the pass's primitives carry no strips), and holding
+/// over a repainted pass freezes them stale.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MirrorFrame {
+    /// No floor strips on screen: release the mirror texture.
+    Release,
+    /// The strips repainted this pass: size to the observed plan and render.
+    Render,
+    /// The strips were held clean: keep the texture, render nothing.
+    Hold,
+}
+
+/// The one place the verdict is decided. A free function over the sources'
+/// two facts so the arm choice is unit-testable without a device; the facts
+/// themselves still come only off `MirrorSources`, whose fields the Gui owns.
+fn mirror_frame_action(rects_empty: bool, repainted: bool) -> MirrorFrame {
+    if rects_empty {
+        MirrorFrame::Release
+    } else if repainted {
+        MirrorFrame::Render
+    } else {
+        MirrorFrame::Hold
+    }
+}
+
+/// The third state exists and the two old ones survive: rendering over a
+/// held pass would blank every floor (its primitives carry no strips), and
+/// releasing on a held pass would leave the raymarch sampling a destroyed
+/// texture — `Hold` is reachable ONLY as keep-but-don't-render.
+#[cfg(test)]
+mod mirror_frame_tests {
+    use super::{MirrorFrame, mirror_frame_action};
+
+    #[test]
+    fn a_held_pass_keeps_the_texture_and_renders_nothing() {
+        assert_eq!(mirror_frame_action(false, false), MirrorFrame::Hold);
+    }
+
+    #[test]
+    fn a_repainted_pass_renders() {
+        assert_eq!(mirror_frame_action(false, true), MirrorFrame::Render);
+    }
+
+    #[test]
+    fn no_strips_releases_whatever_the_verdict_says() {
+        // An empty guest list releases even on a "repainted" pass: with no
+        // floor on screen there is nothing to hold the texture for.
+        assert_eq!(mirror_frame_action(true, false), MirrorFrame::Release);
+        assert_eq!(mirror_frame_action(true, true), MirrorFrame::Release);
+    }
+}
+
 // ── The frame timing lines ──
 //
 // Values, not `log!` arguments, for the same seam reason as the raster lines
@@ -610,6 +680,7 @@ impl super::App {
                 catalogue_pending: self.catalogue_pending,
                 liveness: &self.liveness,
                 floor_tile_zoom_bias: self.mirror_rungs.tile_zoom_bias(),
+                mirror_plan_stamp: self.mirror_plan_stamp,
                 frame_diagnostics: Some(squallar_egui::shell_api::FrameDiagnostics {
                     gpu_passes: self.gpu_passes_panel_line.as_deref(),
                     ..self.frame_ledger.diagnostics()
@@ -1042,7 +1113,8 @@ impl super::App {
             .state
             .as_mut()
             .and_then(|state| state.egui_renderer.upload_totals_if_moved());
-        if rasters.is_none() && uploads.is_none() {
+        let strips = squallar_egui::floor_ledger::totals_if_moved();
+        if rasters.is_none() && uploads.is_none() && strips.is_none() {
             return;
         }
         // Stamped only where a line really went out, so a quiet pipeline does
@@ -1054,6 +1126,9 @@ impl super::App {
         }
         if let Some(u) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));
+        }
+        if let Some(s) = strips {
+            say_telemetry(loud, &floor_strip_line(&s));
         }
     }
 
@@ -2275,45 +2350,77 @@ impl super::App {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        let mirror_rects = self.gui.mirror_source_rects();
+        let mirror_sources = self.gui.mirror_source_rects();
         let demand = self
             .volume_painter
             .as_ref()
             .and_then(|painter| painter.take_floor_demand());
-        let mirror_target = if mirror_rects.is_empty() {
-            if let Some(resources) = state
-                .egui_renderer
-                .callback_resources_mut()
-                .get_mut::<squallar_volumetric::bridge::VolumeResources>()
-            {
-                resources.release_mirror();
+        // Whether the deferral arm below owes the app another frame.
+        let mut mirror_frame_owed = false;
+        let mirror_target = match mirror_frame_action(
+            mirror_sources.rects().is_empty(),
+            mirror_sources.repainted(),
+        ) {
+            MirrorFrame::Release => {
+                if let Some(resources) = state
+                    .egui_renderer
+                    .callback_resources_mut()
+                    .get_mut::<squallar_volumetric::bridge::VolumeResources>()
+                {
+                    resources.release_mirror();
+                }
+                self.mirror_plan_applied = None;
+                None
             }
-            None
-        } else {
-            let points = state.egui_renderer.context().pixels_per_point();
-            // Sized in **points**, from the UI rather than from the surface:
-            let size_in_points = self.gui.mirror_size_points();
-            let plan = self.mirror_rungs.observe(
-                demand,
-                [size_in_points.x, size_in_points.y],
-                points,
-                squallar_gpu::egui_renderer::MirrorLimits::for_device(
-                    state.device.limits().max_texture_dimension_2d,
-                    self.budgets.mirror_bytes,
-                ),
-            );
-            let format = state.egui_renderer.attachment_config().color_format;
-            let device = state.device.clone();
-            state
-                .egui_renderer
-                .callback_resources_mut()
-                .get_mut::<squallar_volumetric::bridge::VolumeResources>()
-                .map(|resources| {
-                    (
-                        resources.ensure_mirror(&device, plan.size_in_pixels, format),
-                        plan,
-                    )
-                })
+            verdict => {
+                let points = state.egui_renderer.context().pixels_per_point();
+                // Sized in **points**, from the UI rather than from the surface:
+                let size_in_points = self.gui.mirror_size_points();
+                // Observed on EVERY frame with strips on screen, held frames
+                // included: the dwell counter is what turns a dolly into a
+                // rung flip, and a counter that paused while the strip was
+                // clean would be a rung that never flips mid-orbit.
+                let plan = self.mirror_rungs.observe(
+                    demand,
+                    [size_in_points.x, size_in_points.y],
+                    points,
+                    squallar_gpu::egui_renderer::MirrorLimits::for_device(
+                        state.device.limits().max_texture_dimension_2d,
+                        self.budgets.mirror_bytes,
+                    ),
+                );
+                if verdict == MirrorFrame::Render {
+                    let format = state.egui_renderer.attachment_config().color_format;
+                    let device = state.device.clone();
+                    self.mirror_plan_applied = Some(plan);
+                    state
+                        .egui_renderer
+                        .callback_resources_mut()
+                        .get_mut::<squallar_volumetric::bridge::VolumeResources>()
+                        .map(|resources| {
+                            (
+                                resources.ensure_mirror(&device, plan.size_in_pixels, format),
+                                plan,
+                            )
+                        })
+                } else {
+                    // The third state: keep-but-don't-render. The floors keep
+                    // sampling last frame's mirror, so the texture is neither
+                    // released (the `Release` arm's job) nor resized — a
+                    // realloc destroys the picture mid-sample. A changed plan
+                    // is deferred behind the stamp instead: the Gui repaints
+                    // every strip next frame, and the realloc lands on
+                    // primitives that carry them.
+                    if self
+                        .mirror_plan_applied
+                        .is_some_and(|applied| applied != plan)
+                    {
+                        self.mirror_plan_stamp = self.mirror_plan_stamp.wrapping_add(1);
+                        mirror_frame_owed = true;
+                    }
+                    None
+                }
+            }
         };
         let mirror =
             mirror_target
@@ -2322,7 +2429,7 @@ impl super::App {
                     view,
                     size_in_pixels: plan.size_in_pixels,
                     pixels_per_point: plan.pixels_per_point,
-                    source_rects: &mirror_rects,
+                    source_rects: mirror_sources.rects(),
                 });
 
         // Finish egui's pass and upload its textures, THEN ask for a surface.
@@ -2350,7 +2457,14 @@ impl super::App {
         if let Some((acquire_start, acquire_end)) = acquire_span.get() {
             self.frame_ledger.record_acquire(acquire_start, acquire_end);
         }
-        let repaint_delay = frame.repaint_delay();
+        // A deferred mirror-plan change owes the app one more frame: the loop
+        // runs on `ControlFlow::Wait`, and the stamp only reaches the Gui at
+        // the top of the next frame.
+        let repaint_delay = if mirror_frame_owed {
+            std::time::Duration::ZERO
+        } else {
+            frame.repaint_delay()
+        };
 
         let surface_texture = match status {
             SurfaceStatus::Ready(texture) => texture,
@@ -2382,6 +2496,10 @@ impl super::App {
                     // handle_redraw() lazily recreates it with a fresh surface.
                     self.render.clear_last_rendered();
                     self.gui.clear_graphics_state();
+                    // The mirror texture died with the device; the strip
+                    // cache was force-flagged by `clear_graphics_state`, and
+                    // the applied plan must not claim otherwise.
+                    self.mirror_plan_applied = None;
                     self.state = None;
                 }
                 self.frame_ledger.mark_present_return();

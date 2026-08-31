@@ -79,6 +79,11 @@ pub(in crate::ui) struct FrameProbes {
     /// The diagnostics-overlay rows the last frame drew, by row id, in draw
     /// order — empty is the "panel off draws nothing" figure.
     pub last_diagnostics_rows: Vec<&'static str>,
+    /// Floor strips painted since this `Gui` was built — the per-instance
+    /// twin of `crate::floor_ledger`'s process-global counter, cumulative on
+    /// purpose so the staleness fixtures assert exact counts without the
+    /// cross-test noise a static would carry.
+    pub strip_paints: u64,
 }
 
 #[cfg(test)]
@@ -118,6 +123,7 @@ impl Default for FrameProbes {
             last_error_toast: None,
             last_attribution: Vec::new(),
             last_diagnostics_rows: Vec::new(),
+            strip_paints: 0,
         }
     }
 }
@@ -136,6 +142,12 @@ impl Gui {
 
     pub(crate) fn concurrent_renders_for_test(&self) -> usize {
         self.concurrent_renders
+    }
+
+    /// Floor strips painted since this `Gui` was built. See
+    /// [`FrameProbes::strip_paints`].
+    pub(crate) fn strip_paints_for_test(&self) -> u64 {
+        self.probes.strip_paints
     }
 }
 

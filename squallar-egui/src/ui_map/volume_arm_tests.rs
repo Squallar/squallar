@@ -1687,7 +1687,8 @@ fn the_mirror_guest_list_is_this_frames_floor_strips() {
     let screen = h.screen_rect();
     let pane_rect = h.pane_rects()[1];
 
-    let rects = h.gui_mut().mirror_source_rects();
+    let sources = h.gui_mut().mirror_source_rects();
+    let rects = sources.rects();
     assert_eq!(
         rects.len(),
         1,
@@ -1722,7 +1723,7 @@ fn the_mirror_guest_list_is_this_frames_floor_strips() {
         .hide_floor = true;
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.gui_mut().mirror_source_rects().is_empty(),
+        h.gui_mut().mirror_source_rects().rects().is_empty(),
         "a 3D pane with its map floor turned off is still paying for a mirror \
          pass it does not read",
     );
@@ -1738,7 +1739,7 @@ fn the_mirror_guest_list_is_this_frames_floor_strips() {
     h.make_pane_map(1);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.gui_mut().mirror_source_rects().is_empty(),
+        h.gui_mut().mirror_source_rects().rects().is_empty(),
         "a layout of plain map panes is still asking for a mirror pass",
     );
 }
@@ -1786,8 +1787,8 @@ fn a_3d_pane_with_no_neighbouring_map_still_gets_a_floor() {
          reproject through zeros",
     );
     assert_eq!(
-        h.gui_mut().mirror_source_rects(),
-        vec![geo.rect],
+        h.gui_mut().mirror_source_rects().rects(),
+        &[geo.rect],
         "the pane is registered to a strip the mirror pass does not copy",
     );
     assert!(
@@ -1815,7 +1816,8 @@ fn two_3d_panes_get_two_strips_that_cannot_collide() {
     h.frames_for(2, FRAME_DT);
 
     let screen = h.screen_rect();
-    let rects = h.gui_mut().mirror_source_rects();
+    let sources = h.gui_mut().mirror_source_rects();
+    let rects = sources.rects();
     assert_eq!(rects.len(), 2, "two 3D panes asked for {rects:?}");
     // Area, not `intersects`: side-by-side panes share an edge and so do
     // their strips, exactly as the panes themselves do on the glass.
@@ -1825,7 +1827,7 @@ fn two_3d_panes_get_two_strips_that_cannot_collide() {
         "the strips {rects:?} overlap over {shared:?}: one pane's floor would \
          be the other pane's map",
     );
-    for strip in &rects {
+    for strip in rects {
         assert!(
             strip.min.y >= screen.max.y,
             "strip {strip:?} is inside the frame",
@@ -1865,7 +1867,7 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
         "a pane with the floor hidden is still handing the renderer a \
          registration to draw one through",
     );
-    assert!(h.gui_mut().mirror_source_rects().is_empty());
+    assert!(h.gui_mut().mirror_source_rects().rects().is_empty());
 
     // Back on, then converted away entirely.
     h.gui_mut()
@@ -1875,11 +1877,11 @@ fn a_pane_that_stops_showing_a_floor_stops_being_registered() {
         .expect("a 3D pane")
         .hide_floor = false;
     h.frames_for(2, FRAME_DT);
-    assert!(h.gui_mut().mirror_source_rects().len() == 1);
+    assert!(h.gui_mut().mirror_source_rects().rects().len() == 1);
     h.make_pane_map(1);
     h.frames_for(2, FRAME_DT);
     assert!(
-        h.gui_mut().mirror_source_rects().is_empty(),
+        h.gui_mut().mirror_source_rects().rects().is_empty(),
         "a pane that is a map again is still on the mirror's guest list, so \
          the mirror is copying a strip nothing draws into",
     );
@@ -1990,6 +1992,7 @@ fn the_panes_map_is_painted_into_the_strip_and_not_onto_the_glass() {
     let strip = *h
         .gui_mut()
         .mirror_source_rects()
+        .rects()
         .first()
         .expect("the 3D pane asked for no strip at all");
 
@@ -2062,6 +2065,7 @@ fn the_panes_legend_is_painted_onto_the_glass_and_never_into_the_strip() {
     let strip = *h
         .gui_mut()
         .mirror_source_rects()
+        .rects()
         .first()
         .expect("the 3D pane asked for no strip at all");
     let on_glass = local_marks(&h, pane_rect);
@@ -2150,7 +2154,7 @@ fn the_colour_scale_does_not_print_through_the_volume_alpha_button() {
     h.make_pane_volume(0);
     h.frames_for(2, FRAME_DT);
     assert!(
-        !h.gui_mut().mirror_source_rects().is_empty(),
+        !h.gui_mut().mirror_source_rects().rects().is_empty(),
         "precondition: the 3D arm never got as far as drawing a pane",
     );
 

@@ -58,6 +58,7 @@ fn every_frame_input_surfaces_and_persists() {
         catalogue_pending: true,
         liveness: &liveness,
         floor_tile_zoom_bias: 2,
+        mirror_plan_stamp: 0,
         frame_diagnostics: None,
     });
 
@@ -153,6 +154,7 @@ fn a_none_gps_clears_the_fix() {
         catalogue_pending: false,
         liveness: &[],
         floor_tile_zoom_bias: 0,
+        mirror_plan_stamp: 0,
         frame_diagnostics: None,
     };
     h.gui_mut().apply_frame_inputs(base);
@@ -173,6 +175,7 @@ fn a_none_gps_clears_the_fix() {
         catalogue_pending: false,
         liveness: &[],
         floor_tile_zoom_bias: 0,
+        mirror_plan_stamp: 0,
         frame_diagnostics: None,
     });
     h.frame();

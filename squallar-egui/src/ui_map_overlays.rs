@@ -143,15 +143,6 @@ pub(super) struct TileLayerPaint {
     pub(super) labels: Vec<walkers::Text>,
     /// Whether every cell was answered with its exact tile. See
     /// [`TileCoverage`].
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the floor-strip cache is this seam's production consumer and \
-                      lands in the next commit; the signature lands first because \
-                      WO-8 shares this file"
-        )
-    )]
     pub(super) coverage: TileCoverage,
 }
 
@@ -170,10 +161,6 @@ pub(super) struct TileCoverage(bool);
 
 impl TileCoverage {
     /// Whether the pass answered its whole span at the requested zoom.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "see `TileLayerPaint::coverage` — same consumer")
-    )]
     pub(super) fn complete(self) -> bool {
         self.0
     }

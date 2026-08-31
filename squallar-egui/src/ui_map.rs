@@ -150,6 +150,7 @@ impl super::Gui {
                     .collect();
                 self.map_pane_geo
                     .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
+                self.floor_strips.begin_pass(&floors);
 
                 self.volume_empty_states.clear();
 
@@ -611,6 +612,7 @@ impl super::Gui {
                 self.sync_viewports(&pre_zooms, &pre_positions);
             });
 
+        self.floor_strips.end_pass();
         self.map_tiles.restore_base_tiles(tiles_owned);
         self.map_tiles.restore_terrain_tiles(terrain_owned);
 
@@ -1663,6 +1665,46 @@ impl super::Gui {
         let mut map_memory = map_memory;
         let map_memory = &mut map_memory;
 
+        // Read before the closure takes `pane`, and read from the same
+        // function the renderer's own `heights` comes from -- see
+        // `pane_ground_heights`. One expression, and the only binding of this
+        // name in the module: a second one composing the answer out of
+        // something else is what `GroundIsMesh` and the source pin in
+        // `ui_map_pane/floor_strip_shading_tests.rs` exist to refuse.
+        let draws_3d_ground = pane_render::GroundIsMesh::from_height_field(
+            pane_ground_heights(pane, pane_idx).as_deref(),
+        );
+
+        // The strip cache's skip decision. The key moves exactly when the
+        // strip's pixels would; a clean, complete strip for every floor pane
+        // means nothing below runs and the mirror keeps last frame's picture.
+        let key_inputs = pane_render::GroundKeyInputs {
+            overlays: &self.overlays,
+            preferences: &self.preferences,
+            pane: &*pane,
+            pane_idx,
+            strip,
+            centre: center,
+            memory: &*map_memory,
+            basemap_generation: tiles
+                .as_deref()
+                .map(crate::tile_source::HttpsTiles::put_generation),
+            terrain_generation: terrain
+                .as_deref()
+                .map(crate::tile_source::HttpsTiles::put_generation),
+            tile_zoom_bias,
+            is_dark: ctx.global_style().visuals.dark_mode,
+            user_location,
+            user_heading,
+            user_fix_present: user_fix.is_some(),
+        };
+        let key = pane_render::ground_content_key(&key_inputs, draws_3d_ground);
+        if !self.floor_strips.decide(pane_idx, key, ctx) {
+            // The skip reuses the cached affine: nothing about the viewport
+            // moved, or the key would have.
+            return self.map_pane_geo.get(&pane_idx).copied();
+        }
+
         let layer = egui::LayerId::new(
             egui::Order::Background,
             egui::Id::new(("volume_floor_strip", pane_idx)),
@@ -1675,15 +1717,7 @@ impl super::Gui {
         strip_ui.set_clip_rect(strip);
 
         let mut strip_click_consumed = false;
-        // Read before the closure takes `pane`, and read from the same
-        // function the renderer's own `heights` comes from -- see
-        // `pane_ground_heights`. One expression, and the only binding of this
-        // name in the module: a second one composing the answer out of
-        // something else is what `GroundIsMesh` and the source pin in
-        // `ui_map_pane/floor_strip_shading_tests.rs` exist to refuse.
-        let draws_3d_ground = pane_render::GroundIsMesh::from_height_field(
-            pane_ground_heights(pane, pane_idx).as_deref(),
-        );
+        let mut resolution = None;
 
         Map::new(None, map_memory, center)
             .zoom_with_ctrl(false)
@@ -1729,8 +1763,24 @@ impl super::Gui {
                     #[cfg(test)]
                     paint_order: Vec::new(),
                 };
-                pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);
+                resolution = Some(pane_render::render_pane_map_content(
+                    ui,
+                    projector,
+                    zoom,
+                    &mut render_ctx,
+                ));
             });
+
+        // Commit what this paint painted under. An incomplete paint —
+        // pending tiles, owed rasters — stays dirty, so the strip keeps
+        // repainting and the tile/raster asks keep going out.
+        let complete = resolution.is_some_and(pane_render::StripResolution::complete);
+        self.floor_strips.commit(pane_idx, key, complete);
+        crate::floor_ledger::note_strip_paint();
+        #[cfg(test)]
+        {
+            self.probes.strip_paints += 1;
+        }
 
         self.map_pane_geo.get(&pane_idx).copied()
     }
@@ -1778,6 +1828,139 @@ fn voxel_pick_bounds() -> crate::ui_region::DragBoundsKm {
     crate::ui_region::DragBoundsKm {
         min_half_width_km: squallar_radar::voxel::MIN_HALF_WIDTH_KM,
         max_half_width_km: squallar_radar::voxel::MAX_HALF_WIDTH_KM,
+    }
+}
+
+/// The floor-strip cache: what each 3D pane's strip painted last, and what
+/// this frame decided about all of them together.
+///
+/// **The decision is all-or-nothing across panes.** The mirror pass clears
+/// its whole texture and redraws every strip from the frame's primitives, so
+/// a frame in which one strip painted and another did not would blank the
+/// one that skipped. The mode below enforces it: the first floor pane the
+/// frame reaches settles whether every strip paints or none does. A pane
+/// found dirty *after* an earlier one already skipped cannot flip the frame
+/// — it raises [`Self::force`], asks for a repaint, and stays one frame
+/// stale instead (only multi-floor layouts can reach that arm).
+pub(super) struct FloorStrips {
+    /// Per pane: the content key the strip last painted under, and whether
+    /// that paint was complete ([`pane_render::StripResolution`]). An
+    /// incomplete paint is permanently dirty, which is the latch that keeps
+    /// a strip with pending tiles or owed rasters repainting.
+    committed: std::collections::HashMap<usize, (u64, bool)>,
+    /// Repaint regardless of keys on the next frame: raised at birth, by
+    /// `Gui::clear_graphics_state` (the mirror texture died with the
+    /// device), by a mirror-plan change (the texture is about to be
+    /// reallocated), and by the deferral arm above. Cleared only by a frame
+    /// that repainted every strip.
+    force: bool,
+    /// This frame's verdict so far. Reset by [`Self::begin_pass`].
+    mode: StripFrameMode,
+    /// Whether any floor pane already skipped this frame — what stops a
+    /// later dirty pane flipping the frame to repaint.
+    any_skipped: bool,
+    /// Whether the pass that just ended painted the strips — the value
+    /// [`crate::ui::Gui::mirror_source_rects`] hands the app, which renders
+    /// the mirror exactly when it is true.
+    painted_this_pass: bool,
+    /// The last mirror-plan stamp `apply_frame_inputs` saw; a moved stamp
+    /// raises [`Self::force`] so the realloc lands on painted primitives.
+    seen_mirror_plan_stamp: u64,
+}
+
+/// One frame's all-or-nothing verdict over the floor strips.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripFrameMode {
+    /// No floor pane reached yet.
+    Undecided,
+    /// The first floor pane was clean and skipped; every later pane must
+    /// skip too.
+    Skipping,
+    /// A floor pane painted; every later pane paints too.
+    Repainting,
+}
+
+impl Default for FloorStrips {
+    fn default() -> Self {
+        Self {
+            committed: std::collections::HashMap::new(),
+            // The first frame has nothing committed and must paint.
+            force: true,
+            mode: StripFrameMode::Undecided,
+            any_skipped: false,
+            painted_this_pass: false,
+            seen_mirror_plan_stamp: 0,
+        }
+    }
+}
+
+impl FloorStrips {
+    /// Start a frame: reset the verdict and drop panes that stopped drawing
+    /// a floor (their committed keys must not survive a pane conversion).
+    pub(super) fn begin_pass(&mut self, floors: &[bool]) {
+        self.mode = StripFrameMode::Undecided;
+        self.any_skipped = false;
+        self.committed
+            .retain(|&idx, _| floors.get(idx).copied().unwrap_or(false));
+    }
+
+    /// Whether pane `pane_idx`'s strip paints this frame, under the
+    /// all-or-nothing protocol. `ctx` is asked for a repaint on the deferral
+    /// arm, so the forced frame actually arrives on a quiet app.
+    fn decide(&mut self, pane_idx: usize, key: u64, ctx: &egui::Context) -> bool {
+        if self.mode == StripFrameMode::Repainting {
+            return true;
+        }
+        let clean = !self.force && self.committed.get(&pane_idx) == Some(&(key, true));
+        if clean {
+            self.mode = StripFrameMode::Skipping;
+            self.any_skipped = true;
+            return false;
+        }
+        if self.any_skipped {
+            // An earlier strip already skipped, so this frame's primitives
+            // cannot carry every strip: stay clean, come back next frame
+            // with everything repainting.
+            self.force = true;
+            ctx.request_repaint();
+            return false;
+        }
+        self.mode = StripFrameMode::Repainting;
+        true
+    }
+
+    /// Record what a painted strip painted under.
+    fn commit(&mut self, pane_idx: usize, key: u64, complete: bool) {
+        self.committed.insert(pane_idx, (key, complete));
+    }
+
+    /// End the frame: publish whether the strips' primitives are in this
+    /// pass's tessellation, and retire the force latch if they all are.
+    pub(super) fn end_pass(&mut self) {
+        self.painted_this_pass = self.mode == StripFrameMode::Repainting;
+        if self.painted_this_pass {
+            self.force = false;
+        }
+    }
+
+    /// Whether the pass that just ended painted the strips.
+    pub(super) fn painted_this_pass(&self) -> bool {
+        self.painted_this_pass
+    }
+
+    /// Repaint everything on the next frame, whatever the keys say.
+    pub(super) fn force_repaint(&mut self) {
+        self.force = true;
+    }
+
+    /// Fold in the app's mirror-plan stamp: a moved stamp means the mirror
+    /// texture is about to be reallocated, and the realloc must land on a
+    /// frame whose primitives carry every strip.
+    pub(super) fn note_mirror_plan_stamp(&mut self, stamp: u64) {
+        if self.seen_mirror_plan_stamp != stamp {
+            self.seen_mirror_plan_stamp = stamp;
+            self.force = true;
+        }
     }
 }
 
@@ -3150,6 +3333,10 @@ mod tests;
 #[path = "ui_map/volume_arm_tests.rs"]
 #[cfg(test)]
 mod volume_arm_tests;
+
+#[path = "ui_map/floor_strip_cache_tests.rs"]
+#[cfg(test)]
+mod floor_strip_cache_tests;
 
 #[path = "ui_map/region_pick_tests.rs"]
 #[cfg(test)]

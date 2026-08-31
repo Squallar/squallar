@@ -69,6 +69,10 @@ pub struct Gui {
     /// registration the pane's floor is reprojected by and the rect the
     /// frontend clips its mirror pass to.
     pub(super) map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
+    /// The floor-strip cache: per-pane content keys, the all-or-nothing
+    /// frame verdict, and the repaint-force latch. See
+    /// [`map::FloorStrips`].
+    pub(super) floor_strips: map::FloorStrips,
     /// Why each 3D pane drew **no picture** on the last frame, by pane index.
     pub(super) volume_empty_states: HashMap<usize, String>,
     /// How much of egui's coordinate space the pane mirror has to cover, in
@@ -553,6 +557,7 @@ impl Gui {
             pending_pane_close: None,
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
+            floor_strips: map::FloorStrips::default(),
             volume_empty_states: HashMap::new(),
             mirror_size_points: egui::Vec2::ZERO,
             floor_tile_zoom_bias: 0,
