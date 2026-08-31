@@ -1125,6 +1125,10 @@ impl VolumePipelines {
 
     /// [`Self::upload_volume`], told whether this device will ever sample the
     /// coarse level.
+    ///
+    /// **The whole grid, in this call.** That is what a test or a cost harness
+    /// wants and what no frame can afford — see [`Self::begin_volume`], which is
+    /// the seam production goes through.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_volume_at(
         &self,
@@ -1136,6 +1140,40 @@ impl VolumePipelines {
         coarse: CoarseLevel,
         staging: &mut VolumeStaging,
     ) -> Option<VolumeTextures> {
+        let mut pending = self.begin_volume(device, queue, cells, indices, lut, coarse)?;
+        while !self.advance_volume(device, queue, &mut pending, indices, staging) {}
+        Some(pending.into_textures())
+    }
+
+    /// Allocate a grid upload and write everything that is not the grid itself:
+    /// the colour table, the stratification tile, the camera buffer and the
+    /// bind group the march reads all three through.
+    ///
+    /// `None` — never a panic, because this runs on the frame thread where a
+    /// wasm panic aborts the tab — for a grid whose index plane does not match
+    /// its shape, or whose colour table is not the size the shader declares.
+    ///
+    /// # It does not finish, and that is the point
+    ///
+    /// **A voxel grid does not fit in a frame.** The shipped desktop rung is
+    /// 256x256x128 cells: 8.00 MiB of index plane read, 32.00 MiB of
+    /// [`VOLUME_TEXTURE_FORMAT`] texels written, and a 4.00 MiB coarse level
+    /// built by walking every one of those cells again — and all of it landed
+    /// in `prepare`, on the frame the grid arrived. So the bytes cross through
+    /// [`Self::advance_volume`] in bands of whole depth planes, and the pane
+    /// keeps painting the grid it already had until the last one lands.
+    ///
+    /// A caller that wants it all at once — a test, a cost harness — calls
+    /// [`Self::upload_volume_at`], which is that loop.
+    pub fn begin_volume(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cells: [u32; 3],
+        indices: &[u8],
+        lut: &[u8],
+        coarse: CoarseLevel,
+    ) -> Option<PendingGridUpload> {
         if let Some(why) = upload_refusal(cells, indices.len(), lut.len()) {
             log::error!("3D volume view: {why}");
             return None;
@@ -1158,30 +1196,6 @@ impl VolumePipelines {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        // The ring first, and the call below only when it declined.
-        if !staging.write_plane(device, queue, &grid, cells, indices) {
-            let premultiplied = coverage_premultiplied_into(staging.widening(), indices);
-            queue.write_texture(
-                grid.as_image_copy(),
-                premultiplied,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    // No 256-byte row padding: `write_texture` repacks
-                    // internally to the backend's `buffer_copy_pitch`, which is
-                    // 4 on GLES.
-                    bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
-                    rows_per_image: Some(cells[1]),
-                },
-                wgpu::Extent3d {
-                    width: cells[0],
-                    height: cells[1],
-                    depth_or_array_layers: cells[2],
-                },
-            );
-        }
-        if grid_mip_levels(cells, coarse) > 1 {
-            upload_coarse_level(queue, &grid, cells, indices);
-        }
 
         let lut_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label("lut")),
@@ -1283,15 +1297,142 @@ impl VolumePipelines {
             ],
         });
 
-        Some(VolumeTextures {
+        // Nothing of the grid is written here. `advance_volume` carries the
+        // texels over in bands, and `is_complete` is what says the grid may be
+        // drawn.
+        Some(PendingGridUpload {
+            textures: VolumeTextures {
+                cells,
+                // The levels this descriptor actually asked for, not the levels
+                // a grid of this shape may have — see `grid_bytes_at`.
+                bytes: resident_grid_bytes_at(cells, coarse).unwrap_or(0),
+                uniform,
+                bind_group,
+                lut_texture,
+            },
+            grid,
             cells,
-            // The levels this descriptor actually asked for, not the levels a
-            // grid of this shape may have — see `grid_bytes_at`.
-            bytes: resident_grid_bytes_at(cells, coarse).unwrap_or(0),
-            uniform,
-            bind_group,
-            lut_texture,
+            next_plane: 0,
+            next_coarse_plane: 0,
+            coarse,
         })
+    }
+
+    /// Carry at most one [`band_planes`] band of `indices` into `pending`, and
+    /// answer whether the grid is now whole.
+    ///
+    /// **The frame thread's whole share of a voxel grid**, and the bound is what
+    /// makes it one. `indices` is the grid's own index plane — the whole of it,
+    /// every call — and the band is sliced out of it here, so nothing is held
+    /// between calls but two counters.
+    ///
+    /// Mip 0 first and the coarse level after it, in a fixed order, so the
+    /// number of calls a grid takes is a function of its shape alone. The
+    /// coarse band is measured in the FINE planes it reads rather than the
+    /// coarse texels it writes: a coarse plane is the box mean of eight cells
+    /// each, so the walk is what costs, not the write.
+    ///
+    /// Answers `true` when there is nothing left to do, so a loop
+    /// `while !advance_volume(..) {}` terminates — which is what
+    /// [`Self::upload_volume_at`] is.
+    pub fn advance_volume(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pending: &mut PendingGridUpload,
+        indices: &[u8],
+        staging: &mut VolumeStaging,
+    ) -> bool {
+        let cells = pending.cells;
+        // An index plane that no longer matches the texture it is filling would
+        // write one grid's texels into another's allocation. Answered rather
+        // than asserted: this is the frame thread.
+        if Some(indices.len()) != cell_count(cells) {
+            log::error!(
+                "3D volume view: refusing to advance a {cells:?} upload with {} index bytes",
+                indices.len(),
+            );
+            return pending.is_complete();
+        }
+        let plane_cells = (cells[0] as usize) * (cells[1] as usize);
+
+        if pending.next_plane < cells[2] {
+            let planes = band_planes(cells).min(cells[2] - pending.next_plane);
+            let from = pending.next_plane as usize * plane_cells;
+            let band = &indices[from..from + planes as usize * plane_cells];
+            // The ring first, and the call below only when it declined.
+            if !staging.write_band(
+                device,
+                queue,
+                &pending.grid,
+                cells,
+                pending.next_plane,
+                planes,
+                band,
+            ) {
+                let premultiplied = coverage_premultiplied_into(staging.widening(), band);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &pending.grid,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: pending.next_plane,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    premultiplied,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        // No 256-byte row padding: `write_texture` repacks
+                        // internally to the backend's `buffer_copy_pitch`, which
+                        // is 4 on GLES.
+                        bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
+                        rows_per_image: Some(cells[1]),
+                    },
+                    wgpu::Extent3d {
+                        width: cells[0],
+                        height: cells[1],
+                        depth_or_array_layers: planes,
+                    },
+                );
+            }
+            pending.next_plane += planes;
+            return pending.is_complete();
+        }
+
+        let coarse_total = pending.coarse_planes();
+        if pending.next_coarse_plane < coarse_total {
+            let coarse = coarse_cells(cells);
+            let planes = coarse_band_planes(cells).min(coarse_total - pending.next_coarse_plane);
+            let band = downsampled_band(cells, indices, pending.next_coarse_plane, planes);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &pending.grid,
+                    mip_level: 1,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: pending.next_coarse_plane,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &band,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(coarse[0] * GRID_BYTES_PER_CELL),
+                    rows_per_image: Some(coarse[1]),
+                },
+                wgpu::Extent3d {
+                    width: coarse[0],
+                    height: coarse[1],
+                    depth_or_array_layers: planes,
+                },
+            );
+            pending.next_coarse_plane += planes;
+        }
+        pending.is_complete()
     }
 
     /// Record the ground pass into `target`, or do nothing when this target
@@ -2217,6 +2358,63 @@ fn create_pane_mirror(
     }
 }
 
+/// A voxel grid upload in flight: everything the march needs except the grid
+/// texture's own contents, and how far those have got.
+///
+/// Opened by [`VolumePipelines::begin_volume`], fed by
+/// [`VolumePipelines::advance_volume`], and worth drawing only once
+/// [`Self::is_complete`] answers `true` — a half-filled grid's tail is the
+/// zeroes `create_texture` left, which the march reads as air.
+pub struct PendingGridUpload {
+    textures: VolumeTextures,
+    /// The grid texture itself. [`VolumeTextures`] keeps only the view, inside
+    /// its bind group, and a copy needs the texture.
+    grid: wgpu::Texture,
+    cells: [u32; 3],
+    /// Depth planes of mip 0 already carried across.
+    next_plane: u32,
+    /// Depth planes of the coarse level already carried across, which starts
+    /// once mip 0 is whole.
+    next_coarse_plane: u32,
+    coarse: CoarseLevel,
+}
+
+impl PendingGridUpload {
+    /// Whether every band has landed, so this may be drawn.
+    pub fn is_complete(&self) -> bool {
+        self.next_plane >= self.cells[2] && self.next_coarse_plane >= self.coarse_planes()
+    }
+
+    /// The finished textures. Call it on a complete upload: on a partial one
+    /// the grid's tail is still zeroes.
+    pub fn into_textures(self) -> VolumeTextures {
+        self.textures
+    }
+
+    /// The textures as they stand, for the colour table — which is written in
+    /// full by [`VolumePipelines::begin_volume`] and may be rewritten in place
+    /// while the grid beside it is still filling.
+    pub fn textures(&self) -> &VolumeTextures {
+        &self.textures
+    }
+
+    /// GPU texture bytes this upload has already reserved. The full cost from
+    /// the first band: the textures are allocated before any of them lands.
+    pub fn texture_bytes(&self) -> usize {
+        self.textures.texture_bytes()
+    }
+
+    /// Depth planes the coarse level has, or 0 when this upload was not given
+    /// one.
+    fn coarse_planes(&self) -> u32 {
+        if grid_mip_levels(self.cells, self.coarse) > 1 {
+            coarse_cells(self.cells)[2]
+        } else {
+            0
+        }
+    }
+}
+
 /// A voxel grid and its palette, uploaded, plus the camera buffer.
 pub struct VolumeTextures {
     cells: [u32; 3],
@@ -2536,38 +2734,53 @@ fn read_channel(plane: &[u8], at: usize) -> f32 {
     half::f16::from_le_bytes(bytes).to_f32()
 }
 
-/// Write the hand-built coarse level into the grid texture's mip 1.
-fn upload_coarse_level(queue: &wgpu::Queue, grid: &wgpu::Texture, cells: [u32; 3], indices: &[u8]) {
-    let (coarse_cells, coarse) = downsampled_grid(cells, indices);
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: grid,
-            mip_level: 1,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &coarse,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(coarse_cells[0] * GRID_BYTES_PER_CELL),
-            rows_per_image: Some(coarse_cells[1]),
-        },
-        wgpu::Extent3d {
-            width: coarse_cells[0],
-            height: coarse_cells[1],
-            depth_or_array_layers: coarse_cells[2],
-        },
-    );
+/// Depth planes of mip 0 one [`VolumePipelines::advance_volume`] call carries:
+/// as many as fit in [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`],
+/// and never fewer than one.
+///
+/// **That constant and no other.** It is the cap the overlay upload's own pan
+/// sweep settled on — 4 MiB, the smallest band that leaves no frame without a
+/// picture — and a voxel band is the same question asked of the same frame
+/// thread. A second number here would be a second answer to it.
+///
+/// Whole planes, so a band is a `copy_buffer_to_texture` with a z origin and
+/// nothing has to be reassembled at a row boundary. A grid whose single plane
+/// is already past the cap still moves one plane a call — the alternative is
+/// not finishing.
+fn band_planes(cells: [u32; 3]) -> u32 {
+    let plane = u64::from(cells[0]) * u64::from(cells[1]) * u64::from(GRID_BYTES_PER_CELL);
+    if plane == 0 {
+        return 1;
+    }
+    let band = squallar_device_profile::constants::BLOCKING_BAND_BYTES as u64;
+    (band / plane).clamp(1, u64::from(u32::MAX)) as u32
+}
+
+/// Depth planes of the **coarse** level one call carries.
+///
+/// Half [`band_planes`], because a coarse plane is built from two fine ones:
+/// the band is the same read of the index plane either way, which is the cost
+/// being bounded. The coarse write itself is a quarter of a fine band.
+fn coarse_band_planes(cells: [u32; 3]) -> u32 {
+    (band_planes(cells) / 2).max(1)
 }
 
 /// The grid's mip level 1: **the plain box mean of both channels**, over all
 /// eight fine cells under each coarse one, no special case anywhere.
+#[cfg(test)]
 fn downsampled_grid(cells: [u32; 3], indices: &[u8]) -> ([u32; 3], Vec<u8>) {
+    let coarse = coarse_cells(cells);
+    (coarse, downsampled_band(cells, indices, 0, coarse[2]))
+}
+
+/// [`downsampled_grid`], for `count` coarse depth planes starting at `from` —
+/// the band [`VolumePipelines::advance_volume`] writes into mip 1.
+fn downsampled_band(cells: [u32; 3], indices: &[u8], from: u32, count: u32) -> Vec<u8> {
     let coarse = coarse_cells(cells);
     let fine = cells.map(|n| n as usize);
     let stride = GRID_BYTES_PER_CELL as usize;
-    let mut out = Vec::with_capacity((coarse[0] * coarse[1] * coarse[2]) as usize * stride);
-    for cz in 0..coarse[2] as usize {
+    let mut out = Vec::with_capacity((coarse[0] * coarse[1] * count) as usize * stride);
+    for cz in from as usize..(from + count) as usize {
         for cy in 0..coarse[1] as usize {
             for cx in 0..coarse[0] as usize {
                 // `Σ c x` and `Σ c`, both exact: the first is at most 8 x 255
@@ -2597,7 +2810,7 @@ fn downsampled_grid(cells: [u32; 3], indices: &[u8]) -> ([u32; 3], Vec<u8>) {
             }
         }
     }
-    (coarse, out)
+    out
 }
 
 /// Entries in the colour table, which is also its texture's width.

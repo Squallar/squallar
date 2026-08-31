@@ -61,20 +61,28 @@ impl VolumeStaging {
         &mut self.widening
     }
 
-    /// Widen `indices` into a staging slot and start the copy into `grid`'s
-    /// mip 0, or say `false` and leave the caller to `write_texture`.
-    pub(super) fn write_plane(
+    /// Widen `indices` into a staging slot and start the copy into `z_count`
+    /// depth layers of `grid`'s mip 0 starting at `z_from`, or say `false` and
+    /// leave the caller to `write_texture`.
+    ///
+    /// `indices` is the band's own slice of the grid's index plane, not the
+    /// whole of it: the ring is sized to a band and the widening pass walks a
+    /// band, which is what keeps both off the frame thread's critical path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn write_band(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         grid: &wgpu::Texture,
         cells: [u32; 3],
+        z_from: u32,
+        z_count: u32,
         indices: &[u8],
     ) -> bool {
         if !self.capable {
             return false;
         }
-        let Some(layout) = PlaneLayout::of(cells) else {
+        let Some(layout) = PlaneLayout::of([cells[0], cells[1], z_count]) else {
             return false;
         };
         if indices.len() != layout.cells {
@@ -107,11 +115,20 @@ impl VolumeStaging {
                     rows_per_image: Some(cells[1]),
                 },
             },
-            grid.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                texture: grid,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: z_from,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::Extent3d {
                 width: cells[0],
                 height: cells[1],
-                depth_or_array_layers: cells[2],
+                depth_or_array_layers: z_count,
             },
         );
         queue.submit(Some(encoder.finish()));
@@ -294,10 +311,10 @@ mod tests {
         for turn in 0..2 {
             for cells in [
                 [1u32, 1, 1],   // build the ring at its smallest
-                [128, 128, 64], // grow — the wasm32 rung, 4.00 MiB a slot
+                [128, 128, 64], // grow — the wasm32 rung, one 4.00 MiB band
                 [7, 5, 3],      // shrink onto that tail
                 [65, 3, 2],     // shrink again, at the awkward stride
-                [192, 192, 96], // grow — the mobile rung, 13.50 MiB a slot
+                [192, 192, 96], // the mobile rung: 4 bands, none of them wider
                 [128, 128, 64], // and fall back, which must not shrink it
             ] {
                 let count = (cells[0] as usize) * (cells[1] as usize) * (cells[2] as usize);
@@ -322,9 +339,78 @@ mod tests {
                     extent(cells),
                 );
 
+                // In bands, exactly as `advance_volume` walks it — so this
+                // compares the routes production takes, not a whole-grid call
+                // no frame makes. Both of them: the ring, and the banded
+                // `write_texture` a device without one falls back to.
                 let through_ring = texture(&device, cells);
-                let took_the_ring =
-                    staging.write_plane(&device, &queue, &through_ring, cells, &indices);
+                let through_banded_write = texture(&device, cells);
+                let planes = super::super::band_planes(cells);
+                let plane_cells = (cells[0] as usize) * (cells[1] as usize);
+                let mut fallback = VolumeStaging::default();
+                let mut took_the_ring = true;
+                let mut bands = 0;
+                let mut z = 0;
+                while z < cells[2] {
+                    let count = planes.min(cells[2] - z);
+                    let from = z as usize * plane_cells;
+                    let band = &indices[from..from + count as usize * plane_cells];
+                    took_the_ring &=
+                        staging.write_band(&device, &queue, &through_ring, cells, z, count, band);
+                    assert!(
+                        !fallback.write_band(
+                            &device,
+                            &queue,
+                            &through_banded_write,
+                            cells,
+                            z,
+                            count,
+                            band,
+                        ),
+                        "host-only staging claimed a ring it cannot have",
+                    );
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &through_banded_write,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y: 0, z },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        super::super::coverage_premultiplied_into(fallback.widening(), band),
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(cells[0] * GRID_BYTES_PER_CELL),
+                            rows_per_image: Some(cells[1]),
+                        },
+                        wgpu::Extent3d {
+                            width: cells[0],
+                            height: cells[1],
+                            depth_or_array_layers: count,
+                        },
+                    );
+                    bands += 1;
+                    z += count;
+                }
+                let banded_write = read_back(&device, &queue, &through_banded_write, cells);
+                let whole_write = read_back(&device, &queue, &through_write_texture, cells);
+                assert!(
+                    whole_write.iter().any(|&b| b != 0),
+                    "turn {turn}, {cells:?}: the reference plane is all zeroes, \
+                     so an upload that wrote nothing at all would pass",
+                );
+                assert_eq!(
+                    banded_write, whole_write,
+                    "turn {turn}, {cells:?}: the grid written {bands} bands at a \
+                     time is not the grid written in one call — a band boundary \
+                     is losing, duplicating or misplacing a depth plane",
+                );
+                assert_eq!(
+                    bands,
+                    cells[2].div_ceil(planes),
+                    "turn {turn}, {cells:?}: the walk took {bands} bands, not the \
+                     {} its shape asks for",
+                    cells[2].div_ceil(planes),
+                );
                 assert_eq!(
                     took_the_ring,
                     staging.has_ring(),
@@ -382,23 +468,25 @@ mod tests {
 
         if staging.has_ring() {
             assert_eq!(
-                grows, 3,
-                "the walk above resized the ring {grows} times, not the three \
-                 the shape order was built to force (build, then the wasm32 \
-                 rung, then the mobile one) — so `Ring::grow`'s body is going \
-                 unchecked and a session that widens its region box is relying \
-                 on code no test runs",
+                grows, 2,
+                "the walk above resized the ring {grows} times, not the two the \
+                 shape order was built to force (build at [1,1,1], then the \
+                 first shape whose band is a whole one) — so `Ring::grow`'s \
+                 body is going unchecked and a session that widens its region \
+                 box is relying on code no test runs",
             );
             assert_eq!(
                 staging.host_bytes(),
                 usize::try_from(
-                    PlaneLayout::of([192, 192, 96])
-                        .expect("the mobile rung")
+                    PlaneLayout::of([128, 128, super::super::band_planes([128, 128, 64])])
+                        .expect("a band of the wasm32 rung")
                         .bytes
                 )
-                .expect("the mobile rung fits")
+                .expect("a band fits")
                     * STAGING_RING_DEPTH,
-                "the ring did not settle at the widest shape it was given",
+                "the ring did not settle at one band a slot — and a band, not a \
+                 grid, is the whole point: the mobile rung's 13.50 MiB plane \
+                 walked past here in four bands and never widened it",
             );
         }
     }
@@ -441,41 +529,66 @@ mod tests {
         }
 
         let cells = squallar_device_profile::constants::DESKTOP_VOLUME_GRID_CELLS;
-        let plane = PlaneLayout::of(cells).expect("the desktop rung").bytes as usize;
-        let count = (cells[0] as usize) * (cells[1] as usize) * (cells[2] as usize);
+        let planes = super::super::band_planes(cells);
+        let band = PlaneLayout::of([cells[0], cells[1], planes])
+            .expect("a band of the desktop rung")
+            .bytes as usize;
+        let plane_cells = (cells[0] as usize) * (cells[1] as usize);
+        let count = plane_cells * cells[2] as usize;
         let indices = vec![7u8; count];
 
         assert_eq!(staging.host_bytes(), 0, "a fresh staging holds nothing");
 
         let grid = texture(&device, cells);
-        assert!(staging.write_plane(&device, &queue, &grid, cells, &indices));
+        assert!(staging.write_band(
+            &device,
+            &queue,
+            &grid,
+            cells,
+            0,
+            planes,
+            &indices[..planes as usize * plane_cells],
+        ));
         let steady = staging.host_bytes();
         assert_eq!(
             steady,
-            plane * STAGING_RING_DEPTH,
+            band * STAGING_RING_DEPTH,
             "the steady state on the desktop rung is not the {STAGING_RING_DEPTH} \
-             × 32.00 MiB the docs quote",
+             × 4.00 MiB a banded upload asks for",
         );
-        assert_eq!(steady, 64 << 20, "…and that is 64.00 MiB");
+        assert_eq!(steady, 8 << 20, "…and that is 8.00 MiB");
 
-        // Now the fallback, exactly as `upload_volume_at` takes it.
-        super::super::coverage_premultiplied_into(staging.widening(), &indices);
+        // Now the fallback, exactly as `advance_volume` takes it: one band, not
+        // the grid.
+        super::super::coverage_premultiplied_into(
+            staging.widening(),
+            &indices[..planes as usize * plane_cells],
+        );
         let worst = staging.host_bytes();
         assert_eq!(
             worst,
-            steady + plane,
-            "one starved upload did not add a whole widening buffer, so the \
-             worst case the docs quote is not what the code reaches",
+            steady + band,
+            "one starved band did not add a whole widening buffer, so the worst \
+             case the docs quote is not what the code reaches",
         );
         assert_eq!(
             worst,
-            96 << 20,
-            "the worst-case desktop residency is not the 96.00 MiB \
-             `VolumeStaging` and `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` both state",
+            12 << 20,
+            "the worst-case desktop residency is not the 12.00 MiB a banded \
+             upload holds — it was 96.00 MiB while a whole 32.00 MiB plane \
+             crossed in one call",
         );
 
         // And it is permanent: a later ring upload does not give it back.
-        assert!(staging.write_plane(&device, &queue, &grid, cells, &indices));
+        assert!(staging.write_band(
+            &device,
+            &queue,
+            &grid,
+            cells,
+            0,
+            planes,
+            &indices[..planes as usize * plane_cells],
+        ));
         assert_eq!(
             staging.host_bytes(),
             worst,

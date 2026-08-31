@@ -1264,6 +1264,17 @@ pub struct VolumeResources {
     /// field it holds. Per pane and not per grid: a field belongs to the box a
     /// pane is drawing, which a stand-in grid does not fix.
     heights: HashMap<usize, HeldHeights>,
+    /// The grid upload in flight, if one is. **One at a time across every
+    /// pane**: a band is a fixed slice of a frame, and two fills would be two
+    /// of them on the same frame thread. A pane whose grid has to wait keeps
+    /// painting what it already had, exactly as the filling pane does.
+    pending: Option<PendingFill>,
+    /// The upload each pane last drew, by pane index.
+    ///
+    /// Not a resource — a `u64` — but it is what [`Self::ensure_upload`] finds
+    /// a stand-in through and what `paint` blits by, so a pane cannot be shown
+    /// another pane's grid.
+    showing: HashMap<usize, u64>,
     /// One uploaded building mesh per pane, beside the field it stands on.
     ///
     /// Per pane for the reason the field is: the prisms belong to the box the
@@ -1305,6 +1316,31 @@ struct VolumeUpload {
     applied_alpha: Option<AlphaCurve>,
 }
 
+/// A grid upload part-way across, and the picture standing in for it.
+struct PendingFill {
+    /// The store id this will become once the last band lands.
+    id: u64,
+    upload: crate::raymarch::PendingGridUpload,
+    /// The curve its colour table already reflects. See [`VolumeUpload`].
+    applied_alpha: Option<AlphaCurve>,
+    /// The upload the pane keeps painting until then, if it had one.
+    ///
+    /// **This is what makes the fill invisible.** The store hands `paint` the
+    /// new grid the moment its build lands, so without this the pane would go
+    /// blank for the length of the fill — the seamless swap's own rule, "the
+    /// old picture until the new one is really there", carried the last step to
+    /// the GPU. Two consecutive volumes of one site and product are built in
+    /// the same box (`squallar_radar::voxel` takes its z range from the
+    /// request), so the stand-in is drawn through exactly its own geometry.
+    /// The one case it is not is a box the user moved between the two, which
+    /// pops once when the real grid lands — the trade `DrawnBox::for_target`
+    /// already names.
+    ///
+    /// Held here rather than in a map because it is what keeps the upload
+    /// alive: [`VolumeResources::retain_uploads`] spares exactly this id.
+    stand_in: Option<u64>,
+}
+
 impl VolumeResources {
     /// Build the pipelines for the pass egui draws into.
     pub fn new(
@@ -1318,6 +1354,8 @@ impl VolumeResources {
             pipelines,
             targets: HashMap::new(),
             uploads: HashMap::new(),
+            pending: None,
+            showing: HashMap::new(),
             mirror: None,
             heights: HashMap::new(),
             buildings: HashMap::new(),
@@ -1333,6 +1371,7 @@ impl VolumeResources {
         self.targets.remove(&pane_idx);
         self.heights.remove(&pane_idx);
         self.buildings.remove(&pane_idx);
+        self.showing.remove(&pane_idx);
         self.retain_uploads(live_ids);
     }
 
@@ -1436,8 +1475,26 @@ impl VolumeResources {
     }
 
     /// Keep the uploads `live_ids` names and drop the rest.
+    ///
+    /// **A fill is retired with its target.** `VolumeStore::enforce_budget`
+    /// evicts by dropping an entry, and the eviction reaches the GPU as an id
+    /// missing from `live_ids`; a fill for one of those has nothing left to
+    /// become, and its half-written texture would otherwise sit resident until
+    /// the pane closed. Its stand-in goes with it in the same pass, because the
+    /// stand-in is only spared for the length of the fill.
     pub fn retain_uploads(&mut self, live_ids: &[u64]) {
-        self.uploads.retain(|id, _| live_ids.contains(id));
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !live_ids.contains(&pending.id))
+        {
+            self.pending = None;
+        }
+        let stand_in = self.pending.as_ref().and_then(|pending| pending.stand_in);
+        self.uploads
+            .retain(|id, _| live_ids.contains(id) || Some(*id) == stand_in);
+        self.showing
+            .retain(|_, id| live_ids.contains(id) || Some(*id) == stand_in);
     }
 
     /// Give `pane_idx` an offscreen of `size_px`, creating or resizing one only
@@ -1453,59 +1510,130 @@ impl VolumeResources {
         slot.is_some()
     }
 
-    /// Make `grid_id`'s upload resident — the texels once, the colour table
-    /// whenever the effective one changed — and say whether it is.
+    /// Make `grid_id`'s upload resident — the texels a band a frame, the colour
+    /// table whenever the effective one changed — and answer which upload
+    /// `pane_idx` should be drawn through: `grid_id` once it is whole, the grid
+    /// the pane was already painting while it fills, and `None` when there is
+    /// nothing to draw at all.
+    ///
+    /// The twin of [`Self::ensure_pane_buildings`], down to the bounded slice
+    /// per call — **except that nothing here is left out of the picture while
+    /// it lands**. A city that has not arrived is a terrain with no city on it;
+    /// a grid that has not arrived would be an empty pane, so the previous grid
+    /// stands in for it. See [`PendingFill::stand_in`].
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pane_idx: usize,
         grid_id: u64,
         cells: [u32; 3],
         indices: &[u8],
         palette: &[u8],
         alpha: Option<&AlphaCurve>,
         coarse: CoarseLevel,
-    ) -> bool {
+    ) -> Option<u64> {
         // Through the entry API rather than `contains_key` + `insert`, which is
         // one hash lookup instead of two — and the upload is refusable, so this
         // is a `match` on the entry rather than `or_insert_with`.
-        match self.uploads.entry(grid_id) {
-            std::collections::hash_map::Entry::Occupied(occupied) => {
-                let upload = occupied.into_mut();
-                // The Volume Alpha seam's steady state: rewrite the 1 KiB table
-                // only when the curve actually changed — a pointer comparison
-                // almost every frame — and leave the 16 MiB grid untouched
-                // always.
-                if upload.applied_alpha.as_ref() != alpha {
-                    upload
-                        .textures
-                        .write_lut(queue, &effective_lut(palette, alpha));
-                    upload.applied_alpha = alpha.cloned();
-                }
-                true
+        if let std::collections::hash_map::Entry::Occupied(occupied) = self.uploads.entry(grid_id) {
+            let upload = occupied.into_mut();
+            // The Volume Alpha seam's steady state: rewrite the 1 KiB table
+            // only when the curve actually changed — a pointer comparison
+            // almost every frame — and leave the 16 MiB grid untouched
+            // always.
+            if upload.applied_alpha.as_ref() != alpha {
+                upload
+                    .textures
+                    .write_lut(queue, &effective_lut(palette, alpha));
+                upload.applied_alpha = alpha.cloned();
             }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Some(textures) = self.pipelines.upload_volume_at(
-                    device,
-                    queue,
-                    cells,
-                    indices,
-                    &effective_lut(palette, alpha),
-                    coarse,
-                    &mut self.staging,
-                ) else {
-                    // `upload_volume` has already logged which invariant it
-                    // refused on. Nothing to add, and nothing to draw.
-                    return false;
-                };
-                vacant.insert(VolumeUpload {
-                    textures,
-                    applied_alpha: alpha.cloned(),
-                });
-                true
+            self.showing.insert(pane_idx, grid_id);
+            return Some(grid_id);
+        }
+
+        // Not uploaded. Open the fill if nothing else is filling, then carry
+        // this frame's band — begin and advance in the one call, so a grid
+        // small enough to land in a single band costs no extra frame.
+        if self.pending.is_none() {
+            let Some(upload) = self.pipelines.begin_volume(
+                device,
+                queue,
+                cells,
+                indices,
+                &effective_lut(palette, alpha),
+                coarse,
+            ) else {
+                // `begin_volume` has already logged which invariant it refused
+                // on. Nothing to add, and nothing to draw.
+                return None;
+            };
+            self.pending = Some(PendingFill {
+                id: grid_id,
+                upload,
+                applied_alpha: alpha.cloned(),
+                stand_in: self
+                    .showing
+                    .get(&pane_idx)
+                    .copied()
+                    .filter(|id| self.uploads.contains_key(id)),
+            });
+        }
+
+        // Destructured so the borrow checker can see that the pipelines and the
+        // staging are read beside the fill and not through it.
+        let VolumeResources {
+            pipelines,
+            pending,
+            staging,
+            ..
+        } = self;
+        let whole = match pending.as_mut().filter(|fill| fill.id == grid_id) {
+            Some(fill) => {
+                // The editor's curve reaches a grid that has not landed yet, so
+                // a drag during a fill is not a drag the pane answers late.
+                if fill.applied_alpha.as_ref() != alpha {
+                    fill.upload
+                        .textures()
+                        .write_lut(queue, &effective_lut(palette, alpha));
+                    fill.applied_alpha = alpha.cloned();
+                }
+                pipelines.advance_volume(device, queue, &mut fill.upload, indices, staging)
+            }
+            None => false,
+        };
+        if whole && let Some(fill) = self.pending.take() {
+            // The last band. Only now does the pane see the new grid.
+            self.uploads.insert(
+                grid_id,
+                VolumeUpload {
+                    textures: fill.upload.into_textures(),
+                    applied_alpha: fill.applied_alpha,
+                },
+            );
+            self.showing.insert(pane_idx, grid_id);
+            return Some(grid_id);
+        }
+
+        // Still filling — this pane's, or another pane's ahead of it. The grid
+        // this pane already had, if it still has one.
+        let stand_in = self
+            .showing
+            .get(&pane_idx)
+            .copied()
+            .filter(|id| self.uploads.contains_key(id))?;
+        if let Some(upload) = self.uploads.get_mut(&stand_in) {
+            // Through the same staleness gate the settled path uses: a curve
+            // edited during a fill applies to the picture actually on screen.
+            if upload.applied_alpha.as_ref() != alpha {
+                upload
+                    .textures
+                    .write_lut(queue, &effective_lut(palette, alpha));
+                upload.applied_alpha = alpha.cloned();
             }
         }
+        Some(stand_in)
     }
 
     /// GPU texture bytes this is holding in the two maps
@@ -1523,10 +1651,15 @@ impl VolumeResources {
                 )
             })
             .sum();
+        // The fill's textures count from its first band, because that is when
+        // the device reserved them — and while one is in flight the stand-in it
+        // spared is in `uploads` beside it, so this is the peak the design
+        // costs: one grid more than the store is holding.
         let uploads: usize = self
             .uploads
             .values()
             .map(|upload| upload.textures.texture_bytes())
+            .chain(self.pending.iter().map(|fill| fill.upload.texture_bytes()))
             .sum();
         let heights: usize = self
             .heights
@@ -1660,11 +1793,6 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             log::warn!("3D volume view: no VolumeResources in the callback map; nothing to draw");
             return Vec::new();
         };
-        // Everything the store has let go of, before this frame's own is made
-        // resident beside it. The same line `release_pane` runs, and the reason
-        // both exist is written there.
-        resources.retain_uploads(&self.live_ids);
-
         if !resources.ensure_pane_offscreen(device, self.pane_idx, self.offscreen) {
             return Vec::new();
         }
@@ -1689,9 +1817,10 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         // carry one; this is the second place that stays true if it ever stops.
         let has_buildings = has_heights && resident;
         let shape = self.grid.dims();
-        if !resources.ensure_upload(
+        let Some(draw_id) = resources.ensure_upload(
             device,
             queue,
+            self.pane_idx,
             self.grid_id,
             [shape.nx as u32, shape.ny as u32, shape.nz as u32],
             self.grid.indices(),
@@ -1708,9 +1837,15 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
                 self.uniform.gradient_shading,
                 largest_cell_km(&self.uniform),
             ),
-        ) {
+        ) else {
             return Vec::new();
-        }
+        };
+        // Everything the store has let go of, and any fill it let go of with
+        // them. **After the upload above, not before**: the grid this pane is
+        // painting while a fill runs is one the store has already stopped
+        // naming, and `ensure_upload` is what marks it spared. The same line
+        // `release_pane` runs, and the reason both exist is written there.
+        resources.retain_uploads(&self.live_ids);
 
         // Destructured so the borrow checker can see that the pipelines are read
         // while the two maps are read beside them.
@@ -1725,12 +1860,17 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             // including the staging ring's own submit, so nothing here is
             // waiting on a plane that has not been handed to the queue.
             staging: _,
+            pending: _,
+            showing: _,
         } = resources;
-        // Both are known present — the two calls above answered `true` — and
+        // Both are known present — the two calls above answered with one — and
         // both are answered rather than unwrapped because this runs on the frame
         // thread, where on wasm a panic aborts the whole application.
+        //
+        // `draw_id` and not `self.grid_id`: while a fill is in flight they are
+        // two different grids, and the one on screen is this one.
         let (Some(Some(target)), Some(upload)) =
-            (targets.get(&self.pane_idx), uploads.get(&self.grid_id))
+            (targets.get(&self.pane_idx), uploads.get(&draw_id))
         else {
             return Vec::new();
         };
@@ -1837,7 +1977,15 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         };
         // Nothing was uploaded, so the offscreen holds whatever the last draw
         // left. Better an empty pane than another pane's volume.
-        if !resources.uploads.contains_key(&self.grid_id) {
+        //
+        // Asked of the pane rather than of `self.grid_id`, because while a fill
+        // is in flight the grid `prepare` marched is the one this pane was
+        // already painting and not the one the store handed the callback.
+        if !resources
+            .showing
+            .get(&self.pane_idx)
+            .is_some_and(|id| resources.uploads.contains_key(id))
+        {
             return;
         }
 
