@@ -451,7 +451,7 @@ fn treadmill_census(latency: usize, cycles: i64) -> String {
     let mut tokens_seen: std::collections::HashSet<u64> = Default::default();
     let mut inflight: Vec<(usize, u64)> = Vec::new();
 
-    let mut land = |app: &mut crate::app::App, token: u64| {
+    let land = |app: &mut crate::app::App, token: u64| {
         app.channels
             .overlay_render_sender
             .send(crate::channels::OverlayRenderResponse {
