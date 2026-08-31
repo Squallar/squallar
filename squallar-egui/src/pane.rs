@@ -1039,15 +1039,18 @@ pub struct PaneState {
     /// [`PaneConfigBaggage`]. Written by `load_ui_config`, read only by
     /// `ui_config_json`, and never acted on in between.
     pub config_baggage: PaneConfigBaggage,
-    /// **A loop this pane was restored wanting**, consumed once by the app when
-    /// it hydrates the reload — `None` on a pane that had no loop, and `None`
-    /// again the moment it has been acted on.
+    /// **A loop this pane wants but does not have yet** — restored from the
+    /// config, or parked by the app while the site's first scan is still on
+    /// the wire. `None` on a pane that wants no loop, and `None` again the
+    /// moment the wish resolves (armed, or refused as unlistable).
     ///
     /// A request rather than a state, because arming a loop needs a fetch
     /// config, a listing dispatch and a download manager, none of which this
     /// crate has. The alternative — restoring a phase directly — would put the
     /// pane in `Playing` with an empty frame list, which is a picture of
-    /// nothing that claims to be a loop.
+    /// nothing that claims to be a loop. While it is parked here it is also
+    /// what a config save writes back, so a save made during the wait keeps
+    /// the loop.
     pub loop_arm_pending: Option<LoopArm>,
     /// **Where this pane sits on the clock, and how it moves along it.** The
     /// pane's own posture, shared by every layer it draws — the layers keep

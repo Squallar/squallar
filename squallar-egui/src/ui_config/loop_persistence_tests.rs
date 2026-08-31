@@ -108,6 +108,34 @@ fn a_pane_without_a_loop_asks_for_nothing() {
     assert_eq!(reopened.pane(0).expect("pane 0").loop_arm_pending, None);
 }
 
+/// **A wish still waiting for its first scan is written back, not dropped.**
+///
+/// A restored loop cannot arm until the site's first scan lands, so between
+/// boot and that arrival the transport's phase is honestly `Inactive` while
+/// `loop_arm_pending` still carries the whole request. A save made in that
+/// window used to read the phase alone and write no key — closing the app
+/// twice in a row before data arrived silently shed the loop.
+#[test]
+fn a_wish_still_waiting_for_its_scan_survives_a_save() {
+    for (playing, want) in [(true, "playing"), (false, "paused")] {
+        let mut gui = Gui::new();
+        {
+            let pane = gui.pane_mut(0).expect("pane 0");
+            pane.loop_arm_pending = Some(LoopArm { playing });
+            assert_eq!(
+                pane.transport_state().phase,
+                LoopPhase::Inactive,
+                "precondition: the wish is parked, not armed",
+            );
+        }
+        assert_eq!(
+            loop_playback_of(gui.pane(0).expect("pane 0")).as_deref(),
+            Some(want),
+            "a parked wish (playing: {playing}) must be written back",
+        );
+    }
+}
+
 /// An unrecognised spelling reads as no loop rather than as an error.
 ///
 /// Every other field in this file is read tolerantly, and a config that has been

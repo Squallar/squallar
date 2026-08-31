@@ -389,9 +389,21 @@ const LOOP_PAUSED: &str = "paused";
 /// listing, rendering — collapse to `paused`, because what they have in common
 /// with a paused loop is "armed, not advancing", and a config written mid-fetch
 /// must not reopen into a state that claims frames it never had.
+///
+/// An `Inactive` transport still asks [`PaneState::loop_arm_pending`]: a
+/// restored loop cannot arm until the site's first scan lands, and a save
+/// made during that wait must write the parked wish back rather than shed
+/// the loop.
 fn loop_playback_of(pane: &PaneState) -> Option<String> {
     match pane.transport_state().phase {
-        crate::pane::LoopPhase::Inactive => None,
+        crate::pane::LoopPhase::Inactive => pane.loop_arm_pending.map(|arm| {
+            if arm.playing {
+                LOOP_PLAYING
+            } else {
+                LOOP_PAUSED
+            }
+            .to_string()
+        }),
         crate::pane::LoopPhase::Playing => Some(LOOP_PLAYING.to_string()),
         crate::pane::LoopPhase::FetchingScanList
         | crate::pane::LoopPhase::Rendering
