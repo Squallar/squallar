@@ -63,6 +63,13 @@ members = [
     # (15 + 22 + 2 added with the Circle serde fix) plus 1 doctest and 1
     # ignored. See vendor/walkers/VENDORED.md and `[patch.crates-io]` below.
     "vendor/walkers",
+    # The fifth vendored crates.io crate, a member for the same reason as the
+    # others: upstream's `model_types` suite is the behaviour pin on the scan
+    # model that the one-method delta (`Scan::into_sweeps`, the owned
+    # decomposition a budget-paced teardown needs) must leave untouched, and it
+    # only runs if `cargo test --workspace` selects it. See
+    # vendor/nexrad-model/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/nexrad-model",
 ]
 
 [workspace.package]
@@ -290,6 +297,7 @@ rustls = { version = "=0.23.43", default-features = false, features = ["ring", "
 [patch.crates-io]
 nexrad-decode = { path = "vendor/nexrad-decode" }
 nexrad-data = { path = "vendor/nexrad-data" }
+nexrad-model = { path = "vendor/nexrad-model" }
 walkers = { path = "vendor/walkers" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
@@ -370,6 +378,15 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.walkers]
+opt-level = 2
+
+# The model every decoded radial lands in: `MomentData::values` and
+# `Sweep::from_radials` run inside the decode of every volume, and they were
+# covered by the `"*"` override until this crate became a member. Naming it
+# here puts it back where it was as a plain dependency.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.nexrad-model]
 opt-level = 2
 
 [profile.release]

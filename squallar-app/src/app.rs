@@ -1616,7 +1616,10 @@ impl App {
                                 scan_info.timestamp,
                                 (Arc::clone(&scan_arc), Arc::clone(&declared_nyquist)),
                             );
-                            squallar_worker::offload::discard_each("capped-still", forced);
+                            squallar_worker::offload::discard_each(
+                                "capped-still",
+                                crate::volume_inventory::volume_drop_parts(forced),
+                            );
                             self.gui.apply(fetch::scan_info_delivery(
                                 site.clone(),
                                 requester,
@@ -1888,15 +1891,31 @@ impl App {
         let wanted = |site: &str, at: chrono::NaiveDateTime| {
             parked.iter().any(|&(s, t)| s == site && t == at)
         };
+        // Each volume crosses to the drop queue split at its sweep seam
+        // (`volume_drop_parts`), so a wasm drain turn frees a sweep, never a
+        // whole volume.
         let evicted_stills = self.volumes.retain_still(&wanted);
-        squallar_worker::offload::discard_each("evicted-scan", evicted_stills);
+        squallar_worker::offload::discard_each(
+            "evicted-scan",
+            crate::volume_inventory::volume_drop_parts(evicted_stills),
+        );
+        let evicted_bases = self.volumes.evict_base(&unshown);
         squallar_worker::offload::discard_each(
             "evicted-base-volume",
-            self.volumes.evict_base(&unshown),
+            crate::volume_inventory::volume_drop_parts(
+                evicted_bases
+                    .into_iter()
+                    .map(|(scan, nyquist, _)| (scan, nyquist)),
+            ),
         );
+        let evicted_cached = evicted(&mut self.latest_cached_scans, &unshown);
         squallar_worker::offload::discard_each(
             "evicted-cached-volume",
-            evicted(&mut self.latest_cached_scans, &unshown),
+            crate::volume_inventory::volume_drop_parts(
+                evicted_cached
+                    .into_iter()
+                    .map(|(scan, nyquist, _, _)| (scan, nyquist)),
+            ),
         );
         self.render.retain_extracts(|key| !unshown(&key.site));
         self.evict_unneeded_loop_scans();
@@ -1963,7 +1982,7 @@ impl App {
         self.loop_mgr.retain_plan_frames(keep);
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",
-            self.loop_mgr.retain_scans(keep),
+            crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep)),
         );
         squallar_worker::offload::discard_each(
             "evicted-loop-object",

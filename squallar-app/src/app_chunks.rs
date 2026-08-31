@@ -264,7 +264,10 @@ impl super::App {
             timestamp,
             (Arc::clone(&scan), Arc::clone(&declared)),
         );
-        squallar_worker::offload::discard_each("capped-still", forced);
+        squallar_worker::offload::discard_each(
+            "capped-still",
+            crate::volume_inventory::volume_drop_parts(forced),
+        );
 
         if let Some((closed, _)) = completed {
             // A whole closed volume is the same volume the archive will publish
