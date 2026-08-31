@@ -522,9 +522,25 @@ pub struct OverlayTextureCache {
     held: Option<HeldOverlayTexture>,
     /// Whether a picture that was still crossing to the GPU has already been
     /// thrown away since the last one reached the screen. Cleared the moment
-    /// [`Self::held`] empties by any route; see the coverage arm of
-    /// [`Self::needs_rerender_with_policy`], which is the only thing that reads
-    /// it and the only dispatch it brakes.
+    /// [`Self::held`] empties by any route; read by
+    /// [`Self::needs_rerender_with_policy`], which brakes **two** arms on it —
+    /// content and coverage. The content arm joined it on measurement: 91.5%
+    /// of a playing loop's superseded uploads were attributable to the as-of
+    /// half of the token, and that arm's own note carries the figures.
+    ///
+    /// **Not the same quantity as [`ledger::Totals::superseded`], and the
+    /// difference runs the opposite way to the obvious guess.** They rise on
+    /// the same condition at the same instant — `squallar-app`'s overlay
+    /// arrival asks `is_holding()` and calls
+    /// [`ledger::note_superseded`] immediately before the [`Self::hold`] whose
+    /// `|=` sets this flag — so neither is a subset of the other *by
+    /// condition*. They differ by **coverage**: radar's own arrival holds
+    /// through `PaneState::place_radar_raster` without touching the ledger, so
+    /// this flag can be set on a pane the counter never counted. A leg reading
+    /// a large `superseded` beside a fixture reading none is therefore not two
+    /// denominators over one population; it is almost always a **synchronous
+    /// fixture**, whose `deliver_held_rasters` empties [`Self::held`] before
+    /// the next arrival and so can never reproduce the condition at all.
     hold_superseded: bool,
     /// The rasters this pane has asked for and not yet been answered, bounded
     /// by the device's `Budgets::concurrent_renders`. Replaced a `bool` that
@@ -668,8 +684,53 @@ impl OverlayTextureCache {
         else {
             return true;
         };
+        // ── Content ─────────────────────────────────────────────────────────
+        //
+        // The pixels are for another token, so a new picture is owed —
+        // **unless this pane has already thrown one away and is still waiting
+        // on its replacement.** That last clause is the brake, and it is the
+        // same one the coverage arm carries at the end of this function; what
+        // follows is why the content arm now carries it too, because this
+        // module used to say in as many words that it did not.
+        //
+        // **The measurement that reversed it** (native scene E2, 1 pane KTLX
+        // at 10 fps with the full stack — six `TimeAxis::EventLifetime`
+        // texture layers — 100 s legs, two runs per arm, interleaved against
+        // a busy box so drift is common-mode). One binary, run against itself
+        // with the as-of half of the token frozen:
+        //
+        // | figure          | as-of live | as-of frozen | attributable |
+        // |-----------------|-----------:|-------------:|-------------:|
+        // | dispatched      |       3089 |          811 |        73.7% |
+        // | picture bytes   |   55.58 GB |     14.58 GB |        73.8% |
+        // | **superseded**  |       1419 |          120 |    **91.5%** |
+        // | frames presented|       6064 |         6809 |      +12.3%¹ |
+        //
+        // ¹ frames the app presented in the same 100 s; the count and not a
+        // percentile, because `frame segments`' `prepare` p99 sits on the
+        // instrument's top bin (38,055 us in three legs of four) and cannot
+        // resolve the arms at all.
+        //
+        // So **44% of the pictures this pane rasterized under a playing loop
+        // were handed to a cache already holding one** — uploaded, then
+        // discarded before a single band of them was drawn. That is the
+        // pathology [`RenderSlot`]'s note describes for the coverage arm and
+        // the fling fixture pins: spend a raster, throw away the upload,
+        // promote nothing. It was measured here on the *content* arm, which
+        // is why the exemption this module used to grant it is gone.
+        //
+        // **What keeps it from dropping content the pipeline could deliver.**
+        // The brake is a statement about delivery and never about rate: it
+        // needs a hold that was already superseded AND one still in flight.
+        // Both clear the moment [`Self::take_held_if_delivered`] sees a
+        // picture land, so a pipeline that keeps up is never braked once —
+        // the 1 fps end of the Speed slider, a synchronous test pipeline, and
+        // every live pane that re-tokenizes once rather than continuously all
+        // dispatch exactly as they did before. What it removes is the second
+        // and later dispatch into a pane that has *demonstrated* it cannot
+        // land the first.
         if tex.data_generation != token {
-            return true;
+            return !(self.hold_superseded && self.held.is_some());
         }
         // The texture is no longer the size this pane would ask for. Nothing
         // else here can notice that: a display-density change — a window moved
@@ -744,9 +805,11 @@ impl OverlayTextureCache {
         // mid-upload, promoted **none**, and left the pane drawing the picture
         // it had when the fling started.
         //
-        // This is the only arm braked. A hold that is stale in *content* is
-        // still superseded, by the arms above, however many have been
-        // superseded before it.
+        // The content arm carries this same brake, on the same two clauses,
+        // for the same reason — see its note and the E2 figures there. The
+        // arms between (plan size, zoom band, settle) stay unbraked: each
+        // fires once per settled change rather than continuously, so none of
+        // them can close the dispatch-and-discard loop this guards.
         !(self.hold_superseded && self.held.is_some())
     }
 }
@@ -990,6 +1053,11 @@ mod settle_tests;
 /// dispatch may throw away.
 #[cfg(test)]
 mod coverage_dispatch_tests;
+
+/// When the content arm may refuse: a pane that has thrown away an upload and
+/// is still waiting on its replacement, and nothing else.
+#[cfg(test)]
+mod content_brake_tests;
 
 /// The deadband on the coverage trigger: a pan too small to move a texel must
 /// not re-rasterise the overlay, and must not be able to stall one either.

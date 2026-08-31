@@ -104,6 +104,23 @@ pub struct Totals {
     /// upload that had started was thrown away before it could be drawn. This
     /// is the quantity the `PAN_REBUILD_THRESHOLD` sweep calls a discarded
     /// hold, and the one a world-anchored tile grid is meant to make rare.
+    ///
+    /// **Reading this beside `OverlayTextureCache::hold_superseded`.** They
+    /// are not two denominators over one population, which is the natural
+    /// guess and is wrong. The two rise on the *same* condition at the *same*
+    /// instant: the overlay arrival asks `is_holding()` and calls
+    /// [`note_superseded`] immediately before the `hold()` whose `|=` sets the
+    /// flag. What differs is coverage, and this figure is the **smaller** one
+    /// — radar's own arrival holds through `PaneState::place_radar_raster`
+    /// without coming past this counter, so the flag can be set where this
+    /// never increments.
+    ///
+    /// So a native leg reading this in the hundreds beside a fixture reading
+    /// **zero** is not a denominator mismatch to reconcile: it is a
+    /// **synchronous fixture**. One whose delivery empties the hold before the
+    /// next arrival can never reproduce the condition, and a conclusion drawn
+    /// from it about an asynchronous pipeline does not hold. That mistake has
+    /// been made on this counter once already.
     pub superseded: u64,
     /// Of [`Self::dispatched`], those withdrawn at the supersede seam (WO-8)
     /// before their answer was used: a newer dispatch replaced every
