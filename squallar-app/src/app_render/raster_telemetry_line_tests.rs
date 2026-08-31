@@ -1,11 +1,20 @@
 //! **The browser rig reads the lines this app actually writes.**
 //!
-//! The two running-total sentences are the whole readout on the web target:
-//! `squallar-gpu` and `squallar-app` count, `App::report_raster_telemetry` says
-//! it once a frame, and `.github/browser-rig/drive.py` scrapes the sentence
-//! back out of the page's console ring with a regex. Nothing else connects
-//! them. They are in two languages, in two directories, and neither one's test
-//! suite compiles the other.
+//! The running-total sentences are the whole readout on the web target:
+//! `squallar-gpu`, `squallar-egui` and `squallar-app` count,
+//! `App::report_raster_telemetry` says them once a frame, and
+//! `.github/browser-rig/drive.py` scrapes the sentence back out of the page's
+//! console ring with a regex. Nothing else connects them. They are in two
+//! languages, in two directories, and neither one's test suite compiles the
+//! other.
+//!
+//! Three of the four sentences are scraped and are pinned here. The
+//! `basemap tiles:` one is the only one the rig **gates** on with a single
+//! conjunct (`--expect-basemap-tiles`, `vector_tiles > 0`), so a drift there
+//! is not merely a `null` in a report: it is a gate that reads
+//! "the basemap decoded nothing" for every run until someone notices. The
+//! fourth, `floor strips:`, has no rig probe and so has nothing to be pinned
+//! against; if one is ever added, it is added here in the same shape.
 //!
 //! **This exact seam has already broken once during this work**, and in the
 //! worst possible way: a line-continuation backslash was eaten while writing
@@ -19,6 +28,7 @@
 //! terms `squallar-web`'s `pwa_assets` reads `worker_port.rs`: a copy of a
 //! literal is a second place for it to be wrong.
 
+use squallar_egui::basemap_ledger;
 use squallar_egui::overlay_cache::ledger;
 use squallar_gpu::egui_renderer::texture_upload::UploadTotals;
 
@@ -79,7 +89,8 @@ fn rendered(pattern: &str, groups: &[u64]) -> String {
     out
 }
 
-/// **Every field of both sentences, with a distinct value in each position.**
+/// **Every field of all three scraped sentences, with a distinct value in each
+/// position.**
 ///
 /// Distinct on purpose: a line whose fields were transposed — `dropped` and
 /// `superseded` swapped, `staged` and `blocking` swapped — reads identically
@@ -128,6 +139,25 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         rendered(&pattern("uploads_re"), &[13, 135, 25, 37, 49, 86]),
         "the `texture uploads:` line and the rig's own probe for it have drifted",
     );
+
+    // Three more distinct values, and none of them a prefix of another: the
+    // rig gates on the FIRST field of this line alone, so a transposition
+    // here would make `--expect-basemap-tiles` read the hillshade counter --
+    // or the sniff counter, which is expected to be zero on every archive
+    // this app opens and would therefore fail every leg for ever.
+    let basemap = basemap_ledger::Totals {
+        vector_tiles: 17,
+        raster_tiles: 29,
+        sniffed_tiles: 43,
+    };
+    assert_eq!(
+        super::basemap_tile_line(&basemap),
+        rendered(&pattern("basemap_re"), &[17, 29, 43]),
+        "the `basemap tiles:` line and the rig's own probe for it have \
+         drifted. --expect-basemap-tiles will then read the basemap as \
+         null, which it reports identically to a basemap that decoded \
+         nothing -- the exact defect this gate was added for",
+    );
 }
 
 /// The floor under the test above: `rendered` really can disagree.
@@ -153,6 +183,24 @@ fn a_line_that_drifted_by_one_space_is_not_accepted() {
         drifted,
         "a line with one extra space compared equal to the real one, so the \
          test above cannot fail",
+    );
+
+    // The same floor under the basemap pin, on the field the rig gates on:
+    // the pattern really names `vector` and would not accept another word.
+    let basemap = basemap_ledger::Totals::default();
+    let good = rendered(&pattern("basemap_re"), &[0; 3]);
+    assert_eq!(super::basemap_tile_line(&basemap), good);
+    let drifted = good.replacen(" vector,", " vectors,", 1);
+    assert_ne!(
+        drifted, good,
+        "the substitution produced a sentence with no ` vector,` in it, so \
+         the perturbation below is not perturbing anything",
+    );
+    assert_ne!(
+        super::basemap_tile_line(&basemap),
+        drifted,
+        "a basemap line with a drifted field name compared equal to the real \
+         one, so the pin above cannot fail",
     );
 }
 
@@ -183,6 +231,34 @@ fn the_rig_seeds_the_key_that_makes_the_lines_loud() {
          running-total lines at `debug`, `console_log` drops them before the \
          console ring, and `--expect-overlay-rasters` reads the overlay path \
          as null -- which is what it reports when that path never ran at all",
+    );
+}
+
+/// **The basemap gate is actually asked for.**
+///
+/// A `--expect-basemap-tiles` that `drive.py` defines and `run_tier2.sh` never
+/// passes is a flag, not a gate: every leg goes green, the figure is printed,
+/// and the reading it exists to force is optional again. This is the same
+/// shape as the seed test above — the two halves live in two files and neither
+/// one's suite compiles the other — so it is checked the same way, from the
+/// side that owns the sentence.
+///
+/// Both halves are named, because either alone can be wrong: the flag has to
+/// exist in the driver's argument parser AND ride a leg in the launcher.
+#[test]
+fn the_rig_asks_for_the_basemap_reading_it_can_now_take() {
+    const FLAG: &str = "--expect-basemap-tiles";
+    assert!(
+        DRIVE_PY.contains(&format!("\"{FLAG}\"")),
+        "drive.py no longer declares {FLAG}, so the `basemap tiles:` line is \
+         a number nobody gates on and a basemap that decodes nothing passes \
+         Tier-2 again",
+    );
+    assert!(
+        RUN_TIER2.contains(FLAG),
+        "run_tier2.sh never passes {FLAG}, so the gate exists and is never \
+         asked for -- every leg stays green with a dead basemap, which is the \
+         state this whole seam was added to end",
     );
 }
 

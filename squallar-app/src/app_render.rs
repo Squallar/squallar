@@ -360,6 +360,27 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
     )
 }
 
+/// The `basemap tiles:` running-total line. See [`overlay_raster_line`] for
+/// why this is a value rather than an argument to `log::info!` — and this one
+/// most of all, because the Tier-2 rig **gates** on it
+/// (`--expect-basemap-tiles`) rather than merely printing it.
+///
+/// A third denominator, added to neither raster figure. Every number here
+/// counts one archive tile *body* that decoded; see
+/// [`squallar_egui::basemap_ledger`] for what that excludes. `vector` is the
+/// self-hosted basemap's MVT and is the floor — it went to zero for the whole
+/// life of a shipped build while every other Tier-2 assertion stayed green,
+/// which is the reading this line exists to make. `raster` is the terrain
+/// hillshade, legitimately zero with terrain off. `sniffed` is an archive that
+/// declared no `tile_type`, which no archive this app opens does, so any
+/// non-zero reading there is itself the finding.
+fn basemap_tile_line(t: &squallar_egui::basemap_ledger::Totals) -> String {
+    format!(
+        "basemap tiles: {} vector, {} raster, {} sniffed",
+        t.vector_tiles, t.raster_tiles, t.sniffed_tiles,
+    )
+}
+
 /// What the shell does with the mirror on one frame — the two old states plus
 /// the strip cache's third.
 ///
@@ -1088,8 +1109,8 @@ impl super::App {
     /// **Say what the raster pipeline has spent, periodically, on a tick where
     /// it spent something since the last one.**
     ///
-    /// Two lines, never one, because they have two different denominators and
-    /// adding them would describe neither:
+    /// Four lines, never one, because they have four different denominators
+    /// and adding any of them would describe neither term:
     ///
     /// * `overlay rasters:` is the whole-picture overlay dispatch — the ten
     ///   layer kinds [`App::spawn_overlay_render`] rasterizes. Radar's own
@@ -1099,6 +1120,14 @@ impl super::App {
     ///   **every** texture egui holds — the font atlas, the basemap tiles and
     ///   radar included. See
     ///   [`squallar_gpu::egui_renderer::texture_upload::UploadTotals`].
+    /// * `floor strips:` is the 3D floor path — strips painted per pane per
+    ///   frame, mirror passes encoded per frame. See
+    ///   [`squallar_egui::floor_ledger`].
+    /// * `basemap tiles:` is archive tile **bodies decoded**, split by the
+    ///   archive header's declared kind. A vector decode uploads no texture at
+    ///   all and is in none of the three above; a raster decode is one egui
+    ///   texture and so is a *subset* of `texture uploads`, never a term to
+    ///   add to it. See [`squallar_egui::basemap_ledger`].
     ///
     /// Running totals rather than per-event deltas, so **one** line is the
     /// whole answer: the browser's console is a ring that evicts, and a reader
@@ -1109,7 +1138,7 @@ impl super::App {
     ///
     /// Two things bound it, and they answer two different questions.
     ///
-    /// **How often**: at most one pair of lines per
+    /// **How often**: at most one round of lines per
     /// [`RASTER_TELEMETRY_PERIOD`], however busy the pipeline is. The
     /// alternative — a line on every frame the pipeline moved — is 120 INFO
     /// lines a second under any activity at all, saying a number that has
@@ -1125,18 +1154,20 @@ impl super::App {
     /// `info` for the instrument is load-bearing on the browser target, where
     /// `console_log` is initialised at `Level::Info` and a `debug!` line is
     /// invisible to the Tier-2 rig. That is why the switch moves the *level*
-    /// and not the sentence: `.github/browser-rig/drive.py` scrapes these two
-    /// lines out of the console ring, and `raster_telemetry_line_tests` pins
-    /// both the sentence and the key the rig has to seed to hear it.
+    /// and not the sentence: `.github/browser-rig/drive.py` scrapes three of
+    /// these lines out of the console ring, and `raster_telemetry_line_tests`
+    /// pins each scraped sentence against the rig's own regex for it, plus the
+    /// key the rig has to seed to hear any of them.
     ///
     /// # What this costs the frame
     ///
     /// One monotonic clock read, and on all but one frame in
     /// [`RASTER_TELEMETRY_PERIOD`] nothing else — the ledgers are not even
     /// loaded. On the frame that is due and moved nothing: nine relaxed loads
-    /// and a failed compare-exchange for the first ledger, one `u64` add and
-    /// one compare for the second, and no formatting, because both
-    /// `*_if_moved` calls answer `None`. Nothing here takes a lock. The
+    /// and a failed compare-exchange for the overlay ledger, and two or three
+    /// relaxed loads plus one `u64` add and one compare for each of the other
+    /// three, and no formatting, because every `*_if_moved` call answers
+    /// `None`. Nothing here takes a lock. The
     /// increments themselves are one `fetch_add` each, at sites that run per
     /// dispatched raster, per arriving raster and per moved band — never in
     /// the per-pane-per-layer walks, which are the hot ones.
@@ -1152,7 +1183,13 @@ impl super::App {
             .and_then(|state| state.egui_renderer.upload_totals_if_moved());
         let strips = squallar_egui::floor_ledger::totals_if_moved();
         let ground = squallar_egui::tile_mesh::ledger::totals_if_moved();
-        if rasters.is_none() && uploads.is_none() && strips.is_none() && ground.is_none() {
+        let basemap = squallar_egui::basemap_ledger::totals_if_moved();
+        if rasters.is_none()
+            && uploads.is_none()
+            && strips.is_none()
+            && ground.is_none()
+            && basemap.is_none()
+        {
             return;
         }
         // Stamped only where a line really went out, so a quiet pipeline does
@@ -1170,6 +1207,9 @@ impl super::App {
         }
         if let Some(g) = ground {
             say_telemetry(loud, &ground_tile_line(&g));
+        }
+        if let Some(b) = basemap {
+            say_telemetry(loud, &basemap_tile_line(&b));
         }
     }
 

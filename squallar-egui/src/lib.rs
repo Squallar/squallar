@@ -17,6 +17,10 @@ pub(crate) mod basemap_areas;
 /// composition are later steps.
 pub mod basemap_download;
 pub mod basemap_layer;
+/// The archive tile path's always-on counters: vector, raster and sniffed
+/// bodies decoded. A basemap that decodes nothing reads zero here and passes
+/// every other gate, which is exactly how one shipped.
+pub mod basemap_ledger;
 /// The two committed basemap styles, compiled in. The `include_str!` pair is
 /// 241 KB of JSON, carried by every build because every build renders the
 /// vector basemap from it.

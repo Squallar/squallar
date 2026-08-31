@@ -2328,6 +2328,68 @@ mod archive_decode {
         );
     }
 
+    /// **A decode that succeeded reaches the basemap ledger, under the kind
+    /// the header declared.**
+    ///
+    /// This is the counter the Tier-2 rig now gates on
+    /// (`--expect-basemap-tiles`, `vector_tiles > 0`), and the whole point of
+    /// it is that a basemap decoding nothing is otherwise invisible: it was
+    /// invisible for the entire life of a shipped build. So the increment
+    /// itself needs a reading, or the gate is downstream of an unpinned line.
+    ///
+    /// **Deltas, and strict-increase deltas at that, never absolute values.**
+    /// The counters are process-global statics and these tests run in
+    /// parallel, so an equality on a total would be asserting what the rest of
+    /// the binary happened to be doing. `after > before` is monotone and
+    /// cannot be flaked by a concurrent decode — while still failing outright
+    /// if the increment were deleted, or wired to the other counter, which is
+    /// the pair of mistakes it exists to catch. What is deliberately NOT
+    /// asserted here is the other half — that a refused decode counts nothing
+    /// — because that IS an equality on a global and would flake; it is
+    /// structural instead: `decode_archive_tile` reaches `note_archive_decode`
+    /// only past a `?`.
+    #[test]
+    fn a_decoded_body_lands_in_the_basemap_ledger_under_its_declared_kind() {
+        let ctx = Context::default();
+
+        if let Some((kind, bytes)) = kind_and_tile("monaco.pmtiles", 14, 8529, 5974) {
+            assert_eq!(kind, ArchiveTileKind::Vector);
+            let before = crate::basemap_ledger::totals();
+            decode_archive_tile(
+                &bytes,
+                kind,
+                &crate::basemap_style::committed(true),
+                14,
+                &ctx,
+            )
+            .expect("the MVT body tessellates");
+            let after = crate::basemap_ledger::totals();
+            assert!(
+                after.vector_tiles > before.vector_tiles,
+                "an MVT body decoded and the basemap ledger's vector counter \
+                 did not move ({} -> {}); --expect-basemap-tiles then reads a \
+                 live basemap as dead on every Tier-2 leg",
+                before.vector_tiles,
+                after.vector_tiles,
+            );
+        }
+
+        if let Some((kind, bytes)) = kind_and_tile("terrain-hillshade-mini.pmtiles", 10, 224, 395) {
+            assert_eq!(kind, ArchiveTileKind::Hillshade);
+            let before = crate::basemap_ledger::totals();
+            decode_archive_tile(&bytes, kind, &Style::default(), 10, &ctx)
+                .expect("the WebP body decodes");
+            let after = crate::basemap_ledger::totals();
+            assert!(
+                after.raster_tiles > before.raster_tiles,
+                "a raster body decoded and the basemap ledger's raster \
+                 counter did not move ({} -> {})",
+                before.raster_tiles,
+                after.raster_tiles,
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Packed elevation
     // -----------------------------------------------------------------------
