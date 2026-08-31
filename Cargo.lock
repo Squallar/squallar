@@ -3600,6 +3600,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmtiles"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4bb49fe41324b32bb89bfe26aed92328ed255a99361d1e7bcb1eccfc8cf2c8a"
+dependencies = [
+ "async-compression",
+ "bytes",
+ "countio",
+ "fast_hilbert",
+ "flate2",
+ "reqwest",
+ "thiserror 2.0.20",
+ "tokio",
+ "twox-hash",
+ "varint-rs",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4670,7 +4688,7 @@ dependencies = [
  "image",
  "log",
  "lru",
- "pmtiles",
+ "pmtiles 0.24.0",
  "reqwest",
  "serde",
  "serde_json",

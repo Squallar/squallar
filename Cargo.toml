@@ -213,7 +213,7 @@ log = "=0.4.34"
 # `squallar-egui` instead of here. It is `dep:reqwest` at `0.13.1`, satisfied by
 # this workspace's `=0.13.4` pin above, so it adds features to a reqwest already
 # in the graph rather than a second copy of it.
-pmtiles = { version = "=0.23.0", default-features = false, features = [
+pmtiles = { version = "=0.24.0", default-features = false, features = [
     "__async",
 ] }
 
