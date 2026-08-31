@@ -374,6 +374,46 @@ const RASTER_STYLE_EPOCH: u64 = 0;
 struct CachedTile {
     epoch: u64,
     tile: Option<Tile>,
+    /// The tile's tessellated fills, flattened for the renderer — `None` for
+    /// a raster tile, a pending marker, or a vector tile whose style produced
+    /// no fills at this zoom. Built beside the styling, on the thread that
+    /// did the styling, so it never costs the frame more than the styling
+    /// already does; see [`crate::tile_mesh`].
+    meshes: Option<Arc<crate::tile_mesh::TileMeshes>>,
+}
+
+/// The cache slot a decoded tile becomes.
+///
+/// **Built where the tile was decoded**, which is the IO runtime's blocking
+/// pool on native and the frame pump's decode budget on wasm32 — the same two
+/// places the styling itself runs, so flattening the fills is billed to the
+/// side that already pays for tessellating them.
+fn slot_for(tile: Tile, epoch: u64) -> CachedTile {
+    let meshes = match &tile {
+        Tile::Vector(shapes) => {
+            let flat = crate::tile_mesh::flatten(shapes);
+            (!flat.is_empty()).then(|| Arc::new(flat))
+        }
+        Tile::Raster(_) => None,
+    };
+    CachedTile {
+        epoch,
+        tile: Some(tile),
+        meshes,
+    }
+}
+
+/// One grid cell's answer: the piece [`Tiles::at`] would have given, plus the
+/// flattened fills of the tile it came from.
+///
+/// The two travel together because they must describe the same cache slot: a
+/// stretched ancestor's fills are the *ancestor's*, and a piece paired with
+/// another tile's buffers would draw the wrong geography under the right
+/// clip.
+pub(crate) struct GroundPiece {
+    pub(crate) tile: Tile,
+    pub(crate) uv: egui::Rect,
+    pub(crate) meshes: Option<Arc<crate::tile_mesh::TileMeshes>>,
 }
 
 /// The terrain hillshade source's cache bound.
@@ -629,15 +669,15 @@ impl<T: TileSource + 'static> AsyncTileSource for T {}
 
 /// What one completed fetch hands the frame side.
 ///
-/// Native: the decoded [`Tile`] — [`fetch_one`] and [`read_one`] decode and
-/// upload on the IO thread — paired with the style generation it was styled
-/// under, so the frame side can drop a tile styled by a style a restyle has
-/// already replaced ([`CachedTile`]). wasm32: the work still owed, under the
-/// frame pump's [`WASM_TILE_DECODES_PER_PUMP`] budget — see
+/// Native: the finished cache slot — [`fetch_one`] and [`read_one`] decode,
+/// upload and flatten on the IO thread — carrying the style generation it was
+/// styled under, so the frame side can drop a tile styled by a style a restyle
+/// has already replaced ([`CachedTile`]). wasm32: the work still owed, under
+/// the frame pump's [`WASM_TILE_DECODES_PER_PUMP`] budget — see
 /// [`HttpsTiles::pump`]; no generation travels with it, because the pump
 /// styles against the frame's current style by construction.
 #[cfg(not(target_arch = "wasm32"))]
-type FetchPayload = (Tile, u64);
+type FetchPayload = CachedTile;
 #[cfg(target_arch = "wasm32")]
 enum FetchPayload {
     /// A tile body the pump must decode — a compressed PNG from a raster
@@ -1245,20 +1285,14 @@ impl HttpsTiles {
             tile_rx,
             NATIVE_TILE_UPLOADS_PER_PUMP,
             io_task_gone_reported,
-            |(tile_id, (tile, epoch)): (TileId, FetchPayload)| {
+            |(tile_id, slot): (TileId, FetchPayload)| {
                 // A tile styled under a generation a restyle has replaced is
                 // dropped, not drawn: its slot keeps showing the old style and
                 // [`Self::request_once`] re-asks under the current one, which
                 // the IO side answers from the parsed cache.
-                if epoch == current {
+                if slot.epoch == current {
                     *put_generation += 1;
-                    cache.put(
-                        tile_id,
-                        CachedTile {
-                            epoch,
-                            tile: Some(tile),
-                        },
-                    );
+                    cache.put(tile_id, slot);
                 }
             },
         );
@@ -1332,13 +1366,7 @@ impl HttpsTiles {
                 match decoded {
                     Ok(tile) => {
                         *put_generation += 1;
-                        cache.put(
-                            tile_id,
-                            CachedTile {
-                                epoch,
-                                tile: Some(tile),
-                            },
-                        );
+                        cache.put(tile_id, slot_for(tile, epoch));
                     }
                     Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
                 }
@@ -1395,7 +1423,14 @@ impl HttpsTiles {
                     slot.epoch = epoch;
                 }
             } else {
-                cache.put(tile_id, CachedTile { epoch, tile: None });
+                cache.put(
+                    tile_id,
+                    CachedTile {
+                        epoch,
+                        tile: None,
+                        meshes: None,
+                    },
+                );
             }
         });
 
@@ -1428,22 +1463,45 @@ impl HttpsTiles {
     /// tile styled by the outgoing style is what stands between the user and a
     /// blank beat, and its slot is already re-stamped for replacement by
     /// [`Self::request_once`].
-    fn cached_or_interpolated(&mut self, tile_id: TileId) -> Option<TilePiece> {
+    fn cached_or_interpolated(&mut self, tile_id: TileId) -> Option<GroundPiece> {
         let mut zoom_candidate = tile_id.zoom;
 
         loop {
             let (ancestor, uv) = interpolate_from_lower_zoom(tile_id, zoom_candidate);
 
             if let Some(CachedTile {
-                tile: Some(cached), ..
+                tile: Some(cached),
+                meshes,
+                ..
             }) = self.cache.get(&ancestor)
             {
-                break Some(TilePiece::new(cached.clone(), uv));
+                break Some(GroundPiece {
+                    tile: cached.clone(),
+                    uv,
+                    meshes: meshes.clone(),
+                });
             }
 
             // Out of ancestors: nothing to draw for this tile yet.
             zoom_candidate = zoom_candidate.checked_sub(1)?;
         }
+    }
+
+    /// [`Tiles::at`]'s answer with the tile's flattened fills beside it — what
+    /// the map's own tile pass draws through, since it is the only caller and
+    /// walkers' trait has no room for the second half.
+    pub(crate) fn ground_at(&mut self, tile_id: TileId) -> Option<GroundPiece> {
+        if !tile_id_is_valid(tile_id) {
+            return None;
+        }
+        let max_zoom = self.source_max_zoom()?;
+        let to_fetch = if tile_id.zoom > max_zoom {
+            interpolate_from_lower_zoom(tile_id, max_zoom).0
+        } else {
+            tile_id
+        };
+        self.request_once(to_fetch);
+        self.cached_or_interpolated(tile_id)
     }
 
     /// The source's deepest zoom, so a consumer picking its own zoom level
@@ -1503,13 +1561,9 @@ impl HttpsTiles {
         // The generation moves exactly as it does for a real arrival, so a
         // fixture's put is a tile-arrival staleness event for the strip key.
         self.put_generation += 1;
-        self.cache.put(
-            tile_id,
-            CachedTile {
-                epoch,
-                tile: Some(tile),
-            },
-        );
+        // Through the same constructor an arrival goes through, so a fixture
+        // carries the flattened fills a real tile carries.
+        self.cache.put(tile_id, slot_for(tile, epoch));
     }
 }
 
@@ -1527,26 +1581,15 @@ impl Tiles for HttpsTiles {
     /// IO task has finished arrives through [`Self::pump`], once for the whole
     /// layer.
     fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
-        if !tile_id_is_valid(tile_id) {
-            return None;
-        }
-
         // An archive source that has not read its header yet does not know what
         // it can serve. Asking anyway means asking for `0/0/0`, which is a real
         // tile that then never leaves the cache; see [`MAX_ZOOM_UNKNOWN`]. The
         // IO task repaints when the header lands, so this waits one frame.
-        let max_zoom = self.source_max_zoom()?;
-
         // Above the source's deepest zoom there is nothing to download; the
-        // ancestor at `max_zoom` is what gets stretched over the gap.
-        let to_fetch = if tile_id.zoom > max_zoom {
-            interpolate_from_lower_zoom(tile_id, max_zoom).0
-        } else {
-            tile_id
-        };
-
-        self.request_once(to_fetch);
-        self.cached_or_interpolated(tile_id)
+        // ancestor at `max_zoom` is what gets stretched over the gap. Both
+        // rules live in [`Self::ground_at`], which this narrows.
+        let piece = self.ground_at(tile_id)?;
+        Some(TilePiece::new(piece.tile, piece.uv))
     }
 
     fn tile_size(&self) -> u32 {
@@ -1600,7 +1643,7 @@ async fn fetch_one<S: TileSource>(
     // only consults a style for a body that is not a recognised image. The
     // epoch is likewise the raster constant: this source never restyles.
     #[cfg(not(target_arch = "wasm32"))]
-    let payload = (
+    let payload = slot_for(
         Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
             .map_err(|error| format!("decoding '{url}': {error}"))?,
         RASTER_STYLE_EPOCH,
@@ -2318,13 +2361,11 @@ where
         #[cfg(not(target_arch = "wasm32"))]
         let payload = {
             let (style, epoch) = current_style(&styling.style);
-            let tile =
-                tokio::task::spawn_blocking(move || styled_tile(&parsed, &style, tile_id.zoom))
-                    .await
-                    .map_err(|error| {
-                        format!("re-styling {tile_id:?} from the parsed cache: {error}")
-                    })?;
-            (tile, epoch)
+            tokio::task::spawn_blocking(move || {
+                slot_for(styled_tile(&parsed, &style, tile_id.zoom), epoch)
+            })
+            .await
+            .map_err(|error| format!("re-styling {tile_id:?} from the parsed cache: {error}"))?
         };
 
         // On wasm the styling belongs to the frame pump, under its budget.
@@ -2350,13 +2391,13 @@ where
         let egui_ctx = egui_ctx.clone();
         let parsed_tiles = Arc::clone(&styling.parsed_tiles);
 
-        let tile = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             decode_archive_tile_remembering(&bytes, kind, &style, tile_id, &egui_ctx, &parsed_tiles)
+                .map(|tile| slot_for(tile, epoch))
         })
         .await
         .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
-        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?;
-        (tile, epoch)
+        .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
     };
 
     // On wasm the tessellation belongs to the frame pump, under its budget.

@@ -379,6 +379,11 @@ pub(super) struct PaneRenderCtx<'a> {
     /// Which halves of the pane's content this pass is for. See
     /// [`PaneSurfaces`].
     pub surfaces: PaneSurfaces,
+    /// What can draw a vector tile's tessellated fills from the GPU, or
+    /// `None` where nothing can. Read through
+    /// [`Self::ground_mesh_painter`], which is where the floor strip is cut
+    /// out of it.
+    pub ground_meshes: Option<&'a std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
     /// Whether the pane this pass belongs to draws its ground as a 3D mesh
     /// rather than as flat map pixels. See [`GroundIsMesh`], which is a
     /// newtype rather than a `bool` for a reason this field is the whole
@@ -443,6 +448,27 @@ impl PaneRenderCtx<'_> {
     fn double_shades(&self, id: &LayerId) -> bool {
         self.surfaces == PaneSurfaces::GroundOnly
             && scene_light_supersedes(self.draws_3d_ground, id)
+    }
+
+    /// What may draw this pass's tile fills from the GPU — **never a floor
+    /// strip**.
+    ///
+    /// A strip's primitives are copied into the mirror by
+    /// `EguiRenderer::render_mirror`, which swaps every
+    /// `Primitive::Callback` for an empty mesh before it draws: a callback
+    /// would run its `prepare` twice otherwise, and `Renderer::render`
+    /// ignores callbacks in that pass anyway. So a strip drawn through
+    /// callbacks would reach the mirror with no ground in it at all, and the
+    /// 3D floor would wear a map made of labels and roads. The strip keeps
+    /// placing its fills on the CPU, which since the floor-strip cache is a
+    /// cost it pays rarely rather than every frame.
+    fn ground_mesh_painter(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>> {
+        match self.surfaces {
+            PaneSurfaces::GroundAndGlass => self.ground_meshes,
+            PaneSurfaces::GroundOnly => None,
+        }
     }
 }
 
@@ -596,8 +622,16 @@ pub(super) fn render_pane_map_content(
                     // every label the tiles carry into `ctx.basemap_labels`
                     // for the `CityLabels` arm — this arm runs first because
                     // the layer's weight (1) is the lowest in the registry.
+                    let ground = ctx.ground_mesh_painter().cloned();
                     if let Some(tiles) = ctx.basemap_tiles.as_deref_mut() {
-                        let paint = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        let paint = draw_tile_layer(
+                            ui,
+                            projector,
+                            zoom,
+                            tiles,
+                            ctx.tile_zoom_bias,
+                            ground.as_ref(),
+                        );
                         resolution.tiles_exact &= paint.coverage.complete();
                         ctx.basemap_labels = paint.labels;
                     }
@@ -606,8 +640,12 @@ pub(super) fn render_pane_map_content(
                     // A raster layer defers no labels: only a vector tile
                     // carries text, so the returned list is empty by
                     // construction and there is nothing to keep.
+                    // `None`, and by construction rather than by policy: a
+                    // raster tile flattens to no fill runs, so a painter here
+                    // would have nothing to hand it.
                     if let Some(tiles) = ctx.terrain_tiles.as_deref_mut() {
-                        let paint = draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias);
+                        let paint =
+                            draw_tile_layer(ui, projector, zoom, tiles, ctx.tile_zoom_bias, None);
                         resolution.tiles_exact &= paint.coverage.complete();
                     }
                 }

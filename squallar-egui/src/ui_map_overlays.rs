@@ -3,7 +3,7 @@ use crate::tile_source::HttpsTiles;
 use squallar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use squallar_overlays::types::OverlayLabel;
 use std::sync::Arc;
-use walkers::{Tile, TileId, Tiles};
+use walkers::{Tile, TileId};
 
 // ---------------------------------------------------------------------------
 /// Shared context for overlay drawing operations.
@@ -180,12 +180,17 @@ const FULL_TILE_UV: egui::Rect =
 /// bottom of the stack and the place names draw at the `CityLabels` layer's
 /// position, above the weather. The caller paints them with [`paint_labels`]
 /// when that layer's turn comes, and drops them when it is switched off.
+///
+/// `ground` is what draws a vector tile's tessellated fills from the GPU, or
+/// `None` for a pass that must place them itself — see
+/// [`PaneRenderCtx::ground_mesh_painter`](super::pane_render::PaneRenderCtx::ground_mesh_painter).
 pub(super) fn draw_tile_layer(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
     tiles: &mut HttpsTiles,
     zoom_bias: u8,
+    ground: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
 ) -> TileLayerPaint {
     // Once for the layer, before the grid loop. `HttpsTiles::at` does not drain,
     // so this is the only thing that moves finished fetches into the cache --
@@ -220,6 +225,10 @@ pub(super) fn draw_tile_layer(
 
     let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
 
+    // egui's own frame counter, so the renderer can tell one frame's ground
+    // draws from the next without a clock or a frame callback of its own.
+    let pass_nr = ui.ctx().cumulative_pass_nr();
+
     // Accumulated across every cell below, so the collision test the caller
     // makes is one test against the whole pane; see [`paint_labels`].
     let mut labels: Vec<walkers::Text> = Vec::new();
@@ -237,10 +246,10 @@ pub(super) fn draw_tile_layer(
                 zoom: tile_zoom,
             };
 
-            let answered = tiles.at(tile_id);
+            let answered = tiles.ground_at(tile_id);
             exact &= answered
                 .as_ref()
-                .is_some_and(|twuv| twuv.uv == FULL_TILE_UV);
+                .is_some_and(|piece| piece.uv == FULL_TILE_UV);
             if let Some(twuv) = answered {
                 // Affine, not geographic. This used to spell the tile's two corners as
                 // latitudes and longitudes and hand them to `geo_corner_rect`, which
@@ -257,7 +266,18 @@ pub(super) fn draw_tile_layer(
                             .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
                     }
                     Tile::Vector(ref shapes) => {
-                        paint_vector_tile(ui.painter(), shapes, rect, twuv.uv, &mut labels);
+                        paint_vector_tile(
+                            ui.painter(),
+                            shapes,
+                            GroundMeshes {
+                                meshes: twuv.meshes.as_ref(),
+                                painter: ground,
+                                pass_nr,
+                            },
+                            rect,
+                            twuv.uv,
+                            &mut labels,
+                        );
                     }
                 }
             }
@@ -382,6 +402,17 @@ fn lay_out_label(
 /// transform it — 158.1 us per tile per frame, against a viewport that holds up
 /// to 84 tiles.
 ///
+/// **The tessellated fills do not take that copy at all where a renderer can
+/// draw them.** They were flattened once when the tile arrived
+/// ([`crate::tile_mesh`]) and are drawn from a GPU buffer with the placement
+/// as a uniform, so a fill run becomes one paint callback rather than a copy
+/// of its vertices. Same fixture, same build: the two coalesced meshes were
+/// 12.63 us of the tile's 26.61 us of placement, and the 708 stroked paths
+/// beside them are the 13.51 us that stays here — strokes carry a width in
+/// screen points that no extent-space pre-tessellation can hold. `ground`
+/// being `None` (a floor strip, a raster tile, a build with no renderer
+/// installed) puts every fill back on this path unchanged.
+///
 /// **Nothing is culled here, and that was measured rather than assumed.** A
 /// per-shape bounding-rect test against the clip looks like the obvious
 /// companion to this, and it was tried: on the quarter-piece ancestor case it
@@ -409,28 +440,147 @@ fn lay_out_label(
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
+    ground: GroundMeshes<'_>,
     rect: egui::Rect,
     uv: egui::Rect,
     labels: &mut Vec<walkers::Text>,
 ) {
     let painter = painter.with_clip_rect(rect);
 
-    let placement = walkers::mvt::placement(full_rect_of_clipped_tile(rect, uv));
+    let full = full_rect_of_clipped_tile(rect, uv);
+    let placement = walkers::mvt::placement(full);
 
-    let placed: Vec<egui::Shape> = shapes
-        .iter()
-        .filter_map(|shape| match shape.placed(placement) {
-            walkers::ShapeOrText::Shape(shape) => Some(shape),
+    // Accumulated and written once per tile per counter, not once per shape:
+    // a dense tile is hundreds of shapes and these are `static` atomics.
+    let mut counted = Counted::default();
+
+    let mut runs = GroundMeshes::runs();
+    let mut placed: Vec<egui::Shape> = Vec::with_capacity(shapes.len());
+
+    for (index, shape) in shapes.iter().enumerate() {
+        // The runs are in shape order, so this walks them in step with the
+        // shapes and never searches. A run whose shape the loop has passed
+        // cannot exist; one it has not reached yet is simply not this shape's.
+        if let Some(callback) = runs.take_at(index, &ground, placement, rect) {
+            counted.mesh_draws += 1;
+            placed.push(callback);
+            continue;
+        }
+        match shape {
+            walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
+                counted.mesh_vertices += mesh.vertices.len() as u64;
+            }
+            walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
+                counted.path_points += path.points.len() as u64;
+            }
+            _ => {}
+        }
+        match shape.placed(placement) {
+            walkers::ShapeOrText::Shape(shape) => placed.push(shape),
             walkers::ShapeOrText::Text(text) => {
                 if rect.contains(text.position) {
+                    counted.label_anchors += 1;
                     labels.push(text);
                 }
-                None
             }
-        })
-        .collect();
+        }
+    }
 
+    counted.report();
     painter.extend(placed);
+}
+
+/// What one tile's ground phase placed, before it is reported.
+#[derive(Default)]
+struct Counted {
+    mesh_vertices: u64,
+    path_points: u64,
+    label_anchors: u64,
+    mesh_draws: u64,
+}
+
+impl Counted {
+    fn report(self) {
+        use crate::tile_mesh::ledger;
+        ledger::note_mesh_vertices_placed(self.mesh_vertices);
+        ledger::note_path_points_placed(self.path_points);
+        ledger::note_label_anchors_placed(self.label_anchors);
+        ledger::note_mesh_draws(self.mesh_draws);
+    }
+}
+
+/// What a tile pass knows about drawing this tile's fills from the GPU: the
+/// flattened buffers the tile arrived with, and the renderer that can draw
+/// them. Either being absent is the CPU path, which is what a floor strip, a
+/// raster tile and every unit test in this crate take.
+#[derive(Clone, Copy)]
+struct GroundMeshes<'a> {
+    meshes: Option<&'a std::sync::Arc<crate::tile_mesh::TileMeshes>>,
+    painter: Option<&'a std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    pass_nr: u64,
+}
+
+impl GroundMeshes<'_> {
+    /// Nothing to draw from the GPU: the whole tile takes the CPU path.
+    #[cfg(test)]
+    const CPU_ONLY: GroundMeshes<'static> = GroundMeshes {
+        meshes: None,
+        painter: None,
+        pass_nr: 0,
+    };
+
+    /// A cursor over this tile's fill runs, in shape order.
+    fn runs() -> RunCursor {
+        RunCursor { next: 0 }
+    }
+}
+
+/// The position in [`TileMeshes::runs`](crate::tile_mesh::TileMeshes::runs)
+/// the shape walk has reached.
+struct RunCursor {
+    next: usize,
+}
+
+impl RunCursor {
+    /// The paint callback for the shape at `index`, if that shape is a fill
+    /// run this install can draw from the GPU. Advances past the run either
+    /// way, so a run the renderer refuses falls through to CPU placement
+    /// exactly once.
+    fn take_at(
+        &mut self,
+        index: usize,
+        ground: &GroundMeshes<'_>,
+        placement: egui::emath::TSTransform,
+        piece: egui::Rect,
+    ) -> Option<egui::Shape> {
+        let meshes = ground.meshes?;
+        let painter = ground.painter?;
+        let run = *meshes.runs().get(self.next)?;
+        if run.shape_index as usize != index {
+            return None;
+        }
+        self.next += 1;
+        let payload = painter.payload(crate::tile_mesh::GroundDraw {
+            meshes,
+            run: self.next - 1,
+            place: crate::tile_mesh::Placement {
+                scale: placement.scaling,
+                translation: [placement.translation.x, placement.translation.y],
+            },
+            pass_nr: ground.pass_nr,
+        })?;
+        Some(egui::Shape::Callback(egui::epaint::PaintCallback {
+            // The **piece**, which is what egui turns into a viewport and
+            // refuses when it is degenerate. The draw replaces that viewport
+            // with the whole screen, because the geometry is placed in screen
+            // points by the uniform exactly as the CPU path places it; the
+            // clip that makes a stretched ancestor draw only the quarter that
+            // belongs to this tile is egui's scissor, taken from the clip
+            // rect the painter above carries.
+            rect: piece,
+            callback: payload,
+        }))
+    }
 }
 
 /// Lay every label this pane collected out against **one** [`OccupiedAreas`].
@@ -599,7 +749,7 @@ mod tests {
         );
 
         let before = tiles.pumps();
-        draw_tile_layer(&ui, &projector, zoom, &mut tiles, 0);
+        draw_tile_layer(&ui, &projector, zoom, &mut tiles, 0, None);
         let drains = tiles.pumps() - before;
         let _ = ctx.end_pass();
 
@@ -706,7 +856,7 @@ mod tests {
         let rect = projector.tile_rect(tile_id);
 
         let shapes = shapes_of_one_pass(&ctx, canvas, |ui| {
-            let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0).labels;
+            let labels = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None).labels;
             // The pane's `CityLabels` arm, which is where the deferred labels
             // are painted; without it this pass draws ground and no names.
             paint_labels(ui.painter(), labels);
@@ -819,6 +969,7 @@ mod tests {
                     0.0,
                     egui::Color32::RED,
                 ))],
+                GroundMeshes::CPU_ONLY,
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 &mut Vec::new(),
@@ -845,7 +996,14 @@ mod tests {
         let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let mut labels = Vec::new();
         for (shapes, rect) in tiles {
-            paint_vector_tile(ui.painter(), shapes, *rect, whole, &mut labels);
+            paint_vector_tile(
+                ui.painter(),
+                shapes,
+                GroundMeshes::CPU_ONLY,
+                *rect,
+                whole,
+                &mut labels,
+            );
         }
         paint_labels(ui.painter(), labels);
     }
@@ -1440,7 +1598,7 @@ mod tests {
 
         // Nothing answered yet: incomplete.
         let empty = shapes_of_one_pass(&ctx, canvas, |ui| {
-            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None);
             assert!(
                 !paint.coverage.complete(),
                 "an unanswered span read complete; the strip cache would freeze \
@@ -1469,7 +1627,7 @@ mod tests {
             tiles.put_for_test(*cell, extent_spanning_tile());
         }
         shapes_of_one_pass(&ctx, canvas, |ui| {
-            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None);
             assert!(
                 !paint.coverage.complete(),
                 "a span with one hole read complete"
@@ -1486,7 +1644,7 @@ mod tests {
         };
         tiles.put_for_test(ancestor, extent_spanning_tile());
         shapes_of_one_pass(&ctx, canvas, |ui| {
-            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None);
             assert!(
                 !paint.coverage.complete(),
                 "a span answered through a stretched ancestor read complete"
@@ -1496,12 +1654,252 @@ mod tests {
         // The last exact tile lands: complete.
         tiles.put_for_test(cells[0], extent_spanning_tile());
         shapes_of_one_pass(&ctx, canvas, |ui| {
-            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0);
+            let paint = draw_tile_layer(ui, &projector, zoom, &mut tiles, 0, None);
             assert!(
                 paint.coverage.complete(),
                 "a fully answered span read incomplete; the strip cache could \
                  never skip and the whole lever is dead"
             );
         });
+    }
+
+    // -----------------------------------------------------------------
+    // The ground-mesh split.
+    //
+    // Every test below reads process-global counters
+    // (`tile_mesh::ledger`), so they take one lock and reset inside it.
+    // Cargo runs tests in threads of one process; without this they would
+    // read each other's tiles.
+    // -----------------------------------------------------------------
+
+    static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A painter that hands back a payload for every run it is asked about,
+    /// and remembers what it was asked.
+    #[derive(Default)]
+    struct RecordingPainter {
+        asked: std::sync::Mutex<Vec<(u64, usize, crate::tile_mesh::Placement)>>,
+    }
+
+    impl crate::tile_mesh::TileMeshPainter for RecordingPainter {
+        fn payload(
+            &self,
+            draw: crate::tile_mesh::GroundDraw<'_>,
+        ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+            self.asked
+                .lock()
+                .expect("the recorder is not poisoned")
+                .push((draw.meshes.id(), draw.run, draw.place));
+            Some(std::sync::Arc::new(()))
+        }
+    }
+
+    /// A tile whose ground is a background rect, two fill meshes with a
+    /// stroke between them, and a label — the shape of a real styled tile in
+    /// miniature.
+    fn a_styled_tile() -> Vec<ShapeOrText> {
+        let quad = |at: f32, colour: egui::Color32| {
+            let mut mesh = egui::epaint::Mesh::default();
+            mesh.add_rect_with_uv(
+                egui::Rect::from_min_size(egui::pos2(at, at), egui::vec2(64.0, 64.0)),
+                egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+                colour,
+            );
+            ShapeOrText::Shape(egui::Shape::Mesh(mesh.into()))
+        };
+        vec![
+            ShapeOrText::Shape(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)),
+                0.0,
+                egui::Color32::from_rgb(0x10, 0x20, 0x30),
+            )),
+            quad(100.0, egui::Color32::RED),
+            ShapeOrText::Shape(egui::Shape::line(
+                vec![egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)],
+                egui::Stroke::new(2.0, egui::Color32::GREEN),
+            )),
+            quad(300.0, egui::Color32::BLUE),
+            ShapeOrText::Text(Text::new(
+                egui::pos2(EXTENT / 2.0, EXTENT / 2.0),
+                "Monaco".to_owned(),
+                12.0,
+                egui::Color32::WHITE,
+                0.0,
+            )),
+        ]
+    }
+
+    /// Paint `a_styled_tile` once, with or without a painter, and answer the
+    /// shapes it emitted and the counters it moved.
+    fn one_ground_pass(
+        painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    ) -> (
+        Vec<egui::epaint::ClippedShape>,
+        crate::tile_mesh::ledger::Totals,
+    ) {
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+        let shapes = a_styled_tile();
+        let meshes = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes));
+
+        crate::tile_mesh::ledger::reset();
+        let mut labels = Vec::new();
+        let emitted = shapes_of_one_pass(&ctx, canvas, |ui| {
+            paint_vector_tile(
+                ui.painter(),
+                &shapes,
+                GroundMeshes {
+                    meshes: Some(&meshes),
+                    painter,
+                    pass_nr: 7,
+                },
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                &mut labels,
+            );
+            paint_labels(ui.painter(), labels.clone());
+        });
+        (emitted, crate::tile_mesh::ledger::totals())
+    }
+
+    /// **No ground fill vertex is placed on the CPU while a renderer can draw
+    /// it — and the labels still place.**
+    ///
+    /// The zero is only readable beside the second figure: a tile pass that
+    /// never ran would report zero for both. The strokes are the third
+    /// figure, and they stay positive by design — a `line-width` is in screen
+    /// points and no extent-space pre-tessellation can hold it, so they are
+    /// reported rather than folded away.
+    ///
+    /// RED on the unmodified baseline: with no painter, every fill vertex is
+    /// placed every frame, which is the `without` half below.
+    #[test]
+    fn ground_fills_stop_being_placed_on_the_cpu_while_labels_still_place() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let (_, without) = one_ground_pass(None);
+        assert!(
+            without.mesh_vertices_placed > 0,
+            "non-triviality: the CPU path placed no fill vertices either, so \
+             the zero below would prove nothing"
+        );
+        assert_eq!(without.mesh_draws, 0, "no painter, no ground draws");
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+        let (_, with) = one_ground_pass(Some(&painter));
+
+        assert_eq!(
+            with.mesh_vertices_placed, 0,
+            "ground fills are still being placed on the frame thread"
+        );
+        assert_eq!(
+            with.mesh_draws, 2,
+            "the tile's two fill runs did not both become ground draws"
+        );
+        assert!(
+            with.label_anchors_placed > 0,
+            "the labels stopped placing, so the zero above is a tile pass that \
+             did not run rather than a fill that moved to the GPU"
+        );
+        assert_eq!(
+            with.path_points_placed, without.path_points_placed,
+            "the strokes changed path; they are the CPU's either way"
+        );
+    }
+
+    /// **A run is drawn where the style put it.** The callback replaces the
+    /// mesh *in place* in the shape sequence, so a fill still draws under the
+    /// stroke that was styled over it.
+    #[test]
+    fn a_fill_run_becomes_a_callback_at_its_own_position() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+        let (with, _) = one_ground_pass(Some(&painter));
+
+        // The tile's own primitives, in the order they were pushed: the
+        // background rect, a callback, the stroke, a callback. (The label
+        // phase adds a text shape after them.)
+        let kinds: Vec<&'static str> = with
+            .iter()
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(_) => "rect",
+                egui::Shape::Callback(_) => "callback",
+                egui::Shape::Path(_) => "path",
+                egui::Shape::Text(_) => "text",
+                other => panic!("unexpected shape {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["rect", "callback", "path", "callback", "text"],
+            "the fills did not draw in the positions the style put them in"
+        );
+    }
+
+    /// Every callback carries the placement the CPU path would have placed
+    /// by, and the run index it was asked for — the two things that decide
+    /// which geometry lands where.
+    #[test]
+    fn each_ground_draw_carries_its_own_run_and_the_cpu_paths_placement() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let recorder = std::sync::Arc::new(RecordingPainter::default());
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+        let _ = one_ground_pass(Some(&painter));
+
+        let asked = recorder.asked.lock().expect("not poisoned").clone();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].1, 0, "the first run was not asked for as run 0");
+        assert_eq!(asked[1].1, 1);
+        assert_eq!(asked[0].0, asked[1].0, "the two runs are one tile's");
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+        let expected = crate::tile_mesh::Placement::of(rect);
+        for (_, _, place) in &asked {
+            assert_eq!(
+                *place, expected,
+                "a ground draw was placed by something other than \
+                 `mvt::placement` over the whole tile"
+            );
+        }
+    }
+
+    /// **A painter that refuses a run leaves it to the CPU, once.** The
+    /// cursor advances either way, so a refusal is not a shape drawn twice
+    /// and not a run silently skipped.
+    #[test]
+    fn a_refused_run_falls_back_to_cpu_placement_exactly_once() {
+        struct Refuses;
+        impl crate::tile_mesh::TileMeshPainter for Refuses {
+            fn payload(
+                &self,
+                _draw: crate::tile_mesh::GroundDraw<'_>,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                None
+            }
+        }
+
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(Refuses);
+        let (shapes, totals) = one_ground_pass(Some(&painter));
+
+        assert_eq!(totals.mesh_draws, 0);
+        assert!(
+            totals.mesh_vertices_placed > 0,
+            "a refused run drew nothing at all"
+        );
+        assert_eq!(
+            shapes
+                .iter()
+                .filter(|c| matches!(c.shape, egui::Shape::Mesh(_)))
+                .count(),
+            2,
+            "a refused run was not placed exactly once"
+        );
     }
 }
