@@ -64,6 +64,15 @@ impl PaneSurfaces {
 /// against this type, and `GroundHeightField` has no other production
 /// construction to fabricate.
 ///
+/// **The type is `pub(in crate::ui)` and the constructors are not**, and the
+/// asymmetry is the point. The Base Map inspector lives outside `ui::map` and
+/// has to hold one of these to decide whether the "Terrain shading" switch is
+/// still doing anything, so it must be able to *name* the type; letting it
+/// *mint* one would hand back exactly the belief the private field refuses.
+/// So `PLAN_VIEW` and `from_height_field` stay `pub(super)`, and the only
+/// door out of `ui::map` is [`super::pane_draws_3d_ground`], which reads the
+/// one function.
+///
 /// **What it does NOT mean is "the mesh drew".** The strip is drawn before
 /// the volume painter runs -- it has to be, it is the mirror that painter
 /// samples -- so this can only be "the pane has a field to draw ground
@@ -89,7 +98,7 @@ impl PaneSurfaces {
 /// Closing either from this side needs the *previous* frame's outcome fed
 /// back, which buys a transient with a permanent one-frame lag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) struct GroundIsMesh(bool);
+pub(in crate::ui) struct GroundIsMesh(bool);
 
 impl GroundIsMesh {
     /// A pane drawing its map in plan: no mesh, no second light, nothing to
@@ -106,6 +115,25 @@ impl GroundIsMesh {
     const fn yes(self) -> bool {
         self.0
     }
+}
+
+/// **Whether the scene light supersedes `id`'s shading on a pane whose ground
+/// is `ground`** -- the one predicate behind every reader of "one ground, one
+/// sun".
+///
+/// Three readers, and they must never disagree. The floor strip's paint walk
+/// ([`PaneRenderCtx::double_shades`], which adds the pass conjunct) is what
+/// stops the hillshade reaching the drape. [`ground_content_key`] mirrors it,
+/// or the strip cache would key on a layer the strip does not draw. And the
+/// Base Map inspector's "Terrain shading" switch goes inert against it and
+/// names the light that took the work over. A switch that stayed live over a
+/// strip that had dropped the layer reads as a bug -- which is the whole
+/// reason this function has a third caller.
+///
+/// Only `TERRAIN` carries baked shading: the base tiles under it are unlit
+/// colour and must keep drawing, or the mesh has nothing to wear.
+pub(in crate::ui) fn scene_light_supersedes(ground: GroundIsMesh, id: &LayerId) -> bool {
+    ground.yes() && *id == known::TERRAIN
 }
 
 /// What one `GroundOnly` pass left unresolved — the completeness half of the
@@ -228,7 +256,7 @@ pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMe
         if !matches!(handler.surface(), Surface::Ground) {
             continue;
         }
-        if ground.yes() && *id == known::TERRAIN {
+        if scene_light_supersedes(ground, id) {
             continue;
         }
         id.hash(h);
@@ -414,8 +442,7 @@ impl PaneRenderCtx<'_> {
     /// depends on B3, not on C2 -- and C2 is what makes the picture whole.
     fn double_shades(&self, id: &LayerId) -> bool {
         self.surfaces == PaneSurfaces::GroundOnly
-            && self.draws_3d_ground.yes()
-            && *id == known::TERRAIN
+            && scene_light_supersedes(self.draws_3d_ground, id)
     }
 }
 

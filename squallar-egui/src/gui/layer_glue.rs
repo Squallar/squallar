@@ -64,10 +64,40 @@ impl Gui {
             .collect();
         for (guest, label) in guests {
             ui.add_space(4.0);
+            // **A switch the pane's own render has taken out of the loop goes
+            // inert and says which mechanism took it over.** Terrain's
+            // hillshade is shading baked into tiles by a sun frozen in map
+            // space; on a pane whose ground is a lit 3D mesh the floor strip
+            // already refuses to drape it, or the terrain would carry two
+            // shadows from two suns. Leaving the switch live over that refusal
+            // is what reads as a bug -- with two panes open you would see the
+            // hillshade on the 2D one, none on the 3D floor, and one ticked
+            // box explaining neither.
+            //
+            // Inert, never hidden: the toggle IS the guest's persisted
+            // per-pane state, and hiding it would leave that state deciding
+            // what other panes draw with nothing on screen able to reach it.
+            // Disabling changes nothing about the state -- the write below is
+            // the only writer, and a disabled widget never reports `changed`.
+            //
+            // Asked of the same seam the strip asks, so the two cannot
+            // disagree: `pane_draws_3d_ground` is the one producer of the
+            // answer and `scene_light_supersedes` the one predicate over it.
+            let superseded = crate::ui::map::pane_render::scene_light_supersedes(
+                crate::ui::map::pane_draws_3d_ground(pane, self.active_pane),
+                &guest,
+            );
             let mut on = pane.is_overlay_enabled(&guest);
-            let response = ui.checkbox(&mut on, label);
+            let response = ui.add_enabled(!superseded, egui::Checkbox::new(&mut on, label));
             #[cfg(test)]
             probe.record_item(&guest, DrawnControlKind::Checkbox, label, response.rect);
+            if superseded {
+                ui.label(
+                    egui::RichText::new(crate::terrain::TERRAIN_SUPERSEDED_NOTE)
+                        .small()
+                        .weak(),
+                );
+            }
             if response.changed() {
                 if on && pane.slot(&guest).is_none() {
                     pane.add_layer(&self.overlays, &guest);

@@ -370,6 +370,13 @@ impl InputHarness {
     /// the pane grid and the panel disagree about which way up they are.
     pub(crate) fn with_screen(size: egui::Vec2) -> Self {
         install_radars();
+        // The terrain scheduler's stand-in is thread-local, and libtest is
+        // free to run tests on the main thread (it does at
+        // `--test-threads=1`), so a harness that did not clear it could
+        // inherit the previous test's ground. Cleared here rather than in
+        // each test: the leak this refuses is exactly the kind nobody writes
+        // a line for.
+        crate::ui::map::test_ground_fields::clear();
         let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let mut harness = Self {
             ctx: egui::Context::default(),
@@ -1508,6 +1515,21 @@ impl InputHarness {
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"))
             .set_view(squallar_radar::types::RenderView::Volume);
+        self.warm_up();
+    }
+
+    /// **Give pane `idx` 3D ground, or take it away** — the one lever that
+    /// puts a pane on the far side of every "does this pane draw 3D ground"
+    /// gate, which the shipped app cannot reach because the height archive is
+    /// unpublished (`ui_map::pane_ground_heights`).
+    ///
+    /// It moves the strip, the renderer and the inspector together, because
+    /// all three read that one function. It is **not** the same question as
+    /// "is this a 3D pane": a volume pane with no field answers `false` here,
+    /// which is every volume pane in the shipped build and is the row that
+    /// keeps a gate on `pane.volume().is_some()` from passing.
+    pub(crate) fn set_pane_draws_3d_ground(&mut self, idx: usize, on: bool) {
+        crate::ui::map::test_ground_fields::set(idx, on);
         self.warm_up();
     }
 
