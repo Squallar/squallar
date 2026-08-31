@@ -438,18 +438,26 @@ fn frame_service_interact_line(h: &squallar_device_profile::hist::Hist) -> Strin
     )
 }
 
-/// The `frame service (idle):` line.
+/// The `frame service (idle):` line, histogram embedded.
 ///
 /// Denominator: presented frames whose egui raw input carried none of the
 /// interaction events — the floor under the interact family, and the figure
 /// that prices this instrument's own overhead. Cumulative from boot.
+///
+/// The histogram is what makes the family window-diffable, and the windowed
+/// idle family is where the **settle burst** shows: WO-8 moved the
+/// post-gesture re-raster out of the interact window, so its cost lands on
+/// input-free frames inside a gesture window's quiet phases. A scoreboard
+/// that read only the interact diff would have moved that cost somewhere no
+/// figure could see it.
 fn frame_service_idle_line(h: &squallar_device_profile::hist::Hist) -> String {
     format!(
-        "frame service (idle): n={}, p50={} us, p90={} us, p99={} us",
+        "frame service (idle): n={}, p50={} us, p90={} us, p99={} us, hist={}",
         h.total(),
         pctl_us(h, 0.50),
         pctl_us(h, 0.90),
         pctl_us(h, 0.99),
+        hist_counts(h),
     )
 }
 

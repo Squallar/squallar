@@ -1261,7 +1261,7 @@ return { attached: attached, different: different, off_frame: off_frame,
 FRAME_LINE_PROBE = r"""
 var C = window.__rig_console || [];
 var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
-var svc_idle_re = /frame service \(idle\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us/;
+var svc_idle_re = /frame service \(idle\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var segments_re = /frame segments \(interact, p99 us\): pre=(\d+|none|over), pump=(\d+|none|over), ui=(\d+|none|over), prepare=(\d+|none|over), finish=(\d+|none|over), post=(\d+|none|over); acquire n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us/;
 var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply, (\d+) us mirror, (\d+) us buffers and callbacks/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
@@ -1270,7 +1270,7 @@ var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
 var cadence = null, gpu_unavailable = false;
-var interact_all = [], cadence_all = [];
+var interact_all = [], idle_all = [], cadence_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -1282,8 +1282,11 @@ for (var i = 0; i < C.length; i++) {
     interact_all.push(interact);
   }
   x = svc_idle_re.exec(m);
-  if (x) idle = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
-                  p99: x[4] };
+  if (x) {
+    idle = { t: t, n: parseInt(x[1], 10), p50: x[2], p90: x[3],
+             p99: x[4], hist: x[5] };
+    idle_all.push(idle);
+  }
   x = segments_re.exec(m);
   if (x) segments = { t: t, pre: x[1], pump: x[2], ui: x[3], prepare: x[4],
                       finish: x[5], post: x[6],
@@ -1317,7 +1320,8 @@ for (var i = 0; i < C.length; i++) {
 }
 return { interact: interact, idle: idle, segments: segments, prep: prep,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
-         interact_all: interact_all, cadence_all: cadence_all,
+         interact_all: interact_all, idle_all: idle_all,
+         cadence_all: cadence_all,
          gesture_begins: begins, gesture_loops: loops,
          console_total: C.length };
 """
@@ -1373,11 +1377,27 @@ def hist_percentile_upper_us(counts, q):
     raise AssertionError("total counted a sample the walk did not reach")
 
 
+def hist_window_max_us(counts):
+    """The topmost occupied bin's conservative upper edge, us -- the closest
+    thing a binned family has to a window max. "over" for the at-or-over
+    64 ms clamp, whose upper edge does not exist; None for an empty diff."""
+    top = None
+    for slot, c in enumerate(counts):
+        if c > 0:
+            top = slot
+    if top is None:
+        return None
+    if top == HIST_SLOTS - 1:
+        return "over"
+    return -(-hist_edge_ns(top) // 1000)
+
+
 def hist_stats(counts):
     return {"n": sum(counts),
             "p50_us": hist_percentile_upper_us(counts, 0.50),
             "p90_us": hist_percentile_upper_us(counts, 0.90),
-            "p99_us": hist_percentile_upper_us(counts, 0.99)}
+            "p99_us": hist_percentile_upper_us(counts, 0.99),
+            "max_us": hist_window_max_us(counts)}
 
 
 class FrameLineWatcher:
@@ -1392,6 +1412,7 @@ class FrameLineWatcher:
     def __init__(self, session):
         self.session = session
         self.interact = {}
+        self.idle = {}
         self.cadence = {}
         self.begins = {}
         self.loops = {}
@@ -1401,6 +1422,8 @@ class FrameLineWatcher:
         sig = self.session.execute(FRAME_LINE_PROBE) or {}
         for r in sig.get("interact_all") or []:
             self.interact[(r.get("t"), r.get("n"))] = r
+        for r in sig.get("idle_all") or []:
+            self.idle[(r.get("t"), r.get("n"))] = r
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for r in sig.get("gesture_begins") or []:
@@ -1421,8 +1444,8 @@ class FrameLineWatcher:
         return best
 
     def readings(self, family):
-        rs = list((self.interact if family == "interact" else
-                   self.cadence).values())
+        rs = list({"interact": self.interact, "idle": self.idle,
+                   "cadence": self.cadence}[family].values())
         rs.sort(key=lambda r: (r.get("t") or 0, r.get("n") or 0))
         return rs
 
@@ -1454,7 +1477,10 @@ def gesture_window_stats(watcher):
     out = {"script": (begins[0].get("script") if begins
                       else loops[-1].get("script")),
            "t0": t0, "t1": t1, "loops_completed": len(loops), "basis": basis}
-    for family in ("interact", "cadence"):
+    # `idle` in a gesture window is the settle-burst family: the input-free
+    # frames of the scripted quiet phases, which is where WO-8 moved the
+    # post-gesture re-raster. Its max is the burst's worst frame.
+    for family in ("interact", "idle", "cadence"):
         rs = [r for r in watcher.readings(family)
               if hist_parse(r.get("hist")) is not None]
         if not rs:

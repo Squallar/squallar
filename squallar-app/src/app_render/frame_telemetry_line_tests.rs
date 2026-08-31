@@ -94,16 +94,23 @@ fn counts_string(h: &Hist) -> String {
 }
 
 /// Three samples in one bin: n and all three percentiles land on that bin's
-/// upper edge. 100 us sits in [88 388, 105 112) ns; upper edge 106 us.
+/// upper edge, and the embedded histogram holds all three in that one slot.
+/// 100 us sits in [88 388, 105 112) ns — geometric bin slot 3, upper edge
+/// 106 us.
 #[test]
 fn the_idle_service_line_reads_exactly_as_pinned() {
     let mut h = Hist::new();
     for _ in 0..3 {
         h.record(100);
     }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
     assert_eq!(
         super::frame_service_idle_line(&h),
-        "frame service (idle): n=3, p50=106 us, p90=106 us, p99=106 us",
+        format!(
+            "frame service (idle): n=3, p50=106 us, p90=106 us, p99=106 us, hist={expected_hist}"
+        ),
     );
 }
 
@@ -112,9 +119,12 @@ fn the_idle_service_line_reads_exactly_as_pinned() {
 /// manual check that the interact family is not contaminated by idle frames.
 #[test]
 fn an_empty_family_prints_a_zero_not_an_absence() {
+    let empty_hist = ["0"; 42].join(",");
     assert_eq!(
         super::frame_service_idle_line(&Hist::new()),
-        "frame service (idle): n=0, p50=none us, p90=none us, p99=none us",
+        format!(
+            "frame service (idle): n=0, p50=none us, p90=none us, p99=none us, hist={empty_hist}"
+        ),
     );
 }
 
@@ -259,9 +269,13 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
     for _ in 0..3 {
         idle.record(100);
     }
+    let idle_hist = counts_string(&idle);
     assert_eq!(
         super::frame_service_idle_line(&idle),
-        rendered(&pattern("svc_idle_re"), &["3", "106", "106", "106"]),
+        rendered(
+            &pattern("svc_idle_re"),
+            &["3", "106", "106", "106", &idle_hist],
+        ),
         "the `frame service (idle):` line and the rig's probe have drifted",
     );
 
@@ -341,7 +355,11 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
 /// that ignored its argument, would hold the equality whatever the app wrote.
 #[test]
 fn a_frame_line_that_drifted_by_one_space_is_not_accepted() {
-    let good = rendered(&pattern("svc_idle_re"), &["0", "none", "none", "none"]);
+    let empty_hist = counts_string(&Hist::new());
+    let good = rendered(
+        &pattern("svc_idle_re"),
+        &["0", "none", "none", "none", &empty_hist],
+    );
     assert_eq!(super::frame_service_idle_line(&Hist::new()), good);
     let drifted = good.replacen(" us", "  us", 1);
     assert_ne!(drifted, good, "the perturbation perturbed nothing");
