@@ -480,6 +480,90 @@ fn an_arrival_is_refused_while_a_raster_is_already_in_flight() {
     );
 }
 
+/// **The second door obeys the same rule as the first: no raster is spent into
+/// a pane that is still landing one.**
+///
+/// The arrival path does not go through `needs_rerender`, so neither of that
+/// gate's brakes has ever reached it. The in-flight mark above is not the same
+/// question — it is cleared the moment a raster comes *back*, and the upload it
+/// started runs for frames after that. A dispatch made in that window comes
+/// back to a `hold` that replaces rather than queues, so the picture the pane
+/// already paid for is discarded before a band of it is drawn and the viewer
+/// sees neither.
+///
+/// **RED on the unmodified baseline**: the arrival dispatched, `taken` moved by
+/// one, and the upload in flight was the thing that raster came back to
+/// replace.
+#[test]
+fn an_arrival_is_refused_while_a_picture_is_still_landing() {
+    let taken = Arc::new(Mutex::new(0usize));
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(CountingPort {
+        taken: Arc::clone(&taken),
+    }));
+    let id = known::NWS_ALERTS;
+    let mut app = seeded(&id, an_alert_round(1));
+    record_a_dispatch(&mut app, 0, &id, A_STALE_TOKEN);
+
+    // A picture on its way to the GPU, with no raster outstanding behind it —
+    // exactly the window the mark above cannot see.
+    let cache = app.gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&id);
+    cache.hold(a_landing_picture(), None);
+    assert!(
+        cache.renders.is_empty(),
+        "fixture: nothing may be in flight, or the mark above is what refuses \
+         and this test measures it a second time",
+    );
+    let before = *taken.lock().unwrap();
+
+    arrive(&mut app, &id, an_alert_round(3));
+
+    assert_eq!(
+        *taken.lock().unwrap(),
+        before,
+        "an arrival spent a raster into a pane whose picture was still \
+         crossing to the GPU. `hold` replaces rather than queues, so that \
+         upload is thrown away when this one lands — and the draw loop would \
+         have asked for the very same picture one frame after it finished.",
+    );
+
+    // Non-triviality: with the hold landed, the same arrival does dispatch.
+    // Without this the assertion above passes on an arrival path that refuses
+    // everything.
+    let cache = app.gui.pane_mut(0).expect("pane 0").overlay_cache_mut(&id);
+    let landed = cache
+        .take_held_if_delivered(|_| true)
+        .expect("the hold is delivered");
+    cache.show(landed.data);
+    arrive(&mut app, &id, an_alert_round(5));
+    assert_eq!(
+        *taken.lock().unwrap(),
+        before + 1,
+        "the refusal outlived the upload that caused it, so an arrival would \
+         never rasterize this pane again",
+    );
+}
+
+/// A picture for [`an_arrival_is_refused_while_a_picture_is_still_landing`] to
+/// hold. Only its existence matters — the hold is a slot, and what is in it is
+/// never read by the path under test.
+fn a_landing_picture() -> squallar_egui::overlay_cache::OverlayTextureData {
+    let ctx = egui::Context::default();
+    squallar_egui::overlay_cache::OverlayTextureData {
+        texture: ctx.load_texture(
+            "landing",
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::NEAREST,
+        ),
+        placed: squallar_geo::PlacedRaster::of(RECORDED_BOUNDS),
+        data_generation: A_STALE_TOKEN,
+        render_zoom: 0,
+        width: 1,
+        height: 1,
+        radar_meta: None,
+        hit_map: None,
+    }
+}
+
 #[test]
 fn an_arrival_is_refused_by_a_pane_the_layout_is_not_showing() {
     let taken = Arc::new(Mutex::new(0usize));
