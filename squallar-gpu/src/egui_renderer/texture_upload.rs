@@ -55,6 +55,27 @@ pub const UPLOAD_BAND_BYTES: usize = 8 << 20;
 /// 0.61 ms worst frame after the first.
 pub const DMA_BANDS_PER_FRAME: usize = crate::staging_ring::STAGING_RING_DEPTH;
 
+/// The largest delta that crosses whole through `Renderer::update_texture` on
+/// a device of this capability, and the band size past it. On a ring device
+/// both stay [`UPLOAD_BAND_BYTES`] — the ring's own measured shape. On a
+/// ringless device — all of web — every byte is a blocking `write_texture` on
+/// the frame thread, so both fall to
+/// [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`], whose sweep
+/// note carries the dry-frame cost this choice was made against.
+fn band_cap(capable: bool) -> usize {
+    if capable {
+        UPLOAD_BAND_BYTES
+    } else {
+        squallar_device_profile::constants::BLOCKING_BAND_BYTES
+    }
+}
+
+/// Whether a delta of `bytes` for a texture this module does not own crosses
+/// whole on this frame's queue rather than being filed as bands.
+fn goes_whole(capable: bool, bytes: usize) -> bool {
+    bytes <= band_cap(capable)
+}
+
 /// Consecutive frames the ring may decline a band before it is pushed across by
 /// `write_texture` regardless.
 ///
@@ -290,9 +311,12 @@ impl TextureUploads {
         // until then the renderer holds only the 1×1 stand-in.
         let mine = self.owned.contains_key(&id) || self.pending.iter().any(|band| band.id == id);
 
-        // Small and not already ours: the font atlas and every overlay under a
-        // band go through `update_texture` untouched.
-        if !mine && image.as_raw().len() <= UPLOAD_BAND_BYTES {
+        // Small and not already ours: the font atlas and every overlay under
+        // this device's whole-delta limit go through `update_texture`
+        // untouched. On a ringless device the limit is the blocking band, so
+        // a web-picture-sized raster spreads over frames instead of spending
+        // one frame whole.
+        if !mine && goes_whole(self.capable, image.as_raw().len()) {
             renderer.update_texture(device, queue, id, delta);
             self.totals.count_whole_write(image.as_raw().len() as u64);
             // Whole, on this frame's queue, before anything can draw it.
@@ -422,9 +446,12 @@ impl TextureUploads {
                     texture
                 }
             };
-            let Some(plan) =
-                BandPlan::of(band.image.width(), band.image.height() as u32, band.done)
-            else {
+            let Some(plan) = BandPlan::of(
+                band.image.width(),
+                band.image.height() as u32,
+                band.done,
+                band_cap(self.capable),
+            ) else {
                 // A finished or degenerate band, dropped rather than requeued —
                 // and *delivered*: "no rows will ever land" answering "not yet"
                 // would hold the pane's previous picture for the session.
@@ -629,8 +656,9 @@ struct BandPlan {
 
 impl BandPlan {
     /// What to move of a `width` × `height` image with `done` rows already
-    /// across, or `None` when there is nothing left to move.
-    fn of(width: usize, height: u32, done: u32) -> Option<Self> {
+    /// across at a band budget of `cap` bytes, or `None` when there is
+    /// nothing left to move.
+    fn of(width: usize, height: u32, done: u32, cap: usize) -> Option<Self> {
         if width == 0 || done >= height {
             return None;
         }
@@ -639,9 +667,9 @@ impl BandPlan {
             .ok()?
             .next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         // Against the **padded** stride, so a band never needs a slot larger
-        // than [`UPLOAD_BAND_BYTES`] and the ring can be built at a fixed size
-        // before any raster is known.
-        let capped = (UPLOAD_BAND_BYTES / padded_row as usize).max(1);
+        // than its cap and the ring can be built at a fixed size before any
+        // raster is known.
+        let capped = (cap / padded_row as usize).max(1);
         let rows = u32::try_from(capped).unwrap_or(u32::MAX).min(height - done);
         Some(Self {
             rows,

@@ -218,6 +218,43 @@ pub const MAX_LOOP_SECTION_CUTS_PER_FRAME: usize = 1;
 /// arrives when it arrives.
 pub const MAX_OVERLAY_LOOP_RENDERS_PER_PASS: usize = 4;
 
+/// The blocking-upload band: on a device with **no staging ring** — all of
+/// web, and any native adapter without `MAPPABLE_PRIMARY_BUFFERS` — this is
+/// both the largest texture delta that crosses whole on the frame's own queue
+/// and the size of one banded `write_texture` chunk, one chunk per frame.
+/// The ring path is untouched: its 8 MiB × 2-slot shape is separately
+/// measured (squallar-gpu's `texture_upload` module note).
+///
+/// # 4 MiB is SWEPT, not chosen. Do not adjust it by feel.
+///
+/// Smaller bands cut the worst blocking chunk (8 MiB is ~3.8 ms through the
+/// measured 2.1 GB/s BAR window; 4 MiB ~1.9 ms) but stretch a picture's
+/// upload across more frames, and the pan pipeline pays for depth in **dry
+/// frames** — frames where nothing the pane holds covers the viewport.
+/// Re-swept 2026-08-30 on the in-module 60 Hz dispatch loop
+/// (`squallar_egui::overlay_cache`'s `PanRig`, the same rig behind
+/// `PAN_REBUILD_THRESHOLD`'s table): dry-frame fraction at the shipped
+/// threshold 0.5, averaged over 56 continuous pan speeds from 0.25 to 3.0
+/// viewports/second, 600 counted frames per speed, raster one frame, upload
+/// depth = ceil(picture / cap) frames for the ~8 MiB whole-picture raster a
+/// web pane ships (spike B measured 8.51 MB Firefox / 7.57 MB Chromium):
+///
+/// | cap        | frames/picture | dry % | first dry speed (vps) |
+/// |------------|----------------|-------|-----------------------|
+/// | 8 MiB      | 1              |  0.0  | none                  |
+/// | **4 MiB**  | **2**          | **0.0** | **none**            |
+/// | (2.67 MiB) | 3              |  9.5  | 2.15                  |
+/// | 2 MiB      | 4              | 26.4  | 1.70                  |
+/// | 1 MiB      | 8              | 66.9  | 0.90                  |
+///
+/// The depth-3 and depth-4 rows reproduce the published pan-threshold table
+/// exactly, which is what says the re-run is the same instrument. 4 MiB is
+/// the smallest cap that stays dry-free at every swept speed: it halves the
+/// worst blocking chunk for free, and the next halving costs 26.4% of pan
+/// frames their picture. The ≈1 MiB the original design card guessed is
+/// refuted by the 8-frame row.
+pub const BLOCKING_BAND_BYTES: usize = 4 << 20;
+
 /// How long a frame keeps *starting* frees of what
 /// squallar-worker's `offload::discard` handed it. It paces; it does not bound
 /// the frame — `drain_deferred_drops` checks the clock *after* each free, so a
