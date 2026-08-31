@@ -5,43 +5,36 @@ use squallar_source::job::{DescribedJob, JobCodec};
 
 use crate::fetch_policy::Whole;
 use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate};
+use crate::render::handlers::sites::{RadarSitesFetchResult, SiteRow};
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     FetchPayload, OverlayHandler, OverlayItem, OverlayState, RasterizeContext, RenderMode,
 };
+use crate::render::rasterize;
 use squallar_source::id::{LayerId, known};
 use squallar_source::time::TimeAxis;
 
-/// **One radar site, as this crate is allowed to know it.** Name and position
-/// and nothing else: the site table lives in `squallar-radar`, which this crate
-/// must not name (WO-M3's edge cut), so the frontend that owns the table
-/// installs the rows through [`RadarSitesFetchResult`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct SiteRow {
-    pub name: String,
-    pub lat: f64,
-    pub lon: f64,
-}
-
-/// The site table arriving from the frontend. Not a *fetch* — this layer never
-/// builds a task — but the same door, so the rows land where every other
-/// layer's data lands.
-pub struct RadarSitesFetchResult(pub Vec<SiteRow>);
-
-impl crate::fetch_policy::FetchRound for RadarSitesFetchResult {
-    type Shape = Whole;
-}
-
-/// The site table, plus which pane draws it. Per-frame interaction (text
-/// labels, site clicking) still happens in `squallar-egui`.
-pub(crate) struct RadarSitesHandler {
+/// **Where the radar network can see, as ground.**
+///
+/// The ground half of what used to be one `RadarSites` layer. The markers, the
+/// station names and the selected station's ring are lengths in points and are
+/// painted per frame; a 230 km coverage radius is 230 km whatever the zoom, so
+/// it belongs in a raster placed by its geographic corners, and that is this.
+///
+/// **Off by default, and that is the whole lesson of the split.** Every station
+/// drawing its own outline at continental zoom overlapped into a mesh that hid
+/// the map under it. Drawn as a filled wash the same geometry answers the
+/// question it was always for — "is this storm inside anybody's coverage" —
+/// because overlapping circles filled under a single non-zero winding rule
+/// merge into one region instead of stacking into 160 edges.
+pub(crate) struct RadarCoverageHandler {
     pub state: OverlayState<Vec<SiteRow>, Whole>,
     /// **The layer's own default**, for a caller that supplied no pane.
     /// Nothing reads it into a pane.
     pub enabled: bool,
 }
 
-impl RadarSitesHandler {
+impl RadarCoverageHandler {
     pub fn new() -> Self {
         Self {
             state: OverlayState::new(),
@@ -50,46 +43,37 @@ impl RadarSitesHandler {
     }
 }
 
-impl OverlayHandler for RadarSitesHandler {
+impl OverlayHandler for RadarCoverageHandler {
     fn id(&self) -> LayerId {
-        known::RADAR_SITES
+        known::RADAR_COVERAGE
     }
 
-    /// The radar network's sites are fixed installations. The list changes on
-    /// the scale of decommissionings, not of anything a pane's timeline reaches.
+    /// Fixed installations. The list changes on the scale of decommissionings,
+    /// not of anything a pane's timeline reaches.
     fn time_axis(&self) -> TimeAxis {
         TimeAxis::Live
     }
     fn surface(&self) -> Surface {
         Surface::Ground
     }
+    /// Under the site markers, which sit at 100. The wash is context for the
+    /// dots, so the dots draw over it.
     fn draw_order_weight(&self) -> u32 {
-        100
+        95
     }
     fn display_name(&self) -> &str {
-        "Radar Sites"
+        "Radar Coverage"
     }
-    /// **Nothing this layer draws is ground any more.**
-    ///
-    /// The marker and the label plate went to the per-frame painter when a
-    /// baked marker turned out to be stretched by every zoom gesture, and the
-    /// coverage ring followed them when it stopped being drawn for all 160
-    /// stations at once. What is left is a dot, a name and the selected
-    /// station's ring — every one of them a length in points on the display,
-    /// and the ring is selection feedback besides, which a whole-picture raster
-    /// round trip would deliver a beat after the dot it belongs to.
-    ///
-    /// The network-wide coverage that *is* ground kept the raster and became
-    /// [`known::RADAR_COVERAGE`].
     fn render_mode(&self) -> RenderMode {
-        RenderMode::PerFrameDirect
+        RenderMode::Texture
     }
 
-    /// The plate under a station's name is drawn in the theme's colours, and
-    /// this layer is the plate's owner even though the painter that draws it
-    /// lives in `squallar-egui`.
+    /// **False, and measurably so**: the wash is one ink, mixed from the
+    /// station colour and an alpha, and nothing in this raster is drawn in a
+    /// theme colour. Answering `true` would re-rasterize the whole network
+    /// every time the theme flipped for no change in a single texel.
     fn theme_sensitive(&self) -> bool {
-        true
+        false
     }
     fn default_enabled(&self) -> bool {
         false
@@ -110,16 +94,34 @@ impl OverlayHandler for RadarSitesHandler {
         !self.state.data.is_empty()
     }
 
-    /// **None, because this layer no longer rasterizes anything.** A
-    /// `PerFrameDirect` layer is never dispatched through the job funnel; the
-    /// site table it holds is read straight off the handler by the per-frame
-    /// painter.
-    fn prepare_job(&self, _ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        None
+    /// **No network, no clock, no weather.** The site table is compiled into
+    /// the binary and pushed through the ordinary arrival door at boot, so this
+    /// answers a job on the first frame of a cold start on a machine with no
+    /// connection at all. Nothing in the input is read from the pane: the wash
+    /// is the whole network, so it does not depend on which station the pane is
+    /// on, and two panes at the same viewport share a raster.
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(DescribedJob::new(rasterize::CoverageInput {
+            sites: self
+                .state
+                .data
+                .iter()
+                .map(|site| rasterize::CoverageSite {
+                    lat: site.lat,
+                    lon: site.lon,
+                })
+                .collect(),
+            device_scale: ctx.device_scale,
+        }))
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
-        None
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/coverage")
     }
     fn is_fetching(&self) -> bool {
         false
@@ -129,10 +131,12 @@ impl OverlayHandler for RadarSitesHandler {
         None
     }
 
-    /// The site table, installed by the frontend that owns it.
+    /// The same table `RadarSites` is handed, through the same door and by the
+    /// same publisher — one arrival, two layers, so the two can never disagree
+    /// about which stations exist.
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(rows) = self.state.downcast_round::<RadarSitesFetchResult>(result) else {
-            log::error!("radar sites handler received unexpected fetch result type");
+            log::error!("radar coverage handler received unexpected fetch result type");
             return;
         };
         self.state.set_data(rows.0);
@@ -142,7 +146,7 @@ impl OverlayHandler for RadarSitesHandler {
     fn controls(&self, pane: &PaneRef<'_>) -> Vec<ControlItem> {
         vec![ControlItem::Toggle {
             id: "enabled",
-            label: "Radar Sites".to_string(),
+            label: "Radar Coverage".to_string(),
             enabled: self.is_enabled(pane),
         }]
     }
@@ -156,13 +160,6 @@ impl OverlayHandler for RadarSitesHandler {
         }
         ControlEffect::None
     }
-
-    // ── Per-pane state (WO-M10b) ──────────────────────────────────────
-    //
-    // This layer's only per-pane fact is whether the pane draws it, so its
-    // state IS the toggle. `self.enabled` survives as the registry's own copy
-    // until WO-M10c deletes the swap that keeps it; every answer below prefers
-    // the pane's when a pane is supplied.
 
     fn create_pane_state(&self, enabled: bool) -> Option<FetchPayload> {
         PaneToggle::create(enabled)

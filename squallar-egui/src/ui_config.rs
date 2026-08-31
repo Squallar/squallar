@@ -162,6 +162,25 @@ struct PaneConfig {
     /// transport.
     #[serde(default = "default_transport", skip_serializing_if = "is_radar")]
     transport: LayerId,
+    /// **Whether this pane draws a coverage ring**, for
+    /// [`crate::pane::PaneState::selected_site`].
+    ///
+    /// A bool and not a station name, because the only settled states are "the
+    /// ring is on the station this pane is showing" and "there is no ring": the
+    /// gesture that selects a station is the gesture that switches to it, so a
+    /// name here would restate [`PaneConfig`]'s own site and could only ever
+    /// disagree with it. The pane's site is restored from this same file, so the
+    /// ring lands back on the station it was on.
+    ///
+    /// **Written only when it is off.** An absent key reads as on, which is what
+    /// every config written before the field existed described — a map that drew
+    /// every station's ring drew the current station's too — and what a fresh
+    /// pane does. A key on every pane would change the bytes of files that say
+    /// nothing about it, which
+    /// `a_config_naming_an_unregistered_layer_is_written_back_byte_preserved`
+    /// forbids.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    coverage_ring: bool,
     /// **This pane's layer stack, bottom to top** — the v3 shape. One entry
     /// per layer, each carrying its own id, enabled flag and saved config;
     /// the list's order IS the draw order. Replaces v2's three parallel
@@ -949,6 +968,7 @@ impl Default for PaneConfig {
             viewport_link: true,
             layer_link: true,
             transport: default_transport(),
+            coverage_ring: default_true(),
             layer_slots: SlotList::default(),
             removed_layers: SlotList::default(),
             zoom: None,
@@ -1552,6 +1572,7 @@ impl super::Gui {
                     viewport_link: pane.viewport_link,
                     layer_link: pane.layer_link,
                     transport: pane.transport_layer().clone(),
+                    coverage_ring: pane.selected_site().is_some(),
                     layer_slots: pane_slot_list(pane, global_live_chunks),
                     removed_layers: pane_removed_list(pane),
                     unknown: pane.config_baggage.fields.clone(),
@@ -1890,6 +1911,11 @@ impl super::Gui {
             if !pane_site.is_empty() {
                 pane.set_site(pane_site);
             }
+            // After the site, never before: the ring is on this pane's own
+            // station, so the name has to be the restored one. `set_site` is
+            // deliberately side-effect-free (see `PaneState::site`), which is
+            // exactly why this is written here at the call site that means it.
+            pane.selected_site = pc.coverage_ring.then(|| pane.site().to_string());
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
             pane.viewing_live = pc.viewing_live;
             // A request for the app to act on, not a state to assume: arming a

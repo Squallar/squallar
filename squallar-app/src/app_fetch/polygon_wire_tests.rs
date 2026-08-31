@@ -48,8 +48,8 @@ fn described_label(job: &squallar_source::job::DescribedJob) -> &'static str {
         "overlay/outlooks"
     } else if job.downcast_ref::<rz::DiscussionsInput>().is_some() {
         "overlay/discussions"
-    } else if job.downcast_ref::<rz::SitesInput>().is_some() {
-        "overlay/sites"
+    } else if job.downcast_ref::<rz::CoverageInput>().is_some() {
+        "overlay/coverage"
     } else if job.downcast_ref::<rz::ReportsInput>().is_some() {
         "overlay/reports"
     } else if job.downcast_ref::<rz::GlmStrikesInput>().is_some() {

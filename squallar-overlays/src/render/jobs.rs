@@ -14,19 +14,24 @@ use squallar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCode
 use squallar_source::wire::Reader;
 
 use crate::render::rasterize::{
-    AlertsInput, AlphaMode, DiscussionsInput, GlmStrikesInput, GriddedInput, HitCells,
-    OutlooksInput, RasterizeOutput, ReportsInput, SitesInput, rasterize_glm_strikes,
-    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    AlertsInput, AlphaMode, CoverageInput, DiscussionsInput, GlmStrikesInput, GriddedInput,
+    HitCells, OutlooksInput, RasterizeOutput, ReportsInput, rasterize_glm_strikes,
+    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_coverage, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
 
-/// The seven overlay rows, in dispatch order: **sites, alerts, outlooks,
+/// The seven overlay rows, in dispatch order: **coverage, alerts, outlooks,
 /// discussions, reports, glm, model**. The order is load-bearing:
 /// `squallar_worker::job_registry::job_codecs` numbers rows by position across
 /// the composed chain, so a row inserted anywhere but the end would renumber
 /// the shipped wire codes.
+///
+/// Row 0 was `overlay/sites` until the site markers became a per-frame layer.
+/// It is **repurposed in place** rather than removed and re-appended, precisely
+/// because of the numbering above: it is still the radar network's ground, now
+/// narrowed to the coverage the sites raster was really drawing.
 pub static JOB_CODECS: &[JobCodec] = &[
-    JobCodec::of::<SitesJob>(),
+    JobCodec::of::<CoverageJob>(),
     JobCodec::of::<AlertsJob>(),
     JobCodec::of::<OutlooksJob>(),
     JobCodec::of::<DiscussionsJob>(),
@@ -35,62 +40,44 @@ pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<GriddedJob>(),
 ];
 
-/// The radar-site markers row.
-pub struct SitesJob;
+/// The radar-network coverage row.
+pub struct CoverageJob;
 
-impl JobSpec for SitesJob {
-    type In = SitesInput;
+impl JobSpec for CoverageJob {
+    type In = CoverageInput;
     type Out = RasterizeOutput;
-    const LABEL: &'static str = "overlay/sites";
+    const LABEL: &'static str = "overlay/coverage";
     const COST: JobCost = JobCost::Raster;
 
-    fn encode(sites: &SitesInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
-        out.extend_from_slice(&sites.zoom.to_le_bytes());
-        out.push(u8::from(sites.is_dark));
-        out.extend_from_slice(&sites.device_scale.to_le_bytes());
-        out.extend_from_slice(&(sites.sites.len() as u32).to_le_bytes());
-        for site in &sites.sites {
+    fn encode(input: &CoverageInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        out.extend_from_slice(&input.device_scale.to_le_bytes());
+        out.extend_from_slice(&(input.sites.len() as u32).to_le_bytes());
+        for site in &input.sites {
             out.extend_from_slice(&site.lat.to_le_bytes());
             out.extend_from_slice(&site.lon.to_le_bytes());
-            out.push(u8::from(site.is_current));
-            out.push(u8::from(site.is_loading));
-            encode_str(out, &site.name);
         }
     }
 
-    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(SitesInput, JobGeometry)> {
-        let zoom = r.f64()?;
-        let is_dark = flag(r.u8()?)?;
+    fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(CoverageInput, JobGeometry)> {
         let device_scale = r.f32()?;
         let count = r.u32()? as usize;
         let mut sites = Vec::new();
         for _ in 0..count {
             let lat = r.f64()?;
             let lon = r.f64()?;
-            let is_current = flag(r.u8()?)?;
-            let is_loading = flag(r.u8()?)?;
-            let name = decode_str(r)?;
-            sites.push(crate::render::rasterize::RadarSiteInfo {
-                name,
-                lat,
-                lon,
-                is_current,
-                is_loading,
-            });
+            sites.push(crate::render::rasterize::CoverageSite { lat, lon });
         }
         Some((
-            crate::render::rasterize::SitesInput {
+            crate::render::rasterize::CoverageInput {
                 sites,
-                zoom,
-                is_dark,
                 device_scale,
             },
             geo,
         ))
     }
 
-    fn run(input: &SitesInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
-        Some(rasterize_radar_sites(
+    fn run(input: &CoverageInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
+        Some(rasterize_radar_coverage(
             input,
             &geo.bounds,
             geo.width,
@@ -99,7 +86,7 @@ impl JobSpec for SitesJob {
     }
 }
 
-impl JobOutCodec for SitesJob {
+impl JobOutCodec for CoverageJob {
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
@@ -1160,8 +1147,7 @@ mod tests {
     use super::*;
     use crate::nws::alert::AlertCategory;
     use crate::render::rasterize::{
-        AlertPaint, DiscussionPaint, FlashPaint, GridWindow, IndexWindow, RadarSiteInfo,
-        ReportPaint,
+        AlertPaint, CoverageSite, DiscussionPaint, FlashPaint, GridWindow, IndexWindow, ReportPaint,
     };
     use crate::spc::discussion::MdType;
     use crate::spc::reports::StormReportKind;
@@ -1249,7 +1235,7 @@ mod tests {
     /// **Deliberately not derived from `JOB_CODECS`** — a list read off the
     /// thing it checks cannot catch a row that moved.
     const EXPECTED_LABELS: [&str; 7] = [
-        "overlay/sites",
+        "overlay/coverage",
         "overlay/alerts",
         "overlay/outlooks",
         "overlay/discussions",
@@ -1285,26 +1271,18 @@ mod tests {
     }
 
     #[test]
-    fn the_sites_row_round_trips() {
-        let job = DescribedJob::new(SitesInput {
+    fn the_coverage_row_round_trips() {
+        let job = DescribedJob::new(CoverageInput {
             sites: vec![
-                RadarSiteInfo {
-                    name: "KTLX".to_owned(),
+                CoverageSite {
                     lat: 35.333,
                     lon: -97.278,
-                    is_current: true,
-                    is_loading: false,
                 },
-                RadarSiteInfo {
-                    name: "KFDR".to_owned(),
+                CoverageSite {
                     lat: 34.362,
                     lon: -98.976,
-                    is_current: false,
-                    is_loading: true,
                 },
             ],
-            zoom: 7.5,
-            is_dark: true,
             device_scale: 2.0,
         });
         assert_round_trips(&JOB_CODECS[0], &job);

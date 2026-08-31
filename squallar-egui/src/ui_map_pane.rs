@@ -675,11 +675,16 @@ pub(super) fn render_pane_map_content(
                     // stops a name being drawn once per tile that carries it.
                     paint_labels(ui.painter(), std::mem::take(&mut ctx.basemap_labels));
                 }
-                id if *id == known::RADAR_SITES => {
+                id if *id == known::RADAR_COVERAGE => {
                     if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
+                }
+                id if *id == known::RADAR_SITES => {
+                    // Under the dots, so a marker is never hidden by the ring
+                    // belonging to it.
+                    draw_selected_site_ring(ui, projector, ctx.pane);
                     handle_radar_site_interactions(ui, zoom, &visible_sites, ctx);
                 }
                 id if *id == known::USER_LOCATION => {
@@ -1252,6 +1257,76 @@ fn visible_radar_sites(
     )
 }
 
+/// Paint the selected station's 230 km coverage ring, and nothing else's.
+///
+/// **Its own pass over the table, not a filter of [`visible_radar_sites`].**
+/// That walk keeps sites within 100 pt of the pane, which is the right margin
+/// for a dot and its label and the wrong one for a ring: a station a whole
+/// screen off the edge still covers ground the pane is looking at. The cull
+/// here is against the ring.
+///
+/// Draws at most one ring — the map's answer to "nothing selected" is dots and
+/// no rings, and the map's answer to "one station selected" is exactly one.
+fn draw_selected_site_ring(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    pane: &PaneState,
+) -> Option<crate::site_marker::RingPlacement> {
+    if !pane.is_overlay_enabled(&known::RADAR_SITES) {
+        return None;
+    }
+    let selected = pane.selected_site()?;
+    let row = squallar_radar::sites::get_radar_site(selected)?;
+
+    let rect = ui.max_rect();
+    let placement = crate::site_marker::ring_placement(
+        projector,
+        row.lat,
+        row.lon,
+        rect.center().x,
+        crate::site_marker::world_width_in_points(projector),
+    )?;
+    if !rect.expand(placement.radius).contains(placement.center) {
+        return None;
+    }
+
+    let role = crate::site_marker::MarkerRole::for_station(
+        selected,
+        pane.site(),
+        pane.loading_site.as_deref(),
+    );
+    crate::site_marker::draw_coverage_ring(ui.painter(), placement, role);
+    Some(placement)
+}
+
+/// The order the station names compete for screen in.
+///
+/// Split out so the rule is one readable function rather than a sort key buried
+/// in the draw loop: the selected station's name is never the one dropped, the
+/// pane's own station comes next, and a WSR-88D outranks a terminal radar
+/// sitting inside its coverage — `TDTW` is what makes Detroit's `KDTX` illegible.
+/// Everything after that is the site table's own fixed order, which does not
+/// move when the map does.
+fn site_label_ranks(sites: &[VisibleSite], pane: &PaneState) -> Vec<crate::site_marker::LabelRank> {
+    use crate::site_marker::LabelRank;
+    let selected = pane.selected_site();
+    let current = pane.site();
+    sites
+        .iter()
+        .map(|s| {
+            if selected == Some(s.site.name) {
+                LabelRank::Selected
+            } else if current == s.site.name {
+                LabelRank::Current
+            } else if s.site.network == squallar_radar::sites::RadarNetwork::Wsr88d {
+                LabelRank::Primary
+            } else {
+                LabelRank::Secondary
+            }
+        })
+        .collect()
+}
+
 /// The walk itself, over whichever table it is handed. The table is an argument
 /// rather than a global read so a test can hand it two tables of different
 /// lengths.
@@ -1327,38 +1402,65 @@ fn handle_radar_site_interactions(
     let current_site = pane.site().to_string();
     let loading_site = pane.loading_site.clone();
 
+    // **Every marker is drawn, at every zoom, for every station.** The dots are
+    // what makes the network discoverable, and only the ring is gated by the
+    // selection. This loop runs first and separately from the labels because a
+    // dot must not be able to lose a contest to a name.
     for site in sites {
-        let radar_site = site.site;
-        let site_screen = site.screen;
-        let icon_rect = site.icon_rect;
+        let role = crate::site_marker::MarkerRole::for_station(
+            site.site.name,
+            &current_site,
+            loading_site.as_deref(),
+        );
+        crate::site_marker::draw_site_marker(ui.painter(), site.screen, zoom, role);
+    }
 
-        let role = if loading_site.as_deref() == Some(radar_site.name) {
-            crate::site_marker::MarkerRole::Loading
-        } else if current_site == radar_site.name {
-            crate::site_marker::MarkerRole::Current
-        } else {
-            crate::site_marker::MarkerRole::Ordinary
-        };
-        crate::site_marker::draw_site_marker(ui.painter(), site_screen, zoom, role);
-
-        if zoom >= 5.0 {
-            let text_pos = egui::pos2(site_screen.x, site_screen.y + icon_size / 2.0 + 3.0);
-            crate::site_marker::draw_site_label(
+    // **One set of claimed areas for the whole pane**, exactly as the city
+    // labels run — see `ui_map_overlays::paint_labels`. Asking in
+    // `label_order`'s order is what makes the result stable: the first name to
+    // ask finds nothing claimed and therefore always draws, so a viewport with
+    // any station in it can never come back with every name suppressed.
+    if zoom >= 5.0 {
+        let mut occupied = walkers::OccupiedAreas::new();
+        let ranks = site_label_ranks(sites, pane);
+        for idx in crate::site_marker::label_order(&ranks) {
+            let site = &sites[idx];
+            let text_pos = egui::pos2(site.screen.x, site.screen.y + icon_size / 2.0 + 3.0);
+            crate::site_marker::try_draw_site_label(
                 ui.painter(),
+                &mut occupied,
                 text_pos,
-                radar_site.name,
+                site.site.name,
                 egui::FontId::monospace(font_size),
                 text_color,
                 is_dark,
             );
         }
+    }
+
+    for site in sites {
+        let radar_site = site.site;
+        let icon_rect = site.icon_rect;
 
         if let Some(pos) = click_pos
             && icon_rect.contains(pos)
             && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
         {
-            pane.loading_site = Some(radar_site.name.to_string());
-            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+            // **The tap moves the ring, and asks for the radar exactly as it
+            // always did.** One gesture, two effects, and the switch half is
+            // unchanged: `App::handle_radar_action` already does nothing to a
+            // pane whose site is not moving (`if pane.site() != site`), so
+            // tapping the station you are already on to put its ring away costs
+            // no fetch.
+            pane.toggle_ring_selection(radar_site.name);
+            // **Only where the site really moves.** `loading_site` is what
+            // paints a marker purple until the volume lands, and a pane that is
+            // already on this station will never be handed one — so setting it
+            // here would leave the dot purple for as long as the pane lived.
+            if current_site != radar_site.name {
+                pane.loading_site = Some(radar_site.name.to_string());
+                pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+            }
             actions.push(GuiAction::SwitchRadarSite {
                 site: radar_site.name.to_string(),
                 pane_idx,

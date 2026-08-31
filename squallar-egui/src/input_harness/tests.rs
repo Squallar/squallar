@@ -5104,7 +5104,10 @@ fn requested_plans(h: &InputHarness) -> Vec<crate::overlay_cache::OverlayTexture
 /// `RenderOverlay`.
 fn harness_requesting_overlays() -> InputHarness {
     let mut h = InputHarness::new();
-    h.gui_mut().enable_overlay_for_test(&known::RADAR_SITES);
+    // `RadarCoverage` and not `RadarSites`: the site layer is `PerFrameDirect`
+    // and describes no job, so it emits no `RenderOverlay` at all. The coverage
+    // wash is the texture half of that split and needs no network either.
+    h.gui_mut().enable_overlay_for_test(&known::RADAR_COVERAGE);
     h.warm_up();
     h
 }

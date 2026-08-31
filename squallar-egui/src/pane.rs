@@ -1077,6 +1077,31 @@ pub struct PaneState {
     orphan_time: LayerTimeState,
     /// Which site is currently being loaded for this pane (transient loading indicator).
     pub loading_site: Option<String>,
+    /// **The one station whose 230 km coverage ring is drawn**, or `None` for a
+    /// map of bare dots.
+    ///
+    /// # Why this is not simply [`Self::site`]
+    ///
+    /// It is *nearly* that, and the near-miss is the whole reason it is stored.
+    /// Tapping a marker on this map switches the pane to that radar — the click
+    /// arm in `ui_map_pane` pushes `GuiAction::SwitchRadarSite` — so in this
+    /// tree there is no gesture that selects a station without also loading it,
+    /// and a selection can therefore only ever be the active site or nothing.
+    /// What the extra state buys is the *nothing*: tapping the already-selected
+    /// station puts the ring away without unloading its data, which is the only
+    /// way a user reaches the bare-dots map at all.
+    ///
+    /// Which station is *active* is already said on the glass without any ring:
+    /// it is the one red marker ([`crate::site_marker::MarkerRole::Current`]).
+    /// So the ring is a dismissible halo on the active station rather than a
+    /// second, independent selection, and forcing it back on for the active
+    /// site would make "no rings" unreachable.
+    ///
+    /// Persisted, like every other piece of pane state — reopen is 1:1, and a
+    /// user who put the rings away does not find them back the next morning.
+    /// Seeded to the pane's own site on a fresh pane, so the default map is the
+    /// one ring the user asked for rather than none.
+    pub selected_site: Option<String>,
     /// Generation counter for RadarSites texture invalidation.
     /// Bumped when site, loading_site, or theme changes.
     pub radar_sites_render_gen: u64,
@@ -1633,6 +1658,32 @@ impl PaneState {
         self.site = site;
     }
 
+    /// The station whose coverage ring is drawn, if any.
+    pub fn selected_site(&self) -> Option<&str> {
+        self.selected_site.as_deref()
+    }
+
+    /// What a tap on `site`'s marker does to the selection.
+    ///
+    /// Tapping the station that already carries the ring puts the ring away;
+    /// tapping any other station moves it there. That is the whole gesture, and
+    /// it is the same one on a touch screen and under a mouse — **there is no
+    /// hover arm here on purpose**. A pointer swept across a continental view
+    /// would flash rings on and off across the whole network, and a phone has
+    /// no hover to sweep.
+    ///
+    /// Deliberately *not* called from [`Self::set_site`], which
+    /// [`Self::site`]'s note forbids from growing side effects: a config load
+    /// assigns a pane's site part-way through restoring it, and a selection
+    /// written from there would overwrite the one being restored.
+    pub fn toggle_ring_selection(&mut self, site: &str) {
+        if self.selected_site.as_deref() == Some(site) {
+            self.selected_site = None;
+        } else {
+            self.selected_site = Some(site.to_string());
+        }
+    }
+
     /// The radar field this pane has selected.
     ///
     /// **By value, and that costs nothing**: a pane's field is always the
@@ -1668,6 +1719,10 @@ impl PaneState {
         let mut map_memory = MapMemory::default();
         let _ = map_memory.set_zoom(DEFAULT_PANE_ZOOM);
         Self {
+            // The ring starts on the station the pane starts on. A fresh map
+            // showing no coverage at all would make the feature invisible until
+            // the user happened to tap a dot.
+            selected_site: Some(site.clone()),
             site,
             scan_info: None,
             data_time: None,

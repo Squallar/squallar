@@ -1184,12 +1184,15 @@ impl super::App {
 
         match &id {
             // **The ten described kinds** — the four polygon kinds, the two
-            // hit-map kinds, the three gridded rasters and, since WO-M10c, the
-            // site table. The list is a coincidence of "answers `prepare_job`",
-            // pinned in `texture_tests`; `RadarSites` joined it when the
-            // handler gained a pane to read its site from, `SpcFireOutlook`
-            // when the fire weather layer landed, `Mrms` with the national
-            // mosaic and `Gmgsi` with the global one.
+            // hit-map kinds, the three gridded rasters and the radar network's
+            // coverage. The list is a coincidence of "answers `prepare_job`",
+            // pinned in `texture_tests`; `SpcFireOutlook` joined it when the
+            // fire weather layer landed, `Mrms` with the national mosaic and
+            // `Gmgsi` with the global one. `RadarCoverage` is here in
+            // `RadarSites`' place: the site markers became a per-frame layer
+            // and stopped answering `prepare_job` at all, while the ground they
+            // used to carry — the 230 km coverage — kept the raster under its
+            // own id.
             id if *id == known::SPC_OUTLOOK
                 || *id == known::SPC_FIRE_OUTLOOK
                 || *id == known::SPC_DISCUSSIONS
@@ -1199,7 +1202,7 @@ impl super::App {
                 || *id == known::MODEL_DATA
                 || *id == known::MRMS
                 || *id == known::GMGSI
-                || *id == known::RADAR_SITES =>
+                || *id == known::RADAR_COVERAGE =>
             {
                 let clock = chrono::Utc::now().naive_utc();
                 let rctx = squallar_overlays::render::overlay_state::RasterizeContext {

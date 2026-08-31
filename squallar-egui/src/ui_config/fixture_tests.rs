@@ -1924,61 +1924,39 @@ fn publishing_a_selection_leaves_the_files_own_tilt_byte_for_byte() {
     );
 }
 
+/// **"You are here" is a per-frame marker fill now**, and it is read here off
+/// the rule the painter uses rather than off a raster.
+///
+/// The site markers left the overlay raster when a baked marker turned out to
+/// be stretched by every zoom gesture, so no described job carries an
+/// `is_current` flag any more — the input to the coverage wash has no names and
+/// no roles in it at all, deliberately, because the wash is the whole network's.
+/// What decides the red disc is [`MarkerRole::for_station`], asked once per
+/// station per frame against the pane's own site, and that is the subject below.
+///
+/// The stations are named as literals rather than taken from
+/// `squallar_radar::sites::radars()`, which is a process-global catalogue
+/// another test may or may not have adopted by the time this one runs.
 #[test]
 fn the_you_are_here_marker_follows_the_site_the_pane_moved_to() {
-    use squallar_overlays::render::handlers::sites::{RadarSitesFetchResult, SiteRow};
-    use squallar_overlays::render::overlay_state::OverlayFetchResult;
+    use crate::site_marker::MarkerRole;
+
+    /// The two stations the fixture's pane could be showing.
+    const STATIONS: [&str; 2] = ["KOUN", "KFWS"];
 
     let store = store_with(include_str!("fixtures/current_full.json"));
     let mut gui = Gui::new();
     assert!(gui.load_ui_config(&store), "the fixture must load");
-    gui.set_overlay_on_pane_for_test(1, &known::RADAR_SITES, true);
-    // The table is handed over explicitly rather than taken from
-    // `squallar_radar::sites::radars()`, which is a process-global catalogue
-    // another test may or may not have adopted by the time this one runs.
-    gui.deliver_overlay_fetch(OverlayFetchResult {
-        kind: known::RADAR_SITES,
-        data: Box::new(RadarSitesFetchResult(vec![
-            SiteRow {
-                name: "KOUN".to_string(),
-                lat: 35.23,
-                lon: -97.46,
-            },
-            SiteRow {
-                name: "KFWS".to_string(),
-                lat: 32.57,
-                lon: -97.30,
-            },
-        ])),
-    });
 
     let current_marks = |gui: &Gui, idx: usize| -> Vec<String> {
         let pane = gui.pane(idx).expect("the fixture's pane");
-        let view = pane.view(idx);
-        let now = chrono::Utc::now().naive_utc();
-        let job = gui
-            .overlays
-            .prepare_job(
-                &known::RADAR_SITES,
-                &squallar_source::handler::RasterizeContext {
-                    is_dark: false,
-                    zoom: 7.0,
-                    device_scale: 1.0,
-                    now,
-                    as_of: now,
-                    frame: None,
-                },
-                &view.layer(&known::RADAR_SITES),
-            )
-            .expect("the sites layer describes a job once it holds the table");
-        let input = job
-            .downcast_ref::<squallar_overlays::render::rasterize::SitesInput>()
-            .expect("the sites layer describes a sites job");
-        input
-            .sites
+        STATIONS
             .iter()
-            .filter(|s| s.is_current)
-            .map(|s| s.name.clone())
+            .filter(|name| {
+                MarkerRole::for_station(name, pane.site(), pane.loading_site.as_deref())
+                    == MarkerRole::Current
+            })
+            .map(|name| (*name).to_string())
             .collect()
     };
 
@@ -1991,14 +1969,13 @@ fn the_you_are_here_marker_follows_the_site_the_pane_moved_to() {
     gui.pane_mut(1)
         .expect("pane 1")
         .set_site("KFWS".to_string());
-    gui.hydrate_pane_layer_states_for_test(1);
 
     assert_eq!(
         current_marks(&gui, 1),
         vec!["KFWS".to_string()],
-        "the pane moved to KFWS and the radar-sites layer still marked KOUN as \
-         \"you are here\" — the marker followed the site the file was opened \
-         on, for the whole session",
+        "the pane moved to KFWS and the map still marked KOUN as \"you are \
+         here\" — the marker followed the site the file was opened on, for the \
+         whole session",
     );
 }
 

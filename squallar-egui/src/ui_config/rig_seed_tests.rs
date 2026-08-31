@@ -30,7 +30,14 @@ const RUN_TIER2: &str = include_str!("../../../.github/browser-rig/run_tier2.sh"
 /// network** — the site table is compiled into `squallar-radar` — and that ships
 /// `default_enabled() == false`, which is what makes removing it from the seed
 /// a real negative control for the rig gate rather than a tamper.
-const SEEDED: squallar_source::id::LayerId = squallar_source::id::known::RADAR_SITES;
+///
+/// **It used to be `RadarSites`.** That layer stopped rasterizing when the
+/// station markers, their names and the selected station's ring all became
+/// screen-space per-frame painting; what was genuinely ground in it — the
+/// network's 230 km coverage — kept the raster under this id. The vehicle's
+/// properties are unchanged, and deliberately so: same compiled-in table, same
+/// arrival door, same `default_enabled() == false`.
+const SEEDED: squallar_source::id::LayerId = squallar_source::id::known::RADAR_COVERAGE;
 
 /// The `SEED_LS` assignment's value, with the shell quoting undone.
 ///

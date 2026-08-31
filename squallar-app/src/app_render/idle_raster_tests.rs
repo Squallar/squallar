@@ -180,15 +180,19 @@ fn enable(app: &mut crate::app::App, idx: usize, id: &LayerId) {
 
 /// The layers this fixture puts a picture on the glass for.
 fn seeded_layers() -> [LayerId; 3] {
-    [known::NWS_ALERTS, known::STORM_REPORTS, known::RADAR_SITES]
+    [
+        known::NWS_ALERTS,
+        known::STORM_REPORTS,
+        known::RADAR_COVERAGE,
+    ]
 }
 
 /// One pane on KTLX with three texture layers on and data behind each.
 ///
-/// `RadarSites` is in the set for the same reason the Tier-2 rig seeds it: it
-/// is the one texture layer that needs no network, because the site table is
-/// compiled in and `publish_radar_sites` pushes it through the ordinary
-/// arrival door.
+/// `RadarCoverage` is in the set because it is the one texture layer that needs
+/// no network: the site table is compiled in and `publish_radar_sites` pushes it
+/// through the ordinary arrival door. It carries the raster half of what used to
+/// be `RadarSites`, which is a per-frame layer now and rasterizes nothing.
 fn a_pane_with_three_texture_layers() -> crate::app::App {
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     app.cached_dark_theme = Some(false);
@@ -288,15 +292,15 @@ fn an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture() {
     );
 
     // **The one thing "idle" cannot promise in this binary**, read on both
-    // sides of the window rather than assumed. `RadarSites` keys its cache
-    // token on `PaneState::radar_sites_render_gen`, which
-    // `Gui::republish_radar_sites_if_the_table_moved` bumps whenever
-    // `squallar_radar::sites::table_generation` moves — and that table is a
-    // process-global `static` that any other test in this binary can resolve
-    // into while this one runs. A `RadarSites` raster asked for across such a
-    // move is the layer doing exactly what it should. Measured: with the whole
-    // `squallar-app` suite running in parallel this fires, and with this test
-    // filtered to itself it does not.
+    // sides of the window rather than assumed. `RadarCoverage` holds a copy of
+    // the site table, and `Gui::republish_radar_sites_if_the_table_moved`
+    // re-delivers it whenever `squallar_radar::sites::table_generation` moves —
+    // which bumps the handler's data generation and so its cache token. That
+    // table is a process-global `static` that any other test in this binary can
+    // resolve into while this one runs. A `RadarCoverage` raster asked for
+    // across such a move is the layer doing exactly what it should. Measured:
+    // with the whole `squallar-app` suite running in parallel this fires, and
+    // with this test filtered to itself it does not.
     //
     // Read BEFORE the window and compared after, so the generation cannot be
     // read as unmoved because it moved while the window ran.
@@ -313,7 +317,7 @@ fn an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture() {
 
     let unexplained: Vec<&(usize, LayerId)> = idle_asks
         .iter()
-        .filter(|(_, id)| !(table_moved && *id == known::RADAR_SITES))
+        .filter(|(_, id)| !(table_moved && *id == known::RADAR_COVERAGE))
         .collect();
     assert!(
         unexplained.is_empty(),

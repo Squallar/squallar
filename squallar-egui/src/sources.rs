@@ -5,7 +5,7 @@ use squallar_source::handler::SourceHandler;
 use squallar_source::id::LayerId;
 
 /// Every layer the app registers, in registration order: the overlays crate's
-/// fourteen, radar's one, and this crate's own two — Terrain and BasemapTiles,
+/// fifteen, radar's one, and this crate's own two — Terrain and BasemapTiles,
 /// streaming-tile layers whose entire engine (archive source, decode, draw)
 /// lives in this crate's tile machinery, so this crate is the one that owns
 /// them.
@@ -35,7 +35,7 @@ pub fn all() -> Vec<Box<dyn SourceHandler>> {
 /// the thing it is meant to floor compares the registry against itself and
 /// cannot fail — the shape that cost this campaign an entire class of pins.
 #[cfg(test)]
-pub(crate) const REGISTERED_LAYER_COUNT: usize = 17;
+pub(crate) const REGISTERED_LAYER_COUNT: usize = 18;
 
 /// **How many FIELDS this build registers — the same hand-kept discipline as
 /// [`REGISTERED_LAYER_COUNT`], one level down.**
@@ -246,15 +246,15 @@ mod controls_parity_tests {
     /// options. A handler whose disabled tree shrank stranded its
     /// sub-options exactly when a user goes looking for why a layer is off
     /// or what it will show once on (the M9.1 user report), so each of the
-    /// seventeen is pinned by name.
+    /// eighteen is pinned by name.
     #[test]
     fn every_handlers_control_tree_is_identical_hidden_and_shown() {
         let mut registry = OverlayRegistry::with_handlers(all());
         let kinds: Vec<LayerId> = registry.handlers().map(|h| h.id()).collect();
         assert_eq!(
             kinds.len(),
-            17,
-            "the registry carries all seventeen handlers, and the walk below \
+            18,
+            "the registry carries all eighteen handlers, and the walk below \
              must cover every one"
         );
         let ctx = PaneRef::bare(0);
@@ -279,7 +279,7 @@ mod state_key_tests {
     /// Every name saved handler state has ever been filed under, as a
     /// **literal** list — the self-verifying-inventory discipline: the live
     /// set is checked against it below, so neither side can rot alone.
-    const STATE_KEYS: [&str; 17] = [
+    const STATE_KEYS: [&str; 18] = [
         "BasemapTiles",
         "Terrain",
         "Gmgsi",
@@ -294,6 +294,7 @@ mod state_key_tests {
         "Metar",
         "Radar",
         "CityLabels",
+        "RadarCoverage",
         "RadarSites",
         "UserLocation",
         "ColorScale",
@@ -301,7 +302,7 @@ mod state_key_tests {
 
     /// **The tripwire on the bytes saved handler state is filed under.**
     #[test]
-    fn handler_state_keys_are_the_seventeen_names_saved_configs_file_state_under() {
+    fn handler_state_keys_are_the_eighteen_names_saved_configs_file_state_under() {
         let handlers = all();
         assert_eq!(
             handlers.len(),
@@ -318,7 +319,7 @@ mod state_key_tests {
         pinned.sort_unstable();
         assert_eq!(
             live, pinned,
-            "the registered ids are no longer exactly the seventeen names saved \
+            "the registered ids are no longer exactly the eighteen names saved \
              configs file handler state under — a rename or a retirement \
              orphans every user's saved state for that layer",
         );
@@ -475,6 +476,9 @@ mod registry_identity_tests {
             "Lightning",
             "Metar",
             "CityLabels",
+            // Under the markers, not over them: the wash is context for the
+            // dots and must not paint across them.
+            "RadarCoverage",
             "RadarSites",
             "UserLocation",
             "ColorScale",
@@ -485,7 +489,7 @@ mod registry_identity_tests {
         );
     }
 
-    /// **Every layer's time axis, pinned by name over the composed seventeen.**
+    /// **Every layer's time axis, pinned by name over the composed eighteen.**
     ///
     /// Written as the whole map rather than as "the non-Live ones", so a new
     /// layer cannot join without this list saying what it does with the clock,
@@ -555,6 +559,7 @@ mod registry_identity_tests {
             ("Lightning", TimeAxis::EventLifetime),
             ("Metar", TimeAxis::Live),
             ("CityLabels", TimeAxis::Live),
+            ("RadarCoverage", TimeAxis::Live),
             ("RadarSites", TimeAxis::Live),
             ("UserLocation", TimeAxis::Live),
             ("ColorScale", TimeAxis::Live),

@@ -243,7 +243,7 @@ PY=python3
 # gate below would have been green on a stormy afternoon and red on a quiet
 # one, which is not a gate.
 #
-# `RadarSites` is what makes it deterministic. It is the one texture layer
+# `RadarCoverage` is what makes it deterministic. It is the one texture layer
 # that needs NO network: the site table is compiled into squallar-radar and
 # `publish_radar_sites` pushes it through the ordinary arrival door at boot, so
 # `has_data` is true on the first frame on a CI box with no weather at all.
@@ -251,12 +251,25 @@ PY=python3
 # rather than a restatement of the default -- pinned by
 # `the_seeded_layer_is_one_a_fresh_pane_would_not_have`.
 #
+# THIS WAS `RadarSites` UNTIL THE SITE LAYER STOPPED RASTERIZING. The markers,
+# the station names and the selected station's coverage ring are all lengths in
+# points, and a picture placed by its geographic corners stretches whatever is
+# baked into it -- so all three became per-frame screen-space painting and the
+# layer became `PerFrameDirect`. It answers `prepare_job` with `None` now and
+# would have taken this gate's `dispatched` to zero on a quiet CI box.
+# `RadarCoverage` carries the half of that layer that really was ground, the
+# network's 230 km coverage, with every property this seed depends on unchanged:
+# same compiled-in table, same arrival door, same `default_enabled() == false`.
+# `RadarSites` is still seeded beside it, because the wide leg's scene is a
+# continental view of the station network and the markers are that scene.
+#
 # THE NEGATIVE CONTROL IS NOT "REMOVE THIS KEY". That was tried and it does not
 # work, for the reason above. The control that does is every texture layer
 # switched explicitly OFF -- a real configuration, and the one a user who
 # cleared their layer stack is in:
 #
-#   enabled_overlays: {"RadarSites":false,"NwsAlerts":false,"SpcDiscussions":false,
+#   enabled_overlays: {"RadarCoverage":false,"RadarSites":false,"NwsAlerts":false,
+#                      "SpcDiscussions":false,
 #                      "SpcOutlook":false,"SpcFireOutlook":false,"StormReports":false,
 #                      "Lightning":false,"ModelData":false,"Mrms":false,"Gmgsi":false}
 #
@@ -290,7 +303,7 @@ PY=python3
 # (`frame_telemetry_line_tests::the_rig_seeds_the_key_that_makes_the_frame_lines_loud`):
 # without it the gesture leg's --expect-interaction-frames reads the interact
 # count as never-written and fails naming the missing seed.
-SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true,\"RadarCoverage\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
 # The `long` leg's scene, and every part of it is load-bearing. `Mrms` is the
 # layer whose decoder held the 98 MB infallible allocation; `Gmgsi` is 60 MB a
@@ -307,7 +320,7 @@ SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enab
 # over its last 20 s -- a green leg over a defect that was live in the build it
 # was driving. The seventeen-layer scene reached the abort on 4 of 4 legs. A
 # gate is the scene that fails, not the scene that is tidy.
-LONG_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{\"ModelData\":true,\"SpcOutlook\":true,\"Radar\":true,\"SpcDiscussions\":true,\"NwsAlerts\":true,\"StormReports\":true,\"Lightning\":true,\"Metar\":true,\"CityLabels\":true,\"RadarSites\":true,\"UserLocation\":true,\"ColorScale\":true,\"SpcFireOutlook\":true,\"Mrms\":true,\"Gmgsi\":true,\"Terrain\":true,\"BasemapTiles\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+LONG_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{\"ModelData\":true,\"SpcOutlook\":true,\"Radar\":true,\"SpcDiscussions\":true,\"NwsAlerts\":true,\"StormReports\":true,\"Lightning\":true,\"Metar\":true,\"CityLabels\":true,\"RadarSites\":true,\"RadarCoverage\":true,\"UserLocation\":true,\"ColorScale\":true,\"SpcFireOutlook\":true,\"Mrms\":true,\"Gmgsi\":true,\"Terrain\":true,\"BasemapTiles\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
 # Scripted seconds in the `long` leg, and the window its progress assert diffs
 # over. 10 + 140 = 150 s, and the 140 is measured too: on the unfixed bundle
@@ -348,7 +361,7 @@ LONG_PROGRESS_WINDOW="${RIG_LONG_PROGRESS_WINDOW:-20}"
 # (`squallar.ui`, `panes[].zoom` / `panes[].center`), so the scene is seeded
 # rather than driven. NO input at all, for the `long` leg's reason -- the freeze
 # does not need any, and a leg that needed input would be testing the harness.
-WIDE_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":3.0,\"center\":[39.83,-98.58],\"enabled_overlays\":{\"RadarSites\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+WIDE_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":3.0,\"center\":[39.83,-98.58],\"enabled_overlays\":{\"RadarSites\":true,\"RadarCoverage\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
 # The user's window, and the leg is nothing without it: the same scene at the
 # rig default survives. drive.py corrects the window until the canvas DRAWING

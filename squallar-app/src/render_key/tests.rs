@@ -24,9 +24,9 @@ fn the_radar_key_is_the_same_in_dark_and_light() {
     // assertion below passes on a registry that lost its handlers.
     assert!(
         overlays.theme_sensitive(&known::RADAR_SITES),
-        "control: the site-label layer bakes `is_dark` into its raster and must \
-         declare itself theme-sensitive — a registry that answers `false` here \
-         cannot distinguish radar's `false` from a dead lookup",
+        "control: the site layer draws its label plates in the theme's colours \
+         and must declare itself theme-sensitive — a registry that answers \
+         `false` here cannot distinguish radar's `false` from a dead lookup",
     );
 
     let declared = overlays.theme_sensitive(&known::RADAR);

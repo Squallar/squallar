@@ -16,8 +16,8 @@ use squallar_source::job::DescribedJob;
 use super::sources;
 use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext, RenderMode};
 use crate::render::rasterize::{
-    self, AlphaMode, GriddedInput, RadarSiteInfo, RasterizeOutput, rasterize_glm_strikes,
-    rasterize_gridded, rasterize_nws_alerts, rasterize_radar_sites, rasterize_spc_discussions,
+    self, AlphaMode, GriddedInput, RasterizeOutput, rasterize_glm_strikes, rasterize_gridded,
+    rasterize_nws_alerts, rasterize_radar_coverage, rasterize_spc_discussions,
     rasterize_spc_outlooks, rasterize_storm_reports,
 };
 use crate::types::{HatchPattern, OverlayFeature};
@@ -113,10 +113,10 @@ fn run_described(
         (known::LIGHTNING, rasterize_glm_strikes(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<GriddedInput>() {
         (known::MODEL_DATA, rasterize_gridded(input, bounds, w, h))
-    } else if let Some(input) = job.downcast_ref::<rasterize::SitesInput>() {
+    } else if let Some(input) = job.downcast_ref::<rasterize::CoverageInput>() {
         (
-            known::RADAR_SITES,
-            rasterize_radar_sites(input, bounds, w, h),
+            known::RADAR_COVERAGE,
+            rasterize_radar_coverage(input, bounds, w, h),
         )
     } else {
         panic!("a handler described an input no handler-backed texture layer claims: {job:?}")
@@ -370,22 +370,17 @@ fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
 }
 
 /// **A station one coverage radius south of [`BOUNDS`].** What this layer draws
-/// is the 230 km ring, and 230 km is wider than this two-degree fixture box —
-/// so a station *inside* it puts its ring entirely outside and the texture comes
-/// back blank. Placed here, the ring's northern arc crosses the box, which is
-/// what the invariants below need: real pixels, some of them anti-aliased and
-/// therefore translucent.
-fn site_fixtures() -> rasterize::SitesInput {
-    rasterize::SitesInput {
-        sites: vec![RadarSiteInfo {
-            name: "KTLX".into(),
+/// is the 230 km coverage region, and 230 km is wider than this two-degree
+/// fixture box — so a station *inside* it covers the whole box uniformly and the
+/// texture comes back with no edge in it. Placed here, the region's northern
+/// boundary crosses the box, which is what the invariants below need: real
+/// pixels, some of them anti-aliased and therefore translucent.
+fn site_fixtures() -> rasterize::CoverageInput {
+    rasterize::CoverageInput {
+        sites: vec![rasterize::CoverageSite {
             lat: 35.0 - rasterize::COVERAGE_RADIUS_DEG_LAT,
             lon: -98.0,
-            is_current: false,
-            is_loading: false,
         }],
-        zoom: 7.0,
-        is_dark: false,
         device_scale: 1.0,
     }
 }
@@ -470,13 +465,13 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
         id if *id == known::MODEL_DATA => Box::new(HrrrFetchResult(Ok(cin_grid()))),
         id if *id == known::MRMS => Box::new(crate::mrms::MrmsFetchResult(Ok(mrms_grid()))),
         id if *id == known::GMGSI => Box::new(crate::gmgsi::GmgsiFetchResult(Ok(gmgsi_grid()))),
-        // **Seeded like every other kind since WO-M10c**: the site table is
-        // installed through the arrival door by the shell that owns it, so
-        // this layer has data of its own and answers `prepare_job` from it.
-        // One coverage radius south of `BOUNDS`, for the reason `site_fixtures`
-        // gives: the ring is wider than this fixture box, so a station inside it
-        // draws entirely outside it and the walks below get a blank texture.
-        id if *id == known::RADAR_SITES => Box::new(super::sites::RadarSitesFetchResult(vec![
+        // The site table is installed through the arrival door by the shell that
+        // owns it, so this layer has data of its own and answers `prepare_job`
+        // from it. One coverage radius south of `BOUNDS`, for the reason
+        // `site_fixtures` gives: the region is wider than this fixture box, so a
+        // station inside it covers the whole texture uniformly and the walks
+        // below never see an edge.
+        id if *id == known::RADAR_COVERAGE => Box::new(super::sites::RadarSitesFetchResult(vec![
             super::sites::SiteRow {
                 name: "KTLX".into(),
                 lat: 35.0 - crate::render::rasterize::COVERAGE_RADIUS_DEG_LAT,
@@ -603,8 +598,8 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     // The same rasterizer reached directly, so the walk above is checked
     // against a fixture this file owns rather than only against the handler's.
     assert_alpha_matches_bytes(
-        "rasterize_radar_sites",
-        &rasterize_radar_sites(&site_fixtures(), &BOUNDS, W, H),
+        "rasterize_radar_coverage",
+        &rasterize_radar_coverage(&site_fixtures(), &BOUNDS, W, H),
     );
 }
 
@@ -646,7 +641,7 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     };
 
     assert_eq!(
-        rasterize_radar_sites(&site_fixtures(), &BOUNDS, 0, 0).alpha,
+        rasterize_radar_coverage(&site_fixtures(), &BOUNDS, 0, 0).alpha,
         AlphaMode::Premultiplied,
     );
     assert_eq!(
@@ -991,7 +986,7 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
 
     // Deliberately spelled out. Do not regenerate this from the registry.
     let expected: [(LayerId, &str); 10] = [
-        (known::RADAR_SITES, "overlay/sites"),
+        (known::RADAR_COVERAGE, "overlay/coverage"),
         (known::NWS_ALERTS, "overlay/alerts"),
         (known::SPC_OUTLOOK, "overlay/outlooks"),
         (known::SPC_FIRE_OUTLOOK, "overlay/outlooks"),

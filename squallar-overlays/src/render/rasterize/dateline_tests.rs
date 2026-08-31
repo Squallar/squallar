@@ -238,26 +238,17 @@ fn a_polygon_across_the_western_edge_is_clipped_not_torn() {
 #[test]
 fn stations_either_side_of_the_seam_all_draw() {
     let view = bounds(5.0, 70.0, 140.0, 200.0);
-    let site = |name: &str, lat: f64, lon: f64| RadarSiteInfo {
-        name: name.to_string(),
-        lat,
-        lon,
-        is_current: false,
-        is_loading: false,
-    };
-    let one = |s: RadarSiteInfo| {
-        let input = super::SitesInput {
-            sites: vec![s],
-            zoom: 6.0,
-            is_dark: true,
+    let one = |lat: f64, lon: f64| {
+        let input = super::CoverageInput {
+            sites: vec![CoverageSite { lat, lon }],
             device_scale: 1.0,
         };
-        painted(&rasterize_radar_sites(&input, &view, TEX, TEX).rgba)
+        painted(&rasterize_radar_coverage(&input, &view, TEX, TEX).rgba)
     };
 
-    let guam = one(site("PGUA", 13.4558, 144.8111));
-    let nome = one(site("PAEC", 64.5114, -165.2950));
-    let bethel = one(site("PABC", 60.7919, -161.8764));
+    let guam = one(13.4558, 144.8111);
+    let nome = one(64.5114, -165.2950);
+    let bethel = one(60.7919, -161.8764);
 
     assert!(
         guam > 0,
@@ -273,25 +264,19 @@ fn stations_either_side_of_the_seam_all_draw() {
     );
 }
 
-/// A station a little *west* of the texture still contributes its label — 50
-/// points of slack, which `wrap_lon` would have deleted by sending it 359.5 deg
-/// east instead of leaving it there.
+/// A station a little *west* of the texture still contributes its coverage —
+/// its 230 km disc reaches ground that is in frame, which `wrap_lon` would have
+/// deleted by sending the station 359.5 deg east instead of leaving it there.
 #[test]
 fn a_station_just_west_of_the_texture_keeps_its_slack() {
     let view = bounds(30.0, 50.0, -100.0, -70.0);
-    let just_west = RadarSiteInfo {
-        name: "KXXX".to_string(),
-        lat: 40.0,
-        lon: -100.5,
-        is_current: false,
-        is_loading: false,
-    };
     let n = painted(
-        &rasterize_radar_sites(
-            &super::SitesInput {
-                sites: vec![just_west],
-                zoom: 6.0,
-                is_dark: true,
+        &rasterize_radar_coverage(
+            &super::CoverageInput {
+                sites: vec![CoverageSite {
+                    lat: 40.0,
+                    lon: -100.5,
+                }],
                 device_scale: 1.0,
             },
             &view,
@@ -302,8 +287,8 @@ fn a_station_just_west_of_the_texture_keeps_its_slack() {
     );
     assert!(
         n > 0,
-        "a station 0.5 deg west of a 30 deg viewport is inside the 50-point slack \
-         and must still paint its label; got {n} px"
+        "a station 0.5 deg west of a 30 deg viewport covers ground inside it \
+         and must still paint; got {n} px"
     );
 }
 

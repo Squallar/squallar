@@ -2241,3 +2241,70 @@ fn the_model_loop_cap_covers_a_forecast_horizon_by_sampling() {
          undecimated, so a decimating sampler would be checked nowhere",
     );
 }
+
+/// **The map with nothing selected is dots and no rings, and it is reachable.**
+///
+/// The gesture is a toggle on one station: tapping the marker that carries the
+/// ring puts it away, tapping any other moves it there. Equalities throughout —
+/// "at most one selection" is also satisfied by never selecting anything, which
+/// is the shape of gate this repo has shipped green over an under-drawing map
+/// before.
+#[test]
+fn tapping_the_selected_station_is_how_a_user_puts_the_rings_away() {
+    let mut pane = PaneState::with_site("KTLX".to_string());
+
+    // A fresh pane rings its own station: the feature is invisible otherwise,
+    // because nothing on a bare map tells a user that tapping a dot would ring it.
+    assert_eq!(
+        pane.selected_site(),
+        Some("KTLX"),
+        "a new pane must start with the ring on the station it is showing",
+    );
+
+    pane.toggle_ring_selection("KTLX");
+    assert_eq!(
+        pane.selected_site(),
+        None,
+        "tapping the ringed station again is the only way to reach the \
+         bare-dots map, so it must clear the selection",
+    );
+    assert_eq!(
+        pane.site(),
+        "KTLX",
+        "putting the ring away must not unload the data the pane is showing",
+    );
+
+    pane.toggle_ring_selection("KFDR");
+    assert_eq!(
+        pane.selected_site(),
+        Some("KFDR"),
+        "tapping a different station moves the ring to it",
+    );
+
+    pane.toggle_ring_selection("KINX");
+    assert_eq!(
+        pane.selected_site(),
+        Some("KINX"),
+        "the ring moves rather than accumulating: one station carries it or \
+         none does",
+    );
+}
+
+/// The selection is pane state, so two panes hold two of them.
+#[test]
+fn two_panes_hold_their_own_ring_selections() {
+    let mut a = PaneState::with_site("KTLX".to_string());
+    let mut b = PaneState::with_site("KFWS".to_string());
+
+    a.toggle_ring_selection("KTLX");
+    assert_eq!(a.selected_site(), None);
+    assert_eq!(
+        b.selected_site(),
+        Some("KFWS"),
+        "clearing one pane's ring must not clear another's",
+    );
+
+    b.toggle_ring_selection("KEWX");
+    assert_eq!(a.selected_site(), None);
+    assert_eq!(b.selected_site(), Some("KEWX"));
+}

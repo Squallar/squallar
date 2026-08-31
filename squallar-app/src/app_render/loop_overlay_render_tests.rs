@@ -254,10 +254,8 @@ impl OverlayHandler for FrameLayer {
             .prepared
             .push(ctx.frame);
         Some(DescribedJob::new(
-            squallar_overlays::render::rasterize::SitesInput {
+            squallar_overlays::render::rasterize::CoverageInput {
                 sites: Vec::new(),
-                zoom: ctx.zoom,
-                is_dark: ctx.is_dark,
                 device_scale: ctx.device_scale,
             },
         ))
@@ -266,7 +264,7 @@ impl OverlayHandler for FrameLayer {
     fn job_codec(&self) -> Option<&'static squallar_source::job::JobCodec> {
         squallar_overlays::render::jobs::JOB_CODECS
             .iter()
-            .find(|row| row.label == "overlay/sites")
+            .find(|row| row.label == "overlay/coverage")
     }
 }
 

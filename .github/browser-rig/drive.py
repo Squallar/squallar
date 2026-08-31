@@ -2261,7 +2261,7 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
 
     **It is NOT "remove the seeded layer".** That was the first control tried
     and it does not work: `NwsAlerts` and `SpcDiscussions` are on by default
-    and are both texture layers, so with `RadarSites` gone they still rasterize
+    and are both texture layers, so with `RadarCoverage` gone they still rasterize
     whenever the live feeds have anything in them. Measured 2026-08-22 with the
     key removed, chromium still reached 2 dispatched / 2 pictures /
     16512000 B. Which is also why the seed exists at all -- not to supply the
@@ -3786,10 +3786,10 @@ def main(argv=None):
                          "pictures>0, picture_bytes>0, shown+promoted>0, and "
                          "arrived==pictures+dropped, within --expect-timeout. "
                          "Needs a texture overlay in the scene -- run_tier2.sh "
-                         "seeds RadarSites, the one that needs no network, so "
+                         "seeds RadarCoverage, the one that needs no network, so "
                          "the gate does not depend on the weather. NEGATIVE "
                          "CONTROL: the every-layer-off seed written out beside "
-                         "SEED_LS; dropping RadarSites alone is NOT a control, "
+                         "SEED_LS; dropping RadarCoverage alone is NOT a control, "
                          "the two default-on texture overlays cover for it")
     ap.add_argument("--expect-basemap-tiles", action="store_true",
                     help="fail unless the self-hosted VECTOR BASEMAP really "

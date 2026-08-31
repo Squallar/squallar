@@ -82,6 +82,19 @@ pub mod known {
     /// machinery -- the ground every other layer paints over, registered so
     /// the Layers panel can see, reorder and remove it like the rest.
     pub const BASEMAP_TILES: LayerId = LayerId::from_static("BasemapTiles");
+    /// **The radar network's 230 km coverage, as ground.**
+    ///
+    /// Split out of [`RADAR_SITES`] when the coverage ring stopped being drawn
+    /// for every station at once. `RadarSites` is the markers, the names and
+    /// the one selected station's ring, all of it screen space and painted per
+    /// frame; this is the ground half — where the network can see, for the
+    /// whole network — and it is a raster because 230 km is 230 km and should
+    /// scale with the map.
+    ///
+    /// Off by default. A hundred and sixty overlapping outlines is what made
+    /// the sites layer illegible in the first place, so this is a question the
+    /// user asks rather than one the map answers unprompted.
+    pub const RADAR_COVERAGE: LayerId = LayerId::from_static("RadarCoverage");
 }
 
 /// Every layer id ever registered.
@@ -99,7 +112,7 @@ pub mod known {
 /// third from the bottom (weight 25), `Mrms` second (weight 15) and `Gmgsi`
 /// **first** (weight 5, under every other layer); all three are appended here
 /// regardless, because append-only wins.
-pub const LAYER_ID_LEDGER: [&str; 18] = [
+pub const LAYER_ID_LEDGER: [&str; 19] = [
     "ModelData",
     "SpcOutlook",
     "Radar",
@@ -123,6 +136,7 @@ pub const LAYER_ID_LEDGER: [&str; 18] = [
     "FakeSource",
     "Terrain",
     "BasemapTiles",
+    "RadarCoverage",
 ];
 
 #[cfg(test)]
@@ -151,6 +165,7 @@ mod tests {
             known::FAKE_SOURCE,
             known::TERRAIN,
             known::BASEMAP_TILES,
+            known::RADAR_COVERAGE,
         ];
         assert_eq!(known_ids.len(), LAYER_ID_LEDGER.len());
         for id in &known_ids {

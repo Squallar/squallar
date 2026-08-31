@@ -445,9 +445,21 @@ impl Gui {
                 lon: site.lon,
             })
             .collect();
+        // **Both layers, one read of the table.** `RadarSites` draws the
+        // markers and names per frame; `RadarCoverage` rasterizes the same
+        // stations' 230 km discs as ground. Delivered from one place so the two
+        // can never be looking at different networks — the failure this
+        // function's own generation check exists to prevent, just with two
+        // copies instead of one.
         self.deliver_overlay_fetch(
             squallar_overlays::render::overlay_state::OverlayFetchResult {
                 kind: squallar_source::id::known::RADAR_SITES,
+                data: Box::new(RadarSitesFetchResult(rows.clone())),
+            },
+        );
+        self.deliver_overlay_fetch(
+            squallar_overlays::render::overlay_state::OverlayFetchResult {
+                kind: squallar_source::id::known::RADAR_COVERAGE,
                 data: Box::new(RadarSitesFetchResult(rows)),
             },
         );

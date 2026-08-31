@@ -6,23 +6,28 @@
 //! site *labels* (per-frame egui text, straight off the table) with no ink at
 //! all under them, which every one of those pins reads as green.
 //!
-//! **What this raster carries is ground, and that is the point.** The station
-//! marker used to be baked in here at a radius in *points*, and the map places
-//! this picture by its geographic corners — so a zoom gesture stretched the
-//! marker to four times its size two levels in and snapped it back half a
-//! second after the zoom stopped. The marker moved to
-//! `squallar_egui::site_marker`, which paints it per frame; the 230 km coverage
-//! ring stayed, because 230 km is 230 km and *should* scale with the map.
+//! **What this raster carries is ground, and only ground.** Two things have now
+//! left it for the per-frame painter, both for the same reason — they are
+//! lengths in points and this picture is placed by its geographic corners, so
+//! the map stretches whatever is baked into it. First the station marker, which
+//! a two-level pinch ran up to four times its size and snapped back half a
+//! second after the zoom stopped. Then the selected station's ring, which is
+//! selection feedback and cannot wait for a whole-picture round trip. What
+//! stayed is the network's 230 km coverage, because 230 km is 230 km and
+//! *should* scale with the map.
 //!
-//! The three fills are the layer's whole vocabulary, and they are not
-//! decoration: blue/red/purple is how the map says "a radar", "the radar this
-//! pane is on" and "the radar it is loading". A test that only counted
-//! non-transparent pixels would pass on a raster that painted all three the
-//! same, so each is asked for by colour.
+//! **The three fills are gone from here and are not gone.** Blue/red/purple —
+//! "a radar", "the radar this pane is on", "the radar it is loading" — is
+//! screen-space vocabulary now, pinned in
+//! `squallar_egui::site_marker::tests::the_three_marker_roles_are_three_colours`.
+//! Nothing in this raster depends on which station a pane is on; `CoverageSite`
+//! carries a position and nothing else, so a fill that varied by role could not
+//! be spelled here.
 //!
-//! This layer is also the Tier-2 rig's `--expect-overlay-rasters` vehicle — the
-//! one texture overlay that is off by default and reproducible with no upstream
-//! — so what is asserted here is what the rig measures the pipeline with.
+//! `RadarCoverage` is also the Tier-2 rig's `--expect-overlay-rasters` vehicle —
+//! the one texture overlay that is off by default and reproducible with no
+//! upstream — so what is asserted here is what the rig measures the pipeline
+//! with.
 //!
 //! Positions are the real ones from `api.weather.gov/radar/stations`, the same
 //! catalogue the app fetches.
@@ -48,48 +53,40 @@ fn viewport() -> GeoBounds {
 const W: u32 = 400;
 const H: u32 = 300;
 
-fn site(name: &str, (lat, lon): (f64, f64)) -> RadarSiteInfo {
-    RadarSiteInfo {
-        name: name.to_string(),
-        lat,
-        lon,
-        is_current: false,
-        is_loading: false,
-    }
+fn site((lat, lon): (f64, f64)) -> CoverageSite {
+    CoverageSite { lat, lon }
 }
 
-fn input(sites: Vec<RadarSiteInfo>) -> SitesInput {
-    SitesInput {
+fn input(sites: Vec<CoverageSite>) -> CoverageInput {
+    CoverageInput {
         sites,
-        // The zoom a user actually looks at radars from.
-        zoom: 7.0,
-        is_dark: true,
         device_scale: 1.0,
     }
 }
 
-/// The raster's bytes are premultiplied; at full alpha that is the colour
-/// itself, so the three fills below are their own literals.
-fn count_pixels(out: &RasterizeOutput, rgba: [u8; 4]) -> usize {
-    out.rgba.chunks_exact(4).filter(|px| *px == rgba).count()
+/// Texels with any ink on them at all.
+fn painted(out: &RasterizeOutput) -> usize {
+    out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
 }
 
-const BLUE: [u8; 4] = [100, 150, 255, 255];
-const RED: [u8; 4] = [255, 100, 100, 255];
-const PURPLE: [u8; 4] = [160, 32, 240, 255];
+/// Texels that are the region's **edge** rather than its wash. The wash goes
+/// down at alpha 38 and the edge at 160 over it; nothing else here reaches the
+/// eighties.
+fn edge(out: &RasterizeOutput) -> usize {
+    out.rgba.chunks_exact(4).filter(|px| px[3] > 80).count()
+}
 
-/// **The floor one drawn ring has to clear.** The viewport is 6 degrees of
-/// longitude across 400 px, so 230 km is tens of pixels of radius and the ring
-/// is hundreds of pixels of circumference; anti-aliasing spreads a hairline
-/// across neighbours and only fully-saturated pixels carry the literal, so a
-/// good part of it is not counted. Fifty is far below what a drawn ring
-/// produces and far above what a stray anti-aliased pixel could fake — a ring
-/// that regressed to a dot, or to a single pixel, would fail it.
-const RING_FLOOR: usize = 50;
+/// **The floor one drawn station has to clear.** The viewport is 6 degrees of
+/// longitude across 400 px, so 230 km is tens of pixels of radius and the
+/// region's edge is hundreds of pixels of perimeter. Fifty is far below what a
+/// drawn disc produces and far above what a stray anti-aliased pixel could fake
+/// — a disc that regressed to a dot, or to a single pixel, would fail it.
+const EDGE_FLOOR: usize = 50;
 
-/// Where the ink is, relative to the antenna: `(painted within a quarter of the
-/// coverage radius, painted in a 2 px annulus at the coverage radius)`.
-fn distance_bands(out: &RasterizeOutput, at: (f64, f64)) -> (usize, usize) {
+/// Where the ink is, relative to the antenna: `(painted inside a quarter of the
+/// coverage radius, painted in a 2 px annulus at the coverage radius, painted
+/// beyond 1.3 coverage radii)`.
+fn distance_bands(out: &RasterizeOutput, at: (f64, f64)) -> (usize, usize, usize) {
     let mb = MercatorBounds::from_geo(&viewport());
     let (cx, cy) = mb.project(at.0, at.1, W as f32, H as f32);
     let (_, north) = mb.project(
@@ -100,7 +97,7 @@ fn distance_bands(out: &RasterizeOutput, at: (f64, f64)) -> (usize, usize) {
     );
     let ring_r = (cy - north).abs();
 
-    let (mut inner, mut on_ring) = (0usize, 0usize);
+    let (mut inner, mut on_ring, mut beyond) = (0usize, 0usize, 0usize);
     for (i, px) in out.rgba.chunks_exact(4).enumerate() {
         if px[3] == 0 {
             continue;
@@ -111,125 +108,92 @@ fn distance_bands(out: &RasterizeOutput, at: (f64, f64)) -> (usize, usize) {
             inner += 1;
         } else if (d - ring_r).abs() <= 2.0 {
             on_ring += 1;
+        } else if d > ring_r * 1.3 {
+            beyond += 1;
         }
     }
-    (inner, on_ring)
+    (inner, on_ring, beyond)
 }
 
-/// **The property the marker's move turned on: this picture is ground.**
+/// **The property this raster exists for: the ink is a 230 km disc.**
 ///
-/// A ring at the coverage radius and *nothing at the antenna*. The second half
-/// is what fails on a raster that went back to baking the marker: a filled disc
-/// at the station is exactly the thing a zoom gesture used to stretch.
+/// Filled to the antenna, edged at the coverage radius, and *stopping* there.
+/// The third band is the one that makes this a measurement of the radius rather
+/// than of "something painted": a rasterizer that washed the whole texture
+/// would clear the first two and fail the third.
 #[test]
-fn a_stations_ink_is_its_coverage_ring_and_not_a_dot_at_the_antenna() {
-    let out = rasterize_radar_sites(&input(vec![site("KTLX", KTLX)]), &viewport(), W, H);
+fn a_stations_ink_is_a_filled_disc_that_ends_at_its_coverage_radius() {
+    let out = rasterize_radar_coverage(&input(vec![site(KTLX)]), &viewport(), W, H);
 
-    let (inner, on_ring) = distance_bands(&out, KTLX);
+    let (inner, on_ring, beyond) = distance_bands(&out, KTLX);
     assert!(
-        on_ring >= RING_FLOOR,
-        "the station painted {on_ring} pixels at its coverage radius; a drawn \
-         ring is hundreds, so this layer is not putting coverage on the map",
-    );
-    assert_eq!(
-        inner, 0,
-        "the station painted {inner} pixels at the antenna. Ink there is sized \
-         in points, not in kilometres, so the map stretches it with every zoom \
-         gesture -- that is the marker, and it belongs in `site_marker`",
-    );
-}
-
-/// **The ring is ground, so it is the same ring whatever the map zoom says.**
-///
-/// Same viewport, same texture, five zoom levels apart: the geometry may not
-/// move, because 230 km did not.
-#[test]
-fn the_ring_is_the_same_size_whatever_zoom_the_picture_was_asked_for() {
-    let at = |zoom: f64| {
-        let mut inp = input(vec![site("KTLX", KTLX)]);
-        inp.zoom = zoom;
-        let out = rasterize_radar_sites(&inp, &viewport(), W, H);
-        distance_bands(&out, KTLX)
-    };
-    let (inner_lo, ring_lo) = at(4.0);
-    let (inner_hi, ring_hi) = at(9.0);
-
-    assert_eq!(
-        (inner_lo, inner_hi),
-        (0, 0),
-        "ink at the antenna is a point-sized thing baked into a picture the \
-         map scales",
+        on_ring >= EDGE_FLOOR,
+        "the station painted {on_ring} texels at its coverage radius; a drawn \
+         disc has hundreds on its edge, so this layer is not putting coverage \
+         on the map",
     );
     assert!(
-        ring_lo >= RING_FLOOR && ring_hi >= RING_FLOOR,
-        "both zooms must draw a ring to compare: {ring_lo} and {ring_hi}",
+        inner > 0,
+        "the ground beside the antenna came back empty; coverage is the disc, \
+         not an outline of it",
+    );
+    assert_eq!(
+        beyond, 0,
+        "the station painted {beyond} texels more than 1.3 coverage radii out. \
+         The disc is 230 km and must end there, or this is a wash over the \
+         whole viewport rather than a statement about range",
+    );
+}
+
+/// **The picture cannot depend on the map zoom, and that is now structural.**
+///
+/// [`CoverageInput`] carries positions and a device scale. There is no zoom in
+/// it to vary, so the raster this module used to check across five zoom levels
+/// is one the type system will not let a caller ask for differently. What is
+/// left to check is the half that is still expressible: the same input is the
+/// same bytes.
+#[test]
+fn the_same_stations_rasterize_to_the_same_bytes() {
+    let once = rasterize_radar_coverage(&input(vec![site(KTLX)]), &viewport(), W, H);
+    let twice = rasterize_radar_coverage(&input(vec![site(KTLX)]), &viewport(), W, H);
+    assert_eq!(
+        once.rgba, twice.rgba,
+        "this is the Tier-2 rig's deterministic vehicle; two rasterizations of \
+         one input must be one picture",
     );
 }
 
 #[test]
-fn every_ordinary_site_paints_a_blue_ring() {
-    let out = rasterize_radar_sites(
-        &input(vec![
-            site("KTLX", KTLX),
-            site("KINX", KINX),
-            site("KVNX", KVNX),
-        ]),
+fn every_station_in_view_contributes_its_coverage() {
+    let one = rasterize_radar_coverage(&input(vec![site(KTLX)]), &viewport(), W, H);
+    let three = rasterize_radar_coverage(
+        &input(vec![site(KTLX), site(KINX), site(KVNX)]),
         &viewport(),
         W,
         H,
     );
 
-    let blue = count_pixels(&out, BLUE);
     assert!(
-        blue >= RING_FLOOR * 3,
-        "three radars in view painted {blue} blue pixels; a drawn ring is \
-         hundreds each, so the map is drawing site labels with nothing under them",
-    );
-    assert_eq!(
-        count_pixels(&out, RED),
-        0,
-        "no pane is on a radar here, so nothing may wear the current-site red",
-    );
-    assert_eq!(count_pixels(&out, PURPLE), 0, "nothing is loading");
-}
-
-#[test]
-fn the_panes_own_radar_is_red_and_the_one_it_is_loading_is_purple() {
-    let mut sites = vec![site("KTLX", KTLX), site("KINX", KINX), site("KVNX", KVNX)];
-    sites[0].is_current = true;
-    sites[1].is_loading = true;
-
-    let out = rasterize_radar_sites(&input(sites), &viewport(), W, H);
-
-    let (red, purple, blue) = (
-        count_pixels(&out, RED),
-        count_pixels(&out, PURPLE),
-        count_pixels(&out, BLUE),
+        edge(&one) >= EDGE_FLOOR,
+        "one radar in view painted {} edge texels; a drawn disc is hundreds, so \
+         the map is drawing site labels with nothing under them",
+        edge(&one),
     );
     assert!(
-        red >= RING_FLOOR,
-        "the pane's own radar painted {red} red pixels",
-    );
-    assert!(
-        purple >= RING_FLOOR,
-        "the loading radar painted {purple} purple pixels",
-    );
-    assert!(
-        blue >= RING_FLOOR,
-        "the third radar, which is neither, painted {blue} blue pixels",
-    );
-    assert!(
-        red < blue + purple + red,
-        "the three fills must be three fills",
+        painted(&three) > painted(&one),
+        "three radars covered {} texels against one radar's {}; the extra two \
+         stations reach ground the first does not, so the region must grow",
+        painted(&three),
+        painted(&one),
     );
 }
 
 /// The uncooperative control: hand the same viewport no rows and the picture
-/// must be empty. Without this, a rasterizer that painted the whole texture
-/// blue would pass the tests above.
+/// must be empty. Without this, a rasterizer that washed the whole texture
+/// would pass the tests above.
 #[test]
 fn an_empty_table_paints_nothing_at_all() {
-    let out = rasterize_radar_sites(&input(Vec::new()), &viewport(), W, H);
+    let out = rasterize_radar_coverage(&input(Vec::new()), &viewport(), W, H);
     assert!(
         out.rgba.iter().all(|&b| b == 0),
         "an empty site list still put ink on the texture",
@@ -241,12 +205,8 @@ fn an_empty_table_paints_nothing_at_all() {
 /// fixture merely being non-empty.
 #[test]
 fn radars_outside_the_viewport_paint_nothing() {
-    let out = rasterize_radar_sites(
-        &input(vec![
-            site("KTLX", KTLX),
-            site("KINX", KINX),
-            site("KVNX", KVNX),
-        ]),
+    let out = rasterize_radar_coverage(
+        &input(vec![site(KTLX), site(KINX), site(KVNX)]),
         &GeoBounds {
             max_lat: 48.0,
             min_lat: 44.0,
@@ -257,22 +217,21 @@ fn radars_outside_the_viewport_paint_nothing() {
         H,
     );
     assert_eq!(
-        count_pixels(&out, BLUE),
+        painted(&out),
         0,
         "a New England viewport drew Oklahoma's radars",
     );
 }
 
-/// **A radar off the texture still covers ground on it**, which the marker's
-/// cull could not express: it culled on the antenna, and 230 km is a long way.
+/// **A radar off the texture still covers ground on it**, which a cull on the
+/// antenna could not express: 230 km is a long way.
 #[test]
 fn a_radar_just_off_the_texture_still_paints_the_ground_it_covers() {
     // KTLX's latitude, moved 1.2 degrees west of the viewport's western edge:
     // outside the picture, well inside its own coverage of it.
-    let just_west = site("KTLX", (35.3331, -101.2));
-    let out = rasterize_radar_sites(&input(vec![just_west]), &viewport(), W, H);
+    let out = rasterize_radar_coverage(&input(vec![site((35.3331, -101.2))]), &viewport(), W, H);
     assert!(
-        count_pixels(&out, BLUE) > 0,
+        painted(&out) > 0,
         "a radar 1.2 degrees west of the viewport covers ground inside it and \
          must paint the arc that lands",
     );

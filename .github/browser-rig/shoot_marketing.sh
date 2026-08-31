@@ -58,6 +58,7 @@ velocity|Storm-relative velocity on a single pane|{"squallar.ui":"{\"pane_count\
 four-pane|Four linked panes comparing products across one volume|{"squallar.ui":"{\"pane_count\":4,\"panes\":[{\"site\":\"KTLX\"},{\"site\":\"KTLX\",\"selected_product\":\"SRV\"},{\"site\":\"KTLX\",\"selected_product\":\"CC\"},{\"site\":\"KTLX\",\"selected_product\":\"ZDR\"}]}"}
 alerts|NWS warning polygons over the national picture|{"squallar.ui":"{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":5.0,\"enabled_overlays\":{\"Alerts\":true,\"Mrms\":true}}]}"}
 satellite|The GMGSI global geostationary mosaic|{"squallar.ui":"{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":4.0,\"enabled_overlays\":{\"Gmgsi\":true}}]}"}
+conus-sites|The radar network over the lower 48: a marker and a name for every station|{"squallar.ui":"{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"zoom\":5.0,\"center\":[39.83,-98.58],\"enabled_overlays\":{\"RadarSites\":true}}]}"}
 SCENES
 }
 

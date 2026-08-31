@@ -272,17 +272,13 @@ fn a_sourceless_voxel_job() -> JobRequest {
     )
 }
 
-/// The sites overlay job, on a fixture with real content.
+/// The radar-coverage overlay job, on a fixture with real content.
+///
+/// `PGUA` is in it deliberately: a station a turn away in the written
+/// coordinates is what the encoding has to carry unharmed for the seam to work
+/// at the other end.
 pub(super) fn an_overlay_sites_job() -> JobRequest {
-    let site = |name: &str, lat: f64, lon: f64, is_current: bool| {
-        squallar_overlays::render::rasterize::RadarSiteInfo {
-            name: name.to_owned(),
-            lat,
-            lon,
-            is_current,
-            is_loading: false,
-        }
-    };
+    let site = |lat: f64, lon: f64| squallar_overlays::render::rasterize::CoverageSite { lat, lon };
     JobRequest {
         geometry: JobGeometry {
             width: 96,
@@ -295,14 +291,12 @@ pub(super) fn an_overlay_sites_job() -> JobRequest {
             },
             side_ceiling_px: 0,
         },
-        job: DescribedJob::new(squallar_overlays::render::rasterize::SitesInput {
+        job: DescribedJob::new(squallar_overlays::render::rasterize::CoverageInput {
             sites: vec![
-                site("KTLX", 35.33, -97.28, true),
-                site("KVNX", 36.74, -98.13, false),
-                site("PGUA", 13.46, 144.81, false),
+                site(35.33, -97.28),
+                site(36.74, -98.13),
+                site(13.46, 144.81),
             ],
-            zoom: 6.5,
-            is_dark: false,
             device_scale: 1.0,
         }),
     }
@@ -970,7 +964,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (4, "section"),
         (5, "voxels"),
         (6, "decode"),
-        (7, "overlay/sites"),
+        (7, "overlay/coverage"),
         (8, "overlay/alerts"),
         (9, "overlay/outlooks"),
         (10, "overlay/discussions"),
@@ -1909,7 +1903,7 @@ fn every_codec_row_has_a_parity_test() {
             "the_archive_decode_is_byte_identical_direct_and_via_the_wire",
         ),
         (
-            "overlay/sites",
+            "overlay/coverage",
             "the_sites_render_is_byte_identical_direct_and_via_the_wire",
         ),
         (
@@ -2626,11 +2620,12 @@ fn the_sites_render_is_byte_identical_direct_and_via_the_wire() {
     let JobRequest { geometry, job } = an_overlay_sites_job();
     let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
     let sites = job
-        .downcast_ref::<squallar_overlays::render::rasterize::SitesInput>()
-        .expect("the fixture is a sites job");
+        .downcast_ref::<squallar_overlays::render::rasterize::CoverageInput>()
+        .expect("the fixture is a coverage job");
 
-    let direct =
-        squallar_overlays::render::rasterize::rasterize_radar_sites(sites, &bounds, width, height);
+    let direct = squallar_overlays::render::rasterize::rasterize_radar_coverage(
+        sites, &bounds, width, height,
+    );
     // The premise the via-wire contract ("always premultiplied") rides on for
     // this kind.
     assert_eq!(
@@ -4009,8 +4004,8 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
         rgba, hit_cells, ..
     } = output.take::<RasterizeOutput>().expect("an overlay raster");
     let sites_row = job_codecs()
-        .find(|row| row.label == "overlay/sites")
-        .expect("the sites row is composed");
+        .find(|row| row.label == "overlay/coverage")
+        .expect("the coverage row is composed");
     let mut head = Vec::new();
     let mut tails = Vec::new();
     (sites_row.encode_out)(
@@ -4087,38 +4082,45 @@ fn a_malformed_overlay_job_is_refused_rather_than_misread() {
     }
 
     // Offsets, stated once: code(1) + width(4) + height(4) + bounds(32) +
-    // ceiling(4) = 45 is the payload's first byte, `zoom`.
-    let mut bad_flag = bytes.clone();
-    bad_flag[53] = 2;
+    // ceiling(4) = 45 is the payload's first byte, `device_scale`; the site
+    // count is the u32 at 49.
+    //
+    // **The old `is_dark` and site-name tampers are gone with the fields they
+    // named.** `CoverageInput` carries a device scale, a count and a flat run of
+    // lat/lon pairs — no flags to put out of `{0, 1}` and no strings to make
+    // invalid UTF-8. What is left to lie about is the count, which is the one
+    // length prefix in the encoding and therefore the one place a malformed job
+    // can ask the decoder to read past its own buffer.
+    let mut renumbered = bytes.clone();
+    renumbered[49..53].copy_from_slice(&2u32.to_le_bytes());
     assert_eq!(
-        JobRequest::from_bytes(&bad_flag),
+        JobRequest::from_bytes(&renumbered),
         None,
-        "is_dark is a bool, not a byte",
+        "a count of 2 leaves the third station's 16 bytes unread, which is a \
+         trailing-bytes disagreement between the two builds",
     );
 
-    // The first site's name: 53 + 1 + count(4) + lat(8) + lon(8) + two flags +
-    // name_len(2) = 82.
-    let mut renamed = bytes.clone();
-    renamed[82] = b'Q';
-    match JobRequest::from_bytes(&renamed) {
-        Some(JobRequest { job, .. }) => {
-            let sites = job
-                .downcast_ref::<squallar_overlays::render::rasterize::SitesInput>()
-                .expect("the sites row decoded");
-            assert_eq!(
-                sites.sites[0].name, "QTLX",
-                "byte 82 is not the first name byte; the refusal below would \
-                 be about some other field",
-            );
-        }
-        other => panic!("the renamed control failed to decode: {other:?}"),
+    for (count, what) in [
+        (4u32, "a count one past the stations actually written"),
+        (u32::MAX, "a count no buffer could satisfy"),
+    ] {
+        let mut overrun = bytes.clone();
+        overrun[49..53].copy_from_slice(&count.to_le_bytes());
+        assert_eq!(
+            JobRequest::from_bytes(&overrun),
+            None,
+            "{what} was accepted",
+        );
     }
-    let mut bad_name = bytes;
-    bad_name[82] = 0xFF;
-    assert_eq!(
-        JobRequest::from_bytes(&bad_name),
-        None,
-        "a site name that is not UTF-8 was accepted",
+
+    // The control: byte 49 really is the count, so the refusals above are about
+    // the field they name and not about some neighbour.
+    let mut same = bytes;
+    same[49..53].copy_from_slice(&3u32.to_le_bytes());
+    assert!(
+        JobRequest::from_bytes(&same).is_some(),
+        "rewriting the count with its own value must decode, or offset 49 is \
+         not the count and every refusal above is accidental",
     );
 }
 

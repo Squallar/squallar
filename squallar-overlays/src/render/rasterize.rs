@@ -379,24 +379,25 @@ pub fn rasterize_nws_alerts(
     }
 }
 
+/// One station, as the coverage wash needs it: a position and nothing else.
+///
+/// **No name and no role.** The wash is the network's, not any one station's,
+/// so which radar the pane is on cannot change a texel of it — which is what
+/// lets two panes at the same viewport share one raster, and what keeps the
+/// input free of the pane read the old sites job needed.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RadarSiteInfo {
-    pub name: String,
+pub struct CoverageSite {
     pub lat: f64,
     pub lon: f64,
-    pub is_current: bool,
-    pub is_loading: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SitesInput {
-    pub sites: Vec<RadarSiteInfo>,
-    pub zoom: f64,
-    pub is_dark: bool,
+pub struct CoverageInput {
+    pub sites: Vec<CoverageSite>,
     pub device_scale: f32,
 }
 
-squallar_source::impl_job_input!(SitesInput);
+squallar_source::impl_job_input!(CoverageInput);
 
 /// A WSR-88D's nominal coverage radius, 230 km, in degrees of latitude.
 ///
@@ -404,46 +405,46 @@ squallar_source::impl_job_input!(SitesInput);
 /// 230 is the range every base product shares, so it is the distance at which
 /// "is this storm inside a radar's coverage" has one answer instead of one per
 /// product.
-pub(crate) const COVERAGE_RADIUS_DEG_LAT: f64 = 230.0 / squallar_geo::KM_PER_DEGREE_LAT;
+/// **Public because there is exactly one of it.** The selected station's ring
+/// is painted per frame by `squallar_egui::site_marker`, in points off the live
+/// projector, while the network-wide coverage wash below is ground in a raster.
+/// Two painters, one radius: a second spelling in the frontend is what
+/// `geodesy_one_definition` exists to refuse, and a 230/111.32 written from
+/// memory is ~250 m wrong on this ring.
+pub const COVERAGE_RADIUS_DEG_LAT: f64 = 230.0 / squallar_geo::KM_PER_DEGREE_LAT;
 
-/// The coverage ring's line width, in points.
-///
-/// It thins as the map pulls back because a continental view holds the whole
-/// network and 160 overlapping rings at a close-in weight is a mesh rather than
-/// a map. Unlike the ring's *radius*, this is a length on the display, so it is
-/// the one thing in this rasterizer that still needs the device scale.
-fn ring_stroke_width(zoom: f64) -> f32 {
-    ((zoom as f32 - 2.0) * 0.25).clamp(0.6, 1.6)
-}
+/// The coverage wash's outline width, in texels before density. A hairline: it
+/// is the edge of the covered region, not a ring around a station.
+const COVERAGE_EDGE_WIDTH: f32 = 1.0;
 
-/// **The radar network's coverage, as ground.** Each station's 230 km ring, in
-/// the three fills that say which station the pane is on: blue for a station,
-/// red for the pane's own, purple for the one it is switching to.
+/// **Where the radar network can see, as ground.**
 ///
-/// **The station *marker* is not here.** A marker is sized in points from the
-/// live map zoom, and this raster is placed by its geographic corners, so a
-/// baked marker was stretched by every zoom gesture — four times its size two
-/// levels into a pinch, snapping back half a second after the zoom stopped.
-/// `squallar_egui::site_marker` paints it per frame instead. A coverage ring is
-/// the opposite kind of thing: 230 km is 230 km, so it *should* scale with the
-/// map, and it is drawn here because a raster is where ground belongs.
-pub fn rasterize_radar_sites(
-    input: &SitesInput,
+/// Every station's 230 km disc, filled **as one path under the non-zero winding
+/// rule**, so the overlaps merge into a single region instead of stacking into
+/// 160 outlines. That is the difference between this and what it replaced: the
+/// old raster stroked each station's ring separately, and at continental zoom
+/// the result was a mesh of intersecting circles with the map invisible under
+/// it. One filled region has one edge — the boundary of national coverage —
+/// which is the thing the 230 km figure was chosen to answer.
+///
+/// **Nothing about the pane reaches this.** No station is coloured for being
+/// current or loading, because the wash is the network's; the markers say which
+/// radar the pane is on, in screen space, and the selected station's own ring is
+/// painted there too.
+pub fn rasterize_radar_coverage(
+    input: &CoverageInput,
     bounds: &GeoBounds,
     width: u32,
     height: u32,
 ) -> RasterizeOutput {
-    let SitesInput {
+    let CoverageInput {
         sites,
-        zoom,
-        is_dark,
         device_scale,
     } = input;
-    let (zoom, is_dark, device_scale) = (*zoom, *is_dark, *device_scale);
-    let scale = sane_device_scale(device_scale);
+    let scale = sane_device_scale(*device_scale);
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         log::error!(
-            "Pixmap allocation failed in rasterize_radar_sites ({}×{})",
+            "Pixmap allocation failed in rasterize_radar_coverage ({}×{})",
             width,
             height
         );
@@ -457,62 +458,63 @@ pub fn rasterize_radar_sites(
     let w = width as f32;
     let h = height as f32;
 
-    // A ring is a hairline whatever the zoom, so its width is a length on the
-    // display and needs the density; its *radius* is ground and needs nothing.
-    let stroke_w = ring_stroke_width(zoom) * scale;
-    // Nothing is drawn in the theme's colours any more — the plate the station
-    // name sits on moved to the per-frame painter with the name itself.
-    let _ = is_dark;
-
+    let mut pb = PathBuilder::new();
     for site in sites {
         // Into the viewport's frame first: the catalogue folds longitude into
         // [-180, 180] while `bounds` is unfolded; 4 of 208 stations are east.
         let lon = mb.nearest_lon(site.lon);
         let (px, py) = mb.project(site.lat, lon, w, h);
 
-        // The ring's radius in texels, taken by projecting a point one coverage
-        // radius due north of the station and measuring. Web Mercator is
-        // conformal, so a circle this small comes back a circle rather than an
-        // ellipse, and the north offset is a faithful radius in every
-        // direction. Latitude scaling is therefore handled for free: the same
-        // 230 km is more texels at Nome than at Key West, which is what the
-        // ground actually looks like on this projection.
+        // The radius in texels, taken by projecting a point one coverage radius
+        // due north of the station and measuring. Web Mercator is conformal, so
+        // a circle this small comes back a circle rather than an ellipse, and
+        // the north offset is a faithful radius in every direction. Latitude
+        // scaling is therefore handled for free: the same 230 km is more texels
+        // at Nome than at Key West, which is what the ground looks like on this
+        // projection.
         let (_, py_north) = mb.project(site.lat + COVERAGE_RADIUS_DEG_LAT, lon, w, h);
-        let ring_radius = (py - py_north).abs();
+        let radius = (py - py_north).abs();
 
-        // Cull on the ring, not on the station: a radar whose antenna is off
-        // the texture still covers ground that is on it.
-        let slack = ring_radius + stroke_w;
-        if px < -slack || px > w + slack || py < -slack || py > h + slack {
+        // Cull on the disc, not on the station: a radar whose antenna is off the
+        // texture still covers ground that is on it.
+        if px < -radius || px > w + radius || py < -radius || py > h + radius {
+            continue;
+        }
+        // A sub-texel disc contributes nothing a reader can see and `push_circle`
+        // is happy to build a degenerate one, so it is dropped here rather than
+        // left for the rasterizer to round away.
+        if !radius.is_finite() || radius < 1.0 {
             continue;
         }
 
-        let ink = if site.is_loading {
-            Color::from_rgba8(160, 32, 240, 255) // purple
-        } else if site.is_current {
-            Color::from_rgba8(255, 100, 100, 255) // red
-        } else {
-            Color::from_rgba8(100, 150, 255, 255) // blue
+        pb.push_circle(px, py, radius);
+    }
+
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+
+        // The wash. Faint on purpose: this draws over the whole eastern half of
+        // the country at continental zoom, and anything a reader has to see
+        // *through* has failed at being a basemap annotation.
+        paint.set_color(Color::from_rgba8(100, 150, 255, 38));
+        // **Winding and not even-odd**, and this is the whole construction: under
+        // even-odd two overlapping discs cancel to a hole where coverage is
+        // doubled, which says the opposite of the truth. Winding merges them.
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+
+        paint.set_color(Color::from_rgba8(100, 150, 255, 160));
+        let stroke = Stroke {
+            width: COVERAGE_EDGE_WIDTH * scale,
+            ..Stroke::default()
         };
-
-        // Below a couple of texels the ring is smaller than the marker drawn
-        // over it and reads as a smudge rather than as coverage.
-        if ring_radius < 2.0 * scale {
-            continue;
-        }
-
-        let mut pb = PathBuilder::new();
-        pb.push_circle(px, py, ring_radius);
-        if let Some(path) = pb.finish() {
-            let mut paint = Paint::default();
-            paint.set_color(ink);
-            paint.anti_alias = true;
-            let stroke = Stroke {
-                width: stroke_w,
-                ..Stroke::default()
-            };
-            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
-        }
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 
     RasterizeOutput {

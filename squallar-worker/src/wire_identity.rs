@@ -28,7 +28,14 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     "voxels | 103 | 0x7992be29197ec332",
     "voxels | 87 | 0xb6df319c59c9e0a5",
     "decode | 74 | 0xc06cc21eea05e948",
-    "overlay/sites | 134 | 0x41633a0073cefd5e",
+    // Re-pinned when the site layer split: row 7 was `overlay/sites | 134`,
+    // whose input carried a zoom, a theme flag and, per station, a name and two
+    // role bools. The markers, the names and the selected station's ring are
+    // screen-space per-frame painting now, so none of that crosses the wire;
+    // what is left is the network's coverage, and `CoverageSite` is a position
+    // and nothing else. The row keeps index 7 deliberately — codes are assigned
+    // by position, so moving it would renumber every row after it.
+    "overlay/coverage | 101 | 0xe9757285d7ff6422",
     "overlay/alerts | 763 | 0x9a307969466bc79a",
     "overlay/outlooks | 560 | 0x01fc75ae56a219d4",
     "overlay/discussions | 267 | 0x6a6da1ea1f7fc09c",

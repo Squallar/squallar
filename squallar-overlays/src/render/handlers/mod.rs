@@ -4,6 +4,7 @@
 // the radar table into. Everything else in them keeps its own visibility.
 pub mod alert;
 mod colorscale;
+mod coverage;
 pub mod discussion;
 pub mod firewx;
 // `pub(crate)` for one reason: the GLM poll's own test module drives
@@ -26,7 +27,7 @@ mod texture_tests;
 
 use super::overlay_state::OverlayHandler;
 
-/// **This crate's layer registrations — fourteen rows, and the only place they
+/// **This crate's layer registrations — fifteen rows, and the only place they
 /// are named.**
 ///
 /// Radar is not here: it lives in `squallar_radar::sources`, and the app's whole
@@ -45,6 +46,7 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(glm::GlmHandler::new()),
         Box::new(metar::MetarHandler::new()),
         Box::new(labels::CityLabelsHandler::new()),
+        Box::new(coverage::RadarCoverageHandler::new()),
         Box::new(sites::RadarSitesHandler::new()),
         Box::new(location::UserLocationHandler::new()),
         Box::new(colorscale::ColorScaleHandler::new()),
@@ -62,9 +64,10 @@ pub fn sources() -> Vec<Box<dyn OverlayHandler>> {
 mod round_delivery_tests {
     /// Every handler file, whether or not it fetches today: the one that
     /// reintroduces this is by definition the one nobody has read yet.
-    const HANDLER_SOURCES: [(&str, &str); 14] = [
+    const HANDLER_SOURCES: [(&str, &str); 15] = [
         ("alert", include_str!("alert.rs")),
         ("colorscale", include_str!("colorscale.rs")),
+        ("coverage", include_str!("coverage.rs")),
         ("discussion", include_str!("discussion.rs")),
         ("firewx", include_str!("firewx.rs")),
         ("glm", include_str!("glm.rs")),
@@ -144,14 +147,15 @@ mod round_delivery_tests {
                  delivery of its round some other way",
             );
         }
-        // **Eleven**, of which `sites` is the odd one: it builds no fetch
-        // task at all, but the frontend installs the radar table through the
-        // same arrival door, so it takes delivery of a round like the ten that
-        // do fetch. A handler that started or stopped taking delivery must be
-        // accounted for here rather than silently skipped.
+        // **Twelve**, of which `sites` and `coverage` are the odd two: neither
+        // builds a fetch task at all, but the frontend installs the radar table
+        // through the same arrival door and hands it to both, so each takes
+        // delivery of a round like the ten that do fetch. A handler that started
+        // or stopped taking delivery must be accounted for here rather than
+        // silently skipped.
         assert_eq!(
-            checked, 11,
-            "eleven handlers take delivery of a round; a handler that started \
+            checked, 12,
+            "twelve handlers take delivery of a round; a handler that started \
              or stopped must be accounted for here rather than silently \
              skipped",
         );

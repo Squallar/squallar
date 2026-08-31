@@ -23,9 +23,34 @@ use squallar_geo::GeoBounds;
 use squallar_source::id::{LayerId, known};
 use std::sync::{Arc, Mutex};
 
-/// The layer superseded. The site table rasterizes from the pane's own slots,
-/// so no fetch seeding is needed for `prepare_job` to produce a described job.
-const KIND: LayerId = known::RADAR_SITES;
+/// **The layer superseded, and the reason it is this one.**
+///
+/// This file is not about any layer; it is about `spawn_overlay_render`'s
+/// supersede seam, and the layer is only a vehicle for producing a described
+/// texture job. What the vehicle has to be is a **texture layer that answers
+/// `prepare_job` with no feed, no clock and no fetch double** — otherwise a test
+/// about withdrawal is also a test about the weather.
+///
+/// It was [`known::RADAR_SITES`] until the site layer split. That layer is
+/// `PerFrameDirect` now: its marker, its station names and the selected
+/// station's ring are all lengths in points, it answers `prepare_job` with
+/// `None`, and `spawn_overlay_render`'s described-kinds arm no longer names it —
+/// so a dispatch of it produces no job and the first assertion below would fail
+/// on an empty worker.
+///
+/// [`known::RADAR_COVERAGE`] took the ground half of that layer and with it the
+/// property this file needs. Its data is the site table compiled into
+/// `squallar-radar`, and `Gui::new` pushes that table through the ordinary
+/// arrival door to **both** halves of the split at construction — so
+/// `crate::app::tests::n_pane_app` on its own is enough for `prepare_job` to
+/// answer, with no feed, no clock and no fetch double. Every other texture layer
+/// wants one of those.
+///
+/// Both halves of that were measured rather than argued: with `KIND` put back to
+/// `RADAR_SITES` all three tests below fail on an empty worker (`left: 0,
+/// right: 1`), and an explicit `publish_radar_sites` in the fixture changes
+/// nothing, because `Gui::new` has already done it.
+const KIND: LayerId = known::RADAR_COVERAGE;
 
 /// A sink that records what the funnel hands it and takes every job — each
 /// test file owns its double; see `sites_wire_tests`.
