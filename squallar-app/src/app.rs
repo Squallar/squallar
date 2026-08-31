@@ -97,12 +97,15 @@ async fn create_instance() -> wgpu::Instance {
 }
 
 /// Request a redraw if a window handle is available.
+///
+/// Every ask for a frame in this app arrives here, from about thirty sites and
+/// a dozen threads, which is what makes it the one place the platform call can
+/// be made safe for all of them at once. What that means, and why a thread that
+/// is not the loop's own never makes that call itself, is on
+/// [`crate::platform::ask_for_a_frame`].
 pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
     if let Some(w) = window {
-        // Background threads may outlive the event loop on exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            w.request_redraw();
-        }));
+        crate::platform::ask_for_a_frame(w);
     }
 }
 
@@ -2366,6 +2369,12 @@ impl App {
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
+        // Winit calls `resumed` only from the loop thread, so this is where that
+        // thread can be named — and naming it is what lets every other thread's
+        // ask for a frame be routed off the blocking platform call. See
+        // `platform::ask_for_a_frame`.
+        crate::platform::record_loop_thread();
+
         // The bridge gets to amend the attributes because the web backend has to bind its
         // canvas here and nowhere else.
         let attributes = self
@@ -2381,7 +2390,10 @@ impl App {
         let held = Some(window.clone());
         self.redraw_waker.install(move || notify_redraw(&held));
 
-        window.request_redraw();
+        // Through the funnel like every other ask, so that the platform call
+        // keeps exactly one spelling in this crate and a future one added by
+        // hand fails the build rather than the app.
+        notify_redraw(&self.window);
     }
 }
 

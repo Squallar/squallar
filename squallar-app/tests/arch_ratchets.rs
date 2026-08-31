@@ -60,7 +60,14 @@
 //! 10a  loop-frame-arm occurrences, squallar-app           8    8  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' squallar-app --glob '*.rs' | wc -l
 //! 10b  ... excluding test-named paths                    2    2  rg -o 'Loop''FrameData|L3Frame''Key|Cached''Volume' squallar-app --glob '*.rs' -g '!*tests*' | wc -l
 //! 11   Ingest-phase callers outside test paths           1    -  rg -o 'self\.poll_data''_channels(' squallar-app --glob '*.rs' -g '!*tests*' | wc -l
+//! 13   platform request-redraw calls, squallar-app        1    2  rg -o '\.request_''redraw()' squallar-app --glob '*.rs' | wc -l
 //! ```
+//!
+//! Row 13 is the one row here that is not about coupling. It is a **deadlock**
+//! ceiling: the call it counts blocks on the main thread on macOS, so it may
+//! be made only from code that has already established which thread it is on.
+//! Its `was` of 2 is the state this repo shipped a freeze in. See
+//! [`the_platform_redraw_call_has_exactly_one_spelling`].
 //!
 //! **Read the commands as documentation, not as the gate.** The gate is the
 //! test below it in every case, because a command in a comment cannot fail. The
@@ -145,6 +152,16 @@ const LOOP_FRAME_ARMS: [&str; 3] = [
 /// If the walk stops seeing this in `squallar-radar`, the needles have rotted
 /// and both counts below mean nothing.
 const LOOP_MANAGER_DEF: &str = concat!("struct LoopDownload", "Manager");
+
+/// Row 13 — the platform's request-redraw call, which has exactly one spelling
+/// in this crate. Split, per this file's needle hygiene.
+const REDRAW_CALL: &str = concat!(".request_", "redraw()");
+/// Row 13's presence controls: the funnel that decides which thread makes that
+/// call, and the wrapper that is the only thing allowed to make it.
+const FRAME_ASK_ANCHOR: &str = concat!("fn ask_for_", "a_frame(");
+const REDRAW_FN_ANCHOR: &str = concat!("fn request_", "redraw(");
+/// Row 13's second half: the funnel every ask goes through.
+const NOTIFY_FN_ANCHOR: &str = concat!("fn notify_", "redraw(");
 
 /// Row 12 — the two site-keyed decoded-volume stores WO-VOLINV moved off the
 /// `App` and behind one owner. Split, per this file's needle hygiene.
@@ -1081,4 +1098,72 @@ fn the_site_keyed_volume_stores_have_one_owner() {
              to the other. Never raise this without a written plan amendment."
         );
     }
+}
+
+/// Row 13 — the platform's request-redraw call has exactly ONE spelling in this
+/// crate, and it is the one that already decided which thread it is on.
+///
+/// # Why this is a build failure and not a review comment
+///
+/// `Window::request_redraw` reads like a post and is not one. On macOS
+/// `winit-0.30.13/src/window.rs:600` routes it through `maybe_queue_on_main`,
+/// whose macOS copy (`src/platform_impl/macos/window.rs:40-51`) deliberately
+/// does not queue: it reaches `objc2_foundation::run_on_main`, which is
+/// `dispatch::Queue::main().exec_sync` for every caller that is not already the
+/// main thread (`objc2-foundation-0.2.2/src/thread.rs:107-121`) and **blocks
+/// until the main thread services the queue**. A background thread that makes
+/// that call while holding anything the loop thread wants is a deadlock, and
+/// the app stops rendering entirely.
+///
+/// That is not hypothetical. It shipped: an off-frame `ctx.request_repaint()`
+/// took egui's context write lock and then waited here, while the loop thread
+/// sat in `Gui::ui` waiting for that same lock. Overlay-heavy scenes froze
+/// within 2-35 s.
+///
+/// `platform::ask_for_a_frame` makes the class impossible rather than absent —
+/// the loop thread calls straight through, every other thread hands off to the
+/// process's redraw thread, which holds no lock anyone wants. **That property
+/// is only worth anything while the funnel has no bypass**, and a bypass is one
+/// `window.request_redraw()` written by hand in a spawned closure, which is
+/// exactly the shape thirty existing sites already have. So the count is
+/// pinned at ONE rather than audited: an auditor has to be asked, a ceiling
+/// does not.
+///
+/// **This may only ever FALL to zero (were the call to leave this crate).
+/// Raising it re-opens a class that has already cost one shipped freeze.**
+#[test]
+fn the_platform_redraw_call_has_exactly_one_spelling() {
+    let crate_root = Path::new(ROOT).join("squallar-app");
+    let app = load_tree(&crate_root);
+
+    // Presence controls, all three read from the SAME walked set the count
+    // below is read from, so a walk that reached the wrong tree fails here
+    // instead of passing a zero over nothing.
+    assert_anchored(&app, "src/platform.rs", FRAME_ASK_ANCHOR);
+    assert_anchored(&app, "src/platform.rs", REDRAW_FN_ANCHOR);
+    assert_anchored(&app, "src/app.rs", NOTIFY_FN_ANCHOR);
+
+    let total = count(&app, REDRAW_CALL);
+    assert_eq!(
+        total, 1,
+        "the platform's request-redraw call is spelled {total} time(s) in \
+         squallar-app, where the pin is ONE. Every ask for a frame goes \
+         through `notify_redraw` -> `platform::ask_for_a_frame`, which is what \
+         keeps a thread that is not the event loop's own out of a call that \
+         blocks on the main thread on macOS. A second spelling is a bypass of \
+         that decision, and a bypass in a spawned closure holding a lock is \
+         the freeze this funnel exists to make impossible.",
+    );
+
+    let (path, _) = app
+        .iter()
+        .find(|(_, t)| t.contains(REDRAW_CALL))
+        .expect("the count above is one, so exactly one file holds it");
+    assert!(
+        path.ends_with("src/platform.rs"),
+        "the one request-redraw call moved to {}. It belongs beside \
+         `ask_for_a_frame`, which is the code that decides whether making it \
+         here is safe; anywhere else, that decision has been left behind.",
+        path.display(),
+    );
 }

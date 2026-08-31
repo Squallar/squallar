@@ -88,6 +88,144 @@ impl RedrawWaker {
     }
 }
 
+/// The thread winit drives the event loop on, learned when the window is made.
+///
+/// `App::create_window` runs inside `ApplicationHandler::resumed`, which winit
+/// calls only from the loop thread, so recording `current()` there names it
+/// exactly. Unset means *not proven to be the loop thread*, and
+/// [`ask_for_a_frame`] reads unproven as foreign — the fail-safe direction is
+/// the one that hands off.
+static LOOP_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Name the loop thread. Idempotent: the first caller wins, and on a
+/// suspend/resume cycle the second is the same thread anyway.
+pub(crate) fn record_loop_thread() {
+    let _ = LOOP_THREAD.set(std::thread::current().id());
+}
+
+/// Whether the caller is the thread winit runs the loop on.
+fn on_loop_thread() -> bool {
+    LOOP_THREAD.get() == Some(&std::thread::current().id())
+}
+
+/// Ask the event loop for a frame, from any thread, without ever waiting on
+/// another one.
+///
+/// **The invariant: no thread but the loop's own performs the platform's
+/// request-redraw call.** `Window::request_redraw` is not the post its name
+/// suggests. `winit-0.30.13/src/window.rs:600` routes it through
+/// `maybe_queue_on_main`, and the macOS copy of that
+/// (`src/platform_impl/macos/window.rs:40-51`) says in its own comment that it
+/// deliberately does *not* queue: it is `MainThreadBound::get_on_main` ->
+/// `objc2_foundation::run_on_main`, which is
+/// `dispatch::Queue::main().exec_sync` for every caller that is not already the
+/// main thread (`objc2-foundation-0.2.2/src/thread.rs:107-121`) and blocks
+/// until the main thread services the queue. The Linux backends pass
+/// `maybe_queue_on_main` straight through
+/// (`src/platform_impl/linux/mod.rs:307-313`), so only macOS pays it.
+///
+/// A blocking call is a deadlock as soon as its caller holds anything the loop
+/// thread wants, and every producer in this app asks for frames off-thread:
+/// tile decodes, basemap segments, area reconciles, the chunk sockets, the
+/// sensor and theme pollers, Android's back button. One of those cycles has
+/// already been paid for — an off-frame `ctx.request_repaint()` took egui's
+/// context write lock and then waited here, while the loop thread sat in
+/// `Gui::ui` waiting for that same lock, and the app stopped rendering
+/// entirely within 2-35 s (fixed in `squallar_gpu::egui_renderer`, which keeps
+/// its own guard because it is handed an arbitrary wake and cannot check this
+/// one). Auditing every producer for the locks it holds is a standing
+/// obligation that grows with each new thread; not making the call from those
+/// threads at all is a property.
+///
+/// The loop thread still calls straight through, which is both the cheap path
+/// and the honest one: `run_on_main` already short-circuits there, so a frame
+/// asking for the next frame costs exactly what it did before.
+pub(crate) fn ask_for_a_frame(window: &crate::WindowRef) {
+    if on_loop_thread() {
+        request_redraw(window);
+    } else {
+        post_off_thread(window);
+    }
+}
+
+/// The platform call itself, and the only place it is spelled.
+///
+/// `catch_unwind` because X11's copy panics once the loop has closed, and
+/// background producers outlive the loop on the way out.
+fn request_redraw(window: &crate::WindowRef) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        window.request_redraw();
+    }));
+}
+
+/// Hand the ask to the process's own redraw thread, which holds no lock anyone
+/// wants and so may block in the platform call for as long as it likes.
+///
+/// One thread for the process, not one per producer: it exists to be the only
+/// thing that ever waits, and the asks are interchangeable.
+#[cfg(not(target_arch = "wasm32"))]
+fn post_off_thread(window: &crate::WindowRef) {
+    type Post = Box<dyn Fn(crate::WindowRef) + Send + Sync>;
+    static POST: std::sync::OnceLock<Post> = std::sync::OnceLock::new();
+    let post = POST.get_or_init(|| Box::new(coalescing_poster("squallar-redraw", request_redraw)));
+    post(window.clone());
+}
+
+/// One thread, so there is nobody to hand off to and nothing that blocks.
+///
+/// The web build has no `dispatch` queue and no second thread to be foreign
+/// from; [`on_loop_thread`] is true for every caller there, so this is the arm
+/// that must exist rather than the arm that runs.
+#[cfg(target_arch = "wasm32")]
+fn post_off_thread(window: &crate::WindowRef) {
+    request_redraw(window);
+}
+
+/// A poster whose payloads are carried out on a thread of its own, newest
+/// first and the rest discarded.
+///
+/// **The whole point is the return: posting never runs `act`.** Whatever the
+/// caller is holding is released on its own schedule, not on the schedule of
+/// whatever `act` has to wait for. `act` may block for as long as it likes,
+/// because the thread it blocks on holds nothing anyone else wants.
+///
+/// Coalescing because the asks are idempotent — *n* asks for a frame are one
+/// frame — and because on macOS each one is a round trip to the loop thread, so
+/// a burst that was cheap to produce is not cheap to deliver. Newest rather
+/// than oldest so a window replaced across a suspend is the one asked, and the
+/// payload is dropped at the end of every iteration so this thread never keeps
+/// a dead window alive.
+#[cfg(not(target_arch = "wasm32"))]
+fn coalescing_poster<T, F>(name: &str, act: F) -> impl Fn(T) + Send + Sync + 'static
+where
+    T: Send + 'static,
+    F: Fn(&T) + Send + 'static,
+{
+    let (post, asked) = std::sync::mpsc::channel::<T>();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            // Ends when every `Sender` is dropped. The redraw one never is —
+            // it lives in a `static` — and a parked `recv` costs nothing.
+            while let Ok(mut latest) = asked.recv() {
+                while let Ok(newer) = asked.try_recv() {
+                    latest = newer;
+                }
+                act(&latest);
+            }
+        })
+        // Louder than the alternatives. Calling `act` inline would put the
+        // caller back in the blocking path this exists to keep it out of, and
+        // swallowing it would leave a loop on `ControlFlow::Wait` that never
+        // draws another off-thread arrival — the same stopped app, without the
+        // stack that explains it.
+        .expect("the redraw thread is what lets an off-thread ask reach the event loop");
+    move |payload| {
+        // Non-blocking: an unbounded `Sender` never waits on its receiver.
+        let _ = post.send(payload);
+    }
+}
+
 /// Drain all pending messages from `rx`, returning the last one (if any).
 ///
 /// Sensor and theme channels are state, not events: only the newest value matters.
@@ -419,6 +557,171 @@ mod tests {
             1,
             "one unwinding wake poisoned the slot, so every producer's every \
              later wake is dropped"
+        );
+    }
+
+    /// **A thread that asks for a frame must not still be asking when it lets
+    /// go of what it was holding.**
+    ///
+    /// This is the deadlock the funnel exists to make impossible, run in
+    /// process. On macOS `Window::request_redraw` blocks the caller until the
+    /// main thread services a dispatch queue
+    /// (`objc2-foundation-0.2.2/src/thread.rs:107-121`, reached from
+    /// `winit-0.30.13/src/platform_impl/macos/window.rs:40-51`). A producer
+    /// that makes that call while holding a lock the loop thread also takes
+    /// waits for a loop thread that is waiting for it, and the app stops
+    /// rendering — which is exactly what shipped, through egui's context write
+    /// lock, freezing overlay-heavy scenes within 2-35 s.
+    ///
+    /// Linux cannot perform that rendezvous at all (its `maybe_queue_on_main`
+    /// is `f(self)`), so the blocking stand-in below is what carries the
+    /// platform's behaviour into a test CI can run. The producer holds a lock
+    /// across the ask; the loop thread then takes that same lock. If posting
+    /// ran the call inline, the producer would still be inside it, still
+    /// holding the lock, and the loop thread would never get it.
+    ///
+    /// The wait is bounded so failure REDDENS rather than hanging the suite,
+    /// and the gate is opened before the assertions so a red cannot leave a
+    /// thread parked on a lock the message would have to read.
+    // wasm32 has no threads, so the poster this exercises is absent there —
+    // and with one thread there is no rendezvous to rule out.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_thread_that_asks_for_a_frame_is_not_the_thread_that_waits_for_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+        use std::time::Duration;
+
+        // Stands in for any lock a producer and the loop thread both take. The
+        // one cycle already paid for used egui's context write lock.
+        let shared = Arc::new(Mutex::new(()));
+
+        // Opened only at the end, so the stand-in platform call is still inside
+        // its rendezvous for the whole of the loop thread's attempt.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicBool::new(false));
+
+        let held = Arc::clone(&gate);
+        let marked = Arc::clone(&entered);
+        let post = coalescing_poster("test-redraw-rendezvous", move |_: &()| {
+            marked.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &*held;
+            let mut open = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*open {
+                open = cvar.wait(open).unwrap_or_else(PoisonError::into_inner);
+            }
+        });
+
+        // Any of the off-thread producers — a tile decode, a chunk socket, the
+        // theme poller — holding something across the ask.
+        let producing = Arc::clone(&shared);
+        let producer = std::thread::spawn(move || {
+            let _guard = producing.lock().unwrap_or_else(PoisonError::into_inner);
+            post(());
+            // `_guard` drops here. In the shape this rules out, the ask would
+            // still be inside the platform call and would never reach it.
+        });
+
+        // The stand-in call has to be INSIDE its block before the loop thread
+        // tries, or this proves nothing about the overlap.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let call_ran = entered.load(Ordering::SeqCst);
+
+        let (done, waited) = mpsc::channel();
+        let wanting = Arc::clone(&shared);
+        let loop_thread = std::thread::spawn(move || {
+            let _held = wanting.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = done.send(());
+        });
+        let reached = waited.recv_timeout(Duration::from_secs(5)).is_ok();
+
+        {
+            let (lock, cvar) = &*gate;
+            *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cvar.notify_all();
+        }
+        let _ = producer.join();
+        let _ = loop_thread.join();
+
+        assert!(
+            call_ran,
+            "the ask never reached the stand-in platform call at all, so this \
+             test never set up the overlap it is here to rule out"
+        );
+        assert!(
+            reached,
+            "a thread asking for a frame carried out the platform call itself \
+             and was still inside it, holding a lock the loop thread takes: \
+             this is the deadlock that stops the app rendering entirely on \
+             macOS"
+        );
+    }
+
+    /// A burst is one ask, and the newest payload is the one carried out.
+    ///
+    /// Not an optimisation to taste: every ask is a round trip to the main
+    /// thread on macOS, and the producers burst — a tile decode storm asks per
+    /// tile. Newest-wins is what makes a window replaced across a suspend the
+    /// one asked rather than the dead one.
+    // wasm32 has no threads, so the poster this exercises is absent there.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_burst_of_asks_is_carried_out_as_one_and_keeps_the_newest() {
+        use std::sync::{Arc, Mutex, PoisonError, mpsc};
+        use std::time::Duration;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (ran, carried) = mpsc::channel();
+
+        let recorded = Arc::clone(&seen);
+        // Parks the poster thread INSIDE `act` until released. That is what
+        // makes this deterministic rather than a race: while it is parked, the
+        // burst below is provably still queued, so the coalescing has
+        // something to coalesce and the test is not timing the threads.
+        let (release, wait) = mpsc::channel::<()>();
+        let post = coalescing_poster("test-redraw-burst", move |n: &u32| {
+            recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(*n);
+            let _ = ran.send(());
+            let _ = wait.recv();
+        });
+
+        post(0);
+        assert!(
+            carried.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first ask was never carried out, so nothing below is about \
+             coalescing"
+        );
+
+        // The poster thread is now parked inside `act` and its queue is empty,
+        // so all seven of these are waiting when it comes back round.
+        for n in 1..=7 {
+            post(n);
+        }
+        let _ = release.send(());
+        assert!(
+            carried.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the seven queued asks were never carried out at all, so a burst \
+             is being dropped rather than coalesced — a producer's arrival \
+             would never draw"
+        );
+        let _ = release.send(());
+
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(
+            seen,
+            vec![0, 7],
+            "eight asks were carried out as {seen:?}. Two rounds are expected \
+             — the first ask, then the seven that queued behind it collapsed \
+             into one carrying the NEWEST payload. More rounds means the \
+             coalescing is gone and macOS pays a main-thread round trip per \
+             tile; a different last value means a suspend would ask a dead \
+             window."
         );
     }
 
