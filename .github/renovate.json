@@ -27,6 +27,28 @@
         "walkers",
         "wgpu"
       ]
+    },
+    {
+      "description": [
+        "Crates vendored under vendor/ and substituted into the graph by [patch.crates-io] in the root Cargo.toml. This rule comes after the egui group on purpose: packageRules merge in order, so the disable here is what wins for walkers.",
+        "ignorePaths does not cover these. The version requirement that renovate edits lives in the ROOT Cargo.toml's [workspace.dependencies] (and, for geo-types, in a member manifest) -- not under vendor/ -- so the file it rewrites was never ignored.",
+        "Raising one of these pins does not fail. cargo stops applying the patch, silently, and resolves the registry copy instead: measured on PR #21, `cargo metadata` exits 0 with no warning and squallar-egui resolves pmtiles 0.24.0 from crates.io while the vendored 0.23.0 sits in the workspace, still compiling, reachable from nothing. The build stays green and the fix the vendoring exists to carry is simply gone.",
+        "walkers 0.58.0 was measured to do the same once geo-types moves to 0.7.20 (PR #20) -- and it re-adds 78 crates to the graph. Today it errors only because the stale geo-types pin happens to block it; that brake is an accident and PR #20 removes it.",
+        "bzip2-rs is listed defensively. It is reachable only as a path dependency of vendor/nexrad-data, so no manifest states a version renovate could edit today.",
+        "Bumping any of these is hand work: port the upstream release into vendor/, keep package.version exactly equal to the pin (a patch is only accepted for a version that satisfies the requirement), and update that crate's VENDORED.md."
+      ],
+      "matchDatasources": [
+        "crate"
+      ],
+      "matchPackageNames": [
+        "bzip2-rs",
+        "nexrad-data",
+        "nexrad-decode",
+        "nexrad-model",
+        "pmtiles",
+        "walkers"
+      ],
+      "enabled": false
     }
   ]
 }
