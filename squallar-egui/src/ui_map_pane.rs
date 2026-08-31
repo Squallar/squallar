@@ -147,10 +147,16 @@ pub(in crate::ui) fn scene_light_supersedes(ground: GroundIsMesh, id: &LayerId) 
 pub(super) struct StripResolution {
     /// Every tile arm that ran answered its whole span with exact tiles.
     tiles_exact: bool,
-    /// Some texture overlay still owes this viewport a raster: a dispatch
-    /// went out or was owed (`needs_rerender`), or a settle re-raster is
-    /// pending (`zoom_is_stale`). While true the strip must keep repainting,
-    /// so the dispatch loop keeps asking until the raster lands.
+    /// Some texture overlay wants a raster this viewport **could not ask
+    /// for**: `needs_rerender` said yes and the render slot refused, or a
+    /// settle re-raster is pending (`zoom_is_stale`). While true the strip
+    /// must keep repainting, because nothing else would re-ask.
+    ///
+    /// **Not "a raster is in flight".** A dispatch that went out carries its
+    /// own wake-up — the arriving texture's identity is a
+    /// [`ground_content_key`] input — so repainting across the flight buys
+    /// nothing and costs a whole map render per frame. See the comment at the
+    /// assignment for the measurement that made the distinction matter.
     overlay_work_owed: bool,
 }
 
@@ -867,15 +873,11 @@ pub(super) fn render_pane_map_content(
             let stale = enabled
                 && has_data
                 && cache.needs_rerender(token, zoom, now, &viewport_bounds, &tex_plan);
-            // Owed whether or not the dispatch is admitted this frame: an
-            // in-flight raster resolves the debt only when it lands, and the
-            // strip must keep repainting (and so keep asking) until then.
-            resolution.overlay_work_owed |= stale;
-            if stale
+            let dispatched = stale
                 && cache
                     .renders
-                    .admits(RenderSlot::WHOLE, ctx.overlay_render_limit)
-            {
+                    .admits(RenderSlot::WHOLE, ctx.overlay_render_limit);
+            if dispatched {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
                     overlay_kind: id.clone(),
@@ -885,6 +887,31 @@ pub(super) fn render_pane_map_content(
                     zoom: qzoom,
                 });
             }
+            // **Owed only while the ask could not go out**, which is a
+            // narrower thing than "a raster is on its way".
+            //
+            // A dispatch that WAS admitted resolves itself without the strip
+            // repainting for the whole flight: the arriving raster is a new
+            // texture identity, and that identity is already a
+            // `ground_content_key` input, so the frame it lands is the frame
+            // the key moves and the strip repaints. Holding the latch open
+            // across the flight instead repaints the strip on every frame of
+            // it — a second whole map render plus the mirror pass, per pane,
+            // per frame.
+            //
+            // Under a playing loop that is every frame, for ever. Measured:
+            // a native E3 leg (KTLX volume loop at 10 fps under orbit,
+            // 1920x1080, 75 s) read `964 paints, 964 incomplete` against 964
+            // frames, so WO-7's skip never fired once. A raster is owed on
+            // every frame there because the pane clock sweeps its whole
+            // window at the playback rate and every
+            // `TimeAxis::EventLifetime` layer re-tokenizes per as-of bucket,
+            // a 60 s quantum against a tick worth ~5 min.
+            //
+            // A dispatch that was REFUSED has no arrival to wait for and
+            // nothing else would ever re-ask, so that one still latches --
+            // this is the `request_once` retry, kept.
+            resolution.overlay_work_owed |= stale && !dispatched;
             // `enabled && has_data` and not just `enabled`. A repaint asked for
             // on a frame that cannot dispatch anything is a 10 Hz wakeup nothing
             // can satisfy.

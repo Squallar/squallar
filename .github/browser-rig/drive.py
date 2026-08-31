@@ -1209,7 +1209,17 @@ var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
 // fills went to the GPU, so a drawing pane reads 0 there and positive in the
 // other three.
 var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered/;
-var rasters = null, uploads = null, basemap = null, ground = null;
+// A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
+// per frame its off-screen map strip really drew, `mirror renders` per mirror
+// pass encoded (per frame, not per pane) -- two denominators, never added, and
+// neither is a term of any figure above. The last three say WHY a paint
+// happened and overlap both each other and `paints`: `key moves` is the
+// repaint rate the floor's own content asked for, so a `paints` figure far
+// above it is a floor repainting for a reason that is not its content, and
+// `incomplete` tracking `paints` is a completeness latch stuck open rather
+// than a key that is moving. Running totals, so the LAST match wins.
+var floor_re = /floor strips: (\d+) paints, (\d+) mirror renders, (\d+) key moves, (\d+) on a stable key, (\d+) incomplete/;
+var rasters = null, uploads = null, basemap = null, ground = null, floor = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -1264,11 +1274,18 @@ for (var i = 0; i < C.length; i++) {
                      upload_bytes: parseInt(gm[6], 10),
                      resident_bytes: parseInt(gm[8], 10),
                      unrendered: parseInt(gm[9], 10) };
+  var fm = floor_re.exec(m);
+  if (fm) floor = { paints: parseInt(fm[1], 10),
+                    mirror_renders: parseInt(fm[2], 10),
+                    key_moves: parseInt(fm[3], 10),
+                    paints_on_stable_key: parseInt(fm[4], 10),
+                    incomplete_paints: parseInt(fm[5], 10) };
 }
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
-         basemap: basemap, ground: ground, console_total: C.length };
+         basemap: basemap, ground: ground, floor: floor,
+         console_total: C.length };
 """
 
 # The frame timing lines, written by App::report_frame_telemetry every 2 s
@@ -2798,6 +2815,12 @@ def run_smoke(args):
         result["ground_tile_totals"] = _sig.get("ground")
         if result["ground_tile_totals"]:
             stage("ground-tiles", **result["ground_tile_totals"])
+        # A fifth record, and a fifth question: what the 3D floor path painted
+        # and why. In none of the four above -- a floor strip's repaint is a
+        # second map render, not a texture delta -- and never summed with them.
+        result["floor_strip_totals"] = _sig.get("floor")
+        if result["floor_strip_totals"]:
+            stage("floor-strips", **result["floor_strip_totals"])
 
         # The frame-telemetry readout: the newest cumulative reading per
         # family, the count assert, and the gesture-window bin-diff when

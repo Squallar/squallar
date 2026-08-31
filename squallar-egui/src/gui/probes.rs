@@ -84,6 +84,16 @@ pub(in crate::ui) struct FrameProbes {
     /// purpose so the staleness fixtures assert exact counts without the
     /// cross-test noise a static would carry.
     pub strip_paints: u64,
+    /// How many times a floor pane's content key differed from the one the
+    /// frame before offered. The bisection figure: a repaint count that
+    /// tracks this is the key moving, and one that exceeds it is not.
+    pub strip_key_moves: u64,
+    /// Strip paints whose key had *not* moved since the previous frame —
+    /// repaints the content key did not ask for.
+    pub strip_paints_on_stable_key: u64,
+    /// Paints that committed an incomplete resolution, which latches the
+    /// strip permanently dirty.
+    pub strip_incomplete_paints: u64,
 }
 
 #[cfg(test)]
@@ -124,6 +134,9 @@ impl Default for FrameProbes {
             last_attribution: Vec::new(),
             last_diagnostics_rows: Vec::new(),
             strip_paints: 0,
+            strip_key_moves: 0,
+            strip_paints_on_stable_key: 0,
+            strip_incomplete_paints: 0,
         }
     }
 }
@@ -148,6 +161,16 @@ impl Gui {
     /// [`FrameProbes::strip_paints`].
     pub(crate) fn strip_paints_for_test(&self) -> u64 {
         self.probes.strip_paints
+    }
+
+    /// Content-key moves, stable-key paints and incomplete commits, in that
+    /// order. See the fields for what each denominator is.
+    pub(crate) fn strip_key_probe_for_test(&self) -> (u64, u64, u64) {
+        (
+            self.probes.strip_key_moves,
+            self.probes.strip_paints_on_stable_key,
+            self.probes.strip_incomplete_paints,
+        )
     }
 }
 

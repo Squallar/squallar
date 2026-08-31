@@ -52,6 +52,58 @@ fn paints(h: &InputHarness) -> u64 {
     h.gui().strip_paints_for_test()
 }
 
+/// Give `NwsAlerts` one warning, so the layer answers `has_data` and the
+/// dispatch loop really considers it. The polygon's position does not matter
+/// — nothing here reads the picture, only whether a raster is owed.
+fn ingest_one_alert(h: &mut InputHarness) {
+    use squallar_overlays::nws::alert::{AlertCategory, NwsAlert};
+    use squallar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+
+    let event = "Tornado Warning";
+    let (fill, stroke) = squallar_overlays::nws::colors::alert_color(event);
+    let alert = NwsAlert {
+        id: "floor-strip-loop".to_owned(),
+        event: event.to_owned(),
+        category: AlertCategory::from_event(event),
+        severity: "Severe".parse().expect("a CAP severity"),
+        urgency: "Immediate".parse().expect("a CAP urgency"),
+        certainty: "Observed".parse().expect("a CAP certainty"),
+        headline: None,
+        description: String::new(),
+        instruction: None,
+        area_desc: String::new(),
+        sender_name: String::new(),
+        effective: String::new(),
+        expires: String::new(),
+        onset: None,
+        ends: None,
+        valid_from: None,
+        valid_until: None,
+        affected_zones: Vec::new(),
+        features: Arc::new(vec![squallar_overlays::types::OverlayFeature::new(
+            vec![vec![vec![
+                (-98.0, 35.0),
+                (-96.0, 35.0),
+                (-96.0, 36.0),
+                (-98.0, 36.0),
+                (-98.0, 35.0),
+            ]]],
+            fill,
+            stroke,
+            event.to_owned(),
+            String::new(),
+            squallar_overlays::types::HatchPattern::None,
+        )]),
+    };
+    h.gui_mut().overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: known::NWS_ALERTS,
+            data: OverlayRegistry::nws_alerts_payload(vec![alert]),
+        },
+        &squallar_overlays::render::overlay_state::PaneRef::bare(1),
+    );
+}
+
 /// Run quiet frames and demand the strip stays clean — the settle every
 /// fixture stands on. **This is the assertion that is RED on the baseline**:
 /// before the cache, every frame painted every strip, so no fixture below
@@ -544,6 +596,173 @@ fn a_dirty_second_pane_defers_one_frame_and_then_both_repaint() {
         "the forced frame's mirror render is the whole point of deferring",
     );
     assert_settles_clean(&mut h, "after the deferral");
+}
+
+/// **The gate on the loop defect.** A *playing* volume loop over an
+/// otherwise resolved floor, ticked exactly the way
+/// `App::advance_loop_playback` ticks it — the pane clock jumps to the next
+/// frame's stamp every `loop_interval`, which scene E seeds at 10 fps against
+/// 60 Hz frames — repaints the strip **at most once per tick**, never once
+/// per frame.
+///
+/// The floor under the assertion is the measurement this gate was written
+/// from: a native E3 leg read `964 paints, 964 incomplete` over ~70 s with a
+/// KTLX volume loop playing under orbit — a completeness latch open on 100%
+/// of paints, so WO-7's skip never fired once. The loop's own content moves
+/// ten times a second; the strip was repainting sixty.
+///
+/// A pane clock that sweeps its window at the playback rate re-tokenizes
+/// every `TimeAxis::EventLifetime` layer on every tick (the quantum is 60 s
+/// and a tick moves the depicted instant by minutes), so a raster is owed
+/// continuously. That is a real ask and it is left alone; what this pins is
+/// that an ask which *went out* no longer repaints the floor for the whole
+/// flight.
+#[test]
+fn a_playing_volume_loop_repaints_the_floor_per_tick_not_per_frame() {
+    use crate::pane::{
+        LoopFrame, LoopFrameImage, LoopPhase, TimeMode, VolumeFrameGrid, VolumeStamp, VolumeTarget,
+    };
+    use squallar_radar::types::RenderView;
+
+    const FRAMES: i64 = 12;
+    let ts = |i: i64| {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(i * 5)
+    };
+    let grid = |i: i64| {
+        LoopFrameImage::Volume(VolumeFrameGrid {
+            id: i as u64,
+            target: VolumeTarget {
+                volume: VolumeStamp {
+                    site: "KTLX".to_owned(),
+                    collected: ts(i),
+                },
+                product: squallar_radar::fields::known::REFLECTIVITY,
+                region: None,
+            },
+        })
+    };
+
+    let mut h = resolved_floor_harness();
+    // The layer that makes this scene the real one: a ground-surface,
+    // `Texture`, `EventLifetime` layer holding data. Its cache token is a
+    // function of the as-of bucket, so every tick below re-tokenizes it and a
+    // whole-viewport raster is owed. Without data it answers `has_data =
+    // false`, the dispatch loop skips it, and this fixture would pass on the
+    // unfixed tree by describing a pane with nothing to raster.
+    h.set_overlay_on_pane(1, &known::NWS_ALERTS, true);
+    ingest_one_alert(&mut h);
+    h.frames_for(4, FRAME_DT);
+    {
+        let pane = h.gui_mut().pane_mut(1).expect("pane 1");
+        let state = pane.time_state_mut(&known::RADAR);
+        state.phase = LoopPhase::Playing;
+        state.view = RenderView::Volume;
+        state.frames = (0..FRAMES)
+            .map(|i| LoopFrame {
+                timestamp: ts(i),
+                image: Some(grid(i)),
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        pane.set_time_mode(TimeMode::AsOf(ts(0)));
+    }
+    h.frames_for(6, FRAME_DT);
+    assert!(
+        h.gui_mut()
+            .pane_mut(1)
+            .expect("pane 1")
+            .active_volume_frame()
+            .is_some(),
+        "precondition: the playhead is on a resident grid",
+    );
+
+    let paints_before = paints(&h);
+    let (moves_before, stable_before, incomplete_before) = h.gui().strip_key_probe_for_test();
+
+    // 60 frames at 60 Hz; the clock advances one loop frame every 6th, which
+    // is scene E's 10 fps.
+    let mut tick = 0i64;
+    for frame in 0..60 {
+        if frame % 6 == 0 {
+            tick += 1;
+            let stamp = ts(tick % FRAMES);
+            h.gui_mut()
+                .pane_mut(1)
+                .expect("pane 1")
+                .set_time_mode(TimeMode::AsOf(stamp));
+        }
+        h.frame_after(FRAME_DT);
+    }
+    let (moves, stable, incomplete) = h.gui().strip_key_probe_for_test();
+    let painted = paints(&h) - paints_before;
+    let detail = format!(
+        "(60 frames, 10 ticks: {painted} paints, {} key moves, {} on a stable \
+         key, {} incomplete)",
+        moves - moves_before,
+        stable - stable_before,
+        incomplete - incomplete_before,
+    );
+
+    // Non-vacuity, both directions. Zero paints would mean the loop never
+    // reached the floor at all and the bound below would hold by describing
+    // nothing; sixty would mean the frames never ran.
+    assert!(
+        painted > 0,
+        "the floor never repainted at all under a playing loop, so this \
+         fixture is not about a bounded repaint rate {detail}",
+    );
+    assert_eq!(
+        incomplete - incomplete_before,
+        0,
+        "a paint still committed an incomplete resolution. The completeness \
+         latch is open, so the strip is permanently dirty and the content key \
+         is not consulted at all — this is the native E3 reading (964 paints, \
+         964 incomplete) reproduced {detail}",
+    );
+    // Ten ticks moved the clock, so ten repaints are the content's own ask.
+    // The bound is deliberately the tick count and not a fraction of the
+    // frames: what the defect did was tie the repaint rate to the FRAME rate,
+    // and any bound expressed per frame would still be satisfied by that.
+    assert!(
+        painted <= 10,
+        "the floor repainted more often than the loop ticked. Under the \
+         defect this is one paint per frame — a second whole map render plus \
+         the mirror pass, sixty times a second instead of ten {detail}",
+    );
+}
+
+/// **The other half of the latch, and it is kept.** A raster that is owed and
+/// whose dispatch is *refused* has nothing that would ever re-ask, so the
+/// strip must go on repainting — the `request_once` retry.
+///
+/// This is the arm the loop gate above narrowed the latch down to, so it is
+/// the fixture that stops that narrowing from becoming "never latch at all".
+/// Without it, deleting the whole `overlay_work_owed` term passes every other
+/// fixture in this file.
+#[test]
+fn a_refused_overlay_dispatch_keeps_the_strip_repainting() {
+    let mut h = resolved_floor_harness();
+    h.set_overlay_on_pane(1, &known::NWS_ALERTS, true);
+    ingest_one_alert(&mut h);
+    // A saturated device: `RenderSlots::admits` refuses on the second
+    // conjunct, so the raster is owed and no dispatch can go out.
+    h.set_concurrent_renders(0);
+    h.frames_for(4, FRAME_DT);
+
+    let before = paints(&h);
+    h.frames_for(10, FRAME_DT);
+    assert_eq!(
+        paints(&h) - before,
+        10,
+        "a strip owing a raster it could not ask for stopped repainting; \
+         nothing else re-asks, so that layer never rasters again and the \
+         floor is missing it for the life of the pane",
+    );
 }
 
 /// The graphics-state reset repaints: the mirror texture died with the

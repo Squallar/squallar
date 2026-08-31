@@ -325,10 +325,16 @@ fn texture_upload_line(u: &squallar_gpu::egui_renderer::texture_upload::UploadTo
 /// frame, its mirror renders per mirror pass encoded. Orbit frames over a
 /// resolved floor move neither — which is the reading that proves the strip
 /// cache is skipping.
+///
+/// The last three say **why** a paint happened, and they overlap both each
+/// other and the first figure — see the ledger's module doc. `key moves` is
+/// the repaint rate the content asked for, and a `paints` figure far above it
+/// is a floor repainting for a reason that is not its content.
 fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
     format!(
-        "floor strips: {} paints, {} mirror renders",
-        t.strip_paints, t.mirror_renders,
+        "floor strips: {} paints, {} mirror renders, {} key moves, \
+         {} on a stable key, {} incomplete",
+        t.strip_paints, t.mirror_renders, t.key_moves, t.paints_on_stable_key, t.incomplete_paints,
     )
 }
 
