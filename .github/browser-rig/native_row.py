@@ -1067,6 +1067,15 @@ def build_row(args, scraped, probes):
 
     skip = args.skip_loops
     win = args.window_loops
+    # `loops`/`settled` are the shared columns the web row grew when window
+    # length became a printed denominator. Native answers them differently and
+    # better: `bracket()` cuts EXACTLY `window_loops` whole loops after
+    # discarding `skip_loops`, so a bracketed native row is length-equalised
+    # and boot-excluded by construction -- it is always the equivalent of the
+    # web row's `settled` window, never of its boot-inclusive default. The two
+    # unbracketed paths below are the exceptions, and they say so rather than
+    # printing a loop count they do not have.
+    row_loops, row_settled = win, "%d-loop" % win
     br, why = bracket(scraped["loops"], skip, win)
     if br is None:
         # A gestureless leg (scene E1) has no markers by design and takes the
@@ -1076,10 +1085,13 @@ def build_row(args, scraped, probes):
             last = scraped["interact"][-1].idx if scraped["interact"] else 0
             br = (first, last)
             basis = "unbracketed (E-scene, no gesture): whole log"
+            row_loops, row_settled = 0, "NO(E-scene: whole log)"
         else:
             invalid.append("no whole-loop bracket: %s" % why)
             br = (0, len(scraped["interact"]) and scraped["interact"][-1].idx or 0)
             basis = "UNBRACKETED FALLBACK -- not a window figure"
+            row_loops = len(scraped["loops"])
+            row_settled = "NO(unbracketed fallback)"
     else:
         basis = "%d whole loops, %d skipped" % (win, skip)
     start_idx, end_idx = br
@@ -1192,6 +1204,8 @@ def build_row(args, scraped, probes):
         "degraded": [d for d in (args.degraded or "").split(",") if d],
         "windows": windows,
         "window_basis": basis,
+        "loops": row_loops,
+        "settled": row_settled,
         "bracket": {"start_line": start_idx, "end_line": end_idx},
         "liveness": live,
         "surface": surf,
@@ -1213,13 +1227,15 @@ def print_row(row):
     print(
         "ROW scene=%s browser=%s arm=%s adapter=%s backend=%s "
         "viewport=%s px=%s dpr=%s cross=%s hz~%s coi=%s panel=%s "
-        "script=%s basemap=%s pictures=%s MB/picture=%s commit=%s "
+        "script=%s basemap=%s pictures=%s MB/picture=%s loops=%s settled=%s "
+        "commit=%s "
         "loadavg_start=%s loadavg_end=%s loadavg_max=%s quiet=%s position=%s%s"
         % (
             row["scene"], row["browser"], row["arm"], row["adapter"],
             row["backend"], row["viewport"], row["px"], row["dpr"],
             row["cross"], row["hz"], row["coi"], row["panel"], row["script"],
             row["basemap"], row["pictures"], row["mb_per_picture"],
+            row.get("loops"), row.get("settled"),
             row["commit"],
             load.get("start", "?"), load.get("end", "?"), load.get("max", "?"),
             row["quiet"], row["position"],
@@ -2064,6 +2080,7 @@ def _fixture_row(clamp=False):
         "platform": "linux", "degraded": [],
         "windows": {"interact": w, "idle": dict(w), "cadence": dict(w)},
         "window_basis": "2 whole loops, 2 skipped",
+        "loops": 2, "settled": "2-loop",
         "bracket": {"start_line": 10, "end_line": 90},
         "liveness": {"ok": True, "grew_by": 40, "verdict": "interact frames "
                      "still rising (+40 after the window)"},

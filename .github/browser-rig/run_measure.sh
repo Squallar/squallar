@@ -176,7 +176,25 @@
 #   RIG_SETTLE        seconds before the warm rAF sample (default 6)
 #   RIG_MEASURE_WINDOW  seconds of scripted time after settle (default 46 --
 #                     at least two full 20 s script loops, so the window is
-#                     bracketed by whole loops)
+#                     bracketed by whole loops). TWO loops is one short of what
+#                     the `settled` window needs: it brackets `loop-2-complete
+#                     to last-loop-marker`, so it wants THREE loop markers and
+#                     the default therefore produces NO settled window. That
+#                     matters because the settled window is the only one with
+#                     boot excluded and a length that does not depend on how
+#                     many loops the run happened to finish -- i.e. the only
+#                     one two rows may be compared on without checking
+#                     `loops=`. Raise this on any leg that will be
+#                     cross-compared, and confirm from the row's own `loops=`
+#                     field rather than from a target number: a loop is 20 s of
+#                     SCRIPT, and its wall-clock cost belongs to the machine
+#                     and the browser, so no single value is right everywhere.
+#                     Measured on an M2, scene A: firefox reached 2 loops at
+#                     46 s, 2 at 75 s and 2 at 140 s; chromium reached 3 at
+#                     46 s. A fixed window therefore hands the two browsers
+#                     different-length windows, which is a systematic bias in
+#                     the one comparison this arm exists to make -- not noise
+#                     that more repeats will cancel.
 #   RIG_FRAMES        rAF deltas per sample (default 240)
 #   RIG_DISPLAY       X display (default: $DISPLAY, then :0)
 #   RIG_PANEL         "on" seeds the diagnostics panel visible (default off);
@@ -806,14 +824,30 @@ for leg in legs:
             "some" if decoded else ("none" if decoded == 0 else "?"),
             "some" if placed else ("none" if placed == 0 else "?"))
 
-    # The denominator row. One leg, one line, never merged with any other.
+    # WINDOW LENGTH IS A DENOMINATOR, and it is the one that hides. Load and
+    # refresh rate both show up in a figure this row already prints; window
+    # length hides inside a per-frame MEAN, which looks window-independent and
+    # is not. Measured 2026-08-31 on one macOS scene-A set: the median over
+    # five passes says firefox is 1.8x FASTER than chrome, and the same five
+    # passes stratified to equal loop counts say chrome is 1.36x faster. A sign
+    # flip from leg selection alone.
+    #
+    # So `loops` and `settled` ride on the denominator line itself, not only on
+    # the window sub-lines below -- because this line is the one that gets
+    # transcribed into a comparison table, and a loop count that lives only in
+    # a sub-line is a loop count that reaches no scoreboard.
+    settled_w = gw.get("settled") or {}
     print("ROW scene=%s browser=%s arm=%s adapter=%s:%s backend=%s "
           "viewport=%sx%s px=%s dpr=%s cross=%s hz~%s coi=%s panel=%s "
-          "script=%s basemap=%s pictures=%s MB/picture=%s commit=%s%s"
+          "script=%s basemap=%s pictures=%s MB/picture=%s loops=%s "
+          "settled=%s commit=%s%s"
           % (scene, r.get("browser"), r.get("arm"), ad.get("class"),
              ad.get("renderer"), backend,
              bw, bh, bw * bh, env.get("dpr"), cross,
              hz, coi, panel, gw.get("script") or "-", basemap, pics, mbpp,
+             gw.get("loops_completed"),
+             ("%s-loop" % settled_w.get("loops_completed")) if settled_w
+             else "NO",
              commit, "" if not invalid else "  ** INVALID **"))
     if ct and not ct.get("met"):
         print("ROW   canvas target %s asked, %s got: this row is NOT "
@@ -942,6 +976,38 @@ for leg in legs:
                       % (label, family, d.get("n"), d.get("p50_us"),
                          d.get("p90_us"), d.get("p99_us"), d.get("max_us"),
                          w.get("loops_completed"), w.get("basis"), note))
+    # A leg with no settled window is not a lesser row, it is a DIFFERENT one:
+    # its only figures come from a window that starts at boot and whose length
+    # is whatever the run happened to complete. Two such rows are comparable
+    # only if their loop counts match, and nothing downstream checks that -- so
+    # the row says it here rather than leaving the reader to notice.
+    #
+    # The settled window needs `loop-2-complete`, i.e. THREE loop markers, and
+    # the default RIG_MEASURE_WINDOW=46 is documented as "at least two full
+    # 20 s script loops" -- two, one short. So the rig's own default cannot
+    # produce the window the rig itself prefers, which is why most rows lack
+    # one.
+    #
+    # No second count is named here on purpose. A scripted loop is 20 s of
+    # SCRIPT, not of wall clock: it takes as long as the app needs to play it,
+    # so the window that buys three loops is a property of the machine AND of
+    # the browser, not a constant. Measured on an M2, scene A: firefox got 2
+    # loops at 46 s, 2 at 75 s and still only 2 at 140 s, while chromium
+    # reached 3 at 46 s. Raise it until the `loops=` field on the row above
+    # reads 3 or more; that field is the check, and it cannot go stale the way
+    # a hardcoded number does.
+    #
+    # THAT ASYMMETRY IS THE WHOLE PROBLEM, not a footnote. Loop count at a
+    # fixed window is browser-correlated, so it does not average out across
+    # repeats the way noise does -- it biases one side of exactly the
+    # comparison this rig exists to make. On the M2 scene-A set: firefox
+    # loops 2,2,1,1,1 against chromium 2,2,3,2,2, at one window setting.
+    if gw and not gw.get("settled"):
+        print("ROW   NO settled window (only %s loops; needs 3). Figures above"
+              " are boot-inclusive and NOT length-equalised: compare only "
+              "against a row with the same loops= count, or raise "
+              "RIG_MEASURE_WINDOW until loops>=3."
+              % gw.get("loops_completed"))
     fl = r.get("frame_lines") or {}
     idle = fl.get("idle") or {}
     if idle:
