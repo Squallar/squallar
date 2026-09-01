@@ -36,6 +36,14 @@ val rustCrateManifest = rootProject.layout.projectDirectory.file("../../squallar
 //   assembleRelease            ->  BUILD SUCCESSFUL, and the APK carries the
 //                                  *debug* .so, byte for byte
 //
+// Those two sizes are the 2025 diagnosis and are kept for the shape of the
+// bug, NOT as a way to tell the profiles apart: the tree has grown enough that
+// they now INVERT. A release .so measured 24.6 MB on 2026-08-31 -- larger than
+// the debug figure above -- so a size rule calibrated to these numbers rejects
+// a correct release build. What discriminates the profiles is what the profile
+// does: profile.release sets `strip = true`, so a release .so is stripped and
+// carries no `.debug_*` sections and a debug one is neither.
+//
 // Gradle does re-run `buildRustLibRelease` there -- the shared directory is
 // declared as an output of both tasks, so writing it from one leaves the other
 // out of date. The task then exits 0 without doing anything, because cargo-ndk
