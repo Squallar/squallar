@@ -122,9 +122,31 @@ pub const WASM_MAX_CONCURRENT_RENDERS: usize = 1;
 ///
 /// A *memory* cap, unlike [`WASM_MAX_CONCURRENT_RENDERS`] above: every rayon
 /// thread is a nested Web Worker with a stack inside the single shared linear
-/// memory the raster worker owns, and wasm32 linear memory is a hard 4 GiB with
-/// no swap under it. `navigator.hardwareConcurrency` is clamped to this by
-/// `squallar_web::rayon_pool::threads`.
+/// memory the raster worker owns, and that memory has **no swap under it and a
+/// declared ceiling of exactly 1.000 GiB**. `navigator.hardwareConcurrency` is
+/// clamped to this by `squallar_web::rayon_pool::threads`.
+///
+/// **1 GiB is measured, not inferred**, from the memory section of the shipped
+/// module — `squallar-web/pkg/squallar_web_bg.wasm`, built 2026-08-31, read
+/// 2026-08-31:
+///
+/// ```text
+/// IMPORTED MEMORY ./squallar_web_bg.js.memory
+///   flags=0x03 shared=true  initial=65 pages (4.1 MiB)  maximum=16384 pages (1.000 GiB)
+/// ```
+///
+/// This doc previously said "a hard 4 GiB". That is the architectural limit of
+/// a 32-bit address space and it is **not this build's ceiling**: the module
+/// declares its own maximum, so the browser refuses to grow past 16384 pages on
+/// every engine and every device. It is a constant, not a per-device refusal
+/// point, and nothing has to be run to learn it. The figure is also not an
+/// engine property but a *build* one — a `shared` memory is required by the
+/// wasm threads specification to declare a maximum, so some number had to be
+/// chosen here, and this is the number that was chosen.
+///
+/// Everything competing for that 1 GiB is competing with these stacks: the
+/// overlay picture in flight ([`WASM_MAX_CONCURRENT_RENDERS`] of them, so one),
+/// every decoded granule, and every tile cache.
 ///
 /// Native has no equivalent because rayon sizes itself there: it defaults to
 /// the core count and its stacks come out of an OS address space that can
