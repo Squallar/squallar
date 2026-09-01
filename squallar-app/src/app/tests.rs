@@ -2,7 +2,7 @@ use super::*;
 use crate::platform_double::TestBridge;
 use squallar_egui::overlay_cache::OverlayTexturePlan;
 use squallar_geo::GeoBounds;
-use squallar_kv::MemoryKvStore;
+use squallar_kv::{KvStore, MemoryKvStore};
 use squallar_source::id::{LayerId, known};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -848,6 +848,55 @@ pub(super) fn headless(mut platform: TestBridge) -> App {
     // test runs. See `MapTileState::go_offline_for_tests`.
     app.gui.go_offline_for_tests();
     app
+}
+
+/// Android learns where config lives only *after* `App::new` — `android_main`
+/// calls `set_config_dir` further down, because `internal_data_path()` is not
+/// available until the Activity exists. Every instrument key is read inside
+/// `App::new` against `platform.kv()`, which on Android is `None` at exactly
+/// that moment, and `set_config_dir` reloaded the site positions, the
+/// catalogue and the UI config while never re-reading the three keys.
+///
+/// So on Android the frame and raster instruments could not be turned on at
+/// all, whatever the config said, and the gesture player could not be armed.
+/// The first assertion is the non-vacuity floor: it holds the fixture to
+/// Android's ordering, so this cannot pass by the store having been visible
+/// at construction after all.
+#[test]
+fn the_instrument_keys_are_honoured_when_the_store_arrives_after_construction() {
+    let store = std::rc::Rc::new(MemoryKvStore::default());
+    for (key, value) in [
+        (render::FRAME_TELEMETRY_KEY, "1"),
+        (render::RASTER_TELEMETRY_KEY, "1"),
+        (render::GESTURE_SCRIPT_KEY, "pan-zoom-2d"),
+    ] {
+        store
+            .store(key, value)
+            .expect("the memory store always accepts a write");
+    }
+
+    let mut app = headless(TestBridge::android().with_store(std::rc::Rc::clone(&store)));
+    assert!(
+        !app.frame_telemetry_loud,
+        "the fixture stopped reproducing Android's ordering: the store was \
+         already readable at construction, so the reload below proves nothing"
+    );
+
+    // What `android_main` does next, once the Activity has a data path.
+    app.set_config_dir(std::path::PathBuf::from("/android/config"));
+
+    assert!(
+        app.frame_telemetry_loud,
+        "the frame instrument stayed off on Android with `frame_telemetry` set"
+    );
+    assert!(
+        app.raster_telemetry_loud,
+        "the raster instrument stayed off on Android with `raster_telemetry` set"
+    );
+    assert!(
+        app.gesture_player.is_some(),
+        "the gesture player stayed dormant on Android with `gesture_script` set"
+    );
 }
 
 /// An HTTP client no dispatch below can complete through, for the fixtures that

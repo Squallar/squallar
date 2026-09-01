@@ -2250,6 +2250,25 @@ impl App {
         // Load config now — on Android this is called after App::new(), so the initial load
         // in new() had no config dir yet.
         if let Some(store) = self.platform.kv() {
+            // The same reason, for the three keys `App::new` read against a
+            // bridge that had no store yet. Without this they keep their
+            // constructed defaults for the life of the process, which on
+            // Android means the frame and raster instruments cannot be turned
+            // on at all and the gesture player cannot be armed — the config
+            // was read before the platform knew where config lived.
+            //
+            // Unconditional rather than fill-if-absent because the only
+            // caller is `android_main`, once, before the event loop runs:
+            // there is no player mid-script to restart. The variable is
+            // re-read with the store so it keeps outranking it, as in
+            // `App::new`.
+            self.raster_telemetry_loud = render::raster_telemetry_is_loud(Some(store.as_ref()));
+            self.frame_telemetry_loud = render::frame_telemetry_is_loud(Some(store.as_ref()));
+            self.gesture_player = render::gesture_player_from(
+                std::env::var("SQUALLAR_GESTURE_SCRIPT").ok(),
+                Some(store.as_ref()),
+            );
+
             self.site_positions = crate::site_positions::SitePositions::load(Some(store.as_ref()));
             self.site_catalogue = crate::site_catalogue::load(Some(store.as_ref()));
             let table = squallar_radar::sites::resolve(
