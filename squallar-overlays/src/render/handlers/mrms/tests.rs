@@ -1007,48 +1007,16 @@ fn retain_frames_drops_this_products_unkept_granules_and_no_others() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
-    use std::io::{Read, Write};
     use std::sync::Mutex;
 
+    // Bound here; **served on the test's own runtime**, below — see the
+    // comment there. It is a measured flake, not a style preference.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     let seen: Arc<Mutex<Vec<String>>> = Default::default();
-    let (release, held) = std::sync::mpsc::channel::<()>();
-    let held = Arc::new(Mutex::new(held));
-    let recorder = Arc::clone(&seen);
     // t(0)'s key ends in its own second-precision stamp, which is what
     // appears on the request line.
     let held_stamp = t(0).format("%Y%m%d-%H%M%S").to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let recorder = Arc::clone(&recorder);
-            let held = Arc::clone(&held);
-            let held_stamp = held_stamp.clone();
-            std::thread::spawn(move || {
-                let mut scratch = [0u8; 4096];
-                let read = stream.read(&mut scratch).unwrap_or(0);
-                let request = String::from_utf8_lossy(&scratch[..read]).to_string();
-                let line = request.lines().next().unwrap_or("").to_string();
-                let hold = line.contains(&held_stamp);
-                recorder
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(line);
-                if hold {
-                    let _ = held.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                }
-                let body = "not a granule; the decode failing is fine here";
-                let _ = stream.write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len(),
-                    )
-                    .as_bytes(),
-                );
-            });
-        }
-    });
 
     let product = MrmsProduct::ReflectivityComposite;
     let mut h = MrmsHandler::new();
@@ -1106,6 +1074,69 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         .build()
         .expect("test runtime");
     rt.block_on(async move {
+        // -- The bucket, served ON THIS RUNTIME AND THIS THREAD -------------
+        //
+        // **It used to be two OS threads, and that is what made this test
+        // flaky.** Every loop below bounds itself by a POLL COUNT and never a
+        // clock, which is right — but the thing each loop is waiting for was
+        // an OS thread being scheduled (accept, then read, then push the
+        // request line), while `tokio::task::yield_now()` on a
+        // `new_current_thread` runtime yields to the RUNTIME and never
+        // releases the OS thread. So the loop spun 200,000 times at 100% of
+        // one core, on a box where every core was already taken, and reached
+        // its cap before the server threads got a slice. It then failed
+        // saying "the first fetch never issued its GET" — which was not what
+        // happened: the GET was on the wire and had not been RECORDED yet.
+        //
+        // On this runtime the count means what it says. The server is two
+        // tasks on the same thread as the fetches, so each `yield_now` turn
+        // is a real, guaranteed chance for accept and read to run. No sleep,
+        // no clock, and no widened tolerance. Same change, same reason, as
+        // the GMGSI twin of this test.
+        listener
+            .set_nonblocking(true)
+            .expect("a freshly bound listener can be made non-blocking");
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("this runtime adopts the bound listener");
+        // A permit, not an edge: `notify_one` before the connection task
+        // reaches `notified()` stores the permit rather than losing it.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let recorder = Arc::clone(&seen);
+        let held = Arc::clone(&release);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorder = Arc::clone(&recorder);
+                let held = Arc::clone(&held);
+                let held_stamp = held_stamp.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut scratch = [0u8; 4096];
+                    let read = stream.read(&mut scratch).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+                    let line = request.lines().next().unwrap_or("").to_string();
+                    let hold = line.contains(&held_stamp);
+                    recorder
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(line);
+                    if hold {
+                        held.notified().await;
+                    }
+                    let body = "not a granule; the decode failing is fine here";
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                                 Connection: close\r\n\r\n{body}",
+                                body.len(),
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+
         let gets = |seen: &Arc<Mutex<Vec<String>>>| -> usize {
             seen.lock().unwrap_or_else(|e| e.into_inner()).len()
         };
@@ -1114,7 +1145,13 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         // server holds it. The cap is a poll count, not a clock.
         let mut turns = 0usize;
         while gets(&seen) == 0 {
-            assert!(turns < 200_000, "the first fetch never issued its GET");
+            assert!(
+                turns < 200_000,
+                "the loopback server recorded no request line in {turns} \
+                 driver turns, each of which was also a poll of the accept \
+                 and read tasks on this same thread. The first fetch never \
+                 put its GET on the wire",
+            );
             assert!(
                 futures::poll!(a.as_mut()).is_pending(),
                 "t(0) completed while the server was holding its response",
@@ -1144,7 +1181,7 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
         );
 
         // 3. Release the held response; A completes and drops the guard.
-        release.send(()).expect("the server thread is alive");
+        release.notify_one();
         let mut turns = 0usize;
         loop {
             if futures::poll!(a.as_mut()).is_ready() {

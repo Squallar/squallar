@@ -1658,7 +1658,19 @@ fn a_live_poll_still_asks_for_the_current_hour_and_evicts_the_archive() {
 
     let paths = request_paths(&seen);
     let current = now.format("GLM-L2-LCFA/%Y/%j/%H/").to_string();
-    let window_start = now - TimeDelta::seconds(GLM_MIN_TIME_WINDOW_SECS as i64);
+    // **`- GRANULE_SPAN`, and leaving it out is a wall-clock flake.** The
+    // listing does not open at the residency's start: `listed_ranges` widens
+    // every range back by one [`GRANULE_SPAN`], because a granule whose key
+    // names 40 s before the window still carries content inside it. This line
+    // used to restate the window as `now - GLM_MIN_TIME_WINDOW_SECS` alone,
+    // which is a DIFFERENT hour from production's for the 40 s after
+    // `hh:01:00` — the poll asks for the previous hour, the test says its
+    // window does not cover it, and the assertion fails on a correct build.
+    // Measured 2026-09-01: 3 failures in 34 runs of the whole crate binary,
+    // all three inside 01:01:0x, none of them load-related. Taken off the
+    // production constant rather than restated, so the two cannot drift again.
+    let window_start =
+        now - TimeDelta::seconds(GLM_MIN_TIME_WINDOW_SECS as i64) - super::GRANULE_SPAN;
     let opened_in = window_start.format("GLM-L2-LCFA/%Y/%j/%H/").to_string();
     assert!(
         paths.iter().any(|p| p.contains(&current)),

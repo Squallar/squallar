@@ -284,11 +284,13 @@ fn say_telemetry(loud: bool, line: &str) {
 fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
     format!(
         "overlay rasters: {} dispatched, {} arrived, {} pictures of {} B, \
-         {} shown, {} promoted, {} dropped, {} superseded, {} cancelled",
+         {} inked, {} shown, {} promoted, {} dropped, {} superseded, \
+         {} cancelled",
         t.dispatched,
         t.arrived,
         t.pictures,
         t.picture_bytes,
+        t.inked,
         t.shown,
         t.promoted,
         t.dropped,
@@ -1814,9 +1816,14 @@ impl super::App {
             // **Once per response, never once per pane.** This one handle is
             // cloned to every pane below, so the pixels cross once however many
             // panes asked; counting inside that loop would multiply the byte
-            // figure by the pane count. `as_raw()` is the picture's own buffer,
-            // so this is the real size rather than `w * h * 4` restated.
-            squallar_egui::overlay_cache::ledger::note_picture(image.as_raw().len() as u64);
+            // figure by the pane count.
+            // `as_raw()` is the picture's own buffer, so this is the real size
+            // rather than `w * h * 4` restated. `resp.ink` was decided on the
+            // offload thread that built those bytes and is only read here.
+            squallar_egui::overlay_cache::ledger::note_picture(
+                image.as_raw().len() as u64,
+                resp.ink,
+            );
 
             // Every pane still named here wants the picture: the retain above is
             // what decided that, and it also cleared every in-flight mark.

@@ -2338,6 +2338,13 @@ mod fixture_tests;
 #[cfg(test)]
 mod rig_seed_tests;
 
+/// The measurement rig's seven scene seeds, each held to the layout its own
+/// header claims — after the shell's propagation, which is where scene C's
+/// three sites became one.
+#[path = "ui_config/measure_seed_tests.rs"]
+#[cfg(test)]
+mod measure_seed_tests;
+
 #[path = "ui_config/tests.rs"]
 #[cfg(test)]
 mod tests;

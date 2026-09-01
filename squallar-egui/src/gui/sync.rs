@@ -178,7 +178,12 @@ impl Gui {
     /// half of time sync with it while `LAYER_LINK_NOTE` promised layers-off
     /// kept only "this pane's site, product, tilt and layers" its own. They
     /// are separate calls now, and either can run without the other.
-    pub(super) fn propagate_pane_sync(&mut self) {
+    /// `pub(crate)` rather than `pub(super)` so
+    /// `ui_config::measure_seed_tests` can ask what a seeded scene really
+    /// looks like once the shell has run: the collapse this performs is not
+    /// visible to a test that only loads the config, and scene C's three sites
+    /// became one here for every row the campaign ever took.
+    pub(crate) fn propagate_pane_sync(&mut self) {
         if self.pane_layout.pane_count <= 1 {
             return;
         }

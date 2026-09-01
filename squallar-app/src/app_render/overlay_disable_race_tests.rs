@@ -70,6 +70,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context) {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            ink: true,
             image: Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
                 [W as usize, H as usize],
                 &vec![255u8; (W * H) as usize * 4],
@@ -201,6 +202,7 @@ fn a_failed_render_clears_the_in_flight_mark_and_touches_nothing() {
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            ink: false,
             image: None,
             geo_bounds: bounds(),
             overlay_kind: KIND,

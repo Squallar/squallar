@@ -39,9 +39,34 @@
 //! * [`Totals::picture_bytes`] is zero with [`Totals::pictures`] positive only
 //!   if pictures are arriving with no pixels in them, which is a different
 //!   fault from "no pictures arrived".
+//! * [`Totals::inked`] is zero with [`Totals::pictures`] positive when every
+//!   picture that arrived **painted nothing**. That is a fourth distinct
+//!   fault, and until 2026-08-31 nothing here could see it: a layer emitting a
+//!   fully transparent pixmap satisfied every conjunct above, because
+//!   [`note_picture`] counted the RGBA buffer whatever was in it. Measured on
+//!   a deliberately emptied raster: 6 dispatched, 6 arrived, 6 pictures, and
+//!   a map drawing nothing.
 //!
 //! Pinned by `the_ledger_separates_a_path_that_never_ran_from_one_that_moved_nothing`
 //! and `every_arrival_is_either_a_picture_or_a_drop`.
+//!
+//! # What "ink" is, and why it is a count rather than a coverage
+//!
+//! [`has_ink`] is the whole definition, and it is exact rather than a
+//! heuristic: egui's `Color32` is **premultiplied**, so a pixel that would
+//! change nothing under `dst = src + dst·(1−src.a)` is zero in all four bytes.
+//! "Some byte of this buffer is non-zero" is therefore precisely "some pixel
+//! of this picture would alter the frame it is drawn on".
+//!
+//! A *coverage* figure — inked pixels over total pixels — was the other
+//! candidate and was not taken. It cannot short-circuit, so it walks every
+//! picture in full whatever is in it, where the predicate stops at the first
+//! non-zero byte and only pays the whole pass for the blank picture it exists
+//! to catch. And its denominator is not one this line already carries:
+//! [`Totals::picture_bytes`] is a sum over pictures of different sizes, so a
+//! ratio against it is an aggregate over an unstated mix rather than "how much
+//! of a picture is ink". [`Totals::inked`] has exactly one denominator,
+//! [`Totals::pictures`], and `inked <= pictures` always.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -55,6 +80,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static PICTURES: AtomicU64 = AtomicU64::new(0);
 /// Bytes of those pictures.
 static PICTURE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Of those pictures, the ones that had any ink in them. See [`has_ink`].
+static INKED: AtomicU64 = AtomicU64::new(0);
 /// Pictures put straight on screen.
 static SHOWN: AtomicU64 = AtomicU64::new(0);
 /// Pictures that reached the screen after their last band landed.
@@ -94,7 +121,21 @@ pub struct Totals {
     pub pictures: u64,
     /// Bytes of [`Self::pictures`] — `width × height × 4`, the picture's own
     /// size, taken at the call that hands the pixels over.
+    ///
+    /// **This is the size of the buffer, never a statement about what is in
+    /// it.** A picture of 8 MB of fully transparent pixels reports 8 MB here,
+    /// which is why [`Self::inked`] exists beside it.
     pub picture_bytes: u64,
+    /// Of [`Self::pictures`], those with at least one non-zero byte — pictures
+    /// that would actually change the frame they were drawn on. `inked <
+    /// pictures` is layers rasterizing blank; `inked == 0` with `pictures > 0`
+    /// is **every** overlay painting nothing, which every other figure on this
+    /// line reports identically to a healthy run.
+    ///
+    /// Decided by [`has_ink`] on the offload thread that produced the pixels,
+    /// never on the frame thread: see `App::overlay_job_deliver`, and
+    /// `no_poller_unmultiplies_on_the_frame_thread` for the rule.
+    pub inked: u64,
     /// Pictures put straight on screen, because the pane was drawing nothing
     /// for that layer yet.
     pub shown: u64,
@@ -175,10 +216,32 @@ pub fn note_dropped() {
     DROPPED.fetch_add(1, Relaxed);
 }
 
-/// Record `bytes` of picture handed to egui.
-pub fn note_picture(bytes: u64) {
+/// Whether any pixel of a premultiplied RGBA buffer would change the frame it
+/// is drawn on.
+///
+/// **Exact, not a sample.** Premultiplication is what makes it exact: a pixel
+/// that contributes nothing has zero in all four bytes, so "no non-zero byte"
+/// and "paints nothing" are the same statement. A sampled or strided version
+/// would miss a picture whose only ink is one polygon, which is the ordinary
+/// shape of an alerts raster.
+///
+/// **Short-circuits.** A picture with ink in its first row costs a handful of
+/// loads; only a picture with no ink at all pays the whole pass, and that is
+/// the reading this exists to take. Called from the offload closure that
+/// produced the pixels — never from a poller; see
+/// `no_poller_unmultiplies_on_the_frame_thread`.
+pub fn has_ink(rgba: &[u8]) -> bool {
+    rgba.iter().any(|&b| b != 0)
+}
+
+/// Record `bytes` of picture handed to egui, and whether [`has_ink`] found
+/// anything in it.
+pub fn note_picture(bytes: u64, inked: bool) {
     PICTURES.fetch_add(1, Relaxed);
     PICTURE_BYTES.fetch_add(bytes, Relaxed);
+    if inked {
+        INKED.fetch_add(1, Relaxed);
+    }
 }
 
 /// Record a picture put straight on screen.
@@ -215,6 +278,7 @@ pub fn totals() -> Totals {
         dropped: DROPPED.load(Relaxed),
         pictures: PICTURES.load(Relaxed),
         picture_bytes: PICTURE_BYTES.load(Relaxed),
+        inked: INKED.load(Relaxed),
         shown: SHOWN.load(Relaxed),
         promoted: PROMOTED.load(Relaxed),
         superseded: SUPERSEDED.load(Relaxed),
@@ -255,6 +319,7 @@ pub fn reset_for_test() {
         &DROPPED,
         &PICTURES,
         &PICTURE_BYTES,
+        &INKED,
         &SHOWN,
         &PROMOTED,
         &SUPERSEDED,

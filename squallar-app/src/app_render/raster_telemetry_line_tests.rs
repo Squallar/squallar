@@ -100,11 +100,16 @@ fn rendered(pattern: &str, groups: &[u64]) -> String {
 /// another.
 #[test]
 fn the_rig_reads_the_lines_the_app_actually_writes() {
+    // `inked` is a subset of `pictures` in the real ledger; here it is given a
+    // value no other position holds, because what this test pins is the
+    // POSITION of each field in the sentence and a plausible value would let a
+    // transposition read as correct.
     let rasters = ledger::Totals {
         dispatched: 11,
         arrived: 22,
         pictures: 33,
         picture_bytes: 44_000_000,
+        inked: 122,
         shown: 55,
         promoted: 66,
         dropped: 77,
@@ -115,7 +120,7 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         super::overlay_raster_line(&rasters),
         rendered(
             &pattern("rasters_re"),
-            &[11, 22, 33, 44_000_000, 55, 66, 77, 88, 99],
+            &[11, 22, 33, 44_000_000, 122, 55, 66, 77, 88, 99],
         ),
         "the `overlay rasters:` line and the rig's own probe for it have \
          drifted. The rig will report the overlay reading as null, which is \
@@ -188,7 +193,7 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
 #[test]
 fn a_line_that_drifted_by_one_space_is_not_accepted() {
     let rasters = ledger::Totals::default();
-    let good = rendered(&pattern("rasters_re"), &[0; 9]);
+    let good = rendered(&pattern("rasters_re"), &[0; 10]);
     assert_eq!(super::overlay_raster_line(&rasters), good);
 
     let drifted = good.replacen(" B, ", " B,  ", 1);
@@ -280,6 +285,87 @@ fn the_rig_asks_for_the_basemap_reading_it_can_now_take() {
          state this whole seam was added to end",
     );
 }
+
+/// **The seed-applied gate greps for lines this build really writes.**
+///
+/// `--expect-seed-applied` is four conjuncts over the console ring, and three
+/// of them are `indexOf` against a literal in `drive.py`. Two of those are
+/// **absences** — "the timezone fallback was never logged", "no config was
+/// refused" — and an absence checked against a string the app no longer writes
+/// is satisfied for ever, silently, by the very build it was meant to catch.
+/// That is the vacuous shape this repo has already had to delete four
+/// instances of, so the substrings are read out of the driver and matched
+/// against the format strings here.
+///
+/// The fourth, `loop state:`, is the positive floor the two absences rest on,
+/// and it is checked from `loop_telemetry`'s own sentence rather than restated.
+#[test]
+fn the_seed_applied_gate_greps_for_lines_this_build_writes() {
+    const FLAG: &str = "--expect-seed-applied";
+    assert!(
+        DRIVE_PY.contains(&format!("\"{FLAG}\"")),
+        "drive.py no longer declares {FLAG}",
+    );
+    assert!(
+        RUN_TIER2.contains(FLAG),
+        "run_tier2.sh never passes {FLAG}, so the gate exists and is never \
+         asked for: a leg that navigated to /index.html, applied no seed and \
+         opened on a timezone-derived site goes green again",
+    );
+
+    // The localStorage name the driver looks for among the keys the prelude
+    // wrote. The app reads under the logical key and `squallar_web::kv` adds
+    // the prefix; a rename on either side leaves the gate looking for a key
+    // nobody sets, which reads as "the seed never landed" on every leg.
+    assert!(
+        DRIVE_PY.contains(&format!(
+            "UI_CONFIG_SEED_KEY = \"squallar.{}\"",
+            squallar_egui::UI_CONFIG_KEY
+        )),
+        "drive.py's UI_CONFIG_SEED_KEY is not `squallar.{}`",
+        squallar_egui::UI_CONFIG_KEY,
+    );
+
+    // The three console substrings, each with the source line that writes it.
+    // `assert!(contains)` on both sides: the driver must still look for it,
+    // and this build must still say it.
+    for (needle, written_by) in [
+        (
+            "nearest to timezone",
+            "app.rs / app_render.rs, the only paths reachable when \
+             `load_ui_config` returned false",
+        ),
+        ("Failed to parse config", "ui_config.rs's parse arm"),
+        (
+            "no radar could be called",
+            "ui_config.rs, a seed naming a site this build has no radar for",
+        ),
+        (
+            "loop state:",
+            "loop_telemetry.rs, the frame-telemetry period",
+        ),
+    ] {
+        assert!(
+            DRIVE_PY.contains(needle),
+            "drive.py's SEED_APPLIED_PROBE no longer greps for {needle:?}",
+        );
+        assert!(
+            [APP, APP_RENDER, UI_CONFIG, LOOP_TELEMETRY]
+                .iter()
+                .any(|source| source.contains(needle)),
+            "no source this test reads still writes {needle:?} ({written_by}). \
+             The driver greps for it, finds nothing, and -- for the two \
+             absence conjuncts -- passes for ever on the exact failure it \
+             exists to catch",
+        );
+    }
+}
+
+/// The sources whose log lines `--expect-seed-applied` reads back.
+const APP: &str = include_str!("../app.rs");
+const APP_RENDER: &str = include_str!("../app_render.rs");
+const UI_CONFIG: &str = include_str!("../../../squallar-egui/src/ui_config.rs");
+const LOOP_TELEMETRY: &str = include_str!("../loop_telemetry.rs");
 
 /// The floor under the test above: the app really does read that key, and
 /// really does refuse anything else.

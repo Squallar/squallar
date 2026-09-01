@@ -63,8 +63,19 @@ tokio = { workspace = true, features = ["fs"] }
 # one of the features tokio accepts on wasm, and an ungated dev-dependency still
 # breaks `cargo check --all-targets --target wasm32-unknown-unknown`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# Drives the `#[ignore]`d live-network checks (IEM and the S3 buckets).
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Drives the `#[ignore]`d live-network checks (IEM and the S3 buckets), and
+# `net`/`io-util`/`sync` serve the frame-gate tests' loopback bucket ON THE
+# TEST'S OWN RUNTIME. Named rather than inherited from reqwest's transitive
+# enablement: a poll-counted loop whose exit condition lives on another OS
+# thread is not bounded by its own count, which is what made both
+# `two_frame_fetches_share_one_gate…` tests flaky under load.
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Deliberately empty. `libsqlite3-sys` was pinned here with `features =

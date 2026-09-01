@@ -24,8 +24,16 @@
 #      scraped from the sources at run time: the day the terrain wiring lands
 #      those flip, and a scene-B row without them silently becomes
 #      incomparable to every row before it.
-#   C  6 panes (3 volume + 3 plan, two sites), pan-zoom-2d -- the many-pane
-#      worst case.
+#   C  6 panes (3 volume + 3 plan, THREE sites -- KTLX, KINX, KVNX), each
+#      pane layer-unlinked, pan-zoom-2d -- the many-pane worst case.
+#      `layer_link` is written explicitly and is load-bearing: it defaults to
+#      TRUE, and a layer-linked group converges every pane onto the ACTIVE
+#      pane's site on the first shell frame (`Gui::propagate_layer_state`,
+#      which calls `p.set_site(active_site)`). Every scene-C row taken before
+#      2026-08-31 therefore measured six panes on ONE site, KTLX, with KINX
+#      and KVNX named in the seed and never displayed -- and this comment said
+#      "two sites" while the seed named three, so all three statements
+#      disagreed. Pinned now by `every_measure_scene_seeds_the_layout_it_claims`.
 #   D  scene A's layer stack driven by ui-sweep -- the UI-responsiveness
 #      scenario (toggles, panels, slider) through the click registry.
 #   E1 scene A's layer stack with the pane's loop seeded PLAYING and no
@@ -263,7 +271,7 @@ scene_seed() {
   case "$1" in
     A) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     B) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "orbit-3d"}' ;;
-    C) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX\",\"render\":\"Volume\"},{\"site\":\"KTLX\"},{\"site\":\"KINX\",\"render\":\"Volume\"},{\"site\":\"KINX\"},{\"site\":\"KVNX\",\"render\":\"Volume\"},{\"site\":\"KVNX\"}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
+    C) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KTLX\",\"layer_link\":false},{\"site\":\"KINX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KINX\",\"layer_link\":false},{\"site\":\"KVNX\",\"layer_link\":false,\"render\":\"Volume\"},{\"site\":\"KVNX\",\"layer_link\":false}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     D) echo '{"squallar.ui": "{'"$PANEL_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "ui-sweep"}' ;;
     E1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
     E2) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"loop_playback\":\"playing\",\"enabled_overlays\":{'"$ALL_LAYERS"'}}]}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
@@ -608,6 +616,7 @@ run_leg() {
       --driver "$driver" --frames "$FRAMES" \
       --settle "$SETTLE" --data-window "$MEASURE_WINDOW" \
       --arm hardware --require-hardware \
+      --expect-seed-applied \
       "${arm_args[@]}" \
       ${EXTRA[@]+"${EXTRA[@]}"}
   local rc=$?

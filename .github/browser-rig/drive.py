@@ -1540,6 +1540,63 @@ return {
 };
 """
 
+# Did THIS BROWSER really apply the scene seed, or is it measuring a page that
+# chose its own scene?
+#
+# THE HOLE THIS CLOSES, and both halves of it happened. `rig_seed_tests` and
+# `measure_seed_tests` prove a seed literal parses into the scene its script
+# claims -- on the HOST, against the config loader. Neither says a browser ever
+# read it, and nothing else did either:
+#
+#   * A leg navigated to /index.html instead of /index-rig.html. serve.py only
+#     injects PAGE_PRELUDE on the -rig route, so there was no window.__rig, no
+#     localStorage write, and the app opened on a site derived from the
+#     machine's timezone. Every figure was against a scene nobody chose and
+#     the row read as valid.
+#   * A seed that parses but is REFUSED at load -- an unknown site, a body the
+#     serde chain rejects -- falls through the same way, with a warning nobody
+#     was reading.
+#
+# Four fields, and the first two are the floor that stops the last two passing
+# vacuously. "No fallback line was logged" is an ABSENCE, and an absence is
+# satisfied for free by a page that logged nothing at all -- which is precisely
+# what the /index.html leg looked like, since without the prelude there is no
+# console ring to log into.
+#
+#   seeded     -- the keys PAGE_PRELUDE actually wrote into localStorage
+#                 (serve.py sets window.__rig.seeded). Null means no prelude
+#                 ran: wrong page, or no --seed-local-storage.
+#   loud       -- a `loop state:` line was seen. report_frame_telemetry writes
+#                 it every period UNCONDITIONALLY when squallar.frame_telemetry
+#                 is loud, and that key comes from the same seed object as
+#                 squallar.ui. So this is a POSITIVE proof that the app read
+#                 this seed, not merely that the prelude wrote it, and it is
+#                 what makes the two absences below mean something.
+#   fallback   -- "opening on <site>, nearest to timezone <zone>" (app.rs and
+#                 app_render.rs, both log::info!). Reachable ONLY where
+#                 gui.load_ui_config(store) returned false.
+#   refused    -- "Failed to parse config" (ui_config.rs) or "config names a
+#                 site no radar could be called" -- a seed that arrived and was
+#                 rejected in whole or in part.
+SEED_APPLIED_PROBE = r"""
+var C = window.__rig_console || [];
+var fallback = [], refused = [], loud = 0;
+for (var i = 0; i < C.length; i++) {
+  var m = String(C[i].msg || "");
+  if (m.indexOf("nearest to timezone") !== -1) fallback.push(m);
+  if (m.indexOf("Failed to parse config") !== -1) refused.push(m);
+  if (m.indexOf("no radar could be called") !== -1) refused.push(m);
+  if (m.indexOf("loop state:") !== -1) loud++;
+}
+return {
+  seeded: (window.__rig && window.__rig.seeded) || null,
+  loud: loud,
+  console_total: C.length,
+  fallback: fallback.slice(0, 4),
+  refused: refused.slice(0, 4)
+};
+"""
+
 # The Tier-2 worker-wire signals, scanned from the console ring the serve.py
 # prelude keeps. Timestamps are page-side Date.now() at log time.
 #   attached  -- worker_port::handle_message's "rasterization worker attached"
@@ -1574,7 +1631,13 @@ var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied ou
 // every texture delta the renderer was shown -- font atlas, basemap tiles and
 // radar included. A single "bytes uploaded" figure over the union would
 // describe neither, and would move when the mix moved.
-var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded, (\d+) cancelled/;
+// `inked` is a SUBSET OF `pictures`, never a term beside it and never added to
+// anything: it is how many of those pictures had a single non-zero byte in
+// them. `pictures` counts buffers handed to egui whatever is in them, so a
+// layer that rasterizes a fully transparent pixmap moves `pictures` and
+// `picture_bytes` exactly as a working one does -- measured 2026-08-31, six
+// dispatched / six arrived / six pictures over a map drawing nothing.
+var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictures of (\d+) B, (\d+) inked, (\d+) shown, (\d+) promoted, (\d+) dropped, (\d+) superseded, (\d+) cancelled/;
 // `whole` is a routing subset of `blocking` (a whole delta moves through a
 // blocking write_texture on the frame's own queue); the GPU total is the
 // disjoint pair staged + blocking. Never add whole to anything.
@@ -1638,11 +1701,12 @@ for (var i = 0; i < C.length; i++) {
                        arrived: parseInt(rm2[2], 10),
                        pictures: parseInt(rm2[3], 10),
                        picture_bytes: parseInt(rm2[4], 10),
-                       shown: parseInt(rm2[5], 10),
-                       promoted: parseInt(rm2[6], 10),
-                       dropped: parseInt(rm2[7], 10),
-                       superseded: parseInt(rm2[8], 10),
-                       cancelled: parseInt(rm2[9], 10) };
+                       inked: parseInt(rm2[5], 10),
+                       shown: parseInt(rm2[6], 10),
+                       promoted: parseInt(rm2[7], 10),
+                       dropped: parseInt(rm2[8], 10),
+                       superseded: parseInt(rm2[9], 10),
+                       cancelled: parseInt(rm2[10], 10) };
   var um = uploads_re.exec(m);
   if (um) uploads = { deltas: parseInt(um[1], 10),
                       bytes: parseInt(um[2], 10),
@@ -2574,13 +2638,21 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
     simulation over a model of this path, and this is what makes the real thing
     observable per browser.
 
-    Five conjuncts, and each can fail on its own. That is the point: a gate
+    Six conjuncts, and each can fail on its own. That is the point: a gate
     with one conjunct on a byte total goes green on a page that never enabled a
     texture layer, because `0 B` is what both the working-but-idle and the
     never-ran cases report. The lesson is WS3b's (a worker that fell back to
     one thread still attached, still answered jobs, and passed every assertion
     the rig had) and WS3c's (`out_copied == 0` needs `out_moved > 0` beside
     it).
+
+    THE SIXTH WAS ADDED 2026-08-31 AND THE FIVE BEFORE IT COULD NOT SEE WHAT IT
+    SEES. `pictures` and `picture_bytes` count the RGBA buffer handed to egui
+    whatever is in it, so a texture layer emitting a fully transparent pixmap
+    satisfied all five over a map painting nothing -- measured on a
+    deliberately emptied raster: 6 dispatched, 6 arrived, 6 pictures. Anyone
+    reasoning "the rig would catch it if the layer stopped drawing" was wrong
+    for as long as there were five.
 
       * `dispatched > 0`   -- something asked for an overlay raster. THE
                               FLOOR. Zero means no enabled texture layer had
@@ -2589,7 +2661,19 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
       * `pictures > 0`     -- rasters came back and their pixels were handed
                               to egui. `dispatched > 0` with this at zero is a
                               dispatch whose answers never arrive.
-      * `picture_bytes > 0`-- and the pictures had pixels in them.
+      * `picture_bytes > 0`-- and the pictures had pixels in them. Says
+                              nothing about what those pixels were: this is
+                              the size of the buffer.
+      * `inked > 0`        -- and at least one of those pictures would have
+                              CHANGED the frame it was drawn on. egui's
+                              Color32 is premultiplied, so a pixel that
+                              contributes nothing is zero in all four bytes
+                              and "some byte is non-zero" is exact rather
+                              than a heuristic. `inked < pictures` is layers
+                              rasterizing blank and is reported, not gated:
+                              `NwsAlerts` legitimately paints nothing when no
+                              alert is in view, so an equality here would red
+                              on quiet weather.
       * `shown + promoted > 0` -- and at least one reached the screen. A page
                               that uploaded and then dropped everything fails
                               here and passes the three above.
@@ -2636,12 +2720,121 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
         "ok": False,
         "waited_s": round(time.monotonic() - t0, 2),
         "error": "the overlay raster path did not complete within %.0fs: %s "
-                 "(wanted dispatched>0, pictures>0, picture_bytes>0, "
+                 "(wanted dispatched>0, pictures>0, picture_bytes>0, inked>0, "
                  "shown+promoted>0, and arrived==pictures+dropped; a page that "
                  "seeded no texture overlay reports every one of these as 0 "
-                 "and passes every other Tier-2 assertion)" % (timeout, best),
+                 "and passes every other Tier-2 assertion, and one whose "
+                 "layers rasterize blank reports every one of them EXCEPT "
+                 "inked exactly as a healthy page does)" % (timeout, best),
     })
     return out
+
+
+def wait_seed_applied(session, timeout=180.0, interval=2.0):
+    """The scene seed was written by THIS page and read by THIS app.
+
+    Four conjuncts, and the order matters: the first two are strict positives
+    and the last two are absences that only mean something behind them.
+
+      * `squallar.ui in seeded` -- PAGE_PRELUDE ran and wrote the config key.
+                            Fails outright on a leg pointed at /index.html,
+                            which is the shape that shipped: no prelude, no
+                            window.__rig, no seed, and the app picks a site
+                            off the machine's timezone.
+      * `loud > 0`        -- a `loop state:` line reached the console ring.
+                            report_frame_telemetry writes it every period
+                            regardless of what moved, gated only on
+                            squallar.frame_telemetry -- a key from the same
+                            seed object. So the app READ this seed. THIS IS
+                            THE NON-VACUITY FLOOR: without it, a page that
+                            logged nothing satisfies both absences below, and
+                            a page with no prelude has no ring to log into.
+      * `fallback == []`  -- no "opening on <site>, nearest to timezone
+                            <zone>". That line is reachable only where
+                            gui.load_ui_config returned false, so its presence
+                            is the seed being absent or unusable, stated by
+                            the app itself.
+      * `refused == []`   -- no "Failed to parse config", no "config names a
+                            site no radar could be called". A seed can arrive,
+                            parse as JSON, and still be thrown away.
+
+    WHAT IT DOES NOT CLAIM, and the omission is deliberate. Nothing the app
+    exposes reports the pane count, the site set or the enabled layers after
+    boot -- `loop state:` counts only ANIMATING panes, so it reads 0 panes for
+    a six-pane scene that is not looping and is useless as a layout check. So
+    this proves "a seed was written and this build accepted it", and the HOST
+    side proves "that literal describes the claimed scene"
+    (`ui_config::rig_seed_tests` for run_tier2.sh,
+    `ui_config::measure_seed_tests` for all seven of run_measure.sh's). The
+    pair is the chain; neither half is the claim.
+
+    NEGATIVE CONTROL, and it is the defect itself rather than a tamper: point
+    --url at /index.html. `seeded` reads null, this goes red naming that, and
+    every other Tier-2 assertion stays green -- the app boots, paints, attaches
+    its worker and rasters overlays on whatever scene it chose for itself.
+
+    Polls because the fallback line is written during boot and `loop state:`
+    only after the first telemetry period, so a single early read would see
+    neither and pass on both counts.
+    """
+    t0 = time.monotonic()
+    best = None
+    while time.monotonic() - t0 < timeout:
+        seen = session.execute(SEED_APPLIED_PROBE) or {}
+        if isinstance(seen, dict):
+            # The newest reading is the whole answer: `seeded` never changes
+            # after the prelude, and both `loud` and the two lists are
+            # cumulative over a ring that only grows within a leg.
+            best = seen
+        if best is not None and _seed_applied_ok(best):
+            out = dict(best)
+            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
+            return out
+        time.sleep(interval)
+    out = dict(best or {})
+    seeded = (best or {}).get("seeded")
+    if not isinstance(seeded, list):
+        why = ("window.__rig.seeded is %r: PAGE_PRELUDE never ran, so nothing "
+               "was written to localStorage at all. The usual cause is a --url "
+               "pointing at /index.html; serve.py only injects the prelude on "
+               "the /index-rig.html route" % (seeded,))
+    elif UI_CONFIG_SEED_KEY not in seeded:
+        why = ("the prelude wrote %r and none of them is %r, so the scene seed "
+               "is not among the keys this leg set"
+               % (seeded, UI_CONFIG_SEED_KEY))
+    elif not (best or {}).get("loud"):
+        why = ("the prelude wrote the seed and no `loop state:` line ever "
+               "reached the console ring, so nothing proves the app read it. "
+               "Either squallar.frame_telemetry is missing from the seed or "
+               "the app never got far enough to write a telemetry period")
+    elif (best or {}).get("fallback"):
+        why = ("the app logged %r: gui.load_ui_config returned false and this "
+               "leg is measuring a site derived from the machine's timezone, "
+               "not the seeded scene" % ((best or {}).get("fallback"),))
+    else:
+        why = ("the app logged %r: the seed arrived and was rejected"
+               % ((best or {}).get("refused"),))
+    out.update({
+        "ok": False,
+        "waited_s": round(time.monotonic() - t0, 2),
+        "error": "the scene seed was not applied within %.0fs: %s" % (timeout, why),
+    })
+    return out
+
+
+# The localStorage name of the config key, as squallar_web::kv::storage_key
+# spells it. Pinned from Rust by `the_rig_gates_on_the_key_it_seeds`.
+UI_CONFIG_SEED_KEY = "squallar.ui"
+
+
+def _seed_applied_ok(r):
+    """The four conjuncts of `wait_seed_applied`, over one reading."""
+    seeded = r.get("seeded")
+    return (isinstance(seeded, list)
+            and UI_CONFIG_SEED_KEY in seeded
+            and r.get("loud", 0) > 0
+            and not r.get("fallback")
+            and not r.get("refused"))
 
 
 def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
@@ -2728,10 +2921,11 @@ def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
 
 
 def _overlay_rasters_ok(r):
-    """The five conjuncts of `wait_overlay_rasters`, over one reading."""
+    """The six conjuncts of `wait_overlay_rasters`, over one reading."""
     return (r.get("dispatched", 0) > 0
             and r.get("pictures", 0) > 0
             and r.get("picture_bytes", 0) > 0
+            and r.get("inked", 0) > 0
             and (r.get("shown", 0) + r.get("promoted", 0)) > 0
             and r.get("arrived", -1) == r.get("pictures", 0) + r.get("dropped", 0))
 
@@ -3498,6 +3692,11 @@ def run_smoke(args):
             result["overlay_rasters"] = wait_overlay_rasters(
                 session, timeout=args.expect_timeout)
             stage("overlay-rasters-done", **result["overlay_rasters"])
+        if args.expect_seed_applied:
+            stage("seed-applied-wait", timeout=args.expect_timeout)
+            result["seed_applied"] = wait_seed_applied(
+                session, timeout=args.expect_timeout)
+            stage("seed-applied-done", **result["seed_applied"])
         if args.expect_basemap_tiles:
             stage("basemap-tiles-wait", timeout=args.expect_timeout)
             result["basemap_tiles"] = wait_basemap_tiles(
@@ -3815,11 +4014,16 @@ def run_smoke(args):
         zc = result.get("zero_copy")
         ovr = result.get("overlay_rasters")
         bmt = result.get("basemap_tiles")
+        # A leg whose seed never landed measured a scene nobody chose. That is
+        # not a weaker fact than a dead worker wire -- it makes every figure on
+        # the row uninterpretable -- so it fails the run on the same terms.
+        sap = result.get("seed_applied")
         worker_ok = ((wrt is None or bool(wrt.get("ok")))
                      and (dr is None or bool(dr.get("ok")))
                      and (rp is None or bool(rp.get("ok")))
                      and (zc is None or bool(zc.get("ok")))
                      and (ovr is None or bool(ovr.get("ok")))
+                     and (sap is None or bool(sap.get("ok")))
                      and (bmt is None or bool(bmt.get("ok"))))
         # The count assert (--expect-interaction-frames) and any requested
         # console waits. Counts and presence only; no ms figure is in here.
@@ -4159,6 +4363,13 @@ def run_smoke(args):
         print("[%s] SUMMARY overlay rasters: %s%s"
               % (tag, "OK" if ovr.get("ok") else "FAILED",
                  "" if ovr.get("ok") else "; " + str(ovr.get("error"))))
+    sap = result.get("seed_applied")
+    if sap is not None:
+        print("[%s] SUMMARY seed applied: %s%s"
+              % (tag, "OK" if sap.get("ok") else "FAILED",
+                 (" (prelude wrote %s; %s loop-state lines)"
+                  % (sap.get("seeded"), sap.get("loud")))
+                 if sap.get("ok") else "; " + str(sap.get("error"))))
     bmt = result.get("basemap_tiles")
     if bmt is not None:
         print("[%s] SUMMARY basemap tiles: %s%s"
@@ -4169,11 +4380,16 @@ def run_smoke(args):
     # never pooled, for the same reason the per-kind medians are not.
     ort = result.get("overlay_raster_totals")
     if ort:
+        # `inked` is printed against its own denominator, `pictures`, because
+        # the bare count says nothing on its own: 6 inked is healthy at 6
+        # pictures and is half the map missing at 12.
         print("[%s] SUMMARY overlay raster totals [whole-picture overlay "
               "dispatch only]: %s dispatched, %s arrived, %s pictures of %s B, "
-              "%s shown, %s promoted, %s dropped, %s superseded, %s cancelled"
+              "%s of %s inked, %s shown, %s promoted, %s dropped, "
+              "%s superseded, %s cancelled"
               % (tag, ort.get("dispatched"), ort.get("arrived"),
                  ort.get("pictures"), ort.get("picture_bytes"),
+                 ort.get("inked"), ort.get("pictures"),
                  ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
                  ort.get("superseded"), ort.get("cancelled")))
     tut = result.get("texture_upload_totals")
@@ -4452,6 +4668,20 @@ def main(argv=None):
                          "CONTROL: the every-layer-off seed written out beside "
                          "SEED_LS; dropping RadarCoverage alone is NOT a control, "
                          "the two default-on texture overlays cover for it")
+    ap.add_argument("--expect-seed-applied", action="store_true",
+                    help="fail unless THIS BROWSER really applied the scene "
+                         "seed: window.__rig.seeded names squallar.ui, a "
+                         "`loop state:` line proves the app read that same "
+                         "seed object, and neither the timezone-fallback line "
+                         "nor a config-refused warning was ever logged. THE "
+                         "HOLE THIS CLOSES: the host-side seed tests prove a "
+                         "literal PARSES into the claimed scene and say "
+                         "nothing about a browser ever reading it -- a leg "
+                         "pointed at /index.html gets no prelude, no "
+                         "localStorage write, and opens on a site derived "
+                         "from the machine's timezone while every other "
+                         "assertion stays green. NEGATIVE CONTROL: the defect "
+                         "itself, --url .../index.html")
     ap.add_argument("--expect-basemap-tiles", action="store_true",
                     help="fail unless the self-hosted VECTOR BASEMAP really "
                          "decoded tiles in this browser: vector_tiles>0 within "

@@ -1072,6 +1072,12 @@ impl super::App {
                 match hit_map {
                     Ok(hit_map) if sized => {
                         response.hit_map = hit_map;
+                        // **Asked here, off the frame thread**, for the reason
+                        // `OverlayRenderResponse::ink` gives: this is a pass
+                        // over the same buffer the premultiply already walks,
+                        // and the arrival that consumes the answer runs inside
+                        // `setup_egui_frame`.
+                        response.ink = squallar_egui::overlay_cache::ledger::has_ink(&rgba);
                         response.image = Some(std::sync::Arc::new(
                             egui::ColorImage::from_rgba_premultiplied(
                                 [width as usize, height as usize],
@@ -1268,6 +1274,8 @@ impl super::App {
                         id_map,
                         OverlayRenderResponse {
                             image: None,
+                            // Set by the deliver above if a picture is built.
+                            ink: false,
                             geo_bounds: render_bounds,
                             overlay_kind: id.clone(),
                             generation: data_generation,
@@ -3648,6 +3656,12 @@ mod polygon_wire_tests;
 #[cfg(test)]
 #[path = "app_fetch/hitmap_wire_tests.rs"]
 mod hitmap_wire_tests;
+
+/// A delivered picture that paints nothing is separable from one that paints —
+/// the reading `--expect-overlay-rasters` could not take before 2026-08-31.
+#[cfg(test)]
+#[path = "app_fetch/overlay_ink_tests.rs"]
+mod overlay_ink_tests;
 
 /// The model-grid dispatch is a described job carrying the grid by `Arc`, whose wire
 /// form is the projection window.

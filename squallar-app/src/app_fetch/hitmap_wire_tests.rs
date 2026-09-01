@@ -329,6 +329,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
 
     let deliver = |id_map, output| {
         let response = super::OverlayRenderResponse {
+            ink: false,
             image: None,
             geo_bounds: a_render_request().geo_bounds,
             overlay_kind: known::STORM_REPORTS,

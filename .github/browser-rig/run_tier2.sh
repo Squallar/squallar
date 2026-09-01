@@ -731,6 +731,14 @@ run_pass() {
       drive_args+=(--expect-overlay-rasters)
     fi
   fi
+  # THIS BROWSER really applied the scene seed. Every leg, unconditionally: it
+  # costs one probe, it needs no network, and what it protects is the meaning
+  # of every other figure on the row. The host-side seed tests
+  # (`ui_config::rig_seed_tests`) prove the literal parses into the scene this
+  # script claims and say nothing about a browser reading it -- a leg pointed
+  # at /index.html gets no prelude, no localStorage write, and opens on a
+  # timezone-derived site with every other assertion green. That happened.
+  drive_args+=(--expect-seed-applied)
   # The self-hosted vector basemap really decoded tiles. LIVE ONLY: the archive
   # is fetched by range over the real network, and the doctored leg spends its
   # first seconds terminating and refetching a worker while the gesture leg is
@@ -1045,11 +1053,16 @@ for leg in legs:
     # which is a different fact from zero bytes.
     ort = r.get("overlay_raster_totals")
     if ort:
+        # `inked` rides beside its own denominator, `pictures`. It is a subset
+        # of that count and is never added to anything: how many of the
+        # buffers handed to egui had a single non-zero byte in them.
         print("%-18s   overlay rasters [overlay dispatch only] "
-              "%s dispatched -> %s arrived -> %s pictures / %s B; "
+              "%s dispatched -> %s arrived -> %s pictures / %s B "
+              "(%s of %s inked); "
               "%s shown, %s promoted, %s dropped, %s superseded, %s cancelled"
               % ("", ort.get("dispatched"), ort.get("arrived"),
                  ort.get("pictures"), ort.get("picture_bytes"),
+                 ort.get("inked"), ort.get("pictures"),
                  ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
                  ort.get("superseded"), ort.get("cancelled")))
     else:

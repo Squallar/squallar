@@ -59,6 +59,7 @@ fn deliver(app: &mut crate::app::App, ctx: &egui::Context, pane_indices: Vec<usi
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            ink: true,
             image: Some(image),
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,
@@ -159,6 +160,7 @@ fn deliver_unmarked(app: &mut crate::app::App, ctx: &egui::Context, pane_indices
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            ink: true,
             image: Some(image),
             geo_bounds: bounds(),
             overlay_kind: known::NWS_ALERTS,

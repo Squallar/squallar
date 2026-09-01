@@ -161,6 +161,20 @@ pub struct OverlayRenderResponse {
     /// so a failure retires the dispatch it answers and no other; see
     /// `squallar_egui::overlay_cache::RenderTicket`.
     pub image: Option<Arc<egui::ColorImage>>,
+    /// Whether [`image`](Self::image) has any ink in it — decided by
+    /// `squallar_egui::overlay_cache::ledger::has_ink` **inside the offload
+    /// closure that produced the pixels**, and carried here rather than asked
+    /// at the arrival.
+    ///
+    /// The arrival runs inside `setup_egui_frame`, and the question costs a
+    /// pass over a buffer that is 17.8 MiB on a 1080p pane and 71.2 MiB on a
+    /// 4K one. That is the same reason the premultiply moved off this thread;
+    /// see `no_poller_unmultiplies_on_the_frame_thread`, which names this
+    /// field's own doc as the rule.
+    ///
+    /// `false` where [`image`](Self::image) is `None`: a render that produced
+    /// no picture painted nothing, and is a drop rather than a blank picture.
+    pub ink: bool,
     pub geo_bounds: GeoBounds,
     /// Which layer this raster is for, carried back to find each pane's cache.
     pub overlay_kind: LayerId,

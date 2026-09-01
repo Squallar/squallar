@@ -389,27 +389,40 @@ fn stamp(valid: chrono::NaiveDateTime) -> FrameStamp {
     FrameStamp { valid, run: None }
 }
 
-/// **Every finished satellite raster, by the instant it depicts** — the pixels
-/// the production renderer really produced, taken off the render channel on
-/// their way to the app and put straight back.
+/// **Every picture the app really handed to egui, by the texture it became** —
+/// taken off the texture manager's own delta queue, downstream of the poller.
 ///
-/// This is what makes "distinct pictures" a claim about pictures. The app sees
-/// exactly the responses it would have seen; nothing is substituted.
-fn capture_rasters(app: &crate::app::App, seen: &mut HashMap<chrono::NaiveDateTime, u64>) {
-    let mut back = Vec::new();
-    while let Ok(resp) = app.channels.overlay_render_receiver.try_recv() {
-        if resp.overlay_kind == known::GMGSI
-            && let (Some(frame), Some(image)) = (resp.frame, resp.image.as_ref())
-        {
-            seen.insert(frame.valid, hash_of(image));
+/// **This replaced a sniff of the render channel, and the reason is a measured
+/// flake.** The old helper drained `overlay_render_receiver`, hashed each
+/// GMGSI loop frame's response and re-sent it; `pump` then ran
+/// `poll_overlay_render_results`, which drains the same receiver. Two consumers,
+/// one channel — and the window between them is not a few instructions but the
+/// whole `Ingest` phase plus four `Apply` rows of `FRAME_PUMP`. A raster
+/// finishing on a pool thread inside that window was taken by the *production*
+/// poller, uploaded correctly, and never seen here. The frame then drew
+/// perfectly and its pixels were unknown, so its rail stop filed `None` — and
+/// because the byte budget holds all thirteen 32x32 textures, nothing was ever
+/// evicted and nothing re-rendered, so the miss was permanent. That is exactly
+/// `left: 12, right: 13`, one loop step short of a full sweep: **1 failure in
+/// 30 runs on a branch, 1 in 20 on unmodified main.**
+///
+/// Reading the texture manager instead removes the second consumer entirely.
+/// The delta is created by `Context::load_texture` *inside* the poller, and is
+/// read here after `pump` has returned, so there is no interleaving left to
+/// lose: it is ordered by the frame, not by a thread. It is also the stronger
+/// reading — these are the pixels egui was given for that exact texture id,
+/// rather than a response believed to have become it.
+///
+/// Whole-image deltas only (`pos.is_none()`), which is every overlay upload;
+/// a banded partial would carry a fragment and hashing it as a picture would
+/// be a different claim.
+fn capture_uploads(ctx: &egui::Context, seen: &mut HashMap<egui::TextureId, u64>) {
+    for (id, delta) in ctx.tex_manager().write().take_delta().set {
+        if delta.pos.is_some() {
+            continue;
         }
-        back.push(resp);
-    }
-    for resp in back {
-        app.channels
-            .overlay_render_sender
-            .send(resp)
-            .expect("the receiver lives on the App");
+        let egui::epaint::image::ImageData::Color(image) = delta.image;
+        seen.insert(id, hash_of(&image));
     }
 }
 
@@ -431,6 +444,7 @@ fn live_raster(app: &mut crate::app::App, ctx: &egui::Context, id: squallar_sour
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
+            ink: true,
             image: Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
                 [32, 32],
                 &[7u8; 32 * 32 * 4],
@@ -591,7 +605,10 @@ fn sweep_a_satellite_loop() -> Sweep {
     }
 
     let mut wire = Wire::default();
-    let mut rasters: HashMap<chrono::NaiveDateTime, u64> = HashMap::new();
+    // Keyed by the texture the picture became, and filled after every pump —
+    // see `capture_uploads` for why this is not read off the render channel.
+    let mut uploads: HashMap<egui::TextureId, u64> = HashMap::new();
+    capture_uploads(&ctx, &mut uploads);
 
     // Fill both loops through the real supply.
     //
@@ -603,8 +620,8 @@ fn sweep_a_satellite_loop() -> Sweep {
     let mut transport_filled = false;
     for _ in 0..600 {
         wire.answer(&mut app);
-        capture_rasters(&app, &mut rasters);
         pump(&mut app, &ctx);
+        capture_uploads(&ctx, &mut uploads);
         let pane = app.gui.pane(0).expect("pane 0");
         let satellite = pane.time_state(&known::GMGSI);
         let mosaic = pane.time_state(&known::MRMS);
@@ -618,13 +635,49 @@ fn sweep_a_satellite_loop() -> Sweep {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 
-    // **Non-triviality of the fixture itself.** Every hour's granule must
-    // have rasterized to its own picture; if two did not, the count below
-    // would read as the defect when what really happened is that two hours
-    // landed on one colour.
-    {
-        let mut shades: Vec<u64> = rasters.values().copied().collect();
+    // **Non-triviality of the fixture itself, and the completeness of the
+    // capture, in one block.** Every hour's granule must have rasterized to
+    // its own picture; if two did not, the count below would read as the
+    // defect when what really happened is that two hours landed on one colour.
+    //
+    // The first assertion is what the channel sniff this replaced could never
+    // make: every filed frame's texture is one `capture_uploads` saw. A miss
+    // there was the flake — a picture correctly drawn whose pixels were
+    // unknown here, filing `None` at its rail stop for ever.
+    let rasters = {
+        let pane = app.gui.pane(0).expect("pane 0");
+        let ls = pane.time_state(&known::GMGSI);
+        let filed: Vec<egui::TextureId> = ls
+            .frames
+            .iter()
+            .filter_map(|f| {
+                f.image
+                    .as_ref()
+                    .and_then(squallar_egui::pane::LoopFrameImage::overlay)
+            })
+            .map(|o| o.texture.id())
+            .collect();
+        let mut shades: Vec<u64> = filed
+            .iter()
+            .filter_map(|id| uploads.get(id).copied())
+            .collect();
+        assert_eq!(
+            shades.len(),
+            filed.len(),
+            "fixture: {} of the satellite layer's {} filed frames carry a \
+             texture this run never saw uploaded. Those steps can only ever \
+             read as blank, whatever the app draws — which is the shape of \
+             the flake this capture was rewritten to remove, not a defect in \
+             the loop.",
+            filed.len() - shades.len(),
+            filed.len(),
+        );
         let described = shades.len();
+        assert!(
+            described > 1,
+            "fixture: the satellite layer filed {described} pictures, so the \
+             distinctness asserted next is over nothing",
+        );
         shades.sort_unstable();
         shades.dedup();
         assert_eq!(
@@ -636,7 +689,8 @@ fn sweep_a_satellite_loop() -> Sweep {
              nothing below can tell one hour from another.",
             shades.len(),
         );
-    }
+        described
+    };
 
     let (rail, satellite_frames) = {
         let pane = app.gui.pane(0).expect("pane 0");
@@ -688,29 +742,22 @@ fn sweep_a_satellite_loop() -> Sweep {
     let mut mosaic_at: HashMap<chrono::NaiveDateTime, Option<egui::TextureId>> = HashMap::new();
     for _ in 0..sweep * 8 {
         wire.answer(&mut app);
-        capture_rasters(&app, &mut rasters);
         pump(&mut app, &ctx);
+        capture_uploads(&ctx, &mut uploads);
 
         let pane = app.gui.pane(0).expect("pane 0");
         if let Some(stop) = pane.time.mode.as_of() {
-            // **Handle -> frame -> stamp -> pixels.** The handle alone is
-            // upload identity, which every frame has by construction; what is
-            // counted is the raster it carries.
-            let on_glass = pane
-                .overlay_texture_on_screen(&known::GMGSI)
-                .map(|tex| tex.texture.id());
+            // **Handle -> pixels, and nothing in between.** The handle alone
+            // is upload identity, which every frame has by construction; what
+            // is counted is the raster it carries, looked up by the very id
+            // egui was handed those pixels under. The old spelling went
+            // handle -> frame -> stamp -> pixels through a `find` over the
+            // frame list, which needed a second map that a channel race could
+            // leave a hole in.
             let ls = pane.time_state(&known::GMGSI);
-            let depicts = on_glass.and_then(|id| {
-                ls.frames
-                    .iter()
-                    .find(|f| {
-                        f.image
-                            .as_ref()
-                            .and_then(squallar_egui::pane::LoopFrameImage::overlay)
-                            .is_some_and(|o| o.texture.id() == id)
-                    })
-                    .and_then(|f| rasters.get(&f.timestamp).copied())
-            });
+            let depicts = pane
+                .overlay_texture_on_screen(&known::GMGSI)
+                .and_then(|tex| uploads.get(&tex.texture.id()).copied());
             drawn_at.entry(stop).or_insert(depicts);
             instants_at
                 .entry(stop)
@@ -755,7 +802,7 @@ fn sweep_a_satellite_loop() -> Sweep {
         satellite_range,
         rail,
         satellite_frames,
-        rasters: rasters.len(),
+        rasters,
         drawn,
         instants,
         mosaic_handles,

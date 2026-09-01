@@ -10,7 +10,74 @@
 //! per-browser figures come off the Tier-2 rig, which is a fresh process per
 //! leg.
 
-use super::ledger::Totals;
+use super::ledger::{Totals, has_ink};
+
+/// **A picture that paints nothing is not a picture that painted.**
+///
+/// The hole this closes, measured 2026-08-31: `note_picture` counted the RGBA
+/// buffer whatever was in it, so a layer emitting a fully transparent pixmap
+/// satisfied every conjunct the rig has — `dispatched > 0`, `arrived > 0`,
+/// `pictures > 0`, `picture_bytes > 0`, `shown + promoted > 0` and the arrival
+/// balance — over a map drawing nothing. The reading below is the one that
+/// comes apart, and it is the only one that does.
+#[test]
+fn a_blank_picture_reads_apart_from_a_painted_one() {
+    // 64 px of premultiplied RGBA, every byte zero: what a layer that
+    // rasterized and drew nothing hands over.
+    let blank = vec![0u8; 64 * 4];
+    // The same buffer with one pixel of ink, in the LAST position — the shape
+    // the cheap wrong answers (peek at the head, sample a stride) get wrong.
+    let mut one_pixel = blank.clone();
+    *one_pixel.last_mut().expect("the buffer is not empty") = 1;
+
+    assert!(
+        !has_ink(&blank),
+        "a fully transparent picture reported ink, so the new conjunct passes \
+         on the exact case it was added for",
+    );
+    assert!(
+        has_ink(&one_pixel),
+        "a picture with one non-transparent pixel reported no ink, so the \
+         conjunct would red-gate every honest run",
+    );
+    assert_eq!(
+        blank.len(),
+        one_pixel.len(),
+        "the two buffers differ in size, so `picture_bytes` would separate \
+         them by itself and this test is not about what it says it is about",
+    );
+
+    // What the two look like on the line, at the same byte figure. The first
+    // five conjuncts cannot tell them apart; that is the hole, stated.
+    let painted = Totals {
+        dispatched: 6,
+        arrived: 6,
+        pictures: 6,
+        picture_bytes: 6 * 256,
+        inked: 6,
+        shown: 6,
+        ..Totals::default()
+    };
+    let blank_run = Totals {
+        inked: 0,
+        ..painted
+    };
+    for reading in [&painted, &blank_run] {
+        assert!(reading.ran());
+        assert!(reading.arrivals_balance());
+        assert!(reading.pictures > 0 && reading.picture_bytes > 0);
+        assert!(reading.on_screen() > 0);
+    }
+    assert_ne!(
+        painted.inked, blank_run.inked,
+        "the two readings agree on every figure including the ink, so nothing \
+         on this line can see a layer that stopped drawing",
+    );
+    assert!(
+        blank_run.inked <= blank_run.pictures && painted.inked <= painted.pictures,
+        "the ink count exceeded its own denominator",
+    );
+}
 
 /// **A zero that means "never ran" is distinguishable from a zero that means
 /// "moved nothing", and that is the whole reason this ledger has a floor.**
