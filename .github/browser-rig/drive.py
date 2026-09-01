@@ -2226,6 +2226,30 @@ var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d
 // `incomplete` tracking `paints` is a completeness latch stuck open rather
 // than a key that is moving. Running totals, so the LAST match wins.
 var floor_re = /floor strips: (\d+) paints, (\d+) mirror renders, (\d+) key moves, (\d+) on a stable key, (\d+) incomplete/;
+// THE SKEW READING, and it is what makes a red on the three lines above
+// mean anything at all. Each strict pattern above names a FIELD LIST, and
+// that list is a property of the BUNDLE BEING DRIVEN rather than of this
+// file: `inked` joined the raster line on 2026-08-31 (79bad6c7). Point this
+// rig at a bundle built before that commit and the strict pattern does not
+// match, the reading stays null, and null is indistinguishable from "the
+// overlay path never ran" -- so the leg reddens blaming the renderer for
+// what is a stale `wasm-pack build`.
+//
+// MEASURED 2026-08-31, this rig against a bundle built at 79bad6c7^: both
+// expect attempts burned the full 180 s timeout (411 s for the leg against
+// 28-31 s green) and the summary printed "no overlay raster ever moved"
+// while the app was writing the line every frame with every counter moving.
+// Two careful lanes read that as a regression in the renderer.
+//
+// The loose patterns match the SENTENCE without its field list. A loose
+// match where the strict one failed is PROOF of skew rather than a guess
+// at it: the app wrote this telemetry line, and this rig cannot read the
+// shape it wrote. The question in front of the reader is then a BUILD
+// question, not a rendering one, and the error says which.
+var rasters_loose_re = /overlay rasters: \d+ dispatched/;
+var uploads_loose_re = /texture uploads: \d+ deltas/;
+var basemap_loose_re = /basemap tiles: \d+ vector/;
+var rasters_unparsed = null, uploads_unparsed = null, basemap_unparsed = null;
 var rasters = null, uploads = null, basemap = null, ground = null, floor = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -2262,6 +2286,7 @@ for (var i = 0; i < C.length; i++) {
                        dropped: parseInt(rm2[8], 10),
                        superseded: parseInt(rm2[9], 10),
                        cancelled: parseInt(rm2[10], 10) };
+  else if (rasters_loose_re.test(m)) rasters_unparsed = m;
   var um = uploads_re.exec(m);
   if (um) uploads = { deltas: parseInt(um[1], 10),
                       bytes: parseInt(um[2], 10),
@@ -2269,10 +2294,12 @@ for (var i = 0; i < C.length; i++) {
                       bands: parseInt(um[4], 10),
                       staged_bytes: parseInt(um[5], 10),
                       blocking_bytes: parseInt(um[6], 10) };
+  else if (uploads_loose_re.test(m)) uploads_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
                       raster_tiles: parseInt(bm[2], 10),
                       sniffed_tiles: parseInt(bm[3], 10) };
+  else if (basemap_loose_re.test(m)) basemap_unparsed = m;
   var gm = ground_re.exec(m);
   if (gm) ground = { placed: parseInt(gm[1], 10),
                      stroke_points: parseInt(gm[2], 10),
@@ -2293,6 +2320,9 @@ return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
          basemap: basemap, ground: ground, floor: floor,
+         rasters_unparsed: rasters_unparsed,
+         uploads_unparsed: uploads_unparsed,
+         basemap_unparsed: basemap_unparsed,
          console_total: C.length };
 """
 
@@ -3240,9 +3270,24 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
 
     NEGATIVE CONTROL, and it is a real configuration rather than a tamper: the
     every-texture-layer-off seed written out beside `SEED_LS` in run_tier2.sh
-    -- the state a user who cleared their layer stack is in. `dispatched`
-    reaches 0, this goes red, and every other Tier-2 assertion stays green,
-    which is precisely the hole it closes.
+    -- the state a user who cleared their layer stack is in. RE-RUN
+    2026-08-31, chromium: this goes red and every other Tier-2 assertion stays
+    green, which is precisely the hole it closes.
+
+    **It reddens by ABSENCE, not by zeroes, and the old text here said
+    otherwise.** `report_raster_telemetry` writes nothing on a tick where
+    `totals_if_moved()` moved nothing, so with every texture layer off the
+    `overlay rasters:` line is never emitted at all and the reading is `None`
+    rather than a row of zeroes. That matters because it is the SAME null a
+    rig/bundle skew produces, and telling those apart is what
+    `rasters_unparsed` is for.
+
+    THE OTHER HALF OF THE CONTROL, measured the same day: the seed reduced to
+    `RadarCoverage` alone -- every weather-fed texture layer explicitly off --
+    reaches 2 dispatched / 2 pictures / 16512000 B / **2 inked** and PASSES.
+    So no conjunct here, `inked` included, depends on a live fetch landing:
+    the compiled-in site table carries all six on a box with no weather. A red
+    on this gate is therefore never "the data never came".
 
     **It is NOT "remove the seeded layer".** That was the first control tried
     and it does not work: `NwsAlerts` and `SpcDiscussions` are on by default
@@ -3256,31 +3301,119 @@ def wait_overlay_rasters(session, timeout=180.0, interval=2.0):
     Accumulates across polls the way `wait_rayon_pool` and
     `wait_zero_copy_replies` do: the page-side console ring evicts, the totals
     are cumulative, and the newest line seen at any poll is the whole answer.
+
+    **`waited_s` IS NOT "how long the app took to produce its first overlay
+    rasters", and it must never be quoted as one.** Two things stop it. It is
+    quantised to `interval`, which is 2 s, so it can only ever land near 0,
+    2, 4 …; and its zero is the start of THIS wait, which runs after the boot,
+    canvas, worker-round-trip, rayon-pool and zero-copy waits, each of which
+    gives the app a variable head start before the clock here begins. A run
+    reading 0.10 and a run reading 2.26 may differ by milliseconds of app
+    timing that straddled the first poll, or by nothing at all in the app.
+
+    MEASURED 2026-08-31, chromium, this leg re-run with `interval` cut to
+    0.1 s: eight runs landed in 0.61-1.33 s with **identical** counters every
+    time (6 dispatched / 6 arrived / 6 pictures / 4 inked / 3 shown /
+    3 promoted). At the shipped 2 s interval the same behaviour reports as
+    either ~0.1 s or ~2.2 s, and the accompanying `dispatched` as either a
+    part-accumulated 3 or a settled 6. A "23x spread in first-raster arrival"
+    read off the 2 s instrument is therefore an artefact of its own
+    quantisation and of where its zero is, and the underlying spread it was
+    read from is 2.2x. Cut the interval before believing any figure here.
     """
     t0 = time.monotonic()
     best = None
+    unparsed = None
+    polls = 0
+    first = None
+    last = None
     while time.monotonic() - t0 < timeout:
         sig = session.execute(WORKER_SIGNAL_PROBE) or {}
+        polls += 1
         seen = sig.get("rasters")
         if isinstance(seen, dict) and isinstance(seen.get("dispatched"), int):
+            if first is None:
+                first = seen
+            last = seen
             if best is None or seen["dispatched"] >= best["dispatched"]:
                 best = seen
         if best is not None and _overlay_rasters_ok(best):
             out = dict(best)
-            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
+            out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2),
+                        "polls": polls})
             return out
+        unparsed = sig.get("rasters_unparsed") or unparsed
+        # **Returns on the first skew reading instead of waiting out the
+        # clock.** A telemetry line's field list cannot change while the page
+        # runs, so every remaining poll would read exactly this one; the wait
+        # was spending the full timeout, twice with the quarantine retry, to
+        # arrive at a strictly worse answer (411 s measured, against 28-31 s
+        # for a green leg). Guarded on `best is None` so a bundle this rig CAN
+        # read never takes this exit — a parsed reading means there is no skew
+        # to report, whatever else is wrong with the figures.
+        if best is None and unparsed:
+            return {
+                "ok": False,
+                "waited_s": round(time.monotonic() - t0, 2),
+                "polls": polls,
+                "skew": True,
+                "unparsed_line": unparsed[:400],
+                "error": _telemetry_skew_error(
+                    "overlay rasters", unparsed[:400],
+                    "dispatched, arrived, pictures of B, inked, shown, "
+                    "promoted, dropped, superseded, cancelled (`inked` "
+                    "joined the line at 79bad6c7, 2026-08-31)"),
+            }
         time.sleep(interval)
     out = dict(best or {})
+    if best is None:
+        # No reading and no skew: the sentence genuinely never appeared.
+        out.update({
+            "ok": False,
+            "waited_s": round(time.monotonic() - t0, 2),
+            "polls": polls,
+            "error": "no `overlay rasters:` line reached the console ring "
+                     "within %.0fs, in any shape this rig can or cannot "
+                     "parse. That is NOT the same fact as zeroed counters: "
+                     "either squallar.raster_telemetry is unseeded (the line "
+                     "is `debug` without it and never reaches the ring), or "
+                     "the app never wrote one because no overlay raster ever "
+                     "moved. Check the seed before reading it as the second."
+                     % timeout,
+        })
+        return out
+    unmet = _overlay_rasters_unmet(best)
+    # **Slow is not stuck, and the failure has to say which.** A reading that
+    # was still changing when the clock expired is a path that is RUNNING and
+    # did not finish in time -- "nothing has landed yet", a starved or
+    # throttled box -- and the repair is a different one from a reading that
+    # never moved across every poll, which is a path that stopped. The old
+    # text could not tell those apart and neither could its reader.
+    moved = first is not None and last is not None and first != last
+    progress = (
+        "the reading was STILL CHANGING when the clock ran out (first %s, "
+        "last %s, over %d polls) -- the path is running and did not finish "
+        "in time, which is a slow or starved box rather than a renderer that "
+        "stopped; re-run before treating it as a defect, and check the box's "
+        "load" % (first, last, polls)
+        if moved else
+        "the reading did NOT move across %d polls spanning %.0fs -- the path "
+        "is stuck, not slow, so a longer timeout would not have helped and "
+        "widening one would only make this fail less often"
+        % (polls, timeout))
     out.update({
         "ok": False,
         "waited_s": round(time.monotonic() - t0, 2),
-        "error": "the overlay raster path did not complete within %.0fs: %s "
-                 "(wanted dispatched>0, pictures>0, picture_bytes>0, inked>0, "
-                 "shown+promoted>0, and arrived==pictures+dropped; a page that "
-                 "seeded no texture overlay reports every one of these as 0 "
-                 "and passes every other Tier-2 assertion, and one whose "
-                 "layers rasterize blank reports every one of them EXCEPT "
-                 "inked exactly as a healthy page does)" % (timeout, best),
+        "polls": polls,
+        "moved_while_waiting": moved,
+        "unmet": unmet,
+        "error": "the overlay raster path did not complete within %.0fs. The "
+                 "line parsed, so this is the app's own reading and not a "
+                 "rig/bundle skew: %s. The conjunct%s it fails %s: %s. And %s"
+                 % (timeout, best,
+                    "" if len(unmet) == 1 else "s",
+                    "is" if len(unmet) == 1 else "are",
+                    "; ".join(unmet), progress),
     })
     return out
 
@@ -3401,7 +3534,7 @@ def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
     leg throughout. Nothing here read the basemap: a page with no ground under
     the map still boots, still reports a non-blank canvas (the overlays paint),
     still attaches its worker, still answers jobs off the frame, and still
-    satisfies all five conjuncts of `--expect-overlay-rasters` -- the basemap
+    satisfies all six conjuncts of `--expect-overlay-rasters` -- the basemap
     is not in that dispatch, so its total is untouched by the basemap being
     dead. The gate was green and the map was empty.
 
@@ -3446,6 +3579,7 @@ def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
     """
     t0 = time.monotonic()
     best = None
+    unparsed = None
     while time.monotonic() - t0 < timeout:
         sig = session.execute(WORKER_SIGNAL_PROBE) or {}
         seen = sig.get("basemap")
@@ -3456,6 +3590,23 @@ def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
             out = dict(best)
             out.update({"ok": True, "waited_s": round(time.monotonic() - t0, 2)})
             return out
+        # The same skew exit `wait_overlay_rasters` takes, for the same
+        # reason: this gate's `null` reads as "the basemap decoded nothing",
+        # which is the exact shipped defect it was built to catch, so a
+        # field-list change here would frame a stale bundle as that defect
+        # returning. It has not happened to this line yet; the reading costs
+        # nothing and the failure mode is already proven on its neighbour.
+        unparsed = sig.get("basemap_unparsed") or unparsed
+        if best is None and unparsed:
+            return {
+                "ok": False,
+                "waited_s": round(time.monotonic() - t0, 2),
+                "skew": True,
+                "unparsed_line": unparsed[:400],
+                "error": _telemetry_skew_error(
+                    "basemap tiles", unparsed[:400],
+                    "vector, raster, sniffed"),
+            }
         time.sleep(interval)
     out = dict(best or {})
     out.update({
@@ -3477,12 +3628,66 @@ def wait_basemap_tiles(session, timeout=180.0, interval=2.0):
 
 def _overlay_rasters_ok(r):
     """The six conjuncts of `wait_overlay_rasters`, over one reading."""
-    return (r.get("dispatched", 0) > 0
-            and r.get("pictures", 0) > 0
-            and r.get("picture_bytes", 0) > 0
-            and r.get("inked", 0) > 0
-            and (r.get("shown", 0) + r.get("promoted", 0)) > 0
-            and r.get("arrived", -1) == r.get("pictures", 0) + r.get("dropped", 0))
+    return not _overlay_rasters_unmet(r)
+
+
+def _overlay_rasters_unmet(r):
+    """Which of the six conjuncts this reading fails, in order.
+
+    The failure text names these rather than restating all six and leaving
+    the reader to diff them against the figures — `inked == 0` beside
+    `pictures > 0` is "every layer rasterized blank", and `dispatched == 0`
+    is "no enabled texture layer had data". Those are different bugs in
+    different crates, and the old message described them identically.
+    """
+    unmet = []
+    if r.get("dispatched", 0) <= 0:
+        unmet.append("dispatched>0 (no enabled texture layer had data to "
+                     "raster; every figure below is then trivially zero)")
+    if r.get("pictures", 0) <= 0:
+        unmet.append("pictures>0 (dispatched, but no raster's pixels ever "
+                     "reached egui)")
+    if r.get("picture_bytes", 0) <= 0:
+        unmet.append("picture_bytes>0 (pictures arrived with no pixels in "
+                     "them)")
+    if r.get("inked", 0) <= 0:
+        unmet.append("inked>0 (pictures arrived and EVERY ONE was blank — "
+                     "premultiplied zero in all four bytes, so the layers "
+                     "rasterized nothing that would change a frame)")
+    if (r.get("shown", 0) + r.get("promoted", 0)) <= 0:
+        unmet.append("shown+promoted>0 (rasters were uploaded and none "
+                     "reached the screen)")
+    if r.get("arrived", -1) != r.get("pictures", 0) + r.get("dropped", 0):
+        unmet.append("arrived==pictures+dropped (the arrival balance broke: "
+                     "an arrival left by an exit neither counter names, so "
+                     "the byte figure now describes a subset)")
+    return unmet
+
+
+def _telemetry_skew_error(what, line, wants):
+    """A telemetry line the app wrote and this rig could not parse.
+
+    **This is never a rendering fault and the text must not read like one.**
+    Every strict pattern in `WORKER_SIGNAL_PROBE` names a field list, and
+    that list belongs to the BUNDLE being driven, not to this file: `inked`
+    joined the raster line at 79bad6c7 on 2026-08-31. A rig one commit newer
+    than the `squallar-web/pkg` it is pointed at reads null, and null used to
+    print as "the line was never written: no overlay raster ever moved" —
+    a sentence that is flatly false about a page writing the line every
+    frame, and that sent two lanes hunting a regression that did not exist.
+    """
+    return ("RIG/BUNDLE SKEW — not a rendering fault, and not a network one. "
+            "The app WROTE its `%s` telemetry line and THIS RIG COULD NOT "
+            "PARSE IT, so every figure it carries reads as absent. Seen: %r. "
+            "This rig's pattern wants %s. A telemetry line's field list is a "
+            "property of the bundle, so the served squallar-web/pkg is an "
+            "older build than this drive.py speaks — the usual cause is "
+            "`run_tier2.sh --skip-build` over a pkg/ built before the field "
+            "landed, or a worktree whose pkg/ was never rebuilt. REBUILD THE "
+            "BUNDLE (run run_tier2.sh without --skip-build) and re-run before "
+            "reading this as a regression: this says nothing whatever about "
+            "whether the path ran, only that the two halves disagree about "
+            "how it reports." % (what, line, wants))
 
 
 def wait_doctored_respawn(session, timeout=180.0, respawn_grace=30.0,
@@ -4669,6 +4874,20 @@ def run_smoke(args):
         result["floor_strip_totals"] = _sig.get("floor")
         if result["floor_strip_totals"]:
             stage("floor-strips", **result["floor_strip_totals"])
+        # The skew reading beside the totals, and it is what keeps the `-` in
+        # the summary honest. A null total is TWO different facts — "the app
+        # never wrote the line" and "the app wrote a line this rig cannot
+        # read" — and the summary printed the first as certain for both,
+        # which is how a stale `squallar-web/pkg` read as "no overlay raster
+        # ever moved". Present only when a line was seen and not parsed, so
+        # an ordinary null stays an ordinary null.
+        result["telemetry_unparsed"] = {
+            k: _sig.get(k + "_unparsed")
+            for k in ("rasters", "uploads", "basemap")
+            if _sig.get(k + "_unparsed")
+        } or None
+        if result["telemetry_unparsed"]:
+            stage("telemetry-unparsed", **result["telemetry_unparsed"])
 
         # The frame-telemetry readout: the newest cumulative reading per
         # family, the count assert, and the gesture-window bin-diff when

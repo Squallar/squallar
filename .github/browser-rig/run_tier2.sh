@@ -157,7 +157,7 @@
 # whole time. Nothing here read the basemap: a page with no ground under the
 # map still boots, still reports a non-blank canvas (the overlays paint), still
 # attaches its worker, still answers jobs off the frame, and still satisfies
-# all five conjuncts of --expect-overlay-rasters, which does not include the
+# all six conjuncts of --expect-overlay-rasters, which does not include the
 # basemap. --expect-basemap-tiles is the missing reading.
 #
 # WS3b made cross-origin isolation part of the DEFAULT posture: serve.py is
@@ -871,6 +871,30 @@ fi
 import json, os, sys
 out, ledger_path = sys.argv[1], sys.argv[2]
 
+
+def _absent_because(r, family, never_moved):
+    """Why a telemetry total is missing — and it is never one fact.
+
+    A `-` here used to be printed as certainty: "the line was never written:
+    no overlay raster ever moved". That sentence is FALSE for the commonest
+    cause of a missing total, which is that the app wrote the line and this
+    rig could not parse it — the field lists are version-coupled (`inked`
+    joined the raster line at 79bad6c7, 2026-08-31) and a `--skip-build` over
+    a stale squallar-web/pkg drives an older app than drive.py speaks.
+    Measured 2026-08-31: that pairing printed "no overlay raster ever moved"
+    for a page writing the line every frame with every counter climbing, and
+    two lanes read it as a renderer regression.
+    """
+    seen = (r.get("telemetry_unparsed") or {}).get(family)
+    if seen:
+        return ("(RIG/BUNDLE SKEW: the app wrote this line and this rig "
+                "could not parse it -- %r. The served squallar-web/pkg is an "
+                "older build than drive.py speaks; REBUILD IT, without "
+                "--skip-build. This says nothing about whether the path ran.)"
+                % seen[:200])
+    return ("(no line this rig could read ever reached the console ring: "
+            "either the telemetry key is unseeded, or %s)" % never_moved)
+
 legs = []
 with open(ledger_path) as f:
     for line in f:
@@ -1049,8 +1073,9 @@ for leg in legs:
     # the whole-picture overlay dispatch alone, the second is every texture
     # delta this renderer was shown (radar, basemap tiles and font atlas
     # included). A single "bytes uploaded" over the union would describe
-    # neither. `-` means the line was never written, i.e. the path never ran,
-    # which is a different fact from zero bytes.
+    # neither. `-` means NO LINE THIS RIG COULD READ arrived, which is a
+    # different fact from zero bytes and is itself two different facts --
+    # see `_absent_because`, which is what says which one this was.
     ort = r.get("overlay_raster_totals")
     if ort:
         # `inked` rides beside its own denominator, `pictures`. It is a subset
@@ -1066,8 +1091,8 @@ for leg in legs:
                  ort.get("shown"), ort.get("promoted"), ort.get("dropped"),
                  ort.get("superseded"), ort.get("cancelled")))
     else:
-        print("%-18s   overlay rasters - (the line was never written: no "
-              "overlay raster ever moved)" % "")
+        print("%-18s   overlay rasters - %s" % ("", _absent_because(r, "rasters",
+              "no overlay raster ever moved")))
     tut = r.get("texture_upload_totals")
     if tut:
         # `whole` is a routing subset of the blocking figure, never added to
@@ -1079,7 +1104,8 @@ for leg in legs:
                  tut.get("whole_bytes"), tut.get("bands"),
                  tut.get("staged_bytes"), tut.get("blocking_bytes")))
     else:
-        print("%-18s   texture uploads - (the line was never written)" % "")
+        print("%-18s   texture uploads - %s" % ("", _absent_because(r, "uploads",
+              "no texture delta ever moved")))
     # The THIRD denominator: bodies DECODED, in neither figure above. `vector`
     # is the self-hosted basemap and is the one gated on; `raster` is the
     # terrain hillshade (legitimately zero with terrain off) and `sniffed` is
@@ -1091,8 +1117,8 @@ for leg in legs:
               % ("", bmtt.get("vector_tiles"), bmtt.get("raster_tiles"),
                  bmtt.get("sniffed_tiles")))
     else:
-        print("%-18s   basemap tiles - (the line was never written: no "
-              "archive body ever decoded)" % "")
+        print("%-18s   basemap tiles - %s" % ("", _absent_because(r, "basemap",
+              "no archive body ever decoded")))
     bmt = r.get("basemap_tiles")
     if bmt is not None and not bmt.get("ok"):
         print("%-18s   basemap tiles EXPECT FAILED: %s" % ("", bmt.get("error")))
