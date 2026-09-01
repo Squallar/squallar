@@ -90,6 +90,16 @@ fn a_slot_holds_one_buffer_hands_it_over_and_declines_an_empty_one() {
 
     // The process's first render.
     let (fresh_image, fresh_values) = render_capacities(&sweep);
+
+    // **A second render before the first offer, and it is load-bearing.** The
+    // slots weigh an offer against the demand the session showed *before* the
+    // render handing it back — so that a warm-up render, the only one of its
+    // size the session will ever do, cannot leave its buffers reserved. One
+    // render into a process that figure is still zero and every offer is
+    // declined, which is the rule working and not the slot failing. What this
+    // file is about is what a slot does with an offer it may accept, so it
+    // takes the process to the point where it may.
+    render_capacities(&sweep);
     assert!(
         fresh_image < TEXTURE_LEN + MARK && fresh_values < PIXELS + MARK_VALUES,
         "a render that allocated for itself came back with {fresh_image} bytes and \

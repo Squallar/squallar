@@ -232,6 +232,13 @@ struct RenderBuffers {
     /// Borrowed from [`POOLED_CELLS`] for the length of one render and handed
     /// back by [`Self::into_output`].
     cells: Vec<AtomicU64>,
+    /// The largest raster the renders **before** this one asked for, in pixels
+    /// — [`demand::high`] read at [`Self::new`], before this render was
+    /// counted. It is what [`Self::recycle`] weighs the finished buffer
+    /// against, and reading it *before* the observation is the whole of the
+    /// rule: a size this process has seen once and never again does not earn a
+    /// carry.
+    carry_ceiling_px: usize,
     /// The gates themselves, at the resolution the radar measured them,
     /// recorded as [`MercatorProjection::render_gate`] paints them.
     polar: polar::PolarBuffers,
@@ -241,9 +248,106 @@ struct RenderBuffers {
 /// The one cell buffer this process keeps between plan-view renders.
 static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
 
-/// How much larger than the render asking for it a carried cell buffer may be
-/// before [`RenderBuffers::checkout`] drops it instead of shrinking it.
-const CELL_POOL_REUSE_FACTOR: usize = 4;
+/// How much larger than the demand behind it a carried buffer may be before
+/// the pool drops it instead of holding it.
+///
+/// **Two, weighed against `capacity`.** The rule this replaced was four,
+/// weighed against `len`, and four against `len` is exactly one rung of this
+/// display's own size ladder: a promoted browser draws a long-range sweep at
+/// 4096 px and everything else at 2048, `4096² = 4 · 2048²`, and the
+/// comparison was `<=`. The guard therefore sat precisely on the boundary of
+/// the one transition it existed for and could never fire — and because
+/// `resize_with` never returns capacity, the 128 MiB one 4096² render reserved
+/// stayed reserved for the life of the process. Measured on a 34-minute web
+/// leg: the rasterization worker's linear memory rose to 385.2 MiB between
+/// 11.5 s and 14.7 s and did not move again for 2028 s.
+const POOL_SLACK: usize = 2;
+
+/// Whether a buffer of `capacity` elements may be carried for demand of
+/// `target` elements.
+///
+/// A buffer *smaller* than the target passes: it will be grown by the render
+/// that asked for it, and that growth is demand. What fails is only the other
+/// direction — capacity the demand does not account for.
+const fn within_slack(capacity: usize, target: usize) -> bool {
+    capacity <= target.saturating_mul(POOL_SLACK)
+}
+
+/// The largest raster the recent past actually asked for, in pixels.
+///
+/// **Demand, not capability.** The side a render takes is
+/// `types::raster_side_px` of the sweep's own reach against the caller's
+/// ceiling, and that ceiling comes from the adapter's reported
+/// `max_texture_dimension_2d`. Sizing a process-lifetime pool to the ceiling
+/// reserves for a raster the session may never ask for a second time; sizing
+/// it to this reserves for the raster the session keeps asking for.
+///
+/// A *decaying* maximum and not a running one, because a maximum that only
+/// rises is the defect: one long-range sweep at boot would pin the pool at its
+/// size forever. Two generations are kept and the older is dropped every
+/// [`DEMAND_WINDOW_RENDERS`] renders, so the figure a pool reads covers between
+/// one and two windows of history and falls on its own once a size stops
+/// recurring.
+mod demand {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// Renders one generation of the high-water lasts. The window a pool
+    /// actually sees is between this and twice it, since the older generation
+    /// is only retired on the boundary.
+    const DEMAND_WINDOW_RENDERS: usize = 8;
+
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static PREVIOUS: AtomicUsize = AtomicUsize::new(0);
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    static CARRY: AtomicUsize = AtomicUsize::new(0);
+
+    /// The largest raster either live generation asked for, in pixels. Includes
+    /// the render in progress, so this is the figure a *reuse* decision wants:
+    /// may this render draw into the buffer on offer.
+    pub(super) fn high() -> usize {
+        CURRENT.load(Relaxed).max(PREVIOUS.load(Relaxed))
+    }
+
+    /// [`high`] as it stood immediately **before** the most recent render was
+    /// counted — the figure a *retention* decision wants: is this size one the
+    /// session had already shown, or is it the first of its kind.
+    ///
+    /// [`RenderBuffers::recycle`](super::RenderBuffers::recycle) does not read
+    /// this; it carries its own render's copy and is exact. This is for the two
+    /// slots whose buffers come back through a public entry point
+    /// ([`super::recycle_image`], [`super::recycle_values`]) — the value grid
+    /// from `frame::RenderedFrame`'s conversion, the texture from the display
+    /// layer — and so arrive with no render to ask. With one raster render in
+    /// flight at a time — which is
+    /// what `WASM_MAX_CONCURRENT_RENDERS` pins on the web arm — it is that
+    /// render's own figure. Where several renders overlap it can be a render or
+    /// two stale, and staleness here costs a retention decision made against a
+    /// neighbouring render's history. It cannot cost correctness: every slot
+    /// hands out a buffer resized to what the next render asks for.
+    pub(super) fn carry() -> usize {
+        CARRY.load(Relaxed)
+    }
+
+    /// Count one render of `pixels`.
+    pub(super) fn observe(pixels: usize) {
+        CARRY.store(high(), Relaxed);
+        CURRENT.fetch_max(pixels, Relaxed);
+        if SEEN.fetch_add(1, Relaxed) + 1 >= DEMAND_WINDOW_RENDERS {
+            SEEN.store(0, Relaxed);
+            PREVIOUS.store(CURRENT.swap(pixels, Relaxed), Relaxed);
+        }
+    }
+
+    /// Forget every generation. What [`super::trim_pools`] does to the history
+    /// behind the buffers it drops — a caller shedding memory is not asking to
+    /// have the same sizes handed straight back.
+    pub(super) fn forget() {
+        CURRENT.store(0, Relaxed);
+        PREVIOUS.store(0, Relaxed);
+        SEEN.store(0, Relaxed);
+        CARRY.store(0, Relaxed);
+    }
+}
 
 /// The one RGBA texture this process keeps between plan-view renders, and the
 /// one value grid, in two slots that fill and empty independently.
@@ -276,12 +380,21 @@ fn values_pool() -> std::sync::MutexGuard<'static, Option<Vec<f32>>> {
 /// paints nothing. `vec![0u8; n]` is what made those pixels transparent, and a
 /// pooled buffer that skipped this would show the previous render's echoes
 /// through the new one's empty sky.
-fn checkout_image(len: usize) -> Vec<u8> {
+fn checkout_image(pixels: usize) -> Vec<u8> {
+    let len = pixels * 4;
+    // `filter` and not a guard on the match arm below: a misfit has to be
+    // *dropped here*, on this statement, so its pages are back on the
+    // allocator's free list before the fallback allocation asks for pages of
+    // its own. A guard would keep it alive to the end of the match and make
+    // the two buffers' peak the sum of both.
+    //
     // Bound to a `let`, and deliberately **not** written as the scrutinee of
     // the `match` below. A guard produced inside a scrutinee temporary lives to
     // the end of the whole `match`, so `match image_pool().take() { .. }` would
     // hold the pool lock across the fallback allocation and the zero-fill.
-    let taken = image_pool().take();
+    let taken = image_pool()
+        .take()
+        .filter(|image| within_slack(image.capacity(), pixels.max(demand::high()) * 4));
     match taken {
         Some(mut image) => {
             image.clear();
@@ -292,12 +405,17 @@ fn checkout_image(len: usize) -> Vec<u8> {
     }
 }
 
-/// An empty value grid with the pool's capacity if it has one.
-fn checkout_values() -> Vec<f32> {
-    // See [`checkout_image`] for why this is a `let` and not a receiver.
-    let taken = values_pool().take();
+/// An empty value grid with room for `pixels` values — the pool's if it has one
+/// the demand behind it accounts for.
+fn checkout_values(pixels: usize) -> Vec<f32> {
+    // See [`checkout_image`] for why this is a `let` and not a receiver, and
+    // for why the misfit is filtered out rather than dropped by a match arm.
+    let taken = values_pool()
+        .take()
+        .filter(|values| within_slack(values.capacity(), pixels.max(demand::high())));
     let mut values = taken.unwrap_or_default();
     values.clear();
+    values.reserve_exact(pixels.saturating_sub(values.capacity()));
     values
 }
 
@@ -307,8 +425,15 @@ fn checkout_values() -> Vec<f32> {
 /// Call it where the texture stops being needed — after it has been copied into
 /// whatever the display layer holds — and not before. What arrives is *dead*:
 /// this takes ownership, and the next render will overwrite every byte.
+///
+/// A buffer larger than the session's demand *before* this render is
+/// **declined**, not held — `demand::carry`, not `demand::high`. A slot is only
+/// worth filling
+/// with a size the next render is likely to ask for, and the size a warm-up
+/// render reached once and never again is a reservation with no reader: on the
+/// measured web leg it was the last render at its size for 2028 seconds.
 pub fn recycle_image(image: Vec<u8>) {
-    if image.capacity() == 0 {
+    if image.capacity() == 0 || !within_slack(image.capacity(), demand::carry() * 4) {
         return;
     }
     let mut pool = image_pool();
@@ -320,7 +445,7 @@ pub fn recycle_image(image: Vec<u8>) {
 /// Offer a finished value grid back. See [`recycle_image`], which this mirrors
 /// exactly.
 pub fn recycle_values(values: Vec<f32>) {
-    if values.capacity() == 0 {
+    if values.capacity() == 0 || !within_slack(values.capacity(), demand::carry()) {
         return;
     }
     let mut pool = values_pool();
@@ -329,45 +454,115 @@ pub fn recycle_values(values: Vec<f32>) {
     }
 }
 
+/// Bytes the three plan-view slots are holding right now: **capacity**, not
+/// length, and the cells' eight bytes a pixel beside the texture's four and the
+/// value grid's four.
+///
+/// An always-on counter and not an instrument — nothing gates on it in the
+/// app — so that "how much is reserved" is a question the process can answer
+/// about itself rather than one only a browser profiler can.
+pub fn pooled_bytes() -> usize {
+    let cells = RenderBuffers::pool()
+        .as_ref()
+        .map_or(0, |c| c.capacity() * std::mem::size_of::<AtomicU64>());
+    let image = image_pool().as_ref().map_or(0, Vec::capacity);
+    let values = values_pool()
+        .as_ref()
+        .map_or(0, |v| v.capacity() * std::mem::size_of::<f32>());
+    cells + image + values
+}
+
+/// Drop every pooled buffer and forget the demand behind them, so the next
+/// render allocates for exactly what it asks for.
+///
+/// Three frees and three stores — no work proportional to the buffers' size,
+/// and each slot's lock is held only long enough to move the buffer out, with
+/// the buffers themselves dropped after the guards are released. So it is cheap
+/// enough for a caller that is shedding memory under pressure.
+///
+/// **It has no production caller.** What it covers is the one case the
+/// retention rule cannot see on its own: a session whose last render was a
+/// large one and that then goes quiet, where no later checkout ever arrives to
+/// weigh the buffer against the demand that has since decayed. Reaching it
+/// needs an idle or memory-pressure signal, and this tree has none — the
+/// browser's rasterization worker is message-driven with the job queue held by
+/// the event loop, so "no job pending" is not a fact it can observe.
+pub fn trim_pools() {
+    let cells = RenderBuffers::pool().take();
+    let image = image_pool().take();
+    let values = values_pool().take();
+    demand::forget();
+    drop(cells);
+    drop(image);
+    drop(values);
+}
+
 impl RenderBuffers {
     fn new(product: types::RadarProduct, side_px: usize, shape: polar::PolarShape) -> Self {
+        let pixels = side_px * side_px;
+        // Read before the observation below, so it is the demand of the
+        // renders *before* this one. See [`Self::carry_ceiling_px`].
+        let carry_ceiling_px = demand::high();
+        demand::observe(pixels);
         Self {
-            cells: Self::checkout(side_px * side_px),
+            cells: Self::checkout(pixels, carry_ceiling_px),
+            carry_ceiling_px,
             polar: polar::PolarBuffers::new(shape),
             product,
         }
     }
 
     /// Take the pooled buffer resized to `n` cells, or build one if this is the
-    /// first render or a second render is already holding it. See
-    /// [`POOLED_CELLS`].
+    /// first render, a second render is already holding it, or the one on offer
+    /// is bigger than the recent past accounts for. See [`POOLED_CELLS`].
     ///
     /// The pool's invariant is that every cell it holds is [`Self::EMPTY`].
     /// [`Self::into_output`] is the only path that puts a buffer back and it
     /// establishes that.
-    fn checkout(n: usize) -> Vec<AtomicU64> {
+    fn checkout(n: usize, carry_ceiling_px: usize) -> Vec<AtomicU64> {
+        // `filter`, so a buffer this render cannot use is freed on this
+        // statement rather than at the end of the `match` — the fallback
+        // allocation below then draws on pages this one just released instead
+        // of holding both at once.
+        //
         // Bound to a `let`, and deliberately **not** written as the `match`
         // scrutinee. A guard produced in a scrutinee lives to the end of the
         // match, so `match Self::pool().take()` would hold the pool lock across
         // the fallback allocation below.
-        let pooled = Self::pool().take();
-        match pooled {
-            // Carried buffers are kept only while they are near the size being
-            // asked for. `resize_with` never returns capacity, so a slot that
-            // once held the largest raster this device allows would hold that
+        let pooled = Self::pool()
+            .take()
+            // Weighed against `capacity` and against the larger of this render
+            // and the recent demand. `resize_with` never returns capacity, so a
+            // buffer weighed by `len` reads as the size it was last resized to
+            // while holding the size it was last *grown* to — which is how a
+            // slot that once held the largest raster a device allows kept that
             // allocation for the life of the process.
-            Some(cells) if cells.len() <= n.saturating_mul(CELL_POOL_REUSE_FACTOR) => {
+            .filter(|cells| within_slack(cells.capacity(), n.max(carry_ceiling_px)));
+        match pooled {
+            Some(cells) => {
                 let mut cells = cells;
                 cells.resize_with(n, || AtomicU64::new(Self::EMPTY));
                 cells
             }
-            _ => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
+            None => (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
         }
     }
 
     /// Offer a drained buffer back to the pool, keeping it only if the slot is
-    /// free. See [`POOLED_CELLS`] for why the slot is one and not many.
-    fn recycle(cells: Vec<AtomicU64>) {
+    /// free **and** `carry_ceiling_px` — the demand of the renders before this
+    /// one — accounts for its size. See [`POOLED_CELLS`] for why the slot is
+    /// one and not many, and [`Self::carry_ceiling_px`] for why the ceiling
+    /// excludes the render handing the buffer back.
+    ///
+    /// So the first render of a size this process has not seen before hands its
+    /// buffer to the allocator rather than to the slot, and it does so before
+    /// [`Self::into_output`] asks for the texture — the one that follows draws
+    /// on the pages this one just returned. A size that recurs is carried from
+    /// its second render on.
+    fn recycle(cells: Vec<AtomicU64>, carry_ceiling_px: usize) {
+        if !within_slack(cells.capacity(), carry_ceiling_px) {
+            return;
+        }
         let mut pool = Self::pool();
         if pool.is_none() {
             *pool = Some(cells);
@@ -417,18 +612,20 @@ impl RenderBuffers {
     fn into_output(self, extent_km: f64) -> SweepRender {
         let Self {
             mut cells,
+            carry_ceiling_px,
             polar,
             product,
         } = self;
-        let mut value_data = checkout_values();
+        let pixels = cells.len();
+        let mut value_data = checkout_values(pixels);
         value_data.extend(cells.iter_mut().map(|a| {
             match std::mem::replace(a.get_mut(), Self::EMPTY) {
                 Self::EMPTY => f32::NAN,
                 cell => f32::from_bits(cell as u32),
             }
         }));
-        Self::recycle(cells);
-        let mut image = checkout_image(value_data.len() * 4);
+        Self::recycle(cells, carry_ceiling_px);
+        let mut image = checkout_image(pixels);
         image
             .par_chunks_mut(4 * Self::COLOR_CHUNK)
             .zip(value_data.par_chunks_mut(Self::COLOR_CHUNK))

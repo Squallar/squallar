@@ -2694,10 +2694,16 @@ const POISON: u8 = 0xA5;
 
 #[test]
 fn a_checked_out_texture_is_zero_at_every_length() {
-    let want = 4096;
+    let pixels = 1024;
+    let want = pixels * 4;
+    // The slots decline a buffer the recent demand does not account for, so the
+    // largest length offered below is declared as demand first — otherwise the
+    // wide offers would be dropped at the door and the pooled path, which is
+    // the one being pinned, would never be taken.
+    super::demand::observe(pixels * 3);
     for held in [0, 1, want / 2, want - 1, want, want + 1, want * 3] {
         super::recycle_image(vec![POISON; held]);
-        let image = super::checkout_image(want);
+        let image = super::checkout_image(pixels);
         assert_eq!(
             image.len(),
             want,
@@ -2711,16 +2717,19 @@ fn a_checked_out_texture_is_zero_at_every_length() {
         );
     }
     let _ = super::image_pool().take();
-    let image = super::checkout_image(want);
+    let image = super::checkout_image(pixels);
     assert_eq!(image.len(), want);
     assert!(image.iter().all(|&b| b == 0));
 }
 
 #[test]
 fn a_checked_out_value_grid_is_empty_at_every_length() {
+    // See `a_checked_out_texture_is_zero_at_every_length` on why demand is
+    // declared before the offers.
+    super::demand::observe(1 << 20);
     for held in [0usize, 1, 1024, 4096, 1 << 20] {
         super::recycle_values(vec![f32::from_bits(0xDEAD_BEEF); held]);
-        let values = super::checkout_values();
+        let values = super::checkout_values(held);
         assert_eq!(
             values.len(),
             0,
