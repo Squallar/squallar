@@ -34,6 +34,40 @@ pub struct FrameDiagnostics<'a> {
     pub gpu_passes: Option<&'a str>,
 }
 
+/// Where [`crate::Gui::ui_phased`] crossed its own phase boundaries, handed
+/// back so the App's frame ledger can cut its `ui` segment with them.
+///
+/// **Instants, not durations, and that is the point.** The ledger's `ui`
+/// segment is bracketed by the App's own two stamps around the call; cutting
+/// it with instants taken *inside* the call makes the cuts contiguous with
+/// those brackets, so the pieces telescope to the segment exactly instead of
+/// summing to something near it. A struct of durations could not do that — it
+/// would leave the prologue and the return outside every figure, which is the
+/// hole the renderer's own four-phase pass ledger had.
+///
+/// Five stamps, six cuts: `ui_start → polled → laid_out → shell → panes →
+/// applied → ui_end`. The two outer boundaries are the ledger's, not this
+/// type's, which is why they are absent here.
+#[derive(Clone, Copy, Debug)]
+pub struct UiPhaseStamps {
+    /// After the frame's polls: the site-table republish, the auto-poll
+    /// check and the offline-download settle. These run before anything is
+    /// laid out and emit most of the frame's fetch actions.
+    pub polled: web_time::Instant,
+    /// After `LayoutCtx::resolve`, the pane-grid reflow, the site-query
+    /// expiry and the fade invariants — the root `Ui` is built and the
+    /// frame's geometry is settled.
+    pub laid_out: web_time::Instant,
+    /// After `render_shell`: the topbar, the layer stack and the drawer.
+    /// **The frame's eye click is read here** and acted on in the next cut.
+    pub shell: web_time::Instant,
+    /// After the time dialog and `render_panes` — the map surfaces.
+    pub panes: web_time::Instant,
+    /// After the pending appliers (pane view, section line, region, section
+    /// edit) and the fade toggle.
+    pub applied: web_time::Instant,
+}
+
 /// One frame's facts, composed by the App from state it already owns, applied
 /// by `Gui::apply_frame_inputs` once per frame immediately before `Gui::ui`.
 pub struct FrameInputs<'a> {

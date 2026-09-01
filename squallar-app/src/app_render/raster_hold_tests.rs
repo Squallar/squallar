@@ -254,7 +254,7 @@ fn a_delivered_raster_is_promoted_before_the_frame_is_laid_out() {
         .find("self.run_frame_pump(PumpPhase::Apply")
         .expect("setup_egui_frame no longer runs the pump's results-apply phase");
     let laid_out = body
-        .find("self.gui.ui(")
+        .find("self.gui.ui_phased(")
         .expect("setup_egui_frame no longer lays out a frame");
     assert!(
         promote < laid_out,

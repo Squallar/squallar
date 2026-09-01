@@ -20,7 +20,7 @@ fn every_poller_runs_before_the_frame_is_laid_out() {
     let advance = at("self.run_frame_pump(PumpPhase::Advance");
     let dispatch = at("self.run_frame_pump(PumpPhase::Dispatch");
     let inputs = at("self.push_frame_inputs(");
-    let laid_out = at("self.gui.ui(");
+    let laid_out = at("self.gui.ui_phased(");
 
     assert!(
         apply < advance,

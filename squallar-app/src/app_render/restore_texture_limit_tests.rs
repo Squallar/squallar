@@ -90,7 +90,7 @@ fn the_restore_runs_from_inside_the_frame_and_not_from_the_state_that_built_it()
     // more App-pokes-Gui occurrence in `squallar-app`, and it would spend a
     // slot of a permanent ceiling that has none. Prose counts too, so this
     // note does not spell it either.
-    let laid_out = at(concat!("self.", "gui.", "ui("));
+    let laid_out = at(concat!("self.", "gui.", "ui_phased("));
     assert!(
         opened < restore,
         "the restore uploads before `begin_frame` has told egui what this \

@@ -4,11 +4,13 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is nine clock reads and about fifteen
-//! integer bin searches — the ledger's own eight stamps plus the one the egui
-//! pass takes on entry, and six of the bin searches are the `prepare` split
-//! ([`PrepareHists`]), which records only on the frames `prepare` itself does.
-//! **No figure recorded here ever gates CI.**
+//! feature gate, and the per-frame cost is fourteen clock reads and about
+//! twenty-one integer bin searches — the ledger's own eight stamps, the one
+//! the egui pass takes on entry, and the five `Gui::ui` takes on its way
+//! through. Six of the bin searches are the `prepare` split
+//! ([`PrepareHists`]) and six more the `ui` split ([`UiHists`]); each records
+//! only on the frames its own segment does. **No figure recorded here ever
+//! gates CI.**
 //!
 //! # The three denominators, stated once
 //!
@@ -59,6 +61,10 @@ struct Marks {
     /// `PreparedFrame` the pass returned. `None` on a frame that never
     /// finished a pass, which is the same frame that leaves no acquire.
     prepare_phases: Option<squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps>,
+    /// Where `Gui::ui` crossed its own phase boundaries, off the stamps it
+    /// returned. `None` on a frame that never called it, which is the same
+    /// frame that leaves no `ui_start`.
+    ui_phases: Option<squallar_egui::shell_api::UiPhaseStamps>,
     /// `present_frame` return.
     present_return: Option<Instant>,
     /// The pass ended without a real present (a skipped or lost surface).
@@ -105,6 +111,52 @@ pub(crate) struct PrepareHists {
     pub(crate) buffers: Hist,
 }
 
+/// Where the `ui` segment's time went, cut at the seams `Gui::ui` has.
+///
+/// # Denominator
+///
+/// **Exactly [`SegmentHists::ui`]'s** — presented interact frames — and that
+/// equality is the whole design. The six are contiguous cuts of the one span,
+/// so they telescope to it (`the_ui_phases_telescope_to_ui`), which makes the
+/// residual arithmetic rather than inference: any `ui` time these six do not
+/// name is a bug in this decomposition, not a mystery.
+///
+/// **Never added to `frame segment (ui)`.** These are not a seventh segment
+/// beside it; they *are* it, opened up. The reporting prefix is deliberately
+/// `frame ui` rather than `frame segment` so a reader cannot make that
+/// mistake by pattern-matching a line.
+///
+/// A sibling of [`PrepareHists`] and independent of it: that one decomposes
+/// `prepare`, this one `ui`. The two share a ledger and nothing else, and
+/// neither is ever added to the other.
+#[derive(Default)]
+pub(crate) struct UiHists {
+    /// `Gui::ui` entry to the polls' end: the site-table republish, the
+    /// auto-poll check and the offline-download settle. Emits most of the
+    /// frame's fetch actions and draws nothing.
+    pub(crate) poll: Hist,
+    /// `LayoutCtx::resolve`, the pane-grid reflow, the site-query expiry, the
+    /// fade invariants and the root `Ui`'s construction — the frame's
+    /// geometry, settled before a widget is placed.
+    pub(crate) layout: Hist,
+    /// `render_shell`: topbar, layer stack, drawer. **The eye click the
+    /// UiSweep scene drives is read here**, and acted on in `panes`.
+    pub(crate) shell: Hist,
+    /// The time dialog and `render_panes` — every map surface, and on a
+    /// toggle frame the pane that acts on the click `shell` just read.
+    pub(crate) panes: Hist,
+    /// The four pending appliers (pane view, section line, region, section
+    /// edit) and the fade toggle: state the surfaces above deferred out of
+    /// their own borrows.
+    pub(crate) apply: Hist,
+    /// Everything after the appliers: pills, the phone bottom bar, the
+    /// timeline, the error toast, the sheet, the download area, the overlay
+    /// popup, the catalog, the diagnostics panel and the deferred pane close.
+    /// One cut rather than ten because it was cheap on every scene measured;
+    /// the day it is not, it splits.
+    pub(crate) chrome: Hist,
+}
+
 /// The per-segment histograms of interact frames, and only interact frames:
 /// the segments exist to say where an interact frame's service went, and
 /// mixing idle frames in would average the answer away.
@@ -116,7 +168,8 @@ pub(crate) struct SegmentHists {
     /// `setup_egui_frame` entry to `Gui::ui` — theme, restore, the raster
     /// promote and the three pump phases.
     pub(crate) pump: Hist,
-    /// The `Gui::ui` call itself: layout and the paint list.
+    /// The `Gui::ui` call itself: layout and the paint list. Opened up by
+    /// [`UiHists`], whose six cuts telescope to exactly this.
     pub(crate) ui: Hist,
     /// `Gui::ui` return to the acquire: mirror planning, tessellation, the
     /// texture-delta uploads and egui's buffer staging. Opened up by
@@ -141,6 +194,8 @@ pub(crate) struct FrameLedger {
     segments: SegmentHists,
     /// See [`PrepareHists`] — `segments.prepare`, opened up, same frames.
     prepare: PrepareHists,
+    /// See [`UiHists`] — `segments.ui`, opened up, same frames.
+    ui: UiHists,
     /// The acquire span itself, interact frames only. Reported beside the
     /// segments and never inside service: it is the vsync block.
     acquire: Hist,
@@ -195,6 +250,29 @@ fn prepare_phase_micros(
     ]
 }
 
+/// The six contiguous cuts of the `ui` segment, in call order:
+/// `[poll, layout, shell, panes, apply, chrome]` — see [`UiHists`], whose
+/// fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `ui`'s own boundaries, so the six sum to
+/// `micros(ui_start, ui_end)` exactly. A free function so the telescoping is
+/// testable without a frame.
+fn ui_phase_micros(
+    ui_start: Instant,
+    phases: &squallar_egui::shell_api::UiPhaseStamps,
+    ui_end: Instant,
+) -> [u32; 6] {
+    [
+        micros(ui_start, phases.polled),
+        micros(phases.polled, phases.laid_out),
+        micros(phases.laid_out, phases.shell),
+        micros(phases.shell, phases.panes),
+        micros(phases.panes, phases.applied),
+        micros(phases.applied, ui_end),
+    ]
+}
+
 impl FrameLedger {
     /// Open a frame: stamp its start and forget the previous frame's marks.
     pub(crate) fn mark_frame_start(&mut self) {
@@ -230,6 +308,13 @@ impl FrameLedger {
         stamps: squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps,
     ) {
         self.cur.prepare_phases = Some(stamps);
+    }
+
+    /// The phase stamps `Gui::ui` took on its way through, carried off the
+    /// call that returned them. Recorded unconditionally; `finalize` decides
+    /// whether this frame is a sample.
+    pub(crate) fn record_ui_phases(&mut self, stamps: squallar_egui::shell_api::UiPhaseStamps) {
+        self.cur.ui_phases = Some(stamps);
     }
 
     pub(crate) fn mark_present_return(&mut self) {
@@ -302,6 +387,19 @@ impl FrameLedger {
                 self.prepare.mirror.record(mirror);
                 self.prepare.buffers.record(buffers);
             }
+            // The same, for the `ui` segment recorded above. Independent of
+            // the prepare block: a different segment, a different set of
+            // stamps, the same denominator rule.
+            if let Some(phases) = m.ui_phases.as_ref() {
+                let [poll, layout, shell, panes, apply, chrome] =
+                    ui_phase_micros(ui_start, phases, ui_end);
+                self.ui.poll.record(poll);
+                self.ui.layout.record(layout);
+                self.ui.shell.record(shell);
+                self.ui.panes.record(panes);
+                self.ui.apply.record(apply);
+                self.ui.chrome.record(chrome);
+            }
         } else {
             self.service_idle.record(service);
         }
@@ -326,6 +424,10 @@ impl FrameLedger {
 
     pub(crate) fn prepare_phases(&self) -> &PrepareHists {
         &self.prepare
+    }
+
+    pub(crate) fn ui_phases(&self) -> &UiHists {
+        &self.ui
     }
 
     pub(crate) fn acquire(&self) -> &Hist {
@@ -361,7 +463,8 @@ impl FrameLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instant, micros, prepare_phase_micros, service_micros};
+    use super::{Instant, micros, prepare_phase_micros, service_micros, ui_phase_micros};
+    use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
 
     /// A pass whose phases land at the given microsecond offsets from
@@ -434,6 +537,114 @@ mod tests {
              groups is measuring something else",
         );
         assert_eq!((already_timed, newly_named), (16_800, 1_500));
+    }
+
+    /// A `Gui::ui` whose phases land at the given microsecond offsets from
+    /// `ui_start`, so a test can state its stamps as arithmetic. Named apart
+    /// from the `prepare` split's `phases_at`: the two decompositions share
+    /// this module and answer with different stamp types.
+    fn ui_phases_at(ui_start: Instant, offsets: [u64; 5]) -> UiPhaseStamps {
+        let at = |us: u64| ui_start + std::time::Duration::from_micros(us);
+        UiPhaseStamps {
+            polled: at(offsets[0]),
+            laid_out: at(offsets[1]),
+            shell: at(offsets[2]),
+            panes: at(offsets[3]),
+            applied: at(offsets[4]),
+        }
+    }
+
+    /// **The six cuts are a decomposition of `ui`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(ui_start, ui_end)` — the very span
+    /// [`super::SegmentHists::ui`] records — so "what is in ui" is answered by
+    /// subtraction rather than by inference, and any phase the split fails to
+    /// name shows up as a gap instead of hiding inside a neighbour.
+    #[test]
+    fn the_ui_phases_telescope_to_ui() {
+        let ui_start = Instant::now();
+        let phases = ui_phases_at(ui_start, [300, 1_900, 24_100, 39_400, 39_450]);
+        let ui_end = ui_start + std::time::Duration::from_micros(41_000);
+
+        let cuts = ui_phase_micros(ui_start, &phases, ui_end);
+        assert_eq!(
+            cuts,
+            [300, 1_600, 22_200, 15_300, 50, 1_550],
+            "a cut moved: the six no longer bracket the phases they are named \
+             for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(ui_start, ui_end),
+            "the six cuts do not sum to the ui span they decompose, so the \
+             residual this instrument reports is not a residual of ui",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 41_000);
+    }
+
+    /// **The non-vacuity floor: a cut may not trivially cover `ui`.**
+    ///
+    /// Telescoping alone is satisfied by a degenerate split — one cut holding
+    /// the whole span and five zeros telescopes perfectly and decomposes
+    /// nothing. That is the shape a "split" written against a wrong guess
+    /// takes, and it is exactly what this campaign has twice shipped. So the
+    /// floor is stated on the boundaries rather than on the sums: **every one
+    /// of the five stamps must be able to move the answer**, which is only
+    /// true if each is read by two different cuts.
+    ///
+    /// Held by perturbation: nudge one stamp and exactly two cuts change, by
+    /// equal and opposite amounts. A split that folded a boundary away — the
+    /// degenerate case — would move one cut or none.
+    #[test]
+    fn every_ui_stamp_is_load_bearing_in_two_cuts() {
+        let ui_start = Instant::now();
+        // Its own fixture, not the telescoping test's: every cut here is
+        // wider than the 100 us nudge, so a stamp that fails to move a cut
+        // fails this test rather than underflowing it.
+        let base_offsets = [500u64, 2_500, 25_000, 38_000, 39_000];
+        let ui_end = ui_start + std::time::Duration::from_micros(41_000);
+        let base = ui_phase_micros(ui_start, &ui_phases_at(ui_start, base_offsets), ui_end);
+
+        for stamp in 0..5 {
+            let mut moved = base_offsets;
+            moved[stamp] -= 100;
+            let cuts = ui_phase_micros(ui_start, &ui_phases_at(ui_start, moved), ui_end);
+            let changed: Vec<usize> = (0..6).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![stamp, stamp + 1],
+                "moving stamp {stamp} did not move exactly the two cuts it \
+                 bounds, so one of them is not reading it and the split is \
+                 narrower than its six names claim",
+            );
+            assert_eq!(
+                (cuts[stamp], cuts[stamp + 1]),
+                (base[stamp] - 100, base[stamp + 1] + 100),
+                "the two cuts around stamp {stamp} did not trade the 100 us \
+                 exactly, so the boundary between them is not the stamp",
+            );
+            assert_eq!(cuts.iter().sum::<u32>(), 41_000);
+        }
+    }
+
+    /// **The floor's other half: no cut may be structurally empty.**
+    ///
+    /// [`every_ui_stamp_is_load_bearing_in_two_cuts`] holds that the
+    /// boundaries are real; this holds that the *regions* are. A split whose
+    /// six names covered `ui` but where five were pinned at zero would pass
+    /// the telescoping test and report a single opaque number under six
+    /// headings — which is the instrument this replaces, renamed.
+    #[test]
+    fn no_ui_cut_is_structurally_pinned_to_zero() {
+        let ui_start = Instant::now();
+        let phases = ui_phases_at(ui_start, [300, 1_900, 24_100, 39_400, 39_450]);
+        let ui_end = ui_start + std::time::Duration::from_micros(41_000);
+        let cuts = ui_phase_micros(ui_start, &phases, ui_end);
+        assert!(
+            cuts.iter().all(|&c| c > 0),
+            "a cut is zero on stamps chosen to make all six non-zero, so it \
+             cannot be reading the span it is named for: {cuts:?}",
+        );
     }
 
     /// The two service spellings agree exactly whenever the segments are the

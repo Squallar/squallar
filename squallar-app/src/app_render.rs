@@ -640,6 +640,33 @@ fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
     ]
 }
 
+/// The six `frame ui (<name>):` lines — the `ui` segment, opened up.
+///
+/// Denominator: **exactly `frame segment (ui)`'s** — presented interact
+/// frames — and the six are contiguous cuts of that one span, so their sums
+/// telescope to its sum. That equality is what makes this a decomposition
+/// rather than a seventh segment: `frame ui (*)` is never added to
+/// `frame segment (ui)`, it *is* it.
+///
+/// A sibling of [`frame_prepare_lines`] and independent of it: that one cuts
+/// `prepare`, this one cuts `ui`, and the two share only the formatter. Both
+/// are decompositions of their own segment and neither is ever added to the
+/// other.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms:
+/// none of the six is ever structurally absent, and a `chrome` cut of zero on
+/// a desktop layout with no phone bar is a figure, not an absence.
+fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 6] {
+    [
+        named_hist_line("frame ui", "poll", &u.poll),
+        named_hist_line("frame ui", "layout", &u.layout),
+        named_hist_line("frame ui", "shell", &u.shell),
+        named_hist_line("frame ui", "panes", &u.panes),
+        named_hist_line("frame ui", "apply", &u.apply),
+        named_hist_line("frame ui", "chrome", &u.chrome),
+    ]
+}
+
 /// The `tile take (<family>):` lines — what one tile take costs the thread
 /// that performs it.
 ///
@@ -855,8 +882,12 @@ impl super::App {
 
         // Last, so this frame is laid out over everything applied above.
         self.frame_ledger.mark_ui_start();
-        let gui_action = self.gui.ui(&ctx);
+        let (gui_action, ui_phases) = self.gui.ui_phased(&ctx);
         self.frame_ledger.mark_ui_end();
+        // After `mark_ui_end`, because the stamps only cut anything when
+        // paired with this frame's `ui_start`/`ui_end`. See
+        // `frame_ledger::UiHists`.
+        self.frame_ledger.record_ui_phases(ui_phases);
 
         (size_in_pixels, gui_action)
     }
@@ -1413,6 +1444,12 @@ impl super::App {
         // Same denominator, six contiguous cuts of that one span — a
         // decomposition of the line above, never a seventh segment beside it.
         for line in frame_prepare_lines(ledger.prepare_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // The `ui` segment above, opened up at the seams `Gui::ui` has. Same
+        // denominator, six contiguous cuts of that one span — a decomposition
+        // of the line above, never a seventh segment beside it.
+        for line in frame_ui_lines(ledger.ui_phases()) {
             say_telemetry(loud, &line);
         }
         // What one tile take cost, per family. Read unconditionally rather

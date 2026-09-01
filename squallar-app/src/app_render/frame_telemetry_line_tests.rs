@@ -715,6 +715,103 @@ fn the_rig_reads_the_prepare_lines_the_app_actually_writes() {
     );
 }
 
+/// The `frame ui (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame segment (…)` and deliberately a **different
+/// prefix**: the six are cuts of the `ui` segment, and a reader who could
+/// mistake one for a seventh segment would add it to the very span it
+/// decomposes. The `sum=` is the load-bearing field for the same reason it is
+/// on the segment line — 3 × 100 = 300, where every percentile of that
+/// histogram answers the bin's 106 us upper edge.
+#[test]
+fn the_frame_ui_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame ui", "shell", &h),
+        format!(
+            "frame ui (shell): n=3, sum=300 us, p50=106 us, p90=106 us, \
+             p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All six `ui` cuts are emitted, under their own names, every tick — and
+/// each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green:
+/// `shell` carrying `panes`' histogram would keep every name right and every
+/// figure wrong, which is the failure a split is most likely to have — and
+/// the two are neighbours across the seam this whole instrument exists to
+/// resolve, so a swap there would answer the question backwards.
+#[test]
+fn every_ui_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::UiHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.poll,
+        &mut phases.layout,
+        &mut phases.shell,
+        &mut phases.panes,
+        &mut phases.apply,
+        &mut phases.chrome,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_ui_lines(&phases);
+    let names = ["poll", "layout", "shell", "panes", "apply", "chrome"];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame ui ({name}): n={}, ", slot + 1)),
+            "ui cut {slot} reported as {line:?}, which is not {name}'s line \
+             carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The `ui` cuts do not collide with the segment lines the rig already
+/// reads.**
+///
+/// Both spellings go through `named_hist_line` and both name a `ui`, so
+/// `frame segment (ui)` and the six `frame ui (…)` lines share a substring.
+/// A rig regex anchored loosely enough to match both would read a cut as the
+/// segment — and since the cuts sum to the segment, the mistake is *plausible
+/// arithmetic* rather than an obvious null, which is how it would survive
+/// review. Held here: the segment line does not start with the cut prefix,
+/// and no cut line starts with the segment prefix.
+#[test]
+fn the_ui_cut_lines_are_not_mistakable_for_the_ui_segment_line() {
+    let mut h = Hist::new();
+    h.record(1_000);
+    let segment_line = super::named_hist_line("frame segment", "ui", &h);
+    assert!(
+        !segment_line.starts_with("frame ui ("),
+        "the ui segment line {segment_line:?} reads as one of its own cuts",
+    );
+    for line in super::frame_ui_lines(&crate::frame_ledger::UiHists::default()) {
+        assert!(
+            line.starts_with("frame ui ("),
+            "a ui cut is not under the cut prefix: {line:?}",
+        );
+        assert!(
+            !line.starts_with("frame segment"),
+            "the ui cut {line:?} reads as a seventh frame segment, which a \
+             reader would add to the span it decomposes",
+        );
+    }
+}
+
 /// The `tile take (…)` sentence, pinned as a literal, and only for a family
 /// that has samples.
 ///

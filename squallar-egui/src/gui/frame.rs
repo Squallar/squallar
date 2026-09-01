@@ -2,10 +2,28 @@
 //! drivers it dispatches — the auto-polls, the initial zoom claim, the pending
 //! appliers, the time dialog and the dismiss chain.
 use super::*;
+use crate::shell_api::UiPhaseStamps;
 
 impl Gui {
     /// Create the UI using egui.
+    ///
+    /// **The shell calls [`Gui::ui_phased`], not this.** This spelling drops
+    /// the frame's phase stamps, and with them the only decomposition of the
+    /// `ui` frame segment that exists; it is here for the harnesses and tests
+    /// that drive a frame without a ledger to file them in.
     pub fn ui(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
+        self.ui_phased(ctx).0
+    }
+
+    /// [`Gui::ui`], with the five instants at which it crossed its own phase
+    /// boundaries.
+    ///
+    /// The stamps are taken unconditionally — five clock reads on a call that
+    /// lays out a whole frame — so there is no armed/unarmed spelling of this
+    /// function to disagree about, and no frame where the instrument is off.
+    /// What the caller does with them is the caller's business; see
+    /// [`crate::shell_api::UiPhaseStamps`] for why they are instants.
+    pub fn ui_phased(&mut self, ctx: &egui::Context) -> (Vec<GuiAction>, UiPhaseStamps) {
         let mut actions = Vec::new();
 
         if !self.settings_visible() {
@@ -22,6 +40,7 @@ impl Gui {
         // record it publishes is what makes the area exist to the rest of the
         // app - so the publish rides the frame, not the screen.
         self.settle_offline_download();
+        let polled = web_time::Instant::now();
 
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
         self.settle_pane_layout();
@@ -72,15 +91,18 @@ impl Gui {
                 .layer_id(egui::LayerId::background())
                 .max_rect(self.layout.content_rect),
         );
+        let laid_out = web_time::Instant::now();
 
         let shell = self.render_shell(&mut root_ui);
         actions.extend(shell.actions);
+        let shell_done = web_time::Instant::now();
 
         if let Some(action) = self.render_time_dialog(ctx) {
             actions.push(action);
         }
 
         actions.extend(self.render_panes(&mut root_ui, &shell.excluded_rects));
+        let panes = web_time::Instant::now();
 
         self.apply_pending_pane_view(&mut actions);
         self.apply_pending_section_line();
@@ -88,6 +110,7 @@ impl Gui {
         self.apply_pending_section_edit();
 
         self.apply_fade_toggle(ctx);
+        let applied = web_time::Instant::now();
 
         self.render_pane_pills(ctx, shell.map_rect, &mut actions);
 
@@ -116,7 +139,16 @@ impl Gui {
 
         self.apply_pending_pane_close(ctx, &mut actions);
 
-        actions
+        (
+            actions,
+            UiPhaseStamps {
+                polled,
+                laid_out,
+                shell: shell_done,
+                panes,
+                applied,
+            },
+        )
     }
 
     /// **Last thing in the frame, and both halves of that matter.**
