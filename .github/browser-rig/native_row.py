@@ -46,6 +46,18 @@ Histograms are cumulative from boot. A windowed reading is the DIFFERENCE of
 two of them, bracketed by the gesture player's own `loop complete` markers so
 the bracket is whole script loops. Cumulative-from-boot figures contaminated
 an entire early scoreboard; nothing here ever quotes one as a window.
+
+---- The runner's decisions live here, not in the shell ---------------------
+
+`run_measure_native.sh` is a driver: it launches a binary, moves a window and
+writes files. Every DECISION it makes -- which platform tools a leg may use,
+whether the box stayed quiet, whether a silent app is wedged or working, what
+order the legs run in -- is a pure function in this file, called from the
+shell. That split is not tidiness. A decision spelled in bash can only be
+checked by running a leg, which needs a display, a GPU and three minutes; the
+same decision spelled here is checked by `--selftest` in milliseconds on any
+machine. Four of the five capabilities that lanes kept rebuilding privately
+were decisions, not mechanism.
 """
 
 import argparse
@@ -338,6 +350,34 @@ def parse_hist(text):
     return counts
 
 
+# The app's own report of the surface it resized to, `App::handle_resized`'s
+# `log::info!("Window resized to {}x{}", width, height)`.
+#
+# One of the two patterns in this file that is not `drive.py`'s, and it earns
+# that the same way `wgpu selected the ` does -- by being the only reading of a
+# quantity nothing else can supply. It is the ONE geometry readback that exists
+# on every platform: `xdotool` answers on X, System Events answers on macOS,
+# nothing answers on Wayland, and all three of those are the window manager's
+# opinion of a frame, while THIS is the surface the app actually allocated and
+# the surface `picture_bytes_for` predicts. So it is what the byte cross-check
+# is taken against, and the WM's answer is demoted to a second opinion.
+#
+# Pinned against the app's own formatter from the Rust side, in
+# `native_seed_pin_tests.rs`, exactly as `drive.py`'s patterns are -- because a
+# copy of a literal is a second place for it to be wrong.
+SURFACE_RE = re.compile(r"Window resized to (\d+)x(\d+)")
+
+
+def app_surface(lines):
+    """The last surface the app said it resized to, as `(w, h)`, or None."""
+    found = None
+    for line in lines:
+        m = SURFACE_RE.search(line)
+        if m:
+            found = (int(m.group(1)), int(m.group(2)))
+    return found
+
+
 def scrape(lines, probes):
     """Every scraped family, in line order.
 
@@ -360,6 +400,7 @@ def scrape(lines, probes):
         "loops": [],
         "backend": None,
         "adapter": None,
+        "surface": None,
         "gpu_unavailable": False,
     }
     fam = (
@@ -430,6 +471,7 @@ def scrape(lines, probes):
                     out["adapter"] = name
         if "gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)" in line:
             out["gpu_unavailable"] = True
+    out["surface"] = app_surface(lines)
     return out
 
 
@@ -542,6 +584,74 @@ def liveness(interact, end_idx):
     }
 
 
+def parse_cpu_time(text):
+    """`ps -o time=`'s accumulated CPU time, in seconds.
+
+    One parser for both platforms: BSD `ps` on macOS prints `MM:SS.ss`, procps
+    on Linux prints `HH:MM:SS`, and either grows a `DD-` day field on a long
+    run. Returns None for anything it cannot read, so a caller distinguishes
+    "no CPU time" from "zero CPU time" -- they mean opposite things here.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        head, text = text.split("-", 1)
+        try:
+            days = int(head)
+        except ValueError:
+            return None
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    secs = 0.0
+    for n in nums:
+        secs = secs * 60.0 + n
+    return secs + days * 86400.0
+
+
+def cpu_liveness(before, after, wall_s):
+    """**A quiet log is not a hang.** Did the process burn CPU while silent?
+
+    A lane read a log that had stopped printing as a wedged app, killed the
+    leg, and only caught itself with a CPU-time check -- the app had been
+    working the whole time on a step that logs nothing. The distinction cannot
+    be made from the log, by construction, so it is made from the scheduler.
+
+    `busy` is the only claim: CPU time advanced over the interval. It does not
+    claim progress -- a spin loop is busy too -- and the verdict says so, so
+    that nobody reads this as proof the leg is healthy.
+    """
+    a, b = parse_cpu_time(before), parse_cpu_time(after)
+    if a is None or b is None:
+        return {
+            "readable": False, "busy": None, "advanced_s": None,
+            "verdict": "no CPU-time readings (%r -> %r): a silent log cannot "
+                       "be told from a wedged process without them"
+                       % (before, after),
+        }
+    adv = b - a
+    frac = (adv / wall_s) if wall_s else None
+    return {
+        "readable": True,
+        "busy": adv > 0,
+        "advanced_s": adv,
+        "cpu_fraction": frac,
+        "verdict": (
+            "process burned %.2f s of CPU over %.0f s of wall (%.0f%% of one "
+            "core): it is BUSY, not wedged -- though busy is not progress"
+            % (adv, wall_s, 100.0 * frac) if adv > 0 else
+            "process burned NO CPU over %.0f s of wall: the silent log is a "
+            "wedged process, not a quiet stage" % wall_s
+        ),
+    }
+
+
 # ------------------------------------------------------------------ surface --
 
 
@@ -647,6 +757,65 @@ def load_samples(path):
     }
 
 
+# A leg sampled at 5 s needs at least this many readings before its quiet stamp
+# means anything. Two samples describe the ends and say nothing about the
+# middle, which is the interval the stamp exists to cover.
+MIN_LOAD_SAMPLES = 4
+
+
+def quiet_verdict(load, quiet_max):
+    """Was the box quiet for the WHOLE leg -- not just at its ends?
+
+    **A quiet START is not a quiet LEG.** The documented protocol defect here
+    is a leg whose start-of-leg gate passed, whose end looked fine, and whose
+    middle carried a sibling lane's compile. Load's error is ONE-SIDED: it
+    depresses only the cheaper-frame arm, so it biases a ratio rather than
+    adding noise to it, and a ratio biased by a confound reads exactly like a
+    result.
+
+    So the verdict is taken on the MAXIMUM over the whole series, and a series
+    too thin to have covered the middle is `unknown` rather than `yes` --
+    refusing to stamp is the point; a fabricated stamp is worse than none.
+    """
+    if load is None:
+        return {
+            "quiet": "unknown",
+            "loud_mid": False,
+            "why": "no during-leg load samples: this leg has no record of the "
+                   "interval it was measured over, and a start-of-leg gate "
+                   "cannot see a compile that began after it passed",
+        }
+    if load["samples"] < MIN_LOAD_SAMPLES:
+        return {
+            "quiet": "unknown",
+            "loud_mid": False,
+            "why": "only %d load samples (need %d): the series describes the "
+                   "ends of the leg and says nothing about its middle"
+                   % (load["samples"], MIN_LOAD_SAMPLES),
+        }
+    quiet = load["max"] < quiet_max
+    # Named separately because it is the case a start-of-leg gate is BLIND to,
+    # and a row that merely says `quiet=no` does not tell its reader that the
+    # endpoints agreed with each other and were both wrong.
+    loud_mid = (
+        not quiet and load["start"] < quiet_max and load["end"] < quiet_max
+    )
+    if quiet:
+        why = "loadavg stayed under %.1f for all %d samples (max %.2f)" % (
+            quiet_max, load["samples"], load["max"])
+    elif loud_mid:
+        why = (
+            "loadavg reached %.2f MID-LEG against a ceiling of %.1f while both "
+            "ends were quiet (start %.2f, end %.2f): a start-of-leg gate would "
+            "have passed this leg" % (
+                load["max"], quiet_max, load["start"], load["end"])
+        )
+    else:
+        why = "loadavg reached %.2f against a ceiling of %.1f" % (
+            load["max"], quiet_max)
+    return {"quiet": "yes" if quiet else "no", "loud_mid": loud_mid, "why": why}
+
+
 # -------------------------------------------------------------- divergence --
 
 
@@ -677,6 +846,153 @@ def divergence(count_a, count_b):
         "threshold": DIVERGENCE_THRESHOLD,
         "third_run_needed": rel > DIVERGENCE_THRESHOLD,
     }
+
+
+# --------------------------------------------------------------- platform ---
+
+# What a leg needs from the machine it runs on, and what supplies it.
+#
+# **A platform this runner does not know is a DEGRADATION WITH A NAME, never an
+# exit.** The runner used to `exit 2` on macOS on a missing `xdotool`, so every
+# lane that needed a macOS row wrote a private runner in a scratchpad that died
+# with its session -- five of them, and no two lanes' rows guaranteed
+# comparable. An unavailable capability costs the row the columns it feeds and
+# says which ones; it does not cost the row.
+#
+# The keys are the four things the driver cannot do in pure shell. `geometry`
+# is deliberately absent: the achieved surface is read from the app's OWN
+# `Window resized to WxH` line, which exists on every platform, so the one
+# reading the byte cross-check depends on never needs a platform tool.
+NATIVE_CAPABILITIES = ("loadavg", "window", "refresh", "cputime")
+
+# `capability -> (tool, what the row loses without it)`. A tool named here is
+# probed by the runner with `command -v` (or a file test) and reported back.
+PLATFORM_TOOLS = {
+    "linux": {
+        "loadavg": ("procfs", "the quiet stamp: the row cannot say the box "
+                              "was quiet and is marked INVALID"),
+        "window":  ("xdotool", "geometry PINNING: the leg runs at whatever "
+                               "size the app opened, and is refused unless "
+                               "that already matches"),
+        "refresh": ("xrandr", "the hz~ column, which prints ?"),
+        "cputime": ("ps", "the wedged-vs-working distinction on a silent log"),
+    },
+    "macos": {
+        "loadavg": ("sysctl", "the quiet stamp: the row cannot say the box "
+                              "was quiet and is marked INVALID"),
+        "window":  ("osascript", "geometry PINNING: needs Accessibility "
+                                 "permission for the process running this, "
+                                 "and System Events resolves the window by "
+                                 "`unix id`, never by title"),
+        "refresh": ("system_profiler", "the hz~ column, which prints ?"),
+        "cputime": ("ps", "the wedged-vs-working distinction on a silent log"),
+    },
+}
+
+
+def platform_name(system, release=""):
+    """`uname -s`/`uname -r` -> the name this file plans for."""
+    s = (system or "").strip().lower()
+    if s.startswith("darwin"):
+        return "macos"
+    if s.startswith("linux"):
+        # WSL is a Linux kernel with no X server of its own worth assuming;
+        # it is still `linux` here, and its missing `xdotool` degrades by the
+        # ordinary path rather than needing a name of its own.
+        return "linux"
+    return "unknown"
+
+
+def platform_plan(system, have, release="", session=""):
+    """The capabilities a leg may use here, and a NAMED reason for each it may not.
+
+    `have` is the set of tool names the runner found. Nothing in the result is
+    fatal by itself: the analyser's own refusals -- the surface byte check, the
+    liveness check, the quiet stamp -- are what decide whether a row is valid,
+    and each of them says which reading it was missing. A runner that exits
+    instead produces no row and no reason, which is how this ended up
+    reimplemented five times.
+    """
+    name = platform_name(system, release)
+    tools = PLATFORM_TOOLS.get(name)
+    caps = {}
+    if tools is None:
+        for cap in NATIVE_CAPABILITIES:
+            caps[cap] = {
+                "ok": False, "tool": None,
+                "why": "no plan for platform %r: this runner knows linux and "
+                       "macos. The leg still runs and the app's own "
+                       "`Window resized to` line still cross-checks its "
+                       "surface; every platform-fed column is absent and the "
+                       "row says so" % (system or "?"),
+            }
+    else:
+        for cap in NATIVE_CAPABILITIES:
+            tool, cost = tools[cap]
+            ok = tool in have
+            caps[cap] = {
+                "ok": ok, "tool": tool,
+                "why": None if ok else
+                       "%s is not on this machine; without it the leg loses %s"
+                       % (tool, cost),
+            }
+    # Wayland is called out by name rather than left to the xdotool probe: on
+    # Wayland `xdotool` may be INSTALLED and still unable to move a native
+    # window, so "the tool is present" is not "the capability works", and a
+    # leg that silently ran unpinned is the exact failure this file exists to
+    # refuse. The runner resolves it the same way either way -- the app's own
+    # surface line against the picture bytes -- but the reason is named.
+    if name == "linux" and (session or "").strip().lower() == "wayland":
+        caps["window"] = {
+            "ok": False, "tool": "xdotool",
+            "why": "XDG_SESSION_TYPE is wayland: xdotool cannot resize a "
+                   "native Wayland surface even when it is installed, so "
+                   "geometry cannot be pinned. Run the leg under Xwayland or "
+                   "an X session, or start the app at the target size",
+        }
+    return {
+        "platform": name,
+        "system": system,
+        "session": session or None,
+        "caps": caps,
+        "degraded": sorted(c for c, v in caps.items() if not v["ok"]),
+    }
+
+
+# ------------------------------------------------------------------ order ---
+
+
+def leg_order(arm_count, runs, counterbalance):
+    """`[(arm_index, run_index)]` -- the order the legs actually run in.
+
+    **Base-first in every pair is a confound, not an ordering.** A previous
+    comparison ran the base arm first in every pair on a box whose load was
+    decaying, so every pair was biased the SAME WAY, which is the one error
+    repetition cannot average out.
+
+    Counterbalanced order alternates direction between runs -- ABBA for two
+    arms, and the same rule generalised for more -- so every arm's MEAN
+    POSITION is equal whenever `runs` is even. That equality is the property,
+    and it is what the test asserts; ABBA is only what it looks like at n=2.
+    """
+    order = []
+    for r in range(1, runs + 1):
+        idx = range(arm_count)
+        if counterbalance and r % 2 == 0:
+            idx = reversed(range(arm_count))
+        for i in idx:
+            order.append((i, r))
+    return order
+
+
+def mean_positions(order, arm_count):
+    """Each arm's mean 1-based position in `order` -- the counterbalance test."""
+    sums = [0.0] * arm_count
+    counts = [0] * arm_count
+    for pos, (arm, _run) in enumerate(order, start=1):
+        sums[arm] += pos
+        counts[arm] += 1
+    return [(sums[i] / counts[i]) if counts[i] else None for i in range(arm_count)]
 
 
 # --------------------------------------------------------------- gate set ---
@@ -772,7 +1088,28 @@ def build_row(args, scraped, probes):
     if not live["ok"]:
         invalid.append("liveness: %s" % live["verdict"])
 
-    surf = surface_check(args.asked_geom, args.achieved_geom, pictures, picture_bytes)
+    # The achieved surface is the APP's own reading where there is one: it is
+    # the quantity `picture_bytes_for` predicts, and it is the only geometry
+    # readback that exists on every platform. The window manager's answer --
+    # which the runner supplies as `--achieved-geom` and which Wayland cannot
+    # supply at all -- is kept as a second opinion and reported when the two
+    # disagree, because a disagreement is a real finding (a scale factor, or a
+    # frame counted with its decorations) and not a reason to prefer either.
+    wm_geom = args.achieved_geom
+    app_geom = scraped["surface"]
+    achieved = app_geom or wm_geom
+    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes)
+    surf["source"] = "app" if app_geom else ("wm" if wm_geom else None)
+    surf["wm_reported"] = ("%dx%d" % wm_geom) if wm_geom else None
+    surf["app_reported"] = ("%dx%d" % app_geom) if app_geom else None
+    if app_geom and wm_geom and app_geom != wm_geom:
+        notes.append(
+            "the window manager reported %dx%d and the app allocated %dx%d. "
+            "The app's figure is the one the picture bytes are checked "
+            "against; the gap is a scale factor or a decorated frame, and "
+            "either way the two targets' rows are only comparable on the "
+            "app's" % (wm_geom + app_geom)
+        )
     if not surf["met"]:
         invalid.append(
             "surface not confirmed: %s" % surf.get("why", "geometry did not match")
@@ -780,15 +1117,10 @@ def build_row(args, scraped, probes):
 
     load = load_samples(args.load_file)
     quiet_max = args.quiet_max
-    if load is None:
-        quiet = "unknown"
-        invalid.append(
-            "no load samples: a leg with no during-leg load record cannot be "
-            "stamped quiet, and a start-of-leg gate would not have seen a "
-            "compile that began after it passed"
-        )
-    else:
-        quiet = "yes" if load["max"] < quiet_max else "no"
+    qv = quiet_verdict(load, quiet_max)
+    quiet = qv["quiet"]
+    if quiet != "yes":
+        invalid.append("not quiet: %s" % qv["why"])
 
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
@@ -814,7 +1146,7 @@ def build_row(args, scraped, probes):
             "leg's throughput figure, not the percentiles" % throughput
         )
 
-    aw, ah = args.achieved_geom if args.achieved_geom else (0, 0)
+    aw, ah = achieved if achieved else (0, 0)
     return {
         "scene": args.scene,
         # The `browser=` column carries `native`. It is the TARGET column in
@@ -841,7 +1173,14 @@ def build_row(args, scraped, probes):
         "position": args.position,
         "load": load,
         "quiet": quiet,
+        "quiet_verdict": qv,
         "quiet_max": quiet_max,
+        # The platform the leg ran on and every capability it had to do
+        # without. A row measured with geometry unpinned is not the same
+        # measurement as one measured with it pinned, and the matrix has to be
+        # able to see which it is holding.
+        "platform": args.platform,
+        "degraded": [d for d in (args.degraded or "").split(",") if d],
         "windows": windows,
         "window_basis": basis,
         "bracket": {"start_line": start_idx, "end_line": end_idx},
@@ -880,15 +1219,22 @@ def print_row(row):
     )
     s = row["surface"]
     print(
-        "ROW   surface asked=%s achieved=%s expected=%s B/picture "
+        "ROW   surface asked=%s achieved=%s (from the %s) expected=%s B/picture "
         "observed=%s B/picture -> %s"
         % (
-            s.get("asked"), s.get("achieved"), s.get("expected_picture_bytes"),
+            s.get("asked"), s.get("achieved"), s.get("source") or "?",
+            s.get("expected_picture_bytes"),
             ("%.0f" % s["observed_picture_bytes"])
             if s.get("observed_picture_bytes") is not None else "-",
             "CONFIRMED" if s.get("met") else "REFUSED",
         )
     )
+    print(
+        "ROW   platform %s; capabilities unavailable: %s"
+        % (row.get("platform") or "?",
+           ", ".join(row.get("degraded") or []) or "none")
+    )
+    print("ROW   quiet: %s" % row["quiet_verdict"]["why"])
     print("ROW   liveness: %s" % row["liveness"]["verdict"])
     for family in ("interact", "idle", "cadence"):
         w = row["windows"].get(family) or {}
@@ -978,6 +1324,45 @@ def cmd_diverge(args):
     return 0
 
 
+def cmd_plan(args):
+    """The platform plan, as `KEY=value` lines the runner can `eval`.
+
+    Values are single-quoted with embedded quotes escaped, so a reason that
+    contains an apostrophe cannot become a shell injection or a syntax error
+    in the runner that evaluates it.
+    """
+    have = {t for t in args.have.split(",") if t}
+    plan = platform_plan(args.system, have, args.release, args.session)
+
+    def sh(value):
+        return "'%s'" % str(value).replace("'", "'\\''")
+
+    print("PLAT_NAME=%s" % sh(plan["platform"]))
+    print("PLAT_DEGRADED=%s" % sh(",".join(plan["degraded"])))
+    for cap in NATIVE_CAPABILITIES:
+        c = plan["caps"][cap]
+        up = cap.upper()
+        print("PLAT_%s=%s" % (up, sh(c["tool"] if c["ok"] else "")))
+        print("PLAT_WHY_%s=%s" % (up, sh(c["why"] or "")))
+    return 0
+
+
+def cmd_order(args):
+    for arm, run in leg_order(args.arms, args.runs, args.counterbalance):
+        print("%d\t%d" % (arm, run))
+    return 0
+
+
+def cmd_cputime(args):
+    v = cpu_liveness(args.before, args.after, args.wall)
+    print(v["verdict"])
+    # Unreadable is not "wedged". Exit 2 keeps the caller from reading a
+    # missing instrument as a finding -- the mistake this check exists to stop.
+    if not v["readable"]:
+        return 2
+    return 0 if v["busy"] else 1
+
+
 def cmd_gates(args):
     rows = gate_set_report(args.repo_root)
     print("the default gate set a measurement or a landing is expected to clear:")
@@ -1017,12 +1402,35 @@ def main(argv):
                    default=DEFAULT_QUIET_MAX)
     a.add_argument("--skip-loops", dest="skip_loops", type=int, default=2)
     a.add_argument("--window-loops", dest="window_loops", type=int, default=2)
+    a.add_argument("--platform", default="unknown")
+    a.add_argument("--degraded", default="",
+                   help="comma-separated capabilities this leg ran without")
     a.add_argument("--json", default="")
     a.set_defaults(func=cmd_analyze)
 
     d = sub.add_parser("diverge", help="adjudicate a run pair")
     d.add_argument("rows", nargs=2)
     d.set_defaults(func=cmd_diverge)
+
+    p = sub.add_parser("plan", help="the platform plan, as shell assignments")
+    p.add_argument("--system", required=True, help="`uname -s`")
+    p.add_argument("--release", default="", help="`uname -r`")
+    p.add_argument("--session", default="", help="XDG_SESSION_TYPE, if any")
+    p.add_argument("--have", default="",
+                   help="comma-separated tool names found on this machine")
+    p.set_defaults(func=cmd_plan)
+
+    o = sub.add_parser("order", help="the leg order, one `armindex<TAB>run` a line")
+    o.add_argument("--arms", type=int, required=True)
+    o.add_argument("--runs", type=int, required=True)
+    o.add_argument("--counterbalance", action="store_true")
+    o.set_defaults(func=cmd_order)
+
+    c = sub.add_parser("cputime", help="a silent process: wedged, or working?")
+    c.add_argument("--before", required=True, help="`ps -o time=` before")
+    c.add_argument("--after", required=True, help="`ps -o time=` after")
+    c.add_argument("--wall", type=float, required=True, help="seconds between")
+    c.set_defaults(func=cmd_cputime)
 
     sc = sub.add_parser("scene", help="run_measure.sh's own seed/script for a scene")
     sc.add_argument("--scene", required=True)
@@ -1357,6 +1765,190 @@ class SeedTests(unittest.TestCase):
             self.assertIn("pane_count", files["ui.json"])
 
 
+class QuietTests(unittest.TestCase):
+    """The quiet stamp covers the WHOLE leg, or it is not a stamp."""
+
+    @staticmethod
+    def _load(vals):
+        return {"start": vals[0], "end": vals[-1], "max": max(vals),
+                "samples": len(vals)}
+
+    def test_a_leg_loud_only_in_the_middle_is_refused(self):
+        """The documented protocol defect: quiet start, quiet end, a sibling
+        lane's compile in between. A start-of-leg gate passes this leg, and
+        load's error is one-sided, so the ratio it feeds is biased rather than
+        noisy."""
+        v = quiet_verdict(self._load([0.4, 0.5, 11.2, 9.7, 0.6, 0.4]), 3.0)
+        self.assertEqual(v["quiet"], "no")
+        self.assertTrue(
+            v["loud_mid"],
+            "the middle of the leg was over the ceiling while both ends were "
+            "under it, and the verdict did not say so -- which is the one "
+            "case a start-of-leg gate is blind to",
+        )
+        self.assertIn("MID-LEG", v["why"])
+
+    def test_a_quiet_leg_is_stamped_quiet(self):
+        v = quiet_verdict(self._load([0.4, 0.5, 0.9, 1.1, 0.6]), 3.0)
+        self.assertEqual(v["quiet"], "yes")
+        self.assertFalse(v["loud_mid"])
+
+    def test_a_leg_loud_at_its_ends_is_refused_but_not_called_mid(self):
+        """Non-vacuity for the flag above: `loud_mid` must distinguish, not
+        just fire whenever a leg is loud."""
+        v = quiet_verdict(self._load([9.0, 8.0, 0.5, 9.5]), 3.0)
+        self.assertEqual(v["quiet"], "no")
+        self.assertFalse(v["loud_mid"])
+
+    def test_a_series_too_thin_to_cover_the_middle_is_unknown(self):
+        v = quiet_verdict(self._load([0.1, 0.1]), 3.0)
+        self.assertEqual(
+            v["quiet"], "unknown",
+            "two samples describe the ends of the leg. Stamping them `yes` is "
+            "the fabrication this refuses: a bad row is worse than no row",
+        )
+
+    def test_no_samples_at_all_is_unknown_not_quiet(self):
+        self.assertEqual(quiet_verdict(None, 3.0)["quiet"], "unknown")
+
+
+class CpuTimeTests(unittest.TestCase):
+    """A quiet log is not a hang."""
+
+    def test_both_platforms_ps_formats_parse(self):
+        self.assertAlmostEqual(parse_cpu_time("0:12.34"), 12.34)     # macOS
+        self.assertAlmostEqual(parse_cpu_time("00:01:05"), 65.0)     # Linux
+        self.assertAlmostEqual(parse_cpu_time("2-01:00:00"), 176400.0)
+        self.assertIsNone(parse_cpu_time(""))
+        self.assertIsNone(parse_cpu_time("?"))
+
+    def test_a_silent_but_busy_process_is_not_called_wedged(self):
+        v = cpu_liveness("0:10.00", "0:19.50", 10.0)
+        self.assertTrue(v["busy"])
+        self.assertNotIn("wedged process", v["verdict"])
+
+    def test_a_silent_process_burning_no_cpu_is_called_wedged(self):
+        v = cpu_liveness("0:10.00", "0:10.00", 10.0)
+        self.assertFalse(v["busy"])
+        self.assertIn("wedged", v["verdict"])
+
+    def test_an_unreadable_reading_is_not_a_verdict(self):
+        v = cpu_liveness("", "0:10.00", 10.0)
+        self.assertFalse(v["readable"])
+        self.assertIsNone(
+            v["busy"],
+            "a missing instrument was reported as a finding; `busy=False` "
+            "here would read as `wedged` and kill a healthy leg",
+        )
+
+
+class OrderTests(unittest.TestCase):
+    """Counterbalancing is an equal mean position, not a four-letter word."""
+
+    def test_two_arms_two_runs_is_abba(self):
+        self.assertEqual(
+            leg_order(2, 2, True), [(0, 1), (1, 1), (1, 2), (0, 2)])
+
+    def test_counterbalanced_arms_share_a_mean_position(self):
+        for arms in (2, 3, 4):
+            for runs in (2, 4):
+                means = mean_positions(leg_order(arms, runs, True), arms)
+                self.assertEqual(
+                    len(set(round(m, 6) for m in means)), 1,
+                    "with %d arms over %d counterbalanced runs the arms' mean "
+                    "positions were %s; unequal means are an order confound, "
+                    "and a decaying box biases every pair the same way"
+                    % (arms, runs, means),
+                )
+
+    def test_uncounterbalanced_order_is_biased(self):
+        """Non-vacuity: the property above must be able to fail, and the order
+        this replaced is exactly what fails it."""
+        means = mean_positions(leg_order(2, 2, False), 2)
+        self.assertNotEqual(
+            round(means[0], 6), round(means[1], 6),
+            "base-first-in-every-pair produced equal mean positions, so the "
+            "counterbalance test above proves nothing",
+        )
+        self.assertLess(means[0], means[1])
+
+
+class PlatformTests(unittest.TestCase):
+    """A platform gap is a named degradation, never an exit."""
+
+    ALL = {"procfs", "xdotool", "xrandr", "ps", "sysctl", "osascript",
+           "system_profiler"}
+
+    def test_macos_is_planned_for_rather_than_refused(self):
+        p = platform_plan("Darwin", self.ALL)
+        self.assertEqual(p["platform"], "macos")
+        self.assertEqual(
+            p["degraded"], [],
+            "macOS with every tool present still reported missing "
+            "capabilities; the hard `exit 2` on the wrong platform is the bug "
+            "this replaced, and five lanes wrote private runners because of it",
+        )
+        self.assertEqual(p["caps"]["window"]["tool"], "osascript")
+
+    def test_every_missing_capability_carries_a_reason(self):
+        p = platform_plan("Linux", {"procfs", "ps"})
+        self.assertEqual(sorted(p["degraded"]), ["refresh", "window"])
+        for cap in p["degraded"]:
+            why = p["caps"][cap]["why"]
+            self.assertTrue(why and len(why) > 20,
+                            "capability %r degraded without a usable reason: "
+                            "%r" % (cap, why))
+            self.assertIn(p["caps"][cap]["tool"], why)
+
+    def test_an_unknown_platform_still_gets_a_plan(self):
+        p = platform_plan("FreeBSD", set())
+        self.assertEqual(p["platform"], "unknown")
+        self.assertEqual(sorted(p["degraded"]), sorted(NATIVE_CAPABILITIES))
+        self.assertIn("FreeBSD", p["caps"]["window"]["why"])
+
+    def test_wayland_cannot_pin_geometry_even_with_xdotool_installed(self):
+        """`command -v xdotool` succeeding is not the capability. A leg that
+        silently ran unpinned is what the byte cross-check caught by
+        factorisation and nothing else caught at all."""
+        p = platform_plan("Linux", self.ALL, session="wayland")
+        self.assertFalse(p["caps"]["window"]["ok"])
+        self.assertIn("wayland", p["caps"]["window"]["why"].lower())
+        # And an X session with the same tools keeps it.
+        self.assertTrue(
+            platform_plan("Linux", self.ALL, session="x11")["caps"]["window"]["ok"])
+
+
+class AppSurfaceTests(unittest.TestCase):
+    """The app's own resize line is the portable geometry readback."""
+
+    def test_the_last_resize_is_the_surface(self):
+        lines = [
+            "[..] INFO Window resized to 1280x720",
+            "[..] INFO something else",
+            "[..] INFO Window resized to 1920x1080",
+        ]
+        self.assertEqual(app_surface(lines), (1920, 1080))
+
+    def test_a_log_with_no_resize_line_has_no_surface(self):
+        self.assertIsNone(app_surface(["[..] INFO nothing here"]))
+
+    def test_the_app_line_is_what_the_byte_check_is_taken_against(self):
+        """The window manager says 1920x1080 and the app allocated 3440x1440.
+        Trusting the WM confirms a leg that ran at another size -- the exact
+        failure a title-matching `wmctrl -r` produced."""
+        real = picture_bytes_for(3440, 1440)
+        wm = surface_check((1920, 1080), (1920, 1080), 10, real * 10)
+        app = surface_check((1920, 1080), (3440, 1440), 10, real * 10)
+        self.assertFalse(wm["met"])
+        self.assertFalse(app["met"])
+        self.assertTrue(
+            app["bytes_met"],
+            "checked against the app's own surface the bytes agree exactly, "
+            "so the leg is refused for the reason it deserves -- it ran at "
+            "the wrong size -- rather than for an unexplained byte mismatch",
+        )
+
+
 class GateSetTests(unittest.TestCase):
     def test_the_default_gate_set_still_exists(self):
         root = os.path.abspath(os.path.join(RIG_DIR, "..", ".."))
@@ -1420,6 +2012,9 @@ def _fixture_row(clamp=False):
         "position": "A1",
         "load": {"start": 1.0, "end": 1.2, "max": 1.4, "samples": 9},
         "quiet": "yes", "quiet_max": 8.0,
+        "quiet_verdict": quiet_verdict(
+            {"start": 1.0, "end": 1.2, "max": 1.4, "samples": 9}, 8.0),
+        "platform": "linux", "degraded": [],
         "windows": {"interact": w, "idle": dict(w), "cadence": dict(w)},
         "window_basis": "2 whole loops, 2 skipped",
         "bracket": {"start_line": 10, "end_line": 90},
