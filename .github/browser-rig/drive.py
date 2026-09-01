@@ -1161,6 +1161,55 @@ def adb_reverse(port, serial=None):
     return " ".join(argv)
 
 
+def android_device_state(serial=None):
+    """Battery level and temperature, READ ONLY, at a moment in time.
+
+    A phone is a thermally throttled device with a battery, and neither of
+    those is constant across a three-minute leg. A row taken at 26.9 C and one
+    taken at 32.3 C are not obviously the same measurement, so both ends of
+    every leg are recorded and the DELTA travels with the figures -- which is
+    also the only way to tell a thermal explanation apart from a real one
+    (the Blink lane refuted its own thermal hypothesis by reproducing an early
+    reading at its highest temperature, and it could only do that because it
+    had both ends).
+
+    `dumpsys battery` and nothing else. This rig is a GUEST on a personal
+    phone: it reads, it never clears, force-stops, uninstalls or re-provisions
+    anything, and it does not tidy up after itself beyond the `adb reverse`
+    mappings it created. Never add a command here that writes.
+
+    Returns a dict, or {"error": ...} -- never raises. A missing reading is a
+    missing column, not a failed leg.
+    """
+    adb = shutil.which("adb")
+    if not adb:
+        return {"error": "no adb on PATH"}
+    argv = [adb] + (["-s", serial] if serial else []) + \
+           ["shell", "dumpsys", "battery"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except Exception as e:                        # noqa: BLE001 - never fatal
+        return {"error": "adb dumpsys battery failed: %s" % e}
+    if r.returncode != 0:
+        return {"error": "adb dumpsys battery rc=%d: %s"
+                         % (r.returncode, (r.stderr or r.stdout).strip()[:200])}
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        k, _, v = line.strip().partition(":")
+        k = k.strip()
+        v = v.strip()
+        if k == "level":
+            out["battery_percent"] = int(v) if v.lstrip("-").isdigit() else v
+        elif k == "temperature":
+            # deci-degrees Celsius, which is the unit `dumpsys battery` uses
+            # and the unit every reading here is quoted in after dividing.
+            out["battery_temp_c"] = (round(int(v) / 10.0, 1)
+                                     if v.lstrip("-").isdigit() else v)
+        elif k in ("status", "health", "plugged"):
+            out[k] = int(v) if v.lstrip("-").isdigit() else v
+    return out or {"error": "dumpsys battery returned nothing parseable"}
+
+
 # --------------------------------------------------------------------------
 # Page probes
 # --------------------------------------------------------------------------
@@ -3134,6 +3183,10 @@ def run_smoke(args):
                 port_ = 443 if args.url.startswith("https") else 80
             stage("adb-reverse", port=port_)
             result["adb_reverse"] = adb_reverse(port_, args.adb_serial)
+            # Both ends of the leg, so the delta is a column rather than a
+            # guess. Read-only; see android_device_state.
+            result["device_before"] = android_device_state(args.adb_serial)
+            stage("device-before", **result["device_before"])
         result["binary"] = info
         caps = session.caps
         result["session"] = {
@@ -3146,10 +3199,35 @@ def run_smoke(args):
 
         session.set_timeouts(script_ms=args.script_timeout * 1000,
                              page_ms=args.page_timeout * 1000)
-        try:
-            session.set_window_rect(*window)
-        except WebDriverError as e:
-            result["gotchas"].append("set_window_rect failed: %s" % e)
+        # A WINDOW IS A DESKTOP CONCEPT. On a phone the browser owns the whole
+        # display, there is nothing to resize, and asking anyway is the rig
+        # requesting something that cannot mean anything. geckodriver says so
+        # out loud -- "unsupported operation: Only supported in desktop
+        # applications", HTTP 500 -- while chromedriver accepts the call and
+        # silently ignores it, which is why the Blink Android legs never
+        # surfaced this and the first Gecko leg did.
+        #
+        # So the skip is on the ANDROID branch, not on the engine: the two
+        # drivers disagree only about how loudly they refuse, and the rig
+        # should not be asking either of them.
+        #
+        # THE CONSEQUENCE IS A DENOMINATOR, NOT A FAILURE. The campaign's
+        # matching-not-marking rule -- correct --canvas until the drawing
+        # buffer is exactly the pinned size -- cannot apply to a display this
+        # rig does not own. An Android row's viewport is REPORTED, never set,
+        # so such a row is `cross=no` against every desktop row by
+        # construction. Two Android rows are comparable to each other and to
+        # nothing else.
+        if args.android:
+            stage("window-not-set",
+                  why="android: the device owns the display; viewport is "
+                      "reported, never set")
+            result["viewport_source"] = "device (reported, not set)"
+        else:
+            try:
+                session.set_window_rect(*window)
+            except WebDriverError as e:
+                result["gotchas"].append("set_window_rect failed: %s" % e)
 
         stage("navigate", url=args.url)
         nav_t = time.monotonic()
@@ -3515,6 +3593,10 @@ def run_smoke(args):
               page_distinct=shots["page"].get("distinct_colors"),
               canvas_distinct=shots.get("canvas", {}).get("distinct_colors"))
 
+        if args.android:
+            result["device_after"] = android_device_state(args.adb_serial)
+            stage("device-after", **result["device_after"])
+
         stage("collect-errors")
         result["rig_signal"] = session.execute(RIG_ERRORS_PROBE)
         if args.browser == "chromium":
@@ -3780,6 +3862,29 @@ def run_smoke(args):
           % (tag, result.get("pass"), v.get("booted"),
              b.get("clientWidth"), b.get("clientHeight"),
              b.get("bufferWidth"), b.get("bufferHeight"), env.get("dpr")))
+    if result.get("viewport_source"):
+        # The Android row's denominators, printed where the caps are, because
+        # nothing on this row can be read beside a desktop row: the viewport
+        # was reported by a device this rig does not own, not corrected to a
+        # pinned size, so `cross=no` is a property of the leg and not a result.
+        bw, bh = b.get("bufferWidth"), b.get("bufferHeight")
+        px = (bw * bh) if isinstance(bw, int) and isinstance(bh, int) else None
+        print("[%s] SUMMARY viewport: %s -- %sx%s css at dpr %s = %s device "
+              "pixels; cross=no against any desktop or native row BY "
+              "CONSTRUCTION (two Android rows compare to each other only)"
+              % (tag, result["viewport_source"], b.get("clientWidth"),
+                 b.get("clientHeight"), env.get("dpr"), px))
+        before = result.get("device_before") or {}
+        after = result.get("device_after") or {}
+        t0_c, t1_c = before.get("battery_temp_c"), after.get("battery_temp_c")
+        drift = (round(t1_c - t0_c, 1)
+                 if isinstance(t0_c, (int, float))
+                 and isinstance(t1_c, (int, float)) else None)
+        print("[%s] SUMMARY device: battery %s%% -> %s%%, %s C -> %s C "
+              "(drift %s C). BOTH ENDS, because a phone throttles: a figure "
+              "quoted without them cannot be told apart from a thermal one"
+              % (tag, before.get("battery_percent"),
+                 after.get("battery_percent"), t0_c, t1_c, drift))
     wg = env.get("webgpu") or {}
     if wg.get("probe_error"):
         webgpu_s = "probe error: %s" % str(wg["probe_error"])[:80]

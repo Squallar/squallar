@@ -185,6 +185,25 @@
 #   RIG_HOST          host/IP to serve and drive when RIG_TLS=1 (default:
 #                     this box's LAN IP as serve.py detects it)
 #   RIG_DRIVE_EXTRA   extra args appended to every drive.py call
+#   RIG_ANDROID       1 = drive the phone's own browser over adb instead of a
+#                     browser on this box. BOTH engines: RIG_BROWSERS=firefox
+#                     goes through geckodriver + moz:firefoxOptions, chromium
+#                     through chromedriver + goog:chromeOptions. Default 0.
+#
+#                     RIG_DRIVE_EXTRA="--android" ALONE IS NOT ENOUGH and this
+#                     knob exists because of it: the display check below is a
+#                     hard FATAL for any X11 browser, and an Android leg needs
+#                     no X display at all -- so a phone leg on a headless box
+#                     would die before drive.py was ever exec'd, and on a box
+#                     with a display it would pass the check for the wrong
+#                     reason. This is also where the row's Android
+#                     denominators get printed.
+#   RIG_ANDROID_PACKAGE  override the package (default: resolved per engine by
+#                     drive.py -- com.android.chrome / org.mozilla.firefox).
+#                     org.mozilla.firefox_beta and org.mozilla.fenix are
+#                     SEPARATE INSTALLS with separate data, which is the way
+#                     to keep automation off somebody's daily browser.
+#   RIG_ADB_SERIAL    adb serial when more than one device is attached
 #
 # --expect-interaction-frames rides on every leg: it is a COUNT assert (the
 # scraped interact family strictly grew) and is this script's row-validity
@@ -207,6 +226,9 @@ FRAMES="${RIG_FRAMES:-240}"
 PANEL="${RIG_PANEL:-off}"
 CANVAS="${RIG_CANVAS:-}"
 TLS="${RIG_TLS:-0}"
+ANDROID="${RIG_ANDROID:-0}"
+ANDROID_PACKAGE="${RIG_ANDROID_PACKAGE:-}"
+ADB_SERIAL="${RIG_ADB_SERIAL:-}"
 # Scripted loops treated as settle for the SECOND, narrower window every
 # gestured leg now also reports. `GesturePlayer::LOOP_SECONDS` is 20 s.
 SKIP_LOOPS="${RIG_SKIP_LOOPS:-2}"
@@ -316,6 +338,14 @@ for _br in $BROWSERS; do
     chromium) NEEDS_X11=1 ;;
   esac
 done
+# An Android leg renders on the phone's own compositor. There is no X display
+# in the story at all, so the FATAL below would be refusing a leg it cannot
+# describe -- and on a box that happens to have a display it would pass for a
+# reason that has nothing to do with the leg. geckodriver is still needed: it
+# runs on THIS box and drives the phone over adb.
+if [ "$ANDROID" = 1 ]; then
+  NEEDS_X11=0
+fi
 
 # ------------------------------------------------------- display check ----
 if [ "$NEEDS_X11" = 1 ]; then
@@ -490,6 +520,26 @@ EXTRA=()
 if [ -n "$CANVAS" ]; then
   EXTRA+=(--canvas "$CANVAS")
 fi
+if [ "$ANDROID" = 1 ]; then
+  EXTRA+=(--android)
+  [ -n "$ANDROID_PACKAGE" ] && EXTRA+=(--android-package "$ANDROID_PACKAGE")
+  [ -n "$ADB_SERIAL" ]      && EXTRA+=(--adb-serial "$ADB_SERIAL")
+  # THE ROW'S DENOMINATOR, printed once beside the commit line rather than
+  # inferred later. On a device this rig does not own the viewport is
+  # REPORTED, never set: --canvas asks for a correction the phone will not
+  # perform, so matching-not-marking cannot apply and every Android row is
+  # cross=no against every desktop and native row. Two Android rows compare to
+  # each other. Nothing else.
+  if [ -n "$CANVAS" ]; then
+    echo "NOTE: RIG_CANVAS=$CANVAS is IGNORED on an Android leg -- the device"
+    echo "      owns the display. The achieved viewport is on each row."
+  fi
+  ANDROID_DEVICE="$( (adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell getprop ro.product.model 2>/dev/null; \
+                      adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell getprop ro.build.version.release 2>/dev/null) \
+                    | tr '\n' ' ' )"
+  echo "android=1 device=[${ANDROID_DEVICE:-UNREADABLE}] package=${ANDROID_PACKAGE:-per-engine default} serial=${ADB_SERIAL:-the one attached}"
+  echo "android rows are cross=no BY CONSTRUCTION: viewport reported, not set"
+fi
 if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
   # shellcheck disable=SC2206
   EXTRA+=($RIG_DRIVE_EXTRA)
@@ -503,7 +553,12 @@ LAST_RUN_ID=""
 LAST_RC=0
 run_leg() {
   local browser="$1" scene="$2"
+  # The tag carries the TARGET, not just the engine. An Android row and a
+  # desktop row for the same scene and browser are different measurements of
+  # different machines, and sharing a filename is how one silently overwrites
+  # the other and gets quoted as it.
   local tag="$scene.$browser" driver seed
+  [ "$ANDROID" = 1 ] && tag="$scene.$browser.android"
   LAST_RUN_ID="$(new_run_id)"
   LAST_RC=0
   # Everything this tag can write goes first, so a missing file means this leg
