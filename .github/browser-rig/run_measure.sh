@@ -556,6 +556,21 @@ if [ "$ANDROID" = 1 ]; then
                     | tr '\n' ' ' )"
   echo "android=1 device=[${ANDROID_DEVICE:-UNREADABLE}] package=${ANDROID_PACKAGE:-per-engine default} serial=${ADB_SERIAL:-the one attached}"
   echo "android rows are cross=no BY CONSTRUCTION: viewport reported, not set"
+  # FOLD STATE, on a foldable, is a row separator and not a footnote: folded
+  # and unfolded are different resolutions, aspects and DPRs, so they are
+  # different denominators and their figures must never be merged. Printed
+  # here because the viewport alone makes them merely LOOK different, and a
+  # reader who does not know the device is a foldable will read two
+  # populations as one noisy one. READ ONLY -- `cmd device_state` can also
+  # FORCE a state, and forcing one on somebody's daily phone is a system
+  # change this rig does not make.
+  ANDROID_FOLD="$( adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell cmd device_state state 2>/dev/null \
+                   | grep -oE "name='[A-Z_]+'" | head -1 | cut -d"'" -f2 )"
+  echo "android fold_state=${ANDROID_FOLD:-UNREADABLE(not a foldable, or cmd device_state unavailable)}"
+  if [ -z "$ANDROID_FOLD" ]; then
+    echo "      -- if this IS a foldable, the rows cannot say which half they"
+    echo "         measured and must not be pooled with the other half."
+  fi
 fi
 if [ -n "${RIG_DRIVE_EXTRA:-}" ]; then
   # shellcheck disable=SC2206
@@ -783,6 +798,54 @@ for leg in legs:
     if ct and not ct.get("met"):
         print("ROW   canvas target %s asked, %s got: this row is NOT "
               "cross-comparable" % (ct.get("asked"), ct.get("got")))
+    # ---- the Android denominators, on the row rather than in the JSON ----
+    #
+    # These were written into the artefact and never PRINTED, which is the
+    # same failure the campaign keeps hitting: a denominator nobody reads is a
+    # denominator nobody applies. `profile_state` is the one that matters
+    # most -- every Blink Android figure this campaign holds was taken on a
+    # browser chromedriver had just `pm clear`ed, and not one of those rows
+    # says so. A cleared row and a preserved row are DIFFERENT MEASUREMENTS:
+    # cleared is the more reproducible of the two (no state accumulates across
+    # passes) and also the PESSIMISTIC one (a cold HTTP cache and a cold
+    # service worker on every pass is not what a returning user pays), so it
+    # reads worse than real second-visit use and must never be quoted beside a
+    # preserved row as though they were one population.
+    binf = r.get("binary") or {}
+    if binf.get("android_package"):
+        db = r.get("device_before") or {}
+        da = r.get("device_after") or {}
+        def _t(d):
+            if d.get("error"):
+                return "?"
+            return "%s%%/%sC" % (d.get("battery_percent", "?"),
+                                 d.get("battery_temp_c", "?"))
+        print("ROW   android package=%s profile_state=%s driver=%s "
+              "attached_to_running=%s battery/temp before=%s after=%s"
+              % (binf.get("android_package"),
+                 binf.get("profile_state", "UNRECORDED"),
+                 binf.get("driver_version", "?"),
+                 binf.get("android_use_running_app"),
+                 _t(db), _t(da)))
+        # The DIRECTION the denominator biases, printed rather than left for
+        # the reader to work out. A caveat nobody can act on from the row is
+        # the same as no caveat: these rows are pessimistic against real
+        # second-visit use, which is the safe direction for a bar we are
+        # trying to clear -- and saying so is what stops a later reader
+        # quoting them as "what a user sees".
+        ps = str(binf.get("profile_state") or "")
+        if ps.startswith("cleared"):
+            print("ROW   android profile_state=cleared BIASES PESSIMISTIC: "
+                  "cold HTTP cache and cold service worker on EVERY pass, "
+                  "which is not what a returning user pays. Uniform across "
+                  "passes (no state accumulates, so variance is not "
+                  "cache-warming), but never comparable to a preserved-"
+                  "profile row")
+        elif ps.startswith("preserved"):
+            print("ROW   android profile_state=preserved: state CARRIES "
+                  "ACROSS passes, so an early pass and a late one are not "
+                  "the same measurement and pass-to-pass variance includes "
+                  "cache warming. Never comparable to a cleared-profile row")
     # E3 is a volume pane too, so it carries the terrain-campaign columns for
     # the same reason scene B does: without them a post-wiring row silently
     # becomes incomparable to every row before it.

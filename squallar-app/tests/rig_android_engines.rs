@@ -193,6 +193,49 @@ fn the_rig_refuses_to_drive_a_daily_browser_by_default() {
     );
 }
 
+/// **The Blink Android path drives exactly one package, by name.**
+///
+/// The daily-driver list above is a DENY-list, and a deny-list on this path was
+/// always wider than anybody's permission: until 2026-08-31 `com.chrome.dev`,
+/// `com.chrome.canary` and every mistyped package name were accepted, on a path
+/// whose driver runs `pm clear` before every session.
+///
+/// The user installed Chrome Beta on 2026-08-31 specifically so this path would
+/// have something safe to drive, and authorised the rig to wipe **that package
+/// and no other**. So the allowance is spelled as a one-entry allow-list, and
+/// it is pinned here rather than only in `drive.py --selftest` because the
+/// failure mode is somebody widening it to make a run go green — which is
+/// exactly the edit that reads as harmless in review.
+#[test]
+fn the_blink_android_path_is_allowed_one_package_by_name() {
+    assert!(
+        DRIVE_PY.contains("ANDROID_CHROMIUM_ALLOWED_PACKAGES = (\"com.chrome.beta\",)"),
+        "the chromium Android allow-list is no longer exactly com.chrome.beta. \
+         Every name on that tuple is permission to delete that app's data on \
+         every session, granted for one package on one day; widening it is how \
+         a deny-list's hole gets reopened, and the phone it runs against is \
+         somebody's daily device",
+    );
+    assert!(
+        DRIVE_PY
+            .contains("if clear_app_data and effective not in ANDROID_CHROMIUM_ALLOWED_PACKAGES:"),
+        "--android-clear-app-data is no longer fenced to the authorised \
+         package by name. Combined with --android-allow-daily-driver that is \
+         the one way to aim a DELIBERATE wipe at release Chrome: the escape \
+         hatch unlocks driving a package, and it must never unlock deleting \
+         one nobody authorised",
+    );
+    assert!(
+        !DRIVE_PY.contains("if True else \"cleared\""),
+        "profile_state is back to a conditional that cannot take its other \
+         branch, so a cleared-profile row describes itself as a preserved one. \
+         That field exists because every Blink Android figure before \
+         2026-08-31 was taken on a freshly cleared browser and none of them \
+         said so -- a field that can only print the reassuring value is worse \
+         than no field",
+    );
+}
+
 /// **The wizard is dismissed by identity, and a dismissal that does nothing
 /// fails.**
 ///
@@ -263,19 +306,39 @@ fn the_onboarding_dismissal_cannot_silently_do_nothing() {
 /// user's browser looks like, and it may be the whole reason those rows read
 /// as outliers.
 ///
-/// **This does not make driving Chrome safe yet**, and the daily-driver guard
-/// stays. Proving the data survives needs a Chrome package that is not
-/// somebody's daily browser, and this device has only `com.android.chrome` —
-/// no Beta, no Dev channel.
+/// **The daily-driver guard stays regardless.** When this landed the device
+/// had only `com.android.chrome`, so there was no package the claim could be
+/// demonstrated on. That changed on 2026-08-31: the user installed Chrome Beta
+/// (`com.chrome.beta`) and authorised the rig to wipe it, which is why the
+/// allow-list below exists.
+///
+/// **What is still not demonstrated is that the data survives.** No session has
+/// ever been created through this path — the device's Chrome Beta is 153 and
+/// the distro chromedriver is 151, and above that, chromedriver refuses to
+/// drive any Chrome package while a *different* one owns the abstract socket
+/// `chrome_devtools_remote`, which the user's running daily Chrome does. So
+/// these assertions pin the capability SHAPE and nothing about its effect on a
+/// real profile.
 #[test]
 fn the_blink_android_path_keeps_the_browsers_data() {
     assert!(
-        DRIVE_PY.contains("\"androidKeepAppDataDir\": True"),
+        DRIVE_PY.contains("opts[\"androidKeepAppDataDir\"] = True"),
         "the chromium Android capabilities no longer carry \
          androidKeepAppDataDir, so chromedriver runs `pm clear` on the \
          browser it drives before every session. That silently makes every \
          Blink Android row a cold-profile row, and it is what cost this \
          project's user their Chrome",
+    );
+    // The capability is now conditional, so what has to be pinned is which way
+    // it defaults. An opt-out that quietly became an opt-IN would wipe the
+    // browser on every leg that never thought about the flag -- and "nobody
+    // chose" is the state both of this project's Android browser incidents
+    // happened in.
+    assert!(
+        DRIVE_PY.contains("keep_app_data=True"),
+        "androidKeepAppDataDir stopped being the DEFAULT and is now something \
+         a leg has to ask for. The safe posture must be the one you get by \
+         not thinking about it; the wipe is what takes a conscious flag",
     );
     assert!(
         DRIVE_PY.contains("androidUseRunningApp"),

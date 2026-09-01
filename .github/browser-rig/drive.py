@@ -944,6 +944,25 @@ ANDROID_DAILY_DRIVER_PACKAGES = {
         "package instead",
 }
 
+# THE BLINK ANDROID PATH IS ALLOWED EXACTLY ONE PACKAGE, BY NAME.
+#
+# The refusal above says "drive a Beta/Dev channel package instead", and until
+# 2026-08-31 that advice pointed at nothing: the device had only release
+# Chrome, so the guard's own recommendation was unreachable and the chromium
+# Android path had no package it was allowed to drive at all.
+#
+# The user then installed Chrome Beta (com.chrome.beta, 153.0.8010.18,
+# 2026-08-31 21:39) specifically to unblock this, and explicitly authorised
+# the rig to let chromedriver wipe THAT package and no other. So the allowance
+# is spelled as a one-entry allow-list rather than as "anything not on the
+# refusal list": before this, com.chrome.dev, com.chrome.canary and every
+# typo'd package name were all silently accepted, which is a much wider
+# permission than anybody granted.
+#
+# Adding a name here is granting permission to delete that app's data on every
+# session. It is not a place to add a package because a run failed.
+ANDROID_CHROMIUM_ALLOWED_PACKAGES = ("com.chrome.beta",)
+
 # The package each engine means by "the browser on the phone". Resolved from
 # the browser rather than defaulted on the flag, because one default cannot be
 # right for two engines -- and a Chrome package silently handed to geckodriver
@@ -1027,7 +1046,7 @@ FIREFOX_ANDROID_PREFS = {
 
 
 def validate_android_args(browser, package, activity, adb_present=True,
-                          allow_daily_driver=False):
+                          allow_daily_driver=False, clear_app_data=False):
     """Is this `--android` invocation drivable? Returns the reason it is not,
     or None.
 
@@ -1072,10 +1091,37 @@ def validate_android_args(browser, package, activity, adb_present=True,
                 "--android-allow-daily-driver and accept that the browser's "
                 "tabs, logins, bookmarks and history are gone."
                 % (effective, reason))
+    # Last of all, and chromium-only: the allow-list. This runs AFTER the
+    # daily-driver refusal so com.android.chrome keeps its own, louder message
+    # naming what it costs, rather than being reported as merely "not on a
+    # list". Everything else that is not the one authorised package lands here.
+    if (browser == "chromium" and not allow_daily_driver
+            and effective not in ANDROID_CHROMIUM_ALLOWED_PACKAGES):
+        return ("REFUSING to drive %s: the Blink Android path is allowed "
+                "exactly one package -- %s -- and that is the only package "
+                "anybody authorised chromedriver to wipe. chromedriver's "
+                "Android mode deletes the app's data before every session, so "
+                "an unrecognised Chrome package here is somebody's browser "
+                "until proven otherwise. If this really is a throwaway "
+                "device, pass --android-allow-daily-driver."
+                % (effective, ", ".join(ANDROID_CHROMIUM_ALLOWED_PACKAGES)))
+    # --android-clear-app-data asks for the wipe ON PURPOSE, so it is fenced
+    # to the authorised package by NAME and not merely by the allow-list
+    # above: --android-allow-daily-driver opens that list to anything, and the
+    # combination of the two flags is the one way to aim a deliberate wipe at
+    # somebody's daily browser. The escape hatch may unlock driving a package;
+    # it does not unlock deleting one that was never authorised.
+    if clear_app_data and effective not in ANDROID_CHROMIUM_ALLOWED_PACKAGES:
+        return ("REFUSING --android-clear-app-data for %s: that flag deletes "
+                "the app's data before every session and it is authorised "
+                "for %s alone. --android-allow-daily-driver unlocks DRIVING "
+                "a package, not wiping one nobody named."
+                % (effective, ", ".join(ANDROID_CHROMIUM_ALLOWED_PACKAGES)))
     return None
 
 
-def chromium_android_capabilities(package, use_running_app=False):
+def chromium_android_capabilities(package, use_running_app=False,
+                                  keep_app_data=True):
     """chromedriver + the phone's own Chrome, WITHOUT wiping it.
 
     `androidKeepAppDataDir` is the capability that stops the clear. Its
@@ -1097,8 +1143,20 @@ def chromium_android_capabilities(package, use_running_app=False):
     a Chrome package, and the only one on this device is the user's daily
     browser -- there is no Beta or Dev channel installed. The daily-driver
     guard therefore STAYS exactly as it was: this makes a safe Chrome row
-    possible in principle, and nothing here is evidence that it is safe yet."""
-    opts = {"androidPackage": package, "androidKeepAppDataDir": True}
+    possible in principle, and nothing here is evidence that it is safe yet.
+
+    `keep_app_data=False` sends NOTHING and lets chromedriver do its default
+    thing, which is to `pm clear` the package on every session. That is a
+    deliberate, authorised option for com.chrome.beta and it buys a
+    denominator: every pass then starts from the same cleared state, so
+    pass-to-pass variance is not contaminated by a cache that warmed up
+    somewhere in the middle of the run. It is also the PESSIMISTIC posture --
+    a cold HTTP cache and a cold service worker on every pass is not what a
+    returning user pays -- and `profile_state` on the row is what keeps those
+    two kinds of figure from ever being quoted as one."""
+    opts = {"androidPackage": package}
+    if keep_app_data:
+        opts["androidKeepAppDataDir"] = True
     if use_running_app:
         opts["androidUseRunningApp"] = True
     return {"capabilities": {"alwaysMatch": {
@@ -1164,7 +1222,8 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
            ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
            display=None, chromium_args=(), android=False,
            android_package=None, android_activity=None,
-           android_serial=None, android_use_running_app=False):
+           android_serial=None, android_use_running_app=False,
+           android_keep_app_data=True):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
@@ -1252,7 +1311,8 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         # the wire shape are what is exercised.
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         caps = chromium_android_capabilities(
-            android_package, use_running_app=android_use_running_app)
+            android_package, use_running_app=android_use_running_app,
+            keep_app_data=android_keep_app_data)
         if android_use_running_app:
             # androidUseRunningApp attaches to a running app and does NOT
             # start one. Left to the caller this is a trap: chromedriver fails
@@ -1265,13 +1325,22 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         info = {"android_package": android_package,
                 "driver_version": _version_of(driver_path),
                 "gpu_mode": "android-device",
-                "android_keep_app_data_dir": True,
+                "android_keep_app_data_dir": bool(android_keep_app_data),
                 "android_use_running_app": bool(android_use_running_app),
                 # THE DENOMINATOR THAT WAS MISSING. Every Blink Android row
                 # taken before 2026-08-31 was taken on a browser chromedriver
-                # had just `pm clear`ed.
+                # had just `pm clear`ed, and none of them said so.
+                #
+                # This landed as a conditional whose test was the constant
+                # true, so it could not take its other branch: the field could
+                # only ever print "preserved", and a cleared-profile row would
+                # have described itself as a warm one. Both branches are now
+                # reachable and the flag that selects them is on the row
+                # beside this.
                 "profile_state": ("preserved (androidKeepAppDataDir)"
-                                  if True else "cleared")}
+                                  if android_keep_app_data
+                                  else "cleared (chromedriver pm clear, "
+                                       "every pass)")}
     elif browser == "chromium":
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         pick = pick_chromium_binary(driver_path, preferred=binary)
@@ -4252,18 +4321,27 @@ def selftest_android():
     # second and not the first.
     # Asked with an explicitly safe package, so what is under test is the
     # ENGINE and not the daily-driver guard below.
-    SAFE = "org.example.testbrowser"
+    # One placeholder used to serve both engines here. That stopped being
+    # possible when the chromium arm gained a by-name allow-list: a Gecko-
+    # shaped package is now correctly refused for Blink, and reusing it would
+    # have made this ENGINE check fail for a PACKAGE reason -- which is the
+    # confusion the "explicitly safe package" note above exists to avoid. So
+    # each engine is asked with a package its own guard permits.
+    SAFE_FOR = {"chromium": ANDROID_CHROMIUM_ALLOWED_PACKAGES[0],
+                "firefox": "org.example.testbrowser",
+                "safari": "org.example.testbrowser"}
+    SAFE = SAFE_FOR["firefox"]
     check(validate_android_args("firefox", SAFE, None) is None,
           "validate_android_args refuses --browser firefox with --android. "
           "That is the Blink-only Android column this work exists to end: "
           "Firefox governs the web target and runs ~2x Chromium's service "
           "time on the desktop, so an Android figure taken only on Blink "
           "reports the engine that tends to win and calls it web")
-    check(validate_android_args("chromium", SAFE, None) is None,
+    check(validate_android_args("chromium", SAFE_FOR["chromium"], None) is None,
           "validate_android_args refuses --browser chromium with --android, "
           "which is the path every Android figure already taken came through")
     accepted = [b for b in ("chromium", "firefox", "safari")
-                if validate_android_args(b, SAFE, None) is None]
+                if validate_android_args(b, SAFE_FOR[b], None) is None]
     check(accepted == ["chromium", "firefox"],
           "the set of engines --android drives is %r, not both and only both. "
           "A THIRD engine appearing here without a launch() branch would fail "
@@ -4783,8 +4861,16 @@ def selftest_android():
     # binary. Without it, every Blink Android row is taken on a cold profile,
     # cold HTTP cache and cold service worker, which is an unstated
     # denominator and not what any user's browser looks like.
-    cao = (chromium_android_capabilities("com.example.beta")
+    # Spelled against the REAL authorised package rather than a stand-in:
+    # com.chrome.beta is the one package this path may drive, so it is the one
+    # the capability shape has to be right for.
+    cao = (chromium_android_capabilities(ANDROID_CHROMIUM_ALLOWED_PACKAGES[0])
            ["capabilities"]["alwaysMatch"]["goog:chromeOptions"])
+    check(cao["androidPackage"] == "com.chrome.beta",
+          "the chromium Android capability builder no longer puts the "
+          "requested package in androidPackage, so the rig would drive "
+          "whatever chromedriver defaults to rather than what it was asked "
+          "for -- and what it was asked for is the only package authorised")
     check(cao.get("androidKeepAppDataDir") is True,
           "the chromium Android capabilities no longer carry "
           "androidKeepAppDataDir, so chromedriver wipes the browser it drives "
@@ -4794,7 +4880,7 @@ def selftest_android():
           "androidUseRunningApp is on by DEFAULT. It attaches to a running "
           "app and never starts one, so a default-on capability turns every "
           "leg on a closed browser into an unexplained session failure")
-    cao2 = (chromium_android_capabilities("com.example.beta",
+    cao2 = (chromium_android_capabilities("com.chrome.beta",
                                           use_running_app=True)
             ["capabilities"]["alwaysMatch"]["goog:chromeOptions"])
     check(cao2.get("androidUseRunningApp") is True
@@ -4803,6 +4889,64 @@ def selftest_android():
           "turns off the keep-data capability while doing it")
     # (that the rig LAUNCHES the package before attaching is a cross-file
     # property and is pinned from the Rust side, in rig_android_engines.rs)
+    #
+    # ---- and the OTHER branch actually exists ---------------------------
+    #
+    # `profile_state` shipped as a conditional whose test was the constant
+    # true, so it could not take its other branch: a cleared-profile row would
+    # have described itself as a preserved one. The opt-out is what makes the
+    # field able to be wrong, which is what makes it worth printing.
+    cao3 = (chromium_android_capabilities("com.chrome.beta",
+                                          keep_app_data=False)
+            ["capabilities"]["alwaysMatch"]["goog:chromeOptions"])
+    check("androidKeepAppDataDir" not in cao3,
+          "--android-clear-app-data still sends androidKeepAppDataDir, so the "
+          "run that is supposed to start from a cleared profile starts from a "
+          "preserved one and the row's profile_state is a lie in the safe-"
+          "sounding direction")
+
+    # ---- the Blink Android path drives ONE package ----------------------
+    #
+    # Before 2026-08-31 the chromium arm refused only the names on the
+    # daily-driver list, which meant com.chrome.dev, com.chrome.canary and
+    # every typo were all accepted -- a far wider permission than anybody
+    # granted, on a path whose driver deletes the app's data every session.
+    check(validate_android_args("chromium", "com.chrome.beta", None) is None,
+          "com.chrome.beta is refused for chromium. It is the ONE package the "
+          "user installed for measurement and authorised the rig to wipe; "
+          "refusing it leaves the Blink Android path with nothing it may "
+          "drive at all, which is the state that blocked it before")
+    for stranger in ("com.chrome.dev", "com.chrome.canary",
+                     "com.example.whatever"):
+        err = validate_android_args("chromium", stranger, None)
+        check(err is not None and "REFUS" in err,
+              "--android-package %s is accepted for chromium. The "
+              "authorisation to let chromedriver wipe a browser covers "
+              "com.chrome.beta and nothing else, and an unrecognised Chrome "
+              "package is somebody's browser until proven otherwise"
+              % (stranger,))
+    # The release-Chrome refusal is NOT the allow-list's doing and must keep
+    # its own message: "not on a list" does not tell somebody what it cost.
+    err = validate_android_args("chromium", "com.android.chrome", None)
+    check(err is not None and "daily browser" in err,
+          "com.android.chrome no longer gets its own daily-driver refusal -- "
+          "it is falling through to the generic allow-list message, which "
+          "does not say that driving it deletes somebody's tabs, logins and "
+          "history, or that it already happened once")
+    # The deliberate wipe is fenced by NAME, so the two flags cannot combine
+    # into a wipe of a package nobody authorised.
+    err = validate_android_args("chromium", "com.android.chrome", None,
+                                allow_daily_driver=True, clear_app_data=True)
+    check(err is not None and "REFUSING --android-clear-app-data" in err,
+          "--android-allow-daily-driver + --android-clear-app-data aims a "
+          "DELIBERATE wipe at release Chrome. The escape hatch unlocks "
+          "driving a package; it must not unlock deleting one that was never "
+          "authorised")
+    check(validate_android_args("chromium", "com.chrome.beta", None,
+                                clear_app_data=True) is None,
+          "--android-clear-app-data is refused for com.chrome.beta, which is "
+          "the one package it is authorised for -- so the measurement posture "
+          "the campaign asked for cannot be run at all")
 
     got = json.dumps(chromium_android_capabilities("com.android.chrome"))
     check(got == PINNED_CHROMIUM_ANDROID_CAPS,
@@ -4939,7 +5083,9 @@ def run_smoke(args):
             display=args.display, chromium_args=args.chromium_arg,
             android=args.android, android_package=args.android_package,
             android_activity=args.android_activity,
-            android_serial=args.adb_serial)
+            android_serial=args.adb_serial,
+            android_use_running_app=args.android_use_running_app,
+            android_keep_app_data=not args.android_clear_app_data)
         if args.android:
             # Before navigate, or 127.0.0.1 on the phone is the phone.
             port_ = urllib.parse.urlsplit(args.url).port
@@ -6348,6 +6494,17 @@ def main(argv=None):
                          "instead of restart-and-clear. The rig launches "
                          "the package first, because the capability "
                          "attaches and never starts")
+    ap.add_argument("--android-clear-app-data", action="store_true",
+                    help="chromium only: DROP androidKeepAppDataDir and let "
+                         "chromedriver `pm clear` the package before every "
+                         "session. Authorised for com.chrome.beta only. It "
+                         "buys a uniform denominator -- every pass starts "
+                         "from the same cleared state, so variance is not "
+                         "contaminated by a cache warming mid-run -- at the "
+                         "cost of being PESSIMISTIC: a cold HTTP cache and "
+                         "cold service worker on every pass is not what a "
+                         "returning user pays. The row says which via "
+                         "profile_state")
     ap.add_argument("--android-activity", default=None,
                     help="moz:firefoxOptions.androidActivity for a Firefox "
                          "build geckodriver has no default for; must not "
@@ -6432,7 +6589,8 @@ def main(argv=None):
         err = validate_android_args(
             args.browser, args.android_package, args.android_activity,
             adb_present=bool(shutil.which("adb")),
-            allow_daily_driver=args.android_allow_daily_driver)
+            allow_daily_driver=args.android_allow_daily_driver,
+            clear_app_data=args.android_clear_app_data)
         if err:
             ap.error(err)
         args.android_package = (args.android_package
