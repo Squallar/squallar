@@ -1906,6 +1906,91 @@ each so that a context answering nothing cannot pass.
 **Test count: `cargo test -p walkers --features mvt --lib` reports 102**, from
 100.
 
+### Changed — source, twenty-fourth commit: the tessellator's scratch outlives the polygon
+
+`src/mvt.rs` and one line of `src/lib.rs`. A `PolygonTessellator` holds what
+tessellation needs and no caller keeps; `styled` builds one per tile instead of
+`tessellate_polygon` building one per polygon.
+
+Three containers were taken fresh for every filled polygon in a tile, and not
+one of them is output:
+
+- lyon's **event queue**, inside `FillTessellator`. `tessellate_path` rebuilds it
+  from the path every call and hands the storage back —
+  `EventQueue::into_builder` opens with `reset`, which is a `clear`
+  (`lyon_tessellation-1.0.21/src/event_queue.rs:116`). Keeping the tessellator
+  is the whole reason lyon makes it a struct rather than a function.
+- the path's **point and verb vectors**, inside `Path::builder()`.
+- the **vertex and index buffers** the tessellator writes into, which are copied
+  into the returned `Mesh` and then dead.
+
+Each grew from empty, per polygon.
+
+The path's size is not a mystery the way the tessellator's output is: it is
+`sum(ring lengths)` points and `sum(ring lengths) + rings` verbs, because
+`add_polygon` writes one verb per point plus a close. So the path is built at
+exactly that, through `NoAttributes::wrap(BuilderImpl::with_capacity(..))`. Two
+allocations for the whole path, no regrowth, and `Build::build`'s two
+`into_boxed_slice` calls have nothing left to move. Upstream's own
+`add_polygon` reserves `points.len()` verbs — one short of what it then writes —
+so **every ring reallocated its verb vector at the close**, and a polygon with
+holes reallocated both vectors again per hole.
+
+`VertexBuffers::new()` is still `with_capacity(512, 1024)`, but that is now paid
+once per tile rather than once per polygon, and the mesh is copied out at the
+content's exact length. That is the same copy the `shrink_to_fit` pair made in
+the nineteenth commit and preserves the property that commit bought: **a cached
+tile's meshes carry no slack.** `a_shared_tessellator_produces_the_same_meshes_as_a_fresh_one_each_time`
+asserts `capacity() == len()` on every mesh it checks, so the 32.35 MB finding
+cannot come back unnoticed.
+
+#### Scoped to the tile, deliberately
+
+The scratch is a local of `styled` and dies with the call. It is not a
+thread-local, not a pool and not an `Arc`, so what it retains is bounded by the
+largest polygon in *that* tile rather than by the largest polygon the process
+has ever decoded. Reuse is the fix; retaining a one-off maximum for a session is
+a different bug, and this does not trade one for the other.
+
+#### Measured
+
+`squallar-egui/tests/mvt_tessellation_scratch.rs`, its own binary with a
+counting `#[global_allocator]`. One `styled` call over
+`squallar-buildings/testdata/monaco-building-z14-8529-5974.mvt` — z14/8529/5974
+of the committed Monaco fixture — under the committed dark style at zoom 14,
+which draws that tile's `building` source-layer through two `fill` layers.
+An `alloc`, an `alloc_zeroed` or a *growing* `realloc` each count one; a
+shrinking `realloc` counts nothing.
+
+| | per polygon | per tile |
+| --- | ---: | ---: |
+| allocator calls, one `styled` | 52,421 | 15,099 |
+| tessellated vertices | 15,102 | 15,102 |
+
+−71.2% on the calls with the vertex count unmoved, which is the cheap form of
+the output identity. The exact form is two tests: upstream's golden,
+`rendering_the_fixture_reproduces_the_recorded_shapes_exactly`, passes
+**unedited**, and the new
+`a_shared_tessellator_produces_the_same_meshes_as_a_fresh_one_each_time` walks
+five polygons of alternating size — the largest deliberately not last — through
+one shared tessellator and one fresh tessellator each, and requires the vertices
+and indices to be equal.
+
+#### What this is worth, and against which denominator
+
+From a 60 s `perf` capture of scene A on native, 27,027 samples, 0 lost:
+`realloc` is **3.204%** of all cycles inclusive, and the deepest owned frame
+under it is `walkers::mvt::styled` for **0.617%** of all cycles (`finish_grow`
+inclusive: 3.572% and 0.631%). That is the ceiling on this path, not the
+measured saving — the allocator-call figure above and the cycle share have
+different denominators and are not multiplied. The largest single term in that
+3.204% is `epaint`'s per-frame tessellator at 1.798%, reached through
+`squallar_gpu::EguiRenderer::end_pass_and_upload`; `egui` is a pinned registry
+dependency and nothing in this directory reaches it.
+
+**Test count: `cargo test -p walkers --features mvt --lib` reports 103**, from
+102.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

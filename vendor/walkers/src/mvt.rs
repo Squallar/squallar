@@ -20,8 +20,10 @@ use egui::{
 pub use geo_types::{Coord, Geometry, Line};
 use log::{trace, warn};
 use lyon_path::{
-    Path, Polygon,
+    Polygon,
+    builder::NoAttributes,
     geom::{Point, point},
+    path::BuilderImpl,
 };
 use lyon_tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, FillVertex, TessellationError, VertexBuffers,
@@ -384,6 +386,9 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
 /// fused path logged and skipped it.
 pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
     let mut shapes = Vec::new();
+    // **One tessellator for the whole tile**, not one per polygon. See
+    // [`PolygonTessellator`] for what it holds and why the scope is the tile.
+    let mut tessellator = PolygonTessellator::new();
 
     for layer in &style.layers {
         // **The zoom gate, before anything reads a feature.** A style layer
@@ -422,7 +427,9 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
             } => {
                 for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
-                    if let Err(err) = render_polygon(geometry, &context, &mut shapes, paint) {
+                    if let Err(err) =
+                        render_polygon(geometry, &context, &mut shapes, paint, &mut tessellator)
+                    {
                         warn!("{err}");
                     }
                 }
@@ -740,6 +747,7 @@ fn render_polygon(
     context: &Context,
     shapes: &mut Vec<ShapeOrText>,
     paint: &Paint,
+    tessellator: &mut PolygonTessellator,
 ) -> Result<(), Error> {
     if let Geometry::MultiPolygon(multi_polygon) = geometry {
         let Some(fill_color) = &paint.fill_color else {
@@ -763,7 +771,11 @@ fn render_polygon(
                 .iter()
                 .map(|hole| lyon_points(&hole.0))
                 .collect::<Vec<_>>();
-            shapes.push(tessellate_polygon(&exterior, &interiors, fill_color)?.into());
+            shapes.push(
+                tessellator
+                    .tessellate(&exterior, &interiors, fill_color)?
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -984,63 +996,126 @@ fn length(line: &Line<f32>) -> f32 {
     (line.dx() * line.dx() + line.dy() * line.dy()).sqrt()
 }
 
+/// The scratch every polygon in one tile shares: lyon's event queue and the
+/// vertex/index buffers it fills.
+///
+/// Neither is output. `FillTessellator` rebuilds its event queue from the path
+/// on every `tessellate_path` and hands the storage back
+/// (`EventQueue::into_builder` calls `reset`, which is a `clear`), and the
+/// `VertexBuffers` are copied out into the returned [`Mesh`] before the next
+/// polygon touches them. Held across polygons they cost one growth to the
+/// tile's largest polygon; taken fresh per polygon they cost a growth from
+/// empty per polygon, which is what [`tessellate_polygon`] used to do and what
+/// [`styled`] no longer does.
+///
+/// **Scoped to one tile, deliberately.** One of these lives for the body of a
+/// [`styled`] call and is dropped with it, so what it retains is bounded by the
+/// largest polygon in *that* tile rather than by the largest polygon the
+/// process has ever seen.
+pub struct PolygonTessellator {
+    tessellator: FillTessellator,
+    buffers: VertexBuffers<Vertex, u32>,
+}
+
+impl Default for PolygonTessellator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolygonTessellator {
+    pub fn new() -> Self {
+        Self {
+            tessellator: FillTessellator::new(),
+            buffers: VertexBuffers::new(),
+        }
+    }
+
+    /// Egui cannot tessellate complex polygons, so we use lyon for that.
+    pub fn tessellate(
+        &mut self,
+        exterior: &[Point<f32>],
+        interiors: &[Vec<Point<f32>>],
+        fill_color: Color32,
+    ) -> Result<Mesh, TessellationError> {
+        // **The path's size is a function of the input, so it is sized from the
+        // input.** `add_polygon` pushes one point and one verb per ring point
+        // plus a closing verb, and its own `reserve` asks for `points.len()`
+        // verbs -- one short, so the close reallocated the verb vector on every
+        // ring. Building at the exact totals costs two allocations for the
+        // whole path and leaves `Build::build`'s two `into_boxed_slice` calls
+        // with nothing to move, where the default builder grew the verb vector
+        // at every ring's close and then shrank it again at build.
+        let ring_points = exterior.len() + interiors.iter().map(Vec::len).sum::<usize>();
+        let rings = 1 + interiors.len();
+        let mut builder =
+            NoAttributes::wrap(BuilderImpl::with_capacity(ring_points, ring_points + rings));
+
+        builder.add_polygon(Polygon {
+            points: exterior,
+            closed: true,
+        });
+
+        for interior in interiors {
+            builder.add_polygon(Polygon {
+                points: interior,
+                closed: true,
+            });
+        }
+
+        self.buffers.vertices.clear();
+        self.buffers.indices.clear();
+
+        self.tessellator.tessellate_path(
+            &builder.build(),
+            &FillOptions::default(),
+            &mut BuffersBuilder::new(&mut self.buffers, |vertex: FillVertex| {
+                let pos = vertex.position();
+                Vertex {
+                    pos: pos2(pos.x, pos.y),
+                    uv: WHITE_UV,
+                    color: fill_color,
+                }
+            }),
+        )?;
+
+        // **`VertexBuffers::new()` is `with_capacity(512, 1024)`**
+        // (`lyon_tessellation-1.0.20/src/geometry_builder.rs`), and those two
+        // allocations are 10,240 + 4,096 bytes whatever the polygon turns out to
+        // need. A vector tile is *thousands* of small polygons, each one a mesh
+        // that then lives in the tile cache for as long as the tile does, so the
+        // slack is not transient: measured on the committed Monaco fixture's z14
+        // tile, 2,257 meshes held 18,018 vertices and 40,812 indices inside
+        // 1,155,584 vertex slots and 2,311,168 index slots -- 32.35 MB of capacity
+        // for 0.52 MB of content, and the whole tile resident at 32.77 MB instead
+        // of 0.77 MB.
+        //
+        // Sizing the buffers up front is not available: the tessellator's output
+        // count is not a function of the input the caller has. So the mesh is
+        // *copied out* at the content's exact length, which is the same copy the
+        // `shrink_to_fit` pair used to make and one allocation each rather than
+        // an allocation and a reallocation each. The 512/1024 slack is paid once
+        // per tile now instead of once per polygon, and it is never what a cached
+        // tile holds.
+        Ok(Mesh {
+            indices: self.buffers.indices.clone(),
+            vertices: self.buffers.vertices.clone(),
+            ..Default::default()
+        })
+    }
+}
+
 /// Egui cannot tessellate complex polygons, so we use lyon for that.
+///
+/// The one-shot spelling, for a caller with a single polygon and nothing to
+/// keep between calls. A caller with many — every tile — wants one
+/// [`PolygonTessellator`] across them instead.
 pub fn tessellate_polygon(
     exterior: &[Point<f32>],
     interiors: &[Vec<Point<f32>>],
     fill_color: Color32,
 ) -> Result<Mesh, TessellationError> {
-    let mut builder = Path::builder();
-
-    builder.add_polygon(Polygon {
-        points: exterior,
-        closed: true,
-    });
-
-    for interior in interiors {
-        builder.add_polygon(Polygon {
-            points: interior,
-            closed: true,
-        });
-    }
-
-    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-
-    FillTessellator::new().tessellate_path(
-        &builder.build(),
-        &FillOptions::default(),
-        &mut BuffersBuilder::new(&mut buffers, |vertex: FillVertex| {
-            let pos = vertex.position();
-            Vertex {
-                pos: pos2(pos.x, pos.y),
-                uv: WHITE_UV,
-                color: fill_color,
-            }
-        }),
-    )?;
-
-    // **`VertexBuffers::new()` is `with_capacity(512, 1024)`**
-    // (`lyon_tessellation-1.0.20/src/geometry_builder.rs`), and those two
-    // allocations are 10,240 + 4,096 bytes whatever the polygon turns out to
-    // need. A vector tile is *thousands* of small polygons, each one a mesh
-    // that then lives in the tile cache for as long as the tile does, so the
-    // slack is not transient: measured on the committed Monaco fixture's z14
-    // tile, 2,257 meshes held 18,018 vertices and 40,812 indices inside
-    // 1,155,584 vertex slots and 2,311,168 index slots -- 32.35 MB of capacity
-    // for 0.52 MB of content, and the whole tile resident at 32.77 MB instead
-    // of 0.77 MB.
-    //
-    // Sizing the buffers up front is not available: the tessellator's output
-    // count is not a function of the input the caller has. Shrinking after is,
-    // and it costs one reallocation and one copy of the content per polygon.
-    buffers.vertices.shrink_to_fit();
-    buffers.indices.shrink_to_fit();
-
-    Ok(Mesh {
-        indices: buffers.indices,
-        vertices: buffers.vertices,
-        ..Default::default()
-    })
+    PolygonTessellator::new().tessellate(exterior, interiors, fill_color)
 }
 
 /// Convert list of `geo_types::Coord` to Lyon's `Point`s.
@@ -2090,6 +2165,69 @@ mod tests {
                 drawn_and_scanned(&ranged, zoom).0,
                 drawn_and_scanned(&absent, zoom).0,
                 "zoom {zoom} is inside [5, 7) and the layers must draw"
+            );
+        }
+    }
+
+    /// **Reuse must not change a single vertex.**
+    ///
+    /// `PolygonTessellator` carries lyon's event queue and the vertex/index
+    /// buffers from one polygon to the next. State that survived a polygon it
+    /// should not have -- an uncleared buffer, a queue the tessellator did not
+    /// rebuild -- shows up here as a mesh that differs from the same polygon
+    /// tessellated alone, and nowhere else: the golden above renders one tile
+    /// once, so it cannot see a second polygon inheriting the first's.
+    ///
+    /// The polygons differ in size deliberately, and the largest is not last:
+    /// a buffer sized by an earlier polygon is the case that a monotonically
+    /// growing sequence would never reach.
+    #[test]
+    fn a_shared_tessellator_produces_the_same_meshes_as_a_fresh_one_each_time() {
+        let ring = |n: usize, radius: f32| -> Vec<Point<f32>> {
+            (0..n)
+                .map(|i| {
+                    let t = (i as f32) / (n as f32) * std::f32::consts::TAU;
+                    point(radius * t.cos(), radius * t.sin())
+                })
+                .collect()
+        };
+
+        // (exterior points, hole points): a triangle, a big ring with a hole,
+        // then a small one again, then a big one with two holes.
+        let cases: Vec<(Vec<Point<f32>>, Vec<Vec<Point<f32>>>)> = vec![
+            (ring(3, 10.0), Vec::new()),
+            (ring(64, 500.0), vec![ring(16, 100.0)]),
+            (ring(5, 20.0), Vec::new()),
+            (ring(48, 400.0), vec![ring(12, 80.0), ring(9, 40.0)]),
+            (ring(3, 10.0), Vec::new()),
+        ];
+        let colour = Color32::from_rgb(7, 11, 13);
+
+        let mut shared = PolygonTessellator::new();
+        for (i, (exterior, interiors)) in cases.iter().enumerate() {
+            let reused = shared
+                .tessellate(exterior, interiors, colour)
+                .expect("a ring tessellates");
+            let alone =
+                tessellate_polygon(exterior, interiors, colour).expect("a ring tessellates");
+
+            assert_eq!(
+                (reused.vertices.len(), reused.indices.len()),
+                (alone.vertices.len(), alone.indices.len()),
+                "case {i} differs in size between a shared and a fresh tessellator"
+            );
+            assert!(
+                reused.vertices == alone.vertices && reused.indices == alone.indices,
+                "case {i} differs in content between a shared and a fresh tessellator"
+            );
+
+            // The mesh a tile caches owns exactly what it holds. This is the
+            // property `shrink_to_fit` used to carry and the copy-out carries
+            // now; a reused buffer handed out directly would fail here.
+            assert_eq!(
+                (reused.vertices.capacity(), reused.indices.capacity()),
+                (reused.vertices.len(), reused.indices.len()),
+                "case {i} carries the scratch buffer's slack into the tile cache"
             );
         }
     }
