@@ -1001,6 +1001,23 @@ GECKODRIVER_KNOWN_PACKAGES = (
 # suppress it and the only unattended route is a package whose onboarding has
 # already been completed once.
 FIREFOX_ANDROID_PREFS = {
+    # Geolocation. The app's UserLocation layer is in the seed's enabled set,
+    # so the page asks for a position and Fenix puts a prompt in front of
+    # everything. Unlike the onboarding wizard -- Android SharedPreferences,
+    # out of reach of any pref -- site permissions ARE Gecko profile state, so
+    # this is the right layer to answer at. 1 = allow, 2 = block; the value is
+    # recorded on every row either way, because granted and denied are
+    # different app behaviours (the location handler draws on the Ground
+    # surface and feeds a content key) and rows taken under the two are not
+    # comparable.
+    "permissions.default.geo": 1,
+    # And the position itself, so a leg never waits on a real GPS fix that a
+    # phone indoors may never produce. Recorded as the denominator it is.
+    "geo.provider.network.url":
+        "data:application/json,{\"location\":{\"lat\":35.33,\"lng\":-97.28},"
+        "\"accuracy\":100.0}",
+    "geo.prompt.testing": True,
+    "geo.prompt.testing.allow": True,
     "browser.aboutwelcome.enabled": False,
     "browser.onboarding.enabled": False,
     "datareporting.policy.dataSubmissionPolicyBypassNotification": True,
@@ -1756,6 +1773,79 @@ def android_dismiss_onboarding(package, serial=None, max_rounds=10,
         "onboarding dismissal hit its %d-round bound without the browser "
         "becoming reachable; taps so far: %s"
         % (max_rounds, json.dumps(trail)))
+
+
+# The OS half of the same question. Gecko can auto-allow a site all it likes;
+# if Android has not granted the APP the runtime permission there is no
+# position to hand over.
+ANDROID_LOCATION_PERMISSIONS = (
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+)
+
+
+def android_grant_location(package, serial=None):
+    """Grant the measurement browser the OS location permission.
+
+    A WRITE to the device, and the only one this rig performs, so it is
+    fenced: REFUSED outright for any daily-driver package. On
+    org.mozilla.firefox_beta it is a package that exists solely for
+    measurement and whose data geckodriver wipes on every launch anyway, so
+    the grant does not survive to affect anything the owner uses.
+
+    Returns what was granted; never raises on a per-permission failure, because
+    a device that refuses one of these is a denominator, not a crash."""
+    if package in ANDROID_DAILY_DRIVER_PACKAGES:
+        raise WebDriverError(
+            "REFUSING to grant location to %s: that is somebody's daily "
+            "browser and this rig does not change permissions on it" % package)
+    out = {"package": package, "granted": [], "failed": {}}
+    for perm in ANDROID_LOCATION_PERMISSIONS:
+        try:
+            r = _adb(["shell", "pm", "grant", package, perm], serial)
+        except Exception as e:                    # noqa: BLE001 - never fatal
+            out["failed"][perm] = str(e)[:120]
+            continue
+        if r.returncode == 0 and not (r.stderr or "").strip():
+            out["granted"].append(perm)
+        else:
+            out["failed"][perm] = ((r.stderr or r.stdout).strip() or
+                                   "rc=%d" % r.returncode)[:120]
+    return out
+
+
+# Read back from the PAGE, which is the only place that knows what the app
+# actually got. `permissions.query` reports Gecko's answer; the position probe
+# reports whether anything is really available, which is the OS half.
+GEO_PROBE = """
+var done = arguments[arguments.length - 1];
+var out = {permission: null, position: null, error: null};
+var finish = function () { done(out); };
+var probe = function () {
+  if (!navigator.geolocation) { out.error = 'no navigator.geolocation'; return finish(); }
+  var settled = false;
+  var t = setTimeout(function () {
+    if (!settled) { settled = true; out.error = 'timeout'; finish(); }
+  }, 8000);
+  navigator.geolocation.getCurrentPosition(
+    function (p) {
+      if (settled) return; settled = true; clearTimeout(t);
+      out.position = {lat: p.coords.latitude, lon: p.coords.longitude,
+                      accuracy: p.coords.accuracy};
+      finish();
+    },
+    function (e) {
+      if (settled) return; settled = true; clearTimeout(t);
+      out.error = 'code ' + e.code + ': ' + e.message;
+      finish();
+    }, {timeout: 7000, maximumAge: 0});
+};
+if (navigator.permissions && navigator.permissions.query) {
+  navigator.permissions.query({name: 'geolocation'}).then(function (s) {
+    out.permission = s.state; probe();
+  }).catch(function () { probe(); });
+} else { probe(); }
+"""
 
 
 def android_find_loaded_tab(xml_text, url_hint=None):
@@ -4737,6 +4827,15 @@ def run_smoke(args):
     driver = session = None
     exit_code = 0
     try:
+        if args.android and args.browser == "firefox":
+            # BEFORE the app launches, so the first page load already has it.
+            # Fenced to non-daily-driver packages inside the function.
+            result["location_grant"] = android_grant_location(
+                args.android_package, args.adb_serial)
+            stage("grant-location", **{
+                k: v for k, v in result["location_grant"].items()
+                if k != "package"})
+
         stage("launch-driver")
         driver, session, info = launch(
             args.browser, out_dir, tag, driver_path=args.driver,
@@ -4855,6 +4954,39 @@ def run_smoke(args):
                 cv = verify_android_content_view(session, timeout=25.0)
             result["content_view"] = cv
             stage("content-view-shown", **cv)
+            # A FOURTH DIALOG WILL COME. Onboarding, the default-browser
+            # chooser and now geolocation were three; treating each as a
+            # bespoke step means the next one is discovered as a mystery.
+            # This is the same bounded, identity-driven handler run again at
+            # the point prompts actually appear -- after the page is on screen
+            # and has started asking for things. It no-ops when the browser is
+            # reachable and nothing is in front of it, and it fails LOUDLY on
+            # a dialog it does not recognise rather than swallowing it.
+            stage("dialogs-after-load")
+            post_dumps = []
+            try:
+                result["dialogs_after_load"] = android_dismiss_onboarding(
+                    args.android_package, args.adb_serial,
+                    dump_sink=post_dumps)
+            finally:
+                if post_dumps:
+                    p = os.path.join(out_dir, "%s.postload.uia.xml" % tag)
+                    with open(p, "w") as fh:
+                        fh.write(post_dumps[-1])
+                    result["dialogs_after_load_dump"] = p
+            stage("dialogs-after-load-done",
+                  rounds=result["dialogs_after_load"]["rounds"],
+                  taps=len(result["dialogs_after_load"]["taps"]))
+            # THE ROW'S LOCATION DENOMINATOR. Granted and denied are different
+            # app behaviours, so a row that does not say which it was is not
+            # comparable to one that does.
+            try:
+                result["geolocation"] = session.execute_async(GEO_PROBE)
+            except WebDriverError as e:
+                result["geolocation"] = {"probe_error": str(e)[:200]}
+            stage("geolocation", **{
+                k: v for k, v in (result["geolocation"] or {}).items()
+                if k != "position"})
 
         boot, boot_wait, timed_out = wait_boot(session,
                                                timeout=args.boot_timeout)
@@ -5559,6 +5691,18 @@ def run_smoke(args):
         drift = (round(t1_c - t0_c, 1)
                  if isinstance(t0_c, (int, float))
                  and isinstance(t1_c, (int, float)) else None)
+        geo = result.get("geolocation") or {}
+        grant = result.get("location_grant") or {}
+        pos = geo.get("position")
+        print("[%s] SUMMARY location: permission=%s position=%s os_granted=%s"
+              "%s -- A DENOMINATOR, not a detail: the UserLocation layer draws "
+              "on the Ground surface and feeds a content key, so a row taken "
+              "with location denied is not comparable to one taken with it "
+              "allowed"
+              % (tag, geo.get("permission"),
+                 ("%.2f,%.2f" % (pos["lat"], pos["lon"])) if pos else None,
+                 len(grant.get("granted") or []),
+                 (" err=%s" % geo.get("error")) if geo.get("error") else ""))
         print("[%s] SUMMARY device: battery %s%% -> %s%%, %s C -> %s C "
               "(drift %s C). BOTH ENDS, because a phone throttles: a figure "
               "quoted without them cannot be told apart from a thermal one"
