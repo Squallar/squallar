@@ -567,6 +567,26 @@ if [ "$ANDROID" = 1 ]; then
   ANDROID_FOLD="$( adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell cmd device_state state 2>/dev/null \
                    | grep -oE "name='[A-Z_]+'" | head -1 | cut -d"'" -f2 )"
   echo "android fold_state=${ANDROID_FOLD:-UNREADABLE(not a foldable, or cmd device_state unavailable)}"
+  # WHAT ELSE IS ON THE PHONE, as a denominator rather than as a footnote.
+  # A browser that is DISABLED is a different device configuration from one
+  # that merely is not running: disabled cannot be relaunched by a
+  # notification tap or a background intent mid-pass, so a set taken against
+  # it is not comparable to a set taken while the same browser was merely
+  # closed and could come back. Both are read with `pm`; nothing here writes.
+  # OTHER_APP is our OWN native build -- two instances of squallar on one
+  # phone is not a configuration any user has, and on a thermally throttled
+  # device the heat from one persists into the next pass of the other.
+  ANDROID_OTHER_BROWSER="$( adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell pm list packages -d 2>/dev/null \
+                            | grep -c 'com\.android\.chrome' )"
+  if [ "${ANDROID_OTHER_BROWSER:-0}" -gt 0 ]; then
+    echo "android daily_browser=DISABLED (com.android.chrome, by the device's owner; cannot relaunch mid-pass)"
+  elif adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell pidof com.android.chrome >/dev/null 2>&1; then
+    echo "android daily_browser=RUNNING (com.android.chrome) -- it owns the base devtools socket; sessions may be REFUSED and any row taken beside it is contended"
+  else
+    echo "android daily_browser=enabled-but-not-running (com.android.chrome) -- it can be relaunched by a notification tap MID-PASS; not the same denominator as DISABLED"
+  fi
+  ANDROID_OTHER_APP="$( adb ${ADB_SERIAL:+-s "$ADB_SERIAL"} shell pidof app.squallar 2>/dev/null | tr -d '\r\n ' )"
+  echo "android our_native_app=${ANDROID_OTHER_APP:+RUNNING pid $ANDROID_OTHER_APP -- ROWS ARE CONTENDED AND NOT QUOTABLE}${ANDROID_OTHER_APP:-not running}"
   if [ -z "$ANDROID_FOLD" ]; then
     echo "      -- if this IS a foldable, the rows cannot say which half they"
     echo "         measured and must not be pooled with the other half."
