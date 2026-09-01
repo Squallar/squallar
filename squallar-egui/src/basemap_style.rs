@@ -5,13 +5,17 @@
 //! it carries them as `include_str!`. One pair of files, two ways in, and
 //! `tests/committed_styles_parse.rs` gates the files themselves.
 //!
-//! Parsing is done **once per theme, at construction**, not per tile.
-//! `Style::from_json` walks 95 internally-tagged layers and every expression
-//! inside them; a tile fetch that repeated it would put that on the IO path for
-//! every one of the tens of tiles a pane asks for.
+//! Parsing is done **once per theme per process**, not per tile and not per
+//! source construction. `Style::from_json` walks 95 internally-tagged layers
+//! and every expression inside them; a tile fetch that repeated it would put
+//! that on the IO path for every one of the tens of tiles a pane asks for, and
+//! [`committed`] used to repeat it on the frame thread every time a layer
+//! toggle rebuilt a source — **measured 0.44–0.70 ms per call, release,
+//! 2026-08-31**, against a 4 ms frame budget. The `OnceLock` pair in
+//! [`committed`] is what makes "once per theme" true rather than aspirational.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use walkers::Style;
 use walkers::style::Layer;
@@ -32,19 +36,24 @@ const LIGHT_JSON: &str = include_str!("../../www/styles/light.json");
 /// recovery from it: a basemap with no style draws a blank rectangle, which is
 /// the silent-partial-success shape this workspace refuses.
 pub fn committed(is_dark: bool) -> Arc<Style> {
-    let (name, json) = if is_dark {
-        ("dark", DARK_JSON)
+    static DARK: OnceLock<Arc<Style>> = OnceLock::new();
+    static LIGHT: OnceLock<Arc<Style>> = OnceLock::new();
+
+    let (slot, name, json) = if is_dark {
+        (&DARK, "dark", DARK_JSON)
     } else {
-        ("light", LIGHT_JSON)
+        (&LIGHT, "light", LIGHT_JSON)
     };
 
-    Arc::new(Style::from_json(json).unwrap_or_else(|error| {
-        panic!(
-            "the compiled-in {name} basemap style does not deserialise: {error}\n\
-             `Style` is one Vec<Layer> as an internally-tagged enum, so one bad \
-             layer fails the whole file. `tests/committed_styles_parse.rs` gates \
-             this and would have gone red first."
-        )
+    Arc::clone(slot.get_or_init(|| {
+        Arc::new(Style::from_json(json).unwrap_or_else(|error| {
+            panic!(
+                "the compiled-in {name} basemap style does not deserialise: {error}\n\
+                 `Style` is one Vec<Layer> as an internally-tagged enum, so one bad \
+                 layer fails the whole file. `tests/committed_styles_parse.rs` gates \
+                 this and would have gone red first."
+            )
+        }))
     }))
 }
 
@@ -94,6 +103,35 @@ pub fn committed_filtered(is_dark: bool, disabled: &BTreeSet<String>) -> Arc<Sty
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second `committed` call re-uses the first parse instead of repeating it.
+    ///
+    /// **The frame-thread claim, as a property rather than a stopwatch.** Every
+    /// layer toggle that rebuilds a tile source calls this from inside
+    /// `Gui::ui`, and before the `OnceLock` pair each of those calls walked 95
+    /// internally-tagged layers again — 0.44–0.70 ms of the 4 ms frame budget,
+    /// measured release on 2026-08-31, for a result that cannot differ because
+    /// the input is a `const &str`. `Arc::ptr_eq` is the whole assertion: same
+    /// allocation means the same parse, and nothing here has to time anything.
+    #[test]
+    fn a_theme_is_parsed_once_and_then_shared() {
+        for is_dark in [true, false] {
+            let first = committed(is_dark);
+            let second = committed(is_dark);
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "committed(is_dark = {is_dark}) parsed the compiled-in style a \
+                 second time; it is a `const &str`, so the second parse can only \
+                 produce what the first did, on the frame thread, for nothing"
+            );
+        }
+
+        assert!(
+            !Arc::ptr_eq(&committed(true), &committed(false)),
+            "the two themes share one cached style, so one of them is drawing \
+             in the other's colours"
+        );
+    }
 
     /// The compiled-in bytes are the committed files, not a stale copy.
     ///

@@ -15,7 +15,8 @@
 //! in-flight de-duplication, lower-zoom interpolation, `max_zoom` clamping,
 //! grid-bounds checking, repaint-on-arrival and attribution.
 //!
-//! Deliberate differences: our client with a [`REQUEST_TIMEOUT`] (walkers sets
+//! Deliberate differences: our client with a
+//! [`crate::basemap_archive::REQUEST_TIMEOUT`] (walkers sets
 //! none); squallar's `User-Agent`; a closed request channel logs instead of
 //! panicking (walkers' `TilesIo::make_sure_is_fetched` calls `panic!`); no HTTP
 //! disk cache, which neither has.
@@ -695,11 +696,10 @@ fn decode_archive_tile_remembering(
 /// cannot count the grid there.
 const MAX_ZOOM_UNKNOWN: u8 = u8::MAX;
 
-/// Per-tile request timeout.
-///
-/// walkers sets none. A tile that never answers would otherwise hold one of the
-/// [`MAX_PARALLEL_DOWNLOADS`] slots for as long as the process lives.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+// The per-tile request timeout used to be declared here as a second
+// `Duration::from_secs(20)` beside `basemap_archive::REQUEST_TIMEOUT`, and the
+// two could drift silently because nothing compared them. `tile_client` is now
+// `archive_client`, so there is one client, one pool and one figure.
 
 /// Tile decodes the frame side performs per **source** per **pass**, wasm32
 /// only.
@@ -1024,10 +1024,15 @@ fn interpolate_from_lower_zoom(tile_id: TileId, available_zoom: u8) -> (TileId, 
 /// [`squallar_radar::tls::client`] and nothing else — platform verifier, *ring*,
 /// `https_only`. There is deliberately no way to inject a different client from
 /// outside the crate.
+///
+/// This is [`crate::basemap_archive::archive_client`], not a second client
+/// built the same way: the two constructions were character-for-character
+/// identical, down to the 20 s [`crate::basemap_archive::REQUEST_TIMEOUT`]
+/// this module used to restate. Spelling it once means one process-wide client and one
+/// connection pool rather than a fresh 4–5 ms platform-verifier build per tile
+/// source — see that function for the measurement.
 pub(crate) fn tile_client() -> reqwest::Client {
-    squallar_radar::tls::client(squallar_radar::tls::USER_AGENT, REQUEST_TIMEOUT)
-        .build()
-        .expect("the tile HTTP client should build")
+    crate::basemap_archive::archive_client()
 }
 
 // ---------------------------------------------------------------------------

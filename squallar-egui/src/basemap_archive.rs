@@ -402,14 +402,47 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// expiry date. A `reqwest::Client::new()` here would both bypass that and, on
 /// this workspace's `rustls-no-provider` pin, panic on construction.
 ///
+/// Built **once per process** and handed out by clone. A `reqwest::Client` is
+/// an `Arc` internally and is documented to be shared rather than rebuilt, and
+/// on this workspace's pin rebuilding is not free: `build()` eagerly
+/// constructs a `rustls_platform_verifier::Verifier`, which PEM-decodes the
+/// platform trust store into anchors — **measured 4.36–4.99 ms per call,
+/// release, over 8 runs on a 127-certificate Linux box, 2026-08-31**, with no
+/// amortisation across calls (the warm call costs the same as the cold one).
+/// That ran on the frame thread every time a layer toggle rebuilt a tile
+/// source, which is more than the whole 4 ms frame budget for one call.
+/// Sharing also gives the basemap, the terrain archive and the download engine
+/// one connection pool instead of three.
+///
 /// # Panics
 ///
 /// If the client will not build, which means the TLS configuration is wrong
 /// for the target rather than anything a caller can recover from.
 pub fn archive_client() -> Client {
-    squallar_radar::tls::client(squallar_radar::tls::USER_AGENT, REQUEST_TIMEOUT)
-        .build()
-        .expect("the basemap archive HTTP client should build")
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+    CLIENT
+        .get_or_init(|| {
+            CLIENT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            squallar_radar::tls::client(squallar_radar::tls::USER_AGENT, REQUEST_TIMEOUT)
+                .build()
+                .expect("the basemap archive HTTP client should build")
+        })
+        .clone()
+}
+
+/// How many times this process has actually constructed the shared client.
+///
+/// Always on, like the raster ledgers: the memoisation above is invisible from
+/// the outside — `reqwest::Client` exposes no identity to compare — so without
+/// a counter the only gate available would be a wall-clock one, and this
+/// workspace counts the operation instead of timing it. Read through
+/// [`client_builds`].
+static CLIENT_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many TLS clients this process has built. See [`CLIENT_BUILDS`].
+pub fn client_builds() -> usize {
+    CLIENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl HttpRangeSource {
@@ -1494,3 +1527,41 @@ mod archives_tests;
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod four_gib_offset_tests;
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod client_memo_tests {
+    use super::{archive_client, client_builds};
+
+    /// However many tile sources a session builds, the process builds **one**
+    /// TLS client.
+    ///
+    /// **Counts the operation rather than timing it**, which is what makes this
+    /// survive a loaded box: `reqwest::Client::build()` eagerly constructs a
+    /// `rustls_platform_verifier::Verifier` and PEM-decodes the platform trust
+    /// store (127 certificates on the box this was measured on), at 4.36–4.99 ms
+    /// a call over 8 release runs on 2026-08-31 with no amortisation between
+    /// them. That ran on the frame thread inside `Gui::ui` every time a layer
+    /// toggle rebuilt a source — one call, more than the entire 4 ms budget.
+    ///
+    /// A cap, not an equality on a fresh count, because this is process-global:
+    /// other tests in this binary reach a client too, and "at most one, ever"
+    /// is true whatever order they run in.
+    #[test]
+    fn the_process_builds_one_tls_client_however_many_sources_ask() {
+        let clients: Vec<_> = (0..8)
+            .map(|_| archive_client())
+            .chain(std::iter::once(crate::tile_source::tile_client()))
+            .collect();
+        assert_eq!(clients.len(), 9, "fixture: nine handles were asked for");
+
+        assert_eq!(
+            client_builds(),
+            1,
+            "nine client handles cost {} platform-verifier builds. Each one \
+             PEM-decodes the whole platform trust store on whatever thread \
+             asked, and the thread that asks is the frame thread.",
+            client_builds()
+        );
+    }
+}
