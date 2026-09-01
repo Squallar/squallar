@@ -1728,6 +1728,80 @@ New public surface: `ParsedTile` (opaque; `heap_bytes()`), `parse`, `styled`.
 **Test count: `cargo test -p walkers --features mvt` reports 98**, from 95.
 Plain `cargo test -p walkers` still selects 48 — the flag gotcha above stands.
 
+### Changed — source, twenty-second commit: a style layer's own zoom range gates it
+
+Two files: `src/style.rs` and `src/mvt.rs`.
+
+`Layer` had no `minzoom` or `maxzoom` field, so serde dropped both at parse and
+`styled` visited every style layer at every zoom. The waste is not
+tessellation — a layer whose range excludes the zoom draws nothing either
+way — it is the **scan**: for each such layer, a `Context` built over every
+feature of its source layer and a filter evaluated against it, for a layer that
+cannot produce a shape.
+
+Measured on this workspace's committed `dark` style (95 layers) over Monaco's
+z14 8529/5974 tile (2,913 features across 14 source layers), before the change:
+**36,921 feature scans at every zoom from 0 to 16** — the same number at zoom 0,
+where 14 of the 95 layers are live by their own declared ranges, as at zoom 16,
+where 78 are. After:
+
+| zoom | scans before | scans after | live layers |
+| --- | --- | --- | --- |
+| 0 | 36,921 | 347 | 14 / 95 |
+| 5 | 36,921 | 4,295 | 26 / 95 |
+| 8 | 36,921 | 6,301 | 31 / 95 |
+| 10 | 36,921 | 9,543 | 37 / 95 |
+| 12 | 36,921 | 18,024 | 55 / 95 |
+| 14 | 36,921 | 23,835 | 65 / 95 |
+| 16 | 36,921 | 36,680 | 78 / 95 |
+
+`ZoomRange` is a two-field struct `#[serde(flatten)]`ed into the five drawing
+variants, so the bounds and their asymmetry are spelled once.
+`minzoom` **inclusive**, `maxzoom` **exclusive** — the specification's wording,
+not a choice: "at zoom levels less than the minzoom, the layer will be hidden"
+against "at zoom levels equal to or greater than the maxzoom, the layer will be
+hidden". Both are `Option<f32>`, because the specification allows fractional
+bounds while the zoom asked about is the integer tile zoom. `raster` and
+`fill-extrusion` stay unit variants and `visible_at` answers `true` for them, so
+this is never the reason one of them is skipped.
+
+**Nothing this workspace draws moved, and that was measured rather than
+reasoned.** Both committed themes over that tile, at zooms 0, 5, 8, 10, 12, 14
+and 16 — fourteen renderings — produce **byte-identical** `Debug` shape lists
+before and after. They can, because the committed styles already fold each
+layer's zoom range into its `filter` as `[">=", ["zoom"], min]` /
+`["<", ["zoom"], max]`, so an out-of-range layer already drew nothing; all this
+change does there is stop paying to discover that per feature. That the
+fourteen renderings match is also the check that `ZoomRange`'s bounds agree with
+the fold's on all 87 ranged layers.
+
+**Where it is not free: a style that does *not* fold.** That is now the better
+style to write, and the same measurement says how much better — with every zoom
+clause stripped from every filter, `styled` at zoom 14 is **5.40 ms** against
+**7.08 ms** for the folded style on unmodified code, output still byte-identical
+at all seven zooms. Removing the fold from `www/styles/{dark,light}.json` is a
+separate change to those documents and is not in this commit.
+
+New public surface: `ZoomRange`, `Layer::visible_at`.
+
+Two new tests, both shown red against unmodified `59f08766` with only the
+test-only additions applied (`git diff --stat`: one file, 164 insertions, **0
+deletions**, so no behaviour was in the demonstration):
+`a_layer_outside_its_zoom_range_is_never_scanned` read 18 scans where 9 is
+correct and drew the out-of-range strokes, and
+`the_zoom_range_honours_minzoom_inclusively_and_maxzoom_exclusively` drew them
+at zoom 4 of a `[5, 7)` range. Both assert equalities — scans *and* picture
+against the same style with the layers deleted — because a one-sided "fewer
+scans" is satisfied by drawing nothing at all.
+
+A `#[cfg(test)]` `mvt::scans` counter arrives with them: a thread-local bumped
+once per feature considered by one style layer. Thread-local so a filtered run
+measuring one walk is not perturbed by a sibling thread rendering. It compiles
+to nothing outside `cfg(test)`.
+
+**Test count: `cargo test -p walkers --features mvt --lib` reports 100**, from
+98.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

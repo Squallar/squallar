@@ -122,8 +122,9 @@
 //!
 //! ## Three things the conversion's brief got wrong
 //!
-//! Each was verified against the tree and the upstream repository, not inferred,
-//! and each still holds.
+//! Each was verified against the tree and the upstream repository, not inferred.
+//! The first and third still hold; the second was overtaken on 2026-09-01 and
+//! carries its own correction.
 //!
 //! 1. **The six Mapbox-Streets renames were already done upstream.** The brief
 //!    called them the highest-risk part of the job; all six fired zero times.
@@ -135,16 +136,31 @@
 //!    rename table went with the converter; the six pairs survive as prose, in
 //!    the failure message of the source-layer membership check, because that is
 //!    the message a reader needs when a name does not resolve.
-//! 2. **Zoom ranges have to be folded into filters.** The brief listed the fold
-//!    among the transforms vendoring had made unnecessary. It had not:
-//!    `walkers::style::Layer` has no `minzoom` or `maxzoom` field, so serde
-//!    drops both at parse, and `walkers::mvt::render` consults each layer's
-//!    `filter` and nothing else. Without the fold every layer draws at every
-//!    zoom. `minzoom` and `maxzoom` are left on the layers as well -- they are
-//!    correct, the specification wants them, and if walkers ever honours them
-//!    the fold merely re-asserts the same range. Pinned end-to-end by
-//!    `a_folded_zoom_range_gates_the_layer_through_the_real_evaluator` and
-//!    structurally, across every layer, by
+//! 2. **Zoom ranges had to be folded into filters — and no longer do.** The
+//!    brief listed the fold among the transforms vendoring had made
+//!    unnecessary. At the time it had not: `walkers::style::Layer` carried no
+//!    `minzoom` or `maxzoom` field, so serde dropped both at parse and
+//!    `walkers::mvt::styled` consulted each layer's `filter` and nothing else.
+//!    Without the fold every layer drew at every zoom.
+//!
+//!    **Superseded on 2026-09-01.** `walkers::style::ZoomRange` parses both
+//!    fields and `styled` skips a layer whose range excludes the tile zoom,
+//!    before it reads a feature. The fold is now redundant rather than
+//!    load-bearing, and it is kept only because removing it is a separate
+//!    change to these documents: measured over Monaco's z14 tile with every
+//!    zoom clause stripped out of every filter, both themes render
+//!    **byte-identical** shape lists at zooms 0, 5, 8, 10, 12, 14 and 16 to
+//!    what the folded styles render — which is also the end-to-end check that
+//!    `ZoomRange`'s inclusive-`minzoom`/exclusive-`maxzoom` bounds agree with
+//!    the fold's `[">=", ["zoom"], min]` / `["<", ["zoom"], max]` on all 87
+//!    ranged layers. Stripping them is worth doing on its own account: the
+//!    same measurement puts `styled` at 5.40 ms against 7.08 ms folded at
+//!    zoom 14, because the surviving layers stop re-evaluating a zoom clause
+//!    once per feature.
+//!
+//!    Both checks below still pass and still describe the documents:
+//!    `a_folded_zoom_range_gates_the_layer_through_the_real_evaluator` and,
+//!    structurally across every layer,
 //!    `every_layer_with_a_zoom_range_folded_it_into_its_filter`.
 //! 3. **Nothing can read the phase tag yet.** The brief wanted each layer tagged
 //!    machine-readably so the renderer could split ground from label. The tag is

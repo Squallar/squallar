@@ -36,23 +36,31 @@ impl Style {
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Layer {
     Background {
+        #[serde(flatten)]
+        zoom_range: ZoomRange,
         paint: Paint,
     },
     #[serde(rename_all = "kebab-case")]
     Fill {
         source_layer: String,
+        #[serde(flatten)]
+        zoom_range: ZoomRange,
         filter: Option<Filter>,
         paint: Paint,
     },
     #[serde(rename_all = "kebab-case")]
     Line {
         source_layer: String,
+        #[serde(flatten)]
+        zoom_range: ZoomRange,
         filter: Option<Filter>,
         paint: Paint,
     },
     #[serde(rename_all = "kebab-case")]
     Symbol {
         source_layer: String,
+        #[serde(flatten)]
+        zoom_range: ZoomRange,
         filter: Option<Filter>,
         layout: Layout,
         paint: Option<Paint>,
@@ -60,10 +68,62 @@ pub enum Layer {
     #[serde(rename_all = "kebab-case")]
     Circle {
         source_layer: String,
+        #[serde(flatten)]
+        zoom_range: ZoomRange,
         filter: Option<Filter>,
     },
     Raster,
     FillExtrusion,
+}
+
+impl Layer {
+    /// Whether this layer draws at `zoom`, by its own declared zoom range.
+    ///
+    /// A layer type that carries no range — `raster`, `fill-extrusion`, which
+    /// this renderer does not draw at all — is visible at every zoom, so that
+    /// the answer here never becomes the reason one of them is skipped.
+    pub fn visible_at(&self, zoom: u8) -> bool {
+        match self {
+            Layer::Background { zoom_range, .. }
+            | Layer::Fill { zoom_range, .. }
+            | Layer::Line { zoom_range, .. }
+            | Layer::Symbol { zoom_range, .. }
+            | Layer::Circle { zoom_range, .. } => zoom_range.contains(zoom),
+            Layer::Raster | Layer::FillExtrusion => true,
+        }
+    }
+}
+
+/// A style layer's `minzoom`/`maxzoom`, with MapLibre's asymmetric bounds.
+///
+/// <https://maplibre.org/maplibre-style-spec/layers/>
+///
+/// **`minzoom` is inclusive and `maxzoom` is exclusive**, which is the
+/// specification's wording and not a choice made here: "at zoom levels less
+/// than the minzoom, the layer will be hidden" against "at zoom levels equal
+/// to or greater than the maxzoom, the layer will be hidden". Getting that
+/// asymmetry backwards would draw one whole zoom level's worth of layers that
+/// the style excluded, or hide one it included, and neither shows up as
+/// anything but a wrong-looking map.
+///
+/// The bounds are `f32` because the specification allows fractional values,
+/// while the zoom this is asked about is the integer tile zoom. A
+/// `"minzoom": 13.5` therefore first admits the layer at tile zoom 14, which
+/// is the same answer MapLibre gives a tile renderer.
+#[derive(Deserialize, Debug, Default)]
+pub struct ZoomRange {
+    pub minzoom: Option<f32>,
+    pub maxzoom: Option<f32>,
+}
+
+impl ZoomRange {
+    /// Whether `zoom` falls inside this range. An absent bound does not
+    /// constrain; an absent range admits every zoom.
+    pub fn contains(&self, zoom: u8) -> bool {
+        let zoom = f32::from(zoom);
+        !self.minzoom.is_some_and(|minzoom| zoom < minzoom)
+            && !self.maxzoom.is_some_and(|maxzoom| zoom >= maxzoom)
+    }
 }
 
 #[derive(Deserialize, Default, Debug)]

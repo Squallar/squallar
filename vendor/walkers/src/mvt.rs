@@ -386,8 +386,20 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
     let mut shapes = Vec::new();
 
     for layer in &style.layers {
+        // **The zoom gate, before anything reads a feature.** A style layer
+        // declares the zooms it draws at; outside them it can produce no shape,
+        // so visiting its source layer is pure waste. Skipping here rather than
+        // inside the arms is what makes it a skip of the *scan* and not just of
+        // the tessellation: measured on the committed dark style over Monaco's
+        // z14 tile, the walk made 36,921 feature scans at every zoom from 0 to
+        // 16 -- the same number at zoom 0, where 14 of the 95 layers are live,
+        // as at zoom 16, where 78 are.
+        if !layer.visible_at(zoom) {
+            continue;
+        }
+
         match layer {
-            Layer::Background { paint } => {
+            Layer::Background { paint, .. } => {
                 let context = Context::new("None".to_string(), HashMap::new(), zoom);
 
                 let bg_color = if let Some(color) = &paint.background_color {
@@ -406,6 +418,7 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
                 source_layer,
                 filter,
                 paint,
+                ..
             } => {
                 for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
@@ -418,6 +431,7 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
                 source_layer,
                 filter,
                 paint,
+                ..
             } => {
                 for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
@@ -431,6 +445,7 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
                 filter,
                 layout,
                 paint,
+                ..
             } => {
                 for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
                 {
@@ -521,6 +536,36 @@ pub fn transformed(shapes: &[ShapeOrText], rect: egui::Rect) -> Vec<ShapeOrText>
     shapes.iter().map(|shape| shape.placed(transform)).collect()
 }
 
+/// Feature scans, counted for the tests that gate the shape of the style walk.
+///
+/// One **scan** is one feature *considered* by one style layer: a [`Context`]
+/// built over it and, if the layer has one, a filter evaluated against it. It
+/// is the unit the walk spends its style time in, and the unit both the zoom
+/// gate and the source-layer grouping exist to reduce, so it is what those
+/// gates assert on rather than a wall clock.
+///
+/// Thread-local, so that a filtered `cargo test` run measuring one walk is not
+/// perturbed by another test rendering on a sibling thread.
+#[cfg(test)]
+pub(crate) mod scans {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        SCANS.with(|scans| scans.set(scans.get() + 1));
+    }
+
+    /// Run `body` and report what it returned alongside the scans it made.
+    pub(crate) fn counted<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        SCANS.with(|scans| scans.set(0));
+        let value = body();
+        (value, SCANS.with(Cell::get))
+    }
+}
+
 fn layer_features<'a>(
     tile: &'a ParsedTile,
     zoom: u8,
@@ -558,6 +603,9 @@ fn layer_features<'a>(
     };
 
     features.iter().filter_map(move |feature| {
+        #[cfg(test)]
+        scans::bump();
+
         // The property bag is *shared* into the context, not rebuilt in it.
         // Converting it to JSON up front cost a `HashMap` allocation and a
         // `String` clone per string-valued property for every feature the
@@ -1912,6 +1960,136 @@ mod tests {
                 Some(2.0),
                 "the point label {:?} lost its wrap width",
                 label.text
+            );
+        }
+    }
+
+    /// The fixture style as JSON, with `patch` applied to every layer whose
+    /// `type` is in `types` — or those layers removed outright when `patch` is
+    /// `None`. The two modes are what make the zoom gate assertable as an
+    /// identity: "these layers are out of range" and "these layers are not
+    /// here" have to produce the same picture.
+    fn fixture_style_with(types: &[&str], patch: Option<(&str, f64)>) -> Style {
+        let mut style: JsonValue = serde_json::from_str(STYLE).expect("the fixture style is JSON");
+        let layers = style["layers"].as_array_mut().expect("a layers array");
+        match patch {
+            Some((key, value)) => {
+                for layer in layers.iter_mut() {
+                    if types.contains(&layer["type"].as_str().unwrap_or_default()) {
+                        layer[key] = serde_json::json!(value);
+                    }
+                }
+            }
+            None => {
+                layers.retain(|layer| !types.contains(&layer["type"].as_str().unwrap_or_default()))
+            }
+        }
+        Style::from_json(&style.to_string()).expect("the patched fixture style parses")
+    }
+
+    /// Render the fixture under `style`, reporting the shapes and the feature
+    /// scans it took to reach them.
+    fn drawn_and_scanned(style: &Style, zoom: u8) -> (String, usize) {
+        let (shapes, scans) =
+            scans::counted(|| render(&fixture(), style, zoom).expect("the fixture tile renders"));
+        (format!("{shapes:?}"), scans)
+    }
+
+    /// **A layer outside its own zoom range does not read a single feature.**
+    ///
+    /// The waste this closes is not tessellation — a layer out of range draws
+    /// nothing either way — it is the *scan*: building a [`Context`] over every
+    /// feature of the layer's source layer and evaluating a filter against it,
+    /// for a layer that cannot produce a shape at this zoom. Measured on the
+    /// committed dark style over Monaco's z14 tile before this gate existed,
+    /// the walk made **36,921 feature scans at every zoom from 0 to 16** — the
+    /// same number at zoom 0, where 14 of the style's 95 layers are live, as at
+    /// zoom 16, where 78 are.
+    ///
+    /// Asserted as an equality on both axes, because a one-sided "fewer scans"
+    /// is satisfied by drawing nothing at all: the scan count drops by exactly
+    /// the three `line` layers' share, and the picture is exactly the picture
+    /// of the style with those three layers deleted.
+    #[test]
+    fn a_layer_outside_its_zoom_range_is_never_scanned() {
+        let (all_drawn, all_scans) = drawn_and_scanned(
+            &Style::from_json(STYLE).expect("fixture style parses"),
+            ZOOM,
+        );
+
+        // The floor. Three `line` layers over `roads`' three features is nine
+        // of the fixture's eighteen scans, and they are what the two variants
+        // below remove — one by putting the layers out of range, one by
+        // deleting them. A fixture that stopped scanning would make both trivially
+        // equal, so the count is pinned here rather than only differenced.
+        assert_eq!(
+            all_scans, 18,
+            "the fixture style scans `landuse` twice over two features (4), \
+             `roads` four times over three (12) and `places` once over two (2)"
+        );
+
+        let out_of_range = fixture_style_with(&["line"], Some(("minzoom", f64::from(ZOOM) + 1.0)));
+        let (gated_drawn, gated_scans) = drawn_and_scanned(&out_of_range, ZOOM);
+
+        let deleted = fixture_style_with(&["line"], None);
+        let (deleted_drawn, deleted_scans) = drawn_and_scanned(&deleted, ZOOM);
+
+        assert_eq!(
+            gated_scans, 9,
+            "a `line` layer whose minzoom is above the tile zoom still read \
+             features: the zoom gate is not skipping the scan"
+        );
+        assert_eq!(
+            gated_scans, deleted_scans,
+            "an out-of-range layer must cost exactly what an absent one costs"
+        );
+        assert_eq!(
+            gated_drawn, deleted_drawn,
+            "an out-of-range layer must draw exactly what an absent one draws"
+        );
+
+        // Non-vacuity: the very layers just gated do draw, and do scan, when
+        // their range admits the zoom. Without this the two equalities above
+        // are also satisfied by a style whose `line` layers never drew.
+        assert!(
+            all_scans > gated_scans && all_drawn != gated_drawn,
+            "the control does not draw or scan more, so the gate proves nothing"
+        );
+    }
+
+    /// **`minzoom` is inclusive, `maxzoom` is exclusive** — the specification's
+    /// asymmetry, which is invisible except as a map that draws one zoom level
+    /// too much or too little.
+    ///
+    /// <https://maplibre.org/maplibre-style-spec/layers/>: "at zoom levels less
+    /// than the minzoom, the layer will be hidden" against "at zoom levels
+    /// equal to or greater than the maxzoom, the layer will be hidden".
+    #[test]
+    fn the_zoom_range_honours_minzoom_inclusively_and_maxzoom_exclusively() {
+        let ranged = {
+            let mut style: JsonValue = serde_json::from_str(STYLE).expect("JSON");
+            for layer in style["layers"].as_array_mut().expect("layers") {
+                if layer["type"] == serde_json::json!("line") {
+                    layer["minzoom"] = serde_json::json!(5);
+                    layer["maxzoom"] = serde_json::json!(7);
+                }
+            }
+            Style::from_json(&style.to_string()).expect("parses")
+        };
+        let absent = fixture_style_with(&["line"], None);
+
+        for zoom in [4u8, 7, 8] {
+            assert_eq!(
+                drawn_and_scanned(&ranged, zoom),
+                drawn_and_scanned(&absent, zoom),
+                "zoom {zoom} is outside [5, 7) and the layers must be absent"
+            );
+        }
+        for zoom in [5u8, 6] {
+            assert_ne!(
+                drawn_and_scanned(&ranged, zoom).0,
+                drawn_and_scanned(&absent, zoom).0,
+                "zoom {zoom} is inside [5, 7) and the layers must draw"
             );
         }
     }

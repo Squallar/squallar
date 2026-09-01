@@ -494,10 +494,18 @@ fn collect_filter_keys(filter: &Value, into: &mut Vec<String>) {
 /// The folded zoom range actually gates, evaluated through the real evaluator.
 ///
 /// This is the end-to-end proof for the most contested transform in the tool.
-/// `walkers::style::Layer` has no `minzoom` field and `walkers::mvt::render`
-/// consults nothing but `filter`, so without the fold every layer draws at
-/// every zoom. Here a building layer's own committed filter is evaluated at a
-/// zoom below its range and at one inside it, and has to answer differently.
+/// Here a building layer's own committed filter is evaluated at a zoom below
+/// its range and at one inside it, and has to answer differently.
+///
+/// **What it proves changed on 2026-09-01, and it is worth being exact about.**
+/// The fold used to be the only thing gating zoom at all:
+/// `walkers::style::Layer` carried no `minzoom` field and `walkers::mvt::styled`
+/// consulted nothing but `filter`, so without the fold every layer drew at
+/// every zoom. `walkers::style::ZoomRange` now parses both bounds and `styled`
+/// skips an out-of-range layer before it reads a feature, so the fold is no
+/// longer what makes the map correct. This test still earns its place: it pins
+/// that the *filters in these documents* say what their `minzoom`/`maxzoom`
+/// say, which is what lets the fold be removed later without re-deriving it.
 #[test]
 fn a_folded_zoom_range_gates_the_layer_through_the_real_evaluator() {
     let style = style_json("dark");
