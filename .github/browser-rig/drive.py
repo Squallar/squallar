@@ -145,7 +145,8 @@ DEFAULT_CHROMEDRIVER = "/usr/bin/chromedriver"
 # pointed anywhere ephemeral would rot silently.
 DEFAULT_GECKODRIVER = os.path.expanduser(
     "~/.cache/squallar-ci/geckodriver-0.37.1/geckodriver")
-DEFAULT_FIREFOX = "/usr/bin/firefox"
+DEFAULT_FIREFOX = ("/Applications/Firefox.app/Contents/MacOS/firefox"
+                   if sys.platform == "darwin" else "/usr/bin/firefox")
 
 
 # --------------------------------------------------------------------------
@@ -418,6 +419,109 @@ class DriverProcess:
                     pass
 
 
+class FirefoxDirectProcess:
+    """Firefox launched by the RIG rather than by geckodriver, for macOS.
+
+    WHY THIS EXISTS (measured on an M2, 2026-08-31, Firefox 154.0.1):
+    geckodriver launches firefox through mozrunner, which always appends
+    `-foreground` on macOS. From a non-GUI context -- an ssh session, which is
+    how this rig is driven -- that makes firefox re-exec itself through
+    LaunchServices to reach the user's Aqua session: the pid geckodriver is
+    watching exits 0 within ~330 ms and geckodriver reports
+
+        Process (pid=N) unexpectedly closed with status 0
+
+    while a perfectly healthy firefox -- same args, same profile, GPU helper
+    and all -- keeps running under a NEW pid. Launching the binary ourselves
+    WITHOUT `-foreground` was verified to keep the original pid (the process
+    stays put and Marionette comes up), so the rig starts firefox and hands
+    geckodriver `--connect-existing --marionette-port N`.
+
+    PROFILE SAFETY. The profile is a throwaway directory this class creates and
+    owns, passed as `-profile`, alongside `-no-remote` so the instance can
+    never attach to -- or be attached to by -- the user's running firefox. The
+    user's real profile is never opened, read or written. This mirrors what
+    geckodriver itself does (it builds a `rust_mozprofile*` temp dir); the only
+    difference is who creates it.
+
+    A CAVEAT THAT IS NOT ABOUT PROFILES. Launching the user's INSTALLED firefox
+    runs its updater, which applies any already-staged update to the app bundle
+    and can prompt the user's own running instance to restart. That was
+    observed on this box: a 153.0.4 -> 154.0.1 update staged five days earlier
+    applied two minutes after the rig's first launch. It costs no user data,
+    but it moves the browser version out from under a measurement campaign, so
+    read `browser_version` off the row rather than trusting what was installed
+    when the leg was queued. A dedicated channel install would avoid it.
+
+    Prefs cannot ride on `moz:firefoxOptions` in connect-existing mode --
+    geckodriver applies those only when it launches the browser itself -- so
+    they are written into the profile's `user.js` before launch. That path
+    matters for measurement: `privacy.reduceTimerPrecision=false` is what gives
+    rAF deltas sub-millisecond resolution, and a row measured without it is
+    quantised to 1 ms and useless for percentiles."""
+
+    def __init__(self, binary, profile_dir, marionette_port, window,
+                 prefs=None, log_path=None, env=None):
+        self.profile_dir = profile_dir
+        self.marionette_port = marionette_port
+        os.makedirs(profile_dir, exist_ok=True)
+        prefs = dict(prefs or {})
+        prefs["marionette.port"] = marionette_port
+        with open(os.path.join(profile_dir, "user.js"), "w") as f:
+            for k, v in sorted(prefs.items()):
+                f.write("user_pref(%s, %s);\n"
+                        % (json.dumps(k), json.dumps(v)))
+        self.argv = [binary, "--marionette", "-no-remote",
+                     "-profile", profile_dir,
+                     "-width", str(window[0]), "-height", str(window[1])]
+        self.log = open(log_path or os.devnull, "ab")
+        self.proc = subprocess.Popen(
+            self.argv, stdout=self.log, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+
+    def wait_ready(self, timeout=90.0):
+        """Block until Marionette is listening, proven by the port file the
+        browser writes into its own profile."""
+        port_file = os.path.join(self.profile_dir, "MarionetteActivePort")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise WebDriverError(
+                    "firefox exited rc=%s before Marionette came up"
+                    % self.proc.returncode)
+            try:
+                with open(port_file) as f:
+                    got = int(f.read().strip())
+                if got:
+                    return got
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        raise WebDriverError("Marionette did not come up in %ss" % timeout)
+
+    def stop(self):
+        try:
+            if self.proc.poll() is None:
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    self.proc.wait(timeout=5)
+        finally:
+            try:
+                self.log.close()
+            except Exception:
+                pass
+            shutil.rmtree(self.profile_dir, ignore_errors=True)
+
+
 def _version_of(binary):
     try:
         out = subprocess.run([binary, "--version"], capture_output=True,
@@ -446,8 +550,13 @@ def pick_chromium_binary(driver_path, preferred=None):
     candidates = []
     if preferred:
         candidates.append(preferred)
-    for name in ("/usr/bin/chromium", "chromium", "/usr/bin/google-chrome",
-                 "google-chrome", "google-chrome-stable"):
+    names = ("/usr/bin/chromium", "chromium", "/usr/bin/google-chrome",
+             "google-chrome", "google-chrome-stable")
+    if sys.platform == "darwin":
+        # macOS ships no chrome on PATH; the app bundle is the binary.
+        names = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                 "/Applications/Chromium.app/Contents/MacOS/Chromium") + names
+    for name in names:
         p = name if os.path.isabs(name) else shutil.which(name)
         if p and p not in candidates:
             candidates.append(p)
@@ -520,6 +629,38 @@ CHROMIUM_HARDWARE_ARGS = [
     "--disable-gpu-sandbox",
     "--use-gl=angle",
     "--use-angle=gl-egl",
+]
+
+# The macOS hardware arm. The list above is a LINUX recipe and saying so is the
+# point: `--use-angle=gl-egl` names desktop-GL-over-EGL, which is not the
+# backend ANGLE uses on macOS -- Metal is -- and forcing it was MEASURED on an
+# M2 (2026-08-31, Chrome 152.0.7977.65) to break WebGPU outright:
+#
+#     "Failed to create WebGPU Context Provider"
+#
+# after which the app's GL fallback ALSO fails, because the failed
+# `getContext("webgpu")` has already bound the canvas:
+#
+#     canvas.getContext() returned null; webgl2 not available or canvas
+#     already in use
+#
+# so the leg ends in a surface-creation panic and prints an INVALID row reading
+# `adapter=none:None backend=UNKNOWN` -- i.e. the rig reports a fully capable
+# machine as having no GPU. That is worse than failing: a row like that gets
+# read as a fact about the hardware.
+#
+# It has a GPU. With these flags instead, requestAdapter() returns an `apple`
+# adapter at maxTextureDimension2D=16384 and WebGL2 comes up as
+# "ANGLE (Apple, ANGLE Metal Renderer: Apple M2)".
+#
+# `--disable-gpu-sandbox` is dropped too: it is a Linux workaround and the
+# macOS GPU process is happy sandboxed. What is deliberately KEPT is the
+# absence of `--enable-unsafe-swiftshader`, so this arm still fails loudly
+# rather than quietly measuring a software rasteriser.
+CHROMIUM_HARDWARE_ARGS_DARWIN = [
+    "--enable-gpu",
+    "--ignore-gpu-blocklist",
+    "--enable-gpu-rasterization",
 ]
 
 # Headless chromium has no window system, so ozone must be told so explicitly;
@@ -677,7 +818,8 @@ def chromium_capabilities(binary, window, headless=True, extra_args=(),
                           arm="software"):
     args = [CHROMIUM_HEADLESS_ARG] if headless else []
     args += (CHROMIUM_SOFTWARE_ARGS if arm == "software"
-             else CHROMIUM_HARDWARE_ARGS)
+             else (CHROMIUM_HARDWARE_ARGS_DARWIN if sys.platform == "darwin"
+                   else CHROMIUM_HARDWARE_ARGS))
     if arm == "hardware" and headless:
         args += CHROMIUM_HEADLESS_OZONE_ARGS
     args += CHROMIUM_BASE_ARGS
@@ -1054,8 +1196,11 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     # today, the Blink Android rows already taken carry that field, and this
     # change is additive. Fixing that is a separate, non-additive edit.
     host = None
-    if arm == "hardware" and browser != "safari" \
+    if arm == "hardware" and browser != "safari" and sys.platform != "darwin" \
             and not (android and browser == "firefox"):
+        # The darwin exemption is safari's, for safari's reason: on macOS there
+        # is no X display to resolve, and recording a failed lookup as
+        # `host_display` would read as though one had been attempted and lost.
         host = resolve_host_display(display)
 
     if browser == "chromium" and android:
@@ -1077,7 +1222,15 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         pick = pick_chromium_binary(driver_path, preferred=binary)
         chrome_headless = headless
-        if arm == "hardware" and host and host.get("display"):
+        if arm == "hardware" and sys.platform == "darwin":
+            # Same intent as the X11 branch below -- headed on the real
+            # compositor -- but on macOS there is no display to hand over:
+            # Quartz is the only one and chrome finds it itself. Without this
+            # the darwin leg stays headless while the firefox and safari legs
+            # beside it are headed, which is a window-system difference that
+            # gets read later as an engine difference.
+            chrome_headless = False
+        elif arm == "hardware" and host and host.get("display"):
             # Headed on the real display: the same surface path a user gets,
             # and the only way the two browsers are measured on the same
             # window system.
@@ -1089,9 +1242,15 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
                                      extra_args=chromium_args, arm=arm)
         argv = [driver_path, "--port=%d" % port, "--log-level=INFO"]
         info = dict(pick)
-        info["gpu_mode"] = ("headed-host-display" if not chrome_headless
-                            else ("headless-angle-egl" if arm == "hardware"
-                                  else "headless-swiftshader"))
+        if not chrome_headless:
+            # The label is a denominator, so it names the compositor actually
+            # used rather than implying an X display on a box that has none.
+            info["gpu_mode"] = ("macos-quartz-headed"
+                                if sys.platform == "darwin"
+                                else "headed-host-display")
+        else:
+            info["gpu_mode"] = ("headless-angle-egl" if arm == "hardware"
+                                else "headless-swiftshader")
     elif browser == "firefox" and android:
         # geckodriver drives the phone's own Firefox over adb, the same way
         # chromedriver drives its Chrome: the package IS the binary. See the
@@ -1142,14 +1301,56 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         info = {"binary": binary, "browser_version": _version_of(binary),
                 "driver_version": _version_of(driver_path)}
         mode = ff_mode
-        if mode == "auto" and arm == "hardware":
+        if sys.platform == "darwin":
+            # macOS has no X display to negotiate and Quartz is the only
+            # compositor, so none of the display modes below apply. See
+            # FirefoxDirectProcess for why the browser is launched by the rig
+            # and geckodriver is pointed at it, rather than the other way
+            # round.
+            mode = "macos-connect"
+        elif mode == "auto" and arm == "hardware":
             mode = "host"
         elif not headless:
             mode = "headed"                      # caller brings the display
         elif mode == "auto":
             mode = "xvfb" if shutil.which("Xvfb") else "headless"
         info["ff_mode"] = mode
-        if mode == "host":
+        if mode == "macos-connect":
+            prefs = dict(FIREFOX_HARDWARE_PREFS) if arm == "hardware" else {}
+            prefs.update({
+                "browser.shell.checkDefaultBrowser": False,
+                "datareporting.policy.dataSubmissionEnabled": False,
+                "app.update.disabledForTesting": True,
+                "browser.sessionstore.resume_from_crash": False,
+                "privacy.reduceTimerPrecision": False,
+            })
+            prefs.update(ff_prefs or {})
+            mport = free_port()
+            profile_dir = os.path.join(tmp_root or out_dir,
+                                       "%s-ffprofile" % tag)
+            ff = FirefoxDirectProcess(
+                binary, profile_dir, mport, window, prefs=prefs,
+                log_path=os.path.join(out_dir, "%s.firefox.log" % tag),
+                env=env)
+            aux_procs.append(ff)
+            try:
+                got_port = ff.wait_ready()
+            except Exception:
+                ff.stop()
+                raise
+            argv = [driver_path, "--port", str(port), "--log", "info",
+                    "--connect-existing", "--marionette-port", str(got_port)]
+            # connect-existing ignores moz:firefoxOptions entirely (the browser
+            # is already up), so the prefs above went in via user.js and the
+            # caps here are the bare minimum the W3C handshake needs.
+            caps = {"capabilities": {"alwaysMatch": {"browserName": "firefox"}}}
+            info["marionette_port"] = got_port
+            info["profile_dir"] = profile_dir
+            info["profile_is_throwaway"] = True
+            info["prefs_via"] = "user.js (connect-existing)"
+            info["prefs"] = dict(prefs)
+            info["gpu_mode"] = "macos-quartz-headed"
+        elif mode == "host":
             if not host:
                 host = resolve_host_display(display)
             if not host.get("display"):
@@ -1212,7 +1413,11 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
     if extra_env:
         env.update(extra_env)
         info["extra_env"] = dict(extra_env)
-    if browser == "firefox":
+    if browser == "firefox" and "prefs" not in info:
+        # macos-connect has already recorded its prefs: they never rode on the
+        # capabilities there (the browser was up before geckodriver attached),
+        # they went into the profile's user.js. Reading them back off a cap
+        # that is absent by design would KeyError.
         info["prefs"] = (caps["capabilities"]["alwaysMatch"]
                          ["moz:firefoxOptions"]["prefs"])
 

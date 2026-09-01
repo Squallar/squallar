@@ -242,7 +242,11 @@ ADB_SERIAL="${RIG_ADB_SERIAL:-}"
 SKIP_LOOPS="${RIG_SKIP_LOOPS:-2}"
 PY=python3
 
-COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# RIG_COMMIT lets a leg run from an exported bundle that has no .git -- which
+# is how the macOS rows are taken: the tree is copied to the Mac, not cloned.
+# The commit is a DENOMINATOR on every row, so "unknown" is not an acceptable
+# answer when the caller knows it.
+COMMIT="${RIG_COMMIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
 # ------------------------------------------------------------- scenes ----
 # All 17 layer ids: LAYER_ID_LEDGER minus the retired FakeSource. Spelled
@@ -338,12 +342,17 @@ echo "scene B denominator columns: $SCENE_B_COLS"
 # ships safaridriver in the OS. Both checks below are therefore scoped to the
 # browsers that were actually asked for -- a safari-only run on a Mac must not
 # die on a display it will never open, and must not reach for geckodriver.
+# On macOS the same exemption extends to firefox and chromium: Quartz is the
+# only compositor there too, so an X display is not merely unnecessary, it does
+# not exist and the lookup below would abort a leg that can run perfectly well.
+# geckodriver is still needed -- but it must be a macOS build, which
+# ensure-geckodriver.sh does not fetch, so a Mac leg passes RIG_GECKODRIVER.
 NEEDS_X11=0
 NEEDS_GECKO=0
 for _br in $BROWSERS; do
   case "$_br" in
-    firefox)  NEEDS_X11=1; NEEDS_GECKO=1 ;;
-    chromium) NEEDS_X11=1 ;;
+    firefox)  [ "$(uname -s)" = Darwin ] || NEEDS_X11=1; NEEDS_GECKO=1 ;;
+    chromium) [ "$(uname -s)" = Darwin ] || NEEDS_X11=1 ;;
   esac
 done
 # An Android leg renders on the phone's own compositor. There is no X display
