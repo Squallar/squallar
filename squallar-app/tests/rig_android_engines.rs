@@ -249,6 +249,55 @@ fn the_onboarding_dismissal_cannot_silently_do_nothing() {
     );
 }
 
+/// **Driving Chrome on a phone does not wipe it.**
+///
+/// `pm clear ` is a literal string in `/usr/bin/chromedriver`, adjacent to
+/// `|shell:` — the driver clears the app's data as routine session startup,
+/// which is how this project's user lost their Chrome. `androidKeepAppDataDir`
+/// is the capability that stops it.
+///
+/// The consequence for the existing rows is separate and worse than the
+/// incident: every Blink Android figure the campaign holds was taken on a
+/// freshly cleared browser — cold profile, cold HTTP cache, cold service
+/// worker, on every pass. That is an unstated denominator, it is not what any
+/// user's browser looks like, and it may be the whole reason those rows read
+/// as outliers.
+///
+/// **This does not make driving Chrome safe yet**, and the daily-driver guard
+/// stays. Proving the data survives needs a Chrome package that is not
+/// somebody's daily browser, and this device has only `com.android.chrome` —
+/// no Beta, no Dev channel.
+#[test]
+fn the_blink_android_path_keeps_the_browsers_data() {
+    assert!(
+        DRIVE_PY.contains("\"androidKeepAppDataDir\": True"),
+        "the chromium Android capabilities no longer carry \
+         androidKeepAppDataDir, so chromedriver runs `pm clear` on the \
+         browser it drives before every session. That silently makes every \
+         Blink Android row a cold-profile row, and it is what cost this \
+         project's user their Chrome",
+    );
+    assert!(
+        DRIVE_PY.contains("androidUseRunningApp"),
+        "androidUseRunningApp is gone. It is the capability that attaches to \
+         a running browser instead of restart-and-clear, and it was absent \
+         from this rig entirely -- named in a docstring and never sent",
+    );
+    assert!(
+        DRIVE_PY.contains("monkey"),
+        "nothing LAUNCHES the package before attaching with \
+         androidUseRunningApp. That capability attaches to a running app and \
+         never starts one, so without this the flag is a trap: the session \
+         fails with nothing saying the browser simply was not open",
+    );
+    assert!(
+        DRIVE_PY.contains("profile_state"),
+        "the Blink Android row no longer records whether the browser's \
+         profile was PRESERVED or CLEARED. Those are different measurements, \
+         and every row taken before this was the cleared kind without saying so",
+    );
+}
+
 /// **A phone throttles, so both ends of the leg travel with the figures.**
 ///
 /// One temperature is not a reading. The Blink lane refuted its own thermal

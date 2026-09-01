@@ -1075,15 +1075,36 @@ def validate_android_args(browser, package, activity, adb_present=True,
     return None
 
 
-def chromium_android_capabilities(package):
-    """chromedriver + the phone's own Chrome. Extracted VERBATIM from the
-    inline literal that used to live in `launch()`; it is a pure move, so the
-    selftest can pin the Blink shape beside the Gecko one and prove the second
-    did not disturb the first."""
+def chromium_android_capabilities(package, use_running_app=False):
+    """chromedriver + the phone's own Chrome, WITHOUT wiping it.
+
+    `androidKeepAppDataDir` is the capability that stops the clear. Its
+    absence is why every Blink Android figure this campaign holds was taken on
+    a freshly `pm clear`ed browser -- cold profile, cold HTTP cache, cold
+    service worker, on every single pass. That is an unstated denominator on
+    all of them and it is not what a real user's browser looks like; it may
+    well be the whole reason those rows read as outliers.
+
+    Both spellings were read out of /usr/bin/chromedriver's own string table,
+    beside the literal `pm clear ` that adjoins `|shell:`:
+      androidKeepAppDataDir   do not delete the app's data directory
+      androidUseRunningApp    attach to the running app instead of
+                              restart-and-clear -- which means the CALLER MUST
+                              HAVE LAUNCHED IT, handled in launch() rather
+                              than left as a trap
+
+    NOT VALIDATED AGAINST HARDWARE. Proving the data survives requires driving
+    a Chrome package, and the only one on this device is the user's daily
+    browser -- there is no Beta or Dev channel installed. The daily-driver
+    guard therefore STAYS exactly as it was: this makes a safe Chrome row
+    possible in principle, and nothing here is evidence that it is safe yet."""
+    opts = {"androidPackage": package, "androidKeepAppDataDir": True}
+    if use_running_app:
+        opts["androidUseRunningApp"] = True
     return {"capabilities": {"alwaysMatch": {
         "browserName": "chrome",
         "acceptInsecureCerts": True,
-        "goog:chromeOptions": {"androidPackage": package},
+        "goog:chromeOptions": opts,
         "goog:loggingPrefs": {"browser": "ALL"},
     }}}
 
@@ -1143,7 +1164,7 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
            ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
            display=None, chromium_args=(), android=False,
            android_package=None, android_activity=None,
-           android_serial=None):
+           android_serial=None, android_use_running_app=False):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
@@ -1230,11 +1251,27 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         # Android device was attached when this landed; arg validation and
         # the wire shape are what is exercised.
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
-        caps = chromium_android_capabilities(android_package)
+        caps = chromium_android_capabilities(
+            android_package, use_running_app=android_use_running_app)
+        if android_use_running_app:
+            # androidUseRunningApp attaches to a running app and does NOT
+            # start one. Left to the caller this is a trap: chromedriver fails
+            # with a bare "no chrome binary" style error and nothing says the
+            # app simply was not up. So the rig starts it and waits.
+            _adb(["shell", "monkey", "-p", android_package, "-c",
+                  "android.intent.category.LAUNCHER", "1"], android_serial)
+            time.sleep(3.0)
         argv = [driver_path, "--port=%d" % port, "--log-level=INFO"]
         info = {"android_package": android_package,
                 "driver_version": _version_of(driver_path),
-                "gpu_mode": "android-device"}
+                "gpu_mode": "android-device",
+                "android_keep_app_data_dir": True,
+                "android_use_running_app": bool(android_use_running_app),
+                # THE DENOMINATOR THAT WAS MISSING. Every Blink Android row
+                # taken before 2026-08-31 was taken on a browser chromedriver
+                # had just `pm clear`ed.
+                "profile_state": ("preserved (androidKeepAppDataDir)"
+                                  if True else "cleared")}
     elif browser == "chromium":
         driver_path = driver_path or DEFAULT_CHROMEDRIVER
         pick = pick_chromium_binary(driver_path, preferred=binary)
@@ -4157,7 +4194,8 @@ PINNED_DESKTOP_FIREFOX_CAPS = (
 PINNED_CHROMIUM_ANDROID_CAPS = (
     '{"capabilities": {"alwaysMatch": {"browserName": "chrome", '
     '"acceptInsecureCerts": true, '
-    '"goog:chromeOptions": {"androidPackage": "com.android.chrome"}, '
+    '"goog:chromeOptions": {"androidPackage": "com.android.chrome", '
+    '"androidKeepAppDataDir": true}, '
     '"goog:loggingPrefs": {"browser": "ALL"}}}}')
 
 
@@ -4710,6 +4748,34 @@ def selftest_android():
           "be additive; a moved key here means every desktop Firefox row this "
           "rig has taken was taken through a different configuration than the "
           "next one will be" % (PINNED_DESKTOP_FIREFOX_CAPS, got))
+    # ---- Blink on Android does not wipe the browser -------------------
+    #
+    # `androidKeepAppDataDir` is the capability that stops chromedriver's
+    # `pm clear` -- the literal string sits beside `|shell:` in the driver
+    # binary. Without it, every Blink Android row is taken on a cold profile,
+    # cold HTTP cache and cold service worker, which is an unstated
+    # denominator and not what any user's browser looks like.
+    cao = (chromium_android_capabilities("com.example.beta")
+           ["capabilities"]["alwaysMatch"]["goog:chromeOptions"])
+    check(cao.get("androidKeepAppDataDir") is True,
+          "the chromium Android capabilities no longer carry "
+          "androidKeepAppDataDir, so chromedriver wipes the browser it drives "
+          "before every session. That cost this project's user their Chrome "
+          "once, and it silently makes every row a cold-profile row")
+    check("androidUseRunningApp" not in cao,
+          "androidUseRunningApp is on by DEFAULT. It attaches to a running "
+          "app and never starts one, so a default-on capability turns every "
+          "leg on a closed browser into an unexplained session failure")
+    cao2 = (chromium_android_capabilities("com.example.beta",
+                                          use_running_app=True)
+            ["capabilities"]["alwaysMatch"]["goog:chromeOptions"])
+    check(cao2.get("androidUseRunningApp") is True
+          and cao2.get("androidKeepAppDataDir") is True,
+          "--android-use-running-app does not reach goog:chromeOptions, or "
+          "turns off the keep-data capability while doing it")
+    # (that the rig LAUNCHES the package before attaching is a cross-file
+    # property and is pinned from the Rust side, in rig_android_engines.rs)
+
     got = json.dumps(chromium_android_capabilities("com.android.chrome"))
     check(got == PINNED_CHROMIUM_ANDROID_CAPS,
           "the chromium Android capability payload changed when it was moved "
@@ -6243,6 +6309,12 @@ def main(argv=None):
                          "Success), which DELETES that browser's tabs, "
                          "logins, bookmarks and history. Only for a device "
                          "nobody uses")
+    ap.add_argument("--android-use-running-app", action="store_true",
+                    help="chromium only: attach to the ALREADY RUNNING "
+                         "browser (goog:chromeOptions.androidUseRunningApp) "
+                         "instead of restart-and-clear. The rig launches "
+                         "the package first, because the capability "
+                         "attaches and never starts")
     ap.add_argument("--android-activity", default=None,
                     help="moz:firefoxOptions.androidActivity for a Firefox "
                          "build geckodriver has no default for; must not "
