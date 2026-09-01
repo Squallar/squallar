@@ -155,7 +155,9 @@ repositories {
 // If absent, release builds still succeed but emit `…-release-unsigned.apk`,
 // which Android will not install. That is the failure mode worth naming: the
 // obvious workaround is to sideload the *debug* APK instead, and that build is
-// `debuggable="true"` under the stock `CN=Android Debug` key. The warning is
+// `debuggable="true"` under the stock `CN=Android Debug` key. It installs
+// alongside a release build rather than over it — see `applicationIdSuffix`
+// below — so reaching for it never costs the installed app its data. The warning is
 // raised from the release assemble tasks (below) rather than here, so it lands
 // at the end of the build it actually applies to instead of on every
 // invocation, including `assembleDebug`.
@@ -275,6 +277,24 @@ android {
     buildTypes {
         getByName("debug") {
             isMinifyEnabled = false
+            // A debug build is a *different package* from the release one, so
+            // the two coexist on one device.
+            //
+            // Without this they share `app.squallar`, and because they are
+            // signed by different keys — release by the keystore below, debug
+            // by the stock `CN=Android Debug` — Android refuses to install
+            // either over the other. The only way through is `adb uninstall`,
+            // which destroys the installed app's data. On a developer's own
+            // handset that is an annoyance; on a phone carrying a real
+            // install it is data loss, and it is the *debug* build (the one
+            // reached for while diagnosing) that forces the choice.
+            //
+            // The suffix moves only the applicationId. `namespace` stays
+            // `app.squallar`, so the Kotlin helpers keep their Java package
+            // and the JNI lookups in `android::entry` — which name
+            // `app.squallar.BackHandler` and friends as *class* names —
+            // resolve unchanged in both variants.
+            applicationIdSuffix = ".debug"
         }
         getByName("release") {
             // Nothing is shrunk, so nothing has to be kept, and that is the trade
