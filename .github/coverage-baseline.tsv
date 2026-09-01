@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1437	1063
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1879	1578
+squallar-app/src/app_fetch.rs	1879	1559
 squallar-app/src/app_render.rs	3102	2506
 squallar-app/src/app_state.rs	76	0
 squallar-app/src/budget_arms.rs	17	17
@@ -20,7 +20,7 @@ squallar-app/src/location_hint.rs	82	51
 squallar-app/src/loop_pool.rs	208	206
 squallar-app/src/loop_refill.rs	97	90
 squallar-app/src/loop_telemetry.rs	23	23
-squallar-app/src/platform.rs	390	320
+squallar-app/src/platform.rs	390	317
 squallar-app/src/platform_double.rs	276	263
 squallar-app/src/render_dispatch.rs	1177	1074
 squallar-app/src/render_key.rs	27	27
@@ -88,7 +88,7 @@ squallar-egui/src/ui_input.rs	352	352
 squallar-egui/src/ui_inspector.rs	295	289
 squallar-egui/src/ui_layout.rs	257	257
 squallar-egui/src/ui_map.rs	2159	2061
-squallar-egui/src/ui_map_overlays.rs	1037	1014
+squallar-egui/src/ui_map_overlays.rs	1037	1011
 squallar-egui/src/ui_map_pane.rs	2043	1880
 squallar-egui/src/ui_menu.rs	406	372
 squallar-egui/src/ui_offline_areas.rs	178	132
@@ -217,7 +217,7 @@ squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	163
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
-squallar-radar/src/chunks.rs	975	797
+squallar-radar/src/chunks.rs	975	805
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	311	294
 squallar-radar/src/dpprep.rs	1022	956
