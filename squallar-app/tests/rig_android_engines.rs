@@ -193,6 +193,62 @@ fn the_rig_refuses_to_drive_a_daily_browser_by_default() {
     );
 }
 
+/// **The wizard is dismissed by identity, and a dismissal that does nothing
+/// fails.**
+///
+/// geckodriver pushes a fresh profile and `pm clear`s the package on every
+/// launch, so Firefox comes up in first-run onboarding, in front of the page,
+/// every time. Prefs cannot reach it — Fenix's wizard state is Android
+/// SharedPreferences, and `moz:firefoxOptions.prefs` writes the Gecko profile;
+/// all five candidate prefs were set, confirmed delivered, and the wizard
+/// still appeared.
+///
+/// The dangerous repair is the obvious one: screenshot, and tap where the
+/// button was last time. That breaks on a different density, theme, locale or
+/// fold, and — worse — it fails *silently*, navigating into the wizard and
+/// reporting a row that describes the onboarding screen. So the controls are
+/// located in the accessibility tree by `resource-id`, each tap is computed
+/// from that node's own `bounds`, and the loop must PROVE it arrived at the
+/// browser rather than assume a tap worked.
+#[test]
+fn the_onboarding_dismissal_cannot_silently_do_nothing() {
+    assert!(
+        DRIVE_PY.contains("def android_dismiss_onboarding"),
+        "the onboarding dismissal is gone. Every Gecko-on-Android leg then \
+         needs a human to tap through a wizard, which means no such leg is \
+         unattended and every figure on it is provisional",
+    );
+    assert!(
+        DRIVE_PY.contains("did not converge"),
+        "the dismissal no longer FAILS when there is nothing to dismiss and \
+         no browser on screen. That is the whole non-triviality floor: \
+         without it the step passes by doing nothing, the leg navigates into \
+         the wizard, and every figure on the row describes the onboarding \
+         screen rather than the app",
+    );
+    assert!(
+        DRIVE_PY.contains("uiautomator") && DRIVE_PY.contains("resource-id"),
+        "the dismissal no longer reads the UI hierarchy, so it is back to \
+         guessing coordinates from pixels -- which breaks on a different \
+         density, theme, locale or fold, and breaks silently",
+    );
+    assert!(
+        DRIVE_PY.contains("_uia_bounds_center"),
+        "taps are no longer computed from each node's own bounds. A \
+         remembered coordinate is a guess wearing a measurement's clothes",
+    );
+    assert!(
+        DRIVE_PY.contains("BROWSER_READY_ID_FRAGMENTS"),
+        "the dismissal no longer verifies it ARRIVED at the browser, so a tap \
+         that returned success but changed nothing reads as a dismissed wizard",
+    );
+    assert!(
+        DRIVE_PY.contains("max_rounds"),
+        "the dismissal is unbounded; a wizard that never completes hangs the \
+         leg instead of failing it",
+    );
+}
+
 /// **A phone throttles, so both ends of the leg travel with the figures.**
 ///
 /// One temperature is not a reading. The Blink lane refuted its own thermal

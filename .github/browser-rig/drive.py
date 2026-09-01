@@ -100,6 +100,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zlib
 from collections import Counter
 
@@ -1252,6 +1253,355 @@ def adb_reverse(port, serial=None):
         raise WebDriverError("adb reverse failed rc=%d: %s"
                              % (r.returncode, (r.stderr or r.stdout).strip()))
     return " ".join(argv)
+
+
+# --------------------------------------------------------------------------
+# Fenix onboarding: dismissed from the accessibility tree, never from pixels
+# --------------------------------------------------------------------------
+#
+# geckodriver pushes a FRESH profile and `pm clear`s the package on every
+# launch (both MEASURED from its own trace), so Firefox comes up in first-run
+# onboarding, in front of the page, every single time. A human tapped through
+# it on every leg taken before this, which means those legs were not
+# unattended and their figures were provisional.
+#
+# PREFS CANNOT DO THIS. Fenix's wizard state lives in Android
+# SharedPreferences under /data/data/<pkg>/shared_prefs/ -- Kotlin app state --
+# and `moz:firefoxOptions.prefs` writes the GECKO PROFILE. All five candidate
+# prefs were set, confirmed delivered in the artifact, and the wizard still
+# appeared. That is a measured negative, not an untried idea.
+#
+# AND NOT FROM PIXELS EITHER. A screenshot plus hardcoded tap coordinates
+# breaks on a different density, theme, locale, or -- on the device this runs
+# against -- a fold. `uiautomator dump` hands back every node's resource-id,
+# text and bounds, so a control is located by IDENTITY and its centre computed
+# from its OWN bounds. Nothing here guesses where anything is.
+#
+# The parsing is split out from the adb I/O so the whole decision procedure --
+# including the case that must FAIL -- is exercised offline by the selftest,
+# with no phone, no driver and no browser.
+
+# Resource-id fragments for the onboarding controls, most-preferred first.
+# Matched as a SUFFIX after the `<package>:id/` prefix, so the same list works
+# for release, beta and nightly packages.
+ONBOARDING_ID_FRAGMENTS = (
+    "onboarding_",
+    "primary_button",
+    "secondary_button",
+    "positive_button",
+    "negative_button",
+    "skip_button",
+    "close_button",
+)
+
+# System dialogs are a DIFFERENT package sitting in front of ours, so they are
+# matched separately and always DECLINED. MEASURED on this device: after the
+# welcome screen, Fenix raises the platform "Set Firefox Beta as your default
+# browser" chooser (com.android.permissioncontroller), listing Chrome as the
+# current default. `android:id/button2` is its Cancel.
+SYSTEM_DECLINE_ID_FRAGMENTS = (
+    "permission_deny_button",
+    "button2",                  # the platform AlertDialog's negative button
+    "cancel_button",
+)
+SYSTEM_DECLINE_TEXT = (
+    "cancel", "not now", "no thanks", "don't allow", "dont allow", "deny",
+    "skip", "maybe later", "later",
+)
+
+# NEVER TAPPED, on any screen, by any matcher. These change the DEVICE, not
+# the wizard: the rig is a guest on somebody's phone and making Firefox Beta
+# the default browser is a settings change nobody asked for -- and the chooser
+# that offers it also lists the user's real Chrome and release Firefox.
+#
+# This filter runs BEFORE classification, so it applies to id matches and text
+# matches alike. A control the rig cannot identify is skipped; a control it
+# identifies as device-altering is refused.
+NEVER_TAP_TEXT = (
+    "set as default", "set default", "make default", "set as browser",
+    "allow", "always allow", "allow all the time", "while using the app",
+    "turn on", "enable", "sign in", "sync", "import",
+)
+
+# English-only text fallback, used ONLY when no id matched. The locale
+# limitation is real and is recorded on the result as the mechanism that
+# fired, so a row can say whether it converged by identity or by guessing at
+# a language.
+ONBOARDING_TEXT_HINTS = (
+    "start browsing", "get started", "not now", "skip", "maybe later",
+    "no thanks", "continue", "done", "next",
+)
+
+# The browser is REACHABLE when one of these is on screen. This is the
+# non-triviality floor: the dismissal does not get to succeed by doing
+# nothing, it has to prove it arrived somewhere.
+#
+# `homepageView` counts because Fenix legitimately shows its home screen when
+# the current tab is blank, which is where a dismissed wizard lands and is a
+# correct place to stop tapping. It is NOT evidence that a page will render --
+# see verify_android_content_view, which is the check that catches the state
+# this list cannot: chrome present, content view never laid out.
+BROWSER_READY_ID_FRAGMENTS = (
+    "mozac_browser_toolbar_url_view",
+    "engineView",
+    "homepageView",
+    "toolbar",
+)
+
+
+def _uia_bounds_center(bounds):
+    """`[x1,y1][x2,y2]` -> (cx, cy), or None when unparseable.
+
+    The centre comes from the node's OWN bounds every time. There is no
+    fallback to a remembered coordinate: a tap this function cannot place is a
+    tap that does not happen."""
+    m = re.match(r"^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$", (bounds or "").strip())
+    if not m:
+        return None
+    x1, y1, x2, y2 = (int(g) for g in m.groups())
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+
+def _uia_id_suffix(resource_id):
+    """`org.mozilla.firefox_beta:id/primary_button` -> `primary_button`."""
+    return (resource_id or "").rsplit("/", 1)[-1]
+
+
+def _uia_area(bounds):
+    m = re.match(r"^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$", (bounds or "").strip())
+    if not m:
+        return 1 << 62
+    x1, y1, x2, y2 = (int(g) for g in m.groups())
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _uia_labels(node):
+    """Every text/content-desc at or under this node.
+
+    Fenix's Compose onboarding buttons have neither of their own -- the label
+    is a non-clickable child -- so a clickable node's identity has to be read
+    from its subtree or it has no identity at all."""
+    out = []
+    for n in node.iter("node"):
+        for key in ("text", "content-desc"):
+            v = (n.attrib.get(key) or "").strip()
+            if v:
+                out.append(v)
+    return out
+
+
+def android_parse_hierarchy(xml_text, package):
+    """Decide what to do with one `uiautomator dump`, without touching a phone.
+
+    Returns {"reachable", "targets", "nodes", "packages"}:
+      reachable  the browser's own URL bar / content view is on screen, so
+                 there is nothing left to dismiss
+      targets    clickable onboarding or permission controls, each with the
+                 centre computed from its own bounds, best candidate first
+
+    THE CASE THAT MATTERS is `reachable False, targets []`: a hierarchy with
+    no onboarding to act on and no browser either. That is not success and
+    must never be reported as such -- it is the shape a silent fall-through
+    would take, and it would navigate into a wizard and measure the app not
+    running."""
+    out = {"reachable": False, "targets": [], "nodes": 0, "packages": []}
+    try:
+        root = ET.fromstring(xml_text or "")
+    except ET.ParseError as e:
+        out["error"] = "uiautomator dump is not parseable XML: %s" % e
+        return out
+    seen_packages = set()
+    ids, perms, texts = [], [], []
+    for node in root.iter("node"):
+        out["nodes"] += 1
+        a = node.attrib
+        pkg = a.get("package") or ""
+        if pkg:
+            seen_packages.add(pkg)
+        rid = _uia_id_suffix(a.get("resource-id"))
+        if any(f in rid for f in BROWSER_READY_ID_FRAGMENTS):
+            out["reachable"] = True
+        if a.get("clickable") != "true" or a.get("enabled") == "false":
+            continue
+        center = _uia_bounds_center(a.get("bounds"))
+        if center is None:
+            continue
+        # MEASURED on Fenix 155 (Beta): the onboarding is Compose and its
+        # buttons carry NO resource-id and NO text of their own -- the visible
+        # label is a separate, non-clickable CHILD node. A parser that reads
+        # only each node's own text finds nothing to tap on the one screen it
+        # exists for, which is exactly what the first version did.
+        labels = _uia_labels(node)
+        cand = {"resource_id": a.get("resource-id"),
+                "text": (labels[0] if labels else ""),
+                "center": center, "package": pkg, "area": _uia_area(a.get("bounds"))}
+        # DECLINE IS DECIDED FIRST, and it has to be: NEVER_TAP_TEXT is
+        # matched as a substring, and "allow" is a substring of "Don't allow".
+        # Checking the ban first would refuse the very button that dismisses a
+        # permission dialog and leave the flow stuck in front of it. Declines
+        # are exact-match, so they cannot be widened by accident.
+        decline = (any(f in rid for f in SYSTEM_DECLINE_ID_FRAGMENTS)
+                   or any(l.strip().lower() in SYSTEM_DECLINE_TEXT
+                          for l in labels))
+        if not decline:
+            # A control that changes the DEVICE is never a candidate, however
+            # it would otherwise have matched.
+            banned = next((l for l in labels
+                           if any(b in l.strip().lower()
+                                  for b in NEVER_TAP_TEXT)), None)
+            if banned is not None:
+                out.setdefault("refused", []).append(
+                    {"text": banned, "center": center,
+                     "why": "would change the device, not the wizard"})
+                continue
+        if decline:
+            cand["matched"] = "system-decline:%s" % (rid or cand["text"])
+            perms.append(cand)
+        elif rid and any(f in rid for f in ONBOARDING_ID_FRAGMENTS):
+            cand["matched"] = "onboarding-id:%s" % rid
+            ids.append(cand)
+        else:
+            hit = next((l for l in labels
+                        if l.strip().lower() in ONBOARDING_TEXT_HINTS), None)
+            if hit is not None:
+                cand["text"] = hit
+                cand["matched"] = "text(en-only):%s" % hit.strip().lower()
+                texts.append(cand)
+    # SMALLEST MATCHING BOX FIRST. Descendant labels mean a big container that
+    # happens to enclose the button also "matches", and tapping its centre
+    # lands wherever the middle of the screen happens to be. The tight box
+    # around the control is the control.
+    texts.sort(key=lambda c: c["area"])
+    out["packages"] = sorted(seen_packages)
+    # A system permission dialog is in FRONT of everything, so it goes first;
+    # then ids, which are identity; then the English text guess, last.
+    if not out["reachable"]:
+        out["targets"] = perms + ids + texts
+    return out
+
+
+def android_dismiss_onboarding(package, serial=None, max_rounds=10,
+                               _dump=None, _tap=None, dump_sink=None):
+    """Tap through Fenix's first-run wizard until the browser is reachable.
+
+    Bounded, verified and LOUD. It loops because the wizard is several screens
+    whose order changes between builds; it verifies arrival against the
+    browser's own toolbar rather than assuming a tap worked because `input
+    tap` exited 0; and when it cannot converge it RAISES, because the
+    alternative is navigating into a wizard and reporting a row for an app
+    that never ran.
+
+    `_dump`/`_tap` are injection seams for the selftest -- the loop's control
+    flow is the part that has to be right, and it is exercised offline."""
+    dump = _dump or (lambda: _adb_uia_dump(package, serial))
+    tap = _tap or (lambda x, y: _adb_tap(x, y, serial))
+    trail = []
+    for round_ in range(max_rounds):
+        raw = dump()
+        # The failure mode here is "the wizard changed and the rig no longer
+        # recognises it", and that is unreadable without the hierarchy that
+        # was actually on screen. Kept for every round, written out by the
+        # caller when this raises.
+        if dump_sink is not None:
+            dump_sink.append(raw)
+        state = android_parse_hierarchy(raw, package)
+        if state.get("reachable"):
+            return {"ok": True, "rounds": round_, "taps": trail,
+                    "note": "browser reachable (toolbar/content view on screen)"}
+        targets = state.get("targets") or []
+        if not targets:
+            raise WebDriverError(
+                "onboarding dismissal did not converge after %d round(s): the "
+                "UI hierarchy has NO onboarding control to act on and NO "
+                "browser toolbar either. Foreground packages seen: %s; %d "
+                "nodes; %s. Refusing to navigate -- a leg that starts inside "
+                "a wizard measures the app not running."
+                % (round_, state.get("packages"), state.get("nodes"),
+                   state.get("error") or "hierarchy parsed"))
+        t = targets[0]
+        tap(*t["center"])
+        trail.append({"round": round_, "matched": t["matched"],
+                      "text": t["text"], "center": list(t["center"])})
+        time.sleep(1.2)          # let the wizard advance before re-reading
+    raise WebDriverError(
+        "onboarding dismissal hit its %d-round bound without the browser "
+        "becoming reachable; taps so far: %s"
+        % (max_rounds, json.dumps(trail)))
+
+
+def verify_android_content_view(session, timeout=30.0, probe=None):
+    """After navigate: the page must actually be ON SCREEN, not merely loaded.
+
+    MEASURED on Fenix 155, and it is the failure this exists for: with the
+    wizard dismissed, geckodriver navigates and the page BOOTS -- Marionette
+    reaches it, JS runs, `crossOriginIsolated` is true, the rayon pool comes
+    up with 8 threads -- while Fenix keeps `homepageView` on top and never
+    lays out the GeckoView. The canvas stays at the HTML default 300x150
+    buffer and 0x0 css, screenshots fail with "Unable to capture screenshot",
+    and every frame figure the leg would print describes a viewport that was
+    never displayed.
+
+    Nothing weaker sees it. `booted` is true, the worker wire is up, the
+    adapter is real hardware. Only the canvas having a SIZE distinguishes a
+    page that rendered from a page that merely ran, so that is what is
+    asserted -- loudly, because the alternative is a full row of plausible
+    numbers for a window nobody was shown."""
+    read = probe or (lambda: session.execute(BOOT_PROBE))
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = read() or {}
+        if (last.get("clientWidth", 0) > 0 and last.get("clientHeight", 0) > 0
+                and last.get("bufferWidth", 0) > 300):
+            return {"ok": True, "waited_s": round(
+                timeout - (deadline - time.monotonic()), 2),
+                "client": [last.get("clientWidth"), last.get("clientHeight")],
+                "buffer": [last.get("bufferWidth"), last.get("bufferHeight")]}
+        time.sleep(0.5)
+    raise WebDriverError(
+        "the page loaded but was never DISPLAYED: after %.0fs the canvas is "
+        "still %sx%s css / %sx%s buffer. On Fenix this is the browser holding "
+        "its home screen in front of the content view -- the app runs, the "
+        "worker pool comes up and nothing else in this rig can tell. Refusing "
+        "to report frame figures for a viewport that was never on screen."
+        % (timeout, (last or {}).get("clientWidth"),
+           (last or {}).get("clientHeight"), (last or {}).get("bufferWidth"),
+           (last or {}).get("bufferHeight")))
+
+
+def _adb(argv, serial=None, timeout=30):
+    adb = shutil.which("adb")
+    if not adb:
+        raise WebDriverError("--android needs adb on PATH")
+    full = [adb] + (["-s", serial] if serial else []) + argv
+    return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+
+
+def _adb_uia_dump(package, serial=None):
+    """One `uiautomator dump`, read back and then REMOVED -- the rig cleans up
+    what it creates and nothing else."""
+    remote = "/data/local/tmp/squallar-rig-uia.xml"
+    r = _adb(["shell", "uiautomator", "dump", remote], serial, timeout=60)
+    if r.returncode != 0:
+        raise WebDriverError("uiautomator dump failed rc=%d: %s"
+                             % (r.returncode, (r.stderr or r.stdout)[:300]))
+    try:
+        cat = _adb(["shell", "cat", remote], serial, timeout=60)
+        if cat.returncode != 0:
+            raise WebDriverError("could not read the uiautomator dump: %s"
+                                 % (cat.stderr or cat.stdout)[:300])
+        return cat.stdout
+    finally:
+        _adb(["shell", "rm", "-f", remote], serial, timeout=30)
+
+
+def _adb_tap(x, y, serial=None):
+    r = _adb(["shell", "input", "tap", str(int(x)), str(int(y))], serial)
+    if r.returncode != 0:
+        raise WebDriverError("input tap failed rc=%d: %s"
+                             % (r.returncode, (r.stderr or r.stdout)[:200]))
 
 
 def android_device_state(serial=None):
@@ -3338,6 +3688,290 @@ def selftest_android():
               "%s is on the daily-driver list, which would leave the rig with "
               "nothing it is allowed to drive" % safe)
 
+    # ---- onboarding dismissal, and the case it must FAIL ----------------
+    #
+    # THE NON-TRIVIALITY FLOOR IS THE POINT. A dismissal that "succeeds" by
+    # doing nothing would navigate into the wizard and produce a row for an
+    # app that never ran -- a measurement of the onboarding screen, reported
+    # as a measurement of squallar. So the case with nothing to tap AND no
+    # browser has to raise, and that is checked before anything else here.
+    PKG = "org.mozilla.firefox_beta"
+
+    def _node(**a):
+        return "<node " + " ".join('%s="%s"' % (k.replace("_", "-"), v)
+                                   for k, v in a.items()) + "/>"
+
+    def _hier(*nodes):
+        return "<?xml version='1.0'?><hierarchy rotation='0'>%s</hierarchy>" \
+               % "".join(nodes)
+
+    onboarding_xml = _hier(_node(
+        package=PKG, resource_id="%s:id/primary_button" % PKG,
+        text="Start browsing", clickable="true", enabled="true",
+        bounds="[100,1800][980,1950]"))
+    ready_xml = _hier(_node(
+        package=PKG,
+        resource_id="%s:id/mozac_browser_toolbar_url_view" % PKG,
+        text="", clickable="true", enabled="true", bounds="[0,100][1080,220]"))
+    # Neither a wizard nor a browser: a lock screen, a crash dialog, a launcher.
+    stuck_xml = _hier(_node(
+        package="com.android.systemui", resource_id="com.android.systemui:id/x",
+        text="", clickable="false", enabled="true", bounds="[0,0][1080,2400]"))
+
+    st = android_parse_hierarchy(stuck_xml, PKG)
+    check(st["reachable"] is False and st["targets"] == [],
+          "a hierarchy that is neither the wizard nor the browser is being "
+          "classified as actionable or as reachable; it is neither")
+    raised = None
+    try:
+        android_dismiss_onboarding(PKG, _dump=lambda: stuck_xml,
+                                   _tap=lambda x, y: None)
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None and "did not converge" in raised,
+          "THE FLOOR IS GONE: onboarding dismissal returns success when there "
+          "is nothing to dismiss and no browser on screen. It would then "
+          "navigate into the wizard and every figure on the row would "
+          "describe the onboarding screen rather than the app")
+    # And it must fail the same way when the dump is unusable, rather than
+    # treating an unparseable hierarchy as "nothing to do".
+    raised = None
+    try:
+        android_dismiss_onboarding(PKG, _dump=lambda: "not xml at all",
+                                   _tap=lambda x, y: None)
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None,
+          "an unparseable uiautomator dump is treated as a clean screen, so a "
+          "broken instrument reads as a dismissed wizard")
+
+    # Already at the browser: zero taps, and it must not invent one.
+    taps = []
+    got = android_dismiss_onboarding(PKG, _dump=lambda: ready_xml,
+                                     _tap=lambda x, y: taps.append((x, y)))
+    check(got["ok"] and got["rounds"] == 0 and taps == [],
+          "the dismissal taps something when the browser is ALREADY on "
+          "screen (%r); a stray tap on a live page is an input event inside "
+          "somebody's measurement window" % (taps,))
+
+    # The wizard, then the browser: exactly one tap, at the node's own centre.
+    seq = [onboarding_xml, ready_xml]
+    taps = []
+    got = android_dismiss_onboarding(
+        PKG, _dump=lambda: seq.pop(0), _tap=lambda x, y: taps.append((x, y)))
+    check(got["ok"] and taps == [(540, 1875)],
+          "the dismissal did not tap the onboarding button's own centre: "
+          "expected one tap at (540, 1875) computed from bounds "
+          "[100,1800][980,1950], got %r. A tap placed anywhere else is a "
+          "guess, and a guess breaks on a different density, theme, locale "
+          "or fold" % (taps,))
+    # Ordering is only testable when BOTH kinds are on the same screen -- a
+    # single id-matched node would satisfy any ordering, which is how the
+    # first version of this check passed its own tamper.
+    both_xml = _hier(
+        _node(package=PKG, resource_id="%s:id/nope" % PKG, text="Get started",
+              clickable="true", enabled="true", bounds="[0,0][100,100]"),
+        _node(package=PKG, resource_id="%s:id/primary_button" % PKG,
+              text="", clickable="true", enabled="true",
+              bounds="[100,1800][980,1950]"))
+    both = android_parse_hierarchy(both_xml, PKG)
+    check(both["targets"] and
+          both["targets"][0]["matched"].startswith("onboarding-id:"),
+          "with an id-matched control and an English-text-matched control on "
+          "the same screen, the TEXT one is being tapped first (%r). Identity "
+          "beats a language guess: the text list is a fallback for builds "
+          "with no ids, and preferring it makes every non-English device tap "
+          "the wrong thing"
+          % ([t["matched"] for t in both["targets"]],))
+    # And a permission dialog is in FRONT of the wizard, so it outranks both.
+    perm_xml = _hier(
+        _node(package=PKG, resource_id="%s:id/primary_button" % PKG, text="",
+              clickable="true", enabled="true", bounds="[100,1800][980,1950]"),
+        _node(package="com.android.permissioncontroller",
+              resource_id="com.android.permissioncontroller:id/"
+                          "permission_deny_button",
+              text="Don't allow", clickable="true", enabled="true",
+              bounds="[60,1700][500,1800]"))
+    perm = android_parse_hierarchy(perm_xml, PKG)
+    check(perm["targets"] and
+          perm["targets"][0]["matched"].startswith("system-decline:"),
+          "a system dialog sitting in front of the wizard is not "
+          "handled first (%r); taps aimed at the wizard behind it land on the "
+          "dialog and the flow never advances"
+          % ([t["matched"] for t in perm["targets"]],))
+
+    # The bound is real: a wizard that never ends stops, it does not spin.
+    raised = None
+    try:
+        android_dismiss_onboarding(PKG, max_rounds=3,
+                                   _dump=lambda: onboarding_xml,
+                                   _tap=lambda x, y: None)
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None and "bound" in raised,
+          "an onboarding flow that never completes loops forever instead of "
+          "failing; the leg would hang rather than report")
+
+    # ---- the shape Fenix 155 actually has -------------------------------
+    #
+    # NOT INVENTED. This fixture is trimmed from a real `uiautomator dump` of
+    # Firefox Beta 155's first-run screen on the SM-F966U: the button carries
+    # no resource-id and no text of its own, the visible "Continue" is a
+    # separate non-clickable child, and three OTHER clickable nodes on the
+    # same screen hold long legal content-descs. A parser that reads only a
+    # node's own text finds nothing here -- which is what the first version
+    # did, and it failed on the device.
+    fenix155 = (
+        "<?xml version='1.0'?><hierarchy rotation='0'>"
+        "<node package='{p}' resource-id='{p}:id/rootContainer'"
+        " clickable='false' text='' content-desc='' bounds='[0,0][1968,2184]'>"
+        "<node package='{p}' text='Welcome to Firefox' clickable='false'"
+        " enabled='true' bounds='[717,977][1220,1046]'/>"
+        "<node package='{p}' text='' content-desc='By continuing, you agree to"
+        " the Firefox Terms of Use' clickable='true' enabled='true'"
+        " bounds='[470,1268][1380,1393]'/>"
+        "<node package='{p}' text='' content-desc='Firefox cares about your"
+        " privacy' clickable='true' enabled='true'"
+        " bounds='[470,1393][1466,1519]'/>"
+        "<node package='{p}' clickable='true' enabled='true' text=''"
+        " content-desc='' bounds='[459,1713][1509,1839]'>"
+        "<node package='{p}' text='Continue' clickable='false' enabled='true'"
+        " bounds='[895,1750][1074,1802]'/>"
+        "</node></node></hierarchy>").format(p=PKG)
+    f = android_parse_hierarchy(fenix155, PKG)
+    check(f["reachable"] is False,
+          "the Fenix 155 onboarding screen is being read as 'the browser is "
+          "reachable'; the leg would navigate straight into the wizard")
+    check(f["targets"],
+          "NOTHING MATCHES on the real Fenix 155 onboarding screen. Its "
+          "buttons carry no resource-id and no text of their own -- the label "
+          "is a non-clickable CHILD -- so a parser that reads only each "
+          "node's own text finds nothing to tap and the leg cannot start")
+    if f["targets"]:
+        top = f["targets"][0]
+        check(top["center"] == (984, 1776),
+              "the wrong control is first on the real Fenix 155 screen: "
+              "expected the Continue button's centre (984, 1776) from bounds "
+              "[459,1713][1509,1839], got %r via %r. The other clickable "
+              "nodes on that screen are the Terms and privacy links -- "
+              "tapping one opens a legal notice and the wizard never advances"
+              % (top["center"], top["matched"]))
+        check("continue" in top["matched"],
+              "the first target on the real screen was matched as %r rather "
+              "than by the button's own label" % top["matched"])
+    # A container that merely ENCLOSES the button also collects its label.
+    # The tight box is the control; the enclosing one is the screen.
+    nested = (
+        "<?xml version='1.0'?><hierarchy rotation='0'>"
+        "<node package='{p}' clickable='true' enabled='true' text=''"
+        " content-desc='' bounds='[0,0][1968,2184]'>"
+        "<node package='{p}' clickable='true' enabled='true' text=''"
+        " content-desc='' bounds='[459,1713][1509,1839]'>"
+        "<node package='{p}' text='Continue' clickable='false' enabled='true'"
+        " bounds='[895,1750][1074,1802]'/>"
+        "</node></node></hierarchy>").format(p=PKG)
+    nst = android_parse_hierarchy(nested, PKG)
+    check(nst["targets"] and nst["targets"][0]["center"] == (984, 1776),
+          "a full-screen container that merely encloses the button is being "
+          "tapped instead of the button (%r). Its centre is the middle of the "
+          "screen, which is not a control"
+          % ([t["center"] for t in nst["targets"]],))
+
+    # ---- the rig never changes the device -------------------------------
+    #
+    # MEASURED, trimmed from a real dump: after the welcome screen Fenix
+    # raises the PLATFORM default-browser chooser, which lists the user's
+    # actual Chrome as current default and their release Firefox beside it.
+    # Its positive button is "Set as default" (android:id/button1) and its
+    # negative is "Cancel" (android:id/button2). Tapping the positive one
+    # would repoint the whole phone's browser association -- a settings change
+    # nobody asked for, on somebody's personal device.
+    default_chooser = (
+        "<?xml version='1.0'?><hierarchy rotation='0'>"
+        "<node package='com.google.android.permissioncontroller'"
+        " resource-id='com.android.permissioncontroller:id/title'"
+        " clickable='false' text='Set Firefox Beta as your default browser'"
+        " bounds='[522,1203][1446,1339]'/>"
+        "<node package='com.google.android.permissioncontroller'"
+        " resource-id='android:id/button2' clickable='true' enabled='true'"
+        " text='Cancel' bounds='[522,1976][903,2071]'/>"
+        "<node package='com.google.android.permissioncontroller'"
+        " resource-id='android:id/button1' clickable='true' enabled='true'"
+        " text='Set as default' bounds='[906,1976][1446,2071]'/>"
+        "</hierarchy>")
+    dc = android_parse_hierarchy(default_chooser, PKG)
+    picked = [t["center"] for t in dc["targets"]]
+    check((712, 2023) in picked,
+          "the default-browser chooser's Cancel button (centre (712, 2023) "
+          "from bounds [522,1976][903,2071]) is not a target, so the flow "
+          "stalls in front of a system dialog it cannot dismiss. Targets: %r"
+          % (dc["targets"],))
+    check((1176, 2023) not in picked,
+          "THE RIG IS ABOUT TO CHANGE THE USER'S DEVICE: 'Set as default' at "
+          "(1176, 2023) is a tap candidate. That button repoints the phone's "
+          "default browser away from whatever the owner chose. It must be "
+          "refused however it matches, not merely ranked below Cancel")
+    check(any("set as default" in (r.get("text") or "").lower()
+              for r in (dc.get("refused") or [])),
+          "'Set as default' was dropped silently rather than RECORDED as "
+          "refused; a control the rig declines to touch is a fact the row "
+          "should carry, not an absence")
+    check(dc["targets"] and dc["targets"][0]["center"] == (712, 2023),
+          "Cancel is not the FIRST target on the default-browser chooser, so "
+          "some other control on a system dialog gets tapped first")
+
+    # ---- loaded is not displayed ----------------------------------------
+    #
+    # The exact reading taken off the device when Fenix held its home screen
+    # in front of the content view: the page had BOOTED, coi was true and the
+    # rayon pool had 8 threads, and the canvas was the untouched HTML default.
+    # Every existing check passed on that state.
+    never_shown = {"booted": True, "hasCanvas": True, "readyState": "complete",
+                   "clientWidth": 0, "clientHeight": 0,
+                   "bufferWidth": 300, "bufferHeight": 150}
+    displayed = {"booted": True, "hasCanvas": True, "readyState": "complete",
+                 "clientWidth": 852, "clientHeight": 818,
+                 "bufferWidth": 2557, "bufferHeight": 2453}
+    raised = None
+    try:
+        verify_android_content_view(None, timeout=0.4,
+                                    probe=lambda: never_shown)
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None and "never DISPLAYED" in raised,
+          "a page that loaded but was NEVER PUT ON SCREEN is accepted. That "
+          "exact state was measured on Fenix 155 -- booted true, coi true, 8 "
+          "rayon threads, canvas 0x0 at the default 300x150 buffer -- and it "
+          "passed every other check this rig has. The whole leg's frame "
+          "figures would describe a viewport nobody was shown")
+    got = verify_android_content_view(None, timeout=5.0,
+                                      probe=lambda: displayed)
+    check(got["ok"] and got["client"] == [852, 818],
+          "a genuinely displayed content view is being rejected (%r), which "
+          "would fail every Android leg instead of only the broken ones"
+          % (got,))
+    # The buffer floor matters on its own: a canvas can report a css size
+    # while its drawing buffer is still the untouched 300x150 default.
+    raised = None
+    try:
+        verify_android_content_view(
+            None, timeout=0.4,
+            probe=lambda: dict(never_shown, clientWidth=852, clientHeight=818))
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None,
+          "a canvas with a css size but the DEFAULT 300x150 drawing buffer is "
+          "accepted as displayed; the buffer is what is rasterized and what "
+          "every byte figure on the row is a figure for")
+
+    # Bounds arithmetic, including the inputs that must be refused.
+    check(_uia_bounds_center("[0,100][200,300]") == (100, 200),
+          "bounds centre arithmetic is wrong")
+    for bad in ("[0,0][0,0]", "[10,10][5,5]", "garbage", "", None):
+        check(_uia_bounds_center(bad) is None,
+              "%r is accepted as a tappable bounds; a zero or inverted "
+              "rectangle is not a place" % (bad,))
+
     # ---- the Gecko capability shape -------------------------------------
     ff = firefox_capabilities(None, (1280, 900), headless=False,
                               android_package="org.mozilla.firefox")
@@ -3564,10 +4198,34 @@ def run_smoke(args):
             except WebDriverError as e:
                 result["gotchas"].append("set_window_rect failed: %s" % e)
 
+        # AFTER the session exists (geckodriver has launched the app) and
+        # BEFORE navigate, because a page loaded behind a wizard is a page
+        # nobody is measuring. Android only -- no desktop leg executes a line
+        # of this.
+        if args.android and args.browser == "firefox":
+            stage("onboarding-dismiss", package=args.android_package)
+            dumps = []
+            try:
+                result["onboarding"] = android_dismiss_onboarding(
+                    args.android_package, args.adb_serial, dump_sink=dumps)
+            finally:
+                if dumps:
+                    uia_path = os.path.join(out_dir, "%s.uia.xml" % tag)
+                    with open(uia_path, "w") as fh:
+                        fh.write(dumps[-1])
+                    result["onboarding_last_dump"] = uia_path
+            stage("onboarding-dismissed",
+                  rounds=result["onboarding"]["rounds"],
+                  taps=len(result["onboarding"]["taps"]))
+
         stage("navigate", url=args.url)
         nav_t = time.monotonic()
         session.navigate(args.url, timeout=args.page_timeout + 30)
         stage("navigated", load_s=round(time.monotonic() - nav_t, 2))
+        if args.android and args.browser == "firefox":
+            # See verify_android_content_view: booted is not displayed.
+            result["content_view"] = verify_android_content_view(session)
+            stage("content-view-shown", **result["content_view"])
 
         boot, boot_wait, timed_out = wait_boot(session,
                                                timeout=args.boot_timeout)
