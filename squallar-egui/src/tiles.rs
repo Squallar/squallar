@@ -189,8 +189,10 @@ pub fn height_archive_url() -> String {
 ///
 /// A process-wide `OnceLock` rather than a `Gui` field because it is process
 /// configuration, not UI state: [`base_source`] and the terrain source are
-/// free functions rebuilding sources across theme flips and layer toggles,
-/// and every rebuild must see the same answer. Ungated and target-shared: a
+/// free functions, called again after a [`MapTileState::clear`] and once per
+/// slot per session otherwise, and every build must see the same answer.
+/// (Neither a theme flip nor a layer toggle is a build any more — the first
+/// re-styles in place, the second parks.) Ungated and target-shared: a
 /// build without the archive reader, or a platform with no filesystem,
 /// simply never reads it.
 static BASEMAP_CACHE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
@@ -484,10 +486,11 @@ pub struct MapTileState {
     /// Built lazily by [`Self::ensure_terrain_tiles`], **only while some
     /// visible pane has the Terrain layer on**: a disabled layer must cost
     /// zero network, and a source that exists is a source whose IO task will
-    /// be asked for tiles. Released by [`Self::release_terrain_tiles`] when
-    /// the last pane switches the layer off (the accepted cost, exactly as
-    /// for a theme flip on the base slot, is a re-download if it comes back),
-    /// and by [`Self::clear`] with everything else.
+    /// be asked for tiles. Parked by [`Self::release_terrain_tiles`] when the
+    /// last pane switches the layer off — still zero network, because a source
+    /// nothing draws is a source nothing asks, and no longer a re-download if
+    /// it comes back; see [`Self::parked_terrain`] for why it is parked rather
+    /// than dropped. Actually let go by [`Self::clear`], with everything else.
     ///
     /// **A theme flip does NOT touch it.** The base slot is re-styled on a
     /// flip because the committed style its tiles are styled with is the
@@ -558,6 +561,33 @@ pub struct MapTileState {
     /// resume is a plausible moment for the network to be back.
     terrain_failed: bool,
 
+    /// The base source the BasemapTiles layer was switched off with, kept
+    /// alive so switching it back on is a move rather than a rebuild.
+    ///
+    /// **Parked, not leaked.** At most one source lives here, it is the one the
+    /// previous frame was already drawing, and it does no work: a parked source
+    /// is never drawn, so nothing calls `request_once` on it and it issues no
+    /// requests. What it holds is its LRU and its parsed-geometry cache, which
+    /// is exactly what makes coming back free.
+    ///
+    /// The reason it is parked rather than dropped is that **dropping it is not
+    /// free and not asynchronous**. `HttpsTiles` owns a `runtime::Runtime`
+    /// whose `Drop` joins the IO thread, and that thread's tokio runtime waits
+    /// for `spawn_blocking` tile tessellations that have already started. That
+    /// join runs on whoever drops the source, and the dropper here is
+    /// `Gui::ui` - the frame thread. Measured release on 2026-08-31 against the
+    /// committed Monaco fixture: **up to 13.1 ms of frame-thread block**,
+    /// against 0.034 ms for a source with no IO thread. `tile_source`'s own
+    /// note called this out as unverified and named "a layer release" as one of
+    /// the moments that could still hit it; it does, and this is that moment
+    /// removed.
+    parked_base: Option<HttpsTiles>,
+
+    /// [`Self::parked_base`] for the terrain slot, for the same reason. The
+    /// hillshade source owns the same kind of `Runtime` and its release ran the
+    /// same join on the same thread.
+    parked_terrain: Option<HttpsTiles>,
+
     /// Where this device keeps downloaded offline areas, or `None` when the
     /// platform has nowhere for them.
     ///
@@ -584,6 +614,8 @@ impl Default for MapTileState {
             #[cfg(test)]
             base_restyles: 0,
             terrain_failed: false,
+            parked_base: None,
+            parked_terrain: None,
             basemap_dir: None,
         }
     }
@@ -631,6 +663,15 @@ impl MapTileState {
         disabled_source_layers: &std::collections::BTreeSet<String>,
         ctx: &egui::Context,
     ) {
+        // Unpark first, before anything reads the slot. A theme or detail flip
+        // that happened while the layer was off has to land on the source that
+        // comes back, and the restyle arm below can only see a source that is
+        // already in the slot; unparking after it would bring back a source
+        // styled for the theme the user has since left.
+        if self.tiles.is_none() {
+            self.tiles = self.parked_base.take();
+        }
+
         if let Some(fault) = self.tiles.as_ref().and_then(HttpsTiles::fault) {
             log::error!(
                 "the basemap archive is unusable, so the basemap draws nothing \
@@ -638,6 +679,8 @@ impl MapTileState {
             );
             self.base_unreachable = true;
             self.tiles = None;
+            // An unusable archive is unusable parked, too.
+            self.parked_base = None;
         }
 
         let style_changed = self.current_theme_is_dark != is_dark
@@ -780,20 +823,37 @@ impl MapTileState {
         self.offline = true;
         self.tiles = None;
         self.terrain = None;
+        // The park slots too: a source built before the switch is a live one,
+        // and unparking it later would put the thing this switch exists to
+        // prevent straight back into the slot.
+        self.parked_base = None;
+        self.parked_terrain = None;
     }
 
-    /// Drop the base source: the last visible pane switched the BasemapTiles
+    /// Park the base source: the last visible pane switched the BasemapTiles
     /// layer off. Symmetric with [`Self::release_terrain_tiles`] — a disabled
-    /// layer costs zero network, and the accepted cost is a re-download if it
-    /// comes back. The unreachable latch survives, exactly as the terrain
-    /// failure latch does: a release is not a network recovery.
+    /// layer still costs zero network, because a source nothing draws is a
+    /// source nothing asks for tiles. The unreachable latch survives, exactly
+    /// as the terrain failure latch does: a release is not a network recovery.
+    ///
+    /// **This used to drop the source, and dropping it blocked the frame
+    /// thread** for as long as an already-started tile tessellation took to
+    /// finish — see [`Self::parked_base`] for the mechanism and the 13.1 ms
+    /// measurement. It also threw away the parsed-geometry cache, so switching
+    /// the layer back on re-downloaded and re-tessellated every visible tile.
+    /// Parking removes both, and is the same trade
+    /// [`HttpsTiles::set_style`] already makes for a theme flip.
     ///
     /// The *read-failure* sample does not survive, because it is not a latch:
-    /// it describes a source, and there is no longer one. Left standing it
-    /// would have a layer the user switched off reported as an unreachable
-    /// archive — the same lie in the other direction.
+    /// it describes what the user can see, and they can no longer see it. Left
+    /// standing it would have a layer the user switched off reported as an
+    /// unreachable archive — the same lie in the other direction.
     pub fn release_base_tiles(&mut self) {
-        self.tiles = None;
+        // `take`, and only when it yields: two releases in a row must not
+        // overwrite the parked source with the empty slot the first one left.
+        if let Some(tiles) = self.tiles.take() {
+            self.parked_base = Some(tiles);
+        }
         self.base_reads_failing = false;
     }
 
@@ -817,12 +877,19 @@ impl MapTileState {
     /// logged once and the layer draws nothing until [`Self::clear`] resets
     /// the latch.
     pub fn ensure_terrain_tiles(&mut self, ctx: &egui::Context) {
+        // As in `ensure_base_tiles`: the slot is refilled from the park before
+        // anything else looks at it.
+        if self.terrain.is_none() {
+            self.terrain = self.parked_terrain.take();
+        }
+
         if let Some(fault) = self.terrain.as_ref().and_then(HttpsTiles::fault) {
             log::error!(
                 "the terrain archive is unusable, so the Terrain layer draws                  nothing this session: {fault}"
             );
             self.terrain_failed = true;
             self.terrain = None;
+            self.parked_terrain = None;
         }
 
         if self.terrain.is_none() && !self.terrain_failed {
@@ -846,11 +913,13 @@ impl MapTileState {
         }
     }
 
-    /// Drop the terrain source: the last pane showing the layer switched it
-    /// off. Symmetric with [`Self::release_base_tiles`]: the accepted cost is
-    /// a re-download if the user switches it back on.
+    /// Park the terrain source: the last pane showing the layer switched it
+    /// off. Symmetric with [`Self::release_base_tiles`], including why it is a
+    /// park and not a drop — see [`Self::parked_terrain`].
     pub fn release_terrain_tiles(&mut self) {
-        self.terrain = None;
+        if let Some(terrain) = self.terrain.take() {
+            self.parked_terrain = Some(terrain);
+        }
     }
 
     /// Temporarily take the terrain tiles out of self for per-pane rendering.
@@ -874,6 +943,12 @@ impl MapTileState {
         self.tiles = None;
         self.terrain = None;
         self.terrain_failed = false;
+        // A suspend or a graphics reset really does mean let go: the park
+        // exists to survive a *toggle*, and a source parked across a suspend
+        // would hold its caches and its IO thread for as long as the app sat
+        // in the background.
+        self.parked_base = None;
+        self.parked_terrain = None;
         // `current_theme_is_dark` and the disabled set stay: they describe the
         // style last asked for, and the next `ensure_base_tiles` builds fresh
         // on the empty slot whatever they say.

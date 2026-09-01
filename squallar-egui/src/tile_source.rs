@@ -2784,15 +2784,22 @@ impl ReadFailureRun {
 /// [`MAX_PARALLEL_DOWNLOADS`], so this is bounded parallelism rather than an
 /// unbounded fan-out, and the reads and the renders stop starving each other.
 ///
-/// **Unverified, and stated so it is not a surprise later**: `Runtime::drop`
-/// joins the IO thread, whose `tokio::runtime::Runtime` drop is documented to
-/// wait for blocking tasks that have already started. If that holds, dropping a
-/// source mid-tessellation blocks the *frame* thread for up to one render --
-/// ~25 ms. A theme flip no longer drops a source (`set_style` re-styles it in
-/// place), so the moments left that do are a layer release, a suspend and a
-/// graphics reset. The inline spelling had a wait of the same order for the
-/// same reason, so this is not believed to be a regression; neither figure has
-/// been measured. The wasm32 arm never reaches `spawn_blocking` at all.
+/// **Measured, 2026-08-31, and it was real.** `Runtime::drop` joins the IO
+/// thread, whose `tokio::runtime::Runtime` drop waits for blocking tasks that
+/// have already started, so dropping a source mid-tessellation blocks whatever
+/// thread dropped it. Against the committed Monaco fixture, release build, a
+/// nine-tile z14 request block: **up to 13.1 ms**, peaking when the drop lands
+/// 1-3 ms after the requests (renders started, none finished) and falling to
+/// ~1.9 ms once they have drained. A source with no IO thread
+/// (`runtime::inert`) drops in 0.034 ms. The worst case reachable through the
+/// restyle path, where six renders start at once with no read latency in
+/// front of them, measured 9.2 ms.
+///
+/// This note used to name "a layer release" as one of the moments that could
+/// still hit it. **It did, on the frame thread**: `MapTileState`'s release now
+/// parks the source instead of dropping it, so the moments left are a suspend
+/// and a graphics reset, both of which already stop drawing. The wasm32 arm
+/// never reaches `spawn_blocking` at all.
 async fn read_one<S, O>(
     archive: &crate::basemap_archive::BasemapArchives<S, O>,
     styling: &ArchiveStyling,

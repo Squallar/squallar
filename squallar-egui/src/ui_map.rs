@@ -75,10 +75,14 @@ impl super::Gui {
         let pane_count = self.visible_pane_count();
         // The base slot follows the BasemapTiles layer exactly as the terrain
         // slot follows Terrain: built only while a visible pane draws it,
-        // released the frame none does. The per-source-layer choices are read
-        // off the layer's declared control surface — the sanctioned door to a
-        // handler's own fields — and a changed set rebuilds the source inside
-        // `ensure_base_tiles`.
+        // released the frame none does. Both of these run inside `Gui::ui`, on
+        // the frame thread, which is why neither branch may do anything
+        // expensive: the release parks the source rather than dropping it
+        // (dropping it joins the IO thread here), and a changed detail set
+        // re-styles it in place inside `ensure_base_tiles` rather than
+        // rebuilding. The per-source-layer choices are read off the layer's
+        // declared control surface — the sanctioned door to a handler's own
+        // fields.
         let basemap_on = self.panes[..pane_count]
             .iter()
             .any(|pane| pane.is_overlay_enabled(&known::BASEMAP_TILES));
@@ -95,9 +99,9 @@ impl super::Gui {
         }
         let mut tiles_owned = self.map_tiles.take_base_tiles();
         // The terrain slot follows the layer, not the frame: built only while
-        // a visible pane draws it, released the frame none does. A disabled
-        // layer must cost zero network, and a source that exists is a source
-        // whose IO task can be asked for tiles.
+        // a visible pane draws it, parked the frame none does. A disabled
+        // layer must cost zero network -- and a parked source costs none,
+        // because nothing draws it and only drawing asks for tiles.
         let terrain_on = self.panes[..pane_count]
             .iter()
             .any(|pane| pane.is_overlay_enabled(&known::TERRAIN));

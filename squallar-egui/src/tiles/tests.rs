@@ -1068,7 +1068,7 @@ fn the_flip_keeps_the_source_whose_caches_serve_the_restyle() {
 }
 
 /// **A changed source-layer set re-styles the base source; an unchanged one
-/// does not churn it; and the release still keeps no source resident.** The
+/// does not churn it; and the release still keeps no source in the slot.** The
 /// comparison in `ensure_base_tiles` is the whole mechanism a toggle flip
 /// rides -- nothing signals it -- so an `ensure_` that stopped comparing
 /// would leave every flip invisible until the next theme change.
@@ -1107,12 +1107,247 @@ fn a_changed_source_layer_set_restyles_the_base_source() {
         "the new set is now the styled set"
     );
 
-    // The release drops the source -- and its parsed cache with it; the next
-    // ensure builds fresh, which is the layer-off contract unchanged.
+    // The release parks the source: the slot empties, so nothing draws it and
+    // it asks the network for nothing, but the next ensure moves it back
+    // rather than paying a build. This assertion used to read `2` -- "coming
+    // back is a fresh build" -- which was the v1 layer-off contract; see
+    // `MapTileState::parked_base` for the measured reason it changed.
     state.release_base_tiles();
     assert!(state.tiles.is_none(), "the release must empty the slot");
     state.ensure_base_tiles(true, &disabled, &ctx);
-    assert_eq!(state.base_builds, 2, "coming back is a fresh build");
+    assert_eq!(
+        state.base_builds, 1,
+        "coming back built a second source, so the release dropped the first \
+         one -- which joins its IO thread on the frame thread and throws away \
+         the parsed cache the layer is about to want back"
+    );
+    assert_eq!(
+        state.base_restyles, 1,
+        "coming back with the set it left under must not restyle: nothing \
+         about the style changed while the layer was off"
+    );
+}
+
+/// **A flip that happens while the layer is OFF must land on the source that
+/// comes back.**
+///
+/// The hazard is an ordering one and it is invisible to every count taken with
+/// the slot full. `ensure_base_tiles` decides whether to restyle by comparing
+/// the theme and the detail set against what the slot was last styled with,
+/// and it can only call `set_style` on a source that is *in* the slot. Unpark
+/// after that comparison and the comparison sees an empty slot: nothing gets
+/// restyled, the remembered fields are updated anyway to say it did, and the
+/// source is then moved back in still styled for the theme the user has since
+/// left. The map comes back in the wrong colours and no counter is wrong.
+///
+/// **Measured as a real hole, not a hypothetical**: with the unpark moved below
+/// the restyle block, the whole `squallar-egui` suite -- 1470 tests -- passed.
+/// The pre-existing restyle assertions could not see it because they never
+/// release, and the release assertions could not see it because they never
+/// change the style across the release. This test changes both halves at once,
+/// which is the only arrangement that discriminates.
+#[test]
+fn a_flip_while_the_layer_is_off_restyles_the_source_that_comes_back() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+    let empty = std::collections::BTreeSet::new();
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    state
+        .tiles
+        .as_mut()
+        .expect("the first ensure builds a source")
+        .pump();
+    let marked = state
+        .tiles
+        .as_ref()
+        .expect("the source is still in the slot")
+        .pumps();
+    assert_eq!(
+        (marked, state.base_builds, state.base_restyles),
+        (1, 1, 0),
+        "fixture: one source, one pump on its ledger, nothing flipped yet"
+    );
+
+    // The layer goes off, and only THEN do the theme and the detail set change
+    // -- the user flipping to light mode, or turning a map-detail row off,
+    // while the basemap layer is switched off.
+    state.release_base_tiles();
+    let disabled: std::collections::BTreeSet<String> = ["water".to_owned()].into();
+    state.ensure_base_tiles(false, &disabled, &ctx);
+
+    assert_eq!(
+        state
+            .tiles
+            .as_ref()
+            .expect("the layer came back with no source")
+            .pumps(),
+        marked,
+        "the layer came back as a different object, so this is a rebuild and \
+         not a park"
+    );
+    assert_eq!(
+        state.base_builds, 1,
+        "coming back paid for a second source construction"
+    );
+    assert_eq!(
+        state.base_restyles, 1,
+        "the source came back WITHOUT being restyled, so it is still styled \
+         for the theme and the detail set the user left. The restyle \
+         comparison ran while the slot was empty, found nothing to call \
+         `set_style` on, and updated the remembered style anyway -- so every \
+         later frame agrees the source is correctly styled and it is not"
+    );
+    assert!(
+        !state.current_theme_is_dark,
+        "the state did not adopt the theme it was handed"
+    );
+}
+
+/// **A layer toggle must not drop the tile source**, because dropping it is a
+/// blocking join on the frame thread.
+///
+/// `HttpsTiles` owns a `runtime::Runtime` whose `Drop` joins the IO thread,
+/// and that thread's tokio runtime waits for `spawn_blocking` tile
+/// tessellations that have already started. Measured release 2026-08-31 on the
+/// committed Monaco fixture: **up to 13.1 ms** of frame-thread block, against
+/// 0.034 ms for a source with no IO thread. Scene D's figure of merit is a
+/// max, and one stalled click frame is the whole defect.
+///
+/// **Identity, not a count, and not a clock.** The pump ledger is per-source
+/// and starts at zero, so a source that comes back still carrying the pumps we
+/// put into it is necessarily the same object -- there is no arrangement of
+/// rebuilds that reproduces it. The wall-clock cost this stands in for is not
+/// asserted here on purpose: a timing assertion would red-gate on a loaded box
+/// and this workspace counts the operation instead.
+///
+/// This state is **online** -- `MapTileState::default()` has not been through
+/// `go_offline_for_tests`, so `ensure_base_tiles` takes the real `base_source`
+/// arm and the release really does drop a real IO thread. A version of this
+/// test written against an inert source would pass on both sides of the fix,
+/// because `runtime::inert()` holds no thread to join.
+#[test]
+fn a_layer_toggle_parks_the_base_source_rather_than_joining_its_io_thread() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+    let empty = std::collections::BTreeSet::new();
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    for _ in 0..3 {
+        state
+            .tiles
+            .as_mut()
+            .expect("the first ensure builds a source")
+            .pump();
+    }
+    let marked = state
+        .tiles
+        .as_ref()
+        .expect("the source is still in the slot")
+        .pumps();
+    assert_eq!(
+        marked, 3,
+        "fixture: the pump ledger did not count the pumps, so it cannot \
+         identify a source below"
+    );
+
+    state.release_base_tiles();
+    assert!(
+        state.tiles.is_none(),
+        "a switched-off layer must draw nothing, parked or not"
+    );
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    assert_eq!(
+        state
+            .tiles
+            .as_ref()
+            .expect("the layer came back with no source at all")
+            .pumps(),
+        marked,
+        "the source that came back has a fresh pump ledger, so it is a new \
+         object and the toggle dropped the old one on the frame thread"
+    );
+    assert_eq!(
+        state.base_builds, 1,
+        "the toggle paid for a second source construction"
+    );
+}
+
+/// [`a_layer_toggle_parks_the_base_source_rather_than_joining_its_io_thread`]
+/// for the terrain slot, which owns the same kind of `Runtime` and ran the
+/// same join. The terrain half had no unit test of its own before this.
+#[test]
+fn a_layer_toggle_parks_the_terrain_source_too() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+
+    state.ensure_terrain_tiles(&ctx);
+    for _ in 0..2 {
+        state
+            .terrain
+            .as_mut()
+            .expect("the first ensure builds a terrain source")
+            .pump();
+    }
+    let marked = state
+        .terrain
+        .as_ref()
+        .expect("the terrain source is still in the slot")
+        .pumps();
+    assert_eq!(marked, 2, "fixture: the pump ledger did not count");
+
+    state.release_terrain_tiles();
+    assert!(
+        state.terrain.is_none(),
+        "a switched-off Terrain layer must draw nothing"
+    );
+
+    state.ensure_terrain_tiles(&ctx);
+    assert_eq!(
+        state
+            .terrain
+            .as_ref()
+            .expect("the Terrain layer came back with no source")
+            .pumps(),
+        marked,
+        "the terrain source that came back is a new object, so the toggle \
+         dropped the old one and joined its IO thread on the frame thread"
+    );
+}
+
+/// A suspend or a graphics reset really does let go, park included.
+///
+/// The park exists to survive a **toggle**. A source parked across a suspend
+/// would hold its LRU, its parsed cache and its IO thread for as long as the
+/// app sat in the background, which is the opposite of what `clear` is for.
+#[test]
+fn a_clear_lets_go_of_the_parked_sources_as_well() {
+    let ctx = egui::Context::default();
+    let mut state = MapTileState::default();
+    let empty = std::collections::BTreeSet::new();
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    state.ensure_terrain_tiles(&ctx);
+    state
+        .tiles
+        .as_mut()
+        .expect("a base source was built")
+        .pump();
+    let marked = state.tiles.as_ref().expect("still there").pumps();
+    assert_eq!(marked, 1, "fixture: the pump was not counted");
+
+    state.release_base_tiles();
+    state.release_terrain_tiles();
+    state.clear();
+
+    state.ensure_base_tiles(true, &empty, &ctx);
+    assert_eq!(
+        state.tiles.as_ref().expect("rebuilt after clear").pumps(),
+        0,
+        "the source from before the clear came back, so a suspended app is \
+         still holding the caches and the IO thread the clear exists to release"
+    );
 }
 
 /// Residency is bounded by the flips rather than grown by them.

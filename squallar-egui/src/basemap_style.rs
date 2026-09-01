@@ -76,9 +76,13 @@ pub fn source_layer_of(layer: &Layer) -> Option<&str> {
 /// skipped per frame.
 ///
 /// Re-parses the JSON when the filter is non-empty; that runs once per
-/// **source construction** (a toggle flip or a theme flip), never per tile or
-/// per frame, so the ~95-layer walk is the accepted cost — the same shape as
-/// the theme flip's re-download.
+/// **restyle** (a detail flip or a theme flip), never per tile or per frame.
+/// Unlike [`committed`], this cannot be memoised behind a `OnceLock` — the
+/// filter is a parameter and the result has to be an owned, mutated `Style` —
+/// so the ~95-layer walk is the accepted cost on the frame thread here, at the
+/// 0.44–0.70 ms [`committed`] records. It is only reached when the user has
+/// actually turned a map-detail row off; the common path is the empty set,
+/// which returns the memoised parse.
 pub fn committed_filtered(is_dark: bool, disabled: &BTreeSet<String>) -> Arc<Style> {
     if disabled.is_empty() {
         return committed(is_dark);

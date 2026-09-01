@@ -246,9 +246,10 @@ mod native {
 
     /// The per-root shared state: one running byte total, one eviction
     /// index, one open walk — shared by every source over the same root
-    /// (every archive `tiles.rs` declares, and every rebuild across theme
-    /// flips and layer toggles), because two sources each keeping a private
-    /// total would both be wrong about the sum.
+    /// (every archive `tiles.rs` declares, and every source rebuilt after a
+    /// `MapTileState::clear`; theme flips and layer toggles no longer rebuild
+    /// anything), because two sources each keeping a private total would both
+    /// be wrong about the sum.
     pub(super) struct CacheShared {
         root: PathBuf,
         cap_bytes: u64,
