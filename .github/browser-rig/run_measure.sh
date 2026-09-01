@@ -549,6 +549,7 @@ fi
 #
 # Sets LAST_RUN_ID / LAST_RC for the caller, which records one ledger row per
 # leg; the summary refuses any artefact that does not carry the id back.
+LAST_TAG=""
 LAST_RUN_ID=""
 LAST_RC=0
 run_leg() {
@@ -559,6 +560,10 @@ run_leg() {
   # the other and gets quoted as it.
   local tag="$scene.$browser" driver seed
   [ "$ANDROID" = 1 ] && tag="$scene.$browser.android"
+  # The caller records the ledger row and the summary reads the artefact by
+  # that name, so the tag has to travel out of here. Spelling it twice is how
+  # every Android leg reported NO RESULT while three of them had just passed.
+  LAST_TAG="$tag"
   LAST_RUN_ID="$(new_run_id)"
   LAST_RC=0
   # Everything this tag can write goes first, so a missing file means this leg
@@ -617,7 +622,7 @@ for browser in $BROWSERS; do
     echo
     echo "================ scene $scene / $browser ================"
     run_leg "$browser" "$scene" || overall=1
-    printf '%s\t%s\t%s\n' "$scene.$browser" "$LAST_RUN_ID" "$LAST_RC" \
+    printf '%s\t%s\t%s\n' "$LAST_TAG" "$LAST_RUN_ID" "$LAST_RC" \
         >> "$MEASURE_LEDGER"
   done
 done

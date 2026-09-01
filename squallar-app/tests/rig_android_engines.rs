@@ -62,7 +62,7 @@ fn the_android_mode_accepts_both_engines() {
 fn each_accepted_engine_has_a_capability_branch_and_a_default_package() {
     assert!(
         DRIVE_PY.contains("\"chromium\": \"com.android.chrome\"")
-            && DRIVE_PY.contains("\"firefox\": \"org.mozilla.firefox\""),
+            && DRIVE_PY.contains("\"firefox\": \"org.mozilla.firefox"),
         "an engine --android accepts has no default package, so drive.py \
          would KeyError in launch() rather than drive anything. One default \
          cannot be right for two engines: com.android.chrome handed to \
@@ -130,6 +130,66 @@ fn the_android_path_never_asks_the_device_to_resize_itself() {
          happened to land on an odd size, and the campaign's \
          matching-not-marking rule -- correct --canvas until the buffer is \
          exact -- appears to have been applied when it cannot be",
+    );
+}
+
+/// **The rig refuses to drive somebody's daily browser.**
+///
+/// Both Android drivers clear the app's data before every session. MEASURED
+/// 2026-08-31 from geckodriver 0.37.1's own `--log trace`, against a real
+/// phone, on an invocation that asked for nothing of the kind:
+///
+/// ```text
+/// mozdevice TRACE execute_host_command: >> "shell:pm clear org.mozilla.firefox"
+/// mozdevice TRACE execute_host_command: << "Success\n"
+/// ```
+///
+/// Nothing in the rig can prevent that — geckodriver's capability parser
+/// accepts `androidActivity`, `androidDeviceSerial`, `androidPackage`,
+/// `profile`, `androidIntentArguments`, `binary`, `env`, `log` and `prefs`,
+/// and not one of them gates the clear. So the only available defence is
+/// refusing the *package*, which makes this a gate rather than a comment
+/// asking people to be careful.
+///
+/// The DEFAULT is the case that matters. A guard that only protects people who
+/// were already thinking about it is not a guard, and "nobody chose" is the
+/// state both of this project's Android browser incidents happened in.
+#[test]
+fn the_rig_refuses_to_drive_a_daily_browser_by_default() {
+    assert!(
+        DRIVE_PY.contains("ANDROID_DAILY_DRIVER_PACKAGES"),
+        "drive.py no longer refuses to drive release browser packages. The \
+         Android drivers run `pm clear <package>` before every session, which \
+         deletes that browser's tabs, logins, bookmarks and history -- and \
+         the rig has no way to stop them, so refusing the package is the only \
+         defence there is",
+    );
+    assert!(
+        DRIVE_PY.contains("\"org.mozilla.firefox\":")
+            && DRIVE_PY.contains("\"com.android.chrome\":"),
+        "a release browser package dropped off the refusal list. Both engines' \
+         daily-driver packages belong on it: this project has already lost one \
+         user's Chrome to the Blink path and had the Gecko path run `pm clear` \
+         on their Firefox",
+    );
+    assert!(
+        DRIVE_PY.contains("effective = package or ANDROID_DEFAULT_PACKAGE[browser]"),
+        "the daily-driver guard no longer covers the RESOLVED DEFAULT, only an \
+         explicitly typed package. The default is exactly the case where \
+         nobody thought about it, which is the case the guard is for",
+    );
+    assert!(
+        DRIVE_PY.contains("\"firefox\": \"org.mozilla.firefox_beta\""),
+        "the firefox Android default is back to release Firefox. A default is \
+         what runs when nobody chose, and the driver wipes whatever it drives; \
+         Beta and Nightly are separate installs with separate storage and the \
+         same engine",
+    );
+    assert!(
+        DRIVE_PY.contains("--android-allow-daily-driver"),
+        "the escape hatch is gone. A refusal with no way past it gets deleted \
+         by the next person who needs a throwaway device, and then there is no \
+         guard at all",
     );
 }
 

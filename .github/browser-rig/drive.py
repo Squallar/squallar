@@ -758,13 +758,63 @@ FIREFOX_HARDWARE_PREFS = {
 
 ANDROID_BROWSERS = ("chromium", "firefox")
 
+# THE DRIVERS WIPE THE BROWSER'S DATA BEFORE EVERY SESSION. This is not a
+# hazard to be careful about; it is what they do, unconditionally, and the rig
+# refuses rather than documents it.
+#
+# MEASURED 2026-08-31 from geckodriver 0.37.1's own `--log trace`, on the
+# user's phone, on a default invocation that asked for nothing of the kind:
+#
+#   mozdevice TRACE execute_host_command: >> "shell:pm clear org.mozilla.firefox"
+#   mozdevice TRACE execute_host_command: << "Success\n"
+#
+# `pm clear` deletes the app's data: profile, tabs, logins, bookmarks,
+# history. The user opened Firefox afterwards and got the first-run welcome
+# wizard, which is what a wiped profile looks like from the outside. The same
+# thing had already cost them their Chrome earlier that day through the Blink
+# Android path.
+#
+# There is NO CAPABILITY TO TURN IT OFF. geckodriver's capability parser
+# accepts exactly androidActivity, androidDeviceSerial, androidPackage,
+# profile, androidIntentArguments, binary, env, log and prefs (read out of the
+# binary's string table); none of them gates the clear, and the deprecated
+# `--android-storage` flag only chooses WHERE the driver's own test_root goes.
+# `moz:firefoxOptions.profile` is a profile the driver PUSHES, not the app's
+# own -- and "Cannot use a named profile on Android" is a literal refusal in
+# the same binary.
+#
+# So the only safe way to drive Gecko on a phone somebody actually uses is to
+# drive a DIFFERENT PACKAGE. Firefox Beta and Nightly are separate installs
+# with separate storage, so the release browser is never opened at all.
+ANDROID_DAILY_DRIVER_PACKAGES = {
+    "org.mozilla.firefox":
+        "release Firefox -- somebody's daily browser. geckodriver runs "
+        "`pm clear org.mozilla.firefox` before every session (MEASURED, and "
+        "it returned Success on a real phone), which deletes tabs, logins, "
+        "bookmarks and history. Drive org.mozilla.firefox_beta or "
+        "org.mozilla.fenix instead: separate installs, separate storage, same "
+        "engine",
+    "com.android.chrome":
+        "release Chrome -- somebody's daily browser. chromedriver's Android "
+        "mode clears the app's data the same way, and it has already cost "
+        "this project's user their Chrome once. Drive a Beta/Dev channel "
+        "package instead",
+}
+
 # The package each engine means by "the browser on the phone". Resolved from
 # the browser rather than defaulted on the flag, because one default cannot be
 # right for two engines -- and a Chrome package silently handed to geckodriver
 # would fail with a package-not-found on the device rather than at the CLI.
+# Firefox defaults to BETA, not release, because the default is the thing that
+# runs when nobody thought about it and the driver wipes whatever it drives.
+# Beta was already installed on the device (`pm list packages` returned both
+# org.mozilla.firefox_beta and org.mozilla.firefox), so this costs nothing.
+# Chromium keeps its historical default so the existing Blink rows stay
+# describable -- but the daily-driver refusal below applies to it too, so
+# reaching that package now takes a conscious flag.
 ANDROID_DEFAULT_PACKAGE = {
     "chromium": "com.android.chrome",
-    "firefox": "org.mozilla.firefox",
+    "firefox": "org.mozilla.firefox_beta",
 }
 
 # geckodriver's own androidPackage validator, verbatim. Applied at the CLI so
@@ -790,7 +840,34 @@ GECKODRIVER_KNOWN_PACKAGES = (
 )
 
 
-def validate_android_args(browser, package, activity, adb_present=True):
+# Firefox on Android comes up in first-run onboarding, in front of the page,
+# on every geckodriver launch -- because geckodriver pushes a FRESH profile
+# each time and onboarding is a property of a fresh profile. A human tapped
+# through it on every leg taken before this, which means those legs were not
+# unattended and their figures are provisional.
+#
+# These are set on the AUTOMATION profile, which geckodriver creates and
+# destroys; the user's own profile is a different directory and is never
+# opened by any of this. Applied on the Android arm only, so no desktop
+# Firefox row moves.
+#
+# WHICH OF THESE FENIX ACTUALLY HONOURS IS AN OPEN QUESTION, and the honest
+# answer needs the device: Fenix's onboarding is Kotlin UI over Android
+# SharedPreferences, and a Gecko pref cannot reach that layer. If the wizard
+# still appears with all of these set, the finding is that prefs cannot
+# suppress it and the only unattended route is a package whose onboarding has
+# already been completed once.
+FIREFOX_ANDROID_PREFS = {
+    "browser.aboutwelcome.enabled": False,
+    "browser.onboarding.enabled": False,
+    "datareporting.policy.dataSubmissionPolicyBypassNotification": True,
+    "browser.startup.homepage_override.mstone": "ignore",
+    "toolkit.telemetry.reportingpolicy.firstRun": False,
+}
+
+
+def validate_android_args(browser, package, activity, adb_present=True,
+                          allow_daily_driver=False):
     """Is this `--android` invocation drivable? Returns the reason it is not,
     or None.
 
@@ -821,6 +898,20 @@ def validate_android_args(browser, package, activity, adb_present=True):
         return ("--android-activity is a geckodriver capability; the chromium "
                 "Android path drives the package's launcher activity and does "
                 "not take one")
+    # Last, so a malformed package is named as malformed rather than as
+    # somebody's browser. Resolved default included: the default is precisely
+    # the case where nobody chose, and "nobody chose" is how the user's Chrome
+    # and then their Firefox were wiped on the same day.
+    effective = package or ANDROID_DEFAULT_PACKAGE[browser]
+    reason = ANDROID_DAILY_DRIVER_PACKAGES.get(effective)
+    if reason and not allow_daily_driver:
+        return ("REFUSING to drive %s: %s.\n"
+                "This is not a warning to read past -- the driver deletes the "
+                "app's data before the session starts and nothing in the rig "
+                "can prevent it. If this really is a throwaway device, pass "
+                "--android-allow-daily-driver and accept that the browser's "
+                "tabs, logins, bookmarks and history are gone."
+                % (effective, reason))
     return None
 
 
@@ -1020,8 +1111,10 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         driver_path = driver_path or (shutil.which("geckodriver")
                                       or DEFAULT_GECKODRIVER)
         argv = [driver_path, "--port", str(port), "--log", "info"]
+        android_prefs = dict(FIREFOX_ANDROID_PREFS)
+        android_prefs.update(ff_prefs or {})
         caps = firefox_capabilities(None, window, headless=False,
-                                    extra_prefs=ff_prefs,
+                                    extra_prefs=android_prefs,
                                     android_package=android_package,
                                     android_activity=android_activity,
                                     android_serial=android_serial)
@@ -2938,23 +3031,26 @@ def selftest_android():
     # Stated as "firefox is accepted", not as "the accept-list contains
     # firefox": a list the validator no longer consults would satisfy the
     # second and not the first.
-    check(validate_android_args("firefox", None, None) is None,
+    # Asked with an explicitly safe package, so what is under test is the
+    # ENGINE and not the daily-driver guard below.
+    SAFE = "org.example.testbrowser"
+    check(validate_android_args("firefox", SAFE, None) is None,
           "validate_android_args refuses --browser firefox with --android. "
           "That is the Blink-only Android column this work exists to end: "
           "Firefox governs the web target and runs ~2x Chromium's service "
           "time on the desktop, so an Android figure taken only on Blink "
           "reports the engine that tends to win and calls it web")
-    check(validate_android_args("chromium", None, None) is None,
+    check(validate_android_args("chromium", SAFE, None) is None,
           "validate_android_args refuses --browser chromium with --android, "
           "which is the path every Android figure already taken came through")
     accepted = [b for b in ("chromium", "firefox", "safari")
-                if validate_android_args(b, None, None) is None]
+                if validate_android_args(b, SAFE, None) is None]
     check(accepted == ["chromium", "firefox"],
           "the set of engines --android drives is %r, not both and only both. "
           "A THIRD engine appearing here without a launch() branch would fail "
           "on the device; a missing one is a silently single-engine column"
           % (accepted,))
-    check(validate_android_args("safari", None, None) is not None,
+    check(validate_android_args("safari", SAFE, None) is not None,
           "--android accepts --browser safari, which has no Android path at "
           "all: safaridriver drives iOS, not Android, and the leg would die "
           "at session creation")
@@ -2977,8 +3073,10 @@ def selftest_android():
               "%r is in this rig's known-package list but fails geckodriver's "
               "own androidPackage regex, so the rig would refuse a package it "
               "advertises" % (good,))
-        check(validate_android_args("firefox", good, None) is None,
-              "--android-package %r refused for firefox" % (good,))
+        check(validate_android_args("firefox", good, None,
+                                    allow_daily_driver=True) is None,
+              "--android-package %r refused for firefox on grounds other than "
+              "the daily-driver guard" % (good,))
 
     check(validate_android_args("firefox", None, "org.mozilla.fenix/Act")
           is not None,
@@ -2997,11 +3095,54 @@ def selftest_android():
           "the chromium Android default package moved off com.android.chrome; "
           "every Blink Android figure already taken is a figure for that "
           "package")
-    check(ANDROID_DEFAULT_PACKAGE["firefox"] == "org.mozilla.firefox",
-          "the firefox Android default package is not the release Firefox")
+    check(ANDROID_DEFAULT_PACKAGE["firefox"] == "org.mozilla.firefox_beta",
+          "the firefox Android default package is no longer Beta. The default "
+          "is what runs when nobody thought about it, and the driver wipes "
+          "whatever it drives -- defaulting to release Firefox is defaulting "
+          "to deleting somebody's tabs, logins and bookmarks")
     check(sorted(ANDROID_DEFAULT_PACKAGE) == sorted(ANDROID_BROWSERS),
           "an engine --android accepts has no default package, so it would "
           "KeyError in launch() instead of driving")
+
+    # ---- the rig refuses to wipe somebody's browser ---------------------
+    #
+    # THE MOST IMPORTANT CHECKS IN THIS FILE. Both drivers run
+    # `pm clear <package>` before every session -- MEASURED on geckodriver
+    # 0.37.1, which answered "Success" against a real phone and left the user
+    # at Firefox's first-run wizard with their tabs, logins and bookmarks
+    # gone. Nothing in the rig can stop the clear, so the only defence is
+    # refusing the package, and a refusal that can be forgotten is not one.
+    for daily in ANDROID_DAILY_DRIVER_PACKAGES:
+        for br in ANDROID_BROWSERS:
+            err = validate_android_args(br, daily, None)
+            check(err is not None and "REFUS" in err,
+                  "--android-package %s is accepted for %s without "
+                  "--android-allow-daily-driver. That package is somebody's "
+                  "daily browser and the driver deletes its data before the "
+                  "session starts" % (daily, br))
+            check(validate_android_args(br, daily, None,
+                                        allow_daily_driver=True) is None,
+                  "--android-allow-daily-driver does not actually unlock %s "
+                  "for %s, so the escape hatch is unusable and somebody will "
+                  "delete the guard instead" % (daily, br))
+    # The DEFAULT is the case that matters: it is what runs when nobody chose,
+    # and nobody choosing is how two browsers were wiped in one day.
+    check(validate_android_args("chromium", None, None) is not None,
+          "--android --browser chromium with NO package now silently defaults "
+          "to com.android.chrome and wipes it. The default must be refused "
+          "too, or the guard only protects people who were already thinking "
+          "about it")
+    check(validate_android_args("firefox", None, None) is None,
+          "the default firefox Android package is refused, so the safe path "
+          "is the one that needs a flag -- which inverts the guard")
+    for safe in ("org.mozilla.firefox_beta", "org.mozilla.fenix"):
+        check(validate_android_args("firefox", safe, None) is None,
+              "%s is refused. It is a SEPARATE INSTALL with separate storage "
+              "and is the whole recommendation; refusing it leaves no safe "
+              "package at all" % safe)
+        check(safe not in ANDROID_DAILY_DRIVER_PACKAGES,
+              "%s is on the daily-driver list, which would leave the rig with "
+              "nothing it is allowed to drive" % safe)
 
     # ---- the Gecko capability shape -------------------------------------
     ff = firefox_capabilities(None, (1280, 900), headless=False,
@@ -3246,6 +3387,23 @@ def run_smoke(args):
         canvas_ok = bool(boot and boot.get("hasCanvas")
                          and boot.get("clientWidth", 0) > 0
                          and boot.get("clientHeight", 0) > 0)
+        # ON ANDROID THE BOOT PROBE IS TOO EARLY, and only there. MEASURED on
+        # Gecko/Android: at 0.45 s after load the canvas is the HTML default
+        # 300x150 buffer at 0x0 css, and by the end of the leg it is 852x818
+        # css / 2557x2453 buffer, non-blank, having rendered the whole run.
+        # Chrome/Android is already sized at boot (750x702), which is why five
+        # Blink legs never saw this. A leg that rendered correctly for three
+        # minutes is not a canvas failure because a probe fired before the
+        # mobile viewport settled -- and reporting it as one makes every Gecko
+        # phone row read red for a reason that is not about the app.
+        #
+        # Scoped to android so no desktop verdict can move: on the desktop
+        # arms boot and final agree, so this can only ever rescue a false red
+        # that only the phone produces.
+        if args.android and not canvas_ok:
+            result["canvas_ok_note"] = (
+                "boot probe saw a 0x0 canvas; re-read at end of leg (mobile "
+                "viewport settles after the boot probe)")
         result["canvas_ok"] = canvas_ok
 
         if args.canvas:
@@ -3572,6 +3730,22 @@ def run_smoke(args):
         # canvas state NOW (the boot-time probe runs before the app sizes
         # the drawing buffer; reporting that one as "the" buffer misleads)
         result["canvas_final"] = session.execute(BOOT_PROBE)
+        # See the canvas_ok note above: on Android only, the end-of-leg read is
+        # what says whether there was ever a canvas to render into.
+        if args.android and not result.get("canvas_ok"):
+            cf = result["canvas_final"] or {}
+            if (cf.get("hasCanvas") and cf.get("clientWidth", 0) > 0
+                    and cf.get("clientHeight", 0) > 0):
+                result["canvas_ok"] = True
+                canvas_ok = True          # the verdict below reads the local
+                result["canvas_ok_note"] = (
+                    "boot probe saw a 0x0 canvas at %.2fs; end of leg is "
+                    "%sx%s css / %sx%s buffer. Mobile viewport settles after "
+                    "the boot probe -- Chrome/Android is already sized there, "
+                    "Gecko/Android is not."
+                    % (result["boot"]["seconds_after_load"],
+                       cf.get("clientWidth"), cf.get("clientHeight"),
+                       cf.get("bufferWidth"), cf.get("bufferHeight")))
         shots = {}
         page_png = os.path.join(out_dir, "%s.page.png" % tag)
         data = save_screenshot(session.screenshot_b64(), page_png)
@@ -4387,6 +4561,13 @@ def main(argv=None):
                          "from --browser: com.android.chrome for chromium, "
                          "org.mozilla.firefox for firefox (Beta is "
                          "org.mozilla.firefox_beta, Nightly org.mozilla.fenix)")
+    ap.add_argument("--android-allow-daily-driver", action="store_true",
+                    help="drive a release browser package anyway. The drivers "
+                         "run `pm clear <package>` before every session "
+                         "(MEASURED on geckodriver 0.37.1: it returned "
+                         "Success), which DELETES that browser's tabs, "
+                         "logins, bookmarks and history. Only for a device "
+                         "nobody uses")
     ap.add_argument("--android-activity", default=None,
                     help="moz:firefoxOptions.androidActivity for a Firefox "
                          "build geckodriver has no default for; must not "
@@ -4470,7 +4651,8 @@ def main(argv=None):
         # does, over the whole matrix, with no device and no parser.
         err = validate_android_args(
             args.browser, args.android_package, args.android_activity,
-            adb_present=bool(shutil.which("adb")))
+            adb_present=bool(shutil.which("adb")),
+            allow_daily_driver=args.android_allow_daily_driver)
         if err:
             ap.error(err)
         args.android_package = (args.android_package
