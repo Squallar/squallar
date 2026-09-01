@@ -726,6 +726,16 @@ def classify_adapter(env):
     renderer = env.get("gl_renderer")
     vendor = env.get("gl_vendor")
     out = {"renderer": renderer, "vendor": vendor, "webgl": webgl}
+    # Recorded as DATA, not only rendered into a label, because the row line
+    # and the summary line build their adapter field independently and both
+    # need to be able to say it. `masked` is decided by the string's own
+    # suffix -- firefox's fingerprinting resistance writes it literally -- and
+    # `host_gpu` is asked of the OS, which is the only place a web leg can get
+    # a true answer.
+    out["masked"] = bool(renderer
+                         and renderer.endswith(MASKED_RENDERER_SUFFIX))
+    if out["masked"]:
+        out["host_gpu"] = host_gpu()
     if not webgl or (isinstance(webgl, str) and webgl.startswith("probe error")):
         out["class"] = "none"
         out["why"] = ("no WebGL context: %s" % webgl) if webgl else "no WebGL context"
@@ -740,13 +750,75 @@ def classify_adapter(env):
     return out
 
 
+# Firefox's fingerprinting-resistant renderer string ends in this, literally.
+# It is not a hedge this rig added and it is not "close enough": on the box
+# these lines were written on, the page says "NVIDIA GeForce GTX 980, or
+# similar" while `nvidia-smi` says GeForce RTX 3090, and on an M2 the page
+# says "Apple M1, or similar". Chromium does not mask -- it reported the M2
+# correctly through ANGLE -- so a row's adapter can be true or masked
+# depending only on which browser took it.
+MASKED_RENDERER_SUFFIX = ", or similar"
+
+_HOST_GPU_CACHE = []
+
+
+def host_gpu():
+    """What the HOST says it has, asked of the OS rather than of the page.
+
+    The browser's renderer string is the only GPU identity a web leg has, and
+    for firefox it is deliberately false. Anything generalising from a web row
+    to a class of hardware needs this instead."""
+    if _HOST_GPU_CACHE:
+        return _HOST_GPU_CACHE[0]
+    got = None
+    probes = []
+    if sys.platform == "darwin":
+        probes = [["system_profiler", "SPDisplaysDataType"]]
+    else:
+        probes = [["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                  ["lspci"]]
+    for argv in probes:
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True,
+                                 timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not out:
+            continue
+        if argv[0] == "nvidia-smi":
+            got = out.strip().splitlines()[0].strip() or None
+        elif argv[0] == "lspci":
+            for line in out.splitlines():
+                if "VGA compatible controller" in line or "3D controller" in line:
+                    got = line.split(":", 2)[-1].strip()
+                    break
+        else:
+            for line in out.splitlines():
+                if "Chipset Model:" in line:
+                    got = line.split(":", 1)[1].strip()
+                    break
+        if got:
+            break
+    _HOST_GPU_CACHE.append(got)
+    return got
+
+
 def adapter_label(adapter):
-    """One short field for summary lines: `hardware:NVIDIA GeForce RTX 3090`."""
+    """One short field for summary lines: `hardware:NVIDIA GeForce RTX 3090`.
+
+    A MASKED renderer says so here rather than only in `classify_adapter`'s
+    docstring, because this string is the one that gets copied onto a board.
+    It was copied onto one as a fact about the GPU."""
     adapter = adapter or {}
     cls = adapter.get("class", "unknown")
     if cls == "none":
         return "none(%s)" % adapter.get("why", "?")
-    return "%s:%s" % (cls, adapter.get("renderer") or "?")
+    renderer = adapter.get("renderer") or "?"
+    label = "%s:%s" % (cls, renderer)
+    if renderer.endswith(MASKED_RENDERER_SUFFIX):
+        label += " [MASKED by the browser, NOT the hardware; host reports: %s]" \
+                 % (host_gpu() or "unknown")
+    return label
 
 
 def resolve_host_display(explicit=None):
@@ -6687,7 +6759,15 @@ def main(argv=None):
                          "hardware arm's")
     ap.add_argument("--ff-pref", action="append", default=[],
                     help="extra firefox pref, key=value (value parsed as "
-                         "JSON when possible); repeatable")
+                         "JSON when possible); repeatable. A pref that "
+                         "changes what the app RUNS ON makes the leg a "
+                         "non-shipping configuration, and the row has to say "
+                         "so: `dom.webgpu.enabled=true` moves linux firefox "
+                         "off `Gl` -- which is what ships there -- onto "
+                         "BrowserWebGpu. That is worth doing to match another "
+                         "platform's backend so a cross-OS pair varies one "
+                         "thing, but the resulting figures are the "
+                         "experiment's cost, not any user's.")
     ap.add_argument("--env", action="append", default=[],
                     help="extra env var for the driver+browser process, "
                          "K=V; repeatable")

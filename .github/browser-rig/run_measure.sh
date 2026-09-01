@@ -864,7 +864,15 @@ for leg in legs:
           "settled=%s loadavg_start=%s loadavg_end=%s loadavg_max=%s "
           "commit=%s%s"
           % (scene, r.get("browser"), r.get("arm"), ad.get("class"),
-             ad.get("renderer"), backend,
+             # A masked renderer says so ON THE ROW. Firefox reports a coarse
+             # stand-in rather than the GPU -- "NVIDIA GeForce GTX 980, or
+             # similar" on an RTX 3090, "Apple M1, or similar" on an M2 --
+             # and this field was read off a row and published as the
+             # hardware. Chromium does not mask, so two rows side by side can
+             # differ in whether their adapter is true.
+             ((ad.get("renderer") or "?")
+              + (" [MASKED, host=%s]" % (ad.get("host_gpu") or "unknown")
+                 if ad.get("masked") else "")), backend,
              bw, bh, bw * bh, env.get("dpr"), cross,
              hz, coi, panel, gw.get("script") or "-", basemap, pics, mbpp,
              gw.get("loops_completed"),
