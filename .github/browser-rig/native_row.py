@@ -207,10 +207,17 @@ def shared_row_keys(source=None):
 # ONE-SIDED -- load depresses only the cheaper-frame arm -- so it biases ratios
 # rather than adding noise, which is why `quiet` is a stamp on the row and not
 # a footnote in a log.
+# `loadavg_start/end/max` USED to live here. They are shared now: the web row
+# grew them too, because a timing row that cannot say whether the box was busy
+# underneath it cannot be defended after the fact, and that is as true of a
+# browser leg as of a native one. They are still printed here, in the same
+# spelling and the same place -- `shared_row_keys()` reads the spelling out of
+# run_measure.sh, so the two cannot drift apart without reddening a test.
+#
+# What stays native-only is what only the native runner can answer: `quiet` is
+# a verdict over load samples taken THROUGH the leg against a ceiling, which
+# the web path does not compute, and `position` is the matrix slot.
 NATIVE_ONLY_ROW_KEYS = (
-    "loadavg_start",
-    "loadavg_end",
-    "loadavg_max",
     "quiet",
     "position",
 )

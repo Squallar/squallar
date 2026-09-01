@@ -853,10 +853,16 @@ for leg in legs:
     # transcribed into a comparison table, and a loop count that lives only in
     # a sub-line is a loop count that reaches no scoreboard.
     settled_w = gw.get("settled") or {}
+    # Host load is a denominator on a timing row, and it was missing here
+    # while `native_row.py` has always carried it. A row that cannot say
+    # whether the box was busy underneath it cannot be defended later, and a
+    # sibling lane lost a scene's worth of rows to exactly that gap.
+    hl = r.get("host_loadavg") or {}
     print("ROW scene=%s browser=%s arm=%s adapter=%s:%s backend=%s "
           "viewport=%sx%s px=%s dpr=%s cross=%s hz~%s coi=%s panel=%s "
           "script=%s basemap=%s pictures=%s MB/picture=%s loops=%s "
-          "settled=%s commit=%s%s"
+          "settled=%s loadavg_start=%s loadavg_end=%s loadavg_max=%s "
+          "commit=%s%s"
           % (scene, r.get("browser"), r.get("arm"), ad.get("class"),
              ad.get("renderer"), backend,
              bw, bh, bw * bh, env.get("dpr"), cross,
@@ -864,6 +870,7 @@ for leg in legs:
              gw.get("loops_completed"),
              ("%s-loop" % settled_w.get("loops_completed")) if settled_w
              else "NO",
+             hl.get("start"), hl.get("end"), hl.get("max"),
              commit, "" if not invalid else "  ** INVALID **"))
     if ct and not ct.get("met"):
         print("ROW   canvas target %s asked, %s got: this row is NOT "

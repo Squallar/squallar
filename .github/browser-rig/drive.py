@@ -522,6 +522,16 @@ class FirefoxDirectProcess:
             shutil.rmtree(self.profile_dir, ignore_errors=True)
 
 
+def _loadavg():
+    """The host's 1-minute load average, or None where the OS has no such
+    idea. `os.getloadavg` covers both platforms this rig runs on -- procfs on
+    linux, sysctl on macOS -- so the row reads the same on either."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        return None
+
+
 def _version_of(binary):
     try:
         out = subprocess.run([binary, "--version"], capture_output=True,
@@ -5080,7 +5090,30 @@ def run_smoke(args):
         "invocation": sys.argv, "started_utc": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "stages": [], "gotchas": [],
+        # HOST LOAD BELONGS IN THE ARTIFACT, not in whatever shell wrapper
+        # happened to run the leg. `native_row.py` has always carried
+        # loadavg_start/end/max; the web path carried nothing, so a web row
+        # could not say afterwards whether the box was busy underneath it --
+        # and a sibling lane lost a whole scene's rows to load variance it
+        # could not attribute, precisely because the samples lived only in a
+        # terminal it had since closed. Sampled here rather than by the
+        # caller so EVERY web leg has it, including ones run by hand.
+        "host_loadavg": {"start": _loadavg(), "end": None, "max": None,
+                         "samples": 1},
     }
+
+    def note_load():
+        """Sample host load into the running max. Called wherever the leg
+        already pauses, so it costs nothing extra."""
+        hl = result["host_loadavg"]
+        v = _loadavg()
+        if v is None:
+            return
+        hl["end"] = v
+        hl["samples"] += 1
+        hl["max"] = v if hl["max"] is None else max(hl["max"], v)
+        if hl["start"] is not None:
+            hl["max"] = max(hl["max"], hl["start"])
 
     def stage(name, **detail):
         entry = {"stage": name, "t": round(time.monotonic() - t0, 2)}
@@ -5432,6 +5465,7 @@ def run_smoke(args):
             mid_done = False
             while True:
                 sig = frames_watch.poll()
+                note_load()
                 seen = len(frames_watch.loops)
                 if not mid_done and seen * 2 >= args.window_loops:
                     result["resources_mid"] = session.execute(RESOURCES_PROBE)
@@ -5455,7 +5489,9 @@ def run_smoke(args):
             time.sleep(args.data_window / 2)
             result["resources_mid"] = session.execute(RESOURCES_PROBE)
             frames_watch.poll()
+            note_load()
             time.sleep(args.data_window / 2)
+        note_load()
         result["resources"] = session.execute(RESOURCES_PROBE)
         stage("resources", count=(result["resources"] or {}).get("count"),
               hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6],
@@ -5943,6 +5979,9 @@ def run_smoke(args):
             result["adb_reverse_removed"] = adb_reverse_cleanup()
 
     result["total_s"] = round(time.monotonic() - t0, 2)
+    # The closing sample, after the browser is gone: `end` should describe the
+    # box the leg ran on, not the teardown.
+    note_load()
     json_path = os.path.join(out_dir, "%s.json" % tag)
     with open(json_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
