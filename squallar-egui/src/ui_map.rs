@@ -3528,3 +3528,7 @@ mod region_pick_tests;
 #[cfg(test)]
 #[path = "ui_map/download_pick_tests.rs"]
 mod download_pick_tests;
+
+#[path = "ui_map/basemap_park_tests.rs"]
+#[cfg(test)]
+mod basemap_park_tests;
