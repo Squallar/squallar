@@ -706,6 +706,39 @@ impl InputHarness {
         self.gui.stack_for_test().clone()
     }
 
+    /// **Every layer the active pane HOLDS an eye for** — the row order
+    /// `render_layer_stack` builds its own walk from, computed here off the
+    /// pane and the registry rather than off what drew.
+    ///
+    /// **This is a denominator the click registry cannot supply, and that is
+    /// the whole reason it exists.** Sweep targets register themselves as they
+    /// DRAW, so a gate that counts presses against the registry is asking "did
+    /// we click everything we found" and never "did we find everything there
+    /// is". On a layout that draws fewer rows — a phone, a narrow desktop
+    /// window, a collapsed drawer — fewer widgets register, fewer are
+    /// targeted, and that gate still reads 100% while the scene exercises less
+    /// of the app. Checker and checked came from one belief.
+    ///
+    /// Kept in step with `render_layer_stack` by
+    /// `one_sweep_loop_clicks_every_registered_target_exactly_as_scheduled`,
+    /// which asserts this list and the rows that drew are equal on a layout
+    /// wide enough to draw them all.
+    pub(crate) fn stack_inventory(&self) -> Vec<LayerId> {
+        let overlays = &self.gui.overlays;
+        self.gui
+            .active_pane()
+            .draw_order()
+            .rev()
+            .filter(|kind| {
+                overlays
+                    .handler_by_id(kind)
+                    .and_then(|h| h.surfaced_through())
+                    .is_none()
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The stack row drawn for `kind`, if the last frame drew one.
     pub(crate) fn stack_row(&self, kind: &LayerId) -> Option<crate::ui::StackRowProbe> {
         self.stack().rows.into_iter().find(|row| row.kind == *kind)
