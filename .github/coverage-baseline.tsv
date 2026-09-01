@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1437	1063
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1879	1561
+squallar-app/src/app_fetch.rs	1879	1578
 squallar-app/src/app_render.rs	3102	2506
 squallar-app/src/app_state.rs	76	0
 squallar-app/src/budget_arms.rs	17	17
@@ -73,7 +73,7 @@ squallar-egui/src/sources.rs	348	334
 squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	105	102
 squallar-egui/src/tile_mesh/ledger.rs	71	41
-squallar-egui/src/tile_source.rs	837	773
+squallar-egui/src/tile_source.rs	837	775
 squallar-egui/src/tile_source/take_ledger.rs	77	69
 squallar-egui/src/tiles.rs	304	257
 squallar-egui/src/ui.rs	1298	1196
@@ -199,12 +199,12 @@ squallar-overlays/src/render/handlers/sites.rs	93	75
 squallar-overlays/src/render/hatch.rs	279	275
 squallar-overlays/src/render/jobs.rs	1126	1096
 squallar-overlays/src/render/overlay_state.rs	757	701
-squallar-overlays/src/render/rasterize.rs	1003	951
+squallar-overlays/src/render/rasterize.rs	1005	953
 squallar-overlays/src/render/rasterize/lambert_fixture.rs	116	116
 squallar-overlays/src/render/signature_memo.rs	23	23
 squallar-overlays/src/render/station_model.rs	646	397
-squallar-overlays/src/spc/colors.rs	44	44
-squallar-overlays/src/spc/discussion.rs	386	372
+squallar-overlays/src/spc/colors.rs	44	42
+squallar-overlays/src/spc/discussion.rs	386	371
 squallar-overlays/src/spc/discussion_archive.rs	63	32
 squallar-overlays/src/spc/fetch.rs	168	110
 squallar-overlays/src/spc/firewx.rs	383	368
@@ -214,7 +214,7 @@ squallar-overlays/src/types.rs	24	24
 squallar-radar/src/archive.rs	249	222
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
-squallar-radar/src/catalogue.rs	174	160
+squallar-radar/src/catalogue.rs	174	163
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
 squallar-radar/src/chunks.rs	975	759
@@ -243,11 +243,11 @@ squallar-radar/src/render/polar.rs	264	260
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
-squallar-radar/src/scan.rs	374	212
+squallar-radar/src/scan.rs	374	219
 squallar-radar/src/site_position.rs	81	81
 squallar-radar/src/sites.rs	801	799
 squallar-radar/src/sounding.rs	234	207
-squallar-radar/src/source.rs	603	555
+squallar-radar/src/source.rs	603	545
 squallar-radar/src/srm.rs	107	102
 squallar-radar/src/srv.rs	203	203
 squallar-radar/src/tls_pins.rs	64	62
