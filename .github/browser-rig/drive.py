@@ -1511,7 +1511,35 @@ def adb_reverse(port, serial=None):
     if r.returncode != 0:
         raise WebDriverError("adb reverse failed rc=%d: %s"
                              % (r.returncode, (r.stderr or r.stdout).strip()))
+    # Registered for teardown. Each leg serves on a fresh kernel-chosen port,
+    # so a rig that only ever ADDS mappings leaves one per leg behind on
+    # somebody's phone -- thirteen of them after one evening, measured. The
+    # rig cleans up what it creates.
+    _ADB_REVERSES.append((port, serial))
     return " ".join(argv)
+
+
+_ADB_REVERSES = []
+
+
+def adb_reverse_cleanup():
+    """Remove every `adb reverse` mapping this process created. Best effort:
+    a mapping that will not come off is a note, never a failed leg."""
+    removed = []
+    while _ADB_REVERSES:
+        port, serial = _ADB_REVERSES.pop()
+        adb = shutil.which("adb")
+        if not adb:
+            break
+        argv = [adb] + (["-s", serial] if serial else []) + \
+               ["reverse", "--remove", "tcp:%d" % port]
+        try:
+            if subprocess.run(argv, capture_output=True, text=True,
+                              timeout=20).returncode == 0:
+                removed.append(port)
+        except Exception:                          # noqa: BLE001 - never fatal
+            pass
+    return removed
 
 
 # --------------------------------------------------------------------------
@@ -5695,6 +5723,11 @@ def run_smoke(args):
             session.delete()
         if driver is not None:
             driver.stop()
+        if args.android:
+            # Every leg serves on a fresh kernel-chosen port, so a rig that
+            # only ADDS mappings leaves one per leg on somebody's phone --
+            # thirteen after one evening, measured. Clean up what we create.
+            result["adb_reverse_removed"] = adb_reverse_cleanup()
 
     result["total_s"] = round(time.monotonic() - t0, 2)
     json_path = os.path.join(out_dir, "%s.json" % tag)
