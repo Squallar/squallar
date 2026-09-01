@@ -1035,7 +1035,7 @@ pub fn overlay_cache_token(
         overlays.content_signature(id, &pane.layer_ref(pane_idx, id))
     };
     let themed = is_dark && overlays.theme_sensitive(id);
-    base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 } ^ as_of_term(overlays, pane, id)
+    base ^ if themed { 0x9E37_79B9_7F4A_7C15 } else { 0 } ^ as_of_term(overlays, pane_idx, pane, id)
 }
 
 /// **The as-of half of the cache token, and it is `0` on a live pane.**
@@ -1054,7 +1054,7 @@ pub fn overlay_cache_token(
 /// It is mixed into `data_generation`, which is part of the key
 /// `group_overlay_renders` shares one raster across panes on — so two panes on
 /// two instants get two rasters without anything else having to know.
-fn as_of_term(overlays: &OverlayRegistry, pane: &PaneState, id: &LayerId) -> u64 {
+fn as_of_term(overlays: &OverlayRegistry, pane_idx: usize, pane: &PaneState, id: &LayerId) -> u64 {
     let TimeMode::AsOf(instant) = pane.time.mode else {
         return 0;
     };
@@ -1064,11 +1064,29 @@ fn as_of_term(overlays: &OverlayRegistry, pane: &PaneState, id: &LayerId) -> u64
     if !matches!(handler.time_axis(), TimeAxis::EventLifetime) {
         return 0;
     }
-    // Hashed rather than mixed raw: the bucket is a small integer and adjacent
-    // buckets must not land on adjacent tokens beside a content signature.
-    let bucket = crate::pane::as_of_bucket(instant, handler.as_of_quantum());
+    // **The layer's own answer first, and the quantum only if it has none.**
+    //
+    // `as_of_quantum` is a proxy for "would the picture differ", and a loose
+    // one: it moves on every bucket the depicted instant crosses whether or
+    // not a single item began or ended in it. A pane clock at playback rate
+    // crosses them continuously — a tick worth ~5 min against a 60 s quantum
+    // — so the proxy minted a fresh whole-viewport raster per bucket for the
+    // picture already on the glass. A layer that can name the items in force
+    // at `instant` answers exactly, and a sweep across a stretch where
+    // nothing begins or ends returns ONE value for the whole stretch.
+    //
+    // `None` is "I cannot say", and the fallback below is then byte-for-byte
+    // what shipped — which is what keeps every layer that does not override
+    // it unaffected.
+    let term = match handler.as_of_signature(&pane.layer_ref(pane_idx, id), instant) {
+        Some(signature) => signature,
+        // Hashed rather than mixed raw: the bucket is a small integer and
+        // adjacent buckets must not land on adjacent tokens beside a content
+        // signature.
+        None => crate::pane::as_of_bucket(instant, handler.as_of_quantum()) as u64,
+    };
     let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hash::hash(&bucket, &mut hasher);
+    std::hash::Hash::hash(&term, &mut hasher);
     std::hash::Hasher::finish(&hasher)
 }
 

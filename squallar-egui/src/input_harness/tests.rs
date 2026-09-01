@@ -16007,3 +16007,228 @@ fn an_open_settings_pane_walks_the_serial_bus_at_most_once() {
          times; the scanner exists so that it is at most one",
     );
 }
+
+/// An alert with an explicit validity window — [`alert_over`] leaves both ends
+/// `None`, which passes the as-of filter at every instant and so cannot make a
+/// picture that differs between two of them.
+fn alert_windowed(
+    id: &str,
+    event: &str,
+    lat: f64,
+    lon: f64,
+    valid_from: Option<chrono::NaiveDateTime>,
+    valid_until: Option<chrono::NaiveDateTime>,
+) -> squallar_overlays::nws::alert::NwsAlert {
+    let mut alert = alert_over(id, event, lat, lon);
+    alert.valid_from = valid_from;
+    alert.valid_until = valid_until;
+    alert
+}
+
+/// **The pipeline that keeps up, in one call**: every raster the last frame
+/// asked for comes back and reaches the screen before the next frame.
+///
+/// This is the regime the two shipped brakes cannot see. Both of them
+/// (`hold_superseded` and `sweep_discarded`) are armed only by a *discarded
+/// upload*, and a pipeline that lands every picture never discards one — so
+/// under this helper `OverlayTextureCache::needs_rerender`'s content arm runs
+/// with both brakes released on every frame of the sweep. Measured on the
+/// tree's own `clock_sweep_tests` rig at `eb578d49`, `superseded` is exactly
+/// **0** for every frames-per-token from 3 to 8, and the dispatch count *peaks*
+/// there (206 rasters over 620 frames at fpt 3, against 156 at fpt 1 where the
+/// brakes do bite). A gate written above this helper is therefore a gate on
+/// the arm neither brake reaches.
+///
+/// Clearing `renders` is what stands in for the arrival: the ticket the
+/// dispatch recorded is retired by `App::overlay_job_deliver` in the app layer,
+/// which no harness frame runs. Without it the destination stays marked and
+/// `RendersInFlight::admits` refuses every later dispatch, which would make any
+/// count below pass for the wrong reason.
+fn land_requested_rasters(h: &mut InputHarness, kind: &LayerId) {
+    let requests: Vec<_> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::RenderOverlay {
+                pane_idx,
+                overlay_kind,
+                geo_bounds,
+                texture,
+                data_generation,
+                zoom,
+            } if overlay_kind == kind => {
+                Some((*pane_idx, *geo_bounds, *texture, *data_generation, *zoom))
+            }
+            _ => None,
+        })
+        .collect();
+    for (pane_idx, geo_bounds, plan, token, zoom) in requests {
+        let texture = h.ctx.load_texture(
+            format!("landed-{kind:?}-{pane_idx}"),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        let pane = &mut h.gui_mut().panes_mut()[pane_idx];
+        let cache = pane.overlay_cache_mut(kind);
+        cache.renders = Default::default();
+        cache.show(crate::overlay_cache::OverlayTextureData {
+            texture,
+            placed: squallar_geo::PlacedRaster::of(plan.coverage(&geo_bounds)),
+            data_generation: token,
+            render_zoom: zoom,
+            width: plan.width,
+            height: plan.height,
+            radar_meta: None,
+            hit_map: None,
+        });
+    }
+}
+
+/// Sweep the pane clock one minute per frame across `minutes`, landing every
+/// raster asked for, and answer how many rasters that cost.
+///
+/// One minute is exactly the alerts layer's `as_of_quantum`, so every step
+/// crosses a bucket boundary: on the shipped proxy this is the worst case by
+/// construction, and it is also what a playing loop really does — the pane
+/// clock moves ~5 min a tick against a 60 s quantum, so every tick crosses
+/// several.
+fn rasters_over_a_swept_clock(
+    h: &mut InputHarness,
+    base: chrono::NaiveDateTime,
+    minutes: i64,
+) -> usize {
+    let mut spent = 0;
+    for step in 0..minutes {
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0")
+            .set_time_mode(crate::pane::TimeMode::AsOf(
+                base + chrono::Duration::minutes(step),
+            ));
+        h.frame();
+        spent += rasterizes_requested(h, &known::NWS_ALERTS);
+        land_requested_rasters(h, &known::NWS_ALERTS);
+    }
+    spent
+}
+
+/// **A swept clock asks for one whole-viewport raster per PICTURE, not one per
+/// as-of bucket it crosses.**
+///
+/// The alerts layer is `TimeAxis::EventLifetime` + `RenderMode::Texture`, it is
+/// default-enabled, and — unlike the four `TimeAxis::FrameSeries` layers — it
+/// holds no frames, so `PaneState::overlay_texture_on_screen` draws it from its
+/// **live cache** on every frame of a playing loop. Its picture is therefore
+/// rebuilt at whatever rate its cache token moves, and the token's own contract
+/// (`overlay_cache_token`) is that it "moves exactly when the picture would be
+/// different".
+///
+/// The as-of half did not keep that contract. It hashed the *index of the 60 s
+/// bucket* the depicted instant falls in, which moves whether or not a single
+/// alert began or ended in that bucket — so a clock sweeping an hour in which
+/// nothing happened minted an 18 MB whole-viewport raster per minute for a
+/// picture that is, pixel for pixel, the one already on the glass.
+///
+/// **Both arms are equalities, and they fail in opposite directions.** A
+/// ceiling alone (`<= 1`) is satisfied by "never rasterize", which freezes the
+/// pane on a stale picture — so the second arm pins that a real boundary
+/// crossing still costs exactly one raster, and the third pins that the map is
+/// still drawing at the end. A floor alone is satisfied by the shipped
+/// behaviour.
+///
+/// **RED on unmodified `eb578d49`**, both arms: the quiet sweep spends **60**
+/// rasters against the 1 asserted here, and the sweep with one boundary in it
+/// spends **60** against the 2 — one per bucket crossed in each case, because
+/// nothing in the shipped token asks whether the picture moved.
+#[test]
+fn a_swept_clock_spends_one_raster_per_picture_not_one_per_bucket() {
+    let base = chrono::NaiveDate::from_ymd_opt(2024, 6, 1)
+        .expect("a real date")
+        .and_hms_opt(12, 0, 0)
+        .expect("a real time");
+    const SWEEP_MINUTES: i64 = 60;
+
+    // ── Arm 1: a sweep across a stretch where the picture never changes ──
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
+    h.warm_up();
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    // Valid across the whole sweep and well past both ends, so no boundary
+    // falls inside it and every instant swept depicts the same one alert.
+    ingest_alerts(
+        &mut h,
+        vec![alert_windowed(
+            "steady",
+            "Tornado Warning",
+            ground.y(),
+            ground.x(),
+            Some(base - chrono::Duration::hours(1)),
+            Some(base + chrono::Duration::hours(6)),
+        )],
+    );
+    h.warm_up();
+    land_requested_rasters(&mut h, &known::NWS_ALERTS);
+
+    let quiet = rasters_over_a_swept_clock(&mut h, base, SWEEP_MINUTES);
+    assert_eq!(
+        quiet, 1,
+        "a clock swept {SWEEP_MINUTES} minutes across a stretch in which no \
+         alert begins or ends spent {quiet} whole-viewport rasters. One is \
+         what the picture is worth: the first, which builds it. Every one \
+         after it was rasterized, uploaded and drawn over a pixel-identical \
+         predecessor",
+    );
+    assert!(
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0")
+            .overlay_cache(&known::NWS_ALERTS)
+            .and_then(|c| c.current())
+            .is_some(),
+        "the correctness floor: the pane must still be DRAWING an alerts \
+         picture at the end of the sweep. A refusal that leaves the layer bare \
+         is a regression wearing this test's clothes",
+    );
+
+    // ── Arm 2: the same sweep, with exactly one boundary inside it ──
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&known::NWS_ALERTS);
+    h.warm_up();
+    let ground = h.ground_at(0, h.pane_rects()[0].center());
+    ingest_alerts(
+        &mut h,
+        vec![
+            alert_windowed(
+                "steady",
+                "Tornado Warning",
+                ground.y(),
+                ground.x(),
+                Some(base - chrono::Duration::hours(1)),
+                Some(base + chrono::Duration::hours(6)),
+            ),
+            // Issues halfway through the sweep: before it the picture is one
+            // alert, after it two. Exactly one boundary, so exactly two
+            // pictures.
+            alert_windowed(
+                "issued-midway",
+                "Severe Thunderstorm Warning",
+                ground.y() + 0.5,
+                ground.x(),
+                Some(base + chrono::Duration::minutes(SWEEP_MINUTES / 2)),
+                Some(base + chrono::Duration::hours(6)),
+            ),
+        ],
+    );
+    h.warm_up();
+    land_requested_rasters(&mut h, &known::NWS_ALERTS);
+
+    let with_boundary = rasters_over_a_swept_clock(&mut h, base, SWEEP_MINUTES);
+    assert_eq!(
+        with_boundary, 2,
+        "a clock swept across a stretch containing exactly one alert boundary \
+         spent {with_boundary} rasters where the sweep depicts exactly two \
+         distinct pictures. Fewer means the second warning never reached the \
+         glass — the failure a ceiling on its own would pass on; more means \
+         the token is still moving for buckets rather than for pictures",
+    );
+}

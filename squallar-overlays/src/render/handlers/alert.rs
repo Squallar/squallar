@@ -469,6 +469,44 @@ impl OverlayHandler for NwsAlertHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **Which alerts are valid at `as_of`**, folded — the exact question the
+    /// bucket quantum only approximates.
+    ///
+    /// The predicate is [`Self::paint_input`]'s as-of filter, restated and not
+    /// re-derived, departure arm included: the rows that travel to the
+    /// rasterizer are the rows this folds, so two instants agree here exactly
+    /// when they would produce the same picture.
+    ///
+    /// **The category filter is deliberately not here.** `paint_input` sends
+    /// every temporally-valid row and hands the enabled categories over
+    /// beside them, and [`Self::content_signature`] is what carries the
+    /// category set into the token. Folding it in twice would move the token
+    /// on a category change that the other half already moved it for.
+    ///
+    /// **Why this is worth a walk.** The proxy it replaces moves the token on
+    /// every 60 s bucket the pane clock crosses, and a playing loop crosses
+    /// them at ~5 min a tick — so a sweep across an hour in which no alert
+    /// begins or ends used to mint ~60 whole-viewport rasters for one
+    /// unchanging picture.
+    fn as_of_signature(&self, _pane: &PaneRef<'_>, as_of: chrono::NaiveDateTime) -> Option<u64> {
+        // **`None` exactly where [`Self::paint_input`] is `None`.** A layer
+        // holding no rows knows nothing about the depicted instant — it has
+        // not fetched the archive covering it — so a constant here would be a
+        // claim about data this handler does not have. The caller falls back
+        // to the quantum, which is what every as-of fixture with an empty
+        // registry is written against.
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(crate::render::signature_memo::as_of_identity(
+            self.state.data.iter().map(|i| {
+                i.alert.valid_from.is_none_or(|from| from <= as_of)
+                    && i.alert.valid_until.is_none_or(|until| as_of < until)
+                    && i.departed.is_none_or(|gone| as_of < gone)
+            }),
+        ))
+    }
+
     /// **One instant per stop, and that is the whole ask.**
     ///
     /// This layer's items carry their own validity windows, and the picture

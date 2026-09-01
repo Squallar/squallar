@@ -189,6 +189,35 @@ impl OverlayHandler for SpcDiscussionHandler {
         TimeAxis::EventLifetime
     }
 
+    /// **Which discussions are in force at `as_of`**, folded — the exact
+    /// question the bucket quantum only approximates.
+    ///
+    /// The predicate is [`Self::paint_input`]'s as-of filter, restated and not
+    /// re-derived: the rows that travel to the rasterizer are the rows this
+    /// folds, so two instants agree here exactly when they would produce the
+    /// same picture. A discussion unbounded on a side passes on that side,
+    /// there as here.
+    ///
+    /// **Why this is worth a walk.** The proxy it replaces moves the token on
+    /// every 60 s bucket the pane clock crosses, and a playing loop crosses
+    /// them at ~5 min a tick — so a sweep across an hour in which no
+    /// discussion begins or ends used to mint ~60 whole-viewport rasters for
+    /// one unchanging picture. This answers with one number for the whole
+    /// stretch, so `needs_rerender`'s content arm asks for nothing.
+    fn as_of_signature(&self, _pane: &PaneRef<'_>, as_of: chrono::NaiveDateTime) -> Option<u64> {
+        // **`None` exactly where [`Self::paint_input`] is `None`** — see the
+        // alerts layer's note; the rule and the reason are the same.
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(crate::render::signature_memo::as_of_identity(
+            self.state.data.iter().map(|i| {
+                i.md.valid_from.is_none_or(|from| from <= as_of)
+                    && i.md.valid_until.is_none_or(|until| as_of < until)
+            }),
+        ))
+    }
+
     /// **One instant per stop, and that is the whole ask.**
     ///
     /// Same shape and same reason as the NWS alerts layer: a discussion carries

@@ -929,6 +929,34 @@ pub trait SourceHandler: Send {
         std::time::Duration::from_secs(60)
     }
 
+    /// **The identity of this layer's picture at `as_of`** — what the as-of
+    /// half of the overlay cache token is really asking, for a layer that can
+    /// answer it exactly.
+    ///
+    /// [`Self::as_of_quantum`] is a *proxy* for this question, and a loose
+    /// one: it moves the token on every bucket the depicted instant crosses,
+    /// whether or not a single item began or ended in that bucket. A pane
+    /// clock sweeping at playback rate crosses buckets continuously — a tick
+    /// worth ~5 min against a 60 s quantum — so the proxy mints a fresh
+    /// whole-viewport raster per bucket for a picture that is, pixel for
+    /// pixel, the one already on the glass.
+    ///
+    /// A layer that overrides this returns a value that is **equal whenever
+    /// its picture at two instants is equal**, which is the contract
+    /// `ui::map::pane_render::overlay_cache_token` states for the whole token
+    /// and which the bucket proxy does not keep. `None` — the default — means
+    /// "I cannot say", and the caller falls back to the quantum, so every
+    /// layer that does not override this is unaffected byte for byte.
+    ///
+    /// **Cheap, and called on the frame thread**: once per pane per layer per
+    /// frame on a scrubbed pane, and never at all on a live one (the caller
+    /// returns before asking). An implementation walks its own items with
+    /// comparisons it has already parsed; it must not allocate, hash a
+    /// `String`, or take a lock.
+    fn as_of_signature(&self, _pane: &PaneRef<'_>, _as_of: chrono::NaiveDateTime) -> Option<u64> {
+        None
+    }
+
     /// **What this layer would have to hold to draw `stops`** — the
     /// [`Residency`] it is asking for, coalesced.
     ///
