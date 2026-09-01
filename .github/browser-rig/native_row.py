@@ -365,11 +365,20 @@ def parse_hist(text):
 # Pinned against the app's own formatter from the Rust side, in
 # `native_seed_pin_tests.rs`, exactly as `drive.py`'s patterns are -- because a
 # copy of a literal is a second place for it to be wrong.
-SURFACE_RE = re.compile(r"Window resized to (\d+)x(\d+)")
+# TWO sentences, because the app has two moments where it knows its surface
+# and only one of them is a change. `Surface configured to` is printed once at
+# startup; `Window resized to` on every later resize. Reading only the second
+# refused a leg whose window opened at exactly the requested size -- no resize
+# event, no line, no confirmable surface -- which is the CORRECT case.
+SURFACE_RE = re.compile(r"(?:Window resized to|Surface configured to) (\d+)x(\d+)")
 
 
 def app_surface(lines):
-    """The last surface the app said it resized to, as `(w, h)`, or None."""
+    """The newest surface the app reported, as `(w, h)`, or None.
+
+    Last match of either sentence wins: the startup line comes first, so a
+    later resize legitimately supersedes it.
+    """
     found = None
     for line in lines:
         m = SURFACE_RE.search(line)
@@ -1931,6 +1940,44 @@ class AppSurfaceTests(unittest.TestCase):
 
     def test_a_log_with_no_resize_line_has_no_surface(self):
         self.assertIsNone(app_surface(["[..] INFO nothing here"]))
+
+    def test_a_window_that_opened_at_the_target_still_reports_a_surface(self):
+        """**The false negative this reader shipped with.**
+
+        A resize line fires on a resize EVENT. An app whose window opens at
+        exactly the size asked for is never resized -- under a bare X server
+        with no window manager, sizing a window to the size already in force
+        produces no event -- so the log carried no resize line, `app_surface`
+        answered None, and the runner REFUSED the leg for having "never
+        reported a surface". That is the correct case being thrown away, and
+        it cost two scene-A legs on 2026-08-31; the surface was confirmed
+        right afterwards, by hand, from the picture bytes.
+
+        The startup line is unconditional, so this case now reads back.
+        """
+        opened_at_target = [
+            "[..] INFO Surface configured to 1920x1080",
+            "[..] INFO wgpu selected the Vulkan backend",
+        ]
+        self.assertEqual(
+            app_surface(opened_at_target), (1920, 1080),
+            "a window that opened at the requested size reports no surface, "
+            "so the runner refuses the leg that got the geometry right")
+        # And the byte check the refusal was standing in front of agrees.
+        self.assertTrue(
+            surface_check((1920, 1080), (1920, 1080), 8,
+                          picture_bytes_for(1920, 1080) * 8)["met"])
+
+    def test_a_later_resize_supersedes_the_startup_line(self):
+        """Two sentences, one answer: newest wins. Were the startup line to
+        win, a leg the runner successfully resized would be judged against
+        the size it opened at rather than the size it ran at -- the same
+        wrong-surface failure from the other direction."""
+        lines = [
+            "[..] INFO Surface configured to 1280x720",
+            "[..] INFO Window resized to 1920x1080",
+        ]
+        self.assertEqual(app_surface(lines), (1920, 1080))
 
     def test_the_app_line_is_what_the_byte_check_is_taken_against(self):
         """The window manager says 1920x1080 and the app allocated 3440x1440.

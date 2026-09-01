@@ -40,9 +40,14 @@ const RUN_NATIVE: &str = include_str!("../../../.github/browser-rig/run_measure_
 /// is the only way to hold its filename rule from here.
 const KV_RS: &str = include_str!("../../../squallar/src/kv.rs");
 
-/// This crate's own `App::handle_resized`, which prints the one geometry
-/// readback that exists on every platform the rig runs on.
+/// This crate's own `App::handle_resized`, which prints the geometry readback
+/// for every surface CHANGE.
 const APP_RS: &str = include_str!("../app.rs");
+
+/// `AppState::new`, which prints the surface the app OPENED at. The other half
+/// of the readback: a resize line cannot describe a window that was never
+/// resized, and refusing that leg threw away the correct case.
+const APP_STATE_RS: &str = include_str!("../app_state.rs");
 
 /// The `squallar.`-prefixed keys scene A's seed sets, prefix stripped.
 ///
@@ -212,30 +217,53 @@ fn the_surface_check_encodes_the_apps_own_picture_size() {
 /// returns nothing, and the leg reports an unconfirmable surface —
 /// indistinguishable from "the overlay path never ran". So the formatter and
 /// both readers are held together from here, as `drive.py`'s patterns are.
+///
+/// # Two sentences, because a resize is a change and a surface is a fact
+///
+/// `Window resized to` fires on a resize EVENT, so an app whose window opens
+/// at exactly the size it was asked for never prints it — under a bare X
+/// server with no window manager, sizing a window to the size already in force
+/// produces no event at all. The rig then read no surface and REFUSED the leg,
+/// which is the *correct* case being thrown away; it cost two scene-A legs on
+/// 2026-08-31, whose surface the picture-byte formula confirmed by hand
+/// immediately afterwards. `Surface configured to` is printed unconditionally
+/// where the surface is decided, so the readback exists on every leg, and both
+/// readers take the newest of either.
 #[test]
-fn both_rig_halves_read_the_surface_line_this_app_prints() {
+fn both_rig_halves_read_the_surface_lines_this_app_prints() {
     assert!(
         APP_RS.contains(r#"log::info!("Window resized to {}x{}", width, height)"#),
         "`App::handle_resized` no longer prints `Window resized to WxH`. That \
-         line is the only geometry readback the native rig has on every \
-         platform: without it a macOS or Wayland leg cannot confirm its \
-         surface at all, and an X leg falls back to a window manager that has \
-         already been caught reporting a size the app was not rendering at",
+         line is the geometry readback the native rig has on every platform: \
+         without it a macOS or Wayland leg cannot confirm a resize at all, and \
+         an X leg falls back to a window manager that has already been caught \
+         reporting a size the app was not rendering at",
     );
     assert!(
-        NATIVE_ROW.contains(r#"SURFACE_RE = re.compile(r"Window resized to (\d+)x(\d+)")"#),
-        "native_row.py no longer scrapes the app's surface line, so the \
-         picture-bytes cross-check is back to trusting whatever the runner \
-         was told the window was — which is how legs ran at 3440x1440 while \
-         believing they had asked for 1920x1080",
+        APP_STATE_RS.contains(r#"log::info!("Surface configured to {}x{}", width, height)"#),
+        "`AppState::new` no longer prints `Surface configured to WxH`. Without \
+         it the only surface readback is a RESIZE, so a window that opens at \
+         exactly the requested size reports nothing and the runner refuses the \
+         leg that got its geometry right — the false negative that cost two \
+         scene-A legs on 2026-08-31",
     );
     assert!(
-        RUN_NATIVE.contains(r#"grep "Window resized to " "$1""#),
-        "run_measure_native.sh no longer reads the app's own surface line. \
-         Its geometry solver converges by spending the residual between the \
-         frame it asked for and the surface it got; with no surface reading \
-         it can only ask once and hope, which is what it did when a title-\
-         matching resize silently ran a campaign at the wrong size",
+        NATIVE_ROW.contains(
+            r#"SURFACE_RE = re.compile(r"(?:Window resized to|Surface configured to) (\d+)x(\d+)")"#
+        ),
+        "native_row.py no longer scrapes both of the app's surface sentences, \
+         so either the picture-bytes cross-check is back to trusting whatever \
+         the runner was told the window was — which is how legs ran at \
+         3440x1440 while believing they had asked for 1920x1080 — or a leg \
+         that opened at the target reads back no surface at all",
+    );
+    assert!(
+        RUN_NATIVE.contains(r#"grep -E "(Window resized to|Surface configured to) " "$1""#),
+        "run_measure_native.sh no longer reads both of the app's surface \
+         sentences. Its geometry solver converges by spending the residual \
+         between the frame it asked for and the surface it got; with no \
+         surface reading it can only ask once and hope, and with only the \
+         resize sentence it refuses every leg that needed no resize",
     );
 }
 

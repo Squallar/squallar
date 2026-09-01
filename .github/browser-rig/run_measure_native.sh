@@ -396,8 +396,14 @@ EOF
 
 # app_surface <log>: the surface the APP says it allocated -- the reading the
 # picture-bytes formula predicts, and the only one that exists everywhere.
+# The app's own surface readback. TWO sentences: `Surface configured to` once
+# at startup, `Window resized to` on every later resize. Reading only the
+# second refused a leg whose window opened at exactly the requested size --
+# no resize event, no line, nothing to confirm against -- and that is the
+# CORRECT case, not a broken one. Newest of either wins.
 app_surface() {
-  grep "Window resized to " "$1" 2>/dev/null | tail -1 | sed 's/.*Window resized to //'
+  grep -E "(Window resized to|Surface configured to) " "$1" 2>/dev/null \
+    | tail -1 | sed -E 's/.*(Window resized to|Surface configured to) //'
 }
 
 # ------------------------------------------------------------------ setup ----

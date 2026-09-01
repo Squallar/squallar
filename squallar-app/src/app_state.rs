@@ -113,6 +113,26 @@ impl AppState {
 
         surface.configure(&device, &surface_config);
 
+        // **The surface the app opened at, said once, unconditionally.**
+        //
+        // `App::handle_resized` prints `Window resized to WxH`, and that line
+        // is what both halves of the native measurement rig read the geometry
+        // back from — it is the only readback that exists on every platform,
+        // and it is a *surface*, which is the quantity the picture-bytes
+        // formula predicts. But it fires on a resize EVENT, and an app that
+        // opens at exactly the size it was asked for is never resized: under a
+        // bare X server with no window manager, `xdotool windowsize` to the
+        // size already in force produces no event at all. The rig then read no
+        // surface, could confirm nothing, and REFUSED the leg — the correct
+        // case was the one it threw away, and two scene-A legs were lost to it
+        // on 2026-08-31 before the byte formula confirmed by hand that the
+        // surface had been right the whole time.
+        //
+        // So the size is announced where it is decided rather than only where
+        // it changes. Post-clamp, because the clamp above is what the surface
+        // actually got.
+        log::info!("Surface configured to {}x{}", width, height);
+
         // See `squallar_gpu::egui_renderer::install_repaint_wake`.
         let wake = {
             let held = Some(window.clone());
