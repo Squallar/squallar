@@ -100,6 +100,11 @@ pub struct PreparedFrame {
     /// is *not* `#[must_use]`, and dropping it makes a callback render nothing
     /// at all, with no validation error. Drained by [`PreparedFrame::submit`].
     user_command_buffers: Vec<wgpu::CommandBuffer>,
+    /// Where this pass crossed its own phase boundaries, for a caller that
+    /// brackets a wider span than this function and needs to cut it. See
+    /// [`pass_costs::PassPhaseStamps`], which says why the stamps travel
+    /// rather than the durations [`pass_costs::PassCosts`] already keeps.
+    phase_stamps: pass_costs::PassPhaseStamps,
 }
 
 /// Whole microseconds from `a` to `b`, for the pass-cost stamps. Saturates
@@ -124,6 +129,14 @@ impl PreparedFrame {
 
     pub fn repaint_delay(&self) -> std::time::Duration {
         self.repaint_delay
+    }
+
+    /// Where the pass that built this frame crossed its phase boundaries.
+    /// See [`pass_costs::PassPhaseStamps`] for the six spans these five
+    /// stamps cut, and why the app's frame ledger needs the instants rather
+    /// than the durations the renderer already totals for itself.
+    pub fn phase_stamps(&self) -> pass_costs::PassPhaseStamps {
+        self.phase_stamps
     }
 
     /// Submit every command buffer this frame recorded, egui's included. Takes
@@ -422,6 +435,11 @@ impl EguiRenderer {
         size_in_pixels: [u32; 2],
         mirror: Option<MirrorRequest<'_>>,
     ) -> PreparedFrame {
+        // Before `end_pass`, so the pass close and the platform-output handoff
+        // are inside a measured span rather than ahead of the first stamp.
+        // They were: `stamp_tessellate` used to be this function's first clock
+        // read, which left everything above it invisible to every figure.
+        let stamp_entry = web_time::Instant::now();
         let full_output = self.state.egui_ctx().end_pass();
 
         // Taken before the output is dismembered.
@@ -481,6 +499,13 @@ impl EguiRenderer {
         PreparedFrame {
             tris,
             screen_descriptor,
+            phase_stamps: pass_costs::PassPhaseStamps {
+                entry: stamp_entry,
+                tessellate: stamp_tessellate,
+                upload: stamp_upload,
+                upload_done: stamp_upload_done,
+                buffers: stamp_buffers,
+            },
             // Freed by the caller AFTER queue.submit(), to avoid destroying GPU
             // resources still referenced by the recorded render pass.
             textures_to_free: full_output.textures_delta.free,

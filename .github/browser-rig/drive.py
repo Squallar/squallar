@@ -2713,6 +2713,14 @@ var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) fram
 // rasters`, to `texture uploads`, or to any frame segment. Several takes can
 // share one `frame segment (pump)` sample.
 var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame segment (prepare)` opened up: six contiguous cuts of that ONE span,
+// same denominator (presented interact frames), so their sums telescope to
+// its sum. A DECOMPOSITION of the prepare segment, never a seventh segment --
+// adding `frame prepare (*)` to `frame segment (prepare)` double-counts the
+// whole of it. Also never added to `frame prep costs:`, which counts every
+// pass ENDED (idle frames and non-presenting frames included) and therefore
+// holds more samples than there are frames here.
+var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // One vector take opened up: `parse` (per source layer, at most sixteen) and
 // `style` (per feature, thousands). A DECOMPOSITION of `tile take (vector)`,
@@ -2727,6 +2735,7 @@ var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
+var frame_prepare_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -2794,6 +2803,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_segment_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                   sum: parseInt(x[3], 10), p50: x[4],
                                   p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_prepare_re.exec(m);
+  if (x) frame_prepare_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                                  sum: parseInt(x[3], 10), p50: x[4],
+                                  p90: x[5], p99: x[6], hist: x[7] });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -2813,7 +2826,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
-         tile_phase_all: tile_phase_all,
+         tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          gesture_begins: begins, gesture_loops: loops,
          console_total: C.length };
 """
@@ -2926,6 +2939,7 @@ class FrameLineWatcher:
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
+                            ("frame_prepare_all", "prepare"),
                             ("tile_take_all", "take"),
                             ("tile_phase_all", "phase")):
             for r in sig.get(prefix) or []:

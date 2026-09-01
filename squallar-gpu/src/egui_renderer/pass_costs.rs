@@ -12,7 +12,9 @@
 /// Cumulative microseconds the pass phases have cost this renderer.
 ///
 /// **Product telemetry, not a campaign instrument.** Always on, no feature
-/// gate, no debug arm: four clock reads and five `u64` adds per pass.
+/// gate, no debug arm: five clock reads and five `u64` adds per pass — four
+/// for these totals and one more at function entry, which only
+/// [`PassPhaseStamps`] reads.
 /// **No figure here ever gates CI** — wall-clock totals describe a machine,
 /// they do not pass or fail one.
 ///
@@ -54,6 +56,53 @@ impl PassCosts {
     pub fn total_us(&self) -> u64 {
         self.tessellate_us + self.upload_apply_us + self.mirror_us + self.buffers_and_callbacks_us
     }
+}
+
+/// The instants [`super::EguiRenderer::end_pass_and_upload`] crossed, handed
+/// back on the [`super::PreparedFrame`] so a caller can cut **its own**
+/// prepare span at the seams this function actually has.
+///
+/// # Why stamps and not durations, when [`PassCosts`] already exists
+///
+/// [`PassCosts`] answers "what did the phases cost", cumulatively, over every
+/// pass ended. It cannot answer "what else is in prepare", for two reasons
+/// that are both fatal on their own:
+///
+/// * **Its denominator is a different set of frames.** Every pass ended,
+///   presented or not, idle or interact. The app's `prepare` segment is
+///   presented *interact* frames only, so the two are not subtractable and a
+///   residual computed from them is not a residual of anything.
+/// * **Durations can be summed but not placed.** `end_pass_and_upload` is
+///   only part of the app's `prepare` span — the mirror-rung planning ahead of
+///   it and `Context::end_pass` inside it are outside every figure
+///   [`PassCosts`] keeps. Four durations cannot say how much of prepare they
+///   failed to cover; five instants against the caller's own two bracketing
+///   stamps say it exactly.
+///
+/// Five stamps, and with the caller's `ui_end` and acquire-start they cut
+/// prepare into six spans that telescope to it exactly:
+///
+/// ```text
+/// ui_end ─plan─> entry ─end-pass─> tessellate ─tessellate─> upload
+///        ─upload─> upload_done ─mirror─> buffers ─buffers─> acquire
+/// ```
+///
+/// The `mirror` span is `upload_done → buffers` rather than the mirror pass's
+/// own bracket, so it stays a real cut of prepare whether or not a mirror was
+/// requested: on a pass with none it is the cost of finding that out, which is
+/// sub-microsecond and reads as the zero it is.
+#[derive(Clone, Copy, Debug)]
+pub struct PassPhaseStamps {
+    /// Function entry, before `Context::end_pass`.
+    pub entry: web_time::Instant,
+    /// After `end_pass` and the platform-output handoff — tessellation opens.
+    pub tessellate: web_time::Instant,
+    /// After tessellation — the texture-delta apply opens.
+    pub upload: web_time::Instant,
+    /// After the texture-delta apply — the optional mirror pass opens.
+    pub upload_done: web_time::Instant,
+    /// After the mirror pass — `update_buffers` opens.
+    pub buffers: web_time::Instant,
 }
 
 /// The single-writer ledger behind [`PassCosts`]: the renderer owns one and

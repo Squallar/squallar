@@ -600,6 +600,121 @@ fn every_frame_segment_is_reported_under_its_own_name() {
     }
 }
 
+/// The `frame prepare (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame segment (…)` and deliberately a **different
+/// prefix**: the six are cuts of the prepare segment, and a reader who could
+/// mistake one for a seventh segment would add it to the very span it
+/// decomposes. The `sum=` is the load-bearing field for the same reason it is
+/// on the segment line — 3 × 100 = 300, where every percentile of that
+/// histogram answers the bin's 106 us upper edge.
+#[test]
+fn the_frame_prepare_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame prepare", "tessellate", &h),
+        format!(
+            "frame prepare (tessellate): n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All six prepare cuts are emitted, under their own names, every tick — and
+/// each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green: `plan`
+/// carrying `upload`'s histogram would keep every name right and every figure
+/// wrong, which is exactly the failure a split is most likely to have.
+#[test]
+fn every_prepare_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::PrepareHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.plan,
+        &mut phases.end_pass,
+        &mut phases.tessellate,
+        &mut phases.upload,
+        &mut phases.mirror,
+        &mut phases.buffers,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_prepare_lines(&phases);
+    let names = [
+        "plan",
+        "end-pass",
+        "tessellate",
+        "upload",
+        "mirror",
+        "buffers",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame prepare ({name}): n={}, ", slot + 1)),
+            "prepare cut {slot} reported as {line:?}, which is not {name}'s \
+             line carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The prepare cuts do not collide with the segment lines the rig already
+/// reads.** Both use `named_hist_line` and both name a `prepare`; the rig keys
+/// its families on the prefix, so a shared one would file six cuts of a span
+/// alongside the span itself under one name and let a reader sum them.
+#[test]
+fn the_prepare_cuts_are_not_readable_as_frame_segments() {
+    let phases = crate::frame_ledger::PrepareHists::default();
+    let segments = crate::frame_ledger::SegmentHists::default();
+    let prepare_lines = super::frame_prepare_lines(&phases);
+    let segment_lines = super::frame_segment_lines(&segments);
+
+    for line in &prepare_lines {
+        assert!(
+            !line.starts_with("frame segment ("),
+            "a prepare cut is written as a frame segment ({line:?}); the rig \
+             would file it beside the six that telescope to service",
+        );
+    }
+    assert!(
+        segment_lines
+            .iter()
+            .any(|line| line.starts_with("frame segment (prepare): ")),
+        "the segment line these cuts decompose is no longer written, so \
+         nothing carries the total they sum to",
+    );
+}
+
+/// The rig's `frame prepare` probe reads what the app writes, character for
+/// character — the same both-ends pin the segment and tile lines carry.
+#[test]
+fn the_rig_reads_the_prepare_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame prepare", "end-pass", &h),
+        rendered(
+            &pattern("frame_prepare_re"),
+            &["end-pass", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame prepare (…)` line and the rig's probe have drifted",
+    );
+}
+
 /// The `tile take (…)` sentence, pinned as a literal, and only for a family
 /// that has samples.
 ///

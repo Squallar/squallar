@@ -4,8 +4,11 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is eight clock reads and a dozen
-//! integer bin searches. **No figure recorded here ever gates CI.**
+//! feature gate, and the per-frame cost is nine clock reads and about fifteen
+//! integer bin searches — the ledger's own eight stamps plus the one the egui
+//! pass takes on entry, and six of the bin searches are the `prepare` split
+//! ([`PrepareHists`]), which records only on the frames `prepare` itself does.
+//! **No figure recorded here ever gates CI.**
 //!
 //! # The three denominators, stated once
 //!
@@ -52,10 +55,54 @@ struct Marks {
     ui_end: Option<Instant>,
     /// The `get_current_texture` span, stamped inside the acquire closure.
     acquire: Option<(Instant, Instant)>,
+    /// Where the egui pass crossed its own phase boundaries, off the
+    /// `PreparedFrame` the pass returned. `None` on a frame that never
+    /// finished a pass, which is the same frame that leaves no acquire.
+    prepare_phases: Option<squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps>,
     /// `present_frame` return.
     present_return: Option<Instant>,
     /// The pass ended without a real present (a skipped or lost surface).
     skipped: bool,
+}
+
+/// Where the `prepare` segment's time went, cut at the seams the code has.
+///
+/// # Denominator
+///
+/// **Exactly [`SegmentHists::prepare`]'s** — presented interact frames — and
+/// that equality is the whole design. The six are contiguous cuts of the one
+/// span, so they telescope to it (`the_prepare_phases_telescope_to_prepare`),
+/// which makes the residual arithmetic rather than inference: any prepare time
+/// these six do not name is a bug in this decomposition, not a mystery.
+///
+/// **Never added to [`squallar_gpu::egui_renderer::pass_costs::PassCosts`]**,
+/// which counts every pass ended — idle frames and non-presenting frames
+/// included — and therefore has more samples in it than this has frames.
+/// The two measure overlapping work over different frame sets; only this one
+/// shares a denominator with `prepare`.
+#[derive(Default)]
+pub(crate) struct PrepareHists {
+    /// `Gui::ui` return to the egui pass's close: the app's own prologue —
+    /// the command encoder, the mirror source rects, the floor demand, the
+    /// mirror rung plan and any mirror-texture realloc.
+    pub(crate) plan: Hist,
+    /// `Context::end_pass` and the platform-output handoff. Was invisible to
+    /// every figure before this split: the renderer's first clock read used to
+    /// be taken after it.
+    pub(crate) end_pass: Hist,
+    /// `Context::tessellate` — shapes to triangles, on this thread.
+    pub(crate) tessellate: Hist,
+    /// Filing and draining this frame's texture deltas: the memcpys into
+    /// staging slots and any blocking `write_texture`.
+    pub(crate) upload: Hist,
+    /// The pane-mirror pass, and on a frame with no mirror request the
+    /// sub-microsecond cost of finding that out.
+    pub(crate) mirror: Hist,
+    /// egui's `update_buffers` — which also dispatches every paint callback's
+    /// `prepare`, the 3D raymarch's CPU-side encode included — plus the return
+    /// to the swapchain acquire, which is a handful of instructions and is
+    /// folded in here rather than given a seventh name it could not fill.
+    pub(crate) buffers: Hist,
 }
 
 /// The per-segment histograms of interact frames, and only interact frames:
@@ -72,7 +119,8 @@ pub(crate) struct SegmentHists {
     /// The `Gui::ui` call itself: layout and the paint list.
     pub(crate) ui: Hist,
     /// `Gui::ui` return to the acquire: mirror planning, tessellation, the
-    /// texture-delta uploads and egui's buffer staging.
+    /// texture-delta uploads and egui's buffer staging. Opened up by
+    /// [`PrepareHists`], whose six cuts telescope to exactly this.
     pub(crate) prepare: Hist,
     /// Acquire return to `present_frame` return: draw, submit, present.
     pub(crate) finish: Hist,
@@ -91,6 +139,8 @@ pub(crate) struct FrameLedger {
     service_idle: Hist,
     /// See [`SegmentHists`] — interact frames only.
     segments: SegmentHists,
+    /// See [`PrepareHists`] — `segments.prepare`, opened up, same frames.
+    prepare: PrepareHists,
     /// The acquire span itself, interact frames only. Reported beside the
     /// segments and never inside service: it is the vsync block.
     acquire: Hist,
@@ -122,6 +172,29 @@ fn service_micros(
     }
 }
 
+/// The six contiguous cuts of the `prepare` segment, in pass order:
+/// `[plan, end_pass, tessellate, upload, mirror, buffers]` — see
+/// [`PrepareHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `prepare`'s own boundaries, so the six sum to
+/// `micros(ui_end, acquire_start)` exactly. A free function so the telescoping
+/// is testable without a frame.
+fn prepare_phase_micros(
+    ui_end: Instant,
+    phases: &squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps,
+    acquire_start: Instant,
+) -> [u32; 6] {
+    [
+        micros(ui_end, phases.entry),
+        micros(phases.entry, phases.tessellate),
+        micros(phases.tessellate, phases.upload),
+        micros(phases.upload, phases.upload_done),
+        micros(phases.upload_done, phases.buffers),
+        micros(phases.buffers, acquire_start),
+    ]
+}
+
 impl FrameLedger {
     /// Open a frame: stamp its start and forget the previous frame's marks.
     pub(crate) fn mark_frame_start(&mut self) {
@@ -147,6 +220,16 @@ impl FrameLedger {
     /// closure itself so the boundary cannot drift from the call.
     pub(crate) fn record_acquire(&mut self, start: Instant, end: Instant) {
         self.cur.acquire = Some((start, end));
+    }
+
+    /// The phase stamps the egui pass took on its way through, carried off the
+    /// `PreparedFrame` it returned. Recorded unconditionally; `finalize`
+    /// decides whether this frame is a sample.
+    pub(crate) fn record_prepare_phases(
+        &mut self,
+        stamps: squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps,
+    ) {
+        self.cur.prepare_phases = Some(stamps);
     }
 
     pub(crate) fn mark_present_return(&mut self) {
@@ -205,6 +288,20 @@ impl FrameLedger {
             self.segments.finish.record(finish);
             self.segments.post.record(post);
             self.acquire.record(acquire);
+            // Inside the interact arm, and only here: these six are cuts of
+            // the `prepare` recorded two lines up, and a sample recorded on a
+            // frame that segment did not take would break the one property
+            // that makes the split arithmetic.
+            if let Some(phases) = m.prepare_phases.as_ref() {
+                let [plan, end_pass, tessellate, upload, mirror, buffers] =
+                    prepare_phase_micros(ui_end, phases, acquire_start);
+                self.prepare.plan.record(plan);
+                self.prepare.end_pass.record(end_pass);
+                self.prepare.tessellate.record(tessellate);
+                self.prepare.upload.record(upload);
+                self.prepare.mirror.record(mirror);
+                self.prepare.buffers.record(buffers);
+            }
         } else {
             self.service_idle.record(service);
         }
@@ -225,6 +322,10 @@ impl FrameLedger {
 
     pub(crate) fn segments(&self) -> &SegmentHists {
         &self.segments
+    }
+
+    pub(crate) fn prepare_phases(&self) -> &PrepareHists {
+        &self.prepare
     }
 
     pub(crate) fn acquire(&self) -> &Hist {
@@ -260,7 +361,80 @@ impl FrameLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::service_micros;
+    use super::{Instant, micros, prepare_phase_micros, service_micros};
+    use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
+
+    /// A pass whose phases land at the given microsecond offsets from
+    /// `ui_end`, so a test can state its stamps as arithmetic.
+    fn phases_at(ui_end: Instant, offsets: [u64; 5]) -> PassPhaseStamps {
+        let at = |us: u64| ui_end + std::time::Duration::from_micros(us);
+        PassPhaseStamps {
+            entry: at(offsets[0]),
+            tessellate: at(offsets[1]),
+            upload: at(offsets[2]),
+            upload_done: at(offsets[3]),
+            buffers: at(offsets[4]),
+        }
+    }
+
+    /// **The six cuts are a decomposition of `prepare`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(ui_end, acquire_start)` — the very span
+    /// `SegmentHists::prepare` records — so "what is in prepare" is answered by
+    /// subtraction rather than by inference, and any phase the split fails to
+    /// name shows up as a gap instead of hiding inside a neighbour.
+    #[test]
+    fn the_prepare_phases_telescope_to_prepare() {
+        let ui_end = Instant::now();
+        let phases = phases_at(ui_end, [400, 1_500, 9_100, 12_000, 12_050]);
+        let acquire_start = ui_end + std::time::Duration::from_micros(18_300);
+
+        let cuts = prepare_phase_micros(ui_end, &phases, acquire_start);
+        assert_eq!(
+            cuts,
+            [400, 1_100, 7_600, 2_900, 50, 6_250],
+            "a cut moved: the six no longer bracket the phases they are named \
+             for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(ui_end, acquire_start),
+            "the six cuts do not sum to the prepare span they decompose, so \
+             the residual this instrument reports is not a residual of prepare",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 18_300);
+    }
+
+    /// **The non-vacuity floor under the two cuts this split adds.**
+    ///
+    /// The renderer's own `PassCosts` ledger already timed four phases, and
+    /// its first clock read was taken at tessellation — so the app's prologue
+    /// (`plan`) and `Context::end_pass` itself were outside every figure the
+    /// instrument had. This holds that the four old phases really do leave a
+    /// hole, and that the hole is exactly the two new cuts: without it, a
+    /// split that renamed the existing four and measured nothing more would
+    /// pass every other test here.
+    #[test]
+    fn the_phases_the_pass_ledger_already_timed_do_not_cover_prepare() {
+        let ui_end = Instant::now();
+        let phases = phases_at(ui_end, [400, 1_500, 9_100, 12_000, 12_050]);
+        let acquire_start = ui_end + std::time::Duration::from_micros(18_300);
+
+        let cuts = prepare_phase_micros(ui_end, &phases, acquire_start);
+        let already_timed: u32 = cuts[2..].iter().sum();
+        let newly_named: u32 = cuts[..2].iter().sum();
+        assert_ne!(
+            newly_named, 0,
+            "the two cuts this split adds are empty, so it opened nothing up",
+        );
+        assert_eq!(
+            already_timed + newly_named,
+            micros(ui_end, acquire_start),
+            "the old four plus the new two are not prepare, so one of the two \
+             groups is measuring something else",
+        );
+        assert_eq!((already_timed, newly_named), (16_800, 1_500));
+    }
 
     /// The two service spellings agree exactly whenever the segments are the
     /// contiguous cuts of the whole frame minus the acquire — the sum

@@ -380,12 +380,24 @@ fn a_paint_callbacks_own_command_buffer_reaches_the_queue() {
         "egui did not gather the callback's command buffer at all, so this \
              test cannot say anything about submission"
     );
+    // Collapsed to one instant: this test is about submission and never reads
+    // the stamps. `PassPhaseStamps` has no `Default` on purpose — a zero
+    // instant does not exist, and a phase split assembled from one would read
+    // as a pass that took no time rather than as the absence it is.
+    let stamp = web_time::Instant::now();
     let mut frame = PreparedFrame {
         tris,
         screen_descriptor,
         textures_to_free: Vec::new(),
         user_command_buffers,
         repaint_delay: std::time::Duration::MAX,
+        phase_stamps: super::pass_costs::PassPhaseStamps {
+            entry: stamp,
+            tessellate: stamp,
+            upload: stamp,
+            upload_done: stamp,
+            buffers: stamp,
+        },
     };
     frame.submit(&queue, encoder);
 

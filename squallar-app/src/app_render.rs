@@ -612,6 +612,34 @@ fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
     ]
 }
 
+/// The six `frame prepare (<name>):` lines — the `prepare` segment, opened up.
+///
+/// Denominator: **exactly `frame segment (prepare)`'s** — presented interact
+/// frames — and the six are contiguous cuts of that one span, so their sums
+/// telescope to its sum. That equality is what makes this a decomposition
+/// rather than a seventh segment: `frame prepare (*)` is never added to
+/// `frame segment (prepare)`, it *is* it.
+///
+/// **Never added to `frame prep costs:` either.** That line counts every egui
+/// pass ended — idle frames and frames that never presented included — so it
+/// has strictly more samples in it than there are frames here. The two time
+/// overlapping work over different frame sets; only these six share a
+/// denominator with a frame segment, which is the whole reason they exist.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms: none
+/// of the six is ever structurally absent, and a `mirror` cut of zero on a
+/// 2D-only install is a figure, not an absence.
+fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
+    [
+        named_hist_line("frame prepare", "plan", &p.plan),
+        named_hist_line("frame prepare", "end-pass", &p.end_pass),
+        named_hist_line("frame prepare", "tessellate", &p.tessellate),
+        named_hist_line("frame prepare", "upload", &p.upload),
+        named_hist_line("frame prepare", "mirror", &p.mirror),
+        named_hist_line("frame prepare", "buffers", &p.buffers),
+    ]
+}
+
 /// The `tile take (<family>):` lines — what one tile take costs the thread
 /// that performs it.
 ///
@@ -1379,6 +1407,12 @@ impl super::App {
         // denominator, with the bins that make a gesture window a subtraction
         // rather than a percentile of the whole run.
         for line in frame_segment_lines(ledger.segments()) {
+            say_telemetry(loud, &line);
+        }
+        // The `prepare` segment above, opened up at the seams the code has.
+        // Same denominator, six contiguous cuts of that one span — a
+        // decomposition of the line above, never a seventh segment beside it.
+        for line in frame_prepare_lines(ledger.prepare_phases()) {
             say_telemetry(loud, &line);
         }
         // What one tile take cost, per family. Read unconditionally rather
@@ -2720,6 +2754,11 @@ impl super::App {
                 acquired
             },
         );
+        // Before the acquire span is filed, because the two are read together:
+        // the phase stamps only cut anything when paired with this frame's
+        // `ui_end` and acquire start. See `frame_ledger::PrepareHists`.
+        self.frame_ledger
+            .record_prepare_phases(frame.phase_stamps());
         if let Some((acquire_start, acquire_end)) = acquire_span.get() {
             self.frame_ledger.record_acquire(acquire_start, acquire_end);
         }
