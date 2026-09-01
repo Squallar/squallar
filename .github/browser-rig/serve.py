@@ -173,6 +173,26 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
   "use strict";
   var E = (window.__rig_errors = []);
   var C = (window.__rig_console = []);
+  // The gesture player's markers, kept OUT of the console ring buffer.
+  //
+  // `C` holds the last 1200 console entries, and the app logs frame telemetry
+  // every frame: at 54-175 Hz that buffer turns over in well under ten
+  // seconds. A `loop complete` marker arrives once per 20 s, so by the time
+  // the driver next polls, earlier markers have been evicted and the scraped
+  // `loops_completed` is not a count of loops that happened -- it is a count
+  // of loops still visible in a window that scrolls faster than they arrive.
+  //
+  // MEASURED: a 90 s leg on linux firefox and a 140 s leg on macOS firefox
+  // both reported 2 loops, as did a 46 s leg; raising the window bought
+  // nothing, because the limit was never time. Worse, the loss rate is a
+  // function of how fast the app logs, which differs per browser -- so the
+  // undercount was browser-correlated, which is the shape that costs validity
+  // rather than precision.
+  //
+  // Markers are rare (one per 20 s) so this array is bounded generously
+  // rather than by turnover; a leg would have to run eleven hours to reach
+  // the cap, and the cap exists only so a runaway cannot exhaust memory.
+  var M = (window.__rig_marks = []);
   window.__rig = { t0: Date.now(), block_sw: __RIG_BLOCK_SW__ };
   var seed = __RIG_SEED_LS__;
   if (seed) {
@@ -203,12 +223,21 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
     push(E, { t: Date.now(), kind: "unhandledrejection",
               msg: String((r && (r.stack || r.message)) || r).slice(0, 2000) });
   });
+  // Cheap substring test first; the marker sentences are the two the gesture
+  // player emits, and `mark` runs on EVERY console line so it must not regex.
+  function mark(t, m) {
+    if (m.indexOf("gesture script ") !== 0) return;
+    if (m.indexOf(" loop complete: ") < 0 && m.indexOf(" begin") < 0) return;
+    try { if (M.length < 20000) M.push({ t: t, msg: m }); } catch (_) {}
+  }
   ["error", "warn", "info", "log", "debug"].forEach(function (lvl) {
     var orig = console[lvl] ? console[lvl].bind(console) : null;
     console[lvl] = function () {
       var m = fmt(arguments);
-      push(C, { t: Date.now(), lvl: lvl, msg: m });
-      if (lvl === "error") push(E, { t: Date.now(), kind: "console.error", msg: m });
+      var t = Date.now();
+      push(C, { t: t, lvl: lvl, msg: m });
+      mark(t, m);
+      if (lvl === "error") push(E, { t: t, kind: "console.error", msg: m });
       if (orig) return orig.apply(null, arguments);
     };
   });

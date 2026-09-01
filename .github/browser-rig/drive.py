@@ -2815,10 +2815,24 @@ for (var i = 0; i < C.length; i++) {
   if (x) tile_phase_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
                                p90: x[5], p99: x[6], hist: x[7] });
-  x = gesture_begin_re.exec(m);
-  if (x) begins.push({ t: t, script: x[1] });
-  x = gesture_loop_re.exec(m);
-  if (x) loops.push({ t: t, script: x[1], frames: parseInt(x[2], 10) });
+}
+// The markers come from `window.__rig_marks`, NOT from the console ring
+// above. `C` keeps the last 1200 entries and the app logs frame telemetry
+// every frame, so at 54-175 Hz it scrolls a loop marker out of view long
+// before the next poll -- which made `loops_completed` a function of the
+// app's log rate rather than of elapsed time, and therefore browser-
+// correlated. `__rig_marks` collects only the two gesture sentences and is
+// not a ring. The console scan is kept as a fallback so a page served
+// without the marks buffer still reports what it can.
+var MK = window.__rig_marks;
+var marks_src = (MK && MK.length) ? MK : C;
+for (var j = 0; j < marks_src.length; j++) {
+  var mm = String(marks_src[j].msg || "");
+  var mt = marks_src[j].t;
+  var y = gesture_begin_re.exec(mm);
+  if (y) begins.push({ t: mt, script: y[1] });
+  y = gesture_loop_re.exec(mm);
+  if (y) loops.push({ t: mt, script: y[1], frames: parseInt(y[2], 10) });
 }
 return { interact: interact, idle: idle, segments: segments, prep: prep,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
@@ -2828,6 +2842,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          gesture_begins: begins, gesture_loops: loops,
+         marks_total: (MK ? MK.length : -1),
          console_total: C.length };
 """
 
@@ -5398,11 +5413,49 @@ def run_smoke(args):
                                   for k, v in (result["raf_warm"] or {}).items()
                                   if k in ("ok", "n", "p50", "p95", "max")})
 
-        stage("data-window", seconds=args.data_window)
-        time.sleep(args.data_window / 2)
-        result["resources_mid"] = session.execute(RESOURCES_PROBE)
-        frames_watch.poll()
-        time.sleep(args.data_window / 2)
+        stage("data-window", seconds=args.data_window,
+              window_loops=args.window_loops)
+        if args.window_loops:
+            # STATE THE WINDOW, DO NOT INFER IT. `--data-window` is seconds,
+            # and seconds are the wrong unit for a window whose whole purpose
+            # is to hold a fixed amount of scripted work: two legs given the
+            # same seconds finish different numbers of loops, and comparing
+            # their per-frame means is the leg-selection error this rig has
+            # already published once. `native_row.py`'s `bracket()` has always
+            # demanded N whole loops; this is the same demand on the web path.
+            #
+            # The poll is what makes it work at all: markers must be collected
+            # as they arrive, because before `__rig_marks` existed they were
+            # scrolling out of the console ring between polls and no amount of
+            # waiting could recover them.
+            deadline = time.monotonic() + args.window_loops_timeout
+            mid_done = False
+            while True:
+                sig = frames_watch.poll()
+                seen = len(frames_watch.loops)
+                if not mid_done and seen * 2 >= args.window_loops:
+                    result["resources_mid"] = session.execute(RESOURCES_PROBE)
+                    mid_done = True
+                if seen >= args.window_loops:
+                    stage("window-loops-met", loops=seen)
+                    break
+                if time.monotonic() > deadline:
+                    stage("window-loops-TIMEOUT", loops=seen,
+                          wanted=args.window_loops,
+                          marks_total=(sig or {}).get("marks_total"))
+                    result.setdefault("gotchas", []).append(
+                        "--window-loops %d not reached in %gs (saw %d); the "
+                        "row's window is NOT the length that was asked for"
+                        % (args.window_loops, args.window_loops_timeout, seen))
+                    break
+                time.sleep(1.0)
+            if not mid_done:
+                result["resources_mid"] = session.execute(RESOURCES_PROBE)
+        else:
+            time.sleep(args.data_window / 2)
+            result["resources_mid"] = session.execute(RESOURCES_PROBE)
+            frames_watch.poll()
+            time.sleep(args.data_window / 2)
         result["resources"] = session.execute(RESOURCES_PROBE)
         stage("resources", count=(result["resources"] or {}).get("count"),
               hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6],
@@ -6332,6 +6385,19 @@ def main(argv=None):
                     help="seconds after boot before the warm rAF sample")
     ap.add_argument("--data-window", type=float, default=10.0,
                     help="seconds to let live data arrive before second sample")
+    ap.add_argument("--window-loops", type=int, default=0,
+                    help="hold the data window open until this many gesture "
+                         "loop markers have been SEEN, instead of for "
+                         "--data-window seconds. The unit a comparison needs: "
+                         "two legs given equal seconds finish unequal loops, "
+                         "and their per-frame means are then not comparable. "
+                         "0 (default) keeps the seconds behaviour.")
+    ap.add_argument("--window-loops-timeout", type=float, default=600.0,
+                    help="give up waiting for --window-loops after this many "
+                         "seconds; the leg still reports, with a gotcha and a "
+                         "`window-loops-TIMEOUT` stage, because a short "
+                         "window that says so is recoverable and one that "
+                         "does not is not")
     ap.add_argument("--boot-timeout", type=float, default=90.0)
     ap.add_argument("--script-timeout", type=float, default=90.0)
     ap.add_argument("--page-timeout", type=float, default=120.0)

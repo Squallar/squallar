@@ -194,7 +194,19 @@
 #                     46 s. A fixed window therefore hands the two browsers
 #                     different-length windows, which is a systematic bias in
 #                     the one comparison this arm exists to make -- not noise
-#                     that more repeats will cancel.
+#                     that more repeats will cancel. PREFER RIG_WINDOW_LOOPS.
+#   RIG_WINDOW_LOOPS  hold the window open until N gesture loop markers have
+#                     been seen, instead of for RIG_MEASURE_WINDOW seconds
+#                     (default 0 = seconds). This is the unit a cross-leg
+#                     comparison needs: equal seconds buy unequal loops, and
+#                     two rows whose windows hold different amounts of
+#                     scripted work have per-frame means that are not
+#                     comparable -- the leg-selection error that withdrew two
+#                     published ratios. Use 3 to guarantee a `settled` window
+#                     (it needs three markers), and read the row's `loops=`
+#                     to confirm; a leg that times out waiting says so on a
+#                     `window-loops-TIMEOUT` stage and in a gotcha rather
+#                     than quietly reporting a short window.
 #   RIG_FRAMES        rAF deltas per sample (default 240)
 #   RIG_DISPLAY       X display (default: $DISPLAY, then :0)
 #   RIG_PANEL         "on" seeds the diagnostics panel visible (default off);
@@ -248,6 +260,9 @@ BROWSERS="${RIG_BROWSERS:-firefox chromium}"
 SCENES="${RIG_SCENES:-A B C D}"
 SETTLE="${RIG_SETTLE:-6}"
 MEASURE_WINDOW="${RIG_MEASURE_WINDOW:-46}"
+# 0 = keep the seconds window. Any N>0 holds the window open until N loop
+# markers are seen, which is the unit a cross-leg comparison actually needs.
+WINDOW_LOOPS="${RIG_WINDOW_LOOPS:-0}"
 FRAMES="${RIG_FRAMES:-240}"
 PANEL="${RIG_PANEL:-off}"
 CANVAS="${RIG_CANVAS:-}"
@@ -677,6 +692,7 @@ run_leg() {
       --out-dir "$OUT_DIR" --tag "$tag" --run-id "$LAST_RUN_ID" \
       --driver "$driver" --frames "$FRAMES" \
       --settle "$SETTLE" --data-window "$MEASURE_WINDOW" \
+      --window-loops "$WINDOW_LOOPS" \
       --arm hardware --require-hardware \
       --expect-seed-applied \
       "${arm_args[@]}" \
@@ -988,25 +1004,23 @@ for leg in legs:
     # produce the window the rig itself prefers, which is why most rows lack
     # one.
     #
-    # No second count is named here on purpose. A scripted loop is 20 s of
-    # SCRIPT, not of wall clock: it takes as long as the app needs to play it,
-    # so the window that buys three loops is a property of the machine AND of
-    # the browser, not a constant. Measured on an M2, scene A: firefox got 2
-    # loops at 46 s, 2 at 75 s and still only 2 at 140 s, while chromium
-    # reached 3 at 46 s. Raise it until the `loops=` field on the row above
-    # reads 3 or more; that field is the check, and it cannot go stale the way
-    # a hardcoded number does.
-    #
-    # THAT ASYMMETRY IS THE WHOLE PROBLEM, not a footnote. Loop count at a
-    # fixed window is browser-correlated, so it does not average out across
-    # repeats the way noise does -- it biases one side of exactly the
-    # comparison this rig exists to make. On the M2 scene-A set: firefox
-    # loops 2,2,1,1,1 against chromium 2,2,3,2,2, at one window setting.
+    # Ask for loops, not seconds. A scripted loop IS 20 s of wall clock --
+    # `GesturePlayer::elapsed_secs` is `Instant::now().elapsed()` -- so the
+    # loops always happened; what varied was whether the rig SAW them. Their
+    # markers were being read out of the 1200-entry console ring, which the
+    # app's per-frame telemetry scrolls in seconds, so a marker arriving once
+    # per 20 s was usually gone by the next poll. Measured before the fix, on
+    # an M2 scene A: firefox reported 2 loops at 46 s, 2 at 75 s and still 2
+    # at 140 s, while chromium reported 3 at 46 s -- an undercount whose rate
+    # tracked how fast each browser logged, i.e. browser-correlated, which is
+    # the shape that costs validity rather than precision. Markers now go to
+    # `window.__rig_marks`, which is not a ring, and RIG_WINDOW_LOOPS waits on
+    # them instead of on a clock.
     if gw and not gw.get("settled"):
         print("ROW   NO settled window (only %s loops; needs 3). Figures above"
               " are boot-inclusive and NOT length-equalised: compare only "
-              "against a row with the same loops= count, or raise "
-              "RIG_MEASURE_WINDOW until loops>=3."
+              "against a row with the same loops= count, or re-run with "
+              "RIG_WINDOW_LOOPS=3, which asks for loops rather than seconds."
               % gw.get("loops_completed"))
     fl = r.get("frame_lines") or {}
     idle = fl.get("idle") or {}
