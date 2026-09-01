@@ -1782,6 +1782,28 @@ clause stripped from every filter, `styled` at zoom 14 is **5.40 ms** against
 at all seven zooms. Removing the fold from `www/styles/{dark,light}.json` is a
 separate change to those documents and is not in this commit.
 
+> **Correction, 2026-09-01 — the two figures above are a mixed baseline and
+> must not be requoted as a pair.** The 7.08 ms was measured before this commit
+> (at `59f08766`, where no `ZoomRange` exists); the 5.40 ms was measured after
+> it. Their difference therefore credits *stripping the fold* with the saving
+> this commit's own zoom gate already delivers. Re-measured on one baseline,
+> over the same tile, min of 61, three interleaved rounds, release:
+>
+> | baseline | folded | stripped |
+> | --- | --- | --- |
+> | `59f08766` (no `ZoomRange`) | 7.37 / 7.40 / 7.41 ms | 7.29 / 7.32 / 7.38 ms |
+> | `404c1f8a` (this commit + the next) | 6.44 / 6.44 / 6.45 ms | 5.29 / 5.30 / 5.32 ms |
+>
+> So stripping the fold is worth **≈17.9%**, not ≈24%. At `59f08766` it is
+> worth nothing at all *and breaks the map* — 3,034 shapes at zoom 0 against
+> the folded style's 3 — which is the direct evidence that the fold, not the
+> range field, was the whole gate before this commit.
+>
+> The strip has since been taken: `www/styles/{dark,light}.json` lost 151
+> clauses each (87 `>=`, 64 `<`), with both themes rendering byte-identical
+> `Debug` shape lists at every zoom 0–25 over Monaco's z14 8529/5974 tile.
+> That is a change to those documents, not to this directory.
+
 New public surface: `ZoomRange`, `Layer::visible_at`.
 
 Two new tests, both shown red against unmodified `59f08766` with only the

@@ -136,32 +136,45 @@
 //!    rename table went with the converter; the six pairs survive as prose, in
 //!    the failure message of the source-layer membership check, because that is
 //!    the message a reader needs when a name does not resolve.
-//! 2. **Zoom ranges had to be folded into filters — and no longer do.** The
+//! 2. **Zoom ranges had to be folded into filters — and no longer are.** The
 //!    brief listed the fold among the transforms vendoring had made
 //!    unnecessary. At the time it had not: `walkers::style::Layer` carried no
 //!    `minzoom` or `maxzoom` field, so serde dropped both at parse and
 //!    `walkers::mvt::styled` consulted each layer's `filter` and nothing else.
 //!    Without the fold every layer drew at every zoom.
 //!
-//!    **Superseded on 2026-09-01.** `walkers::style::ZoomRange` parses both
-//!    fields and `styled` skips a layer whose range excludes the tile zoom,
-//!    before it reads a feature. The fold is now redundant rather than
-//!    load-bearing, and it is kept only because removing it is a separate
-//!    change to these documents: measured over Monaco's z14 tile with every
-//!    zoom clause stripped out of every filter, both themes render
-//!    **byte-identical** shape lists at zooms 0, 5, 8, 10, 12, 14 and 16 to
-//!    what the folded styles render — which is also the end-to-end check that
-//!    `ZoomRange`'s inclusive-`minzoom`/exclusive-`maxzoom` bounds agree with
-//!    the fold's `[">=", ["zoom"], min]` / `["<", ["zoom"], max]` on all 87
-//!    ranged layers. Stripping them is worth doing on its own account: the
-//!    same measurement puts `styled` at 5.40 ms against 7.08 ms folded at
-//!    zoom 14, because the surviving layers stop re-evaluating a zoom clause
-//!    once per feature.
+//!    **Superseded on 2026-09-01, and acted on the same day.**
+//!    `walkers::style::ZoomRange` parses both bounds and `styled` skips a layer
+//!    whose range excludes the tile zoom before it reads a feature, so the fold
+//!    became redundant; the 151 clauses per theme (87 `[">=", ["zoom"], min]`
+//!    and 64 `["<", ["zoom"], max]`) were then removed from both documents.
+//!    Equivalence was measured, not reasoned: over Monaco's z14 8529/5974 tile
+//!    (185,182 decompressed bytes, 738 shapes at z14 dark), both themes render
+//!    **byte-identical** `Debug` shape lists at every zoom from 0 to 25 —
+//!    52 renderings, covering both sides of every bound the documents declare,
+//!    which is where an inclusive/exclusive mistake is the only place it can
+//!    show.
 //!
-//!    Both checks below still pass and still describe the documents:
-//!    `a_folded_zoom_range_gates_the_layer_through_the_real_evaluator` and,
-//!    structurally across every layer,
-//!    `every_layer_with_a_zoom_range_folded_it_into_its_filter`.
+//!    What it bought, on one baseline rather than two: `styled` at zoom 14 over
+//!    that tile is **5.29–5.32 ms stripped against 6.44–6.47 ms folded**, about
+//!    **17.9%** (min of 61, three interleaved rounds, release, 2026-09-01). The
+//!    saving is per feature — a redundant zoom clause is re-evaluated once for
+//!    every feature of the layer's source layer, where the declared range is
+//!    read once for the layer.
+//!
+//!    A figure that circulated alongside this one, **5.40 ms against 7.08 ms
+//!    (≈24%), is a mixed baseline and should not be requoted**: the 7.08 ms was
+//!    measured at `59f08766`, before `ZoomRange` existed, so it credits the
+//!    strip with the gate's own saving. Re-measured at `59f08766` on the same
+//!    box, folded is 7.37–7.41 ms and stripped is 7.29–7.38 ms — stripping
+//!    there saves nothing and draws 3,034 shapes at zoom 0 where the folded
+//!    style draws 3, because nothing honours the range field yet.
+//!
+//!    The two checks that pinned the fold are gone with it, replaced by the
+//!    equivalence they were standing in for:
+//!    `every_declared_zoom_range_gates_exactly_where_the_fold_used_to` (with
+//!    `a_wrong_zoom_asymmetry_disagrees_with_the_production_gate` under it) and,
+//!    structurally, `no_layer_folds_its_zoom_range_into_its_filter`.
 //! 3. **Nothing can read the phase tag yet.** The brief wanted each layer tagged
 //!    machine-readably so the renderer could split ground from label. The tag is
 //!    emitted on every layer under [`PHASE_KEY`], but `walkers::style::Style`

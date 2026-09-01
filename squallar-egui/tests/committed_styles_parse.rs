@@ -52,7 +52,6 @@ use style_gate::{
     walk_for_legacy,
 };
 use walkers::style::{Layer, Style};
-use walkers::{Context, Filter};
 
 /// How many layers each committed style carries.
 ///
@@ -491,108 +490,208 @@ fn collect_filter_keys(filter: &Value, into: &mut Vec<String>) {
     }
 }
 
-/// The folded zoom range actually gates, evaluated through the real evaluator.
+/// A declared zoom range gates exactly where the fold used to, at every zoom.
 ///
-/// This is the end-to-end proof for the most contested transform in the tool.
-/// Here a building layer's own committed filter is evaluated at a zoom below
-/// its range and at one inside it, and has to answer differently.
+/// **This is the assertion the removed fold used to carry.** Until 2026-09-01
+/// `walkers::style::Layer` had no `minzoom`/`maxzoom` field, so the only thing
+/// gating zoom was a `[">=", ["zoom"], min]` / `["<", ["zoom"], max]` pair
+/// folded into each layer's `filter`. Two tests pinned that fold -- one
+/// evaluating a single layer's committed filter above and below its bound
+/// through the real evaluator, one asserting structurally that all 87 ranged
+/// layers carried theirs -- and both were removed on 2026-09-01 with the
+/// clauses they described. (They are not named here: a citation to a deleted
+/// test is what `doc_citations_resolve` exists to reject, and the deletion is
+/// recorded in the commit that made it.) The declared range is the sole gate
+/// now, so what has to be pinned is that it gates *identically* -- otherwise
+/// removing the folds moved the map.
 ///
-/// **What it proves changed on 2026-09-01, and it is worth being exact about.**
-/// The fold used to be the only thing gating zoom at all:
-/// `walkers::style::Layer` carried no `minzoom` field and `walkers::mvt::styled`
-/// consulted nothing but `filter`, so without the fold every layer drew at
-/// every zoom. `walkers::style::ZoomRange` now parses both bounds and `styled`
-/// skips an out-of-range layer before it reads a feature, so the fold is no
-/// longer what makes the map correct. This test still earns its place: it pins
-/// that the *filters in these documents* say what their `minzoom`/`maxzoom`
-/// say, which is what lets the fold be removed later without re-deriving it.
+/// `Layer::visible_at` is not a re-spelling for the test's convenience: it is
+/// the production gate, called by `walkers::mvt::styled` before it reads a
+/// feature. It is checked here against MapLibre's bounds written out
+/// independently from each layer's own committed JSON --
+/// **`minzoom` inclusive, `maxzoom` exclusive**, which is the asymmetry the
+/// deleted fold's `>=`/`<` encoded. Getting it backwards changes what draws at
+/// exactly one zoom level per layer, which is why every zoom is walked rather
+/// than a sampled few: a boundary is the only place the two can disagree.
 #[test]
-fn a_folded_zoom_range_gates_the_layer_through_the_real_evaluator() {
-    let style = style_json("dark");
-    // `aeroway-runway` is the fixture because everything about it beyond the
-    // zoom clause is one property equality, so a `false` can be attributed.
-    let runway = style["layers"]
-        .as_array()
-        .expect("layers")
-        .iter()
-        .find(|l| l["id"] == "aeroway-runway")
-        .expect("an `aeroway-runway` layer")
-        .clone();
+fn every_declared_zoom_range_gates_exactly_where_the_fold_used_to() {
+    // Past the deepest bound any layer declares (24), so both sides of every
+    // boundary are visited.
+    const ZOOMS: std::ops::RangeInclusive<u8> = 0..=25;
 
-    let minzoom = runway["minzoom"].as_u64().expect("a minzoom") as u8;
-    assert!(minzoom > 1, "the fixture needs a zoom below its range");
-
-    let properties = || {
-        let mut map = std::collections::HashMap::new();
-        map.insert("class".to_owned(), json!("runway"));
-        map
-    };
-    let at = |zoom: u8| Context::new("LineString", properties(), zoom);
-
-    let filter: Filter = serde_json::from_value(runway["filter"].clone())
-        .expect("the filter deserialises as a walkers filter");
-
-    assert!(
-        !filter.matches(&at(minzoom - 1)),
-        "the layer draws below its minzoom -- the zoom fold is not gating"
-    );
-    assert!(
-        filter.matches(&at(minzoom)),
-        "the layer does not draw at its minzoom -- the zoom fold over-gates"
-    );
-
-    // Non-vacuity: the same filter with its zoom clauses stripped matches at
-    // the very zoom that was just rejected. So the rejection above came from
-    // the fold and not from the property equality or the geometry type.
-    let stripped: Vec<Value> = runway["filter"]
-        .as_array()
-        .expect("an `all` filter")
-        .iter()
-        .filter(|clause| clause.get(1) != Some(&json!(["zoom"])))
-        .cloned()
-        .collect();
-    let stripped: Filter = serde_json::from_value(Value::Array(stripped)).expect("still a filter");
-    assert!(
-        stripped.matches(&at(minzoom - 1)),
-        "the control does not match, so the gating test proves nothing"
-    );
-}
-
-/// Every layer with a zoom range carries that range in its filter.
-///
-/// The structural companion to
-/// [`a_folded_zoom_range_gates_the_layer_through_the_real_evaluator`], which
-/// proves one layer gates. This one proves none of the other 86 were missed.
-#[test]
-fn every_layer_with_a_zoom_range_folded_it_into_its_filter() {
     for theme in themes() {
-        let style = style_json(theme);
-        let mut folded = 0;
-        for layer in style["layers"].as_array().expect("layers") {
-            let id = layer["id"].as_str().unwrap_or("<no id>");
-            let clauses = || -> Vec<Value> {
-                layer
-                    .get("filter")
-                    .and_then(Value::as_array)
-                    .filter(|f| f.first() == Some(&json!("all")))
-                    .map(|f| f[1..].to_vec())
-                    .unwrap_or_default()
-            };
-            if let Some(min) = layer.get("minzoom") {
-                assert!(
-                    clauses().contains(&json!([">=", ["zoom"], min])),
-                    "{theme}: `{id}` has minzoom {min} that no filter clause enforces"
-                );
-                folded += 1;
+        let json = style_json(theme);
+        let declared = json["layers"].as_array().expect("layers");
+        let parsed = load(theme);
+        assert_eq!(
+            parsed.layers.len(),
+            declared.len(),
+            "{theme}: the parse dropped layers, so the pairing below is not \
+             layer-for-layer"
+        );
+
+        let mut ranged = 0;
+        for (layer, decl) in parsed.layers.iter().zip(declared) {
+            let id = decl["id"].as_str().unwrap_or("<no id>");
+            let min = decl.get("minzoom").and_then(Value::as_f64);
+            let max = decl.get("maxzoom").and_then(Value::as_f64);
+            if min.is_some() || max.is_some() {
+                ranged += 1;
             }
-            if let Some(max) = layer.get("maxzoom") {
-                assert!(
-                    clauses().contains(&json!(["<", ["zoom"], max])),
-                    "{theme}: `{id}` has maxzoom {max} that no filter clause enforces"
+
+            // What the deleted fold said, from this layer's own declaration.
+            let folded_would_draw = |z: u8| {
+                let z = f64::from(z);
+                min.is_none_or(|min| z >= min) && max.is_none_or(|max| z < max)
+            };
+
+            for z in ZOOMS {
+                assert_eq!(
+                    layer.visible_at(z),
+                    folded_would_draw(z),
+                    "{theme}: `{id}` (minzoom {min:?}, maxzoom {max:?}) is \
+                     visible_at({z}) == {} where the removed fold said {}",
+                    layer.visible_at(z),
+                    folded_would_draw(z)
                 );
             }
         }
-        assert_eq!(folded, 87, "{theme}: layers carrying a minzoom");
+        assert_eq!(
+            ranged, 87,
+            "{theme}: layers declaring a zoom range. The ranges are the only \
+             gate now, so losing one is losing the gate, not just a redundancy"
+        );
+    }
+}
+
+/// The zoom-range check can fail: two wrong asymmetries and a dropped bound.
+///
+/// Non-vacuity for
+/// [`every_declared_zoom_range_gates_exactly_where_the_fold_used_to`], whose
+/// two sides would agree trivially if `visible_at` were reading no bounds at
+/// all. Each regressor below is the comparison run against a predicate that is
+/// wrong in exactly one way, and each must disagree with the production gate
+/// somewhere in the committed documents.
+///
+/// The first two are the off-by-one that no rendering at an intermediate zoom
+/// could catch: `minzoom` treated as exclusive, `maxzoom` as inclusive.
+#[test]
+fn a_wrong_zoom_asymmetry_disagrees_with_the_production_gate() {
+    /// `(minzoom, maxzoom, zoom) -> draws`, the shape of a zoom-range rule.
+    type ZoomRule = fn(Option<f64>, Option<f64>, f64) -> bool;
+
+    let regressors: [(&str, ZoomRule); 3] = [
+        // `minzoom` exclusive -- hides one zoom the style declares.
+        ("minzoom exclusive", |min, max, z| {
+            min.is_none_or(|min| z > min) && max.is_none_or(|max| z < max)
+        }),
+        // `maxzoom` inclusive -- draws one zoom the style excludes.
+        ("maxzoom inclusive", |min, max, z| {
+            min.is_none_or(|min| z >= min) && max.is_none_or(|max| z <= max)
+        }),
+        // The bounds ignored entirely -- what a serde field that stopped
+        // parsing would look like.
+        ("no bounds at all", |_, _, _| true),
+    ];
+
+    for (name, wrong) in regressors {
+        let mut disagreements = 0;
+        for theme in themes() {
+            let json = style_json(theme);
+            let parsed = load(theme);
+            for (layer, decl) in parsed.layers.iter().zip(json["layers"].as_array().unwrap()) {
+                let min = decl.get("minzoom").and_then(Value::as_f64);
+                let max = decl.get("maxzoom").and_then(Value::as_f64);
+                for z in 0u8..=25 {
+                    if layer.visible_at(z) != wrong(min, max, f64::from(z)) {
+                        disagreements += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            disagreements > 0,
+            "the `{name}` regressor agreed with the production gate everywhere, \
+             so the zoom-range check cannot fail"
+        );
+    }
+}
+
+/// No layer folds its zoom range into its filter any more.
+///
+/// The structural half, and what makes the ~17% saving stay taken: a fold is
+/// redundant now, and a redundant zoom clause is re-evaluated **once per
+/// feature of the layer's source layer** by the filter walk, where the
+/// declared range is read once per layer. Measured on Monaco's z14 8529/5974
+/// tile with the committed `dark` style, `walkers::mvt::styled` at zoom 14 is
+/// 5.33 ms against 6.44 ms with the 151 clauses folded back in (min of 61,
+/// three interleaved rounds, release, 2026-09-01).
+///
+/// This rejects a reintroduced clause even when it agrees with the declared
+/// range, which is deliberate: a second copy of a bound is a second thing to
+/// keep in step, and
+/// [`every_declared_zoom_range_gates_exactly_where_the_fold_used_to`] already
+/// proves the declaration alone is sufficient. `["zoom"]` in `paint` and
+/// `layout` is untouched by this -- interpolating a width or an opacity over
+/// zoom is not a gate, and 120 such uses in `dark` and 124 in `light` are
+/// expected and must survive.
+#[test]
+fn no_layer_folds_its_zoom_range_into_its_filter() {
+    for theme in themes() {
+        let json = style_json(theme);
+        let mut folded = Vec::new();
+        let mut paint_and_layout_uses = 0;
+        for layer in json["layers"].as_array().expect("layers") {
+            let id = layer["id"].as_str().unwrap_or("<no id>");
+            if let Some(filter) = layer.get("filter")
+                && mentions_zoom(filter)
+            {
+                folded.push(format!("{id}: {filter}"));
+            }
+            for key in ["paint", "layout"] {
+                if let Some(v) = layer.get(key) {
+                    paint_and_layout_uses += count_zoom(v);
+                }
+            }
+        }
+        assert!(
+            folded.is_empty(),
+            "{theme}: {} layer filter(s) still gate on zoom. Declare `minzoom` \
+             / `maxzoom` on the layer instead -- `walkers::mvt::styled` honours \
+             them before it reads a feature, where a filter clause is \
+             re-evaluated per feature: {folded:?}",
+            folded.len()
+        );
+
+        // Non-vacuity floor. A scan that reported nothing because it looks in
+        // the wrong place would pass the assertion above on any document; the
+        // zoom-driven paint and layout expressions are the population it has
+        // to be able to see, and they are the ones that must NOT be stripped.
+        assert!(
+            paint_and_layout_uses > 100,
+            "{theme}: the zoom scan found only {paint_and_layout_uses} \
+             `[\"zoom\"]` uses in paint/layout, so it is not looking where the \
+             folds were"
+        );
+    }
+}
+
+/// Whether `["zoom"]` appears anywhere inside a filter expression.
+fn mentions_zoom(value: &Value) -> bool {
+    count_zoom(value) > 0
+}
+
+/// How many `["zoom"]` expressions a subtree contains.
+fn count_zoom(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => {
+            if items.len() == 1 && items[0] == json!("zoom") {
+                return 1;
+            }
+            items.iter().map(count_zoom).sum()
+        }
+        Value::Object(map) => map.values().map(count_zoom).sum(),
+        _ => 0,
     }
 }
 
