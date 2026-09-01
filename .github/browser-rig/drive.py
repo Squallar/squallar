@@ -2803,6 +2803,18 @@ var frame_segment_re = /frame segment \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // pass ENDED (idle frames and non-presenting frames included) and therefore
 // holds more samples than there are frames here.
 var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame segment (post)` opened up, on `frame prepare`'s terms exactly: six
+// contiguous cuts of that ONE span, same denominator (presented interact
+// frames), so their sums telescope to its sum. A DECOMPOSITION, never a
+// seventh segment -- adding `frame post (*)` to `frame segment (post)`
+// double-counts the whole of it.
+//
+// Why this family exists at all: `post` is not a per-frame cost. On the
+// scene A Safari leg of 2026-09-01 it read under the 62.5 us histogram floor
+// on 79% of interact frames and 8 ms at p99 over the same 475 frames. A
+// percentile of a distribution that shape says an occasional event happened;
+// it cannot say WHICH of the six things the tail does was the event.
+var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // One vector take opened up: `parse` (per source layer, at most sixteen) and
 // `style` (per feature, thousands). A DECOMPOSITION of `tile take (vector)`,
@@ -2817,7 +2829,7 @@ var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
-var frame_prepare_all = [];
+var frame_prepare_all = [], frame_post_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -2889,6 +2901,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_prepare_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                   sum: parseInt(x[3], 10), p50: x[4],
                                   p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_post_re.exec(m);
+  if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                               sum: parseInt(x[3], 10), p50: x[4],
+                               p90: x[5], p99: x[6], hist: x[7] });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -2923,6 +2939,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          cadence_all: cadence_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
+         frame_post_all: frame_post_all,
          gesture_begins: begins, gesture_loops: loops,
          marks_total: (MK ? MK.length : -1),
          console_total: C.length };
@@ -3037,6 +3054,7 @@ class FrameLineWatcher:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
                             ("frame_prepare_all", "prepare"),
+                            ("frame_post_all", "post"),
                             ("tile_take_all", "take"),
                             ("tile_phase_all", "phase")):
             for r in sig.get(prefix) or []:
@@ -3205,7 +3223,7 @@ def watcher_named_in(gw):
     return sorted(k for k in (gw or {})
                   if isinstance(k, str)
                   and (k.startswith("segment:") or k.startswith("take:")
-                       or k.startswith("phase:")))
+                       or k.startswith("phase:") or k.startswith("post:")))
 
 
 def _window_mean_us(a, b):

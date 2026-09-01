@@ -4,11 +4,12 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is fourteen clock reads and about
-//! twenty-one integer bin searches — the ledger's own eight stamps, the one
-//! the egui pass takes on entry, and the five `Gui::ui` takes on its way
-//! through. Six of the bin searches are the `prepare` split
-//! ([`PrepareHists`]) and six more the `ui` split ([`UiHists`]); each records
+//! feature gate, and the per-frame cost is nineteen clock reads and about
+//! twenty-seven integer bin searches — the ledger's own eight stamps, the one
+//! the egui pass takes on entry, the five `Gui::ui` takes on its way through
+//! and the five `handle_redraw` takes across its tail. Six of the bin searches
+//! are the `prepare` split ([`PrepareHists`]), six more the `ui` split
+//! ([`UiHists`]) and six more the `post` split ([`PostHists`]); each records
 //! only on the frames its own segment does. **No figure recorded here ever
 //! gates CI.**
 //!
@@ -67,8 +68,36 @@ struct Marks {
     ui_phases: Option<squallar_egui::shell_api::UiPhaseStamps>,
     /// `present_frame` return.
     present_return: Option<Instant>,
+    /// Where `handle_redraw`'s tail crossed its own phase boundaries, off the
+    /// stamps it took on its way through. `None` on a frame that returned
+    /// before the tail, which is the same frame that leaves no
+    /// `present_return`.
+    post_phases: Option<PostPhaseStamps>,
     /// The pass ended without a real present (a skipped or lost surface).
     skipped: bool,
+}
+
+/// Where `handle_redraw`'s tail crossed the five boundaries between the six
+/// things it does after the present. Taken by `handle_redraw` itself — unlike
+/// the `prepare` and `ui` splits, whose stamps ride back on a call's return
+/// value, this segment has no callee to carry them.
+#[derive(Clone, Copy)]
+pub(crate) struct PostPhaseStamps {
+    /// The action loop's end, inside `process_gui_actions` and before the
+    /// overlay dispatch it tails into. Carried back by that call rather than
+    /// taken here, because it is the one boundary in this tail that is not
+    /// visible from `handle_redraw`.
+    pub(crate) handled: Instant,
+    /// `process_gui_actions` return.
+    pub(crate) actions: Instant,
+    /// `push_back_claim` return.
+    pub(crate) back: Instant,
+    /// The wake condition and any redraw ask it made.
+    pub(crate) wake: Instant,
+    /// `auto_poll_delay` and the `auto_poll_at` it sets.
+    pub(crate) poll: Instant,
+    /// The `repaint_action` match and any redraw ask its arms made.
+    pub(crate) repaint: Instant,
 }
 
 /// Where the `prepare` segment's time went, cut at the seams the code has.
@@ -157,6 +186,62 @@ pub(crate) struct UiHists {
     pub(crate) chrome: Hist,
 }
 
+/// Where the `post` segment's time went, cut at the seams `handle_redraw`'s
+/// tail has.
+///
+/// # Denominator
+///
+/// **Exactly [`SegmentHists::post`]'s** — presented interact frames — and that
+/// equality is the whole design. The six are contiguous cuts of the one span,
+/// so they telescope to it (`the_post_phases_telescope_to_post`), which makes
+/// the residual arithmetic rather than inference: any `post` time these six do
+/// not name is a bug in this decomposition, not a mystery.
+///
+/// **Never added to `frame segment (post)`.** These are not a seventh segment
+/// beside it; they *are* it, opened up. The reporting prefix is `frame post`
+/// rather than `frame segment` for the same reason [`UiHists`]' is `frame ui`.
+///
+/// A sibling of [`PrepareHists`] and [`UiHists`] and independent of both.
+///
+/// # What this split was cut to answer
+///
+/// `post` is not a per-frame cost: on the scene A Safari leg of 2026-09-01 it
+/// read under the 62.5 µs histogram floor on 79% of interact frames and 8 ms
+/// at p99 over the same 475 frames, with a windowed mean of 341 µs. A
+/// distribution that shape is one occasional event, not a segment that grew,
+/// and a percentile cannot say which of the six things below the event is.
+#[derive(Default)]
+pub(crate) struct PostHists {
+    /// The `GuiAction` loop of `process_gui_actions`: every action the frame
+    /// emitted, handled one at a time through `App::handle_gui_action` —
+    /// which is the fetch layer, and reaches the network. `RenderOverlay` is
+    /// not among them; it is intercepted into the list `dispatch` then acts
+    /// on.
+    pub(crate) handle: Hist,
+    /// `dispatch_overlay_renders`: the dedupe, the grouping and one
+    /// `spawn_overlay_render` per surviving request — the call that offloads
+    /// a whole-picture raster to the worker pool.
+    pub(crate) dispatch: Hist,
+    /// `push_back_claim`: one `back_would_dismiss` read, and on the frames
+    /// where the answer moved, one platform call.
+    pub(crate) back: Hist,
+    /// The wake condition — eight in-flight questions asked of the render
+    /// state, the GUI, the chunk feeds, the deferred drops and the gesture
+    /// player — and the redraw ask it makes when any of them says yes.
+    pub(crate) wake: Hist,
+    /// `auto_poll_delay` and the instant it schedules into `auto_poll_at`:
+    /// four delay reads, a minimum and one clock read.
+    pub(crate) poll: Hist,
+    /// The `repaint_action` match on egui's own repaint delay, and the redraw
+    /// ask its `Now` arm makes.
+    pub(crate) repaint: Hist,
+    /// The frame's close: the renderer's `frame_had_interaction` read, which
+    /// is what decides whether this frame is a sample at all, and the return
+    /// into `finalize`. Structurally tiny, and named rather than folded into
+    /// `repaint` so that a `post` residual cannot hide in an unnamed tail.
+    pub(crate) close: Hist,
+}
+
 /// The per-segment histograms of interact frames, and only interact frames:
 /// the segments exist to say where an interact frame's service went, and
 /// mixing idle frames in would average the answer away.
@@ -178,7 +263,8 @@ pub(crate) struct SegmentHists {
     /// Acquire return to `present_frame` return: draw, submit, present.
     pub(crate) finish: Hist,
     /// `present_frame` return to `finalize`: action processing and the
-    /// repaint scheduling tail of `handle_redraw`.
+    /// repaint scheduling tail of `handle_redraw`. Opened up by
+    /// [`PostHists`], whose six cuts telescope to exactly this.
     pub(crate) post: Hist,
 }
 
@@ -196,6 +282,8 @@ pub(crate) struct FrameLedger {
     prepare: PrepareHists,
     /// See [`UiHists`] — `segments.ui`, opened up, same frames.
     ui: UiHists,
+    /// See [`PostHists`] — `segments.post`, opened up, same frames.
+    post: PostHists,
     /// The acquire span itself, interact frames only. Reported beside the
     /// segments and never inside service: it is the vsync block.
     acquire: Hist,
@@ -273,6 +361,36 @@ fn ui_phase_micros(
     ]
 }
 
+/// The seven contiguous cuts of the `post` segment, in call order:
+/// `[handle, dispatch, back, wake, poll, repaint, close]` — see
+/// [`PostHists`], whose fields these are.
+///
+/// Seven where the other two splits have six, because six was not enough: the
+/// first cut of the six-way spelling held 95.6% of `post` on the Safari
+/// scene A leg of 2026-09-01 (131 µs of 137 µs, n=3173 settled interact
+/// frames), which located the cost in `process_gui_actions` and stopped
+/// there. The seam inside that call is where the answer is.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `post`'s own boundaries, so the seven sum to
+/// `micros(present_return, closed)` exactly. A free function so the
+/// telescoping is testable without a frame.
+fn post_phase_micros(
+    present_return: Instant,
+    phases: &PostPhaseStamps,
+    closed: Instant,
+) -> [u32; 7] {
+    [
+        micros(present_return, phases.handled),
+        micros(phases.handled, phases.actions),
+        micros(phases.actions, phases.back),
+        micros(phases.back, phases.wake),
+        micros(phases.wake, phases.poll),
+        micros(phases.poll, phases.repaint),
+        micros(phases.repaint, closed),
+    ]
+}
+
 impl FrameLedger {
     /// Open a frame: stamp its start and forget the previous frame's marks.
     pub(crate) fn mark_frame_start(&mut self) {
@@ -315,6 +433,13 @@ impl FrameLedger {
     /// whether this frame is a sample.
     pub(crate) fn record_ui_phases(&mut self, stamps: squallar_egui::shell_api::UiPhaseStamps) {
         self.cur.ui_phases = Some(stamps);
+    }
+
+    /// The phase stamps `handle_redraw`'s tail took on its way through.
+    /// Recorded unconditionally; `finalize` decides whether this frame is a
+    /// sample.
+    pub(crate) fn record_post_phases(&mut self, stamps: PostPhaseStamps) {
+        self.cur.post_phases = Some(stamps);
     }
 
     pub(crate) fn mark_present_return(&mut self) {
@@ -400,6 +525,20 @@ impl FrameLedger {
                 self.ui.apply.record(apply);
                 self.ui.chrome.record(chrome);
             }
+            // And the same for `post`, whose right-hand boundary is `now` —
+            // the very instant this function opened with, so the sixth cut
+            // closes on the same stamp the segment above did.
+            if let Some(phases) = m.post_phases.as_ref() {
+                let [handle, dispatch, back, wake, poll, repaint, close] =
+                    post_phase_micros(present_return, phases, now);
+                self.post.handle.record(handle);
+                self.post.dispatch.record(dispatch);
+                self.post.back.record(back);
+                self.post.wake.record(wake);
+                self.post.poll.record(poll);
+                self.post.repaint.record(repaint);
+                self.post.close.record(close);
+            }
         } else {
             self.service_idle.record(service);
         }
@@ -428,6 +567,10 @@ impl FrameLedger {
 
     pub(crate) fn ui_phases(&self) -> &UiHists {
         &self.ui
+    }
+
+    pub(crate) fn post_phases(&self) -> &PostHists {
+        &self.post
     }
 
     pub(crate) fn acquire(&self) -> &Hist {
@@ -463,7 +606,10 @@ impl FrameLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instant, micros, prepare_phase_micros, service_micros, ui_phase_micros};
+    use super::{
+        Instant, PostPhaseStamps, micros, post_phase_micros, prepare_phase_micros, service_micros,
+        ui_phase_micros,
+    };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
 
@@ -644,6 +790,123 @@ mod tests {
             cuts.iter().all(|&c| c > 0),
             "a cut is zero on stamps chosen to make all six non-zero, so it \
              cannot be reading the span it is named for: {cuts:?}",
+        );
+    }
+
+    /// A `handle_redraw` tail whose boundaries land at the given microsecond
+    /// offsets from `present_return`, so a test can state its stamps as
+    /// arithmetic. Named apart from the other two splits' fixtures: the three
+    /// decompositions share this module and answer with different stamp types.
+    fn post_phases_at(present_return: Instant, offsets: [u64; 6]) -> PostPhaseStamps {
+        let at = |us: u64| present_return + std::time::Duration::from_micros(us);
+        PostPhaseStamps {
+            handled: at(offsets[0]),
+            actions: at(offsets[1]),
+            back: at(offsets[2]),
+            wake: at(offsets[3]),
+            poll: at(offsets[4]),
+            repaint: at(offsets[5]),
+        }
+    }
+
+    /// **The seven cuts are a decomposition of `post`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(present_return, closed)` — the very span
+    /// [`super::SegmentHists::post`] records — so "what is in post" is
+    /// answered by subtraction rather than by inference, and any phase the
+    /// split fails to name shows up as a gap instead of hiding inside a
+    /// neighbour.
+    #[test]
+    fn the_post_phases_telescope_to_post() {
+        let present_return = Instant::now();
+        let phases = post_phases_at(present_return, [7_900, 8_200, 8_260, 8_400, 8_450, 8_600]);
+        let closed = present_return + std::time::Duration::from_micros(8_640);
+
+        let cuts = post_phase_micros(present_return, &phases, closed);
+        assert_eq!(
+            cuts,
+            [7_900, 300, 60, 140, 50, 150, 40],
+            "a cut moved: the seven no longer bracket the boundaries they are \
+             named for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(present_return, closed),
+            "the seven cuts do not sum to the post span they decompose, so \
+             the residual this instrument reports is not a residual of post",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 8_640);
+    }
+
+    /// **The non-vacuity floor: a cut may not trivially cover `post`.**
+    ///
+    /// The sibling of `every_ui_stamp_is_load_bearing_in_two_cuts`, and the
+    /// hazard is sharper here: `post` reads under the histogram floor on
+    /// nineteen frames in twenty, so six of the seven cuts really are
+    /// near-zero on a real leg. A split whose stamps had been folded together would look exactly
+    /// like that reading and pass a telescoping test. Held by perturbation
+    /// instead: nudge one stamp and exactly two cuts change, by equal and
+    /// opposite amounts.
+    #[test]
+    fn every_post_stamp_is_load_bearing_in_two_cuts() {
+        let present_return = Instant::now();
+        // Its own fixture: every cut is wider than the 100 us nudge, so a
+        // stamp that fails to move a cut fails this test rather than
+        // underflowing it.
+        let base_offsets = [4_500u64, 5_000, 5_500, 6_000, 6_500, 7_000];
+        let closed = present_return + std::time::Duration::from_micros(7_500);
+        let base = post_phase_micros(
+            present_return,
+            &post_phases_at(present_return, base_offsets),
+            closed,
+        );
+
+        for moved in 0..6 {
+            let mut offsets = base_offsets;
+            offsets[moved] += 100;
+            let cuts = post_phase_micros(
+                present_return,
+                &post_phases_at(present_return, offsets),
+                closed,
+            );
+            let changed: Vec<usize> = (0..7).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![moved, moved + 1],
+                "moving stamp {moved} did not move exactly the two cuts it \
+                 bounds, so a boundary is folded away and the split reports \
+                 fewer spans than it names",
+            );
+            assert_eq!(
+                cuts[moved] - base[moved],
+                base[moved + 1] - cuts[moved + 1],
+                "the two cuts stamp {moved} bounds did not trade the same 100 \
+                 us, so they are not contiguous across it",
+            );
+        }
+    }
+
+    /// **`post`'s right-hand boundary is `finalize`'s own `now`.**
+    ///
+    /// The sixth cut and [`super::SegmentHists::post`] must close on the same
+    /// instant, or `frame post (*)` sums to something that is not
+    /// `frame segment (post)` and the two lines may not be read together.
+    /// Stated as a test because the two are computed in different places —
+    /// `micros(present_return, now)` for the segment, `post_phase_micros` for
+    /// the split — and nothing else holds them to the same right edge.
+    #[test]
+    fn the_post_split_closes_on_the_segments_own_right_edge() {
+        let present_return = Instant::now();
+        let phases = post_phases_at(present_return, [20, 40, 90, 300, 340, 900]);
+        let now = present_return + std::time::Duration::from_micros(1_000);
+
+        let segment = micros(present_return, now);
+        let cuts = post_phase_micros(present_return, &phases, now);
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            segment,
+            "the split and the segment do not close on the same instant, so \
+             the seven cuts are not this segment's decomposition",
         );
     }
 

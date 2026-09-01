@@ -755,8 +755,14 @@ impl App {
 
         let (screen_descriptor, gui_actions) = self.setup_egui_frame();
         let repaint_delay = self.present_frame(screen_descriptor);
-        self.process_gui_actions(gui_actions);
+        // The five stamps below cut the `post` segment into the six things
+        // this tail does; `frame_ledger::PostHists` says what each one holds
+        // and why the split exists. Taken here rather than handed back by a
+        // callee because this tail is not one call.
+        let post_handled = self.process_gui_actions(gui_actions);
+        let post_actions = web_time::Instant::now();
         self.push_back_claim();
+        let post_back = web_time::Instant::now();
 
         if self.render.any_render_in_flight()
             || self.gui.any_loop_active()
@@ -773,10 +779,12 @@ impl App {
         {
             notify_redraw(&self.window);
         }
+        let post_wake = web_time::Instant::now();
 
         self.auto_poll_at = self
             .auto_poll_delay()
             .map(|delay| web_time::Instant::now() + delay);
+        let post_poll = web_time::Instant::now();
 
         match repaint_action(repaint_delay) {
             RepaintAction::Now => {
@@ -790,6 +798,15 @@ impl App {
                 self.egui_repaint_at = None;
             }
         }
+        self.frame_ledger
+            .record_post_phases(crate::frame_ledger::PostPhaseStamps {
+                handled: post_handled,
+                actions: post_actions,
+                back: post_back,
+                wake: post_wake,
+                poll: post_poll,
+                repaint: web_time::Instant::now(),
+            });
 
         // Close the frame's timing sample, bucketed by the renderer's own
         // reading of this frame's input, and say the periodic lines if due.
@@ -1484,7 +1501,11 @@ impl App {
     }
 
     /// Process all GUI actions emitted during this frame.
-    fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
+    /// Returns the instant the action loop ended, which is the seam between
+    /// the two cuts `frame_ledger::PostHists` makes here: the handling of the
+    /// frame's actions, and the overlay dispatch it tails into. Stamped
+    /// inside because that boundary is not visible from `handle_redraw`.
+    fn process_gui_actions(&mut self, actions: Vec<GuiAction>) -> web_time::Instant {
         let mut overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)> = Vec::new();
 
         for action in actions {
@@ -1517,7 +1538,9 @@ impl App {
             }
         }
 
+        let handled = web_time::Instant::now();
         self.dispatch_overlay_renders(overlay_renders);
+        handled
     }
 
     /// **The one way an overlay raster is asked for**, whichever path noticed

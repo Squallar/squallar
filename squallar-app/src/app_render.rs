@@ -667,6 +667,30 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 6] {
     ]
 }
 
+/// The seven `frame post (<name>):` lines — the `post` segment, opened up.
+///
+/// Denominator: **exactly `frame segment (post)`'s** — presented interact
+/// frames — and the seven are contiguous cuts of that one span, so their sums
+/// telescope to its sum. That equality is what makes this a decomposition
+/// rather than a seventh segment: `frame post (*)` is never added to
+/// `frame segment (post)`, it *is* it.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+/// Five of the seven are structurally near-empty on every arm measured, and
+/// that is the reading, not an absence: `post`'s cost is one occasional event
+/// and the split exists to name which cut carries it.
+fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
+    [
+        named_hist_line("frame post", "handle", &p.handle),
+        named_hist_line("frame post", "dispatch", &p.dispatch),
+        named_hist_line("frame post", "back", &p.back),
+        named_hist_line("frame post", "wake", &p.wake),
+        named_hist_line("frame post", "poll", &p.poll),
+        named_hist_line("frame post", "repaint", &p.repaint),
+        named_hist_line("frame post", "close", &p.close),
+    ]
+}
+
 /// The `tile take (<family>):` lines — what one tile take costs the thread
 /// that performs it.
 ///
@@ -1450,6 +1474,12 @@ impl super::App {
         // denominator, six contiguous cuts of that one span — a decomposition
         // of the line above, never a seventh segment beside it.
         for line in frame_ui_lines(ledger.ui_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // The `post` segment above, opened up at the seams `handle_redraw`'s
+        // tail has. Same denominator, six contiguous cuts of that one span — a
+        // decomposition of the line above, never a seventh segment beside it.
+        for line in frame_post_lines(ledger.post_phases()) {
             say_telemetry(loud, &line);
         }
         // What one tile take cost, per family. Read unconditionally rather

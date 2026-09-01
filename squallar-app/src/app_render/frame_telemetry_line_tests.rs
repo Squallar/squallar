@@ -715,6 +715,123 @@ fn the_rig_reads_the_prepare_lines_the_app_actually_writes() {
     );
 }
 
+/// The `frame post (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame segment (…)` and deliberately a **different
+/// prefix**, for `frame prepare`'s reason exactly: the six are cuts of the
+/// `post` segment, and a reader who could mistake one for a seventh segment
+/// would add it to the very span it decomposes.
+#[test]
+fn the_frame_post_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame post", "dispatch", &h),
+        format!(
+            "frame post (dispatch): n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All six post cuts are emitted, under their own names, every tick — and
+/// each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green, and it
+/// matters more here than on the other two splits: six of the seven cuts read
+/// under the histogram floor on a real leg, so a `wake` line carrying
+/// `handle`'s histogram would look exactly like the reading everyone expects.
+#[test]
+fn every_post_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::PostHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.handle,
+        &mut phases.dispatch,
+        &mut phases.back,
+        &mut phases.wake,
+        &mut phases.poll,
+        &mut phases.repaint,
+        &mut phases.close,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_post_lines(&phases);
+    let names = [
+        "handle", "dispatch", "back", "wake", "poll", "repaint", "close",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame post ({name}): n={}, ", slot + 1)),
+            "post cut {slot} reported as {line:?}, which is not {name}'s line \
+             carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The post cuts do not collide with the segment lines the rig already
+/// reads.** Both use `named_hist_line` and both name a `post`; the rig keys
+/// its families on the prefix, so a shared one would file six cuts of a span
+/// alongside the span itself under one name and let a reader sum them.
+#[test]
+fn the_post_cuts_are_not_readable_as_frame_segments() {
+    let phases = crate::frame_ledger::PostHists::default();
+    let segments = crate::frame_ledger::SegmentHists::default();
+    let post_lines = super::frame_post_lines(&phases);
+    let segment_lines = super::frame_segment_lines(&segments);
+
+    for line in &post_lines {
+        assert!(
+            !line.starts_with("frame segment ("),
+            "a post cut is written as a frame segment ({line:?}); the rig \
+             would file it beside the six that telescope to service",
+        );
+    }
+    assert!(
+        segment_lines
+            .iter()
+            .any(|line| line.starts_with("frame segment (post): ")),
+        "the segment line these cuts decompose is no longer written, so \
+         nothing carries the total they sum to",
+    );
+}
+
+/// The rig's `frame post` probe reads what the app writes, character for
+/// character — the same both-ends pin the segment, prepare and tile lines
+/// carry.
+///
+/// **This is the non-vacuity floor under the whole split on the web arm.**
+/// The rig cannot save a raw console log (the ring holds 1200 entries and
+/// only the last 60 reach the artefact), so a `frame post` line the probe
+/// fails to match is not a missing family in the JSON — it is an absent one,
+/// indistinguishable from a cut that never fired.
+#[test]
+fn the_rig_reads_the_post_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame post", "dispatch", &h),
+        rendered(
+            &pattern("frame_post_re"),
+            &["dispatch", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame post (…)` line and the rig's probe have drifted",
+    );
+}
+
 /// The `frame ui (…)` sentence, pinned as a literal.
 ///
 /// Same formatter as `frame segment (…)` and deliberately a **different
