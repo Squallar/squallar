@@ -1526,6 +1526,28 @@ NEVER_TAP_TEXT = (
     "set as default", "set default", "make default", "set as browser",
     "allow", "always allow", "allow all the time", "while using the app",
     "turn on", "enable", "sign in", "sync", "import",
+    # Clickable and right next to the wizard's exit on the home screen. A
+    # private window would load the page with a different storage partition
+    # and no persistence -- a different browser, measured under this one's name.
+    "private browsing", "private tab",
+)
+
+# "JUMP BACK IN" -- the user's own route, and the last step of this pipeline.
+#
+# Fenix loads the navigated page into a tab and then keeps its HOME SCREEN in
+# front of it: the page is complete, the rayon pool is up, and the GeckoView
+# has never been laid out (canvas 0x0 at the untouched 300x150 default). The
+# home screen's recent-tabs card is what brings that tab forward, and tapping
+# it by hand is exactly what a human was doing before every leg.
+#
+# MEASURED on Fenix 155, and the trap this exists for: NONE of these nodes
+# carry clickable="true". They are Compose semantics nodes, tappable but not
+# marked, so the clickable filter that finds every onboarding button excludes
+# every one of them. This lookup deliberately ignores that attribute.
+RECENT_TAB_ID_FRAGMENTS = (
+    "recent.tab.title",
+    "recent.tab.url",
+    "recent.tabs",
 )
 
 # English-only text fallback, used ONLY when no id matched. The locale
@@ -1736,7 +1758,89 @@ def android_dismiss_onboarding(package, serial=None, max_rounds=10,
         % (max_rounds, json.dumps(trail)))
 
 
-def verify_android_content_view(session, timeout=30.0, probe=None):
+def android_find_loaded_tab(xml_text, url_hint=None):
+    """Find the home screen's recent-tab card for the page we just loaded.
+
+    Returns {"center", "matched", "url_verified", "url_text"} or None.
+
+    Identity, not position, and identity of the RIGHT tab: Fenix renders the
+    tab's own URL into `recent.tab.url`, so when the served host:port appears
+    there this is provably the card for our page and not somebody's last
+    browsing session. A card that cannot be verified that way is still
+    returned -- it is the only recent tab and the wizard wiped everything else
+    -- but `url_verified` says which happened, and the row carries it.
+
+    `clickable` is deliberately NOT consulted. These are Compose semantics
+    nodes: tappable, and not one of them sets the attribute."""
+    try:
+        root = ET.fromstring(xml_text or "")
+    except ET.ParseError:
+        return None
+    hint = (url_hint or "").strip()
+    best = None
+    for node in root.iter("node"):
+        a = node.attrib
+        rid = _uia_id_suffix(a.get("resource-id"))
+        if not any(rid == f or rid.startswith(f)
+                   for f in RECENT_TAB_ID_FRAGMENTS):
+            continue
+        center = _uia_bounds_center(a.get("bounds"))
+        if center is None:
+            continue
+        text = (a.get("text") or a.get("content-desc") or "").strip()
+        verified = bool(hint and hint in text)
+        cand = {"center": center, "matched": "recent-tab-id:%s" % rid,
+                "url_verified": verified, "url_text": text,
+                "area": _uia_area(a.get("bounds"))}
+        # A URL-verified node wins outright; otherwise the smallest box, which
+        # is the title or url line rather than the whole card container.
+        if best is None:
+            best = cand
+        elif verified and not best["url_verified"]:
+            best = cand
+        elif verified == best["url_verified"] and cand["area"] < best["area"]:
+            best = cand
+    return best
+
+
+def android_surface_loaded_tab(url, serial=None, max_rounds=4,
+                               _dump=None, _tap=None, dump_sink=None):
+    """Bring the loaded tab to the front -- the step a human was doing by hand.
+
+    The user described it exactly: "I always had to go through it then
+    navigate to the 'jump back in' on the home page before the test would
+    start". This is that tap, by identity.
+
+    Raises when it cannot find the card, because the alternative is measuring
+    a page that was never on screen."""
+    dump = _dump or (lambda: _adb_uia_dump(None, serial))
+    tap = _tap or (lambda x, y: _adb_tap(x, y, serial))
+    parts = urllib.parse.urlsplit(url or "")
+    hint = parts.netloc or ""
+    trail = []
+    for round_ in range(max_rounds):
+        raw = dump()
+        if dump_sink is not None:
+            dump_sink.append(raw)
+        found = android_find_loaded_tab(raw, hint)
+        if found is None:
+            raise WebDriverError(
+                "the page is loaded but not shown, and the home screen has no "
+                "recent-tab card to bring it forward (round %d, hint %r). "
+                "Refusing to report figures for a viewport that was never "
+                "displayed." % (round_, hint))
+        tap(*found["center"])
+        trail.append({"round": round_, "matched": found["matched"],
+                      "url_verified": found["url_verified"],
+                      "center": list(found["center"])})
+        return {"ok": True, "rounds": round_ + 1, "taps": trail,
+                "url_verified": found["url_verified"],
+                "url_text": found["url_text"]}
+    raise WebDriverError("surfacing the loaded tab hit its %d-round bound"
+                         % max_rounds)
+
+
+def verify_android_content_view(session, timeout=30.0, probe=None, soft=False):
     """After navigate: the page must actually be ON SCREEN, not merely loaded.
 
     MEASURED on Fenix 155, and it is the failure this exists for: with the
@@ -1765,6 +1869,11 @@ def verify_android_content_view(session, timeout=30.0, probe=None):
                 "client": [last.get("clientWidth"), last.get("clientHeight")],
                 "buffer": [last.get("bufferWidth"), last.get("bufferHeight")]}
         time.sleep(0.5)
+    if soft:
+        # The caller has a repair to try (surfacing the tab). It gets one
+        # chance, and then this same check runs again WITHOUT soft -- the
+        # verdict is never softened, only deferred.
+        return None
     raise WebDriverError(
         "the page loaded but was never DISPLAYED: after %.0fs the canvas is "
         "still %sx%s css / %sx%s buffer. On Fenix this is the browser holding "
@@ -4374,6 +4483,89 @@ def selftest_android():
           "accepted as displayed; the buffer is what is rasterized and what "
           "every byte figure on the row is a figure for")
 
+    # ---- "jump back in": the last step, and the user's own route ---------
+    #
+    # Trimmed from a real dump of the state Fenix leaves after navigate: the
+    # page is loaded, the home screen is in front of it, and the recent-tabs
+    # card carries OUR url. NOT ONE of these nodes sets clickable="true" --
+    # they are Compose semantics nodes -- so the filter that finds every
+    # onboarding button finds none of them. That is the trap this fixture
+    # exists to keep sprung.
+    home_after_nav = (
+        "<?xml version='1.0'?><hierarchy rotation='0'>"
+        "<node package='{p}' resource-id='{p}:id/homepageView' clickable='false'"
+        " text='' bounds='[0,0][1968,2184]'/>"
+        "<node package='{p}' resource-id='private.browsing.homepage.button'"
+        " clickable='true' enabled='true' text='' content-desc='Private browsing'"
+        " bounds='[42,300][194,426]'/>"
+        "<node package='{p}' resource-id='' clickable='false'"
+        " text='Jump back in' bounds='[42,1123][1596,1195]'/>"
+        "<node package='{p}' resource-id='recent.tabs' clickable='false'"
+        " text='' bounds='[42,1264][1926,1496]'/>"
+        "<node package='{p}' resource-id='recent.tab.title' clickable='false'"
+        " text='Squallar' bounds='[358,1307][525,1381]'/>"
+        "<node package='{p}' resource-id='recent.tab.url' clickable='false'"
+        " text='http://127.0.0.1:33319/index' bounds='[426,1381][1075,1454]'/>"
+        "<node package='{p}' resource-id='ADDRESSBAR_TABS_COUNTER'"
+        " clickable='true' enabled='true' text='' bounds='[1653,110][1779,236]'/>"
+        "</hierarchy>").format(p=PKG)
+    tabhit = android_find_loaded_tab(home_after_nav, "127.0.0.1:33319")
+    check(tabhit is not None,
+          "the 'Jump back in' recent-tab card is not found on the real "
+          "post-navigate home screen. None of its nodes set "
+          "clickable='true' -- they are Compose semantics nodes -- so any "
+          "lookup that filters on clickable finds nothing and the leg can "
+          "never be shown the page it loaded")
+    if tabhit:
+        check(tabhit["url_verified"] is True,
+              "the recent tab was found but NOT verified against the served "
+              "url, so the rig would happily surface somebody else's tab and "
+              "measure whatever it contains (%r)" % (tabhit,))
+        check(tabhit["center"] == (750, 1417),
+              "the tap is not on the url line of the card carrying our own "
+              "url: expected (750, 1417) from bounds [426,1381][1075,1454], "
+              "got %r" % (tabhit["center"],))
+    # A different tab must NOT be url-verified -- that flag is the whole
+    # difference between surfacing our page and surfacing a stranger's.
+    other = android_find_loaded_tab(home_after_nav, "127.0.0.1:99999")
+    check(other is not None and other["url_verified"] is False,
+          "a recent tab whose url does not match the served one is being "
+          "reported as verified (%r); the flag would then mean nothing"
+          % (other,))
+    # No card at all -> None, so the caller raises rather than tapping blind.
+    check(android_find_loaded_tab(
+        "<?xml version='1.0'?><hierarchy><node resource-id='x' "
+        "bounds='[0,0][10,10]'/></hierarchy>", "127.0.0.1:1") is None,
+          "a home screen with no recent-tab card returns a tap target anyway; "
+          "the rig would tap a coordinate it did not derive from anything")
+    raised = None
+    try:
+        android_surface_loaded_tab(
+            "http://127.0.0.1:1/x",
+            _dump=lambda: "<?xml version='1.0'?><hierarchy/>",
+            _tap=lambda x, y: None)
+    except WebDriverError as e:
+        raised = str(e)
+    check(raised is not None and "never displayed" in raised.lower(),
+          "surfacing a tab that is not there SUCCEEDS, so a leg whose page "
+          "was never shown goes on to print a full set of frame figures for "
+          "a viewport nobody saw")
+    taps = []
+    surf = android_surface_loaded_tab("http://127.0.0.1:33319/index-rig.html",
+                                      _dump=lambda: home_after_nav,
+                                      _tap=lambda x, y: taps.append((x, y)))
+    check(surf["ok"] and taps == [(750, 1417)] and surf["url_verified"],
+          "surfacing the loaded tab did not tap the url-verified card's own "
+          "centre: %r" % (taps,))
+    # And the private-browsing button, which is the one clickable control
+    # sitting right beside it, must never be a candidate anywhere.
+    hp = android_parse_hierarchy(home_after_nav, PKG)
+    check(all("private" not in (t.get("text") or "").lower()
+              for t in hp["targets"]),
+          "the private-browsing button is a tap candidate. A private window "
+          "has a different storage partition and no persistence -- it is a "
+          "different browser, and it would be measured under this one's name")
+
     # Bounds arithmetic, including the inputs that must be refused.
     check(_uia_bounds_center("[0,100][200,300]") == (100, 200),
           "bounds centre arithmetic is wrong")
@@ -4634,8 +4826,35 @@ def run_smoke(args):
         stage("navigated", load_s=round(time.monotonic() - nav_t, 2))
         if args.android and args.browser == "firefox":
             # See verify_android_content_view: booted is not displayed.
-            result["content_view"] = verify_android_content_view(session)
-            stage("content-view-shown", **result["content_view"])
+            #
+            # Fenix loads the page into a tab and keeps its home screen in
+            # front of it. The user found the way out before the rig did --
+            # "I always had to go through it then navigate to the 'jump back
+            # in' on the home page before the test would start" -- so that is
+            # what this does, by identity, and then RE-CHECKS. The second
+            # check is not soft: a page still unshown after the repair fails
+            # the leg rather than producing figures for a 300x150 default
+            # buffer, which is not a small viewport but no viewport at all.
+            cv = verify_android_content_view(session, timeout=8.0, soft=True)
+            if cv is None:
+                stage("surface-loaded-tab", why="page loaded, home screen in "
+                                                "front of it")
+                tab_dumps = []
+                try:
+                    result["surfaced_tab"] = android_surface_loaded_tab(
+                        args.url, args.adb_serial, dump_sink=tab_dumps)
+                finally:
+                    if tab_dumps:
+                        p = os.path.join(out_dir, "%s.tab.uia.xml" % tag)
+                        with open(p, "w") as fh:
+                            fh.write(tab_dumps[-1])
+                        result["surfaced_tab_last_dump"] = p
+                stage("surfaced-tab", **{
+                    k: v for k, v in result["surfaced_tab"].items()
+                    if k != "taps"})
+                cv = verify_android_content_view(session, timeout=25.0)
+            result["content_view"] = cv
+            stage("content-view-shown", **cv)
 
         boot, boot_wait, timed_out = wait_boot(session,
                                                timeout=args.boot_timeout)
