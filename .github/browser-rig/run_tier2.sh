@@ -429,12 +429,89 @@ EXPECT_OVERLAY_RASTERS="${RIG_EXPECT_OVERLAY_RASTERS:-1}"
 EXPECT_BASEMAP_TILES="${RIG_EXPECT_BASEMAP_TILES:-1}"
 
 SKIP_BUILD=0
+SELFTEST=0
 for arg in "$@"; do
   case "$arg" in
     --skip-build) SKIP_BUILD=1 ;;
+    --selftest) SELFTEST=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
+
+# Preserve a failed attempt's artefacts before the quarantine retry overwrites
+# them in place. Without this the retry's own JSON lands on the failure's path
+# and *positively asserts* `pass: true, rig_errors: 0` -- the failure does not
+# go absent, which someone would notice, it is replaced by a claim of health.
+# Every quarantined failure was therefore unfalsifiable after the fact.
+#
+# Suffixes are enumerated and NOT globbed: the `live` leg's tag is the bare
+# browser name, so `"$OUT_DIR/$tag".*` would sweep up `firefox.long.*` and
+# every other leg of that browser.
+#
+# `.pgid` files are deliberately NOT preserved. They feed the `*.driver.pgid`
+# cleanup sweep, and a stale one only widens the window in which a recycled
+# process group id gets killed on behalf of a process that already exited.
+preserve_attempt() {
+  local tag="$1" n=0 sfx src
+  for sfx in json driver.log driver.stderr xvfb.log canvas.png page.png mem.tsv; do
+    src="$OUT_DIR/$tag.$sfx"
+    [ -e "$src" ] || continue
+    mv "$src" "$OUT_DIR/$tag.attempt1.$sfx" && n=$((n + 1))
+  done
+  if [ "$n" -gt 0 ]; then
+    echo "$tag: preserved $n attempt-1 artefact(s) as $tag.attempt1.*" >&2
+  fi
+}
+
+# Offline selftest for the one branch a green run never executes. The retry
+# path only runs after a failure, so no passing Tier-2 exercises it and its
+# regression would be silent -- which is how the overwrite survived this long.
+if [ "$SELFTEST" = 1 ]; then
+  st_fails=0
+  st_dir="$(mktemp -d)"
+  OUT_DIR="$st_dir"
+  printf ATTEMPT1 > "$st_dir/firefox.long.json"
+  printf A1LOG    > "$st_dir/firefox.long.driver.log"
+  printf 12345    > "$st_dir/firefox.long.driver.pgid"
+  printf LIVE     > "$st_dir/firefox.json"
+
+  st_chk() {
+    if [ "$2" = "$3" ]; then
+      echo "  ok   $1"
+    else
+      echo "  FAIL $1: want '$2', got '$3'"; st_fails=$((st_fails + 1))
+    fi
+  }
+
+  preserve_attempt firefox.long
+  printf ATTEMPT2 > "$st_dir/firefox.long.json"   # the retry writes its own
+
+  st_chk "attempt 1 json survives the retry" \
+      ATTEMPT1 "$(cat "$st_dir/firefox.long.attempt1.json" 2>/dev/null)"
+  st_chk "attempt 1 driver log survives" \
+      A1LOG "$(cat "$st_dir/firefox.long.attempt1.driver.log" 2>/dev/null)"
+  st_chk "the retry's result is on the unsuffixed path" \
+      ATTEMPT2 "$(cat "$st_dir/firefox.long.json" 2>/dev/null)"
+  st_chk "pgid is NOT renamed (it feeds the cleanup sweep)" \
+      12345 "$(cat "$st_dir/firefox.long.driver.pgid" 2>/dev/null)"
+  st_chk "and no suffixed pgid was created" \
+      "" "$(cat "$st_dir/firefox.long.attempt1.driver.pgid" 2>/dev/null)"
+
+  # The `live` leg's tag is the bare browser name, which is a PREFIX of every
+  # other leg of that browser. A glob would sweep them; enumerated suffixes
+  # must not. This check fails if anyone reaches for "$OUT_DIR/$tag".* again.
+  preserve_attempt firefox
+  st_chk "a bare-tag preserve leaves sibling legs alone" \
+      ATTEMPT2 "$(cat "$st_dir/firefox.long.json" 2>/dev/null)"
+  st_chk "the live leg itself is preserved" \
+      LIVE "$(cat "$st_dir/firefox.attempt1.json" 2>/dev/null)"
+
+  rm -rf "$st_dir"
+  if [ "$st_fails" -eq 0 ]; then
+    echo "run_tier2 SELFTEST PASS (7 checks)"; exit 0
+  fi
+  echo "run_tier2 SELFTEST FAIL ($st_fails of 7)" >&2; exit 1
+fi
 
 if [ -z "${RIG_GECKODRIVER:-}" ]; then
   RIG_GECKODRIVER="$(bash "$RIG_DIR/ensure-geckodriver.sh")" || {
@@ -822,14 +899,16 @@ for browser in $BROWSERS; do
     # fresh port, a fresh browser profile. A second failure fails the leg.
     echo "$tag FAILED (rc=$LAST_RC, $LAST_CLASS); one quarantine retry" \
          "(live-network flake policy)" >&2
+    preserve_attempt "$tag"
     echo "================ $tag (retry) ================"
     if ! run_pass "$browser" "$tag" "$leg"; then
       abort_on_usage "$tag"
       echo "$tag failed twice (rc=$LAST_RC, $LAST_CLASS)" >&2
       overall=1
     fi
-    # The row describes the LAST attempt, which is the one whose artefacts are
-    # on disk -- the retry wiped the first attempt's before it started.
+    # The row describes the LAST attempt, whose artefacts are on the unsuffixed
+    # paths. The first attempt's now survive beside them as `$tag.attempt1.*`
+    # rather than being overwritten, so a quarantined failure stays explicable.
     printf '%s\t%s\t%s\t%s\t%s\n' "$tag" "$LAST_CLASS" "$LAST_RUN_ID" \
         "$LAST_RC" 2 >> "$LEDGER"
   done
