@@ -1802,6 +1802,88 @@ to nothing outside `cfg(test)`.
 **Test count: `cargo test -p walkers --features mvt --lib` reports 100**, from
 98.
 
+### Changed — source, twenty-third commit: the geometry type stops being a heap allocation
+
+Two files: `src/expression.rs` and `src/mvt.rs`.
+
+`Context.geometry_type` was a `String`, so `layer_features` called
+`geometry_type_to_str(&feature.geometry).to_string()` — `geometry_type_to_str`
+returns `&'static str`, one of seven literals already in the binary — once per
+feature per style layer. Measured on the committed `dark` style over Monaco's
+z14 8529/5974 tile: **23,835 allocations per tile** at zoom 14 as the walk
+stands after the previous commit, 36,921 before it. None outlives the filter it
+is tested against.
+
+The field, `Context::new` and `Context::with_properties` all take
+`&'static str` now. That is an API narrowing and it is deliberate: every value
+that has ever reached it is a literal, and this directory is where this
+workspace's map widget lives rather than a stopgap. Both call sites outside
+walkers were `"LineString".to_owned()` and are now `"LineString"` —
+`squallar-egui/src/ui_map_overlays.rs` and
+`squallar-egui/tests/committed_styles_parse.rs`.
+
+The three `self.geometry_type.clone()` sites become `.to_owned()`: `$type` and
+`geometry-type` must still hand back a `serde_json::Value::String`, so those
+allocate exactly as before. What is removed is the allocation on the path that
+does **not** ask.
+
+**What it is worth, measured rather than asserted.** `styled` at zoom 14 over
+that tile, min of 61 runs, three rounds interleaved against the previous commit
+as its control: **6.535 / 6.551 / 6.601 ms against 6.621 / 6.621 / 6.668** —
+about **1.3%**, in the same direction every round. Small, and worth saying so
+plainly: the allocation is same-sized and immediately freed, which is the case
+a native allocator serves best. It is recorded here because the wasm target
+runs `dlmalloc` and **no figure was taken there** — the browser rig was not
+run for this.
+
+Output is byte-identical: both committed themes over that tile at zooms
+0/5/8/10/12/14/16, fourteen `Debug` shape lists, unchanged.
+
+#### The restructure that was measured and not taken
+
+The reason this commit is only the allocation: the loop was also going to be
+inverted, on the premise that re-scanning each source layer once per style
+layer — 36,921 feature scans over a tile holding 2,913 features, `transportation`
+named by 49 of the 95 style layers and holding 649 features — was
+**4.257 ms, 44% of the tile**. That premise does not
+survive measurement, and the decomposition is worth keeping so it is not
+re-derived:
+
+| at zoom 14, over the same tile | `styled` |
+| --- | --- |
+| the committed `dark` style, unmodified `59f08766` | 7.187 ms |
+| same, every filter wrapped so it can never match — all 36,921 scans and every real filter evaluated, nothing tessellated | 1.405 ms |
+| same, filters replaced by one always-false clause — all 36,921 scans, minimal filter | 0.899 ms |
+| same, every `source-layer` renamed to a name the tile lacks — 95 layers walked, zero scans | 0.001 ms |
+
+So the whole scan machinery is **0.899 ms of 7.187 ms (12.5%)**, not 44%, and
+the bare style-layer walk is free. The remaining **87%** is tessellation, paint
+and layout expression evaluation, and shape building — none of it reachable by
+reordering the loop.
+
+Inverting the loop cannot remove filter evaluations either: every style layer
+still has to test every feature of its source layer. All it removes is the
+repeated `Context` construction. That was built (as a per-source-layer context
+cache, which needs no change to draw order at all) and measured against this
+commit, min of 61, three interleaved rounds: **6.503 / 6.515 / 6.554 ms against
+6.535 / 6.551 / 6.601** — about **0.6%**, for a transient
+`Vec<Option<Vec<Context>>>` of roughly 233 KB per styling. It was not kept.
+
+Two new tests. `a_context_borrows_its_geometry_type_rather_than_owning_it` is a
+signature pin — what changed is an allocation that no longer happens, and an
+absent allocation is not observable without swapping the global allocator, which
+is process-wide state one test in a parallel run cannot claim. Shown red against
+unmodified `59f08766`: `expected fn pointer fn(&'static str, ..)`, `found fn
+item fn(std::string::String, ..)`.
+`every_geometry_name_answers_type_and_geometry_type` is the safety net rather
+than the detector, and is green on both sides: it walks the seven names
+`geometry_type_to_str` returns plus the `"None"` a background layer is given,
+through both `$type` and `geometry-type`, with a never-matching control beside
+each so that a context answering nothing cannot pass.
+
+**Test count: `cargo test -p walkers --features mvt --lib` reports 102**, from
+100.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

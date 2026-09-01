@@ -527,7 +527,7 @@ fn a_folded_zoom_range_gates_the_layer_through_the_real_evaluator() {
         map.insert("class".to_owned(), json!("runway"));
         map
     };
-    let at = |zoom: u8| Context::new("LineString".to_owned(), properties(), zoom);
+    let at = |zoom: u8| Context::new("LineString", properties(), zoom);
 
     let filter: Filter = serde_json::from_value(runway["filter"].clone())
         .expect("the filter deserialises as a walkers filter");

@@ -400,7 +400,7 @@ pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
 
         match layer {
             Layer::Background { paint, .. } => {
-                let context = Context::new("None".to_string(), HashMap::new(), zoom);
+                let context = Context::new("None", HashMap::new(), zoom);
 
                 let bg_color = if let Some(color) = &paint.background_color {
                     color.evaluate(&context)
@@ -614,7 +614,7 @@ fn layer_features<'a>(
         // value when a lookup asks for it instead, and the `Arc` is what lets
         // one parse serve every styling without copying a bag.
         let context = Context::with_properties(
-            geometry_type_to_str(&feature.geometry).to_string(),
+            geometry_type_to_str(&feature.geometry),
             Properties::Mvt(Arc::clone(&feature.properties)),
             zoom,
         );

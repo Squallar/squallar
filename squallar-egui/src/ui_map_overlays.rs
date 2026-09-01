@@ -1290,7 +1290,7 @@ mod tests {
             })
             .expect("the fixture style has a line layer");
 
-        let context = walkers::Context::new("LineString".to_owned(), Default::default(), 14);
+        let context = walkers::Context::new("LineString", Default::default(), 14);
         let mut shapes = Vec::new();
         walkers::render_line(
             &walkers::mvt::Geometry::LineString(vec![(0.0_f32, 0.0_f32), (EXTENT, EXTENT)].into()),

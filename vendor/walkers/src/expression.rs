@@ -85,17 +85,31 @@ impl Properties {
 
 /// Context in which style expressions are evaluated.
 pub struct Context {
-    geometry_type: String,
+    /// **`&'static str`, not `String`, and the lifetime is the whole point.**
+    /// A geometry type is one of seven fixed names -- `crate::mvt`'s
+    /// `geometry_type_to_str` returns them as literals -- and a `Context` is
+    /// built once per feature per style layer, which is the most frequent
+    /// allocation site in the style walk. Owning the name cost one heap
+    /// allocation per scan for a value that is already in the binary, none of
+    /// which outlives the filter it is tested against. Measured on the
+    /// committed `dark` style over Monaco's z14 8529/5974 tile: **23,835 per
+    /// tile** at zoom 14 as the walk stands, and 36,921 before
+    /// `Layer::visible_at` stopped it visiting out-of-range layers.
+    geometry_type: &'static str,
     properties: Properties,
     zoom: u8,
 }
 
 impl Context {
-    pub fn new(geometry_type: String, properties: HashMap<String, Value>, zoom: u8) -> Self {
+    pub fn new(geometry_type: &'static str, properties: HashMap<String, Value>, zoom: u8) -> Self {
         Self::with_properties(geometry_type, Properties::Json(properties), zoom)
     }
 
-    pub(crate) fn with_properties(geometry_type: String, properties: Properties, zoom: u8) -> Self {
+    pub(crate) fn with_properties(
+        geometry_type: &'static str,
+        properties: Properties,
+        zoom: u8,
+    ) -> Self {
         Self {
             geometry_type,
             properties,
@@ -114,7 +128,7 @@ impl Context {
 
                 match operator.as_str() {
                     "zoom" => Ok(Value::Number((self.zoom as i64).into())),
-                    "geometry-type" => Ok(Value::String(self.geometry_type.clone())),
+                    "geometry-type" => Ok(Value::String(self.geometry_type.to_owned())),
                     "literal" => single_array(arguments),
                     "!" => match self.evaluate(&single_value(arguments)?)? {
                         Value::Bool(b) => Ok(Value::Bool(!b)),
@@ -295,9 +309,11 @@ impl Context {
     /// Evaluate token as either a property key (String) or an expression (Array).
     fn property_or_expression(&self, value: &Value) -> Result<Value, Error> {
         match value {
-            Value::String(key) if key == "$type" => Ok(Value::String(self.geometry_type.clone())),
+            Value::String(key) if key == "$type" => {
+                Ok(Value::String(self.geometry_type.to_owned()))
+            }
             Value::String(key) if key == "geometry-type" => {
-                Ok(Value::String(self.geometry_type.clone()))
+                Ok(Value::String(self.geometry_type.to_owned()))
             }
             // One lookup, where this was a `contains_key` followed by a `get`.
             // The `get` could not fail once the guard had passed, and the error
@@ -466,13 +482,80 @@ mod tests {
         );
     }
 
+    /// **A `Context` borrows its geometry type; it never owns one.**
+    ///
+    /// A signature pin, because what this is about is an allocation that no
+    /// longer happens, and an absent allocation is not observable from a test
+    /// without swapping the global allocator — which is process-wide state, and
+    /// so cannot be asserted on by one test in a parallel run.
+    ///
+    /// It is red on a `Context` whose `geometry_type` is a `String`: that
+    /// signature is `fn(String, ..)`, and no coercion turns it into this one.
+    /// It cannot be satisfied vacuously either — a function pointer either has
+    /// this type or does not exist.
+    #[test]
+    fn a_context_borrows_its_geometry_type_rather_than_owning_it() {
+        let construct: fn(&'static str, HashMap<String, Value>, u8) -> Context = Context::new;
+
+        // And the borrow really is `'static`: a `Context` built from a literal
+        // outlives every owned value in this scope.
+        let context = {
+            let properties = HashMap::from([("k".to_string(), json!("v"))]);
+            construct("LineString", properties, 7)
+        };
+        assert_eq!(
+            context
+                .evaluate(&json!(["geometry-type"]))
+                .expect("evaluates"),
+            json!("LineString")
+        );
+    }
+
+    /// The seven geometry names `crate::mvt::geometry_type_to_str` can return,
+    /// plus the `"None"` a background layer is given, all still answer both
+    /// spellings of the query.
+    ///
+    /// Green before the borrow as well as after — it is the safety net on the
+    /// change, not the thing that detects it. Its job is to catch a geometry
+    /// name that stopped arriving intact.
+    #[test]
+    fn every_geometry_name_answers_type_and_geometry_type() {
+        for name in [
+            "Point",
+            "Line",
+            "LineString",
+            "Polygon",
+            "GeometryCollection",
+            "Rect",
+            "Triangle",
+            "None",
+        ] {
+            let context = Context::new(name, HashMap::new(), 1);
+
+            assert_eq!(
+                context
+                    .evaluate(&json!(["geometry-type"]))
+                    .expect("evaluates"),
+                json!(name)
+            );
+            assert!(
+                Filter(json!(["==", "$type", name])).matches(&context),
+                "`$type` does not answer {name}"
+            );
+            assert!(
+                !Filter(json!(["==", "$type", "NotAGeometryType"])).matches(&context),
+                "`$type` matches a name that is not {name}, so the check is vacuous"
+            );
+        }
+    }
+
     #[test]
     fn test_eq_filter_matching() {
         let park = HashMap::from([("type".to_string(), json!("park"))]);
-        let park_context = Context::new("Point".to_string(), park, 1);
+        let park_context = Context::new("Point", park, 1);
 
         let forest = HashMap::from([("type".to_string(), json!("forest"))]);
-        let forest_context = Context::new("Point".to_string(), forest, 1);
+        let forest_context = Context::new("Point", forest, 1);
 
         let filter = Filter(json!(["==", "type", "park"]));
 
@@ -488,7 +571,7 @@ mod tests {
         let point_filter = Filter(json!(["==", "$type", "Point"]));
 
         let properties = HashMap::new();
-        let point_context = Context::new("Point".to_string(), properties, 1);
+        let point_context = Context::new("Point", properties, 1);
 
         assert!(point_filter.matches(&point_context));
         assert!(!line_filter.matches(&point_context));
@@ -497,10 +580,10 @@ mod tests {
     #[test]
     fn test_in_filter() {
         let park = HashMap::from([("type".to_string(), json!("park"))]);
-        let park_context = Context::new("Point".to_string(), park, 1);
+        let park_context = Context::new("Point", park, 1);
 
         let road = HashMap::from([("type".to_string(), json!("road"))]);
-        let road_context = Context::new("Point".to_string(), road, 1);
+        let road_context = Context::new("Point", road, 1);
 
         let filter = Filter(json!(["in", "type", "park", "forest"]));
 
@@ -511,7 +594,7 @@ mod tests {
     #[test]
     fn test_evaluate_color() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             Color(Value::String("#ffffff".to_string())).evaluate(&context),
@@ -527,7 +610,7 @@ mod tests {
     #[test]
     fn test_literal_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["literal", [1, 2, 3]])).unwrap(),
@@ -538,7 +621,7 @@ mod tests {
     #[test]
     fn test_get_operator() {
         let properties = HashMap::from([("name".to_string(), json!("Polska"))]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["get", "name"]),).unwrap(),
@@ -554,7 +637,7 @@ mod tests {
     #[test]
     fn test_has_operator() {
         let properties = HashMap::from([("name".to_string(), json!("Polska"))]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["has", "name"])).unwrap(),
@@ -565,7 +648,7 @@ mod tests {
     #[test]
     fn test_not_has_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["!has", "name"])).unwrap(),
@@ -576,7 +659,7 @@ mod tests {
     #[test]
     fn test_match_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -598,7 +681,7 @@ mod tests {
     #[test]
     fn test_match_operator_reaching_default() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -619,7 +702,7 @@ mod tests {
     #[test]
     fn test_match_when_arm_label_is_an_array() {
         let properties = HashMap::new();
-        let context = Context::new("Polygon".to_string(), properties, 1);
+        let context = Context::new("Polygon", properties, 1);
 
         assert_eq!(
             json!(true),
@@ -638,7 +721,7 @@ mod tests {
     #[test]
     fn test_case_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -666,7 +749,7 @@ mod tests {
     #[test]
     fn test_coalesce_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -686,7 +769,7 @@ mod tests {
     #[test]
     fn test_eq_operator() {
         let properties = HashMap::from([("name".to_string(), json!("Polska"))]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -706,7 +789,7 @@ mod tests {
     #[test]
     fn test_in_operator() {
         let properties = HashMap::from([("name".to_string(), json!("Polska"))]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -726,7 +809,7 @@ mod tests {
     #[test]
     fn test_any_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["any", true, false])).unwrap(),
@@ -742,7 +825,7 @@ mod tests {
     #[test]
     fn test_all_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context.evaluate(&json!(["all", true, false])).unwrap(),
@@ -758,7 +841,7 @@ mod tests {
     #[test]
     fn test_interpolate_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         // https://maplibre.org/maplibre-style-spec/expressions/#interpolate
         assert_eq!(
@@ -820,7 +903,7 @@ mod tests {
     #[test]
     fn test_interpolate_operator_with_evaluated_stop() {
         let properties = HashMap::from([("zoom".to_string(), json!(5))]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -841,7 +924,7 @@ mod tests {
     #[test]
     fn test_negation_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(context.evaluate(&json!(["!", false])).unwrap(), json!(true));
     }
@@ -851,7 +934,7 @@ mod tests {
     #[test]
     fn test_interpolate_with_an_odd_stop_list_is_an_error() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         // Four stop elements would be two [input, output] pairs; five is a
         // trailing input with no output.
@@ -865,7 +948,7 @@ mod tests {
     #[test]
     fn test_interpolate_with_no_stops_is_an_error() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert!(matches!(
             context.evaluate(&json!(["interpolate", ["linear"], 5])),
@@ -896,7 +979,7 @@ mod tests {
             ("class".to_string(), json!("park")),
             ("park".to_string(), json!("municipal")),
         ]);
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         // "park" on the right is the literal string, not a lookup of the `park`
         // property (which holds "municipal"). `class` is "park", so the two are
@@ -935,14 +1018,14 @@ mod tests {
             ("class".to_string(), json!("service")),
             ("service".to_string(), json!("driveway")),
         ]);
-        let driveway_context = Context::new("LineString".to_string(), driveway, 1);
+        let driveway_context = Context::new("LineString", driveway, 1);
 
         // A primary road carrying the same `service` key.
         let primary = HashMap::from([
             ("class".to_string(), json!("primary")),
             ("service".to_string(), json!("driveway")),
         ]);
-        let primary_context = Context::new("LineString".to_string(), primary, 1);
+        let primary_context = Context::new("LineString", primary, 1);
 
         let filter = Filter(json!(["==", "class", "service"]));
 
@@ -953,7 +1036,7 @@ mod tests {
     #[test]
     fn test_format_operator() {
         let properties = HashMap::new();
-        let context = Context::new("Point".to_string(), properties, 1);
+        let context = Context::new("Point", properties, 1);
 
         assert_eq!(
             context
@@ -984,7 +1067,7 @@ mod tests {
             ("class".to_string(), json!("minor")),
             ("minor".to_string(), json!("trunk")),
         ]);
-        let context = Context::new("LineString".to_string(), properties, 1);
+        let context = Context::new("LineString", properties, 1);
 
         // An array on the right is an expression, and is evaluated as one.
         // Each of the four arms gets an assertion that a raw `&Value` right
@@ -1053,7 +1136,7 @@ mod tests {
             ("class".to_string(), json!("service")),
             ("rank".to_string(), json!(3)),
         ]);
-        let context = Context::new("LineString".to_string(), properties, 1);
+        let context = Context::new("LineString", properties, 1);
 
         // `none` is `!any`: every argument must be false.
         assert_eq!(
