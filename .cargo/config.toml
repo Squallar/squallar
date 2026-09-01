@@ -28,3 +28,57 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = "11.0"
 IPHONEOS_DEPLOYMENT_TARGET = "14.0"
+
+# Windows links its unwinder statically, or it does not start.
+#
+# `x86_64-pc-windows-gnullvm` links LLVM's unwinder as a SHARED library, so the
+# exe carries an import for `libunwind.dll` — a file that exists only inside
+# the llvm-mingw toolchain and on no Windows install anywhere. Measured on a
+# clean Windows 10.0.26200 box: the shipped `windows-x86_64` artifact dies at
+# the loader with `STATUS_DLL_NOT_FOUND` (0xC0000135), before one instruction,
+# with zero bytes on stdout and stderr. It was the only non-system import of
+# the 31 it had; `ucrtbase`, `opengl32` and `vcruntime140` were all present.
+#
+# That failure is invisible to every gate we own. CI builds this target and
+# never runs it, so a `cargo build` that links cleanly is the whole signal, and
+# a launch failure this total produces no log to notice. It shipped that way.
+#
+# `+crt-static` moves `-lunwind` inside the `-Wl,-Bstatic` region, so lld takes
+# `libunwind.a` instead of `libunwind.dll.a`. Measured after the change: 32
+# imports, every one a genuine Windows system DLL, and the exe boots and holds
+# on real hardware from a directory containing nothing but itself. Two other
+# spellings were tried and rejected — `-C link-self-contained=yes` fails to
+# build, and `-static-libgcc` / `--unwindlib=libunwind` build but change
+# nothing.
+#
+# A statically linked unwinder that cannot unwind would be worse than shipping
+# the DLL, because it would fail only once something had already gone wrong.
+# Verified on the same box that it does unwind: `catch_unwind` returns `Err`
+# with its payload, a panic in a spawned thread makes `join()` return `Err`,
+# and a four-frame unwind runs exactly four destructors — an abort runs none.
+#
+# The second flag removes a warning the first one causes. `+crt-static` makes
+# rustc pass `-no-pie` to a clang that has no use for it, and the resulting
+# `argument unused during compilation` reaches rustc's `linker_messages` lint.
+# It is ONE diagnostic echoed per linked target, not a hundred problems:
+# measured across `--all-targets`, a cold build emits 98 `warning:` lines from
+# that single message, and 0 once this flag is set. `cargo build` tolerates it
+# today and would stop the day anything puts `-D warnings` on this target.
+# Suppressing the CAUSE is deliberate: `-A linker_messages` would also swallow
+# genuine future linker messages, which is the one thing that lint is for.
+#
+# The zero is measured on a build that actually LINKS. A warm no-op finishes in
+# 0.54 s and reports zero warnings whatever the flags say, because nothing was
+# linked to warn about — so the confirming run was one that recompiled and
+# relinked the binary, driven by this file with no `RUSTFLAGS` and no
+# `CARGO_TARGET_*_RUSTFLAGS` anywhere in the environment.
+#
+# Here rather than in `build.yaml` for the reason the Apple block above gives:
+# a CI `env:` covers neither a bare `cargo check` nor a developer's local
+# build. Note that a `RUSTFLAGS` in the environment replaces this wholesale —
+# cargo does not merge them — so a caller who sets it must carry both flags.
+[target.x86_64-pc-windows-gnullvm]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-Wno-unused-command-line-argument",
+]
