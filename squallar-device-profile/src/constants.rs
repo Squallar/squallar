@@ -438,6 +438,17 @@ pub const VOLUME_LUT_BYTES: usize = 256 * 4;
 /// The largest 3D texture WebGL2 is *guaranteed* to accept, per axis.
 pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 = 256;
 
+/// The largest `navigator.deviceMemory` declaration that reads as a handheld:
+/// Chromium's bucket edge, the top of the 2 GiB bucket. A declaration is a
+/// hint the page makes about itself, so it can only **lower** a presumption —
+/// a desktop-class browser declaring at most this much is held at
+/// [`crate::budget::Promotion::Step`] — and never raise one: a browser that
+/// declares nothing, or declares more, is promoted by its adapter report and
+/// its form factor alone. Safari never declares, and Chromium's buckets stop
+/// at 8 GiB, which is why the figure is a floor to fall through rather than a
+/// scale to climb.
+pub const DECLARED_RAM_HANDHELD_BYTES: u64 = 2 << 30;
+
 /// Ceiling on what one pane's 3D volume textures may occupy, in bytes.
 #[cfg(target_arch = "wasm32")]
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = WASM_VOLUME_TEXTURE_BUDGET_BYTES;

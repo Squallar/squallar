@@ -180,7 +180,7 @@ fn a_static_render_takes_the_ceiling_the_device_reported_and_no_other() {
 #[test]
 fn the_ceiling_app_state_computes_first_is_not_the_one_a_promoted_browser_is_owed() {
     use squallar_device_profile::budget::{
-        AdapterCeilings, BudgetLimits, DeviceProfile, Platform, Promotion, resolve,
+        AdapterCeilings, BudgetLimits, DeviceProfile, FormFactor, Platform, Promotion, resolve,
     };
 
     // Firefox 153 and Chromium 151 both reported this on a real driver,
@@ -195,6 +195,9 @@ fn the_ceiling_app_state_computes_first_is_not_the_one_a_promoted_browser_is_owe
             platform: Platform::Web,
             limits: BudgetLimits::WASM,
             adapter,
+            // The rig's Xvfb legs run with a mouse: form factor Desktop, which the
+            // ceiling asks for since the form factor is read.
+            form_factor: Some(FormFactor::Desktop),
             ..DeviceProfile::for_target()
         };
         // What `App::new` had, and so what `AppState::new` spent.

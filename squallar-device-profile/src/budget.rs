@@ -55,7 +55,9 @@ pub enum Promotion {
     /// constants, unchanged.
     Floor,
     /// One rung. What an integrated GPU takes, which is the rule
-    /// `LoopPool::for_device` already ships for the pool.
+    /// `LoopPool::for_device` already ships for the pool — and what a
+    /// desktop-class adapter report earns on its own, before the device's
+    /// shape and its memory declaration are asked about the ceiling.
     Step,
     /// The most this build will spend on this class of machine.
     Ceiling,
@@ -129,15 +131,32 @@ impl DeviceProfile {
 
     /// What the adapter's own reported ceilings are worth, where nothing else
     /// answered.
+    ///
+    /// The report separates a driver from a software rasteriser — both axes of
+    /// [`DESKTOP_CLASS_REPORT`], and nothing below it leaves the floor. It does
+    /// not separate a workstation from a tablet with a trackpad, and the form
+    /// factor is what does: a desktop-class report earns the
+    /// [`Promotion::Ceiling`] only on a device with a fine pointer that has not
+    /// declared a handheld's memory. The same report on a handheld, on a device
+    /// whose shape nobody classified, or beside a small `deviceMemory`
+    /// declaration earns the [`Promotion::Step`]. The declaration can only
+    /// lower the rung, never raise it
+    /// ([`constants::DECLARED_RAM_HANDHELD_BYTES`]).
     fn reported_promotion(&self) -> Promotion {
         let desktop_class = self.adapter.max_texture_dimension_2d
             >= DESKTOP_CLASS_REPORT.max_texture_dimension_2d
             && self.adapter.max_texture_dimension_3d
                 >= DESKTOP_CLASS_REPORT.max_texture_dimension_3d;
-        if desktop_class {
+        if !desktop_class {
+            return Promotion::Floor;
+        }
+        let declared_small = self
+            .declared_ram_bytes
+            .is_some_and(|bytes| bytes <= constants::DECLARED_RAM_HANDHELD_BYTES);
+        if self.form_factor == Some(FormFactor::Desktop) && !declared_small {
             Promotion::Ceiling
         } else {
-            Promotion::Floor
+            Promotion::Step
         }
     }
 
@@ -253,6 +272,15 @@ impl CellBracket {
         }
     }
 
+    /// All three rungs, named. See [`Bracket::stepped`].
+    pub const fn stepped(floor: [u32; 3], step: [u32; 3], ceiling: [u32; 3]) -> Self {
+        Self {
+            floor,
+            step,
+            ceiling,
+        }
+    }
+
     /// The rung `promotion` buys.
     pub fn at(&self, promotion: Promotion) -> [u32; 3] {
         let raw = match promotion {
@@ -353,6 +381,18 @@ pub struct BudgetLimits {
 
 impl BudgetLimits {
     /// The wasm32 bracket.
+    ///
+    /// Every field that moves here is `stepped(floor, ceiling, ceiling)`: the
+    /// step **is** the ceiling. A browser has two rungs above the floor to earn
+    /// — [`Promotion::Step`] on a desktop-class adapter report alone,
+    /// [`Promotion::Ceiling`] when the device also has a desktop form factor
+    /// and no small memory declaration — and today they buy the same numbers,
+    /// so a browser that resolves `Step` gets exactly what it resolved as
+    /// `Ceiling` before the form factor was read. The `Ceiling` rung is the
+    /// slot a measured or probed desktop-browser tier fills later; until a
+    /// browser frame has been measured at anything above the mobile tier it
+    /// equals the step, and nothing here moves, by construction. Pinned by
+    /// `the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured`.
     pub const WASM: Self = Self {
         name: "wasm32",
         image_side_px: Bracket::pinned(squallar_radar::types::WASM_IMAGE_SIZE),
@@ -366,22 +406,25 @@ impl BudgetLimits {
         loop_frames_held: Bracket::pinned(constants::WASM_MAX_LOOP_FRAMES),
         loop_span_secs: Bracket::pinned(constants::WASM_LOOP_SPAN_BUDGET_SECS),
         loop_render_budget: Bracket::pinned(constants::WASM_MAX_LOOP_RENDER_BUDGET),
-        loop_pool_bytes: Bracket::new(
+        loop_pool_bytes: Bracket::stepped(
             constants::WASM_LOOP_POOL_FLOOR_BYTES,
             constants::WASM_LOOP_POOL_CEILING_BYTES,
+            constants::WASM_LOOP_POOL_CEILING_BYTES,
         ),
-        // The one promotion a browser can earn. The ceiling is the mobile
-        // tier's own budget, so the worst a misread can do is hand a phone
-        // browser a phone's budget. The desktop tier is not offered: its cells
-        // are 8x the web floor's and no browser frame has been measured.
-        grid_cells: CellBracket::new(
+        // The one promotion a browser can earn, at either rung. Both rungs are
+        // the mobile tier's own budget, so the worst a misread can do is hand a
+        // phone browser a phone's budget. The desktop tier is not offered: its
+        // cells are 8x the web floor's and no browser frame has been measured.
+        grid_cells: CellBracket::stepped(
             constants::WASM_VOLUME_GRID_CELLS,
+            constants::MOBILE_VOLUME_GRID_CELLS,
             constants::MOBILE_VOLUME_GRID_CELLS,
         ),
         // Follows the grid it has to pay for: a promoted grid against an
         // unpromoted per-pane budget is a refused allocation.
-        volume_texture_bytes: Bracket::new(
+        volume_texture_bytes: Bracket::stepped(
             constants::WASM_VOLUME_TEXTURE_BUDGET_BYTES,
+            constants::MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
             constants::MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
         ),
         // The offscreen's promotion is paid in fill rate, not only memory:
@@ -398,15 +441,16 @@ impl BudgetLimits {
         // that sum. Raising this alone would fail that test; raising it
         // together with a term would be raising a term nothing measured.
         app_texture_ceiling_bytes: Bracket::pinned(constants::WASM_APP_TEXTURE_BUDGET_BYTES),
-        // **The second promotion a browser can earn.** See
-        // `WASM_RASTER_SIDE_CEILING_PROMOTED` for the four-leg adapter
+        // **The second promotion a browser can earn**, again at either rung.
+        // See `WASM_RASTER_SIDE_CEILING_PROMOTED` for the four-leg adapter
         // measurement and for why the 3D cap is the axis that separates a
         // software rasteriser from a driver. The floor is untouched, so every
         // adapter that does not clear `DESKTOP_CLASS_REPORT` — llvmpipe and
         // SwiftShader both, as measured — resolves exactly what it resolved
         // before.
-        raster_side_ceiling_px: Bracket::new(
+        raster_side_ceiling_px: Bracket::stepped(
             constants::WASM_RASTER_SIDE_CEILING,
+            constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
             constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
         ),
     };

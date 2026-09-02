@@ -222,13 +222,19 @@ fn synthetic_profiles() -> Vec<DeviceProfile> {
 }
 
 /// `profile` with every host signal unread, exactly as a bridge that answers
-/// nothing hands it over.
+/// nothing hands it over. A native bridge cannot answer nothing about the form
+/// factor — it supplies one as a build fact — so on a native row that field
+/// stays as it is; on a web row it is a pointer-media classification that can
+/// fail, and it is stripped with the rest.
 fn without_host_signals(profile: &DeviceProfile) -> DeviceProfile {
     DeviceProfile {
         system_ram_bytes: None,
         declared_ram_bytes: None,
         parallelism: None,
-        form_factor: None,
+        form_factor: match profile.platform {
+            Platform::Native => profile.form_factor,
+            Platform::Web => None,
+        },
         ..*profile
     }
 }
@@ -445,31 +451,77 @@ fn every_synthetic_profile_satisfies_every_invariant() {
     }
 }
 
-/// **The host signals reach the profile and move nothing.** Every row of the
-/// matrix resolves byte-for-byte the same with its RAM, declared RAM, thread
-/// count and form factor as with all four unread — `resolve` does not read
-/// them yet, and this is the proof that landing the signals landed no
-/// behaviour. Rows where the signals are already `None` are the control that
-/// the comparison is a comparison; the matrix carries both.
+/// **The host signals reach the profile; the two nothing reads move nothing,
+/// and the two the rung reads move its name and, on the web, nothing else.**
+/// Every row of the matrix resolves byte-for-byte the same with its RAM and
+/// thread count as with both unread — `resolve` does not read them. Form
+/// factor and declared RAM do name the rung now, so stripping them may move
+/// `promotion`; on the web bracket that is the only field that moves, because
+/// the step is the ceiling there
+/// ([`the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured`]),
+/// and it moves at most one rung, never across the floor — the floor is the
+/// adapter report's alone. On a native row the form factor is a build fact the
+/// strip leaves in place ([`without_host_signals`]), and no native bridge
+/// declares memory, so the whole set is an identity there. Rows where the
+/// signals are already `None` are the control that the comparison is a
+/// comparison; the matrix carries both.
 #[test]
 fn the_new_signals_change_no_budget_yet() {
     let rows = synthetic_profiles();
     let mut rows_with_a_signal = 0usize;
     for profile in &rows {
-        let unread = without_host_signals(profile);
-        if unread != *profile {
+        let resolved = resolve(profile);
+        let row = format!(
+            "{} / {:?} / {:?}",
+            profile.limits.name, profile.class, profile.form_factor,
+        );
+
+        // RAM and threads: nothing spends them, so byte-identical.
+        let unread = DeviceProfile {
+            system_ram_bytes: None,
+            parallelism: None,
+            ..*profile
+        };
+        assert_eq!(
+            resolved,
+            resolve(&unread),
+            "{row}: RAM or threads moved a budget. Nothing spends them yet; a \
+             field that reads them lands with its own proof, not under this one",
+        );
+
+        let stripped = without_host_signals(profile);
+        if stripped != *profile {
             rows_with_a_signal += 1;
         }
-        assert_eq!(
-            resolve(profile),
-            resolve(&unread),
-            "{} / {:?} / {:?}: a host signal moved a budget. Nothing spends \
-             RAM, threads or form factor yet; a field that reads them lands \
-             with its own proof, not under this one",
-            profile.limits.name,
-            profile.class,
-            profile.form_factor,
-        );
+        let bare = resolve(&stripped);
+        match profile.platform {
+            Platform::Native => assert_eq!(
+                resolved, bare,
+                "{row}: a declared memory moved a native budget, and no native \
+                 bridge declares one",
+            ),
+            Platform::Web => {
+                assert_eq!(
+                    Budgets {
+                        promotion: bare.promotion,
+                        ..resolved
+                    },
+                    bare,
+                    "{row}: the form factor or the declared memory moved a web \
+                     budget's value. They may move the rung's name, and the web \
+                     step is the web ceiling, so the name is all that may move",
+                );
+                assert_eq!(
+                    resolved.promotion == Promotion::Floor,
+                    bare.promotion == Promotion::Floor,
+                    "{row}: stripping the form factor moved a browser across \
+                     the floor ({:?} to {:?}); the floor is the adapter \
+                     report's alone",
+                    resolved.promotion,
+                    bare.promotion,
+                );
+            }
+        }
     }
     assert!(
         rows_with_a_signal * 2 > rows.len(),
@@ -518,6 +570,29 @@ fn two_browser_profiles_on_one_machine_stay_inside_one_bracket() {
         "two browsers on one bracket resolved to different budgets, which can \
          only mean something is reading the report where it should be reading \
          the bracket",
+    );
+
+    // The same two browsers with the form factor the machine reports — one
+    // mouse, read through the same pointer media by both. Nothing branches on
+    // browser identity at this rung either.
+    let shaped = |two_d, three_d| DeviceProfile {
+        form_factor: Some(FormFactor::Desktop),
+        ..web(two_d, three_d)
+    };
+    let (firefox_shaped, chromium_shaped) = (shaped(16384, 16384), shaped(16384, 8192));
+    for profile in [&firefox_shaped, &chromium_shaped] {
+        check_invariants(profile, "browser pair, desktop form factor");
+    }
+    assert_eq!(
+        resolve(&firefox_shaped).promotion,
+        Promotion::Ceiling,
+        "the pair with a mouse is here to exercise the ceiling arm",
+    );
+    assert_eq!(
+        resolve(&firefox_shaped),
+        resolve(&chromium_shaped),
+        "two browsers on one machine with one mouse resolved to different \
+         budgets",
     );
     let b = resolve(&firefox);
     assert!(
@@ -682,15 +757,36 @@ fn a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not() {
         AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_2d,
         AdapterCeilings::WEBGL2_GUARANTEE.max_texture_dimension_3d,
     );
-    let desktop_class = web(
-        DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
-        DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
-    );
+    let desktop_class = DeviceProfile {
+        // The ceiling asks for the form factor too: this is the machine with a
+        // mouse.
+        form_factor: Some(FormFactor::Desktop),
+        ..web(
+            DESKTOP_CLASS_REPORT.max_texture_dimension_2d,
+            DESKTOP_CLASS_REPORT.max_texture_dimension_3d,
+        )
+    };
 
     let floor = resolve(&at_the_guarantee);
     let promoted = resolve(&desktop_class);
     assert_eq!(floor.promotion, Promotion::Floor);
     assert_eq!(promoted.promotion, Promotion::Ceiling);
+    // The same report with the shape unclassified is the step, and the step is
+    // these same numbers: the rung's name is the only thing the form factor
+    // moved.
+    let unshaped = resolve(&DeviceProfile {
+        form_factor: None,
+        ..desktop_class
+    });
+    assert_eq!(
+        unshaped,
+        Budgets {
+            promotion: Promotion::Step,
+            ..promoted
+        },
+        "a desktop-class browser whose shape nobody classified resolved \
+         something other than the ceiling's numbers under the step's name",
+    );
     assert_eq!(
         floor,
         resolve(&shipped_profile(BudgetLimits::WASM)),
@@ -992,6 +1088,9 @@ fn a_real_driver_earns_a_wider_long_range_raster_and_a_software_one_keeps_its_ow
                 max_texture_dimension_2d: two_d,
                 max_texture_dimension_3d: three_d,
             },
+            // The rig's Xvfb legs run with a mouse: form factor Desktop, on all
+            // four rows.
+            form_factor: Some(FormFactor::Desktop),
             ..shipped_profile(BudgetLimits::WASM)
         };
         check_invariants(&profile, leg);
@@ -1085,5 +1184,265 @@ fn the_promoted_ceiling_is_spent_on_long_range_sweeps_and_on_nothing_else() {
     for extent_km in [300.0, 460.0] {
         assert_eq!(raster_side_px(extent_km, wide, dense_km), wide);
         assert_eq!(raster_side_px(extent_km, narrow, dense_km), narrow);
+    }
+}
+
+/// **On the web bracket the step is the ceiling, on every field that moves.**
+/// The `Ceiling` rung is the slot a measured or probed desktop-browser tier
+/// fills later; until it is filled, the two rungs above the floor resolve the
+/// same numbers, and a browser held at the step by its form factor loses
+/// nothing it had. Whoever fills the slot has to come past this line, and past
+/// the web rows of [`the_new_signals_change_no_budget_yet`], which stop being
+/// an identity the moment the two rungs part.
+#[test]
+fn the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured() {
+    let w = BudgetLimits::WASM;
+    for (name, bracket) in [
+        ("image_side_px", w.image_side_px),
+        ("long_range_image_side_px", w.long_range_image_side_px),
+        ("loop_image_side_px", w.loop_image_side_px),
+        ("section_width_px", w.section_width_px),
+        ("concurrent_renders", w.concurrent_renders),
+        ("concurrent_loop_downloads", w.concurrent_loop_downloads),
+        ("loop_frames_held", w.loop_frames_held),
+        ("loop_span_secs", w.loop_span_secs),
+        ("loop_render_budget", w.loop_render_budget),
+        ("loop_pool_bytes", w.loop_pool_bytes),
+        ("volume_texture_bytes", w.volume_texture_bytes),
+        ("offscreen_bytes", w.offscreen_bytes),
+        ("mirror_bytes", w.mirror_bytes),
+        ("render_cache_entries", w.render_cache_entries),
+        ("max_panes", w.max_panes),
+        ("app_texture_ceiling_bytes", w.app_texture_ceiling_bytes),
+        ("raster_side_ceiling_px", w.raster_side_ceiling_px),
+    ] {
+        assert_eq!(
+            bracket.step, bracket.ceiling,
+            "wasm32 / {name}: the step ({}) and the ceiling ({}) parted, so a \
+             browser whose form factor nobody classified now resolves less \
+             than it did — a desktop-browser tier lands with its measurement, \
+             and with this pin re-argued",
+            bracket.step, bracket.ceiling,
+        );
+    }
+    assert_eq!(
+        w.grid_cells.step, w.grid_cells.ceiling,
+        "wasm32 / grid_cells"
+    );
+    assert_eq!(
+        w.quality_ceiling.step, w.quality_ceiling.ceiling,
+        "wasm32 / quality_ceiling"
+    );
+
+    // And the rungs are real: the two promotable axes leave the floor, or the
+    // step is a name with nothing behind it.
+    assert_ne!(w.grid_cells.floor, w.grid_cells.step);
+    assert_ne!(
+        w.raster_side_ceiling_px.floor,
+        w.raster_side_ceiling_px.step
+    );
+}
+
+/// **The classifier's failure modes, one row each, and what the rule does with
+/// them.**
+///
+/// The adapter report separates a driver from a software rasteriser and
+/// nothing else. An iPad with a trackpad, a Chromebook and a phone docked to a
+/// monitor all read `Desktop` from the pointer media — a fine pointer is
+/// present — and the 3D conjunct of [`DESKTOP_CLASS_REPORT`] is the only thing
+/// holding them at the floor. A handheld reporting desktop-class caps takes the
+/// step, which on this bracket is the mobile tier and never above it. A
+/// desktop-class browser whose shape nobody classified takes the step too, and
+/// every value it resolves is the ceiling's — the behaviour-preservation proof,
+/// as a row. `deviceMemory` lowers and never raises: 2 GiB beside a desktop
+/// form factor is the step, 4 GiB leaves the ceiling where it was, 8 GiB on a
+/// handheld is still the step, and no declaration at all is not a declaration
+/// of plenty.
+#[test]
+fn the_form_factor_and_the_declared_memory_pick_between_the_step_and_the_ceiling() {
+    use super::FormFactor::{Desktop, Handheld};
+    use super::Promotion::{Ceiling, Floor, Step};
+    const GIB: u64 = 1 << 30;
+
+    // (leg, 2D cap, 3D cap, form factor, declared RAM, rung, why).
+    type Row = (
+        &'static str,
+        u32,
+        u32,
+        Option<FormFactor>,
+        Option<u64>,
+        Promotion,
+        &'static str,
+    );
+    const ROWS: [Row; 9] = [
+        (
+            "ipad + trackpad",
+            16384,
+            2048,
+            Some(Desktop),
+            None,
+            Floor,
+            "a trackpad reads Desktop and 16384 clears the 2D bar, so the 3D \
+             conjunct is the only thing holding a tablet at the floor",
+        ),
+        (
+            "chromebook",
+            8192,
+            2048,
+            Some(Desktop),
+            None,
+            Floor,
+            "below both bars; the form factor is never consulted at the floor",
+        ),
+        (
+            "phone in DeX",
+            16384,
+            2048,
+            Some(Desktop),
+            None,
+            Floor,
+            "a docked phone reads Desktop from its mouse, and the 3D conjunct \
+             holds it",
+        ),
+        (
+            "touch laptop + dGPU",
+            16384,
+            16384,
+            Some(Desktop),
+            None,
+            Ceiling,
+            "any-pointer: fine wins over a coarse touchscreen, and a \
+             desktop-class driver behind it earns the ceiling",
+        ),
+        (
+            "handheld reporting desktop-class caps",
+            16384,
+            16384,
+            Some(Handheld),
+            None,
+            Step,
+            "a coarse-only pointer holds a desktop-class report at the step",
+        ),
+        (
+            "desktop-class browser declaring 2 GiB",
+            16384,
+            16384,
+            Some(Desktop),
+            Some(2 * GIB),
+            Step,
+            "the declaration lowers the rung: 2 GiB is the handheld bucket",
+        ),
+        (
+            "desktop-class browser declaring 4 GiB",
+            16384,
+            16384,
+            Some(Desktop),
+            Some(4 * GIB),
+            Ceiling,
+            "a declaration above the handheld bucket raises nothing and lowers \
+             nothing",
+        ),
+        (
+            "handheld declaring 8 GiB",
+            16384,
+            16384,
+            Some(Handheld),
+            Some(8 * GIB),
+            Step,
+            "a declaration never raises: 8 GiB on a coarse-only pointer is \
+             still the step",
+        ),
+        (
+            "desktop-class browser, shape unclassified",
+            16384,
+            16384,
+            None,
+            None,
+            Step,
+            "an unclassified shape is not a desktop; the step is what the \
+             report alone earns",
+        ),
+    ];
+
+    let web = |two_d, three_d, form_factor, declared_ram_bytes| DeviceProfile {
+        adapter: AdapterCeilings {
+            max_texture_dimension_2d: two_d,
+            max_texture_dimension_3d: three_d,
+        },
+        form_factor,
+        declared_ram_bytes,
+        ..shipped_profile(BudgetLimits::WASM)
+    };
+
+    for (leg, two_d, three_d, form_factor, declared, rung, why) in ROWS {
+        let profile = web(two_d, three_d, form_factor, declared);
+        check_invariants(&profile, leg);
+        assert_eq!(resolve(&profile).promotion, rung, "{leg}: {why}");
+    }
+
+    // The step on this bracket is the mobile tier, and never above it.
+    let handheld = resolve(&web(16384, 16384, Some(Handheld), None));
+    assert_eq!(
+        handheld.grid_cells,
+        crate::constants::MOBILE_VOLUME_GRID_CELLS,
+        "a handheld reporting desktop-class caps was handed more than the \
+         budget handheld hardware already runs",
+    );
+
+    // The behaviour-preservation proof: field for field, the rung name excepted.
+    let shaped = resolve(&web(16384, 16384, Some(Desktop), None));
+    let unshaped = resolve(&web(16384, 16384, None, None));
+    assert_eq!(shaped.promotion, Ceiling);
+    assert_eq!(
+        unshaped,
+        Budgets {
+            promotion: Step,
+            ..shaped
+        },
+        "a desktop-class browser whose shape nobody classified resolved a \
+         value the same browser with a mouse does not",
+    );
+}
+
+/// The 3D texture cap an Apple GPU reports through WebGL2, in any browser. Not
+/// measured in this tree: the four rig legs were Mesa, NVIDIA, SwiftShader and
+/// ANGLE over NVIDIA. `None` until the adapter line from a Mac is pasted in;
+/// the test below refuses to run on it rather than guess.
+const APPLE_GPU_MAX_TEXTURE_DIMENSION_3D: Option<u32> = None;
+
+/// **A Mac in any browser resolves on its 3D cap, and the rows are here so the
+/// figure has somewhere to land.** Every Mac browser reads `Desktop` — a
+/// trackpad is a fine pointer — and Safari declares no memory, so the 3D
+/// conjunct alone decides between the floor and the ceiling; the step is not
+/// reachable from this table. Whether the conjunct holds every Mac browser at
+/// the floor is the open question the measurement answers.
+#[test]
+#[ignore = "MAX_3D_TEXTURE_SIZE unmeasured on Apple GPUs in this tree; U1"]
+fn a_mac_browser_resolves_on_its_own_3d_cap() {
+    let three_d = APPLE_GPU_MAX_TEXTURE_DIMENSION_3D.expect(
+        "APPLE_GPU_MAX_TEXTURE_DIMENSION_3D is still the placeholder: paste the \
+         measured MAX_3D_TEXTURE_SIZE, write the rung each row is owed, then \
+         drop the ignore",
+    );
+    for leg in [
+        "mac-safari-m-series",
+        "mac-firefox-m-series",
+        "mac-chrome-m-series",
+    ] {
+        let profile = DeviceProfile {
+            adapter: AdapterCeilings {
+                max_texture_dimension_2d: 16384,
+                max_texture_dimension_3d: three_d,
+            },
+            form_factor: Some(FormFactor::Desktop),
+            ..shipped_profile(BudgetLimits::WASM)
+        };
+        check_invariants(&profile, leg);
+        assert_ne!(
+            resolve(&profile).promotion,
+            Promotion::Step,
+            "{leg}: a desktop form factor with no declaration never lands on \
+             the step; the 3D conjunct alone decides",
+        );
     }
 }

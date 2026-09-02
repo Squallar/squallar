@@ -802,8 +802,8 @@ mod budget_agreement {
 
     use crate::budget_arms::shipped_profile;
     use squallar_device_profile::budget::{
-        AdapterCeilings, BudgetLimits, Budgets, DESKTOP_CLASS_REPORT, DeviceProfile, Promotion,
-        resolve,
+        AdapterCeilings, BudgetLimits, Budgets, DESKTOP_CLASS_REPORT, DeviceProfile, FormFactor,
+        Promotion, resolve,
     };
     use squallar_device_profile::quality::DeviceClass;
 
@@ -818,6 +818,9 @@ mod budget_agreement {
                 max_texture_dimension_2d: two_d,
                 max_texture_dimension_3d: three_d,
             },
+            // The ceiling wants the desktop form factor too; the rig's legs run with a
+            // mouse, and the step a shape-less browser takes is the same numbers.
+            form_factor: Some(FormFactor::Desktop),
             ..shipped_profile(BudgetLimits::WASM)
         };
         let floor = resolve(&web(
@@ -856,6 +859,9 @@ mod budget_agreement {
                     max_texture_dimension_2d: two_d,
                     max_texture_dimension_3d: three_d,
                 },
+                // Every machine in this table has a mouse: a build fact natively, pointer
+                // media on the web. The ceiling asks for it since the form factor is read.
+                form_factor: Some(FormFactor::Desktop),
                 ..shipped_profile(limits)
             };
             let b = resolve(&profile);
