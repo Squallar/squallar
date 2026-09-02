@@ -25,6 +25,11 @@ ran". Reading through means a pattern drift reddens the EXISTING Rust pins and
 this file at once, instead of silently producing a native row with empty
 fields.
 
+The readings only this half takes -- the app's surface line and its
+`overlay pictures:` line -- are the exceptions, spelled here one line each
+and pinned from the Rust side (`native_seed_pin_tests.rs`) against THIS file,
+for the same reason.
+
 ---- Two instrument facts this file is built around -----------------------
 
 1. `Hist` is FOUR BINS PER OCTAVE. A one-bin difference is 0-19%, and any
@@ -65,7 +70,6 @@ import json
 import math
 import os
 import re
-import struct
 import sys
 import unittest
 
@@ -364,14 +368,14 @@ def parse_hist(text):
 # The app's own report of the surface it resized to, `App::handle_resized`'s
 # `log::info!("Window resized to {}x{}", width, height)`.
 #
-# One of the two patterns in this file that is not `drive.py`'s, and it earns
-# that the same way `wgpu selected the ` does -- by being the only reading of a
-# quantity nothing else can supply. It is the ONE geometry readback that exists
-# on every platform: `xdotool` answers on X, System Events answers on macOS,
-# nothing answers on Wayland, and all three of those are the window manager's
-# opinion of a frame, while THIS is the surface the app actually allocated and
-# the surface `pane_picture_bytes` prices. So it is what the byte cross-check
-# is taken against, and the WM's answer is demoted to a second opinion.
+# One of the three patterns in this file that is not `drive.py`'s, and it
+# earns that the same way `wgpu selected the ` does -- by being the only reading
+# of a quantity nothing else can supply. It is the ONE geometry readback that
+# exists on every platform: `xdotool` answers on X, System Events answers on
+# macOS, nothing answers on Wayland, and all three of those are the window
+# manager's opinion of a frame, while THIS is the surface the app actually
+# allocated. So it is what the geometry check is taken against, and the WM's
+# answer is demoted to a second opinion.
 #
 # Pinned against the app's own formatter from the Rust side, in
 # `native_seed_pin_tests.rs`, exactly as `drive.py`'s patterns are -- because a
@@ -382,6 +386,32 @@ def parse_hist(text):
 # refused a leg whose window opened at exactly the requested size -- no resize
 # event, no line, no confirmable surface -- which is the CORRECT case.
 SURFACE_RE = re.compile(r"(?:Window resized to|Surface configured to) (\d+)x(\d+)")
+
+# The app's own report of the overlay picture it allocates for EACH pane:
+# `overlay pictures: n=<panes>, px=<w>x<h>[;<w>x<h>...], bytes=<sum>`
+# (`squallar_app::budget_telemetry::overlay_pictures_line`), said once a
+# telemetry period as a LEVEL. `px` is in pane-index order, physical pixels
+# (the DPR is inside them); `0x0` for a pane without a picture -- listed, not
+# skipped, so position IS the pane index -- and EMPTY at `n=0`: a scene with
+# no panes is a reading, not a period the scraper missed, so the empty list
+# is matched and parsed to `[]` rather than left to read as an absent line.
+# `bytes` is the sum of w*h*4 over the list. It is the figure the surface
+# check compares a bracket's uploads against. The third pattern of this
+# file's own, on `SURFACE_RE`'s terms: the harness used to MODEL this figure
+# from the surface and a 40-point top bar -- a model exact when written that
+# expired silently (see `surface_check`) -- so the quantity is read from the
+# only thing that knows it. Every group is mandatory; no match leaves the
+# family empty, which the row prints as UNCHECKED -- a binary older than the
+# line, never a zero-size picture.
+OVERLAY_PICTURES_RE = re.compile(r"overlay pictures: n=(\d+), px=((?:\d+x\d+(?:;\d+x\d+)*)?), bytes=(\d+)")
+
+
+def overlay_pictures_reading(m):
+    """An `OVERLAY_PICTURES_RE` match as `{"n", "px": [(w, h), ...], "bytes"}`."""
+    listed = m.group(2)
+    px = ([tuple(int(v) for v in item.split("x")) for item in listed.split(";")]
+          if listed else [])
+    return {"n": int(m.group(1)), "px": px, "bytes": int(m.group(3))}
 
 
 def app_surface(lines):
@@ -417,6 +447,7 @@ def scrape(lines, probes):
         "loop_state": [],
         "budget_state": [],
         "tile_cache": [],
+        "overlay_pictures": [],
         "segments": [],
         "begins": [],
         "loops": [],
@@ -474,6 +505,13 @@ def scrape(lines, probes):
         if m:
             g = m.groups()
             out["tile_cache"].append((idx, g[0], [int(x) for x in g[1:]]))
+        # `overlay pictures` is a LEVEL with a LIST in it -- every pane's
+        # picture size -- so it has its own arm and its own parser. No match
+        # leaves the family empty, which the surface check reads as UNCHECKED:
+        # a binary older than the line, never a zero-size picture.
+        m = OVERLAY_PICTURES_RE.search(line)
+        if m:
+            out["overlay_pictures"].append((idx, overlay_pictures_reading(m)))
         # `frame segments` is NOT one of them: its percentile groups are
         # `(\d+|none|over)`, and `over` is the top-bin clamp, which has no
         # upper edge and is not a number. Kept as text -- it is reported as
@@ -694,115 +732,6 @@ def cpu_liveness(before, after, wall_s):
 # ------------------------------------------------------------------ surface --
 
 
-def picture_bytes_for(w, h):
-    """The whole-picture overlay raster's size at a WxH surface, ONE pane.
-
-    `(W * 1.5) * ((H - 40) * 1.5) * 4` -- the 1.5 is OVERDRAW_FRACTION 0.25
-    spent on both sides, the 40 is the top bar in points, the 4 is RGBA.
-    Verified exact at three surfaces on 2026-08-31.
-
-    A scene with N panes rasters one picture PER PANE at the pane's own size,
-    so this is the one-pane case of `pane_picture_bytes`, and the two are
-    pinned equal at one pane. Pricing a six-pane leg with this figure marked
-    every multi-pane native row INVALID: 2,994,468 B/picture observed against
-    17,971,200 expected, 2026-09-02.
-    """
-    return int(w * 1.5) * int((h - 40) * 1.5) * 4
-
-
-# The grid the app lays N panes out in -- each entry is the number of columns
-# in that row. `PaneLayout::grid_for` (squallar-egui/src/pane.rs), the desktop
-# table; the one compact-width difference is two panes stacking.
-PANE_GRIDS = {1: [1], 2: [2], 3: [2, 1], 4: [2, 2], 5: [3, 2], 6: [3, 3]}
-MAX_PANES = 6
-# `WidthClass::Compact`: a content width under this stacks two panes.
-COMPACT_MAX_WIDTH = 600.0
-# The top bar in points, and the overdraw the texture plan spends on EACH side
-# of a pane (`OVERDRAW_FRACTION`, squallar-egui/src/overlay_cache.rs).
-TOP_BAR_POINTS = 40.0
-OVERDRAW_FRACTION = 0.25
-
-
-def _f32(x):
-    """`x` rounded to the nearest f32 -- what egui and the app compute in."""
-    return struct.unpack("f", struct.pack("f", x))[0]
-
-
-def pane_grid(w, panes):
-    """Columns per row for `panes` panes on a `w`-point-wide surface."""
-    panes = max(1, min(int(panes), MAX_PANES))
-    if w < COMPACT_MAX_WIDTH and panes == 2:
-        return [1, 1]
-    return list(PANE_GRIDS[panes])
-
-
-def pane_rects(w, h, panes):
-    """Every pane's `(width, height)` in points at a WxH surface, in f32.
-
-    `PaneLayout::pane_rect` restated: the map panel is the surface under the
-    top bar, rows split it by `1/rows`, a row's columns by `1/cols`, and a
-    pane is `Rect::from_min_size` of those -- so its width is `max.x - min.x`
-    after both were rounded to f32, which is how the app reads it back before
-    the 1.5x. There is NO gap between panes in this arithmetic: the dividers
-    are drag zones drawn over the maps afterwards. Six panes at 1920x1080 are
-    six 640x520 rects.
-    """
-    grid = pane_grid(w, panes)
-    width = _f32(float(w))
-    height = _f32(_f32(float(h)) - TOP_BAR_POINTS)
-    row_ratio = _f32(1.0 / len(grid))
-    out = []
-    row_y = TOP_BAR_POINTS
-    for cols in grid:
-        col_ratio = _f32(1.0 / cols)
-        row_h = _f32(height * row_ratio)
-        max_y = _f32(row_y + row_h)
-        col_x = 0.0
-        for _ in range(cols):
-            col_w = _f32(width * col_ratio)
-            min_x = _f32(width * col_x)
-            max_x = _f32(min_x + col_w)
-            out.append((_f32(max_x - min_x), _f32(max_y - row_y)))
-            col_x = _f32(col_x + col_ratio)
-        row_y = max_y
-    return out
-
-
-def _texels(pw, ph):
-    """`plan_overlay_texture` at one pixel per point: `(side * 1.5) as u32`."""
-    scale = _f32(1.0 + 2.0 * OVERDRAW_FRACTION)
-    return int(_f32(pw * scale)), int(_f32(ph * scale))
-
-
-def pane_picture_bytes(w, h, panes):
-    """Each pane's overlay picture in bytes at a WxH surface: one per pane,
-    `(pw * 1.5) as u32 * (ph * 1.5) as u32 * 4`."""
-    out = []
-    for pw, ph in pane_rects(w, h, panes):
-        tw, th = _texels(pw, ph)
-        out.append(tw * th * 4)
-    return out
-
-
-def mixture_tolerance(w, h, panes):
-    """How far a bracket's MEAN bytes/picture may sit from the pane figure.
-
-    Half a texel row plus half a texel column of the largest pane picture, in
-    bytes. The recorded six-pane leg (2026-09-02) averaged 2,994,468 B over
-    pictures whose panes are all 640x520 -- 732 B under the 2,995,200 every
-    one of them prices at -- so the bracket held a MINORITY of pictures a row
-    or a column short (about a fifth at one row of 3,840 B, or a quarter at
-    one column of 3,120 B). A minority one row and one column off moves the
-    mean by less than half of each; a majority -- or every picture one row
-    short, which is the top bar having moved -- is not a mixture and is
-    refused. Far under any structural error: the nearest common surfaces are
-    11% apart and pane counts 33% or more.
-    """
-    pw, ph = max(pane_rects(w, h, panes), key=lambda r: r[0] * r[1])
-    tw, th = _texels(pw, ph)
-    return 2 * (tw + th)
-
-
 def pane_count_of_seed(web_seed):
     """`pane_count` out of a web seed's `squallar.ui` JSON, 1 when unset.
 
@@ -832,56 +761,126 @@ def resolve_pane_count(args):
         )
 
 
-def _band(w, h, panes):
-    """`(lo, hi, tolerance)`: the pane figures' span and the mixture band."""
-    b = pane_picture_bytes(w, h, panes)
-    return min(b), max(b), mixture_tolerance(w, h, panes)
+
+def mixture_tolerance(px):
+    """How far a bracket's MEAN bytes/picture may sit from the reported figure.
+
+    Half a texel row plus half a texel column of the largest reported picture,
+    in bytes: `2 * (w + h)`. The bracket's pictures are not all the size the
+    app reports where the bracket closes -- a recorded six-pane bracket
+    averaged 732 B under its 2,995,200 B pane, a MINORITY of pictures one row
+    or one column short as the layout settled -- and a minority a row and a
+    column off moves the mean by less than half of each. A majority -- every
+    picture a row short, which is the layout having moved under the bracket
+    -- is not a mixture and is refused. Far under any structural error: the
+    next pane count is 33% or more away.
+    """
+    w, h = max(px, key=lambda p: p[0] * p[1])
+    return 2 * (w + h)
 
 
-def _in_band(observed, band):
-    lo, hi, tol = band
+def _in_band(observed, lo, hi, tol):
     return (lo - tol) <= observed <= (hi + tol)
 
 
-def surface_check(asked, achieved, pictures, picture_bytes, panes=1):
-    """Does the picture the app actually drew match the window it was given?
+def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None):
+    """Are the pictures the app uploaded the pictures it says it draws, at the
+    window it was given?
 
-    Geometry is READ BACK, never requested and trusted, and then checked
-    against the bytes -- because a window manager that silently ran a leg at
-    3440x1440 instead of 1920x1080 was caught by exact factorization of the
-    picture totals and by nothing else. A leg whose surface cannot be
-    confirmed is refused rather than reported.
+    The expected picture size is READ from the app, not modelled. The model
+    was `(W * 1.5) * ((H - 40) * 1.5) * 4` with 40 as "the top bar in points",
+    and it was EXACT when written -- verified to the byte at three surfaces
+    on 2026-08-31 -- because the bar then rested on its floor: 40 is
+    `MIN_BAR_HEIGHT`, `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, a minimum the
+    layout may sit on or above. Then the bar rose 3.33 points off it, with no
+    signal: at 1920x1080 a one-pane leg uploads 2880x1555 pictures
+    (17,913,600 B) where the model still said 2880x1560 (17,971,200 B), five
+    texel rows and 57,600 B on every picture, and every multi-pane row read
+    `** INVALID **` against a figure the app no longer produced. A floor used
+    as an equality holds exactly until content grows, then stops; and no
+    constant repairs that, because the bar's height is layout over content
+    and moves with DPI, font and width class, none of which the harness can
+    know. So the app says what it allocated -- `overlay pictures:`, one entry
+    per pane, physical pixels -- and the check compares the bracket's uploads
+    against THAT. What it still refuses is real: a bracket whose pictures are
+    not the size the app says it draws.
 
-    `panes` is how many panes the scene lays out. A multi-pane scene rasters
-    one picture PER PANE at the pane's own size, and `picture_bytes /
-    pictures` is a mean over all of them. Grids of one pane size (1, 2, 4, 6)
-    price to one figure; grids with two sizes (3, 5) price to a band the mean
-    must fall in, since which pane rastered how often is not in the log.
-    Either way the mean is allowed `mixture_tolerance` around the band.
+    Geometry is READ BACK, never requested and trusted: `achieved` is the
+    app's own surface line, and a leg run at another size than it asked for
+    is refused on it -- the catch for a window manager that silently ran legs
+    at 3440x1440. The bytes no longer factorise the surface (that was the
+    model); they confirm the uploads are the reported pictures. Their mean is
+    allowed `mixture_tolerance` around the span of the reported per-pane
+    figures -- one figure when every pane's picture is one size, a band when
+    the grid has two, since which pane rastered how often is not in the log.
+
+    `reported` is the parsed `overlay pictures:` reading, or None when the
+    log has none -- a binary older than the line. None is UNCHECKED, which is
+    neither INVALID nor a zero: the check did not run, and the row says so.
+    `panes` is how many panes the scene seeded, when known; the app's own
+    count is in the line, and the two disagreeing is a leg of another scene.
     """
     out = {
         "asked": "%dx%d" % asked if asked else None,
         "achieved": "%dx%d" % achieved if achieved else None,
         "geometry_met": bool(asked and achieved and asked == achieved),
         "panes": panes,
+        "reported": reported,
+        "unchecked": False,
+        "met": False,
     }
     if not achieved:
-        out["met"] = False
         out["why"] = "no window geometry was read back"
         return out
-    w, h = achieved
-    pane_bytes = pane_picture_bytes(w, h, panes)
-    lo, hi, tol = band = _band(w, h, panes)
-    out["pane_picture_bytes"] = pane_bytes
-    # One figure when every pane prices the same; None -- never a mean over
-    # panes, which describes no picture -- when the grid has two sizes.
+    if reported is None:
+        out["unchecked"] = True
+        out["why"] = (
+            "overlay pictures line absent: the app did not report its picture "
+            "sizes (a binary older than the line), so the bytes were checked "
+            "against nothing"
+        )
+        return out
+    px = reported["px"]
+    summed = sum(w * h * 4 for w, h in px)
+    # The line is held against itself before anything is held against it. A
+    # count that is not its list's length, or a sum that is not its sizes',
+    # is the instrument broken -- and a broken instrument must not print as a
+    # confirmed surface, which is what a lenient reader would make of it.
+    if reported["n"] != len(px) or summed != reported["bytes"]:
+        out["why"] = (
+            "the app's overlay pictures line contradicts itself: n=%d with %d "
+            "sizes listed, bytes=%d against %d summed from them"
+            % (reported["n"], len(px), reported["bytes"], summed)
+        )
+        return out
+    out["reported_panes"] = reported["n"]
+    out["reported_px"] = ";".join("%dx%d" % p for p in px)
+    out["reported_bytes"] = reported["bytes"]
+    out["panes_met"] = panes is None or panes == reported["n"]
+    if not out["panes_met"]:
+        out["why"] = (
+            "the scene seeds %d pane(s) and the app laid out %d: this row is "
+            "of another scene" % (panes, reported["n"])
+        )
+        return out
+    drawn_px = [p for p in px if p[0] and p[1]]  # a 0x0 pane has no picture
+    drawn = [w * h * 4 for w, h in drawn_px]
+    out["pane_picture_bytes"] = drawn
+    if not drawn:
+        out["why"] = "the app reports no pane with a picture (n=%d)" % reported["n"] + (
+            ", yet %d pictures were drawn in the bracket" % pictures if pictures else ""
+        )
+        return out
+    lo, hi = min(drawn), max(drawn)
+    tol = mixture_tolerance(drawn_px)
+    # One figure when every pane's picture is one size; None -- never a mean
+    # over panes, which describes no picture -- when there are two.
     out["expected_picture_bytes"] = lo if lo == hi else None
     out["expected_picture_bytes_lo"] = lo
     out["expected_picture_bytes_hi"] = hi
     out["expected_label"] = ("%d" % lo) if lo == hi else "%d..%d" % (lo, hi)
     out["tolerance_bytes"] = tol
     if not pictures:
-        out["met"] = False
         out["why"] = (
             "no pictures were drawn in the window, so the surface cannot be "
             "confirmed from the bytes"
@@ -889,56 +888,27 @@ def surface_check(asked, achieved, pictures, picture_bytes, panes=1):
         return out
     observed = picture_bytes / float(pictures)
     out["observed_picture_bytes"] = observed
-    out["bytes_met"] = _in_band(observed, band)
+    out["bytes_met"] = _in_band(observed, lo, hi, tol)
     if not out["bytes_met"]:
-        # Every reading the bytes DO fit, because more than one can: two
-        # panes at 2560x1600 price to exactly one pane at 1920x1080
-        # (1280x1560 -> 1920x2340 texels = 2880x1560). Naming only the first
-        # would send a lane after the wrong one.
-        fits = []
-        implied = implied_surface(observed, panes)
-        if implied:
-            fits.append("%s at %d pane(s)" % (implied, panes))
-        other = implied_panes(observed, achieved, panes)
-        if other:
-            fits.append("%s pane(s) at %s"
-                        % (" or ".join(str(k) for k in other), out["achieved"]))
+        # The ratio to the nearer reported figure names the shape of the
+        # miss: 6.000x is six panes' pictures being priced as one, 1.003x is
+        # a bar a few rows taller than something believed.
+        nearest = lo if abs(observed - lo) <= abs(observed - hi) else hi
         out["why"] = (
-            "picture bytes fit %s, not the %s at %d pane(s) the leg believes it "
-            "ran: %d B/picture observed against %s B expected (+-%d)"
-            % (" or ".join(fits) if fits else "no common surface or pane count",
-               out["achieved"], panes, observed, out["expected_label"], tol)
+            "picture bytes are not the pictures the app reports: %d B/picture "
+            "observed against %s B expected (+-%d) for %d pane(s) at %s -- "
+            "%.3fx the reported figure"
+            % (observed, out["expected_label"], tol, reported["n"],
+               out["reported_px"], observed / float(nearest))
+        )
+    elif not out["geometry_met"]:
+        out["why"] = (
+            "the app ran at %s, not the %s the leg asked for; its pictures "
+            "match that surface, so this row is of another measurement"
+            % (out["achieved"], out["asked"])
         )
     out["met"] = bool(out["geometry_met"] and out["bytes_met"])
     return out
-
-
-def implied_surface(observed_bytes, panes=1):
-    """A WxH whose `panes` pictures average `observed_bytes`, if a common one does.
-
-    Names the size the leg REALLY ran at instead of only saying the check
-    failed -- that is the difference between "something is wrong" and "the
-    window manager gave you 3440x1440".
-    """
-    common = [
-        (1920, 1080), (3440, 1440), (2560, 1440), (1280, 900), (1280, 800),
-        (1680, 1050), (1600, 900), (3840, 2160), (2560, 1600), (1440, 900),
-    ]
-    for w, h in common:
-        if _in_band(observed_bytes, _band(w, h, panes)):
-            return "%dx%d" % (w, h)
-    return None
-
-
-def implied_panes(observed_bytes, achieved, panes):
-    """Every pane count other than `panes` whose pictures at `achieved`
-    average `observed_bytes`. More than one is possible by construction: the
-    [3, 2] grid's top row is the [3, 3] grid's cell."""
-    w, h = achieved
-    return [
-        k for k in range(1, MAX_PANES + 1)
-        if k != panes and _in_band(observed_bytes, _band(w, h, k))
-    ]
 
 
 # -------------------------------------------------------------------- load --
@@ -1317,8 +1287,8 @@ def build_row(args, scraped, probes):
         invalid.append("liveness: %s" % live["verdict"])
 
     # The achieved surface is the APP's own reading where there is one: it is
-    # the surface `pane_picture_bytes` prices, and it is the only geometry
-    # readback that exists on every platform. The window manager's answer --
+    # the surface the geometry check is taken against, and it is the only
+    # geometry readback that exists on every platform. The window manager's answer --
     # which the runner supplies as `--achieved-geom` and which Wayland cannot
     # supply at all -- is kept as a second opinion and reported when the two
     # disagree, because a disagreement is a real finding (a scale factor, or a
@@ -1326,16 +1296,27 @@ def build_row(args, scraped, probes):
     wm_geom = args.achieved_geom
     app_geom = scraped["surface"]
     achieved = app_geom or wm_geom
-    # One picture per PANE, so the bytes are priced per pane. The count is
-    # the scene's, read out of the seed that laid the panes out rather than
-    # restated here; `--panes` is for a leg run against a seed the scene
-    # table does not know. A count nothing can supply leaves the surface
-    # unpriceable, and the row says so rather than pricing one pane.
+    # The pictures the bracket's bytes are held against are the ones the APP
+    # reports allocating, per pane, in its `overlay pictures:` line: the level
+    # in force where the bracket closes (the last said at or before its end),
+    # or, on a log too short to have said it by then, the last said at all. A
+    # log that never says it is UNCHECKED, not INVALID -- the check did not
+    # run. The scene's own pane count is read out of the seed that laid the
+    # panes out (`--panes` for a leg run against a seed the scene table does
+    # not know) and held against the app's; a seed nothing can read leaves
+    # that one comparison out and says so -- it no longer refuses the row,
+    # because the app's count is in the line.
+    reported_at = at_or_before(scraped["overlay_pictures"], end_idx)
+    if reported_at is None and scraped["overlay_pictures"]:
+        reported_at = scraped["overlay_pictures"][-1]
+    reported = reported_at[1] if reported_at else None
     panes, panes_source = resolve_pane_count(args)
     if panes is None:
-        invalid.append("pane count unknown: %s" % panes_source)
-    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, panes or 1)
+        notes.append("the seeded pane count was not held against the app's: %s"
+                     % panes_source)
+    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, reported, panes)
     surf["panes_source"] = panes_source if panes is not None else None
+    surf["reported_line"] = reported_at[0] if reported_at else None
     surf["source"] = "app" if app_geom else ("wm" if wm_geom else None)
     surf["wm_reported"] = ("%dx%d" % wm_geom) if wm_geom else None
     surf["app_reported"] = ("%dx%d" % app_geom) if app_geom else None
@@ -1347,10 +1328,19 @@ def build_row(args, scraped, probes):
             "either way the two targets' rows are only comparable on the "
             "app's" % (wm_geom + app_geom)
         )
-    if not surf["met"]:
-        invalid.append(
-            "surface not confirmed: %s" % surf.get("why", "geometry did not match")
-        )
+    # UNCHECKED is its own list, never an entry in `invalid`: a row whose
+    # bytes could not be checked is not a row that failed the check, and the
+    # two stamps are kept apart so a grep for either finds only its own.
+    unchecked = []
+    if surf["unchecked"]:
+        unchecked.append("surface bytes not checked: %s" % surf["why"])
+        if not surf["geometry_met"]:
+            invalid.append(
+                "surface not confirmed: the app ran at %s, not the %s the leg "
+                "asked for" % (surf["achieved"], surf["asked"])
+            )
+    elif not surf["met"]:
+        invalid.append("surface not confirmed: %s" % surf["why"])
 
     load = load_samples(args.load_file)
     quiet_max = args.quiet_max
@@ -1398,7 +1388,7 @@ def build_row(args, scraped, probes):
         "viewport": "%dx%d" % (aw, ah),
         "px": aw * ah,
         "dpr": args.dpr,
-        "cross": "yes" if surf["met"] else "no",
+        "cross": "yes" if surf["met"] else ("unchecked" if surf["unchecked"] else "no"),
         "hz": args.refresh or "?",
         "coi": "n/a",
         "panel": args.panel,
@@ -1438,6 +1428,7 @@ def build_row(args, scraped, probes):
         "throughput_interact_frames": throughput,
         "percentiles_clamped": clamped,
         "invalid": invalid,
+        "unchecked": unchecked,
         "notes": notes,
     }
 
@@ -1516,20 +1507,26 @@ def print_row(row):
             row["commit"],
             load.get("start", "?"), load.get("end", "?"), load.get("max", "?"),
             row["quiet"], row["position"],
-            "" if not row["invalid"] else "  ** INVALID **",
+            ("  ** INVALID **" if row["invalid"] else "")
+            + ("  ** UNCHECKED: overlay pictures line absent **"
+               if row.get("unchecked") else ""),
         )
     )
     s = row["surface"]
+    reported_panes = s.get("reported_panes", s.get("panes"))
     print(
-        "ROW   surface asked=%s achieved=%s (from the %s) panes=%s expected=%s "
-        "B/picture (+-%s) observed=%s B/picture -> %s"
+        "ROW   surface asked=%s achieved=%s (from the %s) panes=%s "
+        "app_pictures=%s expected=%s B/picture (+-%s) observed=%s B/picture -> %s"
         % (
             s.get("asked"), s.get("achieved"), s.get("source") or "?",
-            s.get("panes"), s.get("expected_label", s.get("expected_picture_bytes")),
+            reported_panes if reported_panes is not None else "?",
+            s.get("reported_px") or "absent",
+            s.get("expected_label", "-"),
             s.get("tolerance_bytes", "-"),
             ("%.0f" % s["observed_picture_bytes"])
             if s.get("observed_picture_bytes") is not None else "-",
-            "CONFIRMED" if s.get("met") else "REFUSED",
+            "UNCHECKED" if s.get("unchecked")
+            else ("CONFIRMED" if s.get("met") else "REFUSED"),
         )
     )
     print(
@@ -1618,6 +1615,8 @@ def print_row(row):
         print("ROW   gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)")
     for n in row["notes"]:
         print("ROW   NOTE: %s" % n)
+    for why in row.get("unchecked") or []:
+        print("ROW   UNCHECKED: %s" % why)
     for why in row["invalid"]:
         print("ROW   INVALID: %s" % why)
 
@@ -1928,142 +1927,270 @@ class DivergenceTests(unittest.TestCase):
         )
 
 
-class SurfaceTests(unittest.TestCase):
-    def test_the_three_verified_surfaces(self):
-        """Verified exact on 2026-08-31; see run_measure.sh's header."""
-        self.assertEqual(picture_bytes_for(1920, 1080), 17_971_200)
-        self.assertEqual(picture_bytes_for(1280, 779), 8_509_440)
-        self.assertEqual(picture_bytes_for(1248, 714), 7_570_368)
+# The app's `overlay pictures:` line, as a one-pane leg at 1920x1080 said it on
+# 2026-09-02 -- 2880x1555 is the picture that leg uploaded, five rows short of
+# the deleted model's 2880x1560 -- and as a six-pane leg at the same window is
+# expected to: six 960x777 pictures. The `bytes` are the sums, computed here,
+# and the sizes are what the check READS; nothing here prices a pane.
+ONE_PANE_PICTURE = (2880, 1555)
+ONE_PANE_PICTURE_BYTES = 2880 * 1555 * 4  # 17,913,600
+SIX_PANE_PICTURE = (960, 777)
+SIX_PANE_PICTURE_BYTES = 960 * 777 * 4  # 2,983,680
+OVERLAY_PICTURES_ONE = (
+    "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] overlay pictures: "
+    "n=1, px=2880x1555, bytes=17913600"
+)
+OVERLAY_PICTURES_SIX = (
+    "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] overlay pictures: "
+    "n=6, px=960x777;960x777;960x777;960x777;960x777;960x777, bytes=17902080"
+)
+# What the model said a 1920x1080 window's pictures were: one 2880x1560, or
+# six 960x780. Kept ONLY as the figures a leg must not be confirmed against.
+MODEL_ONE_PANE_BYTES = 17_971_200
+MODEL_SIX_PANE_BYTES = 2_995_200
+# The two literals the app's own pin (`squallar_app::budget_telemetry`) holds
+# its formatter to, VERBATIM: three panes with the middle one pictureless, and
+# a scene with no panes at all. A drift in either file reddens both boards.
+OVERLAY_PICTURES_PEER_PIN = "overlay pictures: n=3, px=2880x1555;0x0;1440x780, bytes=22406400"
+OVERLAY_PICTURES_NONE = "overlay pictures: n=0, px=, bytes=0"
 
-    def test_a_wrong_window_is_refused_and_named(self):
+
+def _reported(px):
+    """A parsed `overlay pictures:` reading for these pane pictures."""
+    return {"n": len(px), "px": list(px), "bytes": sum(w * h * 4 for w, h in px)}
+
+
+class SurfaceTests(unittest.TestCase):
+    def test_the_line_scrapes_into_its_own_arm_with_every_group_mandatory(self):
+        probes = compile_probes()
+        s = scrape([OVERLAY_PICTURES_ONE, OVERLAY_PICTURES_SIX], probes)
+        self.assertEqual(len(s["overlay_pictures"]), 2)
+        _idx, one = s["overlay_pictures"][0]
+        self.assertEqual(one, {"n": 1, "px": [(2880, 1555)], "bytes": 17_913_600})
+        _idx, six = s["overlay_pictures"][1]
+        self.assertEqual(six["n"], 6)
+        self.assertEqual(six["px"], [(960, 777)] * 6)
+        self.assertEqual(six["bytes"], 6 * SIX_PANE_PICTURE_BYTES)
+        self.assertEqual(six["bytes"], 17_902_080, "the fixture's sum is what it says")
+        for truncated in (
+            OVERLAY_PICTURES_SIX.rsplit(", bytes", 1)[0],
+            OVERLAY_PICTURES_SIX.replace(" px=960x777;", " px=;"),
+            OVERLAY_PICTURES_SIX.replace("n=6, ", ""),
+        ):
+            self.assertEqual(
+                scrape([truncated], probes)["overlay_pictures"], [],
+                "a line missing a group matched: every group is mandatory\n%s"
+                % truncated)
+
+    def test_the_apps_own_pinned_line_parses_pane_for_pane(self):
+        """The literal `squallar_app::budget_telemetry` pins its formatter to,
+        verbatim: three panes, the middle one without a picture. `0x0` is
+        kept at index 1 -- position IS the pane index -- and the app's
+        `bytes` is exactly what the check's self-consistency clause recomputes
+        over the list, the empty pane costing nothing."""
+        probes = compile_probes()
+        s = scrape([OVERLAY_PICTURES_PEER_PIN], probes)
+        self.assertEqual(len(s["overlay_pictures"]), 1)
+        _idx, r = s["overlay_pictures"][0]
+        self.assertEqual(r["n"], 3)
+        self.assertEqual(r["px"], [(2880, 1555), (0, 0), (1440, 780)])
+        self.assertEqual(r["bytes"], 22_406_400)
+        self.assertEqual(2880 * 1555 * 4 + 1440 * 780 * 4, 22_406_400)
+        lo, hi = 1440 * 780 * 4, 2880 * 1555 * 4
+        s = surface_check((1920, 1080), (1920, 1080), 10, (lo + hi) * 5, r, panes=3)
+        self.assertNotIn("contradicts", s.get("why", ""))
+        self.assertTrue(s["met"], s.get("why"))
+        self.assertEqual(s["pane_picture_bytes"], [hi, lo], "the 0x0 pane is not priced")
+        self.assertEqual(s["expected_label"], "%d..%d" % (lo, hi))
+
+    def test_a_scene_with_no_panes_is_a_reading_not_an_absent_line(self):
+        """The app prints `n=0, px=, bytes=0` for an empty scene rather than
+        nothing -- its own pin says why: a line that vanished is
+        indistinguishable from a period the scraper missed. An arm that
+        rejected the empty list would read that period as UNCHECKED; it
+        parses to `[]`, and the row is refused for having no picture to
+        confirm, which is what it has."""
+        probes = compile_probes()
+        s = scrape([OVERLAY_PICTURES_NONE], probes)
+        self.assertEqual(len(s["overlay_pictures"]), 1)
+        _idx, r = s["overlay_pictures"][0]
+        self.assertEqual(r, {"n": 0, "px": [], "bytes": 0})
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0, r, panes=None)
+        self.assertFalse(s["unchecked"], "a present line is never absent")
+        self.assertFalse(s["met"])
+        self.assertIn("no pane with a picture (n=0)", s["why"])
+
+    def test_a_matching_surface_is_confirmed(self):
+        s = surface_check((1920, 1080), (1920, 1080), 7, ONE_PANE_PICTURE_BYTES * 7,
+                          _reported([ONE_PANE_PICTURE]), panes=1)
+        self.assertTrue(s["met"], s.get("why"))
+        self.assertFalse(s["unchecked"])
+        self.assertEqual(s["expected_picture_bytes"], 17_913_600)
+        self.assertEqual(s["tolerance_bytes"], 2 * (2880 + 1555),
+                         "half a texel row plus half a texel column, in bytes")
+        self.assertEqual(s["reported_px"], "2880x1555")
+
+    def test_the_forty_point_model_figure_is_refused_on_the_leg_that_exposed_it(self):
+        """2026-09-02: a one-pane leg at 1920x1080 uploaded 2880x1555 pictures
+        and read INVALID against the model's 2880x1560. Read the other way --
+        the app reporting 2880x1555 while the uploads were the model's size --
+        the check refuses just the same: 57,600 B a picture is six times the
+        8,870 B tolerance, and the refusal names the ratio."""
+        s = surface_check((1920, 1080), (1920, 1080), 12, MODEL_ONE_PANE_BYTES * 12,
+                          _reported([ONE_PANE_PICTURE]), panes=1)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["bytes_met"])
+        self.assertGreater(MODEL_ONE_PANE_BYTES - ONE_PANE_PICTURE_BYTES,
+                           s["tolerance_bytes"])
+        self.assertIn("1.003x", s["why"], s["why"])
+        self.assertIn("2880x1555", s["why"], s["why"])
+
+    def test_an_absent_line_is_unchecked_which_is_not_refused(self):
+        """A binary older than the line reports nothing to check against. That
+        is the check not running, and it is stamped as such -- never as the
+        bytes having failed, and never as a zero-size picture."""
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          None, panes=1)
+        self.assertTrue(s["unchecked"])
+        self.assertFalse(s["met"])
+        self.assertIn("absent", s["why"])
+        self.assertNotIn("expected_picture_bytes", s)
+        self.assertNotIn("observed_picture_bytes", s)
+
+    def test_geometry_alone_does_not_confirm(self):
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0,
+                          _reported([ONE_PANE_PICTURE]), panes=1)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["unchecked"])
+        self.assertIn("no pictures were drawn", s["why"])
+
+    def test_a_wrong_window_is_refused_on_the_apps_own_surface(self):
         """The failure that actually happened: a title-substring `wmctrl -r`
-        ran legs at 3440x1440 while the leg believed it asked for 1920x1080."""
-        real = picture_bytes_for(3440, 1440)
-        s = surface_check((1920, 1080), (1920, 1080), 10, real * 10)
+        ran legs at 3440x1440 while the leg believed it asked for 1920x1080.
+        The app's surface line says 3440x1440; the pictures match THAT surface
+        and the row is refused for the reason it deserves, on geometry."""
+        big = (5160, 2835)
+        s = surface_check((1920, 1080), (3440, 1440), 10, 5160 * 2835 * 4 * 10,
+                          _reported([big]), panes=1)
+        self.assertTrue(s["bytes_met"], "the uploads ARE the reported pictures")
+        self.assertFalse(s["geometry_met"])
         self.assertFalse(s["met"])
         self.assertIn("3440x1440", s["why"])
 
-    def test_a_matching_surface_is_confirmed(self):
-        b = picture_bytes_for(1920, 1080)
-        s = surface_check((1920, 1080), (1920, 1080), 7, b * 7)
-        self.assertTrue(s["met"])
-
-    def test_geometry_alone_does_not_confirm(self):
-        s = surface_check((1920, 1080), (1920, 1080), 0, 0)
-        self.assertFalse(s["met"])
-
-    def test_one_pane_is_the_whole_picture_formula_byte_for_byte(self):
-        """The single-pane expectation did not move: `pane_picture_bytes` at
-        one pane IS `picture_bytes_for`, at every surface swept. Ratios of
-        1.0 and a 1.5x of an integer are exact in f32, so the two agree to
-        the byte rather than to a tolerance."""
-        for w in range(320, 4000, 13):
-            for h in range(240, 2400, 17):
-                self.assertEqual(
-                    pane_picture_bytes(w, h, 1), [picture_bytes_for(w, h)],
-                    "one pane at %dx%d is the whole %dx%d panel, so "
-                    "int(%d*1.5)*int(%d*1.5)*4 must be the one-picture formula"
-                    % (w, h, w, h - 40, w, h - 40))
-        self.assertEqual(pane_picture_bytes(1920, 1080, 1), [17_971_200])
-
-    def test_six_panes_at_1920x1080_are_six_equal_pictures_with_no_chrome(self):
-        """Six panes are a [3, 3] grid of the 1920x1040 panel: 1920/3 = 640
-        and 1040/2 = 520 exactly, so every pane prices at 960*780*4 =
-        2,995,200 B -- which IS 17,971,200 / 6, because the pane rects carry
-        no gap (the dividers are drag zones drawn over the maps). So the
-        recorded 732 B residual is not chrome between panes; it is a mixture
-        of picture sizes inside the bracket, and `mixture_tolerance` is what
-        admits it."""
-        self.assertEqual(
-            pane_rects(1920, 1080, 6), [(640.0, 520.0)] * 6,
-            "1920/3 = 640 wide, (1080-40)/2 = 520 tall, all six")
-        self.assertEqual(
-            pane_picture_bytes(1920, 1080, 6), [2_995_200] * 6,
-            "640*1.5 = 960 by 520*1.5 = 780 texels, *4 = 2,995,200 B a pane")
-        self.assertEqual(2_995_200 * 6, picture_bytes_for(1920, 1080),
-                         "six panes with no gap sum to the one-picture figure")
-
-    def test_the_recorded_six_pane_mean_is_confirmed_and_the_one_picture_figure_is_not(self):
+    def test_the_recorded_six_pane_mean_is_inside_the_mixture_tolerance(self):
         """2026-09-02: a six-pane leg at 1920x1080 averaged 2,994,468 B a
-        picture and read INVALID against 17,971,200. Priced per pane it is
-        732 B under 2,995,200 -- inside half a row (960*4/2 = 1,920 B) plus
-        half a column (780*4/2 = 1,560 B) = 3,480 B -- and CONFIRMED. The
-        one-picture figure is refused on the same bytes, and the refusal
-        names the pane count the bytes do fit."""
+        picture over panes the app allocated 960x780 pictures for -- 732 B
+        under, a minority of pictures one row or one column short -- and the
+        tolerance, half a row (960*4/2 = 1,920 B) plus half a column
+        (780*4/2 = 1,560 B) = 3,480 B, admits it. The one-picture figure the
+        same leg was once priced at is refused on the same reading, and the
+        refusal names the shape of the miss: 6.000x."""
+        six = [(960, 780)] * 6
         n = 21
-        s = surface_check((1920, 1080), (1920, 1080), n, 2_994_468 * n, panes=6)
+        s = surface_check((1920, 1080), (1920, 1080), n, 2_994_468 * n,
+                          _reported(six), panes=6)
         self.assertEqual(s["expected_picture_bytes"], 2_995_200)
         self.assertEqual(s["tolerance_bytes"], 3_480, "2 * (960 + 780)")
         self.assertTrue(s["bytes_met"] and s["met"], s.get("why"))
-        one = surface_check((1920, 1080), (1920, 1080), n, 2_994_468 * n)
+        one = surface_check((1920, 1080), (1920, 1080), n, MODEL_ONE_PANE_BYTES * n,
+                            _reported(six), panes=6)
         self.assertFalse(one["met"])
-        self.assertIn(
-            "6 pane", one["why"],
-            "the old one-picture expectation must say the bytes are six "
-            "panes' worth, not merely that they mismatch: %s" % one["why"])
-        six = surface_check((1920, 1080), (1920, 1080), n, 17_971_200 * n, panes=6)
-        self.assertFalse(six["met"])
-        self.assertIn("1 pane", six["why"], six["why"])
+        self.assertIn("6.000x", one["why"], one["why"])
 
     def test_a_majority_at_a_neighbouring_size_is_not_a_mixture(self):
-        """Every picture one texel row short (960x779) is 3,840 B under the
-        pane figure -- more than the 3,480 B band. That is the top bar having
-        grown a point, not a few pictures off, and it is refused so the row
-        says so instead of averaging it away. A sixth of the pictures at that
-        size (640 B off the mean) is inside the band."""
+        """Every picture one texel row short of the reported 960x780 is 3,840
+        B under -- more than the 3,480 B band. That is the layout having moved
+        under the bracket, not a few pictures off, and it is refused so the
+        row says so instead of averaging it away. A sixth of the pictures at
+        that size (640 B off the mean) is inside the band."""
+        six = _reported([(960, 780)] * 6)
         short = 960 * 779 * 4
-        s = surface_check((1920, 1080), (1920, 1080), 12, short * 12, panes=6)
+        s = surface_check((1920, 1080), (1920, 1080), 12, short * 12, six, panes=6)
         self.assertFalse(s["bytes_met"], "3,840 B short on every picture")
         mixed = 10 * 2_995_200 + 2 * short
-        s = surface_check((1920, 1080), (1920, 1080), 12, mixed, panes=6)
+        s = surface_check((1920, 1080), (1920, 1080), 12, mixed, six, panes=6)
         self.assertTrue(s["bytes_met"], "2 of 12 a row short: mean 640 B under")
 
-    def test_two_and_four_panes_price_at_their_own_rects(self):
-        """Two panes are [2]: each 960x1040 -> 1440*1560*4 = 8,985,600 B.
-        Four are [2, 2]: each 960x520 -> 1440*780*4 = 4,492,800 B. Both
-        confirm their own figure and refuse the one-picture one."""
-        self.assertEqual(pane_rects(1920, 1080, 2), [(960.0, 1040.0)] * 2)
-        self.assertEqual(pane_picture_bytes(1920, 1080, 2), [8_985_600] * 2,
-                         "1920/2 = 960 -> 1440 texels; 1040 -> 1560; *4")
-        self.assertEqual(pane_rects(1920, 1080, 4), [(960.0, 520.0)] * 4)
-        self.assertEqual(pane_picture_bytes(1920, 1080, 4), [4_492_800] * 4,
-                         "1920/2 = 960 -> 1440 texels; 1040/2 = 520 -> 780; *4")
-        for panes, b, th in ((2, 8_985_600, 1560), (4, 4_492_800, 780)):
-            s = surface_check((1920, 1080), (1920, 1080), 9, b * 9, panes=panes)
-            self.assertTrue(s["met"], s.get("why"))
-            self.assertEqual(s["tolerance_bytes"], 2 * (1440 + th),
-                             "half a row plus half a column of a 1440x%d picture" % th)
-            one = surface_check((1920, 1080), (1920, 1080), 9, 17_971_200 * 9, panes=panes)
-            self.assertFalse(one["met"])
-            self.assertIn("1 pane", one["why"], one["why"])
-
-    def test_three_panes_price_to_a_band(self):
-        """[2, 1]: two 960x520 panes (4,492,800 B) over one 1920x520 pane
-        (8,985,600 B). Which pane rastered how often is not in the log, so
-        the mean is confirmed anywhere in the band and refused outside it;
-        no single `expected_picture_bytes` is printed, because a mean over
-        two pane sizes describes no picture."""
-        self.assertEqual(pane_picture_bytes(1920, 1080, 3),
-                         [4_492_800, 4_492_800, 8_985_600])
-        s = surface_check((1920, 1080), (1920, 1080), 10, 6_000_000 * 10, panes=3)
+    def test_two_reported_sizes_price_to_a_band(self):
+        """A [2, 1] grid reports two 1440x777 pictures over one 2880x777.
+        Which pane rastered how often is not in the log, so the mean is
+        confirmed anywhere in the band and refused outside it; no single
+        `expected_picture_bytes` is printed, because a mean over two pane
+        sizes describes no picture."""
+        three = _reported([(1440, 777), (1440, 777), (2880, 777)])
+        lo, hi = 1440 * 777 * 4, 2880 * 777 * 4
+        s = surface_check((1920, 1080), (1920, 1080), 10, 6_000_000 * 10, three, panes=3)
         self.assertIsNone(s["expected_picture_bytes"])
-        self.assertEqual(s["expected_label"], "4492800..8985600")
+        self.assertEqual(s["expected_label"], "%d..%d" % (lo, hi))
+        self.assertEqual(s["tolerance_bytes"], 2 * (2880 + 777), "of the LARGEST picture")
         self.assertTrue(s["met"], s.get("why"))
-        for outside in (17_971_200, 2_995_200):
-            s = surface_check((1920, 1080), (1920, 1080), 10, outside * 10, panes=3)
-            self.assertFalse(s["met"], "%d is outside the three-pane band" % outside)
+        for outside in (MODEL_ONE_PANE_BYTES, SIX_PANE_PICTURE_BYTES):
+            s = surface_check((1920, 1080), (1920, 1080), 10, outside * 10, three, panes=3)
+            self.assertFalse(s["met"], "%d is outside the band" % outside)
 
-    def test_the_arithmetic_is_f32_and_the_band_covers_its_last_ulp(self):
-        """1280x779, six panes: 1280/3 is not exact and the app adds in f32,
-        so the analyser's pane widths come out an ulp apart and the six
-        pictures in two sizes one texel column apart. The band is half a row
-        plus half a column -- wider than that column -- so whichever side
-        egui's own additions land on, the app's figure is inside it."""
-        b = pane_picture_bytes(1280, 779, 6)
-        lo, hi = min(b), max(b)
-        self.assertNotEqual(lo, hi, "thirds of 1280 are not exact in f32")
-        self.assertEqual(hi - lo, 554 * 4, "one texel column of a 554-row picture")
-        self.assertGreater(mixture_tolerance(1280, 779, 6), hi - lo)
+    def test_a_mixture_of_reported_sizes_within_tolerance_is_confirmed(self):
+        """Six panes whose pictures the app reports in two sizes one texel row
+        apart -- thirds and halves of a surface are not exact, and egui's f32
+        additions land a pane on either side. The band spans both sizes plus
+        the tolerance, so a mean anywhere between them is confirmed, and one
+        past the band by a byte is not."""
+        px = [(960, 777)] * 3 + [(960, 778)] * 3
+        rep = _reported(px)
+        lo, hi = 960 * 777 * 4, 960 * 778 * 4
+        self.assertEqual(hi - lo, 3_840, "one texel row of a 960-wide picture")
+        tol = 2 * (960 + 778)
+        for mean in (lo, (lo + hi) // 2, hi, lo - tol, hi + tol):
+            s = surface_check((1920, 1080), (1920, 1080), 12, mean * 12, rep, panes=6)
+            self.assertTrue(s["met"], "mean %d: %s" % (mean, s.get("why")))
+            self.assertEqual(s["tolerance_bytes"], tol)
+        for mean in (lo - tol - 12, hi + tol + 12):
+            s = surface_check((1920, 1080), (1920, 1080), 12, mean * 12, rep, panes=6)
+            self.assertFalse(s["met"], "mean %d is a byte past the band" % mean)
+
+    def test_a_self_contradicting_line_is_refused_not_trusted(self):
+        """A count that is not its list's length, or a sum that is not its
+        sizes', is the instrument broken; a lenient reader would confirm a
+        surface on it."""
+        bad_n = {"n": 6, "px": [(960, 777)] * 5, "bytes": 5 * SIX_PANE_PICTURE_BYTES}
+        s = surface_check((1920, 1080), (1920, 1080), 10, SIX_PANE_PICTURE_BYTES * 10,
+                          bad_n, panes=None)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["unchecked"])
+        self.assertIn("contradicts itself", s["why"])
+        bad_sum = {"n": 1, "px": [ONE_PANE_PICTURE], "bytes": ONE_PANE_PICTURE_BYTES + 4}
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          bad_sum, panes=1)
+        self.assertFalse(s["met"])
+        self.assertIn("contradicts itself", s["why"])
+
+    def test_the_seeded_pane_count_is_held_against_the_apps(self):
+        """Scene C seeds six panes. An app that laid out one ran another
+        scene, and the row says so; a seed nothing could read (None) leaves
+        that comparison out rather than refusing the row."""
+        one = _reported([ONE_PANE_PICTURE])
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          one, panes=6)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["panes_met"])
+        self.assertIn("another scene", s["why"])
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          one, panes=None)
+        self.assertTrue(s["met"], s.get("why"))
+
+    def test_a_pane_without_a_picture_is_not_priced(self):
+        """`0x0` is a pane with nothing to raster; it is not a picture the
+        bracket's mean can contain. Every pane empty with pictures drawn is a
+        contradiction between two of the app's own lines, and refused."""
+        two = _reported([ONE_PANE_PICTURE, (0, 0)])
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          two, panes=2)
+        self.assertTrue(s["met"], s.get("why"))
+        self.assertEqual(s["pane_picture_bytes"], [ONE_PANE_PICTURE_BYTES])
+        empty = _reported([(0, 0), (0, 0)])
+        s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
+                          empty, panes=2)
+        self.assertFalse(s["met"])
+        self.assertIn("no pane with a picture", s["why"])
 
     def test_the_pane_count_comes_from_the_scene_seed(self):
         """Scene C seeds six panes and scene A one; the count is read out of
@@ -2073,11 +2200,151 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(scene_pane_count("A"), 1)
         self.assertEqual(pane_count_of_seed({"squallar.ui": "{}"}), 1)
 
-    def test_a_compact_width_stacks_two_panes(self):
-        """`grid_for`'s one compact-width difference."""
-        self.assertEqual(pane_grid(599, 2), [1, 1])
-        self.assertEqual(pane_grid(600, 2), [2])
-        self.assertEqual(pane_grid(1920, 7), [3, 3], "clamped, not flattened")
+
+def _hist_first_bin(n):
+    counts = [0] * SLOTS
+    counts[0] = n
+    return ",".join(str(c) for c in counts)
+
+
+def _leg_log(per_picture, pictures_line):
+    """A whole leg's log, four loops, ten pictures a loop at `per_picture` B.
+
+    `pictures_line` is the app's `overlay pictures:` sentence, or None for a
+    binary older than it. Skip 2, window 2: the bracket is loops 2..4, and
+    across it the app drew 20 pictures whose mean is exactly `per_picture`.
+    """
+    t = "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] "
+    lines = [
+        t + "Surface configured to 1920x1080",
+        t + "wgpu selected the Vulkan backend: NVIDIA GeForce RTX 3090 "
+            "(DiscreteGpu), driver NVIDIA 610.57.04",
+        t + "gesture script pan-zoom-2d begin",
+    ]
+    for k in range(1, 5):
+        n = 100 * k
+        lines.append(
+            t + "frame service (interact): n=%d, p50=63 us, p90=63 us, p99=63 us, "
+            "hist=%s" % (n, _hist_first_bin(n)))
+        pics = 10 * k
+        lines.append(
+            t + "overlay rasters: %d dispatched, %d arrived, %d pictures of %d B, "
+            "%d inked, %d shown, 0 promoted, 0 dropped, 0 superseded, 0 cancelled"
+            % (pics, pics, pics, pics * per_picture, pics, pics))
+        if k == 4 and pictures_line:
+            lines.append(pictures_line)
+        lines.append(t + "gesture script pan-zoom-2d loop complete: 50 frames")
+    lines.append(
+        t + "frame service (interact): n=500, p50=63 us, p90=63 us, p99=63 us, "
+        "hist=%s" % _hist_first_bin(500))
+    return lines
+
+
+def _leg_args(load_file, panes, log="", json_out=""):
+    return argparse.Namespace(
+        log=log, scene="A", script="pan-zoom-2d", commit="deadbeef",
+        asked_geom=(1920, 1080), achieved_geom=None, panes=panes, dpr="1",
+        refresh="60", adapter="unknown", panel="off", position="p1(a)",
+        load_file=load_file, quiet_max=8.0, skip_loops=2, window_loops=2,
+        platform="linux", degraded="", json=json_out,
+    )
+
+
+class RowVerdictTests(unittest.TestCase):
+    """The stamps, at the layer they are printed: a whole log through
+    `scrape`, `build_row` and `print_row`. A quiet, live, bracketed leg, so the
+    only thing that can stamp the row is the surface check."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, per_picture, pictures_line, panes):
+        lines = _leg_log(per_picture, pictures_line)
+        row = build_row(_leg_args(self.load, panes), scrape(lines, self.probes), self.probes)
+        head = _capture(lambda: print_row(row)).splitlines()
+        return row, head[0], "\n".join(head)
+
+    def test_the_leg_fixture_is_quiet_live_and_bracketed(self):
+        row, _first, _text = self._row(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 1)
+        self.assertEqual(row["quiet"], "yes", row["quiet_verdict"]["why"])
+        self.assertTrue(row["liveness"]["ok"], row["liveness"]["verdict"])
+        self.assertEqual(row["window_basis"], "2 whole loops, 2 skipped")
+        self.assertEqual(row["pictures"], 20)
+
+    def test_an_absent_line_stamps_unchecked_and_not_invalid(self):
+        row, first, text = self._row(ONE_PANE_PICTURE_BYTES, None, 1)
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(len(row["unchecked"]), 1)
+        self.assertEqual(row["cross"], "unchecked")
+        self.assertIn("** UNCHECKED: overlay pictures line absent **", first)
+        self.assertNotIn("INVALID", first)
+        self.assertIn("ROW   UNCHECKED: surface bytes not checked", text)
+        self.assertNotIn("ROW   INVALID", text)
+        self.assertIn("app_pictures=absent", text)
+        self.assertIn("-> UNCHECKED", text)
+
+    def test_uploads_matching_the_reported_pictures_stamp_nothing(self):
+        row, first, text = self._row(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 1)
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(row["unchecked"], [])
+        self.assertEqual(row["cross"], "yes")
+        self.assertNotIn("**", first, first)
+        self.assertIn("app_pictures=2880x1555 expected=17913600 B/picture (+-8870) "
+                      "observed=17913600 B/picture -> CONFIRMED", text)
+
+    def test_uploads_off_the_reported_pictures_stamp_invalid_and_not_unchecked(self):
+        row, first, text = self._row(MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 1)
+        self.assertEqual(len(row["invalid"]), 1, row["invalid"])
+        self.assertEqual(row["unchecked"], [])
+        self.assertEqual(row["cross"], "no")
+        self.assertIn("** INVALID **", first)
+        self.assertNotIn("UNCHECKED", first)
+        self.assertIn("ROW   INVALID: surface not confirmed: picture bytes are not the "
+                      "pictures the app reports", text)
+        self.assertNotIn("ROW   UNCHECKED", text)
+
+    def test_a_six_pane_leg_whose_uploads_match_its_six_pictures_is_valid(self):
+        """The row every scene C/D leg printed INVALID: six panes, priced by
+        the model as one picture. Read from the app it is valid."""
+        row, first, text = self._row(SIX_PANE_PICTURE_BYTES, OVERLAY_PICTURES_SIX, 6)
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(row["unchecked"], [])
+        self.assertEqual(row["cross"], "yes")
+        self.assertNotIn("**", first, first)
+        self.assertIn("panes=6 app_pictures=960x777;960x777;960x777;960x777;960x777;"
+                      "960x777 expected=2983680 B/picture (+-3474)", text)
+        self.assertIn("-> CONFIRMED", text)
+
+    def test_a_six_pane_leg_priced_as_one_picture_is_what_was_refused(self):
+        """And the old failure, spelled forwards: uploads of six-pane pictures
+        against a one-picture expectation are refused, naming 6.0x."""
+        row, first, _text = self._row(SIX_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 6)
+        self.assertIn("** INVALID **", first)
+        self.assertIn("another scene", row["invalid"][0],
+                      "the seeded six against the app's one is caught first")
+
+    def test_the_analyser_exits_zero_on_unchecked_and_one_on_invalid(self):
+        """`run_measure_native.sh` takes the exit code as the leg's verdict."""
+        for per_picture, line, want in (
+            (ONE_PANE_PICTURE_BYTES, None, 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0),
+            (MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 1),
+        ):
+            log = os.path.join(self._tmp.name, "leg.log")
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(_leg_log(per_picture, line)) + "\n")
+            rc = [None]
+            _capture(lambda: rc.__setitem__(0, cmd_analyze(_leg_args(self.load, 1, log))))
+            self.assertEqual(rc[0], want, "line=%r per_picture=%d" % (line, per_picture))
 
 
 class WindowTests(unittest.TestCase):
@@ -2298,6 +2565,23 @@ class SharedFormatTests(unittest.TestCase):
         text = _capture(lambda: print_row(row))
         self.assertIn("tile cache (base): asks=1 restyle_asks=2 refetch_after_eviction=3", text)
         self.assertIn("parsed=13", text)
+
+    def test_the_two_stamps_are_distinct_and_each_greppable(self):
+        """`** INVALID **` and `** UNCHECKED: ... **` never stand in for each
+        other: a row whose bytes could not be checked did not fail the check,
+        and a grep for either word finds only its own rows."""
+        text = _capture(lambda: print_row(_fixture_row(reported=None)))
+        first = text.splitlines()[0]
+        self.assertIn("** UNCHECKED: overlay pictures line absent **", first)
+        self.assertNotIn("INVALID", text)
+        self.assertIn("cross=unchecked", first)
+        self.assertIn("ROW   UNCHECKED: surface bytes not checked: overlay pictures "
+                      "line absent", text)
+        text = _capture(lambda: print_row(_fixture_row(reported="six", panes=6)))
+        self.assertNotIn("**", text.splitlines()[0])
+        self.assertIn("cross=yes", text)
+        self.assertIn("panes=6 app_pictures=960x777;", text)
+        self.assertIn("-> CONFIRMED", text)
 
     def test_a_clamped_leg_is_told_to_quote_the_count(self):
         row = _fixture_row(clamp=True)
@@ -2585,8 +2869,8 @@ class AppSurfaceTests(unittest.TestCase):
             "so the runner refuses the leg that got the geometry right")
         # And the byte check the refusal was standing in front of agrees.
         self.assertTrue(
-            surface_check((1920, 1080), (1920, 1080), 8,
-                          picture_bytes_for(1920, 1080) * 8)["met"])
+            surface_check((1920, 1080), (1920, 1080), 8, ONE_PANE_PICTURE_BYTES * 8,
+                          _reported([ONE_PANE_PICTURE]), panes=1)["met"])
 
     def test_a_later_resize_supersedes_the_startup_line(self):
         """Two sentences, one answer: newest wins. Were the startup line to
@@ -2599,21 +2883,25 @@ class AppSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(app_surface(lines), (1920, 1080))
 
-    def test_the_app_line_is_what_the_byte_check_is_taken_against(self):
+    def test_the_app_line_is_what_the_geometry_check_is_taken_against(self):
         """The window manager says 1920x1080 and the app allocated 3440x1440.
-        Trusting the WM confirms a leg that ran at another size -- the exact
-        failure a title-matching `wmctrl -r` produced."""
-        real = picture_bytes_for(3440, 1440)
-        wm = surface_check((1920, 1080), (1920, 1080), 10, real * 10)
-        app = surface_check((1920, 1080), (3440, 1440), 10, real * 10)
-        self.assertFalse(wm["met"])
+        Trusting the WM would confirm a leg that ran at another size -- the
+        exact failure a title-matching `wmctrl -r` produced -- and the bytes
+        can no longer catch it on their own: the picture is read from the
+        app, not factorised from a surface, so BOTH sides of the byte check
+        are the app's. The catch is the app's own surface line, which is why
+        it is the achieved geometry whenever the log has one."""
+        real = _reported([(5160, 2835)])
+        app = surface_check((1920, 1080), (3440, 1440), 10, 5160 * 2835 * 4 * 10, real, 1)
         self.assertFalse(app["met"])
+        self.assertFalse(app["geometry_met"])
         self.assertTrue(
             app["bytes_met"],
             "checked against the app's own surface the bytes agree exactly, "
             "so the leg is refused for the reason it deserves -- it ran at "
             "the wrong size -- rather than for an unexplained byte mismatch",
         )
+        self.assertIn("3440x1440", app["why"])
 
 
 class GateSetTests(unittest.TestCase):
@@ -2659,8 +2947,16 @@ def _capture(fn):
     return buf.getvalue()
 
 
-def _fixture_row(clamp=False):
-    b = picture_bytes_for(1920, 1080)
+def _fixture_row(clamp=False, panes=1, reported="one"):
+    """A printed row's dict. `reported` is "one" or "six" for the app's line
+    at that pane count, or None for a log without it."""
+    if reported == "six":
+        rep, b = _reported([SIX_PANE_PICTURE] * 6), SIX_PANE_PICTURE_BYTES
+    elif reported == "one":
+        rep, b = _reported([ONE_PANE_PICTURE]), ONE_PANE_PICTURE_BYTES
+    else:
+        rep, b = None, ONE_PANE_PICTURE_BYTES
+    surf = surface_check((1920, 1080), (1920, 1080), 10, b * 10, rep, panes)
     w = {
         "n": 1234,
         "hist": [0] * SLOTS,
@@ -2673,9 +2969,10 @@ def _fixture_row(clamp=False):
         "scene": "A", "browser": "native", "arm": "native",
         "adapter": "DiscreteGpu:NVIDIA", "backend": "Vulkan",
         "viewport": "1920x1080", "px": 1920 * 1080, "dpr": "1",
-        "cross": "yes", "hz": "60", "coi": "n/a", "panel": "off",
+        "cross": "yes" if surf["met"] else ("unchecked" if surf["unchecked"] else "no"),
+        "hz": "60", "coi": "n/a", "panel": "off",
         "script": "pan-zoom-2d", "basemap": "some-decoded/some-placed",
-        "pictures": 10, "mb_per_picture": "17.97", "commit": "deadbeef",
+        "pictures": 10, "mb_per_picture": "%.2f" % (b / 1e6), "commit": "deadbeef",
         "position": "A1",
         "load": {"start": 1.0, "end": 1.2, "max": 1.4, "samples": 9},
         "quiet": "yes", "quiet_max": 8.0,
@@ -2688,12 +2985,13 @@ def _fixture_row(clamp=False):
         "bracket": {"start_line": 10, "end_line": 90},
         "liveness": {"ok": True, "grew_by": 40, "verdict": "interact frames "
                      "still rising (+40 after the window)"},
-        "surface": surface_check((1920, 1080), (1920, 1080), 10, b * 10),
+        "surface": surf,
         "loop_state": None, "budget_state": None, "tile_cache": None,
         "gpu_unavailable": False,
         "throughput_interact_frames": 1234,
         "percentiles_clamped": clamp,
-        "invalid": [],
+        "invalid": [] if surf["met"] or surf["unchecked"] else ["surface not confirmed: %s" % surf["why"]],
+        "unchecked": ["surface bytes not checked: %s" % surf["why"]] if surf["unchecked"] else [],
         "notes": (["p99 CLAMPED at the over-64ms bin: quote `interact n=1234` "
                    "as this leg's throughput figure, not the percentiles"]
                   if clamp else []),

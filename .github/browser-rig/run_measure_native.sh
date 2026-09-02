@@ -62,20 +62,21 @@
 #
 # The size is then READ BACK **FROM THE APP ITSELF** -- its own
 # `Window resized to WxH` line, which is the surface it allocated, not the
-# frame the window manager thinks it handed over. That is the reading the
-# picture-bytes formula prices, ONE PICTURE PER PANE at the pane's own rect:
-#
-#     picture bytes = (pane_w * 1.5) * (pane_h * 1.5) * 4
-#
-# where a one-pane scene's rect is the whole W x (H - 40) panel and an N-pane
-# scene's rects come from the app's own grid (`native_row.py`'s `pane_rects`;
-# six panes at 1920x1080 are six 640x520 rects, no gap). The bracket's mean
-# bytes/picture is allowed half a texel row plus half a column around the
-# pane figures, because a recorded six-pane bracket averaged 732 B under its
-# 2,995,200 B pane -- a minority of pictures a row or a column short.
-# 2026-09-02: until this, every multi-pane leg (scene C, the many-pane worst
-# case) was priced as one whole-surface picture and read `** INVALID **`;
-# scene C is valid-able now. The app's own line is
+# frame the window manager thinks it handed over. The picture bytes are read
+# from the app too: its `overlay pictures:` line says what picture it
+# allocated for EACH pane, in physical pixels, and the bracket's mean
+# bytes/picture must sit within half a texel row plus half a column of those
+# figures (a recorded six-pane bracket averaged 732 B under its pane -- a
+# minority of pictures a row or a column short as the layout settled). The
+# analyser used to MODEL that figure from the surface and a 40-point top bar
+# -- exact at three surfaces on 2026-08-31, because the bar then rested on
+# its floor (40 is `MIN_BAR_HEIGHT`, a minimum); when the bar rose 3.33 pt
+# off it the identity expired with no signal, and every multi-pane row read
+# `** INVALID **` against a picture the app no longer drew. A log with no
+# `overlay pictures:` line -- a binary older than it -- reads
+# `** UNCHECKED: overlay pictures line absent **`, which is NOT `** INVALID **`:
+# the bytes were checked against nothing and the row is not refused for it.
+# The app's own surface line is
 # the only geometry readback that exists on every platform, so it is
 # also what makes an unpinnable platform (Wayland) produce a comparable row
 # rather than no row. The window manager's own answer is kept as a second

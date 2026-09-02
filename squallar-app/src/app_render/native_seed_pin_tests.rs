@@ -159,12 +159,11 @@ fn the_runner_arms_the_player_through_the_variable_the_app_reads() {
 
 /// The window the runner pins by default is the window the app opens.
 ///
-/// Not cosmetic. The whole-picture overlay raster is a pure function of the
-/// surface — `(W * 1.5) * ((H - 40) * 1.5) * 4` — so a runner default that
-/// drifted from the app's own default would make every native leg resize its
-/// window at boot, and a resize that raced would produce exactly the pair of
-/// incomparable rows (17,971,200 B against 43,344,000 B) this protocol was
-/// written to stop.
+/// Not cosmetic. The whole-picture overlay raster's size follows the surface,
+/// so a runner default that drifted from the app's own default would make
+/// every native leg resize its window at boot, and a resize that raced would
+/// produce exactly the pair of incomparable rows (17,971,200 B against
+/// 43,344,000 B) this protocol was written to stop.
 #[test]
 fn the_runner_pins_the_window_the_app_actually_opens() {
     let expected = format!("GEOM=\"{RENDER_WIDTH}x{RENDER_HEIGHT}\"");
@@ -177,29 +176,39 @@ fn the_runner_pins_the_window_the_app_actually_opens() {
     );
 }
 
-/// The picture-bytes formula the surface check refuses legs on is the one
-/// this app's overdraw and top bar actually produce.
+/// The surface check reads the picture sizes this app reports; it does not
+/// model them.
 ///
-/// Held here because the check lives in python and the constants it encodes
-/// live in rust. The three surfaces are the ones verified exact on
-/// 2026-08-31 and quoted in `run_measure.sh`'s header.
+/// It used to encode `(W * 1.5) * ((H - 40) * 1.5) * 4`, and this test held
+/// that as "the picture size this app's overdraw and top bar actually
+/// produce". It was — on 2026-08-31, at three surfaces, to the byte — because
+/// the bar then rested on its floor: 40 is `MIN_BAR_HEIGHT`, a minimum, not a
+/// height. When the bar rose 3.33 pt off it the identity expired with no
+/// signal: a one-pane leg at the default window uploads 2880x1555 pictures
+/// (17,913,600 B) against the model's 17,971,200 B, and every multi-pane
+/// native row read INVALID against a figure the app no longer produced. A
+/// floor used as an equality. What is pinned now is the mechanism that
+/// replaced it: the analyser scrapes the app's `overlay pictures:` line
+/// (`budget_telemetry::overlay_pictures_line`) in the spelling the app prints
+/// — prefix, field order, and an empty `px=` at `n=0` — every group
+/// mandatory, and the model is gone.
 #[test]
-fn the_surface_check_encodes_the_apps_own_picture_size() {
+fn the_surface_check_reads_the_apps_own_picture_sizes() {
     assert!(
-        NATIVE_ROW.contains("return int(w * 1.5) * int((h - 40) * 1.5) * 4"),
-        "native_row.py's picture-bytes formula moved. It is what refuses a \
-         leg whose window manager silently gave it another size — the failure \
-         that ran legs at 3440x1440 while they believed they asked for \
-         1920x1080 — and it can only do that while it matches the app",
+        NATIVE_ROW.contains(
+            r#"OVERLAY_PICTURES_RE = re.compile(r"overlay pictures: n=(\d+), px=((?:\d+x\d+(?:;\d+x\d+)*)?), bytes=(\d+)")"#
+        ),
+        "native_row.py no longer scrapes the app's `overlay pictures:` line in \
+         the spelling the app prints. That line is what the surface check \
+         compares a bracket's uploads against; without it every native row \
+         reads UNCHECKED and no native surface is ever confirmed",
     );
-    // The formula, evaluated here, against the figure the campaign quotes for
-    // the app's own default window.
-    let (w, h) = (RENDER_WIDTH as u64, RENDER_HEIGHT as u64);
-    let bytes = (w * 3 / 2) * ((h - 40) * 3 / 2) * 4;
-    assert_eq!(
-        bytes, 17_971_200,
-        "the app's default window no longer produces the 17,971,200 B \
-         picture every native row before today was measured against",
+    assert!(
+        !NATIVE_ROW.contains("int((h - 40) * 1.5)"),
+        "native_row.py models the overlay picture from a 40-point top bar \
+         again. 40 is MIN_BAR_HEIGHT, a floor, not the bar's height; that \
+         model was exact until the bar rose off its floor and then refused \
+         every multi-pane row against a picture the app no longer drew",
     );
 }
 
