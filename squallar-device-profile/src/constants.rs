@@ -153,6 +153,21 @@ pub const WASM_MAX_CONCURRENT_RENDERS: usize = 1;
 /// overcommit.
 pub const WASM_MAX_RAYON_THREADS: usize = 8;
 
+/// The ceiling of one wasm linear memory, in bytes: the `--max-memory` the
+/// module is linked with (`.github/scripts/wasm-threads.sh`), which is why its
+/// memory section declares the `maximum=16384 pages` quoted above.
+///
+/// **A build constant, not a device reading.** A `shared` memory has to state
+/// a maximum at link time because it cannot be relocated on growth, so the
+/// module declares its own wall and no browser and no device moves it. The
+/// page and the rasterization worker are two module instances, each with its
+/// own memory under this same ceiling; the two figures are never added.
+///
+/// Held equal to the link flag by `the_linear_memory_ceiling_is_the_link_flag`
+/// in `squallar-web/tests/linear_memory_ceiling.rs`, which reads the script.
+/// What a reading against it means is [`crate::linear_memory`].
+pub const WASM_LINEAR_MEMORY_MAX_BYTES: u64 = 1 << 30;
+
 pub const MOBILE_MAX_CONCURRENT_RENDERS: usize = 3;
 pub const DESKTOP_MAX_CONCURRENT_RENDERS: usize = 6;
 

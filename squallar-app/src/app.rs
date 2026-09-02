@@ -278,6 +278,10 @@ pub struct App {
     /// family prints, so the panel and a captured log carry one sentence.
     /// `None` until the first tick.
     budget_state_panel_line: Option<String>,
+    /// The wasm heap watermark's session state — see
+    /// [`crate::pressure::LinearMemoryWatch`]. A native bridge reads no heap,
+    /// so this never leaves its construction value there.
+    linear_memory_watch: crate::pressure::LinearMemoryWatch,
     /// The scripted-input player, armed at construction by the
     /// `gesture_script` key or the `SQUALLAR_GESTURE_SCRIPT` variable — see
     /// [`render::gesture_player_from`]. `None` on every shipping install,
@@ -635,6 +639,7 @@ impl App {
             gpu_passes_panel_line: None,
             gpu_passes_panel_frames: None,
             budget_state_panel_line: None,
+            linear_memory_watch: crate::pressure::LinearMemoryWatch::default(),
             gesture_player,
             back_claimed: false,
             exit_requested: false,

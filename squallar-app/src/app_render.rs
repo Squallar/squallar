@@ -1618,16 +1618,35 @@ impl super::App {
         // What the machine told the budget system, beside what the loops
         // hold — see [`crate::budget_telemetry`]. Composed once per tick and
         // parked for the diagnostics overlay's row on the way to the log, so
-        // the panel and a captured log carry the same sentence.
+        // the panel and a captured log carry the same sentence. One heap
+        // reading serves both the line and the watermark below it.
+        let linear = self.platform.linear_memory();
         say_telemetry(
             loud,
             self.budget_state_panel_line
                 .insert(crate::budget_telemetry::budget_state_line(
                     &self.budgets,
                     &self.device_profile,
-                    self.platform.linear_memory(),
+                    linear,
                 )),
         );
+        // The wasm heap watermark, on the same tick. The bridge answers the
+        // platform question: a native bridge reads no heap and this arm is
+        // never entered there. The fuller of the two instances is judged —
+        // each has the same ceiling of its own, and the two are never added.
+        if let Some(heap) = linear {
+            let used = heap.page_bytes.max(heap.worker_bytes.unwrap_or(0));
+            let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+            match self.linear_memory_watch.observe(used, max) {
+                squallar_device_profile::linear_memory::LinearMemoryVerdict::Quiet => {}
+                squallar_device_profile::linear_memory::LinearMemoryVerdict::Warn => {
+                    log::info!("{}", crate::pressure::linear_memory_line(used, max));
+                }
+                squallar_device_profile::linear_memory::LinearMemoryVerdict::Act => {
+                    self.on_pressure(crate::pressure::Pressure::LinearMemory { used, max });
+                }
+            }
+        }
     }
 
     /// One reading of what this application's loops hold — see

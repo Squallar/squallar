@@ -1,6 +1,6 @@
 //! A [`PlatformBridge`] for tests, shaped after the four real ones.
 
-use crate::platform::{GpuCapacitySource, PlatformBridge, RedrawWaker, drain_latest};
+use crate::platform::{GpuCapacitySource, LinearMemory, PlatformBridge, RedrawWaker, drain_latest};
 use egui_wgpu::wgpu;
 use squallar_kv::{KvStore, MemoryKvStore};
 use squallar_location::LocationPermission;
@@ -135,6 +135,10 @@ pub(crate) struct TestBridge {
     /// What `gpu_capacity` answers, whatever adapter it is asked about: this
     /// double has no driver to consult.
     gpu_capacity: Option<(u64, GpuCapacitySource)>,
+    /// What `linear_memory` answers. A gauge rather than a value so a test can
+    /// move the reading between ticks after the bridge is the app's; `None`,
+    /// as every native bridge answers, until a test sets one.
+    linear_memory: Rc<Cell<Option<LinearMemory>>>,
 }
 
 impl TestBridge {
@@ -164,6 +168,7 @@ impl TestBridge {
             location: LocationRecord::default(),
             back_claims: Rc::new(RefCell::new(Vec::new())),
             gpu_capacity: None,
+            linear_memory: Rc::new(Cell::new(None)),
         }
     }
 
@@ -227,6 +232,20 @@ impl TestBridge {
     /// bridge is handed to `App`, which owns it from then on.
     pub(crate) fn back_claim_log(&self) -> Rc<RefCell<Vec<bool>>> {
         Rc::clone(&self.back_claims)
+    }
+
+    /// Answer `linear_memory` with `reading`, as the web bridge answers from
+    /// `memory().buffer().byteLength` and the worker's envelopes.
+    pub(crate) fn with_linear_memory(self, reading: LinearMemory) -> Self {
+        self.linear_memory.set(Some(reading));
+        self
+    }
+
+    /// The gauge behind `linear_memory`, taken before the bridge is handed to
+    /// `App`, so a test can grow the heap reading between ticks the way a real
+    /// heap grows between them.
+    pub(crate) fn linear_memory_gauge(&self) -> Rc<Cell<Option<LinearMemory>>> {
+        Rc::clone(&self.linear_memory)
     }
 
     /// A handle on the blobs `kv` hands out, for seeding a config
@@ -313,6 +332,10 @@ impl TestBridge {
 }
 
 impl PlatformBridge for TestBridge {
+    fn linear_memory(&self) -> Option<LinearMemory> {
+        self.linear_memory.get()
+    }
+
     fn poll_theme(&mut self) -> Option<bool> {
         self.theme_receiver.as_ref().and_then(drain_latest)
     }

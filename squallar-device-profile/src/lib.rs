@@ -22,6 +22,7 @@
 pub mod budget;
 pub mod constants;
 pub mod hist;
+pub mod linear_memory;
 /// The rule behind the `mobile` cfg. Compiled only for tests — the production
 /// copy is `include!`d by `build.rs`.
 #[cfg(test)]

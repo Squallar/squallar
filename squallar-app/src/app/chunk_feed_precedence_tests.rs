@@ -1906,3 +1906,162 @@ fn the_volume_the_frontend_extracted_is_what_the_layer_is_handed() {
          pane is showing a refusal where a build belongs",
     );
 }
+
+/// One telemetry tick, asked for rather than waited on: the 2 s cadence is a
+/// clock `telemetry_is_due` reads, and clearing it is what makes the next
+/// report due — the same reason that predicate takes both instants.
+fn tick(app: &mut App) {
+    app.frame_telemetry_said = None;
+    app.report_frame_telemetry();
+}
+
+const MIB: u64 = 1 << 20;
+
+/// A heap reading with the worker instance at `worker_mib` and the page well
+/// under every line, so what is judged is the fuller of the two.
+fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
+    crate::platform::LinearMemory {
+        page_bytes: 100 * MIB,
+        worker_bytes: Some(worker_mib * MIB),
+    }
+}
+
+/// **The heap watermark at the action line evicts economy and steps the ladder
+/// down once**, on the telemetry tick, from a reading rather than a failure —
+/// and a second tick at the same reading does nothing more, because a wasm
+/// heap that has acted once would otherwise act on every tick for the rest of
+/// the session. Nothing is written to the store.
+#[test]
+fn a_heap_watermark_at_the_act_line_evicts_economy_and_steps_down_once() {
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::web().with_linear_memory(worker_heap(891));
+    let store = platform.store();
+    let mut app = headless(platform);
+    seed_render_cache(&mut app);
+    assert_eq!(app.budgets.steps_back, 0);
+
+    tick(&mut app);
+
+    assert_eq!(
+        app.budgets.steps_back, 1,
+        "a reading at the action line did not step the ladder",
+    );
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        0,
+        "economy survived the watermark: the render cache still holds its entry",
+    );
+    assert_eq!(app.linear_memory_watch.last_acted_at(), Some(891 * MIB));
+
+    seed_render_cache(&mut app);
+    tick(&mut app);
+    assert_eq!(
+        app.budgets.steps_back, 1,
+        "the same reading on the next tick stepped the ladder again",
+    );
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        1,
+        "the same reading on the next tick evicted again",
+    );
+
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+    assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
+}
+
+/// **A heap that grows past the refire step acts again**; one that grows less
+/// does not. The page instance is the fuller one here, so both arms of the
+/// `max(page, worker)` are exercised across this test and the one above.
+#[test]
+fn a_heap_that_grows_past_the_refire_step_acts_again() {
+    use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let store = platform.store();
+    let page = |bytes: u64| {
+        Some(crate::platform::LinearMemory {
+            page_bytes: bytes,
+            worker_bytes: Some(50 * MIB),
+        })
+    };
+    gauge.set(page(891 * MIB));
+    let mut app = headless(platform);
+
+    tick(&mut app);
+    assert_eq!(app.budgets.steps_back, 1);
+
+    gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES - 1));
+    tick(&mut app);
+    assert_eq!(
+        app.budgets.steps_back, 1,
+        "growth short of the refire step acted again",
+    );
+
+    gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
+    tick(&mut app);
+    assert_eq!(
+        app.budgets.steps_back, 2,
+        "growth past the refire step did not act again",
+    );
+    assert_eq!(
+        app.linear_memory_watch.last_acted_at(),
+        Some(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES),
+    );
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+}
+
+/// **A native profile has no heap reading and is never pressured by the
+/// tick.** The bridge answers the platform question — `None` — and the
+/// watermark is never consulted, however many ticks pass.
+#[test]
+fn a_native_profile_with_no_heap_reading_is_never_pressured_by_the_tick() {
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::desktop();
+    let store = platform.store();
+    let mut app = headless(platform);
+    assert_eq!(app.platform.linear_memory(), None, "precondition");
+    seed_render_cache(&mut app);
+
+    for _ in 0..10 {
+        tick(&mut app);
+    }
+
+    assert_eq!(app.budgets.steps_back, 0);
+    assert_eq!(app.render.render_cache.entry_count(), 1);
+    assert_eq!(
+        app.linear_memory_watch,
+        crate::pressure::LinearMemoryWatch::default(),
+        "the watermark moved on a bridge that reads no heap",
+    );
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+}
+
+/// **A reading at the warning line is noted and steps nothing.** The line is
+/// said once per crossing — `the_warn_line_is_said_once_per_crossing` holds
+/// the once — and this holds that the tick reaches the watch and stops there.
+#[test]
+fn a_heap_at_the_warn_line_is_noted_and_steps_nothing() {
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::web().with_linear_memory(worker_heap(800));
+    let store = platform.store();
+    let mut app = headless(platform);
+    seed_render_cache(&mut app);
+    assert!(!app.linear_memory_watch.has_warned());
+
+    tick(&mut app);
+    tick(&mut app);
+
+    assert!(
+        app.linear_memory_watch.has_warned(),
+        "a reading past the warning line was not noted",
+    );
+    assert_eq!(app.linear_memory_watch.last_acted_at(), None);
+    assert_eq!(app.budgets.steps_back, 0, "a warning stepped the ladder");
+    assert_eq!(app.render.render_cache.entry_count(), 1);
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+}
