@@ -1442,6 +1442,44 @@ def build_row(args, scraped, probes):
     }
 
 
+
+def commit_for_arm(label, arm_commits, global_commit, arm_count, head):
+    """Which commit an arm's binary was built from, or an honest `unknown`.
+
+    **A multi-arm row used to stamp every arm with the tree's HEAD**, which on a
+    two-arm comparison is a tree NEITHER binary was built from. Two lanes hit it
+    independently on 2026-09-02 and both worked around it identically, by
+    passing `--commit <a>+<b>` -- one field made to carry two values by string
+    concatenation, which is the defect confessing rather than a workaround. The
+    row that resulted could not say which arm was which tree, so its provenance
+    was unreconstructable afterwards. Not a wrong number; an unrecordable one.
+
+    First hit wins:
+
+    1. `arm_commits`, a list of `LABEL=SHA`, matched on `label`;
+    2. `global_commit`, the whole-run `--commit`, still accepted;
+    3. `head` -- **only when there is one arm**, where the binary is presumed to
+       be this tree's build, which is what the single-arm default always meant;
+    4. `"unknown"`.
+
+    Step 3 is deliberately withheld from multi-arm runs. `unknown` is honest and
+    a reader can go and find out; a plausible-looking wrong commit is worse than
+    an admitted absent one, because nothing downstream can tell it is wrong.
+
+    An empty `head` (no `.git`, a shipped bundle) also lands on `unknown`, which
+    is the behaviour `squallar-app`'s native seed pins already describe.
+    """
+    for spec in arm_commits or ():
+        name, sep, sha = spec.partition("=")
+        if sep and name == label:
+            return sha or "unknown"
+    if global_commit:
+        return global_commit
+    if arm_count <= 1 and head:
+        return head
+    return "unknown"
+
+
 def tile_cache_by_role(readings):
     """The last `tile cache (<role>)` reading per role, or None for none.
 
@@ -1531,10 +1569,8 @@ def print_row(row):
             % (ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[10], ls[11], ls[16])
         )
     # The machine and the bracket the budgets came from, on every scene. A
-    # LEVEL at the end of the log; `pool` is the LIVE loop pool in MiB (what the
-    # scene's loops need, capped by the room the rest of it leaves -- the same
-    # figure `loop state:` prints in B) and `ceiling` the bracket's constant.
-    # Absent when the log has no `budget state:` line: a
+    # LEVEL at the end of the log; `pool`/`ceiling` are the bracket's figures,
+    # never the live pool. Absent when the log has no `budget state:` line: a
     # binary older than the line, printed as such and never as zeroes. `.get`
     # because a row built before the field existed reads the same way.
     bs = row.get("budget_state")
@@ -1758,6 +1794,17 @@ def main(argv):
     g.add_argument("--repo-root", dest="repo_root",
                    default=os.path.abspath(os.path.join(RIG_DIR, "..", "..")))
     g.set_defaults(func=cmd_gates)
+
+    c = sub.add_parser("commit-for-arm",
+                       help="which commit an arm's binary was built from")
+    c.add_argument("--label", required=True)
+    c.add_argument("--arm-commit", action="append", default=[],
+                   help="LABEL=SHA, repeatable")
+    c.add_argument("--commit", default="")
+    c.add_argument("--arms", type=int, default=1)
+    c.add_argument("--head", default="")
+    c.set_defaults(func=lambda a: print(
+        commit_for_arm(a.label, a.arm_commit, a.commit, a.arms, a.head), end=""))
 
     s = sub.add_parser("selftest", help="this file's own tests")
     s.set_defaults(func=lambda _a: run_selftest())
@@ -2318,6 +2365,60 @@ class CpuTimeTests(unittest.TestCase):
             "a missing instrument was reported as a finding; `busy=False` "
             "here would read as `wedged` and kill a healthy leg",
         )
+
+
+class CommitProvenanceTests(unittest.TestCase):
+    """Which commit a row is stamped with, per arm.
+
+    The bug these pin: a two-arm run stamped BOTH rows with the tree's HEAD, a
+    tree neither binary was built from, and the field had no shape for two
+    values. Every case below fails on that behaviour.
+    """
+
+    def test_an_arms_own_commit_wins(self):
+        self.assertEqual(
+            commit_for_arm("ringon", ["ringoff=aaaa", "ringon=bbbb"], "", 2, "head"),
+            "bbbb")
+
+    def test_each_arm_of_a_pair_gets_its_own(self):
+        specs = ["ringon=bbbb", "ringoff=aaaa"]
+        got = [commit_for_arm(x, specs, "", 2, "head") for x in ("ringon", "ringoff")]
+        self.assertEqual(got, ["bbbb", "aaaa"],
+                         "the two arms of a pair must not share a commit; that "
+                         "is the whole defect")
+
+    def test_a_multi_arm_run_never_falls_back_to_head(self):
+        # THE CENTRAL ONE. Before the fix this returned `head` for both arms.
+        for label in ("ringon", "ringoff"):
+            self.assertEqual(
+                commit_for_arm(label, [], "", 2, "deadbee"), "unknown",
+                "a multi-arm run stamped an arm with the tree's HEAD, which is "
+                "a tree neither binary was built from")
+
+    def test_a_single_arm_run_still_defaults_to_head(self):
+        self.assertEqual(commit_for_arm("main", [], "", 1, "deadbee"), "deadbee")
+
+    def test_no_git_lands_on_unknown_not_empty(self):
+        # `squallar-app`'s native seed pins describe `commit=unknown` for a
+        # shipped bundle with no `.git`; an empty string would break that.
+        self.assertEqual(commit_for_arm("main", [], "", 1, ""), "unknown")
+
+    def test_the_whole_run_commit_is_still_accepted(self):
+        self.assertEqual(commit_for_arm("a", [], "cafe", 2, "head"), "cafe")
+
+    def test_an_arms_own_commit_outranks_the_whole_run_one(self):
+        self.assertEqual(
+            commit_for_arm("a", ["a=aaaa"], "cafe", 2, "head"), "aaaa")
+
+    def test_a_label_that_was_not_named_is_unknown_not_another_arms(self):
+        self.assertEqual(
+            commit_for_arm("c", ["a=aaaa", "b=bbbb"], "", 3, "head"), "unknown",
+            "an unnamed arm must not inherit a named arm's commit")
+
+    def test_a_malformed_spec_is_ignored_rather_than_matched(self):
+        self.assertEqual(
+            commit_for_arm("a", ["a"], "", 2, "head"), "unknown",
+            "`a` with no `=` is not a LABEL=SHA pair and must not match")
 
 
 class OrderTests(unittest.TestCase):

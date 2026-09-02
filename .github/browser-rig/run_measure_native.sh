@@ -117,15 +117,26 @@
 #
 #   --arm LABEL=/path/to/binary   an arm to measure (repeatable; default: one
 #                                 arm `main` at the built release binary)
+#   --arm-commit LABEL=SHA        the commit THAT arm's binary was built from
+#                                 (repeatable). On a multi-arm run this is the
+#                                 only way to record provenance correctly: see
+#                                 `commit_for_arm`, which refuses to fall back
+#                                 to the tree's HEAD when there is more than one
+#                                 arm, because HEAD is then a tree neither
+#                                 binary came from.
 #   --scenes "A B"                default A
 #   --geom WxH                    SURFACE to pin (default 1920x1080, the app's
 #                                  own RENDER_WIDTH x RENDER_HEIGHT). Give the
 #                                 WEB leg the same WxH via RIG_CANVAS or the
 #                                 two rows are not comparable.
-#   --commit SHA                  stamped on every row. Defaults to the tree's
-#                                 HEAD; pass it explicitly when the binary was
-#                                 built elsewhere -- a shipped bundle has no
-#                                 `.git` and every row it produced said
+#   --commit SHA                  stamped on every row that has no
+#                                 `--arm-commit` of its own. Defaults to the
+#                                 tree's HEAD ON A SINGLE-ARM RUN ONLY; a
+#                                 multi-arm run with no per-arm commits stamps
+#                                 `unknown` rather than a tree neither binary
+#                                 was built from. Pass it explicitly when the
+#                                 binary was built elsewhere -- a shipped bundle
+#                                 has no `.git` and every row it produced said
 #                                 `commit=unknown`, on the row type where the
 #                                 tree matters most.
 #   --counterbalance              ABBA rather than in-order
@@ -171,6 +182,7 @@ QUIET_MAX=""
 COMMIT=""
 SHOW_PLATFORM=0
 declare -a ARMS=()
+declare -a ARM_COMMITS=()
 
 # `GesturePlayer::LOOP_SECONDS`. Only used to size the timeout; the bracket
 # itself is marker-driven, never clock-driven.
@@ -184,6 +196,7 @@ GEOM_ATTEMPTS=5
 while [ $# -gt 0 ]; do
   case "$1" in
     --arm)            ARMS+=("$2"); shift 2 ;;
+    --arm-commit)     ARM_COMMITS+=("$2"); shift 2 ;;
     --scenes)         SCENES="$2"; shift 2 ;;
     --geom)           GEOM="$2"; shift 2 ;;
     --commit)         COMMIT="$2"; shift 2 ;;
@@ -429,13 +442,42 @@ fi
 W="${GEOM%x*}"
 H="${GEOM#*x}"
 
-# The commit rides on every row. Taken from the tree by default, but ACCEPTED
-# from the caller, because a binary measured on a machine that only has the
-# shipped bundle has no `.git` to ask -- and those rows printed
-# `commit=unknown` on the row type where the tree matters most.
-if [ -z "$COMMIT" ]; then
-  COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-fi
+# The commit rides on every row, and on a multi-arm run it is PER ARM.
+#
+# It used to be one value for the whole run, defaulting to the tree's HEAD. On a
+# two-arm comparison that is not merely imprecise, it is FALSE: both rows get
+# stamped with whatever main happens to be, which is a tree NEITHER binary was
+# built from. Two lanes hit it independently on 2026-09-02 and both worked
+# around it the same way -- by passing `--commit <a>+<b>`, a single field made
+# to carry two values by string concatenation, which is the defect confessing.
+# The row that results cannot say which arm was which tree, so its provenance
+# is unreconstructable afterwards. Not a wrong number; an unrecordable one.
+#
+# The ROW schema did not have to change: `native_row.py` is invoked ONCE PER
+# LEG and every row already carries exactly one arm. Only this script was
+# putting the wrong value into it.
+#
+# Resolution order for an arm, first hit wins:
+#   1. `--arm-commit LABEL=SHA` for that label
+#   2. `--commit SHA`, the whole-run value, still accepted
+#   3. the tree's HEAD -- but ONLY on a single-arm run, where the binary is
+#      presumed to be this tree's build
+#   4. `unknown`
+# Step 3 is deliberately withheld from multi-arm runs. `unknown` is honest;
+# HEAD would be a tree neither binary came from, and a plausible-looking wrong
+# commit is worse than an admitted absent one.
+# The decision itself lives in `native_row.py` as a pure function with tests,
+# for the reason this runner's whole decision set does: a rule re-derived in
+# shell by the next lane is a rule that will be re-derived DIFFERENTLY. See
+# `squallar-app/tests/native_measure_logic.rs`, which is what makes those
+# tests run in CI.
+commit_for_arm() {
+  "$PY" "$ROW_PY" commit-for-arm \
+    --label "$1" --arms "${#ARMS[@]}" --commit "$COMMIT" \
+    --head "$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '')" \
+    ${ARM_COMMITS[@]+"${ARM_COMMITS[@]/#/--arm-commit=}"}
+}
+
 mkdir -p "$OUT_DIR"
 
 REFRESH="$(plat_refresh)"
@@ -537,6 +579,8 @@ solve_geometry() {
 run_leg() {
   local label="$1" bin="$2" scene="$3" position="$4" run="$5"
   local tag="$scene.$label.r$run"
+  # Per arm, not per run. See `commit_for_arm`.
+  local leg_commit; leg_commit="$(commit_for_arm "$label")"
   local dir="$OUT_DIR/$tag"
   local log="$dir/app.log" loadf="$dir/load.tsv"
   local script seed pid handle rc=0
@@ -666,7 +710,7 @@ run_leg() {
   [ -n "$GEOM_WM" ] && geom_args=(--achieved-geom "$GEOM_WM")
 
   "$PY" "$ROW_PY" analyze \
-    --log "$log" --scene "$scene" --script "$script" --commit "$COMMIT" \
+    --log "$log" --scene "$scene" --script "$script" --commit "$leg_commit" \
     --asked-geom "${W}x${H}" ${geom_args[@]+"${geom_args[@]}"} \
     --refresh "$REFRESH" --adapter "$ADAPTER" --panel "$PANEL" \
     --platform "$PLAT_NAME" --degraded "${PLAT_DEGRADED:-}" \
