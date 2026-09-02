@@ -69,6 +69,15 @@ pub struct Gui {
     /// registration the pane's floor is reprojected by and the rect the
     /// frontend clips its mirror pass to.
     pub(super) map_pane_geo: HashMap<usize, crate::volume_view::MapPaneGeo>,
+    /// The basemap's laid-out place names, kept across frames.
+    ///
+    /// On `Gui` rather than inside the pane walk because it is only worth
+    /// anything if it survives the frame: the same names are laid out again
+    /// every frame, and `Context::fonts_mut` — an exclusive lock on the whole
+    /// egui context — is what each fresh layout costs. Held by the shell for
+    /// the same reason nothing else here is a thread-local: one owner, visible
+    /// lifetime, and a test can build its own.
+    pub(super) galley_cache: walkers::GalleyCache,
     /// The floor-strip cache: per-pane content keys, the all-or-nothing
     /// frame verdict, and the repaint-force latch. See
     /// [`map::FloorStrips`].
@@ -565,6 +574,7 @@ impl Gui {
             pending_pane_close: None,
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
+            galley_cache: walkers::GalleyCache::default(),
             floor_strips: map::FloorStrips::default(),
             volume_empty_states: HashMap::new(),
             mirror_size_points: egui::Vec2::ZERO,

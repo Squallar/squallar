@@ -50,7 +50,7 @@ pub use style::Style;
 #[cfg(feature = "mvt")]
 pub use style::{Color, Filter, Float, Layer, Layout, Paint, Value, json};
 #[cfg(feature = "mvt")]
-pub use text::{OccupiedAreas, Text};
+pub use text::{GalleyCache, OccupiedAreas, Text};
 pub use tiles::{Tile, TileId, TilePiece, Tiles, interpolate_from_lower_zoom};
 pub use zoom::InvalidZoom;
 

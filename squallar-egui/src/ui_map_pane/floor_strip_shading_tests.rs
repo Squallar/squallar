@@ -110,6 +110,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
         user_heading: None,
         user_fix: None,
         basemap_labels: Vec::new(),
+        galley_cache: &mut walkers::GalleyCache::default(),
         ground_meshes: None,
         // No tile source either way: what is being measured is which arms the
         // walk dispatches, which is what the paint-order record carries, and

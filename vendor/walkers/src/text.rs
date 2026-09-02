@@ -88,6 +88,47 @@ impl Text {
         ctx.fonts_mut(|fonts| fonts.layout_job(job))
     }
 
+    /// [`Self::galley`], answered from `cache` when this exact label has
+    /// already been laid out.
+    ///
+    /// **The saving is the lookup, not the shaping.** `Fonts::layout_job`
+    /// already memoizes galleys by job hash, so the shaping was never repeated
+    /// — what was repeated is everything needed to *reach* that memo:
+    /// a `String` copy of the label into a fresh `LayoutJob`, the hash of that
+    /// job, and `Context::fonts_mut`, which is `Context::write` and therefore
+    /// an exclusive lock on the whole context. A basemap frame takes that lock
+    /// once per label; this takes it once per label whose text or style is new.
+    ///
+    /// The key is every field [`Self::galley`] reads and no others. `position`
+    /// and `angle` are deliberately absent: a galley is laid out about its own
+    /// origin and placed by [`Self::shape`], so panning the map re-uses every
+    /// entry rather than invalidating it — which is the case this exists for.
+    pub fn galley_cached(
+        &self,
+        ctx: &egui::Context,
+        cache: &mut GalleyCache,
+    ) -> std::sync::Arc<egui::Galley> {
+        cache.settle(ctx.pixels_per_point());
+
+        let key = GalleyKey {
+            text: self.text.clone(),
+            font_size: self.font_size.to_bits(),
+            text_color: self.text_color,
+            max_width_ems: self.max_width_ems.map(f32::to_bits),
+            line_height_ems: self.line_height_ems.map(f32::to_bits),
+        };
+
+        if let Some(hit) = cache.entries.get(&key) {
+            cache.hits += 1;
+            return hit.clone();
+        }
+
+        let galley = self.galley(ctx);
+        cache.layouts += 1;
+        cache.entries.insert(key, galley.clone());
+        galley
+    }
+
     /// The shape drawing `galley` with its block's top-left corner at
     /// `top_left`.
     ///
@@ -216,11 +257,332 @@ impl OccupiedAreas {
     }
 }
 
+/// A memo of laid-out galleys for [`Text::galley_cached`].
+///
+/// **Owned by the caller, never a thread-local or a process-wide pool**, so
+/// what it retains is bounded by the caller's own lifetime and a test can hold
+/// two independent ones. Empty is always correct: every entry is reproducible
+/// from the [`Text`] that made it.
+///
+/// Two things invalidate an entry and both are handled here rather than by the
+/// caller. A change of `pixels_per_point` re-rasterizes every glyph, so the
+/// whole table is dropped when it moves. And the table is dropped when it
+/// exceeds [`Self::MAX_ENTRIES`], because a map being panned across a country
+/// retires label text continuously and a memo with no ceiling would hold every
+/// name the session had ever drawn.
+///
+/// **The drop is bounded by the working set, not by the ceiling.** Only the
+/// labels a frame actually draws are looked up, so the frame after a drop lays
+/// out that frame's labels and no others — the other entries were off-screen
+/// and are simply never asked for. Measured on native scene A at 1920x1080,
+/// a pane hands `paint_labels` 604 names per frame and 534 of them reach a
+/// layout, so a drop costs one frame at the cost this cache exists to remove
+/// and the table is rebuilt to the working set on that same frame. That is a
+/// degradation, not a cliff: it is never worse than having no cache at all,
+/// and it self-heals immediately rather than persisting. A ceiling that
+/// stopped *inserting* instead of dropping would avoid the frame and pay for
+/// it for ever, which is the worse trade.
+///
+/// It does **not** watch the font definitions. A galley laid out under one
+/// `FontDefinitions` is wrong under another, and nothing here would notice;
+/// the caller must drop the cache if it ever installs fonts after startup.
+#[derive(Default)]
+pub struct GalleyCache {
+    pixels_per_point: f32,
+    entries: std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>,
+    layouts: u64,
+    hits: u64,
+}
+
+impl GalleyCache {
+    /// The entry ceiling past which the table is dropped whole.
+    pub const MAX_ENTRIES: usize = 4096;
+
+    /// Galleys this cache has had to lay out — the figure a memo is judged by.
+    pub fn layouts(&self) -> u64 {
+        self.layouts
+    }
+
+    /// Lookups answered without laying anything out.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// How many galleys are held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the table holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Drop every entry, keeping the counters.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Bring the table to `pixels_per_point`, dropping it if that moved or if
+    /// it has outgrown [`Self::MAX_ENTRIES`].
+    fn settle(&mut self, pixels_per_point: f32) {
+        if self.pixels_per_point != pixels_per_point {
+            self.pixels_per_point = pixels_per_point;
+            self.entries.clear();
+        }
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.clear();
+        }
+    }
+}
+
+/// Every field [`Text::galley`] reads, in a form that is `Hash` and `Eq`.
+///
+/// The three `f32`s are keyed by their bits rather than by value because `f32`
+/// is not `Eq`. That is stricter than equality — `-0.0` and `0.0` are two keys
+/// — and stricter is the safe direction for a memo: a spurious miss costs one
+/// layout, a spurious hit draws the wrong text.
+#[derive(PartialEq, Eq, Hash)]
+struct GalleyKey {
+    text: String,
+    font_size: u32,
+    text_color: Color32,
+    max_width_ems: Option<u32>,
+    line_height_ems: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::pos2;
     use std::f32::consts::FRAC_PI_4;
+
+    /// A context with fonts available: `Fonts` exists only after a pass has
+    /// begun, and `galley` panics without it.
+    fn ctx_with_fonts() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        });
+        ctx
+    }
+
+    fn label(text: &str) -> Text {
+        Text {
+            text: text.to_owned(),
+            position: pos2(10.0, 20.0),
+            font_size: 14.0,
+            text_color: Color32::WHITE,
+            angle: 0.0,
+            max_width_ems: None,
+            line_height_ems: None,
+        }
+    }
+
+    /// The identity that makes the memo safe: a cached galley is the galley.
+    ///
+    /// Not "the same size" — the same glyphs, rows and metrics, asserted field
+    /// by field against one laid out the uncached way on the same context.
+    #[test]
+    fn a_cached_galley_is_identical_to_a_freshly_laid_out_one() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+
+        for name in ["Washita River", "Oklahoma City", "Lake Thunderbird"] {
+            let text = label(name);
+            let fresh = text.galley(&ctx);
+            let cached = text.galley_cached(&ctx, &mut cache);
+            // Second time through is the one that comes off the table.
+            let hit = text.galley_cached(&ctx, &mut cache);
+
+            assert_eq!(fresh.text(), cached.text());
+            assert_eq!(fresh.text(), hit.text());
+            assert_eq!(fresh.size(), cached.size());
+            assert_eq!(fresh.size(), hit.size());
+            assert_eq!(fresh.rows.len(), cached.rows.len());
+            assert_eq!(fresh.rows.len(), hit.rows.len());
+            assert_eq!(fresh.rect, cached.rect);
+            assert_eq!(fresh.rect, hit.rect);
+        }
+    }
+
+    /// **The count gate.** A second pass over labels nothing has changed lays
+    /// out zero galleys.
+    ///
+    /// This is the figure the change exists to move, and it is a count rather
+    /// than a clock. The baseline semantics — no memo at all — are spelled in
+    /// the second half: a cache dropped between passes lays the same labels out
+    /// again, which is what this asserts must NOT happen when it is kept.
+    #[test]
+    fn an_unchanged_second_pass_lays_out_nothing() {
+        let ctx = ctx_with_fonts();
+        let names = ["Washita River", "Oklahoma City", "Lake Thunderbird"];
+
+        let mut kept = GalleyCache::default();
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut kept);
+        }
+        let after_first = kept.layouts();
+        assert_eq!(after_first, names.len() as u64);
+
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut kept);
+        }
+        assert_eq!(
+            kept.layouts(),
+            after_first,
+            "an unchanged second pass laid out {} more galleys",
+            kept.layouts() - after_first,
+        );
+        assert_eq!(kept.hits(), names.len() as u64);
+
+        // Baseline semantics, for contrast: without the memo surviving the
+        // pass, the same three labels are laid out all over again.
+        let mut dropped = GalleyCache::default();
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut dropped);
+        }
+        dropped.clear();
+        for name in names {
+            let _ = label(name).galley_cached(&ctx, &mut dropped);
+        }
+        assert_eq!(dropped.layouts(), 2 * names.len() as u64);
+    }
+
+    /// Everything the galley depends on invalidates it, one field at a time.
+    ///
+    /// A memo that answers a stale galley draws the wrong text, so each of
+    /// these must MISS. Written as one test per field rather than one blanket
+    /// assertion so a failure names the field that stopped being keyed.
+    #[test]
+    fn every_field_the_layout_reads_is_keyed() {
+        let ctx = ctx_with_fonts();
+        let base = label("Washita River");
+
+        let variants: Vec<(&str, Text)> = vec![
+            (
+                "text",
+                Text {
+                    text: "Canadian River".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "font_size",
+                Text {
+                    font_size: 18.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "text_color",
+                Text {
+                    text_color: Color32::RED,
+                    ..base.clone()
+                },
+            ),
+            (
+                "max_width_ems",
+                Text {
+                    max_width_ems: Some(6.0),
+                    ..base.clone()
+                },
+            ),
+            (
+                "line_height_ems",
+                Text {
+                    line_height_ems: Some(1.5),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (field, variant) in variants {
+            let mut cache = GalleyCache::default();
+            let _ = base.galley_cached(&ctx, &mut cache);
+            assert_eq!(cache.layouts(), 1, "{field}: setup");
+            let _ = variant.galley_cached(&ctx, &mut cache);
+            assert_eq!(
+                cache.layouts(),
+                2,
+                "{field} changed and the memo answered the old galley",
+            );
+        }
+    }
+
+    /// `position` and `angle` are deliberately NOT keyed: a galley is laid out
+    /// about its own origin, so panning the map must re-use every entry. This
+    /// is the property the whole memo rests on.
+    #[test]
+    fn moving_a_label_does_not_lay_it_out_again() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let base = label("Washita River");
+        let _ = base.galley_cached(&ctx, &mut cache);
+
+        for (x, y) in [(11.0, 20.0), (400.0, 300.0), (-50.0, 900.0)] {
+            let moved = Text {
+                position: pos2(x, y),
+                angle: FRAC_PI_4,
+                ..base.clone()
+            };
+            let _ = moved.galley_cached(&ctx, &mut cache);
+        }
+        assert_eq!(cache.layouts(), 1, "a moved label was laid out again");
+        assert_eq!(cache.hits(), 3);
+    }
+
+    /// A `pixels_per_point` change re-rasterizes every glyph, so the table goes
+    /// with it rather than answering galleys built for the old scale.
+    #[test]
+    fn a_pixels_per_point_change_drops_the_table() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let text = label("Washita River");
+
+        let _ = text.galley_cached(&ctx, &mut cache);
+        assert_eq!(cache.layouts(), 1);
+        assert_eq!(cache.len(), 1);
+
+        // Through the viewport, which is how a real display change arrives.
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&input.viewport_id)
+            .unwrap()
+            .native_pixels_per_point = Some(2.0);
+        ctx.begin_pass(input);
+        assert_eq!(ctx.pixels_per_point(), 2.0, "the test did not move ppp");
+
+        let _ = text.galley_cached(&ctx, &mut cache);
+        assert_eq!(
+            cache.layouts(),
+            2,
+            "the table survived a pixels_per_point change",
+        );
+    }
+
+    /// The table is bounded: a session panning across a country retires label
+    /// text continuously, and a memo with no ceiling would hold all of it.
+    #[test]
+    fn the_table_is_dropped_once_it_outgrows_its_ceiling() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        for i in 0..=GalleyCache::MAX_ENTRIES {
+            let _ = label(&format!("name {i}")).galley_cached(&ctx, &mut cache);
+        }
+        assert!(cache.len() <= GalleyCache::MAX_ENTRIES);
+    }
 
     fn rect(cx: f32, cy: f32, angle: f32, w: f32, h: f32) -> OrientedRect {
         OrientedRect::new(pos2(cx, cy), angle, vec2(w, h))

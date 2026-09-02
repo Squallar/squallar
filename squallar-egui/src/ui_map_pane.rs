@@ -374,6 +374,13 @@ pub(super) struct PaneRenderCtx<'a> {
     /// a pane with **BasemapTiles** off never fills them, because the one
     /// tile draw is where the names come from.
     pub basemap_labels: Vec<walkers::Text>,
+    /// The galley memo the `CityLabels` arm lays its names out through.
+    ///
+    /// Owned by [`crate::gui::Gui`] and lent for the frame, because the whole
+    /// point of it is to outlive the frame: the same place names are laid out
+    /// again on every one of them, and a cache built and dropped inside a
+    /// frame would answer nothing. See [`walkers::GalleyCache`].
+    pub galley_cache: &'a mut walkers::GalleyCache,
     /// The base tile source, taken out of `tiles::MapTileState` for the
     /// frame. `None` while the BasemapTiles layer is off in every visible
     /// pane (the slot is then released — a disabled layer costs zero
@@ -673,7 +680,11 @@ pub(super) fn render_pane_map_content(
                 id if *id == known::CITY_LABELS => {
                     // One `OccupiedAreas` for the whole pane, which is what
                     // stops a name being drawn once per tile that carries it.
-                    paint_labels(ui.painter(), std::mem::take(&mut ctx.basemap_labels));
+                    paint_labels(
+                        ui.painter(),
+                        std::mem::take(&mut ctx.basemap_labels),
+                        ctx.galley_cache,
+                    );
                 }
                 id if *id == known::RADAR_COVERAGE => {
                     if let Some(tex) = ctx.pane.overlay_cache(id).and_then(|c| c.current()) {

@@ -2004,6 +2004,69 @@ dependency and nothing in this directory reaches it.
 **Test count: `cargo test -p walkers --features mvt --lib` reports 103**, from
 102.
 
+### Changed — source, twenty-fifth commit: a place name is laid out once, not once per frame
+
+`src/text.rs` and one line of `src/lib.rs`. `Text::galley_cached` answers from a
+caller-owned `GalleyCache`; `Text::galley` is unchanged and still there, and is
+what the cache calls on a miss.
+
+**The saving is the lookup, not the shaping.** `Fonts::layout_job` already
+memoizes galleys by job hash, so the glyphs were never re-shaped. What was
+repeated every frame is everything needed to *reach* that memo:
+
+- a `String` copy of the label into a fresh `LayoutJob`, per label per frame;
+- the hash of that job, over the label text;
+- `Context::fonts_mut`, which is `Context::write` — an **exclusive lock on the
+  whole egui context**, not on the font atlas. A basemap frame took it once per
+  label.
+
+The key is every field `Text::galley` reads and no others. `position` and
+`angle` are deliberately absent: a galley is laid out about its own origin and
+placed by `Text::shape`, so panning re-uses every entry rather than
+invalidating it — which is the case the cache exists for, and
+`moving_a_label_does_not_lay_it_out_again` is the test that pins it.
+
+The three `f32`s are keyed by bits rather than by value, because `f32` is not
+`Eq`. That is stricter than equality — `-0.0` and `0.0` are two keys — and
+stricter is the safe direction: a spurious miss costs one layout, a spurious hit
+draws the wrong text.
+
+#### Owned by the caller, deliberately
+
+`GalleyCache` is a field of `squallar_egui::gui::Gui`, lent to the pane walk for
+the frame. Not a thread-local, not a process-wide pool and not an `Arc`, for the
+reason the twenty-fourth commit gives for its tessellator scratch: what it
+retains is bounded by one owner's lifetime, two tests can hold two independent
+ones, and nothing hidden accumulates for a session. Empty is always correct —
+every entry is reproducible from the `Text` that made it.
+
+Two things drop the table, both handled inside `settle` rather than by the
+caller. A `pixels_per_point` change re-rasterizes every glyph. And
+`MAX_ENTRIES` (4096) is a ceiling, because a map panned across a country retires
+label text continuously and a memo with no ceiling would hold every name the
+session had ever drawn.
+
+It does **not** watch `FontDefinitions`. A galley laid out under one set of
+fonts is wrong under another and nothing here would notice; this workspace
+installs fonts once, before the first pass, and the doc comment says so.
+
+#### What is NOT covered
+
+Only `walkers::Text` goes through this. `egui::Painter::text` — which is how
+this workspace draws METAR station models — takes the same
+`Context::write` lock through its own `to_string()` and `layout_no_wrap`, and is
+untouched by this commit.
+
+<!--MEASURED-->
+
+**Test count: `cargo test -p walkers --features mvt --lib` reports 109**, from
+103. The six are `a_cached_galley_is_identical_to_a_freshly_laid_out_one`,
+`an_unchanged_second_pass_lays_out_nothing`,
+`every_field_the_layout_reads_is_keyed`,
+`moving_a_label_does_not_lay_it_out_again`,
+`a_pixels_per_point_change_drops_the_table` and
+`the_table_is_dropped_once_it_outgrows_its_ceiling`.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
