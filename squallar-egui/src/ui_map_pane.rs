@@ -747,6 +747,7 @@ pub(super) fn render_pane_map_content(
                     }
                     RenderMode::PerFramePoint => {
                         selected.extend(render_per_frame_overlay(
+                            ctx.galley_cache,
                             ui,
                             projector,
                             &PerFrameOverlayCtx {
@@ -2783,6 +2784,7 @@ struct PerFrameOverlayCtx<'a> {
 
 /// Per-frame rendering for point overlays (e.g. METAR station model plots).
 fn render_per_frame_overlay(
+    galleys: &mut walkers::GalleyCache,
     ui: &egui::Ui,
     projector: &walkers::Projector,
     pf: &PerFrameOverlayCtx<'_>,
@@ -2837,6 +2839,7 @@ fn render_per_frame_overlay(
         let mut ep = EguiPointPainter {
             painter,
             center: screen,
+            galleys,
         };
         pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
 

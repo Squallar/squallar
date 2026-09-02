@@ -290,6 +290,22 @@ impl OccupiedAreas {
 pub struct GalleyCache {
     pixels_per_point: f32,
     entries: std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>,
+    /// The point-label table, keyed in two levels so a lookup can borrow.
+    ///
+    /// **Two levels because the hot path holds a `&str`, not a `String`.**
+    /// `EguiPointPainter` draws a station model from text it already owns, and
+    /// a single-level map keyed by a struct containing `String` cannot be
+    /// probed without building that `String` first — which is the very
+    /// allocation `Painter::text`'s `to_string()` was making. Splitting the
+    /// style out leaves an inner map keyed by `Box<str>`, and `Box<str>:
+    /// Borrow<str>`, so a hit costs a hash of the text and no allocation.
+    points: std::collections::HashMap<
+        PointStyle,
+        std::collections::HashMap<Box<str>, std::sync::Arc<egui::Galley>>,
+    >,
+    /// Entries across every inner map of `points`, kept as a running count so
+    /// the ceiling check stays O(1).
+    points_len: usize,
     layouts: u64,
     hits: u64,
 }
@@ -297,6 +313,49 @@ pub struct GalleyCache {
 impl GalleyCache {
     /// The entry ceiling past which the table is dropped whole.
     pub const MAX_ENTRIES: usize = 4096;
+
+    /// The galley `egui::Painter::text` would lay out, answered from the memo.
+    ///
+    /// **Borrows the text rather than owning it, and that is the whole point.**
+    /// `Painter::text` takes `impl ToString` and calls `to_string()` on every
+    /// call, so a station model drawing four numbers allocated four `String`s
+    /// per station per frame before any lock was taken. This probes the table
+    /// with the `&str` the caller already holds and allocates only on a miss.
+    ///
+    /// Unwrapped, matching `Painter::layout_no_wrap`: the caller places the
+    /// result with `Align2::anchor_size` exactly as `Painter::text` does, so
+    /// the drawn output is the same galley at the same origin.
+    pub fn galley_for_point(
+        &mut self,
+        ctx: &egui::Context,
+        text: &str,
+        font: egui::FontId,
+        color: Color32,
+    ) -> std::sync::Arc<egui::Galley> {
+        self.settle(ctx.pixels_per_point());
+        let style = PointStyle {
+            font_size: font.size.to_bits(),
+            family: font.family.clone(),
+            color,
+        };
+        if let Some(hit) = self.points.get(&style).and_then(|inner| inner.get(text)) {
+            let hit = hit.clone();
+            self.hits += 1;
+            return hit;
+        }
+        let galley = ctx.fonts_mut(|f| f.layout(text.to_owned(), font, color, f32::INFINITY));
+        self.layouts += 1;
+        if self
+            .points
+            .entry(style)
+            .or_default()
+            .insert(text.into(), galley.clone())
+            .is_none()
+        {
+            self.points_len += 1;
+        }
+        galley
+    }
 
     /// Galleys this cache has had to lay out — the figure a memo is judged by.
     pub fn layouts(&self) -> u64 {
@@ -310,17 +369,17 @@ impl GalleyCache {
 
     /// How many galleys are held.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.points_len
     }
 
     /// Whether the table holds nothing.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     /// Drop every entry, keeping the counters.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.drop_all();
     }
 
     /// Bring the table to `pixels_per_point`, dropping it if that moved or if
@@ -328,12 +387,33 @@ impl GalleyCache {
     fn settle(&mut self, pixels_per_point: f32) {
         if self.pixels_per_point != pixels_per_point {
             self.pixels_per_point = pixels_per_point;
-            self.entries.clear();
+            self.drop_all();
         }
-        if self.entries.len() >= Self::MAX_ENTRIES {
-            self.entries.clear();
+        if self.len() >= Self::MAX_ENTRIES {
+            self.drop_all();
         }
     }
+
+    fn drop_all(&mut self) {
+        self.entries.clear();
+        self.points.clear();
+        self.points_len = 0;
+    }
+}
+
+/// The style half of a point label's key — everything but the text itself.
+///
+/// Split from the text so the text can be probed as a borrowed `&str`; see
+/// [`GalleyCache::points`]. `FontId` is **not** `Eq` — it carries the size as a
+/// bare `f32` — so it is taken apart here and the size keyed by its bits, for
+/// the same reason and with the same "stricter is the safe direction" argument
+/// as [`GalleyKey`]: a spurious miss costs one layout, a spurious hit draws the
+/// wrong text.
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct PointStyle {
+    font_size: u32,
+    family: egui::FontFamily,
+    color: Color32,
 }
 
 /// Every field [`Text::galley`] reads, in a form that is `Hash` and `Eq`.
@@ -570,6 +650,100 @@ mod tests {
             2,
             "the table survived a pixels_per_point change",
         );
+    }
+
+    /// **The identity for the point path: the memo returns the galley
+    /// `Painter::text` would have laid out.**
+    ///
+    /// `Painter::text` calls `layout_no_wrap`, which is
+    /// `fonts.layout(text, font, color, f32::INFINITY)`. This asserts the
+    /// cached answer matches that call field for field, including on the
+    /// second lookup — the one that actually comes off the table.
+    #[test]
+    fn a_cached_point_galley_is_what_painter_text_would_have_laid_out() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let font = egui::FontId::proportional(11.0);
+
+        for body in ["24", "-3", "1013.2", "KTLX"] {
+            let direct = ctx.fonts_mut(|f| {
+                f.layout(body.to_owned(), font.clone(), Color32::WHITE, f32::INFINITY)
+            });
+            let first = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
+            let second = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
+
+            assert_eq!(direct.text(), first.text());
+            assert_eq!(direct.text(), second.text());
+            assert_eq!(direct.size(), first.size());
+            assert_eq!(direct.size(), second.size());
+            assert_eq!(direct.rect, first.rect);
+            assert_eq!(direct.rect, second.rect);
+            assert_eq!(direct.rows.len(), second.rows.len());
+        }
+    }
+
+    /// The count gate for the point path: a station whose reading has not
+    /// changed is laid out once, not once per frame.
+    #[test]
+    fn an_unchanged_station_reading_lays_out_once() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let font = egui::FontId::proportional(11.0);
+        let readings = ["24", "-3", "1013.2", "KTLX"];
+
+        for _frame in 0..5 {
+            for body in readings {
+                let _ = cache.galley_for_point(&ctx, body, font.clone(), Color32::WHITE);
+            }
+        }
+        assert_eq!(cache.layouts(), readings.len() as u64);
+        assert_eq!(cache.hits(), 4 * readings.len() as u64);
+    }
+
+    /// Style is keyed as well as text, so the same reading at two sizes or two
+    /// colours is two galleys rather than one wrong one.
+    #[test]
+    fn a_point_galleys_style_is_keyed_too() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let base = egui::FontId::proportional(11.0);
+
+        let _ = cache.galley_for_point(&ctx, "24", base.clone(), Color32::WHITE);
+        assert_eq!(cache.layouts(), 1);
+        let _ =
+            cache.galley_for_point(&ctx, "24", egui::FontId::proportional(14.0), Color32::WHITE);
+        assert_eq!(cache.layouts(), 2, "font size was not keyed");
+        let _ = cache.galley_for_point(&ctx, "24", base.clone(), Color32::RED);
+        assert_eq!(cache.layouts(), 3, "colour was not keyed");
+        let _ = cache.galley_for_point(&ctx, "25", base.clone(), Color32::WHITE);
+        assert_eq!(cache.layouts(), 4, "text was not keyed");
+
+        // **Without this the test is vacuous.** The four assertions above all
+        // count misses, and a memo that cached nothing at all would satisfy
+        // every one of them. Re-asking for the first key proves the table is
+        // actually answering, so "these are four keys" and "nothing is stored"
+        // stop being indistinguishable.
+        let _ = cache.galley_for_point(&ctx, "24", base, Color32::WHITE);
+        assert_eq!(
+            cache.layouts(),
+            4,
+            "a repeat of a keyed style laid out again"
+        );
+        assert_eq!(cache.hits(), 1);
+    }
+
+    /// Both tables answer to one ceiling, and a drop takes both — the label
+    /// memo and the point memo share a `Gui` and must share a bound.
+    #[test]
+    fn the_ceiling_spans_both_tables() {
+        let ctx = ctx_with_fonts();
+        let mut cache = GalleyCache::default();
+        let font = egui::FontId::proportional(11.0);
+        let _ = label("Washita River").galley_cached(&ctx, &mut cache);
+        for i in 0..GalleyCache::MAX_ENTRIES {
+            let _ = cache.galley_for_point(&ctx, &format!("r{i}"), font.clone(), Color32::WHITE);
+        }
+        assert!(cache.len() <= GalleyCache::MAX_ENTRIES);
     }
 
     /// The table is bounded: a session panning across a country retires label

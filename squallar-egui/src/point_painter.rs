@@ -6,6 +6,13 @@ use squallar_overlays::render::draw::{PointPainter, TextAnchor};
 pub(crate) struct EguiPointPainter<'a> {
     pub painter: &'a egui::Painter,
     pub center: Pos2,
+    /// The galley memo every `text` call on this painter goes through.
+    ///
+    /// A station model is several numbers per station and there are hundreds
+    /// of stations on screen, so this path lays out more galleys per frame
+    /// than the basemap's place names do. Lent by the pane walk, the same
+    /// cache the `CityLabels` arm uses; see [`walkers::GalleyCache`].
+    pub galleys: &'a mut walkers::GalleyCache,
 }
 
 impl EguiPointPainter<'_> {
@@ -51,13 +58,19 @@ impl PointPainter for EguiPointPainter<'_> {
             TextAnchor::CenterTop => egui::Align2::CENTER_TOP,
             TextAnchor::CenterBottom => egui::Align2::CENTER_BOTTOM,
         };
-        self.painter.text(
-            self.pos(offset),
-            align,
+        // `Painter::text` spelled out, with the layout answered from the memo:
+        // it is `layout_no_wrap` (which allocates a `String` from `text` and
+        // takes `Context::write`), then `Align2::anchor_size`, then `galley`.
+        // The placement arithmetic below is that function's, unchanged.
+        let color = Self::color(color);
+        let galley = self.galleys.galley_for_point(
+            self.painter.ctx(),
             text,
             FontId::proportional(size),
-            Self::color(color),
+            color,
         );
+        let rect = align.anchor_size(self.pos(offset), galley.size());
+        self.painter.galley(rect.min, galley, color);
     }
 
     fn line(&mut self, from: [f32; 2], to: [f32; 2], color: [u8; 4], width: f32) {
