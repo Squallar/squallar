@@ -14,7 +14,7 @@ use crate::WindowRef;
 use crate::app_state;
 use crate::channels::ChannelHub;
 use crate::input::InputHandler;
-use crate::platform::{PlatformBridge, RedrawWaker};
+use crate::platform::{GpuCapacitySource, PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
 #[cfg(not(target_arch = "wasm32"))]
 use squallar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
@@ -461,6 +461,17 @@ fn volume_job_context(
         half_extent_km,
         cells,
         max_axis,
+    }
+}
+
+/// `24822 MiB of GPU memory (Measured)`, or its absence, for the budgets
+/// line. Integers only, like every byte figure a log line here carries.
+fn describe_gpu_capacity(reading: Option<(u64, GpuCapacitySource)>) -> String {
+    match reading {
+        Some((bytes, source)) => {
+            format!("{} MiB of GPU memory ({source:?})", bytes / (1024 * 1024))
+        }
+        None => "no GPU memory figure".to_string(),
     }
 }
 
@@ -973,10 +984,16 @@ impl App {
     /// Build the volume pipelines on the device that has just appeared and hand the `Gui`
     /// something that can draw a 3D pane.
     fn update_device_profile(&mut self, class: squallar_device_profile::quality::DeviceClass) {
-        // Scoped, and deliberately: the adapter's report is read out here and
-        // the borrow released, so the re-derived raster ceiling below can be
-        // written back into the same `AppState`.
-        let Some(limits) = self.state.as_ref().map(|state| state.device.limits()) else {
+        // Scoped, and deliberately: the adapter's report and the bridge's
+        // capacity reading are taken here and the borrow released, so the
+        // re-derived raster ceiling below can be written back into the same
+        // `AppState`.
+        let Some((limits, capacity)) = self.state.as_ref().map(|state| {
+            (
+                state.device.limits(),
+                self.platform.gpu_capacity(&state.adapter, &state.device),
+            )
+        }) else {
             return;
         };
         self.device_profile.class = class;
@@ -984,14 +1001,16 @@ impl App {
             max_texture_dimension_2d: limits.max_texture_dimension_2d,
             max_texture_dimension_3d: limits.max_texture_dimension_3d,
         };
+        self.adopt_gpu_capacity(capacity);
         let resolved = squallar_device_profile::budget::resolve(&self.device_profile);
         if resolved != self.budgets {
             log::info!(
-                "Budgets: {:?} on a {class:?} adapter reporting {} px 2D and {} px 3D textures: \
-                 {:?} grid cells, {} MiB of offscreen, {} MiB of 3D texture",
+                "Budgets: {:?} on a {class:?} adapter reporting {} px 2D and {} px 3D textures \
+                 and {}: {:?} grid cells, {} MiB of offscreen, {} MiB of 3D texture",
                 resolved.promotion,
                 limits.max_texture_dimension_2d,
                 limits.max_texture_dimension_3d,
+                describe_gpu_capacity(capacity),
                 resolved.grid_cells,
                 resolved.offscreen_bytes / (1024 * 1024),
                 resolved.volume_texture_bytes / (1024 * 1024),
@@ -1022,6 +1041,15 @@ impl App {
             state.raster_side_ceiling_px = promoted_side;
             self.render.set_raster_side_ceiling_px(promoted_side);
         }
+    }
+
+    /// Fold the bridge's GPU capacity reading into the profile, as plain data.
+    /// `resolve` reads none of it yet — the floor crate's matrix holds the
+    /// budgets byte-identical with and without it — so this moves no budget;
+    /// it is the figure the `budget state:` line prints as `vram`. A reader
+    /// that stops answering leaves the field unread rather than stale.
+    fn adopt_gpu_capacity(&mut self, reading: Option<(u64, GpuCapacitySource)>) {
+        self.device_profile.vram_bytes = reading.map(|(bytes, _source)| bytes);
     }
 
     fn install_volume_bridge(&mut self) {
@@ -2638,6 +2666,9 @@ mod gui_action_replay_tests;
 
 #[cfg(test)]
 mod gui_seam_ratchet_tests;
+
+#[cfg(test)]
+mod gpu_capacity_tests;
 
 #[cfg(test)]
 mod tests;

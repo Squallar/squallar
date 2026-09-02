@@ -3,7 +3,9 @@
 
 #[cfg(target_os = "android")]
 use squallar_app::platform::drain_latest;
-use squallar_app::platform::{FormFactor, HostSignals, PlatformBridge, RedrawWaker};
+use squallar_app::platform::{
+    FormFactor, GpuCapacitySource, HostSignals, PlatformBridge, RedrawWaker,
+};
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -249,6 +251,16 @@ impl PlatformBridge for DesktopPlatform {
         crate::capacity::host_signals(FormFactor::Desktop)
     }
 
+    /// Vulkan's device-local heaps or DXGI's local budget for a discrete card;
+    /// `None` over GL and for a UMA part, whose heaps lie. See `crate::capacity`.
+    fn gpu_capacity(
+        &self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Option<(u64, GpuCapacitySource)> {
+        crate::capacity::gpu_capacity(adapter, device)
+    }
+
     /// Handed over before any window exists, which is what [`RedrawWaker`]'s slot
     /// is for.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
@@ -445,6 +457,16 @@ impl PlatformBridge for AndroidPlatform {
         crate::capacity::host_signals(FormFactor::Handheld)
     }
 
+    /// The Vulkan reader, which believes a discrete card only — so a phone
+    /// answers `None` and keeps its presumption. See `crate::capacity`.
+    fn gpu_capacity(
+        &self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Option<(u64, GpuCapacitySource)> {
+        crate::capacity::gpu_capacity(adapter, device)
+    }
+
     /// Taken before the theme poller is started, which is the only ordering this
     /// bridge depends on.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
@@ -620,6 +642,15 @@ impl PlatformBridge for IosPlatform {
     /// An iOS build is a handheld: a build fact, not a reading.
     fn host_signals(&self) -> HostSignals {
         crate::capacity::host_signals(FormFactor::Handheld)
+    }
+
+    /// Metal's working set, for every device class. See `crate::capacity`.
+    fn gpu_capacity(
+        &self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Option<(u64, GpuCapacitySource)> {
+        crate::capacity::gpu_capacity(adapter, device)
     }
 
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {

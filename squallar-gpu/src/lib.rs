@@ -8,6 +8,9 @@
 //! ([`egui_renderer`]), the banded texture upload path, the pane mirror, the
 //! staging ring ([`staging_ring`]), and the device-request policy ([`device`]).
 
+/// Heap arithmetic behind the measured GPU capacity: pure, so the `unsafe`
+/// readers can stay out of this crate.
+pub mod capacity;
 /// The device-request policy: which surface format, which limits, which
 /// present mode.
 pub mod device;

@@ -58,6 +58,14 @@ log = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
 env_logger = "=0.11.11"
+# `wgpu::Adapter`, `wgpu::Device` and `wgpu::hal`, for the GPU readers in
+# `src/capacity/`. No features: squallar-gpu's manifest is the one wgpu
+# feature-chooser for the graph, and this entry only names the copy it already
+# configures. Already in every one of this package's graphs via squallar-app.
+wgpu = { workspace = true }
+# `capacity::device_local_total`, the heap arithmetic the Vulkan reader hands
+# its heaps to. Already in every one of this package's graphs via squallar-app.
+squallar-gpu = { workspace = true }
 
 [dev-dependencies]
 # Only for src/network_security_config.rs, which is `#[cfg(test)]`.
@@ -163,13 +171,21 @@ squallar-nmea-serial = { workspace = true, features = ["serial"] }
 # `DesktopPlatform::start_gps` drives. Same IOKit fence as the two lines above.
 squallar-location = { workspace = true, features = ["serial"] }
 
-# The RAM readers in `src/capacity/`, one per OS. Each entry below widens a
-# crate already in this package's graph for that target -- zero new compiled
-# packages, read off Cargo.lock: `objc2-foundation 0.3.2` reaches both Apple
-# graphs through wgpu-hal and squallar-location's `os-providers`, and
-# `windows 0.62.2` reaches the Windows graph through gpu-allocator and the
-# same squallar-location feature. Linux and Android read `/proc/meminfo`
-# through `std::fs` and need nothing here.
+# The RAM and GPU readers in `src/capacity/`, one per OS and one per backend.
+# Each entry below widens a crate already in this package's graph for that
+# target -- zero new compiled packages, read off Cargo.lock: `objc2-foundation
+# 0.3.2`, `objc2 0.6.4` and `objc2-metal 0.3.2` reach both Apple graphs through
+# wgpu-hal (the first also through squallar-location's `os-providers`),
+# `windows 0.62.2` reaches the Windows graph through gpu-allocator and the same
+# squallar-location feature, and `ash 0.38` is wgpu-hal's own Vulkan binding on
+# every target that has the backend. Linux and Android read `/proc/meminfo`
+# through `std::fs` and need nothing for RAM.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))'.dependencies]
+# `vk::MemoryHeapFlags` and the memory-properties query, for
+# `src/capacity/vulkan.rs`. No features: the query is core Vulkan 1.0, and the
+# loader is wgpu-hal's.
+ash = { version = "=0.38.0", default-features = false }
+
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 # `NSProcessInfo.physicalMemory`, for `src/capacity/apple.rs`. The same
 # `default-features = false` shape as squallar-location's entry, for the same
@@ -178,9 +194,20 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "alloc",
     "NSProcessInfo",
 ] }
+# `MTLDevice::recommendedMaxWorkingSetSize`, for `src/capacity/metal.rs`, and
+# the `sel!`/`respondsToSelector` pair that keeps the call off an iOS older
+# than 16, where the selector does not exist.
+objc2 = { version = "=0.6.4", default-features = false }
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "MTLDevice",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`. No
+# `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`, and
+# `IDXGIAdapter3::QueryVideoMemoryInfo`, for `src/capacity/dx12.rs`. No
 # `default-features = false`: as squallar-location's entry records, that
 # drops the `std` plumbing the generated bindings need.
-windows = { version = "=0.62.2", features = ["Win32_System_SystemInformation"] }
+windows = { version = "=0.62.2", features = [
+    "Win32_System_SystemInformation",
+    "Win32_Graphics_Dxgi",
+] }

@@ -1,6 +1,7 @@
 //! A [`PlatformBridge`] for tests, shaped after the four real ones.
 
-use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
+use crate::platform::{GpuCapacitySource, PlatformBridge, RedrawWaker, drain_latest};
+use egui_wgpu::wgpu;
 use squallar_kv::{KvStore, MemoryKvStore};
 use squallar_location::LocationPermission;
 use std::cell::{Cell, RefCell};
@@ -131,6 +132,9 @@ pub(crate) struct TestBridge {
     /// flag: the whole contract is that the push is *edge-triggered*, and only
     /// the sequence can show a repeat that should not have been sent.
     back_claims: Rc<RefCell<Vec<bool>>>,
+    /// What `gpu_capacity` answers, whatever adapter it is asked about: this
+    /// double has no driver to consult.
+    gpu_capacity: Option<(u64, GpuCapacitySource)>,
 }
 
 impl TestBridge {
@@ -159,6 +163,7 @@ impl TestBridge {
             timezone: None,
             location: LocationRecord::default(),
             back_claims: Rc::new(RefCell::new(Vec::new())),
+            gpu_capacity: None,
         }
     }
 
@@ -273,6 +278,12 @@ impl TestBridge {
     /// Report `zone` as the device's IANA timezone.
     pub(crate) fn with_timezone(mut self, zone: &str) -> Self {
         self.timezone = Some(zone.to_string());
+        self
+    }
+
+    /// Answer `gpu_capacity` with a fixed reading, standing in for a driver.
+    pub(crate) fn with_gpu_capacity(mut self, bytes: u64, source: GpuCapacitySource) -> Self {
+        self.gpu_capacity = Some((bytes, source));
         self
     }
 
@@ -417,6 +428,15 @@ impl PlatformBridge for TestBridge {
             return;
         }
         self.theme_detector = Some(detector);
+    }
+
+    /// The injected reading, or the trait's `None`.
+    fn gpu_capacity(
+        &self,
+        _adapter: &wgpu::Adapter,
+        _device: &wgpu::Device,
+    ) -> Option<(u64, GpuCapacitySource)> {
+        self.gpu_capacity
     }
 
     /// `None` until this platform has been told where config lives, which is what
