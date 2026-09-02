@@ -15,6 +15,9 @@ pub mod egui_renderer;
 /// GPU pass timing through timestamp queries — the opt-in probe behind the
 /// `gpu passes:` telemetry line.
 pub mod gpu_probe;
+/// The out-of-memory count the device's error sink raises and the frame loop
+/// drains — one pressure event per frame, whatever the count.
+pub mod pressure;
 pub mod staging_ring;
 /// A vector tile's tessellated fills, uploaded once and placed by a uniform —
 /// the renderer half of [`squallar_egui::tile_mesh`].

@@ -2951,7 +2951,7 @@ impl super::App {
                         );
                     }
 
-                    self.back_off_budgets();
+                    self.on_pressure(crate::pressure::Pressure::SurfaceLost);
 
                     // Surface is irrecoverably lost (e.g. display changed on a
                     // foldable). Drop the entire rendering state so the next
@@ -3867,8 +3867,51 @@ impl super::App {
         self.loop_pool_state.allocation()
     }
 
-    /// Step the whole budget set down after the device refused, and remember it.
-    pub(super) fn back_off_budgets(&mut self) {
+    /// **Answer memory pressure, within this session.** Economy first — the
+    /// shared render cache, the plan-view extractions, and the loop caches'
+    /// data no live frame names — then one rung down the budget ladder, with
+    /// the position held in the device profile's memo for the life of the
+    /// process. Nothing is written to the store: a reopen starts at the ladder
+    /// top whatever this session learned.
+    ///
+    /// The payloads freed here leave through `offload::discard_each`, never
+    /// dropped on this thread: a shared render is `side^2 x 4` bytes twice
+    /// over, and an extraction is a whole sweep's gates.
+    ///
+    /// Held rasters are not released here. The one call that lets them go is
+    /// on the surface-lost path, which drops the whole graphics state behind
+    /// this anyway; reaching it from here would grow the app's reach into the
+    /// UI layer, and the tile cache's economy is not yet in this system.
+    pub(super) fn on_pressure(&mut self, cause: crate::pressure::Pressure) {
+        let (renders, render_bytes) = self.render.clear_render_cache();
+        let extracts = self.render.clear_extract_cache();
+        let reclaimed = crate::pressure::Reclaimed {
+            render_entries: renders.len(),
+            render_bytes,
+            extracts: extracts.len(),
+        };
+        squallar_worker::offload::discard_each("pressure-render-cache", renders);
+        squallar_worker::offload::discard_each("pressure-extract-cache", extracts);
+        self.evict_unneeded_loop_scans();
+
+        let rung = self.step_ladder_down(cause);
+        log::warn!("{}", crate::pressure::pressure_line(cause, reclaimed, rung));
+    }
+
+    /// Take what the device's error sink counted since the last frame. Any
+    /// count at all is one pressure event; how many errors one frame produced
+    /// does not change the answer. Called once per frame, at the end of the
+    /// present path, so a frame that also lost its surface can step twice —
+    /// two causes, two rungs — which is bounded and rare rather than a defect
+    /// this guards against.
+    pub(super) fn absorb_gpu_pressure(&mut self) {
+        if squallar_gpu::pressure::take_out_of_memory() > 0 {
+            self.on_pressure(crate::pressure::Pressure::OutOfMemory);
+        }
+    }
+
+    /// One rung down for this session, and the rung the ladder now stands on.
+    fn step_ladder_down(&mut self, cause: crate::pressure::Pressure) -> u32 {
         // The bracket the *resolved* budgets carry, not `for_target`'s: the two
         // are the same figures today because no bracket promotes the pool, and
         // reading the resolved one is what keeps them the same when one does.
@@ -3879,14 +3922,14 @@ impl super::App {
             ))
         {
             let bytes = self.loop_pool.bytes();
-            log::warn!(
-                "Loop pool: backed off to {} MiB after a lost surface",
+            log::info!(
+                "Loop pool: backed off to {} MiB after {}",
                 bytes / (1024 * 1024),
+                cause.label(),
             );
             if let Some(memo) = self.device_profile.memo.as_mut() {
                 memo.loop_pool_bytes = Some(bytes);
             }
-            crate::loop_pool::remember(self.platform.kv().as_deref(), bytes);
         }
 
         let memo = self
@@ -3905,22 +3948,24 @@ impl super::App {
         };
         if same_but_for_the_count == self.budgets {
             // Every rung this ladder owns is already at its stop. Roll the count
-            // back rather than persisting a number that describes nothing, so
-            // the memo stays a position on the ladder.
+            // back rather than holding a number that describes nothing, so the
+            // memo stays a position on the ladder.
+            let settled = stepped.saturating_sub(1);
             if let Some(memo) = self.device_profile.memo.as_mut() {
-                memo.steps_back = stepped.saturating_sub(1);
+                memo.steps_back = settled;
             }
-            return;
+            return settled;
         }
-        log::warn!(
-            "Budgets: stepped down to rung {stepped} after a lost surface: {:?} 3D quality \
+        log::info!(
+            "Budgets: stepped down to rung {stepped} after {}: {:?} 3D quality \
              ceiling, {} MiB of offscreen, {:?} grid cells",
+            cause.label(),
             resolved.quality_ceiling,
             resolved.offscreen_bytes / (1024 * 1024),
             resolved.grid_cells,
         );
         self.budgets = resolved;
-        crate::budget_memo::remember_steps(self.platform.kv().as_deref(), stepped);
+        stepped
     }
 
     /// **One raster per loop frame of a non-radar layer that has none** — the

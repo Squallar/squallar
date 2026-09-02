@@ -6,7 +6,6 @@ use squallar_device_profile::constants::{
     MOBILE_VOLUME_GRID_CELLS, WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES,
     WASM_LOOP_POOL_FLOOR_BYTES, WASM_MAX_LOOP_RENDER_BUDGET, WASM_VOLUME_GRID_CELLS,
 };
-use squallar_kv::MemoryKvStore;
 use squallar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// One device class, with both halves of every question a host build cannot otherwise
@@ -563,41 +562,6 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
     // bound.
     let back = settle(&mut state, loops(6));
     assert_eq!(back, six, "a shrink was held off by the dead band");
-}
-
-/// The memo round-trips, and anything unreadable is simply absent.
-#[test]
-fn the_pool_memo_round_trips_and_survives_a_corrupt_entry() {
-    let limits = LoopPoolLimits {
-        floor: 64 * 1024 * 1024,
-        ceiling: 512 * 1024 * 1024,
-    };
-    let store = MemoryKvStore::default();
-    assert_eq!(remembered(Some(&store), limits), None, "nothing yet");
-
-    remember(Some(&store), 128 * 1024 * 1024);
-    assert_eq!(
-        store.load(LOOP_POOL_KEY).as_deref(),
-        Some("128"),
-        "the memo is a bare decimal count of MiB",
-    );
-    assert_eq!(remembered(Some(&store), limits), Some(128 * 1024 * 1024));
-
-    for junk in ["", "  ", "not a number", "-1", "12.5", "{\"mib\":128}"] {
-        store.store(LOOP_POOL_KEY, junk).expect("storable");
-        assert_eq!(
-            remembered(Some(&store), limits),
-            None,
-            "a {junk:?} memo should fall back to the classification",
-        );
-    }
-    // A zero is absent rather than a pool of nothing.
-    store.store(LOOP_POOL_KEY, "0").expect("storable");
-    assert_eq!(remembered(Some(&store), limits), None);
-
-    // No store at all is the wasm-without-localStorage case, and it degrades.
-    assert_eq!(remembered(None, limits), None);
-    remember(None, 128 * 1024 * 1024);
 }
 
 /// `LoopDemand::add` classifies by view exhaustively, like everything else in this

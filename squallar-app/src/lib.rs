@@ -37,6 +37,8 @@ pub mod platform;
 /// The [`PlatformBridge`](platform::PlatformBridge) test double.
 #[cfg(test)]
 pub(crate) mod platform_double;
+/// Why memory is being asked back, and the one line that says what was given.
+pub mod pressure;
 pub mod render_dispatch;
 pub mod render_key;
 pub mod site_catalogue;

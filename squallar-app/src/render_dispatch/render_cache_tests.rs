@@ -151,6 +151,32 @@ fn clear_empties_both_halves() {
     assert!(cache.recency_order().is_empty());
 }
 
+/// The pressure path's door: every entry comes back owned, the byte figure is
+/// what the cache was charging for them, and both halves and the ledger read
+/// empty afterwards.
+#[test]
+fn take_all_hands_every_entry_back_with_the_bytes_they_held() {
+    let mut cache = RenderCache::new(4, usize::MAX);
+    cache.insert(key("KTLX", 0), output_of_side(0.0, 64));
+    cache.insert(key("KTLX", 1), output_of_side(1.0, 64));
+    let held = cache.resident_bytes();
+    assert!(
+        held > 0,
+        "the fixture charges nothing, so the byte figure is untested"
+    );
+
+    let (taken, bytes) = cache.take_all();
+
+    assert_eq!(taken.len(), 2);
+    assert_eq!(
+        bytes, held,
+        "the bytes handed back are not what was resident"
+    );
+    assert_eq!(cache.entry_count(), 0);
+    assert!(cache.recency_order().is_empty());
+    assert_eq!(cache.resident_bytes(), 0);
+}
+
 /// A zero capacity would evict every entry on the way in, silently disabling the cross-pane
 /// sharing the cache exists for.
 #[test]

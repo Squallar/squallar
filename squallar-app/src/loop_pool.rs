@@ -17,10 +17,13 @@ use squallar_device_profile::constants::{
     RENDER_WIDTH, VOLUME_GRID_CELLS,
 };
 use squallar_device_profile::quality::DeviceClass;
-use squallar_kv::KvStore;
 use squallar_radar::types::RenderView;
 
-/// Key the discovered pool size is persisted under.
+/// The key a stale pool size sits under in an older install's store, in MiB.
+/// Never read, never written: the pool is sized from the device class at every
+/// launch, and what a lost surface teaches it lives for this process only. Kept
+/// because the store has no delete, so the entry is named rather than
+/// mysterious.
 pub const LOOP_POOL_KEY: &str = "loop_pool";
 
 /// The bounds this target holds a discovered pool between.
@@ -451,33 +454,6 @@ impl LoopPoolState {
             return true;
         }
         bare.share_bytes as f64 >= in_force.share_bytes as f64 * LOOP_POOL_HYSTERESIS
-    }
-}
-
-/// What a previous session learned this machine can hold, if anything.
-/// Anything unreadable, or zero, is `None` — the caller falls back to the
-/// device classification, which is the same answer a first launch gets.
-pub fn remembered(store: Option<&dyn KvStore>, limits: LoopPoolLimits) -> Option<usize> {
-    let raw = store?.load(LOOP_POOL_KEY)?;
-    let mib: usize = raw.trim().parse().ok().or_else(|| {
-        log::warn!("loop pool memo is not a number ({raw:?}); re-probing this device");
-        None
-    })?;
-    let bytes = mib.checked_mul(1024 * 1024)?;
-    if bytes == 0 {
-        return None;
-    }
-    Some(limits.hold(bytes))
-}
-
-/// Write what this session settled on, synchronously.
-pub fn remember(store: Option<&dyn KvStore>, bytes: usize) {
-    let Some(store) = store else {
-        return;
-    };
-    let mib = bytes / (1024 * 1024);
-    if let Err(e) = store.store_now(LOOP_POOL_KEY, &mib.to_string()) {
-        log::warn!("could not persist the loop pool size: {e}");
     }
 }
 

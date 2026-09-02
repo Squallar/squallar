@@ -1236,9 +1236,43 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
     }
 }
 
-/// **A lost surface steps the whole budget set down, not just the loop pool.**
+/// One shared render in the dispatcher's cache — economy for a pressure event
+/// to evict. A 64 px raster, so the byte figure the cache charges is non-zero
+/// and the eviction is of something rather than of nothing.
+fn seed_render_cache(app: &mut App) {
+    use crate::render_dispatch::CachedRenderOutput;
+    let key = crate::render_key::render_cache_key(
+        "KTLX",
+        &squallar_radar::fields::known::REFLECTIVITY,
+        squallar_radar::types::RenderView::PlanView,
+        0.5,
+    );
+    app.render.render_cache.insert(
+        key,
+        CachedRenderOutput {
+            image: std::sync::Arc::new(egui::ColorImage::new(
+                [64, 64],
+                vec![egui::Color32::BLACK; 64 * 64],
+            )),
+            max_range_km: 230.0,
+            hover: std::sync::Arc::new(squallar_radar::hover::HoverSource::empty()),
+            nyquist_ms: None,
+            melting_layer_source: None,
+            storm_motion: None,
+        },
+    );
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        1,
+        "precondition: the fixture did not land in the cache"
+    );
+}
+
+/// **A lost surface evicts economy, steps the whole budget set down one rung,
+/// and writes nothing.** Nothing is learned across sessions: the rung lives in
+/// the device profile's memo for this process, and the store never hears of it.
 #[test]
-fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
+fn a_lost_surface_evicts_economy_and_steps_down_and_writes_nothing() {
     use squallar_device_profile::quality::GradientShading;
     use squallar_kv::KvStore;
 
@@ -1251,6 +1285,7 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
         None,
         crate::loop_pool::LoopPoolLimits::from_budgets(&app.budgets),
     );
+    seed_render_cache(&mut app);
     let before = app.budgets;
     let pool_before = app.loop_pool.bytes();
     assert_eq!(
@@ -1259,8 +1294,14 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
         "precondition: this build's desktop bracket starts at the cloud rung",
     );
 
-    app.back_off_budgets();
+    app.on_pressure(crate::pressure::Pressure::SurfaceLost);
 
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        0,
+        "economy survived a pressure event: the render cache still holds its entry",
+    );
+    assert_eq!(app.render.extract_cache_len(), 0);
     assert_eq!(
         app.budgets.quality_ceiling.shading,
         GradientShading::Off,
@@ -1276,42 +1317,82 @@ fn a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once() {
         app.loop_pool.bytes() < pool_before,
         "the pool did not halve beside it",
     );
+    assert_eq!(app.budgets.steps_back, 1);
+    // Nothing is learned across sessions (user ruling, 2026-09-01): the rung
+    // is this process's alone, and the store has no entry to carry it.
     assert_eq!(
-        store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
-        Some("1"),
-        "the rung was not persisted at the moment of the decision",
+        store.load(crate::budget_memo::BUDGET_MEMO_KEY),
+        None,
+        "the ladder position was written to the store",
     );
-    assert!(store.load(crate::loop_pool::LOOP_POOL_KEY).is_some());
+    assert_eq!(
+        store.load(crate::loop_pool::LOOP_POOL_KEY),
+        None,
+        "the pool size was written to the store",
+    );
 }
 
-/// **What was learned by crashing is in force from the first paint of the next
-/// session.**
+/// **A reopen starts at the ladder top whatever the store holds.** A stale
+/// entry from an older install is ignored, not honoured — and not deleted
+/// either, since the store cannot.
+///
+/// The seeded pool size sits strictly between the desktop floor and ceiling,
+/// so honouring it would be visible: a value at or under the floor would be
+/// held to the floor and read exactly like the class pick.
 #[test]
-fn a_backed_off_machine_reopens_where_it_left_off() {
+fn a_reopen_starts_at_the_ladder_top_whatever_the_store_holds() {
     use squallar_device_profile::quality::GradientShading;
+    use squallar_kv::KvStore;
 
-    let first = TestBridge::desktop();
-    let store = first.store();
-    let mut app = headless(first);
-    app.back_off_budgets();
-    app.back_off_budgets();
-    let settled = app.budgets;
-    assert_eq!(settled.steps_back, 2);
-
-    let reopened = headless(TestBridge::desktop().with_store(store));
-    assert_eq!(
-        reopened.budgets.steps_back, 2,
-        "the ladder position was re-probed instead of remembered",
+    let platform = TestBridge::desktop();
+    let store = platform.store();
+    store
+        .store(crate::budget_memo::BUDGET_MEMO_KEY, "2")
+        .expect("the memory store cannot fail");
+    store
+        .store(crate::loop_pool::LOOP_POOL_KEY, "1024")
+        .expect("the memory store cannot fail");
+    let limits =
+        crate::loop_pool::LoopPoolLimits::from_budgets(&squallar_device_profile::budget::resolve(
+            &squallar_device_profile::budget::DeviceProfile::for_target(),
+        ));
+    let seeded = 1024 * 1024 * 1024;
+    assert!(
+        limits.floor < seeded && seeded < limits.ceiling,
+        "the fixture's stale size ({seeded}) is not strictly inside the pool \
+         limits ({limits:?}), so honouring it would be invisible here",
     );
-    assert_eq!(reopened.budgets.quality_ceiling, settled.quality_ceiling);
-    assert_eq!(reopened.budgets.offscreen_bytes, settled.offscreen_bytes);
+
+    let reopened = headless(platform);
+    let fresh = headless(TestBridge::desktop());
+
+    assert_eq!(
+        reopened.budgets.steps_back, 0,
+        "a stale ladder position in the store was honoured",
+    );
+    assert_eq!(reopened.budgets, fresh.budgets);
     assert_eq!(
         reopened.budgets.quality_ceiling.shading,
-        GradientShading::Off,
+        GradientShading::On,
+    );
+    assert_eq!(
+        reopened.loop_pool, fresh.loop_pool,
+        "a stale pool size in the store was honoured",
+    );
+    assert_ne!(reopened.loop_pool.bytes(), seeded);
+    // Ignored is not deleted: the entries are still there, and harmless.
+    assert_eq!(
+        store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
+        Some("2"),
+    );
+    assert_eq!(
+        store.load(crate::loop_pool::LOOP_POOL_KEY).as_deref(),
+        Some("1024"),
     );
 }
 
-/// **A machine that keeps failing stops writing, rather than counting for ever.**
+/// **A machine that keeps failing settles rather than counting for ever**,
+/// and never writes.
 #[test]
 fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
     use squallar_kv::KvStore;
@@ -1321,7 +1402,7 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
     let mut app = headless(platform);
 
     for _ in 0..12 {
-        app.back_off_budgets();
+        app.on_pressure(crate::pressure::Pressure::SurfaceLost);
     }
     let settled = app.budgets.steps_back;
     assert!(
@@ -1330,8 +1411,9 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
          ladder at all or a failure counter wearing one as a hat",
     );
     assert_eq!(
-        store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
-        Some(settled.to_string().as_str()),
+        store.load(crate::budget_memo::BUDGET_MEMO_KEY),
+        None,
+        "twelve pressure events, and one of them wrote the store",
     );
     let shipped = squallar_device_profile::budget::BudgetLimits::for_target();
     assert_eq!(app.budgets.grid_cells, shipped.grid_cells.floor);
@@ -1339,6 +1421,83 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
     assert_eq!(
         app.budgets.raster_side_ceiling_px,
         shipped.long_range_image_side_px.floor,
+    );
+}
+
+/// **An out-of-memory error, however many times the device raised it in one
+/// frame, is one rung on that frame — and writes nothing.**
+///
+/// The counter is process-global; this is the only test in this binary that
+/// notes into it or takes from it, and the frame path that takes it never
+/// runs headless.
+#[test]
+fn an_out_of_memory_error_steps_the_ladder_once_per_frame_and_writes_nothing() {
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::desktop();
+    let store = platform.store();
+    let mut app = headless(platform);
+    assert_eq!(app.budgets.steps_back, 0);
+
+    squallar_gpu::pressure::note_out_of_memory();
+    squallar_gpu::pressure::note_out_of_memory();
+    app.absorb_gpu_pressure();
+    assert_eq!(
+        app.budgets.steps_back, 1,
+        "two errors on one frame are one rung, not two",
+    );
+
+    // The next frame, with nothing new noted: the ladder holds.
+    app.absorb_gpu_pressure();
+    assert_eq!(app.budgets.steps_back, 1);
+
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+    assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
+}
+
+/// **A platform memory warning evicts economy and steps down**, and what it
+/// evicts leaves through the deferred-drop path rather than on this thread.
+///
+/// `memory_warning` itself is one line handing `Pressure::MemoryWarning` to
+/// the handler; it takes an `ActiveEventLoop` no host test can build, so the
+/// handler is driven directly and the wiring is read from the source.
+#[test]
+fn a_memory_warning_evicts_economy_and_steps_down() {
+    let mut app = headless(TestBridge::desktop());
+    seed_render_cache(&mut app);
+    let before = app.budgets.steps_back;
+
+    app.on_pressure(crate::pressure::Pressure::MemoryWarning);
+
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        0,
+        "the render cache survived a memory warning",
+    );
+    assert_eq!(app.budgets.steps_back, before + 1);
+
+    let handler = include_str!("../app.rs")
+        .split_once("fn memory_warning(")
+        .map(|(_, rest)| rest.split_once("\n    }").expect("a body").0)
+        .expect("`memory_warning` is implemented on `App`");
+    assert!(
+        handler.contains("Pressure::MemoryWarning"),
+        "the platform's memory warning no longer reaches the pressure handler: {handler}",
+    );
+    let body = include_str!("../app_render.rs")
+        .split_once("fn on_pressure(")
+        .map(|(_, rest)| rest.split_once("\n    }").expect("a body").0)
+        .expect("`on_pressure` is implemented on `App`");
+    assert_eq!(
+        body.matches("squallar_worker::offload::discard_each(")
+            .count(),
+        2,
+        "an evicted cache is freed on the frame thread rather than handed to \
+         the deferred-drop path: {body}",
+    );
+    assert!(
+        body.contains("self.evict_unneeded_loop_scans();"),
+        "the loop caches' sweep is no longer part of the pressure answer: {body}",
     );
 }
 

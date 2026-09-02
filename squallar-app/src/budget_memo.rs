@@ -1,82 +1,90 @@
-//! The budget ladder's persisted position — the app-side half of
-//! [`squallar_device_profile::budget::BudgetMemo`].
+//! The key the budget ladder's position used to be persisted under.
+//!
+//! Nothing is learned across sessions: the ladder starts at its top on every
+//! launch, pressure is answered within the session, and no code in this crate
+//! reads or writes this key any more. It is kept because the store has no
+//! delete — an install that wrote one keeps it — and a named stale entry is
+//! better than an unexplained string in someone's config. The position itself
+//! is [`squallar_device_profile::budget::BudgetMemo::steps_back`] on the
+//! device profile, for the life of the process.
 
-use squallar_kv::KvStore;
-
-/// Key the ladder position ([`BudgetMemo::steps_back`]) is persisted under.
+/// The key a stale ladder position sits under in an older install's store.
+/// Never read, never written; harmless where it exists.
 pub const BUDGET_MEMO_KEY: &str = "budget_steps";
-
-/// What a previous session learned, read back.
-pub fn remembered_steps(store: Option<&dyn KvStore>) -> Option<u32> {
-    let raw = store?.load(BUDGET_MEMO_KEY)?;
-    raw.trim().parse().ok().or_else(|| {
-        log::warn!("budget memo is not a number ({raw:?}); starting this device at its ladder top");
-        None
-    })
-}
-
-/// Write what this session settled on, synchronously. See [`BUDGET_MEMO_KEY`].
-pub fn remember_steps(store: Option<&dyn KvStore>, steps: u32) {
-    let Some(store) = store else {
-        return;
-    };
-    if let Err(e) = store.store_now(BUDGET_MEMO_KEY, &steps.to_string()) {
-        log::warn!("could not persist the budget ladder position: {e}");
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui_wgpu::wgpu;
-    use squallar_device_profile::budget::{
-        AdapterCeilings, BudgetLimits, BudgetMemo, DeviceProfile, Platform, resolve,
-    };
     use squallar_device_profile::constants::{
         WASM_LONG_RANGE_IMAGE_SIZE, WASM_LOOP_IMAGE_SIZE, WEBGL2_MAX_TEXTURE_DIMENSION_3D,
     };
-    use squallar_device_profile::quality::DeviceClass;
     use squallar_radar::types::WASM_IMAGE_SIZE;
 
-    /// **What a machine learned by crashing survives the restart, and reads
-    /// back as the same budgets.**
+    /// **Nothing is learned across sessions.** Neither memo key is read or
+    /// written anywhere in this crate's production source: each appears exactly
+    /// once, at its own definition, and the two files that used to write them
+    /// on a lost surface and read them at construction name neither.
+    ///
+    /// This file and `loop_pool.rs` are scraped up to their own `#[cfg(test)]`,
+    /// so this test's needles do not count against it; `app.rs` and
+    /// `app_render.rs` keep their tests in files of their own and are read
+    /// whole.
     #[test]
-    fn a_ladder_position_survives_its_own_config_entry() {
-        use squallar_kv::MemoryKvStore;
+    fn neither_memo_key_is_read_or_written_by_production_source() {
+        fn production(source: &'static str) -> &'static str {
+            source
+                .split_once("#[cfg(test)]")
+                .map_or(source, |(production, _)| production)
+        }
+        let memo = production(include_str!("budget_memo.rs"));
+        let pool = production(include_str!("loop_pool.rs"));
 
-        let store = MemoryKvStore::default();
-        assert_eq!(remembered_steps(Some(&store)), None, "nothing learned yet");
+        // Presence controls: the two definitions are where the scrape says they
+        // are, spelling the values the constants really carry, so a zero below
+        // is a zero and not an unread file.
+        assert!(memo.contains(&format!(
+            "pub const BUDGET_MEMO_KEY: &str = {BUDGET_MEMO_KEY:?};"
+        )));
+        assert!(pool.contains(&format!(
+            "pub const LOOP_POOL_KEY: &str = {:?};",
+            crate::loop_pool::LOOP_POOL_KEY
+        )));
+        assert_eq!(memo.matches("BUDGET_MEMO_KEY").count(), 1);
+        assert_eq!(pool.matches("LOOP_POOL_KEY").count(), 1);
 
-        remember_steps(Some(&store), 2);
-        assert_eq!(remembered_steps(Some(&store)), Some(2));
-        assert_eq!(store.load(BUDGET_MEMO_KEY).as_deref(), Some("2"));
-
-        // The desktop-bracket profile at its most conservative reading, memo aside —
-        // `shipped_profile` in the floor crate's own tests.
-        let reopened = DeviceProfile {
-            platform: Platform::Native,
-            limits: BudgetLimits::DESKTOP,
-            class: DeviceClass::Discrete,
-            adapter: AdapterCeilings::WEBGL2_GUARANTEE,
-            vram_bytes: None,
-            system_ram_bytes: None,
-            declared_ram_bytes: None,
-            parallelism: None,
-            form_factor: None,
-            memo: Some(BudgetMemo {
-                loop_pool_bytes: None,
-                steps_back: remembered_steps(Some(&store)).unwrap_or(0),
-            }),
-        };
-        assert_eq!(resolve(&reopened).steps_back, 2);
-
-        // Anything unreadable is a re-probe rather than a panic or a zero written
-        // over the top of what the machine actually said.
-        store
-            .store(BUDGET_MEMO_KEY, "not a number")
-            .expect("the memory store cannot fail");
-        assert_eq!(remembered_steps(Some(&store)), None);
-        assert_eq!(remembered_steps(None), None);
+        for (name, source) in [
+            ("budget_memo.rs", memo),
+            ("loop_pool.rs", pool),
+            ("app.rs", include_str!("app.rs")),
+            ("app_render.rs", include_str!("app_render.rs")),
+        ] {
+            for needle in [
+                "remembered_steps",
+                "remember_steps",
+                "store_now(BUDGET",
+                "store_now(LOOP",
+            ] {
+                assert_eq!(
+                    source.matches(needle).count(),
+                    0,
+                    "{name} spells `{needle}`: something reads or writes a memo key \
+                     again, and what a session learns is supposed to die with it",
+                );
+            }
+        }
+        for (name, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("app_render.rs", include_str!("app_render.rs")),
+        ] {
+            for key in ["BUDGET_MEMO_KEY", "LOOP_POOL_KEY"] {
+                assert_eq!(
+                    source.matches(key).count(),
+                    0,
+                    "{name} names `{key}` in production source",
+                );
+            }
+        }
     }
 
     /// The web image fits what a browser is *guaranteed* to accept.

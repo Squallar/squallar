@@ -511,10 +511,9 @@ impl App {
         device_profile.declared_ram_bytes = signals.declared_ram_bytes;
         device_profile.parallelism = signals.parallelism;
         device_profile.form_factor = signals.form_factor;
-        device_profile.memo = Some(squallar_device_profile::budget::BudgetMemo {
-            loop_pool_bytes: None,
-            steps_back: crate::budget_memo::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
-        });
+        // Nothing is learned across sessions: every launch starts at the ladder
+        // top, and what pressure teaches lives in this memo for the process only.
+        device_profile.memo = Some(squallar_device_profile::budget::BudgetMemo::default());
         let budgets = squallar_device_profile::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
 
@@ -579,16 +578,10 @@ impl App {
             platform.kv().as_deref(),
         );
 
+        // The floor until the adapter answers; `install_volume_bridge` sizes it
+        // from the device class once. A stale size in the store is not read.
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
-        let loop_pool_memo =
-            crate::loop_pool::remembered(platform.kv().as_deref(), loop_pool_limits);
-        let loop_pool = crate::loop_pool::LoopPool::new(
-            loop_pool_memo.unwrap_or(loop_pool_limits.floor),
-            loop_pool_limits,
-        );
-        if let Some(memo) = device_profile.memo.as_mut() {
-            memo.loop_pool_bytes = loop_pool_memo;
-        }
+        let loop_pool = crate::loop_pool::LoopPool::new(loop_pool_limits.floor, loop_pool_limits);
 
         let mut app = Self {
             state: None,
@@ -613,7 +606,7 @@ impl App {
                 loop_pool,
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
-            loop_pool_sized: loop_pool_memo.is_some(),
+            loop_pool_sized: false,
             loop_counts: crate::loop_telemetry::LoopState::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
             input,
@@ -771,6 +764,9 @@ impl App {
 
         let (screen_descriptor, gui_actions) = self.setup_egui_frame();
         let repaint_delay = self.present_frame(screen_descriptor);
+        // The end of the present path: whatever the device's error sink noted
+        // while this frame was encoded and presented is answered once, here.
+        self.absorb_gpu_pressure();
         // The five stamps below cut the `post` segment into the six things
         // this tail does; `frame_ledger::PostHists` says what each one holds
         // and why the split exists. Taken here rather than handed back by a
@@ -2580,6 +2576,13 @@ impl ApplicationHandler for App {
             log::info!("Activity is finishing - ending the event loop");
             self.exit_now(event_loop);
         }
+    }
+
+    /// The platform says memory is low — Android's `onLowMemory`, iOS's
+    /// `didReceiveMemoryWarning`. Answered like every other pressure: evict
+    /// what the scene does not need, step the ladder for this session.
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        self.on_pressure(crate::pressure::Pressure::MemoryWarning);
     }
 
     fn window_event(

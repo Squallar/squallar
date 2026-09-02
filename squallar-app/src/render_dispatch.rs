@@ -135,7 +135,8 @@ pub struct RenderCache {
     recency: VecDeque<RenderKey>,
     capacity: usize,
     /// Bytes the resident entries occupy, kept in step with `entries` by
-    /// [`Self::insert`], [`Self::retain`] and [`Self::clear`].
+    /// [`Self::insert`], [`Self::retain`], [`Self::clear`] and
+    /// [`Self::take_all`].
     resident_bytes: usize,
     byte_capacity: usize,
 }
@@ -221,6 +222,18 @@ impl RenderCache {
         self.entries.clear();
         self.recency.clear();
         self.resident_bytes = 0;
+    }
+
+    /// Empty the cache and hand every entry back, owned, with the bytes they
+    /// held — for a caller that will free them off the frame thread.
+    pub fn take_all(&mut self) -> (Vec<CachedRenderOutput>, usize) {
+        let bytes = self.resident_bytes;
+        self.recency.clear();
+        self.resident_bytes = 0;
+        (
+            self.entries.drain().map(|(_, value)| value).collect(),
+            bytes,
+        )
     }
 
     /// Bytes the resident entries occupy.
@@ -949,6 +962,13 @@ impl RenderDispatcher {
         }
     }
 
+    /// Empty the shared render cache under memory pressure. The entries come
+    /// back owned, with the bytes they held, so the caller can hand them to
+    /// the deferred-drop path rather than free them on the frame thread.
+    pub fn clear_render_cache(&mut self) -> (Vec<CachedRenderOutput>, usize) {
+        self.render_cache.take_all()
+    }
+
     /// Check if any pane has a render in flight.
     pub fn any_render_in_flight(&self) -> bool {
         self.pane_render.iter().any(|prs| prs.render_in_flight())
@@ -1619,6 +1639,15 @@ impl RenderDispatcher {
     pub(crate) fn retain_extracts(&mut self, keep: impl Fn(&ExtractKey) -> bool) {
         self.extract_cache.retain(|k, _| keep(k));
         self.extract_recency.retain(|k| keep(k));
+    }
+
+    /// Drop every cached extraction under memory pressure, handing the payloads
+    /// back owned for the same reason [`Self::clear_render_cache`] does.
+    pub(crate) fn clear_extract_cache(
+        &mut self,
+    ) -> Vec<Arc<squallar_radar::render_input::RenderInput>> {
+        self.extract_recency.clear();
+        self.extract_cache.drain().map(|(_, input)| input).collect()
     }
 
     /// How many extractions are resident — the populate tests' observable.

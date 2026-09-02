@@ -271,10 +271,24 @@ fn format_shortfall(features: &wgpu::TextureFormatFeatures) -> Option<String> {
 ///
 /// Consequence: every wgpu resource the volume view creates **must** carry a
 /// `squallar.volume`-prefixed label, or its errors panic the debug build.
+///
+/// An out-of-memory error is different in kind from the rest and is judged
+/// first, on the enum variant rather than the label. Whatever resource it was
+/// for, the answer is the application's — evict what the scene does not need
+/// and step the budgets down — so it is counted in [`squallar_gpu::pressure`]
+/// for the frame loop to take, and neither latched against the volume nor
+/// re-raised.
 pub fn install_error_latch(device: &wgpu::Device) {
     device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
         let rendered = error.to_string();
-        match disposition(&rendered, cfg!(debug_assertions)) {
+        match disposition(&error, cfg!(debug_assertions)) {
+            ErrorDisposition::OutOfMemory => {
+                log::warn!(
+                    "wgpu ran out of memory; the budgets step down at the next frame: \
+                     {rendered}"
+                );
+                squallar_gpu::pressure::note_out_of_memory();
+            }
             ErrorDisposition::LatchVolumeFailure => {
                 log::error!("3D volume view: the graphics driver rejected a resource: {rendered}");
                 degrade::latch_volume_device_error();
@@ -292,6 +306,9 @@ pub fn install_error_latch(device: &wgpu::Device) {
 /// What to do with an uncaptured device error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ErrorDisposition {
+    /// The device ran out of memory, for anything at all. Counted as pressure
+    /// for the frame loop to answer; never latched, never re-raised.
+    OutOfMemory,
     /// The volume view's own. Latch it and carry on.
     LatchVolumeFailure,
     /// Not the volume's, and this build re-raises it, as wgpu's default did.
@@ -302,9 +319,23 @@ enum ErrorDisposition {
 
 /// The handler's decision, separated from the handler.
 ///
+/// Out of memory is judged first and on the variant, not on the rendered text:
+/// the text is what the label scan reads, and a volume-labelled allocation
+/// failure is still an allocation failure. Everything else is decided from the
+/// text by [`rendered_disposition`].
+fn disposition(error: &wgpu::Error, debug_build: bool) -> ErrorDisposition {
+    if matches!(error, wgpu::Error::OutOfMemory { .. }) {
+        return ErrorDisposition::OutOfMemory;
+    }
+    rendered_disposition(&error.to_string(), debug_build)
+}
+
+/// Whose error it is, from the text wgpu rendered — the label half of
+/// [`disposition`].
+///
 /// `debug_build` is a parameter rather than `cfg!(debug_assertions)` read
 /// inline, so that both arms are reachable from one test binary.
-fn disposition(rendered: &str, debug_build: bool) -> ErrorDisposition {
+fn rendered_disposition(rendered: &str, debug_build: bool) -> ErrorDisposition {
     if degrade::error_belongs_to_volume(rendered) {
         ErrorDisposition::LatchVolumeFailure
     } else if debug_build {
@@ -704,7 +735,7 @@ mod tests {
         let volume_error = "In Device::create_render_pipeline, label = 'squallar.volume.raymarch'";
         for debug_build in [true, false] {
             assert_eq!(
-                disposition(volume_error, debug_build),
+                rendered_disposition(volume_error, debug_build),
                 ErrorDisposition::LatchVolumeFailure,
                 "a volume error was not latched with debug_assertions={debug_build}"
             );
@@ -717,10 +748,9 @@ mod tests {
         for rendered in [
             "In Device::create_texture, label = 'egui sampler'",
             "In Queue::write_buffer",
-            "Out of Memory",
         ] {
             assert_eq!(
-                disposition(rendered, true),
+                rendered_disposition(rendered, true),
                 ErrorDisposition::Repanic,
                 "an unrelated wgpu error would be swallowed by a debug build: \
                  {rendered:?}"
@@ -732,9 +762,52 @@ mod tests {
     #[test]
     fn an_unrelated_error_is_logged_rather_than_fatal_in_release() {
         assert_eq!(
-            disposition("In Queue::write_buffer", false),
+            rendered_disposition("In Queue::write_buffer", false),
             ErrorDisposition::Log
         );
+    }
+
+    /// An allocation failure is pressure — whatever it was for, in either
+    /// build. Judged on the variant before any label is read, so a
+    /// volume-labelled one is not latched against the view, and an unlabelled
+    /// one is not re-raised. The other two variants still go where their text
+    /// sends them.
+    #[test]
+    fn an_out_of_memory_error_is_pressure_on_any_label_in_either_build() {
+        let out_of_memory = wgpu::Error::OutOfMemory {
+            source: Box::new(std::fmt::Error),
+        };
+        for debug_build in [true, false] {
+            assert_eq!(
+                disposition(&out_of_memory, debug_build),
+                ErrorDisposition::OutOfMemory,
+                "out of memory was not read as pressure with \
+                 debug_assertions={debug_build}"
+            );
+        }
+        // The rendered text is not what decides it: wgpu renders the variant as
+        // exactly this, and the text alone would have re-panicked.
+        assert_eq!(out_of_memory.to_string(), "Out of Memory");
+        assert_eq!(
+            rendered_disposition(&out_of_memory.to_string(), true),
+            ErrorDisposition::Repanic
+        );
+
+        let volume = wgpu::Error::Validation {
+            source: Box::new(std::fmt::Error),
+            description: "In Device::create_render_pipeline, label = 'squallar.volume.raymarch'"
+                .to_owned(),
+        };
+        assert_eq!(
+            disposition(&volume, true),
+            ErrorDisposition::LatchVolumeFailure
+        );
+        let unrelated = wgpu::Error::Internal {
+            source: Box::new(std::fmt::Error),
+            description: "In Queue::write_buffer".to_owned(),
+        };
+        assert_eq!(disposition(&unrelated, true), ErrorDisposition::Repanic);
+        assert_eq!(disposition(&unrelated, false), ErrorDisposition::Log);
     }
 
     /// The limits the app *requests* clear the floor the volume probe applies.
