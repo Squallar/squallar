@@ -65,6 +65,7 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import unittest
 
@@ -369,7 +370,7 @@ def parse_hist(text):
 # on every platform: `xdotool` answers on X, System Events answers on macOS,
 # nothing answers on Wayland, and all three of those are the window manager's
 # opinion of a frame, while THIS is the surface the app actually allocated and
-# the surface `picture_bytes_for` predicts. So it is what the byte cross-check
+# the surface `pane_picture_bytes` prices. So it is what the byte cross-check
 # is taken against, and the WM's answer is demoted to a second opinion.
 #
 # Pinned against the app's own formatter from the Rust side, in
@@ -694,16 +695,155 @@ def cpu_liveness(before, after, wall_s):
 
 
 def picture_bytes_for(w, h):
-    """The whole-picture overlay raster's size at a WxH surface.
+    """The whole-picture overlay raster's size at a WxH surface, ONE pane.
 
     `(W * 1.5) * ((H - 40) * 1.5) * 4` -- the 1.5 is OVERDRAW_FRACTION 0.25
     spent on both sides, the 40 is the top bar in points, the 4 is RGBA.
     Verified exact at three surfaces on 2026-08-31.
+
+    A scene with N panes rasters one picture PER PANE at the pane's own size,
+    so this is the one-pane case of `pane_picture_bytes`, and the two are
+    pinned equal at one pane. Pricing a six-pane leg with this figure marked
+    every multi-pane native row INVALID: 2,994,468 B/picture observed against
+    17,971,200 expected, 2026-09-02.
     """
     return int(w * 1.5) * int((h - 40) * 1.5) * 4
 
 
-def surface_check(asked, achieved, pictures, picture_bytes):
+# The grid the app lays N panes out in -- each entry is the number of columns
+# in that row. `PaneLayout::grid_for` (squallar-egui/src/pane.rs), the desktop
+# table; the one compact-width difference is two panes stacking.
+PANE_GRIDS = {1: [1], 2: [2], 3: [2, 1], 4: [2, 2], 5: [3, 2], 6: [3, 3]}
+MAX_PANES = 6
+# `WidthClass::Compact`: a content width under this stacks two panes.
+COMPACT_MAX_WIDTH = 600.0
+# The top bar in points, and the overdraw the texture plan spends on EACH side
+# of a pane (`OVERDRAW_FRACTION`, squallar-egui/src/overlay_cache.rs).
+TOP_BAR_POINTS = 40.0
+OVERDRAW_FRACTION = 0.25
+
+
+def _f32(x):
+    """`x` rounded to the nearest f32 -- what egui and the app compute in."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def pane_grid(w, panes):
+    """Columns per row for `panes` panes on a `w`-point-wide surface."""
+    panes = max(1, min(int(panes), MAX_PANES))
+    if w < COMPACT_MAX_WIDTH and panes == 2:
+        return [1, 1]
+    return list(PANE_GRIDS[panes])
+
+
+def pane_rects(w, h, panes):
+    """Every pane's `(width, height)` in points at a WxH surface, in f32.
+
+    `PaneLayout::pane_rect` restated: the map panel is the surface under the
+    top bar, rows split it by `1/rows`, a row's columns by `1/cols`, and a
+    pane is `Rect::from_min_size` of those -- so its width is `max.x - min.x`
+    after both were rounded to f32, which is how the app reads it back before
+    the 1.5x. There is NO gap between panes in this arithmetic: the dividers
+    are drag zones drawn over the maps afterwards. Six panes at 1920x1080 are
+    six 640x520 rects.
+    """
+    grid = pane_grid(w, panes)
+    width = _f32(float(w))
+    height = _f32(_f32(float(h)) - TOP_BAR_POINTS)
+    row_ratio = _f32(1.0 / len(grid))
+    out = []
+    row_y = TOP_BAR_POINTS
+    for cols in grid:
+        col_ratio = _f32(1.0 / cols)
+        row_h = _f32(height * row_ratio)
+        max_y = _f32(row_y + row_h)
+        col_x = 0.0
+        for _ in range(cols):
+            col_w = _f32(width * col_ratio)
+            min_x = _f32(width * col_x)
+            max_x = _f32(min_x + col_w)
+            out.append((_f32(max_x - min_x), _f32(max_y - row_y)))
+            col_x = _f32(col_x + col_ratio)
+        row_y = max_y
+    return out
+
+
+def _texels(pw, ph):
+    """`plan_overlay_texture` at one pixel per point: `(side * 1.5) as u32`."""
+    scale = _f32(1.0 + 2.0 * OVERDRAW_FRACTION)
+    return int(_f32(pw * scale)), int(_f32(ph * scale))
+
+
+def pane_picture_bytes(w, h, panes):
+    """Each pane's overlay picture in bytes at a WxH surface: one per pane,
+    `(pw * 1.5) as u32 * (ph * 1.5) as u32 * 4`."""
+    out = []
+    for pw, ph in pane_rects(w, h, panes):
+        tw, th = _texels(pw, ph)
+        out.append(tw * th * 4)
+    return out
+
+
+def mixture_tolerance(w, h, panes):
+    """How far a bracket's MEAN bytes/picture may sit from the pane figure.
+
+    Half a texel row plus half a texel column of the largest pane picture, in
+    bytes. The recorded six-pane leg (2026-09-02) averaged 2,994,468 B over
+    pictures whose panes are all 640x520 -- 732 B under the 2,995,200 every
+    one of them prices at -- so the bracket held a MINORITY of pictures a row
+    or a column short (about a fifth at one row of 3,840 B, or a quarter at
+    one column of 3,120 B). A minority one row and one column off moves the
+    mean by less than half of each; a majority -- or every picture one row
+    short, which is the top bar having moved -- is not a mixture and is
+    refused. Far under any structural error: the nearest common surfaces are
+    11% apart and pane counts 33% or more.
+    """
+    pw, ph = max(pane_rects(w, h, panes), key=lambda r: r[0] * r[1])
+    tw, th = _texels(pw, ph)
+    return 2 * (tw + th)
+
+
+def pane_count_of_seed(web_seed):
+    """`pane_count` out of a web seed's `squallar.ui` JSON, 1 when unset.
+
+    One is the app's own default. The seed is the ONLY source: a count
+    restated in the runner would be a second place for the scene to be wrong.
+    """
+    ui = json.loads(web_seed.get("squallar.ui") or "{}")
+    return int(ui.get("pane_count", 1))
+
+
+def scene_pane_count(scene, panel="off"):
+    """How many panes `run_measure.sh`'s own seed for `scene` lays out."""
+    return pane_count_of_seed(json.loads(scene_from_shell(scene, panel)))
+
+
+def resolve_pane_count(args):
+    """`(panes, source)`, or `(None, why)` when nothing can say."""
+    given = getattr(args, "panes", None)
+    if given is not None:
+        return int(given), "--panes"
+    try:
+        return scene_pane_count(args.scene, args.panel), "the scene %s seed" % args.scene
+    except (SystemExit, ValueError, KeyError, TypeError) as e:
+        return None, (
+            "scene %r has no readable seed and --panes was not given (%s)"
+            % (args.scene, e)
+        )
+
+
+def _band(w, h, panes):
+    """`(lo, hi, tolerance)`: the pane figures' span and the mixture band."""
+    b = pane_picture_bytes(w, h, panes)
+    return min(b), max(b), mixture_tolerance(w, h, panes)
+
+
+def _in_band(observed, band):
+    lo, hi, tol = band
+    return (lo - tol) <= observed <= (hi + tol)
+
+
+def surface_check(asked, achieved, pictures, picture_bytes, panes=1):
     """Does the picture the app actually drew match the window it was given?
 
     Geometry is READ BACK, never requested and trusted, and then checked
@@ -711,18 +851,35 @@ def surface_check(asked, achieved, pictures, picture_bytes):
     3440x1440 instead of 1920x1080 was caught by exact factorization of the
     picture totals and by nothing else. A leg whose surface cannot be
     confirmed is refused rather than reported.
+
+    `panes` is how many panes the scene lays out. A multi-pane scene rasters
+    one picture PER PANE at the pane's own size, and `picture_bytes /
+    pictures` is a mean over all of them. Grids of one pane size (1, 2, 4, 6)
+    price to one figure; grids with two sizes (3, 5) price to a band the mean
+    must fall in, since which pane rastered how often is not in the log.
+    Either way the mean is allowed `mixture_tolerance` around the band.
     """
     out = {
         "asked": "%dx%d" % asked if asked else None,
         "achieved": "%dx%d" % achieved if achieved else None,
         "geometry_met": bool(asked and achieved and asked == achieved),
+        "panes": panes,
     }
     if not achieved:
         out["met"] = False
         out["why"] = "no window geometry was read back"
         return out
-    expected = picture_bytes_for(*achieved)
-    out["expected_picture_bytes"] = expected
+    w, h = achieved
+    pane_bytes = pane_picture_bytes(w, h, panes)
+    lo, hi, tol = band = _band(w, h, panes)
+    out["pane_picture_bytes"] = pane_bytes
+    # One figure when every pane prices the same; None -- never a mean over
+    # panes, which describes no picture -- when the grid has two sizes.
+    out["expected_picture_bytes"] = lo if lo == hi else None
+    out["expected_picture_bytes_lo"] = lo
+    out["expected_picture_bytes_hi"] = hi
+    out["expected_label"] = ("%d" % lo) if lo == hi else "%d..%d" % (lo, hi)
+    out["tolerance_bytes"] = tol
     if not pictures:
         out["met"] = False
         out["why"] = (
@@ -732,22 +889,32 @@ def surface_check(asked, achieved, pictures, picture_bytes):
         return out
     observed = picture_bytes / float(pictures)
     out["observed_picture_bytes"] = observed
-    # Exact is the expectation; the tolerance only absorbs a ratio taken over
-    # pictures of one size counted in whole bytes.
-    out["bytes_met"] = abs(observed - expected) <= 1.0
+    out["bytes_met"] = _in_band(observed, band)
     if not out["bytes_met"]:
-        implied = implied_surface(observed)
+        # Every reading the bytes DO fit, because more than one can: two
+        # panes at 2560x1600 price to exactly one pane at 1920x1080
+        # (1280x1560 -> 1920x2340 texels = 2880x1560). Naming only the first
+        # would send a lane after the wrong one.
+        fits = []
+        implied = implied_surface(observed, panes)
+        if implied:
+            fits.append("%s at %d pane(s)" % (implied, panes))
+        other = implied_panes(observed, achieved, panes)
+        if other:
+            fits.append("%s pane(s) at %s"
+                        % (" or ".join(str(k) for k in other), out["achieved"]))
         out["why"] = (
-            "picture bytes say the surface was %s, not the %s the window "
-            "reported: %d B/picture observed against %d B expected"
-            % (implied or "some other size", out["achieved"], observed, expected)
+            "picture bytes fit %s, not the %s at %d pane(s) the leg believes it "
+            "ran: %d B/picture observed against %s B expected (+-%d)"
+            % (" or ".join(fits) if fits else "no common surface or pane count",
+               out["achieved"], panes, observed, out["expected_label"], tol)
         )
     out["met"] = bool(out["geometry_met"] and out["bytes_met"])
     return out
 
 
-def implied_surface(observed_bytes):
-    """A WxH whose picture bytes are `observed_bytes`, if a common one fits.
+def implied_surface(observed_bytes, panes=1):
+    """A WxH whose `panes` pictures average `observed_bytes`, if a common one does.
 
     Names the size the leg REALLY ran at instead of only saying the check
     failed -- that is the difference between "something is wrong" and "the
@@ -758,9 +925,20 @@ def implied_surface(observed_bytes):
         (1680, 1050), (1600, 900), (3840, 2160), (2560, 1600), (1440, 900),
     ]
     for w, h in common:
-        if abs(picture_bytes_for(w, h) - observed_bytes) <= 1.0:
+        if _in_band(observed_bytes, _band(w, h, panes)):
             return "%dx%d" % (w, h)
     return None
+
+
+def implied_panes(observed_bytes, achieved, panes):
+    """Every pane count other than `panes` whose pictures at `achieved`
+    average `observed_bytes`. More than one is possible by construction: the
+    [3, 2] grid's top row is the [3, 3] grid's cell."""
+    w, h = achieved
+    return [
+        k for k in range(1, MAX_PANES + 1)
+        if k != panes and _in_band(observed_bytes, _band(w, h, k))
+    ]
 
 
 # -------------------------------------------------------------------- load --
@@ -1139,7 +1317,7 @@ def build_row(args, scraped, probes):
         invalid.append("liveness: %s" % live["verdict"])
 
     # The achieved surface is the APP's own reading where there is one: it is
-    # the quantity `picture_bytes_for` predicts, and it is the only geometry
+    # the surface `pane_picture_bytes` prices, and it is the only geometry
     # readback that exists on every platform. The window manager's answer --
     # which the runner supplies as `--achieved-geom` and which Wayland cannot
     # supply at all -- is kept as a second opinion and reported when the two
@@ -1148,7 +1326,16 @@ def build_row(args, scraped, probes):
     wm_geom = args.achieved_geom
     app_geom = scraped["surface"]
     achieved = app_geom or wm_geom
-    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes)
+    # One picture per PANE, so the bytes are priced per pane. The count is
+    # the scene's, read out of the seed that laid the panes out rather than
+    # restated here; `--panes` is for a leg run against a seed the scene
+    # table does not know. A count nothing can supply leaves the surface
+    # unpriceable, and the row says so rather than pricing one pane.
+    panes, panes_source = resolve_pane_count(args)
+    if panes is None:
+        invalid.append("pane count unknown: %s" % panes_source)
+    surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, panes or 1)
+    surf["panes_source"] = panes_source if panes is not None else None
     surf["source"] = "app" if app_geom else ("wm" if wm_geom else None)
     surf["wm_reported"] = ("%dx%d" % wm_geom) if wm_geom else None
     surf["app_reported"] = ("%dx%d" % app_geom) if app_geom else None
@@ -1296,11 +1483,12 @@ def print_row(row):
     )
     s = row["surface"]
     print(
-        "ROW   surface asked=%s achieved=%s (from the %s) expected=%s B/picture "
-        "observed=%s B/picture -> %s"
+        "ROW   surface asked=%s achieved=%s (from the %s) panes=%s expected=%s "
+        "B/picture (+-%s) observed=%s B/picture -> %s"
         % (
             s.get("asked"), s.get("achieved"), s.get("source") or "?",
-            s.get("expected_picture_bytes"),
+            s.get("panes"), s.get("expected_label", s.get("expected_picture_bytes")),
+            s.get("tolerance_bytes", "-"),
             ("%.0f" % s["observed_picture_bytes"])
             if s.get("observed_picture_bytes") is not None else "-",
             "CONFIRMED" if s.get("met") else "REFUSED",
@@ -1511,6 +1699,9 @@ def main(argv):
     a.add_argument("--commit", default="unknown")
     a.add_argument("--asked-geom", type=geom, dest="asked_geom")
     a.add_argument("--achieved-geom", type=geom, dest="achieved_geom")
+    a.add_argument("--panes", type=int, default=None,
+                   help="panes the scene lays out; default: read from the "
+                        "scene's own seed")
     a.add_argument("--dpr", default="1")
     a.add_argument("--refresh", default="")
     a.add_argument("--adapter", default="unknown")
@@ -1707,6 +1898,133 @@ class SurfaceTests(unittest.TestCase):
     def test_geometry_alone_does_not_confirm(self):
         s = surface_check((1920, 1080), (1920, 1080), 0, 0)
         self.assertFalse(s["met"])
+
+    def test_one_pane_is_the_whole_picture_formula_byte_for_byte(self):
+        """The single-pane expectation did not move: `pane_picture_bytes` at
+        one pane IS `picture_bytes_for`, at every surface swept. Ratios of
+        1.0 and a 1.5x of an integer are exact in f32, so the two agree to
+        the byte rather than to a tolerance."""
+        for w in range(320, 4000, 13):
+            for h in range(240, 2400, 17):
+                self.assertEqual(
+                    pane_picture_bytes(w, h, 1), [picture_bytes_for(w, h)],
+                    "one pane at %dx%d is the whole %dx%d panel, so "
+                    "int(%d*1.5)*int(%d*1.5)*4 must be the one-picture formula"
+                    % (w, h, w, h - 40, w, h - 40))
+        self.assertEqual(pane_picture_bytes(1920, 1080, 1), [17_971_200])
+
+    def test_six_panes_at_1920x1080_are_six_equal_pictures_with_no_chrome(self):
+        """Six panes are a [3, 3] grid of the 1920x1040 panel: 1920/3 = 640
+        and 1040/2 = 520 exactly, so every pane prices at 960*780*4 =
+        2,995,200 B -- which IS 17,971,200 / 6, because the pane rects carry
+        no gap (the dividers are drag zones drawn over the maps). So the
+        recorded 732 B residual is not chrome between panes; it is a mixture
+        of picture sizes inside the bracket, and `mixture_tolerance` is what
+        admits it."""
+        self.assertEqual(
+            pane_rects(1920, 1080, 6), [(640.0, 520.0)] * 6,
+            "1920/3 = 640 wide, (1080-40)/2 = 520 tall, all six")
+        self.assertEqual(
+            pane_picture_bytes(1920, 1080, 6), [2_995_200] * 6,
+            "640*1.5 = 960 by 520*1.5 = 780 texels, *4 = 2,995,200 B a pane")
+        self.assertEqual(2_995_200 * 6, picture_bytes_for(1920, 1080),
+                         "six panes with no gap sum to the one-picture figure")
+
+    def test_the_recorded_six_pane_mean_is_confirmed_and_the_one_picture_figure_is_not(self):
+        """2026-09-02: a six-pane leg at 1920x1080 averaged 2,994,468 B a
+        picture and read INVALID against 17,971,200. Priced per pane it is
+        732 B under 2,995,200 -- inside half a row (960*4/2 = 1,920 B) plus
+        half a column (780*4/2 = 1,560 B) = 3,480 B -- and CONFIRMED. The
+        one-picture figure is refused on the same bytes, and the refusal
+        names the pane count the bytes do fit."""
+        n = 21
+        s = surface_check((1920, 1080), (1920, 1080), n, 2_994_468 * n, panes=6)
+        self.assertEqual(s["expected_picture_bytes"], 2_995_200)
+        self.assertEqual(s["tolerance_bytes"], 3_480, "2 * (960 + 780)")
+        self.assertTrue(s["bytes_met"] and s["met"], s.get("why"))
+        one = surface_check((1920, 1080), (1920, 1080), n, 2_994_468 * n)
+        self.assertFalse(one["met"])
+        self.assertIn(
+            "6 pane", one["why"],
+            "the old one-picture expectation must say the bytes are six "
+            "panes' worth, not merely that they mismatch: %s" % one["why"])
+        six = surface_check((1920, 1080), (1920, 1080), n, 17_971_200 * n, panes=6)
+        self.assertFalse(six["met"])
+        self.assertIn("1 pane", six["why"], six["why"])
+
+    def test_a_majority_at_a_neighbouring_size_is_not_a_mixture(self):
+        """Every picture one texel row short (960x779) is 3,840 B under the
+        pane figure -- more than the 3,480 B band. That is the top bar having
+        grown a point, not a few pictures off, and it is refused so the row
+        says so instead of averaging it away. A sixth of the pictures at that
+        size (640 B off the mean) is inside the band."""
+        short = 960 * 779 * 4
+        s = surface_check((1920, 1080), (1920, 1080), 12, short * 12, panes=6)
+        self.assertFalse(s["bytes_met"], "3,840 B short on every picture")
+        mixed = 10 * 2_995_200 + 2 * short
+        s = surface_check((1920, 1080), (1920, 1080), 12, mixed, panes=6)
+        self.assertTrue(s["bytes_met"], "2 of 12 a row short: mean 640 B under")
+
+    def test_two_and_four_panes_price_at_their_own_rects(self):
+        """Two panes are [2]: each 960x1040 -> 1440*1560*4 = 8,985,600 B.
+        Four are [2, 2]: each 960x520 -> 1440*780*4 = 4,492,800 B. Both
+        confirm their own figure and refuse the one-picture one."""
+        self.assertEqual(pane_rects(1920, 1080, 2), [(960.0, 1040.0)] * 2)
+        self.assertEqual(pane_picture_bytes(1920, 1080, 2), [8_985_600] * 2,
+                         "1920/2 = 960 -> 1440 texels; 1040 -> 1560; *4")
+        self.assertEqual(pane_rects(1920, 1080, 4), [(960.0, 520.0)] * 4)
+        self.assertEqual(pane_picture_bytes(1920, 1080, 4), [4_492_800] * 4,
+                         "1920/2 = 960 -> 1440 texels; 1040/2 = 520 -> 780; *4")
+        for panes, b, th in ((2, 8_985_600, 1560), (4, 4_492_800, 780)):
+            s = surface_check((1920, 1080), (1920, 1080), 9, b * 9, panes=panes)
+            self.assertTrue(s["met"], s.get("why"))
+            self.assertEqual(s["tolerance_bytes"], 2 * (1440 + th),
+                             "half a row plus half a column of a 1440x%d picture" % th)
+            one = surface_check((1920, 1080), (1920, 1080), 9, 17_971_200 * 9, panes=panes)
+            self.assertFalse(one["met"])
+            self.assertIn("1 pane", one["why"], one["why"])
+
+    def test_three_panes_price_to_a_band(self):
+        """[2, 1]: two 960x520 panes (4,492,800 B) over one 1920x520 pane
+        (8,985,600 B). Which pane rastered how often is not in the log, so
+        the mean is confirmed anywhere in the band and refused outside it;
+        no single `expected_picture_bytes` is printed, because a mean over
+        two pane sizes describes no picture."""
+        self.assertEqual(pane_picture_bytes(1920, 1080, 3),
+                         [4_492_800, 4_492_800, 8_985_600])
+        s = surface_check((1920, 1080), (1920, 1080), 10, 6_000_000 * 10, panes=3)
+        self.assertIsNone(s["expected_picture_bytes"])
+        self.assertEqual(s["expected_label"], "4492800..8985600")
+        self.assertTrue(s["met"], s.get("why"))
+        for outside in (17_971_200, 2_995_200):
+            s = surface_check((1920, 1080), (1920, 1080), 10, outside * 10, panes=3)
+            self.assertFalse(s["met"], "%d is outside the three-pane band" % outside)
+
+    def test_the_arithmetic_is_f32_and_the_band_covers_its_last_ulp(self):
+        """1280x779, six panes: 1280/3 is not exact and the app adds in f32,
+        so the analyser's pane widths come out an ulp apart and the six
+        pictures in two sizes one texel column apart. The band is half a row
+        plus half a column -- wider than that column -- so whichever side
+        egui's own additions land on, the app's figure is inside it."""
+        b = pane_picture_bytes(1280, 779, 6)
+        lo, hi = min(b), max(b)
+        self.assertNotEqual(lo, hi, "thirds of 1280 are not exact in f32")
+        self.assertEqual(hi - lo, 554 * 4, "one texel column of a 554-row picture")
+        self.assertGreater(mixture_tolerance(1280, 779, 6), hi - lo)
+
+    def test_the_pane_count_comes_from_the_scene_seed(self):
+        """Scene C seeds six panes and scene A one; the count is read out of
+        `run_measure.sh`'s own seed rather than restated, so the two targets
+        cannot drift onto different scenes under one letter."""
+        self.assertEqual(scene_pane_count("C"), 6)
+        self.assertEqual(scene_pane_count("A"), 1)
+        self.assertEqual(pane_count_of_seed({"squallar.ui": "{}"}), 1)
+
+    def test_a_compact_width_stacks_two_panes(self):
+        """`grid_for`'s one compact-width difference."""
+        self.assertEqual(pane_grid(599, 2), [1, 1])
+        self.assertEqual(pane_grid(600, 2), [2])
+        self.assertEqual(pane_grid(1920, 7), [3, 3], "clamped, not flattened")
 
 
 class WindowTests(unittest.TestCase):

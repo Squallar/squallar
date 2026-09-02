@@ -63,11 +63,20 @@
 # The size is then READ BACK **FROM THE APP ITSELF** -- its own
 # `Window resized to WxH` line, which is the surface it allocated, not the
 # frame the window manager thinks it handed over. That is the reading the
-# picture-bytes formula predicts:
+# picture-bytes formula prices, ONE PICTURE PER PANE at the pane's own rect:
 #
-#     picture bytes = (W * 1.5) * ((H - 40) * 1.5) * 4
+#     picture bytes = (pane_w * 1.5) * (pane_h * 1.5) * 4
 #
-# and it is the only geometry readback that exists on every platform, so it is
+# where a one-pane scene's rect is the whole W x (H - 40) panel and an N-pane
+# scene's rects come from the app's own grid (`native_row.py`'s `pane_rects`;
+# six panes at 1920x1080 are six 640x520 rects, no gap). The bracket's mean
+# bytes/picture is allowed half a texel row plus half a column around the
+# pane figures, because a recorded six-pane bracket averaged 732 B under its
+# 2,995,200 B pane -- a minority of pictures a row or a column short.
+# 2026-09-02: until this, every multi-pane leg (scene C, the many-pane worst
+# case) was priced as one whole-surface picture and read `** INVALID **`;
+# scene C is valid-able now. The app's own line is
+# the only geometry readback that exists on every platform, so it is
 # also what makes an unpinnable platform (Wayland) produce a comparable row
 # rather than no row. The window manager's own answer is kept as a second
 # opinion; when the two disagree the row says so and the app's is used.
