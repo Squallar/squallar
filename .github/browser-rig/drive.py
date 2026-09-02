@@ -2635,7 +2635,7 @@ var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
 // and uploads. The pattern is deliberately not anchored at the end, so the
 // `stroke draws` field appended after `unrendered` leaves every capture
 // index below where it was.
-var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered/;
+var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered(?:, (\d+) stroke draws)?/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and
@@ -2721,6 +2721,11 @@ for (var i = 0; i < C.length; i++) {
                       sniffed_tiles: parseInt(bm[3], 10) };
   else if (basemap_loose_re.test(m)) basemap_unparsed = m;
   var gm = ground_re.exec(m);
+  // `stroke_draws` is an OPTIONAL group: a bundle built before 2026-09-01
+  // does not print the field, and this rig must still read the eight that
+  // predate it rather than reporting the whole line unparsed. `null` here
+  // therefore means "that bundle is older", not "zero stroke runs drew" --
+  // the two are different findings and a caller must not conflate them.
   if (gm) ground = { placed: parseInt(gm[1], 10),
                      stroke_points: parseInt(gm[2], 10),
                      labels: parseInt(gm[3], 10),
@@ -2728,7 +2733,9 @@ for (var i = 0; i < C.length; i++) {
                      uploads: parseInt(gm[5], 10),
                      upload_bytes: parseInt(gm[6], 10),
                      resident_bytes: parseInt(gm[8], 10),
-                     unrendered: parseInt(gm[9], 10) };
+                     unrendered: parseInt(gm[9], 10),
+                     stroke_draws: gm[10] === undefined ? null
+                                                        : parseInt(gm[10], 10) };
   var fm = floor_re.exec(m);
   if (fm) floor = { paints: parseInt(fm[1], 10),
                     mirror_renders: parseInt(fm[2], 10),
