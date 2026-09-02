@@ -2635,7 +2635,15 @@ var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
 // and uploads. The pattern is deliberately not anchored at the end, so the
 // `stroke draws` field appended after `unrendered` leaves every capture
 // index below where it was.
-var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered(?:, (\d+) stroke draws)?/;
+var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered/;
+// `stroke draws` is its OWN pattern and NOT an optional group on the line
+// above, and the reason is `native_row.py`: it reads these patterns out of
+// this file at run time (deliberately, so the two cannot drift) and `int()`s
+// EVERY group of a match. A non-participating optional group hands it `None`
+// and it dies with `int() argument ... not 'NoneType'` -- on the OLD line
+// only, so the arm running the old binary is the one that appears broken. A
+// separate pattern keeps every group of every shared probe mandatory.
+var ground_stroke_draws_re = /ground tiles: .*, (\d+) stroke draws/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and
@@ -2734,8 +2742,11 @@ for (var i = 0; i < C.length; i++) {
                      upload_bytes: parseInt(gm[6], 10),
                      resident_bytes: parseInt(gm[8], 10),
                      unrendered: parseInt(gm[9], 10),
-                     stroke_draws: gm[10] === undefined ? null
-                                                        : parseInt(gm[10], 10) };
+                     stroke_draws: null };
+  // Filled from its own pattern; absent on a bundle built before 2026-09-01,
+  // where `null` means "that bundle is older" and NOT "zero stroke runs drew".
+  if (gm) { var sd = ground_stroke_draws_re.exec(m);
+            if (sd) ground.stroke_draws = parseInt(sd[1], 10); }
   var fm = floor_re.exec(m);
   if (fm) floor = { paints: parseInt(fm[1], 10),
                     mirror_renders: parseInt(fm[2], 10),
