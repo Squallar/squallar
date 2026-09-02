@@ -54,9 +54,8 @@ pub const BLOCK_BYTES: u64 = 64 * 1024;
 
 /// The wasm32 arm of [`BLOCK_CACHE_BYTES`]: zero, because the wrapper is a
 /// pass-through there — no filesystem, no cache, no budget to hold. Named
-/// outside the cascade for the reason `WASM_TILE_CACHE_ENTRIES` is: this
-/// workspace runs `cargo test` on one arm, so the other two are only
-/// reachable from a test if they have names.
+/// outside the cascade because this workspace runs `cargo test` on one arm,
+/// so the other two are only reachable from a test if they have names.
 pub const WASM_BLOCK_CACHE_BYTES: u64 = 0;
 /// The mobile arm — a quarter of the desktop figure, against cache storage
 /// the OS reports to the user as clearable and will clear itself under
@@ -66,9 +65,8 @@ pub const MOBILE_BLOCK_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 /// plus the terrain tiles under it. See [`WASM_BLOCK_CACHE_BYTES`].
 pub const DESKTOP_BLOCK_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// The total-bytes cap for this target, hardcoded per target like every
-/// budget in this tree — the `TILE_CACHE_ENTRIES` cascade is the house style
-/// this follows.
+/// The total-bytes cap for this target, hardcoded per target — a `cfg`
+/// cascade selecting a value, which is the one thing a `cfg` may do here.
 #[cfg(target_arch = "wasm32")]
 pub const BLOCK_CACHE_BYTES: u64 = WASM_BLOCK_CACHE_BYTES;
 /// See the wasm32 arm above.

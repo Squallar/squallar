@@ -188,7 +188,7 @@ All `constants.rs` paths below are `squallar-device-profile/src/constants.rs`.
 | `LOOP_POOL_HYSTERESIS` / `LOOP_POOL_DWELL_FRAMES` | `constants.rs:345,349` | 1.25 / 15 | — | **runtime** — `LoopPoolState::observe` (`loop_pool.rs:421`) |
 | `MAX_LOOP_VOLUME_BUILDS_PER_FRAME` / `MAX_LOOP_SECTION_CUTS_PER_FRAME` | `constants.rs:369,223` | 1 / 1 | — | **runtime** (frame-time pacing, not memory) |
 | `VOLUME_OFFSCREEN_REFERENCE_PANE_PX` | `constants.rs:454` | [2560, 1440] | — | **runtime** |
-| `TILE_CACHE_ENTRIES` / `PARSED_TILE_CACHE_ENTRIES` *(new here)* | `squallar-egui/src/tile_source.rs:182-195` — its **own** cascade on `any(target_os = "android", target_os = "ios")`, not `mobile` | 100 / 100 / 256 and 24 / 24 / 96 (plan, "What exists") | — | **runtime**; wholly outside `Budgets` — §11 |
+| ~~`TILE_CACHE_ENTRIES` / `PARSED_TILE_CACHE_ENTRIES`~~ → `BudgetLimits::{tile_styled_bytes, tile_parsed_bytes, tile_terrain_bytes}` | `squallar-device-profile/src/constants.rs`, `WASM_TILE_STYLED_BYTES` and neighbours | 48/64/64 · 48/64/64 · 25/32/32 MiB (wasm; the ceiling is the step until U1); mobile pinned at the wasm floor; 160/256/512 · 192/256/384 · 64/80/128 MiB (desktop) | — | **runtime**, inside `Budgets` since WO-6 — §11.2 |
 
 ### 1.3 Non-GPU pressure with no budget at all
 
@@ -1604,6 +1604,26 @@ ancestor net. This is the leading hypothesis for ruling 1's "downright broken on
 is **measured in WO-1 before any fix**. The GPU `TileMeshStore` has no capacity
 of its own; identity is minted per put, so no counter tells a first upload from
 a re-upload; the 3,070 uploads vs 2,848 evictions are **undiagnosed** *(plan)*.
+
+**As landed (WO-6, 2026-09-02).** Everything in the paragraph above is the
+state WO-1 measured and WO-6 replaced. The count constants and their cascade
+are deleted; one source owns one `ByteLru` (`squallar-egui/src/tile_source/
+byte_lru.rs`) bounded in bytes by `Budgets::tile_cache()` and floored in
+entries at the working set the last pass measured (`HttpsTiles::note_wanted`,
+called once per layer draw from `draw_tile_layer` with the span's cells and
+the ancestor net's). Every slot is charged where the styling ran
+(`CachedTile::bytes`: marker + texture, or marker + shapes at capacity +
+flattened buffers); the measured city-core tail is
+`MEASURED_STYLED_ENTRY_BYTES` = 1,462,708 B — the plan's ~1.03 MB had the fills
+and not the strokes. Shrink is lazy (one eviction per cache per
+pump, payloads through the installed `offload::discard` sink), grow eager. A
+parked source keeps its caches as economy with a floor of zero and is trimmed
+once per frame from `MapTileState::set_budget`. The channel-full skip's tail
+starvation is fixed by order, not depth: refused asks are queued in walk order
+and asked first next pass (`AskQueue`). On the measured arm the allowance is
+`fit::tile_cache_budget`: the economy allowance split 2:2:1, each share held
+inside its bracket. The `tile cache (base):` line is unchanged; the new levels
+(`overrun`, `floor`, `wanted`) are on `cache_ledger::Totals` and not printed.
 
 ### 11.2 The model, applied
 

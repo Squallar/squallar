@@ -1075,6 +1075,10 @@ impl super::App {
                 // startup and is what every other background render on this
                 // device is admitted against.
                 concurrent_renders: self.render.concurrent_renders(),
+                // What the tile caches may hold, as the last loop walk
+                // priced it against this session's capacity — see
+                // `Self::observe_loop_demand`.
+                tile_cache: self.tile_cache_budget,
                 location_settings_available: self.location_settings_available,
                 // Read off the gate each frame; the gate is the owner and
                 // `poll_platform_state` already redraws on a change.
@@ -3920,9 +3924,13 @@ impl super::App {
         });
         let mut scene = Scene {
             panes: Vec::new(),
-            // The tile term arrives with the tile cache's byte accounting;
-            // until then no source is listed here and the host figure reads 0.
-            tile_sources: Vec::new(),
+            // One entry per tile source that drew last pass, read off the
+            // cache ledger's levels rather than off the Gui: the working set
+            // the pass measured (cells on the glass and in the ancestor net)
+            // at what one resident entry has measured on average. A role
+            // that has drawn nothing yet — or a source parked with its
+            // layer off — wants nothing and is not listed.
+            tile_sources: tile_needs(),
             mirror_px: self
                 .mirror_plan_applied
                 .map_or([0, 0], |plan| plan.size_in_pixels),
@@ -4027,6 +4035,17 @@ impl super::App {
         let (demand, counts, scene) = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
+        // The tile caches' allowance follows the same scene and the same
+        // capacity: the class rung's figures on the presumed arm, the
+        // economy split held inside the bracket on the measured one. Pushed
+        // to the Gui with the next frame's inputs.
+        self.tile_cache_budget = squallar_device_profile::fit::tile_cache_budget(
+            &scene,
+            &self.budgets,
+            &self.device_profile.limits,
+            &self.capacity(),
+            GRID_BYTES,
+        );
         self.loop_pool = self.pool_for_scene(&scene);
         self.loop_pool_state.observe(
             self.loop_pool,
@@ -5706,6 +5725,27 @@ pub(crate) fn test_loop_allocation() -> LoopAllocation {
         LoopFrameModel::from_budgets(&budgets),
         LoopDemand::default(),
     )
+}
+
+/// The tile term of the scene: one `TileNeed` per cache role whose last whole
+/// pass wanted anything, off `cache_ledger`'s levels. The cells are what the
+/// pass asked for, drawn level and ancestor net; the per-tile cost is the
+/// mean charge of the role's resident entries, floored at the marker's node.
+fn tile_needs() -> Vec<squallar_device_profile::scene::TileNeed> {
+    use squallar_egui::tile_source::cache_ledger::{ROLES, totals};
+
+    ROLES
+        .iter()
+        .map(|role| totals(*role))
+        .filter(|t| t.wanted_on_glass + t.wanted_net > 0)
+        .map(|t| squallar_device_profile::scene::TileNeed {
+            tiles_on_glass: t.wanted_on_glass as usize,
+            ancestor_net: t.wanted_net as usize,
+            bytes_per_tile: (t.resident_bytes / t.resident_entries.max(1))
+                .max(squallar_egui::tile_source::byte_lru::MARKER_BYTES)
+                as usize,
+        })
+        .collect()
 }
 
 /// This build's own budgets, for the tests that take them as an argument.

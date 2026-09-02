@@ -820,6 +820,9 @@ impl Gui {
         // that publishes an unchanged status re-states the same allocation.
         self.liveness = inputs.liveness.to_vec();
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
+        // Before the pane loop, when every slot is full: the live sources
+        // and the parked ones are held to the device's allowance from here.
+        self.map_tiles.set_budget(inputs.tile_cache);
         self.floor_strips
             .note_mirror_plan_stamp(inputs.mirror_plan_stamp);
         // Copies histograms only on the frame that closes a 2 s window, and
@@ -1231,18 +1234,34 @@ impl Gui {
     /// The tile zoom bias for one pane: the frame's bias if this pane is
     /// drawing a floor strip, zero otherwise.
     ///
-    /// Gated on the **styled** cache bound only, deliberately: the
-    /// parsed-geometry cache (`tile_source::PARSED_TILE_CACHE_ENTRIES`) is an
-    /// economy cache — a bias whose working set overruns it costs a refetch
-    /// on the next restyle, never a frame — so admitting it here would trade
-    /// a frame guarantee against an economy one. See that constant's docs.
+    /// **Gated in bytes, per source.** The working set the bias would keep
+    /// resident across every floor strip
+    /// ([`Self::floor_tile_working_set`]), priced at what one of that
+    /// source's entries has measured on average
+    /// (`MapTileState::base_entry_bytes`, `terrain_entry_bytes`), against
+    /// that source's own allowance — and both sources must fit, because each
+    /// draws the strips through its own cache and a bias the basemap can
+    /// afford is not one the terrain's rasters can. Gated on the styled and
+    /// terrain populations only, deliberately: the parsed-geometry cache is
+    /// economy — a bias whose working set overruns it costs a refetch on the
+    /// next restyle, never a frame — so admitting it here would trade a frame
+    /// guarantee against an economy one.
+    ///
+    /// The mean moves as tiles land, so near the boundary this can flip a
+    /// frame later than a count would; the strip's sharpness is all it moves,
+    /// and the tile-sharpness rung's dwell (a later landing) is where
+    /// hysteresis for this family belongs.
     pub(crate) fn tile_zoom_bias_for_pane(&self, pane_idx: usize) -> u8 {
         if self.floor_tile_zoom_bias == 0 || !self.is_floor_source(pane_idx) {
             return 0;
         }
-        if self.floor_tile_working_set(self.floor_tile_zoom_bias)
-            > crate::tile_source::TILE_CACHE_ENTRIES.get()
-        {
+        let working_set = self.floor_tile_working_set(self.floor_tile_zoom_bias) as u64;
+        let budget = self.map_tiles.budget();
+        let base_fits =
+            working_set.saturating_mul(self.map_tiles.base_entry_bytes()) <= budget.styled_bytes;
+        let terrain_fits = working_set.saturating_mul(self.map_tiles.terrain_entry_bytes())
+            <= budget.terrain_bytes;
+        if !(base_fits && terrain_fits) {
             return 0;
         }
         self.floor_tile_zoom_bias
@@ -1271,11 +1290,9 @@ impl Gui {
     /// **The Terrain layer does not re-open that question**, and the reason is
     /// worth spelling since it looks like the labels story come back: terrain
     /// *is* a second pyramid over the same ground, but it is a second
-    /// **source** with its own cache at its own bound — and
-    /// `tile_source::TERRAIN_TILE_CACHE_ENTRIES` equals `TILE_CACHE_ENTRIES`
-    /// precisely so this per-source comparison stays the right one for both.
-    /// Each source's working set at `bias` is the figure below unchanged; a
-    /// `layers: 2` here would gate the basemap's cache on the *sum* of two
+    /// **source** with its own cache at its own allowance, and the gate above
+    /// prices this one working set against each source's allowance in turn.
+    /// A `layers: 2` here would gate the basemap's cache on the *sum* of two
     /// caches neither of which holds it.
     fn floor_tile_working_set(&self, bias: u8) -> usize {
         self.panes()

@@ -157,6 +157,12 @@ impl Gui {
         self.concurrent_renders
     }
 
+    pub(crate) fn tile_cache_budget_for_test(
+        &self,
+    ) -> squallar_device_profile::budget::TileCacheBudget {
+        self.map_tiles.budget()
+    }
+
     /// Floor strips painted since this `Gui` was built. See
     /// [`FrameProbes::strip_paints`].
     pub(crate) fn strip_paints_for_test(&self) -> u64 {

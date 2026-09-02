@@ -249,6 +249,17 @@ pub(super) fn draw_tile_layer(
     // draws from the next without a clock or a frame callback of its own.
     let pass_nr = ui.ctx().cumulative_pass_nr();
 
+    // What this pass wants of the source: the cells the walk below draws plus
+    // the net just asked for. The cache's floor follows it, so nothing on the
+    // glass is ever evicted for history, and the cells the channel refused
+    // last pass are asked for now, ahead of the walk's own head. After the
+    // net, before the grid, on purpose — see `HttpsTiles::note_wanted`.
+    tiles.note_wanted(
+        pass_nr,
+        span.tiles(),
+        crate::tiles::warm_net_cells(span, tile_zoom),
+    );
+
     // Once for the layer, not once per tile: a `Context` read lock and a
     // divide, against a span that holds up to 84 cells.
     let feathering = crate::tile_mesh::feathering_of(ui.ctx());

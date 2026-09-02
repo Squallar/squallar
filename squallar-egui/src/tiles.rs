@@ -597,6 +597,20 @@ pub struct MapTileState {
     /// built while this is `None` reads everything from the network, which is
     /// the state every test that does not opt in is in.
     basemap_dir: Option<std::path::PathBuf>,
+
+    /// The byte allowances every source here is held to — the device's,
+    /// pushed in once per frame through `FrameInputs::tile_cache` and
+    /// [`Self::set_budget`]; the compile-time bracket's floor until the first
+    /// frame says otherwise. Applied to the live sources and the parked ones
+    /// alike, so a parked source's caches are economy the budget may reclaim
+    /// and not a hoard the toggle hides.
+    budget: squallar_device_profile::budget::TileCacheBudget,
+
+    /// What one resident entry of the base source cost on average, the last
+    /// time the source was in its slot — see [`Self::base_entry_bytes`].
+    base_entry_bytes: u64,
+    /// The terrain slot's [`Self::base_entry_bytes`].
+    terrain_entry_bytes: u64,
 }
 
 impl Default for MapTileState {
@@ -617,6 +631,9 @@ impl Default for MapTileState {
             parked_base: None,
             parked_terrain: None,
             basemap_dir: None,
+            budget: crate::tile_source::default_tile_budget(),
+            base_entry_bytes: crate::tile_source::byte_lru::MARKER_BYTES,
+            terrain_entry_bytes: crate::tile_source::byte_lru::MARKER_BYTES,
         }
     }
 }
@@ -630,6 +647,66 @@ impl MapTileState {
     /// theme flip is not one — picks this up.
     pub(crate) fn set_basemap_dir(&mut self, dir: Option<std::path::PathBuf>) {
         self.basemap_dir = dir;
+    }
+
+    /// Hold every source here to `budget`: the base slot and its park to the
+    /// styled and parsed allowances, the terrain slot and its park to the
+    /// terrain allowance. Called once per frame from `Gui::apply_frame_inputs`,
+    /// before the pane loop, when every slot is full.
+    ///
+    /// **A parked source is economy, and this is where it shrinks.** Nothing
+    /// pumps a parked source, so nothing would pay its shrink debt; one trim
+    /// per parked source per frame here is the pump's job done for it — one
+    /// eviction, through the discard sink, never a synchronous drop of the
+    /// whole park. Its floor is zero from the moment it was parked
+    /// ([`HttpsTiles::release_working_set`]), so under pressure it can give
+    /// up everything; under none it keeps what it had, which is what makes
+    /// switching the layer back on free.
+    pub fn set_budget(&mut self, budget: squallar_device_profile::budget::TileCacheBudget) {
+        // The figures move rarely — a re-fit, a capacity event — and every
+        // source is told on the frame they do; a frame that re-states the
+        // same figures takes no lock. A source built or unparked later is told
+        // where it is built (`ensure_base_tiles`) or already knows.
+        if self.budget != budget {
+            self.budget = budget;
+            for base in [self.tiles.as_mut(), self.parked_base.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                base.set_budget(budget.styled_bytes, budget.parsed_bytes);
+            }
+            for terrain in [self.terrain.as_mut(), self.parked_terrain.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                terrain.set_budget(budget.terrain_bytes, 0);
+            }
+        }
+        for parked in [self.parked_base.as_mut(), self.parked_terrain.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            parked.pump();
+        }
+    }
+
+    /// The allowances in force. See [`Self::set_budget`].
+    pub fn budget(&self) -> squallar_device_profile::budget::TileCacheBudget {
+        self.budget
+    }
+
+    /// What one resident entry of the base source costs on average, floored
+    /// at the marker — sampled when the source is restored to its slot, so
+    /// the zoom-bias gate, which runs while the pane loop holds the source,
+    /// can price a projected working set without it. The marker's figure
+    /// before any tile has landed.
+    pub fn base_entry_bytes(&self) -> u64 {
+        self.base_entry_bytes
+    }
+
+    /// The terrain slot's [`Self::base_entry_bytes`].
+    pub fn terrain_entry_bytes(&self) -> u64 {
+        self.terrain_entry_bytes
     }
 
     /// Ensure the base-map tiles for the current theme and detail set are
@@ -729,6 +806,11 @@ impl MapTileState {
             // session: latch, exactly as the terrain slot does, so the
             // per-frame cost of an unbuildable source is one bool read.
             self.base_unreachable = self.tiles.is_none();
+            // Built on the bracket's floor; held to the device's allowance
+            // before it is asked for a tile.
+            if let Some(tiles) = self.tiles.as_mut() {
+                tiles.set_budget(self.budget.styled_bytes, self.budget.parsed_bytes);
+            }
         }
 
         // **After the build arm, so a source made this frame is told before
@@ -860,10 +942,23 @@ impl MapTileState {
     /// it describes what the user can see, and they can no longer see it. Left
     /// standing it would have a layer the user switched off reported as an
     /// unreachable archive — the same lie in the other direction.
+    ///
+    /// **What the park keeps is economy, not need.** The source's caches stay
+    /// resident within their budget while the layer is hidden — so switching
+    /// it back on costs nothing: no fetch, no parse, no tessellation, where
+    /// the drop-and-rebuild measured 10.3-11.8 ms on the two frames the eye
+    /// returned to the map — but its working set is released
+    /// ([`HttpsTiles::release_working_set`]): nothing is on the glass, so the
+    /// floor is zero and every slot is the budget's to reclaim, one trim per
+    /// frame from [`Self::set_budget`]. The pinned contract
+    /// (`a_changed_source_layer_set_restyles_the_base_source`) is untouched:
+    /// a changed layer *set* restyles the source in place, and a hide followed
+    /// by a show rebuilds nothing and restyles nothing.
     pub fn release_base_tiles(&mut self) {
         // `take`, and only when it yields: two releases in a row must not
         // overwrite the parked source with the empty slot the first one left.
-        if let Some(tiles) = self.tiles.take() {
+        if let Some(mut tiles) = self.tiles.take() {
+            tiles.release_working_set();
             self.parked_base = Some(tiles);
         }
         self.base_reads_failing = false;
@@ -874,8 +969,12 @@ impl MapTileState {
         self.tiles.take()
     }
 
-    /// Restore the base tiles after per-pane rendering.
+    /// Restore the base tiles after per-pane rendering, sampling what one of
+    /// its entries costs while it is here — see [`Self::base_entry_bytes`].
     pub fn restore_base_tiles(&mut self, tiles: Option<HttpsTiles>) {
+        if let Some(tiles) = &tiles {
+            self.base_entry_bytes = tiles.mean_entry_bytes();
+        }
         self.tiles = tiles;
     }
 
@@ -922,6 +1021,9 @@ impl MapTileState {
             // yields no source and never will this session: latch, so the
             // per-frame cost of an unbuildable source is one bool read.
             self.terrain_failed = self.terrain.is_none();
+            if let Some(terrain) = self.terrain.as_mut() {
+                terrain.set_budget(self.budget.terrain_bytes, 0);
+            }
         }
     }
 
@@ -929,7 +1031,8 @@ impl MapTileState {
     /// off. Symmetric with [`Self::release_base_tiles`], including why it is a
     /// park and not a drop — see [`Self::parked_terrain`].
     pub fn release_terrain_tiles(&mut self) {
-        if let Some(terrain) = self.terrain.take() {
+        if let Some(mut terrain) = self.terrain.take() {
+            terrain.release_working_set();
             self.parked_terrain = Some(terrain);
         }
     }
@@ -939,8 +1042,12 @@ impl MapTileState {
         self.terrain.take()
     }
 
-    /// Restore the terrain tiles after per-pane rendering.
+    /// Restore the terrain tiles after per-pane rendering, sampling the entry
+    /// cost as [`Self::restore_base_tiles`] does.
     pub fn restore_terrain_tiles(&mut self, tiles: Option<HttpsTiles>) {
+        if let Some(tiles) = &tiles {
+            self.terrain_entry_bytes = tiles.mean_entry_bytes();
+        }
         self.terrain = tiles;
     }
 
@@ -1042,6 +1149,21 @@ pub fn tiles_resident_with_warm_net(rect: egui::Rect, zoom_bias: u8, layers: usi
         .saturating_mul(down)
         .saturating_add(net(across).saturating_mul(net(down)))
         .saturating_mul(layers)
+}
+
+/// How many cells of the [`WARM_ANCESTOR_STEPS`] net `span` at `tile_zoom`
+/// sits under — exactly the cells `ui_map_overlays::draw_tile_layer` asks
+/// `HttpsTiles::warm` for, so the working set a pass reports is the count it
+/// requested and not a bound on it. Zero where the drawn level is too shallow
+/// to have a net.
+pub fn warm_net_cells(span: TileSpan, tile_zoom: u8) -> usize {
+    if tile_zoom < WARM_ANCESTOR_STEPS {
+        return 0;
+    }
+    let step = WARM_ANCESTOR_STEPS;
+    let across = ((span.east >> step).saturating_sub(span.west >> step) as usize) + 1;
+    let down = ((span.south >> step).saturating_sub(span.north >> step) as usize) + 1;
+    across.saturating_mul(down)
 }
 
 /// How many tiles a rect keeps resident at a **whole** zoom, where a tile is

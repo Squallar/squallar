@@ -253,7 +253,15 @@ fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
         evicted_bytes: 6_000_060,
         resident_entries: 71,
         resident_bytes: 8_000_082,
+        // Levels the line does not carry: distinct from every printed
+        // figure, so a formatter that started printing one would be caught
+        // by the position check below rather than pass by coincidence.
+        overrun_bytes: 4_004,
+        floor_entries: 5_005,
+        wanted_on_glass: 6_006,
+        wanted_net: 7_007,
         parsed_entries: 93,
+        parsed_bytes: 9_009,
     };
     let pattern = pattern("tile_cache_re");
     let head = r"tile cache \(([a-z0-9-]+)\): ";

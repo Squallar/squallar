@@ -10,13 +10,11 @@ use egui::Context;
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
+use super::byte_lru::MARKER_BYTES;
 use super::{
-    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles, MAX_IN_FLIGHT,
-    MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
-    PARSED_TILE_CACHE_ENTRIES, PumpBudget, ReadFailureRun, SUSTAINED_READ_FAILURES,
-    TILE_CACHE_ENTRIES, TileCache, WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
-    WASM_TILE_DECODES_PER_PUMP, cache_ledger, drain_up_to, interpolate_from_lower_zoom, slot_for,
-    tile_client, tile_id_is_valid,
+    HttpsTiles, MAX_IN_FLIGHT, MAX_PARALLEL_DOWNLOADS, PumpBudget, ReadFailureRun,
+    SUSTAINED_READ_FAILURES, TileCache, WASM_TILE_DECODES_PER_PUMP, cache_ledger, drain_up_to,
+    interpolate_from_lower_zoom, slot_for, tile_client, tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,24 +53,20 @@ fn whole_tile_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
 }
 
-/// The tuning values, restated as literals.
-const EXPECTED_CACHE_ENTRIES: usize = 256;
-const EXPECTED_MOBILE_CACHE_ENTRIES: usize = 100;
-/// Not a fraction of the desktop figure: the worst-case working set of a
-/// 1920x1200-point canvas — the 96 tiles it draws plus the 4-tile bound on the
-/// `WARM_ANCESTOR_STEPS` net it keeps resident beside them.
-const EXPECTED_WASM_CACHE_ENTRIES: usize = 100;
+/// The tuning values, restated as literals. The cache's bounds are bytes now
+/// and live in `squallar-device-profile`'s brackets, pinned there
+/// (`the_tile_allowances_are_the_written_figures_on_every_bracket`); what is
+/// left here is the concurrency, the pump, and what one fixture slot costs.
 const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 /// Re-pointed at WO-10, when the time budget became the governor and the count
 /// became a backstop: the value is the channel's own capacity plus one, so it
 /// means "whatever is queued" rather than a throttle. It was 2.
 const EXPECTED_WASM_DECODES_PER_PUMP: usize = 7;
-/// The 1920x1200 worst-case working set, the same derivation as the wasm
-/// styled arm's: the common canvas restyles wholly from the parsed cache.
-const EXPECTED_DESKTOP_PARSED_ENTRIES: usize = 96;
-/// A byte-budget answer, below the working set on purpose: an evicted parse
-/// costs one refetch on the next restyle, never a frame.
-const EXPECTED_HANDHELD_PARSED_ENTRIES: usize = 24;
+/// What one fixture tile costs the cache once it has landed: the marker's node
+/// plus a 4x4 RGBA texture. A pending or failed marker costs [`MARKER_BYTES`]
+/// alone. Every byte budget below is a multiple of one or the other, so the
+/// counts the old cap tests spoke in read the same.
+const FIXTURE_TILE_BYTES: u64 = MARKER_BYTES + (FIXTURE_SIDE * FIXTURE_SIDE * 4) as u64;
 
 // ---------------------------------------------------------------------------
 
@@ -328,16 +322,15 @@ fn loopback_tiles(server: &TileServer, ctx: &Context) -> HttpsTiles {
     )
 }
 
-/// [`loopback_tiles`] with the cache bound handed in, for the per-tier
-/// eviction test — `cargo test` only ever compiles one arm of
-/// [`TILE_CACHE_ENTRIES`], so the other tiers' bounds have to arrive through
-/// the same seam the client does.
-fn loopback_tiles_with_capacity(server: &TileServer, ctx: &Context, capacity: usize) -> HttpsTiles {
-    HttpsTiles::with_client_and_cache(
+/// [`loopback_tiles`] with the styled cache's byte budget handed in, so a
+/// test can size the cache to a working set — or short of one — rather than
+/// to this build's device bracket.
+fn loopback_tiles_with_budget(server: &TileServer, ctx: &Context, budget_bytes: u64) -> HttpsTiles {
+    HttpsTiles::with_client_and_budget(
         LoopbackSource::new(&server.base_url),
         ctx.clone(),
         loopback_client(),
-        std::num::NonZeroUsize::new(capacity).expect("a test capacity is not zero"),
+        budget_bytes,
     )
 }
 
@@ -1165,48 +1158,14 @@ fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
     );
 }
 
-/// The cache tiers and the concurrency limit are the written figures.
+/// The concurrency limit and the pump's count backstop are the written
+/// figures; the cache bounds are not here to pin, because there are none —
+/// see [`the_two_slots_price_against_the_brackets_they_are_handed`].
 #[test]
-fn the_tuning_constants_are_the_written_figures_on_every_tier() {
+fn the_tuning_constants_are_the_written_figures() {
     assert_eq!(
         MAX_PARALLEL_DOWNLOADS, EXPECTED_PARALLEL_DOWNLOADS,
         "the parallel-download limit is a provider term of use, not a dial"
-    );
-    assert_eq!(
-        DESKTOP_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_CACHE_ENTRIES,
-        "the desktop arm is pinned from below by squallar_gpu's \
-         MIRROR_SCALE_MAX, not by the byte budget"
-    );
-    assert_eq!(
-        MOBILE_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_MOBILE_CACHE_ENTRIES,
-        "the mobile arm is the largest handheld working set, not a fraction \
-         of the desktop figure"
-    );
-    assert_eq!(
-        WASM_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_WASM_CACHE_ENTRIES,
-        "the wasm arm is the worst-case working set of a 1920x1200-point \
-         canvas, not a fraction of the desktop figure"
-    );
-    assert_eq!(
-        WASM_TILE_CACHE_ENTRIES.get(),
-        crate::tiles::tiles_resident_with_warm_net(
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1200.0)),
-            0,
-            1,
-        ),
-        "the wasm arm must stay derived from what a viewport actually keeps \
-         resident, worst case over the whole zoom range — and that is the \
-         drawn level plus the ancestor net, since `draw_tile_layer` asks for \
-         both. An arm sized for the drawn level alone lets the net evict the \
-         glass"
-    );
-    assert!(
-        WASM_TILE_CACHE_ENTRIES.get() <= MOBILE_TILE_CACHE_ENTRIES.get()
-            && MOBILE_TILE_CACHE_ENTRIES.get() <= DESKTOP_TILE_CACHE_ENTRIES.get(),
-        "the tiers must stay ordered by how much memory the class has"
     );
     assert_eq!(
         WASM_TILE_DECODES_PER_PUMP, EXPECTED_WASM_DECODES_PER_PUMP,
@@ -1220,155 +1179,69 @@ fn the_tuning_constants_are_the_written_figures_on_every_tier() {
          a smaller number is a throttle nothing measured, and a larger one \
          cannot be reached because the queue cannot hold it"
     );
+}
 
-    // The two arms that can hold a vector entry must be derived against the
-    // vector entry, which is what the doc comment claims and what stopped being
-    // true when the entry stopped being a 256 KiB texture. A ceiling rather than
-    // an equality: the number is also floored by the working set, so it is not a
-    // pure function of the byte budget.
-    for (entries, ceiling_mib, tier) in [
-        (DESKTOP_TILE_CACHE_ENTRIES.get(), 160, "desktop"),
-        (MOBILE_TILE_CACHE_ENTRIES.get(), 64, "mobile"),
-        (WASM_TILE_CACHE_ENTRIES.get(), 64, "wasm32"),
-    ] {
-        let worst = entries * super::MEASURED_VECTOR_TILE_BYTES;
-        assert!(
-            worst <= ceiling_mib * 1024 * 1024,
-            "the {tier} arm holds {entries} entries, which is {:.1} MiB of \
-             vector tiles per source against a {ceiling_mib} MiB ceiling",
-            worst as f64 / (1024.0 * 1024.0)
-        );
-    }
+/// The styled tail is the whole slot and not the shapes alone: the plan's
+/// 1.03 MB left the strokes out, and the strokes are more than half the
+/// flattened half. If this ever reads under the shapes' own 652,112 plus a
+/// flattened half, the band test has stopped measuring what an arrival puts.
+#[allow(
+    dead_code,
+    reason = "a compile-time assertion; the name is its message"
+)]
+const STYLED_TAIL_CARRIES_THE_FLATTENED_HALF: () = assert!(
+    super::MEASURED_STYLED_ENTRY_BYTES > 652_112 + 400_000,
+    "the measured styled tail no longer carries the flattened buffers beside the shapes"
+);
 
-    // The parsed-geometry population: the second resident cost a style
-    // change rides. The desktop arm is the same working-set derivation the
-    // wasm styled arm carries; the handheld arms are deliberately below the
-    // working set (an evicted parse is one refetch on the next restyle, not a
-    // frame), so they are pinned as written figures plus a byte ceiling.
-    assert_eq!(
-        DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_DESKTOP_PARSED_ENTRIES,
-        "the desktop parsed arm is the 1920x1200 working set"
-    );
-    assert_eq!(
-        DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
-        crate::tiles::tiles_resident_for(
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1200.0)),
-            0,
-            1,
-        ),
-        "the desktop parsed arm must stay derived from what a viewport keeps \
-         resident, worst case over the whole zoom range"
-    );
-    assert_eq!(
-        MOBILE_PARSED_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_HANDHELD_PARSED_ENTRIES,
-        "the mobile parsed arm is a byte-budget figure"
-    );
-    assert_eq!(
-        WASM_PARSED_TILE_CACHE_ENTRIES.get(),
-        EXPECTED_HANDHELD_PARSED_ENTRIES,
-        "the wasm parsed arm is a byte-budget figure"
-    );
-    for (entries, ceiling_mib, tier) in [
-        (DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(), 192, "desktop"),
-        (MOBILE_PARSED_TILE_CACHE_ENTRIES.get(), 48, "mobile"),
-        (WASM_PARSED_TILE_CACHE_ENTRIES.get(), 48, "wasm32"),
-    ] {
-        let worst = entries * super::MEASURED_PARSED_TILE_BYTES;
-        assert!(
-            worst <= ceiling_mib * 1024 * 1024,
-            "the {tier} parsed arm holds {entries} entries, which is {:.1} MiB \
-             of parsed tiles per source against a {ceiling_mib} MiB ceiling",
-            worst as f64 / (1024.0 * 1024.0)
-        );
-    }
-    for (parsed, styled, tier) in [
-        (
-            DESKTOP_PARSED_TILE_CACHE_ENTRIES,
-            DESKTOP_TILE_CACHE_ENTRIES,
-            "desktop",
-        ),
-        (
-            MOBILE_PARSED_TILE_CACHE_ENTRIES,
-            MOBILE_TILE_CACHE_ENTRIES,
-            "mobile",
-        ),
-        (
-            WASM_PARSED_TILE_CACHE_ENTRIES,
-            WASM_TILE_CACHE_ENTRIES,
-            "wasm32",
-        ),
-    ] {
-        assert!(
-            parsed.get() <= styled.get(),
-            "the {tier} parsed arm outgrew the styled arm: an economy cache \
-             holding parses for tiles the styled cache cannot keep is residency \
-             with no consumer"
-        );
-    }
+/// **Two slots price against the brackets they are handed, and the prose that
+/// used to claim it is an imported assertion.** The old sizing note priced
+/// four live sources at 61.5 MiB apiece against
+/// `WASM_APP_TEXTURE_BUDGET_BYTES`; the layout it described no longer exists,
+/// and the two slots that do exist are host memory except for the terrain
+/// rasters, which are the one tile population on the GPU and are omitted from
+/// the GPU sum by name (the device-profile side holds that:
+/// `the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name`). What this
+/// holds, importing the figures rather than restating them: the terrain floor
+/// is a small fraction of the wasm GPU budget it is omitted from; the wasm
+/// styled floor cannot hold the user's 106-tile worst case at the measured
+/// tail and holds 1,600 typical entries; and the measured tail is the whole
+/// slot — shapes and flattened buffers — and not the shapes alone.
+#[test]
+fn the_two_slots_price_against_the_brackets_they_are_handed() {
+    use squallar_device_profile::budget::BudgetLimits;
+    use squallar_device_profile::constants::WASM_APP_TEXTURE_BUDGET_BYTES;
+
+    let wasm = BudgetLimits::WASM;
     assert!(
-        WASM_PARSED_TILE_CACHE_ENTRIES.get() <= MOBILE_PARSED_TILE_CACHE_ENTRIES.get()
-            && MOBILE_PARSED_TILE_CACHE_ENTRIES.get() <= DESKTOP_PARSED_TILE_CACHE_ENTRIES.get(),
-        "the parsed tiers must stay ordered by how much memory the class has"
+        wasm.tile_terrain_bytes.floor <= WASM_APP_TEXTURE_BUDGET_BYTES / 10,
+        "the wasm terrain floor ({} MiB) is more than a tenth of the {} MiB GPU budget it is \
+         omitted from; re-argue the omission",
+        wasm.tile_terrain_bytes.floor >> 20,
+        WASM_APP_TEXTURE_BUDGET_BYTES >> 20,
     );
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        not(any(target_os = "android", target_os = "ios"))
-    ))]
-    assert_eq!(
-        PARSED_TILE_CACHE_ENTRIES, DESKTOP_PARSED_TILE_CACHE_ENTRIES,
-        "a desktop target must carry the desktop parsed arm"
+    let styled_floor = wasm.tile_styled_bytes.floor as u64;
+    assert!(
+        super::worst_case_entries(styled_floor) < 106,
+        "the wasm styled floor holds {} worst-case entries, so it now holds the user's \
+         106-tile window outright and the working-set floor is no longer what carries it",
+        super::worst_case_entries(styled_floor),
     );
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(target_os = "android", target_os = "ios")
-    ))]
-    assert_eq!(
-        PARSED_TILE_CACHE_ENTRIES, MOBILE_PARSED_TILE_CACHE_ENTRIES,
-        "a handheld target must carry the mobile parsed arm"
+    assert!(
+        styled_floor as usize / super::TYPICAL_STYLED_ENTRY_BYTES >= 1_600,
+        "the wasm styled floor holds {} typical entries, under the 1,600 its doc quotes",
+        styled_floor as usize / super::TYPICAL_STYLED_ENTRY_BYTES,
     );
-    #[cfg(target_arch = "wasm32")]
+    // The tail is the whole slot and not the shapes alone — held at compile
+    // time by `STYLED_TAIL_CARRIES_THE_FLATTENED_HALF` below.
+    // The terrain population is priced at the raster, no tail: one 256x256
+    // RGBA texture, and the marker beside it.
+    assert_eq!(super::RASTER_TILE_BYTES, 256 * 256 * 4);
+    // Every slot the loopback fixture puts costs what this file says it does.
     assert_eq!(
-        PARSED_TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES,
-        "wasm32 must carry the wasm parsed arm"
-    );
-
-    // The wasm arm holds vector entries as of `feat(web): the vector basemap
-    // draws on wasm32`, so it is in the loop above rather than exempt from it.
-    // Its raster derivation is still pinned, because the terrain slot holds
-    // raster entries and the arm has to be right for it too.
-    //
-    // 24 -> 25 MiB at WO-10: the count is derived from the working set and the
-    // byte figure follows it, so this moved because the working set gained the
-    // `WARM_ANCESTOR_STEPS` net (96 -> 100), not because a byte budget was
-    // relaxed. See `WASM_TILE_CACHE_ENTRIES`, which prices the vector arm — the
-    // binding one — against `WASM_APP_TEXTURE_BUDGET_BYTES`.
-    assert_eq!(
-        WASM_TILE_CACHE_ENTRIES.get() * super::RASTER_TILE_BYTES,
-        25 * 1024 * 1024,
-        "the wasm arm's raster cost is not what its entry count implies"
-    );
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        not(any(target_os = "android", target_os = "ios"))
-    ))]
-    assert_eq!(
-        TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES,
-        "a desktop target must carry the desktop arm"
-    );
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(target_os = "android", target_os = "ios")
-    ))]
-    assert_eq!(
-        TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
-        "a handheld target must carry the mobile arm"
-    );
-    #[cfg(target_arch = "wasm32")]
-    assert_eq!(
-        TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
-        "wasm32 must carry the wasm arm"
+        FIXTURE_TILE_BYTES,
+        MARKER_BYTES + 64,
+        "the fixture is a 4x4 RGBA tile: 64 texture bytes over the marker"
     );
 }
 
@@ -1399,7 +1272,7 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
         .build()
         .expect("a runtime");
 
-    let shapes = runtime.block_on(async {
+    let tile = runtime.block_on(async {
         let archive = crate::basemap_archive::BasemapArchive::open(
             FileRangeSource::open(&path).expect("the fixture opens"),
         )
@@ -1416,57 +1289,61 @@ fn the_vector_entry_cost_is_what_the_fixture_actually_renders() {
             .into_bytes()
             .expect("the fixture holds Monaco's own z14 tile");
 
-        match Tile::from_mvt(&bytes, &crate::basemap_style::committed(true), 14)
+        Tile::from_mvt(&bytes, &crate::basemap_style::committed(true), 14)
             .expect("the tile renders")
-        {
-            Tile::Vector(shapes) => shapes,
-            Tile::Raster(_) => panic!("an MVT body rendered as a raster"),
-        }
     });
 
     // A non-triviality floor: a tile that rendered nothing would sail through
     // the bound below and prove nothing about the cost of a real one.
+    let shapes = match &tile {
+        Tile::Vector(shapes) => shapes.len(),
+        Tile::Raster(_) => panic!("an MVT body rendered as a raster"),
+    };
     assert!(
-        shapes.len() > 500,
-        "the fixture's densest tile rendered only {} shapes, so this is not \
-         measuring a city core any more",
-        shapes.len()
+        shapes > 500,
+        "the fixture's densest tile rendered only {shapes} shapes, so this is not \
+         measuring a city core any more"
     );
 
-    let heap: usize = std::mem::size_of_val(&shapes[..])
-        + shapes
-            .iter()
-            .map(|shape| match shape {
-                walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
-                    std::mem::size_of::<egui::Mesh>()
-                        + mesh.vertices.capacity() * std::mem::size_of::<egui::epaint::Vertex>()
-                        + mesh.indices.capacity() * 4
-                }
-                walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
-                    std::mem::size_of::<egui::epaint::PathShape>()
-                        + path.points.capacity() * std::mem::size_of::<egui::Pos2>()
-                }
-                walkers::ShapeOrText::Text(text) => text.text.capacity(),
-                walkers::ShapeOrText::Shape(_) => 0,
-            })
-            .sum::<usize>();
+    // The slot exactly as an arrival makes it: shapes priced at capacity plus
+    // the fills and strokes flattened at a feathering of one point — the
+    // value `feathering_of` answers on a 1x display — plus the marker's node.
+    // What is measured is what is resident.
+    let slot = slot_for(tile, 1, 1.0);
+    let heap = slot.bytes() as usize;
+    let shapes_alone = match slot.tile.as_ref() {
+        Some(Tile::Vector(shapes)) => super::styled_heap_bytes(shapes),
+        _ => unreachable!("the slot holds the vector tile it was built from"),
+    };
+    let flattened = slot.meshes.as_ref().map_or(0, |meshes| meshes.bytes()) as usize;
+    assert!(
+        flattened > 0,
+        "the fixture tile flattened to no buffers, so this is not measuring the entry \
+         a real arrival makes"
+    );
+    assert_eq!(
+        heap,
+        MARKER_BYTES as usize + shapes_alone + flattened,
+        "the slot's charge is not the sum of its parts"
+    );
 
     // Not an equality: `size_of` and allocator rounding are toolchain
     // properties, and pinning them would red-gate a compiler bump. The claim
-    // that matters is that the constant the cache is sized against is not an
-    // *under*-estimate, and is still the right order.
+    // that matters is that the constant the brackets are argued from is not
+    // an *under*-estimate, and is still the right order. Re-derive the
+    // constant by reading the figure out of this message, never by inference.
     assert!(
-        heap <= super::MEASURED_VECTOR_TILE_BYTES,
-        "one cached vector entry measures {heap} bytes, over the \
-         {} the cache sizing is derived from",
-        super::MEASURED_VECTOR_TILE_BYTES
+        heap <= super::MEASURED_STYLED_ENTRY_BYTES,
+        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {flattened} \
+         flattened, {MARKER_BYTES} marker), over the {} the brackets are derived from",
+        super::MEASURED_STYLED_ENTRY_BYTES
     );
     assert!(
-        heap * 2 >= super::MEASURED_VECTOR_TILE_BYTES,
-        "one cached vector entry measures {heap} bytes, less than half the \
-         {} the cache sizing is derived from: the derivation has gone stale in \
-         the safe direction, which still means it is not measuring this",
-        super::MEASURED_VECTOR_TILE_BYTES
+        heap * 2 >= super::MEASURED_STYLED_ENTRY_BYTES,
+        "one styled entry measures {heap} bytes ({shapes_alone} of shapes, {flattened} \
+         flattened), less than half the {} the brackets are derived from: the derivation \
+         has gone stale in the safe direction, which still means it is not measuring this",
+        super::MEASURED_STYLED_ENTRY_BYTES
     );
 }
 
@@ -1523,7 +1400,7 @@ fn the_parsed_entry_cost_is_what_the_fixture_actually_parses() {
     // sits below the styled entry is not holding them.
     let heap = parsed.heap_bytes();
     assert!(
-        heap > super::MEASURED_VECTOR_TILE_BYTES / 2,
+        heap > super::MEASURED_STYLED_ENTRY_BYTES / 2,
         "the parse of the fixture's densest tile measures {heap} bytes, which \
          is too small to be the decode of a city core"
     );
@@ -1543,14 +1420,16 @@ fn the_parsed_entry_cost_is_what_the_fixture_actually_parses() {
     );
 }
 
-/// The cache stops growing at its bound.
+/// The cache stops growing at its byte bound. Against a server that answers
+/// 404 every slot is a failed marker charged [`MARKER_BYTES`], so a budget of
+/// 256 markers settles at 256 entries — the count the old cap read, in bytes.
 #[test]
 fn the_tile_cache_is_bounded() {
     let server = TileServer::start(Behaviour::NotFound);
     let ctx = Context::default();
-    let mut tiles = loopback_tiles(&server, &ctx);
+    let capacity = 256usize;
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, capacity as u64 * MARKER_BYTES);
 
-    let capacity = EXPECTED_CACHE_ENTRIES;
     let attempts = capacity as u32 + 64;
 
     let reached = pump_until(DEFAULT_TIMEOUT, || {
@@ -1568,17 +1447,15 @@ fn the_tile_cache_is_bounded() {
     );
 }
 
-/// Eviction is exercised at every tier's cap, by recency, not only compiled in.
+/// Eviction is exercised at several byte budgets, by recency, not only
+/// compiled in. The budgets are markers' worth, since a 404 leaves a marker;
+/// the three counts were once the three tiers' caps and are kept as sizes.
 #[test]
-fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
-    for capacity in [
-        EXPECTED_WASM_CACHE_ENTRIES,
-        EXPECTED_MOBILE_CACHE_ENTRIES,
-        EXPECTED_CACHE_ENTRIES,
-    ] {
+fn eviction_holds_at_every_byte_budget_and_takes_the_least_recent() {
+    for capacity in [8usize, 100, 256] {
         let server = TileServer::start(Behaviour::NotFound);
         let ctx = Context::default();
-        let mut tiles = loopback_tiles_with_capacity(&server, &ctx, capacity);
+        let mut tiles = loopback_tiles_with_budget(&server, &ctx, capacity as u64 * MARKER_BYTES);
         let id = |x: u32| TileId { x, y: 0, zoom: 10 };
 
         // The counter moves before any bound is near: three ids are three
@@ -1655,7 +1532,9 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
 
 /// The grid `ui_map_overlays::draw_tile_layer` walks, in its order: rows
 /// north to south, columns west to east, one `ground_at` per cell — after the
-/// layer's one pump.
+/// layer's one pump. **The bare walk**: no working set is reported, so the
+/// cache has no floor and the byte budget alone decides — the shape the
+/// eviction-mechanism pins below want.
 fn frame_over_grid(tiles: &mut HttpsTiles, side: u32, zoom: u8) {
     tiles.pump();
     for y in 0..side {
@@ -1665,72 +1544,192 @@ fn frame_over_grid(tiles: &mut HttpsTiles, side: u32, zoom: u8) {
     }
 }
 
+/// [`frame_over_grid`] as `draw_tile_layer` really makes a pass: the pump,
+/// the working set reported for `pass_nr` (no ancestor net at this depth is
+/// asked for here, so the net term is zero), then the walk. The report is
+/// what sets the cache's floor and asks for last pass's refused cells first.
+fn pass_over_grid(tiles: &mut HttpsTiles, pass_nr: u64, side: u32, zoom: u8) {
+    tiles.pump();
+    tiles.note_wanted(pass_nr, (side * side) as usize, 0);
+    for y in 0..side {
+        for x in 0..side {
+            tiles.ground_at(TileId { x, y, zoom });
+        }
+    }
+}
+
 /// A 12x12 grid: 144 cells, which is what a 2878x1651-point window draws at
 /// a whole zoom (13x8 = 104) plus part of what it holds between zooms (17x11
-/// = 187), against the wasm32 and mobile cap of 100.
+/// = 187) — and more than the ~106 the user's window measured on the rig at
+/// zoom 13.5 — against a budget that holds 100 of them.
 const GRID_SIDE: u32 = 12;
 const GRID_CELLS: u64 = (GRID_SIDE * GRID_SIDE) as u64;
 const GRID_FRAMES: usize = 120;
 const GRID_ZOOM: u8 = 10;
+/// A budget that holds 100 fixture tiles: the old wasm cap, in bytes, and
+/// short of the grid by 44.
+const BUDGET_FOR_100: u64 = 100 * FIXTURE_TILE_BYTES;
+/// A budget that holds the whole grid with room.
+const BUDGET_FOR_200: u64 = 200 * FIXTURE_TILE_BYTES;
 
-/// **A cache below the working set refetches tiles that are still on the
-/// glass.** The same 144 cells every frame, in the walk order, over a cap of
-/// 100: once the cache fills, every push evicts the least recently touched
-/// cell — which is the one the walk visits first next frame — so each frame
-/// re-asks for tiles it just held, and the source's own counters say so.
+/// **A working set the budget cannot hold is held by the floor, and refetches
+/// nothing.** The same 144 cells every pass, in the walk order, over a budget
+/// that holds 100 of them — the cap the user's 2878x1651 window overran on
+/// the rig (1563 asks, 1457 of them refetches of tiles just evicted, with
+/// nothing moving). Two arms, both `== 0`, because the mechanism and not the
+/// number is what is pinned: with the budget holding the grid the floor is
+/// never consulted; with the budget short by 44 tiles the floor the pass
+/// reports keeps every cell resident, the overrun reads as exactly the
+/// shortfall, and nothing on the glass is ever evicted for history.
 ///
-/// `#[ignore]`d on purpose: it pins the defect, so it reads green while the
-/// defect stands and would read red the day the cache holds its working set
-/// — at which point the assertion flips to `== 0` and the ignore comes off.
-/// Run with `cargo test -p squallar-egui --lib -- --ignored
-/// a_working_set_above_the_cap`. Its twin below at cap 200 is the control:
-/// the mechanism, not the number. What it no longer carries is the double
-/// fetch: an evicted pending marker used to be asked for again, and the run
-/// read 16 duplicate and 9 orphan puts beside its refetches; those two are
-/// zero now, here and in [`an_evicted_pending_marker_is_never_fetched_twice`],
-/// which is not ignored.
+/// This test landed `#[ignore]`d at WO-1 pinning the defect (`refetch > 0`),
+/// and flipped here. What it no longer carries is the double fetch either:
+/// duplicate and orphan puts read zero, as
+/// [`an_evicted_pending_marker_is_never_fetched_twice`] holds without a
+/// floor.
 #[test]
-#[ignore = "pins the defect WO-6 removes; flips to == 0 there"]
-fn a_working_set_above_the_cap_refetches_tiles_still_on_the_glass() {
+fn a_working_set_the_budget_cannot_hold_is_held_by_the_floor_and_refetches_nothing() {
+    for (budget, holds) in [(BUDGET_FOR_200, true), (BUDGET_FOR_100, false)] {
+        let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+        let ctx = Context::default();
+        let mut tiles = loopback_tiles_with_budget(&server, &ctx, budget);
+
+        // Every cell has landed before the steady state is read: the request
+        // channel holds six, so a 144-cell grid takes passes to ask for.
+        let mut pass = 0u64;
+        let landed = pump_until(DEFAULT_TIMEOUT, || {
+            pass += 1;
+            pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
+            (tiles.cache_stats().puts_first >= GRID_CELLS).then_some(())
+        });
+        assert!(
+            landed.is_some(),
+            "budget {budget}: not every cell landed within the timeout: {:?}",
+            tiles.cache_stats()
+        );
+        for _ in 0..GRID_FRAMES {
+            pass += 1;
+            pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let stats = tiles.cache_stats();
+        eprintln!(
+            "budget {budget} over a {GRID_SIDE}x{GRID_SIDE} grid for {GRID_FRAMES} passes: \
+             {stats:?}; the server saw {} requests",
+            server.request_count()
+        );
+        assert_eq!(
+            stats.refetch_after_eviction, 0,
+            "budget {budget}: a tile still on the glass was evicted and asked for again: {stats:?}"
+        );
+        assert_eq!(
+            stats.evicted(),
+            0,
+            "budget {budget}: the floor let a cell of the working set go: {stats:?}"
+        );
+        assert_eq!(
+            stats.requests, GRID_CELLS,
+            "budget {budget}: each of {GRID_CELLS} cells is asked for exactly once: {stats:?}"
+        );
+        assert_eq!(
+            (stats.puts_first, stats.puts_duplicate, stats.puts_orphan),
+            (GRID_CELLS, 0, 0),
+            "budget {budget}: every landing was a first sight: {stats:?}"
+        );
+        assert_eq!(
+            stats.resident_entries, GRID_CELLS,
+            "budget {budget}: the level is what the cache holds: {stats:?}"
+        );
+        assert_eq!(
+            stats.resident_bytes,
+            GRID_CELLS * FIXTURE_TILE_BYTES,
+            "budget {budget}: the level is what the cache is charged: {stats:?}"
+        );
+        assert_eq!(
+            stats.floor_entries,
+            GRID_CELLS + MAX_PARALLEL_DOWNLOADS as u64,
+            "budget {budget}: the floor is the reported working set plus the in-flight markers"
+        );
+        if holds {
+            assert_eq!(
+                stats.overrun_bytes, 0,
+                "budget {budget} holds the grid: {stats:?}"
+            );
+        } else {
+            assert_eq!(
+                stats.overrun_bytes,
+                GRID_CELLS * FIXTURE_TILE_BYTES - budget,
+                "budget {budget}: the overrun is exactly the shortfall the floor carries: {stats:?}"
+            );
+        }
+        assert_eq!(
+            server.request_count() as u64,
+            GRID_CELLS,
+            "budget {budget}: the server saw a request the cache did not count, or the reverse"
+        );
+    }
+}
+
+/// **Every visible cell is asked for, and within the channel's worth of
+/// passes.** The request channel holds seven; a 144-cell walk asks for seven
+/// a pass and is refused the rest, and before the refused-ask queue the
+/// walk's head took the seven every pass while cells at the tail were never
+/// asked at all — 10-20 of 144 in 120 frames at the old cap, the second
+/// "broken on web" mechanism beside the eviction churn. Now the refused cells
+/// are asked for first next pass, in the order they were refused, so a cell
+/// reaches the channel within `ceil(144 / 7)` = 21 passes of asking. The bound
+/// asserted is looser than that arithmetic — the IO thread has to take the
+/// channel between passes, and a loaded box takes longer — but it is the
+/// property that counts: every cell asked, and long before the 120 passes
+/// that used to leave a tenth of them unasked.
+#[test]
+fn every_visible_cell_is_asked_within_the_channels_worth_of_passes() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 100);
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, BUDGET_FOR_200);
+    let ideal = GRID_CELLS.div_ceil(MAX_PARALLEL_DOWNLOADS as u64 + 1);
 
-    for _ in 0..GRID_FRAMES {
-        frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
+    let mut pass = 0u64;
+    let all_asked = pump_until(DEFAULT_TIMEOUT, || {
+        pass += 1;
+        pass_over_grid(&mut tiles, pass, GRID_SIDE, GRID_ZOOM);
         std::thread::sleep(Duration::from_millis(2));
-    }
-
+        let distinct: std::collections::HashSet<String> = server.requests().into_iter().collect();
+        (distinct.len() as u64 >= GRID_CELLS).then_some(pass)
+    });
     let stats = tiles.cache_stats();
+    let asked = all_asked.unwrap_or_else(|| {
+        let distinct: std::collections::HashSet<String> = server.requests().into_iter().collect();
+        panic!(
+            "after {pass} passes only {} of {GRID_CELLS} cells were ever asked for: {stats:?}",
+            distinct.len()
+        )
+    });
     eprintln!(
-        "cap 100 over a {GRID_SIDE}x{GRID_SIDE} grid for {GRID_FRAMES} frames: {stats:?}; \
-         the server saw {} requests",
-        server.request_count()
+        "every cell of a {GRID_SIDE}x{GRID_SIDE} grid was asked for by pass {asked} (the channel \
+         alone allows {ideal}): {stats:?}"
     );
     assert!(
-        stats.refetch_after_eviction > 0,
-        "a 144-cell working set over a 100-slot cache re-asked for no evicted tile: {stats:?}"
-    );
-    assert!(
-        stats.requests > GRID_CELLS,
-        "144 cells were asked for {} times in total, so no tile was ever fetched twice: {stats:?}",
-        stats.requests
+        asked <= GRID_FRAMES as u64 / 2,
+        "every cell was asked for only by pass {asked}, against {ideal} the channel allows and \
+         the {GRID_FRAMES} that used to leave the tail unasked: the refused-ask queue is not \
+         serving the tail first"
     );
     assert_eq!(
-        (stats.puts_duplicate, stats.puts_orphan),
-        (0, 0),
-        "a refetch is the working set exceeding the cap; a duplicate or an orphan is a request \
-         asked twice or never recorded, which the in-flight set forbids: {stats:?}"
+        stats.requests, GRID_CELLS,
+        "each cell asked for once: {stats:?}"
     );
+    assert_eq!(stats.refetch_after_eviction, 0, "{stats:?}");
 }
 
 /// **The control**: the same walk over a cap the working set fits in evicts
 /// nothing, refetches nothing, and asks for each cell exactly once.
 #[test]
-fn a_working_set_under_the_cap_asks_for_every_tile_once_and_refetches_none() {
+fn a_working_set_under_the_budget_asks_for_every_tile_once_and_refetches_none() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 200);
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, BUDGET_FOR_200);
 
     // The request channel holds six, so a 144-cell walk takes frames to ask
     // for everything; every body must also have landed before the put kinds
@@ -1780,19 +1779,21 @@ fn a_working_set_under_the_cap_asks_for_every_tile_once_and_refetches_none() {
 }
 
 /// **An evicted pending marker is not fetched twice.** The same 144 cells
-/// over a cap of 100 as the ignored pin above, which still refetches — that
-/// is the working set exceeding the cap, WO-6's problem — but every landing
-/// is a first sight: no body lands twice for one ask (`duplicate`), no body
-/// lands that nothing asked for (`orphan`), and every ask is either a cell's
-/// first or an honest refetch of a cell the cache let go -- the cells counted
-/// off the server's log, since the walk's tail can go unasked (see the body).
-/// Before the in-flight set the same run read 16 duplicate and 9 orphan over
-/// 607 asks.
+/// over a budget that holds 100, walked **bare** — no working set reported,
+/// so no floor, and the byte budget alone decides — which is the one way left
+/// to make the cache evict tiles still on the glass. It still refetches, on
+/// purpose: that is the mechanism under test. But every landing is a first
+/// sight: no body lands twice for one ask (`duplicate`), no body lands that
+/// nothing asked for (`orphan`), and every ask is either a cell's first or an
+/// honest refetch of a cell the cache let go -- the cells counted off the
+/// server's log, since without the pass report nothing serves the walk's
+/// tail and it can go unasked (see the body). Before the in-flight set the
+/// same run read 16 duplicate and 9 orphan over 607 asks.
 #[test]
 fn an_evicted_pending_marker_is_never_fetched_twice() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 100);
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, BUDGET_FOR_100);
 
     for _ in 0..GRID_FRAMES {
         frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
@@ -1813,13 +1814,13 @@ fn an_evicted_pending_marker_is_never_fetched_twice() {
     );
     let paths = server.requests();
     // Which cells were ever asked for is read off the server's log rather
-    // than assumed to be all 144. With the cap below the working set, the
-    // request channel (seven deep) is spent each frame on the cells the walk
-    // reaches first, and cells at its tail can go unasked for the whole run:
-    // 9 of 144 on the run that found this (2026-09-02). A starvation the
-    // in-flight set neither causes nor cures -- the channel-full skip is the
-    // path it was before -- and one more reading of what a cache below its
-    // working set does to the glass.
+    // than assumed to be all 144. With the budget below the working set and
+    // no pass report to serve the refused cells first, the request channel
+    // (seven deep) is spent each frame on the cells the walk reaches first,
+    // and cells at its tail can go unasked for the whole run: 9 of 144 on the
+    // run that found this (2026-09-02). The pass report is what cures that
+    // (`every_visible_cell_is_asked_within_the_channels_worth_of_passes`);
+    // this walk leaves it out to keep the eviction mechanism under test.
     let distinct: std::collections::HashSet<&String> = paths.iter().collect();
     eprintln!(
         "cap 100 over a {GRID_SIDE}x{GRID_SIDE} grid for {GRID_FRAMES} frames, with the \
@@ -1868,7 +1869,7 @@ fn an_evicted_pending_marker_is_never_fetched_twice() {
 fn a_tile_whose_marker_was_evicted_while_its_request_was_out_is_not_asked_again() {
     let server = TileServer::start(Behaviour::Hang);
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 2);
+    let mut tiles = loopback_tiles_with_budget(&server, &ctx, 2 * MARKER_BYTES);
     let id = |x: u32| TileId { x, y: 0, zoom: 3 };
 
     assert!(
@@ -1926,7 +1927,8 @@ fn a_tile_whose_marker_was_evicted_while_its_request_was_out_is_not_asked_again(
 fn open_requests_stop_at_the_fetch_limit_plus_the_request_channel() {
     let server = TileServer::start(Behaviour::Hang);
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 4 * MAX_IN_FLIGHT);
+    let mut tiles =
+        loopback_tiles_with_budget(&server, &ctx, 4 * MAX_IN_FLIGHT as u64 * FIXTURE_TILE_BYTES);
     let wanted: Vec<TileId> = (0..3 * MAX_IN_FLIGHT as u32)
         .map(|x| TileId { x, y: 0, zoom: 10 })
         .collect();
@@ -1968,7 +1970,8 @@ fn open_requests_stop_at_the_fetch_limit_plus_the_request_channel() {
 fn open_requests_never_exceed_max_in_flight() {
     let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
     let ctx = Context::default();
-    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 4 * MAX_IN_FLIGHT);
+    let mut tiles =
+        loopback_tiles_with_budget(&server, &ctx, 4 * MAX_IN_FLIGHT as u64 * FIXTURE_TILE_BYTES);
     let wanted: Vec<TileId> = (0..3 * MAX_IN_FLIGHT as u32)
         .map(|x| TileId { x, y: 0, zoom: 10 })
         .collect();
@@ -2033,10 +2036,11 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
 
     let role = CacheRole::Terrain;
     let before = totals(role);
-    let mut cache = TileCache::new(std::num::NonZeroUsize::new(2).expect("2 is not zero"), role);
+    // Two markers' worth: every slot here — a marker, or a shapeless vector
+    // tile that flattens to nothing — is charged exactly the marker, so the
+    // byte budget reads as a cap of two and this stays about kinds.
+    let mut cache = TileCache::new(2 * MARKER_BYTES, role);
     let id = |x: u32| TileId { x, y: 0, zoom: 3 };
-    // A vector tile with no shapes: it flattens to nothing, so the slot is
-    // resident without a byte figure, which keeps this about kinds.
     let body = |epoch: u64| slot_for(Tile::Vector(Arc::new(Vec::new())), epoch, 0.0);
 
     cache.ask(id(0), 1);
@@ -2114,14 +2118,17 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     assert!(window.evicted_resident >= s.evicted_resident);
 }
 
-/// **A raster slot is priced at its texture, and the level follows it out.**
-/// The one byte figure the cache can read today for a raster tile; a
-/// vector tile without fills prices at zero, stated as a lower bound.
+/// **A raster slot is priced at its texture over the marker, and the level
+/// follows it out.** A marker is charged its node and nothing else; a raster
+/// tile the node plus its texture. The budget is one raster's worth, so the
+/// marker that follows it is over budget and the raster goes — with exactly
+/// its charge in the eviction figure — and the level falls to the marker.
 #[test]
 fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction() {
     let ctx = Context::default();
+    let texture_bytes = u64::from(FIXTURE_SIDE * FIXTURE_SIDE * 4);
     let mut cache = TileCache::new(
-        std::num::NonZeroUsize::new(1).expect("1 is not zero"),
+        MARKER_BYTES + texture_bytes,
         cache_ledger::CacheRole::Terrain,
     );
     let id = |x: u32| TileId { x, y: 0, zoom: 2 };
@@ -2130,27 +2137,38 @@ fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction
         egui::Color32::WHITE,
     );
     let raster = || Tile::Raster(ctx.load_texture("t", image.clone(), Default::default()));
-    let texture_bytes = u64::from(FIXTURE_SIDE * FIXTURE_SIDE * 4);
 
     cache.ask(id(0), 0);
     assert_eq!(
         cache.stats().resident_bytes,
-        0,
-        "a marker is priced at nothing"
+        MARKER_BYTES,
+        "a marker is priced at its node"
     );
     cache.put(id(0), slot_for(raster(), 0, 0.0));
     let s = cache.stats();
-    assert_eq!((s.resident_entries, s.resident_bytes), (1, texture_bytes));
+    assert_eq!(
+        (s.resident_entries, s.resident_bytes),
+        (1, MARKER_BYTES + texture_bytes)
+    );
+    assert_eq!(
+        s.overrun_bytes, 0,
+        "one raster is the budget exactly: {s:?}"
+    );
 
-    // A second tile at a cap of one evicts the raster and its bytes with it.
+    // A second slot over a budget of one raster evicts the raster and its
+    // bytes with it.
     cache.ask(id(1), 0);
     let s = cache.stats();
     assert_eq!(
         (s.evicted_resident, s.evicted_bytes),
-        (1, texture_bytes),
+        (1, MARKER_BYTES + texture_bytes),
         "{s:?}"
     );
-    assert_eq!((s.resident_entries, s.resident_bytes), (1, 0), "{s:?}");
+    assert_eq!(
+        (s.resident_entries, s.resident_bytes),
+        (1, MARKER_BYTES),
+        "{s:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2162,7 +2180,7 @@ fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction
 /// backstop the queue can never make binding — so reading it here would make
 /// the cap unobservable and the ordering claims below vacuous. What the
 /// production value is stays pinned by
-/// [`the_tuning_constants_are_the_written_figures_on_every_tier`]; what this
+/// [`the_tuning_constants_are_the_written_figures`]; what this
 /// holds is that the drain caps and orders correctly *given* a binding count.
 #[test]
 fn a_pump_decodes_at_most_the_budget_and_the_rest_wait_their_turn() {
@@ -2439,7 +2457,6 @@ async fn the_tile_client_accepts_https() {
 /// A test that reaches the network is not a test. The published planet archive
 /// is 83.88 GB and lives behind a CDN; this is 419 KB and lives in the tree.
 mod archive {
-    use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
     use super::*;
@@ -2482,7 +2499,10 @@ mod archive {
                 logo_dark: None,
             },
             ctx.clone(),
-            NonZeroUsize::new(64).expect("64 is not zero"),
+            super::super::SourceBudget {
+                styled_bytes: 64 << 20,
+                parsed_bytes: Some(64 << 20),
+            },
             cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
@@ -2775,7 +2795,10 @@ mod archive {
                 logo_dark: None,
             },
             ctx.clone(),
-            NonZeroUsize::new(64).expect("64 is not zero"),
+            super::super::SourceBudget {
+                styled_bytes: 64 << 20,
+                parsed_bytes: Some(64 << 20),
+            },
             cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
@@ -2982,7 +3005,10 @@ mod archive {
                 logo_dark: None,
             },
             ctx.clone(),
-            NonZeroUsize::new(64).expect("64 is not zero"),
+            super::super::SourceBudget {
+                styled_bytes: 64 << 20,
+                parsed_bytes: Some(64 << 20),
+            },
             cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
@@ -3397,7 +3423,10 @@ mod archive {
                     logo_dark: None,
                 },
                 ctx.clone(),
-                NonZeroUsize::new(64).expect("64 is not zero"),
+                super::super::SourceBudget {
+                    styled_bytes: 64 << 20,
+                    parsed_bytes: Some(64 << 20),
+                },
                 cache_ledger::CacheRole::Base,
                 None,
                 crate::tile_source::ArchiveStores {
@@ -3464,7 +3493,6 @@ mod archive {
 /// two real archives' shapes — Monaco (`tile_type = 1`, MVT) and the
 /// single-tile terrain wrap (`tile_type = 4`, the real Kansas WebP inside).
 mod archive_decode {
-    use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
     use super::super::{ArchiveTileKind, decode_archive_tile};
@@ -3734,7 +3762,10 @@ mod archive_decode {
                 logo_dark: None,
             },
             ctx,
-            NonZeroUsize::new(8).expect("8 is not zero"),
+            super::super::SourceBudget {
+                styled_bytes: 8 << 20,
+                parsed_bytes: None,
+            },
             cache_ledger::CacheRole::Base,
             declared,
             crate::tile_source::ArchiveStores {
@@ -3819,7 +3850,10 @@ mod archive_decode {
                 logo_dark: None,
             },
             ctx,
-            NonZeroUsize::new(8).expect("8 is not zero"),
+            super::super::SourceBudget {
+                styled_bytes: 8 << 20,
+                parsed_bytes: None,
+            },
             cache_ledger::CacheRole::Base,
             declared,
             crate::tile_source::ArchiveStores {

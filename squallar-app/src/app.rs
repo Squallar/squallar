@@ -252,6 +252,12 @@ pub struct App {
     /// pool's own dwell, so a pane that flickers into existence for a frame
     /// moves no budget.
     pending_fit: Option<(squallar_device_profile::budget::Budgets, u32)>,
+    /// What the map tile caches may hold, priced on the last loop walk's
+    /// scene against this session's capacity
+    /// (`squallar_device_profile::fit::tile_cache_budget`) and handed to the
+    /// Gui with every frame's inputs. The class rung's figures until a walk
+    /// has run.
+    tile_cache_budget: squallar_device_profile::budget::TileCacheBudget,
     /// **What the loops were holding at the last pool observation** — the pane
     /// half of [`crate::loop_telemetry`]'s reading, counted on
     /// `App::loop_demand`'s existing walk rather than on one of its own, and
@@ -640,6 +646,9 @@ impl App {
         // (Android included) is populated before this line runs.
         let mut gui =
             Gui::new().with_basemap_dir(platform.basemap_dir().map(std::path::Path::to_path_buf));
+        // Evicted tile payloads leave the frame thread through the worker's
+        // free lane from here on; see `install_tile_discard`.
+        crate::app::fetch::install_tile_discard();
         let supports_exit = platform.supports_exit();
         let loop_frame_budget = budgets.loop_frames_held;
         let location_settings_available = location.settings_available();
@@ -705,6 +714,7 @@ impl App {
             gpu_probe: GpuProbeReport::Absent,
             gpu_probe_settled: false,
             pending_fit: None,
+            tile_cache_budget: budgets.tile_cache(),
             loop_counts: crate::loop_telemetry::LoopState::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
             input,

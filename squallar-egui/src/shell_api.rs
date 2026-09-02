@@ -92,6 +92,14 @@ pub struct FrameInputs<'a> {
     /// is the App's, and a browser's is not a `cfg` — the same wasm build gets
     /// a different number on a blocklisted driver than on a workstation GPU.
     pub concurrent_renders: usize,
+    /// **What the map tile caches may hold** — the device's
+    /// `Budgets::tile_cache()`, in bytes per population (styled, parsed,
+    /// terrain), composed here for the reason [`Self::concurrent_renders`]
+    /// is: the resolved value is the App's, and on the measured arm it is a
+    /// share of what the card left over once the scene was paid for, which no
+    /// `cfg` can say. Applied to every tile source, live or parked, before the
+    /// pane loop.
+    pub tile_cache: squallar_device_profile::budget::TileCacheBudget,
     /// Whether this platform has a location settings page to offer.
     pub location_settings_available: bool,
     /// What the platform location service is doing: (permission, active).

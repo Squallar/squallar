@@ -3763,3 +3763,15 @@ impl squallar_egui::tile_source::TileOffloader for WorkerTileOffloader {
 pub fn install_tile_offloader() {
     squallar_egui::tile_source::set_tile_offloader(Box::new(WorkerTileOffloader));
 }
+
+/// Route the tile caches' evicted payloads through `offload::discard` — the
+/// pool's free lane on native, the frame-paced deferred queue on wasm32 — so
+/// a styled tile's shapes are never freed on the frame thread. Installed
+/// rather than depended on, for the reason `install_tile_offloader` is:
+/// `squallar-egui` must not name `squallar-worker`. Idempotent; called once
+/// from `App::new` on every target.
+pub fn install_tile_discard() {
+    squallar_egui::tile_source::set_tile_discard(|name, payload| {
+        squallar_worker::offload::discard(name, payload);
+    });
+}

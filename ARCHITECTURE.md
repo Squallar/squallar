@@ -225,8 +225,9 @@ pins it.
 * **Owner**: `squallar-egui/src/shell_api.rs`.
 * **Shape**: one frame's facts, composed by the App from state it already owns,
   applied by `Gui::apply_frame_inputs` once per frame immediately before
-  `Gui::ui`. Insets, exit support, loop frame budget, location permission and
-  fix, heading, catalogue pending, the opaque `liveness` slice, floor tile zoom
+  `Gui::ui`. Insets, exit support, loop frame budget, concurrent renders, the
+  tile caches' byte allowances (`tile_cache`), location permission and fix,
+  heading, catalogue pending, the opaque `liveness` slice, floor tile zoom
   bias.
 * **Contract test (Gui half)**: `squallar-egui/src/shell_api/tests.rs` —
   a sentinel-expression walk asserting every field surfaces through the `Gui`'s

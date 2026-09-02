@@ -11,8 +11,8 @@
 //! [`HttpsTiles`] replaces `HttpTiles`, implementing [`walkers::Tiles`], so the
 //! rest of the walkers integration is untouched. It reproduces async fetching,
 //! bounded concurrency at [`MAX_PARALLEL_DOWNLOADS`], decode and upload via
-//! [`walkers::Tile::new`], a bounded LRU of [`TILE_CACHE_ENTRIES`] tiles,
-//! in-flight de-duplication, lower-zoom interpolation, `max_zoom` clamping,
+//! [`walkers::Tile::new`], a byte-bounded LRU ([`byte_lru::ByteLru`]) floored
+//! at the pass's measured working set, in-flight de-duplication, lower-zoom interpolation, `max_zoom` clamping,
 //! grid-bounds checking, repaint-on-arrival and attribution.
 //!
 //! Deliberate differences: our client with a
@@ -74,190 +74,128 @@ const SUSTAINED_READ_FAILURES: usize = MAX_PARALLEL_DOWNLOADS;
 const RECOVERED: &str = "the archive is answering tile reads again, so it draws and is credited \
                          again";
 
-/// Tiles retained in one source's in-memory cache before LRU eviction starts.
+/// The measured worst-case cost of one **styled** cache entry, in bytes: a
+/// vector tile's shapes plus the flattened [`crate::tile_mesh::TileMeshes`]
+/// built beside them, as [`slot_for`] prices the slot it makes.
 ///
-/// **Two kinds of entry, and they do not cost the same.** This bound is a
-/// *count*, so what it is worth in bytes depends on what the arm can hold:
+/// # How the tile caches are bounded
 ///
-/// | entry            | cost               | which arms hold it |
-/// |------------------|-------------------:|--------------------|
-/// | raster texture   | 256 KiB (256x256 RGBA) | all |
-/// | vector tile      | **646,264 B** worst case | all |
+/// One source owns one [`TileCache`]: a [`byte_lru::ByteLru`] whose budget
+/// is the device's allowance for that source's population
+/// (`squallar_device_profile::budget::TileCacheBudget`, pushed in every frame
+/// through `MapTileState::set_budget`) and whose floor in entries is the
+/// working set the last pass measured ([`HttpsTiles::note_wanted`]). There is
+/// no count constant and no per-target cascade here any more. An LRU below
+/// the working set is not a slower cache, it is a broken one — it evicts a
+/// tile still on the glass and refetches it next frame, for something the
+/// user never stopped looking at — and a count cannot say "48 MiB" when an
+/// entry is anywhere from 456 bytes to a megabyte. The user's own 2878x1651
+/// browser window at zoom 13.5 was the measurement: ~106 distinct tiles on
+/// the glass against a cap of 100, 93 % of asks refetches of tiles just
+/// evicted, 414 MB uploaded to hold 18.8 MB, with nothing moving.
 ///
-/// The vector figure is measured, not derived: the committed Monaco fixture's
-/// z14 city-core tile (185,182 MVT bytes) renders to 738 shapes — 708 paths of
-/// 4,390 points, two coalesced meshes of 18,018 vertices and 40,812 indices,
-/// and 27 labels — held as host allocations, not GPU textures. Over all 246
-/// tiles the fixture holds the *mean* is 13,461 bytes and the median 456, so
-/// this is a tail figure and the tail is what a cache must be sized for: a
-/// viewport over a city is a viewport of city-core tiles.
+/// # Two slots, three populations
 ///
-/// **wasm32 holds vector entries too**, since `feat(web): the vector basemap
-/// draws on wasm32` ungated the archive reader; the arm used to be derived
-/// against the raster cost alone because there was nothing else it could hold.
-/// The 646,264 B figure carries to it unmeasured but not unfounded: `mvt::render`
-/// is the same code over the same fixture, and a `Tile` is host allocations on
-/// every target. It is a native measurement applied to wasm32, and it is
-/// recorded that way rather than restated as a wasm one.
+/// `MapTileState` holds one basemap source and one terrain source; a theme
+/// flip restyles the basemap in place, so there is never a second copy of
+/// either. (The four-source arithmetic this comment once carried — base and
+/// labels, light and dark — priced a layout that no longer exists.) What the
+/// two slots hold, and what one entry of each costs:
 ///
-/// | tier    | entries | worst case, per source        |
-/// |---------|--------:|------------------------------:|
-/// | desktop |     256 | ~158 MiB vector, 64 MiB raster |
-/// | mobile  |      96 | ~59 MiB vector, 24 MiB raster |
-/// | wasm32  |      96 | ~59 MiB vector, 24 MiB raster |
+/// | slot    | population      | one entry                                | figure |
+/// |---------|-----------------|------------------------------------------|--------|
+/// | basemap | styled entries  | shapes + flattened buffers               | this constant (tail), [`TYPICAL_STYLED_ENTRY_BYTES`] (typical) |
+/// | basemap | parsed geometry | the style-independent decode a restyle re-runs from | [`MEASURED_PARSED_TILE_BYTES`] (tail) |
+/// | terrain | rasters         | one 256x256 RGBA texture                 | [`RASTER_TILE_BYTES`], no tail |
 ///
-/// The wasm32 arm is the one where that promotion has a budget to answer to:
-/// `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES` is
-/// 288 MiB for the whole application, and `MapTileState::ensure_base_tiles`
-/// keeps one base source live across theme flips (re-styled in place, never
-/// duplicated), so base plus labels is ~118 MiB of it worst case where the
-/// raster derivation said 48. It fits, with less room than the old figure
-/// implied. The count did not move, because 96 is also the working-set floor
-/// below. The parsed-geometry population is priced separately —
-/// [`MEASURED_PARSED_TILE_BYTES`] and [`PARSED_TILE_CACHE_ENTRIES`].
+/// Every entry is charged at least [`byte_lru::MARKER_BYTES`], so a cache of
+/// pending markers is bounded in bytes like everything else. Styled shapes and
+/// parsed geometry are host allocations; only the terrain rasters (and a
+/// styled tile's flattened buffers once uploaded) touch the GPU, and the
+/// terrain population is omitted from `Budgets::app_texture_bytes` by name
+/// (`the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name`). The relation
+/// this comment used to state in prose against
+/// `WASM_APP_TEXTURE_BUDGET_BYTES` is an imported assertion now:
+/// `the_two_slots_price_against_the_brackets_they_are_handed`.
 ///
-/// **Against the meshes this workspace shipped until 2026-08-28 those figures
-/// were 8.0 GiB and 4.0 GiB.** `VertexBuffers::new()` is
-/// `with_capacity(512, 1024)` and the tile held 2,257 of them, so one entry was
-/// 32.77 MB rather than 0.65 MB. Neither number was ever reached, because a
-/// machine would have died first; they are quoted because they are what this
-/// comment's old derivation — "a tile texture costs the same 256 KiB" — was
-/// silently claiming, 50x under the truth on a cost it was not measuring at all.
+/// # What the brackets hold
 ///
-/// **The mobile arm fell from 128 to 96.** The desktop arm did *not* fall, and
-/// what stopped it is worth naming rather than leaving as an unexplained round
-/// number: it is pinned from below by
-/// `squallar_gpu::egui_renderer::mirror`'s `MIRROR_SCALE_MAX`. That cap is only
-/// legitimate if a floor strip could actually take the rung, and
-/// `mirror::tests::the_rung_above_the_cap_could_never_fit_the_tile_cache`
-/// holds it so: a 900-point pane at two layers keeps 242 tiles resident at
-/// `tile_zoom_bias = 1`, and 72 at bias 0 against a "three times over" margin.
-/// So this arm may not go below 242 without moving the mirror's deepest rung,
-/// which is a different subsystem's decision. What actually fixed desktop
-/// residency was the 50.7x per-*entry* reduction, not the count.
+/// `squallar_device_profile::constants::WASM_TILE_STYLED_BYTES` carries the
+/// whole argument. The user's window measured 86 tiles on the glass at a
+/// whole zoom and ~106 at the half step that rounds onto the archive's top
+/// level; at this tail that is 155 MB of styled entries, which the 48 MiB
+/// wasm floor **cannot hold** (34 entries) and is not asked to — the
+/// working-set floor keeps them resident as overrun, and whole-zoom snapping
+/// (the tile-sharpness rung, a later landing) is what brings such a scene
+/// back under budget. At the typical cost the same floor holds 1,600
+/// entries. [`worst_case_entries`] is the arithmetic, for the tests and for
+/// `squallar_gpu`'s mirror rung cap.
 ///
-/// **The honest remaining gap**: this is still a count, and a count cannot
-/// express "158 MiB" as a limit when entries range from 456 bytes to 646,264.
-/// A byte-budgeted LRU is the answer that would; it is not this change.
+/// # The figure, and how it is re-derived
 ///
-/// "Per source" is the multiplier: each map source owns one of these caches —
-/// base and labels, light and dark — so the old desktop figure on wasm32 could
-/// put 256 MiB of basemap texture against the 288 MiB
-/// `squallar-device-profile`'s `constants::WASM_APP_TEXTURE_BUDGET_BYTES`
-/// allows the whole application. The tiers follow that crate's budget cascade,
-/// spelled rather than imported.
+/// The committed Monaco fixture's z14 city-core tile (185,182 MVT bytes)
+/// styled against the committed dark style renders to ~740 shapes; the shapes
+/// counted at **capacity** measured 652,112 bytes (2026-08-28), and the
+/// flattened buffers beside them — fills **and strokes**, at a feathering of
+/// 1.0 point — measured 810,468 (2026-09-02), which with the marker's node is
+/// the figure below. It is the slot's own [`CachedTile::bytes`], so what is
+/// priced is what is resident. The plan this landed under quoted ~1.03 MB;
+/// that figure had the fills and not the strokes, and the strokes are more
+/// than half the flattened half. The brackets were argued from 1.03 MB and
+/// are re-argued from this on `WASM_TILE_STYLED_BYTES`; nothing in them was
+/// raised to meet it.
 ///
-/// **Every arm is still above its working set, which is the floor no budget may
-/// cross.** See below, and `tiles::tests`'
-/// `the_cache_holds_the_working_set_at_every_zoom`. Mobile's 96 covers the 63 a
-/// 1024x1366-point tablet keeps resident — the largest handheld canvas in
-/// common use — where 128 covered nothing extra that a handheld can present.
-///
-/// **Every arm is sized against the worst case over the whole zoom range**, not
-/// against a whole zoom. A tile is drawn `256 · 2^(zoom − round(zoom))` points
-/// across, down to 181 at the half step, so between two whole zooms more tiles
-/// fit the same window than at either end of it: 84 per source over a
-/// 1920x1080-point canvas at one layer, against 54 at a whole zoom.
-/// [`crate::tiles::tiles_resident_for`] reports that larger figure and
-/// `tiles::tests` holds it equal to what the `tile_span` sweep measures.
-///
-/// What each arm covers, at one layer, in **points** — a 4K panel at the 2x
-/// scaling it is nearly always run at presents 1920x1080 points, not 3840x2160:
-///
-/// | canvas    | tiles | wasm 96 | mobile 96 | desktop 256 |
-/// |-----------|------:|---------|-----------|-------------|
-/// | 1024x1366 |    63 | fits    | fits      | fits        |
-/// | 1920x1080 |    84 | fits    | fits      | fits        |
-/// | 1920x1200 |    96 | fits    | fits      | fits        |
-/// | 2560x1440 |   144 | overruns| overruns  | fits        |
-/// | 3840x2160 |   299 | overruns| overruns  | overruns    |
-///
-/// The wasm arm is 96 because that is 1920x1200 — the tallest panel in common
-/// use at 1920 wide — and it carries 1080p's 84 with room rather than sitting
-/// exactly on it. It costs 24 MiB per source, and the app can hold four live
-/// sources at once (base and labels, light and dark; a theme flip retains
-/// both), so 96 MiB against the 288 MiB budget: a third of it.
-///
-/// An LRU below the working set is not a slower cache, it is a broken one. It
-/// evicts a tile that is still on the glass, the next frame re-enters
-/// `request_once` for it, and that tile is fetched over the network again and
-/// re-decoded against [`WASM_TILE_DECODES_PER_PUMP`] — for something the user
-/// never stopped looking at. `tiles::tests`'
-/// `the_cache_holds_the_working_set_at_every_zoom` is the gate.
-#[cfg(target_arch = "wasm32")]
-pub const TILE_CACHE_ENTRIES: NonZeroUsize = WASM_TILE_CACHE_ENTRIES;
-/// See the wasm32 arm above.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "android", target_os = "ios")
-))]
-pub const TILE_CACHE_ENTRIES: NonZeroUsize = MOBILE_TILE_CACHE_ENTRIES;
-/// See the wasm32 arm above.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
-pub const TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_TILE_CACHE_ENTRIES;
-
-/// The wasm32 arm of [`TILE_CACHE_ENTRIES`]. All three arms are named outside
-/// the cascade because this workspace runs `cargo test` on one arm, so the other
-/// two are only reachable from a test if they have names.
-///
-/// **96 -> 100 at WO-10**, when `draw_tile_layer` started keeping the
-/// [`crate::tiles::WARM_ANCESTOR_STEPS`] net resident beside the level it
-/// draws. The working set is the drawn count plus the net's, and at 1920x1200
-/// — the canvas this arm is quoted against — that is 96 + 4. The arm had been
-/// sitting exactly on 96, so leaving it there would have made the net evict the
-/// glass, which is the broken-cache failure `6345952f` fixed and not a smaller
-/// version of it. 100 costs 61.5 MiB of vector worst case per source against
-/// the old 59.0, so the four-live-source figure the budget note below prices is
-/// 245.8 MiB against `WASM_APP_TEXTURE_BUDGET_BYTES`' 288 MiB: still under, by
-/// less than it was. The full parent level was the alternative and it is the
-/// reason the net is four steps out rather than one — 131 entries, 322 MiB,
-/// over the budget.
-pub const WASM_TILE_CACHE_ENTRIES: NonZeroUsize = NonZeroUsize::new(100).expect("100 is not zero");
-/// The mobile arm — the largest handheld working set, not a fraction of the
-/// desktop figure. See [`WASM_TILE_CACHE_ENTRIES`], including the WO-10 move.
-pub const MOBILE_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(100).expect("100 is not zero");
-/// The desktop arm — pinned from below at 242 by `squallar_gpu`'s
-/// `MIRROR_SCALE_MAX`, not by the byte budget. See [`WASM_TILE_CACHE_ENTRIES`].
-pub const DESKTOP_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(256).expect("256 is not zero");
-
-/// The measured worst-case heap of one cached vector tile, in bytes.
-///
-/// The committed Monaco fixture's z14 city-core tile, 2026-08-28: shape spine,
-/// path points, mesh vertices and indices and label strings, counted at
-/// **capacity** rather than length because capacity is what is resident. The
-/// derivation of [`TILE_CACHE_ENTRIES`] is against this figure; it is named so
-/// a test can hold the two together instead of the number living only in prose.
-///
-/// **Re-measured the same day, 646_264 to 652_112 — +5,848 bytes, +0.9%**, when
-/// `walkers::Text` grew the fields carrying a label's wrapping. It is a
-/// re-measurement and not a relaxation:
 /// `tile_source::tests::the_vector_entry_cost_is_what_the_fixture_actually_renders`
-/// re-derives it rather than trusting this line. The budget it feeds is
-/// unchanged in shape — 96 entries is 62.6 MB where it was 62.0 MB, and the
-/// desktop arm is pinned from below by `MIRROR_SCALE_MAX` rather than by bytes,
-/// so no arm's entry count moves.
-///
-/// **Removing the halo later the same day did NOT move it back, and an earlier
-/// version of this comment predicted that it would.** That prediction came from
-/// attributing the growth to `ShapeOrText` widening by 8 bytes per shape over
-/// 731 shapes, which is arithmetic that lands on 5,848 exactly and is still
-/// wrong: measured, `size_of::<ShapeOrText>()` is **72 both with and without the
-/// halo fields**, because `Text` is 72 with them and 64 without, and the other
-/// variant (`egui::Shape`) is 64 either way. The enum never changed size, so the
-/// halo was never costing the spine anything. The figure below was re-derived
-/// after the removal, with a forced rebuild, and is unchanged.
-///
-/// The lesson worth keeping is about the test rather than the number: it asserts
-/// a *band* (`heap <= CONST <= 2 * heap`) and deliberately not equality, because
-/// `size_of` and allocator rounding are toolchain properties. So it cannot catch
-/// this constant drifting upward into a safe over-estimate. Re-derive it by
-/// forcing the assertion to fail; do not infer it from a type's field list.
-pub const MEASURED_VECTOR_TILE_BYTES: usize = 652_112;
+/// holds a **band** (`heap <= CONST <= 2 * heap`) and deliberately not an
+/// equality, because `size_of` and allocator rounding are toolchain
+/// properties. So it cannot catch this constant drifting upward into a safe
+/// over-estimate: re-derive it by forcing that assertion to fail, never by
+/// inference from a type's field list. An earlier version of this comment
+/// predicted a figure from a struct's fields and was wrong by exactly the
+/// amount it computed; the lesson is kept, the arithmetic is not.
+pub const MEASURED_STYLED_ENTRY_BYTES: usize = 1_462_708;
+
+/// What a typical dense-city styled entry costs — an estimate, carried with
+/// its direction. The committed Monaco fixture's mean over all 246 tiles it
+/// holds measured 13,461 bytes of styled shapes (2026-08-28), and the whole
+/// slot ran 2.24x the shapes on the measured tail
+/// ([`MEASURED_STYLED_ENTRY_BYTES`] against 652,112), so a typical whole
+/// entry is ~30.2 KB, rounded down to 30,000. An estimate from a measured
+/// mean and a measured ratio, not a measured mean of the whole entry; if it
+/// is wrong it is wrong low, and the bracket arguments that lean on it
+/// (1,600 entries in the wasm floor) hold fewer tiles than they say.
+pub const TYPICAL_STYLED_ENTRY_BYTES: usize = 30_000;
+
+/// How many worst-case styled entries `budget_bytes` holds: the figure a
+/// count-shaped question about the cache gets now that the cache is in bytes.
+pub fn worst_case_entries(budget_bytes: u64) -> usize {
+    (budget_bytes / MEASURED_STYLED_ENTRY_BYTES as u64) as usize
+}
+
+/// The host heap behind one styled vector tile's shapes, counted at
+/// **capacity**, because capacity is what is resident while the tile is
+/// cached: the shape spine, mesh vertices and indices, path points and label
+/// strings. Exact on `Vec` capacities; the `size_of` terms are the
+/// toolchain's. Run once per tile where the styling ran, never per frame.
+pub fn styled_heap_bytes(shapes: &[walkers::ShapeOrText]) -> usize {
+    std::mem::size_of_val(shapes)
+        + shapes
+            .iter()
+            .map(|shape| match shape {
+                walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
+                    std::mem::size_of::<egui::Mesh>()
+                        + mesh.vertices.capacity() * std::mem::size_of::<egui::epaint::Vertex>()
+                        + mesh.indices.capacity() * std::mem::size_of::<u32>()
+                }
+                walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
+                    std::mem::size_of::<egui::epaint::PathShape>()
+                        + path.points.capacity() * std::mem::size_of::<egui::Pos2>()
+                }
+                walkers::ShapeOrText::Text(text) => text.text.capacity(),
+                walkers::ShapeOrText::Shape(_) => 0,
+            })
+            .sum::<usize>()
+}
 
 /// What one cached raster tile costs: 256x256 RGBA.
 pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
@@ -266,15 +204,15 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// the second resident population the styled-entry figure above does not
 /// cover.
 ///
-/// Same tile, same method as [`MEASURED_VECTOR_TILE_BYTES`]: the committed
+/// Same tile, same method as [`MEASURED_STYLED_ENTRY_BYTES`]: the committed
 /// Monaco fixture's z14 city-core tile (185,182 MVT bytes), counted at
 /// **capacity** by `walkers::mvt::ParsedTile::heap_bytes` — decoded geometry,
 /// per-feature property bags, key and value strings. Measured 2026-08-29 by
 /// forcing
 /// `tile_source::tests::the_parsed_entry_cost_is_what_the_fixture_actually_parses`
 /// to fail; the band there is the derivation, this line is only its record.
-/// **3.2× the styled entry**, which is why the parsed cache gets its own,
-/// smaller entry count rather than inheriting [`TILE_CACHE_ENTRIES`].
+/// **Twice the styled entry**, which is why the parsed cache has its own byte
+/// allowance beside the styled one's rather than sharing it.
 ///
 /// The composition matters, because the first measurement was **29,903,162 B**
 /// and the difference is a fixed defect, not a re-count: `mvt-reader` grows
@@ -289,113 +227,6 @@ pub const RASTER_TILE_BYTES: usize = 256 * 256 * 4;
 /// never by inference from a type's field list — the band cannot catch this
 /// constant drifting upward into a safe over-estimate.
 pub const MEASURED_PARSED_TILE_BYTES: usize = 2_092_002;
-
-/// Parsed-geometry entries retained per **archive** source before LRU
-/// eviction — the bound on the second population [`MEASURED_PARSED_TILE_BYTES`]
-/// prices.
-///
-/// **What this cache buys and what falling short costs.** It exists so a
-/// style change — a theme flip, a map-detail toggle — re-styles from the
-/// cached parse with **zero fetches and zero re-parses**
-/// ([`HttpsTiles::set_style`]).
-///
-/// **On wasm32 that second half is deliberately given up, and here is the
-/// price.** Once the frame pump offloads ([`TileOffloader`]), the worker holds
-/// the parse and the page does not, so the browser restyles from
-/// [`SharedTileBodies`] — the undecoded body — and pays a **re-parse**. Per
-/// visible tile of the committed Monaco z14 city-core fixture (185,182 B body,
-/// native release, n=30, all terms timed in the same interleaved rounds, on a
-/// box held quiet), in the configuration that ships:
-///
-/// | | frame thread | worker |
-/// | --- | --- | --- |
-/// | from the parsed cache (this constant) | style **2,930 µs** | — |
-/// | from the body cache (wasm32) | wire decode 37 + flatten 231 = **268 µs** | parse 1,744 + style 2,930 |
-///
-/// So the re-parse is real and it is **1,744 µs** — 59.5% of a styling, not a
-/// rounding error — and it buys the removal of 2,930 µs from the frame
-/// thread, a **10.9x** cheaper theme flip there. Against the unfiltered style
-/// the same tile reads 4,750 µs frame-side today against 571 µs after, 8.3x.
-/// A parse on a worker thread, `par_iter`'d across the pool, is not the same
-/// quantity as a tessellation on the thread the gesture runs on.
-///
-/// **`flatten` is now the dominant term left on the frame thread** — 231 µs of
-/// that 268 — because it flattens strokes as well as fills
-/// ([`crate::tile_mesh::flatten`], at `feathering = 1.0`). Shipping the
-/// flattened [`crate::tile_mesh::TileMeshes`] over the wire instead of
-/// `Vec<ShapeOrText>` would move it to the worker too and leave 37 µs; that is
-/// a named follow-on, not this row.
-///
-/// The bodies are also the cheaper population to hold: median 2,411 B against
-/// this constant's 15,389 B median for a parse, over 52 tiles of the committed
-/// archive. An entry that was evicted before the restyle
-/// costs one refetch for that tile, exactly the pre-split behaviour; it never
-/// costs a frame. So unlike [`TILE_CACHE_ENTRIES`], the working set is a
-/// *target*, not a floor a bound below which is broken — which is what lets
-/// the wasm arm sit below it where the byte budget leaves no other choice.
-///
-/// The arithmetic, against the measured 2,092,002 B tail
-/// ([`MEASURED_PARSED_TILE_BYTES`]) and alongside the styled population it
-/// joins (per archive source; the terrain source is raster and holds zero
-/// parsed entries):
-///
-/// | tier    | parsed entries | parsed worst | styled worst | total     |
-/// |---------|---------------:|-------------:|-------------:|----------:|
-/// | desktop |             96 |    191.5 MiB |    159.2 MiB | 350.7 MiB |
-/// | mobile  |             24 |     47.9 MiB |     59.7 MiB | 107.6 MiB |
-/// | wasm32  |             24 |     47.9 MiB |     59.7 MiB | 107.6 MiB |
-///
-/// Desktop's 96 is the 1920x1200 worst-case working set
-/// (`tiles::tiles_resident_for`, the figure the wasm styled arm is derived
-/// from), so the common canvas restyles wholly from cache; the deeper
-/// floor-strip working sets a zoom bias creates (242 at bias 1) are *not*
-/// covered, and `ui.rs`'s `tile_zoom_bias_for_pane` gate deliberately does
-/// not consult this cache — a bias overrunning it degrades restyle economy,
-/// never the frame, so gating on it would trade a real frame guarantee
-/// against an economy one.
-///
-/// The mobile/wasm 24 is a budget answer, not a working-set one:
-/// `squallar-device-profile` allows the whole wasm application 288 MiB, the
-/// styled population already prices at ~59.7 MiB worst case, and 96 parsed
-/// entries would put 191.5 MiB more against it — two thirds of the budget for
-/// an economy cache. 24 holds the most recently *decoded* two dozen tiles — a
-/// phone-sized viewport is 20–35 tiles — so a flip restyles most or all of
-/// the glass from cache and refetches only what had already scrolled away.
-///
-/// These are tail figures over every entry at once, as the styled table's
-/// are: the styled population's fixture-wide mean is 48× below its tail, and
-/// a parse of an ordinary tile is small for the same reason a styling of one
-/// is (no per-tile mean has been measured for the parse; the tail is what
-/// sizing uses). All three arms are held against their ceilings in
-/// `tile_source::tests::the_tuning_constants_are_the_written_figures_on_every_tier`.
-#[cfg(target_arch = "wasm32")]
-pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = WASM_PARSED_TILE_CACHE_ENTRIES;
-/// See the wasm32 arm above.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(target_os = "android", target_os = "ios")
-))]
-pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = MOBILE_PARSED_TILE_CACHE_ENTRIES;
-/// See the wasm32 arm above.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(any(target_os = "android", target_os = "ios"))
-))]
-pub const PARSED_TILE_CACHE_ENTRIES: NonZeroUsize = DESKTOP_PARSED_TILE_CACHE_ENTRIES;
-
-/// The wasm32 arm of [`PARSED_TILE_CACHE_ENTRIES`] — named outside the
-/// cascade for the reason [`WASM_TILE_CACHE_ENTRIES`] is: `cargo test` runs
-/// one arm, and the others are only reachable from a test if they have names.
-pub const WASM_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(24).expect("24 is not zero");
-/// The mobile arm — the same budget arithmetic as wasm's, see
-/// [`PARSED_TILE_CACHE_ENTRIES`].
-pub const MOBILE_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(24).expect("24 is not zero");
-/// The desktop arm — the 1920x1200 worst-case working set, so the common
-/// canvas restyles with zero fetches. See [`PARSED_TILE_CACHE_ENTRIES`].
-pub const DESKTOP_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
-    NonZeroUsize::new(96).expect("96 is not zero");
 
 /// A basemap styling: the built style, and the key that built it.
 ///
@@ -479,26 +310,59 @@ impl BasemapStyling {
 ///
 /// `Arc` because the same buffer is the one the pump staged and the one the
 /// job carried.
-#[cfg(target_arch = "wasm32")]
-type SharedTileBodies = Arc<Mutex<LruCache<TileId, Arc<Vec<u8>>>>>;
+///
+/// Charged at the body's own length: bodies are the cheaper population to
+/// hold — median 2,411 B against 15,389 B for a parse over 52 tiles of the
+/// committed archive — and they share the parsed allowance, because at most
+/// one of the two grows on a given arm: with the offloader installed the
+/// worker holds the parse and only bodies are remembered; without it the pump
+/// remembers both, which is the degraded no-worker configuration.
+type SharedTileBodies = Arc<Mutex<byte_lru::ByteLru<TileId, Arc<Vec<u8>>>>>;
 
-/// What the archive IO task carries bodies in — the cache on wasm32, nothing
-/// on native, where a tile is decoded on the blocking pool and there is no
+/// What the archive IO task carries bodies in — the cache on wasm32 (`None`
+/// for a source with no restyle to serve, the terrain hillshade), nothing on
+/// native, where a tile is decoded on the blocking pool and there is no
 /// second styling to serve. A type alias so [`read_one`] keeps one body.
 #[cfg(target_arch = "wasm32")]
-type IoTileBodies = SharedTileBodies;
+type IoTileBodies = Option<SharedTileBodies>;
 /// See the wasm32 arm above.
 #[cfg(not(target_arch = "wasm32"))]
 type IoTileBodies = ();
 
 /// The parsed-geometry cache one archive source's IO task and frame side
 /// share: the style-independent half of every vector tile the source has
-/// decoded, keyed by [`TileId`].
+/// decoded, keyed by [`TileId`], each charged at
+/// `walkers::mvt::ParsedTile::heap_bytes`.
+///
+/// **Economy, with no floor.** It exists so a style change — a theme flip, a
+/// map-detail toggle — re-styles from the cached parse with zero fetches and
+/// zero re-parses ([`HttpsTiles::set_style`]); an entry evicted before the
+/// restyle costs one refetch for that tile, exactly the pre-split behaviour,
+/// and never a frame. So unlike the styled cache its working set is a target
+/// and not a floor, and its budget (the device's parsed allowance) is the
+/// whole of what bounds it.
+///
+/// **On wasm32 the restyle is served from the undecoded bodies instead once
+/// the pump offloads**, and here is the price, per visible tile of the
+/// committed Monaco z14 city-core fixture (185,182 B body, native release,
+/// n=30, all terms timed in the same interleaved rounds, on a box held
+/// quiet), in the configuration that ships:
+///
+/// | | frame thread | worker |
+/// | --- | --- | --- |
+/// | from the parsed cache | style **2,930 us** | — |
+/// | from the body cache (wasm32) | wire decode 37 + flatten 231 = **268 us** | parse 1,744 + style 2,930 |
+///
+/// The re-parse is real — 1,744 us, 59.5 % of a styling — and it buys the
+/// removal of 2,930 us from the frame thread, a 10.9x cheaper theme flip
+/// there. `flatten` is the dominant term left on the frame thread; shipping
+/// the flattened [`crate::tile_mesh::TileMeshes`] over the wire is a named
+/// follow-on, not this row.
 ///
 /// A `Mutex` because on native the IO runtime's blocking pool writes it while
-/// the frame side owns the handle; on wasm every party is the page thread and
-/// the lock is never contended.
-type SharedParsedTiles = Arc<Mutex<LruCache<TileId, Arc<walkers::mvt::ParsedTile>>>>;
+/// the frame side holds a handle to budget and trim it; on wasm every party is
+/// the page thread and the lock is never contended.
+type SharedParsedTiles = Arc<Mutex<byte_lru::ByteLru<TileId, Arc<walkers::mvt::ParsedTile>>>>;
 
 /// What the archive IO task styles a tile against, and which restyle
 /// generation that styling belongs to. Written by [`HttpsTiles::set_style`],
@@ -566,6 +430,46 @@ struct CachedTile {
     /// slot — so the arrival can be told from a body that landed on a tile
     /// nobody re-asked for. Read by [`TileCache::put`] and nothing else.
     restyle_pending: bool,
+    /// What the slot is charged in the cache: [`byte_lru::MARKER_BYTES`] for
+    /// a marker; for a tile, the marker plus [`Self::priced`]'s figure,
+    /// computed once where the styling ran ([`slot_for`]) and never per frame.
+    bytes: u64,
+}
+
+impl CachedTile {
+    /// A pending or failed marker under `epoch`: no tile, no buffers, the
+    /// node's own charge.
+    fn marker(epoch: u64) -> Self {
+        Self {
+            epoch,
+            tile: None,
+            meshes: None,
+            restyle_pending: false,
+            bytes: byte_lru::MARKER_BYTES,
+        }
+    }
+
+    /// What a tile and its flattened buffers occupy, in bytes: the texture's
+    /// own size for a raster ([`RASTER_TILE_BYTES`] for the 256x256 RGBA every
+    /// archive here serves), the styled shapes' heap plus the buffers for a
+    /// vector tile. See [`MEASURED_STYLED_ENTRY_BYTES`] for what the vector
+    /// figure measures on the fixture.
+    fn priced(tile: &Tile, meshes: Option<&Arc<crate::tile_mesh::TileMeshes>>) -> u64 {
+        match tile {
+            Tile::Raster(texture) => {
+                let [width, height] = texture.size();
+                (width * height * 4) as u64
+            }
+            Tile::Vector(shapes) => {
+                styled_heap_bytes(shapes) as u64 + meshes.map_or(0, |meshes| meshes.bytes())
+            }
+        }
+    }
+
+    /// What this slot is charged. See [`Self::bytes`].
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 /// The cache slot a decoded tile becomes.
@@ -589,45 +493,31 @@ fn slot_for(tile: Tile, epoch: u64, feathering: f32) -> CachedTile {
         // consulted on this arm.
         Tile::Raster(_) => None,
     };
+    // Priced here, on the thread that styled and flattened, so the frame
+    // never walks a tile's shapes to learn what it holds.
+    let bytes = byte_lru::MARKER_BYTES + CachedTile::priced(&tile, meshes.as_ref());
     CachedTile {
         epoch,
         tile: Some(tile),
         meshes,
         restyle_pending: false,
+        bytes,
     }
 }
 
-/// What one slot is worth in bytes, on the best figure the slot carries
-/// today: the flattened buffers where there are any, the texture where the
-/// tile is a raster, and nothing otherwise.
-///
-/// **A lower bound, and stated as one.** The styled shapes of a vector tile
-/// are host allocations this does not walk, and a `None` marker is not free;
-/// the ledger this feeds prices what it can see until the cache prices its
-/// entries in bytes and sizes itself by them. Nothing here is compared to a
-/// budget.
-fn slot_bytes(slot: &CachedTile) -> u64 {
-    match (&slot.meshes, &slot.tile) {
-        (Some(meshes), _) => meshes.bytes(),
-        (None, Some(Tile::Raster(texture))) => {
-            let [width, height] = texture.size();
-            (width * height * 4) as u64
-        }
-        (None, Some(Tile::Vector(_))) | (None, None) => 0,
-    }
-}
-
-/// How many evictions per slot of capacity [`TileCache`] remembers, so a
-/// refetch can be told from a first sight.
+/// How many evictions per entry of the working-set floor [`TileCache`]
+/// remembers, so a refetch can be told from a first sight.
 ///
 /// Four, because a refetch is a tile the viewport still wants and the
-/// viewport is at most a few multiples of the cap: a working set of `n` over
-/// a cap of `c` re-asks every one of its `n` tiles per pass, so the id being
-/// re-asked was evicted at most `n - c` evictions ago, and `n < 4c` covers the
-/// user's own 2878x1651 window (193 against 100) with room. Beyond that the
-/// memory forgets and the refetch is miscounted as a first put — under, never
-/// over.
-const EVICTED_MEMORY_PER_SLOT: usize = 4;
+/// viewport is what the floor holds: the id being re-asked was evicted while
+/// the floor was breached, which the floor forbids, so on a static viewport
+/// this memory should never be consulted at all and four working sets of
+/// history is room to spare for the cases (a floor one pass behind a resize,
+/// a pan) where it is. Beyond that the memory forgets and the refetch is
+/// miscounted as a first put — under, never over. Never smaller than four
+/// times [`MAX_IN_FLIGHT`], so a source that has drawn nothing yet still
+/// remembers what it let go.
+const EVICTED_MEMORY_PER_FLOOR_ENTRY: usize = 4;
 
 /// The most requests one source can have open at once — asked for, and not
 /// yet answered on the frame side — and so the most ids
@@ -658,11 +548,15 @@ const MAX_IN_FLIGHT: usize = 3 * MAX_PARALLEL_DOWNLOADS + 2;
 /// the classification lives here once and the callers keep their `put`.
 struct TileCache {
     role: cache_ledger::CacheRole,
-    slots: LruCache<TileId, CachedTile>,
+    /// The slots, bounded in bytes by the device's allowance for this
+    /// source's population and floored in entries at the working set the
+    /// last pass measured — see [`byte_lru`] for the two conditions an
+    /// eviction needs.
+    slots: byte_lru::ByteLru<TileId, CachedTile>,
     /// Ids this cache evicted recently, most recent last — bounded at
-    /// [`EVICTED_MEMORY_PER_SLOT`] times the cap, so it can never outgrow the
-    /// cache it remembers for. Probed and popped by [`Self::ask`] and by a
-    /// [`Self::put`] that finds no slot.
+    /// [`EVICTED_MEMORY_PER_FLOOR_ENTRY`] times the floor, so it follows the
+    /// working set it remembers for. Probed and popped by [`Self::ask`] and by
+    /// a [`Self::put`] that finds no slot.
     evicted: LruCache<TileId, ()>,
     /// Ids with a request out — asked for, and not yet answered by a body
     /// landing, a body dropped for its generation, or the IO side's word
@@ -680,28 +574,68 @@ struct TileCache {
     /// Bounded by construction at [`MAX_IN_FLIGHT`] on the native arm; see
     /// the constant for the wasm32 offload path's extra term.
     in_flight: HashSet<TileId>,
-    /// What [`Self::slots`] is worth on [`slot_bytes`]' terms, kept as a
-    /// running figure so a put costs one add and one subtract.
-    resident_bytes: u64,
     /// This source's own reading of every event it recorded, moved by the
     /// same [`cache_ledger::Totals::apply`] the statics mirror — so a test
     /// can read one source without another source's events in the number.
     stats: cache_ledger::Totals,
 }
 
+/// How many evicted ids a cache with `floor` entries of working set remembers.
+fn evicted_memory(floor: usize) -> NonZeroUsize {
+    NonZeroUsize::new((floor.max(MAX_IN_FLIGHT)).saturating_mul(EVICTED_MEMORY_PER_FLOOR_ENTRY))
+        .expect("the floor is raised to MAX_IN_FLIGHT, which is not zero")
+}
+
 impl TileCache {
-    fn new(entries: NonZeroUsize, role: cache_ledger::CacheRole) -> Self {
-        let remembered = entries.saturating_mul(
-            NonZeroUsize::new(EVICTED_MEMORY_PER_SLOT).expect("the multiplier is not zero"),
-        );
+    /// An empty cache allowed `budget_bytes` of residency, with no working
+    /// set yet.
+    fn new(budget_bytes: u64, role: cache_ledger::CacheRole) -> Self {
         Self {
             role,
-            slots: LruCache::new(entries),
-            evicted: LruCache::new(remembered),
+            slots: byte_lru::ByteLru::new(budget_bytes),
+            evicted: LruCache::new(evicted_memory(0)),
             in_flight: HashSet::with_capacity(MAX_IN_FLIGHT),
-            resident_bytes: 0,
             stats: cache_ledger::Totals::default(),
         }
+    }
+
+    /// Allow `bytes` of residency. Evicts nothing here — see
+    /// [`byte_lru::ByteLru::set_budget`]; the debt is paid by puts and by
+    /// [`Self::trim_one`] from the pump.
+    fn set_budget(&mut self, bytes: u64) {
+        self.slots.set_budget(bytes);
+        self.publish_levels();
+    }
+
+    /// Hold at least `entries` slots whatever the budget says: the working
+    /// set the pass measured plus what may be in flight for it. The evicted
+    /// memory follows it.
+    fn set_floor_entries(&mut self, entries: usize) {
+        self.slots.set_floor_entries(entries);
+        let remembered = evicted_memory(entries);
+        if self.evicted.cap() != remembered {
+            self.evicted.resize(remembered);
+        }
+        self.publish_levels();
+    }
+
+    /// Pay one entry of shrink debt, if there is any: the least recent slot
+    /// above the floor while the cache is over budget. Called once per pump.
+    fn trim_one(&mut self) -> bool {
+        match self.slots.trim_one() {
+            Some(gone) => {
+                self.let_go(gone);
+                self.publish_levels();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The mean charge of a resident slot, floored at the marker — what the
+    /// zoom-bias gate multiplies a projected working set by.
+    fn mean_entry_bytes(&self) -> u64 {
+        self.slots.mean_entry_bytes()
     }
 
     /// The slot under `tile_id`, refreshing its recency — a use, as
@@ -766,15 +700,7 @@ impl TileCache {
         }
         self.note(cache_ledger::CacheEvent::Request);
         self.in_flight.insert(tile_id);
-        self.insert(
-            tile_id,
-            CachedTile {
-                epoch,
-                tile: None,
-                meshes: None,
-                restyle_pending: false,
-            },
-        );
+        self.insert(tile_id, CachedTile::marker(epoch));
     }
 
     /// [`HttpsTiles::request_once`]'s stale-generation arm: the request
@@ -822,35 +748,53 @@ impl TileCache {
         self.insert(tile_id, slot);
     }
 
-    /// The LRU push, with its eviction accounted: a victim other than the
-    /// inserted id is an eviction, remembered and classified by what it held.
+    /// The put, with its evictions accounted: every slot the byte bound let
+    /// go of is an eviction, remembered and classified by what it held, and
+    /// handed off the frame thread; a slot replaced under the same id is not
+    /// an eviction, and leaves the same way.
     fn insert(&mut self, tile_id: TileId, slot: CachedTile) {
-        let bytes = slot_bytes(&slot);
-        match self.slots.push(tile_id, slot) {
-            Some((victim, old)) if victim != tile_id => {
-                let old_bytes = slot_bytes(&old);
-                self.resident_bytes = self.resident_bytes.saturating_sub(old_bytes);
-                self.evicted.push(victim, ());
-                let kind = if old.tile.is_none() {
-                    cache_ledger::EvictedKind::Pending
-                } else {
-                    cache_ledger::EvictedKind::Resident
-                };
-                self.note(cache_ledger::CacheEvent::Evicted {
-                    kind,
-                    bytes: old_bytes,
-                });
-            }
-            Some((_, old)) => {
-                self.resident_bytes = self.resident_bytes.saturating_sub(slot_bytes(&old));
-            }
-            None => {}
+        let bytes = slot.bytes();
+        let mut evicted = Vec::new();
+        if let Some(replaced) = self.slots.put(tile_id, slot, bytes, &mut evicted) {
+            discard_slot("tile-cache-replace", replaced);
         }
-        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
-        let entries = self.slots.len() as u64;
-        self.stats.resident_entries = entries;
-        self.stats.resident_bytes = self.resident_bytes;
-        cache_ledger::set_resident(self.role, entries, self.resident_bytes);
+        for gone in evicted {
+            self.let_go(gone);
+        }
+        self.publish_levels();
+    }
+
+    /// One eviction's bookkeeping: the id remembered, the kind and the bytes
+    /// counted, the payload handed to the discard sink so a styled tile's
+    /// shapes are never freed on the frame thread. See [`discard_slot`].
+    fn let_go(&mut self, gone: byte_lru::Evicted<TileId, CachedTile>) {
+        self.evicted.push(gone.key, ());
+        let kind = if gone.value.tile.is_none() {
+            cache_ledger::EvictedKind::Pending
+        } else {
+            cache_ledger::EvictedKind::Resident
+        };
+        self.note(cache_ledger::CacheEvent::Evicted {
+            kind,
+            bytes: gone.bytes,
+        });
+        discard_slot("tile-cache-evict", gone.value);
+    }
+
+    /// The levels, stored where they move: on this source's own reading and
+    /// on the role's statics.
+    fn publish_levels(&mut self) {
+        let levels = cache_ledger::Levels {
+            resident_entries: self.slots.len() as u64,
+            resident_bytes: self.slots.resident_bytes(),
+            overrun_bytes: self.slots.overrun_bytes(),
+            floor_entries: self.slots.floor_entries() as u64,
+        };
+        self.stats.resident_entries = levels.resident_entries;
+        self.stats.resident_bytes = levels.resident_bytes;
+        self.stats.overrun_bytes = levels.overrun_bytes;
+        self.stats.floor_entries = levels.floor_entries;
+        cache_ledger::set_resident(self.role, levels);
     }
 
     fn note(&mut self, event: cache_ledger::CacheEvent) {
@@ -871,27 +815,6 @@ pub(crate) struct GroundPiece {
     pub(crate) uv: egui::Rect,
     pub(crate) meshes: Option<Arc<crate::tile_mesh::TileMeshes>>,
 }
-
-/// The terrain hillshade source's cache bound.
-///
-/// Its own name, derived the way [`TILE_CACHE_ENTRIES`]' arms derive theirs —
-/// and the derivation lands on the same three counts, because every floor
-/// behind them is zoom geometry rather than content: 96 covers the 1920x1200
-/// working set on wasm and mobile, and the desktop arm is pinned from below at
-/// 242 by `squallar_gpu`'s `MIRROR_SCALE_MAX` (terrain draws on the 3D floor
-/// strips too, so the mirror's deepest rung binds it exactly as it binds the
-/// basemap). Equality is also what keeps `ui.rs`'s zoom-bias gate coherent:
-/// `tile_zoom_bias_for_pane` compares one per-source working set against one
-/// per-source bound, and a smaller terrain bound would let the gate admit a
-/// bias that overruns terrain's cache while the basemap's absorbs it.
-///
-/// What differs is the **byte** worst case, and it is why the shared count is
-/// cheap here: every terrain entry is a raster texture ([`RASTER_TILE_BYTES`]
-/// = 256 KiB — the WebP body is decoded, remapped and uploaded, never
-/// retained), so the bound is worth the raster column of the table above —
-/// 64 MiB desktop, 24 MiB mobile/wasm — with no 646 KB vector tail to size
-/// for.
-pub const TERRAIN_TILE_CACHE_ENTRIES: NonZeroUsize = TILE_CACHE_ENTRIES;
 
 /// How an archive source's tile bodies become [`Tile`]s — decided **once per
 /// archive from its header's `tile_type`**, never by sniffing bodies.
@@ -1087,16 +1010,22 @@ fn decode_archive_tile_remembering(
     match kind {
         ArchiveTileKind::Vector => {
             let parsed = Arc::new(timed_parse(bytes)?);
-            let held = {
+            let charge = parsed.heap_bytes() as u64;
+            let (held, held_bytes) = {
                 let mut parsed_tiles = parsed_tiles
                     .lock()
                     .expect("the parsed-tile cache is not poisoned");
-                parsed_tiles.put(tile_id, Arc::clone(&parsed));
-                parsed_tiles.len() as u64
+                // What the byte bound lets go of is freed here, on the thread
+                // that just paid for a parse of the same order: the IO
+                // runtime's blocking pool on native, the pump's decode budget
+                // on wasm32. The frame-paced trim is `HttpsTiles::pump`'s.
+                let mut evicted = Vec::new();
+                parsed_tiles.put(tile_id, Arc::clone(&parsed), charge, &mut evicted);
+                (parsed_tiles.len() as u64, parsed_tiles.resident_bytes())
             };
             // A level, stored where the parse lands: the only site that
             // grows this cache, on either target.
-            cache_ledger::set_parsed_entries(role, held);
+            cache_ledger::set_parsed(role, held, held_bytes);
             // The vector arm does not delegate, so it counts for itself; the
             // raster arms are counted inside `decode_archive_tile`.
             note_archive_decode(ArchiveTileKind::Vector);
@@ -1578,12 +1507,27 @@ pub struct HttpsTiles {
     style_slot: Option<Arc<std::sync::RwLock<StyleSlot>>>,
 
     /// The parsed-geometry cache shared with this source's IO task — `Some`
-    /// for an archive source, `None` for a raster HTTP source. wasm32 only,
-    /// because there the pump is the side that parses and remembers; on
-    /// native the IO task owns the only handle, and its clone is what keeps
-    /// the cache alive.
-    #[cfg(target_arch = "wasm32")]
+    /// for a vector archive source, `None` for a raster one (the terrain
+    /// hillshade, a plain HTTP source, an inert source). On wasm32 the pump is
+    /// the side that parses and remembers; on native the IO task is, and the
+    /// frame side holds this clone to budget and trim it ([`Self::set_budget`],
+    /// [`Self::pump`]).
     parsed: Option<SharedParsedTiles>,
+
+    /// The undecoded bodies the wasm32 restyle path serves from, held here to
+    /// budget and trim them for the reason [`Self::parsed`] is. `Some` only
+    /// where the IO task remembers bodies — a vector archive on wasm32; see
+    /// [`remember_body`] — and `None` everywhere else, so no arm of this
+    /// struct's behaviour forks on the target.
+    bodies: Option<SharedTileBodies>,
+
+    /// What the passes drawing this source have said they want — the working
+    /// set the cache's floor follows. See [`Self::note_wanted`].
+    wanted: WantedTally,
+
+    /// The asks the request channel refused, in the order it refused them, so
+    /// the next pass asks for them first. See [`AskQueue`].
+    asks: AskQueue,
 
     /// Tiles the IO task should fetch.
     request_tx: Sender<TileId>,
@@ -1982,7 +1926,7 @@ struct InlineDecode<'a> {
     /// leaving a mismatched flatten in the cache.
     feathering: f32,
     /// Which cache the parses this decode remembers belong to — the level
-    /// [`cache_ledger::set_parsed_entries`] is stored under.
+    /// [`cache_ledger::set_parsed`] is stored under.
     role: cache_ledger::CacheRole,
 }
 
@@ -2168,17 +2112,17 @@ impl HttpsTiles {
         egui_ctx: Context,
         client: reqwest::Client,
     ) -> Self {
-        Self::with_client_and_cache(source, egui_ctx, client, TILE_CACHE_ENTRIES)
+        Self::with_client_and_budget(source, egui_ctx, client, default_tile_budget().styled_bytes)
     }
 
-    /// [`Self::with_client`], with the cache bound supplied. Crate-private, for
-    /// the tests: [`TILE_CACHE_ENTRIES`] is cfg-selected and this workspace runs
-    /// `cargo test` on the desktop arm only.
-    fn with_client_and_cache<S: AsyncTileSource>(
+    /// [`Self::with_client`], with the styled cache's byte budget supplied.
+    /// Crate-private, for the tests, which size a cache to a working set
+    /// rather than to a device.
+    fn with_client_and_budget<S: AsyncTileSource>(
         source: S,
         egui_ctx: Context,
         client: reqwest::Client,
-        cache_entries: NonZeroUsize,
+        styled_bytes: u64,
     ) -> Self {
         let attribution = source.attribution();
         let tile_size = source.tile_size();
@@ -2214,14 +2158,16 @@ impl HttpsTiles {
             reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
             // A plain HTTP raster source draws the ground: the base role.
-            cache: TileCache::new(cache_entries, cache_ledger::CacheRole::Base),
+            cache: TileCache::new(styled_bytes, cache_ledger::CacheRole::Base),
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             // A raster source has no style to swap and no parse to keep.
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: None,
-            #[cfg(target_arch = "wasm32")]
             parsed: None,
+            bodies: None,
+            wanted: WantedTally::default(),
+            asks: AskQueue::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -2380,7 +2326,134 @@ impl HttpsTiles {
     /// user moves *is* minimizing data latency.
     pub fn pump(&mut self) {
         self.pumps += 1;
+        self.trim_economy();
         self.drain_completed_fetches();
+    }
+
+    /// Pay one entry of shrink debt on each of this source's caches, if any
+    /// is over its budget — the lazy half of [`Self::set_budget`]. One entry
+    /// per cache per pump, so a budget that fell by a hundred tiles costs no
+    /// frame more than three evictions, each handed to the discard sink; a
+    /// resize or a pane split never stalls input on a drop.
+    fn trim_economy(&mut self) {
+        self.cache.trim_one();
+        if let Some(parsed) = &self.parsed {
+            let mut parsed = parsed
+                .lock()
+                .expect("the parsed-tile cache is not poisoned");
+            if let Some(gone) = parsed.trim_one() {
+                cache_ledger::set_parsed(
+                    self.cache.role,
+                    parsed.len() as u64,
+                    parsed.resident_bytes(),
+                );
+                drop(parsed);
+                discard_slot("tile-parsed-trim", gone.value);
+            }
+        }
+        if let Some(bodies) = &self.bodies {
+            let gone = bodies
+                .lock()
+                .expect("the tile-body cache is not poisoned")
+                .trim_one();
+            if let Some(gone) = gone {
+                discard_slot("tile-body-trim", gone.value);
+            }
+        }
+    }
+
+    /// Allow this source `styled_bytes` for its styled entries and
+    /// `parsed_bytes` for its parsed geometry (and, on wasm32, the bodies
+    /// that stand in for it) — the device's allowance, pushed in every frame
+    /// by `MapTileState::set_budget`. A rise takes effect at once; a fall is
+    /// paid down by [`Self::pump`] one entry at a time.
+    pub(crate) fn set_budget(&mut self, styled_bytes: u64, parsed_bytes: u64) {
+        self.cache.set_budget(styled_bytes);
+        if let Some(parsed) = &self.parsed {
+            parsed
+                .lock()
+                .expect("the parsed-tile cache is not poisoned")
+                .set_budget(parsed_bytes);
+        }
+        if let Some(bodies) = &self.bodies {
+            bodies
+                .lock()
+                .expect("the tile-body cache is not poisoned")
+                .set_budget(parsed_bytes);
+        }
+    }
+
+    /// **The working set, as the pass drawing this source measured it** —
+    /// `on_glass` cells at the drawn level and `net` cells of the ancestor
+    /// net — accumulated across every pane that draws this source in pass
+    /// `pass_nr`. Called once per layer draw by
+    /// `ui_map_overlays::draw_tile_layer`, after the net is asked for and
+    /// before the grid is walked.
+    ///
+    /// Two things happen here, because this is the one per-pass hook a source
+    /// has that knows where in the pass it is. **The floor**: the cache is
+    /// told to hold the larger of the last completed pass's total and this
+    /// pass's running total, plus [`MAX_PARALLEL_DOWNLOADS`] for the markers
+    /// of requests in flight for it — so a window that grows is held from
+    /// the pass that grows it, and one that shrinks lets go a pass later.
+    /// **The refused asks**: the cells the request channel refused last pass
+    /// are asked for now, in the order they were refused, before this pass's
+    /// walk reaches its own head — the fix for a tail that was never asked.
+    /// See [`AskQueue`] for why the order and not the depth is what moves.
+    ///
+    /// The floor counts entries and the budget counts bytes: while the
+    /// working set costs more than the budget the difference is the
+    /// cache's overrun, reported as a level and never hidden by evicting a
+    /// tile that is on the glass.
+    pub(crate) fn note_wanted(&mut self, pass_nr: u64, on_glass: usize, net: usize) {
+        if self.wanted.note(pass_nr, on_glass, net) {
+            self.asks.new_pass();
+        }
+        let floor = self.wanted.floor().saturating_add(MAX_PARALLEL_DOWNLOADS);
+        self.cache.set_floor_entries(floor);
+        let (completed_on_glass, completed_net) = self.wanted.completed();
+        cache_ledger::set_wanted(
+            self.cache.role,
+            completed_on_glass as u64,
+            completed_net as u64,
+        );
+        self.retry_refused_asks();
+    }
+
+    /// This source stopped drawing — the layer was switched off and the
+    /// source parked. Nothing is on the glass, so the floor is zero and every
+    /// slot is economy the budget may reclaim; the pass tally and the refused
+    /// asks start over when it draws again.
+    pub(crate) fn release_working_set(&mut self) {
+        self.wanted = WantedTally::default();
+        self.asks.clear();
+        self.cache.set_floor_entries(0);
+        cache_ledger::set_wanted(self.cache.role, 0, 0);
+    }
+
+    /// The mean charge of a resident slot, floored at
+    /// [`byte_lru::MARKER_BYTES`] — what a consumer projecting a working
+    /// set's cost multiplies by (`ui.rs`'s zoom-bias gate).
+    pub(crate) fn mean_entry_bytes(&self) -> u64 {
+        self.cache.mean_entry_bytes()
+    }
+
+    /// Ask for the cells the channel refused, oldest first, until it refuses
+    /// again. A refused cell goes back to the front so the order holds; a cell
+    /// that has since arrived or been asked for by another route is simply
+    /// dropped. Runs at the pass boundary, after the net and before the walk.
+    fn retry_refused_asks(&mut self) {
+        let mut budget = self.asks.len();
+        while budget > 0 {
+            budget -= 1;
+            let Some(tile_id) = self.asks.pop_front() else {
+                break;
+            };
+            if self.try_request(tile_id) == Ask::Refused {
+                self.asks.push_front(tile_id);
+                break;
+            }
+        }
     }
 
     /// [`Self::pump`] calls since this source was built.
@@ -2785,8 +2858,21 @@ impl HttpsTiles {
     /// and the next frame re-asks; on wasm32 the pump styles the body against
     /// the frame's current style, so it lands current and no re-ask is owed.
     fn request_once(&mut self, tile_id: TileId) {
+        // Recorded here and not in `try_request`, so a retry from the queue
+        // does not count as the pass wanting the cell: only the walk says
+        // that, and only what the walk still wants survives the next pass's
+        // purge — see `AskQueue::new_pass`.
+        self.asks.wanted(tile_id);
+        if self.try_request(tile_id) == Ask::Refused {
+            self.asks.refuse(tile_id);
+        }
+    }
+
+    /// [`Self::request_once`]'s decision and send, with the outcome named so
+    /// the refused-ask queue can act on it. Records nothing in the queue.
+    fn try_request(&mut self, tile_id: TileId) -> Ask {
         if self.requests_closed {
-            return;
+            return Ask::Unneeded;
         }
         let epoch = self.style_epoch;
 
@@ -2799,13 +2885,13 @@ impl HttpsTiles {
         // `try_get_or_insert` did.
         let known = cache.get(&tile_id).map(|slot| slot.epoch);
         if known == Some(epoch) {
-            return;
+            return Ask::Unneeded;
         }
         // After the `get`, so a wanted tile whose request is out still has
         // its recency refreshed; before the send, so the LRU's treatment of
         // the marker decides nothing.
         if cache.is_in_flight(&tile_id) {
-            return;
+            return Ask::Unneeded;
         }
 
         let outcome = request_tx.try_send(tile_id).map(|()| {
@@ -2819,9 +2905,13 @@ impl HttpsTiles {
         });
 
         match outcome {
-            Ok(()) => log::trace!("requested tile {tile_id:?}"),
+            Ok(()) => {
+                log::trace!("requested tile {tile_id:?}");
+                Ask::Sent
+            }
             Err(error) if error.is_full() => {
                 log::trace!("tile request queue is full, retrying {tile_id:?} next frame");
+                Ask::Refused
             }
             // walkers panics here. The IO task being gone is not worth taking the
             // UI thread down for; the map simply stops fetching -- once, and
@@ -2833,6 +2923,7 @@ impl HttpsTiles {
                      (asking for {tile_id:?}: {error})"
                 );
                 self.requests_closed = true;
+                Ask::Unneeded
             }
         }
     }
@@ -3269,12 +3360,18 @@ impl HttpsTiles {
             HttpRangeSource::new(archive_client(), url)?,
             cache.clone(),
         );
+        // The budgets this build starts on; `MapTileState::set_budget` hands
+        // the resolved ones over the moment the source is in its slot.
+        let budget = default_tile_budget();
         Ok(Self::from_range_source(
             source,
             styling,
             attribution,
             egui_ctx,
-            TILE_CACHE_ENTRIES,
+            SourceBudget {
+                styled_bytes: budget.styled_bytes,
+                parsed_bytes: Some(budget.parsed_bytes),
+            },
             cache_ledger::CacheRole::Base,
             // The header says `tile_type = 1` and that is the whole truth
             // about a vector archive; nothing here knows better.
@@ -3291,7 +3388,9 @@ impl HttpsTiles {
     ///
     /// [`Self::from_archive_url`]'s twin with terrain's facts: an empty style
     /// (the bodies are raster; nothing tessellates, and the raster decode
-    /// never reads a style) and [`TERRAIN_TILE_CACHE_ENTRIES`] as the bound.
+    /// never reads a style), the terrain allowance as the bound, and **no
+    /// parsed cache**: a raster archive has no style-independent decode to
+    /// keep, so a parsed population here would be residency with no consumer.
     /// The hillshade remap is **not** chosen here: the archive's own header
     /// (`tile_type = 4`) routes its bodies through it — see
     /// [`ArchiveTileKind`].
@@ -3323,7 +3422,10 @@ impl HttpsTiles {
             BasemapStyling::raster(),
             attribution,
             egui_ctx,
-            TERRAIN_TILE_CACHE_ENTRIES,
+            SourceBudget {
+                styled_bytes: default_tile_budget().terrain_bytes,
+                parsed_bytes: None,
+            },
             cache_ledger::CacheRole::Terrain,
             // The hillshade is the app's only *pictorial* raster archive, so
             // the header's `tile_type = 4` already routes it correctly. A
@@ -3339,9 +3441,10 @@ impl HttpsTiles {
         ))
     }
 
-    /// [`Self::from_archive_url`] with the range source and the cache bound
+    /// [`Self::from_archive_url`] with the range source and the byte budgets
     /// supplied. Crate-private, for the tests, which read the committed Monaco
-    /// fixture off disk rather than over a network.
+    /// fixture off disk rather than over a network. `budget.parsed_bytes`
+    /// `None` builds no parsed cache at all — the raster archives' shape.
     ///
     /// The two stores travel as one [`ArchiveStores`] rather than as three
     /// arguments, because they mean one thing — what this source consults
@@ -3362,7 +3465,7 @@ impl HttpsTiles {
         styling: BasemapStyling,
         attribution: Attribution,
         egui_ctx: Context,
-        cache_entries: NonZeroUsize,
+        budget: SourceBudget,
         role: cache_ledger::CacheRole,
         declared_kind: Option<ArchiveTileKind>,
         stores: ArchiveStores<St>,
@@ -3391,17 +3494,27 @@ impl HttpsTiles {
 
         // The parsed-geometry cache the IO task and the frame side share, and
         // the slot a restyle publishes the new style through. See
-        // [`SharedParsedTiles`] and [`HttpsTiles::set_style`].
-        let parsed: SharedParsedTiles =
-            Arc::new(Mutex::new(LruCache::new(PARSED_TILE_CACHE_ENTRIES)));
+        // [`SharedParsedTiles`] and [`HttpsTiles::set_style`]. `None` for a
+        // source with nothing style-independent to keep.
+        let parsed: Option<SharedParsedTiles> = budget
+            .parsed_bytes
+            .map(|bytes| Arc::new(Mutex::new(byte_lru::ByteLru::new(bytes))));
         // The undecoded bodies, for the restyle the parsed cache stops
-        // serving once the pump offloads. See [`SharedTileBodies`]; `()` on
-        // native, where the parsed cache still serves it.
+        // serving once the pump offloads, under the same allowance. See
+        // [`SharedTileBodies`]; `()` on native, where the parsed cache still
+        // serves it.
         #[cfg(target_arch = "wasm32")]
-        let tile_bodies: IoTileBodies =
-            Arc::new(Mutex::new(LruCache::new(PARSED_TILE_CACHE_ENTRIES)));
+        let tile_bodies: IoTileBodies = budget
+            .parsed_bytes
+            .map(|bytes| Arc::new(Mutex::new(byte_lru::ByteLru::new(bytes))));
         #[cfg(not(target_arch = "wasm32"))]
         let tile_bodies: IoTileBodies = ();
+        // The frame side's handle to the bodies, to budget and trim them:
+        // a clone of the IO task's on wasm32, nothing where none is kept.
+        #[cfg(target_arch = "wasm32")]
+        let frame_bodies: Option<SharedTileBodies> = tile_bodies.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let frame_bodies: Option<SharedTileBodies> = None;
         #[cfg(not(target_arch = "wasm32"))]
         let style_slot: IoStyleSlot = Arc::new(std::sync::RwLock::new(StyleSlot {
             style: Arc::clone(&style),
@@ -3413,7 +3526,7 @@ impl HttpsTiles {
         #[cfg(target_arch = "wasm32")]
         let style_slot: IoStyleSlot = ();
 
-        // Both clones exist for the reason `with_client_and_cache` clones the
+        // Both clones exist for the reason `with_client_and_budget` clones the
         // context: on wasm32 the frame pump is the tessellating side, so it
         // needs the context to upload through and the style to render against.
         // The IO task is handed its own pair either way -- `read_one` takes
@@ -3424,8 +3537,7 @@ impl HttpsTiles {
         let frame_style = Arc::clone(&style);
         #[cfg(target_arch = "wasm32")]
         let frame_archive_kind = Arc::clone(&archive_kind);
-        #[cfg(target_arch = "wasm32")]
-        let frame_parsed = Arc::clone(&parsed);
+        let frame_parsed = parsed.clone();
         #[cfg(not(target_arch = "wasm32"))]
         let frame_style_slot = Arc::clone(&style_slot);
 
@@ -3462,13 +3574,15 @@ impl HttpsTiles {
             fault,
             reads_failing,
             requests_closed: false,
-            cache: TileCache::new(cache_entries, role),
+            cache: TileCache::new(budget.styled_bytes, role),
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: Some(frame_style_slot),
-            #[cfg(target_arch = "wasm32")]
-            parsed: Some(frame_parsed),
+            parsed: frame_parsed,
+            bodies: frame_bodies,
+            wanted: WantedTally::default(),
+            asks: AskQueue::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -3529,7 +3643,10 @@ impl HttpsTiles {
             fault: Arc::new(OnceLock::new()),
             reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
-            cache: TileCache::new(TILE_CACHE_ENTRIES, cache_ledger::CacheRole::Base),
+            cache: TileCache::new(
+                default_tile_budget().styled_bytes,
+                cache_ledger::CacheRole::Base,
+            ),
             // An inert source never restyles and never parses -- the same
             // never-restyles spelling as a raster source, which is what the
             // epoch constant's doc names for this case.
@@ -3537,8 +3654,10 @@ impl HttpsTiles {
             feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: None,
-            #[cfg(target_arch = "wasm32")]
             parsed: None,
+            bodies: None,
+            wanted: WantedTally::default(),
+            asks: AskQueue::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -3583,10 +3702,12 @@ struct ArchiveStyling {
     /// [`SharedTileBodies`]. `()` on native, whose restyle is served from the
     /// parsed cache instead.
     tile_bodies: IoTileBodies,
-    parsed_tiles: SharedParsedTiles,
+    /// `None` for a raster archive, which has no style-independent decode to
+    /// keep and so builds no cache to keep it in.
+    parsed_tiles: Option<SharedParsedTiles>,
     /// Which cache the parses land for — the level
-    /// [`cache_ledger::set_parsed_entries`] is stored under. Read where the
-    /// parse is remembered, which on wasm32 is the frame pump and not here.
+    /// [`cache_ledger::set_parsed`] is stored under. Read where the parse is
+    /// remembered, which on wasm32 is the frame pump and not here.
     #[cfg_attr(
         target_arch = "wasm32",
         expect(
@@ -3998,6 +4119,7 @@ impl ReadFailureRun {
 /// both targets rather than a `cfg` forking its control flow.
 #[cfg(target_arch = "wasm32")]
 fn remembered_body(cache: &IoTileBodies, tile_id: TileId) -> Option<Arc<Vec<u8>>> {
+    let cache = cache.as_ref()?;
     cache
         .lock()
         .expect("the tile-body cache is not poisoned")
@@ -4015,10 +4137,17 @@ fn remembered_body(_cache: &IoTileBodies, _tile_id: TileId) -> Option<Arc<Vec<u8
 /// Remember this tile's body for a later restyle. See [`remembered_body`].
 #[cfg(target_arch = "wasm32")]
 fn remember_body(cache: &IoTileBodies, tile_id: TileId, bytes: &Arc<Vec<u8>>) {
+    let Some(cache) = cache else {
+        return;
+    };
+    // Charged at the body's own length; what the bound lets go of is one
+    // `Vec`, freed here on the page thread as an O(1) free. The frame-paced
+    // trim is `HttpsTiles::pump`'s.
+    let mut evicted = Vec::new();
     cache
         .lock()
         .expect("the tile-body cache is not poisoned")
-        .put(tile_id, Arc::clone(bytes));
+        .put(tile_id, Arc::clone(bytes), bytes.len() as u64, &mut evicted);
 }
 
 /// See the wasm32 arm above.
@@ -4099,15 +4228,13 @@ where
     // The restyle path: parsed geometry already held means the archive — and
     // the network and disk behind it — is not consulted at all. This is what
     // `HttpsTiles::set_style` turns a theme flip and a detail toggle into.
-    let remembered = if kind == ArchiveTileKind::Vector {
-        styling
-            .parsed_tiles
+    let remembered = match (&styling.parsed_tiles, kind) {
+        (Some(parsed_tiles), ArchiveTileKind::Vector) => parsed_tiles
             .lock()
             .expect("the parsed-tile cache is not poisoned")
             .get(&tile_id)
-            .cloned()
-    } else {
-        None
+            .cloned(),
+        _ => None,
     };
     if let Some(parsed) = remembered {
         #[cfg(not(target_arch = "wasm32"))]
@@ -4139,19 +4266,24 @@ where
     let payload = {
         let (style, epoch, feathering) = current_style(&styling.style);
         let egui_ctx = egui_ctx.clone();
-        let parsed_tiles = Arc::clone(&styling.parsed_tiles);
+        let parsed_tiles = styling.parsed_tiles.clone();
         let role = styling.role;
 
         tokio::task::spawn_blocking(move || {
-            decode_archive_tile_remembering(
-                &bytes,
-                kind,
-                &style,
-                tile_id,
-                &egui_ctx,
-                &parsed_tiles,
-                role,
-            )
+            match &parsed_tiles {
+                Some(parsed_tiles) => decode_archive_tile_remembering(
+                    &bytes,
+                    kind,
+                    &style,
+                    tile_id,
+                    &egui_ctx,
+                    parsed_tiles,
+                    role,
+                ),
+                // Nothing to remember for: a raster archive decodes and
+                // uploads, and keeps no parse.
+                None => decode_archive_tile(&bytes, kind, &style, tile_id.zoom, &egui_ctx),
+            }
             .map(|tile| slot_for(tile, epoch, feathering))
         })
         .await
@@ -4176,6 +4308,211 @@ fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64, f32) 
     (Arc::clone(&slot.style), slot.epoch, slot.feathering)
 }
 
+/// What one [`HttpsTiles::try_request`] did with a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    /// A request went out.
+    Sent,
+    /// The request channel was full; nothing was recorded and the cell is
+    /// owed a retry.
+    Refused,
+    /// Nothing to send: cached at the current generation, a request already
+    /// out, or a source that has stopped fetching.
+    Unneeded,
+}
+
+/// The working set the passes drawing one source measure, pass by pass.
+///
+/// `note` accumulates one pass's cells across every pane drawing the source
+/// — the same source is drawn once per pane that shows it — and rolls the
+/// total over when the pass number moves. The floor the cache is told is the
+/// larger of the completed pass and the pass under way, so a window that
+/// grows is held from the pass that grows it and a window that shrinks lets
+/// go one pass later; the levels the ledger reports are the completed pass's,
+/// which are stable for the whole of the next.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WantedTally {
+    /// The pass being accumulated, once any has been.
+    pass_nr: Option<u64>,
+    /// This pass so far: cells at the drawn level, cells of the ancestor net.
+    running: (usize, usize),
+    /// The last whole pass.
+    completed: (usize, usize),
+}
+
+impl WantedTally {
+    /// Add one layer draw's cells to `pass_nr`, answering whether this call
+    /// began a new pass.
+    fn note(&mut self, pass_nr: u64, on_glass: usize, net: usize) -> bool {
+        let new_pass = self.pass_nr != Some(pass_nr);
+        if new_pass {
+            if self.pass_nr.is_some() {
+                self.completed = self.running;
+            }
+            self.pass_nr = Some(pass_nr);
+            self.running = (0, 0);
+        }
+        self.running.0 = self.running.0.saturating_add(on_glass);
+        self.running.1 = self.running.1.saturating_add(net);
+        new_pass
+    }
+
+    /// The most cells either the last whole pass or this one has wanted.
+    fn floor(&self) -> usize {
+        let running = self.running.0.saturating_add(self.running.1);
+        let completed = self.completed.0.saturating_add(self.completed.1);
+        running.max(completed)
+    }
+
+    /// The last whole pass's `(on_glass, net)`.
+    fn completed(&self) -> (usize, usize) {
+        self.completed
+    }
+}
+
+/// The most refused asks one source remembers. A 3840x2160 canvas at one
+/// zoom of bias keeps 1,196 tiles between zooms plus its net; a pass can
+/// refuse at most that many, and a cell refused past this bound is simply
+/// refused again next pass, exactly as every refused cell was before the
+/// queue existed.
+const MAX_REFUSED_ASKS: usize = 4096;
+
+/// The cells the request channel refused, in the order it refused them.
+///
+/// **The tail-starvation fix, and why it is about order and not depth.** The
+/// channel holds [`MAX_PARALLEL_DOWNLOADS`] plus its sender's slot, and a
+/// pass walks a hundred and more cells in a fixed order; with the cache
+/// evicting the walk's head each pass — which the working-set floor now
+/// forbids, but which a floor one pass behind a resize, or a restyle re-asking
+/// every cell, can still produce for a pass or two — the head took every slot
+/// every pass and cells at the tail were never asked at all: 10-20 of 144
+/// over 120 frames on the loopback pin (2026-09-02). Widening the channel
+/// would move the tail, not remove it; changing the walk order would change
+/// the order labels are collected in, and so which label wins a collision.
+/// So the *ask* order rotates while the walk order stands: every cell the
+/// channel refused is queued here once, in walk order, and the next pass asks
+/// for the queue's head before its own walk begins. A cell reaches the head
+/// within `ceil(working set / channel depth)` passes, whatever the walk does.
+///
+/// **What leaves the queue.** A cell arrives, is found in flight or cached, or
+/// is refused again (and goes back to the front). A cell the walk stopped
+/// asking for — it scrolled off — is purged at the next pass boundary rather
+/// than fetched for nothing: `wanted_now` records what this pass's walk
+/// asked, and `new_pass` keeps only the queued cells the pass before still
+/// wanted.
+#[derive(Debug, Default)]
+struct AskQueue {
+    refused: std::collections::VecDeque<TileId>,
+    queued: HashSet<TileId>,
+    wanted_now: HashSet<TileId>,
+    wanted_before: HashSet<TileId>,
+}
+
+impl AskQueue {
+    /// The walk asked for `tile_id` this pass.
+    fn wanted(&mut self, tile_id: TileId) {
+        self.wanted_now.insert(tile_id);
+    }
+
+    /// The channel refused `tile_id`; queue it once, at the back.
+    fn refuse(&mut self, tile_id: TileId) {
+        if self.refused.len() >= MAX_REFUSED_ASKS || !self.queued.insert(tile_id) {
+            return;
+        }
+        self.refused.push_back(tile_id);
+    }
+
+    /// The oldest refused cell, taken.
+    fn pop_front(&mut self) -> Option<TileId> {
+        let tile_id = self.refused.pop_front()?;
+        self.queued.remove(&tile_id);
+        Some(tile_id)
+    }
+
+    /// Put a cell back at the front: refused again, and still the oldest.
+    fn push_front(&mut self, tile_id: TileId) {
+        if self.queued.insert(tile_id) {
+            self.refused.push_front(tile_id);
+        }
+    }
+
+    /// A pass began: what the last pass wanted becomes the filter, and the
+    /// queue keeps only cells it still wanted.
+    fn new_pass(&mut self) {
+        self.wanted_before = std::mem::take(&mut self.wanted_now);
+        let wanted = &self.wanted_before;
+        self.refused.retain(|tile_id| wanted.contains(tile_id));
+        self.queued.retain(|tile_id| wanted.contains(tile_id));
+    }
+
+    fn clear(&mut self) {
+        self.refused.clear();
+        self.queued.clear();
+        self.wanted_now.clear();
+        self.wanted_before.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.refused.len()
+    }
+}
+
+/// The byte budgets one source is built with: its styled (or, for a raster
+/// source, its texture) cache, and its parsed-geometry cache where it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SourceBudget {
+    /// The population the source's [`TileCache`] holds.
+    pub(crate) styled_bytes: u64,
+    /// `None` builds no parsed cache: a raster archive has nothing
+    /// style-independent to keep.
+    pub(crate) parsed_bytes: Option<u64>,
+}
+
+/// The tile allowances this build starts on before the application has
+/// pushed the resolved ones: the compile-time bracket's floor, resolved by the
+/// same function the application uses — the `concurrent_renders` precedent,
+/// here without a `cfg` constant to name, because the tile allowances have no
+/// cascade.
+pub(crate) fn default_tile_budget() -> squallar_device_profile::budget::TileCacheBudget {
+    squallar_device_profile::budget::resolve(
+        &squallar_device_profile::budget::DeviceProfile::for_target(),
+    )
+    .tile_cache()
+}
+
+/// Where an evicted cache payload goes to be freed.
+///
+/// **Installed rather than depended on**, exactly as [`TileOffloader`] is:
+/// this crate must not name `squallar-worker`, whose `offload::discard` is
+/// the frame thread's route for a large drop (the pool's free lane on native,
+/// the frame-paced deferred queue on wasm32), so the application installs the
+/// function once at startup and every source on every thread reaches it here.
+/// A `fn` pointer and a `OnceLock`: nothing to lock per eviction, nothing to
+/// clear, and a build that installs none — every test, the harness — drops
+/// inline, which is what the code did before the sink existed.
+static TILE_DISCARD: OnceLock<TileDiscard> = OnceLock::new();
+
+/// The shape of the discard sink: a name for the ledger the payload is filed
+/// under, and the payload, boxed — `squallar_worker::offload::discard`'s own
+/// signature with the generic payload already erased.
+pub type TileDiscard = fn(&'static str, Box<dyn std::any::Any + Send>);
+
+/// Install the sink evicted tile payloads are freed through. The first call
+/// wins; later ones are ignored, so a second `App` in one process changes
+/// nothing.
+pub fn set_tile_discard(sink: TileDiscard) {
+    let _ = TILE_DISCARD.set(sink);
+}
+
+/// Free `payload` through the installed sink, or here when none is.
+fn discard_slot(name: &'static str, payload: impl Send + 'static) {
+    match TILE_DISCARD.get() {
+        Some(sink) => sink(name, Box::new(payload)),
+        None => drop(payload),
+    }
+}
+
+pub mod byte_lru;
 pub mod cache_ledger;
 pub mod take_ledger;
 

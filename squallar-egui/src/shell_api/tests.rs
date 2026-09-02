@@ -9,6 +9,7 @@
 use super::FrameInputs;
 use crate::input_harness::InputHarness;
 use crate::radar_layer::{CurrentVolumeStamp, RadarLiveness};
+use squallar_device_profile::budget::TileCacheBudget;
 use squallar_radar::chunk_feed::ChunkFeedStatus;
 
 /// A timestamp no default produces, so reading it back can only mean the
@@ -51,6 +52,11 @@ fn every_frame_input_surfaces_and_persists() {
         supports_exit: false,
         loop_frame_budget: 7,
         concurrent_renders: 5,
+        tile_cache: TileCacheBudget {
+            styled_bytes: 111_111,
+            parsed_bytes: 222_222,
+            terrain_bytes: 333_333,
+        },
         location_settings_available: true,
         location: (squallar_location::LocationPermission::Denied, false),
         gps: Some((squallar_location::Fix::from_lat_lon(12.5, -34.25), gps_at)),
@@ -130,6 +136,15 @@ fn every_frame_input_surfaces_and_persists() {
             5,
             "concurrent_renders did not survive frame {frame}"
         );
+        assert_eq!(
+            gui.tile_cache_budget_for_test(),
+            TileCacheBudget {
+                styled_bytes: 111_111,
+                parsed_bytes: 222_222,
+                terrain_bytes: 333_333,
+            },
+            "tile_cache did not survive frame {frame}"
+        );
     }
 }
 
@@ -144,6 +159,7 @@ fn a_none_gps_clears_the_fix() {
         supports_exit: true,
         loop_frame_budget: 60,
         concurrent_renders: 1,
+        tile_cache: crate::tile_source::default_tile_budget(),
         location_settings_available: false,
         location: (squallar_location::LocationPermission::Granted, true),
         gps: Some((
@@ -170,6 +186,7 @@ fn a_none_gps_clears_the_fix() {
         supports_exit: true,
         loop_frame_budget: 60,
         concurrent_renders: 1,
+        tile_cache: crate::tile_source::default_tile_budget(),
         location_settings_available: false,
         user_heading: None,
         catalogue_pending: false,

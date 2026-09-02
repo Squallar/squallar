@@ -61,11 +61,18 @@
 //!   pending eviction is a request still out whose body will land with no
 //!   marker under it; the request stays open, so the tile is not asked for
 //!   again, and the body lands as a first sight. [`Totals::evicted_bytes`]
-//!   prices the resident ones as `super::slot_bytes` prices a slot.
-//! * The three **levels** — [`Totals::resident_entries`],
-//!   [`Totals::resident_bytes`], [`Totals::parsed_entries`] — are what is held
-//!   right now, stored rather than added, and the only figures here that go
-//!   down. With several sources of one role the last writer's level stands.
+//!   carries what the slots were charged (`super::CachedTile::bytes`).
+//! * The **levels** — [`Totals::resident_entries`], [`Totals::resident_bytes`],
+//!   [`Totals::overrun_bytes`], [`Totals::floor_entries`],
+//!   [`Totals::wanted_on_glass`], [`Totals::wanted_net`],
+//!   [`Totals::parsed_entries`], [`Totals::parsed_bytes`] — are what is held
+//!   or wanted right now, stored rather than added, and the only figures here
+//!   that go down. With several sources of one role the last writer's level
+//!   stands. `overrun` is what the working-set floor keeps resident past the
+//!   byte budget; `floor` is that working set plus the in-flight markers;
+//!   the two `wanted` figures are the last whole pass's cells at the drawn
+//!   level and in the ancestor net, which is the tile term the application
+//!   prices its scene with.
 //!
 //! `requests − puts` is asks still in flight or failed, not a rate. `uploads`
 //! (the GPU store's) is never compared to any figure here by subtraction: an
@@ -157,11 +164,33 @@ pub struct Totals {
     pub evicted_bytes: u64,
     /// A level: slots held right now, markers included.
     pub resident_entries: u64,
-    /// A level: what those slots are priced at, on `super::slot_bytes`'
-    /// terms — a lower bound.
+    /// A level: what those slots are charged, every entry at least the
+    /// marker's node — see `super::CachedTile::bytes`.
     pub resident_bytes: u64,
+    /// A level: resident bytes past the budget, which only the working-set
+    /// floor (or a shrink not yet paid) can produce.
+    pub overrun_bytes: u64,
+    /// A level: the entries the cache is holding whatever the budget says —
+    /// the measured working set plus the in-flight markers.
+    pub floor_entries: u64,
+    /// A level: cells at the drawn level the last whole pass wanted.
+    pub wanted_on_glass: u64,
+    /// A level: cells of the ancestor net the last whole pass wanted.
+    pub wanted_net: u64,
     /// A level: parses held in the source's parsed-geometry cache.
     pub parsed_entries: u64,
+    /// A level: what those parses are charged.
+    pub parsed_bytes: u64,
+}
+
+/// The four cache levels [`set_resident`] stores together, so a reading is
+/// never half of one publish and half of another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Levels {
+    pub resident_entries: u64,
+    pub resident_bytes: u64,
+    pub overrun_bytes: u64,
+    pub floor_entries: u64,
 }
 
 impl Totals {
@@ -231,7 +260,12 @@ impl Totals {
             evicted_bytes: self.evicted_bytes.saturating_sub(earlier.evicted_bytes),
             resident_entries: self.resident_entries,
             resident_bytes: self.resident_bytes,
+            overrun_bytes: self.overrun_bytes,
+            floor_entries: self.floor_entries,
+            wanted_on_glass: self.wanted_on_glass,
+            wanted_net: self.wanted_net,
             parsed_entries: self.parsed_entries,
+            parsed_bytes: self.parsed_bytes,
         }
     }
 }
@@ -250,7 +284,12 @@ struct RoleLedger {
     evicted_bytes: AtomicU64,
     resident_entries: AtomicU64,
     resident_bytes: AtomicU64,
+    overrun_bytes: AtomicU64,
+    floor_entries: AtomicU64,
+    wanted_on_glass: AtomicU64,
+    wanted_net: AtomicU64,
     parsed_entries: AtomicU64,
+    parsed_bytes: AtomicU64,
     /// The last [`Totals::progress`] handed out by [`totals_if_moved`].
     reported: AtomicU64,
 }
@@ -270,7 +309,12 @@ impl RoleLedger {
             evicted_bytes: AtomicU64::new(0),
             resident_entries: AtomicU64::new(0),
             resident_bytes: AtomicU64::new(0),
+            overrun_bytes: AtomicU64::new(0),
+            floor_entries: AtomicU64::new(0),
+            wanted_on_glass: AtomicU64::new(0),
+            wanted_net: AtomicU64::new(0),
             parsed_entries: AtomicU64::new(0),
+            parsed_bytes: AtomicU64::new(0),
             reported: AtomicU64::new(0),
         }
     }
@@ -306,17 +350,31 @@ pub fn note(role: CacheRole, event: CacheEvent) {
     };
 }
 
-/// What one source of `role` holds right now. A level, so stored not added.
-pub fn set_resident(role: CacheRole, entries: u64, bytes: u64) {
+/// What one source of `role` holds right now. Levels, so stored not added.
+pub fn set_resident(role: CacheRole, levels: Levels) {
     let ledger = &LEDGER[role.index()];
-    ledger.resident_entries.store(entries, Relaxed);
-    ledger.resident_bytes.store(bytes, Relaxed);
+    ledger
+        .resident_entries
+        .store(levels.resident_entries, Relaxed);
+    ledger.resident_bytes.store(levels.resident_bytes, Relaxed);
+    ledger.overrun_bytes.store(levels.overrun_bytes, Relaxed);
+    ledger.floor_entries.store(levels.floor_entries, Relaxed);
 }
 
-/// How many parses one source of `role`'s parsed-geometry cache holds. A
-/// level, stored where the parse lands.
-pub fn set_parsed_entries(role: CacheRole, entries: u64) {
-    LEDGER[role.index()].parsed_entries.store(entries, Relaxed);
+/// What the last whole pass drawing one source of `role` wanted: cells at the
+/// drawn level and in the ancestor net. Levels, stored at the pass boundary.
+pub fn set_wanted(role: CacheRole, on_glass: u64, net: u64) {
+    let ledger = &LEDGER[role.index()];
+    ledger.wanted_on_glass.store(on_glass, Relaxed);
+    ledger.wanted_net.store(net, Relaxed);
+}
+
+/// How many parses one source of `role`'s parsed-geometry cache holds, and
+/// what they are charged. Levels, stored where the parse lands or leaves.
+pub fn set_parsed(role: CacheRole, entries: u64, bytes: u64) {
+    let ledger = &LEDGER[role.index()];
+    ledger.parsed_entries.store(entries, Relaxed);
+    ledger.parsed_bytes.store(bytes, Relaxed);
 }
 
 /// Read one role.
@@ -335,7 +393,12 @@ pub fn totals(role: CacheRole) -> Totals {
         evicted_bytes: ledger.evicted_bytes.load(Relaxed),
         resident_entries: ledger.resident_entries.load(Relaxed),
         resident_bytes: ledger.resident_bytes.load(Relaxed),
+        overrun_bytes: ledger.overrun_bytes.load(Relaxed),
+        floor_entries: ledger.floor_entries.load(Relaxed),
+        wanted_on_glass: ledger.wanted_on_glass.load(Relaxed),
+        wanted_net: ledger.wanted_net.load(Relaxed),
         parsed_entries: ledger.parsed_entries.load(Relaxed),
+        parsed_bytes: ledger.parsed_bytes.load(Relaxed),
     }
 }
 

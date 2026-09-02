@@ -107,7 +107,12 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         evicted_bytes: 500,
         resident_entries: 90,
         resident_bytes: 9_000,
+        overrun_bytes: 1,
+        floor_entries: 2,
+        wanted_on_glass: 3,
+        wanted_net: 4,
         parsed_entries: 20,
+        parsed_bytes: 5,
     };
     let later = Totals {
         requests: 25,
@@ -122,7 +127,12 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         evicted_bytes: 1_200,
         resident_entries: 100,
         resident_bytes: 10_000,
+        overrun_bytes: 11,
+        floor_entries: 12,
+        wanted_on_glass: 13,
+        wanted_net: 14,
         parsed_entries: 24,
+        parsed_bytes: 15,
     };
     let window = later.diff(&earlier);
     assert_eq!(
@@ -140,7 +150,12 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
             evicted_bytes: 700,
             resident_entries: 100,
             resident_bytes: 10_000,
+            overrun_bytes: 11,
+            floor_entries: 12,
+            wanted_on_glass: 13,
+            wanted_net: 14,
             parsed_entries: 24,
+            parsed_bytes: 15,
         }
     );
     // Saturating, never wrapping: a reading taken before another source's

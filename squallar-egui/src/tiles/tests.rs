@@ -731,9 +731,9 @@ const WHOLE_ZOOM_WORST: usize = 54;
 /// `TILE_SIDE_POINTS` and more of them fit. See the test below.
 const BETWEEN_ZOOMS_WORST: usize = 84;
 
-/// What the loop asks for and what the cache is sized to hold are the same
-/// number — at a whole zoom, which is the only claim
-/// [`crate::tile_source::TILE_CACHE_ENTRIES`]'s docs make.
+/// What the loop asks for and what the sizing arithmetic reports are the same
+/// number — at a whole zoom, which is the only claim the whole-zoom figure
+/// makes.
 #[test]
 fn the_span_and_the_cache_sizing_agree_at_a_whole_zoom() {
     let budget = tiles_resident_at_whole_zoom(canvas(), 0, 1);
@@ -793,15 +793,21 @@ fn the_span_and_the_cache_sizing_agree_at_a_whole_zoom() {
     );
 }
 
-/// **The cache holds the working set at every zoom, not only the whole ones.**
-///
-/// The wasm arm is the tight one, so it is the arm this gates. An LRU smaller
-/// than the sweep's worst case evicts a tile that is still on the glass, and
-/// the next frame re-enters `request_once` for it: a network fetch and a
+/// **The cache holds the working set at every zoom, not only the whole ones —
+/// by its floor, not by its budget.** The sweep's worst case over the whole
+/// zoom range, plus the ancestor net's bound, is what a pass reports as its
+/// working set; a `ByteLru` floored there holds every one of those entries
+/// at a budget of one byte and evicts only what lies beyond. An LRU that
+/// evicted inside the working set would evict a tile still on the glass, and
+/// the next frame would re-enter `request_once` for it: a network fetch and a
 /// decode against the per-source, per-pass wasm decode budget, for a tile the
-/// user never stopped looking at.
+/// user never stopped looking at. This used to gate a count constant against
+/// the sweep; the constant is gone and the floor is measured per pass, so
+/// what is gated is the mechanism the floor rests on.
 #[test]
 fn the_cache_holds_the_working_set_at_every_zoom() {
+    use crate::tile_source::byte_lru::{ByteLru, MARKER_BYTES};
+
     let mut cases = 0usize;
     let mut worst = (0usize, String::new());
 
@@ -829,14 +835,36 @@ fn the_cache_holds_the_working_set_at_every_zoom() {
          moved; the worst this sweep found is at {}",
         worst.1
     );
+
+    // The floor a pass over this canvas reports: the drawn worst case plus
+    // the net's bound, as `draw_tile_layer` asks for both.
+    let floor = tiles_resident_with_warm_net(canvas(), 0, 1);
     assert!(
-        worst.0 <= crate::tile_source::WASM_TILE_CACHE_ENTRIES.get(),
-        "a {CANVAS:?}-point canvas keeps {} tiles resident per source at {}, \
-         against the {} the wasm arm allows: the LRU evicts tiles that are \
-         still on the glass",
-        worst.0,
+        worst.0 <= floor,
+        "the sweep's worst case {} exceeds the working-set bound {floor} the pass would report",
+        worst.0
+    );
+    let mut cache: ByteLru<usize, ()> = ByteLru::new(1);
+    cache.set_floor_entries(floor);
+    let mut evicted = Vec::new();
+    for entry in 0..floor {
+        cache.put(entry, (), MARKER_BYTES, &mut evicted);
+    }
+    assert!(
+        evicted.is_empty(),
+        "a {CANVAS:?}-point canvas keeps {floor} tiles resident per source at {} and the \
+         net, and the floor let {} of them go at a budget of one byte: the cache evicts \
+         tiles that are still on the glass",
         worst.1,
-        crate::tile_source::WASM_TILE_CACHE_ENTRIES.get()
+        evicted.len()
+    );
+    assert_eq!(cache.len(), floor);
+    // History beyond the floor is the budget's to reclaim.
+    cache.put(floor, (), MARKER_BYTES, &mut evicted);
+    assert_eq!(
+        evicted.len(),
+        1,
+        "the entry beyond the working set is history"
     );
 }
 
@@ -886,11 +914,20 @@ fn tiles_resident_for_reports_the_worst_case_over_the_zoom_range() {
     );
 }
 
-/// The two counts at real canvases, pinned. The tier table in
-/// [`crate::tile_source::TILE_CACHE_ENTRIES`]'s docs quotes every figure here.
+/// The two counts at real canvases, pinned. The bracket arguments in
+/// `squallar-device-profile` quote these figures.
 ///
 /// Sizes are in **points**: a 4K panel at the 2x scaling it is nearly always
 /// run at presents the 1920x1080 row, not the 3840x2160 one.
+///
+/// **The user's own 2878x1651 window is the last row, and it is the row the
+/// arithmetic overstates.** The grid arithmetic says 104 tiles at a whole
+/// zoom and 187 between zooms for a rect that size; the rig measured 86 and
+/// ~106 on the real window (2026-09-02, zoom 14.0 and 13.5), because the map
+/// pane is 0.75-0.83 of the canvas — the chrome takes the rest — and this
+/// function prices the rect it is given. The two measured figures are held
+/// under the two predictions here so the overstatement stays a known
+/// direction and never a surprise.
 #[test]
 fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
     let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
@@ -900,6 +937,7 @@ fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
         (1920.0, 1200.0, 54, 96),
         (2560.0, 1440.0, 77, 144),
         (3840.0, 2160.0, 160, 299),
+        (2878.0, 1651.0, 104, 187),
     ] {
         assert_eq!(
             tiles_resident_at_whole_zoom(canvas(w, h), 0, 1),
@@ -913,6 +951,17 @@ fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
         );
         assert!(worst > whole, "the scale term must only ever add tiles");
     }
+
+    // The user's window, as measured on the rig against what the rect
+    // arithmetic predicts for the whole canvas.
+    const MEASURED_WHOLE_ZOOM: usize = 86;
+    const MEASURED_HALF_STEP: usize = 106;
+    assert!(
+        MEASURED_WHOLE_ZOOM <= tiles_resident_at_whole_zoom(canvas(2878.0, 1651.0), 0, 1)
+            && MEASURED_HALF_STEP <= tiles_resident_for(canvas(2878.0, 1651.0), 0, 1),
+        "the rig measured more tiles on the user's window than the whole-canvas arithmetic \
+         predicts: the map pane is now larger than the canvas"
+    );
 
     // One zoom of bias halves the tile on both axes, so it costs exactly what
     // doubling the canvas on both axes costs.
@@ -930,60 +979,86 @@ fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
     assert_eq!(tiles_resident_for(canvas(1920.0, 1080.0), 255, 1), 0);
 }
 
-/// Every tier holds the worst case for the canvas its docs claim it holds, and
-/// the canvas its docs say it stops at really is past it.
+/// **Each bracket's styled floor holds what its argument says, in bytes, and
+/// the worst case exceeds the wasm floor — which is what the working-set
+/// floor and the snapping rung are for.** The old count test said the wasm
+/// arm "overruns at 1440p by design"; the byte arm's statement is different
+/// in kind. At the typical entry cost every floor holds the user's 2878x1651
+/// window between zooms (193 entries with the net) many times over. At the
+/// measured city-core tail the wasm floor holds 34 entries against the ~106
+/// the window measured: the floor in entries keeps those 106 resident as
+/// overrun, and the tile-sharpness rung snaps to the whole zoom (86) when a
+/// dwell of overrun says so. The desktop floor holds the user's window at the
+/// tail, its step holds 2560x1440 between zooms and its ceiling holds
+/// 3840x2160, so a workstation with a real driver is never in the floor's
+/// care at all. The arithmetic is in every message.
 #[test]
 fn each_tier_holds_the_canvas_its_docs_claim() {
     use crate::tile_source::{
-        DESKTOP_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+        MEASURED_STYLED_ENTRY_BYTES, TYPICAL_STYLED_ENTRY_BYTES, worst_case_entries,
     };
-    let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+    use squallar_device_profile::budget::BudgetLimits;
 
-    for (tier, entries, holds, overruns_at) in [
-        (
-            "wasm32",
-            WASM_TILE_CACHE_ENTRIES.get(),
-            canvas(1920.0, 1200.0),
-            canvas(2560.0, 1440.0),
-        ),
-        (
-            "mobile",
-            MOBILE_TILE_CACHE_ENTRIES.get(),
-            canvas(1920.0, 1200.0),
-            canvas(2560.0, 1440.0),
-        ),
-        (
-            "desktop",
-            DESKTOP_TILE_CACHE_ENTRIES.get(),
-            canvas(2560.0, 1440.0),
-            canvas(3840.0, 2160.0),
-        ),
-    ] {
-        let need = tiles_resident_for(holds, 0, 1);
+    let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+    let user_window = tiles_resident_with_warm_net(canvas(2878.0, 1651.0), 0, 1);
+    const MEASURED_ON_THE_USERS_WINDOW: usize = 106;
+    assert!(
+        user_window >= MEASURED_ON_THE_USERS_WINDOW,
+        "fixture: the arithmetic ({user_window}) must bound the measured {MEASURED_ON_THE_USERS_WINDOW}"
+    );
+
+    for limits in BudgetLimits::SHIPPED {
+        let floor = limits.tile_styled_bytes.floor;
+        let typical = floor / TYPICAL_STYLED_ENTRY_BYTES;
         assert!(
-            need <= entries,
-            "the {tier} arm holds {entries} tiles, but a {holds:?}-point canvas \
-             keeps {need} resident per source"
-        );
-        let past = tiles_resident_for(overruns_at, 0, 1);
-        assert!(
-            past > entries,
-            "the {tier} arm is documented as stopping at {overruns_at:?}, but \
-             that canvas's {past} tiles fit inside its {entries}"
+            typical >= 8 * user_window,
+            "the {} styled floor ({} MiB) holds {typical} typical entries, under eight of the \
+             user's {user_window}-tile window",
+            limits.name,
+            floor >> 20,
         );
     }
 
-    // The wasm arm is the one whole-zoom-only sizing under-served: 84 tiles for
-    // the 1920x1080 canvas every tier is quoted against, which the 64 it used
-    // to hold could not carry at any fractional zoom.
-    let reference = tiles_resident_for(canvas(1920.0, 1080.0), 0, 1);
+    // The wasm floor at the tail: short of the user's window, by design and
+    // by name.
+    let wasm_floor = BudgetLimits::WASM.tile_styled_bytes.floor as u64;
+    let at_tail = worst_case_entries(wasm_floor);
     assert!(
-        reference > 64,
-        "the 64-entry arm was undersized, and by {reference} to 64"
+        at_tail < MEASURED_ON_THE_USERS_WINDOW,
+        "the wasm styled floor ({} MiB) holds {at_tail} entries at the {MEASURED_STYLED_ENTRY_BYTES} B \
+         tail, at least the {MEASURED_ON_THE_USERS_WINDOW} the user's window measured: the worst \
+         case now fits the floor and the snapping rung's premise is gone",
+        wasm_floor >> 20,
     );
-    assert!(reference <= WASM_TILE_CACHE_ENTRIES.get());
-    assert!(reference <= MOBILE_TILE_CACHE_ENTRIES.get());
-    assert!(reference <= DESKTOP_TILE_CACHE_ENTRIES.get());
+    assert!(
+        at_tail >= 30,
+        "the wasm styled floor holds only {at_tail} city-core entries; a phone-sized viewport \
+         is 20-35 tiles and the floor should hold most of one"
+    );
+
+    // Desktop at the tail: the floor holds the user's window, the step holds
+    // 2560x1440 between zooms, the ceiling holds 4K.
+    let desktop = BudgetLimits::DESKTOP.tile_styled_bytes;
+    let qhd = tiles_resident_for(canvas(2560.0, 1440.0), 0, 1);
+    let uhd = tiles_resident_for(canvas(3840.0, 2160.0), 0, 1);
+    assert!(
+        worst_case_entries(desktop.floor as u64) >= MEASURED_ON_THE_USERS_WINDOW,
+        "the desktop styled floor holds {} tail entries, under the {MEASURED_ON_THE_USERS_WINDOW} \
+         the user's window measured",
+        worst_case_entries(desktop.floor as u64)
+    );
+    assert!(
+        worst_case_entries(desktop.step as u64) >= qhd,
+        "the desktop styled step holds {} tail entries, under the {qhd} a 2560x1440 canvas \
+         keeps between zooms",
+        worst_case_entries(desktop.step as u64)
+    );
+    assert!(
+        worst_case_entries(desktop.ceiling as u64) >= uhd,
+        "the desktop styled ceiling holds {} tail entries, under the {uhd} a 3840x2160 canvas \
+         keeps between zooms",
+        worst_case_entries(desktop.ceiling as u64)
+    );
 }
 
 // ---------------------------------------------------------------------------

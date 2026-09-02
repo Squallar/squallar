@@ -50,31 +50,54 @@ fn the_wanted_rung_is_a_power_of_two_inside_the_cap() {
 }
 
 /// The cap is where the tile cache argument bites, not only the byte budget.
+///
+/// Re-argued in bytes, since the tile cache is bounded in bytes now and the
+/// entry count it holds depends on what an entry costs. The rung above the
+/// cap is refused on the **ceiling** of the desktop styled allowance at the
+/// **worst-case** entry (512 MiB / 1.46 MB, ~367 entries): a 900-point strip
+/// at bias 2 wants 882 tiles and could not be held even there, so the cap at
+/// rung 2 is real. The cap itself is admitted on the same ceiling: 242 at
+/// bias 1 fits 367. And bias 0 is held on the **floor** at **typical** cost
+/// (160 MiB / 30 KB, ~5,500 entries) three times over — the working set
+/// never moved, what it is priced with did; at the worst-case cost the floor
+/// holds ~114 and the 72-tile strip once, and it is the working-set floor
+/// that carries a city-core strip past that, not this bound.
 #[test]
 fn the_rung_above_the_cap_could_never_fit_the_tile_cache() {
-    let entries = squallar_egui::tile_source::TILE_CACHE_ENTRIES.get();
+    use squallar_device_profile::budget::BudgetLimits;
+    use squallar_egui::tile_source::{TYPICAL_STYLED_ENTRY_BYTES, worst_case_entries};
+
+    let styled = BudgetLimits::DESKTOP.tile_styled_bytes;
+    let at_ceiling = worst_case_entries(styled.ceiling as u64);
+    let at_floor = worst_case_entries(styled.floor as u64);
+    let typical_at_floor = styled.floor / TYPICAL_STYLED_ENTRY_BYTES;
     let cap_bias = MIRROR_SCALE_MAX.log2() as u8;
     // The most favourable case bias 2 could ever get.
     let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 900.0));
     let layers = 2;
 
     assert!(
-        squallar_egui::tiles::tiles_resident_for(pane, cap_bias + 1, layers) > entries,
-        "bias {} fits the {entries}-entry LRU for a 900-point pane, so the cap \
-         at rung {MIRROR_SCALE_MAX} is not the one the tile cache argues for",
+        squallar_egui::tiles::tiles_resident_for(pane, cap_bias + 1, layers) > at_ceiling,
+        "bias {} fits the {at_ceiling} worst-case entries the desktop styled ceiling holds \
+         for a 900-point pane, so the cap at rung {MIRROR_SCALE_MAX} is not the one the \
+         tile cache argues for",
         cap_bias + 1,
     );
     assert!(
-        squallar_egui::tiles::tiles_resident_for(pane, cap_bias, layers) <= entries,
-        "bias {cap_bias} does not fit even a 900-point pane, so the cap admits \
-         a rung that could never be taken",
+        squallar_egui::tiles::tiles_resident_for(pane, cap_bias, layers) <= at_ceiling,
+        "bias {cap_bias} does not fit even a 900-point pane at the ceiling ({at_ceiling} \
+         entries), so the cap admits a rung that could never be taken",
     );
-    // Bias 0 must be far inside it, or the LRU was already too small. Three
-    // times over rather than four: `tiles_resident_for` reports the worst
-    // case over the whole zoom range, and a tile drawn `2^-0.5` of a side at
-    // the half step puts 72 tiles here where the old whole-zoom-only measure
-    // saw 50. The working set never moved; what it is measured with did.
-    assert!(squallar_egui::tiles::tiles_resident_for(pane, 0, layers) * 3 <= entries);
+    assert!(
+        squallar_egui::tiles::tiles_resident_for(pane, 0, layers) * 3 <= typical_at_floor,
+        "bias 0 at typical cost is not three times inside the floor ({typical_at_floor} \
+         entries): the floor was already too small for a strip"
+    );
+    assert!(
+        squallar_egui::tiles::tiles_resident_for(pane, 0, layers) <= at_floor,
+        "bias 0 at worst-case cost does not fit the floor ({at_floor} entries): a city-core \
+         strip is in the working-set floor's care from the first tile"
+    );
 }
 
 /// A frame that cannot afford the rung says so, and the tile bias follows what
