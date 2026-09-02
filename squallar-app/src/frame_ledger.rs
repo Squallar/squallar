@@ -4,14 +4,16 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is nineteen clock reads and about
-//! twenty-seven integer bin searches — the ledger's own eight stamps, the one
-//! the egui pass takes on entry, the five `Gui::ui` takes on its way through
-//! and the five `handle_redraw` takes across its tail. Six of the bin searches
-//! are the `prepare` split ([`PrepareHists`]), six more the `ui` split
-//! ([`UiHists`]) and six more the `post` split ([`PostHists`]); each records
-//! only on the frames its own segment does. **No figure recorded here ever
-//! gates CI.**
+//! feature gate, and the per-frame cost is nineteen clock reads, about
+//! twenty-seven integer bin searches and two `u32` comparisons — the ledger's
+//! own eight stamps, the one the egui pass takes on entry, the five
+//! `Gui::ui` takes on its way through and the five `handle_redraw` takes
+//! across its tail. Six of the bin searches are the `prepare` split
+//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]) and six more the
+//! `post` split ([`PostHists`]); each records only on the frames its own
+//! segment does. The two comparisons are [`WorstFrame`]'s latch and its
+//! session maximum, and unlike everything else here they are offered EVERY
+//! presented frame. **No figure recorded here ever gates CI.**
 //!
 //! # The three denominators, stated once
 //!
@@ -268,6 +270,59 @@ pub(crate) struct SegmentHists {
     pub(crate) post: Hist,
 }
 
+/// The anatomy of the single most expensive presented frame since the last
+/// report — the one reading scene D's figure of merit asks for and that no
+/// histogram can give.
+///
+/// # Why a latch and not a percentile
+///
+/// A `Hist` can say "a frame in the 13.5–16 ms bin happened"; it cannot say
+/// which of the six segments that frame spent its time in, because the six
+/// are recorded into six independent histograms and nothing ties one frame's
+/// samples together again afterwards. Scene D's verdict is `p99` **AND**
+/// `max` — "a single stalled click frame is the defect" — so the campaign's
+/// own figure of merit is one this instrument could describe only by
+/// inference. That inference has already been made and been wrong: CARD-D
+/// attributed a 53.8 ms scene-D max to the `ui` segment, and the `ui` split
+/// then measured `ui` at 3% of service.
+///
+/// # The denominator, and it is NOT the segments'
+///
+/// **Every presented frame**, interact and idle alike — which is the whole
+/// point. The six segment histograms and all nineteen cuts record interact
+/// frames only, and a click's *consequences* (the raster dispatch it causes,
+/// the texture the answer uploads, the source it releases) are paid on the
+/// frames after the one that carried the pointer event, every one of which
+/// this ledger files as idle. Measured on this box, scene D, 1920x1080 on a
+/// 3440x1440@174.96 display, main@3d5e1559: a two-loop window's worst
+/// **interact** frame lands in the 2.83–3.36 ms bin while its worst **idle**
+/// frame lands in 5.66–6.73 ms, and no split in the tree can open the latter.
+/// So `interact` was never where scene D's worst frame lived.
+///
+/// # Windowed, because a maximum cannot be differenced
+///
+/// Taken and cleared by each report, so the figure is "the worst frame of the
+/// last telemetry period" and a bracket's answer is the MAX over its ticks.
+/// Every other family here is cumulative-from-boot and windowed by
+/// subtraction; a running maximum cannot be subtracted, so this one is
+/// windowed at the source instead. `frame worst` is deliberately a different
+/// prefix from both `frame segments` and `frame segment` — its six figures
+/// are one frame's microseconds, not a percentile over many, and adding it to
+/// either would be adding one frame to a distribution that already contains
+/// it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct WorstFrame {
+    /// This frame's service, on `SERVICE_FROM_WHOLE_FRAME`'s spelling — the
+    /// figure the latch is ordered by.
+    pub(crate) service: u32,
+    /// `[pre, pump, ui, prepare, finish, post]`, this one frame's.
+    pub(crate) segments: [u32; 6],
+    /// Whether this frame's raw input carried interaction. Reported rather
+    /// than filtered on: a scene whose worst frame is always idle is saying
+    /// something, and a family column is how it says it.
+    pub(crate) interact: bool,
+}
+
 /// The frame recorder the `App` owns. Single-writer, on the frame thread.
 #[derive(Default)]
 pub(crate) struct FrameLedger {
@@ -289,6 +344,19 @@ pub(crate) struct FrameLedger {
     acquire: Hist,
     /// Redraw-to-redraw of presented frames, both families.
     cadence: Hist,
+    /// The worst presented frame since the last report — see [`WorstFrame`].
+    /// `None` between a `take_worst` and the next presented frame, which is
+    /// what makes the figure windowed rather than cumulative.
+    worst: Option<WorstFrame>,
+    /// The largest service any presented frame has cost this session, never
+    /// cleared. Rides on the same line as the windowed figure so that ONE
+    /// surviving line still names the worst frame of the whole run: a browser
+    /// console ring holds 1200 entries and the rig scrapes the last 60, so a
+    /// windowed maximum whose tick has scrolled out is indistinguishable from
+    /// a run that never had a bad frame — and "absent" reading as "it never
+    /// happened" is the failure this campaign keeps finding. A running total
+    /// that is re-said every tick cannot be evicted into a false negative.
+    worst_since_boot: u32,
     /// The last presented frame's start, cadence's left stamp.
     last_presented_start: Option<Instant>,
 }
@@ -312,6 +380,24 @@ fn service_micros(
         segments
             .iter()
             .fold(0u32, |sum, &segment| sum.saturating_add(segment))
+    }
+}
+
+/// The standing worst frame after `candidate` has been offered to it.
+///
+/// A free function for the reason `prepare_phase_micros` is one: the property
+/// that matters — **which frames are eligible** — is then testable without
+/// driving a real frame through `finalize`, and a `FrameLedger` cannot be
+/// handed synthetic instants because every `mark_*` reads the clock itself.
+///
+/// A candidate must be **strictly greater** to take the slot, so the FIRST
+/// frame to reach a given service keeps it. Ties are common at microsecond
+/// resolution, and the earlier frame is the one a reader can still find in
+/// the log above the line that reports it.
+fn latch_worst(standing: Option<WorstFrame>, candidate: WorstFrame) -> WorstFrame {
+    match standing {
+        Some(worst) if worst.service >= candidate.service => worst,
+        _ => candidate,
     }
 }
 
@@ -543,6 +629,22 @@ impl FrameLedger {
             self.service_idle.record(service);
         }
 
+        // **Every presented frame, both families** — see [`WorstFrame`]. The
+        // comparison is on service, which is the figure the bar is stated in,
+        // and it is deliberately outside the `interacted` block above: the
+        // frame that pays for a click carries no pointer event and is filed
+        // idle, so a latch inside that block would be blind to exactly the
+        // frame scene D's `max` verdict is about.
+        self.worst = Some(latch_worst(
+            self.worst,
+            WorstFrame {
+                service,
+                segments,
+                interact: interacted,
+            },
+        ));
+        self.worst_since_boot = self.worst_since_boot.max(service);
+
         if let Some(previous) = self.last_presented_start {
             self.cadence.record(micros(previous, start));
         }
@@ -581,6 +683,23 @@ impl FrameLedger {
         &self.cadence
     }
 
+    /// The worst presented frame since the last call, and clear the latch.
+    ///
+    /// Takes rather than borrows, which is what makes the figure windowed:
+    /// see [`WorstFrame`]'s note on why a maximum cannot be differenced the
+    /// way every other family here is. `None` means no frame presented in
+    /// this period — an absence, and reported as one.
+    pub(crate) fn take_worst(&mut self) -> Option<WorstFrame> {
+        self.worst.take()
+    }
+
+    /// The largest service any presented frame has cost this session. Never
+    /// cleared, so it survives a console ring that has dropped the tick the
+    /// frame happened in — see the field.
+    pub(crate) fn worst_service_since_boot(&self) -> u32 {
+        self.worst_since_boot
+    }
+
     /// Every histogram this ledger keeps, borrowed as the diagnostics
     /// overlay's frame input. `gpu_passes` is `None` here — the GPU pass
     /// line is not this ledger's to compose, and `push_frame_inputs` overlays
@@ -608,8 +727,8 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        Instant, PostPhaseStamps, micros, post_phase_micros, prepare_phase_micros, service_micros,
-        ui_phase_micros,
+        Instant, PostPhaseStamps, WorstFrame, latch_worst, micros, post_phase_micros,
+        prepare_phase_micros, service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -933,6 +1052,159 @@ mod tests {
         assert_eq!(
             service_micros(true, whole_frame, segments, acquire),
             whole_frame - acquire,
+        );
+    }
+
+    /// A candidate frame whose six segments sum to `service`, so a test can
+    /// state a frame as one number and still have it telescope.
+    fn frame(service: u32, interact: bool) -> WorstFrame {
+        let sixth = service / 6;
+        let mut segments = [sixth; 6];
+        segments[5] = service - sixth * 5;
+        WorstFrame {
+            service,
+            segments,
+            interact,
+        }
+    }
+
+    /// The latch keeps the largest service, whatever order the frames arrive
+    /// in — a maximum, not a last-writer-wins.
+    #[test]
+    fn the_worst_frame_latch_keeps_the_largest_service() {
+        let a = frame(1_200, true);
+        // Not 6_400: `geodesy_one_definition` reads a bare 6_400 in this
+        // tree as an earth radius in kilometres. 5_657 us is a real bin edge
+        // here and cannot be mistaken for one.
+        let b = frame(5_657, false);
+        let c = frame(900, true);
+        let ascending = [a, b, c]
+            .into_iter()
+            .fold(None, |standing, next| Some(latch_worst(standing, next)));
+        let descending = [c, b, a]
+            .into_iter()
+            .fold(None, |standing, next| Some(latch_worst(standing, next)));
+        assert_eq!(ascending, Some(b));
+        assert_eq!(descending, Some(b));
+    }
+
+    /// **An idle frame can be the worst frame, and this is the whole point.**
+    ///
+    /// Every segment histogram and all nineteen cuts in this file record
+    /// interact frames only, because they exist to say where an *interact*
+    /// frame's service went. A click's consequences — the raster dispatch it
+    /// causes, the texture its answer uploads, the source it releases — are
+    /// paid on the frames after the one carrying the pointer event, and this
+    /// ledger files every one of those as idle. Measured on scene D
+    /// (main@3d5e1559, 1920x1080 on 3440x1440@174.96): a two-loop window's
+    /// worst interact frame is in the 2.83-3.36 ms bin and its worst idle
+    /// frame is in 5.66-6.73 ms. A latch that inherited the segments'
+    /// interact-only rule would report the smaller of those two as the
+    /// window's worst frame and read green while the user waited.
+    ///
+    /// So this is the non-vacuity gate: it is RED against the degenerate
+    /// implementation — the latch moved inside `finalize`'s `if interacted`
+    /// arm — which is exactly the shape this instrument would have taken if
+    /// written to match its neighbours.
+    #[test]
+    fn the_worst_frame_latch_admits_an_idle_frame() {
+        let clicked = frame(3_364, true);
+        let paid_for_the_click = frame(6_728, false);
+        let worst = latch_worst(Some(clicked), paid_for_the_click);
+        assert_eq!(
+            worst, paid_for_the_click,
+            "the latch refused an idle frame that cost twice the interact \
+             frame beside it, which is where scene D's worst frame lives",
+        );
+        assert!(
+            !worst.interact,
+            "the family column must say idle, or a reader cannot tell that \
+             the worst frame was not the one that carried the click",
+        );
+    }
+
+    /// The first frame to reach a service keeps the slot: ties do not churn
+    /// the reading, and the frame the line describes is the earlier one in
+    /// the log.
+    #[test]
+    fn the_worst_frame_latch_holds_the_first_of_a_tie() {
+        let first = frame(4_000, true);
+        let second = WorstFrame {
+            interact: false,
+            ..frame(4_000, false)
+        };
+        assert_eq!(latch_worst(Some(first), second), first);
+    }
+
+    /// **The session maximum is not cleared by the take.**
+    ///
+    /// The windowed figure beside it exists to be bracketed; this one exists
+    /// to survive a scrape that lost the bracket. A browser console ring
+    /// holds 1200 entries and the rig reads the last 60, so the tick a rare
+    /// bad frame was reported in can be evicted before anything reads it —
+    /// and an evicted line is indistinguishable from a run in which the bad
+    /// frame never happened. Clearing this field in `take_worst` would
+    /// reintroduce exactly that false negative, so the take is held to
+    /// touching only the windowed slot.
+    #[test]
+    fn the_session_maximum_survives_a_take() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn take_worst(")
+            .expect("take_worst is no longer a method here")
+            .1
+            .split_once("\n    }")
+            .expect("take_worst has no recognisable body")
+            .0;
+        assert!(
+            !body.contains("worst_since_boot"),
+            "take_worst touches the session maximum, so a console ring that \
+             dropped the bad tick would read as a run with no bad frame",
+        );
+    }
+
+    /// The latched frame's six segments telescope to its own service, so
+    /// `frame worst`'s figures are a decomposition of the frame it names
+    /// rather than six numbers standing beside a seventh.
+    #[test]
+    fn the_worst_frames_segments_telescope_to_its_service() {
+        let w = frame(6_728, false);
+        assert_eq!(
+            service_micros(false, 0, w.segments, 0),
+            w.service,
+            "the worst frame's segments do not sum to the service it was \
+             latched on, so the line would decompose a different frame",
+        );
+    }
+
+    /// **The latch is offered every presented frame, not only interact
+    /// ones.** `latch_worst` cannot see where it is called from, so the
+    /// eligibility rule is held here, against `finalize`'s own source: the
+    /// call must come after the `} else {` that closes the interact arm.
+    #[test]
+    fn the_worst_frame_latch_is_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        let idle_arm = body[interact_arm..]
+            .find("} else {")
+            .map(|at| interact_arm + at)
+            .expect("finalize no longer has an idle arm");
+        let arm_end = body[idle_arm..]
+            .find("\n        }")
+            .map(|at| idle_arm + at)
+            .expect("the interact/idle block has no recognisable end");
+        let latch = body
+            .find("latch_worst(")
+            .expect("finalize no longer latches a worst frame");
+        assert!(
+            latch > arm_end,
+            "the worst-frame latch sits inside finalize's interact/idle \
+             block, so the frames that pay for a click -- every one of which \
+             is filed idle -- cannot be the frame it reports",
         );
     }
 }

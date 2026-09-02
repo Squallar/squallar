@@ -757,6 +757,49 @@ fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
     ]
 }
 
+/// The `frame worst:` line — the anatomy of ONE frame, not a distribution.
+///
+/// Denominator: **every presented frame of the last telemetry period**, both
+/// families, which is not any other frame line's denominator here. The six
+/// segment figures are that single frame's microseconds and they sum to its
+/// service exactly, because they are the same six the ledger telescoped to it.
+///
+/// **Never added to `frame segments` or to `frame segment (*)`.** Those are
+/// percentiles over interact frames; this is one frame, and it is usually not
+/// one of theirs — the frames that pay for a click carry no pointer event, so
+/// they are filed idle and no segment or cut histogram in this file ever sees
+/// them. That gap is the reason this line exists: scene D's verdict is `p99`
+/// AND `max`, and until this line a `max` could be located in a bin but never
+/// opened up. The one previous attempt to open one up by inference — CARD-D's
+/// reading of a 53.8 ms scene-D max as `ui` — was measured wrong afterwards.
+///
+/// `family=` is reported, never filtered on: "this scene's worst frame is
+/// always an idle one" is a finding, and hiding it behind a filter is how the
+/// last one stayed hidden.
+///
+/// A period in which nothing presented prints the absence rather than a zero
+/// frame, on [`frame_segment_lines`]' terms inverted: a zero here would be a
+/// frame that cost nothing, which is a different claim from no frame at all.
+fn frame_worst_line(worst: Option<crate::frame_ledger::WorstFrame>, since_boot: u32) -> String {
+    let Some(w) = worst else {
+        return format!("frame worst: no frame presented this period, since_boot={since_boot} us");
+    };
+    let [pre, pump, ui, prepare, finish, post] = w.segments;
+    format!(
+        "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
+         ui={} us, prepare={} us, finish={} us, post={} us",
+        w.service,
+        if w.interact { "interact" } else { "idle" },
+        since_boot,
+        pre,
+        pump,
+        ui,
+        prepare,
+        finish,
+        post,
+    )
+}
+
 /// The `tile take (<family>):` lines — what one tile take costs the thread
 /// that performs it.
 ///
@@ -1594,6 +1637,10 @@ impl super::App {
         }
         self.frame_telemetry_said = Some(now);
         let loud = self.frame_telemetry_loud;
+        // Taken before the shared borrow below, and taken rather than read:
+        // the latch is cleared by this call, which is what scopes the figure
+        // to one telemetry period. See `frame_ledger::WorstFrame`.
+        let worst = self.frame_ledger.take_worst();
         let ledger = &self.frame_ledger;
         say_telemetry(
             loud,
@@ -1628,6 +1675,13 @@ impl super::App {
         for line in frame_post_lines(ledger.post_phases()) {
             say_telemetry(loud, &line);
         }
+        // One frame, not a distribution: where the most expensive presented
+        // frame of this period actually spent its time. Not added to any line
+        // above — see `frame_worst_line`.
+        say_telemetry(
+            loud,
+            &frame_worst_line(worst, ledger.worst_service_since_boot()),
+        );
         // What one tile take cost, per family. Read unconditionally rather
         // than through an `_if_moved` arm, for the same reason the frame
         // families are: this runs at the end of a frame and the window a

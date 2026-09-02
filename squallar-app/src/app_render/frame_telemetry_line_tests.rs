@@ -1191,3 +1191,106 @@ fn the_tile_phase_line_reads_exactly_as_pinned() {
         "a phase and a take family share a word, so a reader could add them",
     );
 }
+
+/// The `frame worst:` sentence, pinned as a literal.
+///
+/// **Its denominator is not any other frame line's**: one frame, whichever
+/// family it was in, of the last telemetry period. The six figures are that
+/// frame's own microseconds and they sum to its service — they are not
+/// percentiles and they are never added to `frame segments`, which already
+/// contains this frame if it was an interact one.
+#[test]
+fn the_worst_frame_line_reads_exactly_as_pinned() {
+    let worst = crate::frame_ledger::WorstFrame {
+        service: 6_728,
+        segments: [61, 54, 4_402, 1_580, 611, 20],
+        interact: false,
+    };
+    assert_eq!(
+        worst.segments.iter().sum::<u32>(),
+        worst.service,
+        "the fixture's segments do not telescope to its service, so the pin \
+         below would pin a line describing no frame that could exist",
+    );
+    assert_eq!(
+        super::frame_worst_line(Some(worst), 9_513),
+        "frame worst: service=6728 us, family=idle, since_boot=9513 us, \
+         pre=61 us, pump=54 us, ui=4402 us, prepare=1580 us, finish=611 us, \
+         post=20 us",
+    );
+}
+
+/// The family column is reported, never assumed. A worst frame that DID carry
+/// the click says so, and the same formatter says it.
+#[test]
+fn the_worst_frame_line_names_the_interact_family_too() {
+    let worst = crate::frame_ledger::WorstFrame {
+        service: 600,
+        segments: [100; 6],
+        interact: true,
+    };
+    assert!(
+        super::frame_worst_line(Some(worst), 600).contains("family=interact"),
+        "an interact worst frame is not reported as one, so the column \
+         cannot distinguish the two cases it exists to distinguish",
+    );
+}
+
+/// A period in which nothing presented prints the ABSENCE, not a frame of
+/// zeros. "No frame presented" and "a frame that cost nothing" are different
+/// claims and a reader cannot be asked to tell them apart from six zeros.
+#[test]
+fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
+    let line = super::frame_worst_line(None, 9_513);
+    assert!(
+        !line.contains("service=0 us"),
+        "an empty period reads as a frame that cost nothing: {line:?}",
+    );
+    assert_eq!(
+        line, "frame worst: no frame presented this period, since_boot=9513 us",
+        "an empty period must still carry the session maximum, or a console \
+         ring that dropped the bad tick reads as a run with no bad frame",
+    );
+}
+
+/// **`frame worst` does not collide with the segment lines the rig reads.**
+///
+/// It carries the same six names as `frame segments (interact, p99 us): pre=,
+/// pump=, ...` and the same `pre=NNN us` shape, so a regex anchored on the
+/// figures rather than the prefix would scrape one frame's microseconds into
+/// a percentile column — and because a single frame's segments are plausible
+/// percentile values, the mistake would read as data rather than as a null.
+/// Held here in both directions.
+#[test]
+fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
+    let worst = crate::frame_ledger::WorstFrame {
+        service: 600,
+        segments: [100; 6],
+        interact: true,
+    };
+    let worst_line = super::frame_worst_line(Some(worst), 600);
+    assert!(
+        worst_line.starts_with("frame worst: "),
+        "the worst-frame line is not under its own prefix: {worst_line:?}",
+    );
+    assert!(
+        !worst_line.starts_with("frame segment"),
+        "the worst-frame line reads as a segment line, and a reader would \
+         add one frame to a distribution that already contains it: \
+         {worst_line:?}",
+    );
+    let mut h = Hist::new();
+    h.record(1_000);
+    for line in super::frame_segment_lines(&crate::frame_ledger::SegmentHists::default())
+        .into_iter()
+        .chain([super::frame_segments_line(
+            &crate::frame_ledger::SegmentHists::default(),
+            &h,
+        )])
+    {
+        assert!(
+            !line.starts_with("frame worst"),
+            "a segment line reads as the worst-frame line: {line:?}",
+        );
+    }
+}
