@@ -757,6 +757,43 @@ fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
     ]
 }
 
+/// The seven `frame dispatch (<name>):` lines — `frame post (dispatch)`,
+/// opened up.
+///
+/// Denominator: **exactly `frame post (dispatch)`'s**, narrowed to the frames
+/// whose tail dispatched at all — six named cuts plus a residual, contiguous
+/// within that one span, so their sums telescope to it. `frame dispatch (*)`
+/// is never added to `frame post (*)` and never to `frame segment (post)`:
+/// each is the one below it, opened up, and adding any pair double-counts.
+///
+/// **`n` is smaller here than on `frame post (dispatch)`, and that is a
+/// figure.** A frame whose tail dispatched nothing has no dispatch to
+/// decompose and contributes no sample, where the parent cut records a
+/// near-zero span on every interact frame. So `n` on these seven is the count
+/// of dispatching frames in the window — the denominator the 84% reading
+/// needs and the parent line cannot give.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms: a
+/// window in which nothing dispatched is a reading, not an absence.
+///
+/// **Read the verdict off `sum`, not the percentiles.** `Hist` is four bins
+/// per octave, so every percentile it answers is quantized to a bin edge and
+/// any true ratio between 1.68x and 2.38x prints as exactly 2.00x; `sum` is
+/// carried exactly beside the bins and differences exactly. The reading this
+/// split exists to produce — which cut holds what share of `dispatch` — is a
+/// ratio of sums for that reason.
+fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
+    [
+        named_hist_line("frame dispatch", "dedupe", &d.dedupe),
+        named_hist_line("frame dispatch", "marks", &d.marks),
+        named_hist_line("frame dispatch", "hydrate", &d.hydrate),
+        named_hist_line("frame dispatch", "prepare", &d.prepare),
+        named_hist_line("frame dispatch", "hitmap", &d.hitmap),
+        named_hist_line("frame dispatch", "offload", &d.offload),
+        named_hist_line("frame dispatch", "residual", &d.residual),
+    ]
+}
+
 /// The `frame worst:` line — the anatomy of ONE frame, not a distribution.
 ///
 /// Denominator: **every presented frame of the last telemetry period**, both
@@ -1673,6 +1710,11 @@ impl super::App {
         // tail has. Same denominator, six contiguous cuts of that one span — a
         // decomposition of the line above, never a seventh segment beside it.
         for line in frame_post_lines(ledger.post_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // One level below the seven above: which of the things the overlay
+        // dispatch inlines is the one that costs. See `frame_dispatch_lines`.
+        for line in frame_dispatch_lines(ledger.dispatch_cuts()) {
             say_telemetry(loud, &line);
         }
         // One frame, not a distribution: where the most expensive presented

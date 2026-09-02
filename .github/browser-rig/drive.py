@@ -3025,6 +3025,25 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // percentile of a distribution that shape says an occasional event happened;
 // it cannot say WHICH of the six things the tail does was the event.
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame post (dispatch)` opened up, one level below `frame post` on exactly
+// its terms: six named cuts plus a residual, contiguous within that one span,
+// same denominator, so their sums telescope to it. NEVER added to
+// `frame post (*)` and never to `frame segment (post)` -- each is the one
+// below it opened up, and adding any pair double-counts.
+//
+// `n` here is SMALLER than on `frame post (dispatch)` and that is a figure,
+// not a loss: a frame whose tail dispatched nothing has no dispatch to
+// decompose and contributes no sample, while the parent cut records a
+// near-zero span on every interact frame. So this `n` is the count of
+// DISPATCHING frames in the window.
+//
+// Why this family exists: on Firefox scene D, `dispatch` held 84% of `post`
+// (27,728 of 33,043 us) on 19 of 176 frames. `post`'s split could say that
+// and could not say WHICH of the six things the dispatch inlines it was.
+// Read the answer off `sum`, never off a percentile: Hist is four bins per
+// octave, so every percentile is quantized to a bin edge and any true ratio
+// between 1.68x and 2.38x prints as exactly 2.00x, while `sum` is exact.
+var frame_dispatch_re = /frame dispatch \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var tile_take_re = /tile take \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // One vector take opened up: `parse` (per source layer, at most sixteen) and
 // `style` (per feature, thousands). A DECOMPOSITION of `tile take (vector)`,
@@ -3041,7 +3060,7 @@ var loop_state_all = [];
 var budget_state = null, budget_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
-var frame_prepare_all = [], frame_post_all = [];
+var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -3146,6 +3165,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
                                p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_dispatch_re.exec(m);
+  if (x) frame_dispatch_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                                   sum: parseInt(x[3], 10), p50: x[4],
+                                   p90: x[5], p99: x[6], hist: x[7] });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -3183,6 +3206,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          frame_post_all: frame_post_all,
+         frame_dispatch_all: frame_dispatch_all,
          gesture_begins: begins, gesture_loops: loops,
          marks_total: (MK ? MK.length : -1),
          console_total: C.length };
@@ -3298,6 +3322,7 @@ class FrameLineWatcher:
         for prefix, key in (("frame_segment_all", "segment"),
                             ("frame_prepare_all", "prepare"),
                             ("frame_post_all", "post"),
+                            ("frame_dispatch_all", "dispatch"),
                             ("tile_take_all", "take"),
                             ("tile_phase_all", "phase")):
             for r in sig.get(prefix) or []:

@@ -5,15 +5,23 @@
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
 //! feature gate, and the per-frame cost is nineteen clock reads, about
-//! twenty-seven integer bin searches and two `u32` comparisons — the ledger's
+//! twenty-eight integer bin searches and two `u32` comparisons — the ledger's
 //! own eight stamps, the one the egui pass takes on entry, the five
 //! `Gui::ui` takes on its way through and the five `handle_redraw` takes
 //! across its tail. Six of the bin searches are the `prepare` split
-//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]) and six more the
-//! `post` split ([`PostHists`]); each records only on the frames its own
-//! segment does. The two comparisons are [`WorstFrame`]'s latch and its
+//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]) and **seven**
+//! more the `post` split ([`PostHists`]); each records only on the frames its
+//! own segment does. The two comparisons are [`WorstFrame`]'s latch and its
 //! session maximum, and unlike everything else here they are offered EVERY
-//! presented frame. **No figure recorded here ever gates CI.**
+//! presented frame.
+//!
+//! **A dispatching frame pays more, and only a dispatching frame.** The
+//! `dispatch` split ([`DispatchHists`]) adds two clock reads per
+//! `dispatch_overlay_renders` call, eight more per request that survives its
+//! dedupe, and seven bin searches — on the frames whose tail dispatches an
+//! overlay raster at all, which measured 19 of 176 on the scene the split was
+//! cut for, and nothing on the rest. **No figure recorded here ever gates
+//! CI.**
 //!
 //! # The three denominators, stated once
 //!
@@ -75,6 +83,11 @@ struct Marks {
     /// before the tail, which is the same frame that leaves no
     /// `present_return`.
     post_phases: Option<PostPhaseStamps>,
+    /// What this frame's `dispatch` cut spent, by sub-cut. `None` on a frame
+    /// whose tail never dispatched, which is most of them — and an absence
+    /// here is not a zero: a frame that dispatched nothing has no dispatch to
+    /// decompose, while a frame that dispatched cheaply has six small figures.
+    dispatch: Option<DispatchCuts>,
     /// The pass ended without a real present (a skipped or lost surface).
     skipped: bool,
 }
@@ -244,6 +257,120 @@ pub(crate) struct PostHists {
     pub(crate) close: Hist,
 }
 
+/// What one `dispatch_overlay_renders` call spent, by sub-cut, accumulated in
+/// **nanoseconds**.
+///
+/// Nanoseconds and not microseconds because this one accumulates: `post`'s six
+/// siblings are each a single span between two instants, while `dispatch` runs
+/// a loop and these are sums across it. Truncating to whole microseconds once
+/// per surviving request would round every sub-microsecond piece to zero and
+/// hand the difference to the residual, which is the one figure that must not
+/// absorb an artifact — it is read as "time these six do not name".
+///
+/// Filled field-wise by `spawn_overlay_render`, once per surviving request;
+/// `dedupe_ns` is the dispatcher's own and is added once per call.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct DispatchCuts {
+    /// `deduplicate_overlay_renders`: the grouping map and the collect out of
+    /// it. Scales with the number of requests the frame emitted.
+    pub(crate) dedupe_ns: u64,
+    /// The per-pane in-flight marks and the dispatch record written beside
+    /// them. Scales with **pane count**, which is what makes it a structurally
+    /// weak suspect on a one-pane scene.
+    pub(crate) marks_ns: u64,
+    /// `hydrate_layer_states`, and the unconditional radar-selection publish
+    /// it opens with. Scales with the pane's slot count.
+    pub(crate) hydrate_ns: u64,
+    /// `prepare_job` — for a polygon layer, a whole `paint_input` built here,
+    /// on the frame thread. Scales with **layer data**.
+    pub(crate) prepare_ns: u64,
+    /// `hit_items`: the page-side half of a hit map, one `Arc` clone per item.
+    /// Answered by two handlers only. Scales with **layer data**.
+    pub(crate) hitmap_ns: u64,
+    /// `offload_job` and the supersede/cancel seam after it. Scales with pane
+    /// count and with what supersession left orphaned.
+    pub(crate) offload_ns: u64,
+}
+
+impl DispatchCuts {
+    /// Add `other` field-wise, saturating. One call per surviving request.
+    pub(crate) fn add(&mut self, other: DispatchCuts) {
+        self.dedupe_ns = self.dedupe_ns.saturating_add(other.dedupe_ns);
+        self.marks_ns = self.marks_ns.saturating_add(other.marks_ns);
+        self.hydrate_ns = self.hydrate_ns.saturating_add(other.hydrate_ns);
+        self.prepare_ns = self.prepare_ns.saturating_add(other.prepare_ns);
+        self.hitmap_ns = self.hitmap_ns.saturating_add(other.hitmap_ns);
+        self.offload_ns = self.offload_ns.saturating_add(other.offload_ns);
+    }
+
+    /// Whether anything was accumulated at all — a dispatch that ran but
+    /// spent under a nanosecond in every cut is not distinguishable from one
+    /// that never ran, and this reports the second as an absence.
+    fn any(self) -> bool {
+        self.dedupe_ns
+            | self.marks_ns
+            | self.hydrate_ns
+            | self.prepare_ns
+            | self.hitmap_ns
+            | self.offload_ns
+            != 0
+    }
+}
+
+/// Where the `post` segment's `dispatch` cut went — the split that names
+/// which of the six things `dispatch_overlay_renders` inlines is the one that
+/// costs.
+///
+/// # Denominator
+///
+/// **Exactly [`PostHists::dispatch`]'s** — presented interact frames on which
+/// the tail dispatched at all. Six named cuts plus a residual, so they
+/// telescope to `dispatch` by construction
+/// (`the_dispatch_cuts_telescope_to_dispatch`).
+///
+/// **Never added to `frame post (dispatch)`.** These are not a seventh post
+/// cut beside it; they *are* it, opened up — [`PostHists`]' own relationship
+/// to `frame segment (post)`, one level down. The reporting prefix is
+/// `frame dispatch` for that reason.
+///
+/// # What this split was cut to answer
+///
+/// Measured on Firefox scene D, quiet box: `dispatch` held **27,728 of the
+/// 33,043 µs** of `post` — 84% — carried by 19 of 176 frames. `post`'s split
+/// could say *that* and could not say *which*, because the call inlines a
+/// dedupe, a per-pane mark loop, a state hydrate, a `prepare_job`, a
+/// `hit_items` and an offload, and a percentile over the whole span names
+/// none of them.
+///
+/// # The residual reads high, and the six read low
+///
+/// Each cut converts its own nanosecond sum to whole microseconds and
+/// truncates down; the residual is what the parent span has left after all
+/// six. So up to six microseconds of truncation per dispatch land in the
+/// residual rather than in the cut that earned them. Stated because the
+/// residual is the figure that would otherwise be read as an unnamed cost:
+/// a residual of a few microseconds on a frame with six live cuts is
+/// arithmetic, not a finding.
+#[derive(Default)]
+pub(crate) struct DispatchHists {
+    /// See [`DispatchCuts::dedupe_ns`].
+    pub(crate) dedupe: Hist,
+    /// See [`DispatchCuts::marks_ns`].
+    pub(crate) marks: Hist,
+    /// See [`DispatchCuts::hydrate_ns`].
+    pub(crate) hydrate: Hist,
+    /// See [`DispatchCuts::prepare_ns`].
+    pub(crate) prepare: Hist,
+    /// See [`DispatchCuts::hitmap_ns`].
+    pub(crate) hitmap: Hist,
+    /// See [`DispatchCuts::offload_ns`].
+    pub(crate) offload: Hist,
+    /// `dispatch` minus the six above — arithmetic, not inference. Any
+    /// dispatch time the six do not name is a gap in this decomposition, and
+    /// this is where it shows.
+    pub(crate) residual: Hist,
+}
+
 /// The per-segment histograms of interact frames, and only interact frames:
 /// the segments exist to say where an interact frame's service went, and
 /// mixing idle frames in would average the answer away.
@@ -339,6 +466,14 @@ pub(crate) struct FrameLedger {
     ui: UiHists,
     /// See [`PostHists`] — `segments.post`, opened up, same frames.
     post: PostHists,
+    /// See [`DispatchHists`] — `post.dispatch`, opened up, same frames.
+    dispatch: DispatchHists,
+    /// The dispatch accumulator the current `dispatch_overlay_renders` call is
+    /// filling. Cleared and read by that call alone; a frame's value reaches
+    /// `cur.dispatch` through `record_dispatch_cuts`, so an arrival-path
+    /// dispatch — which runs upstream of the `post` tail — cannot leave a
+    /// figure behind that `finalize` would file under `dispatch`.
+    dispatch_scratch: DispatchCuts,
     /// The acquire span itself, interact frames only. Reported beside the
     /// segments and never inside service: it is the vsync block.
     acquire: Hist,
@@ -366,6 +501,15 @@ fn micros(a: Instant, b: Instant) -> u32 {
     b.duration_since(a).as_micros().min(u128::from(u32::MAX)) as u32
 }
 
+/// Whole nanoseconds from `a` to `b`, saturating into the dispatch
+/// accumulator's `u64`. The nanosecond twin of [`micros`], and the one
+/// spelling both `app.rs` and `app_fetch.rs` use to fill [`DispatchCuts`] —
+/// see that type for why this split counts in nanoseconds where every other
+/// one counts in microseconds.
+pub(crate) fn nanos(a: Instant, b: Instant) -> u64 {
+    b.duration_since(a).as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 /// The service figure, from the spelling [`SERVICE_FROM_WHOLE_FRAME`]
 /// selected. `segments` is `[pre, pump, ui, prepare, finish, post]`.
 fn service_micros(
@@ -381,6 +525,44 @@ fn service_micros(
             .iter()
             .fold(0u32, |sum, &segment| sum.saturating_add(segment))
     }
+}
+
+/// The seven cuts of the `dispatch` cut, in call order:
+/// `[dedupe, marks, hydrate, prepare, hitmap, offload, residual]` — see
+/// [`DispatchHists`], whose fields these are.
+///
+/// `dispatch` is the parent span in whole microseconds, as
+/// [`post_phase_micros`] computed it; `cuts` is the nanosecond accumulation
+/// the call itself made. The residual is the parent minus the six, saturating
+/// at zero — a free function so the telescoping is testable without a frame,
+/// on [`ui_phase_micros`]' terms.
+///
+/// **Saturating and not asserting.** The six are measured inside the span the
+/// parent brackets, so they cannot legitimately exceed it; but the parent is
+/// two clock reads and the six are twelve, and a clock that steps backwards
+/// between them (a coarse or non-monotonic web clock) would otherwise panic
+/// on the frame thread. A zero residual is the honest report of that case.
+fn dispatch_cut_micros(cuts: DispatchCuts, dispatch: u32) -> [u32; 7] {
+    let us = |ns: u64| -> u32 { (ns / 1_000).min(u64::from(u32::MAX)) as u32 };
+    let named = [
+        us(cuts.dedupe_ns),
+        us(cuts.marks_ns),
+        us(cuts.hydrate_ns),
+        us(cuts.prepare_ns),
+        us(cuts.hitmap_ns),
+        us(cuts.offload_ns),
+    ];
+    let claimed = named.iter().fold(0u32, |sum, &cut| sum.saturating_add(cut));
+    let [dedupe, marks, hydrate, prepare, hitmap, offload] = named;
+    [
+        dedupe,
+        marks,
+        hydrate,
+        prepare,
+        hitmap,
+        offload,
+        dispatch.saturating_sub(claimed),
+    ]
 }
 
 /// The standing worst frame after `candidate` has been offered to it.
@@ -524,6 +706,37 @@ impl FrameLedger {
     /// The phase stamps `handle_redraw`'s tail took on its way through.
     /// Recorded unconditionally; `finalize` decides whether this frame is a
     /// sample.
+    /// Add what one surviving request spent to the dispatch call in progress.
+    ///
+    /// Called by `spawn_overlay_render`, whose signature is not the place to
+    /// carry this: `app.rs` is pinned to exactly one textual call of it and
+    /// its ~30 test call sites all pass four arguments. The accumulator lives
+    /// here instead, and the call that owns the span clears and takes it.
+    pub(crate) fn add_dispatch_cuts(&mut self, cuts: DispatchCuts) {
+        self.dispatch_scratch.add(cuts);
+    }
+
+    /// Clear the accumulator and return what it held.
+    ///
+    /// Called twice by `dispatch_overlay_renders` — once on entry to start
+    /// from zero, once on return to read the call's own total. The
+    /// clear-on-entry is what keeps an arrival-path dispatch, which runs
+    /// upstream of the `post` tail in the same frame, out of the tail's
+    /// figure: that caller takes its total and drops it.
+    pub(crate) fn take_dispatch_cuts(&mut self) -> DispatchCuts {
+        std::mem::take(&mut self.dispatch_scratch)
+    }
+
+    /// File the `post` tail's dispatch decomposition for this frame.
+    ///
+    /// `None` from a frame whose tail dispatched nothing, which is most of
+    /// them — and that absence is recorded as an absence rather than as seven
+    /// zeros, because a frame with no dispatch has no `dispatch` cut to
+    /// decompose and would otherwise pull every percentile here to the floor.
+    pub(crate) fn record_dispatch_cuts(&mut self, cuts: DispatchCuts) {
+        self.cur.dispatch = cuts.any().then_some(cuts);
+    }
+
     pub(crate) fn record_post_phases(&mut self, stamps: PostPhaseStamps) {
         self.cur.post_phases = Some(stamps);
     }
@@ -624,6 +837,23 @@ impl FrameLedger {
                 self.post.poll.record(poll);
                 self.post.repaint.record(repaint);
                 self.post.close.record(close);
+                // One level further down, and only on the frames whose tail
+                // actually dispatched: `dispatch` is the cut recorded two
+                // lines above `back`, and these seven telescope to exactly
+                // it. A frame that dispatched nothing leaves `cur.dispatch`
+                // empty and contributes no sample here — see
+                // `record_dispatch_cuts`.
+                if let Some(cuts) = m.dispatch {
+                    let [dedupe, marks, hydrate, prepare, hitmap, offload, residual] =
+                        dispatch_cut_micros(cuts, dispatch);
+                    self.dispatch.dedupe.record(dedupe);
+                    self.dispatch.marks.record(marks);
+                    self.dispatch.hydrate.record(hydrate);
+                    self.dispatch.prepare.record(prepare);
+                    self.dispatch.hitmap.record(hitmap);
+                    self.dispatch.offload.record(offload);
+                    self.dispatch.residual.record(residual);
+                }
             }
         } else {
             self.service_idle.record(service);
@@ -669,6 +899,11 @@ impl FrameLedger {
 
     pub(crate) fn ui_phases(&self) -> &UiHists {
         &self.ui
+    }
+
+    /// See [`DispatchHists`] — `post.dispatch`, opened up.
+    pub(crate) fn dispatch_cuts(&self) -> &DispatchHists {
+        &self.dispatch
     }
 
     pub(crate) fn post_phases(&self) -> &PostHists {
@@ -727,8 +962,8 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        Instant, PostPhaseStamps, WorstFrame, latch_worst, micros, post_phase_micros,
-        prepare_phase_micros, service_micros, ui_phase_micros,
+        DispatchCuts, Instant, PostPhaseStamps, WorstFrame, dispatch_cut_micros, latch_worst,
+        micros, post_phase_micros, prepare_phase_micros, service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -1205,6 +1440,110 @@ mod tests {
             "the worst-frame latch sits inside finalize's interact/idle \
              block, so the frames that pay for a click -- every one of which \
              is filed idle -- cannot be the frame it reports",
+        );
+    }
+
+    /// A dispatch accumulation stated in nanoseconds, one field at a time.
+    fn cuts(
+        dedupe: u64,
+        marks: u64,
+        hydrate: u64,
+        prepare: u64,
+        hitmap: u64,
+        offload: u64,
+    ) -> DispatchCuts {
+        DispatchCuts {
+            dedupe_ns: dedupe,
+            marks_ns: marks,
+            hydrate_ns: hydrate,
+            prepare_ns: prepare,
+            hitmap_ns: hitmap,
+            offload_ns: offload,
+        }
+    }
+
+    /// **The seven telescope to `dispatch`.** The residual is defined as the
+    /// parent minus the six named, so this cannot be an approximate equality
+    /// and no reading of the split may need one: any dispatch time the six do
+    /// not name is *in* the seventh figure, not missing from the report.
+    #[test]
+    fn the_dispatch_cuts_telescope_to_dispatch() {
+        let dispatch = 9_000;
+        let seven = dispatch_cut_micros(
+            cuts(1_500_000, 40_000, 300_000, 5_200_000, 900_000, 60_000),
+            dispatch,
+        );
+        assert_eq!(
+            seven.iter().copied().fold(0u32, u32::wrapping_add),
+            dispatch,
+            "the seven cuts of `dispatch` do not sum to it: {seven:?}",
+        );
+        // And the residual is the one absorbing the difference, not a cut.
+        assert_eq!(seven[..6], [1_500, 40, 300, 5_200, 900, 60]);
+        assert_eq!(seven[6], 1_000);
+    }
+
+    /// **Sub-microsecond work is not rounded away.** The six accumulate in
+    /// nanoseconds precisely so that many cheap requests add up to a figure
+    /// instead of to nothing: per-request truncation to whole microseconds
+    /// would have reported eight 900 ns visits as 0 µs and handed the whole
+    /// 7.2 µs to the residual, which is read as "time the six do not name".
+    #[test]
+    fn many_sub_microsecond_visits_survive_into_the_cut_that_earned_them() {
+        let mut accumulated = DispatchCuts::default();
+        for _ in 0..8 {
+            accumulated.add(cuts(0, 0, 0, 0, 900, 0));
+        }
+        let seven = dispatch_cut_micros(accumulated, 20);
+        assert_eq!(seven[4], 7, "hitmap lost its sub-microsecond visits");
+        assert_eq!(seven[6], 13, "the residual absorbed them instead");
+    }
+
+    /// **A span the cuts overrun reports no residual, and does not panic.**
+    /// The parent is two clock reads and the six are twelve; a coarse or
+    /// backward-stepping web clock can order them wrongly, and a frame-thread
+    /// panic in an always-on instrument is a worse outcome than a zero.
+    #[test]
+    fn cuts_that_overrun_their_span_report_a_zero_residual() {
+        let seven = dispatch_cut_micros(cuts(0, 0, 0, 8_000_000, 0, 0), 3_000);
+        assert_eq!(seven[3], 8_000);
+        assert_eq!(
+            seven[6], 0,
+            "the residual went negative rather than to zero"
+        );
+    }
+
+    /// **An empty accumulation is an absence, not seven zeros.** Most frames
+    /// dispatch nothing at all; recording zeros for them would put thousands
+    /// of floor samples in seven histograms whose `n` is meant to *be* the
+    /// count of dispatching frames.
+    #[test]
+    fn a_frame_that_dispatched_nothing_offers_no_dispatch_sample() {
+        let mut ledger = super::FrameLedger::default();
+        ledger.record_dispatch_cuts(DispatchCuts::default());
+        assert!(
+            ledger.cur.dispatch.is_none(),
+            "an empty dispatch was filed as a sample",
+        );
+        ledger.record_dispatch_cuts(cuts(0, 0, 0, 1, 0, 0));
+        assert!(
+            ledger.cur.dispatch.is_some(),
+            "a dispatch that spent a nanosecond was filed as an absence",
+        );
+    }
+
+    /// **The accumulator is cleared by the take, not merely read.** That is
+    /// what keeps an arrival-path dispatch — which reaches the same function
+    /// earlier in the frame — out of the `post` tail's figure.
+    #[test]
+    fn taking_the_accumulator_clears_it() {
+        let mut ledger = super::FrameLedger::default();
+        ledger.add_dispatch_cuts(cuts(0, 0, 0, 4_000, 0, 0));
+        assert_eq!(ledger.take_dispatch_cuts(), cuts(0, 0, 0, 4_000, 0, 0));
+        assert_eq!(
+            ledger.take_dispatch_cuts(),
+            DispatchCuts::default(),
+            "a second take saw the first take's figure again",
         );
     }
 }

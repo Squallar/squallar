@@ -1294,3 +1294,70 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         );
     }
 }
+
+/// **Every dispatch cut is reported under its own name**, on
+/// [`every_post_phase_is_reported_under_its_own_name`]'s terms exactly: seven
+/// figures written in one order and read in another is a silent
+/// misattribution, and this split exists to answer *which* cut costs, so a
+/// swapped pair would be the whole finding, inverted.
+#[test]
+fn every_dispatch_cut_is_reported_under_its_own_name() {
+    let mut cuts = crate::frame_ledger::DispatchHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut cuts.dedupe,
+        &mut cuts.marks,
+        &mut cuts.hydrate,
+        &mut cuts.prepare,
+        &mut cuts.hitmap,
+        &mut cuts.offload,
+        &mut cuts.residual,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_dispatch_lines(&cuts);
+    let names = [
+        "dedupe", "marks", "hydrate", "prepare", "hitmap", "offload", "residual",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame dispatch ({name}): n={}, ", slot + 1)),
+            "dispatch cut {slot} reported as {line:?}, which is not {name}'s \
+             line carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The dispatch cuts collide with neither line the rig already reads.**
+/// These seven are one level below `frame post (dispatch)`, which is itself
+/// one level below `frame segment (post)`. All three spellings come out of
+/// `named_hist_line` and all three name a dispatch or a post; the rig keys
+/// its families on the prefix, so a shared prefix anywhere in that chain
+/// would let a reader add a span to its own decomposition.
+#[test]
+fn the_dispatch_cuts_are_readable_as_neither_post_cuts_nor_segments() {
+    let cuts = crate::frame_ledger::DispatchHists::default();
+    let mut phases = crate::frame_ledger::PostHists::default();
+    phases.dispatch.record(1_000);
+
+    for line in &super::frame_dispatch_lines(&cuts) {
+        assert!(
+            !line.starts_with("frame post (") && !line.starts_with("frame segment ("),
+            "a dispatch cut is written as {line:?}; the rig would file it \
+             beside the span it decomposes",
+        );
+    }
+    assert!(
+        super::frame_post_lines(&phases)
+            .iter()
+            .any(|line| line.starts_with("frame post (dispatch): ")),
+        "the post cut these seven decompose is no longer written, so nothing \
+         carries the total they sum to",
+    );
+}

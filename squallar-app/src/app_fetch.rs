@@ -1157,6 +1157,8 @@ impl super::App {
             return;
         }
 
+        // The `marks` cut opens here — see `frame_ledger::DispatchCuts`.
+        let marks_start = web_time::Instant::now();
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
                 match frame {
@@ -1178,6 +1180,11 @@ impl super::App {
                     .record_overlay_dispatch(pidx, &id, record.clone());
             }
         }
+        self.frame_ledger
+            .add_dispatch_cuts(crate::frame_ledger::DispatchCuts {
+                marks_ns: crate::frame_ledger::nanos(marks_start, web_time::Instant::now()),
+                ..Default::default()
+            });
 
         let first_pane_idx = pane_indices[0];
         if self.gui.pane(first_pane_idx).is_none() {
@@ -1237,19 +1244,44 @@ impl super::App {
                 // **The real pane, with its siblings.** `PaneView` and not
                 // `layer_ref`: the site table reads the radar slot's `"site"`
                 // out of `pane.slots`, and `layer_ref` carries none.
+                // Three cuts are taken inside the borrow below and added
+                // after it: `self.frame_ledger` cannot be reached while
+                // `self.gui` is borrowed mutably, so the stamps land in
+                // locals and the accumulate happens once the block closes.
+                let build_start = web_time::Instant::now();
+                // Declared unassigned: the block below has no early exit, so
+                // all three are definitely written, and a placeholder value
+                // here would be a dead store the compiler is right to flag.
+                let hydrated;
+                let prepared;
+                let hit_mapped;
                 let built = {
                     let (panes, overlays) = self.gui.panes_and_overlays_mut();
                     panes[first_pane_idx].hydrate_layer_states(overlays, first_pane_idx);
+                    hydrated = web_time::Instant::now();
                     let view = panes[first_pane_idx].view(first_pane_idx);
                     let pane = view.layer(id);
                     let job = overlays.prepare_job(id, &rctx, &pane);
+                    prepared = web_time::Instant::now();
                     // The page-side half of a hit map.
                     let id_map = overlays.hit_items(id);
+                    hit_mapped = web_time::Instant::now();
                     // The codec row the handler registered — its label is the
                     // job's name in the timing log.
                     let row = overlays.job_codec(id);
                     job.zip(row).map(|(job, row)| (job, id_map, row))
                 };
+                // Filed BEFORE the refusal exit below: a handler whose
+                // `prepare_job` answers `None` still paid for it, and a cut
+                // that only counted the requests that survived would read the
+                // refusals as free.
+                self.frame_ledger
+                    .add_dispatch_cuts(crate::frame_ledger::DispatchCuts {
+                        hydrate_ns: crate::frame_ledger::nanos(build_start, hydrated),
+                        prepare_ns: crate::frame_ledger::nanos(hydrated, prepared),
+                        hitmap_ns: crate::frame_ledger::nanos(prepared, hit_mapped),
+                        ..Default::default()
+                    });
                 let Some((job, id_map, row)) = built else {
                     self.clear_overlay_render_marks(&pane_indices, id, frame, &ticket);
                     return;
@@ -1261,6 +1293,10 @@ impl super::App {
                     side_ceiling_px: 0,
                 };
                 let request = squallar_worker::offload::JobRequest { geometry, job };
+                // The `offload` cut opens here and closes past the supersede
+                // seam: the two are one hand-off as far as the frame thread
+                // is concerned.
+                let offload_start = web_time::Instant::now();
                 // Kept for the supersede seam below — `pane_indices` itself
                 // rides out inside the response.
                 let destinations = pane_indices.clone();
@@ -1309,6 +1345,14 @@ impl super::App {
                         }
                     }
                 }
+                self.frame_ledger
+                    .add_dispatch_cuts(crate::frame_ledger::DispatchCuts {
+                        offload_ns: crate::frame_ledger::nanos(
+                            offload_start,
+                            web_time::Instant::now(),
+                        ),
+                        ..Default::default()
+                    });
             }
             // **Everything else — and it is NOT "the five non-texture layers".**
             // Four of those five never reach this match at all: `Metar`

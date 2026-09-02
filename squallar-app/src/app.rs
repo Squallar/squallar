@@ -880,7 +880,7 @@ impl App {
         // this tail does; `frame_ledger::PostHists` says what each one holds
         // and why the split exists. Taken here rather than handed back by a
         // callee because this tail is not one call.
-        let post_handled = self.process_gui_actions(gui_actions);
+        let (post_handled, post_dispatch_cuts) = self.process_gui_actions(gui_actions);
         let post_actions = web_time::Instant::now();
         self.push_back_claim();
         let post_back = web_time::Instant::now();
@@ -919,6 +919,10 @@ impl App {
                 self.egui_repaint_at = None;
             }
         }
+        // One level below the `dispatch` cut the stamps above bracket — the
+        // same span, opened up. Filed before the stamps so a reader meets the
+        // decomposition beside the thing it decomposes.
+        self.frame_ledger.record_dispatch_cuts(post_dispatch_cuts);
         self.frame_ledger
             .record_post_phases(crate::frame_ledger::PostPhaseStamps {
                 handled: post_handled,
@@ -1749,7 +1753,10 @@ impl App {
     /// the two cuts `frame_ledger::PostHists` makes here: the handling of the
     /// frame's actions, and the overlay dispatch it tails into. Stamped
     /// inside because that boundary is not visible from `handle_redraw`.
-    fn process_gui_actions(&mut self, actions: Vec<GuiAction>) -> web_time::Instant {
+    fn process_gui_actions(
+        &mut self,
+        actions: Vec<GuiAction>,
+    ) -> (web_time::Instant, crate::frame_ledger::DispatchCuts) {
         let mut overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)> = Vec::new();
 
         for action in actions {
@@ -1783,8 +1790,8 @@ impl App {
         }
 
         let handled = web_time::Instant::now();
-        self.dispatch_overlay_renders(overlay_renders);
-        handled
+        let cuts = self.dispatch_overlay_renders(overlay_renders);
+        (handled, cuts)
     }
 
     /// **The one way an overlay raster is asked for**, whichever path noticed
@@ -1800,12 +1807,23 @@ impl App {
     fn dispatch_overlay_renders(
         &mut self,
         overlay_renders: Vec<(usize, LayerId, fetch::OverlayRenderRequest)>,
-    ) {
+    ) -> crate::frame_ledger::DispatchCuts {
         if overlay_renders.is_empty() {
-            return;
+            return crate::frame_ledger::DispatchCuts::default();
         }
+        // **From zero.** The arrival path reaches this same function earlier
+        // in the frame, in `Ingest`, and fills the same accumulator; its
+        // total is not this call's and this clear is what keeps the two
+        // apart. See `frame_ledger::DispatchHists`.
+        self.frame_ledger.take_dispatch_cuts();
         let should_group = self.gui.overlay_renders_groupable();
+        let dedupe_start = web_time::Instant::now();
         let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
+        self.frame_ledger
+            .add_dispatch_cuts(crate::frame_ledger::DispatchCuts {
+                dedupe_ns: crate::frame_ledger::nanos(dedupe_start, web_time::Instant::now()),
+                ..Default::default()
+            });
         for (pane_indices, id, req) in grouped {
             if should_group {
                 log::debug!(
@@ -1819,6 +1837,9 @@ impl App {
             // `dispatch_overlay_loop_renders`, and it names its frame.
             self.spawn_overlay_render(pane_indices, id, req, None);
         }
+        // What this call spent, by cut. The caller in the `post` tail files
+        // it; the arrival-path caller drops it.
+        self.frame_ledger.take_dispatch_cuts()
     }
 
     /// Drain the archive scan channel and apply every queued volume.
@@ -2065,7 +2086,12 @@ impl App {
         // this runs in `Ingest`, ahead of the paint-list build and the
         // present that a draw-time action waits behind.
         let asks = self.arrived_overlay_asks(&arrived);
-        self.dispatch_overlay_renders(asks);
+        // **Dropped, and that is the point.** This dispatch runs in `Ingest`,
+        // upstream of the `post` tail whose `dispatch` cut the split
+        // decomposes, so its cuts belong to no cut. Filing them would put
+        // samples in a family whose denominator is `frame post (dispatch)`
+        // and stop the seven telescoping to it.
+        let _ = self.dispatch_overlay_renders(asks);
     }
 
     /// Tell the UI each site's current-volume stamp — what a whole-volume pane may build

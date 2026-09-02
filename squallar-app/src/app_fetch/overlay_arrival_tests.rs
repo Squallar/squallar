@@ -974,3 +974,48 @@ fn the_arrival_collection_names_no_dispatch_of_its_own() {
          raster is stale and each will re-dispatch what the other just drew.",
     );
 }
+
+/// **The dispatch decomposition starts from zero on every call, and the clear
+/// happens before any work it would otherwise inherit.**
+///
+/// `dispatch_overlay_renders` is reached twice per frame from different
+/// segments: the arrival path calls it in `Ingest`, upstream of the paint
+/// list, and the action path calls it in `handle_redraw`'s tail. Both fill
+/// the same accumulator on the ledger. Only the second one's total is the
+/// `post` segment's `dispatch` cut, and `frame dispatch (*)` telescopes to
+/// that cut — so an entry that did not clear would file the arrival path's
+/// microseconds inside a family whose denominator excludes them, and the
+/// seven would stop summing to their parent.
+///
+/// Stated as a property of the source because no behavioural test can see it:
+/// an accumulator that kept a stale total still reports seven figures, still
+/// telescopes on any frame where the arrival path happened not to run, and is
+/// wrong only on the frames where it did.
+#[test]
+fn the_dispatch_entry_clears_its_accumulator_before_it_dedupes() {
+    const APP: &str = include_str!("../app.rs");
+    let signature = "fn dispatch_overlay_renders(";
+    let entry = APP
+        .split_once(signature)
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once("\n    }"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("`{signature}` has no recognisable body"));
+
+    let clear = entry.find("take_dispatch_cuts()").unwrap_or_else(|| {
+        panic!(
+            "the dispatch entry never clears its accumulator, so an \
+             arrival-path dispatch earlier in the frame is counted inside the \
+             `post` tail's `dispatch` cut",
+        )
+    });
+    let dedupe = entry
+        .find("deduplicate_overlay_renders(")
+        .expect("control: the entry no longer dedupes, so this reads the wrong function");
+    assert!(
+        clear < dedupe,
+        "the dispatch entry clears its accumulator only after it has begun \
+         work, so whatever the dedupe costs is added to a total the clear \
+         then throws away",
+    );
+}
