@@ -1249,8 +1249,8 @@ impl Gui {
     ///
     /// The mean moves as tiles land, so near the boundary this can flip a
     /// frame later than a count would; the strip's sharpness is all it moves,
-    /// and the tile-sharpness rung's dwell (a later landing) is where
-    /// hysteresis for this family belongs.
+    /// and the tile-sharpness rung's dwell (`tile_source::snap`) is where
+    /// hysteresis for this family lives.
     pub(crate) fn tile_zoom_bias_for_pane(&self, pane_idx: usize) -> u8 {
         if self.floor_tile_zoom_bias == 0 || !self.is_floor_source(pane_idx) {
             return 0;

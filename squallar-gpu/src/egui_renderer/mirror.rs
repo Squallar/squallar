@@ -25,8 +25,9 @@ use squallar_device_profile::constants::MIRROR_MAX_SIDE;
 /// own texel density.
 ///
 /// Two independent things stop at 2. The tile cache: bias `log2(rung)` roughly
-/// quadruples the tiles per level against one shared `TILE_CACHE_ENTRIES` LRU
-/// (256 on desktop) — a 900-point floor strip drawing base and labels needs 72
+/// quadruples the tiles per level against the source's byte allowance
+/// (`Budgets::tile_styled_bytes`, 114 city-core entries at the desktop
+/// floor) — a 900-point floor strip drawing base and labels needs 72
 /// tiles at bias 0, 242 at 1 and 882 at 2, so bias 2 could not be held whatever
 /// the camera asked for. Those are the figures
 /// `squallar_egui::tiles::tiles_resident_for` reports, which are the worst case

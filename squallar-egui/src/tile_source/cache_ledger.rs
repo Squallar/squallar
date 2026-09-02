@@ -65,14 +65,16 @@
 //! * The **levels** — [`Totals::resident_entries`], [`Totals::resident_bytes`],
 //!   [`Totals::overrun_bytes`], [`Totals::floor_entries`],
 //!   [`Totals::wanted_on_glass`], [`Totals::wanted_net`],
-//!   [`Totals::parsed_entries`], [`Totals::parsed_bytes`] — are what is held
-//!   or wanted right now, stored rather than added, and the only figures here
-//!   that go down. With several sources of one role the last writer's level
-//!   stands. `overrun` is what the working-set floor keeps resident past the
-//!   byte budget; `floor` is that working set plus the in-flight markers;
-//!   the two `wanted` figures are the last whole pass's cells at the drawn
-//!   level and in the ancestor net, which is the tile term the application
-//!   prices its scene with.
+//!   [`Totals::parsed_entries`], [`Totals::parsed_bytes`], [`Totals::snapped`]
+//!   — are what is held or wanted right now, stored rather than added, and
+//!   the only figures here that go down. With several sources of one role
+//!   the last writer's level stands. `overrun` is what the working-set floor
+//!   keeps resident past the byte budget; `floor` is that working set plus
+//!   the in-flight markers; the two `wanted` figures are the last whole
+//!   pass's cells at the drawn level and in the ancestor net, which is the
+//!   tile term the application prices its scene with; `snapped` is `1` while
+//!   the tile-sharpness rung holds the source at the whole zoom
+//!   ([`super::snap`]) and is the one level the reported line carries.
 //!
 //! `requests − puts` is asks still in flight or failed, not a rate. `uploads`
 //! (the GPU store's) is never compared to any figure here by subtraction: an
@@ -181,6 +183,10 @@ pub struct Totals {
     pub parsed_entries: u64,
     /// A level: what those parses are charged.
     pub parsed_bytes: u64,
+    /// A level: `1` while the tile-sharpness rung holds a source of this
+    /// role at the whole zoom below the fractional one, else `0` — see
+    /// [`super::snap`]. The reported line's trailing `snap` field.
+    pub snapped: u64,
 }
 
 /// The four cache levels [`set_resident`] stores together, so a reading is
@@ -266,6 +272,7 @@ impl Totals {
             wanted_net: self.wanted_net,
             parsed_entries: self.parsed_entries,
             parsed_bytes: self.parsed_bytes,
+            snapped: self.snapped,
         }
     }
 }
@@ -290,6 +297,7 @@ struct RoleLedger {
     wanted_net: AtomicU64,
     parsed_entries: AtomicU64,
     parsed_bytes: AtomicU64,
+    snapped: AtomicU64,
     /// The last [`Totals::progress`] handed out by [`totals_if_moved`].
     reported: AtomicU64,
 }
@@ -315,6 +323,7 @@ impl RoleLedger {
             wanted_net: AtomicU64::new(0),
             parsed_entries: AtomicU64::new(0),
             parsed_bytes: AtomicU64::new(0),
+            snapped: AtomicU64::new(0),
             reported: AtomicU64::new(0),
         }
     }
@@ -377,6 +386,14 @@ pub fn set_parsed(role: CacheRole, entries: u64, bytes: u64) {
     ledger.parsed_bytes.store(bytes, Relaxed);
 }
 
+/// Whether the tile-sharpness rung holds one source of `role` at the whole
+/// zoom. A level, stored where the source's [`super::snap::SnapState`] flips.
+pub fn set_snapped(role: CacheRole, snapped: bool) {
+    LEDGER[role.index()]
+        .snapped
+        .store(u64::from(snapped), Relaxed);
+}
+
 /// Read one role.
 pub fn totals(role: CacheRole) -> Totals {
     let ledger = &LEDGER[role.index()];
@@ -399,6 +416,7 @@ pub fn totals(role: CacheRole) -> Totals {
         wanted_net: ledger.wanted_net.load(Relaxed),
         parsed_entries: ledger.parsed_entries.load(Relaxed),
         parsed_bytes: ledger.parsed_bytes.load(Relaxed),
+        snapped: ledger.snapped.load(Relaxed),
     }
 }
 

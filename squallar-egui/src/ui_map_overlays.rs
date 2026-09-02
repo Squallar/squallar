@@ -212,9 +212,18 @@ pub(super) fn draw_tile_layer(
         };
     };
 
-    let tile_zoom = (zoom.round() as u8)
-        .saturating_add(zoom_bias)
-        .min(source_max_zoom);
+    // egui's own frame counter, so the renderer can tell one frame's ground
+    // draws from the next without a clock or a frame callback of its own --
+    // and the pass the snap decision below is stepped for.
+    let pass_nr = ui.ctx().cumulative_pass_nr();
+
+    // The tile-sharpness rung, decided once per source per pass from the
+    // levels the last pass left (`tile_source::snap`): a snapped source is
+    // asked for the whole zoom below the fractional one and drawn scaled by
+    // `Projector::tile_rect`, exactly as an unsnapped source's tiles are drawn
+    // scaled between whole zooms. Integers; nothing is measured here.
+    let snapped = tiles.snap_for_pass(pass_nr);
+    let tile_zoom = crate::tiles::tile_zoom_for(zoom, snapped, zoom_bias, source_max_zoom);
 
     let span = crate::tiles::tile_span(projector, ui.max_rect(), tile_zoom);
 
@@ -245,10 +254,6 @@ pub(super) fn draw_tile_layer(
         }
     }
 
-    // egui's own frame counter, so the renderer can tell one frame's ground
-    // draws from the next without a clock or a frame callback of its own.
-    let pass_nr = ui.ctx().cumulative_pass_nr();
-
     // What this pass wants of the source: the cells the walk below draws plus
     // the net just asked for. The cache's floor follows it, so nothing on the
     // glass is ever evicted for history, and the cells the channel refused
@@ -259,6 +264,27 @@ pub(super) fn draw_tile_layer(
         span.tiles(),
         crate::tiles::warm_net_cells(span, tile_zoom),
     );
+
+    // What this pass would have wanted **unsnapped**, for the rung's release
+    // gate: the span itself while the two levels agree, else a second span at
+    // the level `round` picks -- priced by the source, never asked for. The
+    // ancestor net is in both, so the set the source would return to is the
+    // set it left, net and all.
+    let unsnapped_zoom = crate::tiles::tile_zoom_for(zoom, false, zoom_bias, source_max_zoom);
+    if unsnapped_zoom == tile_zoom {
+        tiles.note_unsnapped(
+            pass_nr,
+            span.tiles(),
+            crate::tiles::warm_net_cells(span, tile_zoom),
+        );
+    } else {
+        let unsnapped = crate::tiles::tile_span(projector, ui.max_rect(), unsnapped_zoom);
+        tiles.note_unsnapped(
+            pass_nr,
+            unsnapped.tiles(),
+            crate::tiles::warm_net_cells(unsnapped, unsnapped_zoom),
+        );
+    }
 
     // Once for the layer, not once per tile: a `Context` read lock and a
     // divide, against a span that holds up to 84 cells.
@@ -916,6 +942,142 @@ mod tests {
             "a layer of {cells} cells drained {drains} times; one layer is one \
              drain, and {cells} is what a per-cell drain would have cost"
         );
+    }
+
+    /// **A snapped source is asked for the whole zoom below the fractional one,
+    /// an unsnapped one for the rounded zoom, and each for its own ancestor
+    /// net** — the apply half of the tile-sharpness rung, driven through the
+    /// real decision rather than a test hook: the scene rung arms the source
+    /// and on the fifteenth armed pass the walk asks one level up. At zoom
+    /// 13.5 `round` gives 14 and `floor` 13, the half of every zoom the rung
+    /// exists for; the counts are read off the source's own pass tally, since
+    /// a six-slot request channel refuses most of a span and what is *cached*
+    /// after one pass says nothing about what was *asked* for. What the
+    /// source would draw unsnapped stays tallied while it is snapped — the
+    /// release gate's input — and equals what it drew before the snap.
+    #[test]
+    fn a_snapped_source_is_asked_for_the_whole_zoom_and_its_net_the_same_way() {
+        use crate::tile_source::snap::TILE_SNAP_DWELL_PASSES;
+        squallar_radar::tls::init();
+
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let zoom = 13.5;
+
+        let mut memory = walkers::MapMemory::default();
+        memory
+            .set_zoom(zoom)
+            .expect("zoom 13.5 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+
+        let mut tiles = crate::tile_source::HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+
+        let step = crate::tiles::WARM_ANCESTOR_STEPS;
+        let rounded = zoom.round() as u8;
+        let floored = zoom.floor() as u8;
+        assert_eq!(
+            rounded,
+            floored + 1,
+            "fixture: the half step must separate the two rules"
+        );
+        let sharp = crate::tiles::tile_span(&projector, canvas, rounded);
+        let whole = crate::tiles::tile_span(&projector, canvas, floored);
+        let sharp_set = (sharp.tiles(), crate::tiles::warm_net_cells(sharp, rounded));
+        let whole_set = (whole.tiles(), crate::tiles::warm_net_cells(whole, floored));
+        assert!(
+            whole_set.0 < sharp_set.0 && whole_set.1 > 0,
+            "fixture: the whole zoom must want fewer cells ({whole_set:?} against \
+             {sharp_set:?}) and still want a net"
+        );
+
+        let draw = |tiles: &mut crate::tile_source::HttpsTiles| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(canvas),
+                ..Default::default()
+            });
+            let ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("draw_tile_layer_snap"),
+                egui::UiBuilder::new()
+                    .layer_id(egui::LayerId::background())
+                    .max_rect(canvas),
+            );
+            draw_tile_layer(&ui, &projector, zoom, tiles, 0, None);
+            let _ = ctx.end_pass();
+        };
+
+        // Sharp: two passes so the tally has a whole pass to report.
+        draw(&mut tiles);
+        draw(&mut tiles);
+        assert!(
+            !tiles.snapped(),
+            "a source with no input snapped on its own"
+        );
+        assert_eq!(
+            tiles.wanted_for_test(),
+            sharp_set,
+            "unsnapped, the walk asked at the rounded level"
+        );
+        assert_eq!(
+            tiles.unsnapped_for_test(),
+            sharp_set,
+            "unsnapped, the counterfactual is the walk itself"
+        );
+
+        // The rung arms; the dwell holds the level for fourteen more passes.
+        tiles.set_whole_zoom_rung(true);
+        for _ in 0..TILE_SNAP_DWELL_PASSES - 1 {
+            draw(&mut tiles);
+        }
+        assert!(!tiles.snapped(), "snapped before the dwell had counted");
+        assert_eq!(
+            tiles.wanted_for_test(),
+            sharp_set,
+            "the level moved under the dwell"
+        );
+
+        // The fifteenth armed pass snaps and asks at the whole zoom, with the
+        // net one more step down; the pass after reports it as a whole pass.
+        draw(&mut tiles);
+        assert!(
+            tiles.snapped(),
+            "the dwell passed and the source did not snap"
+        );
+        draw(&mut tiles);
+        assert_eq!(
+            tiles.wanted_for_test(),
+            whole_set,
+            "snapped, the walk did not ask at the whole zoom"
+        );
+        assert_eq!(
+            tiles.unsnapped_for_test(),
+            sharp_set,
+            "snapped, the set the source would return to is not the set it left"
+        );
+        // And the net at the snapped level was really asked for: put as a
+        // marker, or refused by a channel the earlier passes' asks still fill
+        // and queued to go first next pass -- either is the ask; whether the
+        // IO task has drained a dead source's slots by now is not the pass's.
+        let net_zoom = floored - step;
+        for ty in (whole.north >> step)..=(whole.south >> step) {
+            for tx in (whole.west >> step)..=(whole.east >> step) {
+                let net = TileId {
+                    x: tx,
+                    y: ty,
+                    zoom: net_zoom,
+                };
+                assert!(
+                    tiles.asked_or_queued_for_test(net),
+                    "the snapped pass did not ask for its ancestor net at {net:?}: the net was traded"
+                );
+            }
+        }
     }
 
     /// **Drawing a layer asks for the ancestor net, and the net is small.**

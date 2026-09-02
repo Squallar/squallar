@@ -113,6 +113,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         wanted_net: 4,
         parsed_entries: 20,
         parsed_bytes: 5,
+        snapped: 0,
     };
     let later = Totals {
         requests: 25,
@@ -133,6 +134,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
         wanted_net: 14,
         parsed_entries: 24,
         parsed_bytes: 15,
+        snapped: 1,
     };
     let window = later.diff(&earlier);
     assert_eq!(
@@ -156,6 +158,7 @@ fn a_diff_subtracts_counters_and_keeps_levels() {
             wanted_net: 14,
             parsed_entries: 24,
             parsed_bytes: 15,
+            snapped: 1,
         }
     );
     // Saturating, never wrapping: a reading taken before another source's

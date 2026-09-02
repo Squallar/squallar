@@ -923,8 +923,10 @@ fn tiles_resident_for_reports_the_worst_case_over_the_zoom_range() {
 /// **The user's own 2878x1651 window is the last row, and it is the row the
 /// arithmetic overstates.** The grid arithmetic says 104 tiles at a whole
 /// zoom and 187 between zooms for a rect that size; the rig measured 86 and
-/// ~106 on the real window (2026-09-02, zoom 14.0 and 13.5), because the map
-/// pane is 0.75-0.83 of the canvas — the chrome takes the rest — and this
+/// 174 on the real window (2026-09-02, zoom 14.0 and 13.5, the working-set
+/// floor in place — the ~106 first read at 13.5 was the count cap's ceiling
+/// on what could be seen distinct, not the working set), because the map
+/// pane is 0.8-0.9 of the canvas — the chrome takes the rest — and this
 /// function prices the rect it is given. The two measured figures are held
 /// under the two predictions here so the overstatement stays a known
 /// direction and never a surprise.
@@ -954,11 +956,10 @@ fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
 
     // The user's window, as measured on the rig against what the rect
     // arithmetic predicts for the whole canvas.
-    const MEASURED_WHOLE_ZOOM: usize = 86;
-    const MEASURED_HALF_STEP: usize = 106;
+    use super::measured::{HALF_STEP_TILES, WHOLE_ZOOM_TILES};
     assert!(
-        MEASURED_WHOLE_ZOOM <= tiles_resident_at_whole_zoom(canvas(2878.0, 1651.0), 0, 1)
-            && MEASURED_HALF_STEP <= tiles_resident_for(canvas(2878.0, 1651.0), 0, 1),
+        WHOLE_ZOOM_TILES <= tiles_resident_at_whole_zoom(canvas(2878.0, 1651.0), 0, 1)
+            && HALF_STEP_TILES <= tiles_resident_with_warm_net(canvas(2878.0, 1651.0), 0, 1),
         "the rig measured more tiles on the user's window than the whole-canvas arithmetic \
          predicts: the map pane is now larger than the canvas"
     );
@@ -979,21 +980,77 @@ fn the_resident_counts_are_the_ones_the_tier_table_quotes() {
     assert_eq!(tiles_resident_for(canvas(1920.0, 1080.0), 255, 1), 0);
 }
 
+/// **The snapped level is the floor and the sharp level the round**, the bias
+/// after and the source's ceiling last — the one place the rule is spelled,
+/// held at the half step where the two rules part and in the lower half where
+/// they agree. And what the rule buys on the glass, on the projector the
+/// other tests use: at the half step the sharp span is past the whole-zoom
+/// bound and the snapped span inside it.
+#[test]
+fn the_snapped_level_is_the_floor_and_the_sharp_level_the_round() {
+    for zoom in [13.0, 13.25, 13.49] {
+        assert_eq!(tile_zoom_for(zoom, false, 0, 22), 13, "sharp at {zoom}");
+        assert_eq!(
+            tile_zoom_for(zoom, true, 0, 22),
+            13,
+            "snapped at {zoom}: the lower half of a zoom agrees with round"
+        );
+    }
+    for zoom in [13.5, 13.75, 13.99] {
+        assert_eq!(tile_zoom_for(zoom, false, 0, 22), 14, "sharp at {zoom}");
+        assert_eq!(
+            tile_zoom_for(zoom, true, 0, 22),
+            13,
+            "snapped at {zoom}: one level up"
+        );
+    }
+    // The bias applies after the rule and the ceiling last, for both.
+    assert_eq!(tile_zoom_for(13.5, false, 1, 22), 15);
+    assert_eq!(tile_zoom_for(13.5, true, 1, 22), 14);
+    assert_eq!(tile_zoom_for(13.5, false, 0, 13), 13);
+    assert_eq!(tile_zoom_for(13.5, true, 0, 12), 12);
+    assert_eq!(
+        tile_zoom_for(13.5, true, 255, 22),
+        22,
+        "the bias saturates before the ceiling clamps"
+    );
+
+    let (projector, rounded) =
+        projector_for(13.5, (35.33, -97.28), (0.5, 0.5)).expect("zoom 13.5 is in range");
+    assert_eq!(
+        rounded, 14,
+        "fixture: the helper rounds as the sharp rule does"
+    );
+    let sharp = tile_span(&projector, canvas(), tile_zoom_for(13.5, false, 0, 22)).tiles();
+    let snapped = tile_span(&projector, canvas(), tile_zoom_for(13.5, true, 0, 22)).tiles();
+    let whole = tiles_resident_at_whole_zoom(canvas(), 0, 1);
+    assert!(
+        sharp > whole,
+        "the sharp span ({sharp}) at the half step is not past the whole-zoom bound ({whole})"
+    );
+    assert!(
+        snapped <= whole,
+        "the snapped span ({snapped}) is past the whole-zoom bound ({whole}) the rung promises"
+    );
+}
+
 /// **Each bracket's styled floor holds what its argument says, in bytes, and
 /// the worst case exceeds the wasm floor — which is what the working-set
 /// floor and the snapping rung are for.** The old count test said the wasm
 /// arm "overruns at 1440p by design"; the byte arm's statement is different
 /// in kind. At the typical entry cost every floor holds the user's 2878x1651
 /// window between zooms (193 entries with the net) many times over. At the
-/// measured city-core tail the wasm floor holds 34 entries against the ~106
-/// the window measured: the floor in entries keeps those 106 resident as
-/// overrun, and the tile-sharpness rung snaps to the whole zoom (86) when a
-/// dwell of overrun says so. The desktop floor holds the user's window at the
-/// tail, its step holds 2560x1440 between zooms and its ceiling holds
-/// 3840x2160, so a workstation with a real driver is never in the floor's
-/// care at all. The arithmetic is in every message.
+/// measured city-core tail the wasm floor holds 34 entries against the 174
+/// the window measured at the half step: the floor in entries keeps those
+/// 174 resident as overrun, and the tile-sharpness rung snaps to the whole
+/// zoom (at most 86) when a dwell of overrun says so. The desktop floor holds
+/// the user's whole-zoom set at the tail and the half-step set at its
+/// measured cost twice over, its step holds 2560x1440 between zooms and its
+/// ceiling holds 3840x2160, so a workstation with a real driver is never in
+/// the floor's care at all. The arithmetic is in every message.
 #[test]
 fn each_tier_holds_the_canvas_its_docs_claim() {
+    use super::measured::{HALF_STEP_BYTES, HALF_STEP_TILES, WHOLE_ZOOM_BYTES, WHOLE_ZOOM_TILES};
     use crate::tile_source::{
         MEASURED_STYLED_ENTRY_BYTES, TYPICAL_STYLED_ENTRY_BYTES, worst_case_entries,
     };
@@ -1001,7 +1058,7 @@ fn each_tier_holds_the_canvas_its_docs_claim() {
 
     let canvas = |w: f32, h: f32| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
     let user_window = tiles_resident_with_warm_net(canvas(2878.0, 1651.0), 0, 1);
-    const MEASURED_ON_THE_USERS_WINDOW: usize = 106;
+    const MEASURED_ON_THE_USERS_WINDOW: usize = HALF_STEP_TILES;
     assert!(
         user_window >= MEASURED_ON_THE_USERS_WINDOW,
         "fixture: the arithmetic ({user_window}) must bound the measured {MEASURED_ON_THE_USERS_WINDOW}"
@@ -1035,17 +1092,32 @@ fn each_tier_holds_the_canvas_its_docs_claim() {
         "the wasm styled floor holds only {at_tail} city-core entries; a phone-sized viewport \
          is 20-35 tiles and the floor should hold most of one"
     );
+    // And the set the rung snaps the user's window to fits that floor, at
+    // its measured cost: the rung has somewhere to go.
+    assert!(
+        WHOLE_ZOOM_BYTES <= wasm_floor,
+        "the user's whole-zoom set ({WHOLE_ZOOM_BYTES} B) no longer fits the wasm styled floor \
+         ({wasm_floor} B): snapping cannot bring the window under budget"
+    );
 
-    // Desktop at the tail: the floor holds the user's window, the step holds
-    // 2560x1440 between zooms, the ceiling holds 4K.
+    // Desktop: the floor holds the user's whole-zoom set at the tail and the
+    // half-step set at its measured cost twice over -- at the tail the
+    // half-step set (254 MB) would overrun it and snap, to a set it holds --
+    // the step holds 2560x1440 between zooms, the ceiling holds 4K.
     let desktop = BudgetLimits::DESKTOP.tile_styled_bytes;
     let qhd = tiles_resident_for(canvas(2560.0, 1440.0), 0, 1);
     let uhd = tiles_resident_for(canvas(3840.0, 2160.0), 0, 1);
     assert!(
-        worst_case_entries(desktop.floor as u64) >= MEASURED_ON_THE_USERS_WINDOW,
-        "the desktop styled floor holds {} tail entries, under the {MEASURED_ON_THE_USERS_WINDOW} \
-         the user's window measured",
+        worst_case_entries(desktop.floor as u64) >= WHOLE_ZOOM_TILES,
+        "the desktop styled floor holds {} tail entries, under the {WHOLE_ZOOM_TILES} the user's \
+         window measured at a whole zoom: the set the rung snaps to no longer fits the floor",
         worst_case_entries(desktop.floor as u64)
+    );
+    assert!(
+        desktop.floor as u64 >= 2 * HALF_STEP_BYTES,
+        "the desktop styled floor ({} MiB) no longer holds the user's measured half-step set \
+         ({HALF_STEP_BYTES} B) twice over: the desktop arm would snap on the user's own window",
+        desktop.floor >> 20
     );
     assert!(
         worst_case_entries(desktop.step as u64) >= qhd,

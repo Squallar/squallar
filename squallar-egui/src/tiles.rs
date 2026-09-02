@@ -651,7 +651,9 @@ impl MapTileState {
 
     /// Hold every source here to `budget`: the base slot and its park to the
     /// styled and parsed allowances, the terrain slot and its park to the
-    /// terrain allowance. Called once per frame from `Gui::apply_frame_inputs`,
+    /// terrain allowance — and tell each where the ladder's tile-sharpness
+    /// rung stands (`budget.whole_zoom`), the scene-level input to its own
+    /// snap decision. Called once per frame from `Gui::apply_frame_inputs`,
     /// before the pane loop, when every slot is full.
     ///
     /// **A parked source is economy, and this is where it shrinks.** Nothing
@@ -674,12 +676,14 @@ impl MapTileState {
                 .flatten()
             {
                 base.set_budget(budget.styled_bytes, budget.parsed_bytes);
+                base.set_whole_zoom_rung(budget.whole_zoom);
             }
             for terrain in [self.terrain.as_mut(), self.parked_terrain.as_mut()]
                 .into_iter()
                 .flatten()
             {
                 terrain.set_budget(budget.terrain_bytes, 0);
+                terrain.set_whole_zoom_rung(budget.whole_zoom);
             }
         }
         for parked in [self.parked_base.as_mut(), self.parked_terrain.as_mut()]
@@ -810,6 +814,7 @@ impl MapTileState {
             // before it is asked for a tile.
             if let Some(tiles) = self.tiles.as_mut() {
                 tiles.set_budget(self.budget.styled_bytes, self.budget.parsed_bytes);
+                tiles.set_whole_zoom_rung(self.budget.whole_zoom);
             }
         }
 
@@ -1023,6 +1028,7 @@ impl MapTileState {
             self.terrain_failed = self.terrain.is_none();
             if let Some(terrain) = self.terrain.as_mut() {
                 terrain.set_budget(self.budget.terrain_bytes, 0);
+                terrain.set_whole_zoom_rung(self.budget.whole_zoom);
             }
         }
     }
@@ -1081,11 +1087,14 @@ pub const TILE_SIDE_POINTS: f32 = 256.0;
 ///
 /// walkers paints a tile `TILE_SIDE_POINTS · 2^(zoom − tile_zoom)` points
 /// across, and `ui_map_overlays::draw_tile_layer` picks
-/// `tile_zoom = zoom.round() + bias`, so the exponent is
+/// `tile_zoom = zoom.round() + bias` ([`tile_zoom_for`]), so the exponent is
 /// `zoom − round(zoom) − bias`. `zoom − round(zoom)` runs over `[−0.5, 0.5)`
 /// and **attains** `−0.5`, because Rust rounds a half away from zero: a tile is
 /// at its smallest exactly at the half step, `2^−0.5` of a side — 181.02 points
-/// at bias 0 — and more of them fit the same window.
+/// at bias 0 — and more of them fit the same window. A source the
+/// tile-sharpness rung has snapped is asked for `zoom.floor() + bias` instead,
+/// so its exponent runs over `[0, 1)`, it never draws a tile under a whole
+/// side, and its worst case is [`tiles_resident_at_whole_zoom`].
 pub const MIN_TILE_SCALE: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// How many tiles a rect keeps resident, at a zoom bias, across `layers` raster
@@ -1225,6 +1234,26 @@ impl TileSpan {
     }
 }
 
+/// The level `ui_map_overlays::draw_tile_layer` asks a source for: the
+/// fractional `zoom` rounded — or, for a source the tile-sharpness rung has
+/// snapped (`whole_zoom`, see `crate::tile_source::snap`), floored — plus the
+/// 3D floor's `zoom_bias`, clamped to the source's deepest level.
+///
+/// `floor` and `round` agree on the lower half of every zoom and differ by
+/// one on the upper half, which is exactly the half where the rounded level
+/// draws its tiles under a whole side and the most of them fit the glass
+/// ([`MIN_TILE_SCALE`]); the snapped level is drawn at one to two sides and
+/// its count is bounded by [`tiles_resident_at_whole_zoom`]. The bias applies
+/// after and the ceiling last, as they did before the rung existed.
+pub fn tile_zoom_for(zoom: f64, whole_zoom: bool, zoom_bias: u8, source_max_zoom: u8) -> u8 {
+    let level = if whole_zoom {
+        zoom.floor()
+    } else {
+        zoom.round()
+    };
+    (level as u8).saturating_add(zoom_bias).min(source_max_zoom)
+}
+
 /// The tiles that cover `rect` on the glass at `tile_zoom`.
 ///
 /// **Neither end is widened, and widening one would be a bug.**
@@ -1253,6 +1282,28 @@ pub fn tile_span(projector: &walkers::Projector, rect: egui::Rect, tile_zoom: u8
         north: lat_to_tile_y(max_lat, tile_zoom),
         south: lat_to_tile_y(min_lat, tile_zoom),
     }
+}
+
+/// **What the rig measured on the user's own window**, kept once so every
+/// test that argues from it argues from the same figures: Firefox on the
+/// `tilecache` leg, a 2878x1651 browser window over the dense city core,
+/// 2026-09-02, the working-set floor in place and the count cap gone. The
+/// figures are the `tile cache (base):` line's `floor`/`wanted` and
+/// `B resident` levels with nothing moving. The tier arithmetic in this file
+/// bounds them (`the_resident_counts_are_the_ones_the_tier_table_quotes`) and
+/// never replaces them; the plan's 187 and 104 were that arithmetic.
+#[cfg(test)]
+pub(crate) mod measured {
+    /// Cells the base source wanted at zoom 13.5 — the half step, drawn at
+    /// the rounded level 14 — glass and ancestor net together.
+    pub const HALF_STEP_TILES: usize = 174;
+    /// What those cells cost resident, in bytes.
+    pub const HALF_STEP_BYTES: u64 = 60_080_378;
+    /// Cells wanted at zoom 14.0 — a whole zoom, drawn at one side each: the
+    /// most a snapped source can want at that level.
+    pub const WHOLE_ZOOM_TILES: usize = 86;
+    /// What those cells cost resident, in bytes.
+    pub const WHOLE_ZOOM_BYTES: u64 = 32_104_551;
 }
 
 #[path = "tiles/tests.rs"]

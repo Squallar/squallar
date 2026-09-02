@@ -56,6 +56,7 @@ fn every_frame_input_surfaces_and_persists() {
             styled_bytes: 111_111,
             parsed_bytes: 222_222,
             terrain_bytes: 333_333,
+            whole_zoom: true,
         },
         location_settings_available: true,
         location: (squallar_location::LocationPermission::Denied, false),
@@ -142,6 +143,7 @@ fn every_frame_input_surfaces_and_persists() {
                 styled_bytes: 111_111,
                 parsed_bytes: 222_222,
                 terrain_bytes: 333_333,
+                whole_zoom: true,
             },
             "tile_cache did not survive frame {frame}"
         );

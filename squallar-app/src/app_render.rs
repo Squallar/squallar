@@ -404,7 +404,9 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
 /// subset of `asks` that answers that; `duplicate` and `orphan` are the two
 /// shapes of a body fetched for nothing. `entries`, `B resident` and `parsed`
 /// are levels and go down; `B` figures are the lower bound the slot can price
-/// today.
+/// today. `snap` is a level too, `1` while the tile-sharpness rung holds the
+/// role's source at the whole zoom below the fractional one
+/// (`squallar_egui::tile_source::snap`), else `0`.
 ///
 /// Never compared to `ground tiles: uploads` by subtraction: a put is a cache
 /// slot and an upload is a mesh buffer write, and a put with no fills uploads
@@ -416,7 +418,7 @@ fn tile_cache_line(
     format!(
         "tile cache ({}): {} asks, {} restyle asks, {} refetch after eviction, \
          {} puts first, {} restyle, {} duplicate, {} orphan, {} evicted pending, \
-         {} evicted resident of {} B, {} entries, {} B resident, {} parsed",
+         {} evicted resident of {} B, {} entries, {} B resident, {} parsed, snap {}",
         role.label(),
         t.requests,
         t.restyle_asks,
@@ -431,6 +433,7 @@ fn tile_cache_line(
         t.resident_entries,
         t.resident_bytes,
         t.parsed_entries,
+        t.snapped,
     )
 }
 

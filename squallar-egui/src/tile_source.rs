@@ -90,9 +90,10 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 /// tile still on the glass and refetches it next frame, for something the
 /// user never stopped looking at — and a count cannot say "48 MiB" when an
 /// entry is anywhere from 456 bytes to a megabyte. The user's own 2878x1651
-/// browser window at zoom 13.5 was the measurement: ~106 distinct tiles on
-/// the glass against a cap of 100, 93 % of asks refetches of tiles just
-/// evicted, 414 MB uploaded to hold 18.8 MB, with nothing moving.
+/// browser window at zoom 13.5 was the measurement: ~106 distinct tiles seen
+/// against a cap of 100 — the working set the floor later measured there is
+/// 174 — 93 % of asks refetches of tiles just evicted, 414 MB uploaded to
+/// hold 18.8 MB, with nothing moving.
 ///
 /// # Two slots, three populations
 ///
@@ -122,12 +123,13 @@ const RECOVERED: &str = "the archive is answering tile reads again, so it draws 
 ///
 /// `squallar_device_profile::constants::WASM_TILE_STYLED_BYTES` carries the
 /// whole argument. The user's window measured 86 tiles on the glass at a
-/// whole zoom and ~106 at the half step that rounds onto the archive's top
-/// level; at this tail that is 155 MB of styled entries, which the 48 MiB
-/// wasm floor **cannot hold** (34 entries) and is not asked to — the
-/// working-set floor keeps them resident as overrun, and whole-zoom snapping
-/// (the tile-sharpness rung, a later landing) is what brings such a scene
-/// back under budget. At the typical cost the same floor holds 1,600
+/// whole zoom (32,104,551 B) and 174 at the half step that rounds onto the
+/// archive's top level (60,080,378 B; Firefox, 2026-09-02, the floor in
+/// place); at this tail 174 entries would be 254 MB, which the 48 MiB wasm
+/// floor **cannot hold** (34 entries) and is not asked to — the working-set
+/// floor keeps them resident as overrun, and whole-zoom snapping (the
+/// tile-sharpness rung, [`snap`]) is what brings such a scene back under
+/// budget. At the typical cost the same floor holds 1,600
 /// entries. [`worst_case_entries`] is the arithmetic, for the tests and for
 /// `squallar_gpu`'s mirror rung cap.
 ///
@@ -636,6 +638,17 @@ impl TileCache {
     /// zoom-bias gate multiplies a projected working set by.
     fn mean_entry_bytes(&self) -> u64 {
         self.slots.mean_entry_bytes()
+    }
+
+    /// The byte allowance in force. See [`byte_lru::ByteLru::budget`].
+    fn budget(&self) -> u64 {
+        self.slots.budget()
+    }
+
+    /// What the working set alone holds past the allowance. See
+    /// [`byte_lru::ByteLru::floor_overrun_bytes`].
+    fn floor_overrun_bytes(&self) -> u64 {
+        self.slots.floor_overrun_bytes()
     }
 
     /// The slot under `tile_id`, refreshing its recency — a use, as
@@ -1529,6 +1542,21 @@ pub struct HttpsTiles {
     /// the next pass asks for them first. See [`AskQueue`].
     asks: AskQueue,
 
+    /// Where this source stands on the tile-sharpness rung, stepped once per
+    /// pass by [`Self::snap_for_pass`]. See [`snap`].
+    snap: snap::SnapState,
+
+    /// The ladder rung `fit` took, as the frame's budget delivered it
+    /// (`TileCacheBudget::whole_zoom`) — the scene-level input to the snap.
+    whole_zoom_rung: bool,
+
+    /// What the passes drawing this source would want **unsnapped** — the
+    /// cells at the level `round` picks, and their net — tallied per pass as
+    /// [`Self::wanted`] is. Equal to `wanted` while the source draws sharp;
+    /// while snapped it is the counterfactual the release gate prices, since
+    /// the set the source would return to is not on the glass to measure.
+    unsnapped: WantedTally,
+
     /// Tiles the IO task should fetch.
     request_tx: Sender<TileId>,
     /// Tiles the IO task has fetched: decoded on native, compressed bytes on
@@ -2168,6 +2196,9 @@ impl HttpsTiles {
             bodies: None,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            snap: snap::SnapState::default(),
+            whole_zoom_rung: false,
+            unsnapped: WantedTally::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -2426,6 +2457,7 @@ impl HttpsTiles {
     /// asks start over when it draws again.
     pub(crate) fn release_working_set(&mut self) {
         self.wanted = WantedTally::default();
+        self.unsnapped = WantedTally::default();
         self.asks.clear();
         self.cache.set_floor_entries(0);
         cache_ledger::set_wanted(self.cache.role, 0, 0);
@@ -2436,6 +2468,77 @@ impl HttpsTiles {
     /// set's cost multiplies by (`ui.rs`'s zoom-bias gate).
     pub(crate) fn mean_entry_bytes(&self) -> u64 {
         self.cache.mean_entry_bytes()
+    }
+
+    /// Tell this source where the ladder's tile-sharpness rung stands —
+    /// `Budgets::tile_whole_zoom`, pushed with the allowances by
+    /// `MapTileState::set_budget`. One of the two inputs to
+    /// [`Self::snap_for_pass`]; it moves nothing until the dwell has counted.
+    pub(crate) fn set_whole_zoom_rung(&mut self, rung: bool) {
+        self.whole_zoom_rung = rung;
+    }
+
+    /// **Whether this source draws at the whole zoom this pass** — the
+    /// tile-sharpness rung, decided once per pass ([`snap::snap_decision`]
+    /// steps nothing for a pass it has seen) from the levels the last pass
+    /// left: the rung as delivered, the styled cache's working-set overrun,
+    /// and the set the source would draw unsnapped priced at the cache's mean
+    /// entry. Called by `ui_map_overlays::draw_tile_layer` before the level
+    /// is chosen, so every pane drawing the source in a pass draws it the
+    /// same way. A flip is published to the ledger as the `snap` level.
+    pub(crate) fn snap_for_pass(&mut self, pass_nr: u64) -> bool {
+        let (on_glass, net) = self.unsnapped.completed();
+        let reading = snap::SnapReading {
+            whole_zoom_rung: self.whole_zoom_rung,
+            working_set_overrun_bytes: self.cache.floor_overrun_bytes(),
+            unsnapped_bytes: (on_glass.saturating_add(net) as u64)
+                .saturating_mul(self.cache.mean_entry_bytes()),
+            budget_bytes: self.cache.budget(),
+        };
+        let next = snap::snap_decision(self.snap, reading, pass_nr);
+        if next.snapped() != self.snap.snapped() {
+            cache_ledger::set_snapped(self.cache.role, next.snapped());
+        }
+        self.snap = next;
+        next.snapped()
+    }
+
+    /// What the pass drawing this source **would** have wanted unsnapped —
+    /// `on_glass` cells at the level `round` picks and `net` of its ancestor
+    /// net — accumulated across panes in `pass_nr` as [`Self::note_wanted`]
+    /// accumulates what was drawn. Priced, never asked for: the release gate
+    /// of [`Self::snap_for_pass`] reads the last whole pass's total.
+    pub(crate) fn note_unsnapped(&mut self, pass_nr: u64, on_glass: usize, net: usize) {
+        self.unsnapped.note(pass_nr, on_glass, net);
+    }
+
+    /// Whether the tile-sharpness rung holds this source at the whole zoom.
+    pub fn snapped(&self) -> bool {
+        self.snap.snapped()
+    }
+
+    /// The last whole pass's `(on_glass, net)` this source drew. See
+    /// [`Self::note_wanted`]; `cfg(test)` alone for [`Self::tile_is_cached`]'s
+    /// reason.
+    #[cfg(test)]
+    pub(crate) fn wanted_for_test(&self) -> (usize, usize) {
+        self.wanted.completed()
+    }
+
+    /// The last whole pass's `(on_glass, net)` this source would have drawn
+    /// unsnapped. See [`Self::note_unsnapped`].
+    #[cfg(test)]
+    pub(crate) fn unsnapped_for_test(&self) -> (usize, usize) {
+        self.unsnapped.completed()
+    }
+
+    /// Whether a pass asked for `tile_id`: a marker was put, or the channel
+    /// refused it and it is queued to be asked first next pass. The property
+    /// a draw pass leaves behind whatever the IO task has drained, where
+    /// [`Self::tile_is_cached`] alone depends on the channel having had room.
+    #[cfg(test)]
+    pub(crate) fn asked_or_queued_for_test(&self, tile_id: TileId) -> bool {
+        self.cache.contains(&tile_id) || self.asks.queued.contains(&tile_id)
     }
 
     /// Ask for the cells the channel refused, oldest first, until it refuses
@@ -3583,6 +3686,9 @@ impl HttpsTiles {
             bodies: frame_bodies,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            snap: snap::SnapState::default(),
+            whole_zoom_rung: false,
+            unsnapped: WantedTally::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -3658,6 +3764,9 @@ impl HttpsTiles {
             bodies: None,
             wanted: WantedTally::default(),
             asks: AskQueue::default(),
+            snap: snap::SnapState::default(),
+            whole_zoom_rung: false,
+            unsnapped: WantedTally::default(),
             request_tx,
             tile_rx,
             #[cfg(target_arch = "wasm32")]
@@ -4514,6 +4623,7 @@ fn discard_slot(name: &'static str, payload: impl Send + 'static) {
 
 pub mod byte_lru;
 pub mod cache_ledger;
+pub mod snap;
 pub mod take_ledger;
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),

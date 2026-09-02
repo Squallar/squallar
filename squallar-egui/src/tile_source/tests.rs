@@ -1194,6 +1194,96 @@ const STYLED_TAIL_CARRIES_THE_FLATTENED_HALF: () = assert!(
     "the measured styled tail no longer carries the flattened buffers beside the shapes"
 );
 
+/// **The user's canvas on the wasm floor snaps, and on the desktop floor
+/// never does** — the tier-table row for the tile-sharpness rung, in the
+/// bytes the rig measured rather than the counts the plan predicted. At zoom
+/// 13.5 the 2878x1651 window wants 174 tiles costing 60,080,378 B; against
+/// the 48 MiB wasm floor that is 9,748,730 B of working set the floor keeps
+/// as overrun, and fifteen passes of it snap the source to the whole zoom,
+/// whose set is at most the 86 tiles and 32,104,551 B a whole zoom measured
+/// — which fit. The release gate then prices the set the source left, not
+/// the one it holds: 60 MB against four fifths of 48 MiB keeps it snapped for
+/// as long as the window stays, so there is no flap. On the 160 MiB desktop
+/// floor the same 60 MB is under the allowance by 107 MB and nothing arms.
+#[test]
+fn the_users_canvas_snaps_at_the_wasm_floor_and_never_on_the_desktop_floor() {
+    use super::snap::{
+        SnapReading, SnapState, TILE_SNAP_DWELL_PASSES, fits_with_margin, snap_decision,
+    };
+    use crate::tiles::measured::{HALF_STEP_BYTES, WHOLE_ZOOM_BYTES};
+    use squallar_device_profile::budget::BudgetLimits;
+
+    let wasm = BudgetLimits::WASM.tile_styled_bytes.floor as u64;
+    let desktop = BudgetLimits::DESKTOP.tile_styled_bytes.floor as u64;
+    assert!(
+        HALF_STEP_BYTES > wasm && HALF_STEP_BYTES < desktop,
+        "fixture: the row is only a row while the half-step set sits between the two floors \
+         ({wasm} < {HALF_STEP_BYTES} < {desktop})"
+    );
+    let overrun = HALF_STEP_BYTES - wasm;
+    assert_eq!(
+        overrun, 9_748_730,
+        "the wasm floor or the measurement moved"
+    );
+    assert!(
+        WHOLE_ZOOM_BYTES <= wasm,
+        "the whole-zoom set ({WHOLE_ZOOM_BYTES} B) no longer fits the wasm floor ({wasm} B): \
+         the rung has nowhere to snap to on the user's window"
+    );
+
+    // wasm, sharp: the working set overruns by that much on every pass, and
+    // the fifteenth pass of it snaps.
+    let sharp_on_wasm = SnapReading {
+        whole_zoom_rung: false,
+        working_set_overrun_bytes: overrun,
+        unsnapped_bytes: HALF_STEP_BYTES,
+        budget_bytes: wasm,
+    };
+    let mut state = SnapState::default();
+    for pass in 1..u64::from(TILE_SNAP_DWELL_PASSES) {
+        state = snap_decision(state, sharp_on_wasm, pass);
+        assert!(!state.snapped(), "snapped on pass {pass}, before the dwell");
+    }
+    state = snap_decision(state, sharp_on_wasm, u64::from(TILE_SNAP_DWELL_PASSES));
+    assert!(
+        state.snapped(),
+        "fifteen passes of a 9.7 MB overrun did not snap"
+    );
+
+    // wasm, snapped: the whole-zoom set fits so nothing overruns, and the set
+    // the source left is still 60 MB against a 48 MiB allowance -- held.
+    let snapped_on_wasm = SnapReading {
+        working_set_overrun_bytes: 0,
+        ..sharp_on_wasm
+    };
+    assert!(!fits_with_margin(HALF_STEP_BYTES, wasm));
+    for pass in 16..=200 {
+        state = snap_decision(state, snapped_on_wasm, pass);
+        assert!(
+            state.snapped(),
+            "released on pass {pass}: the rung flaps on the user's window"
+        );
+    }
+
+    // desktop: the same set is 107 MB under the allowance; nothing arms, and
+    // the release margin would clear it four times over.
+    let on_desktop = SnapReading {
+        whole_zoom_rung: false,
+        working_set_overrun_bytes: 0,
+        unsnapped_bytes: HALF_STEP_BYTES,
+        budget_bytes: desktop,
+    };
+    assert!(fits_with_margin(HALF_STEP_BYTES, desktop));
+    let mut state = SnapState::default();
+    for pass in 1..=200 {
+        state = snap_decision(state, on_desktop, pass);
+        assert!(
+            !state.snapped(),
+            "the desktop floor snapped the user's window on pass {pass}"
+        );
+    }
+}
+
 /// **Two slots price against the brackets they are handed, and the prose that
 /// used to claim it is an imported assertion.** The old sizing note priced
 /// four live sources at 61.5 MiB apiece against
@@ -1204,7 +1294,7 @@ const STYLED_TAIL_CARRIES_THE_FLATTENED_HALF: () = assert!(
 /// `the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name`). What this
 /// holds, importing the figures rather than restating them: the terrain floor
 /// is a small fraction of the wasm GPU budget it is omitted from; the wasm
-/// styled floor cannot hold the user's 106-tile worst case at the measured
+/// styled floor cannot hold the user's 174-tile half-step set at the measured
 /// tail and holds 1,600 typical entries; and the measured tail is the whole
 /// slot — shapes and flattened buffers — and not the shapes alone.
 #[test]
@@ -1222,10 +1312,11 @@ fn the_two_slots_price_against_the_brackets_they_are_handed() {
     );
     let styled_floor = wasm.tile_styled_bytes.floor as u64;
     assert!(
-        super::worst_case_entries(styled_floor) < 106,
+        super::worst_case_entries(styled_floor) < crate::tiles::measured::HALF_STEP_TILES,
         "the wasm styled floor holds {} worst-case entries, so it now holds the user's \
-         106-tile window outright and the working-set floor is no longer what carries it",
+         {}-tile window outright and the working-set floor is no longer what carries it",
         super::worst_case_entries(styled_floor),
+        crate::tiles::measured::HALF_STEP_TILES,
     );
     assert!(
         styled_floor as usize / super::TYPICAL_STYLED_ENTRY_BYTES >= 1_600,
@@ -1582,8 +1673,9 @@ const BUDGET_FOR_200: u64 = 200 * FIXTURE_TILE_BYTES;
 /// reports keeps every cell resident, the overrun reads as exactly the
 /// shortfall, and nothing on the glass is ever evicted for history.
 ///
-/// This test landed `#[ignore]`d at WO-1 pinning the defect (`refetch > 0`),
-/// and flipped here. What it no longer carries is the double fetch either:
+/// This test first landed `#[ignore]`d, pinning the defect (`refetch > 0`)
+/// while the cache was count-bounded, and flipped when the byte budget and the
+/// floor arrived. What it no longer carries is the double fetch either:
 /// duplicate and orphan puts read zero, as
 /// [`an_evicted_pending_marker_is_never_fetched_twice`] holds without a
 /// floor.

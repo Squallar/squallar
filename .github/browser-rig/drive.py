@@ -2759,7 +2759,7 @@ var ground_stroke_draws_re = /ground tiles: .*, (\d+) stroke draws/;
 // probes; the role group is a WORD, so that file gives this its own arm, as
 // it does `budget_state_re`. Running totals: the LAST match per role wins for
 // the headline reading; every match is kept for the settle assertion.
-var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed/;
+var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed, snap (\d+)/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and

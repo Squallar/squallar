@@ -186,7 +186,7 @@ impl ParsedTile {
     /// control byte per bucket, and this counts `capacity()` of each — the
     /// usable seven-eighths of the buckets — because the bucket count itself
     /// is not observable. Consumers sizing a cache against this should treat
-    /// it the way `MEASURED_VECTOR_TILE_BYTES`' derivation treats its figure:
+    /// it the way squallar-egui's `MEASURED_STYLED_ENTRY_BYTES` treats its figure:
     /// re-measure by forcing the deriving test to fail, never infer.
     pub fn heap_bytes(&self) -> usize {
         self.layers.capacity() * std::mem::size_of::<ParsedLayer>()

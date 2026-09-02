@@ -237,6 +237,10 @@ pub const TILE_ECONOMY_SHARES: [u64; 3] = [2, 2, 1];
 /// ruling 5 asked for). So a card with room resolves the ceiling whatever
 /// rung its class earned, and a 4 GiB card whose scene has taken most of it
 /// resolves toward the floor.
+///
+/// The tile-sharpness rung rides along on both arms: `whole_zoom` is
+/// [`Budgets::tile_whole_zoom`] whatever the capacity's source, because it is
+/// the ladder's answer and not the economy's.
 pub fn tile_cache_budget(
     scene: &Scene,
     budgets: &Budgets,
@@ -257,6 +261,7 @@ pub fn tile_cache_budget(
         styled_bytes: share(TILE_ECONOMY_SHARES[0], limits.tile_styled_bytes),
         parsed_bytes: share(TILE_ECONOMY_SHARES[1], limits.tile_parsed_bytes),
         terrain_bytes: share(TILE_ECONOMY_SHARES[2], limits.tile_terrain_bytes),
+        whole_zoom: budgets.tile_whole_zoom,
     }
 }
 

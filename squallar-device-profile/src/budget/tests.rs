@@ -172,8 +172,65 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
             styled_bytes: limits.tile_styled_bytes.floor as u64,
             parsed_bytes: limits.tile_parsed_bytes.floor as u64,
             terrain_bytes: limits.tile_terrain_bytes.floor as u64,
+            whole_zoom: false,
         }
     );
+}
+
+/// **The sharpness rung rides with the tile allowances, both ways.** The
+/// `TileCacheBudget` a frame hands the tile caches says whether the ladder has
+/// taken the tile rung — `true` from the step that takes it, `false` on a
+/// fresh resolve — because it is the scene-level input to each source's snap
+/// decision (`squallar_egui::tile_source::snap`), and a flag left `false` on a
+/// stepped budget would leave that input dead while every byte figure arrived.
+/// The rung moves sharpness and not bytes: the three allowances are the
+/// figures they were.
+#[test]
+fn the_tile_allowances_carry_the_sharpness_rung() {
+    for limits in BudgetLimits::SHIPPED {
+        let fresh = resolve(&shipped_profile(limits));
+        assert!(
+            !fresh.tile_cache().whole_zoom,
+            "{}: a fresh resolve is snapped",
+            limits.name
+        );
+
+        let mut stepped = fresh;
+        let mut steps = 0;
+        while !stepped.tile_whole_zoom {
+            assert!(
+                step_down(&mut stepped, &limits),
+                "{}: the ladder ended after {steps} steps without taking the tile rung",
+                limits.name,
+            );
+            steps += 1;
+            assert!(
+                steps <= 16,
+                "{}: the tile rung is out of reach",
+                limits.name
+            );
+        }
+        let handed = stepped.tile_cache();
+        assert!(
+            handed.whole_zoom,
+            "{}: the rung was taken and the allowances did not say so",
+            limits.name
+        );
+        assert_eq!(
+            (
+                handed.styled_bytes,
+                handed.parsed_bytes,
+                handed.terrain_bytes
+            ),
+            (
+                fresh.tile_cache().styled_bytes,
+                fresh.tile_cache().parsed_bytes,
+                fresh.tile_cache().terrain_bytes,
+            ),
+            "{}: the sharpness rung moved a byte allowance",
+            limits.name,
+        );
+    }
 }
 
 /// The limits an adapter might really report, as `(2D, 3D)` pairs.
@@ -526,6 +583,7 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
             styled_bytes: b.tile_styled_bytes as u64,
             parsed_bytes: b.tile_parsed_bytes as u64,
             terrain_bytes: b.tile_terrain_bytes as u64,
+            whole_zoom: b.tile_whole_zoom,
         },
         "{from} / {}: the tile caches are handed different figures from the ones resolved",
         b.name,

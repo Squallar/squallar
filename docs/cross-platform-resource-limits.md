@@ -602,7 +602,8 @@ arithmetic instead of by a counter — one module-level six-rung table in
 `budget.rs`, shared by `demote` and `fit` through `step_down` — with two rungs
 inserted between resolution and grid: loop history (rung 3, one halving of
 `loop_render_budget` a step, 2D before 3D) and tile sharpness (rung 4,
-`Budgets::tile_whole_zoom`, consumed by WO-12). The two pins above kept every
+`Budgets::tile_whole_zoom`, consumed since WO-12 by each tile source's own snap
+decision — §11.2). The two pins above kept every
 property and were **re-argued in the body, not kept verbatim**: with the
 inserted rungs the grid reaches its floor and the ladder its fixed point later
 than the 3 and 4 steps the four-rung ladder pinned — by exactly the halvings
@@ -1212,6 +1213,42 @@ economy 512 MiB, … cause 0`) was the plan's sketch, not the app's line: `need`
 appear in the `Budgets:` prose lines when a fit is adopted, and the pressure
 cause in the `pressure:` line — and the source is an integer, not a word.
 
+The tile caches print a sibling line per cache role once anything has moved,
+scraped by `drive.py`'s `tile_cache_re` and by `native_row.py`'s own arm (the
+role is a word, so it cannot ride the all-`int()` loop), and held to the regex
+by `the_rig_reads_the_tile_cache_line_the_app_actually_writes`
+(`squallar-app/src/app_render.rs`, `tile_cache_line`):
+
+```text
+tile cache (<base|terrain>): N asks, N restyle asks, N refetch after eviction, N puts first, N restyle, N duplicate, N orphan, N evicted pending, N evicted resident of N B, N entries, N B resident, N parsed, snap 0|1
+```
+
+Running totals, one event at the cache each, denominators never added: `asks`
+(fresh requests), `restyle asks`, `refetch after eviction` (the subset of asks
+the cache remembers evicting — the `tilecache` leg's settle field), the four
+disjoint `puts`, the two `evicted` kinds and the bytes the resident ones were
+charged; then the levels `entries`, `B resident`, `parsed` and — since WO-12 —
+`snap`, `1` while the tile-sharpness rung holds that role's source at the whole
+zoom below the fractional one, else `0` (§11.2). The ledger's other levels
+(`overrun`, `floor`, the two `wanted`) are on `cache_ledger::Totals` and not
+printed. A binary older than the `snap` group matches nothing and the rig
+reads `n/a`, never `snap 0`. `drive.py`'s scraped object does not yet carry the
+new group (its `tile_cache_re` consumer is a one-line follow-on for that file's
+owner), so on the browser the reading is the console line itself and
+`native_row.py`'s row, whose arm `int()`s every group.
+
+**Figures, as landed and measured (WO-6/WO-12, 2026-09-02).** A styled entry's
+city-core tail is `MEASURED_STYLED_ENTRY_BYTES` = 1,462,708 B (shapes at
+capacity plus the flattened fills and strokes; the plan's ~1.03 MB left the
+strokes out). The styled allowance brackets are 48 / 64 / 64 MiB on wasm and
+mobile and 160 / 256 / 512 MiB on desktop (floor / step / ceiling; §1's table
+has the parsed and terrain populations). The user's 2878×1651 browser window
+over the dense city core wants **174 tiles / 60,080,378 B at zoom 13.5** and
+**86 tiles / 32,104,551 B at zoom 14.0** — glass plus ancestor net, read off
+the line's levels with nothing moving, Firefox — against the plan's arithmetic
+of 187 and 104 for the whole canvas; the ~106 first read at 13.5 was the count
+cap's ceiling on what could be seen distinct, not the working set.
+
 The same sentence is one row in the opt-in diagnostics overlay
 (`squallar-egui/src/ui_diagnostics.rs`). Ruling 4: this is a developer readout,
 not a control. The proof that signals moved nothing before anything read them
@@ -1524,7 +1561,13 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   allowance in force, less the economy the eviction just took; a second event
   lowers it again. `App::refit_under_pressure` carries the argument.
 - **(c) Restore economy and rungs** as pressure clears, in the shape
-  `LoopPoolState::observe` already has (dwell, then hysteresis).
+  `LoopPoolState::observe` already has (dwell, then hysteresis). *As landed
+  for the tile rung (WO-12, 2026-09-02):* `squallar_egui::tile_source::snap`
+  holds a snapped source until the ladder's rung is off **and** the set it
+  would draw unsnapped is projected to fit its allowance with a quarter to
+  spare, for fifteen consecutive passes (`TILE_SNAP_DWELL_PASSES`,
+  `TILE_SNAP_RELEASE_HYSTERESIS` = 5/4) — the same two figures as the pool's,
+  restated for a pass; §11.2.
 
 ### 10.4 Nothing persisted, and why
 
@@ -1622,8 +1665,9 @@ once per frame from `MapTileState::set_budget`. The channel-full skip's tail
 starvation is fixed by order, not depth: refused asks are queued in walk order
 and asked first next pass (`AskQueue`). On the measured arm the allowance is
 `fit::tile_cache_budget`: the economy allowance split 2:2:1, each share held
-inside its bracket. The `tile cache (base):` line is unchanged; the new levels
-(`overrun`, `floor`, `wanted`) are on `cache_ledger::Totals` and not printed.
+inside its bracket. The `tile cache (base):` line was unchanged at WO-6; the new
+levels (`overrun`, `floor`, `wanted`) are on `cache_ledger::Totals` and not
+printed. Since WO-12 the line carries one trailing level, `snap` (§8.6).
 
 ### 11.2 The model, applied
 
@@ -1665,12 +1709,48 @@ host-cache allowance (§9.3). **Shed** = whole-zoom snapping.
   double-fetches — only if WO-1 shows `orphan` / `duplicate` > 0. Stable mesh
   identity across restyles is recommended against: a restyle changes vertex
   colours.
-- **WO-12, the shed rung.** A bytes-based bias gate: after a 15-pass dwell of
-  measured overrun, `tile_zoom = zoom.floor()` for that source (187 → 104 tiles on
-  the glass of the user's canvas, plan) — sharpness, never input latency; hysteresis both
-  ways. **The ancestor net is never traded**: it is what keeps the map from
-  going blank while tiles arrive, and blank is a wrong picture where soft is
-  not.
+- **WO-12, the shed rung.** *(plan)* A bytes-based bias gate: after a 15-pass
+  dwell of measured overrun, `tile_zoom = zoom.floor()` for that source (187 →
+  104 tiles on the glass of the user's canvas) — sharpness, never input
+  latency; hysteresis both ways. **The ancestor net is never traded**: it is
+  what keeps the map from going blank while tiles arrive, and blank is a wrong
+  picture where soft is not.
+
+  **As landed (WO-12, 2026-09-02).** `squallar-egui/src/tile_source/snap.rs`
+  is the decision, pure and per source: `snap_decision(prev, reading, pass_nr)`
+  over a `SnapReading { whole_zoom_rung, working_set_overrun_bytes,
+  unsnapped_bytes, budget_bytes }`, stepped once per pass by
+  `HttpsTiles::snap_for_pass` before `draw_tile_layer` chooses its level (a
+  second pane in the same pass steps nothing). **Two inputs, either arms**: the
+  ladder's rung, `Budgets::tile_whole_zoom`, delivered as
+  `TileCacheBudget::whole_zoom` — the flag rides with the three allowances
+  through `FrameInputs.tile_cache` on both arms of `fit::tile_cache_budget`,
+  zero new `self.gui.` reaches — and the source's own measured overrun,
+  `ByteLru::floor_overrun_bytes`: the plain `overrun_bytes` less the case where
+  history is still leaving, so a shrink not yet paid (an economy event) never
+  sheds the rung. Armed for `TILE_SNAP_DWELL_PASSES` = 15 consecutive passes
+  the source snaps: `tiles::tile_zoom_for` gives `zoom.floor() + bias` where it
+  gave `zoom.round() + bias`, and `Projector::tile_rect` draws the coarser
+  level scaled, as it already drew every level between whole zooms —
+  placement, the warm net, labels and every latency untouched, and the
+  ancestor net asked for at `WARM_ANCESTOR_STEPS` under whichever level is
+  drawn. **Release needs both gone for the same dwell**: the rung off, no
+  overrun of the snapped set, and the set the source would draw *unsnapped*
+  (the cells `round` would want, glass and net, tallied per pass as the working
+  set is and priced at the cache's mean resident entry) fitting the allowance
+  with a quarter to spare (`TILE_SNAP_RELEASE_HYSTERESIS` = 5/4). Not the
+  resident bytes — they fill to the budget with history by design and would
+  never release a busy source — and not the snapped set's own bytes, which fit
+  by construction the moment the snap lands and would flap with period twice
+  the dwell. **Measured, not the plan's counts**: the user's window wants 174
+  tiles / 60,080,378 B at zoom 13.5 and 86 / 32,104,551 B at 14.0 (§8.6); on
+  the 48 MiB wasm floor that is 9,748,730 B of overrun, snapped after fifteen
+  passes to a set the floor holds and held there (60 MB against four fifths of
+  48 MiB — no flap); on the 160 MiB desktop floor nothing arms
+  (`the_users_canvas_snaps_at_the_wasm_floor_and_never_on_the_desktop_floor`).
+  The `tile cache (<role>):` line gains one trailing level, `snap 0|1` (§8.6).
+  Nothing runs on the frame thread for this but the decision's integers and,
+  while snapped, one more `tile_span` for the counterfactual.
 - **WO-14, page-thread cost.** Measure `tile phase (parse|style)` p50/p99 on
   Firefox, then Chromium; if `style` dominates, a resumable `StyledCursor` in
   `vendor/walkers/src/mvt.rs`. Worker offload of tile styling is the structural

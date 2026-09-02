@@ -905,6 +905,7 @@ fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_ot
             styled_bytes: limits.tile_styled_bytes.ceiling as u64,
             parsed_bytes: limits.tile_parsed_bytes.ceiling as u64,
             terrain_bytes: limits.tile_terrain_bytes.ceiling as u64,
+            whole_zoom: false,
         },
         "a 24 GiB card holds the ceiling and not a byte more"
     );
@@ -920,6 +921,7 @@ fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_ot
             styled_bytes: limits.tile_styled_bytes.floor as u64,
             parsed_bytes: limits.tile_parsed_bytes.floor as u64,
             terrain_bytes: limits.tile_terrain_bytes.floor as u64,
+            whole_zoom: false,
         },
         "a card with no economy left still holds the floor"
     );
@@ -941,7 +943,27 @@ fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_ot
             styled_bytes: limits.tile_styled_bytes.hold((e / parts * 2) as usize) as u64,
             parsed_bytes: limits.tile_parsed_bytes.hold((e / parts * 2) as usize) as u64,
             terrain_bytes: limits.tile_terrain_bytes.hold((e / parts) as usize) as u64,
+            whole_zoom: false,
         }
+    );
+
+    // The sharpness rung rides on both arms: step the budgets to the tile rung
+    // and the measured arm's allowance carries it as the presumed arm's does.
+    let mut snapped = budgets;
+    while !snapped.tile_whole_zoom {
+        assert!(
+            crate::budget::step_down(&mut snapped, &limits),
+            "the ladder ended before the tile rung"
+        );
+    }
+    assert!(
+        tile_cache_budget(&scene, &snapped, &limits, &presumed, stand_in_grid_bytes).whole_zoom
+    );
+    assert!(tile_cache_budget(&scene, &snapped, &limits, &roomy, stand_in_grid_bytes).whole_zoom);
+    assert_eq!(
+        tile_cache_budget(&scene, &snapped, &limits, &roomy, stand_in_grid_bytes).styled_bytes,
+        at_ceiling.styled_bytes,
+        "the sharpness rung moved the styled allowance"
     );
     assert!(
         inside.styled_bytes > limits.tile_styled_bytes.floor as u64

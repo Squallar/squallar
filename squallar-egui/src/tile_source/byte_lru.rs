@@ -222,6 +222,21 @@ impl<K: Hash + Eq, V> ByteLru<K, V> {
         self.resident.saturating_sub(self.budget)
     }
 
+    /// What the **working set alone** holds past the budget:
+    /// [`Self::overrun_bytes`] once every entry the floor does not protect is
+    /// gone, and zero while any remains. The distinction is what the
+    /// tile-sharpness rung arms on (`super::snap`): a shrink not yet paid is
+    /// economy leaving one entry a pump and reads as plain overrun for as many
+    /// pumps as it has entries, which must never shed a rung; a working set
+    /// that does not fit reads here, and only here.
+    pub fn floor_overrun_bytes(&self) -> u64 {
+        if self.slots.len() <= self.floor_entries {
+            self.overrun_bytes()
+        } else {
+            0
+        }
+    }
+
     /// The mean charge of a resident entry, floored at [`MARKER_BYTES`] — what
     /// a consumer projecting a working set's cost multiplies by.
     pub fn mean_entry_bytes(&self) -> u64 {
@@ -334,6 +349,44 @@ mod tests {
         assert_eq!(cache.trim_one().map(|e| e.key), None, "the debt is paid");
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.overrun_bytes(), 0);
+    }
+
+    /// **The working set's overrun is told from a shrink's.** Ten entries over
+    /// a budget of two read as eight of plain overrun either way; with a floor
+    /// of four they are history leaving and the working set reads zero until
+    /// the history is gone, then the two floor entries the budget cannot hold.
+    #[test]
+    fn the_floor_overrun_is_zero_while_history_remains() {
+        let mut cache: ByteLru<u32, ()> = ByteLru::new(10 * MARKER_BYTES);
+        let mut evicted = Vec::new();
+        for k in 0..10 {
+            cache.put(k, (), MARKER_BYTES, &mut evicted);
+        }
+        cache.set_floor_entries(4);
+        cache.set_budget(2 * MARKER_BYTES);
+        assert_eq!(cache.overrun_bytes(), 8 * MARKER_BYTES);
+        assert_eq!(
+            cache.floor_overrun_bytes(),
+            0,
+            "a shrink not yet paid read as the working set overrunning"
+        );
+        for _ in 0..6 {
+            cache.trim_one().expect("history remains");
+        }
+        assert_eq!(cache.len(), 4, "the trim went under the floor");
+        assert_eq!(cache.trim_one().map(|e| e.key), None, "the floor holds");
+        assert_eq!(cache.overrun_bytes(), 2 * MARKER_BYTES);
+        assert_eq!(
+            cache.floor_overrun_bytes(),
+            2 * MARKER_BYTES,
+            "the history is gone and the floor's own overrun did not read"
+        );
+        cache.set_budget(4 * MARKER_BYTES);
+        assert_eq!(
+            cache.floor_overrun_bytes(),
+            0,
+            "a budget that holds the floor overruns nothing"
+        );
     }
 
     /// A put under debt pays at most `EVICTIONS_PER_PUT` of it.

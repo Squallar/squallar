@@ -480,6 +480,12 @@ pub struct TileCacheBudget {
     pub parsed_bytes: u64,
     /// The terrain source's rasters. See [`BudgetLimits::tile_terrain_bytes`].
     pub terrain_bytes: u64,
+    /// Whether the ladder's tile-sharpness rung is taken —
+    /// [`Budgets::tile_whole_zoom`], the scene-level input to each source's
+    /// snap decision (`squallar_egui::tile_source::snap`). It rides with the
+    /// allowances because it is decided where they are, by `fit` against the
+    /// same capacity, and consumed where they are, per source per frame.
+    pub whole_zoom: bool,
 }
 
 /// A bracket from a `[floor, step, ceiling]` triple, the shape the tile
@@ -746,9 +752,11 @@ pub struct Budgets {
     pub raster_side_ceiling_px: usize,
     /// Whether map tiles are drawn at the whole zoom below the fractional one
     /// — fewer, larger tiles covering the same glass. The tile-sharpness rung
-    /// of the ladder sets it; `false` at every class rung. **No consumer reads
-    /// it yet**: the tile pump's bytes-based bias gate is a later landing, and
-    /// until it arrives this is the rung's position and nothing more.
+    /// of the ladder sets it; `false` at every class rung. Delivered to every
+    /// tile source through [`TileCacheBudget::whole_zoom`] as one of the two
+    /// inputs to its snap decision (`squallar_egui::tile_source::snap`; the
+    /// other is the source's own measured overrun), which snaps after a dwell
+    /// and releases only once this is `false` again.
     pub tile_whole_zoom: bool,
     /// Bytes the building geometry on one pane may occupy -- the `vram_bytes`
     /// ceiling a `BuildingMeshJob` is to be dispatched with once a production
@@ -773,6 +781,7 @@ impl Budgets {
             styled_bytes: self.tile_styled_bytes as u64,
             parsed_bytes: self.tile_parsed_bytes as u64,
             terrain_bytes: self.tile_terrain_bytes as u64,
+            whole_zoom: self.tile_whole_zoom,
         }
     }
 
