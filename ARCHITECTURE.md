@@ -833,3 +833,9 @@ Three corollaries this tree has paid for:
 
 Keep this file, `features.md` and `data.md` updated when architecture or
 features change.
+
+`docs/cross-platform-resource-limits.md` is the authority on resource budgets: the
+need / capacity / economy model, the capacity source per platform, and the
+degradation ladder `squallar_device_profile::budget::demote` walks.
+`squallar-device-profile/src/budget.rs` cites it by section number (§4.3, §7.4),
+so its section numbers are stable — extend it, do not renumber it.
