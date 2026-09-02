@@ -15,6 +15,7 @@
 //! under test.
 
 use squallar_device_profile::hist::Hist;
+use squallar_gpu::egui_renderer::geometry_staging::GeometryStagingTotals;
 use squallar_gpu::egui_renderer::pass_costs::{PassCosts, StagedGeometry};
 
 /// The rig driver, read at compile time so a moved or deleted file is a
@@ -202,10 +203,15 @@ fn the_prep_geometry_line_reads_exactly_as_pinned() {
         indices: 3333,
         bytes: 57_776,
     };
+    let routes = GeometryStagingTotals {
+        staged: 9,
+        declined: 2,
+        bytes: 57_776,
+    };
     assert_eq!(
-        super::prep_geometry_line(&staged),
+        super::prep_geometry_line(&staged, &routes),
         "frame prep geometry: 11 stagings, 2222 vertices, 3333 indices, \
-         57776 B staged",
+         57776 B staged, 9 through the ring, 2 declined",
     );
 }
 
@@ -343,11 +349,16 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
         indices: 3333,
         bytes: 57_776,
     };
+    let routes = GeometryStagingTotals {
+        staged: 9,
+        declined: 2,
+        bytes: 57_776,
+    };
     assert_eq!(
-        super::prep_geometry_line(&staged),
+        super::prep_geometry_line(&staged, &routes),
         rendered(
             &pattern("prep_geometry_re"),
-            &["11", "2222", "3333", "57776"],
+            &["11", "2222", "3333", "57776", "9", "2"],
         ),
         "the `frame prep geometry:` line and the rig's probe have drifted",
     );

@@ -206,6 +206,36 @@ fn a_frame_with_no_callbacks_still_submits_eguis_own_buffer() {
     assert_eq!(submission_order(Vec::new(), "egui"), vec!["egui"]);
 }
 
+/// A renderer built on a ring-capable device must be handed a geometry stager.
+///
+/// Nothing else in this crate can say so. The stager is installed by
+/// `EguiRenderer::new`, which needs a window and an event loop, and the
+/// behavioural gate for the staging itself
+/// (`squallar-gpu/tests/geometry_staging_gpu.rs`) builds a bare
+/// `egui_wgpu::Renderer` and installs one by hand. Between the two there is
+/// exactly one uncovered line, and dropping it would put every frame's
+/// geometry back through the BAR window with no test anywhere going red.
+#[test]
+fn a_new_renderer_installs_the_geometry_stager() {
+    let body = body_of(
+        include_str!("../egui_renderer.rs"),
+        "    ) -> EguiRenderer {",
+    );
+    assert!(
+        body.contains("set_geometry_stager("),
+        "EguiRenderer::new no longer installs a geometry stager, so every \
+         frame's vertices and indices go back to being pushed across PCIe by \
+         this thread at 2.15 GB/s",
+    );
+    assert!(
+        body.contains("geometry_staging::available(device)"),
+        "the geometry stager is installed without asking whether the device \
+         has a staging ring. On a device without one every claim declines, \
+         which is slower than not trying: see \
+         `geometry_staging::GeometryStagingTotals::declined`",
+    );
+}
+
 /// `update_buffers`' return must be bound and carried, not dropped.
 #[test]
 fn end_pass_and_upload_carries_the_callback_command_buffers() {

@@ -17,8 +17,8 @@ architecture or features change.
 ## 1. The crate graph
 
 Cargo workspace, `resolver = "2"`, edition 2024, toolchain `stable`
-(`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty-two members:
-eighteen first-party `squallar-*` crates, the `nexrad-level3` decoder, and three
+(`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty-nine members:
+twenty first-party `squallar-*` crates, the `nexrad-level3` decoder, and eight
 vendored crates.io crates.
 
 Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
@@ -151,20 +151,35 @@ as a **dev**-dependency only, for its own test targets. Cargo's normal-dep graph
 is acyclic. Read dependency questions off `cargo metadata`, per kind, the way
 the charters do.
 
-**Vendored members.** Seven directories under `vendor/` are workspace members
+**Vendored members.** Eight directories under `vendor/` are workspace members
 rather than `exclude`d: `nexrad-decode`, `nexrad-data`, `bzip2-rs`, `walkers`,
-`nexrad-model`, `pmtiles` and `mvt-reader`. Six of the seven are members
-deliberately, because their own upstream test targets are the behaviour pin that
-our patches must leave untouched, and those only run if `cargo test --workspace`
-selects them. All but `bzip2-rs` are patched over the registry copies by
-`[patch.crates-io]` in the root `Cargo.toml`; `bzip2-rs` is not patched —
-nothing else in the graph resolves that name, so `vendor/nexrad-data` depends on
-it by path. Each carries a `VENDORED.md` saying what was changed and why.
+`nexrad-model`, `pmtiles`, `mvt-reader` and `egui-wgpu`. Six of the eight are
+members deliberately, because their own upstream test targets are the behaviour
+pin that our patches must leave untouched, and those only run if
+`cargo test --workspace` selects them. All but `bzip2-rs` are patched over the
+registry copies by `[patch.crates-io]` in the root `Cargo.toml`; `bzip2-rs` is
+not patched — nothing else in the graph resolves that name, so
+`vendor/nexrad-data` depends on it by path. Each carries a `VENDORED.md` saying
+what was changed and why.
 
-`mvt-reader` is the exception to the "inherited pin" reason and its `VENDORED.md`
-leads with that: the published tarball carries **no test target at all**, so
-membership buys no upstream coverage and the pin on the patched function
-(`src/peak_allocation_tests.rs`) is written locally. Membership is still what
+**Membership is not free, and `egui-wgpu` is where that showed.** A member is
+built as a **root package with its own default features on**, whatever its
+dependents asked for, so vendoring a crate whose defaults are not benign
+rewrites the whole graph's feature set. `egui-wgpu`'s defaults pull
+`wgpu/default` and `wgpu/metal` into every target and
+`fragile-send-sync-non-atomic-wasm` into the browser one — 199 errors on the
+wasm row on the day it was vendored. Its vendored manifest empties `default`
+for that reason, and a ninth directory should check the same thing before it
+lands.
+
+`mvt-reader` and `egui-wgpu` are the exceptions to the "inherited pin" reason and
+their `VENDORED.md`s lead with it. `mvt-reader`'s published tarball carries **no
+test target at all**, so membership buys no upstream coverage and the pin on the
+patched function (`src/peak_allocation_tests.rs`) is written locally.
+`egui-wgpu` publishes no test target either; what it does carry is two
+one-line `Send + Sync` marker assertions in `src/`, which is a thinner pin than
+the other six inherit — the real one for the geometry-staging patch is
+`squallar-gpu/tests/geometry_staging_gpu.rs`. Membership is still what
 makes the patch possible — cargo cannot patch a crate the workspace does not
 build.
 

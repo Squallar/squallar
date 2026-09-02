@@ -17,6 +17,9 @@ pub struct EguiRenderer {
     uploads: texture_upload::TextureUploads,
     /// What ending each pass cost, phase by phase.
     pass_costs: pass_costs::PassCostLedger,
+    /// Which route this renderer's geometry took. The write side is inside
+    /// `egui_wgpu::Renderer`; this is the read side of the same counters.
+    geometry_staging: geometry_staging::GeometryStagingLedger,
     /// Whether this frame's raw input carried interaction. Written by
     /// [`Self::begin_frame`]; see [`Self::frame_had_interaction`].
     frame_interacted: bool,
@@ -63,6 +66,10 @@ pub mod pass_costs;
 
 /// How a texture delta gets onto the GPU without the frame paying for it.
 pub mod texture_upload;
+
+/// How a frame's vertices and indices get there without the frame paying for
+/// them either.
+pub mod geometry_staging;
 
 /// What the mirror pass is asked to copy, and where to put it. The 3D view's
 /// map floor is the pane's own map render, drawn into an off-screen strip below
@@ -315,7 +322,7 @@ impl EguiRenderer {
             None,
             Some(max_texture_side),
         );
-        let egui_renderer = Renderer::new(
+        let mut egui_renderer = Renderer::new(
             device,
             output_color_format,
             egui_wgpu::RendererOptions {
@@ -325,6 +332,18 @@ impl EguiRenderer {
                 ..Default::default()
             },
         );
+
+        // Without this the frame's vertices and indices are pushed across PCIe
+        // by this thread at 2.15 GB/s; with it the copy engine pulls them at
+        // an order of magnitude more. See [`geometry_staging`]. A device
+        // without the ring feature -- all of the web -- gets no stager and
+        // egui's own route, unchanged.
+        let geometry_ledger = geometry_staging::GeometryStagingLedger::default();
+        if geometry_staging::available(device) {
+            egui_renderer.set_geometry_stager(Box::new(geometry_staging::GeometryStaging::new(
+                &geometry_ledger,
+            )));
+        }
 
         EguiRenderer {
             state: egui_state,
@@ -338,6 +357,7 @@ impl EguiRenderer {
             },
             uploads: texture_upload::TextureUploads::new(device),
             pass_costs: pass_costs::PassCostLedger::default(),
+            geometry_staging: geometry_ledger,
             frame_interacted: false,
             probe: None,
         }
@@ -718,6 +738,13 @@ impl EguiRenderer {
     /// mirror pass makes twice in one pass.
     pub fn staged_geometry(&self) -> pass_costs::StagedGeometry {
         self.pass_costs.staged()
+    }
+
+    /// Which route that geometry took, asked unconditionally. See
+    /// [`geometry_staging::GeometryStagingTotals`] for the denominator and for
+    /// why a zero here is readable.
+    pub fn geometry_staging_totals(&self) -> geometry_staging::GeometryStagingTotals {
+        self.geometry_staging.totals()
     }
 
     /// What ending passes has cost this renderer's frame thread, asked

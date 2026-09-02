@@ -113,6 +113,32 @@ members = [
     # it fails on the pre-patch expression. See vendor/mvt-reader/VENDORED.md
     # and `[patch.crates-io]` below.
     "vendor/mvt-reader",
+    # The eighth vendored crates.io crate, and the one with the thinnest
+    # inherited pin. The published tarball sets `autotests = false` and carries
+    # no test target; what `cargo test -p egui-wgpu` selects is the two plain
+    # `#[test]` fns in `src/` -- measured: 2 unit tests, 0 doctests -- and both
+    # are one-line `Send + Sync` marker assertions. That is a narrower pin than
+    # the other seven inherit, and it is not nothing: `renderer_impl_send_sync`
+    # is what caught the local change's first spelling, which put a
+    # `Box<dyn GeometryStager>` on `Renderer` and took `Send + Sync` off it.
+    #
+    # It is a member because the workspace cannot patch a crate it does not
+    # build, and the patch is not optional: every frame's
+    # vertex and index data reaches the GPU through
+    # `Renderer::update_buffers`, which stages it with `queue.write_buffer_with`
+    # -- a `MAP_WRITE` buffer, which `wgpu-hal` places in the card's host-visible
+    # BAR window. Measured on this box, RTX 3090 / Vulkan: 2.15 GB/s through
+    # that window against 21 GB/s into cached system RAM, i.e. a ~10x per-byte
+    # penalty paid on the frame thread. `squallar-gpu`'s own texture path
+    # escaped this in August 2026 (`squallar-gpu/src/staging_ring.rs`);
+    # geometry never did.
+    #
+    # The pin that replaces the absent upstream one is written here rather than
+    # inherited, the same way `vendor/mvt-reader`'s is:
+    # `squallar-gpu/tests/geometry_staging_gpu.rs` reads the same picture back
+    # texel-for-texel off both routes and asserts the staged counts are
+    # identical. See vendor/egui-wgpu/VENDORED.md and `[patch.crates-io]` below.
+    "vendor/egui-wgpu",
 ]
 
 [workspace.package]
@@ -368,6 +394,7 @@ nexrad-model = { path = "vendor/nexrad-model" }
 walkers = { path = "vendor/walkers" }
 pmtiles = { path = "vendor/pmtiles" }
 mvt-reader = { path = "vendor/mvt-reader" }
+egui-wgpu = { path = "vendor/egui-wgpu" }
 
 # File and line in every frame, and nothing beyond it. A backtrace, a panic
 # location and a `#[track_caller]` frame are all line-table lookups, so each
@@ -475,6 +502,16 @@ opt-level = 2
 #
 # Delete this together with the `[patch.crates-io]` entry above.
 [profile.dev.package.pmtiles]
+opt-level = 2
+
+# And the last of them, for the reason every entry above gives: `"*"` covers
+# only non-members, so vendoring this crate dropped it to opt-level 0. It is
+# the most frame-path-bound of the eight -- `Renderer::update_buffers` and
+# `Renderer::render` run once per pass, every pass -- and the staging memcpy
+# this copy exists to redirect is a byte loop.
+#
+# Delete this together with the `[patch.crates-io]` entry above.
+[profile.dev.package.egui-wgpu]
 opt-level = 2
 
 [profile.release]

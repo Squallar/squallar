@@ -2799,7 +2799,7 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // subtraction. Mirror off: exact. Mirror on: a lower bound, never an
 // overstatement. `vertices`/`indices` are the staging
 // identity -- the same picture staged by another route reads the same two.
-var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged/;
+var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
@@ -2914,7 +2914,13 @@ for (var i = 0; i < C.length; i++) {
   if (x) prep_geometry = { t: t, stagings: parseInt(x[1], 10),
                            vertices: parseInt(x[2], 10),
                            indices: parseInt(x[3], 10),
-                           bytes_staged: parseInt(x[4], 10) };
+                           bytes_staged: parseInt(x[4], 10),
+                           // Which route those bytes took. A DIFFERENT
+                           // denominator from `stagings`: these two sum to the
+                           // stagings that had a mesh to move, so they are
+                           // never subtracted from it.
+                           ring_staged: parseInt(x[5], 10),
+                           ring_declined: parseInt(x[6], 10) };
   x = gpu_passes_re.exec(m);
   if (x) gpu = { t: t,
                  raymarch: { n: parseInt(x[1], 10), p50: x[2], p99: x[3] },

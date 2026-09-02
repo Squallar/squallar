@@ -817,10 +817,24 @@ fn prep_costs_line(c: &squallar_gpu::egui_renderer::pass_costs::PassCosts) -> St
 /// `vertices` and `indices` are the staging identity: the same picture staged
 /// by a different route must read the same two counts, so a route that is
 /// quicker because it stages less cannot pass as quicker.
-fn prep_geometry_line(g: &squallar_gpu::egui_renderer::pass_costs::StagedGeometry) -> String {
+///
+/// **Which route, and a third denominator.** The trailing pair is
+/// [`squallar_gpu::egui_renderer::geometry_staging::GeometryStagingTotals`]:
+/// stagings that went through cached host memory, and stagings that fell back
+/// to the mapping `wgpu` places in the card's BAR window. They sum to
+/// `stagings` minus the calls whose picture was entirely paint callbacks, so
+/// they are **not** subtracted from the count above. Both zero is a build with
+/// no ring — all of the web; `0 through the ring` with a non-zero
+/// `declined` is a ring that is installed and refusing, which costs what the
+/// BAR costs and is invisible in every other figure on this line.
+fn prep_geometry_line(
+    g: &squallar_gpu::egui_renderer::pass_costs::StagedGeometry,
+    r: &squallar_gpu::egui_renderer::geometry_staging::GeometryStagingTotals,
+) -> String {
     format!(
-        "frame prep geometry: {} stagings, {} vertices, {} indices, {} B staged",
-        g.calls, g.vertices, g.indices, g.bytes,
+        "frame prep geometry: {} stagings, {} vertices, {} indices, {} B staged, \
+         {} through the ring, {} declined",
+        g.calls, g.vertices, g.indices, g.bytes, r.staged, r.declined,
     )
 }
 
@@ -1571,7 +1585,10 @@ impl super::App {
             // them: a byte total and a microsecond total on two denominators.
             say_telemetry(
                 loud,
-                &prep_geometry_line(&state.egui_renderer.staged_geometry()),
+                &prep_geometry_line(
+                    &state.egui_renderer.staged_geometry(),
+                    &state.egui_renderer.geometry_staging_totals(),
+                ),
             );
             // The GPU pass family: real figures where a probe is installed,
             // the verbatim absence where this install asked (the probe is
