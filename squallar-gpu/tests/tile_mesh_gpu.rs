@@ -89,10 +89,18 @@ fn flat() -> std::sync::Arc<tile_mesh::TileMeshes> {
 /// texels.
 const FEATHERING: f32 = 1.0;
 
-/// The tile's strokes: four polylines with corners of every kind — a gentle
+/// The tile's strokes: five polylines with corners of every kind — a gentle
 /// bend, a right angle, and one sharper than a right angle, which is the
 /// branch that splits a path point in two — in translucent colours so the
 /// feathered edges have to blend the same way on both paths.
+///
+/// **The last one is a hairline**, thinner than [`FEATHERING`], so it takes
+/// epaint's three-edge ridge branch rather than the thick one. Both branches
+/// are in one fixture deliberately: they draw through the same pipeline out of
+/// the same buffer, so a gate over only one of them would leave the other with
+/// no picture ever compared. `the_stroke_callback_path_...` asserts both are
+/// present rather than trusting these numbers to stay on the right sides of
+/// the threshold.
 ///
 /// Coordinates are integers, as MVT geometry is, so the `i16` position the
 /// packed vertex carries is exact.
@@ -104,7 +112,7 @@ fn strokes() -> Vec<egui::epaint::PathShape> {
         colour: egui::Color32,
         width: f32,
     }
-    let lines: [Line; 4] = [
+    let lines: [Line; 5] = [
         Line {
             points: &[(200.0, 200.0), (3800.0, 600.0), (3600.0, 3600.0)],
             colour: egui::Color32::from_rgba_premultiplied(220, 40, 40, 255),
@@ -130,6 +138,13 @@ fn strokes() -> Vec<egui::epaint::PathShape> {
             points: &[(3900.0, 100.0), (100.0, 3900.0)],
             colour: egui::Color32::from_rgba_premultiplied(200, 200, 40, 80),
             width: 2.0,
+        },
+        // A hairline: 0.5 <= 0.9 * FEATHERING, so epaint paints it as a ridge
+        // two feather-widths wide with the thinness in the opacity.
+        Line {
+            points: &[(300.0, 3000.0), (2400.0, 900.0), (3800.0, 2600.0)],
+            colour: egui::Color32::from_rgba_premultiplied(240, 120, 200, 255),
+            width: 0.5,
         },
     ];
     lines
@@ -540,6 +555,21 @@ fn the_stroke_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
     // zero-length fill buffer for it would be a wgpu validation failure
     // rather than an empty draw.
     assert_eq!(meshes.vertex_count(), 0, "this fixture is strokes only");
+
+    // **Both of epaint's feathered branches are in the picture.** They share a
+    // pipeline and a buffer, so a fixture that drifted onto one side of the
+    // hairline threshold would still pass every assertion below while leaving
+    // the other branch with no rendered comparison anywhere.
+    let (thick, hairline): (Vec<_>, Vec<_>) = paths
+        .iter()
+        .partition(|path| path.stroke.width > 0.9 * FEATHERING);
+    assert!(
+        !thick.is_empty() && !hairline.is_empty(),
+        "the fixture has {} thick and {} hairline strokes at feathering \
+         {FEATHERING}; both branches must be drawn here",
+        thick.len(),
+        hairline.len()
+    );
 
     let mut readings = Vec::new();
     for format in [

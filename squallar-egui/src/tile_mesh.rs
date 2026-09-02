@@ -33,9 +33,13 @@
 //! * **Labels.** They need egui's font atlas and its glyph layout, they are
 //!   few, and they are laid out once per pane rather than once per tile.
 //! * **The background rectangle.** One shape per tile.
-//! * **Any stroke [`stroke::is_thick_open_stroke`] refuses** — a path whose
-//!   coordinates are not integers in `i16`, or one thinner than a pixel, whose
-//!   topology is a different branch of epaint's tessellator.
+//! * **Any stroke [`stroke::is_open_stroke`] refuses** — a closed path, a
+//!   filled one, a `ColorMode::UV` one, or a path whose coordinates are not
+//!   integers in `i16`. None of those can come out of `mvt::render_line` over
+//!   an MVT tile, so on the shipped path this list is empty; it is the branch
+//!   that keeps that a checked fact rather than a belief. **Both** of
+//!   epaint's feathered branches are carried, the thick one and the hairline
+//!   one — a line thinner than a pixel is not a refusal.
 //!
 //! # The GPU half
 //!

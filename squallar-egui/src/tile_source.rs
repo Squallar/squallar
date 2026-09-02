@@ -403,7 +403,7 @@ const RASTER_STYLE_EPOCH: u64 = 0;
 /// What a source flattens strokes at, given what the frame side has told it.
 ///
 /// Zero until it has said anything, and zero is the value
-/// `tile_mesh::stroke::is_thick_open_stroke` refuses every path at — so a
+/// `tile_mesh::stroke::is_open_stroke` refuses every path at — so a
 /// source that was never told keeps its strokes on the CPU rather than baking
 /// them at a guessed `pixels_per_point`.
 fn flatten_feathering(feathering: Option<f32>) -> f32 {
@@ -1133,7 +1133,7 @@ pub struct HttpsTiles {
     /// `None` until the frame side has said, which is what keeps a source
     /// that was never told off the GPU stroke path rather than guessing at
     /// it: [`Self::flatten_feathering`] answers 0, which
-    /// `tile_mesh::stroke::is_thick_open_stroke` refuses.
+    /// `tile_mesh::stroke::is_open_stroke` refuses.
     feathering: Option<f32>,
 
     /// Where a restyle lands for the IO task — the slot [`read_one`] reads a

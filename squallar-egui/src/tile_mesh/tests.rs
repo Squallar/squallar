@@ -3,7 +3,7 @@ use super::*;
 const EXTENT: f32 = 4096.0;
 
 /// Feathering off, which is what every fill-only case here wants: it is the
-/// value `stroke::is_thick_open_stroke` refuses at, so a `Shape::Path` in the
+/// value `stroke::is_open_stroke` refuses at, so a `Shape::Path` in the
 /// shape list stays the CPU path's exactly as it did before strokes were
 /// flattened at all.
 const NO_FEATHERING: f32 = 0.0;
@@ -420,23 +420,38 @@ fn a_fractional_coordinate_is_refused_and_closes_the_run() {
     assert_eq!(flatten(&integral, FEATHERING).runs().len(), 1);
 }
 
-/// **A hairline is refused.** epaint paints a line thinner than a pixel as a
-/// three-edge ridge with no caps — a different topology with a different
-/// vertex count — and that branch is *on feathering*, so it cannot ride in a
-/// uniform. The control is the same line one step thicker.
+/// **A hairline takes epaint's other branch, and is drawn rather than
+/// refused.** A line thinner than a pixel becomes a three-edge ridge — three
+/// vertices per path point instead of four, four triangles per segment
+/// instead of six, and no caps — which is a different topology but the same
+/// `point + normal * scalar` shape, so it pre-computes exactly as the thick
+/// branch does.
+///
+/// Both arms are here because the *counts* are what tell them apart, and a
+/// tree that quietly drew one as the other would still produce a picture.
 #[test]
-fn a_stroke_thinner_than_the_feathering_is_refused() {
+fn a_hairline_is_tessellated_on_epaints_ridge_branch_not_refused() {
+    let two_points = vec![egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)];
+
     let hairline = ShapeOrText::Shape(egui::Shape::line(
-        vec![egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)],
+        two_points.clone(),
         egui::Stroke::new(0.5 * FEATHERING, egui::Color32::RED),
     ));
-    assert!(flatten(&[hairline], FEATHERING).is_empty());
+    let flat = flatten(&[hairline], FEATHERING);
+    assert_eq!(flat.runs().len(), 1, "a hairline is a run, not a refusal");
+    // Two path points: 3 vertices each, 4 triangles for the one segment.
+    assert_eq!(flat.stroke_vertex_count(), 6);
+    assert_eq!(flat.stroke_index_count(), 12);
 
     let thick = ShapeOrText::Shape(egui::Shape::line(
-        vec![egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0)],
+        two_points,
         egui::Stroke::new(1.5 * FEATHERING, egui::Color32::RED),
     ));
-    assert_eq!(flatten(&[thick], FEATHERING).runs().len(), 1);
+    let flat = flatten(&[thick], FEATHERING);
+    assert_eq!(flat.runs().len(), 1);
+    // Two path points: 4 vertices each, and 18n - 6 indices.
+    assert_eq!(flat.stroke_vertex_count(), 8);
+    assert_eq!(flat.stroke_index_count(), 30);
 }
 
 /// Runs are in shape order, which is what lets the ground phase walk them in
@@ -487,11 +502,19 @@ fn stroke_indices_are_rebased_onto_each_runs_own_first_vertex() {
     );
 
     for run in strokes {
-        // Every path point contributes four vertices, so the run's vertex
-        // count is recoverable from its index count: 18n - 6 indices for n
-        // path points, hence n = (index_count + 6) / 18.
-        let points = (run.index_count + 6) / 18;
-        let vertices = points * stroke::VERTICES_PER_PATH_POINT;
+        // **The run's own vertex span, not a count derived from its index
+        // count.** Vertices per path point is 4 on epaint's thick branch and 3
+        // on its hairline one, so deriving one from the other would silently
+        // assume a branch; the span is what the vertex-buffer binding offset
+        // actually makes addressable either way.
+        let vertices = flat
+            .runs()
+            .iter()
+            .filter(|other| other.first_vertex > run.first_vertex)
+            .map(|other| other.first_vertex)
+            .min()
+            .unwrap_or(flat.stroke_vertex_count())
+            - run.first_vertex;
         for i in 0..run.index_count as usize {
             let index = flat
                 .stroke_index(run.first_index as usize + i)

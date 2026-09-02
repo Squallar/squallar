@@ -41,9 +41,13 @@ fn draw_rect() -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(1731.0, 909.0), egui::vec2(256.0, 256.0))
 }
 
-/// The fixture's shape list under the committed dark style, or `None` when
-/// the archive will not open.
-fn monaco_shapes() -> Option<Vec<ShapeOrText>> {
+/// The fixture tile's decoded geometry, or `None` when the archive will not
+/// open.
+///
+/// The **parse**, not the styling: [`walkers::mvt::styled`] evaluates any
+/// style at any zoom over this without re-reading the bytes, which is what
+/// lets the zoom sweep below cost one decode rather than fifteen.
+fn monaco_parsed() -> Option<walkers::mvt::ParsedTile> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/monaco.pmtiles");
     if FileRangeSource::open(&path).is_err() {
         eprintln!(
@@ -68,30 +72,54 @@ fn monaco_shapes() -> Option<Vec<ShapeOrText>> {
             .into_bytes()
             .expect("the fixture holds Monaco's own z14 tile")
     });
-    Some(
-        walkers::mvt::render(&bytes, &crate::basemap_style::committed(true), TILE.0)
-            .expect("the tile renders"),
-    )
+    Some(walkers::mvt::parse(&bytes).expect("the tile decodes"))
+}
+
+/// The fixture's shape list under the committed dark style at its own zoom.
+fn monaco_shapes() -> Option<Vec<ShapeOrText>> {
+    let parsed = monaco_parsed()?;
+    Some(walkers::mvt::styled(
+        &parsed,
+        &crate::basemap_style::committed(true),
+        TILE.0,
+    ))
 }
 
 /// epaint's tessellator, configured the way egui configures it for a frame at
-/// [`PIXELS_PER_POINT`].
-fn tessellator() -> egui::epaint::Tessellator {
+/// `pixels_per_point`.
+fn tessellator_at(pixels_per_point: f32) -> egui::epaint::Tessellator {
     egui::epaint::Tessellator::new(
-        PIXELS_PER_POINT,
+        pixels_per_point,
         egui::epaint::TessellationOptions::default(),
         [1, 1],
         Vec::new(),
     )
 }
 
-/// The feathering [`tessellator`] will use, read the way the shipped code
+/// The feathering [`tessellator_at`] will use, read the way the shipped code
 /// reads it rather than restated.
-fn feathering() -> f32 {
+fn feathering_at(pixels_per_point: f32) -> f32 {
     let options = egui::epaint::TessellationOptions::default();
     assert!(options.feathering, "the default is feathered");
-    options.feathering_size_in_pixels / PIXELS_PER_POINT
+    options.feathering_size_in_pixels / pixels_per_point
 }
+
+/// The feathering at [`PIXELS_PER_POINT`], which is what most of this file
+/// sweeps at.
+fn feathering() -> f32 {
+    feathering_at(PIXELS_PER_POINT)
+}
+
+/// The `pixels_per_point` that forces most of the committed styles' widths
+/// onto epaint's **hairline** branch.
+///
+/// The thinnest evaluated width is 0.3 points and the thickest 22.0, so no
+/// single value puts every stroke on one branch; 0.25 gives a feathering of 4
+/// and a hairline threshold of 3.6 points, which is above the great majority
+/// of them. It is not a display anybody has — it is a lever for reaching the
+/// branch, and `the_offsets_reproduce_epaints_own_tessellation` asserts that
+/// both branches were actually reached rather than assuming this worked.
+const HAIRLINE_PIXELS_PER_POINT: f32 = 0.25;
 
 /// **The pre-computed offsets reproduce epaint's own tessellation.**
 ///
@@ -106,19 +134,23 @@ fn feathering() -> f32 {
 /// runs the other way from what a reader expects — extent coordinates are
 /// small integers, so this side's subtraction is exact while epaint's loses
 /// bits to cancellation — but it is measured rather than argued.
-#[test]
-fn the_offsets_reproduce_epaints_own_tessellation() {
-    let Some(shapes) = monaco_shapes() else {
-        return;
-    };
-    let feathering = feathering();
-    let flat = flatten(&shapes, feathering);
+/// [`the_offsets_reproduce_epaints_own_tessellation`] at one
+/// `pixels_per_point`, answering how many paths it compared, how many of them
+/// took each of epaint's two branches, and the worst position disagreement.
+fn offsets_against_epaint(
+    shapes: &[ShapeOrText],
+    pixels_per_point: f32,
+) -> (usize, usize, usize, f32) {
+    let feathering = feathering_at(pixels_per_point);
+    let flat = flatten(shapes, feathering);
     let rect = draw_rect();
     let place = Placement::of(rect);
     let placement = walkers::mvt::placement(rect);
-    let mut tess = tessellator();
+    let mut tess = tessellator_at(pixels_per_point);
 
     let mut compared = 0usize;
+    let mut thick = 0usize;
+    let mut hairline = 0usize;
     let mut worst = 0.0f32;
 
     for run in flat.runs() {
@@ -142,6 +174,14 @@ fn the_offsets_reproduce_epaints_own_tessellation() {
             else {
                 panic!("the path arm did not answer a path");
             };
+
+            if stroke::vertices_per_path_point(placed.stroke.width, feathering)
+                == stroke::HAIRLINE_VERTICES_PER_PATH_POINT
+            {
+                hairline += 1;
+            } else {
+                thick += 1;
+            }
 
             let mut oracle = egui::epaint::Mesh::default();
             tess.tessellate_path(&placed, &mut oracle);
@@ -189,30 +229,68 @@ fn the_offsets_reproduce_epaints_own_tessellation() {
         }
     }
 
-    assert!(
-        compared > 400,
-        "only {compared} paths were compared against epaint; the fixture's \
-         densest tile holds hundreds and a comparison over a handful proves \
-         nothing"
-    );
+    (compared, thick, hairline, worst)
+}
 
-    // **The bound is one ulp of the placed coordinate**, not a tolerance
-    // somebody picked. Nothing can be closer: the two sides land on adjacent
-    // representable `f32`s at worst, which is the floor of what the format can
-    // express and is 32x under the 1/256 of a point the rasteriser resolves.
-    // Stating it this way also makes the bound independent of the style and of
-    // where the tile is drawn, so a style edit cannot quietly loosen it.
-    let ulp = f32::EPSILON * rect.max.x.max(rect.max.y);
-    println!(
-        "worst position disagreement with epaint: {worst:e} points over \
-         {compared} paths, against one ulp of the placed coordinate = {ulp:e}"
-    );
+/// **The pre-computed offsets reproduce epaint's own tessellation, on both of
+/// its branches.**
+///
+/// The claim this whole mechanism rests on. Run twice: once at
+/// [`PIXELS_PER_POINT`], where the committed styles are mostly thick, and once
+/// at [`HAIRLINE_PIXELS_PER_POINT`], where most widths cross onto the ridge.
+/// **Both arms are asserted to have been reached**, so neither pass can be a
+/// silent repeat of the other branch.
+#[test]
+fn the_offsets_reproduce_epaints_own_tessellation() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+
+    let mut reached_thick = 0usize;
+    let mut reached_hairline = 0usize;
+
+    for pixels_per_point in [PIXELS_PER_POINT, HAIRLINE_PIXELS_PER_POINT] {
+        let (compared, thick, hairline, worst) = offsets_against_epaint(&shapes, pixels_per_point);
+        reached_thick += thick;
+        reached_hairline += hairline;
+
+        assert!(
+            compared > 400,
+            "only {compared} paths were compared against epaint at \
+             pixels_per_point {pixels_per_point}; the fixture's densest tile \
+             holds hundreds and a comparison over a handful proves nothing"
+        );
+
+        // **The bound is one ulp of the placed coordinate**, not a tolerance
+        // somebody picked. Nothing can be closer: the two sides land on
+        // adjacent representable `f32`s at worst, which is the floor of what
+        // the format can express and is far under the 1/256 of a point the
+        // rasteriser resolves. Stating it this way also makes the bound
+        // independent of the style and of where the tile is drawn.
+        let rect = draw_rect();
+        let ulp = f32::EPSILON * rect.max.x.max(rect.max.y);
+        println!(
+            "  pixels_per_point {pixels_per_point}: {compared} paths \
+             ({thick} thick, {hairline} hairline), worst disagreement \
+             {worst:e} points against one ulp = {ulp:e}"
+        );
+        assert!(
+            worst <= ulp,
+            "at pixels_per_point {pixels_per_point} the pre-computed offsets \
+             put a vertex {worst} points from where epaint's own tessellator \
+             put it, over {compared} paths — more than the {ulp} that is one \
+             ulp of the placed coordinate, so the two are no longer differing \
+             only in the last bit"
+        );
+    }
+
+    // Neither branch may be untested: a pass over thick strokes alone would
+    // say nothing about the hairline arm, and vice versa.
     assert!(
-        worst <= ulp,
-        "the pre-computed offsets put a vertex {worst} points from where \
-         epaint's own tessellator put it, over {compared} paths — more than \
-         the {ulp} that is one ulp of the placed coordinate, so the two are \
-         no longer differing only in the last bit"
+        reached_thick > 0 && reached_hairline > 0,
+        "the comparison reached {reached_thick} thick paths and \
+         {reached_hairline} hairline ones; both of epaint's feathered \
+         branches have to be exercised or one of the two arms is unproven"
     );
 }
 
@@ -364,7 +442,7 @@ fn the_counts_are_epaints_arithmetic() {
     };
     let feathering = feathering();
     let flat = flatten(&shapes, feathering);
-    let mut tess = tessellator();
+    let mut tess = tessellator_at(PIXELS_PER_POINT);
 
     let mut vertices = 0u32;
     let mut indices = 0u32;
@@ -376,14 +454,304 @@ fn the_counts_are_epaints_arithmetic() {
         tess.tessellate_path(path, &mut oracle);
         vertices += oracle.vertices.len() as u32;
         indices += oracle.indices.len() as u32;
+
+        // Which arithmetic applies is a property of the width against the
+        // feathering, so it is asked rather than assumed: 4 vertices and
+        // `18n - 6` indices on the thick branch, 3 and `12(n - 1)` on the
+        // hairline one.
+        let per_point = stroke::vertices_per_path_point(path.stroke.width, feathering);
+        let n = oracle.vertices.len() as u32 / per_point;
+        let expected = if per_point == stroke::HAIRLINE_VERTICES_PER_PATH_POINT {
+            12 * (n - 1)
+        } else {
+            18 * n - 6
+        };
         assert_eq!(
             oracle.indices.len() as u32,
-            18 * (oracle.vertices.len() as u32 / stroke::VERTICES_PER_PATH_POINT) - 6,
-            "epaint's own output is not 4 vertices and 18n-6 indices per path \
-             point, so the arithmetic this file documents is wrong"
+            expected,
+            "epaint's own output does not match the arithmetic this file \
+             documents for the branch a {}-point line takes at feathering \
+             {feathering}",
+            path.stroke.width
         );
     }
 
     assert_eq!(flat.stroke_vertex_count(), vertices);
     assert_eq!(flat.stroke_index_count(), indices);
+}
+
+/// Which shapes of `shapes` a stroke run of `flat` has taken to the GPU.
+///
+/// A `Text` inside a span is marked too and simply never counted: the caller
+/// only ever asks about paths.
+fn covered_by_a_stroke_run(shapes: &[ShapeOrText], flat: &TileMeshes) -> Vec<bool> {
+    let mut covered = vec![false; shapes.len()];
+    for run in flat.runs() {
+        if run.kind != RunKind::Stroke {
+            continue;
+        }
+        for at in run.shape_index..run.shape_index + run.shape_span {
+            covered[at as usize] = true;
+        }
+    }
+    covered
+}
+
+/// What one sweep of both committed themes over every reachable zoom found.
+struct Sweep {
+    /// Stroke points the styles produced, over every (theme, zoom) pair.
+    points: usize,
+    /// Of those, points on a path the GPU path refused.
+    refused: usize,
+    /// Points on a path epaint paints as a **hairline** — its three-edge
+    /// ridge branch, a different topology with no caps. Counted over *every*
+    /// stroke point and not only the refused ones, because since the hairline
+    /// arm landed these are drawn rather than refused, and the figure is now
+    /// the coverage of that arm rather than the size of a gap.
+    hairline: usize,
+    pairs: usize,
+    pairs_with_strokes: usize,
+    /// The (theme, zoom, refused, hairline) that refused most.
+    worst: Option<(&'static str, u8, usize, usize)>,
+}
+
+/// Style the fixture at every zoom of both committed themes, flatten each
+/// result at `feathering`, and count what the GPU path refused.
+///
+/// **Integer zooms are the whole population, not a sample.** `mvt::styled`
+/// takes `zoom: u8` and every call site rounds
+/// (`ui_map_overlays::draw_tile_layer`'s `zoom.round() as u8`), so a style is
+/// never evaluated between two stops and an interpolated width has no
+/// continuum to dip in. `0..=TILE.0` is the reachable range for this archive:
+/// `tile_zoom` is `.min(source_max_zoom)`-capped and the fixture declares 14.
+///
+/// What this does **not** vary is the geometry: one tile's features, styled at
+/// every zoom. A real z6 frame draws a z6 tile. The widths are the variable
+/// under test and the geometry is here to carry them.
+fn sweep(parsed: &walkers::mvt::ParsedTile, feathering: f32) -> Sweep {
+    let mut out = Sweep {
+        points: 0,
+        refused: 0,
+        hairline: 0,
+        pairs: 0,
+        pairs_with_strokes: 0,
+        worst: None,
+    };
+
+    for (theme, dark) in [("dark", true), ("light", false)] {
+        let style = crate::basemap_style::committed(dark);
+        for zoom in 0..=TILE.0 {
+            let shapes = walkers::mvt::styled(parsed, &style, zoom);
+            let flat = flatten(&shapes, feathering);
+            let covered = covered_by_a_stroke_run(&shapes, &flat);
+
+            let (mut points, mut refused, mut hairline) = (0usize, 0usize, 0usize);
+            for (index, shape) in shapes.iter().enumerate() {
+                let ShapeOrText::Shape(egui::Shape::Path(path)) = shape else {
+                    continue;
+                };
+                points += path.points.len();
+                // Before the coverage test: this is which epaint branch the
+                // width takes, not whether this code handled it.
+                if path.stroke.width <= 0.9 * feathering {
+                    hairline += path.points.len();
+                }
+                if covered[index] {
+                    continue;
+                }
+                refused += path.points.len();
+            }
+
+            out.pairs += 1;
+            out.pairs_with_strokes += usize::from(points > 0);
+            out.points += points;
+            out.refused += refused;
+            out.hairline += hairline;
+            if refused > 0 && out.worst.is_none_or(|(_, _, most, _)| refused > most) {
+                out.worst = Some((theme, zoom, refused, hairline));
+            }
+        }
+    }
+    out
+}
+
+/// Non-vacuity for a sweep, so a zero refusal count is a result and not an
+/// absence of strokes to refuse.
+fn assert_sweep_is_populated(s: &Sweep) {
+    println!(
+        "  swept {} (theme, zoom) pairs, {} with strokes, {} stroke points",
+        s.pairs, s.pairs_with_strokes, s.points
+    );
+    assert!(
+        s.points > 10_000,
+        "the sweep saw only {} stroke points across {} (theme, zoom) pairs, \
+         so a refusal count over it says nothing",
+        s.points,
+        s.pairs
+    );
+    assert!(
+        s.pairs_with_strokes * 2 >= s.pairs,
+        "only {} of {} (theme, zoom) pairs produced any stroke at all, so the \
+         count is mostly the absence of strokes rather than a reading of them",
+        s.pairs_with_strokes,
+        s.pairs
+    );
+}
+
+/// **No stroke of either committed style falls back to the CPU**, at any zoom
+/// `mvt::styled` can be asked for.
+///
+/// Every reason [`stroke::append`] can refuse a path is either impossible over
+/// an MVT tile — a non-integer coordinate, one outside `i16`, a closed or
+/// filled path — or was the hairline branch, which now has its own arm. So the
+/// gate is a flat zero rather than a share, and a non-zero here is a defect in
+/// this code and not a property of the styles.
+///
+/// **The non-vacuity conjunct is the hairline count.** A zero refusal count
+/// would also be what a sweep that never reached a hairline produced, and that
+/// sweep would say nothing about the arm this test exists to cover — so the
+/// hairline share is asserted positive beside the refusal zero. It was
+/// **11.4% of stroke points** when the arm landed, which is the figure that
+/// justified building it.
+///
+/// Swept at [`PIXELS_PER_POINT`] 1, the **largest** feathering any
+/// `pixels_per_point >= 1` produces and so the case where the hairline branch
+/// is easiest to reach.
+#[test]
+fn no_stroke_of_either_committed_style_falls_back_to_the_cpu() {
+    let Some(parsed) = monaco_parsed() else {
+        return;
+    };
+    let feathering = feathering();
+    let swept = sweep(&parsed, feathering);
+    assert_sweep_is_populated(&swept);
+
+    let share = 100.0 * swept.hairline as f64 / swept.points as f64;
+    println!(
+        "  at feathering {feathering} (pixels_per_point {PIXELS_PER_POINT}): \
+         {} of {} stroke points refused; {} on epaint's hairline branch \
+         ({share:.1}% of all stroke points)",
+        swept.refused, swept.points, swept.hairline
+    );
+
+    assert!(
+        swept.hairline > 0,
+        "the sweep never reached epaint's hairline branch, so the zero below \
+         is a sweep of thick strokes only and says nothing about the arm that \
+         carries the other {share:.1}%"
+    );
+    assert_eq!(
+        swept.refused, 0,
+        "{} of {} stroke points still fall back to the CPU. Every remaining \
+         refusal reason is impossible over an MVT tile, so this is a defect \
+         in tile_mesh::stroke. Worst pair: {:?}",
+        swept.refused, swept.points, swept.worst
+    );
+}
+
+/// **Where the hairline branch begins**, derived analytically and confirmed by
+/// the sweep.
+///
+/// epaint's hairline branch fires at `width <= 0.9 * feathering`, and
+/// feathering is `feathering_size_in_pixels / pixels_per_point`. So no width
+/// is a hairline once `feathering <= min_width`, and the `pixels_per_point`
+/// that gives that is `feathering_size_in_pixels / min_width`. Above it every
+/// stroke takes the thick branch; below it some take the ridge.
+///
+/// **Two spellings that must agree**, and this is the whole point of the
+/// test: the boundary is derived from the minimum evaluated width, and then
+/// the sweep is re-run on both sides of it. An arithmetic slip in the
+/// derivation shows up as a count that disagrees rather than as a plausible
+/// number in a log. It is not a claim that either side is better — both are
+/// drawn now — only that this code and epaint agree about which is which.
+///
+/// # The population the minimum is over, exactly
+///
+/// **Evaluated widths, not declared literals.** The widths come off shapes
+/// `walkers::mvt::styled` produced, and `mvt::render_line` computes each one
+/// as `width.evaluate(context)` with the zoom in the context — so an
+/// `["interpolate", ["linear"], ["zoom"], …]` width is evaluated here, at
+/// every zoom, rather than read as its source text. This matters more than it
+/// looks: **55 of the 56 line layers in each committed style are expressions**
+/// and only `boundary_country_outline` is a literal, so a test that read
+/// source text would be reading one layer in fifty-six.
+#[test]
+fn the_hairline_branch_begins_where_the_arithmetic_says_it_does() {
+    let Some(parsed) = monaco_parsed() else {
+        return;
+    };
+    let feathering_size_in_pixels =
+        egui::epaint::TessellationOptions::default().feathering_size_in_pixels;
+
+    let mut thinnest = f32::INFINITY;
+    let mut at = (String::new(), 0u8);
+    let mut seen = 0usize;
+    for (theme, dark) in [("dark", true), ("light", false)] {
+        let style = crate::basemap_style::committed(dark);
+        for zoom in 0..=TILE.0 {
+            for shape in walkers::mvt::styled(&parsed, &style, zoom) {
+                let ShapeOrText::Shape(egui::Shape::Path(path)) = shape else {
+                    continue;
+                };
+                seen += 1;
+                // A zero-width stroke draws nothing in epaint either way, so
+                // it is not the thinnest *drawn* line and would drag this to
+                // zero.
+                if path.stroke.width > 0.0 && path.stroke.width < thinnest {
+                    thinnest = path.stroke.width;
+                    at = (theme.to_owned(), zoom);
+                }
+            }
+        }
+    }
+
+    assert!(
+        seen > 1_000,
+        "only {seen} stroked paths across the sweep, so the minimum below is \
+         not a minimum over anything"
+    );
+    // **Without this the derivation divides by infinity and the sweep below
+    // runs at feathering 0, where `is_thick_open_stroke` refuses everything
+    // for a different reason entirely.**
+    assert!(
+        thinnest.is_finite() && thinnest > 0.0,
+        "no stroked path in the sweep had a positive width, so there is no \
+         thinnest line to derive a threshold from"
+    );
+
+    let threshold = feathering_size_in_pixels / thinnest;
+    println!(
+        "  thinnest evaluated line-width: {thinnest} points ({} z{}); every \
+         stroke is thick at pixels_per_point >= {threshold}",
+        at.0, at.1
+    );
+
+    // Above the boundary. At exactly this feathering every width satisfies
+    // `width > 0.9 * feathering`, since the smallest is `feathering` itself.
+    let above = sweep(&parsed, thinnest);
+    assert_sweep_is_populated(&above);
+    assert_eq!(
+        above.hairline, 0,
+        "the derivation says pixels_per_point {threshold} puts every stroke on \
+         the thick branch, but sweeping at that feathering found {} hairline \
+         stroke points. The arithmetic and the predicate disagree",
+        above.hairline
+    );
+
+    // Below it. Without this the equality above is satisfied by a feathering
+    // so small that nothing is a hairline anywhere, which proves no boundary.
+    let below = sweep(&parsed, feathering());
+    assert!(
+        below.hairline > 0,
+        "no width is a hairline even at feathering {}, so there is no \
+         boundary here to have located",
+        feathering()
+    );
+    assert_eq!(
+        below.refused,
+        0,
+        "{} stroke points fell back at feathering {}",
+        below.refused,
+        feathering()
+    );
 }

@@ -63,9 +63,6 @@ pub const STROKE_INDEX_BYTES: u64 = 2;
 /// is addressable. A run is split at a path boundary, never inside one.
 pub const STROKE_RUN_VERTICES: u32 = 65_536;
 
-/// Vertices one path point contributes: outer, inner, inner, outer.
-pub const VERTICES_PER_PATH_POINT: u32 = 4;
-
 /// One vertex of a tile's pre-tessellated strokes.
 ///
 /// `pos` is in **MVT extent units** and `offset` is in **screen points**: the
@@ -115,7 +112,15 @@ pub(super) struct Scratch {
 ///
 /// `feathering` is the tessellator's, in points: egui's
 /// `feathering_size_in_pixels / pixels_per_point`.
-pub(super) fn is_thick_open_stroke(path: &PathShape, feathering: f32) -> bool {
+///
+/// **Both of epaint's feathered branches are covered.** The thick one emits
+/// four vertices per path point and the hairline one three, but every vertex
+/// of either is `point + normal * scalar` with the scalar in screen points —
+/// so both are invariant under the placement and both pre-compute. Which
+/// branch a path takes depends on the feathering, and the feathering is a
+/// flatten input ([`super::TileMeshes::feathering`]), so the choice is made
+/// here rather than deferred to a shader that could not make it.
+pub(super) fn is_open_stroke(path: &PathShape, feathering: f32) -> bool {
     let ColorMode::Solid(color) = path.stroke.color else {
         // `ColorMode::UV` colours a vertex from its position, which the
         // placement moves. `mvt::render_line` emits none.
@@ -127,14 +132,49 @@ pub(super) fn is_thick_open_stroke(path: &PathShape, feathering: f32) -> bool {
         && path.stroke.width > 0.0
         && color != Color32::TRANSPARENT
         && feathering > 0.0
-        // A line thinner than a pixel is painted as a three-edge ridge with no
-        // caps — a different topology with a different vertex count, and a
-        // branch *on feathering*, so it cannot be carried in a uniform. It is
-        // refused rather than reproduced.
-        && path.stroke.width > 0.9 * feathering
         // What `From<Stroke> for PathStroke` produces, and the only kind that
         // leaves the centreline where it is.
         && path.stroke.kind == egui::StrokeKind::Middle
+}
+
+/// Whether epaint paints this width as a **hairline**: a three-edge ridge two
+/// feather-widths wide, with the thinness carried by the opacity rather than
+/// by the geometry, because a line painted narrower than a pixel would alias.
+///
+/// epaint's own comparison, epsilon included. It is not a rare branch — over
+/// both committed styles at every zoom `mvt::styled` can be asked for, **11.4%
+/// of stroke points land here at `pixels_per_point` 1**, and none at 3.34 or
+/// above; `fixture_tests::no_stroke_of_either_committed_style_falls_back_to_the_cpu`
+/// is where those figures come from.
+fn is_hairline(width: f32, feathering: f32) -> bool {
+    width <= 0.9 * feathering
+}
+
+/// Vertices one path point contributes on epaint's thick branch: outer,
+/// inner, inner, outer.
+pub const THICK_VERTICES_PER_PATH_POINT: u32 = 4;
+
+/// Vertices one path point contributes on the hairline branch: outer, middle,
+/// outer.
+pub const HAIRLINE_VERTICES_PER_PATH_POINT: u32 = 3;
+
+/// Vertices one path point of this stroke contributes, which is a function of
+/// the feathering and not of the geometry.
+pub fn vertices_per_path_point(width: f32, feathering: f32) -> u32 {
+    if is_hairline(width, feathering) {
+        HAIRLINE_VERTICES_PER_PATH_POINT
+    } else {
+        THICK_VERTICES_PER_PATH_POINT
+    }
+}
+
+/// One vertex, in the byte layout [`StrokeVertex`] declares.
+fn write_vertex(vertices: &mut Vec<u8>, pos: [i16; 2], offset: Vec2, color: [u8; 4]) {
+    vertices.extend_from_slice(&pos[0].to_ne_bytes());
+    vertices.extend_from_slice(&pos[1].to_ne_bytes());
+    vertices.extend_from_slice(&offset.x.to_ne_bytes());
+    vertices.extend_from_slice(&offset.y.to_ne_bytes());
+    vertices.extend_from_slice(&color);
 }
 
 /// Append one open stroked path to a run's buffers.
@@ -143,6 +183,11 @@ pub(super) fn is_thick_open_stroke(path: &PathShape, feathering: f32) -> bool {
 /// appended are rebased onto it, so a run draws through a `u16` index buffer
 /// and a vertex-buffer offset rather than a base vertex, which WebGL2 has no
 /// draw call for.
+///
+/// A run may mix the two branches freely: both write the same
+/// [`StrokeVertex`] into the same buffer and are drawn by the same pipeline.
+/// What differs is only how many vertices a point contributes and which
+/// triangles join them.
 ///
 /// On anything but [`Appended::Wrote`] **both buffers are exactly as they
 /// were**.
@@ -154,7 +199,7 @@ pub(super) fn append(
     indices: &mut Vec<u8>,
     first_vertex: u32,
 ) -> Appended {
-    if !is_thick_open_stroke(path, feathering) {
+    if !is_open_stroke(path, feathering) {
         return Appended::Refused;
     }
     let ColorMode::Solid(color) = path.stroke.color else {
@@ -170,23 +215,47 @@ pub(super) fn append(
     if n < 2 {
         return Appended::Refused;
     }
-    if first_vertex + VERTICES_PER_PATH_POINT * n > STROKE_RUN_VERTICES {
+
+    let width = path.stroke.width;
+    let hairline = is_hairline(width, feathering);
+    let per_point = vertices_per_path_point(width, feathering);
+    if first_vertex + per_point * n > STROKE_RUN_VERTICES {
         return Appended::RunFull;
     }
 
-    let inner_rad = 0.5 * (path.stroke.width - feathering);
-    let outer_rad = 0.5 * (path.stroke.width + feathering);
+    vertices.reserve(per_point as usize * n as usize * STROKE_VERTEX_BYTES as usize);
+    if hairline {
+        append_hairline_vertices(&scratch.points, width, feathering, color, vertices);
+        Appended::Wrote(hairline_triangles(n, first_vertex, indices))
+    } else {
+        append_thick_vertices(&scratch.points, width, feathering, color, vertices);
+        Appended::Wrote(thick_triangles(n, first_vertex, indices))
+    }
+}
+
+/// epaint's thick branch: four vertices per point at `±outer_rad` and
+/// `±inner_rad`, with the two outer ones at each end extruded back along the
+/// line to anti-alias the cap.
+fn append_thick_vertices(
+    points: &[PathPoint],
+    width: f32,
+    feathering: f32,
+    color: Color32,
+    vertices: &mut Vec<u8>,
+) {
+    let inner_rad = 0.5 * (width - feathering);
+    let outer_rad = 0.5 * (width + feathering);
     let outer = Color32::TRANSPARENT.to_array();
     let middle = color.to_array();
+    let last = points.len() - 1;
 
-    vertices.reserve(VERTICES_PER_PATH_POINT as usize * n as usize * STROKE_VERTEX_BYTES as usize);
-    for (i, point) in scratch.points.iter().enumerate() {
+    for (i, point) in points.iter().enumerate() {
         let normal = point.normal;
         // epaint anti-aliases an open line's two ends by extruding the outer
         // edge one feathering along the line, away from the body.
         let extrude = if i == 0 {
             normal.rot90() * feathering
-        } else if i as u32 == n - 1 {
+        } else if i == last {
             -normal.rot90() * feathering
         } else {
             Vec2::ZERO
@@ -200,16 +269,47 @@ pub(super) fn append(
             (-outer_rad, outer, true),
         ] {
             let offset = normal * radius + if extruded { extrude } else { Vec2::ZERO };
-            vertices.extend_from_slice(&point.pos[0].to_ne_bytes());
-            vertices.extend_from_slice(&point.pos[1].to_ne_bytes());
-            vertices.extend_from_slice(&offset.x.to_ne_bytes());
-            vertices.extend_from_slice(&offset.y.to_ne_bytes());
-            vertices.extend_from_slice(&color);
+            write_vertex(vertices, point.pos, offset, color);
         }
     }
+}
 
-    // epaint's triangle order, kept because a moved index is a moved picture:
-    // the start cap, then six per segment, then the end extension.
+/// epaint's hairline branch: three vertices per point at `+n·feathering`, the
+/// centreline, and `−n·feathering`.
+///
+/// The ridge is two feather-widths wide whatever the stroke asked for, and the
+/// thinness is carried by the **opacity** instead — which is why a hairline
+/// cannot be drawn as a thin version of the thick branch and needs its own
+/// arm. `mul_color` is `Color32::gamma_multiply`, so that is called here
+/// rather than reproduced and the byte is epaint's own.
+///
+/// **No caps.** epaint's hairline branch carries a standing `TODO` for them
+/// and emits none, so neither does this — a cap here would be geometry the
+/// path it replaces does not draw.
+fn append_hairline_vertices(
+    points: &[PathPoint],
+    width: f32,
+    feathering: f32,
+    color: Color32,
+    vertices: &mut Vec<u8>,
+) {
+    let middle = color.gamma_multiply(width / feathering).to_array();
+    // Both outer edges: `color_outer` above the line and `color_fill` below
+    // it, and an open stroke's fill is transparent.
+    let outer = Color32::TRANSPARENT.to_array();
+
+    for point in points {
+        let normal = point.normal;
+        write_vertex(vertices, point.pos, normal * feathering, outer);
+        write_vertex(vertices, point.pos, Vec2::ZERO, middle);
+        write_vertex(vertices, point.pos, -normal * feathering, outer);
+    }
+}
+
+/// epaint's thick-branch triangles, in epaint's order because a moved index is
+/// a moved picture: the start cap, six per segment, then the end extension.
+/// `18n − 6` indices for `n` path points.
+fn thick_triangles(n: u32, first_vertex: u32, indices: &mut Vec<u8>) -> u32 {
     indices.reserve(3 * (6 * n as usize - 2));
     let mut written = 0u32;
     let mut triangle = |a: u32, b: u32, c: u32| {
@@ -230,12 +330,40 @@ pub(super) fn append(
         triangle(i0 + 2, i0 + 3, i1 + 2);
         triangle(i0 + 3, i1 + 2, i1 + 3);
     }
-    let last = VERTICES_PER_PATH_POINT * (n - 1);
+    let last = THICK_VERTICES_PER_PATH_POINT * (n - 1);
     triangle(last, last + 1, last + 2);
     triangle(last, last + 2, last + 3);
 
     debug_assert_eq!(written, 18 * n - 6, "epaint's index count for {n} points");
-    Appended::Wrote(written)
+    written
+}
+
+/// epaint's hairline triangles: four per segment and none at the ends.
+/// `12(n − 1)` indices for `n` path points.
+///
+/// epaint spells this as a loop over every point with `connect_with_previous`
+/// false at the first one for an open path; this is that loop with the dead
+/// first iteration removed, which emits the same triangles in the same order.
+fn hairline_triangles(n: u32, first_vertex: u32, indices: &mut Vec<u8>) -> u32 {
+    indices.reserve(3 * 4 * (n as usize - 1));
+    let mut written = 0u32;
+    let mut triangle = |a: u32, b: u32, c: u32| {
+        for corner in [a, b, c] {
+            indices.extend_from_slice(&((first_vertex + corner) as u16).to_ne_bytes());
+        }
+        written += 3;
+    };
+    for i1 in 1..n {
+        let i0 = 3 * (i1 - 1);
+        let i1 = 3 * i1;
+        triangle(i0, i0 + 1, i1);
+        triangle(i0 + 1, i1, i1 + 1);
+        triangle(i0 + 1, i0 + 2, i1 + 1);
+        triangle(i0 + 2, i1 + 1, i1 + 2);
+    }
+
+    debug_assert_eq!(written, 12 * (n - 1), "epaint's index count for {n} points");
+    written
 }
 
 /// Build the path points epaint's `Path::add_open_points` would build.
@@ -248,7 +376,7 @@ fn add_open_points(points: &[Pos2], out: &mut Vec<PathPoint>) -> bool {
     out.clear();
 
     let n = points.len();
-    debug_assert!(n >= 2, "checked by is_thick_open_stroke");
+    debug_assert!(n >= 2, "checked by is_open_stroke");
 
     let mut narrowed: Vec<[i16; 2]> = Vec::with_capacity(n);
     for point in points {
