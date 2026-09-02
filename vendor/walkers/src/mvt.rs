@@ -682,11 +682,21 @@ pub fn render_line(
         // constant. squallar draws a tile 256 points across at a whole zoom and
         // zoom bias 0, 181 at the half step, 362 at the other half, and 128
         // when `MirrorPlan::tile_zoom_bias` asks a 3D pane's floor strip for one
-        // level deeper. Measured against the committed styles, whose 56 `line`
-        // layers all ask for width 8, the factor `4096/256 = 16` delivered
-        // 8.00 / 5.66 / 11.31 / 4.00 at those four sides -- a road breathing
-        // +-41% through a continuous zoom sweep and drawn quarter-width on
-        // every floor strip.
+        // level deeper. Take a layer that asks for width 8 --
+        // `boundary_country_outline`, which is the ONLY one of the 56 `line`
+        // layers in either committed style whose `line-width` is a literal at
+        // all -- and the factor `4096/256 = 16` delivered 8.00 / 5.66 / 11.31
+        // / 4.00 at those four sides: a road breathing +-41% through a
+        // continuous zoom sweep and drawn quarter-width on every floor strip.
+        //
+        // The breathing is a ratio, so one layer illustrates a defect every
+        // width has. This comment used to say all 56 layers ask for 8, which
+        // described that one layer and wrote it as fifty-six; the other 55 are
+        // zoom expressions, and their evaluated widths span 0.3 to 22.0 points
+        // (counted 2026-09-01, both themes, integer zooms 0..=14). Do not read
+        // a width of 8 anywhere off this paragraph -- 27 of the 56 layers
+        // evaluate to 0.9 or less somewhere in their zoom range, which is
+        // where epaint's hairline branch begins.
         //
         // An ancestor stretched over a gap is the same rule and reads better
         // for it: its roads are the width the style asked for rather than

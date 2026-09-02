@@ -109,10 +109,21 @@
 #
 # ---- Basemap state is a denominator too -----------------------------------
 #
-# Every web leg measured before `a7465238` (2026-08-31) drew NO basemap: the
+# Every web leg measured before `4882611e` (2026-08-31) drew NO basemap: the
 # pmtiles offsets were truncated to 32 bits, so no vector tile ever resolved
 # on wasm32 and the web legs skipped tile placement, tessellation and tile
-# uploads entirely while the native legs did all of it. Rows now print
+# uploads entirely while the native legs did all of it.
+#
+# RESOLVE THAT FIX BY MESSAGE, NEVER BY HASH. It has a live pre-rebase twin,
+# `a7465238`, carrying the identical subject and the identical date and still
+# reachable from a dozen feature branches -- which this comment block cited
+# until 2026-09-01. `git cat-file -t` answers "commit" for it, `git log -1`
+# prints the right subject: three of four checks confirm a commit that is NOT
+# on main, and only `git merge-base --is-ancestor <hash> main` disagrees. The
+# question a leg actually asks is "is my bundle on the right side of this
+# fix", and the twin answers it confidently and wrongly. Grep the subject
+# (`fix(basemap): archive offsets were truncated to 32 bits on wasm32`) and
+# check ancestry against main. Rows now print
 # `basemap=<decoded>/<placed>` off two independent counters, so a pre-fix row
 # can never again be quoted beside a post-fix one:
 #
@@ -824,7 +835,9 @@ for leg in legs:
 
     # Did the basemap draw at all? Two independent readings, and the decode
     # one leads because it is the direct answer: a leg on the wrong side of
-    # the pmtiles 32-bit truncation (`a7465238`) decodes zero vector tiles.
+    # the pmtiles 32-bit truncation (`4882611e`; see the header -- that hash
+    # has a live pre-rebase twin, so resolve it by message) decodes zero
+    # vector tiles.
     # The ground counters are the second half -- a leg can decode tiles and
     # still place nothing -- and neither `placed` nor `stroke_points` is the
     # test there: both the fills and the strokes went to the GPU (2026-09-01),

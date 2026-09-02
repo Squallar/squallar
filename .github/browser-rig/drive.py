@@ -2625,7 +2625,9 @@ var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
 // DECODED, this counts what the ground phase then PLACED on the frame thread.
 // The two come apart exactly where it matters -- a leg can decode tiles and
 // place nothing -- and together they are what makes a row comparable across
-// the pmtiles 32-bit truncation fix (`a7465238`, 2026-08-31), before which no
+// the pmtiles 32-bit truncation fix (`4882611e`, 2026-08-31 -- resolve it by
+// message, not by hash: the pre-rebase twin `a7465238` carries the same
+// subject and date and is not on main), before which no
 // vector tile resolved on wasm32 at all while every native leg did the whole
 // placement, tessellation and upload. `placed` alone is not the test, and
 // since 2026-09-01 neither is `stroke pts`: the fills AND the strokes go to

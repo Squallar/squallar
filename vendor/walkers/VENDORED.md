@@ -1418,10 +1418,17 @@ are overriding.
 The `else` branch — `2.0` when a layer sets no `line-width` — is **left as
 upstream wrote it**, and it is inconsistent with the line above it: MapLibre's
 default is 1, so it should be `1.0 * LINE_WIDTH_TO_EXTENT`. Nothing in this
-workspace reaches it. All 56 `line` layers of both committed styles
-(`www/styles/{dark,light}.json`) set `line-width`, counted 2026-08-28, and all
-56 set it to the scalar `8`. Changing a branch no committed style exercises
-would be an unverifiable edit inside a vendored file.
+workspace reaches it: all 56 `line` layers of both committed styles
+(`www/styles/{dark,light}.json`) set `line-width`, counted 2026-08-28 and
+re-counted 2026-09-01. Changing a branch no committed style exercises would be
+an unverifiable edit inside a vendored file.
+
+This sentence used to carry a second claim — that all 56 set it to the scalar
+`8` — and that half was **false**. Exactly one layer,
+`boundary_country_outline`, sets a literal at all; the other 55 are zoom
+expressions whose evaluated widths span 0.3 to 22.0 points. The two halves are
+independent and only the first is what makes the `2.0` branch unreachable, so
+the correction does not disturb the reasoning above it.
 
 `mvt::tests::rendering_the_fixture_reproduces_the_recorded_shapes_exactly` moves
 with the factor, and this is the one class of golden edit that is legitimate:
@@ -1445,8 +1452,10 @@ widths.
 The eighteenth commit above fixed the constant and left the shape of the defect
 in place: `transformed` scales by `rect.width() / ONLY_SUPPORTED_EXTENT`, so
 *any* pre-multiplier baked at render time is correct at exactly one
-`rect.width()`. Measured against the committed styles, whose 56 `line` layers
-all ask for width `8`:
+`rect.width()`. Taking `boundary_country_outline`, the one `line` layer of
+either committed style whose `line-width` is a literal — `8` (see the
+correction under the eighteenth commit: the other 55 are zoom expressions
+spanning 0.3 to 22.0 points, and this table used to claim all 56 asked for 8):
 
 | tile drawn at | 16.0 delivered | now |
 | --- | ---: | ---: |
@@ -1455,6 +1464,10 @@ all ask for width `8`:
 | 256 pt (whole zoom, bias 0) | 8.00 | 8.00 |
 | 362 pt (the other half step) | 11.31 | 8.00 |
 | 512 pt | 16.00 | 8.00 |
+
+The column is one layer's widths, and the *ratio* between rows is the defect —
+which every width has, whatever it is. A reader taking `8` off this table as
+the workspace's line width would be taking it from a population of one.
 
 The rule, and it is MapLibre's: `line-width` and `text-size` are in **screen
 points**, the geometry beside them is in MVT extent units, and a style's own
