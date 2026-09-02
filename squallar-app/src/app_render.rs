@@ -1800,6 +1800,20 @@ impl super::App {
                     self.gpu_probe,
                 )),
         );
+        // What this frame's panes' overlay pictures are sized at, so a
+        // harness reads the figure instead of modelling it — see
+        // `crate::budget_telemetry::overlay_pictures_line`. Its own line, and
+        // never appended to the one above: the two have different
+        // denominators, and `budget state:` is scraped by a regex whose
+        // groups are positional.
+        say_telemetry(
+            loud,
+            &crate::budget_telemetry::overlay_pictures_line(
+                &self
+                    .render
+                    .overlay_picture_sizes(self.scene_of().panes.len()),
+            ),
+        );
         // The wasm heap watermark, on the same tick. The bridge answers the
         // platform question: a native bridge reads no heap and this arm is
         // never entered there. The fuller of the two instances is judged —

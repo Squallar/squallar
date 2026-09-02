@@ -70,10 +70,25 @@
 #
 #     picture bytes = (W * 1.5) * ((H - 40) * 1.5) * 4
 #
-# (the 1.5 is `OVERDRAW_FRACTION` 0.25 spent on both sides, the 40 is the top
-# bar in points, the 4 is RGBA). Verified exact at three surfaces on
-# 2026-08-31: native 1920x1080 -> 17,971,200 B; firefox canvas 1280x779 ->
-# 8,509,440 B; chromium canvas 1248x714 -> 7,570,368 B.
+# (the 1.5 is `OVERDRAW_FRACTION` 0.25 spent on both sides, the 4 is RGBA).
+# Verified exact at three surfaces on 2026-08-31: native 1920x1080 ->
+# 17,971,200 B; firefox canvas 1280x779 -> 8,509,440 B; chromium canvas
+# 1248x714 -> 7,570,368 B.
+#
+# **STALE AS OF 2026-09-02, AND THE WAY IT WENT STALE IS THE POINT.** The 40
+# is not the top bar: it is `MIN_BAR_HEIGHT` in squallar-egui's topbar,
+# `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, which is a FLOOR and is
+# `#[cfg(test)]`-only. It happened to equal the bar's laid-out height on
+# 2026-08-31, which is why all three surfaces verified. Native 1920x1080 now
+# measures 17,913,600 B -- 2880 x 1555, i.e. (1080 - 43.333) x 1.5 -- so the
+# bar now lays out 3.33 points above its own minimum and the identity broke
+# with no signal. Every scene D row read `** INVALID **` by exactly 57,600 B,
+# five texel rows, until this was found.
+#
+# The app now REPORTS the size it allocated, on its own `overlay pictures:`
+# telemetry line, and `native_row.py` reads that instead of computing this.
+# The formula is kept here only as the history of what it replaced: do not
+# re-derive a picture size from it.
 #
 # Three ways that has already produced an incomparable pair:
 #

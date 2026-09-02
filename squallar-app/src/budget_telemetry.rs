@@ -137,6 +137,53 @@ pub(crate) fn budget_state_line(
     )
 }
 
+/// The `overlay pictures:` line — what the whole-picture overlay rasters of
+/// this frame's panes are sized at, per pane.
+///
+/// # Why the app says this rather than a harness computing it
+///
+/// `native_row.py` priced a pane's picture as `(W * 1.5) * ((H - 40) * 1.5) * 4`
+/// and called the 40 "the top bar in points". It is not: 40 is
+/// `MIN_BAR_HEIGHT` (`squallar_egui`'s topbar), `2 * VERTICAL_MARGIN +
+/// INTERACT_HEIGHT`, which is a **floor**. The bar egui actually lays out at
+/// 1920x1080 on this box is 43.33 points, so every scene D row read
+/// `** INVALID **` by exactly 57,600 B — five texel rows.
+///
+/// **And the model was exact when it was written.** `run_measure.sh` records
+/// it verified at three surfaces on 2026-08-31 — 1920x1080, and two web
+/// canvases — and the formula still reproduces all three to the byte. The
+/// constants have not moved since. What moved is the bar: it sat *on* its
+/// minimum then and lays out above it now, so a floor used as an equality
+/// held exactly until content grew and then stopped, with no signal. That is
+/// the argument for reading the number rather than deriving it — not that
+/// the derivation was wrong, but that it was right by coincidence and the
+/// coincidence expired silently.
+///
+/// So this reports the size the app allocated. `px` lists every pane in
+/// pane-index order; a pane with no overlay picture prints `0x0`, which is an
+/// absence and not a pane of zero area. `bytes` is the RGBA total over that
+/// list and is the figure a surface check compares a round's uploads against.
+///
+/// Re-said every telemetry period rather than emitted on change: a browser
+/// console ring holds 1200 entries and a rig reads the last 60, so a line
+/// that spoke once is indistinguishable from a run in which nothing was
+/// rastered.
+pub(crate) fn overlay_pictures_line(sizes: &[(u32, u32)]) -> String {
+    let px = sizes
+        .iter()
+        .map(|(w, h)| format!("{w}x{h}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let bytes: u64 = sizes
+        .iter()
+        .map(|(w, h)| u64::from(*w) * u64::from(*h) * 4)
+        .sum();
+    format!(
+        "overlay pictures: n={}, px={px}, bytes={bytes}",
+        sizes.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +471,84 @@ mod tests {
             drifted,
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",
+        );
+    }
+
+    /// **The `overlay pictures:` line keeps its prefix and its field order.**
+    ///
+    /// A harness reads this positionally, and the whole reason it exists is
+    /// that the harness previously MODELLED the figure and was quietly wrong.
+    /// A rename or a reordering would null its reader — and a null that reads
+    /// as a zero is how a modelled figure got believed in the first place. So
+    /// the shape is pinned here: a rename reddens this board rather than the
+    /// rig's row.
+    #[test]
+    fn the_overlay_pictures_line_keeps_its_prefix_and_field_order() {
+        let line = overlay_pictures_line(&[(2880, 1555), (0, 0), (1440, 780)]);
+        assert_eq!(
+            line,
+            "overlay pictures: n=3, px=2880x1555;0x0;1440x780, bytes=22406400",
+        );
+    }
+
+    /// **`bytes` is the RGBA sum over the list, and a pane with no picture
+    /// contributes nothing to it.** The figure is compared against bytes a
+    /// round actually uploaded, so an absent pane counted as anything but
+    /// zero would move an equality check.
+    #[test]
+    fn a_pane_with_no_picture_costs_nothing_and_is_still_listed() {
+        let none = overlay_pictures_line(&[(0, 0)]);
+        assert!(
+            none.contains("n=1") && none.contains("px=0x0") && none.contains("bytes=0"),
+            "a pane with no picture is not reported as an empty slot: {none}",
+        );
+        // Listed, not skipped: position in `px` IS the pane index.
+        let mixed = overlay_pictures_line(&[(0, 0), (10, 10)]);
+        assert!(
+            mixed.contains("px=0x0;10x10"),
+            "the empty pane was dropped from the list, so every pane after it \
+             is reported under the wrong index: {mixed}",
+        );
+    }
+
+    /// **An empty scene prints the absence rather than nothing.** No panes is
+    /// a reading; a line that vanished would be indistinguishable from a
+    /// period the scraper missed.
+    #[test]
+    fn a_scene_with_no_panes_still_says_so() {
+        assert_eq!(
+            overlay_pictures_line(&[]),
+            "overlay pictures: n=0, px=, bytes=0",
+        );
+    }
+
+    /// **The byte total is `u64` arithmetic, and this is the floor under
+    /// that.**
+    ///
+    /// NOT REACHABLE TODAY, and said so rather than dressed up: the pane grid
+    /// stops at six and the largest picture is bounded by the adapter's
+    /// texture side, so the real worst case is six at 8192 square = 1.61 GB,
+    /// which fits a `u32` (4.29 GB) with room to spare. The first draft of
+    /// this test asserted six pictures overflowed and was WRONG; its own
+    /// "the case is not a case" guard caught it, which is the only reason
+    /// this comment is accurate.
+    ///
+    /// So what is pinned here is the TYPE, not a live case: seventeen
+    /// max-side pictures do overflow a `u32`, and the day the pane cap or the
+    /// texture ceiling moves, the arithmetic must not wrap into a plausible
+    /// small number under a harness that compares it for equality. Narrowing
+    /// the sum to `u32` reddens this.
+    #[test]
+    fn a_byte_total_past_the_u32_ceiling_does_not_wrap() {
+        let many = vec![(8192u32, 8192u32); 17];
+        let expected = 17u64 * 8192 * 8192 * 4;
+        assert!(
+            expected > u64::from(u32::MAX),
+            "the case is not a case: {expected} fits a u32",
+        );
+        assert!(
+            overlay_pictures_line(&many).contains(&format!("bytes={expected}")),
+            "the byte total wrapped",
         );
     }
 }

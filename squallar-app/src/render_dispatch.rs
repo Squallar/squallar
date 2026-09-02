@@ -1085,6 +1085,36 @@ impl RenderDispatcher {
             .insert((pane_idx, id.clone()), req);
     }
 
+    /// **The overlay picture each pane's last live dispatch was sized at**,
+    /// pane-index ordered, in physical pixels — `(0, 0)` for a pane that has
+    /// dispatched none.
+    ///
+    /// Read off the recorded `OverlayTexturePlan` rather than recomputed from
+    /// a pane rect: this is the size the app actually allocated, which is the
+    /// figure a harness comparing against uploaded bytes needs. A harness that
+    /// models it instead has to model the top bar, and `native_row.py` did —
+    /// with `MIN_BAR_HEIGHT`, which is a floor and not a height, so every
+    /// scene D row read `** INVALID **` by a stable 57,600 B.
+    ///
+    /// Loop-frame dispatches are not in here at all: `spawn_overlay_render`
+    /// writes the record only when `frame.is_none()`, so this is the live
+    /// raster's plan and never a loop frame's.
+    ///
+    /// The layers of one pane agree by construction — the plan is a function
+    /// of the pane rect and the adapter's limit, both of which every layer on
+    /// that pane shares — so the `max` is a formality that also keeps a record
+    /// left over from before a resize from under-reporting.
+    pub(crate) fn overlay_picture_sizes(&self, pane_count: usize) -> Vec<(u32, u32)> {
+        let mut sizes = vec![(0u32, 0u32); pane_count];
+        for ((pane_idx, _), req) in &self.last_overlay_dispatch {
+            if let Some(slot) = sizes.get_mut(*pane_idx) {
+                slot.0 = slot.0.max(req.texture.width);
+                slot.1 = slot.1.max(req.texture.height);
+            }
+        }
+        sizes
+    }
+
     /// Record that job `job` is the raster on its way to `(pane, id)` for
     /// every pane in `panes`, and answer the jobs that supersession just
     /// orphaned: each returned id has **no** destination left that wants its

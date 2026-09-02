@@ -237,3 +237,62 @@ fn the_ceiling_app_state_computes_first_is_not_the_one_a_promoted_browser_is_owe
         assert_eq!(dispatcher.static_side_ceiling_px(), post_adapter, "{leg}");
     }
 }
+
+/// **The overlay picture sizes are placed by pane index, read off the recorded
+/// plan, and absent where nothing was dispatched.**
+///
+/// The formatter's own tests cannot see any of that — they are handed a list.
+/// This is the gate on where the list comes from, and it exists because a
+/// tamper that made the reader return zeros left every formatter test green.
+///
+/// Position is the whole contract: `px` in the line is read positionally as
+/// the pane index, so a reader that packed only the panes it found would
+/// report pane 2's picture as pane 1's.
+#[test]
+fn overlay_picture_sizes_land_on_their_own_pane_and_nowhere_else() {
+    use squallar_egui::overlay_cache::OverlayTexturePlan;
+
+    let plan = |w: u32, h: u32| crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        texture: OverlayTexturePlan {
+            width: w,
+            height: h,
+            overdraw: 0.0,
+            pixels_per_point: 1.0,
+        },
+        data_generation: 1,
+        zoom: 32,
+    };
+
+    // This build's own budgets: the reader hands back a recorded plan and
+    // consults none of them, so the test asks for nothing the shipping app
+    // does not already construct.
+    let mut render = RenderDispatcher::new();
+    // Panes 0 and 2 have dispatched; 1 and 3 have not.
+    render.record_overlay_dispatch(0, &squallar_source::id::known::NWS_ALERTS, plan(2880, 1555));
+    render.record_overlay_dispatch(2, &squallar_source::id::known::NWS_ALERTS, plan(1440, 780));
+    // A second layer on pane 0 agrees with the first, as every layer on one
+    // pane does — the plan is a function of the pane rect and the adapter's
+    // limit, both of which they share.
+    render.record_overlay_dispatch(
+        0,
+        &squallar_source::id::known::STORM_REPORTS,
+        plan(2880, 1555),
+    );
+
+    assert_eq!(
+        render.overlay_picture_sizes(4),
+        vec![(2880, 1555), (0, 0), (1440, 780), (0, 0)],
+        "a pane's picture is not reported at its own index, or an undispatched \
+         pane is not reported as absent",
+    );
+    // A pane index past the scene is dropped rather than growing the list:
+    // the list length IS the pane count the line reports as `n`.
+    render.record_overlay_dispatch(9, &squallar_source::id::known::NWS_ALERTS, plan(64, 64));
+    assert_eq!(render.overlay_picture_sizes(4).len(), 4);
+}
