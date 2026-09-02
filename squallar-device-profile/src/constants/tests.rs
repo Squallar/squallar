@@ -570,6 +570,9 @@ fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
         // The page-thread teardown allowance; wasm's arm is pinned below
         // desktop's by `the_wasm_drop_budget_is_tighter_than_desktops`.
         "DEFERRED_DROP_BUDGET_PER_FRAME",
+        // The building geometry row: one number on every arm, pinned until a
+        // second machine is measured.
+        "PRISM_GEOMETRY_BYTES",
     ];
 
     // Cascades that still spell their arms as literals, and so cannot be
@@ -918,6 +921,35 @@ fn the_static_render_textures_are_named_even_though_the_ceiling_omits_them() {
             arm.max_panes * arm.static_frame_bytes() / (1024 * 1024),
             worst_mib,
             "{name} worst-case static textures",
+        );
+    }
+}
+
+/// The prism buffers the app ceiling does **not** count: buffers rather than
+/// textures, one number on every arm, and the worst case named.
+#[test]
+fn the_prism_buffers_are_named_even_though_the_ceiling_omits_them() {
+    let expected = [("wasm32", 96), ("mobile", 64), ("desktop", 96)];
+    for (arm, (name, worst_mib)) in arms().into_iter().zip(expected) {
+        assert_eq!(arm.name, name);
+        assert_eq!(
+            arm.prism_vram_bytes,
+            16 * 1024 * 1024,
+            "{name}: the building geometry row is the one machine's 16 MiB \
+             until a second machine is measured",
+        );
+        assert_eq!(
+            arm.max_panes * arm.prism_vram_bytes / (1024 * 1024),
+            worst_mib,
+            "{name} worst-case prism buffers",
+        );
+        assert_eq!(
+            arm.app_texture_bytes(),
+            arm.loop_pool_ceiling_bytes
+                + arm.volume_loop_bytes()
+                + arm.max_panes * arm.offscreen_bytes,
+            "{name}: the texture ceiling's sum gained a term; prism buffers \
+             are not textures and are priced by `need`, not by this sum",
         );
     }
 }

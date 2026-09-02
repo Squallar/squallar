@@ -1334,9 +1334,12 @@ later WO once `need` prices every term.
   `Budgets::frames_for_span_of` and held to both.
 - **Buildings.** `squallar-buildings/src/budget.rs` `PrismCeilings.vram_bytes`
   (`:186-189`) is a 16 MiB constant and a third budget outside the system; it
-  becomes `BudgetLimits.prism_geometry_bytes` pinned at 16 MiB on the presumed
-  arm and a `need` term priced by the job's own `budgeted_bytes()` on the
-  measured arm (WO-15).
+  becomes `BudgetLimits.prism_geometry_bytes` pinned at 16 MiB on every arm
+  and a `need` term for a pane drawing buildings, priced at the resolved
+  `Budgets.prism_vram_bytes` -- the ceiling the job is fitted inside; the job's
+  own fitted `budgeted_bytes()` is not reachable from squallar-device-profile,
+  whose charter declares squallar-radar and nothing else. `squallar-worker`'s
+  agreement test holds the resolved figure equal to the worker's default.
 
 ### 9.6 Snugness, on both arms
 

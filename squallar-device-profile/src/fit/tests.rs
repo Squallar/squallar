@@ -150,6 +150,21 @@ fn every_term_is_the_cost_function_it_reuses() {
     );
     assert!(grounded.offscreens <= b.offscreen_bytes as u64);
 
+    // Buildings: the ceiling the prism ladder is fitted inside, once per pane
+    // drawing them, and nothing for a pane that does not.
+    let city = terms(&scene_of(vec![PaneNeed {
+        buildings: true,
+        ..volume_pane(HD, GroundPass::On)
+    }]));
+    assert_eq!(city.buildings, b.prism_vram_bytes as u64);
+    assert_eq!(city.buildings, 16 * MIB, "the one machine's 16 MiB");
+    assert_eq!(grounded.buildings, 0);
+    assert_eq!(
+        city.total().gpu_bytes,
+        city.grids + city.offscreens + city.buildings,
+        "the buildings term is in the GPU total",
+    );
+
     // The mirror: a colour target of its size, held to the mirror budget.
     let mirror = terms(&Scene {
         mirror_px: [2048, 2048],
@@ -303,6 +318,22 @@ fn the_same_scene_costs_the_same_bytes_on_every_bracket() {
         m, w,
         "{ruling}: two Half-rung brackets priced one offscreen differently"
     );
+
+    // Buildings: one number on every bracket, the one machine's measurement,
+    // so the term has no bracket difference to account for.
+    let city = scene_of(vec![PaneNeed {
+        buildings: true,
+        ..volume_pane(HD, GroundPass::Off)
+    }]);
+    for b in [&mobile, &wasm] {
+        assert_eq!(
+            terms(&city, &desktop).buildings,
+            terms(&city, b).buildings,
+            "{ruling}: {} prices a pane's buildings differently",
+            b.name,
+        );
+    }
+    assert_eq!(terms(&city, &desktop).buildings, 16 * MIB);
 
     // The mirror and the tiles have no bracket term at all.
     let shared = Scene {

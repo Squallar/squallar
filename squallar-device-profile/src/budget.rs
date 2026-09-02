@@ -443,6 +443,12 @@ pub struct BudgetLimits {
     /// blocklisted driver and on a workstation GPU, and only the adapter's own
     /// report separates them.
     pub raster_side_ceiling_px: Bracket,
+    /// Bytes the building geometry on one pane may occupy: the row
+    /// `squallar_buildings`' prism ladder is fitted inside, resolved here so
+    /// the figure a job is dispatched with is a budget and not a constant the
+    /// worker chose for itself. Pinned on every arm at the one machine's
+    /// measurement (`constants::DESKTOP_PRISM_GEOMETRY_BYTES`).
+    pub prism_geometry_bytes: Bracket,
 }
 
 impl BudgetLimits {
@@ -519,6 +525,7 @@ impl BudgetLimits {
             constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
             constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
         ),
+        prism_geometry_bytes: Bracket::pinned(constants::WASM_PRISM_GEOMETRY_BYTES),
     };
 
     /// The mobile bracket — native Android and iOS.
@@ -549,6 +556,7 @@ impl BudgetLimits {
         max_panes: Bracket::pinned(MAX_PANES_MOBILE),
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: Bracket::pinned(constants::MOBILE_RASTER_SIDE_CEILING),
+        prism_geometry_bytes: Bracket::pinned(constants::MOBILE_PRISM_GEOMETRY_BYTES),
     };
 
     /// The desktop bracket.
@@ -596,6 +604,7 @@ impl BudgetLimits {
             constants::DESKTOP_APP_TEXTURE_CEILING_BYTES,
         ),
         raster_side_ceiling_px: Bracket::pinned(constants::DESKTOP_RASTER_SIDE_CEILING),
+        prism_geometry_bytes: Bracket::pinned(constants::DESKTOP_PRISM_GEOMETRY_BYTES),
     };
 
     /// The bracket this build compiled.
@@ -687,6 +696,12 @@ pub struct Budgets {
     /// it yet**: the tile pump's bytes-based bias gate is a later landing, and
     /// until it arrives this is the rung's position and nothing more.
     pub tile_whole_zoom: bool,
+    /// Bytes the building geometry on one pane may occupy -- the `vram_bytes`
+    /// ceiling a `BuildingMeshJob` is to be dispatched with once a production
+    /// caller exists. Today no dispatch site reads it, so nothing spends it.
+    /// **Buffers, not textures**: not a term of [`Self::app_texture_bytes`],
+    /// priced by `crate::fit::need` for a pane that draws buildings.
+    pub prism_vram_bytes: usize,
 }
 
 impl Budgets {
@@ -813,6 +828,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
             .at(promotion)
             .max(limits.long_range_image_side_px.floor),
         tile_whole_zoom: false,
+        prism_vram_bytes: limits.prism_geometry_bytes.at(promotion),
     };
     demote(&mut budgets, limits, profile.steps_back());
     budgets

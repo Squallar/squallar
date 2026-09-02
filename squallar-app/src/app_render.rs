@@ -3947,6 +3947,9 @@ impl super::App {
                 // the height field it holds, which this walk cannot see; the
                 // offscreen term is held to the offscreen budget either way.
                 ground: GroundPass::Off,
+                // No production caller dispatches a `BuildingMeshJob` yet, so
+                // no pane spends the prism row.
+                buildings: false,
             };
             let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {

@@ -73,6 +73,11 @@ pub struct PaneNeed {
     pub volume_grids: usize,
     /// Whether a 3D pane's offscreen carries the ground pass's attachments.
     pub ground: GroundPass,
+    /// Whether the pane draws 3D buildings: prism geometry fitted inside
+    /// `Budgets::prism_vram_bytes` and priced at that ceiling. `false` until a
+    /// `BuildingMeshJob` is dispatched for the pane, which no production
+    /// caller does yet.
+    pub buildings: bool,
 }
 
 /// One map tile source's working set.
@@ -255,6 +260,7 @@ pub(crate) mod fixtures {
             overlay_frame_bytes: 0,
             volume_grids: 0,
             ground: GroundPass::Off,
+            buildings: false,
         }
     }
 
@@ -269,13 +275,15 @@ pub(crate) mod fixtures {
             overlay_frame_bytes: 0,
             volume_grids: 1,
             ground,
+            buildings: false,
         }
     }
 
     /// The scenes every profile is fitted against: nothing; one loop; a full
-    /// screen of two-hour loops; a 3D pane drawing ground; and the user's own
-    /// 2878 x 1651 window with the 193 tiles it needs between zooms, at the
-    /// 1.03 MB a styled entry was measured to cost.
+    /// screen of two-hour loops; a 3D pane drawing ground; the same pane
+    /// drawing buildings too; and the user's own 2878 x 1651 window with the
+    /// 193 tiles it needs between zooms, at the 1.03 MB a styled entry was
+    /// measured to cost.
     pub(crate) fn scene_table() -> Vec<(&'static str, Scene)> {
         const HD: [u32; 2] = [1920, 1080];
         const TWO_HOURS: usize = 2 * 60 * 60;
@@ -302,6 +310,17 @@ pub(crate) mod fixtures {
                 "one volume pane with ground",
                 Scene {
                     panes: vec![volume_pane([2560, 1440], GroundPass::On)],
+                    tile_sources: Vec::new(),
+                    mirror_px: [2560, 1440],
+                },
+            ),
+            (
+                "one volume pane with ground and buildings",
+                Scene {
+                    panes: vec![PaneNeed {
+                        buildings: true,
+                        ..volume_pane([2560, 1440], GroundPass::On)
+                    }],
                     tile_sources: Vec::new(),
                     mirror_px: [2560, 1440],
                 },

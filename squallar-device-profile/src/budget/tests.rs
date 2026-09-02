@@ -41,6 +41,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             max_panes: MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: WASM_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: WASM_RASTER_SIDE_CEILING,
+            prism_vram_bytes: WASM_PRISM_GEOMETRY_BYTES,
             tile_whole_zoom: false,
         },
         Budgets {
@@ -67,6 +68,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             max_panes: MAX_PANES_MOBILE,
             app_texture_ceiling_bytes: MOBILE_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: MOBILE_RASTER_SIDE_CEILING,
+            prism_vram_bytes: MOBILE_PRISM_GEOMETRY_BYTES,
             tile_whole_zoom: false,
         },
         Budgets {
@@ -93,6 +95,7 @@ fn the_resolver_reproduces_every_shipped_constant() {
             max_panes: MAX_PANES_DESKTOP,
             app_texture_ceiling_bytes: DESKTOP_APP_TEXTURE_BUDGET_BYTES,
             raster_side_ceiling_px: DESKTOP_RASTER_SIDE_CEILING,
+            prism_vram_bytes: DESKTOP_PRISM_GEOMETRY_BYTES,
             // The tile-sharpness rung's position: a class rung never snaps.
             tile_whole_zoom: false,
         },
@@ -135,6 +138,7 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     assert_eq!(b.render_cache_entries, MAX_RENDER_CACHE_ENTRIES);
     assert_eq!(b.quality_ceiling, crate::quality::PLATFORM_CEILING);
     assert_eq!(b.app_texture_ceiling_bytes, APP_TEXTURE_BUDGET_BYTES);
+    assert_eq!(b.prism_vram_bytes, PRISM_GEOMETRY_BYTES);
     assert_eq!(
         b.grid_shape(WEBGL2_MAX_TEXTURE_DIMENSION_3D),
         VOLUME_GRID_FLOOR_SHAPE,
@@ -445,6 +449,11 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
         "app_texture_ceiling_bytes",
         b.app_texture_ceiling_bytes,
         limits.app_texture_ceiling_bytes,
+    );
+    within(
+        "prism_vram_bytes",
+        b.prism_vram_bytes,
+        limits.prism_geometry_bytes,
     );
     for axis in 0..3 {
         assert!(
@@ -1316,6 +1325,7 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
     assert!(pinned(limits.volume_texture_bytes));
     assert!(pinned(limits.app_texture_ceiling_bytes));
     assert!(pinned(limits.raster_side_ceiling_px));
+    assert!(pinned(limits.prism_geometry_bytes));
     assert_eq!(limits.grid_cells.floor, limits.grid_cells.ceiling);
     for class in CLASSES {
         let profile = DeviceProfile {

@@ -89,6 +89,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
                 overlay_frame_bytes: 0,
                 volume_grids: 0,
                 ground: squallar_device_profile::quality::GroundPass::Off,
+                buildings: false,
             };
             6
         ],

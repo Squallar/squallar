@@ -400,6 +400,34 @@ pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 /// [`crate::budget::Promotion::Ceiling`].
 pub const DESKTOP_APP_TEXTURE_CEILING_BYTES: usize = 4032 * 1024 * 1024;
 
+/// Bytes the building geometry on one pane -- prism positions, normals and
+/// indices together -- may occupy, per class.
+///
+/// **One number on all three arms, and pinned, because it was measured on one
+/// machine.** `squallar_buildings::budget::DEFAULT_PRISM_VRAM_BYTES` is the
+/// worker side's own default for the same row and carries the measurement
+/// behind it: the ground pass timed on an RTX 3090 (Vulkan, one machine,
+/// 2026-08-30), where the whole shipped rung costs under 0.035 ms of a frame.
+/// Nothing has timed that pass on a WebGL2 browser or on a phone, and a figure
+/// scaled from a discrete desktop card is not a measurement, so the three arms
+/// carry the same 16 MiB until a second machine is measured. The two constants
+/// are held equal by `squallar-worker`'s agreement test.
+///
+/// **Buffers, not textures**: this row is a vertex and an index buffer, so it
+/// is not a term of `Budgets::app_texture_bytes` and the whole-application
+/// texture ceiling neither counts nor bounds it
+/// (`the_prism_buffers_are_named_even_though_the_ceiling_omits_them`).
+pub const WASM_PRISM_GEOMETRY_BYTES: usize = 16 * 1024 * 1024;
+pub const MOBILE_PRISM_GEOMETRY_BYTES: usize = WASM_PRISM_GEOMETRY_BYTES;
+pub const DESKTOP_PRISM_GEOMETRY_BYTES: usize = WASM_PRISM_GEOMETRY_BYTES;
+
+#[cfg(target_arch = "wasm32")]
+pub const PRISM_GEOMETRY_BYTES: usize = WASM_PRISM_GEOMETRY_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const PRISM_GEOMETRY_BYTES: usize = MOBILE_PRISM_GEOMETRY_BYTES;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const PRISM_GEOMETRY_BYTES: usize = DESKTOP_PRISM_GEOMETRY_BYTES;
+
 /// The share of a **measured or probed** GPU capacity the scene's need may
 /// occupy, as `(numerator, denominator)`: three quarters. Metal's own
 /// recommended working set is ~75 % of RAM on M-series, the one vendor figure

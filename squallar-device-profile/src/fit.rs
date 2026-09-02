@@ -5,7 +5,8 @@
 //! `Budgets::section_frame_bytes`, `Budgets::static_frame_bytes`, the raymarch's
 //! own resident-grid arithmetic handed in as [`GridBytes`],
 //! `quality::VolumeQuality::fit` for the offscreen, `quality::offscreen_bytes`
-//! for the mirror, and the tile cache's measured entry cost. Nothing here
+//! for the mirror, the tile cache's measured entry cost, and
+//! `Budgets::prism_vram_bytes` for a pane that draws buildings. Nothing here
 //! invents a byte figure.
 //!
 //! [`fit`] is the degradation ladder driven by arithmetic instead of a counter:
@@ -54,6 +55,9 @@ pub struct NeedTerms {
     pub offscreens: u64,
     /// The one pane-mirror texture.
     pub mirror: u64,
+    /// The prism buffers of every pane drawing buildings, each at the ceiling
+    /// its mesh is fitted inside.
+    pub buildings: u64,
     /// The tile working set, on the host.
     pub tiles_host: u64,
 }
@@ -73,6 +77,7 @@ impl NeedTerms {
             .saturating_add(self.grids)
             .saturating_add(self.offscreens)
             .saturating_add(self.mirror)
+            .saturating_add(self.buildings)
     }
 }
 
@@ -96,6 +101,9 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
         terms.offscreens = terms
             .offscreens
             .saturating_add(offscreen_term(pane, budgets));
+        terms.buildings = terms
+            .buildings
+            .saturating_add(buildings_term(pane, budgets));
     }
     terms.mirror = mirror_term(scene.mirror_px, budgets);
     for source in &scene.tile_sources {
@@ -250,6 +258,23 @@ fn offscreen_term(pane: &PaneNeed, budgets: &Budgets) -> u64 {
             .fit(pane.px, budgets.offscreen_bytes, pane.ground)
             .bytes() as u64,
         RenderView::PlanView | RenderView::CrossSection => 0,
+    }
+}
+
+/// What a pane's buildings cost: the ceiling the prism ladder is fitted
+/// inside, [`Budgets::prism_vram_bytes`], and nothing for a pane that draws
+/// none. The fitted rung's own `PrismBudget::budgeted_bytes` is the exact
+/// figure and it is not reachable from here -- `squallar-buildings` sits
+/// beside this crate, not under it, and this crate's charter declares
+/// `squallar-radar` and nothing else -- so the term is the worst case, the
+/// way the static raster term is the raster ceiling's worst case rather than
+/// the sweep's own side. The ladder never exceeds its ceiling while the
+/// ceiling clears the floor rung's 1.18 MB, which every shipped arm does.
+fn buildings_term(pane: &PaneNeed, budgets: &Budgets) -> u64 {
+    if pane.buildings {
+        budgets.prism_vram_bytes as u64
+    } else {
+        0
     }
 }
 
