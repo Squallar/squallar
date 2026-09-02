@@ -54,10 +54,9 @@ pub enum Promotion {
     /// What a device that says nothing about itself gets: the shipped
     /// constants, unchanged.
     Floor,
-    /// One rung. What an integrated GPU takes, which is the rule
-    /// `LoopPool::for_device` already ships for the pool — and what a
-    /// desktop-class adapter report earns on its own, before the device's
-    /// shape and its memory declaration are asked about the ceiling.
+    /// One rung. What an integrated GPU takes — and what a desktop-class
+    /// adapter report earns on its own, before the device's shape and its
+    /// memory declaration are asked about the ceiling.
     Step,
     /// The most this build will spend on this class of machine.
     Ceiling,
@@ -559,7 +558,10 @@ pub struct Budgets {
     pub name: &'static str,
     /// How far up its bracket each field was spent.
     pub promotion: Promotion,
-    /// Rungs of the ladder surrendered before this was resolved. See [`demote`].
+    /// Rungs of the ladder surrendered to produce this: what a memo asked
+    /// [`demote`] for, plus every rung `crate::fit::fit` took to make the
+    /// scene fit its capacity. A count of what was shed, never a position to
+    /// remember.
     pub steps_back: u32,
     /// The side a static plan-view render takes at the base size.
     pub image_side_px: usize,
@@ -583,7 +585,9 @@ pub struct Budgets {
     /// rather than the figure itself.
     pub loop_render_budget: usize,
     /// The loop pool's floor. A pair rather than one resolved figure because
-    /// `LoopPool::for_device` picks inside it and `back_off` walks back down it.
+    /// the pool is held inside it: what the loops need, capped by the room the
+    /// rest of the scene leaves under the capacity (`crate::fit::loop_pool_bytes`),
+    /// never below this and never above the ceiling.
     pub loop_pool_floor_bytes: usize,
     /// The loop pool's ceiling. See [`Self::loop_pool_floor_bytes`].
     pub loop_pool_ceiling_bytes: usize,
@@ -610,6 +614,12 @@ pub struct Budgets {
     pub app_texture_ceiling_bytes: usize,
     /// The largest side a static plan-view raster may reach on this class.
     pub raster_side_ceiling_px: usize,
+    /// Whether map tiles are drawn at the whole zoom below the fractional one
+    /// — fewer, larger tiles covering the same glass. The tile-sharpness rung
+    /// of the ladder sets it; `false` at every class rung. **No consumer reads
+    /// it yet**: the tile pump's bytes-based bias gate is a later landing, and
+    /// until it arrives this is the rung's position and nothing more.
+    pub tile_whole_zoom: bool,
 }
 
 impl Budgets {
@@ -660,10 +670,19 @@ impl Budgets {
 
     /// Frames of `cadence_secs` apiece it takes to cover [`Self::loop_span_secs`].
     pub fn frames_for_span(&self, cadence_secs: Option<u32>) -> usize {
+        self.frames_for_span_of(self.loop_span_secs, cadence_secs)
+    }
+
+    /// Frames of `cadence_secs` apiece it takes to cover `span_secs` of a
+    /// pane's own lookback, held to [`Self::loop_span_secs`] and to the render
+    /// budget — the same clamp as [`Self::frames_for_span`], with the pane's
+    /// span in place of the budget's. A loop with no cadence yet buys the whole
+    /// render budget, as it always has.
+    pub fn frames_for_span_of(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
         let Some(cadence) = cadence_secs.filter(|secs| *secs > 0) else {
             return self.loop_render_budget;
         };
-        (1 + self.loop_span_secs / cadence as usize).clamp(
+        (1 + span_secs.min(self.loop_span_secs) / cadence as usize).clamp(
             constants::MIN_LOOP_FRAMES_PER_PANE,
             self.loop_render_budget
                 .max(constants::MIN_LOOP_FRAMES_PER_PANE),
@@ -726,59 +745,95 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
             .raster_side_ceiling_px
             .at(promotion)
             .max(limits.long_range_image_side_px.floor),
+        tile_whole_zoom: false,
     };
     demote(&mut budgets, limits, profile.steps_back());
     budgets
 }
 
-/// Walk `steps` rungs down the degradation ladder, in the order
-/// `docs/cross-platform-resource-limits.md` §4.3 fixes.
+/// One rung: mutate, and say whether anything actually moved.
+type Rung = fn(&mut Budgets, &BudgetLimits) -> bool;
+
+/// The degradation ladder, in the order `docs/cross-platform-resource-limits.md`
+/// §4.3 fixes: degrade what the user is least likely to notice, and degrade
+/// smoothly before degrading discretely. One table, walked by [`demote`] for a
+/// counted step and by `crate::fit::fit` for as many steps as the scene's need
+/// asks. A rung whose knob the scene does not exercise still moves the budget
+/// — the budget is the ladder's position — and costs the picture nothing.
+///
+/// 1. **3D lighting**: the gradient shading, seven fetches a step against one.
+/// 2. **3D offscreen resolution**, one coarsening a step (`Native`, `Half`,
+///    `Quarter`), and the offscreen and app ceilings to their floors with it.
+/// 3. **Loop history, 2D before 3D**: the render budget halves toward
+///    `MIN_LOOP_FRAMES_PER_PANE`, one halving a step, so a scene that is a
+///    little over sheds a little history rather than a rung of detail. A
+///    shorter loop is the least destructive thing in the application — nothing
+///    on screen gets worse, there is just less of it.
+/// 4. **Tile sharpness**: fewer, larger tiles cover the same glass. Above the
+///    grid because a softer basemap is a softer picture and a coarser grid is
+///    a wrong-looking one.
+/// 5. **3D grid cells**, and the volume texture budget with them: the first
+///    rung a user calls "worse".
+/// 6. **Raster side**, to the long-range floor: the most visible, so last.
+const LADDER: [Rung; 6] = [
+    |b, _| {
+        let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
+        let moved = cheaper != b.quality_ceiling.shading;
+        b.quality_ceiling.shading = cheaper;
+        moved
+    },
+    |b, limits| {
+        let coarser = b.quality_ceiling.resolution.next_coarser();
+        let floor = limits.offscreen_bytes.floor;
+        let moved = coarser.is_some() || b.offscreen_bytes > floor;
+        if let Some(coarser) = coarser {
+            b.quality_ceiling.resolution = coarser;
+        }
+        b.offscreen_bytes = floor;
+        // The bound the offscreen's promotion moved comes back with it.
+        b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
+        moved
+    },
+    |b, _| {
+        let halved = (b.loop_render_budget / 2).max(constants::MIN_LOOP_FRAMES_PER_PANE);
+        let moved = halved < b.loop_render_budget;
+        b.loop_render_budget = halved;
+        moved
+    },
+    |b, _| {
+        let moved = !b.tile_whole_zoom;
+        b.tile_whole_zoom = true;
+        moved
+    },
+    |b, limits| {
+        let moved = b.grid_cells != limits.grid_cells.floor;
+        b.grid_cells = limits.grid_cells.floor;
+        b.volume_texture_bytes = limits.volume_texture_bytes.floor;
+        moved
+    },
+    |b, limits| {
+        let floor = limits.long_range_image_side_px.floor;
+        let moved = b.raster_side_ceiling_px > floor;
+        b.raster_side_ceiling_px = floor;
+        moved
+    },
+];
+
+/// Walk `steps` rungs down the degradation ladder — each step the *first rung
+/// that moves*, not the nth rung, so a machine already at a rung's stop steps
+/// the next one. Total: past the last rung's stop nothing moves.
 pub fn demote(budgets: &mut Budgets, limits: &BudgetLimits, steps: u32) {
-    /// One rung: mutate, and say whether anything actually moved.
-    type Rung = fn(&mut Budgets, &BudgetLimits) -> bool;
-
-    const LADDER: [Rung; 4] = [
-        |b, _| {
-            let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
-            let moved = cheaper != b.quality_ceiling.shading;
-            b.quality_ceiling.shading = cheaper;
-            moved
-        },
-        |b, limits| {
-            let coarser = b.quality_ceiling.resolution.next_coarser();
-            let floor = limits.offscreen_bytes.floor;
-            let moved = coarser.is_some() || b.offscreen_bytes > floor;
-            if let Some(coarser) = coarser {
-                b.quality_ceiling.resolution = coarser;
-            }
-            b.offscreen_bytes = floor;
-            // The bound the offscreen's promotion moved comes back with it.
-            b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
-            moved
-        },
-        |b, limits| {
-            let moved = b.grid_cells != limits.grid_cells.floor;
-            b.grid_cells = limits.grid_cells.floor;
-            b.volume_texture_bytes = limits.volume_texture_bytes.floor;
-            moved
-        },
-        |b, limits| {
-            let floor = limits.long_range_image_side_px.floor;
-            let moved = b.raster_side_ceiling_px > floor;
-            b.raster_side_ceiling_px = floor;
-            moved
-        },
-    ];
-
     budgets.steps_back = steps;
     for _ in 0..steps {
-        // The *first rung that moves*, not the nth rung.
-        for rung in LADDER {
-            if rung(budgets, limits) {
-                break;
-            }
+        if !step_down(budgets, limits) {
+            break;
         }
     }
+}
+
+/// One step down the ladder: the first rung that moves, and whether one did.
+pub(crate) fn step_down(budgets: &mut Budgets, limits: &BudgetLimits) -> bool {
+    LADDER.iter().any(|rung| rung(budgets, limits))
 }
 
 #[path = "budget/tests.rs"]

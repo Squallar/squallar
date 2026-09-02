@@ -400,6 +400,25 @@ pub const DESKTOP_APP_TEXTURE_BUDGET_BYTES: usize = 3840 * 1024 * 1024;
 /// [`crate::budget::Promotion::Ceiling`].
 pub const DESKTOP_APP_TEXTURE_CEILING_BYTES: usize = 4032 * 1024 * 1024;
 
+/// The share of a **measured or probed** GPU capacity the scene's need may
+/// occupy, as `(numerator, denominator)`: three quarters. Metal's own
+/// recommended working set is ~75 % of RAM on M-series, the one vendor figure
+/// for how much of a memory a renderer is meant to take; the rest is the
+/// driver, the compositor and the picture in flight. **Never applied to a
+/// presumed capacity**: the bracket's `APP_TEXTURE_BUDGET_BYTES` constant was
+/// argued with its own headroom and is what today's sum proof already spends up
+/// to, so on that arm the constant is the allowance
+/// ([`crate::scene::Capacity::allowance`]).
+pub const NEED_FRACTION: (u64, u64) = (3, 4);
+
+/// How full of economy — what is resident beyond need — a capacity may be
+/// filled, as `(numerator, denominator)`: nine tenths. The last tenth is the
+/// in-flight picture, the driver and the compositor. Also the step a session's
+/// presumption is lowered by when pressure says the wall was under it: nothing
+/// in this tree measures GPU residency, so the wall is taken to be at most the
+/// allowance in force, less the economy the eviction just took.
+pub const ECONOMY_FRACTION: (u64, u64) = (9, 10);
+
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
 #[cfg(mobile)]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = MOBILE_MAX_RENDER_CACHE_ENTRIES;
@@ -541,6 +560,12 @@ const _: () = const {
     assert!(LOOP_POOL_DWELL_FRAMES > 0);
     assert!(LOOP_POOL_HYSTERESIS > 1.0);
     assert!(LOOP_POOL_FLOOR_BYTES / MIN_LOOP_FRAMES_PER_PANE > 0);
+    // A fraction at or over one is no headroom; a zero one is no allowance.
+    assert!(NEED_FRACTION.0 > 0 && NEED_FRACTION.0 < NEED_FRACTION.1);
+    assert!(ECONOMY_FRACTION.0 > 0 && ECONOMY_FRACTION.0 < ECONOMY_FRACTION.1);
+    // Need sits under economy: what the scene costs may not be allowed to
+    // occupy more than what is resident is allowed to.
+    assert!(NEED_FRACTION.0 * ECONOMY_FRACTION.1 <= ECONOMY_FRACTION.0 * NEED_FRACTION.1);
     assert!(MAX_RENDER_CACHE_ENTRIES > 0);
     assert!(MAX_CONCURRENT_RENDERS > 0);
     assert!(MAX_CONCURRENT_LOOP_DOWNLOADS > 0);
