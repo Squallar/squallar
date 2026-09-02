@@ -1,5 +1,5 @@
-// One vector tile's tessellated fills, placed by a uniform rather than by the
-// CPU.
+// One vector tile's tessellated fills and strokes, placed by a uniform rather
+// than by the CPU.
 //
 // **This is egui's own shader with the texture factored out.** Every arithmetic
 // step below — the colour unpack, the clip-space map, the dither, the two
@@ -81,6 +81,34 @@ fn vs_main(
     // `ShapeOrText::placed` spells this `scaling * p + translation`, and so
     // does this: same operands, same order.
     out.position = position_from_screen(r_locals.scale * a_pos + r_locals.translation);
+    return out;
+}
+
+// One tile's pre-tessellated strokes.
+//
+// `a_pos` is the centreline point in MVT extent units, as an integer: MVT
+// geometry arrives as integer varints and `tile_mesh::stroke` refuses any
+// point that is not one, so this is a narrowing and not a quantisation.
+//
+// `a_offset` is what epaint's tessellator put between that point and this
+// vertex — `normal * radius`, plus the end extrude — and it is in **screen
+// points**, so the placement must not scale it. epaint reads the normal off
+// the path's own points and the placement is a scale-and-translate with no
+// rotation, which is what makes the offset the same number of points at every
+// tile side and lets it be computed once at tile build. That is the whole of
+// the difference from `vs_main`: one attribute, one add, after the placement
+// rather than inside it.
+@vertex
+fn vs_stroke(
+    @location(0) a_pos: vec2<i32>,
+    @location(1) a_offset: vec2<f32>,
+    @location(2) a_color: u32,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.color = unpack_color(a_color);
+    out.position = position_from_screen(
+        r_locals.scale * vec2<f32>(a_pos) + r_locals.translation + a_offset
+    );
     return out;
 }
 

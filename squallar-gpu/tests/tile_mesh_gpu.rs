@@ -1,5 +1,5 @@
-//! A tile's fills drawn through the GPU path put the **same bytes on the
-//! screen** as the CPU placement path they replace.
+//! A tile's fills and strokes drawn through the GPU path put the **same bytes
+//! on the screen** as the CPU placement path they replace.
 //!
 //! This is the gate the whole mechanism turns on. The two paths reach the same
 //! render pass through two different pipelines: egui's, which samples the font
@@ -80,6 +80,99 @@ fn fills() -> egui::epaint::Mesh {
 /// The fixture's fills, through the map's own flattener.
 fn flat() -> std::sync::Arc<tile_mesh::TileMeshes> {
     std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, &fills()))))
+}
+
+/// The feathering the stroke fixture is flattened and drawn at.
+///
+/// egui's default `feathering_size_in_pixels` over the `pixels_per_point` the
+/// frames below use, which is 1: the canvas is [`SIDE`] points and [`SIDE`]
+/// texels.
+const FEATHERING: f32 = 1.0;
+
+/// The tile's strokes: four polylines with corners of every kind — a gentle
+/// bend, a right angle, and one sharper than a right angle, which is the
+/// branch that splits a path point in two — in translucent colours so the
+/// feathered edges have to blend the same way on both paths.
+///
+/// Coordinates are integers, as MVT geometry is, so the `i16` position the
+/// packed vertex carries is exact.
+fn strokes() -> Vec<egui::epaint::PathShape> {
+    /// One fixture line: its centreline in extent units, its colour and its
+    /// width in screen points.
+    struct Line {
+        points: &'static [(f32, f32)],
+        colour: egui::Color32,
+        width: f32,
+    }
+    let lines: [Line; 4] = [
+        Line {
+            points: &[(200.0, 200.0), (3800.0, 600.0), (3600.0, 3600.0)],
+            colour: egui::Color32::from_rgba_premultiplied(220, 40, 40, 255),
+            width: 9.0,
+        },
+        Line {
+            // A right angle, and then one much sharper than a right angle.
+            points: &[
+                (400.0, 3600.0),
+                (2000.0, 3600.0),
+                (2000.0, 1200.0),
+                (1700.0, 3400.0),
+            ],
+            colour: egui::Color32::from_rgba_premultiplied(30, 140, 70, 190),
+            width: 5.0,
+        },
+        Line {
+            points: &[(100.0, 2048.0), (3900.0, 2048.0)],
+            colour: egui::Color32::from_rgba_premultiplied(60, 60, 210, 120),
+            width: 13.0,
+        },
+        Line {
+            points: &[(3900.0, 100.0), (100.0, 3900.0)],
+            colour: egui::Color32::from_rgba_premultiplied(200, 200, 40, 80),
+            width: 2.0,
+        },
+    ];
+    lines
+        .into_iter()
+        .map(|line| {
+            egui::epaint::PathShape::line(
+                line.points.iter().map(|&(x, y)| egui::pos2(x, y)).collect(),
+                egui::Stroke::new(line.width, line.colour),
+            )
+        })
+        .collect()
+}
+
+/// The fixture's strokes, through the map's own flattener.
+fn flat_strokes(paths: &[egui::epaint::PathShape]) -> std::sync::Arc<tile_mesh::TileMeshes> {
+    std::sync::Arc::new(tile_mesh::flatten_paths(
+        paths.iter().enumerate().map(|(i, p)| (i as u32, p)),
+        FEATHERING,
+    ))
+}
+
+/// The CPU path's shapes for the strokes: the paths placed by
+/// `scale * p + translation`, which is exactly what `ShapeOrText::placed`'s
+/// path arm produces and what `paint_vector_tile` pushes today.
+///
+/// **This arm is egui's own tessellator**, not a re-derivation: the whole
+/// question is whether the pre-computed offsets put the same triangles on
+/// screen as epaint would, so epaint has to be the one drawing the control.
+fn cpu_stroke_shapes(paths: &[egui::epaint::PathShape]) -> Vec<egui::Shape> {
+    let place = tile_mesh::Placement::of(piece());
+    paths
+        .iter()
+        .map(|path| {
+            let mut placed = path.clone();
+            for point in &mut placed.points {
+                *point = egui::pos2(
+                    place.scale * point.x + place.translation[0],
+                    place.scale * point.y + place.translation[1],
+                );
+            }
+            egui::Shape::Path(placed)
+        })
+        .collect()
 }
 
 /// Held for the length of a test, so only one talks to the GPU at a time —
@@ -400,6 +493,109 @@ fn the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
     // The interleaved control: the two target formats really do produce
     // different pictures, so the byte compares above were capable of failing
     // on exactly the difference this gate exists to catch.
+    assert_ne!(
+        readings[0], readings[1],
+        "the sRGB and non-sRGB targets read back identically, so this suite \
+         cannot see a gamma convention at all and both passes above are vacuous"
+    );
+}
+
+/// **The same gate for strokes**, and the harder half: a stroke's geometry is
+/// not carried across, only the *offset* each vertex takes from its point, and
+/// the shader adds it after the placement. The control arm is egui's own
+/// tessellator over the placed `Shape::Path`, which is literally the path this
+/// replaces.
+///
+/// Two texel budgets rather than one byte compare, and the reason is measured
+/// in `squallar-egui`: the two sides compute the normal from differences taken
+/// in different spaces, so the vertex positions agree to within one ulp of the
+/// placed coordinate rather than exactly
+/// (`tile_mesh::fixture_tests::the_offsets_reproduce_epaints_own_tessellation`).
+/// One ulp is far under the rasteriser's sub-pixel step, so the expectation is
+/// still zero differing texels; the budget is there so that if a driver's
+/// coverage rounding does land on a boundary, this reddens with a *number*
+/// rather than turning into a flake somebody re-runs.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn the_stroke_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let paths = strokes();
+    let meshes = flat_strokes(&paths);
+    assert_eq!(
+        meshes.runs().len(),
+        1,
+        "the fixture's four consecutive paths are one run"
+    );
+    assert!(
+        meshes.stroke_vertex_count() > 0,
+        "the fixture flattened to no stroke vertices, so the GPU arm below \
+         would draw nothing and match an empty picture"
+    );
+    // **And no fills at all**, which makes this the stroke-only tile too — a
+    // style at one zoom can produce one, and a residency that allocated a
+    // zero-length fill buffer for it would be a wgpu validation failure
+    // rather than an empty draw.
+    assert_eq!(meshes.vertex_count(), 0, "this fixture is strokes only");
+
+    let mut readings = Vec::new();
+    for format in [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ] {
+        let mut renderer = renderer_for(&device, format);
+        let cpu = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            cpu_stroke_shapes(&paths),
+        );
+        let gpu = frame(
+            &device,
+            &queue,
+            &mut renderer,
+            format,
+            callback_shapes(&meshes, 1),
+        );
+
+        let drew = painted(&cpu);
+        assert!(
+            drew > (SIDE * SIDE / 64) as usize,
+            "{format:?}: the CPU path painted only {drew} texels, so a match \
+             would be two nearly-empty pictures agreeing"
+        );
+
+        let differing = cpu
+            .chunks_exact(4)
+            .zip(gpu.chunks_exact(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        let worst = cpu
+            .iter()
+            .zip(gpu.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        println!(
+            "{format:?}: {differing} of {} texels differ, worst channel \
+             delta {worst}, over {drew} painted",
+            SIDE * SIDE
+        );
+        assert_eq!(
+            differing,
+            0,
+            "{format:?}: {differing} of {} texels differ between egui's own \
+             tessellation of the placed path and the pre-computed offsets \
+             (worst channel delta {worst})",
+            SIDE * SIDE
+        );
+        readings.push(cpu);
+    }
+
     assert_ne!(
         readings[0], readings[1],
         "the sRGB and non-sRGB targets read back identically, so this suite \

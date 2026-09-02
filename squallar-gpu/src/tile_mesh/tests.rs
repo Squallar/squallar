@@ -60,14 +60,16 @@ fn ring_slots_are_spaced_by_the_adapters_alignment() {
 
 /// **The fragment entry point is chosen off the target's sRGB-ness, the way
 /// egui chooses its own.** A pipeline built for the other convention draws
-/// every fill at the wrong gamma, which the adapter-backed parity suite
-/// catches — this is the same claim without a device, so a refactor that
-/// drops the branch reddens on every board rather than only on the GPU one.
+/// every fill and every stroke at the wrong gamma, which the adapter-backed
+/// parity suite catches — this is the same claim without a device, so a
+/// refactor that drops the branch reddens on every board rather than only on
+/// the GPU one. The choice lives inside `build_pipeline`, which is what makes
+/// it one answer for both pipelines rather than two that could diverge.
 #[test]
 fn the_entry_point_is_keyed_off_the_targets_srgb_ness() {
     let source = include_str!("../tile_mesh.rs");
     let body = source
-        .split_once("let entry_point = if attachments.color_format.is_srgb() {")
+        .split_once("let fragment_entry = if attachments.color_format.is_srgb() {")
         .map(|(_, rest)| rest.split_once("};").expect("the choice is a block").0)
         .expect("the entry-point choice no longer keys off `is_srgb`");
     let (srgb, plain) = body
@@ -83,15 +85,62 @@ fn the_entry_point_is_keyed_off_the_targets_srgb_ness() {
     );
 }
 
-/// Both entry points, and only those two, exist in the shader — so the choice
-/// above cannot name one that silently is not there.
+/// Every entry point the two pipelines name exists in the shader — so a
+/// choice above cannot name one that silently is not there.
 #[test]
-fn the_shader_declares_both_entry_points_egui_declares() {
+fn the_shader_declares_every_entry_point_the_pipelines_name() {
     let wgsl = include_str!("../tile_mesh.wgsl");
-    for entry in ["fs_main_linear_framebuffer", "fs_main_gamma_framebuffer"] {
+    for entry in [
+        "fs_main_linear_framebuffer",
+        "fs_main_gamma_framebuffer",
+        "vs_main",
+        "vs_stroke",
+    ] {
         assert!(
             wgsl.contains(&format!("fn {entry}(")),
             "the shader has no `{entry}`"
         );
     }
+}
+
+/// **The stroke vertex adds its offset after the placement, never inside it.**
+///
+/// The whole design is that the offset is a *screen-point* quantity: scaling
+/// it with the tile would make a road breathe through a zoom sweep, which is
+/// exactly the defect `mvt::render_line`'s own comment records upstream having
+/// shipped. A source-text assertion rather than a rendered one because the
+/// rendered gate (`tests/tile_mesh_gpu.rs`) needs an adapter and this does
+/// not, so a tree that folds the offset into the multiply reddens on every
+/// board rather than only the ones with a GPU.
+#[test]
+fn the_stroke_shader_adds_the_offset_outside_the_scale() {
+    let wgsl = include_str!("../tile_mesh.wgsl");
+    assert!(
+        wgsl.contains("r_locals.scale * vec2<f32>(a_pos) + r_locals.translation + a_offset"),
+        "the stroke vertex shader no longer spells the placement as \
+         `scale * pos + translation + offset`; an offset inside the scale is \
+         a road that changes width with the tile side"
+    );
+}
+
+/// The stroke vertex layout the pipeline declares is the one the flattener
+/// writes: three attributes at 0, 4 and 12, in a stride of
+/// [`stroke::STROKE_VERTEX_BYTES`].
+///
+/// A layout and a writer that disagree produce a picture rather than an
+/// error, which is why this is stated twice and compared.
+#[test]
+fn the_stroke_vertex_layout_is_the_one_the_flattener_writes() {
+    assert_eq!(
+        stroke::STROKE_VERTEX_BYTES,
+        wgpu::VertexFormat::Sint16x2.size()
+            + wgpu::VertexFormat::Float32x2.size()
+            + wgpu::VertexFormat::Uint32.size(),
+        "the stride is not the three attributes end to end, so either the \
+         flattener is padding or the pipeline is reading past a vertex"
+    );
+    assert_eq!(stroke::STROKE_INDEX_BYTES, 2, "a u16 index");
+    // The `u16` index space is what bounds a run, and the two must agree or a
+    // run can address a vertex the index cannot name.
+    assert_eq!(stroke::STROKE_RUN_VERTICES, u32::from(u16::MAX) + 1);
 }

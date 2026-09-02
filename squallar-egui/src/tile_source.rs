@@ -380,6 +380,11 @@ type SharedParsedTiles = Arc<Mutex<LruCache<TileId, Arc<walkers::mvt::ParsedTile
 struct StyleSlot {
     style: Arc<Style>,
     epoch: u64,
+    /// The tessellator feathering the IO task must flatten strokes at, in
+    /// points. Travels with the style because it is the other flatten input
+    /// and the two must be read under one lock; see
+    /// [`HttpsTiles::set_feathering`].
+    feathering: f32,
 }
 
 /// What the archive IO task carries to style against — the slot on native,
@@ -394,6 +399,16 @@ type IoStyleSlot = ();
 /// The style generation raster payloads carry: raster sources never restyle,
 /// so their frame-side epoch stays at this value and every payload matches.
 const RASTER_STYLE_EPOCH: u64 = 0;
+
+/// What a source flattens strokes at, given what the frame side has told it.
+///
+/// Zero until it has said anything, and zero is the value
+/// `tile_mesh::stroke::is_thick_open_stroke` refuses every path at — so a
+/// source that was never told keeps its strokes on the CPU rather than baking
+/// them at a guessed `pixels_per_point`.
+fn flatten_feathering(feathering: Option<f32>) -> f32 {
+    feathering.unwrap_or(0.0)
+}
 
 /// One slot of [`HttpsTiles`]' tile cache: the styled tile — or the
 /// pending/failed `None` marker — and the style generation it belongs to.
@@ -421,14 +436,21 @@ struct CachedTile {
 ///
 /// **Built where the tile was decoded**, which is the IO runtime's blocking
 /// pool on native and the frame pump's decode budget on wasm32 — the same two
-/// places the styling itself runs, so flattening the fills is billed to the
-/// side that already pays for tessellating them.
-fn slot_for(tile: Tile, epoch: u64) -> CachedTile {
+/// places the styling itself runs, so flattening the fills and the strokes is
+/// billed to the side that already pays for tessellating them.
+///
+/// `feathering` is the stroke half's other input, in points. A tile flattened
+/// at one feathering and drawn at another would paint wrong-width roads, so
+/// the ground phase compares the two and declines the run; see
+/// [`HttpsTiles::set_feathering`] for what re-flattens it.
+fn slot_for(tile: Tile, epoch: u64, feathering: f32) -> CachedTile {
     let meshes = match &tile {
         Tile::Vector(shapes) => {
-            let flat = crate::tile_mesh::flatten(shapes);
+            let flat = crate::tile_mesh::flatten(shapes, feathering);
             (!flat.is_empty()).then(|| Arc::new(flat))
         }
+        // A raster tile has no geometry to flatten, so `feathering` is not
+        // consulted on this arm.
         Tile::Raster(_) => None,
     };
     CachedTile {
@@ -1104,6 +1126,16 @@ pub struct HttpsTiles {
     /// never restyles.
     style_epoch: u64,
 
+    /// The tessellator feathering the frame side draws at, in points —
+    /// `feathering_size_in_pixels / pixels_per_point`, and so a function of
+    /// the display the window is on.
+    ///
+    /// `None` until the frame side has said, which is what keeps a source
+    /// that was never told off the GPU stroke path rather than guessing at
+    /// it: [`Self::flatten_feathering`] answers 0, which
+    /// `tile_mesh::stroke::is_thick_open_stroke` refuses.
+    feathering: Option<f32>,
+
     /// Where a restyle lands for the IO task — the slot [`read_one`] reads a
     /// (style, generation) pair from, once per tile. `None` for a raster HTTP
     /// source, which has no style to swap. On wasm32 the frame pump is the
@@ -1395,6 +1427,7 @@ impl HttpsTiles {
             requests_closed: false,
             cache: LruCache::new(cache_entries),
             style_epoch: RASTER_STYLE_EPOCH,
+            feathering: None,
             // A raster source has no style to swap and no parse to keep.
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: None,
@@ -1443,6 +1476,53 @@ impl HttpsTiles {
         self.install_style(style);
     }
 
+    /// Adopt `feathering` — the tessellator's, in points — for every tile
+    /// this source flattens from now on.
+    ///
+    /// **A flatten input, not a paint parameter.** Stroke offsets are
+    /// pre-computed in extent units and a feathering sets both radii, the end
+    /// extrude and, at hairline widths, which topology branch epaint takes. It
+    /// changes when `pixels_per_point` does — the window crossing to a
+    /// different-DPI display, or the user moving the UI scale — and the tiles
+    /// already flattened are then wrong for the frame.
+    ///
+    /// So this rides the **same seam a restyle rides**: the generation is
+    /// bumped, every cached tile keeps drawing while
+    /// [`Self::request_once`] re-asks for it, and the IO side answers out of
+    /// the parsed cache with zero fetches and zero re-parses. Until the
+    /// re-flattened tile lands the ground phase draws that tile's strokes on
+    /// the CPU, which is where they were before any of this.
+    ///
+    /// The **first** call installs without bumping: it happens before this
+    /// source has been asked for a tile, so there is nothing to re-ask for.
+    pub(crate) fn set_feathering(&mut self, feathering: f32) {
+        if self.feathering == Some(feathering) {
+            return;
+        }
+        let first = self.feathering.is_none();
+        self.feathering = Some(feathering);
+        if !first {
+            self.style_epoch += 1;
+        }
+        self.publish_feathering();
+    }
+
+    /// The native arm of [`Self::set_feathering`]: republish the pair the IO
+    /// task reads, keeping the style it already has.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_feathering(&mut self) {
+        if let Some(slot) = &self.style_slot {
+            let mut slot = slot.write().expect("the style slot is not poisoned");
+            slot.epoch = self.style_epoch;
+            slot.feathering = flatten_feathering(self.feathering);
+        }
+    }
+
+    /// The wasm32 arm: the frame pump is the flattening side and reads the
+    /// field directly.
+    #[cfg(target_arch = "wasm32")]
+    fn publish_feathering(&mut self) {}
+
     /// The native arm of the [`Self::set_style`] split: publish the pair to
     /// the IO task's slot.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1451,6 +1531,7 @@ impl HttpsTiles {
             *slot.write().expect("the style slot is not poisoned") = StyleSlot {
                 style,
                 epoch: self.style_epoch,
+                feathering: flatten_feathering(self.feathering),
             };
         }
     }
@@ -1603,6 +1684,7 @@ impl HttpsTiles {
             parsed,
             io_task_gone_reported,
             style_epoch,
+            feathering,
             put_generation,
             takes,
             ..
@@ -1613,6 +1695,7 @@ impl HttpsTiles {
         // The pump styles against the frame's current style, so what it puts
         // is current by construction.
         let epoch = *style_epoch;
+        let feathering = flatten_feathering(*feathering);
 
         let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
         let budget = allowance.budget;
@@ -1678,7 +1761,7 @@ impl HttpsTiles {
                 match decoded {
                     Ok(tile) => {
                         *put_generation += 1;
-                        cache.put(tile_id, slot_for(tile, epoch));
+                        cache.put(tile_id, slot_for(tile, epoch, feathering));
                     }
                     Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
                 }
@@ -1943,7 +2026,8 @@ impl HttpsTiles {
         self.put_generation += 1;
         // Through the same constructor an arrival goes through, so a fixture
         // carries the flattened fills a real tile carries.
-        self.cache.put(tile_id, slot_for(tile, epoch));
+        let feathering = flatten_feathering(self.feathering);
+        self.cache.put(tile_id, slot_for(tile, epoch, feathering));
     }
 }
 
@@ -2027,6 +2111,8 @@ async fn fetch_one<S: TileSource>(
         Tile::new(&body, &Style::default(), tile_id.zoom, egui_ctx)
             .map_err(|error| format!("decoding '{url}': {error}"))?,
         RASTER_STYLE_EPOCH,
+        // A raster body flattens to nothing, so no feathering is consulted.
+        0.0,
     );
 
     // On wasm the decode belongs to the frame pump, under its budget.
@@ -2268,6 +2354,9 @@ impl HttpsTiles {
         let style_slot: IoStyleSlot = Arc::new(std::sync::RwLock::new(StyleSlot {
             style: Arc::clone(&style),
             epoch: RASTER_STYLE_EPOCH,
+            // Refuses every stroke until the frame side says what it draws
+            // at; see `HttpsTiles::set_feathering`.
+            feathering: 0.0,
         }));
         #[cfg(target_arch = "wasm32")]
         let style_slot: IoStyleSlot = ();
@@ -2321,6 +2410,7 @@ impl HttpsTiles {
             requests_closed: false,
             cache: LruCache::new(cache_entries),
             style_epoch: RASTER_STYLE_EPOCH,
+            feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: Some(frame_style_slot),
             #[cfg(target_arch = "wasm32")]
@@ -2379,6 +2469,7 @@ impl HttpsTiles {
             // never-restyles spelling as a raster source, which is what the
             // epoch constant's doc names for this case.
             style_epoch: RASTER_STYLE_EPOCH,
+            feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
             style_slot: None,
             #[cfg(target_arch = "wasm32")]
@@ -2834,9 +2925,13 @@ where
     if let Some(parsed) = remembered {
         #[cfg(not(target_arch = "wasm32"))]
         let payload = {
-            let (style, epoch) = current_style(&styling.style);
+            let (style, epoch, feathering) = current_style(&styling.style);
             tokio::task::spawn_blocking(move || {
-                slot_for(styled_tile(&parsed, &style, tile_id.zoom), epoch)
+                slot_for(
+                    styled_tile(&parsed, &style, tile_id.zoom),
+                    epoch,
+                    feathering,
+                )
             })
             .await
             .map_err(|error| format!("re-styling {tile_id:?} from the parsed cache: {error}"))?
@@ -2861,13 +2956,13 @@ where
 
     #[cfg(not(target_arch = "wasm32"))]
     let payload = {
-        let (style, epoch) = current_style(&styling.style);
+        let (style, epoch, feathering) = current_style(&styling.style);
         let egui_ctx = egui_ctx.clone();
         let parsed_tiles = Arc::clone(&styling.parsed_tiles);
 
         tokio::task::spawn_blocking(move || {
             decode_archive_tile_remembering(&bytes, kind, &style, tile_id, &egui_ctx, &parsed_tiles)
-                .map(|tile| slot_for(tile, epoch))
+                .map(|tile| slot_for(tile, epoch, feathering))
         })
         .await
         .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
@@ -2882,12 +2977,13 @@ where
 }
 
 /// The style the IO task must render against right now, with the restyle
-/// generation it belongs to — read together under one lock so a styling can
-/// never be stamped with another generation's number.
+/// generation it belongs to and the feathering its strokes flatten at — read
+/// together under one lock so a styling can never be stamped with another
+/// generation's number.
 #[cfg(not(target_arch = "wasm32"))]
-fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64) {
+fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64, f32) {
     let slot = slot.read().expect("the style slot is not poisoned");
-    (Arc::clone(&slot.style), slot.epoch)
+    (Arc::clone(&slot.style), slot.epoch, slot.feathering)
 }
 
 pub mod take_ledger;

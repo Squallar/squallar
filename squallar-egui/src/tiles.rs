@@ -731,6 +731,18 @@ impl MapTileState {
             self.base_unreachable = self.tiles.is_none();
         }
 
+        // **After the build arm, so a source made this frame is told before
+        // it is asked for a tile** — that first install is the one
+        // `HttpsTiles::set_feathering` does not bump the generation for.
+        // Unconditional and per frame: the comparison inside is one `f32`,
+        // and the event this exists to catch — the window crossing to a
+        // different-DPI display — arrives as a changed `pixels_per_point` on
+        // an ordinary frame with no other seam behind it. The terrain slot is
+        // untouched: a hillshade tile is raster and flattens to nothing.
+        if let Some(tiles) = self.tiles.as_mut() {
+            tiles.set_feathering(crate::tile_mesh::feathering_of(ctx));
+        }
+
         // The other half of the health question, and the half the archive can
         // only answer after it has opened: a source that opened and then
         // answered nothing. Sampled here, where the slot is still full — the

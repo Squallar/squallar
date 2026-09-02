@@ -2627,9 +2627,12 @@ var basemap_re = /basemap tiles: (\d+) vector, (\d+) raster, (\d+) sniffed/;
 // place nothing -- and together they are what makes a row comparable across
 // the pmtiles 32-bit truncation fix (`a7465238`, 2026-08-31), before which no
 // vector tile resolved on wasm32 at all while every native leg did the whole
-// placement, tessellation and upload. `placed` alone is not the test: the
-// fills went to the GPU, so a drawing pane reads 0 there and positive in the
-// other three.
+// placement, tessellation and upload. `placed` alone is not the test, and
+// since 2026-09-01 neither is `stroke pts`: the fills AND the strokes go to
+// the GPU, so a drawing pane reads 0 in both and positive in labels, draws
+// and uploads. The pattern is deliberately not anchored at the end, so the
+// `stroke draws` field appended after `unrendered` leaves every capture
+// index below where it was.
 var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d+) draws, (\d+) uploads of (\d+) B, (\d+) evicted, (\d+) B resident, (\d+) unrendered/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror

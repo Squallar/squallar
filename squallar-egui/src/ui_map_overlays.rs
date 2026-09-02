@@ -249,6 +249,10 @@ pub(super) fn draw_tile_layer(
     // draws from the next without a clock or a frame callback of its own.
     let pass_nr = ui.ctx().cumulative_pass_nr();
 
+    // Once for the layer, not once per tile: a `Context` read lock and a
+    // divide, against a span that holds up to 84 cells.
+    let feathering = crate::tile_mesh::feathering_of(ui.ctx());
+
     // Accumulated across every cell below, so the collision test the caller
     // makes is one test against the whole pane; see [`paint_labels`].
     let mut labels: Vec<walkers::Text> = Vec::new();
@@ -293,6 +297,7 @@ pub(super) fn draw_tile_layer(
                                 meshes: twuv.meshes.as_ref(),
                                 painter: ground,
                                 pass_nr,
+                                feathering,
                             },
                             rect,
                             twuv.uv,
@@ -422,16 +427,19 @@ fn lay_out_label(
 /// transform it — 158.1 us per tile per frame, against a viewport that holds up
 /// to 84 tiles.
 ///
-/// **The tessellated fills do not take that copy at all where a renderer can
-/// draw them.** They were flattened once when the tile arrived
+/// **The tessellated fills and the strokes do not take that copy at all where
+/// a renderer can draw them.** Both were flattened once when the tile arrived
 /// ([`crate::tile_mesh`]) and are drawn from a GPU buffer with the placement
-/// as a uniform, so a fill run becomes one paint callback rather than a copy
-/// of its vertices. Same fixture, same build: the two coalesced meshes were
-/// 12.63 us of the tile's 26.61 us of placement, and the 708 stroked paths
-/// beside them are the 13.51 us that stays here — strokes carry a width in
-/// screen points that no extent-space pre-tessellation can hold. `ground`
-/// being `None` (a floor strip, a raster tile, a build with no renderer
-/// installed) puts every fill back on this path unchanged.
+/// as a uniform, so a run becomes one paint callback rather than a copy of its
+/// geometry. Same fixture, same build: the two coalesced meshes were 12.63 us
+/// of the tile's 26.61 us of placement and the 708 stroked paths beside them
+/// were the other 13.51 us. A stroke's width is in screen points while its
+/// geometry is in extent units, which is what used to keep it here; the offset
+/// each vertex takes from its point is invariant under the placement, so it is
+/// pre-computed and added in the shader ([`crate::tile_mesh::stroke`]).
+/// `ground` being `None` (a floor strip, a raster tile, a build with no
+/// renderer installed) puts every run back on this path unchanged, and so does
+/// a tile flattened at a feathering this frame does not draw at.
 ///
 /// **Nothing is culled here, and that was measured rather than assumed.** A
 /// per-shape bounding-rect test against the clip looks like the obvious
@@ -481,9 +489,20 @@ fn paint_vector_tile(
         // The runs are in shape order, so this walks them in step with the
         // shapes and never searches. A run whose shape the loop has passed
         // cannot exist; one it has not reached yet is simply not this shape's.
-        if let Some(callback) = runs.take_at(index, &ground, placement, rect) {
-            counted.mesh_draws += 1;
+        if let Some((callback, kind)) = runs.take_at(index, &ground, placement, rect) {
+            match kind {
+                crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
+                crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
+            }
             placed.push(callback);
+            continue;
+        }
+        // A stroke run covers a *span* of consecutive paths and drew all of
+        // them under the callback its first shape pushed. Only a path can be
+        // inside a span — anything else that draws closes the run at flatten
+        // time — so this cannot swallow a shape the run did not draw.
+        if runs.covers(index) && matches!(shape, walkers::ShapeOrText::Shape(egui::Shape::Path(_)))
+        {
             continue;
         }
         match shape {
@@ -517,6 +536,7 @@ struct Counted {
     path_points: u64,
     label_anchors: u64,
     mesh_draws: u64,
+    stroke_draws: u64,
 }
 
 impl Counted {
@@ -526,6 +546,7 @@ impl Counted {
         ledger::note_path_points_placed(self.path_points);
         ledger::note_label_anchors_placed(self.label_anchors);
         ledger::note_mesh_draws(self.mesh_draws);
+        ledger::note_stroke_draws(self.stroke_draws);
     }
 }
 
@@ -538,6 +559,10 @@ struct GroundMeshes<'a> {
     meshes: Option<&'a std::sync::Arc<crate::tile_mesh::TileMeshes>>,
     painter: Option<&'a std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
     pass_nr: u64,
+    /// The feathering **this frame** tessellates at, in points, from
+    /// [`crate::tile_mesh::feathering_of`]. A stroke run whose tile was
+    /// flattened at another value is declined; see [`RunCursor::take_at`].
+    feathering: f32,
 }
 
 impl GroundMeshes<'_> {
@@ -547,11 +572,15 @@ impl GroundMeshes<'_> {
         meshes: None,
         painter: None,
         pass_nr: 0,
+        feathering: 0.0,
     };
 
-    /// A cursor over this tile's fill runs, in shape order.
+    /// A cursor over this tile's runs, in shape order.
     fn runs() -> RunCursor {
-        RunCursor { next: 0 }
+        RunCursor {
+            next: 0,
+            covered_to: 0,
+        }
     }
 }
 
@@ -559,20 +588,23 @@ impl GroundMeshes<'_> {
 /// the shape walk has reached.
 struct RunCursor {
     next: usize,
+    /// One past the last shape an issued run has already drawn. A fill run
+    /// reaches one shape; a stroke run reaches its whole span.
+    covered_to: usize,
 }
 
 impl RunCursor {
-    /// The paint callback for the shape at `index`, if that shape is a fill
-    /// run this install can draw from the GPU. Advances past the run either
-    /// way, so a run the renderer refuses falls through to CPU placement
-    /// exactly once.
+    /// The paint callback for the shape at `index`, if that shape opens a run
+    /// this install can draw from the GPU, and which kind of run it was.
+    /// Advances past the run either way, so a run the renderer refuses falls
+    /// through to CPU placement exactly once.
     fn take_at(
         &mut self,
         index: usize,
         ground: &GroundMeshes<'_>,
         placement: egui::emath::TSTransform,
         piece: egui::Rect,
-    ) -> Option<egui::Shape> {
+    ) -> Option<(egui::Shape, crate::tile_mesh::RunKind)> {
         let meshes = ground.meshes?;
         let painter = ground.painter?;
         let run = *meshes.runs().get(self.next)?;
@@ -580,6 +612,18 @@ impl RunCursor {
             return None;
         }
         self.next += 1;
+        // **The `pixels_per_point` guard.** Stroke offsets are baked at a
+        // feathering, and drawing them under a different one paints
+        // wrong-width roads. A tile whose flatten has not caught up with a
+        // display change is not drawn wrong; its paths place on the CPU, as
+        // they did before any of this, until the re-flatten
+        // (`HttpsTiles::set_feathering`) lands. Bit equality is the right
+        // test: both sides come from `tile_mesh::feathering_of`, so equal
+        // inputs give equal bits and there is no tolerance to pick.
+        if run.kind == crate::tile_mesh::RunKind::Stroke && meshes.feathering() != ground.feathering
+        {
+            return None;
+        }
         let payload = painter.payload(crate::tile_mesh::GroundDraw {
             meshes,
             run: self.next - 1,
@@ -589,17 +633,26 @@ impl RunCursor {
             },
             pass_nr: ground.pass_nr,
         })?;
-        Some(egui::Shape::Callback(egui::epaint::PaintCallback {
-            // The **piece**, which is what egui turns into a viewport and
-            // refuses when it is degenerate. The draw replaces that viewport
-            // with the whole screen, because the geometry is placed in screen
-            // points by the uniform exactly as the CPU path places it; the
-            // clip that makes a stretched ancestor draw only the quarter that
-            // belongs to this tile is egui's scissor, taken from the clip
-            // rect the painter above carries.
-            rect: piece,
-            callback: payload,
-        }))
+        self.covered_to = index + run.shape_span as usize;
+        Some((
+            egui::Shape::Callback(egui::epaint::PaintCallback {
+                // The **piece**, which is what egui turns into a viewport and
+                // refuses when it is degenerate. The draw replaces that viewport
+                // with the whole screen, because the geometry is placed in screen
+                // points by the uniform exactly as the CPU path places it; the
+                // clip that makes a stretched ancestor draw only the quarter that
+                // belongs to this tile is egui's scissor, taken from the clip
+                // rect the painter above carries.
+                rect: piece,
+                callback: payload,
+            }),
+            run.kind,
+        ))
+    }
+
+    /// Whether an already-issued run has drawn the shape at `index`.
+    fn covers(&self, index: usize) -> bool {
+        index < self.covered_to
     }
 }
 
@@ -1838,10 +1891,26 @@ mod tests {
         ]
     }
 
+    /// Feathering off, which puts every stroke on the CPU path — what the
+    /// fill-only cases below were written against and still assert.
+    const NO_FEATHERING: f32 = 0.0;
+
+    /// One physical pixel at `pixels_per_point` 1, which is what puts the
+    /// fixture's stroke on the GPU path.
+    const FEATHERING: f32 = 1.0;
+
     /// Paint `a_styled_tile` once, with or without a painter, and answer the
     /// shapes it emitted and the counters it moved.
-    fn one_ground_pass(
+    ///
+    /// **One `feathering` for both halves**, because that is the invariant
+    /// the ground phase enforces: the value the tile was flattened at and the
+    /// value the frame draws at. `flattened_at` differing from it is the
+    /// display-change case, and `a_stroke_run_flattened_at_another_ppp_...`
+    /// is what exercises it.
+    fn one_ground_pass_at(
         painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+        flattened_at: f32,
+        drawn_at: f32,
     ) -> (
         Vec<egui::epaint::ClippedShape>,
         crate::tile_mesh::ledger::Totals,
@@ -1850,7 +1919,7 @@ mod tests {
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
         let shapes = a_styled_tile();
-        let meshes = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes));
+        let meshes = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes, flattened_at));
 
         crate::tile_mesh::ledger::reset();
         let mut labels = Vec::new();
@@ -1862,6 +1931,7 @@ mod tests {
                     meshes: Some(&meshes),
                     painter,
                     pass_nr: 7,
+                    feathering: drawn_at,
                 },
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -1872,14 +1942,25 @@ mod tests {
         (emitted, crate::tile_mesh::ledger::totals())
     }
 
+    /// [`one_ground_pass_at`] with the strokes on the CPU, which is what the
+    /// fill-only cases were written against.
+    fn one_ground_pass(
+        painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+    ) -> (
+        Vec<egui::epaint::ClippedShape>,
+        crate::tile_mesh::ledger::Totals,
+    ) {
+        one_ground_pass_at(painter, NO_FEATHERING, NO_FEATHERING)
+    }
+
     /// **No ground fill vertex is placed on the CPU while a renderer can draw
     /// it — and the labels still place.**
     ///
     /// The zero is only readable beside the second figure: a tile pass that
-    /// never ran would report zero for both. The strokes are the third
-    /// figure, and they stay positive by design — a `line-width` is in screen
-    /// points and no extent-space pre-tessellation can hold it, so they are
-    /// reported rather than folded away.
+    /// never ran would report zero for both. The strokes are held **off** the
+    /// GPU path here by a zero feathering, so this case pins the fill half on
+    /// its own; `ground_strokes_stop_being_placed_on_the_cpu` is the stroke
+    /// half.
     ///
     /// RED on the unmodified baseline: with no painter, every fill vertex is
     /// placed every frame, which is the `without` half below.
@@ -1975,6 +2056,115 @@ mod tests {
                  `mvt::placement` over the whole tile"
             );
         }
+    }
+
+    /// **No stroke point is placed on the CPU while a renderer can draw it.**
+    ///
+    /// The stroke half of
+    /// `ground_fills_stop_being_placed_on_the_cpu_while_labels_still_place`,
+    /// and **RED on the unmodified baseline**, where the flatten had no stroke
+    /// arm at all and every stroke point was copied on the frame thread every
+    /// frame. The `without` arm is the same tile at the same feathering with
+    /// no painter, so the zero is a move and not an absence.
+    #[test]
+    fn ground_strokes_stop_being_placed_on_the_cpu() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let (_, without) = one_ground_pass_at(None, FEATHERING, FEATHERING);
+        assert!(
+            without.path_points_placed > 0,
+            "non-triviality: the CPU path placed no stroke points either, so \
+             the zero below would prove nothing"
+        );
+        assert_eq!(without.stroke_draws, 0, "no painter, no stroke draws");
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+        let (_, with) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING);
+
+        assert_eq!(
+            with.path_points_placed, 0,
+            "stroke points are still being copied on the frame thread"
+        );
+        assert_eq!(
+            with.stroke_draws, 1,
+            "the tile's one stroke run did not become a ground draw"
+        );
+        assert!(
+            with.label_anchors_placed > 0,
+            "the labels stopped placing, so the zero above is a tile pass \
+             that did not run rather than a stroke that moved to the GPU"
+        );
+    }
+
+    /// **A tile flattened at another `pixels_per_point` is not drawn.**
+    ///
+    /// Stroke offsets are baked at a feathering, and feathering is
+    /// `feathering_size_in_pixels / pixels_per_point`. Dragging the window to
+    /// a different-DPI display would otherwise paint every road at the old
+    /// display's width until the tile was evicted. The fills are unaffected —
+    /// their vertices carry no screen-space quantity — and that asymmetry is
+    /// what this pins.
+    #[test]
+    fn a_stroke_run_flattened_at_another_ppp_falls_back_to_the_cpu() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+
+        // The control: flattened and drawn at one value, the strokes go to
+        // the GPU.
+        let (_, matched) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING);
+        assert_eq!(matched.path_points_placed, 0);
+        assert_eq!(matched.stroke_draws, 1);
+
+        // The display change: the tile is still the one flattened for the old
+        // `pixels_per_point`, and the frame is drawing at the new one.
+        let (_, mismatched) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING / 2.0);
+        assert_eq!(
+            mismatched.stroke_draws, 0,
+            "a tile flattened at another feathering was drawn from the GPU, \
+             which paints its roads the width the old display asked for"
+        );
+        assert!(
+            mismatched.path_points_placed > 0,
+            "the strokes were neither drawn from the GPU nor placed on the \
+             CPU, so they were not drawn at all"
+        );
+        assert_eq!(
+            mismatched.mesh_draws, matched.mesh_draws,
+            "the fills stopped drawing from the GPU too; only the strokes \
+             carry a screen-space quantity"
+        );
+    }
+
+    /// **A stroke run draws where the style put it.** The callback replaces
+    /// the span *in place*, so a road still draws over the fill it was styled
+    /// above and under the one styled above it.
+    #[test]
+    fn a_stroke_run_becomes_a_callback_at_its_own_position() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+        let (with, _) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING);
+
+        let kinds: Vec<&'static str> = with
+            .iter()
+            .map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(_) => "rect",
+                egui::Shape::Callback(_) => "callback",
+                egui::Shape::Path(_) => "path",
+                egui::Shape::Text(_) => "text",
+                other => panic!("unexpected shape {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["rect", "callback", "callback", "callback", "text"],
+            "the fixture's fill, stroke, fill order did not survive: the \
+             stroke must be the middle callback, not before or after both"
+        );
     }
 
     /// **A painter that refuses a run leaves it to the CPU, once.** The

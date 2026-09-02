@@ -15,16 +15,24 @@
 //!   mirror swaps callbacks for empty meshes, so a callback tile would not
 //!   reach the floor at all).
 //! * [`Totals::path_points_placed`] — **points of stroked lines that
-//!   `placed` copied on the frame thread**. These stay on the CPU by design;
-//!   see the module doc of [`super`] for why. Reported beside the fills rather
-//!   than folded into them, because a single "ground vertices" figure would
-//!   read as the whole of the ground phase and it is about half of it.
+//!   `placed` copied on the frame thread**. The stroke half of the first
+//!   figure, and it goes to zero on the same frames, for the same reason:
+//!   since 2026-09-01 strokes are pre-tessellated too. Reported beside the
+//!   fills rather than folded into them, because a single "ground vertices"
+//!   figure would read as the whole of the ground phase and it is about half
+//!   of it. A tile flattened at another `pixels_per_point` puts its paths
+//!   back here until the re-flatten lands, so this is the figure a display
+//!   change moves.
 //! * [`Totals::label_anchors_placed`] — **label anchors the ground phase
 //!   deferred**. The non-triviality conjunct under the first figure: a zero
 //!   there means the fills went to the GPU only if this is still positive; if
 //!   both are zero the tile pass did not run.
 //! * [`Totals::mesh_draws`] — **paint callbacks pushed for fill runs**, one
 //!   per run per tile per frame. The floor under the first figure's zero.
+//! * [`Totals::stroke_draws`] — **paint callbacks pushed for stroke runs**,
+//!   likewise one per run per tile per frame, and the floor under the
+//!   *second* figure's zero. A stroke run covers a span of consecutive paths,
+//!   so this is far below the shape count and is not comparable to it.
 //!
 //! A fifth pair, [`Totals::mesh_uploads`] and [`Totals::mesh_upload_bytes`],
 //! is written by the **renderer**, not by this crate, and counts buffer
@@ -38,6 +46,7 @@ static MESH_VERTICES_PLACED: AtomicU64 = AtomicU64::new(0);
 static PATH_POINTS_PLACED: AtomicU64 = AtomicU64::new(0);
 static LABEL_ANCHORS_PLACED: AtomicU64 = AtomicU64::new(0);
 static MESH_DRAWS: AtomicU64 = AtomicU64::new(0);
+static STROKE_DRAWS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static MESH_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static MESH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +60,7 @@ pub struct Totals {
     pub path_points_placed: u64,
     pub label_anchors_placed: u64,
     pub mesh_draws: u64,
+    pub stroke_draws: u64,
     pub mesh_uploads: u64,
     pub mesh_upload_bytes: u64,
     pub mesh_evictions: u64,
@@ -83,6 +93,11 @@ pub fn note_label_anchors_placed(n: u64) {
 /// Fill runs this tile handed to the renderer. One call per tile.
 pub fn note_mesh_draws(n: u64) {
     MESH_DRAWS.fetch_add(n, Relaxed);
+}
+
+/// Stroke runs this tile handed to the renderer. One call per tile.
+pub fn note_stroke_draws(n: u64) {
+    STROKE_DRAWS.fetch_add(n, Relaxed);
 }
 
 /// One tile's buffers crossed to the GPU. Called by the renderer.
@@ -118,6 +133,7 @@ impl Totals {
             .wrapping_add(self.path_points_placed)
             .wrapping_add(self.label_anchors_placed)
             .wrapping_add(self.mesh_draws)
+            .wrapping_add(self.stroke_draws)
             .wrapping_add(self.mesh_uploads)
             .wrapping_add(self.mesh_evictions)
             .wrapping_add(self.mesh_store_missing)
@@ -145,6 +161,7 @@ pub fn totals() -> Totals {
         path_points_placed: PATH_POINTS_PLACED.load(Relaxed),
         label_anchors_placed: LABEL_ANCHORS_PLACED.load(Relaxed),
         mesh_draws: MESH_DRAWS.load(Relaxed),
+        stroke_draws: STROKE_DRAWS.load(Relaxed),
         mesh_uploads: MESH_UPLOADS.load(Relaxed),
         mesh_upload_bytes: MESH_UPLOAD_BYTES.load(Relaxed),
         mesh_evictions: MESH_EVICTIONS.load(Relaxed),
@@ -165,6 +182,7 @@ pub(crate) fn reset() {
         &PATH_POINTS_PLACED,
         &LABEL_ANCHORS_PLACED,
         &MESH_DRAWS,
+        &STROKE_DRAWS,
         &MESH_UPLOADS,
         &MESH_UPLOAD_BYTES,
         &MESH_EVICTIONS,

@@ -120,9 +120,10 @@
 #     on the wrong side of the truncation reads `none-decoded`.
 #   * PLACED is `ground tiles:` -- what the ground phase then put on the frame
 #     thread. A leg can decode tiles and place nothing, which is why this is
-#     not folded into the first. `placed` alone is NOT the test here: the
-#     fills went to the GPU, so a drawing pane is legitimately zero in that
-#     one field and positive in stroke points, labels, draws and uploads.
+#     not folded into the first. `placed` alone is NOT the test here, and
+#     neither is `stroke pts`: since 2026-09-01 the strokes go to the GPU
+#     beside the fills, so a drawing pane is legitimately zero in BOTH and is
+#     positive in labels, draws and uploads.
 #
 # ---- The native protocol ---------------------------------------------------
 #
@@ -825,8 +826,10 @@ for leg in legs:
     # one leads because it is the direct answer: a leg on the wrong side of
     # the pmtiles 32-bit truncation (`a7465238`) decodes zero vector tiles.
     # The ground counters are the second half -- a leg can decode tiles and
-    # still place nothing -- and `placed` alone is not the test there, because
-    # the fills went to the GPU and a drawing pane reads 0 in that one.
+    # still place nothing -- and neither `placed` nor `stroke_points` is the
+    # test there: both the fills and the strokes went to the GPU (2026-09-01),
+    # so a drawing pane reads 0 in BOTH and is carried by labels, draws and
+    # uploads. The disjunction below is what makes that a non-event.
     bt = r.get("basemap_tile_totals")
     g = r.get("ground_tile_totals")
     decoded = None if not bt else (bt.get("vector_tiles", 0)

@@ -343,19 +343,29 @@ fn floor_strip_line(t: &squallar_egui::floor_ledger::Totals) -> String {
 /// The `ground tiles:` running-total line. See [`overlay_raster_line`] for why
 /// this is a value.
 ///
-/// **Five denominators, none of them added.** `placed` counts fill vertices
-/// the frame thread copied and `stroke pts` counts stroke points it copied —
-/// two halves of one tile's ground phase, reported apart because the fills go
-/// to the GPU and the strokes cannot (a `line-width` is in screen points).
-/// `labels` is the anchors the pass deferred, and is what makes a zero in the
-/// first figure readable: both zero is a tile pass that never ran. `draws` is
-/// paint callbacks pushed, per run per tile per frame. `uploads` counts buffer
-/// writes, once per tile lifetime rather than once per frame, and `resident`
-/// is a **level** — the only figure here that goes down.
+/// **Six denominators, none of them added.** `placed` counts fill vertices the
+/// frame thread copied and `stroke pts` counts stroke points it copied — two
+/// halves of one tile's ground phase, reported apart because they reach the
+/// GPU through different vertex formats and a display change can put the
+/// second back on the CPU while the first stays off it. `labels` is the
+/// anchors the pass deferred, and is what makes a zero in either of the first
+/// two readable: all three zero is a tile pass that never ran. `draws` and
+/// `stroke draws` are paint callbacks pushed, per run per tile per frame, and
+/// are the floors under those two zeros — a stroke run covers a span of
+/// consecutive paths, so its count is far below the shape count and the two
+/// draw figures are not comparable to each other either. `uploads` counts
+/// buffer writes, once per tile lifetime rather than once per frame, and
+/// `resident` is a **level** — the only figure here that goes down.
+///
+/// `stroke draws` is **appended** rather than placed beside `draws` because
+/// the browser rig parses this line by an unanchored regex
+/// (`.github/browser-rig/drive.py`); a field added at the end leaves every
+/// existing capture where it was.
 fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
     format!(
         "ground tiles: {} placed, {} stroke pts, {} labels, {} draws, \
-         {} uploads of {} B, {} evicted, {} B resident, {} unrendered",
+         {} uploads of {} B, {} evicted, {} B resident, {} unrendered, \
+         {} stroke draws",
         t.mesh_vertices_placed,
         t.path_points_placed,
         t.label_anchors_placed,
@@ -365,6 +375,7 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
         t.mesh_evictions,
         t.mesh_resident_bytes,
         t.mesh_store_missing,
+        t.stroke_draws,
     )
 }
 
