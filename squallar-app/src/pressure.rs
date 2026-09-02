@@ -15,6 +15,7 @@
 //! so that a browser session sheds before it traps. [`LinearMemoryWatch`] is
 //! that reading's session state.
 
+use crate::platform::GpuProbeReport;
 use squallar_device_profile::linear_memory::{LinearMemoryVerdict, linear_memory_verdict};
 
 /// What raised the pressure.
@@ -52,6 +53,20 @@ impl Pressure {
             }
         }
     }
+}
+
+/// **Whether an out-of-memory event is the WebGPU probe's own doing.** While
+/// the probe's report is `Pending` it is holding its doubling textures — up
+/// to 8 GiB for about two seconds — and an allocation the browser refuses the
+/// application's device in that window is the probe's, not a wall of this
+/// session's: the textures are destroyed the moment it reports. Lowering the
+/// presumption on such an event would hold the probed figure down for the
+/// whole session, to nine tenths of the *presumption* the app still stood on.
+/// So the economy is evicted as for any event, and the presumption is held.
+/// Only out-of-memory is attributed: a lost surface or a memory warning in the
+/// same window is the application's own.
+pub fn is_the_gpu_probes_own(cause: Pressure, probe: GpuProbeReport) -> bool {
+    cause == Pressure::OutOfMemory && probe == GpuProbeReport::Pending
 }
 
 /// What one pressure event took out of the caches, counted for the line.
@@ -147,6 +162,47 @@ impl LinearMemoryWatch {
 mod tests {
     use super::*;
     use LinearMemoryVerdict::{Act, Quiet, Warn};
+
+    /// Out-of-memory while the probe is pending is the probe's; every other
+    /// pairing of cause and probe state is the application's own.
+    #[test]
+    fn only_an_oom_while_the_probe_is_pending_is_the_probes_own() {
+        let found = GpuProbeReport::Found(crate::platform::ProbedCapacity {
+            bytes: 4032 << 20,
+            failed_at: Some(8128 << 20),
+            steps: 7,
+            elapsed_ms: 812,
+            capped: false,
+        });
+        assert!(is_the_gpu_probes_own(
+            Pressure::OutOfMemory,
+            GpuProbeReport::Pending
+        ));
+        for probe in [
+            GpuProbeReport::Absent,
+            GpuProbeReport::Skipped,
+            GpuProbeReport::Empty,
+            found,
+        ] {
+            assert!(
+                !is_the_gpu_probes_own(Pressure::OutOfMemory, probe),
+                "{probe:?}: an OOM outside the probe window is the session's own"
+            );
+        }
+        for cause in [
+            Pressure::SurfaceLost,
+            Pressure::MemoryWarning,
+            Pressure::LinearMemory {
+                used: 900 * MIB,
+                max: GIB,
+            },
+        ] {
+            assert!(
+                !is_the_gpu_probes_own(cause, GpuProbeReport::Pending),
+                "{cause:?} in the probe window is still the application's own"
+            );
+        }
+    }
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;

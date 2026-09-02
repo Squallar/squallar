@@ -113,6 +113,12 @@ pub mod worker_retry;
 /// truth table runs on the host; only the reads in `bridge` are gated.
 pub mod form_factor;
 
+/// The browser's per-tab WebGPU allowance, probed by allocating until refused.
+/// Not wasm32-gated for the same reason: the doubling plan, the texture
+/// shapes and the stopping rules are pure and host-tested; only `gpu_probe::run`,
+/// which holds a device, is gated.
+pub mod gpu_probe;
+
 #[cfg(target_arch = "wasm32")]
 pub mod bridge;
 

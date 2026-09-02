@@ -1678,6 +1678,10 @@ impl super::App {
             loud,
             &crate::loop_telemetry::loop_state_line(&self.loop_state()),
         );
+        // The browser probe's figure, if it has landed since the last tick,
+        // folded before the line below is composed so the tick it arrives on
+        // prints `cap N 2` beside it. Nothing natively, nothing on WebGL2.
+        self.poll_gpu_probe();
         // What the machine told the budget system, beside what the loops
         // hold — see [`crate::budget_telemetry`]. Composed once per tick and
         // parked for the diagnostics overlay's row on the way to the log, so
@@ -1693,6 +1697,7 @@ impl super::App {
                     linear,
                     self.loop_pool.bytes(),
                     &self.capacity(),
+                    self.gpu_probe,
                 )),
         );
         // The wasm heap watermark, on the same tick. The bridge answers the
@@ -4155,7 +4160,18 @@ impl super::App {
         squallar_worker::offload::discard_each("pressure-extract-cache", extracts);
         self.evict_unneeded_loop_scans();
 
-        let rung = self.refit_under_pressure(cause);
+        // An allocation the browser refused while the WebGPU probe was holding
+        // its doubling textures is the probe's doing, not a wall of this
+        // session's: the textures are destroyed the moment the probe reports,
+        // and a presumption lowered here would hold the probed figure down for
+        // the whole session (`crate::pressure::is_the_gpu_probes_own`). The
+        // economy is evicted all the same; the rung stands.
+        let rung = if crate::pressure::is_the_gpu_probes_own(cause, self.gpu_probe) {
+            log::warn!("pressure: oom during gpu probe, presumption held");
+            self.budgets.steps_back
+        } else {
+            self.refit_under_pressure(cause)
+        };
         log::warn!("{}", crate::pressure::pressure_line(cause, reclaimed, rung));
     }
 

@@ -1,10 +1,25 @@
 //! The browser's [`PlatformBridge`]. Most of the trait is capabilities a tab
 //! does not have, so most of this file is honest `None`s.
 
-use squallar_app::platform::{HostSignals, LinearMemory, PlatformBridge};
+use egui_wgpu::wgpu;
+use squallar_app::platform::{
+    GpuProbeReport, HostSignals, LinearMemory, PlatformBridge, ProbedCapacity, gpu_probe_applies_to,
+};
 use winit::platform::web::WindowAttributesExtWebSys;
 
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";
+
+/// Where the WebGPU probe stands, as the bridge has driven it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuProbe {
+    /// Nobody has asked yet.
+    NotStarted,
+    /// Started; the outcome cell is empty until it lands.
+    Running,
+    /// Reported, or skipped: this is the bridge's last word, re-said on
+    /// every later ask so the level line can carry it.
+    Settled(GpuProbeReport),
+}
 
 pub struct WebPlatform {
     /// The canvas the winit window is bound to. Held because `window_attributes`
@@ -12,6 +27,8 @@ pub struct WebPlatform {
     canvas: web_sys::HtmlCanvasElement,
     /// Last theme reported to the app, so `poll_theme` can answer "changed?".
     last_theme: Option<bool>,
+    /// See [`GpuProbe`].
+    gpu_probe: GpuProbe,
 }
 
 impl WebPlatform {
@@ -19,6 +36,7 @@ impl WebPlatform {
         Self {
             canvas,
             last_theme: None,
+            gpu_probe: GpuProbe::NotStarted,
         }
     }
 }
@@ -133,6 +151,47 @@ impl PlatformBridge for WebPlatform {
             page_bytes: crate::shared_loan::memory_bytes()?,
             worker_bytes: crate::worker_port::worker_memory_bytes(),
         })
+    }
+
+    /// The WebGPU probe, driven from the app's asks. The first ask starts it
+    /// when the app's own backend is WebGPU and logs a skip once for anything
+    /// else — a WebGL2 page would have the probe measure an API that is not
+    /// the one drawing (`crate::gpu_probe`). Later asks read the outcome
+    /// cell; once it has landed the same report is re-said on every ask, so
+    /// the app's level line can carry it after the once-only lines are gone
+    /// from the console ring. A probe that held nothing settles as `Empty`.
+    fn gpu_probe_report(&mut self, backend: wgpu::Backend) -> GpuProbeReport {
+        match self.gpu_probe {
+            GpuProbe::NotStarted => {
+                if gpu_probe_applies_to(backend) {
+                    crate::gpu_probe::run::start();
+                    self.gpu_probe = GpuProbe::Running;
+                    GpuProbeReport::Pending
+                } else {
+                    log::info!("gpu probe: skipped (backend {backend:?})");
+                    self.gpu_probe = GpuProbe::Settled(GpuProbeReport::Skipped);
+                    GpuProbeReport::Skipped
+                }
+            }
+            GpuProbe::Running => {
+                let Some(outcome) = crate::gpu_probe::run::outcome() else {
+                    return GpuProbeReport::Pending;
+                };
+                let report = match crate::gpu_probe::capacity_from(&outcome) {
+                    Some(bytes) => GpuProbeReport::Found(ProbedCapacity {
+                        bytes,
+                        failed_at: outcome.failed_at,
+                        steps: outcome.steps,
+                        elapsed_ms: outcome.elapsed_ms,
+                        capped: outcome.capped,
+                    }),
+                    None => GpuProbeReport::Empty,
+                };
+                self.gpu_probe = GpuProbe::Settled(report);
+                report
+            }
+            GpuProbe::Settled(report) => report,
+        }
     }
 
     fn window_attributes(

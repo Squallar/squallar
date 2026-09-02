@@ -14,7 +14,9 @@ use crate::WindowRef;
 use crate::app_state;
 use crate::channels::ChannelHub;
 use crate::input::InputHandler;
-use crate::platform::{GpuCapacitySource, PlatformBridge, RedrawWaker};
+use crate::platform::{
+    GpuCapacitySource, GpuProbeReport, PlatformBridge, ProbedCapacity, RedrawWaker,
+};
 use crate::render_dispatch::RenderDispatcher;
 #[cfg(not(target_arch = "wasm32"))]
 use squallar_device_profile::constants::{RENDER_HEIGHT, RENDER_WIDTH};
@@ -230,6 +232,20 @@ pub struct App {
     /// the event less one economy fraction. Discarded at exit — nothing is
     /// learned across sessions.
     session_capacity: Option<u64>,
+    /// **Where the browser's WebGPU probe stands**, as the bridge last said:
+    /// `Absent` natively and until the first ask, then skipped, pending, empty
+    /// or found. A found figure is the per-tab allowance in bytes, which
+    /// [`Self::capacity`] spends in place of the bracket's presumption on a
+    /// web profile the driver would not class ([`capacity_with_probe`]).
+    /// Printed as `probe <code>` on every `budget state:` line, so the state
+    /// survives the console ring the probe's own once-only lines do not.
+    /// Adopted once, never persisted.
+    gpu_probe: GpuProbeReport,
+    /// Whether the bridge has said its last word about the probe — anything
+    /// but `Pending` — so [`Self::poll_gpu_probe`] stops asking. Kept apart
+    /// from the report because a native bridge's last word is `Absent`, the
+    /// same value the report holds before the first ask.
+    gpu_probe_settled: bool,
     /// The budgets the scene has been asking for, and for how many
     /// consecutive frames. `fit` is pure and cheap, so it is re-run on every
     /// loop walk; a different answer is adopted only once it has held for the
@@ -490,6 +506,56 @@ fn describe_gpu_capacity(reading: Option<(u64, GpuCapacitySource)>) -> String {
     }
 }
 
+/// **The profile's capacity, or the browser probe's figure where the profile
+/// has only a presumption to offer.** The probe applies on exactly one
+/// profile: `Platform::Web` with a class the driver would not name — every
+/// browser, since WebGPU reports no device type — where `DeviceProfile::
+/// capacity` answers the bracket's presumption. A measured capacity
+/// outranks it, a native profile ignores it (the readers answer there and
+/// the probe never runs), and a web adapter classed software or virtual
+/// keeps its presumption: a rasteriser's allowance is not this app's
+/// picture, as the lie-guard already says of its readings.
+pub(super) fn capacity_with_probe(
+    profile: &squallar_device_profile::budget::DeviceProfile,
+    probed_gpu_bytes: Option<u64>,
+) -> squallar_device_profile::scene::Capacity {
+    use squallar_device_profile::budget::Platform;
+    use squallar_device_profile::quality::DeviceClass;
+    use squallar_device_profile::scene::{Capacity, CapacitySource};
+
+    let own = profile.capacity();
+    match (
+        own.source,
+        profile.platform,
+        profile.class,
+        probed_gpu_bytes,
+    ) {
+        (CapacitySource::Presumed, Platform::Web, DeviceClass::Unknown, Some(bytes)) => {
+            Capacity::probed(bytes)
+        }
+        _ => own,
+    }
+}
+
+/// `gpu probe: 4032 MiB ok, failed at 8128 MiB, 7 steps, 812 ms, backend
+/// BrowserWebGpu` — the probe's report, once, when it lands. `failed at none`
+/// and a trailing `, capped` when the probe stopped at its own bound rather
+/// than the device's. Integers only, ASCII only, like every telemetry line.
+pub(super) fn gpu_probe_line(probe: &ProbedCapacity, backend: wgpu::Backend) -> String {
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    let failed_at = match probe.failed_at {
+        Some(bytes) => format!("{} MiB", mib(bytes)),
+        None => "none".to_string(),
+    };
+    let capped = if probe.capped { ", capped" } else { "" };
+    format!(
+        "gpu probe: {} MiB ok, failed at {failed_at}, {} steps, {} ms, backend {backend:?}{capped}",
+        mib(probe.bytes),
+        probe.steps,
+        probe.elapsed_ms,
+    )
+}
+
 /// Point a fresh `Gui` at the radar nearest this device's timezone.
 fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
     let Some(zone) = platform.iana_timezone() else {
@@ -636,6 +702,8 @@ impl App {
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             session_capacity: None,
+            gpu_probe: GpuProbeReport::Absent,
+            gpu_probe_settled: false,
             pending_fit: None,
             loop_counts: crate::loop_telemetry::LoopState::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
@@ -1064,14 +1132,78 @@ impl App {
         self.device_profile.vram_bytes = reading.map(|(bytes, _source)| bytes);
     }
 
+    /// **Ask the bridge where the browser probe stands, and adopt its figure
+    /// once.** Runs on the telemetry tick — so the first ask follows the first
+    /// presented frame, and the probe never competes with the page's boot —
+    /// and only until the answer settles: a native bridge's `Absent`, a WebGL2
+    /// page's `Skipped`, an `Empty` probe or a `Found` figure ends the asking;
+    /// `Pending` asks again next tick. The backend named is the one this
+    /// session's adapter answered with; the bridge decides on it whether a
+    /// probe applies at all (`platform::gpu_probe_applies_to`). Nothing
+    /// happens before an adapter exists: the probe's figure is only
+    /// meaningful beside the backend that is drawing.
+    pub(super) fn poll_gpu_probe(&mut self) {
+        if self.gpu_probe_settled {
+            return;
+        }
+        let Some(backend) = self
+            .state
+            .as_ref()
+            .map(|state| state.adapter.get_info().backend)
+        else {
+            return;
+        };
+        let report = self.platform.gpu_probe_report(backend);
+        self.gpu_probe_settled = report.is_settled();
+        match report {
+            GpuProbeReport::Found(probe) => self.adopt_probed_capacity(probe, backend),
+            other => self.gpu_probe = other,
+        }
+    }
+
+    /// **Fold the browser probe's figure into this session's capacity**, and
+    /// re-fit the scene to it at once — the path [`Self::update_device_profile`]
+    /// takes for a driver's reading, minus the profile: the figure is the
+    /// session's, not the profile's, so `DeviceProfile::capacity` stays the
+    /// pure function it is and [`capacity_with_probe`] decides where the
+    /// figure applies. Once: a second report changes nothing, so a probe
+    /// that reported and a bridge that keeps answering agree.
+    fn adopt_probed_capacity(&mut self, probe: ProbedCapacity, backend: wgpu::Backend) {
+        if self.gpu_probe.bytes().is_some() {
+            return;
+        }
+        log::info!("{}", gpu_probe_line(&probe, backend));
+        self.gpu_probe = GpuProbeReport::Found(probe);
+        let scene = self.scene_of();
+        let refitted = self.fit_scene(&scene);
+        let cap = self.capacity();
+        if refitted != self.budgets {
+            log::info!(
+                "Budgets: rung {} against the {} MiB {} for the scene ({} panes): {:?} 3D \
+                 quality ceiling, {} MiB of offscreen, {:?} grid cells, {} textured loop frames",
+                refitted.steps_back,
+                cap.gpu_bytes / (1024 * 1024),
+                crate::budget_telemetry::capacity_source_word(cap.source),
+                scene.panes.len(),
+                refitted.quality_ceiling,
+                refitted.offscreen_bytes / (1024 * 1024),
+                refitted.grid_cells,
+                refitted.loop_render_budget,
+            );
+        }
+        self.adopt_budgets(refitted);
+        self.pending_fit = None;
+        self.loop_pool = self.pool_for_scene(&scene);
+    }
+
     /// **What this session takes the GPU to hold.** The profile's own answer
     /// — measured where its readings amount to a measurement of the GPU, the
     /// bracket's whole-application constant otherwise
-    /// (`DeviceProfile::capacity`) — held to whatever pressure has taught this
-    /// session.
+    /// (`DeviceProfile::capacity`) — or the browser probe's figure where the
+    /// profile has only a presumption to offer ([`capacity_with_probe`]),
+    /// held to whatever pressure has taught this session.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
-        self.device_profile
-            .capacity()
+        capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
             .held_to(self.session_capacity)
     }
 

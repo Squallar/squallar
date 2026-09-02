@@ -2883,7 +2883,12 @@ var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) fram
 // unified-memory part's capacity is half its `ram` with `vram` 0, a software
 // rasteriser's is the presumption with `vram` read. Firefox on WebGL2 reads
 // `cap 288 0` on every leg; Chromium reads `cap N 2` once the probe lands.
-var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+), pool (\d+) MiB, ceiling (\d+) MiB, vram (\d+) MiB, ram (\d+) MiB, declared (\d+) MiB, threads (\d+), form (\d+), linear (\d+)\/(\d+) MiB, cap (\d+) (\d+)/;
+// `probe` is where that WebGPU probe stands, carried HERE because its own
+// lines are said once and this console ring evicts them within seconds: 0
+// absent (native, or not asked yet), 1 skipped (a WebGL2 page -- every
+// Firefox/Linux leg), 2 pending, 3 empty (ran, held nothing), 4 found at the
+// device's refusal, 5 found at the probe's own bound (the figure is a floor).
+var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+), pool (\d+) MiB, ceiling (\d+) MiB, vram (\d+) MiB, ram (\d+) MiB, declared (\d+) MiB, threads (\d+), form (\d+), linear (\d+)\/(\d+) MiB, cap (\d+) (\d+), probe (\d+)/;
 // The two WINDOWABLE families, both `<prefix> (<name>):` with the same
 // payload. `n` and `sum` are running totals and both subtract, so a windowed
 // mean is exact: (sum_b - sum_a) / (n_b - n_a). `hist` is the same 42-slot
@@ -3028,7 +3033,8 @@ for (var i = 0; i < C.length; i++) {
                      linear_page_mib: parseInt(x[11], 10),
                      linear_worker_mib: parseInt(x[12], 10),
                      cap_mib: parseInt(x[13], 10),
-                     cap_source: parseInt(x[14], 10) };
+                     cap_source: parseInt(x[14], 10),
+                     probe: parseInt(x[15], 10) };
     budget_state_all.push(budget_state);
   }
   x = frame_segment_re.exec(m);
@@ -6696,17 +6702,20 @@ def run_smoke(args):
         # and never one figure; the two `linear` figures are two instances;
         # `cap` is the capacity in force and its source (0 presumed, 1
         # measured, 2 probed) -- Firefox on WebGL2 is `288 0`, never merged
-        # with a Chromium reading.
+        # with a Chromium reading; `probe` is where the WebGPU probe stands
+        # (0 absent, 1 skipped, 2 pending, 3 empty, 4 found, 5 found capped),
+        # read off this level line because the probe's own lines are evicted
+        # from the console ring within seconds.
         print("[%s] SUMMARY [%s] budget state [level, end of leg]: bracket %s, "
               "rung %s, steps %s; pool %s MiB, ceiling %s MiB; vram %s MiB, "
               "ram %s MiB, declared %s MiB, threads %s, form %s; "
-              "linear %s/%s MiB; cap %s MiB source %s"
+              "linear %s/%s MiB; cap %s MiB source %s; probe %s"
               % (tag, alabel, b.get("bracket"), b.get("rung"), b.get("steps"),
                  b.get("pool_mib"), b.get("ceiling_mib"), b.get("vram_mib"),
                  b.get("ram_mib"), b.get("declared_mib"), b.get("threads"),
                  b.get("form"), b.get("linear_page_mib"),
                  b.get("linear_worker_mib"), b.get("cap_mib"),
-                 b.get("cap_source")))
+                 b.get("cap_source"), b.get("probe")))
     gw = result.get("gesture_window")
     if gw:
         print("[%s] SUMMARY [%s] gesture window (%s, %s loops, %s):"

@@ -47,6 +47,78 @@ pub struct LinearMemory {
     pub worker_bytes: Option<u64>,
 }
 
+/// What the browser's WebGPU probe found: the **per-tab allowance**, as the
+/// last total a throwaway device held resident before refusing — see
+/// `squallar_web::gpu_probe`. The browser's figure and not the card's: a tab
+/// is allowed a share, and no API states it. Plain data, integers only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbedCapacity {
+    /// The last total held without refusal, in bytes. Never zero: a probe
+    /// that held nothing reports no figure at all.
+    pub bytes: u64,
+    /// The total the device refused to reach, in bytes, or `None` when it
+    /// never refused and the probe stopped at its own bound.
+    pub failed_at: Option<u64>,
+    /// Allocations attempted.
+    pub steps: u32,
+    /// Wall time the probe took, in milliseconds.
+    pub elapsed_ms: u32,
+    /// Whether the probe stopped at its own byte ceiling, time budget or a
+    /// shape no texture takes, rather than at a refusal — in which case
+    /// [`Self::bytes`] is a floor on the allowance, not the allowance.
+    pub capped: bool,
+}
+
+/// Where the WebGPU probe stands, as the bridge last said. Carried on the
+/// re-said `budget state:` line as `probe <code>` (`crate::budget_telemetry::
+/// gpu_probe_code`), because the browser console keeps a bounded ring and a
+/// once-only line is evicted within seconds of the frame telemetry that
+/// follows it — a rig scrape reading it as absent cannot tell "evicted" from
+/// "never ran". Every fact a row might read is therefore on the level line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuProbeReport {
+    /// No probe on this bridge — every native one — or none asked for yet.
+    #[default]
+    Absent,
+    /// The page's own backend is not WebGPU, so the probe never ran.
+    Skipped,
+    /// Started; no figure yet.
+    Pending,
+    /// Ran and held nothing — the first allocation refused, or no second
+    /// adapter or device — so there is no figure and the presumption stands.
+    Empty,
+    /// Held a figure; see [`ProbedCapacity::capped`] for whose bound it is.
+    Found(ProbedCapacity),
+}
+
+impl GpuProbeReport {
+    /// The bytes a found probe held, or `None` in every other state.
+    pub fn bytes(self) -> Option<u64> {
+        match self {
+            Self::Found(probe) => Some(probe.bytes),
+            _ => None,
+        }
+    }
+
+    /// Whether the bridge has said its last word: everything but
+    /// [`Self::Pending`]. An [`Self::Absent`] answer from a bridge that was
+    /// asked is a bridge with no probe, and is not asked again.
+    pub fn is_settled(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+}
+
+/// Whether the WebGPU probe's figure would describe the API the application
+/// draws with. wgpu binds one browser API when the instance is built, and the
+/// probe measures WebGPU's allowance through a second instance of its own;
+/// on a WebGL2 page — `Gl`, every Firefox/Linux leg today — it would measure
+/// an API that is not the one drawing, and WebGL2 has no clean failure of its
+/// own to probe (`docs/cross-platform-resource-limits.md` §8.4). Native
+/// backends have readers, not probes.
+pub fn gpu_probe_applies_to(backend: wgpu::Backend) -> bool {
+    backend == wgpu::Backend::BrowserWebGpu
+}
+
 /// How a GPU capacity figure was obtained, in order of trust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuCapacitySource {
@@ -557,6 +629,19 @@ pub trait PlatformBridge {
     ) -> Option<(u64, GpuCapacitySource)> {
         None
     }
+
+    /// Where the WebGPU probe of the browser's per-tab GPU allowance stands:
+    /// [`GpuProbeReport::Absent`] on every native bridge, and on the web the
+    /// probe's own state — skipped on a WebGL2 page, pending, empty, or found
+    /// with its figure. `backend` is the one the application renders with;
+    /// the web bridge starts the probe on the first ask that names
+    /// `BrowserWebGpu` ([`gpu_probe_applies_to`]) and logs one skip for
+    /// anything else. Asked on the telemetry tick until the answer settles,
+    /// so the first ask follows the first presented frame and the probe never
+    /// competes with the page's own boot.
+    fn gpu_probe_report(&mut self, _backend: wgpu::Backend) -> GpuProbeReport {
+        GpuProbeReport::Absent
+    }
 }
 
 #[cfg(test)]
@@ -578,6 +663,31 @@ mod tests {
 
     fn woke(count: &std::sync::atomic::AtomicUsize) -> usize {
         count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The probe describes WebGPU's allowance and nothing else: it applies to
+    /// `BrowserWebGpu` alone. A WebGL2 page never runs it, and no native
+    /// backend does — those have readers.
+    #[test]
+    fn a_probe_on_a_webgl2_page_never_runs() {
+        assert!(!gpu_probe_applies_to(wgpu::Backend::Gl));
+        assert!(gpu_probe_applies_to(wgpu::Backend::BrowserWebGpu));
+        for native in [
+            wgpu::Backend::Vulkan,
+            wgpu::Backend::Metal,
+            wgpu::Backend::Dx12,
+            wgpu::Backend::Noop,
+        ] {
+            assert!(
+                !gpu_probe_applies_to(native),
+                "{native:?} has a reader, not a probe"
+            );
+        }
+        let applicable: Vec<_> = wgpu::Backend::ALL
+            .into_iter()
+            .filter(|b| gpu_probe_applies_to(*b))
+            .collect();
+        assert_eq!(applicable, [wgpu::Backend::BrowserWebGpu]);
     }
 
     /// Producers are handed their waker while `App::window` is still `None`.

@@ -1,6 +1,9 @@
 //! A [`PlatformBridge`] for tests, shaped after the four real ones.
 
-use crate::platform::{GpuCapacitySource, LinearMemory, PlatformBridge, RedrawWaker, drain_latest};
+use crate::platform::{
+    GpuCapacitySource, GpuProbeReport, LinearMemory, PlatformBridge, ProbedCapacity, RedrawWaker,
+    drain_latest, gpu_probe_applies_to,
+};
 use egui_wgpu::wgpu;
 use squallar_kv::{KvStore, MemoryKvStore};
 use squallar_location::LocationPermission;
@@ -139,6 +142,12 @@ pub(crate) struct TestBridge {
     /// move the reading between ticks after the bridge is the app's; `None`,
     /// as every native bridge answers, until a test sets one.
     linear_memory: Rc<Cell<Option<LinearMemory>>>,
+    /// What `gpu_probe_report` answers when asked about a WebGPU backend,
+    /// standing in for the browser probe's outcome cell. `None` makes the
+    /// double a native bridge, which reports `Absent`; `Some` makes it a web
+    /// bridge whose probe has landed, which reports the figure for a WebGPU
+    /// backend and `Skipped` for anything else.
+    probed_gpu_capacity: Option<ProbedCapacity>,
 }
 
 impl TestBridge {
@@ -169,6 +178,7 @@ impl TestBridge {
             back_claims: Rc::new(RefCell::new(Vec::new())),
             gpu_capacity: None,
             linear_memory: Rc::new(Cell::new(None)),
+            probed_gpu_capacity: None,
         }
     }
 
@@ -303,6 +313,21 @@ impl TestBridge {
     /// Answer `gpu_capacity` with a fixed reading, standing in for a driver.
     pub(crate) fn with_gpu_capacity(mut self, bytes: u64, source: GpuCapacitySource) -> Self {
         self.gpu_capacity = Some((bytes, source));
+        self
+    }
+
+    /// Answer `gpu_probe_report` with `bytes` held, standing in for a browser
+    /// probe that was refused on the step after — the shape the web bridge
+    /// hands over. Only when asked about a WebGPU backend, as that bridge
+    /// answers; `Skipped` for any other.
+    pub(crate) fn with_probed_capacity(mut self, bytes: u64) -> Self {
+        self.probed_gpu_capacity = Some(ProbedCapacity {
+            bytes,
+            failed_at: Some(bytes.saturating_mul(2)),
+            steps: 4,
+            elapsed_ms: 120,
+            capped: false,
+        });
         self
     }
 
@@ -462,6 +487,17 @@ impl PlatformBridge for TestBridge {
         self.gpu_capacity
     }
 
+    /// The injected probe, behind the same backend guard the web bridge
+    /// applies: asked about a WebGL2 or native backend, `Skipped`. With
+    /// nothing injected this double is a native bridge and says `Absent`.
+    fn gpu_probe_report(&mut self, backend: wgpu::Backend) -> GpuProbeReport {
+        match self.probed_gpu_capacity {
+            None => GpuProbeReport::Absent,
+            Some(probe) if gpu_probe_applies_to(backend) => GpuProbeReport::Found(probe),
+            Some(_) => GpuProbeReport::Skipped,
+        }
+    }
+
     /// `None` until this platform has been told where config lives, which is what
     /// makes `App::set_config_dir` observable.
     fn kv(&self) -> Option<Box<dyn KvStore>> {
@@ -565,5 +601,32 @@ mod tests {
         assert!(TestBridge::desktop().basemap_dir().is_some());
         assert!(TestBridge::ios().basemap_dir().is_some());
         assert_eq!(TestBridge::web().basemap_dir(), None);
+    }
+
+    /// The double guards the probe on the backend as the web bridge does, so
+    /// an app test that asks about a WebGL2 page gets the same `Skipped`; with
+    /// nothing injected it is a native bridge and says `Absent`.
+    #[test]
+    fn the_double_answers_a_probe_only_for_a_webgpu_backend() {
+        let mut bridge = TestBridge::web().with_probed_capacity(4032 << 20);
+        assert_eq!(
+            bridge.gpu_probe_report(wgpu::Backend::Gl),
+            GpuProbeReport::Skipped
+        );
+        assert_eq!(
+            bridge.gpu_probe_report(wgpu::Backend::Vulkan),
+            GpuProbeReport::Skipped
+        );
+        let GpuProbeReport::Found(probe) = bridge.gpu_probe_report(wgpu::Backend::BrowserWebGpu)
+        else {
+            panic!("the injected probe is found for a WebGPU backend");
+        };
+        assert_eq!(probe.bytes, 4032 << 20);
+        assert!(!probe.capped);
+        assert_eq!(
+            TestBridge::desktop().gpu_probe_report(wgpu::Backend::BrowserWebGpu),
+            GpuProbeReport::Absent,
+            "nothing injected is a bridge with no probe, whatever it is asked"
+        );
     }
 }

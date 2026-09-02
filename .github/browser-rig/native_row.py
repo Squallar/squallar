@@ -459,7 +459,7 @@ def scrape(lines, probes):
                 out[key].append((idx, [int(x) for x in m.groups()]))
         # `budget state` is a level too, but its first group is the bracket's
         # NAME, so it cannot ride the all-`int()` loop above: the word is kept
-        # as text and the thirteen figures after it are ints. Every group is
+        # as text and the fourteen figures after it are ints. Every group is
         # mandatory; no match at all leaves the family empty, which the row
         # prints as absent -- an older binary, never a zero reading.
         m = probes["budget_state_re"].search(line)
@@ -1426,7 +1426,7 @@ def build_row(args, scraped, probes):
         "liveness": live,
         "surface": surf,
         "loop_state": (scraped["loop_state"][-1][1] if scraped["loop_state"] else None),
-        # `(line, bracket, [thirteen ints])`, or None when the log has no
+        # `(line, bracket, [fourteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
         "budget_state": (scraped["budget_state"][-1] if scraped["budget_state"] else None),
@@ -1571,7 +1571,9 @@ def print_row(row):
     # The machine and the bracket the budgets came from, on every scene. A
     # LEVEL at the end of the log; `pool` is the LIVE loop pool in MiB and
     # `ceiling` the bracket's constant; `cap` is the capacity in force and
-    # `source` how it was learned (0 presumed, 1 measured, 2 probed). Absent
+    # `source` how it was learned (0 presumed, 1 measured, 2 probed); `probe`
+    # is where the browser's WebGPU probe stands (0 absent -- every native
+    # log, 1 skipped, 2 pending, 3 empty, 4 found, 5 found capped). Absent
     # when the log has no `budget state:` line: a binary older than the line,
     # printed as such and never as zeroes. `.get` because a row built before
     # the field existed reads the same way.
@@ -1581,9 +1583,9 @@ def print_row(row):
         print(
             "ROW   budget bracket=%s rung=%s steps=%s pool=%s MiB ceiling=%s MiB "
             "vram=%s MiB ram=%s MiB declared=%s MiB threads=%s form=%s "
-            "linear=%s/%s MiB cap=%s MiB source=%s"
+            "linear=%s/%s MiB cap=%s MiB source=%s probe=%s"
             % (bracket_name, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
-               f[8], f[9], f[10], f[11], f[12])
+               f[8], f[9], f[10], f[11], f[12], f[13])
         )
     else:
         print(
@@ -2241,17 +2243,17 @@ class SharedFormatTests(unittest.TestCase):
         self.assertIsNone(tile_cache_by_role([]))
 
     def test_the_budget_state_line_scrapes_into_its_own_arm(self):
-        """The bracket word first, thirteen ints after -- the app's exact
+        """The bracket word first, fourteen ints after -- the app's exact
         sentence, so a drift in either file reddens this before a leg is
-        spent. The last two are the capacity in force and its source; a
-        binary older than those two groups matches nothing and reads as
-        absent, never as `cap 0`."""
+        spent. The last three are the capacity in force, its source and the
+        WebGPU probe's state; a binary older than any of those groups matches
+        nothing and reads as absent, never as `cap 0`."""
         probes = compile_probes()
         line = (
             "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] budget state: "
             "bracket desktop, rung 1, steps 3, pool 3072 MiB, ceiling 3840 MiB, "
             "vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, threads 32, form 2, "
-            "linear 300/700 MiB, cap 5120 2"
+            "linear 300/700 MiB, cap 5120 2, probe 5"
         )
         s = scrape([line], probes)
         self.assertEqual(len(s["budget_state"]), 1)
@@ -2259,12 +2261,17 @@ class SharedFormatTests(unittest.TestCase):
         self.assertEqual(bracket, "desktop")
         self.assertEqual(
             figures,
-            [1, 3, 3072, 3840, 24576, 65536, 8192, 32, 2, 300, 700, 5120, 2],
+            [1, 3, 3072, 3840, 24576, 65536, 8192, 32, 2, 300, 700, 5120, 2, 5],
         )
         older = line.rsplit(", cap", 1)[0]
         self.assertEqual(
             scrape([older], probes)["budget_state"], [],
             "a line without the capacity groups matched: every group is mandatory",
+        )
+        before_probe = line.rsplit(", probe", 1)[0]
+        self.assertEqual(
+            scrape([before_probe], probes)["budget_state"], [],
+            "a line without the probe group matched: every group is mandatory",
         )
 
     def test_a_log_without_the_budget_state_line_prints_n_a_not_zero(self):
@@ -2274,11 +2281,12 @@ class SharedFormatTests(unittest.TestCase):
         self.assertIn("budget: n/a", text)
         self.assertNotIn("cap=0", text)
         row["budget_state"] = (
-            7, "desktop", [1, 3, 3072, 3840, 24576, 65536, 8192, 32, 2, 300, 700, 5120, 2],
+            7, "desktop",
+            [1, 3, 3072, 3840, 24576, 65536, 8192, 32, 2, 300, 700, 5120, 2, 5],
         )
         text = _capture(lambda: print_row(row))
         self.assertIn("budget bracket=desktop rung=1 steps=3 pool=3072 MiB", text)
-        self.assertIn("linear=300/700 MiB cap=5120 MiB source=2", text)
+        self.assertIn("linear=300/700 MiB cap=5120 MiB source=2 probe=5", text)
 
     def test_a_log_without_the_tile_cache_line_prints_n_a_not_zero(self):
         row = _fixture_row()

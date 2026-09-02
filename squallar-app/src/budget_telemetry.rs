@@ -29,16 +29,37 @@
 //! integer after it is how it was learned: 0 presumed, 1 measured, 2 probed.
 //! `cap` is not `vram`: a unified-memory part's capacity is half its `ram`
 //! with `vram` unread, a rasteriser's is the presumption with `vram` read.
-//! Every byte figure is MiB by integer division, because the rig's probe
-//! reads these sentences with `(\d+)` groups.
+//! `probe` is where the browser's WebGPU probe stands ([`gpu_probe_code`]):
+//! carried here, on the level line, because the probe's own lines are said
+//! once and the browser console's bounded ring evicts them within seconds,
+//! so a scrape reading them as absent could not tell "evicted" from "never
+//! ran". Every byte figure is MiB by integer division, because the rig's
+//! probe reads these sentences with `(\d+)` groups.
 //!
 //! Product telemetry, not a campaign instrument: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, and no figure it prints
 //! gates CI.
 
-use crate::platform::LinearMemory;
+use crate::platform::{GpuProbeReport, LinearMemory};
 use squallar_device_profile::budget::{Budgets, DeviceProfile, FormFactor, Promotion};
 use squallar_device_profile::scene::{Capacity, CapacitySource};
+
+/// The integer the line prints for where the WebGPU probe stands: 0 absent
+/// (every native bridge, or not asked yet), 1 skipped (a WebGL2 page),
+/// 2 pending, 3 empty (ran, held nothing), 4 found at the device's refusal,
+/// 5 found at the probe's own bound (`capped` — the figure is a floor). A
+/// `cap N 2` beside 4 or 5 is the probe's figure in force; `cap 288 0`
+/// beside 1 is a WebGL2 page on its presumption, never a probe that failed.
+pub(crate) fn gpu_probe_code(report: GpuProbeReport) -> u8 {
+    match report {
+        GpuProbeReport::Absent => 0,
+        GpuProbeReport::Skipped => 1,
+        GpuProbeReport::Pending => 2,
+        GpuProbeReport::Empty => 3,
+        GpuProbeReport::Found(probe) if probe.capped => 5,
+        GpuProbeReport::Found(_) => 4,
+    }
+}
 
 /// The integer the line prints for how a capacity was learned: 0 presumed,
 /// 1 measured, 2 probed — in ascending order of trust, so a reader who sorts
@@ -69,7 +90,8 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// heap is at least its initial pages — while `form` spells unknown
 /// explicitly as 0 against 1 (handheld) and 2 (desktop). `cap` is never
 /// unread: every session has a capacity in force, and the integer after it
-/// says which arm it is ([`capacity_source_code`]).
+/// says which arm it is ([`capacity_source_code`]). `probe` spells its own
+/// absent explicitly as 0 ([`gpu_probe_code`]).
 ///
 /// A free function returning a `String` for the reason every other telemetry
 /// sentence in this tree is one: `.github/browser-rig/drive.py` scrapes it
@@ -82,6 +104,7 @@ pub(crate) fn budget_state_line(
     linear: Option<LinearMemory>,
     pool_bytes: usize,
     cap: &Capacity,
+    probe: GpuProbeReport,
 ) -> String {
     let mib = |bytes: u64| bytes / (1024 * 1024);
     let rung = match budgets.promotion {
@@ -97,7 +120,7 @@ pub(crate) fn budget_state_line(
     format!(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
-         linear {}/{} MiB, cap {} {}",
+         linear {}/{} MiB, cap {} {}, probe {}",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -110,6 +133,7 @@ pub(crate) fn budget_state_line(
         mib(linear.and_then(|l| l.worker_bytes).unwrap_or(0)),
         mib(cap.gpu_bytes),
         capacity_source_code(cap.source),
+        gpu_probe_code(probe),
     )
 }
 
@@ -200,6 +224,16 @@ mod tests {
         source: CapacitySource::Probed,
     };
 
+    /// The probe report for the distinct line: found at the probe's own
+    /// bound, which prints `5` — a code no other position carries.
+    const PROBE: GpuProbeReport = GpuProbeReport::Found(crate::platform::ProbedCapacity {
+        bytes: 5 << 30,
+        failed_at: None,
+        steps: 8,
+        elapsed_ms: 1900,
+        capped: true,
+    });
+
     /// A profile with a distinct value in every position the line prints, so
     /// a transposed pair cannot read as a correct line. The ceiling is set
     /// directly rather than resolved, for the same reason, and the pool is
@@ -243,36 +277,85 @@ mod tests {
     /// The literal pin: every figure once, in the documented order, in MiB.
     /// `pool` is the live pool handed in, not the bracket ceiling the line
     /// once printed: a scene's loops are what it holds. `cap` is the capacity
-    /// handed in and its source code, not a field of the profile.
+    /// handed in and its source code, not a field of the profile; `probe` is
+    /// the report handed in, as its code.
     #[test]
     fn the_budget_state_line_reads_exactly_as_pinned() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP),
+            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
-             threads 32, form 2, linear 300/700 MiB, cap 5120 2",
+             threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
-            budget_state_line(&budgets, &profile, linear, 576 << 20, &CAP)
+            budget_state_line(&budgets, &profile, linear, 576 << 20, &CAP, PROBE)
                 .contains(", pool 576 MiB,"),
         );
         // And the capacity follows what it is handed: this profile's own
         // measured 24 GiB reads `24576 1`, a session presumption lowered to
         // 3456 MiB reads `3456 0`.
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, &profile.capacity())
-                .ends_with(", cap 24576 1"),
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                &profile.capacity(),
+                GpuProbeReport::Absent
+            )
+            .ends_with(", cap 24576 1, probe 0"),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, &lowered).ends_with(", cap 3456 0"),
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                &lowered,
+                GpuProbeReport::Skipped
+            )
+            .ends_with(", cap 3456 0, probe 1"),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
         assert_eq!(capacity_source_code(CapacitySource::Measured), 1);
         assert_eq!(capacity_source_code(CapacitySource::Probed), 2);
         assert_eq!(capacity_source_word(CapacitySource::Measured), "measured");
+    }
+
+    /// The probe codes, in the order the doc names them, and the one fact that
+    /// splits `Found` in two: whose bound the figure stopped at.
+    #[test]
+    fn the_probe_code_names_every_state_the_bridge_can_be_in() {
+        let found = |capped: bool| {
+            GpuProbeReport::Found(crate::platform::ProbedCapacity {
+                bytes: 4032 << 20,
+                failed_at: (!capped).then_some(8128 << 20),
+                steps: 7,
+                elapsed_ms: 812,
+                capped,
+            })
+        };
+        assert_eq!(gpu_probe_code(GpuProbeReport::Absent), 0);
+        assert_eq!(gpu_probe_code(GpuProbeReport::Skipped), 1);
+        assert_eq!(gpu_probe_code(GpuProbeReport::Pending), 2);
+        assert_eq!(gpu_probe_code(GpuProbeReport::Empty), 3);
+        assert_eq!(gpu_probe_code(found(false)), 4);
+        assert_eq!(gpu_probe_code(found(true)), 5);
+        assert_eq!(GpuProbeReport::default(), GpuProbeReport::Absent);
+        assert_eq!(found(false).bytes(), Some(4032 << 20));
+        assert_eq!(GpuProbeReport::Empty.bytes(), None);
+        assert!(!GpuProbeReport::Pending.is_settled());
+        for settled in [
+            GpuProbeReport::Absent,
+            GpuProbeReport::Skipped,
+            GpuProbeReport::Empty,
+            found(true),
+        ] {
+            assert!(settled.is_settled(), "{settled:?}");
+        }
     }
 
     /// **An unread signal prints 0, and every field is still there.** The
@@ -288,28 +371,28 @@ mod tests {
             ..resolve(&profile)
         };
         let cap = Capacity::presumed(&BudgetLimits::DESKTOP);
-        let line = budget_state_line(&budgets, &profile, None, POOL, &cap);
+        let line = budget_state_line(&budgets, &profile, None, POOL, &cap, GpuProbeReport::Absent);
         let (_, tail) = line
             .split_once(", vram ")
             .expect("the line carries a vram field");
         assert_eq!(
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
-             cap 3840 0",
+             cap 3840 0, probe 0",
         );
         assert_eq!(
             line.matches(", ").count(),
-            11,
-            "twelve comma-separated groups, eleven separators: a field was dropped or \
+            12,
+            "thirteen comma-separated groups, twelve separators: a field was dropped or \
              gained",
         );
     }
 
     /// The values the distinct line carries, in the rig's group order: the
-    /// bracket word and the thirteen integers after it.
-    const DISTINCT_GROUPS: [&str; 14] = [
+    /// bracket word and the fourteen integers after it.
+    const DISTINCT_GROUPS: [&str; 15] = [
         "desktop", "1", "3", "3072", "3840", "24576", "65536", "8192", "32", "2", "300", "700",
-        "5120", "2",
+        "5120", "2", "5",
     ];
 
     /// **The rig reads the budget line the app actually writes.** An extra
@@ -319,7 +402,7 @@ mod tests {
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP),
+            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
             rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS),
             "the `budget state:` line and the rig's probe have drifted",
         );
@@ -331,13 +414,13 @@ mod tests {
         let (budgets, profile, linear) = distinct();
         let good = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP),
+            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
             good
         );
         let drifted = good.replacen(" rung", "  rung", 1);
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
         assert_ne!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP),
+            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
             drifted,
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",

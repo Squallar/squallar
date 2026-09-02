@@ -972,15 +972,100 @@ dependency rule (`squallar-radar` + `log` only) is untouched.
 
 ### 8.3 The WebGPU probe
 
-*(plan D1)* On a WebGPU adapter the app **probes**: request a second adapter,
-create a throwaway device, `pushErrorScope("out-of-memory")`, allocate textures
-in doubling steps and clear each in a render pass so it is actually resident,
-catch `GPUOutOfMemoryError` or `device.lost`, destroy everything. It runs after
-the first frame; the app starts on the presumption (§8.4) and raises when the
-probe reports. What it measures is the browser's **per-tab allowance**, which is
-the right figure — the card's size is not what a tab may spend. WO-10; the state
-machine is pure and host-tested; the rig expects two rows, never merged:
-Chromium `cap N probed`, Firefox `cap 288 presumed` *(plan §Verification)*.
+**Landed** (`squallar-web/src/gpu_probe.rs`, its wasm-only `run` submodule,
+`squallar_app::platform::ProbedCapacity`). On a page whose own backend is
+WebGPU the app **probes**: a second `wgpu::Instance` on `navigator.gpu`, a
+second adapter (the app's own is consumed by the one `requestDevice` that
+already took it), a throwaway device, and textures allocated in **doubling
+steps from 64 MiB** — each a square power-of-two `Rgba8Unorm` 2D array under
+the device's `maxTextureDimension2D` and `maxTextureArrayLayers`, **every
+layer cleared in its own render pass** so the memory is resident and not
+merely reserved — inside a `pushErrorScope("out-of-memory")` per step, until
+the scope pops a `GPUOutOfMemoryError` or `device.lost` fires. Then every
+texture and the device are destroyed. Nothing is persisted (ruling 6).
+
+**What it measures** is the browser's **per-tab WebGPU allowance**: the last
+total the throwaway device held without refusal. Not the card — a tab is
+allowed a share, decided by the browser, and no API states it. The figure
+enters as `Capacity::probed`, never through `vram_bytes`: nothing a browser
+*reports* is a measurement, and a probe is not a report. It takes the same
+three-quarter allowance a measured figure does (§9.3).
+
+**Bounds.** Three of the probe's own, each reported as `capped`: an **8 GiB**
+byte ceiling (the last step is clamped so a device that never refuses reports
+exactly 8 GiB — above that the figure would be the card, not an allowance); a
+**2 s** wall budget, applied predictively (a step is taken to cost twice the
+last, and one that would carry the total past 2 s is not taken); and a shape
+no single texture can take on a narrow adapter. A capped figure is a floor on
+the allowance. A probe that held nothing — the first allocation refused, no
+second adapter, no device — reports no figure, and the presumption stands.
+
+**When it runs.** After the first presented frame, never before: the app asks
+the bridge on the 2 s telemetry tick (`PlatformBridge::probed_gpu_capacity`,
+defaulted `None`; the web bridge starts the probe on the first ask and reads
+a thread-local outcome cell on the later ones, the way the worker's heap
+reading arrives, with no channel receiver spent). The app starts on the
+presumption (§8.4), folds the figure **once** when it lands
+(`App::adopt_probed_capacity`), re-fits the scene against it and re-sizes the
+loop pool. `DeviceProfile::capacity` is untouched and stays pure: the figure
+is the session's, and `capacity_with_probe` spends it on exactly one profile
+— `Platform::Web` with `DeviceClass::Unknown`, which is every browser, since
+WebGPU reports no device type. A measured capacity outranks it; a native
+profile ignores it (`a_probe_on_a_native_profile_is_ignored`); a web adapter
+classed software or virtual keeps its presumption, as the lie-guard already
+rules for its readings.
+
+**When it is skipped.** Whenever the app's own backend is not `BrowserWebGpu`
+(`gpu_probe_applies_to`, pinned by `a_probe_on_a_webgl2_page_never_runs`). wgpu
+binds one browser API when the instance is built (`ARCHITECTURE.md` §4), and
+on a WebGL2 page the probe would measure an API that is not the one drawing;
+WebGL2 itself has no clean failure to probe (§8.4). The web bridge logs
+`gpu probe: skipped (backend Gl)` once — every Firefox/Linux leg today — and
+the presumption stands.
+
+**What it prints, and which line carries what.** Two kinds of line, for two
+readers. **Once-only, for humans**: `gpu probe: 4032 MiB ok, failed at
+8128 MiB, 7 steps, 812 ms, backend BrowserWebGpu` when the figure lands
+(`failed at none` and a trailing `, capped` when the probe stopped at its own
+bound), `gpu probe: skipped (backend Gl)` on a WebGL2 page, `gpu probe:
+nothing held (...)` or `gpu probe: no second adapter (...)` when it ran and
+held nothing. These carry the step count, the elapsed time and the refused
+total, and **nothing may be read off them by a test or a rig row**: the
+browser console keeps a bounded ring, frame telemetry evicts a once-only
+line within seconds, and a scrape reading it as absent cannot tell "evicted"
+from "never ran". **Re-said every 2 s, for the rig**: the `budget state:`
+line (§8.6) carries the two facts a row reads — `cap N 2`, the figure in
+force and that it is probed, and `probe <code>`, where the probe stands:
+
+```text
+gpu probe: 4032 MiB ok, failed at 8128 MiB, 7 steps, 812 ms, backend BrowserWebGpu
+budget state: bracket wasm32, rung 0, ..., cap 4032 2, probe 4
+budget state: bracket wasm32, rung 0, ..., cap 288 0, probe 1        (a WebGL2 page)
+```
+
+`probe` is `0` absent (native, or not yet asked), `1` skipped, `2` pending,
+`3` empty, `4` found at the device's refusal, `5` found at the probe's own
+bound. Integers only, ASCII only. The rig expects two rows, never merged:
+Chromium under `--enable-unsafe-webgpu --enable-features=Vulkan
+--use-angle=vulkan` shows `cap N 2, probe 4|5`; Firefox/Linux shows `cap 288
+0, probe 1`. Neither row has been taken yet by this revision; the state
+machine is host-tested in `squallar-web/src/gpu_probe.rs` and the fold in
+`squallar-app/src/app/gpu_capacity_tests.rs`
+(`a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2`: six
+two-hour loops that the 288 MiB presumption had to shorten fit at the class
+rung under a probed 4032 MiB).
+
+**Through wgpu, not `web-sys`.** The WebGPU backend surfaces
+`GPUOutOfMemoryError` as `wgpu::Error::OutOfMemory` from a popped
+`ErrorFilter::OutOfMemory` scope and device loss through
+`set_device_lost_callback`, so `squallar-web` gained no `web-sys` feature and
+no package — only `egui-wgpu`, already in its wasm32 graph. Two filters are
+pushed per step and no more: the out-of-memory scope is the reading, a
+validation scope drains the errors a refused texture goes on to produce so
+they never reach the device's uncaptured path, and an `Internal` filter is
+never pushed because wgpu 29.0.4's backend maps a popped `GPUInternalError`
+to a panic. A lost device answers every later call as if it succeeded, so
+the loss flag outranks a silent scope.
 
 ### 8.4 Why WebGL2 has no safe probe, and what "presumed" means
 
@@ -1094,7 +1179,7 @@ prints it** (`squallar-app/src/budget_telemetry.rs`, pinned by
 `the_rig_reads_the_budget_line_the_app_actually_writes`):
 
 ```text
-budget state: bracket desktop, rung 2, steps 0, pool 3456 MiB, ceiling 4032 MiB, vram 24822 MiB, ram 65536 MiB, declared 0 MiB, threads 32, form 2, linear 0/0 MiB, cap 24822 1
+budget state: bracket desktop, rung 2, steps 0, pool 3456 MiB, ceiling 4032 MiB, vram 24822 MiB, ram 65536 MiB, declared 0 MiB, threads 32, form 2, linear 0/0 MiB, cap 24822 1, probe 0
 ```
 
 The fields, in order, every one mandatory and every byte figure MiB by integer
@@ -1109,10 +1194,17 @@ measurement of any of them), `threads`, `form` (0 unknown, 1 handheld,
 (the **capacity in force this session** — measured where the readings amount
 to a measurement, the bracket's presumption where they do not, held to what
 pressure has taught the session) and its source (`0` presumed, `1` measured,
-`2` probed). `cap` is not `vram`: an integrated part on a 64 GiB host prints
-`vram 0 … cap 32768 1`; llvmpipe reading 24 GiB prints `vram 24576 … cap 3840 0`.
-A binary older than the last two groups matches nothing and the rig reads
-`null`/`n/a`, never `cap 0`.
+`2` probed), and `probe` (where the browser's WebGPU probe of §8.3 stands:
+`0` absent — every native log, or not asked yet; `1` skipped — a WebGL2 page;
+`2` pending; `3` empty — ran, held nothing; `4` found at the device's refusal;
+`5` found at the probe's own bound, so the `cap` figure is a floor). `probe`
+rides this level line rather than the probe's own once-only lines because
+the browser console keeps a bounded ring and frame telemetry evicts a
+once-only line within seconds; a scrape reading it as absent could not tell
+"evicted" from "never ran". `cap` is not `vram`: an integrated part on a
+64 GiB host prints `vram 0 … cap 32768 1`; llvmpipe reading 24 GiB prints
+`vram 24576 … cap 3840 0`. A binary older than the last three groups matches
+nothing and the rig reads `null`/`n/a`, never `cap 0`.
 
 The earlier example in this section (`cap 24576 MiB measured, need 1380 MiB,
 economy 512 MiB, … cause 0`) was the plan's sketch, not the app's line: `need`,

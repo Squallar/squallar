@@ -78,6 +78,12 @@ squallar-overlays = { workspace = true }
 # token (extracted from squallar-app at WO-RW).
 squallar-worker = { workspace = true }
 winit = { workspace = true }
+# `egui_wgpu::wgpu`, the one wgpu re-export every crate here names its wgpu
+# through: `gpu_probe::run` builds the probe's second instance, adapter and
+# throwaway device on it, and `bridge` speaks `wgpu::Backend`. Already in this
+# target's graph through squallar-app, so the line adds no compiled package;
+# the feature set stays squallar-gpu's, the one chooser for the whole graph.
+egui-wgpu = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated
 # bindings do not line up; these move when that stack moves.
