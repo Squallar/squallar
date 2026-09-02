@@ -228,6 +228,73 @@ fn a_line_that_drifted_by_one_space_is_not_accepted() {
     );
 }
 
+/// **The rig reads the tile cache line the app actually writes**: the role
+/// word and thirteen figures, each at a value no other position holds, for
+/// both roles.
+///
+/// The role is a word group in the pattern's parenthesis and [`rendered`]
+/// speaks `(\d+)` only, so the opening is checked by name and the rest of
+/// the sentence is rendered on `rendered`'s terms — the honesty check over
+/// the numeric part is kept intact rather than widened.
+#[test]
+fn the_rig_reads_the_tile_cache_line_the_app_actually_writes() {
+    use squallar_egui::tile_source::cache_ledger::{CacheRole, ROLES, Totals};
+
+    let totals = Totals {
+        requests: 1001,
+        restyle_asks: 12,
+        refetch_after_eviction: 103,
+        puts_first: 904,
+        puts_restyle: 15,
+        puts_duplicate: 26,
+        puts_orphan: 37,
+        evicted_pending: 48,
+        evicted_resident: 59,
+        evicted_bytes: 6_000_060,
+        resident_entries: 71,
+        resident_bytes: 8_000_082,
+        parsed_entries: 93,
+    };
+    let pattern = pattern("tile_cache_re");
+    let head = r"tile cache \(([a-z0-9-]+)\): ";
+    assert!(
+        pattern.starts_with(head),
+        "the rig's tile cache pattern no longer opens with the role word: {pattern:?}",
+    );
+    let body = rendered(
+        &pattern[head.len()..],
+        &[
+            1001, 12, 103, 904, 15, 26, 37, 48, 59, 6_000_060, 71, 8_000_082, 93,
+        ],
+    );
+    for role in ROLES {
+        assert_eq!(
+            super::tile_cache_line(role, &totals),
+            format!("tile cache ({}): {body}", role.label()),
+            "the `tile cache ({}):` line and the rig's own probe for it have \
+             drifted. The rig records the reading as absent, which is what it \
+             also records for a bundle older than the line",
+            role.label(),
+        );
+    }
+
+    // The floor under the pin above, on the field the settle assertion
+    // differences: the pattern really names `refetch after eviction`.
+    let good = super::tile_cache_line(CacheRole::Base, &totals);
+    let drifted = good.replacen(" refetch after eviction,", " refetches after eviction,", 1);
+    assert_ne!(
+        drifted, good,
+        "the substitution produced a sentence with no ` refetch after eviction,` \
+         in it, so the perturbation below is not perturbing anything",
+    );
+    assert_ne!(
+        super::tile_cache_line(CacheRole::Base, &totals),
+        drifted,
+        "a tile cache line with a drifted field name compared equal to the \
+         real one, so the pin above cannot fail",
+    );
+}
+
 /// The rig driver's launcher, read at compile time for the same reason
 /// [`DRIVE_PY`] is.
 const RUN_TIER2: &str = include_str!("../../../.github/browser-rig/run_tier2.sh");

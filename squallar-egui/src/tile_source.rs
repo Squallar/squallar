@@ -559,6 +559,12 @@ struct CachedTile {
     /// did the styling, so it never costs the frame more than the styling
     /// already does; see [`crate::tile_mesh`].
     meshes: Option<Arc<crate::tile_mesh::TileMeshes>>,
+    /// Whether this slot's tile is drawing under a generation
+    /// [`HttpsTiles::request_once`] has since re-asked for. Set by the
+    /// stale-generation re-stamp, cleared by the arrival that replaces the
+    /// slot — so the arrival can be told from a body that landed on a tile
+    /// nobody re-asked for. Read by [`TileCache::put`] and nothing else.
+    restyle_pending: bool,
 }
 
 /// The cache slot a decoded tile becomes.
@@ -586,6 +592,190 @@ fn slot_for(tile: Tile, epoch: u64, feathering: f32) -> CachedTile {
         epoch,
         tile: Some(tile),
         meshes,
+        restyle_pending: false,
+    }
+}
+
+/// What one slot is worth in bytes, on the best figure the slot carries
+/// today: the flattened buffers where there are any, the texture where the
+/// tile is a raster, and nothing otherwise.
+///
+/// **A lower bound, and stated as one.** The styled shapes of a vector tile
+/// are host allocations this does not walk, and a `None` marker is not free;
+/// the ledger this feeds prices what it can see until the cache prices its
+/// entries in bytes and sizes itself by them. Nothing here is compared to a
+/// budget.
+fn slot_bytes(slot: &CachedTile) -> u64 {
+    match (&slot.meshes, &slot.tile) {
+        (Some(meshes), _) => meshes.bytes(),
+        (None, Some(Tile::Raster(texture))) => {
+            let [width, height] = texture.size();
+            (width * height * 4) as u64
+        }
+        (None, Some(Tile::Vector(_))) | (None, None) => 0,
+    }
+}
+
+/// How many evictions per slot of capacity [`TileCache`] remembers, so a
+/// refetch can be told from a first sight.
+///
+/// Four, because a refetch is a tile the viewport still wants and the
+/// viewport is at most a few multiples of the cap: a working set of `n` over
+/// a cap of `c` re-asks every one of its `n` tiles per pass, so the id being
+/// re-asked was evicted at most `n - c` evictions ago, and `n < 4c` covers the
+/// user's own 2878x1651 window (193 against 100) with room. Beyond that the
+/// memory forgets and the refetch is miscounted as a first put — under, never
+/// over.
+const EVICTED_MEMORY_PER_SLOT: usize = 4;
+
+/// One source's tile cache, with what [`cache_ledger`] needs read **at the
+/// cache**: which kind of slot a landing body replaced, and whether an ask is
+/// for an id this cache recently let go of.
+///
+/// A wrapper rather than the bare `LruCache` because the four sites that put
+/// (the native drain, the wasm32 inline decode, the wasm32 batch reply and
+/// the test fixture) and the one that asks must all classify the same way;
+/// the classification lives here once and the callers keep their `put`.
+struct TileCache {
+    role: cache_ledger::CacheRole,
+    slots: LruCache<TileId, CachedTile>,
+    /// Ids this cache evicted recently, most recent last — bounded at
+    /// [`EVICTED_MEMORY_PER_SLOT`] times the cap, so it can never outgrow the
+    /// cache it remembers for. Probed and popped by [`Self::ask`] and by an
+    /// orphan [`Self::put`].
+    evicted: LruCache<TileId, ()>,
+    /// What [`Self::slots`] is worth on [`slot_bytes`]' terms, kept as a
+    /// running figure so a put costs one add and one subtract.
+    resident_bytes: u64,
+    /// This source's own reading of every event it recorded, moved by the
+    /// same [`cache_ledger::Totals::apply`] the statics mirror — so a test
+    /// can read one source without another source's events in the number.
+    stats: cache_ledger::Totals,
+}
+
+impl TileCache {
+    fn new(entries: NonZeroUsize, role: cache_ledger::CacheRole) -> Self {
+        let remembered = entries.saturating_mul(
+            NonZeroUsize::new(EVICTED_MEMORY_PER_SLOT).expect("the multiplier is not zero"),
+        );
+        Self {
+            role,
+            slots: LruCache::new(entries),
+            evicted: LruCache::new(remembered),
+            resident_bytes: 0,
+            stats: cache_ledger::Totals::default(),
+        }
+    }
+
+    /// The slot under `tile_id`, refreshing its recency — a use, as
+    /// `LruCache::get` is.
+    fn get(&mut self, tile_id: &TileId) -> Option<&CachedTile> {
+        self.slots.get(tile_id)
+    }
+
+    /// Whether `tile_id` holds a slot, without touching recency. Gated as
+    /// its one caller, [`HttpsTiles::tile_is_cached`], is.
+    #[cfg(test)]
+    fn contains(&self, tile_id: &TileId) -> bool {
+        self.slots.contains(tile_id)
+    }
+
+    /// Slots held, markers included. Gated as its one caller,
+    /// [`HttpsTiles::cached_entries`], is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// This source's own counters. See [`Self::stats`]. Gated as its one
+    /// caller, [`HttpsTiles::cache_stats`], is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn stats(&self) -> cache_ledger::Totals {
+        self.stats
+    }
+
+    /// [`HttpsTiles::request_once`]'s fresh ask: a `None` marker under
+    /// `tile_id` at `epoch`, and one request counted — a refetch if this
+    /// cache remembers evicting the id.
+    fn ask(&mut self, tile_id: TileId, epoch: u64) {
+        if self.evicted.pop(&tile_id).is_some() {
+            self.note(cache_ledger::CacheEvent::RefetchAfterEviction);
+        }
+        self.note(cache_ledger::CacheEvent::Request);
+        self.insert(
+            tile_id,
+            CachedTile {
+                epoch,
+                tile: None,
+                meshes: None,
+                restyle_pending: false,
+            },
+        );
+    }
+
+    /// [`HttpsTiles::request_once`]'s stale-generation arm: the slot keeps
+    /// its tile and is re-stamped as "a request is out" under `epoch`.
+    fn re_ask(&mut self, tile_id: TileId, epoch: u64) {
+        if let Some(slot) = self.slots.get_mut(&tile_id) {
+            slot.epoch = epoch;
+            slot.restyle_pending = true;
+        }
+        self.note(cache_ledger::CacheEvent::RestyleAsk);
+    }
+
+    /// A tile landing, classified by what it found under its id. See
+    /// [`cache_ledger`] for the four kinds.
+    fn put(&mut self, tile_id: TileId, slot: CachedTile) {
+        let kind = match self.slots.peek(&tile_id) {
+            // A pending marker, of any generation: nothing drew yet, so this
+            // is the tile's first sight whatever the marker was stamped.
+            Some(CachedTile { tile: None, .. }) => cache_ledger::PutKind::First,
+            Some(CachedTile {
+                restyle_pending: true,
+                ..
+            }) => cache_ledger::PutKind::Restyle,
+            Some(_) => cache_ledger::PutKind::Duplicate,
+            None if self.evicted.pop(&tile_id).is_some() => cache_ledger::PutKind::Orphan,
+            None => cache_ledger::PutKind::First,
+        };
+        self.note(cache_ledger::CacheEvent::Put(kind));
+        self.insert(tile_id, slot);
+    }
+
+    /// The LRU push, with its eviction accounted: a victim other than the
+    /// inserted id is an eviction, remembered and classified by what it held.
+    fn insert(&mut self, tile_id: TileId, slot: CachedTile) {
+        let bytes = slot_bytes(&slot);
+        match self.slots.push(tile_id, slot) {
+            Some((victim, old)) if victim != tile_id => {
+                let old_bytes = slot_bytes(&old);
+                self.resident_bytes = self.resident_bytes.saturating_sub(old_bytes);
+                self.evicted.push(victim, ());
+                let kind = if old.tile.is_none() {
+                    cache_ledger::EvictedKind::Pending
+                } else {
+                    cache_ledger::EvictedKind::Resident
+                };
+                self.note(cache_ledger::CacheEvent::Evicted {
+                    kind,
+                    bytes: old_bytes,
+                });
+            }
+            Some((_, old)) => {
+                self.resident_bytes = self.resident_bytes.saturating_sub(slot_bytes(&old));
+            }
+            None => {}
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        let entries = self.slots.len() as u64;
+        self.stats.resident_entries = entries;
+        self.stats.resident_bytes = self.resident_bytes;
+        cache_ledger::set_resident(self.role, entries, self.resident_bytes);
+    }
+
+    fn note(&mut self, event: cache_ledger::CacheEvent) {
+        self.stats.apply(event);
+        cache_ledger::note(self.role, event);
     }
 }
 
@@ -812,14 +1002,21 @@ fn decode_archive_tile_remembering(
     tile_id: TileId,
     ctx: &Context,
     parsed_tiles: &SharedParsedTiles,
+    role: cache_ledger::CacheRole,
 ) -> Result<Tile, String> {
     match kind {
         ArchiveTileKind::Vector => {
             let parsed = Arc::new(timed_parse(bytes)?);
-            parsed_tiles
-                .lock()
-                .expect("the parsed-tile cache is not poisoned")
-                .put(tile_id, Arc::clone(&parsed));
+            let held = {
+                let mut parsed_tiles = parsed_tiles
+                    .lock()
+                    .expect("the parsed-tile cache is not poisoned");
+                parsed_tiles.put(tile_id, Arc::clone(&parsed));
+                parsed_tiles.len() as u64
+            };
+            // A level, stored where the parse lands: the only site that
+            // grows this cache, on either target.
+            cache_ledger::set_parsed_entries(role, held);
             // The vector arm does not delegate, so it counts for itself; the
             // raster arms are counted inside `decode_archive_tile`.
             note_archive_decode(ArchiveTileKind::Vector);
@@ -1252,8 +1449,10 @@ pub struct HttpsTiles {
     /// *and* "asked for, and it failed" — the two are deliberately
     /// indistinguishable, because both mean "do not ask again" — for as long
     /// as the slot's style generation is current. See [`Self::request_once`]
-    /// and [`CachedTile`] for what a stale generation re-opens.
-    cache: LruCache<TileId, CachedTile>,
+    /// and [`CachedTile`] for what a stale generation re-opens. Wrapped by
+    /// [`TileCache`], which classifies every put and eviction for
+    /// [`cache_ledger`].
+    cache: TileCache,
 
     /// The style generation the frame side currently wants — bumped by
     /// [`Self::set_style`], stamped on every slot, compared against arriving
@@ -1682,13 +1881,16 @@ struct InlineDecode<'a> {
     /// exactly that reason, so a change to it re-asks every tile rather than
     /// leaving a mismatched flatten in the cache.
     feathering: f32,
+    /// Which cache the parses this decode remembers belong to — the level
+    /// [`cache_ledger::set_parsed_entries`] is stored under.
+    role: cache_ledger::CacheRole,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl InlineDecode<'_> {
     fn take(
         &self,
-        cache: &mut LruCache<TileId, CachedTile>,
+        cache: &mut TileCache,
         put_generation: &mut u64,
         tile_id: TileId,
         payload: FetchPayload,
@@ -1741,6 +1943,7 @@ impl InlineDecode<'_> {
                             tile_id,
                             self.egui_ctx,
                             parsed,
+                            self.role,
                         ),
                         None => decode_archive_tile(
                             &bytes,
@@ -1892,7 +2095,8 @@ impl HttpsTiles {
             fault: Arc::new(OnceLock::new()),
             reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
-            cache: LruCache::new(cache_entries),
+            // A plain HTTP raster source draws the ground: the base role.
+            cache: TileCache::new(cache_entries, cache_ledger::CacheRole::Base),
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             // A raster source has no style to swap and no parse to keep.
@@ -2199,6 +2403,7 @@ impl HttpsTiles {
             // for that reason, so a change re-asks rather than leaving a
             // mismatched flatten in the cache.
             feathering: flatten_feathering(*feathering),
+            role: cache.role,
         };
 
         let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
@@ -2445,18 +2650,9 @@ impl HttpsTiles {
             if known.is_some() {
                 // The stale slot keeps its tile; the re-stamp is the "a
                 // request is out" record.
-                if let Some(slot) = cache.get_mut(&tile_id) {
-                    slot.epoch = epoch;
-                }
+                cache.re_ask(tile_id, epoch);
             } else {
-                cache.put(
-                    tile_id,
-                    CachedTile {
-                        epoch,
-                        tile: None,
-                        meshes: None,
-                    },
-                );
+                cache.ask(tile_id, epoch);
             }
         });
 
@@ -2621,6 +2817,15 @@ impl HttpsTiles {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn cached_entries(&self) -> usize {
         self.cache.len()
+    }
+
+    /// This source's own cache counters — every event its cache recorded,
+    /// and no other source's. The statics [`cache_ledger::totals`] reads
+    /// are shared by every source of a role in the process, which in a test
+    /// binary is every test's; a pin on one source reads this instead.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn cache_stats(&self) -> cache_ledger::Totals {
+        self.cache.stats()
     }
 
     /// Whether `tile_id` currently occupies a slot, pending and failed markers
@@ -2878,6 +3083,7 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TILE_CACHE_ENTRIES,
+            cache_ledger::CacheRole::Base,
             // The header says `tile_type = 1` and that is the whole truth
             // about a vector archive; nothing here knows better.
             None,
@@ -2926,6 +3132,7 @@ impl HttpsTiles {
             attribution,
             egui_ctx,
             TERRAIN_TILE_CACHE_ENTRIES,
+            cache_ledger::CacheRole::Terrain,
             // The hillshade is the app's only *pictorial* raster archive, so
             // the header's `tile_type = 4` already routes it correctly. A
             // declaration here would claim a fact the header carries.
@@ -2954,12 +3161,17 @@ impl HttpsTiles {
     /// PNG archive. It is verified against the header at open and is not a
     /// pre-set answer — see [`ArchiveSlots::declared`]. `None` leaves
     /// the header's word standing, which is what both published archives use.
+    ///
+    /// `role` is which cache [`cache_ledger`] files this source's events
+    /// under; the two public constructors each name their own.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_range_source<S, St>(
         source: S,
         styling: BasemapStyling,
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
+        role: cache_ledger::CacheRole,
         declared_kind: Option<ArchiveTileKind>,
         stores: ArchiveStores<St>,
     ) -> Self
@@ -3031,6 +3243,7 @@ impl HttpsTiles {
                 style: style_slot,
                 tile_bodies,
                 parsed_tiles: parsed,
+                role,
             },
             ArchiveSlots {
                 max_zoom: Arc::clone(&max_zoom),
@@ -3057,7 +3270,7 @@ impl HttpsTiles {
             fault,
             reads_failing,
             requests_closed: false,
-            cache: LruCache::new(cache_entries),
+            cache: TileCache::new(cache_entries, role),
             style_epoch: RASTER_STYLE_EPOCH,
             feathering: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -3124,7 +3337,7 @@ impl HttpsTiles {
             fault: Arc::new(OnceLock::new()),
             reads_failing: Arc::new(AtomicBool::new(false)),
             requests_closed: false,
-            cache: LruCache::new(TILE_CACHE_ENTRIES),
+            cache: TileCache::new(TILE_CACHE_ENTRIES, cache_ledger::CacheRole::Base),
             // An inert source never restyles and never parses -- the same
             // never-restyles spelling as a raster source, which is what the
             // epoch constant's doc names for this case.
@@ -3179,6 +3392,17 @@ struct ArchiveStyling {
     /// parsed cache instead.
     tile_bodies: IoTileBodies,
     parsed_tiles: SharedParsedTiles,
+    /// Which cache the parses land for — the level
+    /// [`cache_ledger::set_parsed_entries`] is stored under. Read where the
+    /// parse is remembered, which on wasm32 is the frame pump and not here.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            dead_code,
+            reason = "on wasm the frame pump remembers the parse and carries its own role"
+        )
+    )]
+    role: cache_ledger::CacheRole,
 }
 
 /// What this device already holds of the archive, and where.
@@ -3690,10 +3914,19 @@ where
         let (style, epoch, feathering) = current_style(&styling.style);
         let egui_ctx = egui_ctx.clone();
         let parsed_tiles = Arc::clone(&styling.parsed_tiles);
+        let role = styling.role;
 
         tokio::task::spawn_blocking(move || {
-            decode_archive_tile_remembering(&bytes, kind, &style, tile_id, &egui_ctx, &parsed_tiles)
-                .map(|tile| slot_for(tile, epoch, feathering))
+            decode_archive_tile_remembering(
+                &bytes,
+                kind,
+                &style,
+                tile_id,
+                &egui_ctx,
+                &parsed_tiles,
+                role,
+            )
+            .map(|tile| slot_for(tile, epoch, feathering))
         })
         .await
         .map_err(|error| format!("rendering {tile_id:?} from the basemap archive: {error}"))?
@@ -3717,6 +3950,7 @@ fn current_style(slot: &std::sync::RwLock<StyleSlot>) -> (Arc<Style>, u64, f32) 
     (Arc::clone(&slot.style), slot.epoch, slot.feathering)
 }
 
+pub mod cache_ledger;
 pub mod take_ledger;
 
 // Native-only: `#[tokio::test]` (the dev-dependency is target-gated),

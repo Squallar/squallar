@@ -379,6 +379,50 @@ fn ground_tile_line(t: &squallar_egui::tile_mesh::ledger::Totals) -> String {
     )
 }
 
+/// The `tile cache (<role>):` running-total line, one per cache role that
+/// has recorded anything. See [`overlay_raster_line`] for why this is a
+/// value.
+///
+/// Denominator: **one event at a tile source's cache** — see
+/// `squallar_egui::tile_source::cache_ledger`, which states the ten counters
+/// and the three levels and why none is added to another. It is the reading
+/// the `ground tiles:` line above cannot give: that line's `uploads` and
+/// `evicted` are the GPU store's, keyed on a minted identity, so they cannot
+/// say whether an upload was a tile's first sight, a restyle, or the same tile
+/// fetched again after the cache dropped it. `refetch after eviction` is the
+/// subset of `asks` that answers that; `duplicate` and `orphan` are the two
+/// shapes of a body fetched for nothing. `entries`, `B resident` and `parsed`
+/// are levels and go down; `B` figures are the lower bound the slot can price
+/// today.
+///
+/// Never compared to `ground tiles: uploads` by subtraction: a put is a cache
+/// slot and an upload is a mesh buffer write, and a put with no fills uploads
+/// nothing.
+fn tile_cache_line(
+    role: squallar_egui::tile_source::cache_ledger::CacheRole,
+    t: &squallar_egui::tile_source::cache_ledger::Totals,
+) -> String {
+    format!(
+        "tile cache ({}): {} asks, {} restyle asks, {} refetch after eviction, \
+         {} puts first, {} restyle, {} duplicate, {} orphan, {} evicted pending, \
+         {} evicted resident of {} B, {} entries, {} B resident, {} parsed",
+        role.label(),
+        t.requests,
+        t.restyle_asks,
+        t.refetch_after_eviction,
+        t.puts_first,
+        t.puts_restyle,
+        t.puts_duplicate,
+        t.puts_orphan,
+        t.evicted_pending,
+        t.evicted_resident,
+        t.evicted_bytes,
+        t.resident_entries,
+        t.resident_bytes,
+        t.parsed_entries,
+    )
+}
+
 /// The `basemap tiles:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value rather than an argument to `log::info!` — and this one
 /// most of all, because the Tier-2 rig **gates** on it
@@ -1500,6 +1544,14 @@ impl super::App {
         }
         if let Some(g) = ground {
             say_telemetry(loud, &ground_tile_line(&g));
+        }
+        // Beside the ground line it explains, once per role that moved since
+        // its last reading. Read here rather than in the early-return above:
+        // a cache event on a drawing pane always moves the ground line too.
+        for role in squallar_egui::tile_source::cache_ledger::ROLES {
+            if let Some(t) = squallar_egui::tile_source::cache_ledger::totals_if_moved(role) {
+                say_telemetry(loud, &tile_cache_line(role, &t));
+            }
         }
         if let Some(b) = basemap {
             say_telemetry(loud, &basemap_tile_line(&b));

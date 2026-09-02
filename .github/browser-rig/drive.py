@@ -2644,6 +2644,25 @@ var ground_re = /ground tiles: (\d+) placed, (\d+) stroke pts, (\d+) labels, (\d
 // only, so the arm running the old binary is the one that appears broken. A
 // separate pattern keeps every group of every shared probe mandatory.
 var ground_stroke_draws_re = /ground tiles: .*, (\d+) stroke draws/;
+// A SIXTH denominator, and the one the fourth cannot supply: events AT THE
+// TILE CACHE, per cache role (`base` = the basemap sources, `terrain` = the
+// hillshade), where a first sight, a refetch, a restyle and a duplicate are
+// different events. `ground_re`'s `uploads`/`evicted` are the GPU store's,
+// keyed on an identity minted per mesh, so they cannot say whether an upload
+// was a tile's first sight or the same tile fetched again after the LRU
+// dropped it -- which is the whole question behind "3,070 uploads against
+// 2,848 evictions". `refetch after eviction` is the SUBSET of `asks` whose id
+// the cache remembers evicting; `duplicate` and `orphan` are the two shapes
+// of a body fetched for nothing. `entries`, `B resident` and `parsed` are
+// LEVELS and go down; the `B` figures are the lower bound a slot can price.
+// Never subtracted from `uploads`: a put is a cache slot, an upload is a mesh
+// buffer write, and a put with no fills uploads nothing. Its OWN pattern with
+// every group mandatory, for `ground_stroke_draws_re`'s reason: `native_row.py`
+// reads these literals at run time and `int()`s every group of the shared
+// probes; the role group is a WORD, so that file gives this its own arm, as
+// it does `budget_state_re`. Running totals: the LAST match per role wins for
+// the headline reading; every match is kept for the settle assertion.
+var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks, (\d+) refetch after eviction, (\d+) puts first, (\d+) restyle, (\d+) duplicate, (\d+) orphan, (\d+) evicted pending, (\d+) evicted resident of (\d+) B, (\d+) entries, (\d+) B resident, (\d+) parsed/;
 // A FIFTH, and the only one about the 3D floor path. `paints` is per 3D pane
 // per frame its off-screen map strip really drew, `mirror renders` per mirror
 // pass encoded (per frame, not per pane) -- two denominators, never added, and
@@ -2679,6 +2698,9 @@ var uploads_loose_re = /texture uploads: \d+ deltas/;
 var basemap_loose_re = /basemap tiles: \d+ vector/;
 var rasters_unparsed = null, uploads_unparsed = null, basemap_unparsed = null;
 var rasters = null, uploads = null, basemap = null, ground = null, floor = null;
+// The settle assertion's history: every match, page-stamped, so a window can
+// be differenced. `tile_cache` is the headline reading, last match PER ROLE.
+var tile_cache = null, tile_cache_all = [], ground_all = [], basemap_all = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -2747,6 +2769,31 @@ for (var i = 0; i < C.length; i++) {
   // where `null` means "that bundle is older" and NOT "zero stroke runs drew".
   if (gm) { var sd = ground_stroke_draws_re.exec(m);
             if (sd) ground.stroke_draws = parseInt(sd[1], 10); }
+  // Kept for the settle assertion: the two GPU-store figures with their
+  // page stamp, and the one decode figure with its.
+  if (gm) ground_all.push({ t: C[i].t, uploads: parseInt(gm[5], 10),
+                            evicted: parseInt(gm[7], 10) });
+  if (bm) basemap_all.push({ t: C[i].t, vector_tiles: parseInt(bm[1], 10) });
+  var tcm = tile_cache_re.exec(m);
+  if (tcm) {
+    var tc = { t: C[i].t, role: tcm[1],
+               asks: parseInt(tcm[2], 10),
+               restyle_asks: parseInt(tcm[3], 10),
+               refetch_after_eviction: parseInt(tcm[4], 10),
+               puts_first: parseInt(tcm[5], 10),
+               puts_restyle: parseInt(tcm[6], 10),
+               puts_duplicate: parseInt(tcm[7], 10),
+               puts_orphan: parseInt(tcm[8], 10),
+               evicted_pending: parseInt(tcm[9], 10),
+               evicted_resident: parseInt(tcm[10], 10),
+               evicted_bytes: parseInt(tcm[11], 10),
+               resident_entries: parseInt(tcm[12], 10),
+               resident_bytes: parseInt(tcm[13], 10),
+               parsed_entries: parseInt(tcm[14], 10) };
+    if (!tile_cache) tile_cache = {};
+    tile_cache[tcm[1]] = tc;
+    tile_cache_all.push(tc);
+  }
   var fm = floor_re.exec(m);
   if (fm) floor = { paints: parseInt(fm[1], 10),
                     mirror_renders: parseInt(fm[2], 10),
@@ -2758,6 +2805,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
          basemap: basemap, ground: ground, floor: floor,
+         tile_cache: tile_cache, tile_cache_all: tile_cache_all,
+         ground_all: ground_all, basemap_all: basemap_all,
          rasters_unparsed: rasters_unparsed,
          uploads_unparsed: uploads_unparsed,
          basemap_unparsed: basemap_unparsed,
@@ -3169,6 +3218,115 @@ class FrameLineWatcher:
         rs = list((by_name.get(family) or self.named.get(family) or {}).values())
         rs.sort(key=lambda r: (r.get("t") or 0, r.get("n") or 0))
         return rs
+
+
+class RunningTotalsWatcher:
+    """Accumulates the running-total lines a settle assertion differences.
+
+    For `FrameLineWatcher`'s reason: the page-side console ring holds 1200
+    entries and evicts, and the reading that brackets the START of a window
+    can be gone by the time the window ends. Every `tile cache (<role>):`,
+    `ground tiles:` and `basemap tiles:` match seen at any poll is kept here
+    by its page-side timestamp.
+
+    These three lines are written at most once per 2 s and ONLY when their
+    ledger moved (`*_if_moved` on the Rust side), so SILENCE over a window is
+    itself a zero delta for every counter on the line. That is what makes a
+    running total the right shape to assert a settled viewport on: nothing
+    has to be summed, and a reading the ring evicted is not a reading lost --
+    the next one carries it."""
+
+    def __init__(self, session):
+        self.session = session
+        self.tile_cache = {}
+        self.ground = {}
+        self.basemap = {}
+
+    def poll(self):
+        sig = self.session.execute(WORKER_SIGNAL_PROBE) or {}
+        for r in sig.get("tile_cache_all") or []:
+            self.tile_cache[(r.get("t"), r.get("role"))] = r
+        for r in sig.get("ground_all") or []:
+            self.ground[r.get("t")] = r
+        for r in sig.get("basemap_all") or []:
+            self.basemap[r.get("t")] = r
+        return sig
+
+    def readings(self, family, role=None):
+        """Every reading of `family` (optionally of one `role`), oldest first."""
+        source = {"tile_cache": self.tile_cache, "ground": self.ground,
+                  "basemap": self.basemap}[family]
+        rs = [r for r in source.values() if role is None or r.get("role") == role]
+        rs.sort(key=lambda r: r.get("t") or 0)
+        return rs
+
+
+def tile_cache_settles(watcher, span_s, now_ms):
+    """THE SETTLE ASSERTION: over the last `span_s` seconds of a static
+    viewport, `tile cache (base): refetch after eviction`, `ground tiles:
+    uploads` and `basemap tiles: vector` all moved by ZERO.
+
+    Three denominators, never added and each asserted on its own: a cache
+    ask the cache remembers evicting, a mesh buffer upload in the GPU store,
+    and a vector body decoded. A viewport nobody is touching, whose tiles
+    have all arrived, owes none of the three. A cache below the working set
+    owes all three every frame -- it evicts a tile still on the glass, asks
+    for it again, decodes it again, uploads it again -- which is the defect
+    this leg exists to put a number on, and the reading `ground tiles:`
+    alone cannot classify.
+
+    The base of each difference is the last reading BEFORE the window, or
+    zero when there is none: these are running totals from boot, so a first
+    write inside the window is a move from zero. A family with no reading at
+    all is an ERROR, not a zero -- either `squallar.raster_telemetry` is
+    unseeded or the bundle predates the line -- and it fails the assertion
+    rather than passing it vacuously. A family that wrote nothing inside the
+    window is a zero delta by construction (see `RunningTotalsWatcher`), and
+    the verdict says so as its basis.
+
+    Pair this with --expect-frame-progress: a frame loop that DIED writes
+    nothing either, and only the app's own frame counter tells the two apart.
+    """
+    window_start = now_ms - span_s * 1000.0
+    out = {"ok": True, "window_s": span_s, "families": {}}
+    checks = (
+        ("tile cache (base): refetch after eviction",
+         watcher.readings("tile_cache", role="base"), "refetch_after_eviction"),
+        ("ground tiles: uploads", watcher.readings("ground"), "uploads"),
+        ("basemap tiles: vector", watcher.readings("basemap"), "vector_tiles"),
+    )
+    for name, rs, field in checks:
+        fam = {"readings": len(rs)}
+        if not rs:
+            fam.update(ok=False, delta=None, error=(
+                "`%s` was never written: either squallar.raster_telemetry is "
+                "unseeded, or the served bundle predates the line. NOT a zero "
+                "reading" % name))
+        else:
+            inside = [r for r in rs if (r.get("t") or 0) >= window_start]
+            before = [r for r in rs if (r.get("t") or 0) < window_start]
+            if before:
+                base, basis = before[-1][field], "last reading before the window"
+            else:
+                base, basis = 0, "boot: no reading before the window, running totals start at zero"
+            if not inside:
+                fam.update(ok=True, delta=0, base=base, last=base, in_window=0,
+                           basis="silent: no line inside the window, and the "
+                                 "line is written only when its ledger moves")
+            else:
+                last = inside[-1][field]
+                delta = last - base
+                fam.update(ok=(delta == 0), delta=delta, base=base, last=last,
+                           in_window=len(inside), basis=basis)
+                if delta != 0:
+                    fam["error"] = (
+                        "`%s` moved by %d over the last %.0f s of a static "
+                        "viewport (%s -> %s, %d readings inside)"
+                        % (name, delta, span_s, base, last, len(inside)))
+        out["families"][name] = fam
+        if not fam["ok"]:
+            out["ok"] = False
+    return out
 
 
 def gesture_window_stats(watcher, quiet_settle_s=None, skip_loops=0):
@@ -5532,6 +5690,11 @@ def run_smoke(args):
         # strictly exceeded by the end of the leg.
         frames_watch = FrameLineWatcher(session)
         frames_watch.poll()
+        # The running-total lines' history, for --expect-tile-cache-settles.
+        # Polled wherever the frame watcher is polled inside the data window,
+        # so the ring's eviction cannot lose a reading between polls.
+        totals_watch = RunningTotalsWatcher(session)
+        totals_watch.poll()
         interact_before = frames_watch.interact_n()
         if args.expect_interaction_frames or args.w3c_gesture:
             stage("frame-lines-baseline", interact_n=interact_before)
@@ -5660,9 +5823,11 @@ def run_smoke(args):
             time.sleep(args.data_window / 2)
             result["resources_mid"] = session.execute(RESOURCES_PROBE)
             frames_watch.poll()
+            totals_watch.poll()
             note_load()
             time.sleep(args.data_window / 2)
         note_load()
+        totals_watch.poll()
         result["resources"] = session.execute(RESOURCES_PROBE)
         stage("resources", count=(result["resources"] or {}).get("count"),
               hosts=list(((result["resources"] or {}).get("hosts") or {}))[:6],
@@ -5733,6 +5898,16 @@ def run_smoke(args):
         result["ground_tile_totals"] = _sig.get("ground")
         if result["ground_tile_totals"]:
             stage("ground-tiles", **result["ground_tile_totals"])
+        # A sixth record, per cache role, and the one that classifies what
+        # the fourth counts: events AT the tile cache (see `tile_cache_re`).
+        # None -- never 0 -- when no `tile cache (...)` line matched: an older
+        # bundle, or a cache that recorded nothing, and the two are told apart
+        # by the `basemap` reading beside it.
+        result["tile_cache_totals"] = _sig.get("tile_cache")
+        if result["tile_cache_totals"]:
+            for _role, _tc in sorted(result["tile_cache_totals"].items()):
+                stage("tile-cache-" + _role,
+                      **{k: v for k, v in _tc.items() if k not in ("t", "role")})
         # A fifth record, and a fifth question: what the 3D floor path painted
         # and why. In none of the four above -- a floor strip's repaint is a
         # second map render, not a texture delta -- and never summed with them.
@@ -5839,6 +6014,18 @@ def run_smoke(args):
                     fp["gained"] = inside[-1]["n"] - inside[0]["n"]
             result["frame_progress"] = fp
             stage("frame-progress", **fp)
+
+        # The settle assertion. See `tile_cache_settles` for the rule and
+        # for why silence is a zero and an absent line is an error.
+        if args.expect_tile_cache_settles:
+            totals_watch.poll()
+            now_ms = session.execute("return Date.now();")
+            tcs = tile_cache_settles(totals_watch, args.expect_tile_cache_settles,
+                                     now_ms)
+            result["tile_cache_settles"] = tcs
+            stage("tile-cache-settles", ok=tcs["ok"], window_s=tcs["window_s"],
+                  **{"delta_" + name.split(":")[-1].strip().replace(" ", "_"):
+                     fam.get("delta") for name, fam in tcs["families"].items()})
         fl_last = frames_watch.last or {}
         result["frame_lines"] = {
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
@@ -6022,6 +6209,8 @@ def run_smoke(args):
 
         fp_ok = (result.get("frame_progress") is None
                  or bool((result.get("frame_progress") or {}).get("ok")))
+        tcs_ok = (result.get("tile_cache_settles") is None
+                  or bool((result.get("tile_cache_settles") or {}).get("ok")))
         # THE CANVAS THIS LEG ACTUALLY GOT, asserted rather than requested.
         # `fit_canvas` has always returned `met`, and until 2026-08-31 nothing
         # read it: a leg could ask for 2878x1651, be handed 1280x815 because
@@ -6050,7 +6239,7 @@ def run_smoke(args):
                               % (ct.get("got"), ct.get("asked")))}
         result["pass"] = (booted and canvas_ok and raf_ok
                           and canvas_blank is not True and not panics
-                          and not traps and fp_ok
+                          and not traps and fp_ok and tcs_ok
                           and worker_ok and ifr_ok and cwaits_ok
                           and sw_ok is not False and coi_ok is not False
                           and cv_ok is not False
@@ -6074,6 +6263,8 @@ def run_smoke(args):
                                 if traps else None),
             "frame_progress_ok": (None if result.get("frame_progress") is None
                                   else bool(result["frame_progress"]["ok"])),
+            "tile_cache_settles_ok": (None if result.get("tile_cache_settles") is None
+                                      else bool(result["tile_cache_settles"]["ok"])),
             # The SIZE this row's every other number is a figure for. A leg
             # that passed at 1280x815 and one that passed at 2878x1651 are not
             # the same evidence, and a summary that does not say which is which
@@ -6382,6 +6573,39 @@ def run_smoke(args):
               "in neither figure above]: %s vector, %s raster, %s sniffed"
               % (tag, bmtt.get("vector_tiles"), bmtt.get("raster_tiles"),
                  bmtt.get("sniffed_tiles")))
+    tct = result.get("tile_cache_totals")
+    if tct:
+        # A SIXTH denominator, per cache role: events at the tile cache.
+        # `refetch after eviction` is a SUBSET of `asks`; the four put kinds
+        # are disjoint and sum to the puts; the last three are LEVELS. Never
+        # subtracted from `uploads` above.
+        for role in sorted(tct):
+            c = tct[role]
+            print("[%s] SUMMARY tile cache totals (%s) [events AT the tile "
+                  "cache; refetch is a subset of asks; entries/resident/parsed "
+                  "are levels]: %s asks, %s restyle asks, %s refetch after "
+                  "eviction, %s puts first, %s restyle, %s duplicate, %s orphan, "
+                  "%s evicted pending, %s evicted resident of %s B, %s entries, "
+                  "%s B resident, %s parsed"
+                  % (tag, role, c.get("asks"), c.get("restyle_asks"),
+                     c.get("refetch_after_eviction"), c.get("puts_first"),
+                     c.get("puts_restyle"), c.get("puts_duplicate"),
+                     c.get("puts_orphan"), c.get("evicted_pending"),
+                     c.get("evicted_resident"), c.get("evicted_bytes"),
+                     c.get("resident_entries"), c.get("resident_bytes"),
+                     c.get("parsed_entries")))
+    tcs = result.get("tile_cache_settles")
+    if tcs is not None:
+        print("[%s] SUMMARY tile cache settles [last %.0f s of a static "
+              "viewport; three deltas, never added]: %s"
+              % (tag, tcs.get("window_s") or 0,
+                 "OK" if tcs.get("ok") else "FAILED"))
+        for name, fam in (tcs.get("families") or {}).items():
+            print("[%s] SUMMARY   %s: delta %s over %s readings in the window "
+                  "(%s)%s"
+                  % (tag, name, fam.get("delta"), fam.get("in_window", 0),
+                     fam.get("basis", "no reading"),
+                     "" if fam.get("ok") else "; " + str(fam.get("error"))))
     # The frame-telemetry readout. Cumulative rows are labelled cumulative
     # and the gesture-window rows are labelled with their bracket, because
     # the spike showed cumulative-from-boot p99s are boot-contaminated and
@@ -6753,6 +6977,24 @@ def main(argv=None):
                          "every screenshot and rAF check still passes. Needs "
                          "the squallar.frame_telemetry seed; a leg that never "
                          "wrote the line fails with that stated")
+    ap.add_argument("--expect-tile-cache-settles", type=float, default=None,
+                    metavar="SECONDS",
+                    help="fail unless, over the last SECONDS of the leg, the "
+                         "deltas of `tile cache (base): refetch after "
+                         "eviction`, `ground tiles: uploads` and `basemap "
+                         "tiles: vector` are ALL zero -- three denominators, "
+                         "each asserted alone. A static viewport whose tiles "
+                         "have arrived owes none of them; a tile cache below "
+                         "its working set owes all three every frame, "
+                         "because it evicts a tile still on the glass, asks "
+                         "for it again, decodes it again and uploads it "
+                         "again. Silence inside the window is a zero (the "
+                         "lines are written only when their ledger moves); a "
+                         "line never written at all is an ERROR, never a "
+                         "zero. Needs the squallar.raster_telemetry seed. "
+                         "Pair with --expect-frame-progress: a dead frame "
+                         "loop is silent too, and only the app's own frame "
+                         "counter tells the two apart")
     ap.add_argument("--w3c-gesture", choices=("pan", "wheel", "pan+wheel"),
                     default=None,
                     help="drive real input through the driver's W3C /actions "

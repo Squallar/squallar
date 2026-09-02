@@ -14,9 +14,9 @@ use super::{
     DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles,
     MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
     PARSED_TILE_CACHE_ENTRIES, PumpBudget, ReadFailureRun, SUSTAINED_READ_FAILURES,
-    TILE_CACHE_ENTRIES, WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
-    WASM_TILE_DECODES_PER_PUMP, drain_up_to, interpolate_from_lower_zoom, tile_client,
-    tile_id_is_valid,
+    TILE_CACHE_ENTRIES, TileCache, WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
+    WASM_TILE_DECODES_PER_PUMP, cache_ledger, drain_up_to, interpolate_from_lower_zoom, slot_for,
+    tile_client, tile_id_is_valid,
 };
 
 // ---------------------------------------------------------------------------
@@ -1653,6 +1653,240 @@ fn eviction_holds_at_every_tier_cap_and_takes_the_least_recent() {
 
 // ---------------------------------------------------------------------------
 
+/// The grid `ui_map_overlays::draw_tile_layer` walks, in its order: rows
+/// north to south, columns west to east, one `ground_at` per cell — after the
+/// layer's one pump.
+fn frame_over_grid(tiles: &mut HttpsTiles, side: u32, zoom: u8) {
+    tiles.pump();
+    for y in 0..side {
+        for x in 0..side {
+            tiles.ground_at(TileId { x, y, zoom });
+        }
+    }
+}
+
+/// A 12x12 grid: 144 cells, which is what a 2878x1651-point window draws at
+/// a whole zoom (13x8 = 104) plus part of what it holds between zooms (17x11
+/// = 187), against the wasm32 and mobile cap of 100.
+const GRID_SIDE: u32 = 12;
+const GRID_CELLS: u64 = (GRID_SIDE * GRID_SIDE) as u64;
+const GRID_FRAMES: usize = 120;
+const GRID_ZOOM: u8 = 10;
+
+/// **A cache below the working set refetches tiles that are still on the
+/// glass.** The same 144 cells every frame, in the walk order, over a cap of
+/// 100: once the cache fills, every push evicts the least recently touched
+/// cell — which is the one the walk visits first next frame — so each frame
+/// re-asks for tiles it just held, and the source's own counters say so.
+///
+/// `#[ignore]`d on purpose: it pins the defect, so it reads green while the
+/// defect stands and would read red the day the cache holds its working set
+/// — at which point the assertion flips to `== 0` and the ignore comes off.
+/// Run with `cargo test -p squallar-egui --lib -- --ignored
+/// a_working_set_above_the_cap`. Its twin below at cap 200 is the control:
+/// the mechanism, not the number.
+#[test]
+#[ignore = "pins the defect WO-6 removes; flips to == 0 there"]
+fn a_working_set_above_the_cap_refetches_tiles_still_on_the_glass() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 100);
+
+    for _ in 0..GRID_FRAMES {
+        frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let stats = tiles.cache_stats();
+    eprintln!(
+        "cap 100 over a {GRID_SIDE}x{GRID_SIDE} grid for {GRID_FRAMES} frames: {stats:?}; \
+         the server saw {} requests",
+        server.request_count()
+    );
+    assert!(
+        stats.refetch_after_eviction > 0,
+        "a 144-cell working set over a 100-slot cache re-asked for no evicted tile: {stats:?}"
+    );
+    assert!(
+        stats.requests > GRID_CELLS,
+        "144 cells were asked for {} times in total, so no tile was ever fetched twice: {stats:?}",
+        stats.requests
+    );
+}
+
+/// **The control**: the same walk over a cap the working set fits in evicts
+/// nothing, refetches nothing, and asks for each cell exactly once.
+#[test]
+fn a_working_set_under_the_cap_asks_for_every_tile_once_and_refetches_none() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 200);
+
+    // The request channel holds six, so a 144-cell walk takes frames to ask
+    // for everything; every body must also have landed before the put kinds
+    // are read.
+    let landed = pump_until(DEFAULT_TIMEOUT, || {
+        frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
+        (tiles.cache_stats().puts_first >= GRID_CELLS).then_some(())
+    });
+    assert!(
+        landed.is_some(),
+        "not every cell landed within the timeout: {:?}",
+        tiles.cache_stats()
+    );
+    for _ in 0..GRID_FRAMES {
+        frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let stats = tiles.cache_stats();
+    assert_eq!(
+        stats.refetch_after_eviction, 0,
+        "a working set under the cap refetched: {stats:?}"
+    );
+    assert_eq!(
+        stats.evicted(),
+        0,
+        "a working set under the cap evicted: {stats:?}"
+    );
+    assert_eq!(
+        stats.requests, GRID_CELLS,
+        "each of {GRID_CELLS} cells is asked for exactly once: {stats:?}"
+    );
+    assert_eq!(
+        (stats.puts_first, stats.puts_duplicate, stats.puts_orphan),
+        (GRID_CELLS, 0, 0),
+        "every landing was a first sight: {stats:?}"
+    );
+    assert_eq!(
+        stats.resident_entries, GRID_CELLS,
+        "the level is what the cache holds: {stats:?}"
+    );
+    assert_eq!(
+        server.request_count() as u64,
+        GRID_CELLS,
+        "the server saw a request the cache did not count, or the reverse"
+    );
+}
+
+/// **The cache classifies what lands and what it lets go**, at the cache:
+/// a body on its own marker is a first sight, a body whose marker was evicted
+/// is an orphan, an ask for an id it remembers evicting is a refetch, a body
+/// on a re-stamped tile is a restyle, and a body on a current tile is a
+/// duplicate. Each event lands in the source's own reading and, by at least
+/// as much, in the role's statics.
+#[test]
+fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orphan() {
+    use cache_ledger::{CacheRole, totals};
+
+    let role = CacheRole::Terrain;
+    let before = totals(role);
+    let mut cache = TileCache::new(std::num::NonZeroUsize::new(2).expect("2 is not zero"), role);
+    let id = |x: u32| TileId { x, y: 0, zoom: 3 };
+    // A vector tile with no shapes: it flattens to nothing, so the slot is
+    // resident without a byte figure, which keeps this about kinds.
+    let body = |epoch: u64| slot_for(Tile::Vector(Arc::new(Vec::new())), epoch, 0.0);
+
+    cache.ask(id(0), 1);
+    cache.ask(id(1), 1);
+    let s = cache.stats();
+    assert_eq!(
+        (s.requests, s.refetch_after_eviction, s.evicted()),
+        (2, 0, 0)
+    );
+    assert_eq!(s.resident_entries, 2);
+
+    // id 0's body lands on its own marker.
+    cache.put(id(0), body(1));
+    assert_eq!(cache.stats().puts_first, 1);
+
+    // A third ask at the cap evicts the least recently touched slot — id 1's
+    // pending marker, since the put just touched id 0.
+    cache.ask(id(2), 1);
+    let s = cache.stats();
+    assert_eq!((s.evicted_pending, s.evicted_resident), (1, 0));
+    assert!(!cache.contains(&id(1)));
+
+    // id 1's body lands with its marker gone: an orphan — and its arrival
+    // evicts id 0, a resident tile.
+    cache.put(id(1), body(1));
+    let s = cache.stats();
+    assert_eq!(s.puts_orphan, 1, "{s:?}");
+    assert_eq!((s.evicted_pending, s.evicted_resident), (1, 1), "{s:?}");
+
+    // id 0 is wanted again: a refetch, and a request.
+    cache.ask(id(0), 1);
+    let s = cache.stats();
+    assert_eq!((s.requests, s.refetch_after_eviction), (4, 1), "{s:?}");
+
+    // A restyle: id 1 is re-asked under a new generation and its restyled
+    // body replaces it.
+    cache.re_ask(id(1), 2);
+    assert_eq!(cache.stats().restyle_asks, 1);
+    cache.put(id(1), body(2));
+    assert_eq!(cache.stats().puts_restyle, 1);
+
+    // A second body for id 1 that nothing asked for.
+    cache.put(id(1), body(2));
+    let s = cache.stats();
+    assert_eq!(s.puts_duplicate, 1, "{s:?}");
+    assert_eq!(s.puts(), 4, "four landings, one per kind: {s:?}");
+
+    // The statics saw at least this source's events. `>=`, because other
+    // tests in this binary build terrain sources too.
+    let window = totals(role).diff(&before);
+    assert!(window.requests >= s.requests, "{window:?} < {s:?}");
+    assert!(window.refetch_after_eviction >= s.refetch_after_eviction);
+    assert!(window.restyle_asks >= s.restyle_asks);
+    assert!(window.puts_first >= s.puts_first);
+    assert!(window.puts_restyle >= s.puts_restyle);
+    assert!(window.puts_duplicate >= s.puts_duplicate);
+    assert!(window.puts_orphan >= s.puts_orphan);
+    assert!(window.evicted_pending >= s.evicted_pending);
+    assert!(window.evicted_resident >= s.evicted_resident);
+}
+
+/// **A raster slot is priced at its texture, and the level follows it out.**
+/// The one byte figure the cache can read today for a raster tile; a
+/// vector tile without fills prices at zero, stated as a lower bound.
+#[test]
+fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction() {
+    let ctx = Context::default();
+    let mut cache = TileCache::new(
+        std::num::NonZeroUsize::new(1).expect("1 is not zero"),
+        cache_ledger::CacheRole::Terrain,
+    );
+    let id = |x: u32| TileId { x, y: 0, zoom: 2 };
+    let image = egui::ColorImage::filled(
+        [FIXTURE_SIDE as usize, FIXTURE_SIDE as usize],
+        egui::Color32::WHITE,
+    );
+    let raster = || Tile::Raster(ctx.load_texture("t", image.clone(), Default::default()));
+    let texture_bytes = u64::from(FIXTURE_SIDE * FIXTURE_SIDE * 4);
+
+    cache.ask(id(0), 0);
+    assert_eq!(
+        cache.stats().resident_bytes,
+        0,
+        "a marker is priced at nothing"
+    );
+    cache.put(id(0), slot_for(raster(), 0, 0.0));
+    let s = cache.stats();
+    assert_eq!((s.resident_entries, s.resident_bytes), (1, texture_bytes));
+
+    // A second tile at a cap of one evicts the raster and its bytes with it.
+    cache.ask(id(1), 0);
+    let s = cache.stats();
+    assert_eq!(
+        (s.evicted_resident, s.evicted_bytes),
+        (1, texture_bytes),
+        "{s:?}"
+    );
+    assert_eq!((s.resident_entries, s.resident_bytes), (1, 0), "{s:?}");
+}
+
+// ---------------------------------------------------------------------------
+
 /// One pump decodes at most the budget; the rest wait their turn, in order.
 ///
 /// The count is handed in rather than read off [`WASM_TILE_DECODES_PER_PUMP`].
@@ -1981,6 +2215,7 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
             None,
@@ -2273,6 +2508,7 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
             None,
@@ -2479,6 +2715,7 @@ mod archive {
             },
             ctx.clone(),
             NonZeroUsize::new(64).expect("64 is not zero"),
+            cache_ledger::CacheRole::Base,
             // Nothing declared: the header's word stands, which is what the
             // archives under test are read by.
             None,
@@ -2893,6 +3130,7 @@ mod archive {
                 },
                 ctx.clone(),
                 NonZeroUsize::new(64).expect("64 is not zero"),
+                cache_ledger::CacheRole::Base,
                 None,
                 crate::tile_source::ArchiveStores {
                     seed: None,
@@ -3229,6 +3467,7 @@ mod archive_decode {
             },
             ctx,
             NonZeroUsize::new(8).expect("8 is not zero"),
+            cache_ledger::CacheRole::Base,
             declared,
             crate::tile_source::ArchiveStores {
                 seed: None,
@@ -3313,6 +3552,7 @@ mod archive_decode {
             },
             ctx,
             NonZeroUsize::new(8).expect("8 is not zero"),
+            cache_ledger::CacheRole::Base,
             declared,
             crate::tile_source::ArchiveStores {
                 seed: None,

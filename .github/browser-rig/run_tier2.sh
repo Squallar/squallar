@@ -81,6 +81,16 @@
 #             see HUGE_WINDOW below) passes while claiming a size it never
 #             rendered at, which is the same "verdict the rig has not earned"
 #             this file's run-id binding exists to end.
+#   tilecache NOT IN THE DEFAULT ROSTER -- opt in with RIG_LEGS="tilecache".
+#             One pane at zoom 14 over a dense city core, the basemap on and
+#             nobody touching the page, and ONE assert beyond liveness: over
+#             the last 30 s the tile cache refetched nothing it had evicted,
+#             the GPU store uploaded no mesh and the archive decoded no body
+#             (--expect-tile-cache-settles). Two sizes, chosen by
+#             RIG_TILECACHE_WINDOW: the user's 2878x1651 canvas (default; the
+#             repro, asserted with --expect-canvas like `huge`) and 1280x900
+#             (the control). See the TILECACHE block below for why it is held
+#             out and where it writes.
 #
 # EVERY VERDICT IS BOUND TO THE RUN THAT PRODUCED IT (2026-08-31). Each attempt
 # mints a run id, hands it to drive.py, and the summary refuses any artefact
@@ -418,6 +428,71 @@ HUGE_WINDOW="${RIG_HUGE_WINDOW_SIZE:-3100x1900}"
 HUGE_SETTLE="${RIG_HUGE_SETTLE:-8}"
 HUGE_WINDOW_S="${RIG_HUGE_WINDOW:-45}"
 HUGE_PROGRESS_WINDOW="${RIG_HUGE_PROGRESS_WINDOW:-15}"
+
+# ---------------------------------------------------------------------------
+# THE `tilecache` LEG: does the tile cache hold the tiles on the glass?
+# ---------------------------------------------------------------------------
+#
+# A Tier-2 leg once read 3,070 mesh uploads against 2,848 evictions to hold
+# 10.25 MB resident, and nothing in the rig could say why: `ground tiles:`
+# counts the GPU store's uploads and evictions on an identity minted per mesh,
+# so it cannot tell a tile's first sight from the same tile fetched again after
+# the LRU dropped it. The `tile cache (base):` line classifies those events at
+# the cache (see drive.py's `tile_cache_re`), and this leg is the scene that
+# makes the classification a verdict: a static viewport, every tile arrived,
+# and then thirty seconds in which a cache that holds its working set records
+# nothing while a cache below it evicts, re-asks, re-decodes and re-uploads
+# tiles that never left the glass.
+#
+# The scene is ONE pane at zoom 14 over midtown Manhattan (the densest MVT
+# tiles the archive serves), `BasemapTiles` on and nothing else seeded -- the
+# two default-on texture overlays still come up, as on every leg. Zoom and
+# centre are seeded rather than driven, for the `wide` leg's reason. The site
+# is KOKX so the pane's own site is the one under it.
+#
+# THE WINDOW IS THE VARIABLE. At 2878x1651 (the user's own canvas, the `huge`
+# leg's target) the pane draws 104 tiles per source at a whole zoom and 187
+# between zooms, 110 / 193 with the ancestor net, against a wasm32 cache of
+# 100 entries -- below the working set at every zoom. At 1280x900 it fits.
+# RIG_TILECACHE_WINDOW chooses: the default is the repro, `1280x900` the
+# control, and any other WxH is taken as a canvas target. A canvas target is
+# ASSERTED (--expect-canvas) and the window starts above it, for the reason
+# HUGE_WINDOW gives: the Firefox arm's Xvfb screen is sized from the initial
+# window and cannot grow past it.
+#
+# 15 + 45 = 60 s, and the assertion reads the last 30: the archive is fetched
+# over the real network and a 2878-wide viewport asks for ~190 tiles through
+# six download slots, so the first half of the leg is arrival and the second
+# half is the question. --expect-frame-progress rides along because a frame
+# loop that DIED is silent too, and only the app's own frame counter tells a
+# settled cache from a dead page.
+#
+# HELD OUT OF THE DEFAULT ROSTER ON PURPOSE. The repro is expected to FAIL on
+# the shipped cache -- that is the finding it exists to record -- and it goes
+# into the default the day the cache holds its working set, as the proof.
+# The control is expected to pass today.
+#
+# WHERE IT WRITES: the runner's default RIG_OUT_DIR is `<rig>/out`, inside
+# the checkout. Run this leg with an out-of-tree directory, e.g.
+#   RIG_LEGS=tilecache RIG_OUT_DIR=~/.cache/rustdar-fb-rig-out/tilecache-$(date +%F) \
+#     RIG_BROWSERS=firefox .github/browser-rig/run_tier2.sh --skip-build
+# and once more with RIG_BROWSERS=chromium: web is two targets and the two
+# figures are never merged.
+TILECACHE_SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KOKX\",\"zoom\":14.0,\"center\":[40.758,-73.9855],\"enabled_overlays\":{\"BasemapTiles\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
+TILECACHE_WINDOW="${RIG_TILECACHE_WINDOW:-2878x1651}"
+TILECACHE_SETTLE="${RIG_TILECACHE_SETTLE:-15}"
+TILECACHE_WINDOW_S="${RIG_TILECACHE_WINDOW_S:-45}"
+TILECACHE_SETTLES="${RIG_TILECACHE_SETTLES:-30}"
+TILECACHE_PROGRESS_WINDOW="${RIG_TILECACHE_PROGRESS_WINDOW:-15}"
+
+# The window a canvas target is started at: the `huge` leg's margins (3100x1900
+# for 2878x1651), so the default repro is exactly that leg's geometry.
+tilecache_window_for_canvas() {
+  local canvas="$1" w h
+  w="${canvas%x*}"
+  h="${canvas#*x}"
+  echo "$((w + 222))x$((h + 249))"
+}
 
 # Set to 0 to report the overlay raster totals without gating on them -- for a
 # measurement round, never as a way past a red leg.
@@ -762,6 +837,22 @@ run_pass() {
                  --window "$HUGE_WINDOW"
                  --settle "$HUGE_SETTLE" --data-window "$HUGE_WINDOW_S"
                  --expect-frame-progress "$HUGE_PROGRESS_WINDOW")
+  elif [ "$leg" = tilecache ]; then
+    # The static scene, then the settle assertion over its tail. See the
+    # TILECACHE block above for the scene, the two sizes and the hold-out.
+    SEED="$TILECACHE_SEED_LS"
+    drive_args+=(--settle "$TILECACHE_SETTLE" --data-window "$TILECACHE_WINDOW_S"
+                 --expect-tile-cache-settles "$TILECACHE_SETTLES"
+                 --expect-frame-progress "$TILECACHE_PROGRESS_WINDOW")
+    if [ "$TILECACHE_WINDOW" = 1280x900 ]; then
+      # The control: the rig's default window, the canvas the browser gives.
+      drive_args+=(--window "$TILECACHE_WINDOW")
+    else
+      # The repro, or another canvas target: asserted, and started above, for
+      # HUGE_WINDOW's reason.
+      drive_args+=(--canvas "$TILECACHE_WINDOW" --expect-canvas
+                   --window "$(tilecache_window_for_canvas "$TILECACHE_WINDOW")")
+    fi
   elif [ "$leg" = long ]; then
     # Ninety seconds, an overlay loop, nobody touching the page, and one
     # assert: the app's own frame counter was still moving at the end of it.
