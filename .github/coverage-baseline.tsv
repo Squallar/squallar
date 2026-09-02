@@ -8,7 +8,7 @@ nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1473	1069
 squallar-app/src/app_chunks.rs	220	133
 squallar-app/src/app_fetch.rs	1887	1586
-squallar-app/src/app_render.rs	3189	2562
+squallar-app/src/app_render.rs	3195	2565
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
 squallar-app/src/budget_memo.rs	52	52
@@ -79,7 +79,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	241	204
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	971	933
+squallar-egui/src/tile_source.rs	971	936
 squallar-egui/src/tile_source/take_ledger.rs	95	69
 squallar-egui/src/tiles.rs	325	297
 squallar-egui/src/ui.rs	1298	1196
@@ -124,7 +124,8 @@ squallar-geo/src/min_elevation.rs	194	175
 squallar-geo/src/solar.rs	86	86
 squallar-gpu/src/capacity.rs	23	23
 squallar-gpu/src/device.rs	151	131
-squallar-gpu/src/egui_renderer.rs	358	46
+squallar-gpu/src/egui_renderer.rs	368	46
+squallar-gpu/src/egui_renderer/geometry_staging.rs	105	36
 squallar-gpu/src/egui_renderer/mirror.rs	109	108
 squallar-gpu/src/egui_renderer/pass_costs.rs	35	35
 squallar-gpu/src/egui_renderer/texture_upload.rs	379	123
@@ -200,7 +201,7 @@ squallar-overlays/src/render/handlers/location.rs	76	58
 squallar-overlays/src/render/handlers/metar.rs	505	366
 squallar-overlays/src/render/handlers/mod.rs	54	53
 squallar-overlays/src/render/handlers/model.rs	2495	2356
-squallar-overlays/src/render/handlers/mrms.rs	631	560
+squallar-overlays/src/render/handlers/mrms.rs	631	559
 squallar-overlays/src/render/handlers/outlook.rs	1427	1351
 squallar-overlays/src/render/handlers/reports.rs	627	563
 squallar-overlays/src/render/handlers/sites.rs	93	75
@@ -219,13 +220,13 @@ squallar-overlays/src/spc/firewx.rs	383	368
 squallar-overlays/src/spc/outlook.rs	382	345
 squallar-overlays/src/spc/reports.rs	212	202
 squallar-overlays/src/types.rs	24	24
-squallar-radar/src/archive.rs	249	227
+squallar-radar/src/archive.rs	249	222
 squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	163
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
-squallar-radar/src/chunks.rs	975	804
+squallar-radar/src/chunks.rs	975	710
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	311	294
 squallar-radar/src/dpprep.rs	1022	956
@@ -239,7 +240,7 @@ squallar-radar/src/hover.rs	49	49
 squallar-radar/src/jobs.rs	594	561
 squallar-radar/src/kdp.rs	247	203
 squallar-radar/src/l3_values.rs	282	281
-squallar-radar/src/level3.rs	188	121
+squallar-radar/src/level3.rs	188	116
 squallar-radar/src/loop_downloads.rs	736	717
 squallar-radar/src/loop_geometry.rs	7	7
 squallar-radar/src/nrot.rs	3227	3168
@@ -342,6 +343,11 @@ vendor/bzip2-rs/src/header/mod.rs	37	33
 vendor/bzip2-rs/src/huffman.rs	85	81
 vendor/bzip2-rs/src/move_to_front.rs	76	75
 vendor/bzip2-rs/src/threadpool.rs	9	9
+vendor/egui-wgpu/src/capture.rs	185	0
+vendor/egui-wgpu/src/lib.rs	227	4
+vendor/egui-wgpu/src/renderer.rs	743	13
+vendor/egui-wgpu/src/setup.rs	116	0
+vendor/egui-wgpu/src/winit.rs	484	0
 vendor/mvt-reader/src/feature.rs	3	0
 vendor/mvt-reader/src/generated/vector_tile.rs	15	0
 vendor/mvt-reader/src/lib.rs	197	179
@@ -425,8 +431,8 @@ vendor/nexrad-decode/src/messages/rda_status_data/snapshot_test.rs	5	5
 vendor/nexrad-decode/src/messages/rda_status_data/volume_coverage_pattern.rs	12	0
 vendor/nexrad-decode/src/messages/request_for_data/message.rs	32	6
 vendor/nexrad-decode/src/messages/request_for_data/snapshot_test.rs	5	5
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	76
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	51
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	74
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	52
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/message.rs	24	24
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/raw/elevation_data_block.rs	19	18
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/snapshot_test.rs	5	5
