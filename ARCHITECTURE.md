@@ -613,17 +613,17 @@ makes the walker read zero while the coupling is identical.
 **The rule**: a ceiling equals the count it measures, and the land that sheds
 an occurrence lowers the constant with it. A value below is therefore never a
 standing promise — it is the last measurement that satisfied the rule. Values
-here were re-measured at **WO-ARREARS, 2026-08-21, base `178ab361`**, each by
-its own instrument (the crate-wide walk in `arch_ratchets.rs`; the
+here were re-measured on **2026-09-02, base `3d5e1559`**, each by its own
+instrument (the crate-wide walk in `arch_ratchets.rs`; the
 whitespace-collapsed per-file scrape in `gui_seam_ratchet_tests.rs` — they are
 different instruments and one's number is never the other's).
 
-### 6.1 `squallar-app/tests/arch_ratchets.rs` — 10 tests
+### 6.1 `squallar-app/tests/arch_ratchets.rs` — 11 tests
 
 | Test | Constant | Ceiling | What it counts |
 |---|---|---|---|
-| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 181 | `self.gui.` anywhere in `squallar-app` |
-| | `SELF_GUI_NON_TEST_MAX` | 176 | the same, outside test-named paths |
+| `the_app_pokes_gui_coupling_never_grows` | `SELF_GUI_MAX` | 164 | `self.gui.` anywhere in `squallar-app` |
+| | `SELF_GUI_NON_TEST_MAX` | 159 | the same, outside test-named paths |
 | | — | 0 | `self.gui.set_` anywhere in `squallar-app` — the target zero, held as a test rather than as a grep |
 | `the_config_swap_stays_deleted` | — | 0 | `load_pane_configs` / `save_pane_configs` / `loaded_configs`, with `serialize_pane_state` as the presence control |
 | `the_gui_setter_surface_never_grows` | `UI_SETTER_MAX` | 0 | `pub fn set_` in `squallar-egui/src/ui.rs` |
@@ -636,12 +636,13 @@ different instruments and one's number is never the other's).
 | | `LOOP_FRAME_ARMS_NON_TEST_MAX` | 2 | the same, outside tests |
 | `the_ingest_phase_has_exactly_one_production_caller` | `INGEST_CALLERS_NON_TEST` | 1 | `self.poll_data_channels(` outside test paths — the frame pump's `Ingest` phase, whose once-per-frame property WO-M13b measured and registered as unpinned |
 | `the_site_keyed_volume_stores_have_one_owner` | — | 0 / 0 | the two site-keyed decoded-volume store names as fields of `pub struct App`, with the third such store (deliberately left on the `App`) and the `volumes` field as two presence controls read from the same extracted block |
+| `the_platform_redraw_call_has_exactly_one_spelling` | — | 1 | `.request_redraw()` anywhere in `squallar-app`: exactly one, and in `src/platform.rs` beside `ask_for_a_frame`. A deadlock ceiling rather than a coupling one, with three presence anchors read from the same walk |
 
 Run it by target name — a filter matching zero tests is a failed run, not a
 pass:
 
 ```bash
-cargo test -p squallar-app --test arch_ratchets   # 10/10
+cargo test -p squallar-app --test arch_ratchets   # 11/11
 ```
 
 ### 6.2 `squallar-app/src/app/gui_seam_ratchet_tests.rs` — the per-file coupling ceilings
@@ -649,9 +650,9 @@ cargo test -p squallar-app --test arch_ratchets   # 10/10
 | Test | File | Ceiling |
 |---|---|---|
 | `no_production_file_pushes_through_a_gui_setter` | `app.rs`, `app_fetch.rs`, `app_render.rs`, `app_chunks.rs` | 0 `self.gui.set_` each |
-| `the_gui_coupling_only_ever_shrinks` | `app.rs` | 37 |
-| | `app_fetch.rs` | 42 |
-| | `app_render.rs` | 108 |
+| `the_gui_coupling_only_ever_shrinks` | `app.rs` | 35 |
+| | `app_fetch.rs` | 35 |
+| | `app_render.rs` | 101 |
 | | `app_chunks.rs` | 13 |
 
 Both scrapes are **whitespace-collapsed**, so a call wrapped across lines counts
@@ -683,6 +684,14 @@ So the honest form of the claim is dated: **as re-measured at WO-ARREARS
 measured value.** Checking that is a `git diff` of the constants against a
 fresh measurement, not a sentence to trust.
 
+Re-measured again on **2026-09-02, base `3d5e1559`**, by both instruments:
+`app.rs`'s per-file ceiling sat one above its scrape (36 against 35) and was
+lowered; the other seven values were on their measurements (164 / 159 crate-wide,
+35 / 101 / 13 per file). The tables in §6.1 and §6.2 had meanwhile gone stale on
+their own -- they still carried 181 / 176 and 37 / 42 / 108 while the constants
+had fallen to 164 / 159 and 36 / 35 / 101 over four lands -- and were corrected
+in the same commit. A table here is a copy of the constants, not a measurement.
+
 The two honest sheds are:
 
 * **loop-state addressing** — the vocabulary by which the app reaches loop state
@@ -700,10 +709,10 @@ ceilings above are the number the walk sees, not the coupling the crate has.
 (`app_render.rs`) hides 1. WO-ARREARS **compile-proved neither is
 borrow-forced** — a direct reach builds with no diagnostic in either case — so
 they are evasion, not borrow-splitting. Shedding them makes the crate-wide walk
-read **186** against the 181 it reads today — five above the ceiling, and above
-both values it has carried since WO-E9e (185, then 184). (It would have fitted
-under the 188 the ceiling carried earlier in the campaign; that headroom was
-spent down deliberately and is not available to reclaim.) The shed therefore
+read **169** (the 164 it reads today plus the five reaches) — five above the
+ceiling, and above every value it has carried since WO-E9e. (It would have
+fitted under the 188 the ceiling carried earlier in the campaign; that headroom
+was spent down deliberately and is not available to reclaim.) The shed therefore
 needs a land that can also shed the difference, and it was **refused rather
 than paid for with a raise**. The full record lives on `SELF_GUI_MAX`'s own doc. A third such
 binding has no standing: these two are documented because they were found and

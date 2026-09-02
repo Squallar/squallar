@@ -149,6 +149,15 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// `handle_navigate_time` and `handle_jump_to_live` each shed two pushes and
 /// the door spends one. The crate-wide walk moved by the same three, since
 /// every site is a production file.
+///
+/// # Arrears, re-measured 2026-09-02 on base `3d5e1559`
+///
+/// `app.rs` read 35 by this scrape against a pin of 36; the other three files
+/// read their pins exactly (35 / 101 / 13). The occurrence went at `b8582701`
+/// (theme selection and persistence), which did not lower the pin, and no
+/// land since has touched this file. The crate-wide walk in `arch_ratchets.rs`
+/// read 164 / 159, equal to its own pins, so the arrears was this file's
+/// alone. The pin now sits on its measurement.
 #[test]
 fn the_gui_coupling_only_ever_shrinks() {
     // Presence control: the scrape reads real, current source. Without it every
@@ -159,7 +168,7 @@ fn the_gui_coupling_only_ever_shrinks() {
          reading the source these ceilings exist to measure",
     );
     for (name, source, ceiling) in [
-        ("app.rs", APP, 36),
+        ("app.rs", APP, 35),
         ("app_fetch.rs", APP_FETCH, 35),
         ("app_render.rs", APP_RENDER, 101),
         ("app_chunks.rs", APP_CHUNKS, 13),
