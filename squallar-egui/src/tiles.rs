@@ -452,7 +452,7 @@ fn base_source(
 
     match HttpsTiles::from_archive_url(
         &url,
-        crate::basemap_style::committed_filtered(is_dark, disabled_source_layers),
+        crate::tile_source::BasemapStyling::committed(is_dark, disabled_source_layers),
         attribution,
         ctx.to_owned(),
         archive_block_cache(&url),
@@ -689,7 +689,7 @@ impl MapTileState {
             self.current_theme_is_dark = is_dark;
             self.base_disabled_source_layers = disabled_source_layers.clone();
             if let Some(tiles) = self.tiles.as_mut() {
-                tiles.set_style(crate::basemap_style::committed_filtered(
+                tiles.set_style(crate::tile_source::BasemapStyling::committed(
                     is_dark,
                     disabled_source_layers,
                 ));

@@ -38,6 +38,10 @@ use std::time::Duration;
 
 use egui::Context;
 use futures::channel::mpsc::{Receiver, Sender, TryRecvError, channel};
+// The batch-reply channel is the wasm arm's alone: native decodes on the IO
+// thread and has nothing to hand back.
+#[cfg(target_arch = "wasm32")]
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt, future::Either, future::select};
 use lru::LruCache;
@@ -292,7 +296,38 @@ pub const MEASURED_PARSED_TILE_BYTES: usize = 2_092_002;
 /// **What this cache buys and what falling short costs.** It exists so a
 /// style change — a theme flip, a map-detail toggle — re-styles from the
 /// cached parse with **zero fetches and zero re-parses**
-/// ([`HttpsTiles::set_style`]). An entry that was evicted before the restyle
+/// ([`HttpsTiles::set_style`]).
+///
+/// **On wasm32 that second half is deliberately given up, and here is the
+/// price.** Once the frame pump offloads ([`TileOffloader`]), the worker holds
+/// the parse and the page does not, so the browser restyles from
+/// [`SharedTileBodies`] — the undecoded body — and pays a **re-parse**. Per
+/// visible tile of the committed Monaco z14 city-core fixture (185,182 B body,
+/// native release, n=30, all terms timed in the same interleaved rounds, on a
+/// box held quiet), in the configuration that ships:
+///
+/// | | frame thread | worker |
+/// | --- | --- | --- |
+/// | from the parsed cache (this constant) | style **2,930 µs** | — |
+/// | from the body cache (wasm32) | wire decode 37 + flatten 231 = **268 µs** | parse 1,744 + style 2,930 |
+///
+/// So the re-parse is real and it is **1,744 µs** — 59.5% of a styling, not a
+/// rounding error — and it buys the removal of 2,930 µs from the frame
+/// thread, a **10.9x** cheaper theme flip there. Against the unfiltered style
+/// the same tile reads 4,750 µs frame-side today against 571 µs after, 8.3x.
+/// A parse on a worker thread, `par_iter`'d across the pool, is not the same
+/// quantity as a tessellation on the thread the gesture runs on.
+///
+/// **`flatten` is now the dominant term left on the frame thread** — 231 µs of
+/// that 268 — because it flattens strokes as well as fills
+/// ([`crate::tile_mesh::flatten`], at `feathering = 1.0`). Shipping the
+/// flattened [`crate::tile_mesh::TileMeshes`] over the wire instead of
+/// `Vec<ShapeOrText>` would move it to the worker too and leave 37 µs; that is
+/// a named follow-on, not this row.
+///
+/// The bodies are also the cheaper population to hold: median 2,411 B against
+/// this constant's 15,389 B median for a parse, over 52 tiles of the committed
+/// archive. An entry that was evicted before the restyle
 /// costs one refetch for that tile, exactly the pre-split behaviour; it never
 /// costs a frame. So unlike [`TILE_CACHE_ENTRIES`], the working set is a
 /// *target*, not a floor a bound below which is broken — which is what lets
@@ -360,6 +395,100 @@ pub const MOBILE_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
 /// canvas restyles with zero fetches. See [`PARSED_TILE_CACHE_ENTRIES`].
 pub const DESKTOP_PARSED_TILE_CACHE_ENTRIES: NonZeroUsize =
     NonZeroUsize::new(96).expect("96 is not zero");
+
+/// A basemap styling: the built style, and the key that built it.
+///
+/// **Together, because a source that held one without the other could offload
+/// a batch styled differently from the tiles beside it.** The frame's inline
+/// path renders against the `Style`; the worker is handed only the `key` and
+/// builds its own `Style` from the same compiled-in JSON
+/// ([`squallar_basemap::style`]). The two are derived in one place so they
+/// cannot drift.
+#[derive(Clone)]
+pub struct BasemapStyling {
+    pub style: Arc<Style>,
+    /// The key `style` was built from, or `None` for a source that has no
+    /// style to speak of.
+    ///
+    /// A source without a key **never offloads**: the worker rebuilds the
+    /// style from the key, so a batch posted without one could not be
+    /// guaranteed to be styled the way the tiles already on the glass were.
+    /// That is not a limitation in practice — the sources without a key are
+    /// the terrain archive and the raster HTTP providers, whose bodies are
+    /// pictures and belong on the frame thread's texture upload anyway.
+    pub key: Option<squallar_basemap::jobs::StyleKey>,
+}
+
+impl BasemapStyling {
+    /// The committed style for a theme and a disabled-source-layer set, with
+    /// the key that names it.
+    pub fn committed(is_dark: bool, disabled: &std::collections::BTreeSet<String>) -> Self {
+        Self {
+            style: crate::basemap_style::committed_filtered(is_dark, disabled),
+            key: Some(squallar_basemap::jobs::StyleKey {
+                is_dark,
+                disabled: disabled.clone(),
+            }),
+        }
+    }
+
+    /// A specific style with **no key**, so the source that holds it never
+    /// offloads.
+    ///
+    /// Tests only, and named rather than defaulted: several of this module's
+    /// fixtures build a style directly to assert on what it draws, and are not
+    /// about the worker at all. Production code reaches a keyless styling
+    /// through [`Self::raster`], which says *why* there is no key; this one
+    /// would be a way to lose the offload silently.
+    // Gated exactly as its callers are (`tile_source::tests` is
+    // `all(test, not(wasm32))`), so the wasm arm does not compile a function
+    // nothing there can reach.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn keyless(style: Arc<Style>) -> Self {
+        Self { style, key: None }
+    }
+
+    /// A source with no style to restyle — the terrain archive and the raster
+    /// HTTP providers. See [`Self::key`].
+    pub fn raster() -> Self {
+        Self {
+            style: Arc::new(Style::default()),
+            key: None,
+        }
+    }
+}
+
+/// The **undecoded** MVT bodies a wasm archive source keeps, keyed by
+/// [`TileId`] — what makes a theme flip cost no archive read once the pump is
+/// offloading.
+///
+/// It exists because [`SharedParsedTiles`] stops being filled on the offload
+/// path: the worker holds the parse and the page never sees one, so the
+/// restyle route that cache was built for
+/// ([`read_one`]'s `remembered` arm) would find nothing and re-read the
+/// archive for every visible tile. On wasm32 that is a range request each,
+/// over a network, for a theme flip that used to touch nothing.
+///
+/// **Bodies rather than parses, and it is the cheaper cache of the two.**
+/// Measured over the committed Monaco archive: a body is 2,411 bytes at the
+/// median and 185,182 at the tail, against a parse's 15,389 and 2,092,002 —
+/// the same tile costs roughly an eighth as much held this way. It is also
+/// page-side, where this workspace has measured its ceiling, rather than on
+/// the worker, whose headroom nothing has read.
+///
+/// `Arc` because the same buffer is the one the pump staged and the one the
+/// job carried.
+#[cfg(target_arch = "wasm32")]
+type SharedTileBodies = Arc<Mutex<LruCache<TileId, Arc<Vec<u8>>>>>;
+
+/// What the archive IO task carries bodies in — the cache on wasm32, nothing
+/// on native, where a tile is decoded on the blocking pool and there is no
+/// second styling to serve. A type alias so [`read_one`] keeps one body.
+#[cfg(target_arch = "wasm32")]
+type IoTileBodies = SharedTileBodies;
+/// See the wasm32 arm above.
+#[cfg(not(target_arch = "wasm32"))]
+type IoTileBodies = ();
 
 /// The parsed-geometry cache one archive source's IO task and frame side
 /// share: the style-independent half of every vector tile the source has
@@ -611,8 +740,14 @@ pub(crate) fn decode_archive_tile(
 
 /// Tell [`crate::basemap_ledger`] that one archive body of `kind` decoded.
 ///
-/// **Called only where a decode returned `Ok`**, and by both decoders, so the
-/// ledger's denominator is exactly "bodies that became a [`Tile`]". The kind
+/// **Called only where a decode returned `Ok`**, and by every decoder, so the
+/// ledger's denominator is exactly "bodies that became a [`Tile`]". That now
+/// includes bodies decoded on the WORKER: `note_archive_decode` runs on the
+/// thread the tile lands on, not the thread it was parsed on, because the
+/// worker's statics are not the page's and this counter is read on the page
+/// (`squallar_egui::basemap_ledger`, scraped by the browser rig as its
+/// basemap positive control). A tile that drew but was not counted here would
+/// read as an archive serving nothing. The kind
 /// is the archive header's word and never the bytes', which is the same rule
 /// [`decode_archive_tile`] itself obeys — a ledger that sniffed would be
 /// answering a different question from the decoder it is measuring.
@@ -876,7 +1011,7 @@ type FetchPayload = CachedTile;
 enum FetchPayload {
     /// A tile body the pump must decode — a compressed PNG from a raster
     /// source, an MVT body from the archive (parsed, remembered, styled).
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
     /// A parse the IO task found in [`SharedParsedTiles`]: the fetch was
     /// skipped entirely; only the styling remains, and it still bills the
     /// pump budget — tessellation is the heavy half.
@@ -1184,6 +1319,33 @@ pub struct HttpsTiles {
     #[cfg(target_arch = "wasm32")]
     archive_kind: Option<Arc<OnceLock<ArchiveTileKind>>>,
 
+    /// wasm32 only: the vector bodies on their way to the worker, and the
+    /// batch already with it. See [`TileBatch`].
+    #[cfg(target_arch = "wasm32")]
+    batch: TileBatch,
+
+    /// wasm32 only: where a finished batch lands. A channel and not a shared
+    /// cell because the delivery closure runs outside this source's borrow —
+    /// it cannot touch the cache, so it hands the reply to the next pump,
+    /// which owns it.
+    ///
+    /// Unbounded, and it costs nothing to be: at most one batch is
+    /// outstanding, so the queue holds at most one reply. A bounded channel
+    /// would introduce a full-queue arm whose only correct behaviour would be
+    /// to drop a reply this source is holding tiles for.
+    #[cfg(target_arch = "wasm32")]
+    batch_tx: UnboundedSender<Option<squallar_basemap::jobs::BasemapTiles>>,
+    /// The read end of [`Self::batch_tx`].
+    #[cfg(target_arch = "wasm32")]
+    batch_rx: UnboundedReceiver<Option<squallar_basemap::jobs::BasemapTiles>>,
+
+    /// wasm32 only: the key [`Self::style`] was built from, and the only part
+    /// of a style that crosses to the worker. `None` for a source with no
+    /// style to restyle, which therefore never offloads — see
+    /// [`BasemapStyling::key`].
+    #[cfg(target_arch = "wasm32")]
+    style_key: Option<squallar_basemap::jobs::StyleKey>,
+
     /// Whether "the tile IO task is gone" has already been said for this
     /// source. See [`drain_up_to`]: the condition is permanent, so the line is
     /// not.
@@ -1307,6 +1469,308 @@ impl PumpBudget {
     }
 }
 
+// ── Offloading a pass's vector tiles ──────────────────────────────────────
+
+/// Where a pass's vector tile bodies go instead of onto the frame thread.
+///
+/// **A seam and not a dependency.** The funnel lives in `squallar-worker`,
+/// which sits *below* this crate: `squallar-worker` composes
+/// `squallar-basemap`'s codec row, and a `squallar-egui -> squallar-worker`
+/// edge would invert that and drag `squallar-elevation` and
+/// `squallar-buildings` into the UI layer's graph for the life of the tree.
+/// So the app installs an implementation here, the way
+/// `squallar_worker::offload::set_worker` is itself installed from
+/// `squallar-web`. Native and every test get "no offloader installed" for
+/// free, which is exactly today's path.
+///
+/// There is no `cancel`, deliberately. A batch this source has stopped caring
+/// about costs nothing to let finish: the reply is keyed back by `TileId`, a
+/// superseded style generation is dropped by [`TileBatch`]'s epoch check, and
+/// a dropped source's delivery finds a closed channel and discards. What
+/// `cancel_job` would buy is the page-side pending slot released a few
+/// hundred milliseconds sooner, against a surface every caller would have to
+/// reason about.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub trait TileOffloader {
+    /// How many jobs the funnel currently owes, or `None` when it has no
+    /// worker to run them on.
+    ///
+    /// **`None` is not "busy", it is "posting would run it HERE"** — with no
+    /// sink attached `offload_job` executes the job inline on the calling
+    /// thread, unbudgeted, which is strictly worse than the pump decoding it
+    /// under [`PUMP_TIME_BUDGET`]. A funnel still inside its handshake window
+    /// answers `None` too: a job posted then is *held* until a worker
+    /// attaches, and a held tile is a tile that appears later.
+    fn queued(&self) -> Option<usize>;
+
+    /// Hand `job` over, answering whether it was accepted. `deliver` runs
+    /// where the answer can be used — the page's own thread in the browser.
+    /// `deliver` is `Send` because `squallar_worker::offload::offload_job`
+    /// requires it on every target — the native funnel runs a job on a pool
+    /// thread and hands the answer back across it. The browser never uses
+    /// that freedom (page and pump are one thread), but the bound is the
+    /// funnel's and this seam does not get to relax it.
+    fn post(
+        &self,
+        job: squallar_basemap::jobs::BasemapTilesJob,
+        deliver: Box<dyn FnOnce(Option<squallar_basemap::jobs::BasemapTiles>) + Send>,
+    ) -> bool;
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+thread_local! {
+    /// The installed offloader, or `None` — which every native build and
+    /// every test has unless it says otherwise, and which means "decode on
+    /// this thread, exactly as before".
+    static TILE_OFFLOADER: std::cell::RefCell<Option<Box<dyn TileOffloader>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the offloader every [`HttpsTiles`] on this thread will hand its
+/// vector batches to. Replaces any previous one.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub fn set_tile_offloader(offloader: Box<dyn TileOffloader>) {
+    TILE_OFFLOADER.with(|slot| *slot.borrow_mut() = Some(offloader));
+}
+
+/// Remove the installed offloader, putting every source back on the inline
+/// path. The tests' undo for [`set_tile_offloader`]; nothing in the app calls
+/// it.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub fn clear_tile_offloader() {
+    TILE_OFFLOADER.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Run `f` over the installed offloader.
+///
+/// The `RefCell` borrow is held across `f`, which is sound because nothing an
+/// offloader does re-enters this module: `post` hands bytes to a message port
+/// and returns, and its `deliver` sends into a channel the pump drains on a
+/// later frame rather than calling back into the source.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn with_offloader<T>(f: impl FnOnce(Option<&dyn TileOffloader>) -> T) -> T {
+    TILE_OFFLOADER.with(|slot| f(slot.borrow().as_deref()))
+}
+
+/// One source's batch state: the vector bodies waiting to be handed over, and
+/// the batch already with the worker.
+///
+/// **A struct rather than three fields on [`HttpsTiles`]**, because the rule
+/// this holds is the whole of what makes the change safe — the pump either
+/// offloads or does *exactly* what shipped before it — and a rule spelled
+/// inline in a `cfg(target_arch = "wasm32")` function body can only ever be
+/// exercised in a browser. Compiled on native for the tests, as
+/// [`PumpBudget`] is.
+/// Tile bodies waiting for, or riding in, one batch.
+#[cfg(any(test, target_arch = "wasm32"))]
+type StagedBodies = Vec<(TileId, Arc<Vec<u8>>)>;
+
+#[cfg(any(test, target_arch = "wasm32"))]
+#[derive(Default)]
+struct TileBatch {
+    /// Bodies taken off the channel and not yet handed over. `Arc` because
+    /// the same buffer goes into the job and stays here: a tile the reply
+    /// omits or refuses is decoded inline from this copy, so a refusal costs
+    /// a slower tile and never a missing one.
+    staging: StagedBodies,
+    /// The batch with the worker, if any. At most one, which is what keeps a
+    /// backlog from queueing several deep behind a radar rasterization.
+    outstanding: Option<OutstandingBatch>,
+}
+
+/// The batch currently with the worker.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct OutstandingBatch {
+    /// The style generation it was posted under. A reply that arrives after a
+    /// restyle is dropped rather than drawn — the rule the native arm has
+    /// always had in `drain_completed_fetches` and the wasm arm did not need
+    /// until now, because until now the pump styled against the frame's
+    /// current style by construction.
+    epoch: u64,
+    /// What was asked for, with the bodies retained, so a tile the reply does
+    /// not carry can be decoded here instead of refetched.
+    asked: StagedBodies,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl TileBatch {
+    /// Hold one body for the next batch.
+    fn stage(&mut self, tile_id: TileId, bytes: Arc<Vec<u8>>) {
+        self.staging.push((tile_id, bytes));
+    }
+
+    /// Whether this pump should stage its vector bodies rather than decode
+    /// them, given what the funnel owes.
+    ///
+    /// **Every `false` here is today's code path**, which is the property the
+    /// whole change rests on: the offload is a win when it happens and a
+    /// no-op when it does not, never a trade.
+    ///
+    /// `queued` is [`TileOffloader::queued`]. The comparison is against what
+    /// *this source* already has outstanding, so "the funnel holds exactly my
+    /// batch and nothing else" is the same answer as "the funnel is idle" —
+    /// and anything else in the queue (a 160-190 ms radar rasterization, an
+    /// unbounded Level II decode) means a batch posted now would appear
+    /// later than a tile decoded here.
+    fn should_stage(&self, queued: Option<usize>) -> bool {
+        let ours = usize::from(self.outstanding.is_some());
+        queued == Some(ours)
+    }
+
+    /// Whether there is a batch to post right now.
+    fn ready_to_post(&self) -> bool {
+        self.outstanding.is_none() && !self.staging.is_empty()
+    }
+
+    /// Take the staged bodies for a post under `epoch`, recording them as
+    /// outstanding.
+    fn open(&mut self, epoch: u64) -> StagedBodies {
+        let asked = std::mem::take(&mut self.staging);
+        self.outstanding = Some(OutstandingBatch {
+            epoch,
+            asked: asked.clone(),
+        });
+        asked
+    }
+
+    /// Retire the outstanding batch, answering what it asked for and the
+    /// generation it was posted under.
+    fn close(&mut self) -> Option<(u64, StagedBodies)> {
+        self.outstanding
+            .take()
+            .map(|batch| (batch.epoch, batch.asked))
+    }
+
+    /// Take one staged body back, oldest first, for the caller to decode on
+    /// this thread.
+    ///
+    /// **The gate can shut between a body being staged and the batch being
+    /// posted** — the funnel takes a radar job, or the worker dies. Without
+    /// this those bodies wait for a flight that may never happen, and their
+    /// tiles never draw: the pass that follows sees `staging == false`,
+    /// decodes the CHANNEL's arrivals inline, and steps straight over the
+    /// list. One per pass rather than the whole list, because the whole list
+    /// is up to thirteen multi-millisecond tessellations and one per pass is
+    /// the rate a dense take clears the channel at anyway.
+    fn take_one_staged(&mut self) -> Option<(TileId, Arc<Vec<u8>>)> {
+        (!self.staging.is_empty()).then(|| self.staging.remove(0))
+    }
+}
+
+/// One take decoded **on this thread**, which is what the wasm arm did for
+/// every tile before the offload existed and still does for every tile the
+/// dispatch gate declines.
+///
+/// A struct rather than eight arguments, and lifted out of the pump's closure
+/// rather than rewritten, so that the fallback path is literally the code that
+/// shipped: the gate's whole claim is that declining costs nothing, and that
+/// claim is only as good as the two paths being one body.
+#[cfg(target_arch = "wasm32")]
+struct InlineDecode<'a> {
+    style: &'a Style,
+    archive_kind: Option<&'a Arc<OnceLock<ArchiveTileKind>>>,
+    parsed: Option<&'a SharedParsedTiles>,
+    egui_ctx: &'a Context,
+    /// The generation the pump is styling against — current by construction
+    /// on this path, because the styling happens inside this call.
+    epoch: u64,
+    /// The tessellator feathering the fills are flattened at, in points.
+    ///
+    /// Carried rather than read at draw time because a tile flattened at one
+    /// feathering and drawn at another paints wrong-width roads — see
+    /// [`HttpsTiles::set_feathering`], which bumps the style generation for
+    /// exactly that reason, so a change to it re-asks every tile rather than
+    /// leaving a mismatched flatten in the cache.
+    feathering: f32,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl InlineDecode<'_> {
+    fn take(
+        &self,
+        cache: &mut LruCache<TileId, CachedTile>,
+        put_generation: &mut u64,
+        tile_id: TileId,
+        payload: FetchPayload,
+    ) -> take_ledger::TakeKind {
+        // The family this take belongs to, decided before the work rather
+        // than after it, so a decode that FAILS is still charged to what it
+        // attempted. Classified by the archive header's declared kind and
+        // never by the bytes — the rule [`decode_archive_tile`] itself obeys.
+        let kind = match (&payload, self.archive_kind) {
+            (FetchPayload::Parsed(_), _) => take_ledger::TakeKind::Restyle,
+            // A plain HTTP source has no header to declare anything; its body
+            // goes through `Tile::new`'s sniff.
+            (FetchPayload::Bytes(_), None) => take_ledger::TakeKind::Sniffed,
+            (FetchPayload::Bytes(_), Some(declared)) => {
+                match declared
+                    .get()
+                    .copied()
+                    .unwrap_or(ArchiveTileKind::Undeclared)
+                {
+                    ArchiveTileKind::Vector => take_ledger::TakeKind::Vector,
+                    ArchiveTileKind::Hillshade | ArchiveTileKind::TerrainRgb => {
+                        take_ledger::TakeKind::Raster
+                    }
+                    ArchiveTileKind::Undeclared => take_ledger::TakeKind::Sniffed,
+                }
+            }
+        };
+        let decoded = match payload {
+            // A restyle served from the parsed cache: no bytes were fetched,
+            // only the styling is owed — still under this budget, because it
+            // is the tessellation half.
+            FetchPayload::Parsed(parse) => Ok(styled_tile(&parse, self.style, tile_id.zoom)),
+            FetchPayload::Bytes(bytes) => match self.archive_kind {
+                // A raster HTTP source: the body is whatever image the
+                // provider serves, sniffed as it always was.
+                None => Tile::new(&bytes, self.style, tile_id.zoom, self.egui_ctx)
+                    .map_err(|error| error.to_string()),
+                // An archive source: the header's word decides. The IO task
+                // writes the slot at open, before any tile is served, so an
+                // empty slot cannot be reached through the normal order of
+                // events; if it ever is, sniffing is the pre-seam behaviour
+                // rather than a guess of this code's.
+                Some(kind) => {
+                    let kind = kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared);
+                    match self.parsed {
+                        Some(parsed) => decode_archive_tile_remembering(
+                            &bytes,
+                            kind,
+                            self.style,
+                            tile_id,
+                            self.egui_ctx,
+                            parsed,
+                        ),
+                        None => decode_archive_tile(
+                            &bytes,
+                            kind,
+                            self.style,
+                            tile_id.zoom,
+                            self.egui_ctx,
+                        ),
+                    }
+                }
+            },
+        };
+        match decoded {
+            Ok(tile) => {
+                *put_generation += 1;
+                cache.put(tile_id, slot_for(tile, self.epoch, self.feathering));
+            }
+            Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
+        }
+        // Counted here and nowhere else, against the same population
+        // `note_tiles_offloaded` counts: one **vector body** disposed of. A
+        // restyle carries no body and a raster is not vector, so neither is in
+        // this denominator. See [`take_ledger::Disposition`].
+        if kind == take_ledger::TakeKind::Vector {
+            take_ledger::note_tiles_decoded_inline(1);
+        }
+        kind
+    }
+}
+
 /// Move at most `budget` completed fetches out of `rx`, handing each to `take`.
 /// Returns how many were taken. Stops early when the channel is empty; a closed
 /// channel is the IO task gone, and is logged rather than panicked on, as
@@ -1403,6 +1867,9 @@ impl HttpsTiles {
         // channel is the backpressure that makes `request_once` retry later.
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        // Where a finished batch lands. See `HttpsTiles::batch_tx`.
+        #[cfg(target_arch = "wasm32")]
+        let (batch_tx, batch_rx) = unbounded();
 
         // The frame pump needs the context too on wasm: it is the decoding
         // side there. See `FetchPayload`.
@@ -1446,6 +1913,14 @@ impl HttpsTiles {
             // Not an archive: no header to obey, so the sniff stands.
             #[cfg(target_arch = "wasm32")]
             archive_kind: None,
+            #[cfg(target_arch = "wasm32")]
+            batch: TileBatch::default(),
+            #[cfg(target_arch = "wasm32")]
+            batch_tx,
+            #[cfg(target_arch = "wasm32")]
+            batch_rx,
+            #[cfg(target_arch = "wasm32")]
+            style_key: None,
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
@@ -1471,9 +1946,9 @@ impl HttpsTiles {
     ///
     /// Meaningful only for an archive source; a raster source has no style
     /// slot and ignores the swap beyond the (harmless) generation bump.
-    pub(crate) fn set_style(&mut self, style: Arc<Style>) {
+    pub(crate) fn set_style(&mut self, styling: BasemapStyling) {
         self.style_epoch += 1;
-        self.install_style(style);
+        self.install_style(styling);
     }
 
     /// Adopt `feathering` — the tessellator's, in points — for every tile
@@ -1526,10 +2001,10 @@ impl HttpsTiles {
     /// The native arm of the [`Self::set_style`] split: publish the pair to
     /// the IO task's slot.
     #[cfg(not(target_arch = "wasm32"))]
-    fn install_style(&mut self, style: Arc<Style>) {
+    fn install_style(&mut self, styling: BasemapStyling) {
         if let Some(slot) = &self.style_slot {
             *slot.write().expect("the style slot is not poisoned") = StyleSlot {
-                style,
+                style: styling.style,
                 epoch: self.style_epoch,
                 feathering: flatten_feathering(self.feathering),
             };
@@ -1539,8 +2014,11 @@ impl HttpsTiles {
     /// The wasm32 arm: the frame pump is the styling side, so the live style
     /// is this field.
     #[cfg(target_arch = "wasm32")]
-    fn install_style(&mut self, style: Arc<Style>) {
-        self.style = style;
+    fn install_style(&mut self, styling: BasemapStyling) {
+        self.style = styling.style;
+        // The key moves with the style, so a batch posted after this is
+        // styled by the worker exactly as the pump would style it here.
+        self.style_key = styling.key;
     }
 
     /// Move what the IO task has finished into the cache.
@@ -1665,8 +2143,8 @@ impl HttpsTiles {
         *takes += taken as u64;
     }
 
-    /// wasm32: decode, upload and cache at most this pass's remaining allowance
-    /// of fetched tiles.
+    /// wasm32: hand this pass's vector bodies to the worker, or decode them
+    /// here exactly as this arm always has.
     ///
     /// [`PumpBudget`] keeps a burst of completed fetches from billing one pass
     /// for this source's whole backlog. The put is unconditional, exactly as a
@@ -1674,6 +2152,23 @@ impl HttpsTiles {
     /// again.
     #[cfg(target_arch = "wasm32")]
     fn drain_completed_fetches(&mut self) {
+        // Anything the worker has already answered goes in FIRST, so a reply
+        // that landed between frames is drawn this frame rather than next.
+        self.install_batch_reply();
+
+        // **One decision per pass, taken before the drain and never per
+        // take.** A pass either stages its vector bodies or decodes them, and
+        // deciding per take would put two populations — a pointer move and a
+        // multi-millisecond tessellation — into one `take:vector` reading,
+        // whose whole purpose is to say what a vector take costs this thread.
+        //
+        // Every `false` below lands on the code this arm shipped before the
+        // offload existed. That is the property the change rests on: a win
+        // when the funnel is free, a no-op when it is not, and never a trade.
+        let queued = with_offloader(|offloader| offloader.and_then(TileOffloader::queued));
+        let staging =
+            self.archive_is_vector() && self.style_key.is_some() && self.batch.should_stage(queued);
+
         let Self {
             cache,
             tile_rx,
@@ -1687,87 +2182,65 @@ impl HttpsTiles {
             feathering,
             put_generation,
             takes,
+            batch,
             ..
         } = self;
-        let style: &Style = style;
-        let archive_kind = archive_kind.as_ref();
-        let parsed = parsed.as_ref();
-        // The pump styles against the frame's current style, so what it puts
-        // is current by construction.
-        let epoch = *style_epoch;
-        let feathering = flatten_feathering(*feathering);
+        let inline = InlineDecode {
+            style,
+            archive_kind: archive_kind.as_ref(),
+            parsed: parsed.as_ref(),
+            egui_ctx,
+            // The pump styles against the frame's current style, so what it
+            // puts is current by construction.
+            epoch: *style_epoch,
+            // And flattens at the frame's current feathering: a tile flattened
+            // at one and drawn at another paints wrong-width roads. See
+            // `HttpsTiles::set_feathering`, which bumps the style generation
+            // for that reason, so a change re-asks rather than leaving a
+            // mismatched flatten in the cache.
+            feathering: flatten_feathering(*feathering),
+        };
 
         let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
         let budget = allowance.budget;
-        let taken = drain_up_to(
-            tile_rx,
-            budget,
-            allowance.deadline,
-            allowance.first_take_free,
-            io_task_gone_reported,
-            |(tile_id, payload): (TileId, FetchPayload)| {
-                // The family this take belongs to, decided before the work
-                // rather than after it, so a decode that FAILS is still
-                // charged to what it attempted. Classified by the archive
-                // header's declared kind and never by the bytes — the rule
-                // [`decode_archive_tile`] itself obeys.
-                let kind = match (&payload, archive_kind) {
-                    (FetchPayload::Parsed(_), _) => take_ledger::TakeKind::Restyle,
-                    // A plain HTTP source has no header to declare anything;
-                    // its body goes through `Tile::new`'s sniff.
-                    (FetchPayload::Bytes(_), None) => take_ledger::TakeKind::Sniffed,
-                    (FetchPayload::Bytes(_), Some(declared)) => {
-                        match declared
-                            .get()
-                            .copied()
-                            .unwrap_or(ArchiveTileKind::Undeclared)
-                        {
-                            ArchiveTileKind::Vector => take_ledger::TakeKind::Vector,
-                            ArchiveTileKind::Hillshade | ArchiveTileKind::TerrainRgb => {
-                                take_ledger::TakeKind::Raster
-                            }
-                            ArchiveTileKind::Undeclared => take_ledger::TakeKind::Sniffed,
-                        }
+        // A body staged for a flight that will not happen — see
+        // [`TileBatch::take_one_staged`]. Taken before the channel so the
+        // oldest body is served first, and charged to this pass's allowance
+        // like any other take.
+        let mut reclaimed = 0usize;
+        if !staging
+            && budget > 0
+            && let Some((tile_id, bytes)) = batch.take_one_staged()
+        {
+            inline.take(cache, put_generation, tile_id, FetchPayload::Bytes(bytes));
+            reclaimed = 1;
+        }
+        let taken = reclaimed
+            + drain_up_to(
+                tile_rx,
+                budget - reclaimed,
+                allowance.deadline,
+                // The pass's unconditional first take is spent if the reclaim
+                // above took it.
+                allowance.first_take_free && reclaimed == 0,
+                io_task_gone_reported,
+                |(tile_id, payload): (TileId, FetchPayload)| match (payload, staging) {
+                    // The offload path's take, and the whole of it: a pointer
+                    // move onto the staging list. Charged to the same family as
+                    // the decode it replaces, because it IS this pass's vector
+                    // take — which is what makes `take:vector` going to ~0 the
+                    // direct expression of the defect rather than a family that
+                    // quietly stopped being recorded.
+                    (FetchPayload::Bytes(bytes), true) => {
+                        batch.stage(tile_id, bytes);
+                        take_ledger::TakeKind::Vector
                     }
-                };
-                let decoded = match payload {
-                    // A restyle served from the parsed cache: no bytes were
-                    // fetched, only the styling is owed — still under this
-                    // budget, because it is the tessellation half.
-                    FetchPayload::Parsed(parse) => Ok(styled_tile(&parse, style, tile_id.zoom)),
-                    FetchPayload::Bytes(bytes) => match archive_kind {
-                        // A raster HTTP source: the body is whatever image the
-                        // provider serves, sniffed as it always was.
-                        None => Tile::new(&bytes, style, tile_id.zoom, egui_ctx)
-                            .map_err(|error| error.to_string()),
-                        // An archive source: the header's word decides. The IO
-                        // task writes the slot at open, before any tile is
-                        // served, so an empty slot cannot be reached through the
-                        // normal order of events; if it ever is, sniffing is the
-                        // pre-seam behaviour rather than a guess of this code's.
-                        Some(kind) => {
-                            let kind = kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared);
-                            match parsed {
-                                Some(parsed) => decode_archive_tile_remembering(
-                                    &bytes, kind, style, tile_id, egui_ctx, parsed,
-                                ),
-                                None => {
-                                    decode_archive_tile(&bytes, kind, style, tile_id.zoom, egui_ctx)
-                                }
-                            }
-                        }
-                    },
-                };
-                match decoded {
-                    Ok(tile) => {
-                        *put_generation += 1;
-                        cache.put(tile_id, slot_for(tile, epoch, feathering));
-                    }
-                    Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
-                }
-                kind
-            },
-        );
+                    // Everything else, unchanged: a restyle from the parsed
+                    // cache, a raster body, a sniffed body, and every vector body
+                    // on a pass that is not offloading.
+                    (payload, _) => inline.take(cache, put_generation, tile_id, payload),
+                },
+            );
         pump_budget.record(taken);
         *takes += taken as u64;
 
@@ -1775,6 +2248,163 @@ impl HttpsTiles {
             // The whole allowance went, so more completions may be waiting.
             // Ask for a frame so a backlog drains while the user is idle.
             egui_ctx.request_repaint();
+        }
+
+        // The borrow above ends here, which is why the post is its own step.
+        self.post_staged_batch();
+    }
+
+    /// Whether this source's archive serves vector bodies — the header's
+    /// word, read once by the IO task at open. Anything else (a hillshade, a
+    /// sniffed body, a source with no archive at all) keeps the inline path:
+    /// a raster take needs `Context::load_texture`, which is the frame
+    /// thread's to call.
+    #[cfg(target_arch = "wasm32")]
+    fn archive_is_vector(&self) -> bool {
+        self.archive_kind
+            .as_ref()
+            .and_then(|kind| kind.get())
+            .is_some_and(|kind| *kind == ArchiveTileKind::Vector)
+    }
+
+    /// Hand the staged bodies to the worker, if there are any and nothing of
+    /// this source's is already out there.
+    #[cfg(target_arch = "wasm32")]
+    fn post_staged_batch(&mut self) {
+        if !self.batch.ready_to_post() {
+            return;
+        }
+        let Some(style_key) = self.style_key.clone() else {
+            // Unreachable: `drain_completed_fetches` will not stage without a
+            // key, so nothing is ever waiting here without one. Stated rather
+            // than left to a `expect`, because the failure it would guard
+            // against is a source that stages forever and draws nothing.
+            log::error!("a basemap batch was staged with no style key; decoding here instead");
+            return;
+        };
+        let epoch = self.style_epoch;
+        let tiles = self.batch.open(epoch);
+        let job = squallar_basemap::jobs::BasemapTilesJob {
+            style: style_key,
+            tiles: tiles
+                .iter()
+                .map(|(tile_id, mvt)| squallar_basemap::jobs::TileBody {
+                    z: tile_id.zoom,
+                    x: tile_id.x,
+                    y: tile_id.y,
+                    mvt: Arc::clone(mvt),
+                })
+                .collect(),
+        };
+        let count = job.tiles.len();
+
+        let reply_tx = self.batch_tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let posted = with_offloader(|offloader| {
+            offloader.is_some_and(|offloader| {
+                offloader.post(
+                    job,
+                    Box::new(move |tiles| {
+                        // Nothing is installed here: the source owns the
+                        // cache and this runs outside its borrow. The pump
+                        // drains this on its next pass, which the repaint
+                        // asks for.
+                        let _ = reply_tx.unbounded_send(tiles);
+                        ctx.request_repaint();
+                    }),
+                )
+            })
+        });
+
+        if posted {
+            take_ledger::note_tiles_offloaded(count as u64);
+            return;
+        }
+        // Refused between the gate and the post — a worker lost in that
+        // window. Put the bodies back; the next pump finds `queued() == None`
+        // and decodes them here.
+        if let Some((_, asked)) = self.batch.close() {
+            self.batch.staging.extend(asked);
+        }
+    }
+
+    /// Install whatever the worker has answered, and decode here anything it
+    /// did not answer for.
+    ///
+    /// **A reply from a superseded style generation is dropped, not drawn**,
+    /// which is the rule the native arm has always had and this arm did not
+    /// need until a batch could outlive the style it was posted under. The
+    /// slot keeps showing the old styling while `request_once` re-asks under
+    /// the current one — a stale-styled tile beats a blank one.
+    #[cfg(target_arch = "wasm32")]
+    fn install_batch_reply(&mut self) {
+        // `try_recv` answers `Result<T, _>` where `T` is itself the reply's
+        // `Option` — so `Ok(None)` is **a batch that answered nothing**, not an
+        // empty channel, and it still owes `close()`. Spelled as a match and
+        // not as a `let ... else` on `Ok(Some(..))`, which would drop that
+        // arm on the floor and leave the batch outstanding forever, staging
+        // every later body behind a flight that already landed.
+        let reply = match self.batch_rx.try_recv() {
+            Ok(reply) => reply,
+            // Empty this pass, or the sender is gone with the source.
+            Err(_) => return,
+        };
+        let Some((epoch, asked)) = self.batch.close() else {
+            // A reply with no outstanding batch: the source was reset under
+            // it. Nothing to install and nothing owed.
+            return;
+        };
+
+        // What the reply actually carried, in the order it carried it.
+        let mut styled: Vec<(TileId, Vec<walkers::ShapeOrText>)> = Vec::new();
+        if let Some(tiles) = reply {
+            for tile in tiles.tiles {
+                let tile_id = TileId {
+                    zoom: tile.z,
+                    x: tile.x,
+                    y: tile.y,
+                };
+                if let Some(shapes) = tile.shapes {
+                    styled.push((tile_id, shapes));
+                }
+            }
+        }
+
+        if epoch == self.style_epoch {
+            for (tile_id, shapes) in &styled {
+                // Counted where the tile lands, for the reason
+                // `note_archive_decode` records: the worker parsed this body,
+                // but the worker's counters are not the ones anything reads.
+                note_archive_decode(ArchiveTileKind::Vector);
+                self.put_generation += 1;
+                self.cache.put(
+                    *tile_id,
+                    slot_for(
+                        Tile::Vector(Arc::new(shapes.clone())),
+                        epoch,
+                        flatten_feathering(self.feathering),
+                    ),
+                );
+            }
+        } else {
+            log::debug!(
+                "a batch of {} basemap tiles came back styled under generation \
+                 {epoch}, which generation {} has replaced; re-asking",
+                styled.len(),
+                self.style_epoch,
+            );
+        }
+
+        // Anything asked for and not answered — a body that would not parse,
+        // a worker that died, a reply this build could not read — goes back
+        // to the staging list rather than being refetched. The next pump
+        // decodes it here or offloads it again, and either way the tile
+        // arrives.
+        let answered: Vec<TileId> = styled.iter().map(|(tile_id, _)| *tile_id).collect();
+        for (tile_id, bytes) in asked {
+            if !answered.contains(&tile_id) {
+                self.batch.stage(tile_id, bytes);
+            }
         }
     }
 
@@ -2117,7 +2747,7 @@ async fn fetch_one<S: TileSource>(
 
     // On wasm the decode belongs to the frame pump, under its budget.
     #[cfg(target_arch = "wasm32")]
-    let payload = FetchPayload::Bytes(body.to_vec());
+    let payload = FetchPayload::Bytes(Arc::new(body.to_vec()));
 
     Ok((tile_id, payload))
 }
@@ -2230,7 +2860,7 @@ impl HttpsTiles {
     /// warm-up runs through this source's cache, once per generation.
     pub fn from_archive_url(
         url: &str,
-        style: Arc<Style>,
+        styling: BasemapStyling,
         attribution: Attribution,
         egui_ctx: Context,
         cache: Option<crate::basemap_archive::block_cache::BlockCacheConfig>,
@@ -2244,7 +2874,7 @@ impl HttpsTiles {
         );
         Ok(Self::from_range_source(
             source,
-            style,
+            styling,
             attribution,
             egui_ctx,
             TILE_CACHE_ENTRIES,
@@ -2290,7 +2920,9 @@ impl HttpsTiles {
         );
         Ok(Self::from_range_source(
             source,
-            Arc::new(Style::default()),
+            // Pictures, not geometry: nothing here restyles, and nothing here
+            // offloads. See `BasemapStyling::raster`.
+            BasemapStyling::raster(),
             attribution,
             egui_ctx,
             TERRAIN_TILE_CACHE_ENTRIES,
@@ -2324,7 +2956,7 @@ impl HttpsTiles {
     /// the header's word standing, which is what both published archives use.
     pub(crate) fn from_range_source<S, St>(
         source: S,
-        style: Arc<Style>,
+        styling: BasemapStyling,
         attribution: Attribution,
         egui_ctx: Context,
         cache_entries: NonZeroUsize,
@@ -2337,7 +2969,15 @@ impl HttpsTiles {
     {
         let (request_tx, request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        // Where a finished batch lands. See `HttpsTiles::batch_tx`.
+        #[cfg(target_arch = "wasm32")]
+        let (batch_tx, batch_rx) = unbounded();
 
+        let style = styling.style;
+        // The key is the worker's half of a styling and never the frame's, so
+        // it exists only where a worker does.
+        #[cfg(target_arch = "wasm32")]
+        let style_key = styling.key;
         let max_zoom = Arc::new(AtomicU8::new(MAX_ZOOM_UNKNOWN));
         let fault: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
         let reads_failing = Arc::new(AtomicBool::new(false));
@@ -2350,6 +2990,14 @@ impl HttpsTiles {
         // [`SharedParsedTiles`] and [`HttpsTiles::set_style`].
         let parsed: SharedParsedTiles =
             Arc::new(Mutex::new(LruCache::new(PARSED_TILE_CACHE_ENTRIES)));
+        // The undecoded bodies, for the restyle the parsed cache stops
+        // serving once the pump offloads. See [`SharedTileBodies`]; `()` on
+        // native, where the parsed cache still serves it.
+        #[cfg(target_arch = "wasm32")]
+        let tile_bodies: IoTileBodies =
+            Arc::new(Mutex::new(LruCache::new(PARSED_TILE_CACHE_ENTRIES)));
+        #[cfg(not(target_arch = "wasm32"))]
+        let tile_bodies: IoTileBodies = ();
         #[cfg(not(target_arch = "wasm32"))]
         let style_slot: IoStyleSlot = Arc::new(std::sync::RwLock::new(StyleSlot {
             style: Arc::clone(&style),
@@ -2381,6 +3029,7 @@ impl HttpsTiles {
             source,
             ArchiveStyling {
                 style: style_slot,
+                tile_bodies,
                 parsed_tiles: parsed,
             },
             ArchiveSlots {
@@ -2429,6 +3078,14 @@ impl HttpsTiles {
             style: frame_style,
             #[cfg(target_arch = "wasm32")]
             archive_kind: Some(frame_archive_kind),
+            #[cfg(target_arch = "wasm32")]
+            batch: TileBatch::default(),
+            #[cfg(target_arch = "wasm32")]
+            batch_tx,
+            #[cfg(target_arch = "wasm32")]
+            batch_rx,
+            #[cfg(target_arch = "wasm32")]
+            style_key,
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
@@ -2455,6 +3112,9 @@ impl HttpsTiles {
     pub(crate) fn inert(attribution: Attribution, egui_ctx: Context) -> Self {
         let (request_tx, _request_rx) = channel(MAX_PARALLEL_DOWNLOADS);
         let (_tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
+        // Where a finished batch lands. See `HttpsTiles::batch_tx`.
+        #[cfg(target_arch = "wasm32")]
+        let (batch_tx, batch_rx) = unbounded();
         let _ = &egui_ctx;
 
         Self {
@@ -2484,6 +3144,14 @@ impl HttpsTiles {
             style: Arc::new(Style::default()),
             #[cfg(target_arch = "wasm32")]
             archive_kind: None,
+            #[cfg(target_arch = "wasm32")]
+            batch: TileBatch::default(),
+            #[cfg(target_arch = "wasm32")]
+            batch_tx,
+            #[cfg(target_arch = "wasm32")]
+            batch_rx,
+            #[cfg(target_arch = "wasm32")]
+            style_key: None,
             io_task_gone_reported: false,
             put_generation: 0,
             pumps: 0,
@@ -2506,6 +3174,10 @@ struct ArchiveStyling {
         )
     )]
     style: IoStyleSlot,
+    /// The undecoded bodies this source keeps for restyling — see
+    /// [`SharedTileBodies`]. `()` on native, whose restyle is served from the
+    /// parsed cache instead.
+    tile_bodies: IoTileBodies,
     parsed_tiles: SharedParsedTiles,
 }
 
@@ -2891,6 +3563,71 @@ impl ReadFailureRun {
 /// parks the source instead of dropping it, so the moments left are a suspend
 /// and a graphics reset, both of which already stop drawing. The wasm32 arm
 /// never reaches `spawn_blocking` at all.
+/// This tile's remembered body, when the target keeps one.
+///
+/// The whole `cfg` split for the body cache lives in this function and
+/// [`remember_body`], and is deliberately a **value** selection: the native
+/// arm answers `None` unconditionally, so [`read_one`] below has one body on
+/// both targets rather than a `cfg` forking its control flow.
+#[cfg(target_arch = "wasm32")]
+fn remembered_body(cache: &IoTileBodies, tile_id: TileId) -> Option<Arc<Vec<u8>>> {
+    cache
+        .lock()
+        .expect("the tile-body cache is not poisoned")
+        .get(&tile_id)
+        .cloned()
+}
+
+/// See the wasm32 arm above. Native restyles from [`SharedParsedTiles`], so
+/// there is no second population to keep.
+#[cfg(not(target_arch = "wasm32"))]
+fn remembered_body(_cache: &IoTileBodies, _tile_id: TileId) -> Option<Arc<Vec<u8>>> {
+    None
+}
+
+/// Remember this tile's body for a later restyle. See [`remembered_body`].
+#[cfg(target_arch = "wasm32")]
+fn remember_body(cache: &IoTileBodies, tile_id: TileId, bytes: &Arc<Vec<u8>>) {
+    cache
+        .lock()
+        .expect("the tile-body cache is not poisoned")
+        .put(tile_id, Arc::clone(bytes));
+}
+
+/// See the wasm32 arm above.
+#[cfg(not(target_arch = "wasm32"))]
+fn remember_body(_cache: &IoTileBodies, _tile_id: TileId, _bytes: &Arc<Vec<u8>>) {}
+
+/// This tile's undecoded body: from the body cache where the target keeps
+/// one, and from the archive otherwise, the archive's answer remembered on
+/// the way out.
+///
+/// `Ok(None)` is the archive positively holding nothing there, unchanged.
+async fn body_of<S, O>(
+    archive: &crate::basemap_archive::BasemapArchives<S, O>,
+    cache: &IoTileBodies,
+    tile_id: TileId,
+) -> Result<Option<Arc<Vec<u8>>>, String>
+where
+    S: crate::basemap_archive::ArchiveRangeSource,
+    O: crate::basemap_archive::ArchiveRangeSource,
+{
+    if let Some(bytes) = remembered_body(cache, tile_id) {
+        return Ok(Some(bytes));
+    }
+    let bytes = archive
+        .tile(tile_id.zoom, tile_id.x, tile_id.y)
+        .await
+        .map_err(|error| format!("reading {tile_id:?} from the basemap archive: {error}"))?;
+    let Some(bytes) = bytes.into_bytes() else {
+        log::trace!("the basemap archive holds no tile at {tile_id:?}");
+        return Ok(None);
+    };
+    let bytes = Arc::new(bytes);
+    remember_body(cache, tile_id, &bytes);
+    Ok(Some(bytes))
+}
+
 async fn read_one<S, O>(
     archive: &crate::basemap_archive::BasemapArchives<S, O>,
     styling: &ArchiveStyling,
@@ -2944,13 +3681,7 @@ where
         return Ok(Some((tile_id, payload)));
     }
 
-    let bytes = archive
-        .tile(tile_id.zoom, tile_id.x, tile_id.y)
-        .await
-        .map_err(|error| format!("reading {tile_id:?} from the basemap archive: {error}"))?;
-
-    let Some(bytes) = bytes.into_bytes() else {
-        log::trace!("the basemap archive holds no tile at {tile_id:?}");
+    let Some(bytes) = body_of(archive, &styling.tile_bodies, tile_id).await? else {
         return Ok(None);
     };
 

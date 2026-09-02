@@ -13,6 +13,14 @@ pub use squallar_radar::tls;
 pub type WindowRef = Arc<Window>;
 
 pub mod app;
+
+/// Route the browser frame pump's basemap tiles through the rasterization
+/// worker. `squallar-web` calls this once at startup; `app::fetch` is
+/// `pub(crate)`, so the one item that crosses is named here rather than the
+/// module being opened up for it.
+#[cfg(target_arch = "wasm32")]
+pub use app::fetch::install_tile_offloader;
+
 pub mod app_state;
 #[cfg(test)]
 pub(crate) mod budget_arms;

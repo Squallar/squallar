@@ -1972,7 +1972,7 @@ mod archive {
 
         Some(HttpsTiles::from_range_source(
             source,
-            crate::basemap_style::committed(is_dark),
+            super::super::BasemapStyling::keyless(crate::basemap_style::committed(is_dark)),
             Attribution {
                 text: "test",
                 url: "https://example.invalid/",
@@ -2264,7 +2264,7 @@ mod archive {
                 reads: Arc::clone(&reads),
                 dead: Arc::clone(&dead),
             },
-            style,
+            super::super::BasemapStyling::keyless(style),
             Attribution {
                 text: "test",
                 url: "https://example.invalid/",
@@ -2375,7 +2375,7 @@ mod archive {
             "fixture: the first fill read the archive"
         );
 
-        tiles.set_style(after_style.clone());
+        tiles.set_style(super::super::BasemapStyling::keyless(after_style.clone()));
 
         // Immediately after the swap the stale tile still draws — that is the
         // no-blank-beat half of the contract.
@@ -2470,7 +2470,7 @@ mod archive {
         let ctx = Context::default();
         let mut tiles = HttpsTiles::from_range_source(
             DeadRangeSource,
-            crate::basemap_style::committed(true),
+            super::super::BasemapStyling::keyless(crate::basemap_style::committed(true)),
             Attribution {
                 text: "test",
                 url: "https://example.invalid/",
@@ -2884,7 +2884,7 @@ mod archive {
                     window: first_bad..first_bad + width,
                     fired: Arc::clone(&fired),
                 },
-                crate::basemap_style::committed(true),
+                super::super::BasemapStyling::keyless(crate::basemap_style::committed(true)),
                 Attribution {
                     text: "test",
                     url: "https://example.invalid/",
@@ -3220,7 +3220,7 @@ mod archive_decode {
         let ctx = Context::default();
         let mut tiles = HttpsTiles::from_range_source(
             FileRangeSource::open(path).expect("the archive file opens"),
-            std::sync::Arc::new(Style::default()),
+            super::super::BasemapStyling::keyless(std::sync::Arc::new(Style::default())),
             Attribution {
                 text: "test",
                 url: "https://example.invalid/",
@@ -3304,7 +3304,7 @@ mod archive_decode {
         let ctx = Context::default();
         let mut tiles = HttpsTiles::from_range_source(
             FileRangeSource::open(path).expect("the archive file opens"),
-            std::sync::Arc::new(Style::default()),
+            super::super::BasemapStyling::keyless(std::sync::Arc::new(Style::default())),
             Attribution {
                 text: "test",
                 url: "https://example.invalid/",
@@ -3482,4 +3482,306 @@ fn both_halves_of_a_vector_decode_reach_the_phase_ledger() {
             window.phase(phase).total(),
         );
     }
+}
+
+/// The dispatch gate, as a property rather than as a browser session.
+///
+/// [`TileBatch`] is compiled on native for exactly this reason. The rule it
+/// holds — a pass either offloads its vector bodies or does *precisely* what
+/// this arm did before the offload existed — is the whole of what makes the
+/// change a win-or-no-op rather than a trade, and a rule spelled inline in a
+/// `cfg(target_arch = "wasm32")` function body could only ever be exercised by
+/// a human with a browser open.
+mod dispatch_gate {
+    use super::super::TileBatch;
+    use super::*;
+
+    fn body(n: u8) -> Arc<Vec<u8>> {
+        Arc::new(vec![n; 4])
+    }
+
+    fn a_tile(x: u32) -> TileId {
+        TileId {
+            zoom: 14,
+            x,
+            y: 5974,
+        }
+    }
+
+    /// **The property the whole change rests on.** Every reason not to
+    /// offload has to land on the inline path, because that path is what
+    /// ships today: an idle funnel is the only state that stages.
+    #[test]
+    fn only_an_idle_funnel_stages_and_every_other_answer_falls_through() {
+        let mut batch = TileBatch::default();
+
+        // No offloader installed, or no worker attached, or still inside the
+        // handshake window: `queued` is `None` and posting would run the job
+        // on this very thread, unbudgeted.
+        assert!(
+            !batch.should_stage(None),
+            "a funnel with no worker must never be staged for: posting there \
+             runs the batch inline and unbudgeted, which is worse than the \
+             pump decoding it under PUMP_TIME_BUDGET",
+        );
+
+        // Somebody else's job is in the worker — a 160-190 ms radar
+        // rasterization, or an unbounded Level II decode. A batch posted now
+        // appears later than a tile decoded here.
+        for busy in [1usize, 2, 7] {
+            assert!(
+                !batch.should_stage(Some(busy)),
+                "{busy} queued job(s) was staged for; a batch behind one \
+                 makes tiles appear LATER, which is the objection the gate \
+                 exists to answer",
+            );
+        }
+
+        // Nothing owed at all: the one state that offloads.
+        assert!(
+            batch.should_stage(Some(0)),
+            "an idle funnel must stage, or the offload never happens",
+        );
+
+        // With a batch already out, "the funnel holds exactly mine" is the
+        // same answer as idle — so a second pass keeps staging instead of
+        // falling back to a tessellation it does not need to pay.
+        batch.stage(a_tile(1), body(1));
+        let _ = batch.open(0);
+        assert!(
+            batch.should_stage(Some(1)),
+            "a funnel holding only this source's own batch must keep staging",
+        );
+        assert!(
+            !batch.should_stage(Some(2)),
+            "a funnel holding this source's batch AND something else must not",
+        );
+        assert!(
+            !batch.should_stage(None),
+            "and a dead funnel still must not"
+        );
+    }
+
+    /// At most one batch is outstanding. That is what keeps a backlog from
+    /// queueing several deep behind a radar rasterization.
+    #[test]
+    fn only_one_batch_is_ever_outstanding() {
+        let mut batch = TileBatch::default();
+        batch.stage(a_tile(1), body(1));
+        assert!(batch.ready_to_post());
+
+        let opened = batch.open(0);
+        assert_eq!(opened.len(), 1);
+        assert!(
+            !batch.ready_to_post(),
+            "a second batch was offered while the first was still out",
+        );
+
+        // More arrive while it is in flight; they wait rather than posting.
+        batch.stage(a_tile(2), body(2));
+        assert!(
+            !batch.ready_to_post(),
+            "bodies staged during a flight must wait for it to land",
+        );
+
+        batch.close();
+        assert!(
+            batch.ready_to_post(),
+            "the batch retired and its successor is still not offered",
+        );
+        assert_eq!(batch.open(0).len(), 1, "the successor carries what waited");
+    }
+
+    /// An empty staging list is not a batch. A post with no tiles would spend
+    /// a round trip to be told nothing.
+    #[test]
+    fn nothing_staged_is_never_posted() {
+        let mut batch = TileBatch::default();
+        assert!(!batch.ready_to_post());
+        batch.stage(a_tile(1), body(1));
+        assert!(batch.ready_to_post());
+        assert!(batch.take_one_staged().is_some());
+        assert!(
+            !batch.ready_to_post(),
+            "reclaiming for the inline path left a phantom batch behind",
+        );
+        assert!(
+            batch.take_one_staged().is_none(),
+            "an empty staging list must reclaim nothing",
+        );
+    }
+
+    /// **The gate can shut between a body being staged and a batch going
+    /// out**, and those bodies must not be stranded: the pass that follows
+    /// decodes the CHANNEL's arrivals inline and would step straight over the
+    /// staging list. `take_one_staged` is what the pump reclaims them with,
+    /// oldest first, one per pass.
+    ///
+    /// This was a live hole until a dead-code warning on the unused reclaim
+    /// method exposed it — the method existed and nothing called it, so a
+    /// worker that died after a stage left those tiles undrawn forever.
+    #[test]
+    fn a_body_staged_before_the_gate_shut_is_reclaimable_oldest_first() {
+        let mut batch = TileBatch::default();
+        batch.stage(a_tile(1), body(1));
+        batch.stage(a_tile(2), body(2));
+
+        let (first, bytes) = batch.take_one_staged().expect("one was staged");
+        assert_eq!(first, a_tile(1), "the reclaim is not oldest-first");
+        assert_eq!(*bytes, vec![1u8; 4], "the wrong body came back");
+        assert_eq!(
+            batch.take_one_staged().map(|(id, _)| id),
+            Some(a_tile(2)),
+            "the second body was not reclaimable",
+        );
+        assert!(batch.take_one_staged().is_none());
+    }
+
+    /// The bodies are **retained** while the batch is out, so a tile the
+    /// reply does not carry is decoded from the copy here rather than
+    /// refetched from the archive.
+    ///
+    /// This is what makes the row's `None` arm cost a slower tile and never a
+    /// missing one.
+    #[test]
+    fn an_outstanding_batch_keeps_the_bodies_it_sent() {
+        let mut batch = TileBatch::default();
+        batch.stage(a_tile(1), body(11));
+        batch.stage(a_tile(2), body(22));
+        let sent = batch.open(3);
+        assert_eq!(sent.len(), 2);
+
+        let (epoch, asked) = batch.close().expect("a batch was outstanding");
+        assert_eq!(epoch, 3, "the generation it was posted under comes back");
+        assert_eq!(asked.len(), 2, "both bodies came back with it");
+        assert_eq!(
+            *asked[0].1,
+            vec![11u8; 4],
+            "the body that came back is not the body that went out",
+        );
+        // And they are the same allocations, not copies: the retention is a
+        // pointer each, which is what makes it affordable.
+        assert!(Arc::ptr_eq(&sent[0].1, &asked[0].1));
+    }
+
+    /// Closing with nothing outstanding answers `None` rather than
+    /// fabricating a batch — the state a reply arriving after a source reset
+    /// lands in.
+    #[test]
+    fn closing_nothing_answers_nothing() {
+        let mut batch = TileBatch::default();
+        assert!(batch.close().is_none());
+        batch.stage(a_tile(1), body(1));
+        batch.open(0);
+        assert!(batch.close().is_some());
+        assert!(batch.close().is_none(), "a batch was retired twice");
+    }
+}
+
+/// The offloader seam itself: installing one, seeing it, and taking it away.
+///
+/// **`squallar-egui` cannot name the funnel**, so this is the only place the
+/// install path is exercised at all — the real implementation lives in
+/// `squallar-app` and only compiles for wasm32. Without this the seam would be
+/// dead code on every native build, which is exactly what clippy said.
+mod offloader_seam {
+    use super::super::{TileOffloader, clear_tile_offloader, set_tile_offloader, with_offloader};
+
+    /// An offloader that reports a fixed queue depth and accepts nothing.
+    struct Fixed(Option<usize>);
+
+    impl TileOffloader for Fixed {
+        fn queued(&self) -> Option<usize> {
+            self.0
+        }
+
+        fn post(
+            &self,
+            _job: squallar_basemap::jobs::BasemapTilesJob,
+            _deliver: Box<dyn FnOnce(Option<squallar_basemap::jobs::BasemapTiles>) + Send>,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// With nothing installed the pump sees `None`, which is its instruction
+    /// to decode on this thread — the state every native build is in for the
+    /// life of the process, and the reason the offload is opt-in rather than
+    /// something a target has to switch off.
+    #[test]
+    fn nothing_installed_reads_as_no_funnel() {
+        clear_tile_offloader();
+        assert_eq!(
+            with_offloader(|o| o.and_then(TileOffloader::queued)),
+            None,
+            "an uninstalled seam must read as `no worker`, not as an idle one",
+        );
+    }
+
+    /// An installed offloader is what the pump reads, and clearing puts it
+    /// back.
+    #[test]
+    fn an_installed_offloader_is_what_the_pump_reads() {
+        clear_tile_offloader();
+        set_tile_offloader(Box::new(Fixed(Some(0))));
+        assert_eq!(
+            with_offloader(|o| o.and_then(TileOffloader::queued)),
+            Some(0)
+        );
+
+        // Replacing rather than stacking: the second install is what answers.
+        set_tile_offloader(Box::new(Fixed(Some(3))));
+        assert_eq!(
+            with_offloader(|o| o.and_then(TileOffloader::queued)),
+            Some(3)
+        );
+
+        // And an installed offloader may still report no funnel — a worker
+        // that died between frames.
+        set_tile_offloader(Box::new(Fixed(None)));
+        assert_eq!(with_offloader(|o| o.and_then(TileOffloader::queued)), None);
+
+        clear_tile_offloader();
+        assert_eq!(with_offloader(|o| o.and_then(TileOffloader::queued)), None);
+    }
+}
+
+/// **A tile installed from a worker batch must count on the page's basemap
+/// ledger.**
+///
+/// Held as a source scrape because nothing else can hold it: the installer is
+/// `cfg(target_arch = "wasm32")`, so no native test executes it, and the
+/// counter it feeds is a process static the browser rig reads as its basemap
+/// positive control (`basemap tiles: N vector`). Miss it and an offloading leg
+/// reports zero decoded tiles while the map draws perfectly — which is
+/// indistinguishable from a leg where the basemap genuinely never decoded, and
+/// that is the exact reading a measurement of this change must not produce for
+/// the wrong reason.
+///
+/// The worker parses the body, but the worker's statics are not the page's.
+#[test]
+fn a_batch_installed_tile_is_counted_on_the_basemap_ledger() {
+    const SOURCE: &str = include_str!("../tile_source.rs");
+
+    let (_, after) = SOURCE
+        .split_once("fn install_batch_reply(&mut self)")
+        .expect("`install_batch_reply` is no longer written here");
+    let body = after
+        .split_once("\n    }")
+        .map(|(body, _)| body)
+        .expect("`install_batch_reply` has no recognisable body");
+
+    // Control: the scrape is over the right function.
+    assert!(
+        body.contains("self.cache.put("),
+        "control: `install_batch_reply` no longer puts into the cache, so the \
+         check below is reading the wrong function",
+    );
+    assert!(
+        body.contains("note_archive_decode("),
+        "`install_batch_reply` installs tiles without calling \
+         `note_archive_decode`. The page's `basemap tiles:` counter is what \
+         the browser rig asserts the basemap decoded at all; a worker-decoded \
+         tile that skips it makes a working map read as a dead archive.",
+    );
 }

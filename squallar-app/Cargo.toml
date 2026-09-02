@@ -43,6 +43,10 @@ squallar-source = { workspace = true }
 # composed codec registry and the wire identity — moved down at WO-RW so the
 # engine sits below the app side.
 squallar-worker = { workspace = true }
+# Named to install the basemap tile offloader: `WorkerTileOffloader::post`
+# builds the row's input and downcasts its output. The row itself is composed
+# by squallar-worker; this is the dispatch site.
+squallar-basemap = { workspace = true }
 squallar-geo = { workspace = true }
 squallar-kv = { workspace = true }
 # SerialConfig only — the reader stays behind nmea-serial's `serial` feature,

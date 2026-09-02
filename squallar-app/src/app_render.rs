@@ -757,6 +757,28 @@ fn tile_phase_lines(t: &squallar_egui::tile_source::take_ledger::PhaseTotals) ->
         .collect()
 }
 
+/// The `tile bodies:` line — where this process's vector tile bodies were
+/// paid for.
+///
+/// Denominator: **one vector tile body disposed of**, which is the
+/// denominator the two `tile phase` lines above should be read against.
+/// Running totals, never added to a take family and never to a duration.
+///
+/// **Emitted unconditionally, unlike every family line above it**, and that
+/// asymmetry is the reason this line exists. A take family with no samples is
+/// not printed, which is right for a family — but once the browser's pump
+/// offloads, `tile phase (parse)` and `(style)` fall towards `n = 0` because
+/// the work genuinely left the frame thread, and a reader cannot tell that
+/// from a line that was never collected. A count has nothing to diff against
+/// and no reason to go quiet, so `0 offloaded, 0 inline` is a reading rather
+/// than a silence.
+fn tile_disposition_line(d: &squallar_egui::tile_source::take_ledger::Disposition) -> String {
+    format!(
+        "tile bodies: {} offloaded, {} decoded on the frame thread",
+        d.offloaded, d.inline,
+    )
+}
+
 /// The `frame prep costs:` running-total line.
 ///
 /// Denominator: every egui pass this renderer ended, presented or not — see
@@ -1537,6 +1559,12 @@ impl super::App {
         for line in tile_phase_lines(&squallar_egui::tile_source::take_ledger::phase_totals()) {
             say_telemetry(loud, &line);
         }
+        // Unconditional, where the two blocks above are filtered: this is what
+        // makes a phase line's absence readable. See `tile_disposition_line`.
+        say_telemetry(
+            loud,
+            &tile_disposition_line(&squallar_egui::tile_source::take_ledger::disposition()),
+        );
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
             // Immediately after the clocks it divides into, and never added to

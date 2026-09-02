@@ -3699,3 +3699,67 @@ mod step_button_tests;
 #[cfg(test)]
 #[path = "app_fetch/loop_restore_race_tests.rs"]
 mod loop_restore_race_tests;
+
+/// The browser's basemap tile offloader: what `squallar_egui::tile_source`'s
+/// frame pump hands a pass's vector bodies to instead of tessellating them on
+/// the frame thread.
+///
+/// **Installed rather than depended on.** `squallar-egui` must not name
+/// `squallar-worker` — the worker composes `squallar-basemap`'s codec row and
+/// so sits *below* the UI layer — so the pump declares a seam and this is the
+/// app's implementation of it, exactly as `squallar_web::worker_port` installs
+/// the funnel's own sink. Native builds install nothing and keep the inline
+/// path, which is correct there: the IO thread already decodes off the frame
+/// thread.
+#[cfg(target_arch = "wasm32")]
+struct WorkerTileOffloader;
+
+#[cfg(target_arch = "wasm32")]
+impl squallar_egui::tile_source::TileOffloader for WorkerTileOffloader {
+    /// `None` whenever posting would not promptly run: with no worker
+    /// attached `offload_job` executes the job **inline on the calling
+    /// thread**, unbudgeted, and during the handshake window it *holds* the
+    /// job until one attaches. Both are worse for tile latency than the pump
+    /// decoding under `PUMP_TIME_BUDGET`, and the pump reads this as "do what
+    /// you did before".
+    fn queued(&self) -> Option<usize> {
+        if !squallar_worker::offload::worker_attached()
+            || squallar_worker::offload::expecting_sink()
+        {
+            return None;
+        }
+        Some(squallar_worker::offload::jobs_in_worker())
+    }
+
+    fn post(
+        &self,
+        job: squallar_basemap::jobs::BasemapTilesJob,
+        deliver: Box<dyn FnOnce(Option<squallar_basemap::jobs::BasemapTiles>) + Send>,
+    ) -> bool {
+        squallar_worker::offload::offload_job(
+            "basemap-tiles",
+            squallar_worker::offload::Job::Described(
+                squallar_worker::offload::JobRequest::describe(
+                    job,
+                    // A batch of shapes has no raster geometry of its own:
+                    // extent units are the tile's, not the screen's.
+                    squallar_worker::offload::ceiling_only_geometry(0),
+                ),
+            ),
+            move |result| {
+                deliver(result.and_then(|out| out.take::<squallar_basemap::jobs::BasemapTiles>()))
+            },
+        )
+        .is_some()
+    }
+}
+
+/// Route the frame pump's vector tiles through the rasterization worker.
+///
+/// Idempotent and cheap; called once at startup on the page's own thread,
+/// which is the thread the offloader is stored on and the thread every
+/// `HttpsTiles` pumps on.
+#[cfg(target_arch = "wasm32")]
+pub fn install_tile_offloader() {
+    squallar_egui::tile_source::set_tile_offloader(Box::new(WorkerTileOffloader));
+}

@@ -4658,6 +4658,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "squallar-basemap",
  "squallar-device-profile",
  "squallar-egui",
  "squallar-geo",

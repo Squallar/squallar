@@ -54,6 +54,14 @@ pub fn start() -> Result<(), JsValue> {
     // the rendering context come up. It never blocks.
     crate::worker_port::attach();
 
+    // And the seam the basemap tile pump hands its vector bodies to, on this
+    // same page thread — the thread the offloader is stored on and the thread
+    // every `HttpsTiles` pumps on. Installed AFTER `attach` only for reading
+    // order; the pump asks `queued()` per pass, so an offloader installed
+    // before a worker exists simply answers "decode it yourself" until one
+    // does.
+    squallar_app::install_tile_offloader();
+
     // `WebBackend::new` starts a *permission query*, which prompts nobody; the
     // watch waits for the gate.
     let platform = crate::bridge::WebPlatform::new(canvas);

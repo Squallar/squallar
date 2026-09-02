@@ -304,6 +304,78 @@ pub fn phase_totals() -> PhaseTotals {
     PhaseTotals { phases }
 }
 
+// ── Where a vector take was paid ──────────────────────────────────────────
+
+/// Vector tile bodies handed to the worker, beside bodies the frame thread
+/// decoded itself.
+///
+/// **Counts, not clocks, and that is the whole point.** When the browser's
+/// tile pump offloads, `parse` and `style` stop happening on the frame thread,
+/// so [`VectorPhase`]'s two families legitimately fall towards `n = 0` — and a
+/// family with no samples is not reported at all (see
+/// `squallar_app`'s `tile_phase_lines`). "Zero because everything went to the
+/// worker" and "zero because nothing was ever reported" would then read
+/// identically, and the second is an instrument failure wearing the first's
+/// clothes.
+///
+/// These two are what tell them apart, and they are reported
+/// **unconditionally** — a count has nothing to diff against and no reason to
+/// go quiet, so an idle reading of `0 offloaded, 0 inline` is itself a fact.
+///
+/// They are never added to a take family and never to each other's duration:
+/// `offloaded + inline` is the vector bodies this process has disposed of, and
+/// it is the denominator both `tile phase` lines should be read against.
+///
+/// The worker's own parse and style microseconds are deliberately **not**
+/// carried home into [`VectorPhase`]. That family's denominator is
+/// frame-thread cost; folding off-thread work into it would corrupt a
+/// denominator rather than fill a gap, and `squallar-worker`'s
+/// `no_run_body_reads_a_clock` forbids the row timing itself in any case —
+/// a duration is as nondeterministic as an instant, and the byte-identity
+/// parity gates depend on the row not being either.
+static OFFLOADED: AtomicU64 = AtomicU64::new(0);
+
+/// See [`OFFLOADED`].
+static DECODED_INLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Record `n` vector bodies handed to the worker.
+pub fn note_tiles_offloaded(n: u64) {
+    OFFLOADED.fetch_add(n, Relaxed);
+}
+
+/// Record `n` vector bodies the frame thread decoded itself — the pump's
+/// path when no offloader is installed, when the funnel is busy, and when a
+/// batch came back without a tile it was asked for.
+pub fn note_tiles_decoded_inline(n: u64) {
+    DECODED_INLINE.fetch_add(n, Relaxed);
+}
+
+/// Where this process's vector bodies were paid for. See [`OFFLOADED`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disposition {
+    pub offloaded: u64,
+    pub inline: u64,
+}
+
+impl Disposition {
+    /// The windowed reading between two snapshots, on [`Totals::diff`]'s
+    /// terms.
+    pub fn diff(&self, earlier: &Disposition) -> Disposition {
+        Disposition {
+            offloaded: self.offloaded.saturating_sub(earlier.offloaded),
+            inline: self.inline.saturating_sub(earlier.inline),
+        }
+    }
+}
+
+/// Read both counters.
+pub fn disposition() -> Disposition {
+    Disposition {
+        offloaded: OFFLOADED.load(Relaxed),
+        inline: DECODED_INLINE.load(Relaxed),
+    }
+}
+
 /// The last [`Totals::takes`] a caller was handed by [`totals_if_moved`].
 static REPORTED: AtomicU64 = AtomicU64::new(0);
 
