@@ -2,7 +2,11 @@
 #
 # run_gpu_arm.sh -- the HARDWARE arm of the browser rig. Same page, same
 # server discipline and same probes as run_tier2.sh; the one difference is
-# which adapter answers.
+# which adapter answers. It seeds the two telemetry switches Tier-2 seeds, so
+# its rows carry the `budget state:`, `tile cache` and `overlay rasters` lines
+# rather than losing them at debug. Its hardware check accepts a WebGPU adapter
+# as well as a hardware WebGL one, because a page on the WebGPU backend has no
+# WebGL2 context by design.
 #
 # Why this lives in .github/browser-rig/ and not on a harness branch
 # ------------------------------------------------------------------
@@ -62,8 +66,10 @@
 #   RIG_BROWSERS=firefox RIG_DRIVE_EXTRA="--ff-pref dom.webgpu.enabled=true" \
 #     run_gpu_arm.sh --skip-build
 #
-#   # chromium: needs the Vulkan ANGLE backend, and LOSES WebGL2 entirely --
-#   # the app boots and paints nothing, so --require-hardware fails the run
+#   # chromium: needs the Vulkan ANGLE backend; the app then runs on
+#   # BrowserWebGpu and the page has no WebGL2 context by design, so the
+#   # hardware floor is cleared by the WebGPU adapter (the verdict's
+#   # `hardware_via`), not by a WebGL renderer
 #   RIG_BROWSERS=chromium RIG_DRIVE_EXTRA="\
 #       --chromium-arg=--enable-unsafe-webgpu \
 #       --chromium-arg=--enable-features=Vulkan \
@@ -85,9 +91,16 @@ SETTLE="${RIG_SETTLE:-6}"
 DATA_WINDOW="${RIG_DATA_WINDOW:-8}"
 PY=python3
 
-# Identical to run_tier2.sh's seed: a figure from here and a verdict from
-# there must describe the same scene, or the delta is a scene delta.
-SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}"}'
+# `squallar.ui` is this arm's scene -- one KTLX pane -- unchanged. The two
+# telemetry keys are run_tier2.sh's spelling, verbatim, seeded through the
+# same single --seed-local-storage JSON, for Tier-2's reason: the app says its
+# frame lines (`budget state:`, `loop state:`, the frame-service histograms)
+# at `info` only while `squallar.frame_telemetry` holds "1", and its raster
+# lines (`overlay rasters`, `tile cache`) only while `squallar.raster_telemetry`
+# does; otherwise both go out at `debug`, which never reaches the console
+# ring. An arm that seeds only the scene therefore reads a null
+# `budget_state` by construction, not by a regex miss.
+SEED_LS='{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\"}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}'
 
 SKIP_BUILD=0
 ALSO_SOFTWARE=0
@@ -319,10 +332,22 @@ for tag, r in rows:
     v = r.get("verdict") or {}
     print("%-16s arm=%-8s adapter=%s (%s)"
           % (tag, r.get("arm"), cls, rend))
-    print("%-16s   pass=%s booted=%s canvas_blank=%s hardware_ok=%s"
+    print("%-16s   pass=%s booted=%s canvas_blank=%s hardware_ok=%s via=%s"
           % ("", r.get("pass"), v.get("booted"),
              (r.get("screenshots") or {}).get("canvas", {}).get("blank"),
-             v.get("hardware_ok")))
+             v.get("hardware_ok"), v.get("hardware_via")))
+    print("%-16s   [%s] webgpu adapter class=%s"
+          % ("", rend, (r.get("webgpu_adapter") or {}).get("class")))
+    # A null here with the seed in place is a finding; a null without the
+    # seed is the seed.
+    bs = (r.get("frame_lines") or {}).get("budget_state")
+    print("%-16s   [%s] budget state %s"
+          % ("", rend,
+             ("bracket %s, rung %s, pool %s MiB, ceiling %s MiB"
+              % (bs.get("bracket"), bs.get("rung"), bs.get("pool_mib"),
+                 bs.get("ceiling_mib")))
+             if bs else "NOT HEARD (squallar.frame_telemetry unseeded, or "
+                        "the line never logged)"))
     print("%-16s   [%s] max_texture=%s max_3d=%s max_renderbuffer=%s"
           % ("", rend, env.get("max_texture_size"),
              env.get("max_3d_texture_size"), env.get("max_renderbuffer_size")))

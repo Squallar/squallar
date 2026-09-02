@@ -821,6 +821,97 @@ def adapter_label(adapter):
     return label
 
 
+def classify_webgpu_adapter(wg):
+    """Name the adapter behind a set of WEBGPU_PROBE readings, as
+    `classify_adapter` names the one behind the WebGL probe.
+
+    A second classification because it is a second question. A page the app
+    runs on the WebGPU backend has no WebGL2 context by design -- the canvas
+    has answered `getContext("webgpu")` and answers no other -- so on that arm
+    `classify_adapter` reads `none` while a real GPU is drawing, and a
+    hardware floor that consults only WebGL fails the very run the arm exists
+    to take. `hardware` here means requestAdapter() returned an adapter that
+    the browser does not flag as a fallback (the spec's word for software:
+    SwiftShader, and lavapipe, which Dawn types as a CPU adapter) and whose
+    info strings carry none of the SOFTWARE_RENDERER_MARKERS. A browser that
+    redacts `description` to "" -- chromium does -- leaves the fallback flag
+    as the load-bearing test, which is why the probe records it.
+
+    The classes match `classify_adapter`'s (`none`, `software`, `hardware`)
+    so a verdict can name which of the two adapters it read."""
+    wg = wg or {}
+    info = wg.get("adapter_info")
+    if not isinstance(info, dict):
+        info = {}
+    limits = wg.get("adapter_limits")
+    if not isinstance(limits, dict):
+        limits = {}
+    out = {"vendor": info.get("vendor"),
+           "architecture": info.get("architecture"),
+           "description": info.get("description"),
+           "is_fallback": wg.get("adapter_is_fallback"),
+           "max_texture_dimension_2d": limits.get("maxTextureDimension2D")}
+    if wg.get("probe_error"):
+        out["class"] = "none"
+        out["why"] = "probe error: %s" % str(wg["probe_error"])[:80]
+        return out
+    if not wg.get("gpu_object"):
+        out["class"] = "none"
+        out["why"] = "no navigator.gpu"
+        return out
+    if not wg.get("adapter"):
+        out["class"] = "none"
+        out["why"] = "requestAdapter -> null%s" % (
+            ("; " + str(wg["error"])[:80]) if wg.get("error") else "")
+        return out
+    if out["is_fallback"] is True:
+        out["class"] = "software"
+        out["marker"] = "isFallbackAdapter"
+        return out
+    haystack = " ".join(str(info.get(k) or "")
+                        for k in ("vendor", "architecture", "device",
+                                  "description")).lower()
+    hit = next((m for m in SOFTWARE_RENDERER_MARKERS if m in haystack), None)
+    if hit:
+        out["class"] = "software"
+        out["marker"] = hit
+        return out
+    out["class"] = "hardware"
+    return out
+
+
+def webgpu_adapter_label(adapter):
+    """`adapter_label`'s counterpart for the WebGPU classification:
+    `hardware:nvidia (maxTex2D=16384)`, `software:google [swiftshader]`,
+    `none(requestAdapter -> null)`."""
+    adapter = adapter or {}
+    cls = adapter.get("class", "unknown")
+    if cls == "none":
+        return "none(%s)" % adapter.get("why", "?")
+    name = adapter.get("description") or adapter.get("vendor") or "?"
+    label = "%s:%s" % (cls, name)
+    if adapter.get("max_texture_dimension_2d") is not None:
+        label += " (maxTex2D=%s)" % adapter["max_texture_dimension_2d"]
+    if cls == "software":
+        label += " [%s]" % adapter.get("marker")
+    return label
+
+
+def hardware_floor(adapter, webgpu_adapter):
+    """--require-hardware's decision: the adapter that is a GPU, or None.
+
+    `webgl` when the WebGL renderer classified hardware -- the reading this
+    floor has always taken, kept first so the WebGL2 arm's rows do not move;
+    `webgpu` when it did not but requestAdapter() returned a hardware
+    adapter; None when neither did, i.e. a software or absent WebGL adapter
+    beside an absent, null or software WebGPU one."""
+    if (adapter or {}).get("class") == "hardware":
+        return "webgl"
+    if (webgpu_adapter or {}).get("class") == "hardware":
+        return "webgpu"
+    return None
+
+
 def resolve_host_display(explicit=None):
     """Find the machine's REAL X display, and the cookie that opens it.
 
@@ -2372,6 +2463,12 @@ try {
         var info = a.info || {};
         out.adapter_info = { vendor: info.vendor, architecture: info.architecture,
                              device: info.device, description: info.description };
+        // The spec's word for a software adapter (SwiftShader; lavapipe, which
+        // Dawn types as a CPU adapter). Read off `info`, where the spec keeps
+        // it; the older `GPUAdapter.isFallbackAdapter` is deprecated and logs
+        // on every read. null when the browser does not say.
+        out.adapter_is_fallback = (typeof info.isFallbackAdapter === 'boolean')
+                                    ? info.isFallbackAdapter : null;
       } catch (e) { out.adapter_info = 'info error: ' + String(e); }
       try {
         var L = a.limits || {};
@@ -5340,9 +5437,112 @@ def selftest_android():
     return fails
 
 
+def selftest_adapters():
+    """The hardware floor over both adapter probes, offline.
+
+    The case that matters is the WebGPU arm: no WebGL context at all beside a
+    real WebGPU adapter must clear the floor via `webgpu`; and every way the
+    floor used to fail must still fail -- software WebGL with no WebGPU
+    adapter, no WebGL with `requestAdapter -> null`, and a WebGPU adapter
+    that is itself software (the fallback flag, or a SwiftShader name)."""
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append("adapters: " + msg)
+
+    gl_hw = {"webgl": "webgl2", "gl_vendor": "NVIDIA Corporation",
+             "gl_renderer": "NVIDIA GeForce RTX 3090/PCIe/SSE2"}
+    gl_sw = {"webgl": "webgl2", "gl_vendor": "Google Inc. (Google)",
+             "gl_renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device "
+                            "(Subzero) (0x0000C0DE)), SwiftShader driver)"}
+    gl_none = {"webgl": None}
+    wg_hw = {"gpu_object": True, "adapter": True,
+             "adapter_info": {"vendor": "nvidia", "architecture": "ampere",
+                              "device": "", "description": ""},
+             "adapter_is_fallback": False,
+             "adapter_limits": {"maxTextureDimension2D": 16384}}
+    wg_null = {"gpu_object": True, "adapter": None,
+               "error": "requestAdapter timed out after 15000 ms"}
+    wg_absent = {"gpu_object": False, "adapter": None}
+    wg_fallback = dict(wg_hw, adapter_is_fallback=True)
+    wg_swift = dict(wg_hw, adapter_is_fallback=None,
+                    adapter_info={"vendor": "google",
+                                  "architecture": "swiftshader",
+                                  "device": "", "description": ""})
+    wg_probe_err = {"probe_error": "script timeout"}
+
+    def floor(env, wg):
+        return hardware_floor(classify_adapter(env),
+                              classify_webgpu_adapter(wg))
+
+    check(classify_adapter(gl_hw)["class"] == "hardware",
+          "WebGL nvidia not hardware")
+    check(classify_adapter(gl_sw)["class"] == "software",
+          "WebGL SwiftShader not software")
+    check(classify_adapter(gl_none)["class"] == "none",
+          "no WebGL context not none")
+    check(classify_webgpu_adapter(wg_hw)["class"] == "hardware",
+          "WebGPU nvidia not hardware")
+    check(classify_webgpu_adapter(wg_fallback)["class"] == "software",
+          "fallback WebGPU adapter not software")
+    check(classify_webgpu_adapter(wg_swift)["class"] == "software",
+          "SwiftShader WebGPU adapter not software")
+    check(classify_webgpu_adapter(wg_null)["class"] == "none",
+          "requestAdapter -> null not none")
+    check(classify_webgpu_adapter(wg_absent)["class"] == "none",
+          "no navigator.gpu not none")
+    check(classify_webgpu_adapter(wg_probe_err)["class"] == "none",
+          "probe error not none")
+    check(classify_webgpu_adapter(None)["class"] == "none",
+          "missing probe not none")
+
+    # The WebGL2 arm, unchanged: a hardware WebGL renderer clears the floor
+    # whatever WebGPU says; a software or absent one beside no WebGPU adapter
+    # does not.
+    check(floor(gl_hw, wg_absent) == "webgl",
+          "WebGL hardware alone should clear via webgl")
+    check(floor(gl_hw, wg_hw) == "webgl", "both hardware should name webgl")
+    check(floor(gl_sw, wg_absent) is None,
+          "software WebGL, no WebGPU must fail")
+    check(floor(gl_sw, wg_null) is None,
+          "software WebGL, requestAdapter null must fail")
+    check(floor(gl_none, wg_absent) is None,
+          "no WebGL, no navigator.gpu must fail")
+    check(floor(gl_none, wg_null) is None,
+          "no WebGL, requestAdapter null must fail")
+    check(floor(gl_none, wg_probe_err) is None,
+          "no WebGL, WebGPU probe error must fail")
+    # The WebGPU arm: the page has no WebGL2 context by design and a real
+    # adapter answers requestAdapter().
+    check(floor(gl_none, wg_hw) == "webgpu",
+          "no WebGL beside a hardware WebGPU adapter should clear via webgpu")
+    # ...and a software WebGPU adapter is not a way past the floor.
+    check(floor(gl_none, wg_fallback) is None,
+          "fallback WebGPU adapter must not clear the floor")
+    check(floor(gl_none, wg_swift) is None,
+          "SwiftShader WebGPU adapter must not clear the floor")
+    check(floor(gl_sw, wg_fallback) is None,
+          "software WebGL + fallback WebGPU must fail")
+
+    # The failure message names both adapters it looked at.
+    lbl_gl = adapter_label(classify_adapter(gl_none))
+    lbl_wg = webgpu_adapter_label(classify_webgpu_adapter(wg_null))
+    check(lbl_gl.startswith("none("), "WebGL none label: %r" % lbl_gl)
+    check("requestAdapter -> null" in lbl_wg, "WebGPU null label: %r" % lbl_wg)
+    lbl_hw = webgpu_adapter_label(classify_webgpu_adapter(wg_hw))
+    check(lbl_hw == "hardware:nvidia (maxTex2D=16384)",
+          "WebGPU hardware label: %r" % lbl_hw)
+    lbl_sw = webgpu_adapter_label(classify_webgpu_adapter(wg_swift))
+    check(lbl_sw == "software:google (maxTex2D=16384) [swiftshader]",
+          "WebGPU software label: %r" % lbl_sw)
+    return fails
+
+
 def selftest():
     failures = []
     failures += selftest_android()
+    failures += selftest_adapters()
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -6214,14 +6414,27 @@ def run_smoke(args):
         # software figures "hardware" is the precise defect this arm exists to
         # correct. Same refusal as the a9 harness's assertHardwareRenderer.
         adapter = result.get("adapter") or {}
+        # Two adapters are asked, because they are two questions: a page the
+        # app runs on the WebGPU backend has no WebGL2 context by design (the
+        # canvas has answered `getContext("webgpu")` and answers no other), so
+        # its WebGL classification reads `none` while a real GPU draws. Either
+        # a hardware WebGL adapter or a hardware WebGPU adapter clears the
+        # floor; a software or absent WebGL adapter beside no WebGPU adapter
+        # fails it, exactly as before. See `hardware_floor`.
+        webgpu_adapter = classify_webgpu_adapter(wg)
+        result["webgpu_adapter"] = webgpu_adapter
         hw_ok = None
+        hw_via = None
         if args.require_hardware:
-            hw_ok = (adapter.get("class") == "hardware")
+            hw_via = hardware_floor(adapter, webgpu_adapter)
+            hw_ok = hw_via is not None
             if not hw_ok:
                 result["gotchas"].append(
-                    "--require-hardware: adapter is %s (renderer %r); "
-                    "fix the GPU flags rather than reporting this figure"
-                    % (adapter_label(adapter), adapter.get("renderer")))
+                    "--require-hardware: WebGL adapter is %s; WebGPU adapter "
+                    "is %s; neither is a GPU -- fix the GPU flags rather than "
+                    "reporting this figure"
+                    % (adapter_label(adapter),
+                       webgpu_adapter_label(webgpu_adapter)))
 
         fp_ok = (result.get("frame_progress") is None
                  or bool((result.get("frame_progress") or {}).get("ok")))
@@ -6264,7 +6477,9 @@ def run_smoke(args):
             "arm": args.arm,
             "adapter_class": adapter.get("class"),
             "adapter_renderer": adapter.get("renderer"),
+            "webgpu_adapter_class": webgpu_adapter.get("class"),
             "hardware_ok": hw_ok,
+            "hardware_via": hw_via,
             "booted": booted, "canvas_ok": canvas_ok, "raf_ok": raf_ok,
             "service_worker_ok": sw_ok,
             "cross_origin_isolated": coi,
@@ -6470,9 +6685,15 @@ def run_smoke(args):
     for key in ("backend", "raster_ceiling"):
         if app.get(key):
             print("[%s] SUMMARY [%s]   %s" % (tag, alabel, app[key]))
+    wa = result.get("webgpu_adapter") or classify_webgpu_adapter(wg)
     if v.get("hardware_ok") is False:
-        print("[%s] SUMMARY HARDWARE ARM FAILED: adapter is %s, not a GPU"
-              % (tag, alabel))
+        print("[%s] SUMMARY HARDWARE ARM FAILED: WebGL adapter is %s, WebGPU "
+              "adapter is %s -- neither is a GPU"
+              % (tag, alabel, webgpu_adapter_label(wa)))
+    elif v.get("hardware_ok") is True:
+        print("[%s] SUMMARY hardware floor cleared by the %s adapter (WebGL "
+              "%s; WebGPU %s)"
+              % (tag, v.get("hardware_via"), alabel, webgpu_adapter_label(wa)))
     swr = result.get("service_worker") or {}
     print("[%s] SUMMARY isolation: crossOriginIsolated=%s SharedArrayBuffer=%s "
           "sw_blocked_by_rig=%s sw_registrations=%s"
@@ -7106,10 +7327,14 @@ def main(argv=None):
                          "recorded in the artifact and printed on every "
                          "summary line that carries a cap")
     ap.add_argument("--require-hardware", action="store_true",
-                    help="fail the run unless the WebGL renderer is a real "
-                         "GPU (pair with --arm hardware). Without it the "
-                         "hardware arm cannot fail: a silent SwiftShader "
-                         "fallback reads exactly like a driver")
+                    help="fail the run unless the WebGL renderer OR the "
+                         "WebGPU adapter is a real GPU (pair with --arm "
+                         "hardware). Two adapters, because a page on the "
+                         "WebGPU backend has no WebGL2 context by design; "
+                         "the verdict names which one cleared the floor "
+                         "(`hardware_via`). Without it the hardware arm "
+                         "cannot fail: a silent SwiftShader fallback reads "
+                         "exactly like a driver")
     ap.add_argument("--display", default=None,
                     help="X display for --arm hardware (default: $RIG_DISPLAY, "
                          "then $DISPLAY, then :0, first one with a live "
