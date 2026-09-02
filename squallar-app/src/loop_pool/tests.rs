@@ -6,6 +6,7 @@ use squallar_device_profile::constants::{
     MOBILE_VOLUME_GRID_CELLS, WASM_LOOP_IMAGE_SIZE, WASM_LOOP_POOL_CEILING_BYTES,
     WASM_LOOP_POOL_FLOOR_BYTES, WASM_MAX_LOOP_RENDER_BUDGET, WASM_VOLUME_GRID_CELLS,
 };
+use squallar_device_profile::quality::DeviceClass;
 use squallar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
 
 /// One device class, with both halves of every question a host build cannot otherwise
@@ -375,93 +376,213 @@ fn an_equal_share_buys_a_section_loop_more_history() {
     }
 }
 
-/// The classification is the only signal there is, and it is spent this way.
+/// One plan-view pane looping over two hours with no cadence yet — it wants the
+/// whole render budget.
+fn looping_pane() -> squallar_device_profile::scene::PaneNeed {
+    squallar_device_profile::scene::PaneNeed {
+        px: [1920, 1080],
+        view: RenderView::PlanView,
+        looping: true,
+        loop_span_secs: 2 * 60 * 60,
+        cadence_secs: None,
+        overlay_frame_bytes: 0,
+        volume_grids: 0,
+        ground: squallar_device_profile::quality::GroundPass::Off,
+    }
+}
+
+/// `panes` of [`looping_pane`] and nothing else.
+fn scene_of(panes: usize) -> Scene {
+    Scene {
+        panes: vec![looping_pane(); panes],
+        tile_sources: Vec::new(),
+        mirror_px: [0, 0],
+    }
+}
+
+/// **The scene decides where between the bounds the pool sits, not the
+/// class.** One two-hour loop needs exactly the floor on every arm — the floor
+/// was argued as one loop's span, and this is that argument read back — and a
+/// full screen of them needs the lesser of their sum and the room the static
+/// renders leave under the presumed capacity, held to the bracket. An adapter
+/// that says nothing and a discrete card get the same pool for the same one
+/// loop: the ruling, as arithmetic. On the desktop bracket one loop is 36 x
+/// 16 MiB = 576 MiB, not the 3072 MiB ceiling a discrete card used to be
+/// handed, and six are min(3456, 3840 - 6 x 256) = 2304 MiB.
 #[test]
-fn the_device_class_decides_where_between_the_bounds_the_pool_sits() {
-    for arm in arms() {
-        let at = |class| LoopPool::for_device(class, None, arm.limits).bytes();
-        assert_eq!(
-            at(DeviceClass::Discrete),
-            arm.limits.ceiling,
-            "{}",
-            arm.name
-        );
-        assert_eq!(
-            at(DeviceClass::Integrated),
-            (arm.limits.floor * 2).min(arm.limits.ceiling),
-            "{}",
-            arm.name,
-        );
-        for blind in [
-            DeviceClass::Unknown,
-            DeviceClass::Virtual,
-            DeviceClass::Software,
-        ] {
+fn the_scene_decides_where_between_the_bounds_the_pool_sits() {
+    use crate::budget_arms::shipped_profile;
+    use squallar_device_profile::budget::{BudgetLimits, DeviceProfile, FormFactor, resolve};
+
+    const MIB: usize = 1024 * 1024;
+    for limits in BudgetLimits::SHIPPED {
+        let cap = Capacity::presumed(&limits);
+        let mut one_loop_pools = Vec::new();
+        for class in [DeviceClass::Unknown, DeviceClass::Discrete] {
+            let b = resolve(&DeviceProfile {
+                class,
+                form_factor: Some(FormFactor::Desktop),
+                ..shipped_profile(limits)
+            });
+            let pool_for = |panes: usize| {
+                LoopPool::for_scene(&scene_of(panes), &b, &cap, LoopPoolLimits::from_budgets(&b))
+                    .bytes()
+            };
+
+            let one = b.loop_render_budget * b.loop_frame_bytes();
             assert_eq!(
-                at(blind),
-                arm.limits.floor,
-                "{}: a {blind:?} adapter must take the floor — this is the arm \
-                 every browser lands in",
-                arm.name,
+                pool_for(1),
+                one,
+                "{} / {class:?}: one loop does not get exactly its own span",
+                limits.name,
+            );
+            assert_eq!(
+                one, b.loop_pool_floor_bytes,
+                "{}: the floor stopped being one loop's span budget",
+                limits.name,
+            );
+            one_loop_pools.push(pool_for(1));
+
+            let full = b.max_panes;
+            let need = full * one;
+            let room = usize::try_from(cap.allowance())
+                .unwrap()
+                .saturating_sub(full * b.static_frame_bytes());
+            let expected = need
+                .min(room)
+                .clamp(b.loop_pool_floor_bytes, b.loop_pool_ceiling_bytes);
+            assert_eq!(
+                pool_for(full),
+                expected,
+                "{} / {class:?}: {full} loops want {} MiB and {} MiB of room is left \
+                 under the {} MiB presumption once {full} static renders of {} MiB \
+                 are paid for; the pool is the lesser, held to [{}, {}] MiB",
+                limits.name,
+                need / MIB,
+                room / MIB,
+                cap.allowance() / MIB as u64,
+                b.static_frame_bytes() / MIB,
+                b.loop_pool_floor_bytes / MIB,
+                b.loop_pool_ceiling_bytes / MIB,
             );
         }
-        // A device that says it is discrete does not get to claim more than the ceiling,
-        // which is the misread this bound exists for.
-        assert!(at(DeviceClass::Discrete) <= arm.limits.ceiling);
+        assert!(
+            one_loop_pools.windows(2).all(|pair| pair[0] == pair[1]),
+            "{}: the class moved the pool for one and the same loop: {one_loop_pools:?}",
+            limits.name,
+        );
     }
+
+    // The desktop figures, named.
+    let desktop = resolve(&shipped_profile(BudgetLimits::DESKTOP));
+    let cap = Capacity::presumed(&BudgetLimits::DESKTOP);
+    let pool_for = |panes: usize| {
+        LoopPool::for_scene(
+            &scene_of(panes),
+            &desktop,
+            &cap,
+            LoopPoolLimits::from_budgets(&desktop),
+        )
+        .bytes()
+    };
+    assert_eq!(pool_for(1), 576 * MIB, "36 x 16 MiB");
+    assert_eq!(pool_for(6), 2304 * MIB, "min(6 x 576, 3840 - 6 x 256)");
 }
 
-/// What a session remembered outranks what the adapter is.
+/// The bounds hold whatever the scene asks: nothing looping is the floor, and
+/// no scene reaches past the ceiling.
 #[test]
-fn a_remembered_pool_outranks_the_classification() {
-    let limits = LoopPoolLimits {
-        floor: 64 * 1024 * 1024,
-        ceiling: 512 * 1024 * 1024,
-    };
-    let remembered = 128 * 1024 * 1024;
+fn the_pool_is_held_inside_the_bracket_whatever_the_scene_asks() {
+    for arm in arms() {
+        assert_eq!(
+            LoopPool::new(usize::MAX, arm.limits).bytes(),
+            arm.limits.ceiling
+        );
+        assert_eq!(LoopPool::new(0, arm.limits).bytes(), arm.limits.floor);
+    }
+    let desktop = crate::budget_arms::arms()[2];
+    let cap = Capacity::presumed(&squallar_device_profile::budget::BudgetLimits::DESKTOP);
+    let limits = LoopPoolLimits::from_budgets(&desktop);
     assert_eq!(
-        LoopPool::for_device(DeviceClass::Discrete, Some(remembered), limits).bytes(),
-        remembered,
-        "a discrete adapter overrode what this machine had already learned",
-    );
-    // Still held to the bounds: a memo written by a build with different ones is evidence
-    // about the machine, not a licence to leave this build's.
-    assert_eq!(
-        LoopPool::for_device(DeviceClass::Discrete, Some(usize::MAX), limits).bytes(),
-        limits.ceiling,
-    );
-    assert_eq!(
-        LoopPool::for_device(DeviceClass::Discrete, Some(1), limits).bytes(),
+        LoopPool::for_scene(&Scene::empty(), &desktop, &cap, limits).bytes(),
         limits.floor,
+        "nothing looping asks for nothing, and the floor holds",
+    );
+    assert!(
+        LoopPool::for_scene(&scene_of(60), &desktop, &cap, limits).bytes() <= limits.ceiling,
+        "sixty loops reached past the ceiling",
     );
 }
 
-/// Backing off halves toward the floor and stops there.
+/// **A pool or a frame model that moves under the same demand is re-planned
+/// after the dwell, like a demand that moves.** The pool follows the scene's
+/// need and room, and the model follows a re-fit of the budgets; an
+/// allocation planned against the old one would cap frames the new one cannot
+/// pay for. A flicker inside the dwell still changes nothing, and a shrink is
+/// taken with no dead band.
 #[test]
-fn backing_off_halves_toward_the_floor_and_stops() {
+fn a_pool_or_model_that_moves_under_the_same_demand_is_replanned_after_the_dwell() {
+    use squallar_device_profile::constants::LOOP_POOL_DWELL_FRAMES;
+
+    let model = model(
+        DESKTOP_LOOP_IMAGE_SIZE,
+        NATIVE_SECTION_WIDTH,
+        DESKTOP_VOLUME_GRID_CELLS,
+        DESKTOP_MAX_LOOP_RENDER_BUDGET,
+    );
     let limits = LoopPoolLimits {
-        floor: 64 * 1024 * 1024,
-        ceiling: 512 * 1024 * 1024,
+        floor: DESKTOP_LOOP_POOL_FLOOR_BYTES,
+        ceiling: DESKTOP_LOOP_POOL_CEILING_BYTES,
     };
-    let mut pool = LoopPool::new(limits.ceiling, limits);
-    let mut seen = vec![pool.bytes()];
-    while pool.back_off(limits) {
-        seen.push(pool.bytes());
-        assert!(seen.len() < 16, "back-off did not terminate: {seen:?}");
+    let wide = LoopPool::new(limits.ceiling, limits);
+    let narrow = LoopPool::new(limits.floor, limits);
+    let one = LoopDemand {
+        plan_view_loops: 1,
+        ..LoopDemand::default()
+    };
+    let mut state = LoopPoolState::new(wide, model);
+    for _ in 0..LOOP_POOL_DWELL_FRAMES {
+        state.observe(wide, model, one);
+    }
+    let settled = state.allocation();
+    assert_eq!(settled.share_bytes, wide.bytes());
+
+    // The pool halves and comes back on alternate frames: nothing moves.
+    for frame in 0..LOOP_POOL_DWELL_FRAMES * 8 {
+        let pool = if frame % 2 == 0 { narrow } else { wide };
+        assert_eq!(
+            state.observe(pool, model, one),
+            settled,
+            "the allocation moved on frame {frame} of a pool flicker",
+        );
+    }
+
+    // Held for the dwell, the narrower pool is taken at once: a shrink.
+    for _ in 0..LOOP_POOL_DWELL_FRAMES {
+        state.observe(narrow, model, one);
+    }
+    let shrunk = state.allocation();
+    assert_eq!(shrunk.share_bytes, narrow.bytes());
+    assert!(shrunk.plan_view_frames <= settled.plan_view_frames);
+    assert_eq!(
+        shrunk.plan_view_frames, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "the floor was argued as one loop's whole span: 36 frames",
+    );
+
+    // The model moves under the same pool and demand — a re-fit halved the
+    // render budget — and after the dwell the frames are capped by the new one.
+    let halved = LoopFrameModel {
+        render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET / 2,
+        ..model
+    };
+    for _ in 0..LOOP_POOL_DWELL_FRAMES {
+        state.observe(narrow, halved, one);
     }
     assert_eq!(
-        seen,
-        vec![
-            512 * 1024 * 1024,
-            256 * 1024 * 1024,
-            128 * 1024 * 1024,
-            64 * 1024 * 1024,
-        ],
+        state.allocation().plan_view_frames,
+        DESKTOP_MAX_LOOP_RENDER_BUDGET / 2,
+        "a halved render budget did not reach the allocation in force",
     );
-    // At the floor it reports that nothing moved, which is the caller's cue not to write
-    // the same value to the config store on every subsequent loss.
-    assert!(!pool.back_off(limits));
-    assert_eq!(pool.bytes(), limits.floor);
 }
 
 /// A pane that appears and vanishes inside the dwell costs nothing at all.
@@ -801,18 +922,78 @@ mod budget_agreement {
     }
 
     use crate::budget_arms::shipped_profile;
+    use crate::loop_pool::{GRID_BYTES, LoopFrameModel};
     use squallar_device_profile::budget::{
         AdapterCeilings, BudgetLimits, Budgets, DESKTOP_CLASS_REPORT, DeviceProfile, FormFactor,
         Promotion, resolve,
     };
+    use squallar_device_profile::fit::{loop_room, need_terms};
     use squallar_device_profile::quality::DeviceClass;
+    use squallar_device_profile::scene::Capacity;
 
-    /// The pool moves with a browser promotion, on the same rung — the `LoopPool` half of
-    /// the floor crate's
-    /// `a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not`, asserted
-    /// beside the pool because the pool sits above the resolver (WO-RD).
+    /// **A 3D pane's need is priced by the raymarch's own grid arithmetic** —
+    /// the floor crate takes the function in rather than re-deriving it, and
+    /// the one it is handed is the one [`LoopFrameModel::from_budgets`] reads,
+    /// so a grid cannot be priced two ways. Every mip level as the backend
+    /// lays it out, the colour table's texture and the jitter tile, on every
+    /// arm.
     #[test]
-    fn a_promoted_browsers_pool_moves_on_the_same_rung() {
+    fn a_3d_panes_need_is_priced_by_the_raymarchs_own_grid_arithmetic() {
+        use squallar_device_profile::scene::{PaneNeed, Scene};
+
+        for arm in arms() {
+            let grid = volume_bytes(&arm);
+            assert_eq!(
+                GRID_BYTES(arm.grid_cells),
+                Some(grid),
+                "{}: the pool's pricer and the raymarch's are not one function",
+                arm.name,
+            );
+            assert_eq!(
+                LoopFrameModel::from_budgets(&arm).grid,
+                grid,
+                "{}",
+                arm.name
+            );
+            let scene = Scene {
+                panes: vec![PaneNeed {
+                    px: [1920, 1080],
+                    view: squallar_radar::types::RenderView::Volume,
+                    looping: true,
+                    loop_span_secs: 2 * 60 * 60,
+                    cadence_secs: None,
+                    overlay_frame_bytes: 0,
+                    volume_grids: 1,
+                    ground: squallar_device_profile::quality::GroundPass::Off,
+                }],
+                tile_sources: Vec::new(),
+                mirror_px: [0, 0],
+            };
+            let terms = need_terms(&scene, &arm, GRID_BYTES);
+            assert_eq!(terms.grids, grid as u64, "{}: the live grid", arm.name);
+            assert_eq!(
+                terms.loops,
+                (arm.loop_render_budget * grid) as u64,
+                "{}: a 3D loop's frames are grids at the raymarch's price",
+                arm.name,
+            );
+            assert_eq!(
+                terms.static_rasters, 0,
+                "{}: a 3D pane's picture is its offscreen",
+                arm.name
+            );
+        }
+    }
+
+    /// **The promotion no longer moves the pool for the same scene** — the
+    /// `LoopPool` half of the floor crate's
+    /// `a_desktop_class_browser_is_promoted_and_a_spec_floor_browser_is_not`,
+    /// re-argued: one loop on a promoted browser is the same 14 x 4 MiB =
+    /// 56 MiB it is on a browser at the guarantee. What the promotion buys is
+    /// resolution — the grid's cells and the raster's side — and what the
+    /// wider raster costs is room: 288 - 64 MiB against 288 - 16.
+    #[test]
+    fn a_promoted_browser_holds_the_same_loop_in_the_same_pool() {
         let web = |two_d: u32, three_d: u32| DeviceProfile {
             adapter: AdapterCeilings {
                 max_texture_dimension_2d: two_d,
@@ -833,23 +1014,50 @@ mod budget_agreement {
         ));
         assert_eq!(floor.promotion, Promotion::Floor);
         assert_eq!(promoted.promotion, Promotion::Ceiling);
-        let pool = |b: &Budgets, p: Promotion| {
-            crate::loop_pool::LoopPool::for_promotion(
-                p,
-                None,
+        let cap = Capacity::presumed(&BudgetLimits::WASM);
+        let one = super::scene_of(1);
+        let pool = |b: &Budgets| {
+            crate::loop_pool::LoopPool::for_scene(
+                &one,
+                b,
+                &cap,
                 crate::loop_pool::LoopPoolLimits::from_budgets(b),
             )
             .bytes()
         };
+        assert_eq!(
+            pool(&promoted),
+            pool(&floor),
+            "a promotion moved the pool for one and the same loop",
+        );
+        assert_eq!(pool(&floor), 14 * 4 * 1024 * 1024);
+        let cells = |b: &Budgets| b.grid_cells.iter().map(|&n| n as usize).product::<usize>();
         assert!(
-            pool(&promoted, promoted.promotion) > pool(&floor, floor.promotion),
-            "a promoted browser's grids came out of an unpromoted pool, so the \
-             loop pays for the detail in history",
+            cells(&promoted) > cells(&floor),
+            "the promotion buys nothing at all, so this test compares an arm with itself",
+        );
+        assert_eq!(
+            loop_room(&one, &floor, &cap, GRID_BYTES),
+            (288 - 16) * 1024 * 1024,
+            "a 2048 px static render beside the loop",
+        );
+        assert_eq!(
+            loop_room(&one, &promoted, &cap, GRID_BYTES),
+            (288 - 64) * 1024 * 1024,
+            "a 4096 px static render beside the loop: the promotion costs room",
         );
     }
 
     /// The stage's whole answer on one page, pinned so that a change to any rule has to
     /// come past a table someone can read.
+    ///
+    /// **The pool column stopped moving with the rung.** It is what one
+    /// two-hour loop needs on the bracket — 36 x 16 MiB = 576 MiB natively,
+    /// 14 x 4 MiB = 56 MiB on the web — whatever the machine, which is the
+    /// ruling as a column; the 3072 / 1152 / 192 a class used to be handed
+    /// were capacity presumptions wearing the pool's name. What does move with
+    /// the rung is the **room** column beside it: the allowance less the static
+    /// renders, which the promoted raster side makes smaller.
     #[test]
     fn what_five_real_machines_get() {
         let row = |limits, class, two_d, three_d| {
@@ -865,9 +1073,12 @@ mod budget_agreement {
                 ..shipped_profile(limits)
             };
             let b = resolve(&profile);
-            let pool = crate::loop_pool::LoopPool::for_promotion(
-                b.promotion,
-                None,
+            let cap = Capacity::presumed(&limits);
+            let one = super::scene_of(1);
+            let pool = crate::loop_pool::LoopPool::for_scene(
+                &one,
+                &b,
+                &cap,
                 crate::loop_pool::LoopPoolLimits::from_budgets(&b),
             )
             .bytes();
@@ -876,45 +1087,45 @@ mod budget_agreement {
                 b.grid_cells.iter().map(|&n| n as usize).product::<usize>(),
                 b.offscreen_bytes / (1024 * 1024),
                 pool / (1024 * 1024),
+                loop_room(&one, &b, &cap, GRID_BYTES) / (1024 * 1024),
                 b.raster_side_for_adapter(two_d),
             )
         };
         let d = BudgetLimits::DESKTOP;
         let w = BudgetLimits::WASM;
 
-        // machine                       | rung     | cells     | offscreen | pool | raster
+        // machine                       | rung     | cells     | offscreen | pool | room | raster
         assert_eq!(
             row(d, DeviceClass::Discrete, 32768, 16384),
-            (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+            (Promotion::Ceiling, 8_388_608, 48, 576, 3840 - 256, 8192),
             "RTX 3090 over Vulkan",
         );
         assert_eq!(
             row(d, DeviceClass::Unknown, 32768, 16384),
-            (Promotion::Ceiling, 8_388_608, 48, 3072, 8192),
+            (Promotion::Ceiling, 8_388_608, 48, 576, 3840 - 256, 8192),
             "the same RTX 3090 over GL, where the driver names it `Other` — the \
              case a class-only rule gets wrong on real hardware",
         );
         assert_eq!(
             row(d, DeviceClass::Integrated, 16384, 8192),
-            (Promotion::Step, 8_388_608, 20, 1152, 8192),
+            (Promotion::Step, 8_388_608, 20, 576, 3840 - 256, 8192),
             "a desktop integrated GPU: promoted by nothing it reports, because \
              what it reports is capacity and what holds it back is fill rate",
         );
-        // **The raster column moved from 2048 to 4096 at WS1**, and it is the
-        // only figure in this table that did. It is not a re-point: the web
-        // arm's `raster_side_ceiling_px` stopped being pinned, on the four-leg
+        // **The raster column moved from 2048 to 4096 at WS1**, on the four-leg
         // adapter measurement recorded at
-        // `constants::WASM_RASTER_SIDE_CEILING_PROMOTED`. The row below it —
-        // a browser at the WebGL2 guarantee — is unmoved, which is the half
-        // that says the software path did not come with it.
+        // `constants::WASM_RASTER_SIDE_CEILING_PROMOTED`; the room column is
+        // what that costs. The row below it — a browser at the WebGL2
+        // guarantee — is unmoved, which is the half that says the software
+        // path did not come with it.
         assert_eq!(
             row(w, DeviceClass::Unknown, 16384, 16384),
-            (Promotion::Ceiling, 3_538_944, 5, 192, 4096),
+            (Promotion::Ceiling, 3_538_944, 5, 56, 288 - 64, 4096),
             "Firefox 153 on the RTX 3090, at what it will actually allocate",
         );
         assert_eq!(
             row(w, DeviceClass::Unknown, 2048, 256),
-            (Promotion::Floor, 1_048_576, 5, 56, 2048),
+            (Promotion::Floor, 1_048_576, 5, 56, 288 - 16, 2048),
             "a browser at the WebGL2 guarantee, which keeps every byte it had",
         );
     }

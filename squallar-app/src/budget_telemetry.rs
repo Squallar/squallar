@@ -12,10 +12,11 @@
 //!
 //! **Denominators, stated once, never added.** `bracket` is the compile-time
 //! set (`Budgets::name`) and `rung` the promotion it was resolved at, `steps`
-//! the ladder rungs surrendered. `pool` is the loop pool's bracket ceiling
-//! (`Budgets::loop_pool_ceiling_bytes`) — the term `app_texture_bytes` sums,
-//! never the live pool, which `loop state:` prints in bytes — and `ceiling`
-//! is the whole-application texture ceiling (`app_texture_ceiling_bytes`).
+//! the ladder rungs `fit` shed to make the scene fit. `pool` is the **live**
+//! loop pool — what the loops need, capped by the room the scene leaves, the
+//! same figure `loop state:` prints in bytes, here in MiB — and `ceiling` is
+//! the whole-application texture ceiling (`app_texture_ceiling_bytes`), the
+//! bracket's constant and on the presumed arm the capacity itself.
 //! `vram`, `ram` and `declared` come from three different sources (measured
 //! VRAM, measured RAM, a browser's `deviceMemory` declaration) and are never
 //! summed or read as one figure; `threads` is what the host reports, not what
@@ -49,6 +50,7 @@ pub(crate) fn budget_state_line(
     budgets: &Budgets,
     profile: &DeviceProfile,
     linear: Option<LinearMemory>,
+    pool_bytes: usize,
 ) -> String {
     let mib = |bytes: u64| bytes / (1024 * 1024);
     let rung = match budgets.promotion {
@@ -67,7 +69,7 @@ pub(crate) fn budget_state_line(
          linear {}/{} MiB",
         budgets.name,
         budgets.steps_back,
-        mib(budgets.loop_pool_ceiling_bytes as u64),
+        mib(pool_bytes as u64),
         mib(budgets.app_texture_ceiling_bytes as u64),
         mib(profile.vram_bytes.unwrap_or(0)),
         mib(profile.system_ram_bytes.unwrap_or(0)),
@@ -148,9 +150,14 @@ mod tests {
         out
     }
 
+    /// The live pool the line prints beside the bracket figures: 3 GiB, a
+    /// value no shipped constant carries.
+    const POOL: usize = 3 << 30;
+
     /// A profile with a distinct value in every position the line prints, so
-    /// a transposed pair cannot read as a correct line. The two budget
-    /// figures are set directly rather than resolved, for the same reason.
+    /// a transposed pair cannot read as a correct line. The ceiling is set
+    /// directly rather than resolved, for the same reason, and the pool is
+    /// [`POOL`] — the pool is the live one, handed in, not a budget field.
     fn distinct() -> (Budgets, DeviceProfile, Option<LinearMemory>) {
         let profile = DeviceProfile {
             platform: Platform::Native,
@@ -171,7 +178,6 @@ mod tests {
             }),
         };
         let budgets = Budgets {
-            loop_pool_ceiling_bytes: 3 << 30,
             app_texture_ceiling_bytes: 3840 << 20,
             ..resolve(&profile)
         };
@@ -189,14 +195,20 @@ mod tests {
     }
 
     /// The literal pin: every figure once, in the documented order, in MiB.
+    /// `pool` is the live pool handed in, not the bracket ceiling the line
+    /// once printed: a scene's loops are what it holds.
     #[test]
     fn the_budget_state_line_reads_exactly_as_pinned() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear),
+            budget_state_line(&budgets, &profile, linear, POOL),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB",
+        );
+        // The figure follows the pool it is handed, not a field of the budgets.
+        assert!(
+            budget_state_line(&budgets, &profile, linear, 576 << 20).contains(", pool 576 MiB,"),
         );
     }
 
@@ -208,11 +220,10 @@ mod tests {
     fn an_unread_signal_prints_zero_and_no_field_is_dropped() {
         let profile = DeviceProfile::for_target();
         let budgets = Budgets {
-            loop_pool_ceiling_bytes: 3 << 30,
             app_texture_ceiling_bytes: 3840 << 20,
             ..resolve(&profile)
         };
-        let line = budget_state_line(&budgets, &profile, None);
+        let line = budget_state_line(&budgets, &profile, None, POOL);
         let (_, tail) = line
             .split_once(", vram ")
             .expect("the line carries a vram field");
@@ -234,7 +245,7 @@ mod tests {
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear),
+            budget_state_line(&budgets, &profile, linear, POOL),
             rendered(
                 &pattern("budget_state_re"),
                 &[
@@ -257,11 +268,11 @@ mod tests {
                 "700",
             ],
         );
-        assert_eq!(budget_state_line(&budgets, &profile, linear), good);
+        assert_eq!(budget_state_line(&budgets, &profile, linear, POOL), good);
         let drifted = good.replacen(" rung", "  rung", 1);
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
         assert_ne!(
-            budget_state_line(&budgets, &profile, linear),
+            budget_state_line(&budgets, &profile, linear, POOL),
             drifted,
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",

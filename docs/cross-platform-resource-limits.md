@@ -579,7 +579,7 @@ degrade smoothly before degrading discretely.** Each rung names its knob.
 | 0 | *nothing* — top rung above | — | — |
 | 1 | **3D lighting model** | `GradientShading::On → Off` (`quality.rs:129`) | The app's first rung and the reasoning is measured: on a 3090 the cloud rung is 0.766 ms dense vs 0.263 ms for the flat march at 1440×900 (`quality.rs:8`). The cheapest large saving, and the one a user is least likely to name. `quality.rs:27`: "The ladder degrades lighting before resolution". |
 | 2 | **3D offscreen resolution** | `ResolutionRung::Native → Half → Quarter` (`quality.rs:93,101`) | ~3.4× per step at ~85 % efficiency (`quality.rs:14-15`). Blurrier, still correct, still interactive. |
-| 3 | **Loop *history*, 2D before 3D** | `loop_span_secs` / `loop_frames_held`, then `loop_render_budget`; floor `MIN_LOOP_FRAMES_PER_PANE` | A shorter loop is the least destructive thing in the app: nothing on screen gets worse, there is just less of it. The pool already divides smoothly and floors. **2D loop frames go before 3D grid resolution** — §4.4. |
+| 3 | **Loop *history*, 2D before 3D** | `loop_render_budget`, halved toward `MIN_LOOP_FRAMES_PER_PANE` one halving a step; `loop_span_secs` stays the demand *(knob as landed, WO-7 2026-09-02)* | A shorter loop is the least destructive thing in the app: nothing on screen gets worse, there is just less of it. The pool already divides smoothly and floors. **2D loop frames go before 3D grid resolution** — §4.4. |
 | 4 | **Tile sharpness** *(replaces "overlay texture area")* | whole-zoom snap: `tile_zoom = zoom.floor()` for the overrunning source | Fewer, larger tiles cover the same glass; the picture is less crisp, never wrong, and the ancestor net that keeps the map from going blank is never traded — §11. Placed above raster resolution because a coarser radar raster is a *wrong-looking* picture and a softer basemap is a *softer* one. |
 | 5 | **3D grid cell budget** | `grid_cells` down the named brackets | Now the picture itself gets coarser. This is the first rung the user will call "worse", so it is deliberately late. |
 | 6 | **2D raster side** | `raster_side_ceiling_px` → the long-range floor | Has a runtime path: `squallar-app/src/app_state.rs:90-98` resolves and logs "plan views may reach N px". Late because it is the most visible. |
@@ -597,11 +597,22 @@ rung's stop steps the next one. Pinned by
 (`budget/tests.rs:768`) and
 `no_number_of_back_offs_takes_a_machine_below_its_bracket_floor` (`:811`).
 
-**What the plan adds (WO-7, WO-12).** `fit` (§9) walks this same ladder by
-arithmetic instead of by a counter, with two rungs inserted between resolution
-and grid: loop span (rung 3, 2D before 3D) and tile sharpness (rung 4). The two
-pins above **survive verbatim** as `fit`'s shed order; `deep` still has grid at
-floor and raster at the long-range floor (plan §Pins).
+**What landed (WO-7, 2026-09-02).** `fit` (§9) walks this same ladder by
+arithmetic instead of by a counter — one module-level six-rung table in
+`budget.rs`, shared by `demote` and `fit` through `step_down` — with two rungs
+inserted between resolution and grid: loop history (rung 3, one halving of
+`loop_render_budget` a step, 2D before 3D) and tile sharpness (rung 4,
+`Budgets::tile_whole_zoom`, consumed by WO-12). The two pins above kept every
+property and were **re-argued in the body, not kept verbatim**: with the
+inserted rungs the grid reaches its floor and the ladder its fixed point later
+than the 3 and 4 steps the four-rung ladder pinned — by exactly the halvings
+the bracket's render budget takes to reach the two-frame floor plus one tile
+step, a rung with nowhere to go on a bracket costing no step — and the
+resolution rung, like the history rung, is one coarsening a step, so it is two
+steps on the desktop bracket (Native to Half to Quarter) and one on the other
+two: desktop 9 (1+2+4+1+0+1, its grid is pinned), mobile 5 (0+1+3+1+0+0),
+wasm32 7 (0+1+3+1+1+1). `deep` still has grid at floor and raster at the
+long-range floor.
 
 ### 4.4 The direct competition the brief flags: 2D loop frames vs 3D grid resolution
 
@@ -620,7 +631,7 @@ They draw on the same pool. The ladder says **2D loop frames yield first**
   not a degradation ordering, and it stays — but the degradation ordering above
   it lets the 2D side shrink first.
 
-Concretely: when `fit` must cut, it cuts `loop_span_secs` toward
+Concretely: when `fit` must cut, it halves `loop_render_budget` toward
 `MIN_LOOP_FRAMES_PER_PANE` frames before it steps `grid_cells` down a bracket.
 
 ---
@@ -1111,22 +1122,45 @@ body:
 
 ```rust
 pub struct Scene { pub panes: Vec<PaneNeed>, pub tile_sources: Vec<TileNeed>, pub mirror_px: [u32; 2] }
-pub struct PaneNeed { pub px: [u32; 2], pub view: RenderView, pub loop_span_secs: usize, pub cadence_secs: Option<u32>, pub volume_grids: usize, pub ground: GroundPass }
+pub struct PaneNeed { pub px: [u32; 2], pub view: RenderView, pub looping: bool, pub loop_span_secs: usize, pub cadence_secs: Option<u32>, pub overlay_frame_bytes: usize, pub volume_grids: usize, pub ground: GroundPass }
 pub struct TileNeed { pub tiles_on_glass: usize, pub ancestor_net: usize, pub bytes_per_tile: usize }
 
-pub struct Capacity { pub gpu_bytes: Option<u64>, pub host_bytes: Option<u64>, pub source: CapacitySource }
+pub struct Capacity { pub gpu_bytes: u64, pub host_bytes: Option<u64>, pub source: CapacitySource }
 pub enum CapacitySource { Measured, Probed, Presumed }
 
+/// The raymarch's own resident-grid arithmetic, handed in: this crate sits under it.
+pub type GridBytes = fn([u32; 3]) -> Option<usize>;
+
 /// The cost of a scene at a given Budgets: every term the tree already prices.
-pub fn need(scene: &Scene, b: &Budgets) -> Need   // { gpu_bytes, host_bytes }
+pub fn need(scene: &Scene, b: &Budgets, grid_bytes: GridBytes) -> Need   // { gpu_bytes, host_bytes }
 
-/// The largest Budgets whose need fits NEED_FRACTION × capacity, shedding down the
+/// The largest Budgets whose need fits `cap.allowance()`, shedding down the
 /// existing `demote` ladder (extended) one rung at a time until it does. Pure.
-pub fn fit(scene: &Scene, limits: &BudgetLimits, cap: &Capacity) -> Budgets
+pub fn fit(scene: &Scene, profile: &DeviceProfile, cap: &Capacity, grid_bytes: GridBytes) -> Budgets
 
-pub const NEED_FRACTION: Share = Share::of(3, 4);
-pub const ECONOMY_FRACTION: Share = Share::of(9, 10);
+pub const NEED_FRACTION: (u64, u64) = (3, 4);
+pub const ECONOMY_FRACTION: (u64, u64) = (9, 10);
 ```
+
+*(as landed, WO-7 2026-09-02 — `squallar-device-profile/src/{scene,fit}.rs`)*
+Three small differences from the plan's sketch, each for a reason: `need` and
+`fit` take the grid pricer as a function (`squallar_volumetric::raymarch::
+resident_grid_bytes` on the app side) rather than re-deriving the raymarch's
+tiling arithmetic in a crate that sits under it — the volumetric suite already
+records that "the byte figure is this module's arithmetic and the resolver must
+not call up into it"; `PaneNeed` carries `looping` and the pane's measured
+`overlay_frame_bytes`, because an overlay loop's frame is the pane's own raster
+planned by a crate this one cannot see and pricing it as a radar frame is the
+4.6× under-price on wasm the pool's own tests refuse; and `fit` takes the
+`DeviceProfile` (whose `limits` it reads) so that it starts from `resolve`.
+
+**The allowance rule.** `Capacity::allowance()` is `NEED_FRACTION × gpu_bytes`
+for a **measured or probed** figure — raw hardware, needing headroom for the
+driver, the compositor and the picture in flight — and **the figure itself for
+a presumed one**: the bracket's `APP_TEXTURE_BUDGET_BYTES` constant was argued
+with its own headroom and today's sum proof already spends up to it, so the
+fraction is not applied twice. `Capacity::presumed(limits)` is that constant at
+the bracket's floor (288 / 1024 / 3840 MiB) whatever rung the class earned.
 
 `need` sums terms the tree already prices: `loop_frame_bytes`,
 `squallar_volumetric::raymarch::resident_grid_bytes` (read by
@@ -1145,8 +1179,9 @@ is a cap on what the machine may hold.
 ### 9.3 The only two fractions, and why
 
 *(plan D0, §Decisions)* `NEED_FRACTION = 3/4`: need may occupy at most 75 % of
-capacity — Metal's own working set is ~75 % of RAM on M-series, which is the one
-vendor figure for how much of a unified memory a renderer is meant to take.
+a **measured or probed** capacity — Metal's own working set is ~75 % of RAM on
+M-series, which is the one vendor figure for how much of a unified memory a
+renderer is meant to take. It is not applied to a presumed capacity (§9.2).
 `ECONOMY_FRACTION = 9/10`: economy may fill to 90 %; the last 10 % is the
 in-flight picture, the driver and the compositor.
 
@@ -1193,18 +1228,25 @@ later WO once `need` prices every term.
   `budget.rs:453-462`: 4K native is ~4.9 ms of a 16.7 ms frame on a 3090; an
   integrated desktop GPU extrapolates to 12–23 ms at 1440×900). `fit` may
   *shed* them (rungs 1–2) but never raise them past the class rung.
-- **Loop pool.** `LoopPool::new(min(Σ loop need, room), limits)` where
-  `room = NEED_FRACTION × cap − (need without loops)`; `LoopPoolState::observe`
+- **Loop pool.** `LoopPool::for_scene(scene, budgets, cap, limits)` =
+  `min(Σ loop need, room)` where `room = cap.allowance() − (need without loops)`
+  — the allowance being the constant on the presumed arm (§9.2). One two-hour
+  loop on the desktop bracket is 36 × 16 MiB = 576 MiB whatever the card; six
+  are min(3456, 3840 − 6 × 256) = 2304 MiB at the class rung; `LoopPoolState::observe`
   (`squallar-app/src/loop_pool.rs:421`) with its 15-frame dwell and 1.25×
   hysteresis stays as the live re-planner — it divides a *pool size*, which is
   the one capacity-shaped thing already in the tree, and under this plan the
-  size it divides is what the loops *need*, capped by what capacity leaves.
-  `for_promotion`, `back_off` and the `loop_pool` key retire (WO-7).
+  size it divides is what the loops *need*, capped by what capacity leaves,
+  and its dwell now keys on the pool and the frame model as well as the demand.
+  `for_promotion`, `for_device` and `back_off` retired at WO-7; the `loop_pool`
+  key is named and never read.
 - **Span.** `LOOP_SPAN_BUDGET_SECS` is 2 h / 1 h / 45 min per bracket
   (`constants.rs:167-169`) — a capacity presumption in disguise. First landings
   keep it as the per-bracket *demand*; a later WO makes the demand 2 h
   everywhere and lets `fit` shorten it, so a phone that can hold two hours gets
-  two hours.
+  two hours. What `fit` shortens today is `loop_render_budget` (§4.3 rung 3);
+  a pane's own lookback is converted at its cadence by
+  `Budgets::frames_for_span_of` and held to both.
 - **Buildings.** `squallar-buildings/src/budget.rs` `PrismCeilings.vram_bytes`
   (`:186-189`) is a 16 MiB constant and a third budget outside the system; it
   becomes `BudgetLimits.prism_geometry_bytes` pinned at 16 MiB on the presumed
@@ -1280,9 +1322,16 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   calls, bounded per frame. This is the whole response when need alone still
   fits, which is the common case ruling 5 anticipates: the picture does not
   change.
-- **(b) Lower the session's capacity presumption** to `resident_at_event × 0.9`
-  — a measurement of *this* session's wall, discarded at exit — and **re-fit**
-  the scene, which sheds rungs only if need alone no longer fits.
+- **(b) Lower the session's capacity presumption** and **re-fit** the scene,
+  which sheds rungs only if need alone no longer fits. *As landed (WO-7,
+  2026-09-02):* the presumption comes down to `allowance × ECONOMY_FRACTION`,
+  not to `resident_at_event × 0.9` — nothing in the tree measures what was
+  resident (the profile's `vram_bytes` is capacity and the upload ledgers are
+  running totals), and lowering to nine tenths of *need* can never be fitted by
+  that same need, so it would shed a rung on every event including one whose
+  whole cause was economy. The wall is therefore taken to be at most the
+  allowance in force, less the economy the eviction just took; a second event
+  lowers it again. `App::refit_under_pressure` carries the argument.
 - **(c) Restore economy and rungs** as pressure clears, in the shape
   `LoopPoolState::observe` already has (dwell, then hysteresis).
 
@@ -1308,13 +1357,22 @@ repeated launch as evidence first.
 
 ### 10.5 Pins that move
 
-*(plan §Pins)* `a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once`
-(`squallar-app/src/app/chunk_feed_precedence_tests.rs:1241`) →
-`a_lost_surface_evicts_economy_and_refits_and_writes_nothing`;
-`a_backed_off_machine_reopens_where_it_left_off` (`:1290`) →
+*(plan §Pins; names as landed at WO-7)* `a_lost_surface_steps_the_budgets_down_a_rung_and_writes_it_at_once`
+→ (WO-4) `a_lost_surface_evicts_economy_and_steps_down_and_writes_nothing` →
+`a_lost_surface_evicts_economy_and_refits_and_writes_nothing`, joined by
+`a_lost_surface_refits_a_scene_the_lowered_presumption_no_longer_holds` (a
+scene that fits the presumption to the byte, then loses a surface: the loop
+history is the first rung that pays);
+`a_backed_off_machine_reopens_where_it_left_off` → (WO-4)
+`a_reopen_starts_at_the_ladder_top_whatever_the_store_holds` →
 `a_reopen_fits_the_same_scene_to_the_same_budgets`;
-`the_ladder_position_stops_rising_once_every_rung_is_at_its_stop` (`:1316`) →
-the presumption-lowering floor. The source-scrape order pin
+`the_ladder_position_stops_rising_once_every_rung_is_at_its_stop` →
+`a_session_that_keeps_failing_settles_at_the_floor_and_never_writes` (nine
+steps on the desktop bracket, twelve tenths off the presumption);
+`an_out_of_memory_error_steps_the_ladder_once_per_frame_and_writes_nothing` →
+`an_out_of_memory_error_refits_once_per_frame_and_writes_nothing`;
+`a_memory_warning_evicts_economy_and_steps_down` →
+`a_memory_warning_evicts_economy_and_refits`. The source-scrape order pin
 `the_device_profile_is_folded_in_before_any_budget_is_spent` (`:1214-1237`:
 `self.update_device_profile(` precedes `LoopPoolLimits::from_budgets` and
 `self.budgets.quality_ceiling` in `install_volume_bridge`) is untouched.

@@ -218,13 +218,24 @@ pub struct App {
     budgets: squallar_device_profile::budget::Budgets,
     /// Everything known about the machine, and the only input [`Self::budgets`] has.
     device_profile: squallar_device_profile::budget::DeviceProfile,
-    /// The application's whole loop allowance, and the hysteresis that governs how it is
-    /// divided.
+    /// The application's whole loop allowance — what the scene's loops need,
+    /// capped by the room the rest of the scene leaves under
+    /// [`Self::capacity`], re-derived on every loop walk — and the hysteresis
+    /// that governs how it is divided.
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
-    /// Whether [`Self::loop_pool`] is already the answer for this machine.
-    loop_pool_sized: bool,
+    /// **This session's GPU capacity presumption**, lowered by pressure and
+    /// never raised: `None` until an event, then the allowance in force at
+    /// the event less one economy fraction. Discarded at exit — nothing is
+    /// learned across sessions.
+    session_capacity: Option<u64>,
+    /// The budgets the scene has been asking for, and for how many
+    /// consecutive frames. `fit` is pure and cheap, so it is re-run on every
+    /// loop walk; a different answer is adopted only once it has held for the
+    /// pool's own dwell, so a pane that flickers into existence for a frame
+    /// moves no budget.
+    pending_fit: Option<(squallar_device_profile::budget::Budgets, u32)>,
     /// **What the loops were holding at the last pool observation** — the pane
     /// half of [`crate::loop_telemetry`]'s reading, counted on
     /// `App::loop_demand`'s existing walk rather than on one of its own, and
@@ -526,9 +537,9 @@ impl App {
         device_profile.declared_ram_bytes = signals.declared_ram_bytes;
         device_profile.parallelism = signals.parallelism;
         device_profile.form_factor = signals.form_factor;
-        // Nothing is learned across sessions: every launch starts at the ladder
-        // top, and what pressure teaches lives in this memo for the process only.
-        device_profile.memo = Some(squallar_device_profile::budget::BudgetMemo::default());
+        // Nothing is learned across sessions: every launch resolves the class
+        // rung and lets `fit` shed from there for the scene it finds, and what
+        // pressure teaches lowers this session's capacity presumption only.
         let budgets = squallar_device_profile::budget::resolve(&device_profile);
         let render = RenderDispatcher::with_budgets(&budgets);
 
@@ -593,8 +604,9 @@ impl App {
             platform.kv().as_deref(),
         );
 
-        // The floor until the adapter answers; `install_volume_bridge` sizes it
-        // from the device class once. A stale size in the store is not read.
+        // The floor until the first loop walk: nothing loops before the first
+        // frame, and `observe_loop_demand` re-derives the pool from the scene
+        // every frame after it. A stale size in the store is not read.
         let loop_pool_limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
         let loop_pool = crate::loop_pool::LoopPool::new(loop_pool_limits.floor, loop_pool_limits);
 
@@ -621,7 +633,8 @@ impl App {
                 loop_pool,
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
-            loop_pool_sized: false,
+            session_capacity: None,
+            pending_fit: None,
             loop_counts: crate::loop_telemetry::LoopState::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
             input,
@@ -1007,54 +1020,83 @@ impl App {
             max_texture_dimension_3d: limits.max_texture_dimension_3d,
         };
         self.adopt_gpu_capacity(capacity);
-        let resolved = squallar_device_profile::budget::resolve(&self.device_profile);
+        // The class rung, shed for the scene on screen: `fit` starts where the
+        // adapter's report puts the budgets and takes rungs only while the
+        // scene's need is over what this session presumes it can hold.
+        let scene = self.scene_of();
+        let resolved = squallar_device_profile::fit::fit(
+            &scene,
+            &self.device_profile,
+            &self.capacity(),
+            crate::loop_pool::GRID_BYTES,
+        );
         if resolved != self.budgets {
             log::info!(
-                "Budgets: {:?} on a {class:?} adapter reporting {} px 2D and {} px 3D textures \
-                 and {}: {:?} grid cells, {} MiB of offscreen, {} MiB of 3D texture",
+                "Budgets: {:?} rung {} on a {class:?} adapter reporting {} px 2D and {} px 3D \
+                 textures and {}: {:?} grid cells, {} MiB of offscreen, {} MiB of 3D texture, \
+                 {} textured loop frames",
                 resolved.promotion,
+                resolved.steps_back,
                 limits.max_texture_dimension_2d,
                 limits.max_texture_dimension_3d,
                 describe_gpu_capacity(capacity),
                 resolved.grid_cells,
                 resolved.offscreen_bytes / (1024 * 1024),
                 resolved.volume_texture_bytes / (1024 * 1024),
+                resolved.loop_render_budget,
             );
         }
-        self.budgets = resolved;
-
-        // **The raster ceiling is re-derived here, not only in `AppState::new`.**
-        // `AppState` computed it from the budgets this build resolved before it
-        // had met an adapter — `Promotion::Floor` on every target, because
-        // `DeviceProfile::for_target` carries the WebGL2 guarantee. The adapter
-        // has now answered, and on a browser that is the only thing that ever
-        // separates a workstation GPU from a blocklisted driver. Without this
-        // the web bracket's promotion would resolve correctly and reach
-        // nothing: the dispatcher would keep offering the floor for the whole
-        // life of the process.
-        let reported = limits.max_texture_dimension_2d;
-        let promoted_side = resolved.raster_side_for_adapter(reported);
-        if let Some(state) = self.state.as_mut()
-            && state.raster_side_ceiling_px != promoted_side
-        {
-            log::info!(
-                "plan views may now reach {promoted_side} px, up from {}: a {class:?} adapter \
-                 reporting {reported} px 2D textures resolved to {:?}",
-                state.raster_side_ceiling_px,
-                resolved.promotion,
-            );
-            state.raster_side_ceiling_px = promoted_side;
-            self.render.set_raster_side_ceiling_px(promoted_side);
-        }
+        self.adopt_budgets(resolved);
     }
 
     /// Fold the bridge's GPU capacity reading into the profile, as plain data.
-    /// `resolve` reads none of it yet — the floor crate's matrix holds the
-    /// budgets byte-identical with and without it — so this moves no budget;
-    /// it is the figure the `budget state:` line prints as `vram`. A reader
-    /// that stops answering leaves the field unread rather than stale.
+    /// `fit` reads none of it yet — the floor crate's matrix holds the budgets
+    /// byte-identical with and without it — so this moves no budget; it is
+    /// the figure the `budget state:` line prints as `vram`. A reader that
+    /// stops answering leaves the field unread rather than stale.
     fn adopt_gpu_capacity(&mut self, reading: Option<(u64, GpuCapacitySource)>) {
         self.device_profile.vram_bytes = reading.map(|(bytes, _source)| bytes);
+    }
+
+    /// **What this session takes the GPU to hold.** The presumed arm: the
+    /// bracket's whole-application constant, held to whatever pressure has
+    /// taught this session. The measured figure the profile carries
+    /// (`vram_bytes`) is not spent here yet.
+    pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
+        squallar_device_profile::scene::Capacity::presumed(&self.device_profile.limits)
+            .held_to(self.session_capacity)
+    }
+
+    /// Make `budgets` the budgets in force, and re-derive what hangs off them.
+    ///
+    /// **The raster ceiling is re-derived here, not only in `AppState::new`.**
+    /// `AppState` computed it from the budgets this build resolved before it
+    /// had met an adapter — `Promotion::Floor` on every target, because
+    /// `DeviceProfile::for_target` carries the WebGL2 guarantee. Once the
+    /// adapter has answered that report is, on a browser, the only thing that
+    /// ever separates a workstation GPU from a blocklisted driver; without
+    /// this the web bracket's promotion would resolve correctly and reach
+    /// nothing, the dispatcher offering the floor for the whole life of the
+    /// process. And the ladder's last rung walks the same figure *down*, which
+    /// has to reach the dispatcher the same way.
+    pub(super) fn adopt_budgets(&mut self, budgets: squallar_device_profile::budget::Budgets) {
+        self.budgets = budgets;
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let reported = state.device.limits().max_texture_dimension_2d;
+        let side = budgets.raster_side_for_adapter(reported);
+        if state.raster_side_ceiling_px != side {
+            log::info!(
+                "plan views may now reach {side} px, from {}: an adapter reporting {reported} \
+                 px 2D textures at {:?} rung {}",
+                state.raster_side_ceiling_px,
+                budgets.promotion,
+                budgets.steps_back,
+            );
+            state.raster_side_ceiling_px = side;
+            self.render.set_raster_side_ceiling_px(side);
+        }
     }
 
     fn install_volume_bridge(&mut self) {
@@ -1070,21 +1112,24 @@ impl App {
 
         self.update_device_profile(class);
 
-        // The same signal, spent a second time on a different question, and the *only* one
-        // there is for capacity: wgpu 29.0.4 reports no memory on any backend.
-        if !self.loop_pool_sized {
-            self.loop_pool_sized = true;
-            self.loop_pool = crate::loop_pool::LoopPool::for_promotion(
-                self.budgets.promotion,
-                None,
-                crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
-            );
-            log::info!(
-                "Loop pool: {} MiB for a {class:?} adapter at {:?}",
-                self.loop_pool.bytes() / (1024 * 1024),
-                self.budgets.promotion,
-            );
-        }
+        // The pool follows the scene, not the class: what its loops need,
+        // capped by the room the rest leaves under this session's capacity.
+        // Re-derived on every loop walk; sized here once so the first figure
+        // is logged beside the adapter that earned the budgets it came from.
+        let scene = self.scene_of();
+        self.loop_pool = crate::loop_pool::LoopPool::for_scene(
+            &scene,
+            &self.budgets,
+            &self.capacity(),
+            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
+        );
+        log::info!(
+            "Loop pool: {} MiB for {} pane(s) on a {class:?} adapter at {:?}, {} MiB presumed",
+            self.loop_pool.bytes() / (1024 * 1024),
+            scene.panes.len(),
+            self.budgets.promotion,
+            self.capacity().gpu_bytes / (1024 * 1024),
+        );
 
         let Some(state) = self.state.as_mut() else {
             return;

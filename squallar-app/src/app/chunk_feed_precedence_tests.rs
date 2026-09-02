@@ -1268,31 +1268,86 @@ fn seed_render_cache(app: &mut App) {
     );
 }
 
-/// **A lost surface evicts economy, steps the whole budget set down one rung,
-/// and writes nothing.** Nothing is learned across sessions: the rung lives in
-/// the device profile's memo for this process, and the store never hears of it.
+/// A headless application with `panes` KTLX plan-view panes, the first
+/// `looping` of them running a two-hour loop with no cadence yet — each wants
+/// the whole render budget — so on the desktop bracket the scene costs
+/// `looping x 36 x 16 MiB` of loop frames beside `panes x 256 MiB` of static
+/// render. Restored from the store the way a real launch restores its layout.
+fn app_with_looping_panes(platform: TestBridge, panes: usize, looping: usize) -> App {
+    use squallar_egui::UI_CONFIG_KEY;
+    use squallar_kv::KvStore;
+
+    let store = platform.store();
+    let listed = (0..panes)
+        .map(|_| r#"{"site":"KTLX"}"#)
+        .collect::<Vec<_>>()
+        .join(",");
+    store
+        .store(
+            UI_CONFIG_KEY,
+            &format!(r#"{{"pane_count":{panes},"site":"KTLX","panes":[{listed}]}}"#),
+        )
+        .expect("the memory store cannot fail");
+    let mut app = headless(platform);
+    assert_eq!(
+        app.gui.pane_count(),
+        panes,
+        "precondition: the fixture must really have {panes} panes",
+    );
+    app.render.ensure_pane_count(panes);
+    let site = squallar_radar::sites::get_radar_site("KTLX").expect("KTLX is a known site");
+    for idx in 0..looping {
+        *app.gui.pane_mut(idx).unwrap().time_state_mut(&known::RADAR) =
+            squallar_egui::radar_layer::begin_loop(
+                7200,
+                site,
+                squallar_radar::types::RenderView::PlanView,
+            );
+    }
+    assert_eq!(
+        app.scene_of()
+            .panes
+            .iter()
+            .filter(|pane| pane.looping)
+            .count(),
+        looping,
+        "precondition: the scene does not see the loops the fixture started",
+    );
+    app
+}
+
+/// **A lost surface evicts economy, lowers the session's capacity presumption,
+/// re-fits the scene to it, and writes nothing.** The headless application's
+/// scene is one pane and nothing looping — 256 MiB of static render against a
+/// 3840 MiB presumption — so the eviction is the whole answer: the presumption
+/// comes down one economy fraction to 3456 MiB, the scene still fits it, and
+/// **no rung moves**. Nothing is learned across sessions: the presumption lives
+/// on the `App` for this process, and the store never hears of it.
 #[test]
-fn a_lost_surface_evicts_economy_and_steps_down_and_writes_nothing() {
+fn a_lost_surface_evicts_economy_and_refits_and_writes_nothing() {
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_device_profile::quality::GradientShading;
     use squallar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();
     let mut app = headless(platform);
-
-    app.loop_pool = crate::loop_pool::LoopPool::for_promotion(
-        squallar_device_profile::budget::Promotion::Ceiling,
-        None,
-        crate::loop_pool::LoopPoolLimits::from_budgets(&app.budgets),
-    );
     seed_render_cache(&mut app);
     let before = app.budgets;
-    let pool_before = app.loop_pool.bytes();
+    let pool_before = app.loop_pool;
+    let presumed = app.capacity().allowance();
     assert_eq!(
         before.quality_ceiling.shading,
         GradientShading::On,
         "precondition: this build's desktop bracket starts at the cloud rung",
     );
+    assert_eq!(
+        app.session_capacity, None,
+        "precondition: a fresh session presumes the bracket"
+    );
+    let scene = app.scene_of();
+    assert_eq!(scene.panes.len(), 1);
+    assert!(scene.panes.iter().all(|pane| !pane.looping));
 
     app.on_pressure(crate::pressure::Pressure::SurfaceLost);
 
@@ -1303,23 +1358,23 @@ fn a_lost_surface_evicts_economy_and_steps_down_and_writes_nothing() {
     );
     assert_eq!(app.render.extract_cache_len(), 0);
     assert_eq!(
-        app.budgets.quality_ceiling.shading,
-        GradientShading::Off,
-        "a lost surface left the most expensive rung in the application in \
-         place, so the next one costs the same and the ladder never runs",
+        app.session_capacity,
+        Some(presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0),
+        "the session's presumption did not come down by one economy fraction",
     );
     assert_eq!(
-        app.budgets.offscreen_bytes, before.offscreen_bytes,
-        "the first rung took two things at once, so a device that only needed \
-         to give up its lighting also lost its resolution",
+        app.budgets, before,
+        "a scene that still fits the lowered presumption was shed a rung anyway: \
+         with 256 MiB of need against 3456 MiB the eviction was the whole answer",
     );
-    assert!(
-        app.loop_pool.bytes() < pool_before,
-        "the pool did not halve beside it",
+    assert_eq!(app.budgets.steps_back, 0);
+    assert_eq!(
+        app.loop_pool, pool_before,
+        "nothing loops, so the pool had nothing to follow",
     );
-    assert_eq!(app.budgets.steps_back, 1);
-    // Nothing is learned across sessions (user ruling, 2026-09-01): the rung
-    // is this process's alone, and the store has no entry to carry it.
+    // Nothing is learned across sessions (user ruling, 2026-09-01): the
+    // presumption is this process's alone, and the store has no entry to
+    // carry it.
     assert_eq!(
         store.load(crate::budget_memo::BUDGET_MEMO_KEY),
         None,
@@ -1332,15 +1387,82 @@ fn a_lost_surface_evicts_economy_and_steps_down_and_writes_nothing() {
     );
 }
 
-/// **A reopen starts at the ladder top whatever the store holds.** A stale
-/// entry from an older install is ignored, not honoured — and not deleted
-/// either, since the store cannot.
+/// **A scene that fits exactly, then a lost surface: the re-fit sheds the loop
+/// history first.** Four two-hour loops beside two still panes cost
+/// 4 x 576 + 6 x 256 = 3840 MiB — the desktop presumption to the byte — so
+/// they fit at the class rung and nothing is shed. The event lowers the
+/// presumption to 3456 MiB; the ladder's first three steps are 3D rungs that
+/// take nothing from a 2D scene — lighting, then resolution twice — and the
+/// fourth halves the loop history to 18 frames: 4 x 288 + 1536 = 2688 MiB fits. The grid, the raster and the tiles
+/// are untouched, and the pool follows the loops down: min(4 x 288, 3456 -
+/// 1536) = 1152 MiB.
+#[test]
+fn a_lost_surface_refits_a_scene_the_lowered_presumption_no_longer_holds() {
+    use crate::loop_pool::GRID_BYTES;
+    use squallar_device_profile::fit::{fit, need};
+    use squallar_device_profile::quality::{GradientShading, ResolutionRung};
+
+    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 4);
+    let scene = app.scene_of();
+    let at_the_class_rung = need(&scene, &app.budgets, GRID_BYTES).gpu_bytes;
+    assert_eq!(at_the_class_rung, (4 * 36 * 16 + 6 * 256) * MIB);
+    assert_eq!(
+        at_the_class_rung,
+        app.capacity().allowance(),
+        "precondition: the scene fits the presumption exactly",
+    );
+    assert_eq!(
+        fit(&scene, &app.device_profile, &app.capacity(), GRID_BYTES),
+        app.budgets,
+        "precondition: a scene that fits is left at the class rung",
+    );
+    let before = app.budgets;
+
+    app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+
+    assert_eq!(
+        app.budgets.steps_back, 4,
+        "lighting, resolution twice, one halving of the loop history",
+    );
+    assert_eq!(app.budgets.quality_ceiling.shading, GradientShading::Off);
+    assert_eq!(
+        app.budgets.quality_ceiling.resolution,
+        ResolutionRung::Quarter
+    );
+    assert_eq!(
+        app.budgets.loop_render_budget,
+        before.loop_render_budget / 2,
+        "the loop history is the first rung that lowers a 2D scene's need",
+    );
+    assert_eq!(app.budgets.grid_cells, before.grid_cells);
+    assert_eq!(
+        app.budgets.raster_side_ceiling_px,
+        before.raster_side_ceiling_px
+    );
+    assert!(!app.budgets.tile_whole_zoom);
+    let after = need(&app.scene_of(), &app.budgets, GRID_BYTES).gpu_bytes;
+    assert_eq!(after, (4 * 18 * 16 + 6 * 256) * MIB);
+    assert!(after <= app.capacity().allowance());
+    assert_eq!(
+        app.loop_pool.bytes() as u64,
+        4 * 18 * 16 * MIB,
+        "the pool did not follow the loops down: min(4 x 288, 3456 - 1536)",
+    );
+}
+
+/// **A reopen fits the same scene to the same budgets, whatever the store
+/// holds.** Determinism replaces persistence: `fit` is pure, so two fresh
+/// applications on one bracket resolve identical budgets and pools with
+/// nothing remembered between them, and a stale entry from an older install is
+/// ignored, not honoured — and not deleted either, since the store cannot.
 ///
 /// The seeded pool size sits strictly between the desktop floor and ceiling,
 /// so honouring it would be visible: a value at or under the floor would be
-/// held to the floor and read exactly like the class pick.
+/// held to the floor and read exactly like the scene's own answer.
 #[test]
-fn a_reopen_starts_at_the_ladder_top_whatever_the_store_holds() {
+fn a_reopen_fits_the_same_scene_to_the_same_budgets() {
+    use crate::loop_pool::GRID_BYTES;
+    use squallar_device_profile::fit::fit;
     use squallar_device_profile::quality::GradientShading;
     use squallar_kv::KvStore;
 
@@ -1376,10 +1498,31 @@ fn a_reopen_starts_at_the_ladder_top_whatever_the_store_holds() {
         GradientShading::On,
     );
     assert_eq!(
+        reopened.session_capacity, None,
+        "a capacity presumption outlived the session that learned it",
+    );
+    assert_eq!(
         reopened.loop_pool, fresh.loop_pool,
         "a stale pool size in the store was honoured",
     );
     assert_ne!(reopened.loop_pool.bytes(), seeded);
+    // The property a memo used to carry, now carried by arithmetic: the same
+    // scene against the same capacity fits to the same budgets, twice.
+    let scene = reopened.scene_of();
+    assert_eq!(
+        scene,
+        fresh.scene_of(),
+        "two fresh applications see two scenes"
+    );
+    let first = fit(
+        &scene,
+        &reopened.device_profile,
+        &reopened.capacity(),
+        GRID_BYTES,
+    );
+    let second = fit(&scene, &fresh.device_profile, &fresh.capacity(), GRID_BYTES);
+    assert_eq!(first, second, "one scene, one capacity, two answers");
+    assert_eq!(first, reopened.budgets);
     // Ignored is not deleted: the entries are still there, and harmless.
     assert_eq!(
         store.load(crate::budget_memo::BUDGET_MEMO_KEY).as_deref(),
@@ -1391,18 +1534,31 @@ fn a_reopen_starts_at_the_ladder_top_whatever_the_store_holds() {
     );
 }
 
-/// **A machine that keeps failing settles rather than counting for ever**,
-/// and never writes.
+/// **A session that keeps failing settles at the ladder's floor rather than
+/// counting for ever**, and never writes. Six two-hour loops cost 4992 MiB at
+/// the class rung; each event lowers the presumption by a tenth — 3456, 3110,
+/// 2799, 2519, 2267, 2041, 1837, 1653 MiB — and the re-fit follows it down the
+/// ladder: 18 frames, then 9, 4 and 2, the tiles snapped, the raster to 4096,
+/// at which point 6 x (2 x 16 + 64) = 576 MiB fits every presumption twelve
+/// events reach and the rung stays at the ladder's length — nine on this
+/// bracket: lighting, resolution twice, four halvings, the snap, a pinned grid
+/// that costs no step, the raster. The rung never comes back up under pressure,
+/// and the presumption is exactly twelve tenths off, in integer steps.
 #[test]
-fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
+fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
+    use squallar_device_profile::constants::{ECONOMY_FRACTION, MIN_LOOP_FRAMES_PER_PANE};
+    use squallar_device_profile::fit::every_rung_at_its_stop;
     use squallar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();
-    let mut app = headless(platform);
+    let mut app = app_with_looping_panes(platform, 6, 6);
+    let presumed = app.capacity().allowance();
 
+    let mut rungs = Vec::new();
     for _ in 0..12 {
         app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+        rungs.push(app.budgets.steps_back);
     }
     let settled = app.budgets.steps_back;
     assert!(
@@ -1411,10 +1567,24 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
          ladder at all or a failure counter wearing one as a hat",
     );
     assert_eq!(
+        settled, 9,
+        "lighting, resolution twice, four halvings of the history, the snap, a pinned \
+         grid that costs no step, the raster: {rungs:?}",
+    );
+    assert!(
+        rungs.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the rung came back up under pressure: {rungs:?}",
+    );
+    assert!(every_rung_at_its_stop(
+        &app.budgets,
+        &app.device_profile.limits
+    ));
+    assert_eq!(
         store.load(crate::budget_memo::BUDGET_MEMO_KEY),
         None,
         "twelve pressure events, and one of them wrote the store",
     );
+    assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
     let shipped = squallar_device_profile::budget::BudgetLimits::for_target();
     assert_eq!(app.budgets.grid_cells, shipped.grid_cells.floor);
     assert_eq!(app.budgets.offscreen_bytes, shipped.offscreen_bytes.floor);
@@ -1422,50 +1592,74 @@ fn the_ladder_position_stops_rising_once_every_rung_is_at_its_stop() {
         app.budgets.raster_side_ceiling_px,
         shipped.long_range_image_side_px.floor,
     );
+    assert_eq!(app.budgets.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+    assert!(app.budgets.tile_whole_zoom);
+    let mut expected = presumed;
+    for _ in 0..12 {
+        expected = expected / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+    }
+    assert_eq!(app.session_capacity, Some(expected));
 }
 
 /// **An out-of-memory error, however many times the device raised it in one
-/// frame, is one rung on that frame — and writes nothing.**
+/// frame, is one event on that frame — one lowering of the presumption, one
+/// re-fit — and writes nothing.** Six two-hour loops never fitted the 3840 MiB
+/// presumption, so the re-fit against 3456 MiB sheds to 18 frames at step 4;
+/// two events would have reached 3110 MiB and step 5. The next frame, with
+/// nothing new noted, holds.
 ///
 /// The counter is process-global; this is the only test in this binary that
 /// notes into it or takes from it, and the frame path that takes it never
 /// runs headless.
 #[test]
-fn an_out_of_memory_error_steps_the_ladder_once_per_frame_and_writes_nothing() {
+fn an_out_of_memory_error_refits_once_per_frame_and_writes_nothing() {
     use squallar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();
-    let mut app = headless(platform);
+    let mut app = app_with_looping_panes(platform, 6, 6);
     assert_eq!(app.budgets.steps_back, 0);
 
     squallar_gpu::pressure::note_out_of_memory();
     squallar_gpu::pressure::note_out_of_memory();
     app.absorb_gpu_pressure();
     assert_eq!(
-        app.budgets.steps_back, 1,
-        "two errors on one frame are one rung, not two",
+        app.budgets.steps_back, 4,
+        "two errors on one frame are one event, not two",
+    );
+    assert_eq!(app.budgets.loop_render_budget, 18);
+    assert_eq!(
+        app.session_capacity,
+        Some(3456 * MIB),
+        "two errors on one frame lowered the presumption twice",
     );
 
-    // The next frame, with nothing new noted: the ladder holds.
+    // The next frame, with nothing new noted: the presumption and the budgets
+    // hold.
     app.absorb_gpu_pressure();
-    assert_eq!(app.budgets.steps_back, 1);
+    assert_eq!(app.budgets.steps_back, 4);
+    assert_eq!(app.session_capacity, Some(3456 * MIB));
 
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
     assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
 }
 
-/// **A platform memory warning evicts economy and steps down**, and what it
+/// **A platform memory warning evicts economy and re-fits**, and what it
 /// evicts leaves through the deferred-drop path rather than on this thread.
+/// The headless scene fits its lowered presumption, so the eviction is the
+/// whole answer and the budgets stand.
 ///
 /// `memory_warning` itself is one line handing `Pressure::MemoryWarning` to
 /// the handler; it takes an `ActiveEventLoop` no host test can build, so the
 /// handler is driven directly and the wiring is read from the source.
 #[test]
-fn a_memory_warning_evicts_economy_and_steps_down() {
+fn a_memory_warning_evicts_economy_and_refits() {
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
+
     let mut app = headless(TestBridge::desktop());
     seed_render_cache(&mut app);
-    let before = app.budgets.steps_back;
+    let before = app.budgets;
+    let presumed = app.capacity().allowance();
 
     app.on_pressure(crate::pressure::Pressure::MemoryWarning);
 
@@ -1474,7 +1668,14 @@ fn a_memory_warning_evicts_economy_and_steps_down() {
         0,
         "the render cache survived a memory warning",
     );
-    assert_eq!(app.budgets.steps_back, before + 1);
+    assert_eq!(
+        app.session_capacity,
+        Some(presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0),
+    );
+    assert_eq!(
+        app.budgets, before,
+        "one still pane fits the lowered presumption; the eviction was the whole answer",
+    );
 
     let handler = include_str!("../app.rs")
         .split_once("fn memory_warning(")
@@ -1926,13 +2127,19 @@ fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
     }
 }
 
-/// **The heap watermark at the action line evicts economy and steps the ladder
-/// down once**, on the telemetry tick, from a reading rather than a failure —
-/// and a second tick at the same reading does nothing more, because a wasm
-/// heap that has acted once would otherwise act on every tick for the rest of
-/// the session. Nothing is written to the store.
+/// **The heap watermark at the action line evicts economy and lowers the
+/// session's presumption once**, on the telemetry tick, from a reading rather
+/// than a failure — and a second tick at the same reading does nothing more,
+/// because a wasm heap that has acted once would otherwise act on every tick
+/// for the rest of the session. Nothing is written to the store.
+///
+/// The per-event observable is the presumption, not a rung: the headless
+/// scene is one still pane, 256 MiB against a presumption that comes down to
+/// 3456 MiB, so the re-fit moves no budget and the eviction is the whole
+/// answer — the case ruling 5 anticipates.
 #[test]
-fn a_heap_watermark_at_the_act_line_evicts_economy_and_steps_down_once() {
+fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_once() {
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_kv::KvStore;
 
     let platform = TestBridge::web().with_linear_memory(worker_heap(891));
@@ -1940,12 +2147,20 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_steps_down_once() {
     let mut app = headless(platform);
     seed_render_cache(&mut app);
     assert_eq!(app.budgets.steps_back, 0);
+    assert_eq!(app.session_capacity, None);
+    let presumed = app.capacity().allowance();
+    let lowered_once = presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
 
     tick(&mut app);
 
     assert_eq!(
-        app.budgets.steps_back, 1,
-        "a reading at the action line did not step the ladder",
+        app.session_capacity,
+        Some(lowered_once),
+        "a reading at the action line did not lower the presumption",
+    );
+    assert_eq!(
+        app.budgets.steps_back, 0,
+        "one still pane fits the lowered presumption; the eviction was the whole answer",
     );
     assert_eq!(
         app.render.render_cache.entry_count(),
@@ -1957,8 +2172,9 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_steps_down_once() {
     seed_render_cache(&mut app);
     tick(&mut app);
     assert_eq!(
-        app.budgets.steps_back, 1,
-        "the same reading on the next tick stepped the ladder again",
+        app.session_capacity,
+        Some(lowered_once),
+        "the same reading on the next tick lowered the presumption again",
     );
     assert_eq!(
         app.render.render_cache.entry_count(),
@@ -1975,6 +2191,7 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_steps_down_once() {
 /// `max(page, worker)` are exercised across this test and the one above.
 #[test]
 fn a_heap_that_grows_past_the_refire_step_acts_again() {
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
     use squallar_kv::KvStore;
 
@@ -1989,21 +2206,29 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
     };
     gauge.set(page(891 * MIB));
     let mut app = headless(platform);
+    let lowered = |events: u32| {
+        let mut cap = app.capacity().allowance();
+        for _ in 0..events {
+            cap = cap / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+        }
+        Some(cap)
+    };
+    let (once, twice) = (lowered(1), lowered(2));
 
     tick(&mut app);
-    assert_eq!(app.budgets.steps_back, 1);
+    assert_eq!(app.session_capacity, once);
 
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES - 1));
     tick(&mut app);
     assert_eq!(
-        app.budgets.steps_back, 1,
+        app.session_capacity, once,
         "growth short of the refire step acted again",
     );
 
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
     tick(&mut app);
     assert_eq!(
-        app.budgets.steps_back, 2,
+        app.session_capacity, twice,
         "growth past the refire step did not act again",
     );
     assert_eq!(

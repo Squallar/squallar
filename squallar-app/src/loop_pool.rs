@@ -4,20 +4,32 @@
 //! The unit of division is a **loop**, not a pane: two 3D panes orbiting one
 //! volume are one resident set in one store, so they cost one share.
 //!
-//! wgpu 29.0.4 exposes no memory capacity on any backend and WebGL2 reports no
-//! device type, so each target's pool is a floor/ceiling around a runtime
-//! class, with [`LoopPool::back_off`] halving toward the floor on a device
-//! error or a lost surface as the backstop. `mobile` is a cfg for native
-//! Android/iOS: a browser on a phone is `wasm32`, not `mobile`.
+//! The pool's size is **what the loops need**, capped by the room the rest of
+//! the scene leaves under the device's capacity — [`LoopPool::for_scene`], on
+//! `squallar_device_profile::fit`'s arithmetic — and held inside the bracket's
+//! floor and ceiling. A device with more room holds no more loop than the scene
+//! asks for; one with less holds what it can, and [`LoopPool::plan`] divides
+//! that. Nothing about the pool is remembered across sessions, and what
+//! pressure teaches lowers the session's capacity presumption rather than the
+//! pool itself. `mobile` is a cfg for native Android/iOS: a browser on a phone
+//! is `wasm32`, not `mobile`.
 
-use squallar_device_profile::budget::{Budgets, Promotion};
+use squallar_device_profile::budget::Budgets;
 use squallar_device_profile::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
     LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, RENDER_HEIGHT,
     RENDER_WIDTH, VOLUME_GRID_CELLS,
 };
-use squallar_device_profile::quality::DeviceClass;
+use squallar_device_profile::fit::{GridBytes, loop_pool_bytes};
+use squallar_device_profile::scene::{Capacity, Scene};
 use squallar_radar::types::RenderView;
+
+/// The raymarch's own resident-grid arithmetic — every mip level as the
+/// backend lays it out, the colour table's texture, the jitter tile — handed to
+/// the floor crate's `need` and `fit`, which price a grid through it rather
+/// than re-deriving it. The same function [`LoopFrameModel::from_budgets`]
+/// reads, so the pool and the need cannot price one grid two ways.
+pub const GRID_BYTES: GridBytes = squallar_volumetric::raymarch::resident_grid_bytes;
 
 /// The key a stale pool size sits under in an older install's store, in MiB.
 /// Never read, never written: the pool is sized from the device class at every
@@ -320,45 +332,27 @@ impl LoopPool {
         }
     }
 
-    /// What this device gets, before anything has been rendered.
-    pub fn for_device(
-        class: DeviceClass,
-        remembered: Option<usize>,
+    /// **The pool a scene asks for**: what its loops need — every looping
+    /// pane's frames for its span at its frame's cost — capped by the room the
+    /// rest of the scene leaves under `cap`'s allowance, and held inside
+    /// `limits`. One two-hour loop on the desktop bracket is 36 x 16 MiB =
+    /// 576 MiB whatever card it runs on; six are 3456 MiB, or the room if that
+    /// is less. The class of the machine is not an input: the same scene
+    /// costs the same bytes on every bracket, and what a bigger card buys is
+    /// room, never a longer loop than was asked for.
+    pub fn for_scene(
+        scene: &Scene,
+        budgets: &Budgets,
+        cap: &Capacity,
         limits: LoopPoolLimits,
     ) -> Self {
-        Self::for_promotion(Promotion::for_class(class), remembered, limits)
-    }
-
-    /// The same, at the [`Promotion`] the whole budget set was resolved at.
-    pub fn for_promotion(
-        promotion: Promotion,
-        remembered: Option<usize>,
-        limits: LoopPoolLimits,
-    ) -> Self {
-        if let Some(bytes) = remembered {
-            return Self::new(bytes, limits);
-        }
-        let bytes = match promotion {
-            Promotion::Ceiling => limits.ceiling,
-            Promotion::Step => limits.floor.saturating_mul(2),
-            Promotion::Floor => limits.floor,
-        };
-        Self::new(bytes, limits)
+        let bytes = loop_pool_bytes(scene, budgets, cap, GRID_BYTES);
+        Self::new(usize::try_from(bytes).unwrap_or(usize::MAX), limits)
     }
 
     /// The pool, in bytes.
     pub fn bytes(&self) -> usize {
         self.bytes
-    }
-
-    /// Step down after the device refused, and say whether anything moved.
-    pub fn back_off(&mut self, limits: LoopPoolLimits) -> bool {
-        let reduced = limits.hold(self.bytes / 2);
-        if reduced >= self.bytes {
-            return false;
-        }
-        self.bytes = reduced;
-        true
     }
 
     /// Divide the pool among the loops that want one.
@@ -393,24 +387,39 @@ impl LoopPool {
     }
 }
 
+/// What an allocation was planned against: the pool, the frame model and the
+/// demand. A change in any of the three is a change the dwell and the dead
+/// band answer — the pool moves when the scene's need or its room does, the
+/// model when the budgets re-fit, the demand when a loop starts or stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Planned {
+    pool: LoopPool,
+    model: LoopFrameModel,
+    demand: LoopDemand,
+}
+
 /// The allocation in force, and how long the panes have disagreed with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopPoolState {
     allocation: LoopAllocation,
-    /// The demand [`Self::allocation`] was last settled against — a growth
-    /// refused by the dead band still moves this, so a declined demand is not
+    /// What [`Self::allocation`] was last settled against — a growth refused
+    /// by the dead band still moves this, so a declined ask is not
     /// reconsidered on every frame for ever.
-    settled_for: LoopDemand,
-    pending: Option<(LoopDemand, u32)>,
+    settled_for: Planned,
+    pending: Option<(Planned, u32)>,
 }
 
 impl LoopPoolState {
     /// Start with nothing looping, which is what a fresh application has.
     pub fn new(pool: LoopPool, model: LoopFrameModel) -> Self {
-        let demand = LoopDemand::default();
+        let planned = Planned {
+            pool,
+            model,
+            demand: LoopDemand::default(),
+        };
         Self {
-            allocation: pool.plan(model, demand),
-            settled_for: demand,
+            allocation: pool.plan(model, planned.demand),
+            settled_for: planned,
             pending: None,
         }
     }
@@ -420,29 +429,34 @@ impl LoopPoolState {
         self.allocation
     }
 
-    /// Fold one frame's demand into the allocation.
+    /// Fold one frame's pool, model and demand into the allocation.
     pub fn observe(
         &mut self,
         pool: LoopPool,
         model: LoopFrameModel,
         demand: LoopDemand,
     ) -> LoopAllocation {
-        if demand == self.settled_for {
+        let asked = Planned {
+            pool,
+            model,
+            demand,
+        };
+        if asked == self.settled_for {
             self.pending = None;
             return self.allocation;
         }
         self.pending = match self.pending {
-            Some((pending, frames)) if pending == demand => Some((demand, frames + 1)),
-            _ => Some((demand, 1)),
+            Some((pending, frames)) if pending == asked => Some((asked, frames + 1)),
+            _ => Some((asked, 1)),
         };
-        if let Some((demand, frames)) = self.pending
+        if let Some((asked, frames)) = self.pending
             && frames >= LOOP_POOL_DWELL_FRAMES
         {
-            let bare = pool.plan(model, demand);
+            let bare = asked.pool.plan(asked.model, asked.demand);
             if Self::worth_taking(self.allocation, bare) {
                 self.allocation = bare;
             }
-            self.settled_for = demand;
+            self.settled_for = asked;
             self.pending = None;
         }
         self.allocation

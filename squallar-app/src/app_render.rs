@@ -1,11 +1,14 @@
 use super::frame_pump::PumpPhase;
-use crate::loop_pool::{LoopAllocation, LoopDemand, LoopFrameModel};
+use crate::loop_pool::{GRID_BYTES, LoopAllocation, LoopDemand, LoopFrameModel, LoopPool};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use squallar_device_profile::constants::{
-    DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS,
-    MAX_LOOP_VOLUME_BUILDS_PER_FRAME, MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
+    DEFAULT_LOOP_SPEED_FPS, ECONOMY_FRACTION, LOOP_POOL_DWELL_FRAMES,
+    MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS, MAX_LOOP_VOLUME_BUILDS_PER_FRAME,
+    MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
 };
+use squallar_device_profile::fit::{fit, need};
+use squallar_device_profile::scene::Scene;
 use squallar_egui::actions::GuiAction;
 use squallar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use squallar_egui::radar_layer;
@@ -1680,6 +1683,7 @@ impl super::App {
                     &self.budgets,
                     &self.device_profile,
                     linear,
+                    self.loop_pool.bytes(),
                 )),
         );
         // The wasm heap watermark, on the same tick. The bridge answers the
@@ -3873,13 +3877,17 @@ impl super::App {
     /// downloaded scan data but no rendered texture yet.
     ///
     /// **Also counts what the loops are holding**, for
-    /// [`crate::loop_telemetry`]. Not a second concern bolted on: this is the
-    /// one walk over every pane the frame already makes for the pool's sake,
-    /// and the alternative is two more reaches into the `Gui` in a file whose
-    /// coupling ceiling is permanent and already at its measured value. The
-    /// counting is a handful of integer reads over the layers this walk is
-    /// touching anyway.
-    fn loop_demand(&self) -> (LoopDemand, crate::loop_telemetry::LoopState) {
+    /// [`crate::loop_telemetry`], **and describes the scene** the budget
+    /// system prices — one [`squallar_device_profile::scene::PaneNeed`] per
+    /// pane. Neither is a second concern bolted on: this is the one walk over
+    /// every pane the frame already makes for the pool's sake, and the
+    /// alternative is more reaches into the `Gui` in a file whose coupling
+    /// ceiling is permanent and already at its measured value. Both are a
+    /// handful of integer reads over the layers this walk is touching anyway.
+    fn loop_demand(&self) -> (LoopDemand, crate::loop_telemetry::LoopState, Scene) {
+        use squallar_device_profile::quality::GroundPass;
+        use squallar_device_profile::scene::PaneNeed;
+
         let mut demand = LoopDemand::default();
         let mut counts = crate::loop_telemetry::LoopState {
             // Every pane carries the same copy of the posture — see
@@ -3887,6 +3895,23 @@ impl super::App {
             // first is the setting.
             advance_us: 0,
             ..crate::loop_telemetry::LoopState::default()
+        };
+        // Every pane is priced at the window's own size. The offscreen a 3D
+        // pane raymarches into is held to the offscreen budget whatever size
+        // goes in, so a whole-window figure over-prices a split pane by at
+        // most that budget and never under-prices one. `[0, 0]` before a
+        // surface exists.
+        let px = self.state.as_ref().map_or([0, 0], |state| {
+            [state.surface_config.width, state.surface_config.height]
+        });
+        let mut scene = Scene {
+            panes: Vec::new(),
+            // The tile term arrives with the tile cache's byte accounting;
+            // until then no source is listed here and the host figure reads 0.
+            tile_sources: Vec::new(),
+            mirror_px: self
+                .mirror_plan_applied
+                .map_or([0, 0], |plan| plan.size_in_pixels),
         };
         let mut seen: Vec<(
             String,
@@ -3900,6 +3925,20 @@ impl super::App {
                     .min(u128::from(u64::MAX)) as u64;
             }
             counts.count_pane(pane);
+            let view = pane.render_view();
+            let mut pane_need = PaneNeed {
+                px,
+                view,
+                looping: false,
+                loop_span_secs: pane.time.span_secs as usize,
+                cadence_secs: None,
+                overlay_frame_bytes: 0,
+                volume_grids: usize::from(view == squallar_radar::types::RenderView::Volume),
+                // The terrain ground pass is decided by the volume bridge from
+                // the height field it holds, which this walk cannot see; the
+                // offscreen term is held to the offscreen budget either way.
+                ground: GroundPass::Off,
+            };
             let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
                 // **A pane looping something other than radar is a share
@@ -3910,14 +3949,25 @@ impl super::App {
                 // loop in the application, twice over with two such panes. A
                 // pane whose radar IS looping is already counted below, and
                 // `layer_share` divides that one share across the layers it
-                // animates rather than the pane asking twice.
-                if pane.animating_layers().next().is_some() {
+                // animates rather than the pane asking twice. Its need is
+                // priced at the layer's own frame — measured off the texture
+                // it is drawing with — over the wider of the pane's lookback
+                // and the window the layer's listing was asked over.
+                if let Some(slot) = pane.animating_layers().next() {
                     demand.add_overlay_pane();
+                    pane_need.looping = true;
+                    pane_need.cadence_secs = slot.time.cadence_secs;
+                    pane_need.loop_span_secs =
+                        pane_need.loop_span_secs.max(slot.time.span_secs as usize);
+                    pane_need.overlay_frame_bytes =
+                        overlay_frame_bytes(pane, &slot.id, &self.budgets);
                 }
+                scene.panes.push(pane_need);
                 continue;
             }
             let already = if ls.view == squallar_radar::types::RenderView::Volume {
                 let Some(product) = loop_product(ls) else {
+                    scene.panes.push(pane_need);
                     continue;
                 };
                 let key = (
@@ -3934,20 +3984,80 @@ impl super::App {
                 false
             };
             demand.add(ls.view, already);
+            // A second pane orbiting a volume already counted holds no set of
+            // its own: its frames and its live grid are the first pane's.
+            pane_need.looping = !already;
+            pane_need.cadence_secs = ls.cadence_secs;
+            if already {
+                pane_need.volume_grids = 0;
+            }
+            scene.panes.push(pane_need);
         }
-        (demand, counts)
+        (demand, counts, scene)
+    }
+
+    /// What is on screen, in the terms the budget system prices — built on
+    /// the one pane walk [`Self::loop_demand`] already makes.
+    pub(super) fn scene_of(&self) -> Scene {
+        self.loop_demand().2
     }
 
     /// The division of the pool in force, after the dwell and the dead band
-    /// have had their say.
+    /// have had their say. The pool itself follows the scene: what its loops
+    /// need, capped by the room the rest of it leaves under this session's
+    /// capacity — never the class's ceiling.
     pub(super) fn observe_loop_demand(&mut self) -> LoopAllocation {
-        let (demand, counts) = self.loop_demand();
+        let (demand, counts, scene) = self.loop_demand();
         self.loop_counts = counts;
+        self.refit_to_scene(&scene);
+        self.loop_pool = LoopPool::for_scene(
+            &scene,
+            &self.budgets,
+            &self.capacity(),
+            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
+        );
         self.loop_pool_state.observe(
             self.loop_pool,
             LoopFrameModel::from_budgets(&self.budgets),
             demand,
         )
+    }
+
+    /// **Re-fit the budgets to the scene**, adopting a different answer only
+    /// once it has held for the pool's own dwell. `fit` is pure and a few
+    /// multiplications per pane, so it runs on every loop walk; the dwell is
+    /// what keeps a pane that flickers into existence for a frame from moving
+    /// the 3D quality ceiling with it. A scene that shrinks gets its rungs back
+    /// the same way — computed live from scene and capacity, no counter.
+    pub(super) fn refit_to_scene(&mut self, scene: &Scene) {
+        let wanted = fit(scene, &self.device_profile, &self.capacity(), GRID_BYTES);
+        if wanted == self.budgets {
+            self.pending_fit = None;
+            return;
+        }
+        let held = match self.pending_fit {
+            Some((pending, frames)) if pending == wanted => frames + 1,
+            _ => 1,
+        };
+        if held < LOOP_POOL_DWELL_FRAMES {
+            self.pending_fit = Some((wanted, held));
+            return;
+        }
+        self.pending_fit = None;
+        log::info!(
+            "Budgets: rung {} for the scene ({} panes, {} MiB of need against {} MiB presumed): \
+             {:?} 3D quality ceiling, {} MiB of offscreen, {:?} grid cells, {} textured loop \
+             frames",
+            wanted.steps_back,
+            scene.panes.len(),
+            need(scene, &wanted, GRID_BYTES).gpu_bytes / (1024 * 1024),
+            self.capacity().allowance() / (1024 * 1024),
+            wanted.quality_ceiling,
+            wanted.offscreen_bytes / (1024 * 1024),
+            wanted.grid_cells,
+            wanted.loop_render_budget,
+        );
+        self.adopt_budgets(wanted);
     }
 
     /// The allocation in force. See [`Self::observe_loop_demand`].
@@ -3957,10 +4067,11 @@ impl super::App {
 
     /// **Answer memory pressure, within this session.** Economy first — the
     /// shared render cache, the plan-view extractions, and the loop caches'
-    /// data no live frame names — then one rung down the budget ladder, with
-    /// the position held in the device profile's memo for the life of the
-    /// process. Nothing is written to the store: a reopen starts at the ladder
-    /// top whatever this session learned.
+    /// data no live frame names — then the session's capacity presumption
+    /// comes down and the scene is re-fitted to it, which sheds a rung only
+    /// when need alone no longer fits. Nothing is written to the store: a
+    /// reopen fits the same scene to the same budgets whatever this session
+    /// learned.
     ///
     /// The payloads freed here leave through `offload::discard_each`, never
     /// dropped on this thread: a shared render is `side^2 x 4` bytes twice
@@ -3982,7 +4093,7 @@ impl super::App {
         squallar_worker::offload::discard_each("pressure-extract-cache", extracts);
         self.evict_unneeded_loop_scans();
 
-        let rung = self.step_ladder_down(cause);
+        let rung = self.refit_under_pressure(cause);
         log::warn!("{}", crate::pressure::pressure_line(cause, reclaimed, rung));
     }
 
@@ -3998,62 +4109,60 @@ impl super::App {
         }
     }
 
-    /// One rung down for this session, and the rung the ladder now stands on.
-    fn step_ladder_down(&mut self, cause: crate::pressure::Pressure) -> u32 {
-        // The bracket the *resolved* budgets carry, not `for_target`'s: the two
-        // are the same figures today because no bracket promotes the pool, and
-        // reading the resolved one is what keeps them the same when one does.
-        if self
-            .loop_pool
-            .back_off(crate::loop_pool::LoopPoolLimits::from_budgets(
-                &self.budgets,
-            ))
-        {
-            let bytes = self.loop_pool.bytes();
+    /// **Lower this session's capacity presumption and re-fit the scene to
+    /// it**; the rung the ladder now stands on.
+    ///
+    /// **Why the allowance and not the need.** The design sketched
+    /// `resident_at_event x 0.9`. Nothing in this tree measures what was
+    /// resident — the profile's `vram_bytes` is capacity and the upload ledgers
+    /// are running totals — and the one figure to hand, the scene's need, is
+    /// the wrong stand-in: nine tenths of a need can never be fitted by that
+    /// same need, so a presumption set there would shed a rung on every event,
+    /// including one whose whole cause was economy the eviction has already
+    /// taken. The wall is therefore taken to be at most the allowance in force,
+    /// and the presumption comes down by one economy fraction: what sat above
+    /// need at the event is what the eviction gave back. The scene then re-fits
+    /// against it, which sheds rungs only when need alone no longer fits; when
+    /// the eviction was the whole answer nothing moves and the log says so, and
+    /// a second event lowers the presumption again. Never persisted: the
+    /// presumption dies with the process.
+    fn refit_under_pressure(&mut self, cause: crate::pressure::Pressure) -> u32 {
+        let lowered = self.capacity().allowance() / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+        self.session_capacity = Some(lowered);
+        let scene = self.scene_of();
+        let refitted = fit(&scene, &self.device_profile, &self.capacity(), GRID_BYTES);
+        let needed = need(&scene, &refitted, GRID_BYTES).gpu_bytes / (1024 * 1024);
+        if refitted == self.budgets {
             log::info!(
-                "Loop pool: backed off to {} MiB after {}",
-                bytes / (1024 * 1024),
+                "Budgets: held at rung {} after {}: the scene's {needed} MiB fits the {} MiB \
+                 this session now presumes",
+                self.budgets.steps_back,
                 cause.label(),
+                lowered / (1024 * 1024),
             );
-            if let Some(memo) = self.device_profile.memo.as_mut() {
-                memo.loop_pool_bytes = Some(bytes);
-            }
-        }
-
-        let memo = self
-            .device_profile
-            .memo
-            .get_or_insert_with(Default::default);
-        let stepped = memo.steps_back.saturating_add(1);
-        memo.steps_back = stepped;
-        let resolved = squallar_device_profile::budget::resolve(&self.device_profile);
-        // Compared with the count itself held equal, because the count is a
-        // field of what is being compared: `steps_back` always differs after an
-        // increment, and what is being asked is whether *the budgets* moved.
-        let same_but_for_the_count = squallar_device_profile::budget::Budgets {
-            steps_back: self.budgets.steps_back,
-            ..resolved
-        };
-        if same_but_for_the_count == self.budgets {
-            // Every rung this ladder owns is already at its stop. Roll the count
-            // back rather than holding a number that describes nothing, so the
-            // memo stays a position on the ladder.
-            let settled = stepped.saturating_sub(1);
-            if let Some(memo) = self.device_profile.memo.as_mut() {
-                memo.steps_back = settled;
-            }
-            return settled;
+            return self.budgets.steps_back;
         }
         log::info!(
-            "Budgets: stepped down to rung {stepped} after {}: {:?} 3D quality \
-             ceiling, {} MiB of offscreen, {:?} grid cells",
+            "Budgets: re-fitted to rung {} after {}: {needed} MiB against the {} MiB this \
+             session now presumes; {:?} 3D quality ceiling, {} MiB of offscreen, {} textured \
+             loop frames, {:?} grid cells",
+            refitted.steps_back,
             cause.label(),
-            resolved.quality_ceiling,
-            resolved.offscreen_bytes / (1024 * 1024),
-            resolved.grid_cells,
+            lowered / (1024 * 1024),
+            refitted.quality_ceiling,
+            refitted.offscreen_bytes / (1024 * 1024),
+            refitted.loop_render_budget,
+            refitted.grid_cells,
         );
-        self.budgets = resolved;
-        stepped
+        self.adopt_budgets(refitted);
+        self.pending_fit = None;
+        self.loop_pool = LoopPool::for_scene(
+            &scene,
+            &self.budgets,
+            &self.capacity(),
+            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
+        );
+        self.budgets.steps_back
     }
 
     /// **One raster per loop frame of a non-radar layer that has none** — the

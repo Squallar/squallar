@@ -940,7 +940,7 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
 
     // `loop_demand` counts the loop-telemetry level on the same walk; this
     // test is about the pool's demand, which is the first half.
-    let (demand, counts) = app.loop_demand();
+    let (demand, counts, _scene) = app.loop_demand();
     assert_eq!(
         counts.layers, 1,
         "the same walk's telemetry half must see the one animating layer this \

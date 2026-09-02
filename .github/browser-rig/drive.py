@@ -2869,9 +2869,10 @@ var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) fram
 // a group on any shared probe, for `ground_stroke_draws_re`'s reason. The
 // bracket group is a WORD: `native_row.py` `int()`s every group of the
 // probes in its running-totals loop, so this one has its own arm there.
-// Denominators, never added: `pool` is the loop pool's bracket ceiling (the
-// term `app_texture_bytes` sums, NOT the live pool `loop state:` prints in
-// B), `ceiling` the whole-app texture ceiling; `vram`/`ram`/`declared` are
+// Denominators, never added: `pool` is the LIVE loop pool in MiB -- what the
+// scene's loops need, capped by the room the rest of the scene leaves; the
+// same figure `loop state:` prints in B -- and `ceiling` the whole-app
+// texture ceiling, the bracket's constant; `vram`/`ram`/`declared` are
 // three sources (measured VRAM, measured RAM, a browser's `deviceMemory`
 // declaration) and never one figure; `linear` is the page instance's heap
 // over the rasterization worker's -- two instances, two ceilings.
@@ -6681,8 +6682,8 @@ def run_smoke(args):
                  s.get("advance_us")))
     if fl.get("budget_state"):
         b = fl["budget_state"]
-        # A LEVEL at the end of the leg. `pool`/`ceiling` are the bracket's
-        # figures, never the live pool; vram/ram/declared are three sources
+        # A LEVEL at the end of the leg. `pool` is the live loop pool in MiB
+        # and `ceiling` the bracket's constant; vram/ram/declared are three sources
         # and never one figure; the two `linear` figures are two instances.
         print("[%s] SUMMARY [%s] budget state [level, end of leg]: bracket %s, "
               "rung %s, steps %s; pool %s MiB, ceiling %s MiB; vram %s MiB, "

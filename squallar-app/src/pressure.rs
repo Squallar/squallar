@@ -2,10 +2,11 @@
 //! what it gave.
 //!
 //! Pressure is answered within the session. Economy — what is resident beyond
-//! what the scene on screen needs — is evicted first; then the budget ladder
-//! steps down one rung, held in the device profile's memo for the life of the
-//! process; and nothing about either is written to the store. A reopen starts
-//! at the ladder top whatever this session learned: capacity is measured,
+//! what the scene on screen needs — is evicted first; then the session's
+//! capacity presumption comes down and the scene is re-fitted to it, which
+//! sheds a rung of the budget ladder only when need alone no longer fits; and
+//! nothing about either is written to the store. A reopen fits the same scene
+//! to the same budgets whatever this session learned: capacity is measured,
 //! probed or presumed at startup, never remembered.
 //!
 //! Four causes reach [`Pressure`]: a lost surface, a wgpu allocation failure,

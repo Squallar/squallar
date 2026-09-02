@@ -1531,8 +1531,10 @@ def print_row(row):
             % (ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[10], ls[11], ls[16])
         )
     # The machine and the bracket the budgets came from, on every scene. A
-    # LEVEL at the end of the log; `pool`/`ceiling` are the bracket's figures,
-    # never the live pool. Absent when the log has no `budget state:` line: a
+    # LEVEL at the end of the log; `pool` is the LIVE loop pool in MiB (what the
+    # scene's loops need, capped by the room the rest of it leaves -- the same
+    # figure `loop state:` prints in B) and `ceiling` the bracket's constant.
+    # Absent when the log has no `budget state:` line: a
     # binary older than the line, printed as such and never as zeroes. `.get`
     # because a row built before the field existed reads the same way.
     bs = row.get("budget_state")
