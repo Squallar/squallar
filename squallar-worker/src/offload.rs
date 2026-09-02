@@ -301,7 +301,7 @@ impl JobRequest {
 pub(crate) use crate::job_registry::job_codecs;
 
 /// The dense wire code of `row`: its index in the composed registry, **plus
-/// one** — codes `1..=15`. Plus one so **0 stays unallocated and a zeroed buffer
+/// one** — codes `1..=16`. Plus one so **0 stays unallocated and a zeroed buffer
 /// never decodes**. Panics on a row outside the registry: the caller resolved it
 /// with [`row_for`] from the same registry, so a miss is a build defect and a
 /// wrong code byte would be a payload decoded as another kind.

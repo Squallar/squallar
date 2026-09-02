@@ -4677,6 +4677,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "squallar-basemap"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "log",
+ "rayon",
+ "squallar-geo",
+ "squallar-source",
+ "walkers",
+]
+
+[[package]]
 name = "squallar-buildings"
 version = "0.1.0"
 dependencies = [
@@ -4713,6 +4725,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "squallar-basemap",
  "squallar-device-profile",
  "squallar-elevation",
  "squallar-geo",
@@ -4958,6 +4971,7 @@ dependencies = [
  "log",
  "nexrad-model",
  "serde_json",
+ "squallar-basemap",
  "squallar-buildings",
  "squallar-device-profile",
  "squallar-elevation",

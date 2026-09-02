@@ -1,0 +1,42 @@
+# The basemap row: the committed vector style, and the codec that lets one
+# batch of MVT bodies be parsed and tessellated where every other heavy job
+# runs instead of on the browser's frame thread.
+#
+# A LEAF by construction. It must never depend on `squallar-egui`: the reply
+# direction is composed into `squallar_worker::job_registry`, and the worker
+# sits below the UI layer. What it names is the job vocabulary
+# (squallar-source), the map widget whose types the wire carries (walkers), and
+# egui for the shape types themselves -- the same premultiply-style exception
+# `squallar-worker` already records for `egui`.
+[package]
+name = "squallar-basemap"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+squallar-source = { workspace = true }
+# `mvt` unconditionally, as `squallar-egui` enables it: `parse` and `styled`
+# ARE this crate's job, and the 22 expression tests behind that feature are the
+# behaviour pin under them.
+walkers = { workspace = true, features = ["mvt"] }
+egui = { workspace = true }
+log = { workspace = true }
+# One batch is `par_iter`'d across the worker's pool: eight tiles serial on the
+# frame thread become eight tiles wide off it. Declared exactly as
+# `squallar-radar` declares it, and for the same reason -- see the note on the
+# wasm32 section below.
+rayon = "=1.12.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rayon's locks spin where waiting is forbidden; additive on top of the plain
+# entry above, exactly as `squallar-radar` does it. Cargo unifies features
+# across target sections, so this selects the browser's lock strategy without
+# giving the native arm a second rayon.
+rayon = { version = "=1.12.0", features = ["web_spin_lock"] }
+
+[dev-dependencies]
+# The run envelope's `bounds` term is `squallar_geo::GeoBounds`, and the tests
+# have to build one to call `encode`/`decode`. A dev-dependency and not a
+# normal one: nothing in this crate's own code names a geographic bound —
+# shapes are in MVT extent units, and the envelope crosses this row verbatim.
+squallar-geo = { workspace = true }

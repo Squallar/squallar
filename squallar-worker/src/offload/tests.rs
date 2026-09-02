@@ -882,6 +882,35 @@ pub(super) fn a_building_job() -> JobRequest {
     )
 }
 
+/// The basemap row's fixture: a style key and one tile body.
+///
+/// Literal throughout, for the reason the height and buildings fixtures are:
+/// nothing in this row's digest may be what a platform's libm answered. The
+/// body is `A_BUILDING_TILE_MVT` again — this row frames tile bytes opaquely
+/// and never interprets them, so what it needs from a fixture is a length and
+/// a byte pattern, not a tile that styles to anything.
+///
+/// Two disabled source-layers, not zero: the shipping default filter is
+/// non-empty (`building` and `poi` are off), so an empty set here would pin a
+/// framing the app never posts.
+pub(super) fn a_basemap_tiles_job() -> JobRequest {
+    JobRequest::describe(
+        squallar_basemap::jobs::BasemapTilesJob {
+            style: squallar_basemap::jobs::StyleKey {
+                is_dark: true,
+                disabled: ["building".to_owned(), "poi".to_owned()].into(),
+            },
+            tiles: vec![squallar_basemap::jobs::TileBody {
+                z: 14,
+                x: 8529,
+                y: 5975,
+                mvt: Arc::new(A_BUILDING_TILE_MVT.to_vec()),
+            }],
+        },
+        ceiling_only_geometry(0),
+    )
+}
+
 /// Every kind survives its own wire form — and **every kind is here**, which is
 /// the half review found silently open: the roster was a bare array, so a row
 /// added without a fixture was simply never round-tripped.
@@ -911,6 +940,7 @@ fn every_job_kind_survives_the_wire_format() {
         an_overlay_model_job(),
         a_height_job(),
         a_building_job(),
+        a_basemap_tiles_job(),
     ];
     let covered: std::collections::BTreeSet<&str> = jobs.iter().map(|job| job.kind()).collect();
     let composed: std::collections::BTreeSet<&str> = job_codecs().map(|row| row.label).collect();
@@ -957,7 +987,7 @@ fn an_unallocated_code_is_refused() {
 #[test]
 fn every_code_is_the_literal_index_and_label_this_registry_composes() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(u8, &str); 15] = [
+    let table: [(u8, &str); 16] = [
         (1, "radar"),
         (2, "level3"),
         (3, "level3/vild"),
@@ -973,6 +1003,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (13, "overlay/model"),
         (14, "terrain/heights"),
         (15, "buildings/prisms"),
+        (16, "basemap/tiles"),
     ];
 
     // Against the composed registry: row `i` is labelled what this table says
@@ -1000,7 +1031,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
 
     // And the encoder really posts those bytes — the table could agree with
     // the registry while the framing that writes the byte does not.
-    let framing: [(JobRequest, u8); 15] = [
+    let framing: [(JobRequest, u8); 16] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 3),
@@ -1016,6 +1047,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (an_overlay_model_job(), 13),
         (a_height_job(), 14),
         (a_building_job(), 15),
+        (a_basemap_tiles_job(), 16),
     ];
     assert_eq!(
         framing.len(),
@@ -1789,10 +1821,18 @@ fn framing_of(request: &JobRequest) -> Vec<u8> {
             .input
             .to_bytes()
             .len(),
-        // Opaque payloads: an archive, a Level III object or a rectangle of
-        // Terrain-RGB tile bodies, which this codec frames and never
-        // interprets.
-        "level3" | "level3/vild" | "decode" | "terrain/heights" | "buildings/prisms" => 0,
+        // Opaque payloads: an archive, a Level III object, a rectangle of
+        // Terrain-RGB tile bodies, or a batch of MVT bodies, which this codec
+        // frames and never interprets. `basemap/tiles` belongs here and not
+        // above: its request nests no layout with a pin of its own -- the
+        // style key is a bool and a set of names this row spells itself, and
+        // the tile bodies are protobuf that only `walkers::mvt::parse` reads,
+        // on the far side of `run`. Its REPLY does have a layout of its own,
+        // and it is pinned where the buildings row's is -- by that crate's own
+        // round-trip identity suite, not by `WIRE_REPLY_ROWS`, which covers
+        // the two overlay reply forms and nothing else.
+        "level3" | "level3/vild" | "decode" | "terrain/heights" | "buildings/prisms"
+        | "basemap/tiles" => 0,
         // Every byte is an overlay row's own: the geometry header and the
         // row's fields are all this wire's framing, with no nested payload
         // carrying a pin of its own.
@@ -1836,6 +1876,10 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         // stored bits rather than over what a platform's `sin`/`atan2`
         // answered.
         a_building_job(),
+        // And literal again for the same reason: the style key is two spelled
+        // names and a bool, and the one tile body is a byte array, so this
+        // row's digest is over stored bits.
+        a_basemap_tiles_job(),
     ];
     let rows: Vec<String> = requests
         .iter()
@@ -1877,7 +1921,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 #[test]
 fn every_codec_row_has_a_parity_test() {
     // Deliberately spelled out, label beside test name, in registry order.
-    let named: [(&str, &str); 15] = [
+    let named: [(&str, &str); 16] = [
         (
             "radar",
             "the_radar_render_is_byte_identical_direct_and_via_the_wire",
@@ -1938,6 +1982,10 @@ fn every_codec_row_has_a_parity_test() {
             "buildings/prisms",
             "the_building_mesh_is_byte_identical_direct_and_via_the_wire",
         ),
+        (
+            "basemap/tiles",
+            "the_basemap_tiling_is_byte_identical_direct_and_via_the_wire",
+        ),
     ];
     assert_eq!(
         job_codecs().count(),
@@ -1969,6 +2017,50 @@ fn every_codec_row_has_a_parity_test() {
     }
 }
 
+/// The parity gate for the basemap row.
+///
+/// **Byte-identity over the ENCODED REPLY, not over the value.** `BasemapTiles`
+/// carries `walkers::ShapeOrText`, which derives no `PartialEq` — and comparing
+/// debug strings would compare a rendering rather than the bytes the page
+/// actually reads. `encode_out` is what crosses the port, so that is what is
+/// compared, head and all four tails.
+#[test]
+fn the_basemap_tiling_is_byte_identical_direct_and_via_the_wire() {
+    let job = a_basemap_tiles_job();
+    let bytes = job.to_bytes();
+    assert_eq!(
+        JobRequest::from_bytes(&bytes).as_ref(),
+        Some(&job),
+        "the basemap job does not survive its own wire form",
+    );
+
+    let encoded = |out: JobResult| -> (Vec<u8>, Vec<Vec<u8>>) {
+        let tiles = out
+            .and_then(|out| out.take::<squallar_basemap::jobs::BasemapTiles>())
+            .expect("the basemap row answers its own output type");
+        // Non-vacuity: a batch that styled nothing would be byte-identical for
+        // the wrong reason. The fixture body is a real `building` layer, and
+        // the fixture style leaves that layer on.
+        assert!(
+            tiles.tiles.iter().any(|t| t.shapes.is_some()),
+            "the fixture styled no tile, so byte-identity would be vacuous",
+        );
+        let (mut head, mut tails) = (Vec::new(), Vec::new());
+        <squallar_basemap::jobs::BasemapTilesJob as squallar_source::job::JobOutCodec>::encode_out(
+            tiles, &mut head, &mut tails,
+        );
+        (head, tails)
+    };
+
+    let direct = encoded(execute(&job));
+    let via_wire = encoded(execute_bytes(&bytes));
+    assert_eq!(
+        via_wire, direct,
+        "the basemap tiling differs between the direct call and the wire — the \
+         two paths have stopped being one tessellator",
+    );
+}
+
 /// **No `run` body reads a clock** — the grep ratchet over EVERY jobs module
 /// the registry composes (WO-M7.2, the pwa_assets source-scrape shape).
 #[test]
@@ -1976,7 +2068,7 @@ fn no_run_body_reads_a_clock() {
     // `include_str!` rather than a runtime read: the compiler re-runs this
     // test's crate when either module changes, so the ratchet cannot go stale
     // against the file it scans.
-    let modules: [(&str, &str); 4] = [
+    let modules: [(&str, &str); 5] = [
         (
             "squallar-radar/src/jobs.rs",
             include_str!("../../../squallar-radar/src/jobs.rs"),
@@ -1992,6 +2084,10 @@ fn no_run_body_reads_a_clock() {
         (
             "squallar-buildings/src/jobs.rs",
             include_str!("../../../squallar-buildings/src/jobs.rs"),
+        ),
+        (
+            "squallar-basemap/src/jobs.rs",
+            include_str!("../../../squallar-basemap/src/jobs.rs"),
         ),
     ];
     // The roster is the registry's, not a hand-kept list: `job_registry.rs`

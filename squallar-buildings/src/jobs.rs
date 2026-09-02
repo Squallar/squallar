@@ -16,19 +16,28 @@
 //! # The second payload class, costed
 //!
 //! The height row ships PNG tiles because there is no decoded terrain anywhere
-//! on the page. This row ships **MVT tiles that the page has already decoded
+//! on the page. This row ships **MVT tiles that have already been decoded
 //! once**, and that is a real cost rather than a convenience:
 //!
-//! * the parsed-tile cache is page-side (`squallar_egui::tile_source`'s
-//!   `SharedParsedTiles`) and a worker cannot read it — on the browser arm it
-//!   is a different address space entirely;
 //! * `vendor/walkers`' `ParsedTile` has no accessor that would yield a
-//!   feature's geometry even to a caller on the right side of that boundary
-//!   (see [`crate::footprint`]).
+//!   feature's geometry to any caller at all (see [`crate::footprint`]), so
+//!   even a parse in the same address space is unreadable here;
+//! * the two parses are not in the same address space anyway. This note used
+//!   to say the reason was that the parsed-tile cache is *page-side* while the
+//!   worker is a different address space. **That half is now out of date**:
+//!   `squallar_basemap::jobs` moved the basemap parse and tessellation into the
+//!   worker, so on the browser arm a parsed vector tile is held beside this row
+//!   rather than across a port from it. The accessor above is what still makes
+//!   it unreachable, and it is enough on its own.
 //!
 //! So the bytes go across and are parsed a second time. What that buys is that
 //! the second parse happens beside the tessellation, on the worker, instead of
 //! the tessellation happening beside the cache, on the frame thread.
+//!
+//! **A follow-on this makes possible, deliberately not taken here**: with both
+//! rows on the worker, a shared parse would remove the second one entirely. It
+//! needs an accessor on `ParsedTile` that does not exist, in a vendored crate a
+//! parallel lane is currently changing, so it is named rather than done.
 //!
 //! **The size of what crosses, measured, and it is bigger than an earlier
 //! draft of this paragraph said.** `BuildingTile::mvt` is the **decompressed**

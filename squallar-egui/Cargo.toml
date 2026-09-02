@@ -25,6 +25,9 @@ gps-serial = ["squallar-nmea-serial/serial"]
 
 [dependencies]
 web-time = { workspace = true }
+# The basemap row: the committed style (moved here so the ~222 KB of JSON is
+# compiled in ONCE) and the styled-tile wire the frame pump offloads through.
+squallar-basemap = { workspace = true }
 squallar-geo = { workspace = true }
 squallar-kv = { workspace = true }
 # The pane caps (MAX_PANES_DESKTOP/MOBILE) live in the device-class policy

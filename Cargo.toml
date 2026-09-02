@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "squallar",
     "squallar-app",
+    "squallar-basemap",
     "squallar-buildings",
     "squallar-device-profile",
     "squallar-elevation",
@@ -121,6 +122,7 @@ edition = "2024"
 [workspace.dependencies]
 nexrad-level3 = { path = "nexrad-level3" }
 squallar-app = { path = "squallar-app" }
+squallar-basemap = { path = "squallar-basemap" }
 squallar-buildings = { path = "squallar-buildings" }
 squallar-device-profile = { path = "squallar-device-profile" }
 squallar-egui = { path = "squallar-egui" }

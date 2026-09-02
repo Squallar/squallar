@@ -9,8 +9,8 @@ edition.workspace = true
 
 # Deliberately these and NOTHING else normal: `tests/charter.rs` holds the
 # ceiling. The engine composes the source crates' codec registries
-# (squallar-radar, squallar-overlays, squallar-elevation and
-# squallar-buildings, over squallar-source's vocabulary), reads
+# (squallar-radar, squallar-overlays, squallar-elevation, squallar-buildings
+# and squallar-basemap, over squallar-source's vocabulary), reads
 # its thread and raster budgets from the device floor
 # (squallar-device-profile), and speaks geometry in squallar-geo's types. A
 # dependency lands here only after the charter test and the plan change
@@ -18,6 +18,7 @@ edition.workspace = true
 [dependencies]
 squallar-source = { workspace = true }
 squallar-radar = { workspace = true }
+squallar-basemap = { workspace = true }
 squallar-overlays = { workspace = true }
 squallar-elevation = { workspace = true }
 squallar-buildings = { workspace = true }

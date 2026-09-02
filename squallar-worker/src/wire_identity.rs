@@ -11,10 +11,10 @@
 //! decoded volume) are pinned by `squallar-radar`'s own digest suites and do
 //! not feed this one.
 
-/// The 16 job-framing rows, exactly as
+/// The 17 job-framing rows, exactly as
 /// `offload::tests::the_job_framing_is_the_one_this_protocol_ships` asserts
 /// them, in test order: `kind | framed-prefix length | FNV-1a-64 digest`.
-/// Sixteen rows for **fifteen** kinds: `voxels` contributes two — the
+/// Seventeen rows for **sixteen** kinds: `voxels` contributes two — the
 /// picked-region and sourceless forms frame differently.
 ///
 /// The literal list lives HERE, never regenerated from the encoder; the test
@@ -59,6 +59,14 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     // widths did not move, only the values that make the swap visible.
     "terrain/heights | 406 | 0xc776d09fd53b08e0",
     "buildings/prisms | 239 | 0x607da6bb1409aaa8",
+    // The basemap row, chained last so no code before it is renumbered.
+    // Its whole payload is framing too: the tile bodies are opaque MVT this
+    // codec frames and never interprets, the same ruling `framing_of` gives an
+    // archive, a Level III object and a terrain PNG.
+    // Row-length arithmetic, independent of the encoder: 1 code byte + 44
+    // envelope + 1 theme u8 + 4 disabled count + 2 names (4 + 8 "building",
+    // 4 + 3 "poi") + 4 tile count + one tile of 13 header + 113 body = 199.
+    "basemap/tiles | 199 | 0xb09a70866af7ef06",
 ];
 
 /// The 2 overlay-reply framing rows, exactly as

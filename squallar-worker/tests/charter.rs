@@ -65,6 +65,13 @@ fn the_dependency_ceiling_holds() {
     let expected: BTreeSet<(String, String)> = [
         ("normal", "squallar-source"),
         ("normal", "squallar-radar"),
+        // The basemap row, added when the browser's vector-tile parse and
+        // tessellation moved off the frame thread. A registry crate like the
+        // four above it and admitted on the same terms: it owns a `JobSpec`
+        // and its codec row, `job_registry` composes it LAST, and it is a leaf
+        // -- it must never reach back to `squallar-egui`, which sits above
+        // this crate.
+        ("normal", "squallar-basemap"),
         ("normal", "squallar-overlays"),
         ("normal", "squallar-elevation"),
         ("normal", "squallar-buildings"),
