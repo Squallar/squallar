@@ -1991,26 +1991,28 @@ fn the_form_factor_and_the_declared_memory_pick_between_the_step_and_the_ceiling
     );
 }
 
-/// The 3D texture cap an Apple GPU reports through WebGL2, in any browser. Not
-/// measured in this tree: the four rig legs were Mesa, NVIDIA, SwiftShader and
-/// ANGLE over NVIDIA. `None` until the adapter line from a Mac is pasted in;
-/// the test below refuses to run on it rather than guess.
-const APPLE_GPU_MAX_TEXTURE_DIMENSION_3D: Option<u32> = None;
+/// The 3D texture cap an Apple GPU reports through WebGL2. Measured 2026-09-02
+/// by the browser rig's environment probe (its `A.safari.json` from a run at
+/// tree c5673408), not by the app's own log, on the user's Mac mini M2 (10 GPU
+/// cores, 8 GB unified) running macOS 26.4.1 and Safari 26.4: renderer string
+/// `Apple GPU`, `MAX_TEXTURE_SIZE` 16384, `MAX_3D_TEXTURE_SIZE` 2048, and
+/// WebGPU's `maxTextureDimension3D` on the same device also 2048. Firefox and
+/// Chrome on the Mac were not run (no drivers); the WebGL2 caps come from the
+/// GPU and its driver rather than the browser, so the same 2048 is presumed for
+/// those two legs, unmeasured.
+const APPLE_GPU_MAX_TEXTURE_DIMENSION_3D: u32 = 2048;
 
-/// **A Mac in any browser resolves on its 3D cap, and the rows are here so the
-/// figure has somewhere to land.** Every Mac browser reads `Desktop` — a
-/// trackpad is a fine pointer — and Safari declares no memory, so the 3D
-/// conjunct alone decides between the floor and the ceiling; the step is not
-/// reachable from this table. Whether the conjunct holds every Mac browser at
-/// the floor is the open question the measurement answers.
+/// **A Mac in any browser resolves on its 3D cap, and the cap holds it at the
+/// floor.** Every Mac browser reads `Desktop` (a trackpad is a fine pointer)
+/// and Safari declares no memory, so the 3D conjunct alone decides between the
+/// floor and the ceiling; the step is not reachable from this table. The
+/// measured 2048 is a quarter of the 8192 the desktop-class line asks for, so
+/// the conjunct fails and the form factor is never consulted: a Mac browser is
+/// budgeted as a device that said nothing about itself.
 #[test]
-#[ignore = "MAX_3D_TEXTURE_SIZE unmeasured on Apple GPUs in this tree; U1"]
 fn a_mac_browser_resolves_on_its_own_3d_cap() {
-    let three_d = APPLE_GPU_MAX_TEXTURE_DIMENSION_3D.expect(
-        "APPLE_GPU_MAX_TEXTURE_DIMENSION_3D is still the placeholder: paste the \
-         measured MAX_3D_TEXTURE_SIZE, write the rung each row is owed, then \
-         drop the ignore",
-    );
+    let three_d = APPLE_GPU_MAX_TEXTURE_DIMENSION_3D;
+    let desktop_class_three_d = DESKTOP_CLASS_REPORT.max_texture_dimension_3d;
     for leg in [
         "mac-safari-m-series",
         "mac-firefox-m-series",
@@ -2025,8 +2027,17 @@ fn a_mac_browser_resolves_on_its_own_3d_cap() {
             ..shipped_profile(BudgetLimits::WASM)
         };
         check_invariants(&profile, leg);
+        let promotion = resolve(&profile).promotion;
+        assert_eq!(
+            promotion,
+            Promotion::Floor,
+            "{leg}: a 3D cap of {three_d} is under the desktop-class line's \
+             {desktop_class_three_d}, so the 3D conjunct fails, the report is \
+             not desktop-class, and the form factor is never asked; the floor \
+             is what a device that said nothing about itself gets",
+        );
         assert_ne!(
-            resolve(&profile).promotion,
+            promotion,
             Promotion::Step,
             "{leg}: a desktop form factor with no declaration never lands on \
              the step; the 3D conjunct alone decides",

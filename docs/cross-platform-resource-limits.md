@@ -805,7 +805,15 @@ checked against the need. Status as of 2026-09-01 in brackets.
    desktop discrete GPU and a desktop iGPU. *Slots into:* the web presumption.
    [Partly landed: `DESKTOP_CLASS_REPORT {16384, 8192}` is "the componentwise
    least either desktop-class machine this project has measured a browser report
-   on". The Mac's 3D cap is **unmeasured** — plan U1.]
+   on". The Mac's 3D cap is **measured**: `MAX_3D_TEXTURE_SIZE` 2048 (WebGL2
+   renderer string `Apple GPU`, `MAX_TEXTURE_SIZE` 16384; WebGPU
+   `maxTextureDimension3D` also 2048), read 2026-09-02 by the browser rig's
+   environment probe — not the app log — on the user's Mac mini M2 (10 GPU cores,
+   8 GB unified), macOS 26.4.1, Safari 26.4. Firefox and Chrome on the Mac were
+   not run; the caps come from the GPU and driver, not the browser, so the same
+   2048 is presumed for them, unmeasured. 2048 < 8192 fails the 3D conjunct, so
+   every Mac browser resolves to `Floor` regardless of `FormFactor::Desktop`
+   (`a_mac_browser_resolves_on_its_own_3d_cap`).]
 5. **The same five, from Chromium, on the same machine.** [Same status. If they
    are identical, one web bracket suffices and the pair test is cheap insurance.]
 6. **`get_texture_format_features(Rg16Float)` from both browsers.** *Slots into:*
@@ -834,7 +842,8 @@ checked against the need. Status as of 2026-09-01 in brackets.
    makes the *measured* arm the way Apple Silicon stops being a lie
    (`recommendedMaxWorkingSetSize`, §8), without a promotion rule for
    `Integrated`. The one-time measurements only the user can run are the plan's
-   U1 (Mac browsers) and U2 (a ≤ 4 GiB and a ≥ 12 GiB Android, 20 min each).
+   U1 (Mac browsers — the Safari leg landed 2026-09-02, 3D cap 2048, §7 item 4)
+   and U2 (a ≤ 4 GiB and a ≥ 12 GiB Android, 20 min each).
 5. Does `MTLDevice.recommendedMaxWorkingSetSize` or DXGI `QueryVideoMemoryInfo`
    reach through wgpu 29.0.4 at all? [No — and the thin platform-layer reader is
    acceptable: ruling 2, §7.5. `Adapter::as_hal` is `unsafe fn`, so the readers
@@ -992,7 +1001,9 @@ fills later. Classifier failure modes are pinned as rows, unmeasured ones
 `#[ignore]` with a reason: iPad + trackpad (16384/2048/Desktop → `Floor`, held
 only by the 3D conjunct), Chromebook, phone in DeX, touch laptop + dGPU
 (→ `Ceiling`), a Handheld reporting desktop-class caps (→ mobile tier, never
-above), Mac in Safari/Firefox/Chrome (3D cap **unmeasured** — U1).
+above), Mac in Safari/Firefox/Chrome (16384/2048/Desktop → `Floor`; the 2048
+**measured** in Safari 26.4 on the user's M2 by the rig's environment probe,
+2026-09-02, and presumed the same for Firefox and Chrome, unmeasured).
 
 **The web signals, and what each is worth.** *(survey, carried forward; plan D1
 where it sharpened the rule)*
