@@ -31,6 +31,7 @@
 //! The pump is called **once per layer**, by `ui_map_overlays::draw_tile_layer`
 //! before its grid loop, and never from [`Tiles::at`] — see
 //! [`HttpsTiles::pump`] for why, and for the one thing that would break.
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -628,6 +629,25 @@ fn slot_bytes(slot: &CachedTile) -> u64 {
 /// over.
 const EVICTED_MEMORY_PER_SLOT: usize = 4;
 
+/// The most requests one source can have open at once — asked for, and not
+/// yet answered on the frame side — and so the most ids
+/// [`TileCache::in_flight`] holds on the native arm. Three bounded queues
+/// stand between an ask and its answer: the request channel, the IO task's
+/// own concurrency, and the completion channel. Both channels are
+/// `channel(MAX_PARALLEL_DOWNLOADS)` with a single sender, and a futures
+/// channel holds `buffer + senders`, so `MAX_PARALLEL_DOWNLOADS + 1` apiece;
+/// the IO task holds at most [`MAX_PARALLEL_DOWNLOADS`] fetches, the one
+/// whose result it is handing over included. Twenty at the shipped six. A
+/// full request channel makes [`HttpsTiles::request_once`]'s `try_send` fail,
+/// and a failed send opens nothing.
+///
+/// On wasm32 the offload path holds bodies past the completion channel —
+/// staged for, or riding in, a worker batch — and those requests stay open
+/// until the reply is installed or dropped; each id is there at most once,
+/// because an open request is never re-asked, so that arm's set is bounded by
+/// this plus the batch's contents.
+const MAX_IN_FLIGHT: usize = 3 * MAX_PARALLEL_DOWNLOADS + 2;
+
 /// One source's tile cache, with what [`cache_ledger`] needs read **at the
 /// cache**: which kind of slot a landing body replaced, and whether an ask is
 /// for an id this cache recently let go of.
@@ -641,9 +661,25 @@ struct TileCache {
     slots: LruCache<TileId, CachedTile>,
     /// Ids this cache evicted recently, most recent last — bounded at
     /// [`EVICTED_MEMORY_PER_SLOT`] times the cap, so it can never outgrow the
-    /// cache it remembers for. Probed and popped by [`Self::ask`] and by an
-    /// orphan [`Self::put`].
+    /// cache it remembers for. Probed and popped by [`Self::ask`] and by a
+    /// [`Self::put`] that finds no slot.
     evicted: LruCache<TileId, ()>,
+    /// Ids with a request out — asked for, and not yet answered by a body
+    /// landing, a body dropped for its generation, or the IO side's word
+    /// that none is coming. **The authority for "do not ask again".**
+    ///
+    /// The `None` marker in [`Self::slots`] used to be that authority, and
+    /// it is an LRU citizen: under pressure the LRU evicts it before the body
+    /// lands, [`HttpsTiles::request_once`] finds no slot and asks again, and
+    /// one tile is fetched, decoded and uploaded twice — 16 duplicate puts
+    /// over 607 asks at cap 100 on a 12x12 grid, on the loopback pin. This
+    /// set is what the LRU cannot touch. The marker stays: it still reserves
+    /// the slot and still says "failed, do not ask again" once the request
+    /// is over, and its eviction is still counted.
+    ///
+    /// Bounded by construction at [`MAX_IN_FLIGHT`] on the native arm; see
+    /// the constant for the wasm32 offload path's extra term.
+    in_flight: HashSet<TileId>,
     /// What [`Self::slots`] is worth on [`slot_bytes`]' terms, kept as a
     /// running figure so a put costs one add and one subtract.
     resident_bytes: u64,
@@ -662,6 +698,7 @@ impl TileCache {
             role,
             slots: LruCache::new(entries),
             evicted: LruCache::new(remembered),
+            in_flight: HashSet::with_capacity(MAX_IN_FLIGHT),
             resident_bytes: 0,
             stats: cache_ledger::Totals::default(),
         }
@@ -687,6 +724,31 @@ impl TileCache {
         self.slots.len()
     }
 
+    /// Requests open right now. Gated as its one caller,
+    /// [`HttpsTiles::in_flight_len`], is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Whether a request for `tile_id` is out — asked for, and not yet put,
+    /// dropped, or answered with nothing. What [`HttpsTiles::request_once`]
+    /// consults before it sends, whatever the LRU did to the marker; see
+    /// [`Self::in_flight`].
+    fn is_in_flight(&self, tile_id: &TileId) -> bool {
+        self.in_flight.contains(tile_id)
+    }
+
+    /// A request over with nothing to put: the IO side's word that no body
+    /// is coming (a failed fetch, an archive with no tile there), a body
+    /// dropped for a generation a restyle replaced, or a body that would not
+    /// decode. Closes the request, so [`HttpsTiles::request_once`] may ask
+    /// again when the marker is gone and the tile still wanted. A body that
+    /// lands closes its request through [`Self::put`] instead.
+    fn answered(&mut self, tile_id: &TileId) {
+        self.in_flight.remove(tile_id);
+    }
+
     /// This source's own counters. See [`Self::stats`]. Gated as its one
     /// caller, [`HttpsTiles::cache_stats`], is.
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -694,14 +756,16 @@ impl TileCache {
         self.stats
     }
 
-    /// [`HttpsTiles::request_once`]'s fresh ask: a `None` marker under
-    /// `tile_id` at `epoch`, and one request counted — a refetch if this
-    /// cache remembers evicting the id.
+    /// [`HttpsTiles::request_once`]'s fresh ask: the request opened in
+    /// [`Self::in_flight`], a `None` marker under `tile_id` at `epoch`, and
+    /// one request counted — a refetch if this cache remembers evicting the
+    /// id.
     fn ask(&mut self, tile_id: TileId, epoch: u64) {
         if self.evicted.pop(&tile_id).is_some() {
             self.note(cache_ledger::CacheEvent::RefetchAfterEviction);
         }
         self.note(cache_ledger::CacheEvent::Request);
+        self.in_flight.insert(tile_id);
         self.insert(
             tile_id,
             CachedTile {
@@ -713,19 +777,23 @@ impl TileCache {
         );
     }
 
-    /// [`HttpsTiles::request_once`]'s stale-generation arm: the slot keeps
-    /// its tile and is re-stamped as "a request is out" under `epoch`.
+    /// [`HttpsTiles::request_once`]'s stale-generation arm: the request
+    /// opened in [`Self::in_flight`], and the slot keeps its tile, re-stamped
+    /// as "a request is out" under `epoch`.
     fn re_ask(&mut self, tile_id: TileId, epoch: u64) {
         if let Some(slot) = self.slots.get_mut(&tile_id) {
             slot.epoch = epoch;
             slot.restyle_pending = true;
         }
         self.note(cache_ledger::CacheEvent::RestyleAsk);
+        self.in_flight.insert(tile_id);
     }
 
     /// A tile landing, classified by what it found under its id. See
-    /// [`cache_ledger`] for the four kinds.
+    /// [`cache_ledger`] for the four kinds. Closes the id's request in
+    /// [`Self::in_flight`]: this is the arrival the entry was open for.
     fn put(&mut self, tile_id: TileId, slot: CachedTile) {
+        let asked = self.in_flight.remove(&tile_id);
         let kind = match self.slots.peek(&tile_id) {
             // A pending marker, of any generation: nothing drew yet, so this
             // is the tile's first sight whatever the marker was stamped.
@@ -735,8 +803,20 @@ impl TileCache {
                 ..
             }) => cache_ledger::PutKind::Restyle,
             Some(_) => cache_ledger::PutKind::Duplicate,
-            None if self.evicted.pop(&tile_id).is_some() => cache_ledger::PutKind::Orphan,
-            None => cache_ledger::PutKind::First,
+            None => {
+                // No slot. With a request open, the LRU let the marker go
+                // while the body was on its way — the eviction is already
+                // counted, and the id is popped here so the memory holds
+                // only ids that are gone — and the body is the tile's first
+                // sight all the same, and its only one. With no request
+                // open, nothing asked for this body.
+                self.evicted.pop(&tile_id);
+                if asked {
+                    cache_ledger::PutKind::First
+                } else {
+                    cache_ledger::PutKind::Orphan
+                }
+            }
         };
         self.note(cache_ledger::CacheEvent::Put(kind));
         self.insert(tile_id, slot);
@@ -1065,8 +1145,9 @@ const MAX_ZOOM_UNKNOWN: u8 = u8::MAX;
 ///
 /// **The count is a backstop; [`PUMP_TIME_BUDGET`] is the governor.** `tile_rx`
 /// is `channel(MAX_PARALLEL_DOWNLOADS)` with a single sender, so the queue
-/// cannot hold more than [`MAX_PARALLEL_DOWNLOADS`] and this value means
-/// "whatever is queued" rather than a throttle — the same figure and the same
+/// holds at most [`MAX_PARALLEL_DOWNLOADS`] plus that sender's one guaranteed
+/// slot — this exact figure — and this value means "whatever is queued"
+/// rather than a throttle — the same figure and the same
 /// meaning as [`NATIVE_TILE_UPLOADS_PER_PUMP`], because after the time bound
 /// went in the two arms want the same rule.
 ///
@@ -1214,6 +1295,21 @@ enum FetchPayload {
     /// pump budget — tessellation is the heavy half.
     Parsed(Arc<walkers::mvt::ParsedTile>),
 }
+
+/// One request's answer, as the IO side hands it over: the payload, or
+/// `None` for a request that gets no body — a fetch that failed, an archive
+/// that positively holds no tile at that coordinate.
+///
+/// **The empty answer is delivered, not dropped.** The frame side keeps every
+/// request open in [`TileCache::in_flight`] from the ask until something
+/// arrives under its id, and a request that never arrived would be a tile
+/// that is never asked for again once the LRU has let its marker go. The
+/// failure itself is logged where it happened; the cache's `None` marker
+/// under the id stays as it is — "asked, and nothing came" — which is what
+/// "do not ask again" has always meant for a failed tile. An empty answer
+/// changes no pixel, so it asks for no repaint, and it is no family's take in
+/// [`take_ledger`]: nothing was decoded, uploaded or put.
+type Fetched = (TileId, Option<FetchPayload>);
 
 /// Managed IO runtime for the tile fetch task — and for
 /// [`crate::basemap_download`], which owns the same kind of task for the same
@@ -1449,7 +1545,10 @@ pub struct HttpsTiles {
     /// *and* "asked for, and it failed" — the two are deliberately
     /// indistinguishable, because both mean "do not ask again" — for as long
     /// as the slot's style generation is current. See [`Self::request_once`]
-    /// and [`CachedTile`] for what a stale generation re-opens. Wrapped by
+    /// and [`CachedTile`] for what a stale generation re-opens. The slot is
+    /// an LRU citizen and can be evicted with its request still out;
+    /// [`TileCache::in_flight`] is the record the LRU cannot evict, and the
+    /// one [`Self::request_once`] consults before it sends. Wrapped by
     /// [`TileCache`], which classifies every put and eviction for
     /// [`cache_ledger`].
     cache: TileCache,
@@ -1490,8 +1589,9 @@ pub struct HttpsTiles {
     request_tx: Sender<TileId>,
     /// Tiles the IO task has fetched: decoded on native, compressed bytes on
     /// wasm32, where this channel doubles as the decode queue the frame pump
-    /// drains under [`WASM_TILE_DECODES_PER_PUMP`].
-    tile_rx: Receiver<(TileId, FetchPayload)>,
+    /// drains under [`WASM_TILE_DECODES_PER_PUMP`] — or the word that a
+    /// request gets no body; see [`Fetched`].
+    tile_rx: Receiver<Fetched>,
 
     /// wasm32 only: the context the frame pump decodes and uploads through,
     /// and asks for the queue-draining repaint on. On native the IO thread
@@ -1961,7 +2061,13 @@ impl InlineDecode<'_> {
                 *put_generation += 1;
                 cache.put(tile_id, slot_for(tile, self.epoch, self.feathering));
             }
-            Err(error) => log::warn!("decoding tile {tile_id:?}: {error}"),
+            Err(error) => {
+                // The request is over with nothing to put; the marker stays
+                // as "failed, do not ask again" for as long as the LRU keeps
+                // it.
+                cache.answered(&tile_id);
+                log::warn!("decoding tile {tile_id:?}: {error}");
+            }
         }
         // Counted here and nowhere else, against the same population
         // `note_tiles_offloaded` counts: one **vector body** disposed of. A
@@ -1979,6 +2085,13 @@ impl InlineDecode<'_> {
 /// channel is the IO task gone, and is logged rather than panicked on, as
 /// everywhere else in this module.
 ///
+/// `take` answers the family the item was, or `None` for an item that was no
+/// take at all — the IO side's word that a request gets no body, see
+/// [`Fetched`] — which is moved and counted against `budget` but never priced:
+/// a zero-cost sample in a decode family's histogram would read as a fast
+/// decode. A bare [`take_ledger::TakeKind`] is accepted as always-`Some`, so a
+/// caller that never sees an empty answer need not say so.
+///
 /// Both arms of [`HttpsTiles::drain_completed_fetches`] are this loop over a
 /// different `take` and a different budget — which is the whole platform
 /// difference behind [`HttpsTiles::pump`].
@@ -1991,14 +2104,17 @@ impl InlineDecode<'_> {
 /// rate: **120 `console.error`s in one 40 s Firefox run against a host that
 /// answers `200` to a range request**, measured 2026-08-28. The condition is
 /// permanent and the user can do nothing about it, so it is said once.
-fn drain_up_to<T>(
+fn drain_up_to<T, K>(
     rx: &mut Receiver<T>,
     budget: usize,
     deadline: web_time::Instant,
     first_take_free: bool,
     reported: &mut bool,
-    mut take: impl FnMut(T) -> take_ledger::TakeKind,
-) -> usize {
+    mut take: impl FnMut(T) -> K,
+) -> usize
+where
+    K: Into<Option<take_ledger::TakeKind>>,
+{
     let mut taken = 0;
     while taken < budget {
         // The first take of the **pass** is unconditional, so a frame already
@@ -2018,9 +2134,11 @@ fn drain_up_to<T>(
                 // pays the budget plus one whole unbounded pass through here.
                 // See [`take_ledger`] for the denominator and the families.
                 let began = web_time::Instant::now();
-                let kind = take(item);
+                let kind: Option<take_ledger::TakeKind> = take(item).into();
                 let cost = web_time::Instant::now().duration_since(began);
-                take_ledger::note_take(kind, cost.as_micros().min(u128::from(u32::MAX)) as u32);
+                if let Some(kind) = kind {
+                    take_ledger::note_take(kind, cost.as_micros().min(u128::from(u32::MAX)) as u32);
+                }
                 taken += 1;
             }
             Err(TryRecvError::Empty) => break,
@@ -2327,21 +2445,31 @@ impl HttpsTiles {
             // a pass-wide spelling of it to bound. See [`PUMP_TIME_BUDGET`].
             true,
             io_task_gone_reported,
-            |(tile_id, slot): (TileId, FetchPayload)| {
+            |(tile_id, answer): Fetched| {
+                let Some(slot) = answer else {
+                    // The IO side's word that no body is coming: the request
+                    // is over, and nothing moved but the word. See
+                    // [`Fetched`] for why it is no family's take.
+                    cache.answered(&tile_id);
+                    return None;
+                };
                 // A tile styled under a generation a restyle has replaced is
                 // dropped, not drawn: its slot keeps showing the old style and
                 // [`Self::request_once`] re-asks under the current one, which
-                // the IO side answers from the parsed cache.
+                // the IO side answers from the parsed cache. Dropped is still
+                // answered: the request is over either way.
                 if slot.epoch == current {
                     *put_generation += 1;
                     cache.put(tile_id, slot);
+                } else {
+                    cache.answered(&tile_id);
                 }
                 // The whole native take, whether or not the slot survived its
                 // epoch check: a dropped restyle still cost the frame the
                 // move off the channel. See [`take_ledger::TakeKind::Put`] —
                 // on this arm the decode already happened on the IO thread,
                 // which is why one family covers the arm.
-                take_ledger::TakeKind::Put
+                Some(take_ledger::TakeKind::Put)
             },
         );
         *takes += taken as u64;
@@ -2429,21 +2557,32 @@ impl HttpsTiles {
                 // above took it.
                 allowance.first_take_free && reclaimed == 0,
                 io_task_gone_reported,
-                |(tile_id, payload): (TileId, FetchPayload)| match (payload, staging) {
+                |(tile_id, answer): Fetched| match (answer, staging) {
+                    // The IO side's word that no body is coming: the request
+                    // is over, there is nothing to decode, and — see
+                    // [`Fetched`] — it is no family's take.
+                    (None, _) => {
+                        cache.answered(&tile_id);
+                        None
+                    }
                     // The offload path's take, and the whole of it: a pointer
                     // move onto the staging list. Charged to the same family as
                     // the decode it replaces, because it IS this pass's vector
                     // take — which is what makes `take:vector` going to ~0 the
                     // direct expression of the defect rather than a family that
-                    // quietly stopped being recorded.
-                    (FetchPayload::Bytes(bytes), true) => {
+                    // quietly stopped being recorded. The request stays open:
+                    // the body is on its way to the worker, and its reply is
+                    // what closes it, in `install_batch_reply`.
+                    (Some(FetchPayload::Bytes(bytes)), true) => {
                         batch.stage(tile_id, bytes);
-                        take_ledger::TakeKind::Vector
+                        Some(take_ledger::TakeKind::Vector)
                     }
                     // Everything else, unchanged: a restyle from the parsed
                     // cache, a raster body, a sniffed body, and every vector body
                     // on a pass that is not offloading.
-                    (payload, _) => inline.take(cache, put_generation, tile_id, payload),
+                    (Some(payload), _) => {
+                        Some(inline.take(cache, put_generation, tile_id, payload))
+                    }
                 },
             );
         pump_budget.record(taken);
@@ -2598,6 +2737,11 @@ impl HttpsTiles {
                 styled.len(),
                 self.style_epoch,
             );
+            // Dropped is still answered: each request is over, which is what
+            // lets the re-ask go out.
+            for (tile_id, _) in &styled {
+                self.cache.answered(tile_id);
+            }
         }
 
         // Anything asked for and not answered — a body that would not parse,
@@ -2613,21 +2757,33 @@ impl HttpsTiles {
         }
     }
 
-    /// Ask for `tile_id` unless it has already been asked for **under the
-    /// current style generation**.
+    /// Ask for `tile_id` unless a request for it is out, or it has already
+    /// been asked for **under the current style generation**.
     ///
-    /// The de-duplication and the cache are the same structure: a slot under
-    /// the tile's id stamped with the current generation records "a request is
-    /// out" (or "it is here", or "it failed") and reserves the slot. When the
-    /// request channel is full nothing is recorded and the tile is retried on
-    /// a later frame — recording the ask while dropping the request would
-    /// strand it forever.
+    /// Two records say "do not ask". A slot under the tile's id stamped with
+    /// the current generation records "it is here" (or "it failed", or "a
+    /// request is out") and reserves the slot. The id's entry in
+    /// [`TileCache::in_flight`] records "a request is out" and nothing else.
+    /// The slot used to be the only record, and it is an LRU citizen: under
+    /// pressure the cache evicts a pending marker before its body lands, and
+    /// with the marker gone this asked again — one tile, two fetches, two
+    /// decodes, two uploads, and a second body landing as a duplicate put (16
+    /// of them over 607 asks at cap 100 on a 12x12 grid, measured on the
+    /// loopback pin). The in-flight entry is what the LRU cannot evict, and
+    /// it is consulted **before** the send. When the request channel is full
+    /// nothing is recorded and the tile is retried on a later frame —
+    /// recording the ask while dropping the request would strand it forever.
     ///
     /// A slot from an **older** generation is a tile styled by a style
     /// [`Self::set_style`] has replaced: it keeps drawing (see
     /// [`Self::cached_or_interpolated`]) while this re-asks for it, and the
     /// re-stamp to the current generation is the same "a request is out"
-    /// record as a fresh insert.
+    /// record as a fresh insert. A restyle does not close the in-flight set:
+    /// a tile whose request is out is not re-asked under the new generation
+    /// until that request is answered. On native its body arrives stamped
+    /// with the stale generation, the drain drops it and closes the request,
+    /// and the next frame re-asks; on wasm32 the pump styles the body against
+    /// the frame's current style, so it lands current and no re-ask is owed.
     fn request_once(&mut self, tile_id: TileId) {
         if self.requests_closed {
             return;
@@ -2643,6 +2799,12 @@ impl HttpsTiles {
         // `try_get_or_insert` did.
         let known = cache.get(&tile_id).map(|slot| slot.epoch);
         if known == Some(epoch) {
+            return;
+        }
+        // After the `get`, so a wanted tile whose request is out still has
+        // its recency refreshed; before the send, so the LRU's treatment of
+        // the marker decides nothing.
+        if cache.is_in_flight(&tile_id) {
             return;
         }
 
@@ -2819,6 +2981,13 @@ impl HttpsTiles {
         self.cache.len()
     }
 
+    /// Requests open right now — see [`TileCache::in_flight`]. Exposed for
+    /// the bound test; gated as [`Self::cached_entries`] is.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn in_flight_len(&self) -> usize {
+        self.cache.in_flight_len()
+    }
+
     /// This source's own cache counters — every event its cache recorded,
     /// and no other source's. The statics [`cache_ledger::totals`] reads
     /// are shared by every source of a role in the process, which in a test
@@ -2847,6 +3016,9 @@ impl HttpsTiles {
     /// Test-only, and the reason it exists is isolation rather than
     /// convenience: the seam's dispatch — `Tile::Vector` reaching the painter
     /// — stays testable without an archive open or an IO task running.
+    /// Nothing asked for the tile, so the ledger classes the landing as an
+    /// orphan (or a duplicate, over a resident slot) — the honest reading of
+    /// a fixture, and one reason no test reads the statics for an absolute.
     ///
     /// `cfg(test)` alone, NOT the `all(test, not(wasm32))` its neighbours
     /// carry: its caller (`ui_map_overlays`' seam tests) compiles on the
@@ -2900,6 +3072,17 @@ impl Tiles for HttpsTiles {
 // The IO task
 // ---------------------------------------------------------------------------
 
+/// [`fetch_body`], with the id kept beside the outcome, so that a failure is
+/// delivered under the id it was for — see [`Fetched`].
+async fn fetch_one<S: TileSource>(
+    source: &S,
+    client: &reqwest::Client,
+    egui_ctx: &Context,
+    tile_id: TileId,
+) -> (TileId, Result<FetchPayload, String>) {
+    (tile_id, fetch_body(source, client, egui_ctx, tile_id).await)
+}
+
 /// Download one tile — and on native, decode and upload it too.
 ///
 /// On native, decoding happens here on the IO runtime, as walkers does it:
@@ -2909,7 +3092,7 @@ impl Tiles for HttpsTiles {
 /// are handed over undecoded — see [`FetchPayload`].
 ///
 /// The error is a `String` because walkers' `TileError` is not exported.
-async fn fetch_one<S: TileSource>(
+async fn fetch_body<S: TileSource>(
     source: &S,
     client: &reqwest::Client,
     #[cfg_attr(
@@ -2921,7 +3104,7 @@ async fn fetch_one<S: TileSource>(
     )]
     egui_ctx: &Context,
     tile_id: TileId,
-) -> Result<(TileId, FetchPayload), String> {
+) -> Result<FetchPayload, String> {
     let url = source.tile_url(tile_id);
     log::trace!("downloading '{url}'");
 
@@ -2954,7 +3137,7 @@ async fn fetch_one<S: TileSource>(
     #[cfg(target_arch = "wasm32")]
     let payload = FetchPayload::Bytes(Arc::new(body.to_vec()));
 
-    Ok((tile_id, payload))
+    Ok(payload)
 }
 
 /// Serve tile requests until [`HttpsTiles`] is dropped.
@@ -2971,7 +3154,7 @@ async fn fetch_continuously<S: TileSource>(
     source: S,
     client: reqwest::Client,
     mut request_rx: Receiver<TileId>,
-    mut tile_tx: Sender<(TileId, FetchPayload)>,
+    mut tile_tx: Sender<Fetched>,
     egui_ctx: Context,
 ) {
     let mut outstanding = FuturesUnordered::new();
@@ -3003,18 +3186,27 @@ async fn fetch_continuously<S: TileSource>(
 
         // `outstanding` was non-empty on both paths that reach here, so this is
         // always `Some`; treating it otherwise would just spin.
-        let Some(result) = completed else { continue };
+        let Some((tile_id, result)) = completed else {
+            continue;
+        };
 
-        match result {
-            Ok(fetched) => {
-                if tile_tx.send(fetched).await.is_err() {
-                    break;
-                }
-                // Without this the tile sits in the channel until some unrelated
-                // input wakes the UI, and the map appears to stop loading.
-                egui_ctx.request_repaint();
+        // A failure is delivered too, as the empty answer — see [`Fetched`].
+        let answer = match result {
+            Ok(payload) => Some(payload),
+            Err(error) => {
+                log::warn!("{error}");
+                None
             }
-            Err(error) => log::warn!("{error}"),
+        };
+        let arrived = answer.is_some();
+        if tile_tx.send((tile_id, answer)).await.is_err() {
+            break;
+        }
+        if arrived {
+            // Without this the tile sits in the channel until some unrelated
+            // input wakes the UI, and the map appears to stop loading. An
+            // empty answer changes no pixel and asks for no frame.
+            egui_ctx.request_repaint();
         }
     }
 
@@ -3515,7 +3707,7 @@ async fn serve_archive_continuously<S, St>(
     styling: ArchiveStyling,
     slots: ArchiveSlots,
     mut request_rx: Receiver<TileId>,
-    mut tile_tx: Sender<(TileId, FetchPayload)>,
+    mut tile_tx: Sender<Fetched>,
     egui_ctx: Context,
     stores: ArchiveStores<St>,
 ) where
@@ -3641,30 +3833,33 @@ async fn serve_archive_continuously<S, St>(
             outstanding.next().await
         };
 
-        let Some(result) = completed else { continue };
+        let Some((tile_id, result)) = completed else {
+            continue;
+        };
 
-        match result {
+        // Every outcome is delivered under its id — a body, or the empty
+        // answer that closes the request; see [`Fetched`].
+        let answer = match result {
             // The archive positively holds no tile there. Not an error and not
             // a retry: the `None` the cache already carries under this id is
-            // the right answer forever. It is also the archive *answering*,
-            // which is why it ends a failure run — a viewport of open ocean
-            // must not read as an archive that is not there.
+            // the right answer for as long as the cache keeps it. It is also
+            // the archive *answering*, which is why it ends a failure run — a
+            // viewport of open ocean must not read as an archive that is not
+            // there.
             Ok(None) => {
                 if failures.answered() {
                     log::info!("{RECOVERED}");
-                    // An absent tile has nothing to arrive, so without this the
+                    // An absent tile has nothing to draw, so without this the
                     // recovered credit would wait for whatever asked next.
                     egui_ctx.request_repaint();
                 }
+                None
             }
-            Ok(Some(fetched)) => {
+            Ok(Some(payload)) => {
                 if failures.answered() {
                     log::info!("{RECOVERED}");
                 }
-                if tile_tx.send(fetched).await.is_err() {
-                    break;
-                }
-                egui_ctx.request_repaint();
+                Some(payload)
             }
             Err(error) => {
                 log::warn!("{error}");
@@ -3675,10 +3870,18 @@ async fn serve_archive_continuously<S, St>(
                         failures.len(),
                     );
                     // Nothing else would wake the UI to repaint the credit: a
-                    // failed read has no tile to arrive.
+                    // failed read has no tile to draw.
                     egui_ctx.request_repaint();
                 }
+                None
             }
+        };
+        let arrived = answer.is_some();
+        if tile_tx.send((tile_id, answer)).await.is_err() {
+            break;
+        }
+        if arrived {
+            egui_ctx.request_repaint();
         }
     }
 
@@ -3852,7 +4055,30 @@ where
     Ok(Some(bytes))
 }
 
+/// [`read_body`], with the id kept beside the outcome, so that "no tile
+/// there" and a failed read are delivered under the id they were for — see
+/// [`Fetched`].
 async fn read_one<S, O>(
+    archive: &crate::basemap_archive::BasemapArchives<S, O>,
+    styling: &ArchiveStyling,
+    egui_ctx: &Context,
+    kind: ArchiveTileKind,
+    tile_id: TileId,
+) -> (TileId, Result<Option<FetchPayload>, String>)
+where
+    S: crate::basemap_archive::ArchiveRangeSource,
+    O: crate::basemap_archive::ArchiveRangeSource,
+{
+    (
+        tile_id,
+        read_body(archive, styling, egui_ctx, kind, tile_id).await,
+    )
+}
+
+/// The body of [`read_one`], which keeps the id beside this outcome so that
+/// "no tile there" and a failed read are delivered under the id they were
+/// for — see [`Fetched`].
+async fn read_body<S, O>(
     archive: &crate::basemap_archive::BasemapArchives<S, O>,
     styling: &ArchiveStyling,
     #[cfg_attr(
@@ -3865,7 +4091,7 @@ async fn read_one<S, O>(
     egui_ctx: &Context,
     kind: ArchiveTileKind,
     tile_id: TileId,
-) -> Result<Option<(TileId, FetchPayload)>, String>
+) -> Result<Option<FetchPayload>, String>
 where
     S: crate::basemap_archive::ArchiveRangeSource,
     O: crate::basemap_archive::ArchiveRangeSource,
@@ -3902,7 +4128,7 @@ where
         #[cfg(target_arch = "wasm32")]
         let payload = FetchPayload::Parsed(parsed);
 
-        return Ok(Some((tile_id, payload)));
+        return Ok(Some(payload));
     }
 
     let Some(bytes) = body_of(archive, &styling.tile_bodies, tile_id).await? else {
@@ -3937,7 +4163,7 @@ where
     #[cfg(target_arch = "wasm32")]
     let payload = FetchPayload::Bytes(bytes);
 
-    Ok(Some((tile_id, payload)))
+    Ok(Some(payload))
 }
 
 /// The style the IO task must render against right now, with the restyle

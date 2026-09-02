@@ -41,18 +41,27 @@
 //!   figure "downright broken on web" is diagnosed by: a cache below the
 //!   working set shows this climbing on a static viewport.
 //! * The four **puts**, one per tile landing and each landing in exactly one:
-//!   [`Totals::puts_first`] (the slot was a pending marker, or nothing this
-//!   cache remembers), [`Totals::puts_restyle`] (the slot held a tile
-//!   re-asked for restyling), [`Totals::puts_duplicate`] (the slot already
-//!   held a current tile — two bodies for one ask), [`Totals::puts_orphan`]
-//!   (the slot was gone and its id is in the evicted memory: the pending
-//!   marker was evicted before its body landed, so the body was fetched for
-//!   nothing and will be fetched again).
+//!   [`Totals::puts_first`] (the slot was a pending marker — or there was no
+//!   slot, the LRU having let the marker go while the request was out: the
+//!   body is the tile's first sight either way and, the request having
+//!   stayed open in `super::TileCache::in_flight`, its only one),
+//!   [`Totals::puts_restyle`] (the slot held a tile re-asked for restyling),
+//!   [`Totals::puts_duplicate`] (the slot already held a current tile: a
+//!   second body nothing asked for), [`Totals::puts_orphan`] (no slot and no
+//!   request open: a body nothing asked for and nothing holds). The last two
+//!   are the two shapes of a body fetched for nothing, and both read zero
+//!   while the in-flight set is right — a duplicate is a re-ask that got past
+//!   it, an orphan an arrival it never recorded. Before the set, an evicted
+//!   pending marker made one or the other: its body landed as an orphan when
+//!   it beat the re-ask, and the re-ask's body as a duplicate when it did
+//!   not — 9 and 16 respectively over 607 asks at cap 100 on the 12x12
+//!   loopback pin.
 //! * [`Totals::evicted_pending`] and [`Totals::evicted_resident`] — LRU
 //!   evictions, split by whether the slot held a tile or only a marker. A
-//!   pending eviction is a fetch in flight whose result now has no home.
-//!   [`Totals::evicted_bytes`] prices the resident ones as
-//!   `super::slot_bytes` prices a slot.
+//!   pending eviction is a request still out whose body will land with no
+//!   marker under it; the request stays open, so the tile is not asked for
+//!   again, and the body lands as a first sight. [`Totals::evicted_bytes`]
+//!   prices the resident ones as `super::slot_bytes` prices a slot.
 //! * The three **levels** — [`Totals::resident_entries`],
 //!   [`Totals::resident_bytes`], [`Totals::parsed_entries`] — are what is held
 //!   right now, stored rather than added, and the only figures here that go
@@ -101,16 +110,22 @@ impl CacheRole {
 /// What a body landing in the cache found there. See the module doc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PutKind {
+    /// A pending marker, or no slot with the request still open: the tile's
+    /// first sight.
     First,
+    /// A tile re-asked for under a newer style generation.
     Restyle,
+    /// A current tile already there: a second body nothing asked for.
     Duplicate,
+    /// No slot and no request open: a body nothing asked for.
     Orphan,
 }
 
 /// What an LRU eviction let go of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvictedKind {
-    /// A `None` marker: a fetch in flight (or a recorded failure).
+    /// A `None` marker: a request still out (or a recorded failure). The
+    /// request itself is not evicted with it.
     Pending,
     /// A tile that could draw.
     Resident,

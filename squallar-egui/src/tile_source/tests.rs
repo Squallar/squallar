@@ -11,7 +11,7 @@ use walkers::sources::{Attribution, TileSource};
 use walkers::{Style, Tile, TileId, TilePiece, Tiles};
 
 use super::{
-    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles,
+    DESKTOP_PARSED_TILE_CACHE_ENTRIES, DESKTOP_TILE_CACHE_ENTRIES, HttpsTiles, MAX_IN_FLIGHT,
     MAX_PARALLEL_DOWNLOADS, MOBILE_PARSED_TILE_CACHE_ENTRIES, MOBILE_TILE_CACHE_ENTRIES,
     PARSED_TILE_CACHE_ENTRIES, PumpBudget, ReadFailureRun, SUSTAINED_READ_FAILURES,
     TILE_CACHE_ENTRIES, TileCache, WASM_PARSED_TILE_CACHE_ENTRIES, WASM_TILE_CACHE_ENTRIES,
@@ -1684,7 +1684,11 @@ const GRID_ZOOM: u8 = 10;
 /// — at which point the assertion flips to `== 0` and the ignore comes off.
 /// Run with `cargo test -p squallar-egui --lib -- --ignored
 /// a_working_set_above_the_cap`. Its twin below at cap 200 is the control:
-/// the mechanism, not the number.
+/// the mechanism, not the number. What it no longer carries is the double
+/// fetch: an evicted pending marker used to be asked for again, and the run
+/// read 16 duplicate and 9 orphan puts beside its refetches; those two are
+/// zero now, here and in [`an_evicted_pending_marker_is_never_fetched_twice`],
+/// which is not ignored.
 #[test]
 #[ignore = "pins the defect WO-6 removes; flips to == 0 there"]
 fn a_working_set_above_the_cap_refetches_tiles_still_on_the_glass() {
@@ -1711,6 +1715,12 @@ fn a_working_set_above_the_cap_refetches_tiles_still_on_the_glass() {
         stats.requests > GRID_CELLS,
         "144 cells were asked for {} times in total, so no tile was ever fetched twice: {stats:?}",
         stats.requests
+    );
+    assert_eq!(
+        (stats.puts_duplicate, stats.puts_orphan),
+        (0, 0),
+        "a refetch is the working set exceeding the cap; a duplicate or an orphan is a request \
+         asked twice or never recorded, which the in-flight set forbids: {stats:?}"
     );
 }
 
@@ -1769,12 +1779,254 @@ fn a_working_set_under_the_cap_asks_for_every_tile_once_and_refetches_none() {
     );
 }
 
+/// **An evicted pending marker is not fetched twice.** The same 144 cells
+/// over a cap of 100 as the ignored pin above, which still refetches — that
+/// is the working set exceeding the cap, WO-6's problem — but every landing
+/// is a first sight: no body lands twice for one ask (`duplicate`), no body
+/// lands that nothing asked for (`orphan`), and every ask is either a cell's
+/// first or an honest refetch of a cell the cache let go -- the cells counted
+/// off the server's log, since the walk's tail can go unasked (see the body).
+/// Before the in-flight set the same run read 16 duplicate and 9 orphan over
+/// 607 asks.
+#[test]
+fn an_evicted_pending_marker_is_never_fetched_twice() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 100);
+
+    for _ in 0..GRID_FRAMES {
+        frame_over_grid(&mut tiles, GRID_SIDE, GRID_ZOOM);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Let the tail land: a request still out at the last frame has not put
+    // yet, and the put kinds are read once every request has been answered.
+    let settled = pump_until(DEFAULT_TIMEOUT, || {
+        tiles.pump();
+        let s = tiles.cache_stats();
+        (s.puts() == s.requests).then_some(())
+    });
+
+    let stats = tiles.cache_stats();
+    assert!(
+        settled.is_some(),
+        "not every request was answered within the timeout: {stats:?}"
+    );
+    let paths = server.requests();
+    // Which cells were ever asked for is read off the server's log rather
+    // than assumed to be all 144. With the cap below the working set, the
+    // request channel (seven deep) is spent each frame on the cells the walk
+    // reaches first, and cells at its tail can go unasked for the whole run:
+    // 9 of 144 on the run that found this (2026-09-02). A starvation the
+    // in-flight set neither causes nor cures -- the channel-full skip is the
+    // path it was before -- and one more reading of what a cache below its
+    // working set does to the glass.
+    let distinct: std::collections::HashSet<&String> = paths.iter().collect();
+    eprintln!(
+        "cap 100 over a {GRID_SIDE}x{GRID_SIDE} grid for {GRID_FRAMES} frames, with the \
+         in-flight set: {stats:?}; the server saw {} requests for {} distinct tiles",
+        paths.len(),
+        distinct.len()
+    );
+    assert_eq!(
+        (stats.puts_duplicate, stats.puts_orphan),
+        (0, 0),
+        "a body landed twice for one ask, or landed unasked: {stats:?}"
+    );
+    assert!(
+        distinct.len() as u64 <= GRID_CELLS,
+        "the server saw a tile the grid does not have: {distinct:?}"
+    );
+    assert_eq!(
+        stats.requests,
+        distinct.len() as u64 + stats.refetch_after_eviction,
+        "an ask that was neither a tile's first nor a refetch of an evicted one ({} distinct \
+         tiles): {stats:?}",
+        distinct.len()
+    );
+    assert_eq!(
+        stats.puts_first, stats.requests,
+        "every ask landed exactly once, as a first sight: {stats:?}"
+    );
+    assert_eq!(
+        paths.len() as u64,
+        stats.requests,
+        "the server saw a request the cache did not count, or the reverse"
+    );
+    assert_eq!(
+        tiles.in_flight_len(),
+        0,
+        "a request stayed open after every body had landed"
+    );
+}
+
+/// **The marker is the LRU's to evict; the request is not.** Two tiles are
+/// asked for and never answered; a third ask at a cap of two evicts the
+/// first's pending marker. Before the in-flight set the next frame found no
+/// slot and asked again. Now the server sees exactly one request per tile,
+/// however long the marker has been gone.
+#[test]
+fn a_tile_whose_marker_was_evicted_while_its_request_was_out_is_not_asked_again() {
+    let server = TileServer::start(Behaviour::Hang);
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 2);
+    let id = |x: u32| TileId { x, y: 0, zoom: 3 };
+
+    assert!(
+        server.wait_for_requests(2, &mut || {
+            tiles.at(id(0));
+            tiles.at(id(1));
+        }),
+        "the first two requests never reached the server"
+    );
+    // The third ask at the cap: id 0 is the least recently touched, and goes.
+    assert!(
+        server.wait_for_requests(3, &mut || {
+            tiles.at(id(2));
+        }),
+        "the third request never reached the server"
+    );
+    assert!(
+        !tiles.tile_is_cached(id(0)),
+        "fixture: the third ask must evict the first's marker"
+    );
+    assert_eq!(tiles.cache_stats().evicted_pending, 1);
+
+    // Keep wanting id 0, with its marker gone and its request out.
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        tiles.pump();
+        assert!(
+            tiles.at(id(0)).is_none(),
+            "fixture: the server never answers"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        server.request_count(),
+        3,
+        "a tile whose request was out was asked for again: {:?}",
+        server.requests()
+    );
+    assert_eq!(tiles.cache_stats().requests, 3);
+    assert_eq!(
+        tiles.in_flight_len(),
+        3,
+        "three requests out and none answered"
+    );
+}
+
+/// **Open requests stop at what can be outstanding, and the first two terms
+/// of [`MAX_IN_FLIGHT`] are exact.** Against a server that never answers, the
+/// IO task holds [`MAX_PARALLEL_DOWNLOADS`] fetches and the request channel
+/// fills behind it — [`MAX_PARALLEL_DOWNLOADS`] plus its single sender's
+/// guaranteed slot — and the frame side, wanting far more, opens exactly that
+/// many and not one more: a full channel refuses the send, and a refused send
+/// opens nothing.
+#[test]
+fn open_requests_stop_at_the_fetch_limit_plus_the_request_channel() {
+    let server = TileServer::start(Behaviour::Hang);
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 4 * MAX_IN_FLIGHT);
+    let wanted: Vec<TileId> = (0..3 * MAX_IN_FLIGHT as u32)
+        .map(|x| TileId { x, y: 0, zoom: 10 })
+        .collect();
+    let expected = 2 * MAX_PARALLEL_DOWNLOADS + 1;
+
+    let reached = pump_until(DEFAULT_TIMEOUT, || {
+        tiles.pump();
+        for id in &wanted {
+            tiles.at(*id);
+        }
+        (tiles.in_flight_len() == expected && server.request_count() == MAX_PARALLEL_DOWNLOADS)
+            .then_some(())
+    });
+    assert!(
+        reached.is_some(),
+        "open requests settled at {} with the server holding {}, not at {expected} and \
+         {MAX_PARALLEL_DOWNLOADS}",
+        tiles.in_flight_len(),
+        server.request_count()
+    );
+    // And stays there: more wanting cannot open more.
+    for _ in 0..8 {
+        tiles.pump();
+        for id in &wanted {
+            tiles.at(*id);
+        }
+        assert_eq!(tiles.in_flight_len(), expected);
+    }
+}
+
+/// **The completion channel is [`MAX_IN_FLIGHT`]'s third term, and the bound
+/// holds.** Against a server that answers, with the frame side never pumping,
+/// finished fetches queue in the completion channel while the IO task blocks
+/// with one more in hand and the rest of its fetches behind it: more open than
+/// the no-answer figure, and never more than [`MAX_IN_FLIGHT`]. Then one pump
+/// takes the queue, and the count falls by exactly what it took — one closed
+/// request per take.
+#[test]
+fn open_requests_never_exceed_max_in_flight() {
+    let server = TileServer::start(Behaviour::Serve(Arc::new(fixture_png())));
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles_with_capacity(&server, &ctx, 4 * MAX_IN_FLIGHT);
+    let wanted: Vec<TileId> = (0..3 * MAX_IN_FLIGHT as u32)
+        .map(|x| TileId { x, y: 0, zoom: 10 })
+        .collect();
+    let without_answers = 2 * MAX_PARALLEL_DOWNLOADS + 1;
+
+    let mut most = 0;
+    let reached = pump_until(DEFAULT_TIMEOUT, || {
+        // No pump: nothing leaves the completion channel.
+        for id in &wanted {
+            tiles.at(*id);
+        }
+        let open = tiles.in_flight_len();
+        assert!(
+            open <= MAX_IN_FLIGHT,
+            "{open} requests open, over the bound of {MAX_IN_FLIGHT}"
+        );
+        most = most.max(open);
+        (open > without_answers).then_some(())
+    });
+    assert!(
+        reached.is_some(),
+        "open requests never exceeded the no-answer figure {without_answers} (most seen: \
+         {most}); the completion channel's term is missing"
+    );
+    for _ in 0..8 {
+        for id in &wanted {
+            tiles.at(*id);
+        }
+        let open = tiles.in_flight_len();
+        assert!(open <= MAX_IN_FLIGHT, "{open} open, over {MAX_IN_FLIGHT}");
+        most = most.max(open);
+    }
+    eprintln!("open requests peaked at {most} of a bound of {MAX_IN_FLIGHT}");
+
+    // Only the frame side moves the set, so nothing changes between this
+    // reading and the pump.
+    let before = tiles.in_flight_len();
+    let takes_before = tiles.takes();
+    tiles.pump();
+    let taken = (tiles.takes() - takes_before) as usize;
+    assert!(
+        taken > 0,
+        "the pump took nothing off a full completion channel"
+    );
+    assert_eq!(
+        tiles.in_flight_len(),
+        before - taken,
+        "a take closed no request, or more than one"
+    );
+}
+
 /// **The cache classifies what lands and what it lets go**, at the cache:
-/// a body on its own marker is a first sight, a body whose marker was evicted
-/// is an orphan, an ask for an id it remembers evicting is a refetch, a body
-/// on a re-stamped tile is a restyle, and a body on a current tile is a
-/// duplicate. Each event lands in the source's own reading and, by at least
-/// as much, in the role's statics.
+/// a body on its own marker is a first sight, and so is a body whose marker
+/// was evicted while its request was out; an ask for an id it remembers
+/// evicting is a refetch; a body on a re-stamped tile is a restyle; a body on
+/// a current tile is a duplicate; and a body with no slot and no request open
+/// is an orphan. Each event lands in the source's own reading and, by at
+/// least as much, in the role's statics.
 #[test]
 fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orphan() {
     use cache_ledger::{CacheRole, totals};
@@ -1801,18 +2053,28 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     assert_eq!(cache.stats().puts_first, 1);
 
     // A third ask at the cap evicts the least recently touched slot — id 1's
-    // pending marker, since the put just touched id 0.
+    // pending marker, since the put just touched id 0. The marker was the
+    // LRU's to evict; the request was not.
     cache.ask(id(2), 1);
     let s = cache.stats();
     assert_eq!((s.evicted_pending, s.evicted_resident), (1, 0));
     assert!(!cache.contains(&id(1)));
+    assert!(
+        cache.is_in_flight(&id(1)),
+        "the eviction closed the request"
+    );
 
-    // id 1's body lands with its marker gone: an orphan — and its arrival
-    // evicts id 0, a resident tile.
+    // id 1's body lands with its marker gone: the tile's first sight all the
+    // same, its request having been open — and its arrival evicts id 0, a
+    // resident tile, and closes the request.
     cache.put(id(1), body(1));
     let s = cache.stats();
-    assert_eq!(s.puts_orphan, 1, "{s:?}");
+    assert_eq!((s.puts_first, s.puts_orphan), (2, 0), "{s:?}");
     assert_eq!((s.evicted_pending, s.evicted_resident), (1, 1), "{s:?}");
+    assert!(
+        !cache.is_in_flight(&id(1)),
+        "the landing left the request open"
+    );
 
     // id 0 is wanted again: a refetch, and a request.
     cache.ask(id(0), 1);
@@ -1823,6 +2085,7 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     // body replaces it.
     cache.re_ask(id(1), 2);
     assert_eq!(cache.stats().restyle_asks, 1);
+    assert!(cache.is_in_flight(&id(1)), "a re-ask is a request out");
     cache.put(id(1), body(2));
     assert_eq!(cache.stats().puts_restyle, 1);
 
@@ -1830,7 +2093,12 @@ fn the_cache_tells_a_first_sight_from_a_refetch_a_restyle_a_duplicate_and_an_orp
     cache.put(id(1), body(2));
     let s = cache.stats();
     assert_eq!(s.puts_duplicate, 1, "{s:?}");
-    assert_eq!(s.puts(), 4, "four landings, one per kind: {s:?}");
+
+    // A body for an id nothing asked for and nothing holds.
+    cache.put(id(3), body(2));
+    let s = cache.stats();
+    assert_eq!(s.puts_orphan, 1, "{s:?}");
+    assert_eq!(s.puts(), 5, "five landings over the four kinds: {s:?}");
 
     // The statics saw at least this source's events. `>=`, because other
     // tests in this binary build terrain sources too.
