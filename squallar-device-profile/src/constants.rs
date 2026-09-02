@@ -427,6 +427,98 @@ pub const PRISM_GEOMETRY_BYTES: usize = WASM_PRISM_GEOMETRY_BYTES;
 pub const PRISM_GEOMETRY_BYTES: usize = MOBILE_PRISM_GEOMETRY_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const PRISM_GEOMETRY_BYTES: usize = DESKTOP_PRISM_GEOMETRY_BYTES;
+/// One mebibyte, for the tile allowances below, which are argued in MiB.
+pub const fn mib(n: usize) -> usize {
+    n * 1024 * 1024
+}
+
+/// The map tile caches' host-heap allowances, in bytes, as `[floor, step,
+/// ceiling]` per bracket: styled entries, parsed geometry, terrain rasters.
+///
+/// **What they price.** Three resident populations, two slots
+/// (`squallar_egui::tiles::MapTileState` holds one basemap source and one
+/// terrain source; a theme flip restyles the basemap in place, so there is
+/// never a second copy of either). A **styled** entry is a vector tile's
+/// shapes plus its flattened `TileMeshes`; the measured city-core tail is
+/// `squallar_egui::tile_source::MEASURED_STYLED_ENTRY_BYTES`, **1.46 MB**
+/// (the plan's ~1.03 MB had the fills and not the strokes; the band test
+/// re-derived it at 1,462,708), and a typical dense-city entry is ~30 KB. A
+/// **parsed** entry is the style-independent decode a restyle re-tessellates
+/// from, ~2.09 MB at the same tail (`MEASURED_PARSED_TILE_BYTES`). A
+/// **terrain** entry is one 256x256 RGBA texture, 256 KiB, no tail.
+///
+/// **Need and economy.** The tile cache is a byte-bounded LRU with a floor in
+/// entries: the working set the last pass measured (tiles on the glass plus
+/// the ancestor net) is never evicted whatever the budget says, and the
+/// budget bounds what is kept *beyond* it. So these figures are the economy's
+/// bound and the working set's target, never a cap on the glass.
+///
+/// **The arithmetic, on the canvases the floors must hold.** The user's own
+/// 2878x1651 browser window measured 86 tiles on the glass at a whole zoom and
+/// ~106 at the half step that lands on the archive's top level (rig legs,
+/// 2026-09-02; the 104/187 the grid arithmetic predicts overstate the map
+/// pane, which is 0.75-0.83 of the canvas). Worst case that is 106 x 1.46 MB
+/// = 155 MB of styled entries. **The 48 MiB wasm floor cannot hold that worst
+/// case** — it holds 34 such entries — and is not asked to: the working-set
+/// floor keeps the 106 resident as overrun, and the tile-sharpness rung
+/// (whole-zoom snapping, a later landing) is what brings a scene like that
+/// back under budget. What the floor does hold is 1,600 typical tiles,
+/// fifteen canvases of them, and every raster the terrain slot can be asked
+/// for over that window (106 x 256 KiB = 26.5 MiB against 25 MiB: the terrain
+/// floor is that working set to the mebibyte, and its own floor in entries
+/// carries the difference).
+///
+/// **Per bracket.** wasm32 is a browser tab whose linear memory is one
+/// gigabyte (`WASM_LINEAR_MEMORY_MAX_BYTES`) shared with every other heap in
+/// the page: 48/48/25 MiB at the floor is 121 MiB, an eighth of it. The step
+/// — a desktop-class adapter report — buys 64/64/32, 160 MiB, because a tab
+/// on a real driver has the RAM and the window that wants a longer history.
+/// **The wasm ceiling is the wasm step**, as it is for every other field of
+/// the bracket
+/// (`the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured`):
+/// the desktop-browser tier that would fill the ceiling — 96/96/48, 240 MiB,
+/// the figures the plan wrote for it — lands with its measurement (U1) and
+/// not before, so a browser whose shape nobody classified resolves exactly
+/// what a desktop-shaped one does. Mobile is **pinned** at the wasm floor:
+/// aarch64 is unmeasured and every mobile bracket is pinned until it is
+/// (`the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64`).
+/// Desktop starts at 160/192/64 — 114 tail entries, the user's own window at
+/// the tail (106) with eight to spare, and a parsed cache that restyles the
+/// common 1920x1200 canvas (96 x 2.09 MB = 201 MB, held to 192) wholly from
+/// cache; a 2560x1440 window between zooms (144 entries, 211 MB at the tail)
+/// is the floor's overrun and the step's fit (256 MiB, 183 entries) — and
+/// rises to 512/384/128 on a discrete adapter with a desktop shape, where a
+/// 3840x2160 window between zooms (299 tiles, 437 MB at the tail) fits
+/// without the floor's help.
+///
+/// **The host ceilings** (`*_TILE_HOST_CEILING_BYTES`) bound the three at each
+/// rung the way `APP_TEXTURE_BUDGET_BYTES` bounds the GPU sum, and
+/// `check_budgets` holds each within 1.25x of the sum it bounds. Terrain
+/// rasters are egui textures and so GPU memory, yet they are priced here and
+/// **omitted from `app_texture_bytes` by name**: the wasm GPU sum sits at 278
+/// of its 288 MiB, and folding 25 MiB of hillshade into it would fail the
+/// snugness proof for a population the tile cache already bounds. See
+/// `the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name`.
+pub const WASM_TILE_STYLED_BYTES: [usize; 3] = [mib(48), mib(64), mib(64)];
+pub const WASM_TILE_PARSED_BYTES: [usize; 3] = [mib(48), mib(64), mib(64)];
+pub const WASM_TILE_TERRAIN_BYTES: [usize; 3] = [mib(25), mib(32), mib(32)];
+/// 121 / 160 / 160 MiB of allowances at the three rungs, each held under
+/// this within 1.25x. See [`WASM_TILE_STYLED_BYTES`].
+pub const WASM_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(128), mib(192), mib(192)];
+
+/// The mobile arm: the wasm floor, pinned. See [`WASM_TILE_STYLED_BYTES`].
+pub const MOBILE_TILE_STYLED_BYTES: usize = WASM_TILE_STYLED_BYTES[0];
+pub const MOBILE_TILE_PARSED_BYTES: usize = WASM_TILE_PARSED_BYTES[0];
+pub const MOBILE_TILE_TERRAIN_BYTES: usize = WASM_TILE_TERRAIN_BYTES[0];
+pub const MOBILE_TILE_HOST_CEILING_BYTES: usize = WASM_TILE_HOST_CEILING_BYTES[0];
+
+/// The desktop arm. See [`WASM_TILE_STYLED_BYTES`].
+pub const DESKTOP_TILE_STYLED_BYTES: [usize; 3] = [mib(160), mib(256), mib(512)];
+pub const DESKTOP_TILE_PARSED_BYTES: [usize; 3] = [mib(192), mib(256), mib(384)];
+pub const DESKTOP_TILE_TERRAIN_BYTES: [usize; 3] = [mib(64), mib(80), mib(128)];
+/// 416 / 592 / 1024 MiB of allowances at the three rungs. The ceiling rung is
+/// exactly its sum: nothing is slack there.
+pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(448), mib(640), mib(1024)];
 
 /// The share of a **measured or probed** GPU capacity the scene's need may
 /// occupy, as `(numerator, denominator)`: three quarters. Metal's own
@@ -598,6 +690,28 @@ const _: () = const {
     assert!(LOOP_POOL_DWELL_FRAMES > 0);
     assert!(LOOP_POOL_HYSTERESIS > 1.0);
     assert!(LOOP_POOL_FLOOR_BYTES / MIN_LOOP_FRAMES_PER_PANE > 0);
+    // Each tile host ceiling holds the three allowances at its rung and is
+    // within 1.25x of their sum; a pinned mobile arm is one rung.
+    let mut rung = 0;
+    while rung < 3 {
+        let wasm = WASM_TILE_STYLED_BYTES[rung]
+            + WASM_TILE_PARSED_BYTES[rung]
+            + WASM_TILE_TERRAIN_BYTES[rung];
+        assert!(wasm <= WASM_TILE_HOST_CEILING_BYTES[rung]);
+        // `ceiling <= 1.25 x sum`, spelled without the product: the desktop
+        // ceiling rung is 1 GiB and `x 4` overflows a 32-bit `usize` on wasm32,
+        // where these constants compile too.
+        assert!(WASM_TILE_HOST_CEILING_BYTES[rung] <= wasm + wasm / 4);
+        let desktop = DESKTOP_TILE_STYLED_BYTES[rung]
+            + DESKTOP_TILE_PARSED_BYTES[rung]
+            + DESKTOP_TILE_TERRAIN_BYTES[rung];
+        assert!(desktop <= DESKTOP_TILE_HOST_CEILING_BYTES[rung]);
+        assert!(DESKTOP_TILE_HOST_CEILING_BYTES[rung] <= desktop + desktop / 4);
+        rung += 1;
+    }
+    let mobile = MOBILE_TILE_STYLED_BYTES + MOBILE_TILE_PARSED_BYTES + MOBILE_TILE_TERRAIN_BYTES;
+    assert!(mobile <= MOBILE_TILE_HOST_CEILING_BYTES);
+    assert!(MOBILE_TILE_HOST_CEILING_BYTES <= mobile + mobile / 4);
     // A fraction at or over one is no headroom; a zero one is no allowance.
     assert!(NEED_FRACTION.0 > 0 && NEED_FRACTION.0 < NEED_FRACTION.1);
     assert!(ECONOMY_FRACTION.0 > 0 && ECONOMY_FRACTION.0 < ECONOMY_FRACTION.1);

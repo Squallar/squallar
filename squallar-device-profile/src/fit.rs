@@ -24,7 +24,7 @@
 //! exactly as before a reader existed. [`fit_holds`] is the one invariant both
 //! arms promise, checked where the application adopts an answer.
 
-use crate::budget::{BudgetLimits, Budgets, DeviceProfile, resolve, step_down};
+use crate::budget::{BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down};
 use crate::quality::{GroundPass, offscreen_bytes};
 use crate::scene::{Capacity, Need, PaneNeed, Scene};
 use squallar_radar::types::RenderView;
@@ -215,6 +215,49 @@ pub fn economy_allowance(
     grid_bytes: GridBytes,
 ) -> u64 {
     cap.economy_allowance(need(scene, budgets, grid_bytes))
+}
+
+/// The shares of the economy allowance the three tile populations take on
+/// the measured arm — styled, parsed, terrain — as parts of five. Two, two
+/// and one: the styled history and the parsed geometry are the two economies
+/// a pan and a restyle come back to, and a terrain raster is a small fraction
+/// of a styled entry's tail.
+pub const TILE_ECONOMY_SHARES: [u64; 3] = [2, 2, 1];
+
+/// **What the tile caches may hold under `cap`**, per population.
+///
+/// On the **presumed** arm this is the class rung's own figures
+/// ([`Budgets::tile_cache`]), exactly as every other presumed allowance is
+/// the bracket's constant. On the **measured or probed** arm the economy
+/// allowance — `ECONOMY_FRACTION` of the card less what the scene needs — is
+/// split [`TILE_ECONOMY_SHARES`] ways, and each share is **held inside its
+/// bracket**: never below the floor (the worst device this build works on
+/// still holds its history), never above the ceiling (a 24 GiB card does not
+/// hold gigabytes of tiles because it could; the ceiling is the generous cap
+/// ruling 5 asked for). So a card with room resolves the ceiling whatever
+/// rung its class earned, and a 4 GiB card whose scene has taken most of it
+/// resolves toward the floor.
+pub fn tile_cache_budget(
+    scene: &Scene,
+    budgets: &Budgets,
+    limits: &BudgetLimits,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> TileCacheBudget {
+    if cap.source == crate::scene::CapacitySource::Presumed {
+        return budgets.tile_cache();
+    }
+    let economy = economy_allowance(scene, budgets, cap, grid_bytes);
+    let parts: u64 = TILE_ECONOMY_SHARES.iter().sum();
+    let share = |n: u64, bracket: crate::budget::Bracket| {
+        let raw = usize::try_from(economy / parts * n).unwrap_or(usize::MAX);
+        bracket.hold(raw) as u64
+    };
+    TileCacheBudget {
+        styled_bytes: share(TILE_ECONOMY_SHARES[0], limits.tile_styled_bytes),
+        parsed_bytes: share(TILE_ECONOMY_SHARES[1], limits.tile_parsed_bytes),
+        terrain_bytes: share(TILE_ECONOMY_SHARES[2], limits.tile_terrain_bytes),
+    }
 }
 
 /// One resident grid's cost, `u64::MAX` where the raymarch's arithmetic

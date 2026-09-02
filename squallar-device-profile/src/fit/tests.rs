@@ -870,3 +870,83 @@ fn fit_holds_for_every_answer_fit_gives_and_refuses_a_budget_that_was_not_fitted
         ));
     }
 }
+
+/// **The tile allowance on the measured arm is the economy split, held inside
+/// the bracket.** Presumed: the class rung's figures, untouched. Measured
+/// with room: every population at its ceiling, whatever rung the class earned
+/// — a card that can hold more history holds more, up to the generous cap.
+/// Measured without room — a card the scene has nearly filled — the floor,
+/// never below it. The shares are 2:2:1 and each is clamped on its own.
+#[test]
+fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_otherwise() {
+    use crate::fit::{TILE_ECONOMY_SHARES, tile_cache_budget};
+    use crate::scene::{Capacity, CapacitySource};
+
+    let limits = BudgetLimits::DESKTOP;
+    let profile = shipped_profile(limits);
+    let budgets = resolve(&profile);
+    let scene = scene_of(vec![plan_pane(HD, false, 0, None)]);
+
+    // Presumed: the class rung's own figures.
+    let presumed = Capacity::presumed(&limits);
+    assert_eq!(
+        tile_cache_budget(&scene, &budgets, &limits, &presumed, stand_in_grid_bytes),
+        budgets.tile_cache(),
+        "the presumed arm reads the bracket, as every presumed allowance does"
+    );
+
+    // Measured, with a card that has room: the ceiling on every population.
+    let roomy = Capacity::measured(24 << 30, None);
+    assert_eq!(roomy.source, CapacitySource::Measured);
+    let at_ceiling = tile_cache_budget(&scene, &budgets, &limits, &roomy, stand_in_grid_bytes);
+    assert_eq!(
+        at_ceiling,
+        TileCacheBudget {
+            styled_bytes: limits.tile_styled_bytes.ceiling as u64,
+            parsed_bytes: limits.tile_parsed_bytes.ceiling as u64,
+            terrain_bytes: limits.tile_terrain_bytes.ceiling as u64,
+        },
+        "a 24 GiB card holds the ceiling and not a byte more"
+    );
+
+    // Measured, with a card the scene has nearly filled: the floor, whatever
+    // the class rung was.
+    let scene_need = need(&scene, &budgets, stand_in_grid_bytes).gpu_bytes;
+    let tight = Capacity::measured(scene_need + 1, None);
+    let at_floor = tile_cache_budget(&scene, &budgets, &limits, &tight, stand_in_grid_bytes);
+    assert_eq!(
+        at_floor,
+        TileCacheBudget {
+            styled_bytes: limits.tile_styled_bytes.floor as u64,
+            parsed_bytes: limits.tile_parsed_bytes.floor as u64,
+            terrain_bytes: limits.tile_terrain_bytes.floor as u64,
+        },
+        "a card with no economy left still holds the floor"
+    );
+
+    // Between the two the shares are what they say: pick an economy that
+    // lands every population strictly inside its bracket.
+    let parts: u64 = TILE_ECONOMY_SHARES.iter().sum();
+    let economy = 5 * (200u64 << 20);
+    let cap = Capacity::measured(
+        (economy + scene_need) * crate::constants::ECONOMY_FRACTION.1
+            / crate::constants::ECONOMY_FRACTION.0,
+        None,
+    );
+    let inside = tile_cache_budget(&scene, &budgets, &limits, &cap, stand_in_grid_bytes);
+    let e = crate::fit::economy_allowance(&scene, &budgets, &cap, stand_in_grid_bytes);
+    assert_eq!(
+        inside,
+        TileCacheBudget {
+            styled_bytes: limits.tile_styled_bytes.hold((e / parts * 2) as usize) as u64,
+            parsed_bytes: limits.tile_parsed_bytes.hold((e / parts * 2) as usize) as u64,
+            terrain_bytes: limits.tile_terrain_bytes.hold((e / parts) as usize) as u64,
+        }
+    );
+    assert!(
+        inside.styled_bytes > limits.tile_styled_bytes.floor as u64
+            && inside.styled_bytes < limits.tile_styled_bytes.ceiling as u64,
+        "fixture: the styled share must land strictly inside the bracket to prove the \
+         arithmetic, not a clamp: {inside:?}"
+    );
+}

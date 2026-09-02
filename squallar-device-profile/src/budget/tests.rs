@@ -43,6 +43,10 @@ fn the_resolver_reproduces_every_shipped_constant() {
             raster_side_ceiling_px: WASM_RASTER_SIDE_CEILING,
             prism_vram_bytes: WASM_PRISM_GEOMETRY_BYTES,
             tile_whole_zoom: false,
+            tile_styled_bytes: WASM_TILE_STYLED_BYTES[0],
+            tile_parsed_bytes: WASM_TILE_PARSED_BYTES[0],
+            tile_terrain_bytes: WASM_TILE_TERRAIN_BYTES[0],
+            tile_host_ceiling_bytes: WASM_TILE_HOST_CEILING_BYTES[0],
         },
         Budgets {
             name: "mobile",
@@ -70,6 +74,10 @@ fn the_resolver_reproduces_every_shipped_constant() {
             raster_side_ceiling_px: MOBILE_RASTER_SIDE_CEILING,
             prism_vram_bytes: MOBILE_PRISM_GEOMETRY_BYTES,
             tile_whole_zoom: false,
+            tile_styled_bytes: MOBILE_TILE_STYLED_BYTES,
+            tile_parsed_bytes: MOBILE_TILE_PARSED_BYTES,
+            tile_terrain_bytes: MOBILE_TILE_TERRAIN_BYTES,
+            tile_host_ceiling_bytes: MOBILE_TILE_HOST_CEILING_BYTES,
         },
         Budgets {
             name: "desktop",
@@ -98,6 +106,10 @@ fn the_resolver_reproduces_every_shipped_constant() {
             prism_vram_bytes: DESKTOP_PRISM_GEOMETRY_BYTES,
             // The tile-sharpness rung's position: a class rung never snaps.
             tile_whole_zoom: false,
+            tile_styled_bytes: DESKTOP_TILE_STYLED_BYTES[0],
+            tile_parsed_bytes: DESKTOP_TILE_PARSED_BYTES[0],
+            tile_terrain_bytes: DESKTOP_TILE_TERRAIN_BYTES[0],
+            tile_host_ceiling_bytes: DESKTOP_TILE_HOST_CEILING_BYTES[0],
         },
     ];
 
@@ -146,6 +158,21 @@ fn the_compiled_targets_budgets_are_the_constants_this_build_selected() {
     assert!(
         !b.tile_whole_zoom,
         "a class rung snaps no tiles: only the ladder's tile-sharpness rung does",
+    );
+    // The tile allowances have no `cfg` cascade to compare against — that is
+    // the point of them — so the target's own bracket at the floor is the
+    // reference: a fresh profile has met no adapter and earns nothing.
+    let limits = BudgetLimits::for_target();
+    assert_eq!(b.tile_styled_bytes, limits.tile_styled_bytes.floor);
+    assert_eq!(b.tile_parsed_bytes, limits.tile_parsed_bytes.floor);
+    assert_eq!(b.tile_terrain_bytes, limits.tile_terrain_bytes.floor);
+    assert_eq!(
+        b.tile_cache(),
+        TileCacheBudget {
+            styled_bytes: limits.tile_styled_bytes.floor as u64,
+            parsed_bytes: limits.tile_parsed_bytes.floor as u64,
+            terrain_bytes: limits.tile_terrain_bytes.floor as u64,
+        }
     );
 }
 
@@ -454,6 +481,54 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
         "prism_vram_bytes",
         b.prism_vram_bytes,
         limits.prism_geometry_bytes,
+    );
+    within(
+        "tile_styled_bytes",
+        b.tile_styled_bytes,
+        limits.tile_styled_bytes,
+    );
+    within(
+        "tile_parsed_bytes",
+        b.tile_parsed_bytes,
+        limits.tile_parsed_bytes,
+    );
+    within(
+        "tile_terrain_bytes",
+        b.tile_terrain_bytes,
+        limits.tile_terrain_bytes,
+    );
+    within(
+        "tile_host_ceiling_bytes",
+        b.tile_host_ceiling_bytes,
+        limits.tile_host_ceiling_bytes,
+    );
+    // The tile caches' own sum proof, on the host: the three allowances fit
+    // their ceiling, and the ceiling is snug enough to catch one of them
+    // silently doubling — the same 1.25x the GPU sum is held to.
+    let tiles = b.tile_host_bytes();
+    assert!(
+        tiles <= b.tile_host_ceiling_bytes,
+        "{from} / {}: {} MiB of tile allowances against a {} MiB host ceiling",
+        b.name,
+        tiles / (1024 * 1024),
+        b.tile_host_ceiling_bytes / (1024 * 1024),
+    );
+    assert!(
+        b.tile_host_ceiling_bytes * 4 <= tiles * 5,
+        "{from} / {}: the {} MiB tile host ceiling is more than 1.25x the {} MiB it bounds",
+        b.name,
+        b.tile_host_ceiling_bytes / (1024 * 1024),
+        tiles / (1024 * 1024),
+    );
+    assert_eq!(
+        b.tile_cache(),
+        TileCacheBudget {
+            styled_bytes: b.tile_styled_bytes as u64,
+            parsed_bytes: b.tile_parsed_bytes as u64,
+            terrain_bytes: b.tile_terrain_bytes as u64,
+        },
+        "{from} / {}: the tile caches are handed different figures from the ones resolved",
+        b.name,
     );
     for axis in 0..3 {
         assert!(
@@ -1326,6 +1401,10 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
     assert!(pinned(limits.app_texture_ceiling_bytes));
     assert!(pinned(limits.raster_side_ceiling_px));
     assert!(pinned(limits.prism_geometry_bytes));
+    assert!(pinned(limits.tile_styled_bytes));
+    assert!(pinned(limits.tile_parsed_bytes));
+    assert!(pinned(limits.tile_terrain_bytes));
+    assert!(pinned(limits.tile_host_ceiling_bytes));
     assert_eq!(limits.grid_cells.floor, limits.grid_cells.ceiling);
     for class in CLASSES {
         let profile = DeviceProfile {
@@ -1347,6 +1426,169 @@ fn the_mobile_bracket_promotes_nothing_until_somebody_measures_aarch64() {
              run this on",
         );
     }
+}
+
+/// **The tile allowances are the written figures, in MiB, on every bracket
+/// and at every rung.** The argument for each is on
+/// `constants::WASM_TILE_STYLED_BYTES`; this holds the arithmetic it was
+/// made from — styled / parsed / terrain at floor, step and ceiling — and the
+/// two relations the argument rests on: the styled floor holds 2,400 typical
+/// entries and not the 106-tile worst case, and desktop's parsed floor is
+/// what a 1920x1200 restyle needs.
+#[test]
+fn the_tile_allowances_are_the_written_figures_on_every_bracket() {
+    let mib = |n: usize| n * 1024 * 1024;
+    let rungs = |b: Bracket| [b.floor, b.step, b.ceiling];
+    for (limits, styled, parsed, terrain, ceiling) in [
+        (
+            BudgetLimits::WASM,
+            [48, 64, 64],
+            [48, 64, 64],
+            [25, 32, 32],
+            [128, 192, 192],
+        ),
+        (
+            BudgetLimits::MOBILE,
+            [48, 48, 48],
+            [48, 48, 48],
+            [25, 25, 25],
+            [128, 128, 128],
+        ),
+        (
+            BudgetLimits::DESKTOP,
+            [160, 256, 512],
+            [192, 256, 384],
+            [64, 80, 128],
+            [448, 640, 1024],
+        ),
+    ] {
+        let name = limits.name;
+        assert_eq!(
+            rungs(limits.tile_styled_bytes),
+            styled.map(mib),
+            "{name} styled"
+        );
+        assert_eq!(
+            rungs(limits.tile_parsed_bytes),
+            parsed.map(mib),
+            "{name} parsed"
+        );
+        assert_eq!(
+            rungs(limits.tile_terrain_bytes),
+            terrain.map(mib),
+            "{name} terrain"
+        );
+        assert_eq!(
+            rungs(limits.tile_host_ceiling_bytes),
+            ceiling.map(mib),
+            "{name} host ceiling"
+        );
+        // Ordered by rung on every axis: a step below its floor would resolve
+        // as the floor and read as a promotion that did nothing.
+        for bracket in [
+            limits.tile_styled_bytes,
+            limits.tile_parsed_bytes,
+            limits.tile_terrain_bytes,
+            limits.tile_host_ceiling_bytes,
+        ] {
+            assert!(
+                bracket.floor <= bracket.step && bracket.step <= bracket.ceiling,
+                "{name}: a tile bracket is out of order: {bracket:?}"
+            );
+        }
+    }
+
+    // The relations the figures were argued from, at the two measured entry
+    // costs — the city-core tail (1,462,708 B, squallar-egui's
+    // `MEASURED_STYLED_ENTRY_BYTES`, restated here because this crate sits
+    // under that one) and the typical dense-city entry (~30 KB).
+    const TAIL: usize = 1_462_708;
+    const TYPICAL: usize = 30_000;
+    const USER_WINDOW_WORST: usize = 106;
+    let wasm_floor = BudgetLimits::WASM.tile_styled_bytes.floor;
+    assert!(
+        wasm_floor / TAIL < USER_WINDOW_WORST,
+        "the wasm styled floor holds {} worst-case entries; the user's 2878x1651 window          wants {USER_WINDOW_WORST} between zooms. If this ever fits, the working-set floor          and the snapping rung are no longer what carries that window and the doc on          WASM_TILE_STYLED_BYTES is stale",
+        wasm_floor / TAIL,
+    );
+    assert!(
+        wasm_floor / TYPICAL >= 1_600,
+        "the wasm styled floor holds {} typical entries, under the 1,600 its doc quotes",
+        wasm_floor / TYPICAL,
+    );
+    // Desktop's floor holds the user's window at the tail; its step holds
+    // 2560x1440 between zooms (144).
+    let desktop_floor = BudgetLimits::DESKTOP.tile_styled_bytes.floor;
+    assert!(
+        desktop_floor / TAIL >= USER_WINDOW_WORST,
+        "desktop's styled floor holds {} tail entries, under the user's {USER_WINDOW_WORST}",
+        desktop_floor / TAIL,
+    );
+    let desktop_step = BudgetLimits::DESKTOP.tile_styled_bytes.step;
+    assert!(
+        desktop_step / TAIL >= 144,
+        "desktop's styled step holds {} tail entries, under the 144 a 2560x1440 canvas keeps \
+         between zooms",
+        desktop_step / TAIL,
+    );
+    // Desktop's parsed floor restyles the common 1920x1200 canvas — 96 tiles
+    // between zooms — from cache at the parsed tail (2.09 MB), to within the
+    // rounding its doc states.
+    const PARSED_TAIL: usize = 2_092_002;
+    let desktop_parsed = BudgetLimits::DESKTOP.tile_parsed_bytes.floor;
+    assert!(
+        desktop_parsed / PARSED_TAIL >= 96,
+        "desktop's parsed floor holds {} worst-case parses, under the 96 a 1920x1200          canvas keeps between zooms",
+        desktop_parsed / PARSED_TAIL,
+    );
+    // The ceiling rung holds a 3840x2160 window between zooms — 299 tiles —
+    // at the tail without the floor's help.
+    let desktop_ceiling = BudgetLimits::DESKTOP.tile_styled_bytes.ceiling;
+    assert!(
+        desktop_ceiling / TAIL >= 299,
+        "desktop's styled ceiling holds {} worst-case entries, under the 299 a 4K window          keeps between zooms",
+        desktop_ceiling / TAIL,
+    );
+}
+
+/// **Terrain rasters are GPU textures, and they are left out of
+/// `app_texture_bytes` on purpose, by name.** This is the named omission: the
+/// wasm GPU sum sits at 278 of its 288 MiB, so folding even the terrain
+/// *floor* into it fails the snugness proof for a population the tile cache
+/// already bounds in bytes. The day the sum has the room, this test is what
+/// says so — and the omission should then be re-argued, not silently kept.
+#[test]
+fn the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name() {
+    for profile in profiles() {
+        let b = resolve(&profile);
+        // Two budgets differing only in their tile allowances price the GPU
+        // sum identically: no tile figure is a term of it.
+        let mut doubled = b;
+        doubled.tile_styled_bytes *= 2;
+        doubled.tile_parsed_bytes *= 2;
+        doubled.tile_terrain_bytes *= 2;
+        assert_eq!(
+            doubled.app_texture_bytes(),
+            b.app_texture_bytes(),
+            "{}: a tile allowance moved the GPU sum",
+            b.name,
+        );
+        assert_eq!(
+            doubled.tile_host_bytes(),
+            2 * b.tile_host_bytes(),
+            "{}: the tile allowances are priced on the host sum and nowhere else",
+            b.name,
+        );
+    }
+    // And the omission is load-bearing on the arm it was made for.
+    let wasm = resolve(&shipped_profile(BudgetLimits::WASM));
+    assert!(
+        wasm.app_texture_bytes() + wasm.tile_terrain_bytes > wasm.app_texture_ceiling_bytes,
+        "wasm32: {} MiB of GPU textures plus the {} MiB terrain floor fits the {} MiB          ceiling after all, so the omission no longer needs to be one",
+        wasm.app_texture_bytes() / (1024 * 1024),
+        wasm.tile_terrain_bytes / (1024 * 1024),
+        wasm.app_texture_ceiling_bytes / (1024 * 1024),
+    );
 }
 
 /// Halvings from `frames` down to `MIN_LOOP_FRAMES_PER_PANE`, the way the
@@ -1802,6 +2044,10 @@ fn the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured() {
         ("max_panes", w.max_panes),
         ("app_texture_ceiling_bytes", w.app_texture_ceiling_bytes),
         ("raster_side_ceiling_px", w.raster_side_ceiling_px),
+        ("tile_styled_bytes", w.tile_styled_bytes),
+        ("tile_parsed_bytes", w.tile_parsed_bytes),
+        ("tile_terrain_bytes", w.tile_terrain_bytes),
+        ("tile_host_ceiling_bytes", w.tile_host_ceiling_bytes),
     ] {
         assert_eq!(
             bracket.step, bracket.ceiling,

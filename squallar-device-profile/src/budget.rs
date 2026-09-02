@@ -449,6 +449,43 @@ pub struct BudgetLimits {
     /// worker chose for itself. Pinned on every arm at the one machine's
     /// measurement (`constants::DESKTOP_PRISM_GEOMETRY_BYTES`).
     pub prism_geometry_bytes: Bracket,
+    /// Host bytes the basemap's **styled** tile entries may occupy beyond the
+    /// working set — the LRU history a pan comes back to. The argument for
+    /// every tile figure is written once, on
+    /// [`constants::WASM_TILE_STYLED_BYTES`].
+    pub tile_styled_bytes: Bracket,
+    /// Host bytes the basemap's **parsed** geometry may occupy: the
+    /// style-independent decodes a theme flip restyles from without a fetch.
+    /// Economy through and through — an evicted parse is one refetch on the
+    /// next restyle, never a frame.
+    pub tile_parsed_bytes: Bracket,
+    /// Bytes the **terrain** hillshade's raster tiles may occupy beyond their
+    /// working set. GPU textures, priced here and omitted from
+    /// [`Budgets::app_texture_bytes`] by name — see the constants' doc.
+    pub tile_terrain_bytes: Bracket,
+    /// What the three tile allowances may sum to at each rung, the way
+    /// [`Self::app_texture_ceiling_bytes`] bounds the GPU sum; `check_budgets`
+    /// holds it within 1.25x of that sum.
+    pub tile_host_ceiling_bytes: Bracket,
+}
+
+/// The three tile allowances a set of budgets hands the tile caches, in
+/// bytes — what `squallar_egui::tiles::MapTileState` is told every frame
+/// through `FrameInputs`. `u64` because the caches count resident bytes in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TileCacheBudget {
+    /// The basemap source's styled entries. See [`BudgetLimits::tile_styled_bytes`].
+    pub styled_bytes: u64,
+    /// The basemap source's parsed geometry. See [`BudgetLimits::tile_parsed_bytes`].
+    pub parsed_bytes: u64,
+    /// The terrain source's rasters. See [`BudgetLimits::tile_terrain_bytes`].
+    pub terrain_bytes: u64,
+}
+
+/// A bracket from a `[floor, step, ceiling]` triple, the shape the tile
+/// allowances are written in.
+const fn rungs(triple: [usize; 3]) -> Bracket {
+    Bracket::stepped(triple[0], triple[1], triple[2])
 }
 
 impl BudgetLimits {
@@ -526,6 +563,14 @@ impl BudgetLimits {
             constants::WASM_RASTER_SIDE_CEILING_PROMOTED,
         ),
         prism_geometry_bytes: Bracket::pinned(constants::WASM_PRISM_GEOMETRY_BYTES),
+        // Host-heap figures with a real step: a desktop-class adapter report
+        // buys a longer tile history. The ceiling is the step, as on every
+        // other field here, until a desktop-browser tier is measured — see
+        // the constants' doc for the figures that tier would fill.
+        tile_styled_bytes: rungs(constants::WASM_TILE_STYLED_BYTES),
+        tile_parsed_bytes: rungs(constants::WASM_TILE_PARSED_BYTES),
+        tile_terrain_bytes: rungs(constants::WASM_TILE_TERRAIN_BYTES),
+        tile_host_ceiling_bytes: rungs(constants::WASM_TILE_HOST_CEILING_BYTES),
     };
 
     /// The mobile bracket — native Android and iOS.
@@ -557,6 +602,11 @@ impl BudgetLimits {
         app_texture_ceiling_bytes: Bracket::pinned(constants::MOBILE_APP_TEXTURE_BUDGET_BYTES),
         raster_side_ceiling_px: Bracket::pinned(constants::MOBILE_RASTER_SIDE_CEILING),
         prism_geometry_bytes: Bracket::pinned(constants::MOBILE_PRISM_GEOMETRY_BYTES),
+        // Pinned at the wasm floor, like every other mobile field: unmeasured.
+        tile_styled_bytes: Bracket::pinned(constants::MOBILE_TILE_STYLED_BYTES),
+        tile_parsed_bytes: Bracket::pinned(constants::MOBILE_TILE_PARSED_BYTES),
+        tile_terrain_bytes: Bracket::pinned(constants::MOBILE_TILE_TERRAIN_BYTES),
+        tile_host_ceiling_bytes: Bracket::pinned(constants::MOBILE_TILE_HOST_CEILING_BYTES),
     };
 
     /// The desktop bracket.
@@ -605,6 +655,10 @@ impl BudgetLimits {
         ),
         raster_side_ceiling_px: Bracket::pinned(constants::DESKTOP_RASTER_SIDE_CEILING),
         prism_geometry_bytes: Bracket::pinned(constants::DESKTOP_PRISM_GEOMETRY_BYTES),
+        tile_styled_bytes: rungs(constants::DESKTOP_TILE_STYLED_BYTES),
+        tile_parsed_bytes: rungs(constants::DESKTOP_TILE_PARSED_BYTES),
+        tile_terrain_bytes: rungs(constants::DESKTOP_TILE_TERRAIN_BYTES),
+        tile_host_ceiling_bytes: rungs(constants::DESKTOP_TILE_HOST_CEILING_BYTES),
     };
 
     /// The bracket this build compiled.
@@ -702,9 +756,33 @@ pub struct Budgets {
     /// **Buffers, not textures**: not a term of [`Self::app_texture_bytes`],
     /// priced by `crate::fit::need` for a pane that draws buildings.
     pub prism_vram_bytes: usize,
+    /// The basemap's styled-entry allowance. See [`BudgetLimits::tile_styled_bytes`].
+    pub tile_styled_bytes: usize,
+    /// The basemap's parsed-geometry allowance. See [`BudgetLimits::tile_parsed_bytes`].
+    pub tile_parsed_bytes: usize,
+    /// The terrain rasters' allowance. See [`BudgetLimits::tile_terrain_bytes`].
+    pub tile_terrain_bytes: usize,
+    /// What the three may sum to. See [`BudgetLimits::tile_host_ceiling_bytes`].
+    pub tile_host_ceiling_bytes: usize,
 }
 
 impl Budgets {
+    /// The three tile allowances, as the tile caches take them.
+    pub fn tile_cache(&self) -> TileCacheBudget {
+        TileCacheBudget {
+            styled_bytes: self.tile_styled_bytes as u64,
+            parsed_bytes: self.tile_parsed_bytes as u64,
+            terrain_bytes: self.tile_terrain_bytes as u64,
+        }
+    }
+
+    /// Every host byte the tile caches may hold between them, worst case: the
+    /// figure [`Self::tile_host_ceiling_bytes`] bounds. Not a term of
+    /// [`Self::app_texture_bytes`] — see the constants' doc for the omission.
+    pub fn tile_host_bytes(&self) -> usize {
+        self.tile_styled_bytes + self.tile_parsed_bytes + self.tile_terrain_bytes
+    }
+
     /// Ceiling on the resident voxel grids a 3D loop may hold, application-wide.
     pub fn volume_loop_bytes(&self) -> usize {
         self.loop_pool_floor_bytes
@@ -829,6 +907,10 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
             .max(limits.long_range_image_side_px.floor),
         tile_whole_zoom: false,
         prism_vram_bytes: limits.prism_geometry_bytes.at(promotion),
+        tile_styled_bytes: limits.tile_styled_bytes.at(promotion),
+        tile_parsed_bytes: limits.tile_parsed_bytes.at(promotion),
+        tile_terrain_bytes: limits.tile_terrain_bytes.at(promotion),
+        tile_host_ceiling_bytes: limits.tile_host_ceiling_bytes.at(promotion),
     };
     demote(&mut budgets, limits, profile.steps_back());
     budgets
