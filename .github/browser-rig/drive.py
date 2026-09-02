@@ -2810,6 +2810,23 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // application's whole allowance, and floor/ceiling the tier's bracket -- a
 // pool below the value it booted at is `LoopPool::back_off` having fired.
 var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us/;
+// The `budget state:` line: the bracket and rung the budgets were resolved
+// at, and every host signal the device profile carries beside them. A LEVEL,
+// every group MANDATORY: the app prints every field on every tick, with 0
+// where a signal is unread (0 is not a possible measurement of RAM, VRAM,
+// threads or a live heap) and `form` 0/1/2 for unknown/handheld/desktop. A
+// bundle built before the line never matches, and that reads as `null`
+// below -- "that bundle is older", never "zero". Its OWN pattern rather than
+// a group on any shared probe, for `ground_stroke_draws_re`'s reason. The
+// bracket group is a WORD: `native_row.py` `int()`s every group of the
+// probes in its running-totals loop, so this one has its own arm there.
+// Denominators, never added: `pool` is the loop pool's bracket ceiling (the
+// term `app_texture_bytes` sums, NOT the live pool `loop state:` prints in
+// B), `ceiling` the whole-app texture ceiling; `vram`/`ram`/`declared` are
+// three sources (measured VRAM, measured RAM, a browser's `deviceMemory`
+// declaration) and never one figure; `linear` is the page instance's heap
+// over the rasterization worker's -- two instances, two ceilings.
+var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+), pool (\d+) MiB, ceiling (\d+) MiB, vram (\d+) MiB, ram (\d+) MiB, declared (\d+) MiB, threads (\d+), form (\d+), linear (\d+)\/(\d+) MiB/;
 // The two WINDOWABLE families, both `<prefix> (<name>):` with the same
 // payload. `n` and `sum` are running totals and both subtract, so a windowed
 // mean is exact: (sum_b - sum_a) / (n_b - n_a). `hist` is the same 42-slot
@@ -2862,6 +2879,7 @@ var interact = null, idle = null, segments = null, prep = null, gpu = null;
 var prep_geometry = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
+var budget_state = null, budget_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [];
@@ -2933,6 +2951,21 @@ for (var i = 0; i < C.length; i++) {
                    advance_us: parseInt(x[17], 10) };
     loop_state_all.push(loop_state);
   }
+  x = budget_state_re.exec(m);
+  if (x) {
+    // A LEVEL, like `loop_state`: the last reading inside a window is the
+    // reading. Stays `null` when no line matched -- an older bundle, never a
+    // zero reading.
+    budget_state = { t: t, bracket: x[1], rung: parseInt(x[2], 10),
+                     steps: parseInt(x[3], 10), pool_mib: parseInt(x[4], 10),
+                     ceiling_mib: parseInt(x[5], 10),
+                     vram_mib: parseInt(x[6], 10), ram_mib: parseInt(x[7], 10),
+                     declared_mib: parseInt(x[8], 10),
+                     threads: parseInt(x[9], 10), form: parseInt(x[10], 10),
+                     linear_page_mib: parseInt(x[11], 10),
+                     linear_worker_mib: parseInt(x[12], 10) };
+    budget_state_all.push(budget_state);
+  }
   x = frame_segment_re.exec(m);
   if (x) frame_segment_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                   sum: parseInt(x[3], 10), p50: x[4],
@@ -2976,6 +3009,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          prep_geometry: prep_geometry,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
          loop_state: loop_state, loop_state_all: loop_state_all,
+         budget_state: budget_state, budget_state_all: budget_state_all,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
@@ -5804,6 +5838,9 @@ def run_smoke(args):
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
                                         "prep", "gpu", "gpu_unavailable",
                                         "cadence", "loop_state")}
+        # Recorded beside `loop_state`, and None -- never 0 -- when no
+        # `budget state:` line matched: an older bundle, not a zero reading.
+        result["frame_lines"]["budget_state"] = fl_last.get("budget_state")
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
@@ -6412,6 +6449,20 @@ def run_smoke(args):
                  s.get("share_bytes"), s.get("pool_bytes"),
                  s.get("floor_bytes"), s.get("ceiling_bytes"),
                  s.get("advance_us")))
+    if fl.get("budget_state"):
+        b = fl["budget_state"]
+        # A LEVEL at the end of the leg. `pool`/`ceiling` are the bracket's
+        # figures, never the live pool; vram/ram/declared are three sources
+        # and never one figure; the two `linear` figures are two instances.
+        print("[%s] SUMMARY [%s] budget state [level, end of leg]: bracket %s, "
+              "rung %s, steps %s; pool %s MiB, ceiling %s MiB; vram %s MiB, "
+              "ram %s MiB, declared %s MiB, threads %s, form %s; "
+              "linear %s/%s MiB"
+              % (tag, alabel, b.get("bracket"), b.get("rung"), b.get("steps"),
+                 b.get("pool_mib"), b.get("ceiling_mib"), b.get("vram_mib"),
+                 b.get("ram_mib"), b.get("declared_mib"), b.get("threads"),
+                 b.get("form"), b.get("linear_page_mib"),
+                 b.get("linear_worker_mib")))
     gw = result.get("gesture_window")
     if gw:
         print("[%s] SUMMARY [%s] gesture window (%s, %s loops, %s):"

@@ -149,7 +149,8 @@ def drive_pattern(name, source=None):
 
 
 # The probes this analyser needs. Every one is `drive.py`'s, unmodified: the
-# JS and Python flavours agree on all of `\d`, `\(`, `[0-9,]+`, `[a-z0-9-]+`.
+# JS and Python flavours agree on all of `\d`, `\(`, `\/`, `[0-9,]+`,
+# `[a-z0-9]+`, `[a-z0-9-]+`.
 PROBE_NAMES = (
     "svc_interact_re",
     "svc_idle_re",
@@ -161,6 +162,7 @@ PROBE_NAMES = (
     "ground_re",
     "floor_re",
     "loop_state_re",
+    "budget_state_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -411,6 +413,7 @@ def scrape(lines, probes):
         "ground": [],
         "floor": [],
         "loop_state": [],
+        "budget_state": [],
         "segments": [],
         "begins": [],
         "loops": [],
@@ -451,6 +454,15 @@ def scrape(lines, probes):
             m = probes[probe].search(line)
             if m:
                 out[key].append((idx, [int(x) for x in m.groups()]))
+        # `budget state` is a level too, but its first group is the bracket's
+        # NAME, so it cannot ride the all-`int()` loop above: the word is kept
+        # as text and the eleven figures after it are ints. Every group is
+        # mandatory; no match at all leaves the family empty, which the row
+        # prints as absent -- an older binary, never a zero reading.
+        m = probes["budget_state_re"].search(line)
+        if m:
+            g = m.groups()
+            out["budget_state"].append((idx, g[0], [int(x) for x in g[1:]]))
         # `frame segments` is NOT one of them: its percentile groups are
         # `(\d+|none|over)`, and `over` is the top-bin clamp, which has no
         # upper edge and is not a number. Kept as text -- it is reported as
@@ -1217,6 +1229,10 @@ def build_row(args, scraped, probes):
         "liveness": live,
         "surface": surf,
         "loop_state": (scraped["loop_state"][-1][1] if scraped["loop_state"] else None),
+        # `(line, bracket, [eleven ints])`, or None when the log has no
+        # `budget state:` line -- a binary older than the line, kept apart
+        # from a live binary reporting zeroes.
+        "budget_state": (scraped["budget_state"][-1] if scraped["budget_state"] else None),
         "gpu_unavailable": scraped["gpu_unavailable"],
         "throughput_interact_frames": throughput,
         "percentiles_clamped": clamped,
@@ -1296,6 +1312,26 @@ def print_row(row):
             "ROW   loop %s panes, %s layers animating, %s frames listed, "
             "%s resident (%s in flight, %s failed); cap=%s held=%s; advance=%s us"
             % (ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[10], ls[11], ls[16])
+        )
+    # The machine and the bracket the budgets came from, on every scene. A
+    # LEVEL at the end of the log; `pool`/`ceiling` are the bracket's figures,
+    # never the live pool. Absent when the log has no `budget state:` line: a
+    # binary older than the line, printed as such and never as zeroes. `.get`
+    # because a row built before the field existed reads the same way.
+    bs = row.get("budget_state")
+    if bs:
+        _line, bracket_name, f = bs
+        print(
+            "ROW   budget bracket=%s rung=%s steps=%s pool=%s MiB ceiling=%s MiB "
+            "vram=%s MiB ram=%s MiB declared=%s MiB threads=%s form=%s "
+            "linear=%s/%s MiB"
+            % (bracket_name, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+               f[8], f[9], f[10])
+        )
+    else:
+        print(
+            "ROW   budget: n/a (no `budget state:` line in this log -- a binary "
+            "older than the line, not a zero reading)"
         )
     if row["gpu_unavailable"]:
         print("ROW   gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)")
@@ -2092,7 +2128,7 @@ def _fixture_row(clamp=False):
         "liveness": {"ok": True, "grew_by": 40, "verdict": "interact frames "
                      "still rising (+40 after the window)"},
         "surface": surface_check((1920, 1080), (1920, 1080), 10, b * 10),
-        "loop_state": None, "gpu_unavailable": False,
+        "loop_state": None, "budget_state": None, "gpu_unavailable": False,
         "throughput_interact_frames": 1234,
         "percentiles_clamped": clamp,
         "invalid": [],

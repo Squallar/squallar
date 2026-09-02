@@ -243,6 +243,27 @@ mod js {
         fn is_shared(&self) -> bool {
             self.0.is_instance_of::<js_sys::SharedArrayBuffer>()
         }
+
+        /// `byteLength`, whichever of the two buffer kinds this is. `None`
+        /// for a value that is neither — which a `WebAssembly.Memory` cannot
+        /// hand back, so the `Option` is the shape of the cast.
+        fn byte_length(&self) -> Option<u64> {
+            if let Some(shared) = self.0.dyn_ref::<js_sys::SharedArrayBuffer>() {
+                Some(u64::from(shared.byte_length()))
+            } else {
+                self.0
+                    .dyn_ref::<js_sys::ArrayBuffer>()
+                    .map(|plain| u64::from(plain.byte_length()))
+            }
+        }
+    }
+
+    /// How many bytes this instance's linear memory currently spans — the
+    /// page's on the page, the worker's in the worker, each read against its
+    /// own `--max-memory`. A level, not a high-water mark: a shared memory
+    /// only ever grows, so on this target the two are the same figure.
+    pub fn memory_bytes() -> Option<u64> {
+        memory_buffer()?.byte_length()
     }
 
     /// Register `buffers` as lent and build one `Uint8Array` view per buffer.
@@ -347,4 +368,6 @@ mod js {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use js::{bytes_outstanding, can_lend, is_foreign_shared, lend, release, release_all};
+pub use js::{
+    bytes_outstanding, can_lend, is_foreign_shared, lend, memory_bytes, release, release_all,
+};

@@ -108,6 +108,11 @@ pub mod kv;
 /// a retry policy only a browser can walk is one no test ever checks.
 pub mod worker_retry;
 
+/// The device's form factor from pointer media and touch points. Not
+/// wasm32-gated for `worker_retry`'s reason: the classifier is pure and its
+/// truth table runs on the host; only the reads in `bridge` are gated.
+pub mod form_factor;
+
 #[cfg(target_arch = "wasm32")]
 pub mod bridge;
 

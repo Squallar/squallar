@@ -60,7 +60,8 @@ mod tests {
             adapter: AdapterCeilings::WEBGL2_GUARANTEE,
             vram_bytes: None,
             system_ram_bytes: None,
-            parallelism: 1,
+            declared_ram_bytes: None,
+            parallelism: None,
             form_factor: None,
             memo: Some(BudgetMemo {
                 loop_pool_bytes: None,

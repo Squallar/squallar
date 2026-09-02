@@ -15,6 +15,9 @@
 // caller of looks dead.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub mod android;
+/// The RAM and thread readers behind `PlatformBridge::host_signals`, one
+/// module per OS.
+pub mod capacity;
 pub mod kv;
 /// Test-only. See the module docs for why it lives in this crate.
 pub mod network_security_config;

@@ -31,11 +31,12 @@ use wasm_bindgen::prelude::*;
 
 /// Threads to ask for in the rasterization worker.
 ///
-/// Reads `navigator.hardwareConcurrency` through `Reflect` rather than through
-/// a `web-sys` binding because the worker's global is a `WorkerNavigator` and
-/// the page's is a `Navigator`; the property is the same on both and this way
-/// the crate does not carry a feature for each. A global that will not name a
-/// count reads as [`DEFAULT_THREADS`].
+/// Reads `navigator.hardwareConcurrency` through `Reflect`
+/// (`crate::bridge::navigator_number`) rather than through a `web-sys`
+/// binding because the worker's global is a `WorkerNavigator` and the page's
+/// is a `Navigator`; the property is the same on both and this way the crate
+/// does not carry a feature for each. A global that will not name a count
+/// reads as [`DEFAULT_THREADS`].
 ///
 /// Clamped to [`squallar_device_profile::constants::WASM_MAX_RAYON_THREADS`],
 /// which is the memory budget: every rayon thread costs a stack inside the one
@@ -43,11 +44,8 @@ use wasm_bindgen::prelude::*;
 /// this module has no business believing.
 #[wasm_bindgen(js_name = squallarRayonThreads)]
 pub fn threads() -> usize {
-    let reported = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("navigator"))
-        .ok()
-        .and_then(|nav| js_sys::Reflect::get(&nav, &JsValue::from_str("hardwareConcurrency")).ok())
-        .and_then(|n| n.as_f64())
-        .filter(|n| n.is_finite() && *n >= 1.0)
+    let reported = crate::bridge::navigator_number("hardwareConcurrency")
+        .filter(|n| *n >= 1.0)
         .map_or(DEFAULT_THREADS, |n| n as usize);
 
     reported.clamp(

@@ -997,6 +997,7 @@ impl super::App {
                 mirror_plan_stamp: self.mirror_plan_stamp,
                 frame_diagnostics: Some(squallar_egui::shell_api::FrameDiagnostics {
                     gpu_passes: self.gpu_passes_panel_line.as_deref(),
+                    budget_state: self.budget_state_panel_line.as_deref(),
                     ..self.frame_ledger.diagnostics()
                 }),
             });
@@ -1568,6 +1569,19 @@ impl super::App {
         say_telemetry(
             loud,
             &crate::loop_telemetry::loop_state_line(&self.loop_state()),
+        );
+        // What the machine told the budget system, beside what the loops
+        // hold — see [`crate::budget_telemetry`]. Composed once per tick and
+        // parked for the diagnostics overlay's row on the way to the log, so
+        // the panel and a captured log carry the same sentence.
+        say_telemetry(
+            loud,
+            self.budget_state_panel_line
+                .insert(crate::budget_telemetry::budget_state_line(
+                    &self.budgets,
+                    &self.device_profile,
+                    self.platform.linear_memory(),
+                )),
         );
     }
 

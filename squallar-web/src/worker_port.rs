@@ -53,6 +53,7 @@ use crate::worker_protocol as proto;
 use crate::worker_retry::Backoff;
 use squallar_worker::offload::{self, JobRequest, JobSink};
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wasm_bindgen::prelude::*;
 
 /// Where the worker's bootstrap lives, relative to the page.
@@ -80,6 +81,33 @@ thread_local! {
     /// Whether a respawn is already on a timer, so a `FATAL` and an `onerror` from
     /// the same dying worker schedule one attempt.
     static RESPAWN_SCHEDULED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The worker's heap size as it last reported on its hello or a reply — see
+/// `worker_protocol::MEM`. 0 is "no worker has said yet", which
+/// [`worker_memory_bytes`] spells as `None`; a real heap is never 0 bytes.
+static WORKER_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The rasterization worker's linear memory, in bytes, as it last reported;
+/// `None` until one has. A replaced worker's last figure stands until its
+/// successor speaks, which is the same rule its jobs follow.
+pub(crate) fn worker_memory_bytes() -> Option<u64> {
+    match WORKER_MEMORY_BYTES.load(Ordering::Relaxed) {
+        0 => None,
+        bytes => Some(bytes),
+    }
+}
+
+/// Take the worker's heap reading off a message that carries one. A message
+/// without the field — a worker from a build before it — leaves the last
+/// reading alone rather than writing a zero.
+fn note_worker_memory(data: &JsValue) {
+    if let Some(bytes) = proto::field(data, proto::MEM)
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        WORKER_MEMORY_BYTES.store(bytes as u64, Ordering::Relaxed);
+    }
 }
 
 /// Start the rasterization worker and, once it identifies itself as this same
@@ -226,6 +254,9 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
                 .and_then(|v| v.as_f64())
                 .map_or_else(|| "?".to_string(), |n| (n as usize).to_string());
             log::info!("rasterization worker attached ({ours}, rayon: {threads} threads)");
+            // After the token check: a worker of another build is not the one
+            // whose heap this page reports.
+            note_worker_memory(data);
             // The ladder resets **here**, on a worker that has proved itself.
             BACKOFF.with(|backoff| {
                 let mut ladder = backoff.get();
@@ -244,7 +275,10 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
             worker.terminate();
             lose(generation, "the worker failed to start");
         }
-        Some(proto::DONE) => deliver(worker, data),
+        Some(proto::DONE) => {
+            note_worker_memory(data);
+            deliver(worker, data)
+        }
         // The worker has finished copying a request out of this page's memory.
         Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
         other => log::warn!("ignoring a worker message of kind {other:?}"),

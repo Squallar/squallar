@@ -1,7 +1,7 @@
 //! The browser's [`PlatformBridge`]. Most of the trait is capabilities a tab
 //! does not have, so most of this file is honest `None`s.
 
-use squallar_app::platform::PlatformBridge;
+use squallar_app::platform::{HostSignals, LinearMemory, PlatformBridge};
 use winit::platform::web::WindowAttributesExtWebSys;
 
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";
@@ -105,6 +105,36 @@ impl PlatformBridge for WebPlatform {
     // permission is asked about before anything is asked *for*, and the watch is
     // started only from `request_location`.
 
+    /// What the browser will say about the machine: a declared RAM bucket
+    /// (Chromium exposes one, Firefox does not), the thread count the
+    /// hardware reports, and the form factor from pointer media. Measured RAM
+    /// is `None` on every browser, because no API answers.
+    fn host_signals(&self) -> HostSignals {
+        HostSignals {
+            system_ram_bytes: None,
+            declared_ram_bytes: declared_ram_bytes(),
+            parallelism: navigator_number("hardwareConcurrency")
+                .filter(|n| *n >= 1.0)
+                .map(|n| n as usize),
+            form_factor: crate::form_factor::classify(
+                media_matches("(pointer: coarse)"),
+                media_matches("(any-pointer: fine)"),
+                navigator_number("maxTouchPoints")
+                    .filter(|n| *n >= 0.0)
+                    .map(|n| n as u32),
+            ),
+        }
+    }
+
+    /// This page's heap, and the rasterization worker's as it last reported
+    /// — two instances under two ceilings, see [`LinearMemory`].
+    fn linear_memory(&self) -> Option<LinearMemory> {
+        Some(LinearMemory {
+            page_bytes: crate::shared_loan::memory_bytes()?,
+            worker_bytes: crate::worker_port::worker_memory_bytes(),
+        })
+    }
+
     fn window_attributes(
         &self,
         attributes: winit::window::WindowAttributes,
@@ -119,6 +149,43 @@ impl PlatformBridge for WebPlatform {
             // The canvas is already in the document; appending adds a second one.
             .with_append(false)
     }
+}
+
+/// One numeric property off `navigator`, read through `Reflect` because the
+/// page's global is a `Navigator` and a worker's is a `WorkerNavigator`, the
+/// properties this crate reads are the same on both, and this way the crate
+/// carries no `web-sys` feature for each. `None` for a browser that does not
+/// expose the key — Firefox has no `deviceMemory` — or answers something
+/// that is not a finite number.
+pub(crate) fn navigator_number(key: &str) -> Option<f64> {
+    use wasm_bindgen::JsValue;
+
+    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("navigator"))
+        .ok()
+        .and_then(|nav| js_sys::Reflect::get(&nav, &JsValue::from_str(key)).ok())
+        .and_then(|n| n.as_f64())
+        .filter(|n| n.is_finite())
+}
+
+/// `navigator.deviceMemory`, scaled to bytes. The Device Memory spec rounds
+/// the value to a power of two between 0.25 and 8 GiB, so this is a bucket
+/// the page declares about itself and never a measurement — which is why it
+/// lands in `declared_ram_bytes` and not beside the native readers.
+fn declared_ram_bytes() -> Option<u64> {
+    const GIB: f64 = (1u64 << 30) as f64;
+    navigator_number("deviceMemory")
+        .filter(|gib| *gib > 0.0)
+        .map(|gib| (gib * GIB) as u64)
+}
+
+/// `matchMedia(query).matches`, or `None` where the browser would not run
+/// the query at all — so a refused query is unknown, never "did not match".
+fn media_matches(query: &str) -> Option<bool> {
+    web_sys::window()?
+        .match_media(query)
+        .ok()
+        .flatten()
+        .map(|list| list.matches())
 }
 
 /// The browser's IANA timezone, e.g. `"America/Denver"`.

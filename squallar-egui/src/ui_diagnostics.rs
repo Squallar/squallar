@@ -31,6 +31,10 @@ pub(in crate::ui) const WINDOW_PERIOD: Duration = Duration::from_secs(2);
 /// same absence-not-extrapolation contract the telemetry lines hold.
 const GPU_PASSES_ABSENT: &str = "gpu passes: unavailable";
 
+/// What the budget row says before the telemetry tick has composed a
+/// sentence — the same contract: an absence, never a zero row.
+const BUDGET_STATE_ABSENT: &str = "budget state: not yet composed";
+
 /// One cumulative reading of every histogram the panel windows. The fields
 /// are copies: a snapshot must hold still while its recorder keeps counting,
 /// or the diff against it would be a diff against itself.
@@ -104,6 +108,8 @@ pub(in crate::ui) struct DiagnosticsState {
     window: Option<Snapshot>,
     /// The gpu-passes row, verbatim, once a probe supplies one.
     gpu_passes: Option<String>,
+    /// The budget row, verbatim, once the telemetry tick has composed one.
+    budget_state: Option<String>,
 }
 
 impl DiagnosticsState {
@@ -120,7 +126,7 @@ impl DiagnosticsState {
         now: Instant,
     ) {
         if !shown {
-            if self.baseline.is_some() || self.gpu_passes.is_some() {
+            if self.baseline.is_some() || self.gpu_passes.is_some() || self.budget_state.is_some() {
                 *self = Self::default();
             }
             return;
@@ -130,6 +136,9 @@ impl DiagnosticsState {
         };
         if self.gpu_passes.as_deref() != d.gpu_passes {
             self.gpu_passes = d.gpu_passes.map(str::to_owned);
+        }
+        if self.budget_state.as_deref() != d.budget_state {
+            self.budget_state = d.budget_state.map(str::to_owned);
         }
         match (&self.baseline, self.baseline_at) {
             (Some(baseline), Some(at)) => {
@@ -227,6 +236,12 @@ impl DiagnosticsState {
                     .clone()
                     .unwrap_or_else(|| GPU_PASSES_ABSENT.to_owned()),
             ),
+            (
+                "budget",
+                self.budget_state
+                    .clone()
+                    .unwrap_or_else(|| BUDGET_STATE_ABSENT.to_owned()),
+            ),
         ]
     }
 }
@@ -299,6 +314,7 @@ mod tests {
             acquire: h,
             cadence: h,
             gpu_passes: None,
+            budget_state: None,
         }
     }
 
@@ -462,6 +478,7 @@ mod tests {
                 "acquire",
                 "cadence",
                 "gpu",
+                "budget",
             ],
             "with the switch on, the panel draws its whole roster",
         );

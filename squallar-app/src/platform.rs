@@ -4,6 +4,62 @@
 //! entry point that constructs it, because this crate must build for targets
 //! whose bridges it has never heard of.
 
+use egui_wgpu::wgpu;
+pub use squallar_device_profile::budget::FormFactor;
+
+/// What the host can say about itself before any adapter has answered — the
+/// capacity-shaped signals a bridge reads once, at construction, and hands
+/// over as plain data. Every field is `Option` because `None` is the majority
+/// arm on at least one target, and a signal a platform cannot read is absent
+/// rather than invented.
+///
+/// **Two RAM figures, never one.** [`Self::system_ram_bytes`] is *measured*
+/// (`/proc/meminfo`, `NSProcessInfo`, `GlobalMemoryStatusEx`);
+/// [`Self::declared_ram_bytes`] is a browser's `navigator.deviceMemory`, a
+/// coarse bucket the page asserts about itself. A declaration may lower a
+/// presumption and never raises one, so the two are kept apart at the seam.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostSignals {
+    /// Measured system RAM, where an API answers. `None` in every browser.
+    pub system_ram_bytes: Option<u64>,
+    /// Declared system RAM — `navigator.deviceMemory` in GiB, scaled to
+    /// bytes. `None` natively and on every browser that does not expose it.
+    pub declared_ram_bytes: Option<u64>,
+    /// Threads the host reports: `available_parallelism()` natively,
+    /// `navigator.hardwareConcurrency` in a browser. The machine's own figure,
+    /// not what any pool was built with; unknown is `None`, never `1`.
+    pub parallelism: Option<usize>,
+    /// A build fact natively (the desktop bridge is a desktop; Android and
+    /// iOS are handheld); a pointer-media classification in a browser.
+    pub form_factor: Option<FormFactor>,
+}
+
+/// How full the wasm linear memories are. **Two instances, two ceilings**: the
+/// page and the rasterization worker each hold their own `WebAssembly.Memory`
+/// under their own `--max-memory`, so the two figures are never one and
+/// never added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearMemory {
+    /// `memory().buffer().byteLength` of the instance the bridge runs in.
+    pub page_bytes: u64,
+    /// The worker's own reading, as it last reported on its hello or a reply
+    /// envelope. `None` until a worker has said.
+    pub worker_bytes: Option<u64>,
+}
+
+/// How a GPU capacity figure was obtained, in order of trust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuCapacitySource {
+    /// Read from the driver: a Vulkan `DEVICE_LOCAL` heap sum, a DXGI budget,
+    /// Metal's recommended working set.
+    Measured,
+    /// Found by allocating until the API refused — the browser's per-tab
+    /// allowance, which no API states.
+    Probed,
+    /// The bracket's constant, refined by what the adapter reports.
+    Presumed,
+}
+
 /// What a [`RedrawWaker`] fires, once there is a window to fire it at. `Arc`
 /// rather than `Box` so [`RedrawWaker::wake`] can drop the guard before calling.
 type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -469,6 +525,38 @@ pub trait PlatformBridge {
     /// `JavaVM`; both stay in the `squallar` crate's cfg(android) modules because
     /// this crate must compile for targets that have never heard of JNI.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}
+
+    /// What the host says about itself: RAM, threads, form factor. Read once,
+    /// from `App::new`, and copied into the device profile as plain data.
+    ///
+    /// The readers live beside each bridge — `/proc/meminfo` in the shell's
+    /// Linux module, `matchMedia` in the web bridge — because this crate must
+    /// compile for targets whose APIs it has never heard of. A bridge that
+    /// reads nothing answers the default, which is every field `None`.
+    fn host_signals(&self) -> HostSignals {
+        HostSignals::default()
+    }
+
+    /// How full the wasm linear memories are, or `None` on a target that has
+    /// no linear memory to fill — which is every native bridge.
+    fn linear_memory(&self) -> Option<LinearMemory> {
+        None
+    }
+
+    /// The GPU's capacity in bytes and how that figure was obtained, or
+    /// `None` where no reader exists for this adapter.
+    ///
+    /// The seam only: no bridge answers yet, and the app spends nothing on
+    /// the answer. The readers (Vulkan heaps, DXGI budgets, Metal's working
+    /// set, the WebGPU probe) land behind this signature so that landing them
+    /// changes one bridge each and nothing in this crate.
+    fn gpu_capacity(
+        &self,
+        _adapter: &wgpu::Adapter,
+        _device: &wgpu::Device,
+    ) -> Option<(u64, GpuCapacitySource)> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,11 @@ pub struct FrameDiagnostics<'a> {
     /// `None` prints as the overlay's absence text — absence, never
     /// extrapolation.
     pub gpu_passes: Option<&'a str>,
+    /// The `budget state:` sentence, verbatim — the bracket and rung the
+    /// budgets were resolved at and the host signals beside them. `None`
+    /// until the telemetry tick has composed one; the overlay prints its
+    /// absence text there.
+    pub budget_state: Option<&'a str>,
 }
 
 /// Where [`crate::Gui::ui_phased`] crossed its own phase boundaries, handed

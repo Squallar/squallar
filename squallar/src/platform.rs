@@ -3,7 +3,7 @@
 
 #[cfg(target_os = "android")]
 use squallar_app::platform::drain_latest;
-use squallar_app::platform::{PlatformBridge, RedrawWaker};
+use squallar_app::platform::{FormFactor, HostSignals, PlatformBridge, RedrawWaker};
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -243,6 +243,12 @@ impl PlatformBridge for DesktopPlatform {
         false
     }
 
+    /// A desktop build is a desktop, whatever pointer is plugged in: a build
+    /// fact, not a reading. RAM and threads come from `crate::capacity`.
+    fn host_signals(&self) -> HostSignals {
+        crate::capacity::host_signals(FormFactor::Desktop)
+    }
+
     /// Handed over before any window exists, which is what [`RedrawWaker`]'s slot
     /// is for.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
@@ -433,6 +439,12 @@ impl PlatformBridge for AndroidPlatform {
         true
     }
 
+    /// An Android build is a handheld: a build fact, not a reading. RAM is
+    /// `/proc/meminfo`, the same reader as Linux.
+    fn host_signals(&self) -> HostSignals {
+        crate::capacity::host_signals(FormFactor::Handheld)
+    }
+
     /// Taken before the theme poller is started, which is the only ordering this
     /// bridge depends on.
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {
@@ -603,6 +615,11 @@ impl PlatformBridge for IosPlatform {
 
     fn supports_exit(&self) -> bool {
         false
+    }
+
+    /// An iOS build is a handheld: a build fact, not a reading.
+    fn host_signals(&self) -> HostSignals {
+        crate::capacity::host_signals(FormFactor::Handheld)
     }
 
     fn set_redraw_waker(&mut self, waker: RedrawWaker) {

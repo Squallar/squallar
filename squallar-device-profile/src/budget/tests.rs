@@ -15,7 +15,8 @@ fn shipped_profile(limits: BudgetLimits) -> DeviceProfile {
         adapter: AdapterCeilings::WEBGL2_GUARANTEE,
         vram_bytes: None,
         system_ram_bytes: None,
-        parallelism: 1,
+        declared_ram_bytes: None,
+        parallelism: None,
         form_factor: None,
         memo: None,
     }
@@ -173,9 +174,16 @@ const CLASSES: [DeviceClass; 5] = [
     DeviceClass::Unknown,
 ];
 
+/// Every form factor a bridge can report, the unknown arm included.
+const FORM_FACTORS: [Option<FormFactor>; 3] =
+    [None, Some(FormFactor::Handheld), Some(FormFactor::Desktop)];
+
 /// The cross product the plan asks for: bracket × class × reported ceilings ×
-/// VRAM reading × memo, with the shipped rows named so a regression on a real
-/// target says which one.
+/// VRAM reading × memo × form factor, with the shipped rows named so a
+/// regression on a real target says which one. The host signals ride the VRAM
+/// axis: a row that measures VRAM also measures RAM (twice the VRAM), declares
+/// RAM (the same, capped at the 8 GiB `deviceMemory` bucket) and reports a
+/// thread count.
 fn synthetic_profiles() -> Vec<DeviceProfile> {
     let mut out = Vec::new();
     for limits in BudgetLimits::SHIPPED {
@@ -189,29 +197,40 @@ fn synthetic_profiles() -> Vec<DeviceProfile> {
                             steps_back: 0,
                         }),
                     ] {
-                        out.push(DeviceProfile {
-                            class,
-                            adapter: AdapterCeilings {
-                                max_texture_dimension_2d: two_d,
-                                max_texture_dimension_3d: three_d,
-                            },
-                            vram_bytes: vram,
-                            system_ram_bytes: vram.map(|v| v * 2),
-                            parallelism: if limits.name == "wasm32" { 1 } else { 8 },
-                            form_factor: if limits.name == "mobile" {
-                                Some(FormFactor::Handheld)
-                            } else {
-                                Some(FormFactor::Desktop)
-                            },
-                            memo,
-                            ..shipped_profile(limits)
-                        });
+                        for form_factor in FORM_FACTORS {
+                            out.push(DeviceProfile {
+                                class,
+                                adapter: AdapterCeilings {
+                                    max_texture_dimension_2d: two_d,
+                                    max_texture_dimension_3d: three_d,
+                                },
+                                vram_bytes: vram,
+                                system_ram_bytes: vram.map(|v| v * 2),
+                                declared_ram_bytes: vram.map(|v| (v * 2).min(8 << 30)),
+                                parallelism: Some(if limits.name == "wasm32" { 1 } else { 8 }),
+                                form_factor,
+                                memo,
+                                ..shipped_profile(limits)
+                            });
+                        }
                     }
                 }
             }
         }
     }
     out
+}
+
+/// `profile` with every host signal unread, exactly as a bridge that answers
+/// nothing hands it over.
+fn without_host_signals(profile: &DeviceProfile) -> DeviceProfile {
+    DeviceProfile {
+        system_ram_bytes: None,
+        declared_ram_bytes: None,
+        parallelism: None,
+        form_factor: None,
+        ..*profile
+    }
 }
 
 /// Every invariant a resolved budget must satisfy, whatever produced it.
@@ -415,10 +434,49 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
 #[test]
 fn every_synthetic_profile_satisfies_every_invariant() {
     let rows = synthetic_profiles();
-    assert_eq!(rows.len(), 720, "the matrix changed shape");
+    assert_eq!(
+        rows.len(),
+        2160,
+        "the matrix changed shape: 3 brackets x 5 classes x 6 reported \
+         ceilings x 4 VRAM readings x 2 memos x 3 form factors = 2160 rows",
+    );
     for profile in &rows {
         check_invariants(profile, "matrix");
     }
+}
+
+/// **The host signals reach the profile and move nothing.** Every row of the
+/// matrix resolves byte-for-byte the same with its RAM, declared RAM, thread
+/// count and form factor as with all four unread — `resolve` does not read
+/// them yet, and this is the proof that landing the signals landed no
+/// behaviour. Rows where the signals are already `None` are the control that
+/// the comparison is a comparison; the matrix carries both.
+#[test]
+fn the_new_signals_change_no_budget_yet() {
+    let rows = synthetic_profiles();
+    let mut rows_with_a_signal = 0usize;
+    for profile in &rows {
+        let unread = without_host_signals(profile);
+        if unread != *profile {
+            rows_with_a_signal += 1;
+        }
+        assert_eq!(
+            resolve(profile),
+            resolve(&unread),
+            "{} / {:?} / {:?}: a host signal moved a budget. Nothing spends \
+             RAM, threads or form factor yet; a field that reads them lands \
+             with its own proof, not under this one",
+            profile.limits.name,
+            profile.class,
+            profile.form_factor,
+        );
+    }
+    assert!(
+        rows_with_a_signal * 2 > rows.len(),
+        "only {rows_with_a_signal} of {} rows carried a signal to strip, so \
+         the identity above was mostly a row compared with itself",
+        rows.len(),
+    );
 }
 
 /// The shipped rows by name, so a regression on a real target says which one.
@@ -514,8 +572,17 @@ fn a_random_sweep_of_profiles_satisfies_every_invariant() {
                 0 => None,
                 _ => Some(rng.in_range(1 << 30, 256u64 << 30)),
             },
-            parallelism: rng.in_range(1, 256) as usize,
-            form_factor: rng.pick(&[None, Some(FormFactor::Handheld), Some(FormFactor::Desktop)]),
+            // The `deviceMemory` buckets, and the unknown arm every browser
+            // but Chromium's takes.
+            declared_ram_bytes: match rng.next() % 3 {
+                0 => None,
+                _ => Some(rng.pick(&[1u64 << 28, 1 << 29, 1 << 30, 2 << 30, 4 << 30, 8 << 30])),
+            },
+            parallelism: match rng.next() % 3 {
+                0 => None,
+                _ => Some(rng.in_range(1, 256) as usize),
+            },
+            form_factor: rng.pick(&FORM_FACTORS),
             memo: match rng.next() % 2 {
                 0 => None,
                 _ => Some(BudgetMemo {

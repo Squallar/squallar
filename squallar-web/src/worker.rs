@@ -38,10 +38,20 @@ pub fn squallar_worker_main() -> Result<(), JsValue> {
     // the truth rather than by anyone remembering to say so.
     let threads = rayon::current_num_threads();
     proto::set_field(&hello, proto::THREADS, &JsValue::from_f64(threads as f64));
+    say_memory(&hello);
     scope.post_message(&hello)?;
 
     log::info!("squallar rasterization worker ready (rayon: {threads} threads)");
     Ok(())
+}
+
+/// Write this worker's own heap size onto `message` — see [`proto::MEM`].
+/// Skipped rather than zeroed when the memory cannot be read: absent is
+/// unknown, and 0 would read as a measurement.
+fn say_memory(message: &js_sys::Object) {
+    if let Some(bytes) = crate::shared_loan::memory_bytes() {
+        proto::set_field(message, proto::MEM, &JsValue::from_f64(bytes as f64));
+    }
 }
 
 fn worker_scope() -> Result<web_sys::DedicatedWorkerGlobalScope, JsValue> {
@@ -141,6 +151,9 @@ fn post_result(
     let message = js_sys::Object::new();
     proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::DONE));
     proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
+    // Read AFTER the job ran, so the reply carries the heap the job left
+    // behind — the figure the page's watermark wants.
+    say_memory(&message);
 
     let transfer = js_sys::Array::new();
     // Written first and overwritten by the arm that has a payload, so no path

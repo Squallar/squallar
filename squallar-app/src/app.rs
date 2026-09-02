@@ -273,6 +273,11 @@ pub struct App {
     /// composed at, so the sentence is rebuilt only when a figure can have
     /// moved rather than allocated every frame.
     gpu_passes_panel_frames: Option<u64>,
+    /// The `budget state:` sentence as last composed on the telemetry tick,
+    /// kept for the diagnostics overlay's row — the same line the telemetry
+    /// family prints, so the panel and a captured log carry one sentence.
+    /// `None` until the first tick.
+    budget_state_panel_line: Option<String>,
     /// The scripted-input player, armed at construction by the
     /// `gesture_script` key or the `SQUALLAR_GESTURE_SCRIPT` variable — see
     /// [`render::gesture_player_from`]. `None` on every shipping install,
@@ -496,6 +501,16 @@ impl App {
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         let mut device_profile = squallar_device_profile::budget::DeviceProfile::for_target();
+        // What the host says about itself, copied in as plain data before the
+        // first resolve. Nothing spends these yet: `resolve` reads none of
+        // them, and the floor crate's matrix holds the budgets byte-identical
+        // with and without them. The adapter's own reading joins in
+        // `update_device_profile`, once there is an adapter to ask.
+        let signals = platform.host_signals();
+        device_profile.system_ram_bytes = signals.system_ram_bytes;
+        device_profile.declared_ram_bytes = signals.declared_ram_bytes;
+        device_profile.parallelism = signals.parallelism;
+        device_profile.form_factor = signals.form_factor;
         device_profile.memo = Some(squallar_device_profile::budget::BudgetMemo {
             loop_pool_bytes: None,
             steps_back: crate::budget_memo::remembered_steps(platform.kv().as_deref()).unwrap_or(0),
@@ -615,6 +630,7 @@ impl App {
             frame_telemetry_said: None,
             gpu_passes_panel_line: None,
             gpu_passes_panel_frames: None,
+            budget_state_panel_line: None,
             gesture_player,
             back_claimed: false,
             exit_requested: false,

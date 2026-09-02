@@ -600,6 +600,7 @@ impl FrameLedger {
             acquire: &self.acquire,
             cadence: &self.cadence,
             gpu_passes: None,
+            budget_state: None,
         }
     }
 }

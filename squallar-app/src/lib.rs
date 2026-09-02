@@ -17,6 +17,7 @@ pub mod app_state;
 #[cfg(test)]
 pub(crate) mod budget_arms;
 pub mod budget_memo;
+pub(crate) mod budget_telemetry;
 pub mod channels;
 pub(crate) mod frame_ledger;
 pub mod input;

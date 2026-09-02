@@ -53,6 +53,13 @@ pub const LOAN: &str = "loan";
 /// Absent reads as unknown, not as 1: a worker from a build before WS3b never
 /// sets it, and reporting that as "1 thread" would be inventing a measurement.
 pub const THREADS: &str = "threads";
+/// Worker → page, on `HELLO` and on every `DONE`: `memory().buffer().byteLength`
+/// of the WORKER's own instance, in bytes. The worker's heap is a second
+/// linear memory under a second `--max-memory` that the page cannot read, so
+/// the worker says, on the messages that already cross. Absent reads as
+/// unknown, never as 0: a worker from a build before this field never sets
+/// it, and the page's `linear_memory` answers `None` for the worker half.
+pub const MEM: &str = "mem";
 
 /// Worker → page: **the answer's HEAD** — scalars and framing in the dispatched
 /// codec row's own `encode_out` form, as one transferred `Uint8Array`; null

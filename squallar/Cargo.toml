@@ -162,3 +162,25 @@ squallar-nmea-serial = { workspace = true, features = ["serial"] }
 # The facade's serial provider (`squallar_location::serial`), which
 # `DesktopPlatform::start_gps` drives. Same IOKit fence as the two lines above.
 squallar-location = { workspace = true, features = ["serial"] }
+
+# The RAM readers in `src/capacity/`, one per OS. Each entry below widens a
+# crate already in this package's graph for that target -- zero new compiled
+# packages, read off Cargo.lock: `objc2-foundation 0.3.2` reaches both Apple
+# graphs through wgpu-hal and squallar-location's `os-providers`, and
+# `windows 0.62.2` reaches the Windows graph through gpu-allocator and the
+# same squallar-location feature. Linux and Android read `/proc/meminfo`
+# through `std::fs` and need nothing here.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# `NSProcessInfo.physicalMemory`, for `src/capacity/apple.rs`. The same
+# `default-features = false` shape as squallar-location's entry, for the same
+# reason: the defaults pull modules neither Apple graph compiles today.
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+    "alloc",
+    "NSProcessInfo",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`. No
+# `default-features = false`: as squallar-location's entry records, that
+# drops the `std` plumbing the generated bindings need.
+windows = { version = "=0.62.2", features = ["Win32_System_SystemInformation"] }

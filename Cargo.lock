@@ -4628,6 +4628,7 @@ dependencies = [
  "iana-time-zone",
  "jni",
  "log",
+ "objc2-foundation 0.3.2",
  "pollster",
  "rustls-platform-verifier",
  "squallar-app",
@@ -4638,6 +4639,7 @@ dependencies = [
  "squallar-nmea-serial",
  "squallar-overlays",
  "squallar-source",
+ "windows",
  "winit",
 ]
 

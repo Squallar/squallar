@@ -8,7 +8,9 @@ use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
 pub enum Platform {
     /// A native build: Vulkan, Metal or DX12, real threads, real limits.
     Native,
-    /// A browser: WebGL2, one thread, and no memory signal of any kind.
+    /// A browser: WebGL2 or WebGPU, one thread on the page, and no *measured*
+    /// memory signal — `navigator.deviceMemory` is a declaration, and only
+    /// some browsers make it.
     Web,
 }
 
@@ -96,11 +98,21 @@ pub struct DeviceProfile {
     /// **majority** arm, not a fallback: wgpu 29.0.4 reports no capacity on any
     /// backend, and no browser API answers the question at all.
     pub vram_bytes: Option<u64>,
-    /// Measured or declared system RAM. `None` for the same reasons.
+    /// **Measured** system RAM: `/proc/meminfo`, `NSProcessInfo`,
+    /// `GlobalMemoryStatusEx`. `None` where no API answers, which is every
+    /// browser.
     pub system_ram_bytes: Option<u64>,
-    /// Threads actually available. 1 in a browser.
-    pub parallelism: usize,
-    /// Browser-side class refinement, when a platform bridge can supply it.
+    /// **Declared** system RAM — a browser's `navigator.deviceMemory`, a
+    /// coarse bucket the page reports about itself. Kept apart from
+    /// [`Self::system_ram_bytes`] because a declaration is a hint and never a
+    /// bound; nothing may treat the two as one figure.
+    pub declared_ram_bytes: Option<u64>,
+    /// Threads the host reports: `available_parallelism()` natively,
+    /// `navigator.hardwareConcurrency` in a browser. `None` where nothing
+    /// reported one — unknown is not spelled `1`.
+    pub parallelism: Option<usize>,
+    /// What the platform can say about the shape of the device: a build fact
+    /// natively, a pointer-media classification in a browser.
     pub form_factor: Option<FormFactor>,
     /// See [`BudgetMemo`]. Wins outright when present.
     pub memo: Option<BudgetMemo>,
@@ -149,7 +161,8 @@ impl DeviceProfile {
             adapter: AdapterCeilings::WEBGL2_GUARANTEE,
             vram_bytes: None,
             system_ram_bytes: None,
-            parallelism: 1,
+            declared_ram_bytes: None,
+            parallelism: None,
             form_factor: None,
             memo: None,
         }
