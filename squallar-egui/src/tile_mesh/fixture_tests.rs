@@ -240,6 +240,103 @@ fn offsets_against_epaint(
 /// at [`HAIRLINE_PIXELS_PER_POINT`], where most widths cross onto the ridge.
 /// **Both arms are asserted to have been reached**, so neither pass can be a
 /// silent repeat of the other branch.
+/// **The count gate: the frame stops visiting 738 shapes to produce ~30.**
+///
+/// Exact, and a count rather than a clock. The plan is the whole of the frame's
+/// walk, so its length IS the number of shapes a frame visits for this tile.
+/// Measured on the committed fixture's densest tile, whose composition
+/// `tile_source.rs` records: 738 shapes — 708 paths, two coalesced meshes and
+/// 27 labels. Once fills and strokes are runs, the 708 collapse into a handful
+/// of `Run` steps and the only per-shape work left is the labels.
+#[test]
+fn the_plan_visits_a_fraction_of_the_shapes_the_walk_did() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+    let flat = flatten(&shapes, feathering());
+    let plan = flat.plan().expect("flatten builds a plan");
+
+    assert!(plan.matches(shapes.len()));
+    assert!(
+        shapes.len() >= 700,
+        "fixture is not the dense tile any more: {} shapes",
+        shapes.len(),
+    );
+    assert!(
+        plan.steps().len() * 10 < shapes.len(),
+        "the plan is {} steps against {} shapes -- less than a 10x cut means \
+         the walk was not actually replaced",
+        plan.steps().len(),
+        shapes.len(),
+    );
+}
+
+/// **The identity gate: the plan makes the same decisions the walk made.**
+///
+/// Replays the un-planned walk's branches over every shape and requires the
+/// plan to agree step for step, in order. This is what stops a count win that
+/// is really a dropped label — in particular a `Text` whose anchor falls inside
+/// a stroke run's span, which the run does not draw and the plan must still
+/// place.
+#[test]
+fn the_plan_reproduces_the_unplanned_walks_decisions_exactly() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+    let flat = flatten(&shapes, feathering());
+    let plan = flat.plan().expect("flatten builds a plan");
+
+    let covered = covered_by_a_stroke_run(&shapes, &flat);
+    let mut expected: Vec<PlanStep> = Vec::new();
+    let mut next_run = 0usize;
+    for (index, shape) in shapes.iter().enumerate() {
+        if next_run < flat.runs().len() && flat.runs()[next_run].shape_index as usize == index {
+            expected.push(PlanStep::Run(next_run as u32));
+            next_run += 1;
+            continue;
+        }
+        if covered[index] && matches!(shape, ShapeOrText::Shape(egui::Shape::Path(_))) {
+            continue;
+        }
+        expected.push(PlanStep::Place(index as u32));
+    }
+
+    assert_eq!(plan.steps(), expected.as_slice());
+
+    // Non-triviality: the two lists agreeing proves nothing if neither holds
+    // the interesting cases. This fixture must exercise both kinds and must
+    // actually drop shapes, or the gate is comparing two empty walks.
+    assert!(expected.iter().any(|s| matches!(s, PlanStep::Run(_))));
+    assert!(expected.iter().any(|s| matches!(s, PlanStep::Place(_))));
+    assert!(expected.len() < shapes.len());
+}
+
+/// Every label survives the plan. The count gate rewards dropping work, and
+/// dropping a label is the cheapest way to score on it.
+#[test]
+fn the_plan_places_every_label_the_tile_carries() {
+    let Some(shapes) = monaco_shapes() else {
+        return;
+    };
+    let flat = flatten(&shapes, feathering());
+    let plan = flat.plan().expect("flatten builds a plan");
+
+    let labels: Vec<usize> = shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, ShapeOrText::Text(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!labels.is_empty(), "fixture carries no labels to check");
+
+    for index in labels {
+        assert!(
+            plan.steps().contains(&PlanStep::Place(index as u32)),
+            "label at shape {index} is not placed by the plan",
+        );
+    }
+}
+
 #[test]
 fn the_offsets_reproduce_epaints_own_tessellation() {
     let Some(shapes) = monaco_shapes() else {

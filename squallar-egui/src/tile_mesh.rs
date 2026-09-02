@@ -115,6 +115,57 @@ pub enum RunKind {
 /// span rather than closing it: the ground phase defers every `Text` to
 /// [`crate::ui_map_overlays::paint_labels`], so no label ever draws between
 /// two of a span's paths.
+/// One step of a tile's per-frame ground draw, in submission order.
+///
+/// **This is the shape walk, precomputed.** Which index opens a run, which
+/// span a run covers, and which shapes the CPU still has to place are all a
+/// pure function of `(tile, style epoch)` — the same pair [`TileMeshes`] is
+/// built for, off the frame thread. Only the affine placement is per-frame, so
+/// the frame has no reason to rediscover the structure by walking every shape.
+///
+/// It matters because the walk it replaces had almost nothing left to find.
+/// Measured on the committed Monaco fixture's z14 city-core tile
+/// (`tile_source.rs`): **738 shapes — 708 paths, two coalesced meshes and 27
+/// labels.** Once fills moved to the GPU (`af3af305`) and strokes followed,
+/// 708 of those 738 became runs the walk skips one at a time. The loop was not
+/// slow; its reason for existing had been removed by two changes that shipped
+/// without revisiting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStep {
+    /// Issue `runs[i]`. If the renderer declines it — no store, or a
+    /// feathering this frame does not draw at — every shape in its span is
+    /// placed on the CPU instead, which is exactly what the un-planned walk
+    /// did when `take_at` returned `None`.
+    Run(u32),
+    /// Place `shapes[i]` on the CPU.
+    Place(u32),
+}
+
+/// A tile's precomputed [`PlanStep`] list, with the shape count it was built
+/// for.
+///
+/// **The count is a guard, not bookkeeping.** A plan is only valid for the
+/// exact shape list it was derived from, and `TileMeshes` can also be built by
+/// [`flatten_meshes`] / [`flatten_paths`], which never see a shape list. A
+/// caller checks `matches` before trusting the steps, so a mismatched pair
+/// falls back to the full walk rather than drawing the wrong tile.
+#[derive(Debug)]
+pub struct TilePlan {
+    steps: Vec<PlanStep>,
+    shape_count: u32,
+}
+
+impl TilePlan {
+    pub fn steps(&self) -> &[PlanStep] {
+        &self.steps
+    }
+
+    /// Whether this plan was built for a shape list of exactly this length.
+    pub fn matches(&self, shape_count: usize) -> bool {
+        self.shape_count as usize == shape_count
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshRun {
     pub shape_index: u32,
@@ -163,6 +214,9 @@ pub struct TileMeshes {
     /// the tile.
     feathering: f32,
     runs: Vec<MeshRun>,
+    /// The precomputed shape walk, when this was built from a shape list.
+    /// `None` from [`flatten_meshes`] / [`flatten_paths`], which have none.
+    plan: Option<TilePlan>,
 }
 
 /// Identities are minted, never derived from a tile id: one `TileId` is a
@@ -197,6 +251,11 @@ impl TileMeshes {
 
     pub fn runs(&self) -> &[MeshRun] {
         &self.runs
+    }
+
+    /// The precomputed shape walk, if this tile has one.
+    pub fn plan(&self) -> Option<&TilePlan> {
+        self.plan.as_ref()
     }
 
     /// The stroke vertex buffer's contents, in [`stroke::StrokeVertex`]'s
@@ -320,7 +379,59 @@ pub fn flatten(shapes: &[ShapeOrText], feathering: f32) -> TileMeshes {
             ShapeOrText::Shape(_) => flat.close_stroke_run(),
         }
     }
-    flat.finish()
+    let mut flat = flat.finish();
+    flat.plan = Some(build_plan(shapes, &flat.runs));
+    flat
+}
+
+/// The precomputed shape walk for `shapes`, given the runs flattening produced.
+///
+/// **It reproduces the un-planned walk's decisions exactly, in its order.**
+/// Every branch below is one the frame loop used to take per shape:
+///
+/// * a run's opening index becomes [`PlanStep::Run`] — the `take_at` arm;
+/// * a **path** inside a run's span is dropped — the `covers` arm, which is
+///   spelled for `Shape::Path` and nothing else;
+/// * everything remaining becomes [`PlanStep::Place`] — labels, the background
+///   rectangle, and any path no run claimed.
+///
+/// The `Path` test is the subtle one and it is deliberate rather than
+/// inherited: a `Text` whose anchor falls inside a stroke run's span is **not**
+/// drawn by that run, so it must still be placed. Dropping the whole span
+/// would silently lose labels in dense tiles, which is the one failure a
+/// count-based gate would happily report as an improvement.
+///
+/// Runs arrive sorted by `shape_index` (`Flattening::finish`), which is what
+/// lets this walk both lists once rather than searching.
+fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
+    let mut covered = vec![false; shapes.len()];
+    for run in runs {
+        for at in run.shape_index..run.shape_index + run.shape_span {
+            if let Some(slot) = covered.get_mut(at as usize) {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut steps = Vec::new();
+    let mut next_run = 0usize;
+    for (index, shape) in shapes.iter().enumerate() {
+        if next_run < runs.len() && runs[next_run].shape_index as usize == index {
+            steps.push(PlanStep::Run(next_run as u32));
+            next_run += 1;
+            continue;
+        }
+        if covered[index] && matches!(shape, ShapeOrText::Shape(egui::Shape::Path(_))) {
+            continue;
+        }
+        steps.push(PlanStep::Place(index as u32));
+    }
+
+    steps.shrink_to_fit();
+    TilePlan {
+        steps,
+        shape_count: shapes.len() as u32,
+    }
 }
 
 /// [`flatten`]'s fill half, over `(shape index, mesh)` pairs.
@@ -516,6 +627,7 @@ impl Flattening {
         self.runs.shrink_to_fit();
 
         TileMeshes {
+            plan: None,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             vertices: self.vertices,
             indices: self.indices,

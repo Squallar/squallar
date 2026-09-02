@@ -466,6 +466,41 @@ fn lay_out_label(
 /// its neighbours' data too; without the anchor test each copy would be drawn,
 /// and copies generalised at different zooms do not land close enough to be
 /// collided away.
+/// Place one shape on the CPU: count it, transform it, and file it as geometry
+/// or as a deferred label.
+///
+/// A free function because both the planned walk and the un-planned fallback
+/// must do exactly this and must not drift — the fallback is what a tile with
+/// no plan takes, and a divergence between the two would be a difference
+/// nothing draws attention to.
+fn place_one(
+    shape: &walkers::ShapeOrText,
+    placement: egui::emath::TSTransform,
+    rect: egui::Rect,
+    counted: &mut Counted,
+    placed: &mut Vec<egui::Shape>,
+    labels: &mut Vec<walkers::Text>,
+) {
+    match shape {
+        walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
+            counted.mesh_vertices += mesh.vertices.len() as u64;
+        }
+        walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
+            counted.path_points += path.points.len() as u64;
+        }
+        _ => {}
+    }
+    match shape.placed(placement) {
+        walkers::ShapeOrText::Shape(shape) => placed.push(shape),
+        walkers::ShapeOrText::Text(text) => {
+            if rect.contains(text.position) {
+                counted.label_anchors += 1;
+                labels.push(text);
+            }
+        }
+    }
+}
+
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
@@ -486,43 +521,77 @@ fn paint_vector_tile(
     let mut runs = GroundMeshes::runs();
     let mut placed: Vec<egui::Shape> = Vec::with_capacity(shapes.len());
 
-    for (index, shape) in shapes.iter().enumerate() {
-        // The runs are in shape order, so this walks them in step with the
-        // shapes and never searches. A run whose shape the loop has passed
-        // cannot exist; one it has not reached yet is simply not this shape's.
-        if let Some((callback, kind)) = runs.take_at(index, &ground, placement, rect) {
-            match kind {
-                crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
-                crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
-            }
-            placed.push(callback);
-            continue;
-        }
-        // A stroke run covers a *span* of consecutive paths and drew all of
-        // them under the callback its first shape pushed. Only a path can be
-        // inside a span — anything else that draws closes the run at flatten
-        // time — so this cannot swallow a shape the run did not draw.
-        if runs.covers(index) && matches!(shape, walkers::ShapeOrText::Shape(egui::Shape::Path(_)))
-        {
-            continue;
-        }
-        match shape {
-            walkers::ShapeOrText::Shape(egui::Shape::Mesh(mesh)) => {
-                counted.mesh_vertices += mesh.vertices.len() as u64;
-            }
-            walkers::ShapeOrText::Shape(egui::Shape::Path(path)) => {
-                counted.path_points += path.points.len() as u64;
-            }
-            _ => {}
-        }
-        match shape.placed(placement) {
-            walkers::ShapeOrText::Shape(shape) => placed.push(shape),
-            walkers::ShapeOrText::Text(text) => {
-                if rect.contains(text.position) {
-                    counted.label_anchors += 1;
-                    labels.push(text);
+    // **The walk is precomputed; this only applies the placement.** Which index
+    // opens a run, which span a run covers and which shapes the CPU still has
+    // to place are a pure function of (tile, style epoch) and were settled by
+    // `tile_mesh::build_plan` off the frame thread. See `PlanStep`.
+    //
+    // The guard is the shape count: `TileMeshes` can also come from
+    // `flatten_meshes`/`flatten_paths`, which never saw a shape list, and a
+    // plan built for a different list would draw the wrong tile. A mismatch
+    // falls back to the full walk below rather than trusting it.
+    let planned = ground
+        .meshes
+        .and_then(|meshes| meshes.plan().map(|plan| (meshes, plan)))
+        .filter(|(_, plan)| plan.matches(shapes.len()));
+
+    if let Some((meshes, plan)) = planned {
+        for step in plan.steps() {
+            match *step {
+                crate::tile_mesh::PlanStep::Run(index) => {
+                    let Some(run) = meshes.runs().get(index as usize).copied() else {
+                        continue;
+                    };
+                    match runs.take_at(run.shape_index as usize, &ground, placement, rect) {
+                        Some((callback, kind)) => {
+                            match kind {
+                                crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
+                                crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
+                            }
+                            placed.push(callback);
+                        }
+                        // Declined -- no store, or a feathering this frame does
+                        // not draw at. The span goes back on the CPU exactly as
+                        // it did when `take_at` returned `None` mid-walk.
+                        None => {
+                            for at in run.shape_index..run.shape_index + run.shape_span {
+                                if let Some(shape) = shapes.get(at as usize) {
+                                    place_one(
+                                        shape,
+                                        placement,
+                                        rect,
+                                        &mut counted,
+                                        &mut placed,
+                                        labels,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                crate::tile_mesh::PlanStep::Place(index) => {
+                    if let Some(shape) = shapes.get(index as usize) {
+                        place_one(shape, placement, rect, &mut counted, &mut placed, labels);
+                    }
                 }
             }
+        }
+    } else {
+        for (index, shape) in shapes.iter().enumerate() {
+            if let Some((callback, kind)) = runs.take_at(index, &ground, placement, rect) {
+                match kind {
+                    crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
+                    crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
+                }
+                placed.push(callback);
+                continue;
+            }
+            if runs.covers(index)
+                && matches!(shape, walkers::ShapeOrText::Shape(egui::Shape::Path(_)))
+            {
+                continue;
+            }
+            place_one(shape, placement, rect, &mut counted, &mut placed, labels);
         }
     }
 
