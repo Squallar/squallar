@@ -33,8 +33,12 @@
 //! carried here, on the level line, because the probe's own lines are said
 //! once and the browser console's bounded ring evicts them within seconds,
 //! so a scrape reading them as absent could not tell "evicted" from "never
-//! ran". Every byte figure is MiB by integer division, because the rig's
-//! probe reads these sentences with `(\d+)` groups.
+//! ran". `balloon` is what the loops hold **above their base** — the bytes
+//! the pool's planner spent on density past what `fit` charged, summed over
+//! every loop, 0 when every loop holds its base or less; it is a subset of
+//! `pool` and is never added to it. Every byte figure is MiB by integer
+//! division, because the rig's probe reads these sentences with `(\d+)`
+//! groups.
 //!
 //! Product telemetry, not a campaign instrument: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, and no figure it prints
@@ -91,7 +95,8 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// explicitly as 0 against 1 (handheld) and 2 (desktop). `cap` is never
 /// unread: every session has a capacity in force, and the integer after it
 /// says which arm it is ([`capacity_source_code`]). `probe` spells its own
-/// absent explicitly as 0 ([`gpu_probe_code`]).
+/// absent explicitly as 0 ([`gpu_probe_code`]). `balloon` is 0 whenever no
+/// loop holds more than its base, which is a real zero: nothing was granted.
 ///
 /// A free function returning a `String` for the reason every other telemetry
 /// sentence in this tree is one: `.github/browser-rig/drive.py` scrapes it
@@ -103,6 +108,7 @@ pub(crate) fn budget_state_line(
     profile: &DeviceProfile,
     linear: Option<LinearMemory>,
     pool_bytes: usize,
+    balloon_bytes: usize,
     cap: &Capacity,
     probe: GpuProbeReport,
 ) -> String {
@@ -120,7 +126,7 @@ pub(crate) fn budget_state_line(
     format!(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
-         linear {}/{} MiB, cap {} {}, probe {}",
+         linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -134,6 +140,7 @@ pub(crate) fn budget_state_line(
         mib(cap.gpu_bytes),
         capacity_source_code(cap.source),
         gpu_probe_code(probe),
+        mib(balloon_bytes as u64),
     )
 }
 
@@ -258,6 +265,10 @@ mod tests {
     /// value no shipped constant carries.
     const POOL: usize = 3 << 30;
 
+    /// The balloon in force for the distinct line: 7 MiB, a figure no other
+    /// position carries.
+    const BALLOON: usize = 7 << 20;
+
     /// The capacity in force for the distinct line: a probed 5 GiB, which no
     /// profile produces and no other position carries, so the `cap` figure
     /// and its source code are each distinct from every neighbour. The
@@ -330,15 +341,22 @@ mod tests {
     fn the_budget_state_line_reads_exactly_as_pinned() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
-             threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5",
+             threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
+             balloon 7 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
-            budget_state_line(&budgets, &profile, linear, 576 << 20, &CAP, PROBE)
+            budget_state_line(&budgets, &profile, linear, 576 << 20, BALLOON, &CAP, PROBE)
                 .contains(", pool 576 MiB,"),
+        );
+        // And the balloon follows what it is handed: a scene holding every
+        // base and nothing more reads a real 0, last on the line.
+        assert!(
+            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE)
+                .ends_with(", probe 5, balloon 0 MiB"),
         );
         // And the capacity follows what it is handed: this profile's own
         // measured 24 GiB reads `24576 1`, a session presumption lowered to
@@ -349,10 +367,11 @@ mod tests {
                 &profile,
                 linear,
                 POOL,
+                BALLOON,
                 &profile.capacity(),
                 GpuProbeReport::Absent
             )
-            .ends_with(", cap 24576 1, probe 0"),
+            .ends_with(", cap 24576 1, probe 0, balloon 7 MiB"),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
         assert!(
@@ -361,10 +380,11 @@ mod tests {
                 &profile,
                 linear,
                 POOL,
+                BALLOON,
                 &lowered,
                 GpuProbeReport::Skipped
             )
-            .ends_with(", cap 3456 0, probe 1"),
+            .ends_with(", cap 3456 0, probe 1, balloon 7 MiB"),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
         assert_eq!(capacity_source_code(CapacitySource::Measured), 1);
@@ -418,28 +438,36 @@ mod tests {
             ..resolve(&profile)
         };
         let cap = Capacity::presumed(&BudgetLimits::DESKTOP);
-        let line = budget_state_line(&budgets, &profile, None, POOL, &cap, GpuProbeReport::Absent);
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            None,
+            POOL,
+            0,
+            &cap,
+            GpuProbeReport::Absent,
+        );
         let (_, tail) = line
             .split_once(", vram ")
             .expect("the line carries a vram field");
         assert_eq!(
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
-             cap 3840 0, probe 0",
+             cap 3840 0, probe 0, balloon 0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            12,
-            "thirteen comma-separated groups, twelve separators: a field was dropped or \
+            13,
+            "fourteen comma-separated groups, thirteen separators: a field was dropped or \
              gained",
         );
     }
 
     /// The values the distinct line carries, in the rig's group order: the
-    /// bracket word and the fourteen integers after it.
-    const DISTINCT_GROUPS: [&str; 15] = [
+    /// bracket word and the fifteen integers after it, the balloon last.
+    const DISTINCT_GROUPS: [&str; 16] = [
         "desktop", "1", "3", "3072", "3840", "24576", "65536", "8192", "32", "2", "300", "700",
-        "5120", "2", "5",
+        "5120", "2", "5", "7",
     ];
 
     /// **The rig reads the budget line the app actually writes.** An extra
@@ -449,7 +477,7 @@ mod tests {
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
             rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS),
             "the `budget state:` line and the rig's probe have drifted",
         );
@@ -461,13 +489,13 @@ mod tests {
         let (budgets, profile, linear) = distinct();
         let good = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
             good
         );
         let drifted = good.replacen(" rung", "  rung", 1);
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
         assert_ne!(
-            budget_state_line(&budgets, &profile, linear, POOL, &CAP, PROBE),
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
             drifted,
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",

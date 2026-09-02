@@ -61,7 +61,7 @@ fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneS
             &no_handlers(),
             site.name,
             ts(minute),
-            allocation(),
+            &allocation(),
             &budgets(),
         );
     }
@@ -113,7 +113,12 @@ fn budgets() -> squallar_device_profile::budget::Budgets {
 }
 
 fn held_for(pane: &PaneState) -> usize {
-    crate::app::render::loop_frames_held(allocation(), pane.time_state(&known::RADAR), &budgets())
+    crate::app::render::loop_frames_held(
+        &allocation(),
+        0,
+        pane.time_state(&known::RADAR),
+        &budgets(),
+    )
 }
 
 fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
@@ -412,7 +417,7 @@ fn a_polled_scan_only_reaches_loops_on_its_own_site() {
         &no_handlers(),
         "KTLX",
         ts(10),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -435,7 +440,7 @@ fn the_loops_site_decides_not_the_panes_live_site() {
         &no_handlers(),
         "KTLX",
         ts(10),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     assert_eq!(
@@ -449,7 +454,7 @@ fn the_loops_site_decides_not_the_panes_live_site() {
         &no_handlers(),
         "KOUN",
         ts(10),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
@@ -469,7 +474,7 @@ fn an_inactive_loop_takes_no_frames() {
         &no_handlers(),
         "KTLX",
         ts(10),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     append_polled_frame_to_loops(
@@ -477,7 +482,7 @@ fn an_inactive_loop_takes_no_frames() {
         &no_handlers(),
         "",
         ts(11),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -494,7 +499,7 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
         &no_handlers(),
         "KTLX",
         ts(5),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
@@ -504,7 +509,7 @@ fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
         &no_handlers(),
         "KTLX",
         ts(5),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     assert_eq!(
@@ -524,7 +529,7 @@ fn appending_evicts_past_the_lookback_window() {
         &no_handlers(),
         "KTLX",
         ts(15),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -557,7 +562,7 @@ fn eviction_pulls_the_playhead_back_inside_the_list() {
         &no_handlers(),
         "KTLX",
         ts(25),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -606,7 +611,7 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
         &no_handlers(),
         "KTLX",
         ts(25),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -637,7 +642,7 @@ fn a_scrubbed_panes_window_follows_its_clock_not_the_newest_frame() {
         &no_handlers(),
         "KTLX",
         ts(30),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
     assert_eq!(
@@ -665,7 +670,7 @@ fn a_live_panes_window_is_still_anchored_on_its_newest_frame() {
         &no_handlers(),
         "KTLX",
         ts(25),
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -696,7 +701,7 @@ fn live_appends_do_not_take_a_loop_past_its_frame_cap() {
             &no_handlers(),
             "KTLX",
             ts(newest + i * 4),
-            allocation(),
+            &allocation(),
             &budgets(),
         );
     }
@@ -730,7 +735,7 @@ fn capping_an_appended_loop_keeps_its_whole_window() {
         &no_handlers(),
         "KTLX",
         appended,
-        allocation(),
+        &allocation(),
         &budgets(),
     );
 
@@ -762,7 +767,7 @@ fn a_loop_holding_every_scan_re_measures_the_cadence_as_it_follows_the_site() {
             &no_handlers(),
             "KTLX",
             ts(36),
-            allocation(),
+            &allocation(),
             &budgets(),
         );
 

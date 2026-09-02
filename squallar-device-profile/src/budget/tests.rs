@@ -1,5 +1,5 @@
 use super::*;
-use crate::fit::{fit, fit_holds, loop_pool_bytes, loop_room, need, need_terms};
+use crate::fit::{fit, fit_holds, loop_ceiling, loop_pool_bytes, loop_room, need, need_terms};
 use crate::quality::{DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING};
 use crate::scene::fixtures::{scene_table, shipped_profile, stand_in_grid_bytes};
 use crate::scene::{Capacity, CapacitySource};
@@ -385,8 +385,11 @@ fn check_fit_against(profile: &DeviceProfile, cap: &Capacity, from: &str) {
                 extra - 1,
             );
         }
-        // The pool: what the loops need, capped by the room, and no more; the
-        // room never past the allowance.
+        // The pool: the room the rest of the scene leaves, capped at what the
+        // loops could ever fill — their whole lookback at their cadence, no
+        // loop past the list cap — and never less than what they need; the
+        // room never past the allowance. `fit` charged the need, so the pool
+        // can always pay it; the difference is what the planner balloons into.
         let terms = need_terms(&scene, &fitted, stand_in_grid_bytes);
         let room = loop_room(&scene, &fitted, cap, stand_in_grid_bytes);
         assert!(
@@ -394,11 +397,19 @@ fn check_fit_against(profile: &DeviceProfile, cap: &Capacity, from: &str) {
             "{from} / {} / {scene_name}: {room} B of room under a {allowance} B allowance",
             b.name,
         );
+        let pool = loop_pool_bytes(&scene, &fitted, cap, stand_in_grid_bytes);
         assert_eq!(
-            loop_pool_bytes(&scene, &fitted, cap, stand_in_grid_bytes),
-            terms.loops.min(room),
-            "{from} / {} / {scene_name}: the pool is not min(loops, room)",
+            pool,
+            loop_ceiling(&scene, &fitted, stand_in_grid_bytes).min(room),
+            "{from} / {} / {scene_name}: the pool is not min(ceiling, room)",
             b.name,
+        );
+        assert!(
+            pool >= terms.loops.min(room),
+            "{from} / {} / {scene_name}: the pool ({pool} B) cannot pay the loops' need \
+             ({} B) inside the room ({room} B)",
+            b.name,
+            terms.loops,
         );
         // Nothing above the class rung, on either arm.
         assert_eq!(fitted.promotion, b.promotion, "{from} / {scene_name}");

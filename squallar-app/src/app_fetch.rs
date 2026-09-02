@@ -2393,7 +2393,7 @@ impl super::App {
         // layer is asked what it has come to hold, and only radar's own stamp
         // arrives as an argument.
         let (panes, overlays) = self.gui.panes_and_overlays_mut();
-        append_polled_frame_to_loops(panes, overlays, site, timestamp, allocation, &budgets);
+        append_polled_frame_to_loops(panes, overlays, site, timestamp, &allocation, &budgets);
     }
 
     /// **Re-arm every pane that is animating anything**, over the window its
@@ -3154,7 +3154,7 @@ fn append_polled_frame_to_loops(
     overlays: &squallar_overlays::render::overlay_state::OverlayRegistry,
     site: &str,
     timestamp: chrono::NaiveDateTime,
-    allocation: crate::loop_pool::LoopAllocation,
+    allocation: &crate::loop_pool::LoopAllocation,
     budgets: &squallar_device_profile::budget::Budgets,
 ) {
     for (pane_idx, pane) in panes.iter_mut().enumerate() {
@@ -3179,6 +3179,7 @@ fn append_polled_frame_to_loops(
                     overlays,
                     layer,
                     &view.layer(layer),
+                    pane_idx,
                     site,
                     timestamp,
                     clock,
@@ -3250,10 +3251,11 @@ fn plan_loop_append(
     overlays: &squallar_overlays::render::overlay_state::OverlayRegistry,
     layer: &squallar_source::id::LayerId,
     pane_ref: &squallar_source::handler::PaneRef<'_>,
+    pane_idx: usize,
     site: &str,
     timestamp: chrono::NaiveDateTime,
     clock: squallar_egui::pane::TimeMode,
-    allocation: crate::loop_pool::LoopAllocation,
+    allocation: &crate::loop_pool::LoopAllocation,
     budgets: &squallar_device_profile::budget::Budgets,
     animating: usize,
 ) -> Option<LoopAppend> {
@@ -3321,14 +3323,17 @@ fn plan_loop_append(
     });
 
     Some(LoopAppend {
-        // The pane's whole-loop cap, divided across the layers it is
+        // The pane's whole-loop grant, divided across the layers it is
         // animating — the budget is a texture-memory allowance and a pane
         // animating two things spends it twice. Read off THIS layer's
         // timeline, not radar's slot: the two have different views and
         // therefore different prices per frame.
         held: super::render::layer_share(
             allocation,
-            Some(super::render::loop_frames_held(allocation, ls, budgets)),
+            pane_idx,
+            Some(super::render::loop_frames_held(
+                allocation, pane_idx, ls, budgets,
+            )),
             crate::loop_pool::LoopFrameModel::from_budgets(budgets).bytes_for(ls.view),
             animating,
         ),
@@ -3576,9 +3581,27 @@ fn append_polled_frame(
             },
         );
     }
+    // The listing the frames were chosen from gains the same stamps, so a
+    // later re-sample to a changed allocation can choose from what has
+    // published since the listing landed, not only from what it named.
+    if let Some(listing) = ls.listing.as_mut() {
+        for &valid in stamps {
+            if !listing.frames.iter().any(|f| f.valid == valid) {
+                let at = listing.frames.partition_point(|f| f.valid < valid);
+                listing
+                    .frames
+                    .insert(at, squallar_source::time::FrameStamp { valid, run: None });
+            }
+        }
+    }
 
     if let Some(cutoff) = cutoff {
         ls.frames.retain(|f| f.timestamp >= cutoff);
+        // And what the window slid past leaves the listing too, or a
+        // re-sample would bring frames back from outside the lookback.
+        if let Some(listing) = ls.listing.as_mut() {
+            listing.frames.retain(|f| f.valid >= cutoff);
+        }
     }
 
     // Re-measure the cadence, while it is still measurable.

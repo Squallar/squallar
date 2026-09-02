@@ -233,7 +233,7 @@ fn poll(
         registry,
         site,
         at,
-        crate::app::render::test_loop_allocation(),
+        &crate::app::render::test_loop_allocation(),
         &crate::app::render::test_budgets(),
     );
 }

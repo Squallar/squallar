@@ -357,7 +357,7 @@ fn a_pane_that_did_not_change_radar_keeps_its_loop() {
             &squallar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
             BYSTANDER,
             at(minute),
-            crate::app::render::test_loop_allocation(),
+            &crate::app::render::test_loop_allocation(),
             &crate::app::render::test_budgets(),
         );
     }
@@ -476,7 +476,7 @@ fn re_picking_the_site_a_pane_is_on_keeps_its_loop() {
             &squallar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
             WSR88D,
             at(minute),
-            crate::app::render::test_loop_allocation(),
+            &crate::app::render::test_loop_allocation(),
             &crate::app::render::test_budgets(),
         );
     }

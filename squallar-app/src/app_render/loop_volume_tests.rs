@@ -389,8 +389,8 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
          sampling below is not exercised",
     );
 
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut ls,
         SITE,
@@ -408,8 +408,8 @@ fn the_scan_listing_is_sampled_to_the_resident_frame_count() {
     // view rather than about the cap having moved for everyone.
     let mut plan = squallar_egui::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut plan,
         SITE,
@@ -670,8 +670,8 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
         test_loop_allocation().volume_frames,
     );
 
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &budgets,
         &mut ls,
         SITE,
@@ -707,8 +707,8 @@ fn a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span() {
     // the span budget never paid for.
     let mut plan = squallar_egui::radar_layer::begin_loop(10 * 3600, &site(), RenderView::PlanView);
     plan.phase = LoopPhase::Rendering;
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &budgets,
         &mut plan,
         SITE,

@@ -2985,7 +2985,12 @@ var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) fram
 // absent (native, or not asked yet), 1 skipped (a WebGL2 page -- every
 // Firefox/Linux leg), 2 pending, 3 empty (ran, held nothing), 4 found at the
 // device's refusal, 5 found at the probe's own bound (the figure is a floor).
-var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+), pool (\d+) MiB, ceiling (\d+) MiB, vram (\d+) MiB, ram (\d+) MiB, declared (\d+) MiB, threads (\d+), form (\d+), linear (\d+)\/(\d+) MiB, cap (\d+) (\d+), probe (\d+)/;
+// `balloon` is what the loops hold ABOVE their base, in MiB -- the bytes the
+// pool's planner spent on density past what `fit` charged, summed over every
+// loop; a SUBSET of `pool`, never added to it, and a real 0 when every loop
+// holds its base or less. Last on the line, and mandatory like every other
+// group: a bundle older than it matches nothing and reads `null`.
+var budget_state_re = /budget state: bracket ([a-z0-9]+), rung (\d+), steps (\d+), pool (\d+) MiB, ceiling (\d+) MiB, vram (\d+) MiB, ram (\d+) MiB, declared (\d+) MiB, threads (\d+), form (\d+), linear (\d+)\/(\d+) MiB, cap (\d+) (\d+), probe (\d+), balloon (\d+) MiB/;
 // The two WINDOWABLE families, both `<prefix> (<name>):` with the same
 // payload. `n` and `sum` are running totals and both subtract, so a windowed
 // mean is exact: (sum_b - sum_a) / (n_b - n_a). `hist` is the same 42-slot
@@ -3150,7 +3155,8 @@ for (var i = 0; i < C.length; i++) {
                      linear_worker_mib: parseInt(x[12], 10),
                      cap_mib: parseInt(x[13], 10),
                      cap_source: parseInt(x[14], 10),
-                     probe: parseInt(x[15], 10) };
+                     probe: parseInt(x[15], 10),
+                     balloon_mib: parseInt(x[16], 10) };
     budget_state_all.push(budget_state);
   }
   x = frame_segment_re.exec(m);
@@ -6964,17 +6970,18 @@ def run_smoke(args):
         # with a Chromium reading; `probe` is where the WebGPU probe stands
         # (0 absent, 1 skipped, 2 pending, 3 empty, 4 found, 5 found capped),
         # read off this level line because the probe's own lines are evicted
-        # from the console ring within seconds.
+        # from the console ring within seconds; `balloon` is what the loops
+        # hold above their base, a subset of `pool` and never added to it.
         print("[%s] SUMMARY [%s] budget state [level, end of leg]: bracket %s, "
               "rung %s, steps %s; pool %s MiB, ceiling %s MiB; vram %s MiB, "
               "ram %s MiB, declared %s MiB, threads %s, form %s; "
-              "linear %s/%s MiB; cap %s MiB source %s; probe %s"
+              "linear %s/%s MiB; cap %s MiB source %s; probe %s; balloon %s MiB"
               % (tag, alabel, b.get("bracket"), b.get("rung"), b.get("steps"),
                  b.get("pool_mib"), b.get("ceiling_mib"), b.get("vram_mib"),
                  b.get("ram_mib"), b.get("declared_mib"), b.get("threads"),
                  b.get("form"), b.get("linear_page_mib"),
                  b.get("linear_worker_mib"), b.get("cap_mib"),
-                 b.get("cap_source"), b.get("probe")))
+                 b.get("cap_source"), b.get("probe"), b.get("balloon_mib")))
     gw = result.get("gesture_window")
     if gw:
         print("[%s] SUMMARY [%s] gesture window (%s, %s loops, %s):"

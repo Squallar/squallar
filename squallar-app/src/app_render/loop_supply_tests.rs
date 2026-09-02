@@ -478,7 +478,7 @@ fn a_long_listing_is_sampled_to_what_the_panes_byte_share_buys() {
          suite passes for a build that cannot see an overlay frame at all.",
         test_budgets().loop_frame_bytes(),
     );
-    let held = layer_share(allocation, None, frame_bytes, 1);
+    let held = layer_share(&allocation, 0, None, frame_bytes, 1);
     assert!(
         held >= 2,
         "precondition: the share must buy a loop at all, and it bought {held}",
@@ -533,7 +533,7 @@ fn a_long_listing_is_sampled_to_what_the_panes_byte_share_buys() {
 #[test]
 fn sampled_says_whether_the_listing_had_to_be_thinned() {
     let allocation = test_loop_allocation();
-    let held = layer_share(allocation, None, overlay_bytes(), 1);
+    let held = layer_share(&allocation, 0, None, overlay_bytes(), 1);
 
     for (count, expected) in [(held / 2, false), (held * 3, true)] {
         let listed: Vec<_> = (0..count as i64).map(|i| ts(i * 60)).collect();
@@ -561,13 +561,13 @@ fn sampled_says_whether_the_listing_had_to_be_thinned() {
 fn a_share_too_small_for_two_frames_still_gets_two() {
     let allocation = test_loop_allocation();
     assert_eq!(
-        layer_share(allocation, None, allocation.share_bytes * 4, 1),
+        layer_share(&allocation, 0, None, allocation.share_bytes * 4, 1),
         squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
         "the floor is where the budget stops being divisible, and it is the \
          one place the byte bound is knowingly exceeded",
     );
     assert_eq!(
-        layer_share(allocation, None, 0, 1),
+        layer_share(&allocation, 0, None, 0, 1),
         squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
         "a frame that costs nothing is a model built wrong, and it must not \
          become an unbounded loop",
@@ -580,8 +580,8 @@ fn a_share_too_small_for_two_frames_still_gets_two() {
 fn two_animating_layers_each_get_half_the_bytes() {
     let allocation = test_loop_allocation();
     let bytes = overlay_bytes();
-    let one = layer_share(allocation, None, bytes, 1);
-    let two = layer_share(allocation, None, bytes, 2);
+    let one = layer_share(&allocation, 0, None, bytes, 1);
+    let two = layer_share(&allocation, 0, None, bytes, 2);
     assert!(
         two < one,
         "a pane animating two layers spends its share twice: {one} frames \
@@ -783,8 +783,9 @@ fn the_radar_arm_produces_the_same_loop_it_always_did() {
     let allocation = app.loop_allocation();
     let ls_for_cap = app.gui.pane(0).expect("a pane").time_state(&known::RADAR);
     let held = layer_share(
-        allocation,
-        Some(loop_frames_held(allocation, ls_for_cap, &app.budgets)),
+        &allocation,
+        0,
+        Some(loop_frames_held(&allocation, 0, ls_for_cap, &app.budgets)),
         LoopFrameModel::from_budgets(&app.budgets).bytes_for(ls_for_cap.view),
         1,
     );

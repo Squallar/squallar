@@ -588,6 +588,66 @@ fn the_loop_pool_is_what_the_loops_need_capped_by_the_room() {
     );
 }
 
+/// **The pool is the room, capped at the loops' ceiling — not their base.** A
+/// pane whose listing has said 300 s over a six-hour lookback has a base of
+/// 25 frames (two hours at 300 s, the rung's span: what `fit` charges) and a
+/// ceiling of 60 (`MAX_LOOP_FRAMES`; the lookback at that cadence is 73). The
+/// pool is sized to the ceiling so the application's planner has room to
+/// balloon into: 960 MiB for one such pane under the presumption, and six of
+/// them are held to the 2304 MiB of room — the same room six two-hour loops
+/// with no cadence get, because the room does not depend on what the loops
+/// ask. `fit` asks whether the scene fits and charges the base; the pool asks
+/// how much room is left. Where no cadence is known, the ceiling is the base
+/// and nothing here moves.
+#[test]
+fn the_pool_is_the_room_capped_at_the_loops_ceiling_not_their_base() {
+    let top = desktop();
+    let cap = Capacity::presumed(&BudgetLimits::DESKTOP);
+    const SIX_HOURS: usize = 6 * 60 * 60;
+    let pane = plan_pane(HD, true, SIX_HOURS, Some(300));
+
+    assert_eq!(loop_frames(&pane, &top), 25, "the base: two hours at 300 s");
+    assert_eq!(
+        loop_frames_ceiling(&pane, &top),
+        60,
+        "the ceiling: min(1 + 21600 / 300 = 73, MAX_LOOP_FRAMES = 60)"
+    );
+    let one = scene_of(vec![pane]);
+    assert_eq!(loop_need(&one, &top, stand_in_grid_bytes), 25 * 16 * MIB);
+    assert_eq!(loop_ceiling(&one, &top, stand_in_grid_bytes), 60 * 16 * MIB);
+    assert_eq!(
+        loop_pool_bytes(&one, &top, &cap, stand_in_grid_bytes),
+        960 * MIB,
+        "min(60 x 16, 3840 - 256): the ceiling, not the base's 400 MiB",
+    );
+
+    let six = scene_of(vec![pane; 6]);
+    assert_eq!(
+        loop_pool_bytes(&six, &top, &cap, stand_in_grid_bytes),
+        2304 * MIB,
+        "min(6 x 960, 3840 - 6 x 256): the room",
+    );
+    assert_eq!(
+        loop_pool_bytes(&six, &top, &cap, stand_in_grid_bytes),
+        loop_room(&six, &top, &cap, stand_in_grid_bytes),
+    );
+
+    // No cadence: the ceiling is the base, and the pool is what it always was.
+    let bare = plan_pane(HD, true, SIX_HOURS, None);
+    assert_eq!(loop_frames_ceiling(&bare, &top), loop_frames(&bare, &top));
+    assert_eq!(
+        loop_pool_bytes(&scene_of(vec![bare]), &top, &cap, stand_in_grid_bytes),
+        36 * 16 * MIB,
+    );
+    // A lookback inside the rung's span: the ceiling is the base too.
+    let hour = plan_pane(HD, true, 3600, Some(300));
+    assert_eq!(loop_frames(&hour, &top), 13);
+    assert_eq!(loop_frames_ceiling(&hour, &top), 13);
+    // Never below the base, whatever the cadence says.
+    let coarse = plan_pane(HD, true, 600, Some(3600));
+    assert!(loop_frames_ceiling(&coarse, &top) >= loop_frames(&coarse, &top));
+}
+
 /// `fit` is pure: the same scene against the same capacity fits to the same
 /// budgets every time, which is what makes a reopen 1:1 without a memo.
 #[test]

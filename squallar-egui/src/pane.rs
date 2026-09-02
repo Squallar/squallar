@@ -616,10 +616,13 @@ pub struct LayerTimeState {
     /// and the arrival path stops consulting it.
     pub asked_range: Option<(NaiveDateTime, NaiveDateTime)>,
     /// **What the source answered when asked which frames exist.** `None`
-    /// until a listing has been accepted through the contract; the frames the
-    /// pane actually holds are [`Self::frames`], and this is the answer they
-    /// were chosen from. No producer writes it before WO-M12 — radar's
-    /// listing still arrives on its own path.
+    /// until a listing has been accepted; the frames the pane actually holds
+    /// are [`Self::frames`], and this is the answer they were chosen from.
+    /// Written when a listing is accepted and kept in step by the live append
+    /// path — stamps that publish join it, stamps the window slides past
+    /// leave it — so that [`Self::resample_frames`] can choose denser or
+    /// sparser from what the source said exists. `range` is the window the
+    /// listing was asked over and is not slid with the frames.
     pub listing: Option<squallar_source::time::FrameListing>,
     /// Whether the listing this loop was built from had to be **sampled** to fit
     /// the frame cap — `Some(true)` when scans were dropped, `Some(false)` when
@@ -1532,6 +1535,56 @@ impl LayerTimeState {
         let mut kept: Vec<Option<LoopFrame>> = self.frames.drain(..).map(Some).collect();
         self.frames = indices.into_iter().filter_map(|i| kept[i].take()).collect();
         self.sampled = Some(true);
+        true
+    }
+
+    /// **Bring the frame list to `held` frames chosen from the listing** —
+    /// denser than it is when the pool granted this loop a balloon, sparser
+    /// when a pane joined and took it back — by the same endpoint-anchored
+    /// sampling the listing was first capped with. A frame whose stamp
+    /// survives keeps its texture and its in-flight mark; a stamp that joins
+    /// arrives as a fresh frame owed a picture, which the supply that fills
+    /// every other frame asks for. Without a listing to choose from this can
+    /// only thin, as [`Self::cap_frames`] does. Returns whether the list
+    /// changed; the caller settles the playhead, which then names the same
+    /// instant on the new list. Integers over a few dozen stamps: nothing
+    /// here is heavy.
+    pub fn resample_frames(&mut self, held: usize) -> bool {
+        // A loop waiting on a listing holds no frames on purpose — a refill
+        // cleared them — and the listing it still carries is the one being
+        // replaced. Nothing is chosen from it.
+        if !self.is_active() || self.phase == LoopPhase::FetchingScanList {
+            return false;
+        }
+        let Some(listing) = self.listing.as_ref() else {
+            return self.cap_frames(held);
+        };
+        let total = listing.frames.len();
+        let want = held.min(total);
+        if total == 0 || want == self.frames.len() {
+            return false;
+        }
+        let stamps: Vec<NaiveDateTime> = listing_sample_indices(total, want)
+            .unwrap_or_else(|| (0..total).collect())
+            .into_iter()
+            .map(|i| listing.frames[i].valid)
+            .collect();
+        let mut kept: Vec<LoopFrame> = std::mem::take(&mut self.frames);
+        self.frames = stamps
+            .into_iter()
+            .map(|valid| {
+                kept.iter().position(|f| f.timestamp == valid).map_or_else(
+                    || LoopFrame {
+                        timestamp: valid,
+                        image: None,
+                        render_in_flight: false,
+                        render_failed: false,
+                    },
+                    |at| kept.swap_remove(at),
+                )
+            })
+            .collect();
+        self.sampled = Some(total > want);
         true
     }
 

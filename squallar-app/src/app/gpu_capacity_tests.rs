@@ -23,6 +23,7 @@ fn budget_line(app: &App) -> String {
         &app.device_profile,
         None,
         app.loop_pool.bytes(),
+        app.loop_pool_state.allocation().balloon_bytes(),
         &app.capacity(),
         app.gpu_probe,
     )
@@ -87,7 +88,7 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     let mut app = web_app(TestBridge::web().with_probed_capacity(probe.bytes));
     assert_eq!(app.device_profile.class, DeviceClass::Unknown);
     assert!(
-        budget_line(&app).ends_with(", cap 288 0, probe 0"),
+        budget_line(&app).contains(", cap 288 0, probe 0, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -127,7 +128,7 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
         "three quarters of a probed figure"
     );
     assert!(
-        budget_line(&app).ends_with(", cap 4032 2, probe 4"),
+        budget_line(&app).contains(", cap 4032 2, probe 4, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -147,7 +148,7 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     app.adopt_probed_capacity(a_probe_of(8 << 30), wgpu::Backend::BrowserWebGpu);
     assert_eq!(app.gpu_probe.bytes(), Some(4032 << 20));
     assert!(
-        budget_line(&app).ends_with(", cap 4032 2, probe 4"),
+        budget_line(&app).contains(", cap 4032 2, probe 4, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -170,7 +171,7 @@ fn a_capped_probe_prints_five_beside_its_figure() {
         wgpu::Backend::BrowserWebGpu,
     );
     assert!(
-        budget_line(&app).ends_with(", cap 8192 2, probe 5"),
+        budget_line(&app).contains(", cap 8192 2, probe 5, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -209,7 +210,7 @@ fn a_probe_on_a_native_profile_is_ignored() {
     // capacity in force is still the presumption (`cap 3840 0`). No native
     // bridge produces this pair; the double is what makes the arm reachable.
     assert!(
-        budget_line(&app).ends_with(", cap 3840 0, probe 4"),
+        budget_line(&app).contains(", cap 3840 0, probe 4, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -442,6 +443,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             &app.device_profile,
             None,
             app.loop_pool.bytes(),
+            app.loop_pool_state.allocation().balloon_bytes(),
             &app.capacity(),
             app.gpu_probe,
         )
@@ -467,7 +469,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
 
     let plain = headless(TestBridge::desktop());
     assert!(
-        line(&plain).ends_with(", cap 3840 0, probe 0"),
+        line(&plain).contains(", cap 3840 0, probe 0, balloon "),
         "{}",
         line(&plain)
     );
@@ -482,7 +484,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
     // the adapter: the class, then the reading through the tested fold.
     app.device_profile.class = DeviceClass::Discrete;
     assert!(
-        line(&app).ends_with(", cap 3840 0, probe 0"),
+        line(&app).contains(", cap 3840 0, probe 0, balloon "),
         "a discrete class with no reading yet is still the presumption: {}",
         line(&app),
     );
@@ -493,7 +495,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
 
     assert_eq!(app.capacity(), Capacity::measured(24 << 30, None));
     assert!(
-        line(&app).ends_with(", cap 24576 1, probe 0"),
+        line(&app).contains(", cap 24576 1, probe 0, balloon "),
         "{}",
         line(&app)
     );
@@ -516,7 +518,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
     // presumed arm: nothing is remembered.
     app.adopt_gpu_capacity(None);
     assert!(
-        line(&app).ends_with(", cap 3840 0, probe 0"),
+        line(&app).contains(", cap 3840 0, probe 0, balloon "),
         "{}",
         line(&app)
     );

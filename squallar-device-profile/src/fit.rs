@@ -139,9 +139,46 @@ pub fn loop_room(scene: &Scene, budgets: &Budgets, cap: &Capacity, grid_bytes: G
         .saturating_sub(need_terms(scene, budgets, grid_bytes).gpu_without_loops())
 }
 
-/// The loop pool's size: what the loops need, capped by the room. The pool is
-/// then divided among the loops by the application's own planner; a device with
-/// more room does not hold more loop than the scene asks for.
+/// **The most frames one looping pane could ever hold**: its whole lookback
+/// at its cadence — not held to the budget's span, which is what
+/// [`loop_frames`] is held to — and never more than the class's list cap,
+/// since a longer listing is sampled down to that before anything is fetched.
+/// The base itself where no cadence is known yet: nothing says what more
+/// exists. Never below the base.
+pub fn loop_frames_ceiling(pane: &PaneNeed, budgets: &Budgets) -> usize {
+    let base = loop_frames(pane, budgets);
+    let Some(cadence) = pane.cadence_secs.filter(|secs| *secs > 0) else {
+        return base;
+    };
+    (1 + pane.loop_span_secs / cadence as usize)
+        .min(budgets.loop_frames_held)
+        .max(base)
+}
+
+/// What the loops could ever fill, in bytes: every looping pane's
+/// [`loop_frames_ceiling`] at its frame's cost. Not a term of [`need`] — `fit`
+/// never charges it.
+pub fn loop_ceiling(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> u64 {
+    let grid = grid_cost(budgets, grid_bytes);
+    scene
+        .panes
+        .iter()
+        .filter(|pane| pane.looping)
+        .fold(0u64, |sum, pane| {
+            sum.saturating_add(
+                (loop_frames_ceiling(pane, budgets) as u64)
+                    .saturating_mul(loop_frame_bytes(pane, budgets, grid)),
+            )
+        })
+}
+
+/// The loop pool's size: **the room the rest of the scene leaves**, capped at
+/// what the loops could ever fill ([`loop_ceiling`]). The two functions here
+/// ask two different questions: [`fit`] asks *does the scene fit* — its need
+/// is every loop's base, the lookback held to the rung's span — and this asks
+/// *how much room is left* once it does. The application's own planner gives
+/// that room out base first and the rest by time, so a device with more room
+/// holds the loops the scene asked for more densely, never longer.
 pub fn loop_pool_bytes(
     scene: &Scene,
     budgets: &Budgets,
@@ -149,8 +186,7 @@ pub fn loop_pool_bytes(
     grid_bytes: GridBytes,
 ) -> u64 {
     let terms = need_terms(scene, budgets, grid_bytes);
-    terms
-        .loops
+    loop_ceiling(scene, budgets, grid_bytes)
         .min(cap.allowance().saturating_sub(terms.gpu_without_loops()))
 }
 

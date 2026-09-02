@@ -634,7 +634,7 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
     // The figure WI-5 built the list under: no raster has landed, so
     // `overlay_frame_bytes` falls back to the model's own `overlay` arm.
     let fallback_bytes = LoopFrameModel::from_budgets(&budgets).overlay;
-    let held_at_build = layer_share(allocation, None, fallback_bytes, animating);
+    let held_at_build = layer_share(&allocation, 0, None, fallback_bytes, animating);
     let built = frame_stamps(&app).len();
     assert_eq!(
         built,
@@ -696,9 +696,9 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
 
     // **A second layer starts animating.** The pane's share divides across
     // every layer that is looping, so the list built for one layer's whole
-    // share is now twice what this layer is entitled to. Nothing re-lists and
-    // nothing re-samples — this dispatch is the only thing that gives the
-    // difference back.
+    // share is now twice what this layer is entitled to. Nothing re-lists —
+    // this dispatch re-samples the list to the share it now has, from the
+    // listing it was chosen from, and gives the difference back.
     *app.gui
         .pane_mut(0)
         .expect("pane 0")
@@ -715,7 +715,7 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
         &known::MODEL_DATA,
         &budgets,
     );
-    let held_now = layer_share(allocation, None, frame_bytes, animating_now);
+    let held_now = layer_share(&allocation, 0, None, frame_bytes, animating_now);
     assert!(
         held_now < built,
         "premise: the second animating layer must have made the built list \
@@ -726,31 +726,73 @@ fn the_dispatch_holds_no_more_frames_than_the_pane_s_byte_share_buys() {
         allocation.share_bytes,
     );
 
+    let textured_before: Vec<chrono::NaiveDateTime> = frame_stamps(&app);
     asked.lock().expect("no poisoned lock").prepared.clear();
     *taken.lock().expect("no poisoned lock") = 0;
     app.dispatch_overlay_loop_renders();
 
-    let textured = frame_textures(&app).iter().filter(|t| t.is_some()).count();
+    // The list follows the share: half the frames, chosen again from the
+    // eighty the listing named, endpoint-anchored.
+    let stamps_now = frame_stamps(&app);
     assert_eq!(
-        textured,
+        stamps_now.len(),
         held_now,
-        "the pane is holding {textured} textures where its share buys \
-         {held_now}: {} B held against {} B — the pane's {} B of pool share \
-         divided {animating_now} ways — at {frame_bytes} B a frame.",
-        textured * frame_bytes,
+        "the frame list holds {} frames where the pane's share buys {held_now}: \
+         {} B against {} B — the pane's {} B of pool share divided \
+         {animating_now} ways — at {frame_bytes} B a frame.",
+        stamps_now.len(),
+        stamps_now.len() * frame_bytes,
         allocation.share_bytes / animating_now,
         allocation.share_bytes,
     );
-    assert!(
-        asked.lock().expect("no poisoned lock").prepared.is_empty(),
-        "the dispatch asked for a raster it had just evicted, which is a loop \
-         that spends its whole share re-rendering the frames it keeps throwing \
-         away",
+    assert_eq!(
+        stamps_now.first(),
+        listed.first(),
+        "the oldest frame survives"
     );
+    assert_eq!(stamps_now.last(), listed.last(), "and the newest");
+    let textures_now = frame_textures(&app);
+    let textured = textures_now.iter().filter(|t| t.is_some()).count();
+    assert!(
+        textured <= held_now,
+        "the pane is holding {textured} textures where its share buys {held_now}",
+    );
+    // A frame whose stamp survived the re-sample kept the picture it had.
+    for (stamp, texture) in stamps_now.iter().zip(&textures_now) {
+        if textured_before.contains(stamp) {
+            assert!(
+                texture.is_some(),
+                "the frame at {stamp} survived the re-sample and lost its texture",
+            );
+        }
+    }
+    assert!(textured >= 2, "both ends survived, textured: {textured}");
+    // What the dispatch asked for is the pictures the frames that JOINED are
+    // owed — bounded by the burst cap — and never a raster it had just evicted.
+    let prepared = asked.lock().expect("no poisoned lock").prepared.clone();
+    assert!(
+        prepared.len() <= squallar_device_profile::constants::MAX_OVERLAY_LOOP_RENDERS_PER_PASS,
+        "{} asks in one pass",
+        prepared.len(),
+    );
+    for stamp in prepared.iter().flatten() {
+        assert!(
+            stamps_now.contains(&stamp.valid),
+            "the dispatch asked for {}, a frame the list does not hold",
+            stamp.valid,
+        );
+        assert!(
+            !textured_before.contains(&stamp.valid),
+            "the dispatch asked for a raster it had just evicted ({}), which is a \
+             loop that spends its whole share re-rendering the frames it keeps \
+             throwing away",
+            stamp.valid,
+        );
+    }
     assert_eq!(
         *taken.lock().expect("no poisoned lock"),
-        0,
-        "and nothing reached the funnel",
+        prepared.len(),
+        "every ask reached the funnel once, and nothing else did",
     );
 }
 
@@ -860,7 +902,7 @@ fn a_pane_animating_two_layers_divides_its_bytes_and_not_its_frame_count() {
     let animating = app.gui.pane(0).expect("pane 0").animating_layers().count();
     let pane = app.gui.pane_mut(0).expect("pane 0");
     crate::app::render::accept_scan_listing_for_test(
-        allocation,
+        &allocation,
         &budgets,
         pane.time_state_mut(&known::RADAR),
         "KTLX",
@@ -947,33 +989,51 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
          test premised, or the two halves are reading different panes",
     );
     assert_eq!(
-        demand.overlay_loops, 1,
+        demand.count(crate::loop_pool::LoopKind::Overlay),
+        1,
         "the pane's model loop did not reach the pool's demand at all",
     );
     assert_eq!(
         demand.shares(),
         1,
-        "a pane looping a model field is one way the pool is split; at 0 the \
-         `shares().max(1)` in `LoopPool::plan` hands it the whole pool and a \
-         second such pane gets the whole pool again",
+        "a pane looping a model field is one loop the pool is given to; unseen, \
+         it would read the kind's ceiling as though it were the only loop, and a \
+         second such pane would too",
     );
 
     // The byte consequence, on the pool's own arithmetic: a second such pane
-    // halves what each of them may hold.
+    // takes frames from what the first may hold. The need is the pane's real
+    // one — three listed frames, so three is the most it can hold — and the
+    // pool is five frames' worth with the bracket's floor lifted, so that two
+    // panes cannot both hold their three: the bracket floor pays six with room
+    // to spare, which would show no division at all.
     let budgets = app.budgets;
     let model = LoopFrameModel::from_budgets(&budgets);
+    let need = demand.needs()[0];
+    assert_eq!(need.max_frames, 3, "the listing named three frames");
     let pool = crate::loop_pool::LoopPool::new(
-        budgets.loop_pool_floor_bytes,
-        crate::loop_pool::LoopPoolLimits::from_budgets(&budgets),
+        5 * need.frame_bytes,
+        crate::loop_pool::LoopPoolLimits {
+            floor: 0,
+            ceiling: usize::MAX,
+        },
     );
-    let two = crate::loop_pool::LoopDemand {
-        overlay_loops: 2,
-        ..Default::default()
-    };
-    assert_eq!(
-        pool.plan(model, two).share_bytes * 2,
-        pool.plan(model, demand).share_bytes,
-        "two panes looping a model field must divide the pool between them",
+    let alone = pool
+        .plan(model, &demand)
+        .frames_for_pane(0)
+        .expect("pane 0 asked for a loop");
+    let mut two = demand.clone();
+    let mut second = demand.needs()[0];
+    second.key = crate::loop_pool::LoopKey { pane: 1 };
+    two.push(second);
+    let shared = pool
+        .plan(model, &two)
+        .frames_for_pane(0)
+        .expect("pane 0 still asks for a loop");
+    assert!(
+        shared < alone,
+        "two panes looping a model field must divide the pool between them: \
+         {alone} frames alone, {shared} beside another",
     );
 }
 

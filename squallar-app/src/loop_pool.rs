@@ -1,24 +1,28 @@
-//! One loop allowance for the whole application, divided among the loops that
-//! actually want one.
+//! One loop allowance for the whole application, given to the loops that
+//! actually want one — each by its own need, and the rest by time.
 //!
 //! The unit of division is a **loop**, not a pane: two 3D panes orbiting one
-//! volume are one resident set in one store, so they cost one share.
+//! volume are one resident set in one store, so they are one loop here.
 //!
-//! The pool's size is **what the loops need**, capped by the room the rest of
-//! the scene leaves under the device's capacity — [`LoopPool::for_scene`], on
-//! `squallar_device_profile::fit`'s arithmetic — and held inside the bracket's
-//! floor and ceiling. A device with more room holds no more loop than the scene
-//! asks for; one with less holds what it can, and [`LoopPool::plan`] divides
-//! that. Nothing about the pool is remembered across sessions, and what
-//! pressure teaches lowers the session's capacity presumption rather than the
-//! pool itself. `mobile` is a cfg for native Android/iOS: a browser on a phone
-//! is `wasm32`, not `mobile`.
+//! The pool's size is the **room** the rest of the scene leaves under the
+//! device's capacity, capped at what the loops could ever fill —
+//! [`LoopPool::for_scene`], on `squallar_device_profile::fit`'s arithmetic —
+//! and held inside the bracket's floor and ceiling. [`LoopPool::plan`] then
+//! gives every loop its **base** (what its lookback costs at the fitted rung,
+//! which `fit` already made sure fits) and spends what is left as a
+//! **balloon**, raising the loops' held frames until their temporal
+//! resolution is equal, each stopping at what its listing holds. One pane and
+//! six panes share one budget: more panes slice it thinner, and a lone pane
+//! holds every scan in its window when the room allows. Nothing about the pool
+//! is remembered across sessions, and what pressure teaches lowers the
+//! session's capacity presumption rather than the pool itself. `mobile` is a
+//! cfg for native Android/iOS: a browser on a phone is `wasm32`, not `mobile`.
 
 use squallar_device_profile::budget::Budgets;
 use squallar_device_profile::constants::{
     LOOP_IMAGE_SIZE, LOOP_POOL_CEILING_BYTES, LOOP_POOL_DWELL_FRAMES, LOOP_POOL_FLOOR_BYTES,
-    LOOP_POOL_HYSTERESIS, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, RENDER_HEIGHT,
-    RENDER_WIDTH, VOLUME_GRID_CELLS,
+    LOOP_POOL_HYSTERESIS, MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE,
+    RENDER_HEIGHT, RENDER_WIDTH, VOLUME_GRID_CELLS,
 };
 use squallar_device_profile::fit::{GridBytes, loop_pool_bytes};
 use squallar_device_profile::scene::{Capacity, CapacitySource, Scene};
@@ -152,7 +156,7 @@ pub fn nominal_overlay_frame_bytes() -> usize {
 }
 
 /// What one loop frame costs on this device class, and how many the dispatcher
-/// will ever texture.
+/// will ever texture or list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopFrameModel {
     /// A [`LOOP_IMAGE_SIZE`]² RGBA raster.
@@ -165,12 +169,17 @@ pub struct LoopFrameModel {
     /// a satellite band — which is a rasterized overlay texture and not one of
     /// radar's three shapes. See [`nominal_overlay_frame_bytes`].
     pub overlay: usize,
-    /// This class's `MAX_LOOP_RENDER_BUDGET`: no share buys more frames
-    /// than the dispatcher would texture. **Radar's own figure**: it is what
-    /// `loop_span_secs` costs at the fastest radar measured, so it is not
-    /// applied to an overlay loop, whose cadence is its layer's (an HRRR run
-    /// is hourly, and 48 h of it is 49 frames).
+    /// This class's `MAX_LOOP_RENDER_BUDGET`: the base a radar loop with no
+    /// cadence yet asks for, and the most a radar loop of the fallback kind
+    /// is textured to. **Radar's own figure**: it is what `loop_span_secs`
+    /// costs at the fastest radar measured, so it is not applied to an
+    /// overlay loop, whose cadence is its layer's (an HRRR run is hourly, and
+    /// 48 h of it is 49 frames).
     pub render_budget: usize,
+    /// This class's `MAX_LOOP_FRAMES`: the most frames any loop **lists**, and
+    /// so the most a balloon can ever raise one to — a listing longer than
+    /// this is sampled down to it before anything is fetched.
+    pub list_cap: usize,
 }
 
 impl LoopFrameModel {
@@ -186,6 +195,7 @@ impl LoopFrameModel {
                 .unwrap_or(usize::MAX),
             overlay: nominal_overlay_frame_bytes(),
             render_budget: MAX_LOOP_RENDER_BUDGET,
+            list_cap: MAX_LOOP_FRAMES,
         }
     }
 
@@ -202,6 +212,7 @@ impl LoopFrameModel {
                 .unwrap_or(usize::MAX),
             overlay: nominal_overlay_frame_bytes(),
             render_budget: budgets.loop_render_budget,
+            list_cap: budgets.loop_frames_held,
         }
     }
 
@@ -214,126 +225,360 @@ impl LoopFrameModel {
             RenderView::Volume => self.grid,
         }
     }
-}
 
-/// What the panes are asking for, this frame.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LoopDemand {
-    /// Panes running a plan-view loop.
-    pub plan_view_loops: usize,
-    /// Panes running a cross-section loop.
-    pub section_loops: usize,
-    /// **Distinct volume loop keys**, not panes. Two 3D panes on one volume are
-    /// one entry here, because they are one resident set in one store.
-    pub volume_sets: usize,
-    /// **Panes looping a layer that is not radar, and no radar loop of their
-    /// own.**
-    ///
-    /// A share is a *pane's* slice, not a layer's: a pane already counted by
-    /// one of the three arms above is not counted again for the model field it
-    /// is animating beside its radar, because `app_render::layer_share`
-    /// divides that one share across every layer the pane animates. This arm
-    /// exists for the pane those three cannot see at all — a radar-off pane
-    /// looping a forecast or a satellite band, which before WB-7 asked the
-    /// pool for nothing and was then handed a share sized as though it were
-    /// the only thing running.
-    pub overlay_loops: usize,
-}
-
-impl LoopDemand {
-    /// How many ways the pool is split.
-    pub fn shares(&self) -> usize {
-        self.plan_view_loops + self.section_loops + self.volume_sets + self.overlay_loops
-    }
-
-    /// Fold one more loop of `view` in, deduplicating 3D loops by `key`.
-    /// `key` is `None` for the two raster kinds, which never share.
-    pub fn add(&mut self, view: RenderView, already_counted: bool) {
-        match view {
-            RenderView::PlanView => self.plan_view_loops += 1,
-            RenderView::CrossSection => self.section_loops += 1,
-            RenderView::Volume => {
-                if !already_counted {
-                    self.volume_sets += 1;
-                }
-            }
+    /// What one frame of a loop of `kind` costs on this class, before a pane
+    /// has measured its own.
+    pub fn price(&self, kind: LoopKind) -> usize {
+        match kind {
+            LoopKind::PlanView => self.plan_view,
+            LoopKind::CrossSection => self.section,
+            LoopKind::Volume => self.grid,
+            LoopKind::Overlay => self.overlay,
         }
     }
 
-    /// Fold in one pane whose loops are all a layer other than radar's.
-    /// See [`Self::overlay_loops`] for why it is per pane and not per layer.
-    pub fn add_overlay_pane(&mut self) {
-        self.overlay_loops += 1;
+    /// The most frames a loop of `kind` is textured to when nothing more
+    /// specific is known about it: radar's three shapes stop at the render
+    /// budget, an overlay loop at the list cap (its cadence is its layer's,
+    /// and the render budget is radar's figure).
+    fn kind_cap(&self, kind: LoopKind) -> usize {
+        let cap = match kind {
+            LoopKind::PlanView | LoopKind::CrossSection | LoopKind::Volume => self.render_budget,
+            LoopKind::Overlay => self.list_cap,
+        };
+        // `render_budget` could be edited below the minimum, and `clamp`
+        // panics on a crossed pair; the floor wins.
+        cap.max(MIN_LOOP_FRAMES_PER_PANE)
     }
 }
 
-/// What each loop gets, once the pool has been divided.
+/// Which shape a loop's frames are, and so what one of them costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LoopKind {
+    /// A radar plan-view raster.
+    PlanView,
+    /// A radar cross-section raster.
+    CrossSection,
+    /// A resident voxel grid.
+    Volume,
+    /// A rasterized overlay texture: any layer that is not radar.
+    Overlay,
+}
+
+impl LoopKind {
+    /// The kind a radar loop of `view` is.
+    pub fn of(view: RenderView) -> Self {
+        match view {
+            RenderView::PlanView => Self::PlanView,
+            RenderView::CrossSection => Self::CrossSection,
+            RenderView::Volume => Self::Volume,
+        }
+    }
+}
+
+/// **One loop's identity in the pool**: the pane it runs on. A pane runs at
+/// most one loop the pool can see — its radar loop, or one overlay loop when
+/// radar is off — so the pane index is the whole key. Two 3D panes orbiting
+/// one volume are one loop under the first pane's key, and the second is an
+/// **alias** of it ([`LoopDemand::alias`]), so both read the same grant while
+/// the pool charges the set once. A frame identity shared across panes can
+/// join this key later; it is a struct rather than a bare index so that it
+/// can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopKey {
+    /// The pane the loop runs on.
+    pub pane: usize,
+}
+
+/// **What one loop asks the pool for.** Built by the pane walk that also
+/// describes the scene for `fit`, from what the pane knows this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopNeed {
+    /// Which loop this is.
+    pub key: LoopKey,
+    /// What its frames are, and so what one costs.
+    pub kind: LoopKind,
+    /// The pane's lookback in seconds — the width the frames are spread over,
+    /// which is what the balloon equalises against.
+    pub span_secs: u64,
+    /// The source's own frame cadence over the window, once its listing has
+    /// said; `None` before then.
+    pub cadence_secs: Option<u32>,
+    /// Bytes one frame of this loop costs: the model's price for radar's
+    /// three shapes, the pane's own measured raster for an overlay loop.
+    pub frame_bytes: usize,
+    /// **The base**: the frames `fit` already made room for — the pane's
+    /// lookback at its cadence, held to the fitted rung's span and render
+    /// budget (`Budgets::frames_for_span_of`). What `fit`'s need charged, so
+    /// the pool can always pay it when the ladder has done its job.
+    pub base_frames: usize,
+    /// **The most this loop can hold**: every scan the listing named in the
+    /// window, or the window at the cadence when no listing has landed, never
+    /// more than the class's list cap. A balloon never inflates a loop past
+    /// what exists to show.
+    pub max_frames: usize,
+}
+
+impl LoopNeed {
+    /// What this loop holds at its base, once the base is held to what exists
+    /// and to the two-frame floor.
+    fn held_at_base(&self) -> usize {
+        self.base_frames
+            .min(self.max_frames)
+            .max(MIN_LOOP_FRAMES_PER_PANE)
+    }
+
+    /// Bytes this loop charges whatever its frame count: a 3D loop's live grid
+    /// lives in the same store as its frames, so its slice carries one grid
+    /// beside them — the headroom the shipped 3D frame counts were derived
+    /// with. Nothing for the raster kinds.
+    fn fixed_bytes(&self) -> usize {
+        match self.kind {
+            LoopKind::Volume => self.frame_bytes,
+            LoopKind::PlanView | LoopKind::CrossSection | LoopKind::Overlay => 0,
+        }
+    }
+}
+
+/// **The most frames a loop can hold**, for [`LoopNeed::max_frames`]: what
+/// its listing holds when one has landed (`listed`), else the window at the
+/// cadence, else the base — never more than the class's list cap. Pure, so the
+/// pane walk and the tests spell it once.
+pub fn loop_ceiling_frames(
+    listed: Option<usize>,
+    span_secs: u64,
+    cadence_secs: Option<u32>,
+    base_frames: usize,
+    list_cap: usize,
+) -> usize {
+    let known = listed.unwrap_or_else(|| {
+        cadence_secs
+            .filter(|secs| *secs > 0)
+            .map_or(base_frames, |secs| {
+                1 + usize::try_from(span_secs / u64::from(secs)).unwrap_or(usize::MAX)
+            })
+    });
+    known.min(list_cap)
+}
+
+/// What the loops are asking for, this frame: one [`LoopNeed`] per loop, and
+/// which panes read another pane's loop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoopDemand {
+    needs: Vec<LoopNeed>,
+    /// `(pane, owner)`: `pane` orbits the volume `owner`'s loop already holds,
+    /// so it reads `owner`'s grant and asks for nothing of its own.
+    aliases: Vec<(usize, usize)>,
+}
+
+impl LoopDemand {
+    /// Fold one more loop in. A second need under a key already present
+    /// replaces the first, so a walk that visits a pane twice cannot charge
+    /// it twice.
+    pub fn push(&mut self, need: LoopNeed) {
+        match self.needs.iter_mut().find(|n| n.key == need.key) {
+            Some(slot) => *slot = need,
+            None => self.needs.push(need),
+        }
+    }
+
+    /// Record that `pane` shares `owner`'s loop — a second 3D pane on one
+    /// volume, which is one resident set in one store and so one loop here.
+    pub fn alias(&mut self, pane: usize, owner: usize) {
+        if !self.aliases.contains(&(pane, owner)) {
+            self.aliases.push((pane, owner));
+        }
+    }
+
+    /// The loops, in the order the panes were walked.
+    pub fn needs(&self) -> &[LoopNeed] {
+        &self.needs
+    }
+
+    /// How many loops the pool is given to.
+    pub fn shares(&self) -> usize {
+        self.needs.len()
+    }
+
+    /// How many loops of `kind` are asking.
+    pub fn count(&self, kind: LoopKind) -> usize {
+        self.needs.iter().filter(|n| n.kind == kind).count()
+    }
+}
+
+/// **What one loop was given**: its need, and the frames it may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopGrant {
+    /// Which loop.
+    pub key: LoopKey,
+    /// What its frames are.
+    pub kind: LoopKind,
+    /// The width the frames are spread over, from the need.
+    pub span_secs: u64,
+    /// The cadence the need was planned with — `None` when the loop's listing
+    /// had not landed, which a consumer reads as "planned before this loop
+    /// knew its cadence".
+    pub cadence_secs: Option<u32>,
+    /// Bytes one frame costs, from the need.
+    pub frame_bytes: usize,
+    /// The frames the base bought, once held to what exists and to the floor.
+    pub base: usize,
+    /// The most frames the loop can hold, from the need.
+    pub max: usize,
+    /// **Frames this loop may hold**: the base plus its share of the
+    /// balloon, or less than the base when the pool could not pay every base.
+    pub frames: usize,
+    /// The bytes charged whatever the frame count — a 3D loop's live grid.
+    fixed_bytes: usize,
+}
+
+impl LoopGrant {
+    /// What this grant charges the pool.
+    pub fn bytes(&self) -> usize {
+        self.frames
+            .saturating_mul(self.frame_bytes)
+            .saturating_add(self.fixed_bytes)
+    }
+
+    /// The frames' own bytes — what a pane's animating layers divide.
+    pub fn frame_bytes_held(&self) -> usize {
+        self.frames.saturating_mul(self.frame_bytes)
+    }
+
+    /// The bytes above the base — this loop's balloon, 0 when it holds its
+    /// base or less.
+    pub fn balloon_bytes(&self) -> usize {
+        self.frames
+            .saturating_sub(self.base)
+            .saturating_mul(self.frame_bytes)
+    }
+
+    /// Seconds one frame stands for — the temporal resolution the balloon
+    /// equalises. Compared as a ratio through [`Self::coarser_than`] so the
+    /// decision never rounds.
+    fn resolution(&self) -> (u128, u128) {
+        (
+            u128::from(self.span_secs.max(1)),
+            self.frames.max(1) as u128,
+        )
+    }
+
+    /// Whether this loop's frames stand for more seconds apiece than
+    /// `other`'s — exact, by cross-multiplication.
+    fn coarser_than(&self, other: &Self) -> bool {
+        let (span_a, frames_a) = self.resolution();
+        let (span_b, frames_b) = other.resolution();
+        span_a * frames_b > span_b * frames_a
+    }
+}
+
+/// What each loop gets, once the pool has been given out.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopAllocation {
-    /// One loop's slice of the pool, in bytes.
+    grants: Vec<LoopGrant>,
+    aliases: Vec<(usize, usize)>,
+    model: LoopFrameModel,
+    /// The pool this was planned from.
+    pool_bytes: usize,
+    /// **Mean bytes one loop holds** — the pool over the loops when every
+    /// loop's grant is summed, the whole pool when nothing loops. The `loop
+    /// state:` line's `share`; one figure for a division that is no longer
+    /// equal, so it is a summary and not any one loop's slice.
     pub share_bytes: usize,
-    /// Textured frames a plan-view loop may keep.
+    /// The most frames a plan-view loop holds under this plan, or what one
+    /// would hold as the sole loop when none does — the ceiling a plan-view
+    /// loop the plan has not seen is held to.
     pub plan_view_frames: usize,
-    /// Textured frames a cross-section loop may keep — more than a plan-view
-    /// loop at the same share, because a section frame is half the size.
+    /// The same for a cross-section loop.
     pub section_frames: usize,
-    /// Resident grids **one** 3D loop may keep, which for that kind is also its
-    /// whole frame list. See [`Self::volume_reserve_bytes`].
+    /// The same for a 3D loop, whose frames are resident grids and whose
+    /// frame list is its resident set.
     pub volume_frames: usize,
-    /// Textured frames a loop of a **non-radar** layer may keep, at the device
-    /// class's nominal overlay frame ([`LoopFrameModel::overlay`]). A pane that
-    /// has already rasterized the layer is priced off the texture it is really
-    /// drawing with — [`Self::frames_at`] takes that measurement — and this is
-    /// the pool's own answer before one exists.
-    ///
-    /// Unlike the three radar arms it is **not** capped by
-    /// [`LoopFrameModel::render_budget`]: that figure is what radar's
-    /// `loop_span_secs` costs at the fastest radar measured, and an overlay
-    /// loop's cadence is its own layer's.
+    /// The same for a loop of a **non-radar** layer, at the class's nominal
+    /// overlay frame ([`LoopFrameModel::overlay`]). Not held to the render
+    /// budget — see [`LoopFrameModel::kind_cap`] — but to the list cap.
     pub overlay_frames: usize,
     /// The distinct 3D loops this allocation was computed for.
     pub volume_sets: usize,
 }
 
 impl LoopAllocation {
-    /// Frames of a loop of this view that are ready to show at once.
-    pub fn frames_for(&self, view: RenderView) -> usize {
-        match view {
-            RenderView::PlanView => self.plan_view_frames,
-            RenderView::CrossSection => self.section_frames,
-            RenderView::Volume => self.volume_frames,
+    /// Every grant, in the order the panes were walked.
+    pub fn grants(&self) -> &[LoopGrant] {
+        &self.grants
+    }
+
+    /// The grant `pane`'s loop reads — its own, or the one it is an alias of.
+    pub fn grant_for_pane(&self, pane: usize) -> Option<&LoopGrant> {
+        let owner = self
+            .aliases
+            .iter()
+            .find(|(alias, _)| *alias == pane)
+            .map_or(pane, |(_, owner)| *owner);
+        self.grants.iter().find(|g| g.key.pane == owner)
+    }
+
+    /// Frames `pane`'s loop may hold, or `None` for a pane the plan has not
+    /// seen — a loop that started inside the dwell, which the caller holds to
+    /// the kind's ceiling ([`Self::frames_for`]) until the plan catches up.
+    pub fn frames_for_pane(&self, pane: usize) -> Option<usize> {
+        self.grant_for_pane(pane).map(|g| g.frames)
+    }
+
+    /// Frames of a loop of `kind` that are ready to show at once, when the
+    /// plan names nothing more specific: the kind's ceiling.
+    pub fn frames_for_kind(&self, kind: LoopKind) -> usize {
+        match kind {
+            LoopKind::PlanView => self.plan_view_frames,
+            LoopKind::CrossSection => self.section_frames,
+            LoopKind::Volume => self.volume_frames,
+            LoopKind::Overlay => self.overlay_frames,
         }
     }
 
-    /// What `VolumeStore::enforce_budget` is held to.
+    /// [`Self::frames_for_kind`], for a radar loop of `view`.
+    pub fn frames_for(&self, view: RenderView) -> usize {
+        self.frames_for_kind(LoopKind::of(view))
+    }
+
+    /// **Bytes `pane`'s loop holds its frames in** — what its animating
+    /// layers divide: the grant's frames at the grant's price, or
+    /// [`Self::share_bytes`] for a pane the plan has not seen — the whole
+    /// pool on an idle application, one loop's mean beside others — until the
+    /// plan catches up within the dwell, which is the figure the equal split
+    /// handed such a pane before.
+    pub fn share_bytes_for(&self, pane: usize) -> usize {
+        self.grant_for_pane(pane)
+            .map_or(self.share_bytes, LoopGrant::frame_bytes_held)
+    }
+
+    /// What `VolumeStore::enforce_budget` is held to: every 3D loop's grids
+    /// and the live grid beside them, which is what each was charged.
     pub fn volume_reserve_bytes(&self) -> usize {
-        self.share_bytes * self.volume_sets
+        self.grants
+            .iter()
+            .filter(|g| g.kind == LoopKind::Volume)
+            .fold(0usize, |sum, g| sum.saturating_add(g.bytes()))
     }
 
-    /// What this allocation costs if every loop in `demand` fills it.
-    pub fn bytes(&self, model: LoopFrameModel, demand: LoopDemand) -> usize {
-        demand.plan_view_loops * self.plan_view_frames * model.plan_view
-            + demand.section_loops * self.section_frames * model.section
-            + demand.volume_sets * self.volume_frames * model.grid
-            + demand.overlay_loops * self.overlay_frames * model.overlay
+    /// What this allocation charges the pool in all.
+    pub fn bytes(&self) -> usize {
+        self.grants
+            .iter()
+            .fold(0usize, |sum, g| sum.saturating_add(g.bytes()))
     }
 
-    /// **Frames one share buys at a measured `frame_bytes` apiece** — the count
-    /// a layer gets when it is the only thing its pane animates.
-    ///
-    /// Floored at [`MIN_LOOP_FRAMES_PER_PANE`], deliberately and in the open:
-    /// two frames is where a loop stops being a loop, and it is the same floor
-    /// [`LoopPool::plan`] applies to every other arm. **On a share that does
-    /// not buy two frames the floor wins and the byte bound is exceeded** — one
-    /// frame over, by construction, and stating it is the alternative to an
-    /// animation that cannot animate.
-    ///
-    /// [`MIN_LOOP_FRAMES_PER_PANE`]: squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
-    pub fn frames_at(&self, frame_bytes: usize) -> usize {
-        self.share_bytes
-            .checked_div(frame_bytes)
-            .unwrap_or(MIN_LOOP_FRAMES_PER_PANE)
-            .max(MIN_LOOP_FRAMES_PER_PANE)
+    /// Bytes held above every loop's base — the balloon in force, 0 when
+    /// every loop holds its base or less.
+    pub fn balloon_bytes(&self) -> usize {
+        self.grants
+            .iter()
+            .fold(0usize, |sum, g| sum.saturating_add(g.balloon_bytes()))
+    }
+
+    /// The pool this was planned from.
+    pub fn pool_bytes(&self) -> usize {
+        self.pool_bytes
     }
 }
 
@@ -351,17 +596,18 @@ impl LoopPool {
         }
     }
 
-    /// **The pool a scene asks for**: what its loops need — every looping
-    /// pane's frames for its span at its frame's cost — capped by the room the
-    /// rest of the scene leaves under `cap`'s allowance, and held inside
-    /// `limits` on `cap`'s arm ([`LoopPoolLimits::on`]). One two-hour loop on
-    /// the desktop bracket is 36 x 16 MiB = 576 MiB whatever card it runs on;
-    /// six are 3456 MiB, or the room if that is less — under the 3840 MiB
-    /// presumption the room is 2304 MiB, under a measured 3090 it is not the
-    /// bound and the 3072 MiB bracket ceiling is not either. The class of the
-    /// machine is not an input: the same scene costs the same bytes on every
-    /// bracket, and what a bigger card buys is room, never a longer loop than
-    /// was asked for.
+    /// **The pool a scene leaves for its loops**: the room the rest of the
+    /// scene leaves under `cap`'s allowance, capped at what the loops could
+    /// ever fill — every looping pane's window at its cadence, at its frame's
+    /// cost, no loop past the list cap — and held inside `limits` on `cap`'s
+    /// arm ([`LoopPoolLimits::on`]). One two-hour loop on the desktop bracket
+    /// is 36 x 16 MiB = 576 MiB whatever card it runs on; six are 3456 MiB,
+    /// or the room if that is less — under the 3840 MiB presumption the room
+    /// is 2304 MiB, under a measured 3090 it is not the bound and the 3072 MiB
+    /// bracket ceiling is not either. The class of the machine is not an
+    /// input: the same scene costs the same bytes on every bracket, and what
+    /// a bigger card buys is room — which [`Self::plan`] spends on the density
+    /// of the window the user asked for, never on a longer one.
     pub fn for_scene(
         scene: &Scene,
         budgets: &Budgets,
@@ -377,43 +623,141 @@ impl LoopPool {
         self.bytes
     }
 
-    /// Divide the pool among the loops that want one.
-    pub fn plan(&self, model: LoopFrameModel, demand: LoopDemand) -> LoopAllocation {
-        let share_bytes = self.bytes / demand.shares().max(1);
-        // `render_budget` could be edited below the minimum, and `clamp`
-        // panics on a crossed pair; the floor wins.
-        let cap = model.render_budget.max(MIN_LOOP_FRAMES_PER_PANE);
-        // A frame that costs nothing is a model built wrong; the cap
-        // cannot then divide by zero and cannot become an unbounded loop.
-        let frames = |budget: usize, cost: usize| {
-            budget
-                .checked_div(cost)
-                .unwrap_or(cap)
-                .clamp(MIN_LOOP_FRAMES_PER_PANE, cap)
+    /// **Give the pool to the loops that want one: base first, then the
+    /// balloon, by time.**
+    ///
+    /// Every loop is first held at its base — what `fit` made room for, held
+    /// to what its listing holds and to the two-frame floor. When the bases
+    /// together fit the pool, what is left is spent as a **balloon**: one
+    /// frame at a time to whichever growable loop's frames stand for the most
+    /// seconds apiece (exact, by cross-multiplication — no float decides),
+    /// ties to the earlier pane, each loop stopping at its `max_frames` or
+    /// when one more of its frames would not fit. Loops of unequal cost and
+    /// equal span therefore reach the same temporal resolution, not the same
+    /// bytes; a cheaper frame buys its loop nothing its neighbour does not
+    /// get, and a longer window holds proportionally more frames. When the
+    /// bases together do **not** fit — the ladder had nothing left to shed,
+    /// or the presumed arm's ceiling binds — the same rule runs downward: one
+    /// frame at a time from whichever loop's frames stand for the fewest
+    /// seconds, none below the floor, until the plan fits or nothing can
+    /// shrink. That replaces the equal-bytes split, which gave a section loop
+    /// twice a plan-view loop's history for the same lookback and held six
+    /// panes to the density one pane earned.
+    ///
+    /// Deterministic: the same pool, model and demand plan the same grants.
+    pub fn plan(&self, model: LoopFrameModel, demand: &LoopDemand) -> LoopAllocation {
+        let mut grants: Vec<LoopGrant> = demand
+            .needs
+            .iter()
+            .map(|need| {
+                let base = need.held_at_base();
+                LoopGrant {
+                    key: need.key,
+                    kind: need.kind,
+                    span_secs: need.span_secs,
+                    cadence_secs: need.cadence_secs,
+                    frame_bytes: need.frame_bytes,
+                    base,
+                    max: need.max_frames.max(base),
+                    frames: base,
+                    fixed_bytes: need.fixed_bytes(),
+                }
+            })
+            .collect();
+
+        let charged = |grants: &[LoopGrant]| {
+            grants
+                .iter()
+                .fold(0usize, |sum, g| sum.saturating_add(g.bytes()))
         };
-        let volume_frames = frames(share_bytes.saturating_sub(model.grid), model.grid);
-        let mut allocation = LoopAllocation {
+
+        if charged(&grants) <= self.bytes {
+            // Up: the coarsest growable loop takes the next frame.
+            loop {
+                let spent = charged(&grants);
+                let room = self.bytes - spent;
+                let next = grants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.frames < g.max && g.frame_bytes <= room)
+                    .fold(None::<usize>, |best, (i, g)| match best {
+                        Some(b) if !g.coarser_than(&grants[b]) => Some(b),
+                        _ => Some(i),
+                    });
+                let Some(i) = next else {
+                    break;
+                };
+                grants[i].frames += 1;
+            }
+        } else {
+            // Down: the finest shrinkable loop gives the next frame back.
+            while charged(&grants) > self.bytes {
+                let next = grants
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.frames > MIN_LOOP_FRAMES_PER_PANE)
+                    .fold(None::<usize>, |best, (i, g)| match best {
+                        Some(b) if !grants[b].coarser_than(g) => Some(b),
+                        _ => Some(i),
+                    });
+                let Some(i) = next else {
+                    break;
+                };
+                grants[i].frames -= 1;
+            }
+        }
+
+        // The per-kind ceilings: the most any loop of the kind holds, or the
+        // single-loop answer where none does — the whole pool as one share,
+        // held to the kind's cap, and a 3D loop leaving one grid of headroom
+        // for the live grid it keeps beside its frames.
+        let ceiling = |kind: LoopKind| {
+            grants
+                .iter()
+                .filter(|g| g.kind == kind)
+                .map(|g| g.frames)
+                .max()
+                .unwrap_or_else(|| {
+                    let price = model.price(kind);
+                    let budget = match kind {
+                        LoopKind::Volume => self.bytes.saturating_sub(price),
+                        _ => self.bytes,
+                    };
+                    // A frame that costs nothing is a model built wrong; the
+                    // cap answers rather than a division by zero.
+                    let cap = model.kind_cap(kind);
+                    budget
+                        .checked_div(price)
+                        .unwrap_or(cap)
+                        .clamp(MIN_LOOP_FRAMES_PER_PANE, cap)
+                })
+        };
+        let share_bytes = if grants.is_empty() {
+            self.bytes
+        } else {
+            charged(&grants) / grants.len()
+        };
+        LoopAllocation {
+            plan_view_frames: ceiling(LoopKind::PlanView),
+            section_frames: ceiling(LoopKind::CrossSection),
+            volume_frames: ceiling(LoopKind::Volume),
+            overlay_frames: ceiling(LoopKind::Overlay),
+            volume_sets: demand.count(LoopKind::Volume),
             share_bytes,
-            plan_view_frames: frames(share_bytes, model.plan_view),
-            section_frames: frames(share_bytes, model.section),
-            volume_frames,
-            overlay_frames: MIN_LOOP_FRAMES_PER_PANE,
-            volume_sets: demand.volume_sets,
-        };
-        // Bytes and the floor, and no `render_budget` — see
-        // `LoopAllocation::overlay_frames`. Through `frames_at` rather than
-        // spelled again here, so the pool's own answer and a pane's measured
-        // one cannot come out of two different divisions.
-        allocation.overlay_frames = allocation.frames_at(model.overlay);
-        allocation
+            grants,
+            aliases: demand.aliases.clone(),
+            model,
+            pool_bytes: self.bytes,
+        }
     }
 }
 
 /// What an allocation was planned against: the pool, the frame model and the
 /// demand. A change in any of the three is a change the dwell and the dead
 /// band answer — the pool moves when the scene's need or its room does, the
-/// model when the budgets re-fit, the demand when a loop starts or stops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// model when the budgets re-fit, the demand when a loop starts or stops, or
+/// when a listing lands and says what a loop can hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Planned {
     pool: LoopPool,
     model: LoopFrameModel,
@@ -421,7 +765,7 @@ struct Planned {
 }
 
 /// The allocation in force, and how long the panes have disagreed with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopPoolState {
     allocation: LoopAllocation,
     /// What [`Self::allocation`] was last settled against — a growth refused
@@ -440,15 +784,15 @@ impl LoopPoolState {
             demand: LoopDemand::default(),
         };
         Self {
-            allocation: pool.plan(model, planned.demand),
+            allocation: pool.plan(model, &planned.demand),
             settled_for: planned,
             pending: None,
         }
     }
 
     /// The allocation in force.
-    pub fn allocation(&self) -> LoopAllocation {
-        self.allocation
+    pub fn allocation(&self) -> &LoopAllocation {
+        &self.allocation
     }
 
     /// Fold one frame's pool, model and demand into the allocation.
@@ -457,7 +801,7 @@ impl LoopPoolState {
         pool: LoopPool,
         model: LoopFrameModel,
         demand: LoopDemand,
-    ) -> LoopAllocation {
+    ) -> &LoopAllocation {
         let asked = Planned {
             pool,
             model,
@@ -465,31 +809,72 @@ impl LoopPoolState {
         };
         if asked == self.settled_for {
             self.pending = None;
-            return self.allocation;
+            return &self.allocation;
         }
-        self.pending = match self.pending {
+        self.pending = match self.pending.take() {
             Some((pending, frames)) if pending == asked => Some((asked, frames + 1)),
             _ => Some((asked, 1)),
         };
-        if let Some((asked, frames)) = self.pending
-            && frames >= LOOP_POOL_DWELL_FRAMES
-        {
-            let bare = asked.pool.plan(asked.model, asked.demand);
-            if Self::worth_taking(self.allocation, bare) {
-                self.allocation = bare;
+        if let Some((asked, frames)) = self.pending.take() {
+            if frames >= LOOP_POOL_DWELL_FRAMES {
+                let bare = asked.pool.plan(asked.model, &asked.demand);
+                if Self::worth_taking(&self.allocation, &bare) {
+                    self.allocation = bare;
+                }
+                self.settled_for = asked;
+            } else {
+                self.pending = Some((asked, frames));
             }
-            self.settled_for = asked;
-            self.pending = None;
         }
-        self.allocation
+        &self.allocation
     }
 
-    /// Whether `bare` is a change worth re-planning every loop on screen for.
-    fn worth_taking(in_force: LoopAllocation, bare: LoopAllocation) -> bool {
-        if bare.share_bytes <= in_force.share_bytes {
+    /// Whether `bare` is a change worth re-planning every loop on screen for:
+    /// a loop that started (it needs a grant of its own), any loop or kind
+    /// ceiling that shrinks, or one that grows by the dead band's ratio **in
+    /// frames** — the thing a re-plan actually changes on screen. A loop that
+    /// stopped is not by itself a reason: its grant lingers, charging nothing
+    /// real, until a change worth taking arrives — the dead band's whole
+    /// point is that five loops are not re-sampled denser for a 1.2x gain the
+    /// moment a sixth closes.
+    fn worth_taking(in_force: &LoopAllocation, bare: &LoopAllocation) -> bool {
+        let started = bare
+            .grants
+            .iter()
+            .any(|g| in_force.grant_for_pane(g.key.pane).is_none())
+            || bare
+                .aliases
+                .iter()
+                .any(|alias| !in_force.aliases.contains(alias));
+        if started {
             return true;
         }
-        bare.share_bytes as f64 >= in_force.share_bytes as f64 * LOOP_POOL_HYSTERESIS
+        let kinds = [
+            LoopKind::PlanView,
+            LoopKind::CrossSection,
+            LoopKind::Volume,
+            LoopKind::Overlay,
+        ];
+        let pairs = bare
+            .grants
+            .iter()
+            .filter_map(|now| {
+                in_force
+                    .grants
+                    .iter()
+                    .find(|was| was.key == now.key)
+                    .map(|was| (was.frames, now.frames))
+            })
+            .chain(
+                kinds
+                    .iter()
+                    .map(|kind| (in_force.frames_for_kind(*kind), bare.frames_for_kind(*kind))),
+            )
+            .collect::<Vec<_>>();
+        pairs.iter().any(|(was, now)| now < was)
+            || pairs
+                .iter()
+                .any(|(was, now)| *now as f64 >= *was as f64 * LOOP_POOL_HYSTERESIS)
     }
 }
 

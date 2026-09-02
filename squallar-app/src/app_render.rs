@@ -1,5 +1,8 @@
 use super::frame_pump::PumpPhase;
-use crate::loop_pool::{GRID_BYTES, LoopAllocation, LoopDemand, LoopFrameModel, LoopPool};
+use crate::loop_pool::{
+    GRID_BYTES, LoopAllocation, LoopDemand, LoopFrameModel, LoopKey, LoopKind, LoopNeed, LoopPool,
+    loop_ceiling_frames,
+};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use squallar_device_profile::constants::{
@@ -1799,6 +1802,7 @@ impl super::App {
                     &self.device_profile,
                     linear,
                     self.loop_pool.bytes(),
+                    self.loop_pool_state.allocation().balloon_bytes(),
                     &self.capacity(),
                     self.gpu_probe,
                 )),
@@ -3270,23 +3274,20 @@ impl super::App {
                     // animating, and it is counted HERE - where the budget is
                     // consumed - not pushed down with it.
                     let animating = pane.animating_layers().count();
-                    // **The listed stamps whole, not just their instants.**
+                    // **The listing whole, not just its instants.**
                     // `FrameStamp::run` is what tells two runs' grids for the
                     // same valid time apart, and the model layer's
                     // `frame_target` — the resolver behind both `fetch_frame`
                     // and the frame-addressed `prepare_job` — answers `None`
                     // without it. A `LoopFrame` carries only a timestamp, so
-                    // the run has to be carried alongside rather than read
-                    // back off the frame list.
-                    let listed: Vec<squallar_source::time::FrameStamp> = {
+                    // the run is carried in the stamps `build_loop_frames`
+                    // hands back, and the listing itself stays on the
+                    // timeline for the re-sample a changed allocation asks.
+                    let listing: squallar_source::time::FrameListing = {
                         let view = pane.view(pane_idx);
                         let pane_ref = view.layer(&layer);
-                        overlays
-                            .list_frames(&layer, &config, &pane_ref, range)
-                            .frames
+                        overlays.list_frames(&layer, &config, &pane_ref, range)
                     };
-                    let frames: Vec<chrono::NaiveDateTime> =
-                        listed.iter().map(|frame| frame.valid).collect();
                     let Some(site) = site.as_deref() else {
                         // -- Every layer but radar --------------------------
                         // The cap is a byte division rather than radar's
@@ -3294,8 +3295,8 @@ impl super::App {
                         // frame's size.
                         let frame_bytes = overlay_frame_bytes(pane, &layer, &budgets);
                         let ls = pane.time_state_mut(&layer);
-                        let Some(stamps) = build_loop_frames(ls, frames, |_| {
-                            layer_share(allocation, None, frame_bytes, animating)
+                        let Some(stamps) = build_loop_frames(ls, listing, |_| {
+                            layer_share(&allocation, pane_idx, None, frame_bytes, animating)
                         }) else {
                             log::warn!(
                                 "Loop: {} listed no frames in the requested window for \
@@ -3322,12 +3323,12 @@ impl super::App {
                                 .map(|idx| {
                                     let valid = ls.frames[idx].timestamp;
                                     // The stamp the LAYER named, carried back
-                                    // whole — see `listed` above. The
+                                    // whole — see `listing` above. The
                                     // reconstruction is the fallback for a
                                     // layer whose sampling dropped the row,
                                     // which cannot happen while the frames come
-                                    // from `listed` itself.
-                                    listed.iter().copied().find(|f| f.valid == valid).unwrap_or(
+                                    // from `stamps` itself.
+                                    stamps.iter().copied().find(|f| f.valid == valid).unwrap_or(
                                         squallar_source::time::FrameStamp { valid, run: None },
                                     )
                                 })
@@ -3345,11 +3346,12 @@ impl super::App {
                     // frame list, is decided in one place - including refusing a
                     // listing for a site the pane's loop has since moved off.
                     let Some(plan) = accept_scan_listing(
-                        allocation,
+                        &allocation,
+                        pane_idx,
                         &budgets,
                         pane.time_state_mut(&known::RADAR),
                         site,
-                        frames,
+                        listing,
                         animating,
                     ) else {
                         continue;
@@ -3786,7 +3788,7 @@ impl super::App {
             // name (WI-2) - pinned by
             // `the_readiness_walk_settles_every_animating_layer_not_only_radar`.
             for slot in p.animating_layers_mut() {
-                let budget = loop_render_budget(allocation, &slot.time, &budgets);
+                let budget = loop_ready_budget(&allocation, pidx, &slot.time, &budgets);
                 let settled = if slot.id == squallar_source::id::known::RADAR {
                     // Radar answers both questions out of its own bookkeeping.
                     settle_radar_loop_phase(loop_mgr, pidx, &mut slot.time, budget)
@@ -4048,12 +4050,11 @@ impl super::App {
                 .mirror_plan_applied
                 .map_or([0, 0], |plan| plan.size_in_pixels),
         };
-        let mut seen: Vec<(
-            String,
-            squallar_radar::types::RadarProduct,
-            Option<squallar_egui::pane::VolumeLoopKey>,
-        )> = Vec::new();
-        for pane in self.gui.panes() {
+        // Distinct 3D loops seen so far, each with the pane that owns it: a
+        // later pane on the same volume is an alias of that pane's loop.
+        let mut seen: Vec<(VolumeLoopIdentity, usize)> = Vec::new();
+        let model = LoopFrameModel::from_budgets(&self.budgets);
+        for (pane_idx, pane) in self.gui.panes().iter().enumerate() {
             if counts.advance_us == 0 {
                 counts.advance_us = loop_interval(pane.time.speed_fps)
                     .as_micros()
@@ -4092,18 +4093,26 @@ impl super::App {
                 // it is drawing with — over the wider of the pane's lookback
                 // and the window the layer's listing was asked over.
                 if let Some(slot) = pane.animating_layers().next() {
-                    demand.add_overlay_pane();
+                    let span = pane_need.loop_span_secs.max(slot.time.span_secs as usize);
+                    let cadence = slot.time.cadence_secs;
+                    let frame_bytes = overlay_frame_bytes(pane, &slot.id, &self.budgets);
+                    demand.push(pane_loop_need(
+                        pane,
+                        pane_idx,
+                        LoopKind::Overlay,
+                        &slot.time,
+                        &self.budgets,
+                        &model,
+                    ));
                     pane_need.looping = true;
-                    pane_need.cadence_secs = slot.time.cadence_secs;
-                    pane_need.loop_span_secs =
-                        pane_need.loop_span_secs.max(slot.time.span_secs as usize);
-                    pane_need.overlay_frame_bytes =
-                        overlay_frame_bytes(pane, &slot.id, &self.budgets);
+                    pane_need.cadence_secs = cadence;
+                    pane_need.loop_span_secs = span;
+                    pane_need.overlay_frame_bytes = frame_bytes;
                 }
                 scene.panes.push(pane_need);
                 continue;
             }
-            let already = if ls.view == squallar_radar::types::RenderView::Volume {
+            let owner = if ls.view == squallar_radar::types::RenderView::Volume {
                 let Some(product) = loop_product(ls) else {
                     scene.panes.push(pane_need);
                     continue;
@@ -4113,21 +4122,37 @@ impl super::App {
                     product,
                     ls.volume_key().cloned(),
                 );
-                let seen_before = seen.contains(&key);
-                if !seen_before {
-                    seen.push(key);
+                match seen.iter().find(|(k, _)| *k == key) {
+                    Some((_, owner)) => Some(*owner),
+                    None => {
+                        seen.push((key, pane_idx));
+                        None
+                    }
                 }
-                seen_before
             } else {
-                false
+                None
             };
-            demand.add(ls.view, already);
-            // A second pane orbiting a volume already counted holds no set of
-            // its own: its frames and its live grid are the first pane's.
-            pane_need.looping = !already;
             pane_need.cadence_secs = ls.cadence_secs;
-            if already {
-                pane_need.volume_grids = 0;
+            match owner {
+                // A second pane orbiting a volume already counted holds no
+                // set of its own: its frames and its live grid are the first
+                // pane's, and it reads that pane's grant.
+                Some(owner) => {
+                    demand.alias(pane_idx, owner);
+                    pane_need.looping = false;
+                    pane_need.volume_grids = 0;
+                }
+                None => {
+                    demand.push(pane_loop_need(
+                        pane,
+                        pane_idx,
+                        LoopKind::of(ls.view),
+                        ls,
+                        &self.budgets,
+                        &model,
+                    ));
+                    pane_need.looping = true;
+                }
             }
             scene.panes.push(pane_need);
         }
@@ -4160,11 +4185,13 @@ impl super::App {
             GRID_BYTES,
         );
         self.loop_pool = self.pool_for_scene(&scene);
-        self.loop_pool_state.observe(
-            self.loop_pool,
-            LoopFrameModel::from_budgets(&self.budgets),
-            demand,
-        )
+        self.loop_pool_state
+            .observe(
+                self.loop_pool,
+                LoopFrameModel::from_budgets(&self.budgets),
+                demand,
+            )
+            .clone()
     }
 
     /// **`fit` for `scene` against this session's capacity, its answer
@@ -4261,7 +4288,7 @@ impl super::App {
 
     /// The allocation in force. See [`Self::observe_loop_demand`].
     pub(super) fn loop_allocation(&self) -> LoopAllocation {
-        self.loop_pool_state.allocation()
+        self.loop_pool_state.allocation().clone()
     }
 
     /// **Answer memory pressure, within this session.** Economy first — the
@@ -4459,6 +4486,9 @@ impl super::App {
                     continue;
                 }
                 pane.hydrate_layer_states(overlays, pane_idx);
+                // Read before any timeline is borrowed mutably: a re-sampled
+                // list is settled onto the pane's own clock.
+                let clock = pane.time.mode;
                 for id in ids {
                     if overlays.render_mode(&id)
                         != Some(squallar_overlays::render::overlay_state::RenderMode::Texture)
@@ -4466,15 +4496,27 @@ impl super::App {
                         continue;
                     }
                     let held = layer_share(
-                        allocation,
+                        &allocation,
+                        pane_idx,
                         None,
                         overlay_frame_bytes(pane, &id, &budgets),
                         animating,
                     );
-                    // Give bytes back before asking for more — see the note on
-                    // the share moving under a list that is already built.
-                    pane.time_state_mut(&id)
-                        .evict_textures_outside_render_set(held);
+                    // The list follows the allocation in force — denser when
+                    // the pool granted this loop a balloon, sparser when a
+                    // pane joined and took it back — and bytes are given back
+                    // before more is asked for; see the note on the share
+                    // moving under a list that is already built. A frame the
+                    // re-sample adds is owed its data and its picture, and the
+                    // walk below asks for both through the supply that fills
+                    // every other frame.
+                    {
+                        let ls = pane.time_state_mut(&id);
+                        if ls.resample_frames(held) {
+                            ls.settle_playhead(clock);
+                        }
+                        ls.evict_textures_outside_render_set(held);
+                    }
                     let resident = {
                         let view = pane.view(pane_idx);
                         overlays.frames_resident(&id, &view.layer(&id))
@@ -4622,6 +4664,17 @@ impl super::App {
     fn dispatch_loop_renders(&mut self) {
         let allocation = self.observe_loop_demand();
         let budgets = self.budgets;
+        let model = LoopFrameModel::from_budgets(&budgets);
+        // Radar loops whose frame list was re-sampled to the allocation in
+        // force this pass: the pane, its product, the loop's site and the list
+        // as it now stands, so the download queue can be re-derived from it
+        // once the panes are released.
+        let mut resampled: Vec<(
+            usize,
+            squallar_radar::types::RadarProduct,
+            String,
+            Vec<chrono::NaiveDateTime>,
+        )> = Vec::new();
         // Panes whose product moved to another datasource, so the frames now need
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
@@ -4679,6 +4732,10 @@ impl super::App {
                     srv_fallback,
                 )
             });
+            // Read before the timeline is borrowed mutably: the divisor the
+            // pane's layers share, and the clock a re-sampled list settles to.
+            let animating = pane.animating_layers().count();
+            let clock = pane.time.mode;
             let ls = pane.time_state_mut(&known::RADAR);
             if !ls.is_active() {
                 retire_queues.push(pane_idx);
@@ -4686,6 +4743,32 @@ impl super::App {
             }
             if ls.frames.is_empty() {
                 continue;
+            }
+
+            // **The frame list follows the allocation in force**: denser
+            // when the pool granted this loop a balloon, sparser when a pane
+            // joined and took it back. A 2D radar loop animating alone lists
+            // its whole cap and only its textured set moves below; a 3D
+            // loop's list is its resident set, and a 2D loop beside another
+            // animating layer is held to its bytes, so this is where a
+            // balloon adds their frames and a deflation drops them. Integers
+            // over a few dozen stamps, and a no-op on every pass the list
+            // already matches.
+            let held = layer_share(
+                &allocation,
+                pane_idx,
+                Some(loop_frames_held(&allocation, pane_idx, ls, &budgets)),
+                model.bytes_for(ls.view),
+                animating,
+            );
+            if ls.resample_frames(held) {
+                ls.settle_playhead(clock);
+                resampled.push((
+                    pane_idx,
+                    product,
+                    radar_layer::site(ls).to_string(),
+                    ls.frames.iter().map(|f| f.timestamp).collect(),
+                ));
             }
 
             let view_key = match ls.view {
@@ -4717,7 +4800,12 @@ impl super::App {
             }
 
             // Evict textures from frames far from the playhead to cap memory usage.
-            ls.evict_textures_outside_render_set(loop_render_budget(allocation, ls, &budgets));
+            ls.evict_textures_outside_render_set(loop_render_budget(
+                &allocation,
+                pane_idx,
+                ls,
+                &budgets,
+            ));
         }
         for pane_idx in drop_pending {
             self.loop_mgr.remove_pending(pane_idx);
@@ -4743,6 +4831,23 @@ impl super::App {
                 "3D loop: pane {pane_idx} retargeted, released its resident set ({dropped} grids \
                  freed)",
             );
+        }
+        // A re-sampled list names volumes the plan may not: the plan is
+        // re-set from the list as it stands and the queue re-derived, so the
+        // frames a balloon added are fetched — and nothing already cached is
+        // fetched twice, since the download dispatch skips the cache.
+        for (pane_idx, product, site, frames) in resampled {
+            log::info!(
+                "Loop: pane {pane_idx} re-sampled its {site} list to {} frames for the \
+                 allocation in force",
+                frames.len(),
+            );
+            self.loop_mgr
+                .set_plan(pane_idx, FramePlan::new(site, frames));
+            if self.loop_mgr.plan_downloads_for(pane_idx, product) {
+                self.dispatch_pending_loop_downloads(pane_idx);
+                self.dispatch_pending_loop_l3_pairings(pane_idx);
+            }
         }
         for (pane_idx, product) in replan {
             if self.loop_mgr.plan_downloads_for(pane_idx, product) {
@@ -4802,7 +4907,8 @@ impl super::App {
 
             // The intended render set — shared with the readiness check so the two
             // cannot drift apart (see `LayerTimeState::render_set_settled`).
-            let indices = ls.render_set_indices(loop_render_budget(allocation, ls, &budgets));
+            let indices =
+                ls.render_set_indices(loop_render_budget(&allocation, pane_idx, ls, &budgets));
 
             if ls.view == squallar_radar::types::RenderView::Volume {
                 let Some(key) = ls.volume_key().cloned() else {
@@ -5275,6 +5381,15 @@ fn section_source_refusal(
     Some(squallar_egui::pane::SectionUnavailable::AwaitingVolume)
 }
 
+/// What makes two 3D loops one resident set: the site, the product and the
+/// volume key — the ground the frames are resampled over and the vector they
+/// are derived with. Two panes agreeing on all three orbit one volume.
+type VolumeLoopIdentity = (
+    String,
+    squallar_radar::types::RadarProduct,
+    Option<squallar_egui::pane::VolumeLoopKey>,
+);
+
 /// **One frame listing that landed**, and what the loop builder has to match
 /// it against a pane with.
 ///
@@ -5288,15 +5403,17 @@ pub(crate) struct LoopListingArrival {
 }
 
 /// **A listing becomes this layer's frame list**, sampled to `held` and with
-/// the two recorded decisions the timeline caption reads back.
+/// the two recorded decisions the timeline caption reads back — and the
+/// listing itself is kept on the timeline, so a changed allocation can
+/// re-sample the list denser or sparser from what the source said exists.
 ///
 /// The layer-agnostic half of [`accept_scan_listing`], and literally the same
 /// code: radar calls it after its own site check and the two arms cannot
 /// sample, order or park differently.
 ///
-/// Returns the stamps that became frames, or `None` when the listing named
-/// nothing — a loop with no frames is not a loop, and the caller switches it
-/// off.
+/// Returns the stamps that became frames, runs and all, or `None` when the
+/// listing named nothing — a loop with no frames is not a loop, and the
+/// caller switches it off.
 ///
 /// **`held` is a closure, and the order is the reason.** A 3D loop's cap is
 /// `frames_for_span`, which reads the layer's own `cadence_secs` — recorded
@@ -5307,35 +5424,39 @@ pub(crate) struct LoopListingArrival {
 /// `a_slow_site_shortens_a_3d_loops_list_without_shortening_its_span`.
 fn build_loop_frames(
     ls: &mut squallar_egui::pane::LayerTimeState,
-    stamps: Vec<chrono::NaiveDateTime>,
+    listing: squallar_source::time::FrameListing,
     held: impl FnOnce(&squallar_egui::pane::LayerTimeState) -> usize,
-) -> Option<Vec<chrono::NaiveDateTime>> {
-    if stamps.is_empty() {
+) -> Option<Vec<squallar_source::time::FrameStamp>> {
+    if listing.frames.is_empty() {
         return None;
     }
     // The source's own cadence, read off the listing *before* the sampling
     // below throws stamps away. Once sampled there is no way back to it, and
     // it is what the timeline caption needs to tell "every frame" from "one in
     // five".
-    ls.cadence_secs = median_step_secs(&stamps);
+    let valids: Vec<chrono::NaiveDateTime> = listing.frames.iter().map(|s| s.valid).collect();
+    ls.cadence_secs = median_step_secs(&valids);
 
     // Cap the frame list by evenly sampling the listing — endpoint-anchored,
     // so the window's two ends survive whatever the cap is.
     let held = held(ls);
-    let total = stamps.len();
+    let total = listing.frames.len();
     let sample = squallar_egui::pane::listing_sample_indices(total, held);
     ls.sampled = Some(sample.is_some());
-    let stamps: Vec<chrono::NaiveDateTime> = match sample {
-        Some(indices) => indices.into_iter().map(|i| stamps[i]).collect(),
-        None => stamps,
+    let stamps: Vec<squallar_source::time::FrameStamp> = match sample {
+        Some(indices) => indices.into_iter().map(|i| listing.frames[i]).collect(),
+        None => listing.frames.clone(),
     };
+    // The answer the frames were chosen from, kept whole: what a re-sample to
+    // a changed allocation chooses from, denser or sparser.
+    ls.listing = Some(listing);
 
     ls.phase = squallar_egui::pane::LoopPhase::Rendering;
     // Oldest-first, matching the listing order.
     ls.frames = stamps
         .iter()
-        .map(|ts| squallar_egui::pane::LoopFrame {
-            timestamp: *ts,
+        .map(|stamp| squallar_egui::pane::LoopFrame {
+            timestamp: stamp.valid,
             image: None,
             render_in_flight: false,
             render_failed: false,
@@ -5401,11 +5522,12 @@ fn frames_are_resident(
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
 /// it now owes.
 fn accept_scan_listing(
-    allocation: LoopAllocation,
+    allocation: &LoopAllocation,
+    pane_idx: usize,
     budgets: &squallar_device_profile::budget::Budgets,
     ls: &mut squallar_egui::pane::LayerTimeState,
     site: &str,
-    scans: Vec<chrono::NaiveDateTime>,
+    listing: squallar_source::time::FrameListing,
     animating: usize,
 ) -> Option<FramePlan> {
     if !ls.is_active() || radar_layer::site(ls) != site {
@@ -5415,12 +5537,13 @@ fn accept_scan_listing(
     // Cap the downloads by evenly sampling the listing. A 3D loop's cap is its
     // *resident* one and is far lower, because for that kind the frame list and
     // the resident set are one thing — see `loop_frames_held`.
-    let total = scans.len();
+    let total = listing.frames.len();
     let model = LoopFrameModel::from_budgets(budgets);
-    let Some(scans) = build_loop_frames(ls, scans, |ls| {
+    let Some(scans) = build_loop_frames(ls, listing, |ls| {
         layer_share(
             allocation,
-            Some(loop_frames_held(allocation, ls, budgets)),
+            pane_idx,
+            Some(loop_frames_held(allocation, pane_idx, ls, budgets)),
             model.bytes_for(ls.view),
             animating,
         )
@@ -5436,7 +5559,10 @@ fn accept_scan_listing(
         );
     }
 
-    Some(FramePlan::new(site.to_string(), scans))
+    Some(FramePlan::new(
+        site.to_string(),
+        scans.iter().map(|stamp| stamp.valid).collect(),
+    ))
 }
 
 /// The median gap between consecutive scan times, in whole seconds.
@@ -5836,7 +5962,7 @@ pub(crate) fn test_loop_allocation() -> LoopAllocation {
     let limits = crate::loop_pool::LoopPoolLimits::from_budgets(&budgets);
     crate::loop_pool::LoopPool::new(limits.floor, limits).plan(
         LoopFrameModel::from_budgets(&budgets),
-        LoopDemand::default(),
+        &LoopDemand::default(),
     )
 }
 
@@ -5869,26 +5995,137 @@ pub(crate) fn test_budgets() -> squallar_device_profile::budget::Budgets {
     )
 }
 
-/// Frames this loop may keep **textured**, which is the term that bounds memory.
-fn loop_render_budget(
-    allocation: LoopAllocation,
+/// Frames this loop may keep **textured**, which is the term that bounds
+/// memory.
+///
+/// **The grant is the answer** for a pane the plan has seen: its base already
+/// holds the pane's lookback to the rung's span (`Budgets::frames_for_span_of`,
+/// which is what `fit` charged), and everything above it is the balloon the
+/// pool granted, so clamping it to the span again here would take the balloon
+/// back. Two cases still read the span clamp, and both are the plan not having
+/// caught up yet: a pane the plan has not seen, held to its kind's ceiling as
+/// a loop with no grant always was; and a grant planned before this loop's
+/// listing said what its cadence is, held to the rung's span at that cadence
+/// exactly as before — the demand carries the cadence on the next walk, and
+/// the plan follows within the dwell.
+pub(super) fn loop_render_budget(
+    allocation: &LoopAllocation,
+    pane_idx: usize,
     ls: &squallar_egui::pane::LayerTimeState,
     budgets: &squallar_device_profile::budget::Budgets,
 ) -> usize {
-    allocation
-        .frames_for(ls.view)
-        .min(budgets.frames_for_span(ls.cadence_secs))
+    match allocation.grant_for_pane(pane_idx) {
+        Some(grant) if grant.cadence_secs.is_some() || ls.cadence_secs.is_none() => grant.frames,
+        Some(grant) => grant.frames.min(budgets.frames_for_span(ls.cadence_secs)),
+        None => allocation
+            .frames_for(ls.view)
+            .min(budgets.frames_for_span(ls.cadence_secs)),
+    }
+}
+
+/// **Frames that have to be settled before a loop is ready to play**: the
+/// base — what `fit` made room for, and what the loop was held to before a
+/// balloon existed — never the balloon. A loop granted sixty frames over a
+/// base of twenty-five starts playing when the twenty-five nearest the
+/// playhead are textured, exactly when it did before, and the dispatch fills
+/// the other thirty-five in behind it. Gating readiness on the whole grant
+/// would trade time-to-first-playback for density, which no ruling asked for.
+/// A pane the plan has not seen reads [`loop_render_budget`]'s own answer,
+/// which for it is already the span-held figure.
+pub(super) fn loop_ready_budget(
+    allocation: &LoopAllocation,
+    pane_idx: usize,
+    ls: &squallar_egui::pane::LayerTimeState,
+    budgets: &squallar_device_profile::budget::Budgets,
+) -> usize {
+    let textured = loop_render_budget(allocation, pane_idx, ls, budgets);
+    match allocation.grant_for_pane(pane_idx) {
+        Some(grant) => textured.min(grant.base),
+        None => textured,
+    }
+}
+
+/// **What one pane's animating layers ask the pool for, as one need.** The
+/// pool sees a pane as one loop and [`layer_share`] divides the pane's bytes
+/// equally across the layers it animates, each converting at its own price —
+/// so the need has to be sized for all of them, or a second animating layer
+/// halves the first's frames below what its own listing named. Its price is
+/// the dearest layer's frame times the number of layers, and its frames are
+/// the most any layer asks for (base and ceiling alike); every layer's equal
+/// slice then buys at least its own frames, and the divider holds each to its
+/// own list. One layer alone is exactly its own need. `primary` is the layer
+/// the pane's clock walks — radar's timeline where radar loops, the first
+/// animating layer otherwise — and its cadence is the one the grant records.
+fn pane_loop_need(
+    pane: &squallar_egui::pane::PaneState,
+    pane_idx: usize,
+    kind: LoopKind,
+    primary: &squallar_egui::pane::LayerTimeState,
+    budgets: &squallar_device_profile::budget::Budgets,
+    model: &LoopFrameModel,
+) -> LoopNeed {
+    let mut layers = 0usize;
+    let mut price = 0usize;
+    let mut span_secs = pane.time.span_secs;
+    let mut base_frames = 0usize;
+    let mut max_frames = 0usize;
+    for slot in pane.animating_layers() {
+        layers += 1;
+        let ls = &slot.time;
+        let layer_price = if slot.id == squallar_source::id::known::RADAR {
+            model.bytes_for(ls.view)
+        } else {
+            overlay_frame_bytes(pane, &slot.id, budgets)
+        };
+        price = price.max(layer_price);
+        let span = pane.time.span_secs.max(ls.span_secs);
+        span_secs = span_secs.max(span);
+        let base = budgets.frames_for_span_of(span as usize, ls.cadence_secs);
+        base_frames = base_frames.max(base);
+        // What this layer lists, read off the answer its frames were chosen
+        // from — `None` before a listing has landed, and then the base is the
+        // most it can hold, because nothing says what more exists.
+        let listed = ls.listing.as_ref().map(|listing| listing.frames.len());
+        max_frames = max_frames.max(loop_ceiling_frames(
+            listed,
+            span,
+            ls.cadence_secs,
+            base,
+            budgets.loop_frames_held,
+        ));
+    }
+    if layers == 0 {
+        // Reachable only for a pane whose primary timeline is active while
+        // no slot is — a fixture's shape, not the walk's — priced as the
+        // primary alone.
+        layers = 1;
+        price = model.price(kind);
+        base_frames = budgets.frames_for_span_of(span_secs as usize, primary.cadence_secs);
+        max_frames = base_frames;
+    }
+    LoopNeed {
+        key: LoopKey { pane: pane_idx },
+        kind,
+        span_secs,
+        cadence_secs: primary.cadence_secs,
+        frame_bytes: price.saturating_mul(layers),
+        base_frames,
+        max_frames,
+    }
 }
 
 /// Frames a loop of this view **holds**, before the pane's own layers divide
 /// it — see [`layer_share`].
 pub(super) fn loop_frames_held(
-    allocation: LoopAllocation,
+    allocation: &LoopAllocation,
+    pane_idx: usize,
     ls: &squallar_egui::pane::LayerTimeState,
     budgets: &squallar_device_profile::budget::Budgets,
 ) -> usize {
     match ls.view {
-        squallar_radar::types::RenderView::Volume => loop_render_budget(allocation, ls, budgets),
+        squallar_radar::types::RenderView::Volume => {
+            loop_render_budget(allocation, pane_idx, ls, budgets)
+        }
         squallar_radar::types::RenderView::PlanView
         | squallar_radar::types::RenderView::CrossSection => budgets.loop_frames_held,
     }
@@ -5902,10 +6139,12 @@ pub(super) fn loop_frames_held(
 /// layer's frame costs the same, and they do not: a radar plan-view frame is
 /// `LOOP_IMAGE_SIZE`² × 4 (4 MiB on wasm, 16 MiB native) and a model or
 /// satellite frame is the pane's own raster. So each animating layer takes an
-/// equal slice of `share_bytes` and converts it at **its own** price. A pane
-/// animating a 4 MiB layer beside a 16 MiB one holds them **4:1**, and the two
-/// together fit the share — where an equal count split would hold 5:1 of the
-/// bytes it was given.
+/// equal slice of the pane's bytes — its grant's frames at its grant's price,
+/// or the pool's own summary for a pane the plan has not seen
+/// ([`LoopAllocation::share_bytes_for`]) — and converts it at **its own**
+/// price. A pane animating a 4 MiB layer beside a 16 MiB one holds them
+/// **4:1**, and the two together fit the bytes — where an equal count split
+/// would hold 5:1 of the bytes it was given.
 ///
 /// `count_cap` is what this layer may hold on top of what the bytes allow:
 ///
@@ -5932,7 +6171,8 @@ pub(super) fn loop_frames_held(
 ///
 /// [`MIN_LOOP_FRAMES_PER_PANE`]: squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE
 pub(super) fn layer_share(
-    allocation: LoopAllocation,
+    allocation: &LoopAllocation,
+    pane_idx: usize,
     count_cap: Option<usize>,
     frame_bytes: usize,
     animating: usize,
@@ -5944,7 +6184,7 @@ pub(super) fn layer_share(
     }
     // A frame that costs nothing is a model built wrong; the floor answers
     // rather than a division by zero.
-    let by_bytes = (allocation.share_bytes / animating.max(1))
+    let by_bytes = (allocation.share_bytes_for(pane_idx) / animating.max(1))
         .checked_div(frame_bytes)
         .unwrap_or(squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE);
     by_bytes
@@ -5953,17 +6193,50 @@ pub(super) fn layer_share(
 }
 
 /// [`accept_scan_listing`] under a name the sibling test modules can reach —
-/// the function itself is private to this module and stays that way.
+/// the function itself is private to this module and stays that way. Takes
+/// the bare instants the suites list with and wraps them as the listing radar
+/// would have answered (no runs, the window read off its ends), for pane 0.
 #[cfg(test)]
 pub(crate) fn accept_scan_listing_for_test(
-    allocation: LoopAllocation,
+    allocation: &LoopAllocation,
     budgets: &squallar_device_profile::budget::Budgets,
     ls: &mut squallar_egui::pane::LayerTimeState,
     site: &str,
     scans: Vec<chrono::NaiveDateTime>,
     animating: usize,
 ) -> Option<FramePlan> {
-    accept_scan_listing(allocation, budgets, ls, site, scans, animating)
+    accept_scan_listing(
+        allocation,
+        0,
+        budgets,
+        ls,
+        site,
+        listing_of_for_test(scans),
+        animating,
+    )
+}
+
+/// A listing radar would have answered for `scans`: the instants alone, the
+/// window read off its two ends, and complete.
+#[cfg(test)]
+pub(crate) fn listing_of_for_test(
+    scans: Vec<chrono::NaiveDateTime>,
+) -> squallar_source::time::FrameListing {
+    let range = match (scans.first(), scans.last()) {
+        (Some(first), Some(last)) => (*first, *last),
+        _ => (
+            chrono::NaiveDateTime::default(),
+            chrono::NaiveDateTime::default(),
+        ),
+    };
+    squallar_source::time::FrameListing {
+        range,
+        frames: scans
+            .into_iter()
+            .map(|valid| squallar_source::time::FrameStamp { valid, run: None })
+            .collect(),
+        complete: true,
+    }
 }
 
 /// A 3D loop frame the dispatcher intends to make resident.
@@ -6242,6 +6515,10 @@ mod loop_interval_tests;
 #[path = "app_render/layer_share_tests.rs"]
 #[cfg(test)]
 mod layer_share_tests;
+
+#[path = "app_render/loop_balloon_tests.rs"]
+#[cfg(test)]
+mod loop_balloon_tests;
 
 /// The Level III half of the loop: pairing a bucket object to each frame's volume,
 /// what a gap does, and what happens when a pane retargets across the datasource

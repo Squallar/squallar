@@ -2308,3 +2308,146 @@ fn two_panes_hold_their_own_ring_selections() {
     assert_eq!(a.selected_site(), None);
     assert_eq!(b.selected_site(), Some("KEWX"));
 }
+
+// ── Re-sampling the frame list to the allocation in force ────────────────────
+
+/// Five-minute stamps from a fixed origin, so a listing can be longer than an hour.
+fn five_minutes(i: i64) -> NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 9, 2)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        + chrono::Duration::minutes(i * 5)
+}
+
+/// A loop whose listing named `listed` stamps and whose list was capped to `held` of
+/// them, the way the listing path builds one: endpoint-anchored, the listing kept.
+fn listed_loop(listed: usize, held: usize) -> LayerTimeState {
+    let stamps: Vec<squallar_source::time::FrameStamp> = (0..listed as i64)
+        .map(|i| squallar_source::time::FrameStamp {
+            valid: five_minutes(i),
+            run: None,
+        })
+        .collect();
+    let mut ls = LayerTimeState::new();
+    ls.phase = LoopPhase::Rendering;
+    let picked = listing_sample_indices(listed, held).unwrap_or_else(|| (0..listed).collect());
+    ls.frames = picked
+        .into_iter()
+        .map(|i| LoopFrame {
+            timestamp: stamps[i].valid,
+            image: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    ls.sampled = Some(listed > held);
+    ls.listing = Some(squallar_source::time::FrameListing {
+        range: (stamps[0].valid, stamps[listed - 1].valid),
+        frames: stamps,
+        complete: true,
+    });
+    ls
+}
+
+/// **A re-sample chooses denser or sparser from the listing, keeps the textures of the
+/// frames that survive, and is a no-op when the list already matches.** The one thing
+/// `cap_frames` could never do is go denser: it thins the list it has, and a balloon has to
+/// add frames the listing named and the list dropped.
+#[test]
+fn a_resample_goes_denser_from_the_listing_and_sparser_back_keeping_surviving_textures() {
+    let ctx = egui::Context::default();
+    let mut ls = listed_loop(40, 10);
+    assert_eq!(ls.frames.len(), 10, "precondition: capped to ten of forty");
+    let first = ls.frames[0].timestamp;
+    let last = ls.frames[9].timestamp;
+    ls.frames[0].image = Some(dummy_texture(&ctx));
+    ls.frames[9].image = Some(dummy_texture(&ctx));
+    ls.frames[9].render_in_flight = true;
+
+    // Denser: a balloon granted twenty.
+    assert!(
+        ls.resample_frames(20),
+        "twenty of forty is a different list"
+    );
+    assert_eq!(ls.frames.len(), 20);
+    assert_eq!(
+        ls.frames[0].timestamp, first,
+        "endpoint-anchored: the oldest survives"
+    );
+    assert_eq!(ls.frames[19].timestamp, last, "and the newest");
+    assert_eq!(ls.sampled, Some(true), "twenty of forty is still sampled");
+    let listing = ls
+        .listing
+        .as_ref()
+        .expect("the listing is kept")
+        .frames
+        .clone();
+    assert!(
+        ls.frames
+            .iter()
+            .all(|f| listing.iter().any(|s| s.valid == f.timestamp)),
+        "every frame is one the listing named",
+    );
+    assert!(
+        ls.frames[0].image.is_some() && ls.frames[19].image.is_some(),
+        "the frames that survived kept their textures",
+    );
+    assert!(ls.frames[19].render_in_flight, "and their in-flight mark");
+    let owed = ls
+        .frames
+        .iter()
+        .filter(|f| f.image.is_none() && !f.render_in_flight && !f.render_failed)
+        .count();
+    assert_eq!(
+        owed, 18,
+        "the frames that joined are owed a picture, nothing more"
+    );
+    let times: Vec<NaiveDateTime> = ls.frames.iter().map(|f| f.timestamp).collect();
+    let mut sorted = times.clone();
+    sorted.sort();
+    assert_eq!(times, sorted, "oldest-first, matching the listing order");
+
+    // Every scan: the whole listing, no sampling.
+    assert!(ls.resample_frames(40));
+    assert_eq!(ls.frames.len(), 40);
+    assert_eq!(ls.sampled, Some(false));
+    assert!(ls.frames[0].image.is_some());
+
+    // More than the listing holds is the listing.
+    assert!(
+        !ls.resample_frames(100),
+        "there is nothing denser than every scan"
+    );
+    assert_eq!(ls.frames.len(), 40);
+
+    // Sparser: a pane joined and took the balloon back.
+    assert!(ls.resample_frames(10));
+    assert_eq!(ls.frames.len(), 10);
+    assert_eq!(ls.frames[0].timestamp, first);
+    assert_eq!(ls.frames[9].timestamp, last);
+    assert_eq!(ls.sampled, Some(true));
+    assert!(
+        ls.frames[0].image.is_some(),
+        "a survivor keeps its texture through a thinning too"
+    );
+
+    // And the list that already matches is left alone, on every pass.
+    assert!(!ls.resample_frames(10), "a matching list is a no-op");
+}
+
+/// Without a listing to choose from a re-sample can only thin, as `cap_frames` does: a
+/// loop built before its listing was kept cannot be asked for frames nobody named.
+#[test]
+fn a_resample_without_a_listing_can_only_thin() {
+    let mut ls = listed_loop(40, 10);
+    ls.listing = None;
+    assert!(
+        !ls.resample_frames(20),
+        "no listing, nothing to go denser from"
+    );
+    assert_eq!(ls.frames.len(), 10);
+    assert!(ls.resample_frames(5), "thinning needs no listing");
+    assert_eq!(ls.frames.len(), 5);
+    assert_eq!(ls.sampled, Some(true));
+}

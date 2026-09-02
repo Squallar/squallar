@@ -60,7 +60,8 @@ fn pane_animating(extra: &[squallar_source::id::LayerId]) -> PaneState {
 fn radar_share(animating: usize) -> usize {
     let budgets = crate::app::render::test_budgets();
     crate::app::render::layer_share(
-        crate::app::render::test_loop_allocation(),
+        &crate::app::render::test_loop_allocation(),
+        0,
         Some(budgets.loop_frames_held),
         crate::loop_pool::LoopFrameModel::from_budgets(&budgets).plan_view,
         animating,
@@ -77,7 +78,7 @@ fn fill(pane: &mut PaneState, minutes: u32) {
             &squallar_overlays::render::overlay_state::OverlayRegistry::with_handlers(Vec::new()),
             "KTLX",
             ts(minute),
-            allocation,
+            &allocation,
             &budgets,
         );
         *pane = panes.into_iter().next().expect("one pane");
@@ -149,7 +150,7 @@ fn a_listing_is_sampled_down_to_the_share_not_to_the_whole_cap() {
     let build = |animating: usize| {
         let mut pane = pane_animating(&[]);
         crate::app::render::accept_scan_listing_for_test(
-            allocation,
+            &allocation,
             &budgets,
             pane.time_state_mut(&known::RADAR),
             "KTLX",

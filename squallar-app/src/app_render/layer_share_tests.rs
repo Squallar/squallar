@@ -81,8 +81,9 @@ impl Arm {
             grid: self.plan_view,
             overlay: self.plan_view,
             render_budget: self.render_budget,
+            list_cap: self.frames_held,
         };
-        LoopPool::new(limits.floor, limits).plan(model, LoopDemand::default())
+        LoopPool::new(limits.floor, limits).plan(model, &LoopDemand::default())
     }
 }
 
@@ -108,7 +109,13 @@ fn a_pane_animating_radar_alone_keeps_the_count_it_had_before_wb7() {
         let allocation = arm.allocation();
         for animating in [0usize, 1] {
             assert_eq!(
-                layer_share(allocation, Some(arm.frames_held), arm.plan_view, animating,),
+                layer_share(
+                    &allocation,
+                    0,
+                    Some(arm.frames_held),
+                    arm.plan_view,
+                    animating,
+                ),
                 arm.frames_held,
                 "{}: a pane animating {animating} layer(s) must be handed \
                  radar's list length exactly as it stands, and {} became \
@@ -158,8 +165,8 @@ fn two_animating_layers_divide_the_bytes_and_not_the_count() {
         let allocation = arm.allocation();
         let cheap_bytes = arm.plan_view / 4;
 
-        let radar = layer_share(allocation, Some(arm.frames_held), arm.plan_view, 2);
-        let cheap = layer_share(allocation, None, cheap_bytes, 2);
+        let radar = layer_share(&allocation, 0, Some(arm.frames_held), arm.plan_view, 2);
+        let cheap = layer_share(&allocation, 0, None, cheap_bytes, 2);
 
         assert_ne!(
             radar, cheap,
@@ -207,7 +214,7 @@ fn no_animating_layer_is_cut_below_two_frames() {
         for animating in 2..=64 {
             for cap in [Some(arm.frames_held), None] {
                 assert!(
-                    layer_share(allocation, cap, arm.plan_view, animating) >= 2,
+                    layer_share(&allocation, 0, cap, arm.plan_view, animating) >= 2,
                     "{}: {animating} layers left one of them below two frames, \
                      which is a layer that cannot animate",
                     arm.name,
@@ -217,7 +224,7 @@ fn no_animating_layer_is_cut_below_two_frames() {
         // A frame that costs nothing is a model built wrong; it must answer
         // the floor rather than divide by zero or become unbounded.
         assert_eq!(
-            layer_share(allocation, None, 0, 2),
+            layer_share(&allocation, 0, None, 0, 2),
             MIN_LOOP_FRAMES_PER_PANE,
             "{}: a zero-byte frame did not answer the floor",
             arm.name,
@@ -225,7 +232,7 @@ fn no_animating_layer_is_cut_below_two_frames() {
         // Non-triviality: the division really does produce answers other than
         // the floor, or "never below two" would be true of a constant.
         assert!(
-            (2..=8).any(|n| layer_share(allocation, None, arm.plan_view, n) > 2),
+            (2..=8).any(|n| layer_share(&allocation, 0, None, arm.plan_view, n) > 2),
             "{}: some division must land above the floor",
             arm.name,
         );
@@ -235,7 +242,7 @@ fn no_animating_layer_is_cut_below_two_frames() {
         // is where a loop stops being a loop. On wasm that is eight layers of
         // a 4 MiB frame against a 56 MiB pool: 8 x 2 x 4 MiB = 64 MiB.
         let crowded = 32;
-        let each = layer_share(allocation, None, arm.plan_view, crowded);
+        let each = layer_share(&allocation, 0, None, arm.plan_view, crowded);
         assert_eq!(
             each, MIN_LOOP_FRAMES_PER_PANE,
             "{}: {crowded} animating layers must be the floor's arm",
@@ -256,7 +263,7 @@ fn no_animating_layer_is_cut_below_two_frames() {
     // division to floor.
     let allocation = arms()[0].allocation();
     assert_eq!(
-        layer_share(allocation, Some(1), arms()[0].plan_view, 1),
+        layer_share(&allocation, 0, Some(1), arms()[0].plan_view, 1),
         1,
         "a one-frame allowance stays one frame — the floor belongs to the \
          division and there was no division",

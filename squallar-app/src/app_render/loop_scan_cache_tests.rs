@@ -66,8 +66,8 @@ fn install_listing(app: &mut crate::app::App, minutes: &[u32]) {
     let budgets = test_budgets();
     let scans: Vec<_> = minutes.iter().map(|&minute| at(minute)).collect();
     let pane = app.gui.pane_mut(0).expect("a fresh Gui has one pane");
-    accept_scan_listing(
-        allocation,
+    accept_scan_listing_for_test(
+        &allocation,
         &budgets,
         pane.time_state_mut(&known::RADAR),
         SITE,

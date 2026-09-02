@@ -278,8 +278,8 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     let stale = vec![ts(0)];
 
     assert!(
-        accept_scan_listing(
-            test_loop_allocation(),
+        accept_scan_listing_for_test(
+            &test_loop_allocation(),
             &test_budgets(),
             &mut koun,
             "KTLX",
@@ -292,8 +292,8 @@ fn a_listing_for_the_site_the_loop_left_is_refused() {
     assert!(koun.frames.is_empty(), "and left no frames behind");
 
     let live = vec![ts(0)];
-    let plan = accept_scan_listing(
-        test_loop_allocation(),
+    let plan = accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut koun,
         "KOUN",
@@ -317,8 +317,8 @@ fn a_listing_for_an_inactive_loop_is_refused() {
 
     let scans = vec![ts(0)];
     assert!(
-        accept_scan_listing(
-            test_loop_allocation(),
+        accept_scan_listing_for_test(
+            &test_loop_allocation(),
             &test_budgets(),
             &mut ls,
             "KTLX",
@@ -336,8 +336,8 @@ fn an_empty_listing_switches_the_loop_off() {
     ls.phase = LoopPhase::FetchingScanList;
 
     assert!(
-        accept_scan_listing(
-            test_loop_allocation(),
+        accept_scan_listing_for_test(
+            &test_loop_allocation(),
             &test_budgets(),
             &mut ls,
             "KTLX",
@@ -561,8 +561,8 @@ fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
 
     let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40)).map(ts).collect();
 
-    let plan = accept_scan_listing(
-        test_loop_allocation(),
+    let plan = accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut ls,
         "KTLX",
@@ -596,8 +596,8 @@ fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
     let total = MAX_LOOP_FRAMES * 3 + 7;
     let scans: Vec<_> = (0..total as u32).map(ts).collect();
 
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut ls,
         "KTLX",
@@ -644,8 +644,8 @@ fn a_listing_one_scan_over_the_cap_is_recorded_as_sampled() {
         let mut ls = loop_on(&ctx, "KTLX", &[]);
         let scans: Vec<_> = (0..listed as u32).map(ts).collect();
 
-        accept_scan_listing(
-            test_loop_allocation(),
+        accept_scan_listing_for_test(
+            &test_loop_allocation(),
             &test_budgets(),
             &mut ls,
             "KTLX",
@@ -981,7 +981,7 @@ fn a_loops_render_set_is_its_span_budget_at_its_own_sites_cadence() {
     ] {
         let mut ls = loop_on(&ctx, "KTLX", &[]);
         ls.cadence_secs = Some(cadence);
-        let frames = loop_render_budget(allocation, &ls, &budgets);
+        let frames = loop_render_budget(&allocation, 0, &ls, &budgets);
         assert!(
             frames >= squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE,
             "{radar}: {frames} frames is not a loop"
@@ -1008,7 +1008,7 @@ fn a_loop_that_has_not_learned_a_cadence_keeps_the_whole_budget() {
         "precondition: a freshly built loop knows nothing about its site's cadence"
     );
     assert_eq!(
-        loop_render_budget(test_loop_allocation(), &ls, &budgets),
+        loop_render_budget(&test_loop_allocation(), 0, &ls, &budgets),
         test_loop_allocation().frames_for(ls.view),
         "a loop with no cadence is held only by the pool's share"
     );
@@ -1021,8 +1021,8 @@ fn a_listing_teaches_the_cadence_before_the_frame_count_is_spent() {
     ls.phase = LoopPhase::FetchingScanList;
     let scans: Vec<_> = (0..13u32).filter(|i| *i != 4).map(|i| ts(i * 6)).collect();
 
-    accept_scan_listing(
-        test_loop_allocation(),
+    accept_scan_listing_for_test(
+        &test_loop_allocation(),
         &test_budgets(),
         &mut ls,
         "KTLX",

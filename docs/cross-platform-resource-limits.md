@@ -1498,6 +1498,77 @@ the answer to §3.2's tautology objection: the two sides of the snugness test
 are still independent on the arm where the constant is the capacity, and on the
 other arm the constant is not in the test at all.
 
+### 9.7 Ballooning: base and balloon
+
+Two rulings, verbatim: *"a 1 pane window should have the same overall pane
+budget as a 6 pane window"*, and *"more panes open just slice that whole pane
+budget slimmer. and honestly, no reason for it to be equal slices either. let
+panes have as much ram as they need."* The earlier rulings still bind
+underneath: capacity only limits; the same data at the same resolution costs
+the same bytes on every machine; nothing is learned across sessions; nothing is
+user-facing; a reopen is 1:1.
+
+**What the pool is.** `LoopPool::for_scene` is
+`min(Σ loop ceiling, room)` held to the bracket — the room the rest of the
+scene leaves under the allowance, capped at what the loops could ever fill
+(`fit::loop_ceiling`: every looping pane's whole lookback at its cadence, never
+past the class's list cap). `fit` is untouched and still asks *does the scene
+fit*, charging every loop's **base** — the lookback held to the rung's span
+(`Budgets::frames_for_span_of`). The pool asks *how much room is left*. A lone
+pane and six panes therefore see one budget; six slice it thinner.
+
+**What a loop asks for.** One `LoopNeed` per loop (`loop_pool.rs`): its key
+(the pane; a second 3D pane on the same volume is an alias of the first, one
+resident set charged once), its kind and so its frame price, its span, its
+cadence, its `base_frames`, and its `max_frames` — every scan the listing named
+in the window, never more than `MAX_LOOP_FRAMES`. A balloon never inflates a
+loop past what exists to show; an over-long window with a thin archive is a
+short list, and an empty one turns the loop off, exactly as before.
+
+**The water-fill rule.** `LoopPool::plan` first gives every loop its base.
+When the bases together fit, the surplus is spent one frame at a time to
+whichever growable loop's frames stand for the *most seconds apiece* (exact, by
+cross-multiplication of `span × frames`; ties to the earlier pane), each loop
+stopping at its `max_frames` or when one more of its frames would not fit. Loops
+of unequal cost and equal span reach the *same temporal resolution*, not the
+same bytes; a longer window holds proportionally more frames. When the bases do
+not fit — the ladder had nothing left, or the presumed arm's ceiling binds —
+the same rule runs downward from whichever loop's frames stand for the fewest
+seconds, none below `MIN_LOOP_FRAMES_PER_PANE`. This replaces the equal-bytes
+split, which gave a section loop twice a plan-view loop's history for one
+lookback and held six panes to the density one pane earned.
+
+**Pinned figures** (`loop_pool/tests.rs`, desktop, 16 MiB plan-view frames):
+a lone plan-view pane at a 6 h lookback and a 300 s cadence lists 73 scans; its
+base is 25 (2 h at 300 s, the rung's span), its ceiling 60 — `MAX_LOOP_FRAMES`
+binds, not the pool — and it holds 60 on a measured 3090 with 17 GiB of room
+and 60 on the presumed arm's 3072 MiB alike. Six such panes at 3072 MiB hold
+32 each (6 × 32 × 16 MiB = 3072 exactly); at the presumed arm's 2304 MiB of
+room the bases (150 frames) do not fit and every pane shrinks to 24. A plan-view
+and a section loop of one lookback over a 1200 MiB pool hold 50 frames each.
+
+**Deflate first.** A pane joining changes the demand; after the 15-frame dwell
+the new plan is taken whenever any loop shrinks, and a growth only when some
+loop's *frames* clear `LOOP_POOL_HYSTERESIS` (1.25×). Balloons are what a
+joining pane takes back — no base is cut while any loop holds more than its
+base, because the bases are paid before the first balloon frame. When the
+allocation in force changes a loop's frames, its frame list is re-sampled from
+the listing it was chosen from (`LayerTimeState::resample_frames`, the same
+endpoint-anchored sampling the listing was capped with; the append path keeps
+that listing in step): frames whose stamp survives keep their texture, new
+stamps arrive owed a picture and the existing supply fetches and renders them,
+and textures a deflation no longer covers go through the existing eviction on
+the next dispatch. Integers over a few dozen stamps; nothing lands on the frame
+thread that was not already there.
+
+**What is never traded.** The lookback is the user's — `Gui.loop_lookback_secs`,
+persisted, is read by the pool path and never written by it; the balloon buys
+*density* inside that window, never a longer one. Resolution is never bought
+with room (`LOOP_IMAGE_SIZE`, `grid_cells` stay the rung's). The scrubber
+follows the span, unaffected. The `budget state:` line carries the balloon as
+its last, mandatory field — `balloon <MiB>`, Σ bytes above every base, a subset
+of `pool` and never added to it — so a deflation is a figure on every row.
+
 ---
 
 ## 10. Pressure: reclaim, then re-fit, within the session
