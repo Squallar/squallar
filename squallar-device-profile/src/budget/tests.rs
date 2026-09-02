@@ -1,8 +1,8 @@
 use super::*;
-use crate::fit::{every_rung_at_its_stop, fit, need};
+use crate::fit::{fit, fit_holds, loop_pool_bytes, loop_room, need, need_terms};
 use crate::quality::{DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING};
-use crate::scene::Capacity;
 use crate::scene::fixtures::{scene_table, shipped_profile, stand_in_grid_bytes};
+use crate::scene::{Capacity, CapacitySource};
 
 /// Every device class this workspace builds for, exactly once.
 pub fn profiles() -> [DeviceProfile; 3] {
@@ -230,20 +230,36 @@ fn without_host_signals(profile: &DeviceProfile) -> DeviceProfile {
 }
 
 /// Every invariant a resolved budget must satisfy, whatever produced it — and
-/// the fit property on the presumed arm: for every scene in the table, the
-/// budgets `fit` answers satisfy the same invariants, the scene's need fits the
-/// presumed capacity's allowance (or every rung is at its stop, where the
-/// runtime clamps and logs), a scene that already fits sheds nothing, and no
-/// rung was shed that the scene did not need.
+/// the fit property on every arm the profile can stand on: for every scene in
+/// the table, the budgets `fit` answers satisfy the same invariants, the
+/// scene's need fits the capacity's allowance (or every rung is at its stop,
+/// where the runtime clamps and logs), a scene that already fits sheds
+/// nothing, and no rung was shed that the scene did not need. The presumed arm
+/// is checked on every row; the measured arm on every row whose readings
+/// amount to a measurement ([`DeviceProfile::gpu_capacity_bytes`]).
 fn check_invariants(profile: &DeviceProfile, from: &str) {
+    check_budgets(&resolve(profile), profile, from);
+    check_fit_against(profile, &Capacity::presumed(&profile.limits), from);
+    let measured = profile.capacity();
+    if measured.source == CapacitySource::Measured {
+        check_fit_against(profile, &measured, &format!("{from} / measured"));
+    }
+}
+
+/// The fit property against one capacity, on whichever arm it is: every answer
+/// passes [`check_budgets`]; need is under the allowance or every rung is at
+/// its stop; a scene that fits at the class rung is left there; every rung
+/// taken was needed; the pool is what the loops need capped by the room, and
+/// the room is under the allowance; and **no field ends above the class
+/// rung** — capacity moves the pool and the room and sheds rungs, and raises
+/// nothing: the fill-rate and wire-capped fields stay where the class put
+/// them on both arms.
+fn check_fit_against(profile: &DeviceProfile, cap: &Capacity, from: &str) {
     let limits = &profile.limits;
     let b = resolve(profile);
-    check_budgets(&b, profile, from);
-
-    let cap = Capacity::presumed(limits);
     let allowance = cap.allowance();
     for (scene_name, scene) in scene_table() {
-        let fitted = fit(&scene, profile, &cap, stand_in_grid_bytes);
+        let fitted = fit(&scene, profile, cap, stand_in_grid_bytes);
         check_budgets(
             &fitted,
             profile,
@@ -251,7 +267,7 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
         );
         let after = need(&scene, &fitted, stand_in_grid_bytes);
         assert!(
-            after.gpu_bytes <= allowance || every_rung_at_its_stop(&fitted, limits),
+            fit_holds(&scene, &fitted, limits, cap, stand_in_grid_bytes),
             "{from} / {} / {scene_name}: {} MiB of need against a {} MiB allowance \
              with rungs left to shed",
             b.name,
@@ -279,6 +295,46 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
                  have done",
                 b.name,
                 extra - 1,
+            );
+        }
+        // The pool: what the loops need, capped by the room, and no more; the
+        // room never past the allowance.
+        let terms = need_terms(&scene, &fitted, stand_in_grid_bytes);
+        let room = loop_room(&scene, &fitted, cap, stand_in_grid_bytes);
+        assert!(
+            room <= allowance,
+            "{from} / {} / {scene_name}: {room} B of room under a {allowance} B allowance",
+            b.name,
+        );
+        assert_eq!(
+            loop_pool_bytes(&scene, &fitted, cap, stand_in_grid_bytes),
+            terms.loops.min(room),
+            "{from} / {} / {scene_name}: the pool is not min(loops, room)",
+            b.name,
+        );
+        // Nothing above the class rung, on either arm.
+        assert_eq!(fitted.promotion, b.promotion, "{from} / {scene_name}");
+        assert!(
+            fitted.offscreen_bytes <= b.offscreen_bytes,
+            "{from} / {} / {scene_name}: capacity raised the offscreen past the class rung",
+            b.name,
+        );
+        assert_eq!(
+            fitted.quality_ceiling.capped_by(b.quality_ceiling),
+            fitted.quality_ceiling,
+            "{from} / {} / {scene_name}: capacity raised the 3D quality past the class rung",
+            b.name,
+        );
+        assert!(fitted.loop_render_budget <= b.loop_render_budget);
+        assert!(fitted.raster_side_ceiling_px <= b.raster_side_ceiling_px);
+        assert!(fitted.app_texture_ceiling_bytes <= b.app_texture_ceiling_bytes);
+        assert!(fitted.volume_texture_bytes <= b.volume_texture_bytes);
+        for axis in 0..3 {
+            assert!(
+                fitted.grid_cells[axis] <= b.grid_cells[axis],
+                "{from} / {} / {scene_name}: capacity raised grid axis {axis} past the \
+                 class rung",
+                b.name,
             );
         }
     }
@@ -517,38 +573,74 @@ fn every_synthetic_profile_satisfies_every_invariant() {
         "the matrix changed shape: 3 brackets x 5 classes x 6 reported \
          ceilings x 4 VRAM readings x 2 memos x 3 form factors = 2160 rows",
     );
+    let mut measured = 0usize;
     for profile in &rows {
         check_invariants(profile, "matrix");
+        if profile.capacity().source == CapacitySource::Measured {
+            measured += 1;
+        }
     }
+    assert_eq!(
+        measured, 504,
+        "the measured arm changed shape: on each of the two native brackets, the \
+         Discrete and Integrated rows with a reading (2 classes x 6 ceilings x 3 \
+         readings x 2 memos x 3 form factors = 216) plus the Unknown rows at the two \
+         desktop-class ceilings with a reading (2 x 3 x 2 x 3 = 36), so 252 twice",
+    );
 }
 
-/// **The host signals reach the profile; the two nothing reads move nothing,
-/// and the two the rung reads move its name and, on the web, nothing else.**
-/// Every row of the matrix resolves byte-for-byte the same with its RAM and
-/// thread count as with both unread — `resolve` does not read them. Form
-/// factor and declared RAM do name the rung now, so stripping them may move
-/// `promotion`; on the web bracket that is the only field that moves, because
-/// the step is the ceiling there
-/// ([`the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured`]),
-/// and it moves at most one rung, never across the floor — the floor is the
-/// adapter report's alone. On a native row the form factor is a build fact the
-/// strip leaves in place ([`without_host_signals`]), and no native bridge
-/// declares memory, so the whole set is an identity there. Rows where the
-/// signals are already `None` are the control that the comparison is a
-/// comparison; the matrix carries both.
+/// **The host signals reach the profile; on the presumed arm they move
+/// nothing, and on the measured arm they move the pool and its room and
+/// nothing else.** Re-argued from the proof that the signals changed no budget
+/// when they landed: they now do, on purpose. A measured VRAM — or, on a
+/// unified-memory part, a measured RAM — is the capacity the scene is fitted
+/// to (ruling 3: no static pinned VRAM ceilings where capacity is measured),
+/// and what it buys is room, never a bigger picture (ruling 5: a desktop does
+/// not use more memory for the same scene because it has more).
+///
+/// Three statements, on every row of the matrix:
+///
+/// * `resolve` reads none of VRAM, RAM or threads — byte-identical with all
+///   three unread, on every arm: the class rung is the adapter's and the form
+///   factor's. Form factor and declared RAM do name the rung, so stripping
+///   them may move `promotion`; on the web bracket that is the only field
+///   that moves, because the step is the ceiling there
+///   ([`the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured`]),
+///   and it moves at most one rung, never across the floor — the floor is the
+///   adapter report's alone. On a native row the form factor is a build fact
+///   the strip leaves in place ([`without_host_signals`]), and no native
+///   bridge declares memory, so the whole set is an identity there.
+/// * On the **presumed** arm — a browser, a software or virtual adapter, a
+///   discrete card whose reader answered nothing, an unclassed adapter below
+///   the desktop-class line — `fit`, the pool and the room are byte-identical
+///   with the readings stripped, for every scene in the table.
+/// * On the **measured** arm the class rung is the same budgets; what differs
+///   from the stripped twin is the capacity, so the room, so the pool, and so
+///   the rungs `fit` sheds — and each fitted answer on either arm is that one
+///   class rung walked its own `steps_back` down the ladder, never a raised
+///   field. `check_invariants` holds every such answer to the bracket.
+///
+/// Non-vacuity on each arm: more than half of the presumed rows carry a
+/// reading to strip, and more than half of the measured rows differ from
+/// their stripped twin in pool or room for at least one scene.
 #[test]
-fn the_new_signals_change_no_budget_yet() {
+fn the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where_measured() {
     let rows = synthetic_profiles();
     let mut rows_with_a_signal = 0usize;
+    let mut presumed_rows = 0usize;
+    let mut presumed_rows_with_a_reading = 0usize;
+    let mut measured_rows = 0usize;
+    let mut measured_rows_whose_pool_or_room_moved = 0usize;
     for profile in &rows {
         let resolved = resolve(profile);
         let row = format!(
-            "{} / {:?} / {:?}",
-            profile.limits.name, profile.class, profile.form_factor,
+            "{} / {:?} / {:?} / vram {:?}",
+            profile.limits.name, profile.class, profile.form_factor, profile.vram_bytes,
         );
 
-        // RAM and threads: nothing spends them, so byte-identical.
+        // VRAM, RAM and threads: `resolve` spends none of them.
         let unread = DeviceProfile {
+            vram_bytes: None,
             system_ram_bytes: None,
             parallelism: None,
             ..*profile
@@ -556,8 +648,8 @@ fn the_new_signals_change_no_budget_yet() {
         assert_eq!(
             resolved,
             resolve(&unread),
-            "{row}: RAM or threads moved a budget. Nothing spends them yet; a \
-             field that reads them lands with its own proof, not under this one",
+            "{row}: a reading moved the class rung. Capacity is `fit`'s input and \
+             never `resolve`'s",
         );
 
         let stripped = without_host_signals(profile);
@@ -593,12 +685,107 @@ fn the_new_signals_change_no_budget_yet() {
                 );
             }
         }
+
+        // The two arms. Stripping every reading always lands on the presumed
+        // one, so `unread` is the presumed twin of whichever arm `profile` is on.
+        let cap = profile.capacity();
+        let bare = unread.capacity();
+        assert_eq!(
+            bare.source,
+            CapacitySource::Presumed,
+            "{row}: a profile with nothing read has a measured capacity",
+        );
+        let g = stand_in_grid_bytes;
+        match cap.source {
+            CapacitySource::Presumed => {
+                presumed_rows += 1;
+                if profile.vram_bytes.is_some() || profile.system_ram_bytes.is_some() {
+                    presumed_rows_with_a_reading += 1;
+                }
+                assert_eq!(cap, bare, "{row}: a presumed capacity depends on a reading");
+                for (name, scene) in scene_table() {
+                    assert_eq!(
+                        fit(&scene, profile, &cap, g),
+                        fit(&scene, &unread, &bare, g),
+                        "{row} / {name}: a reading moved a budget on the presumed arm, \
+                         where nothing it carries is a measurement",
+                    );
+                    let with = fit(&scene, profile, &cap, g);
+                    assert_eq!(
+                        loop_pool_bytes(&scene, &with, &cap, g),
+                        loop_pool_bytes(&scene, &with, &bare, g),
+                        "{row} / {name}: a reading moved the pool on the presumed arm",
+                    );
+                    assert_eq!(
+                        loop_room(&scene, &with, &cap, g),
+                        loop_room(&scene, &with, &bare, g),
+                        "{row} / {name}: a reading moved the room on the presumed arm",
+                    );
+                }
+            }
+            CapacitySource::Measured => {
+                measured_rows += 1;
+                assert_eq!(profile.platform, Platform::Native, "{row}");
+                assert!(
+                    !matches!(profile.class, DeviceClass::Software | DeviceClass::Virtual),
+                    "{row}: a rasteriser's reading was believed",
+                );
+                let mut moved = false;
+                for (name, scene) in scene_table() {
+                    let with = fit(&scene, profile, &cap, g);
+                    let without = fit(&scene, &unread, &bare, g);
+                    // Every difference between the arms is a ladder position
+                    // off the one class rung.
+                    for (arm, fitted) in [("measured", with), ("presumed", without)] {
+                        let mut walked = resolved;
+                        demote(
+                            &mut walked,
+                            &profile.limits,
+                            fitted.steps_back - resolved.steps_back,
+                        );
+                        assert_eq!(
+                            Budgets {
+                                steps_back: fitted.steps_back,
+                                ..walked
+                            },
+                            fitted,
+                            "{row} / {name} / {arm}: a fitted budget is not the class rung \
+                             walked {} rungs down the ladder — capacity raised a field",
+                            fitted.steps_back,
+                        );
+                    }
+                    moved |= loop_pool_bytes(&scene, &with, &cap, g)
+                        != loop_pool_bytes(&scene, &without, &bare, g)
+                        || loop_room(&scene, &with, &cap, g)
+                            != loop_room(&scene, &without, &bare, g);
+                }
+                if moved {
+                    measured_rows_whose_pool_or_room_moved += 1;
+                }
+            }
+            CapacitySource::Probed => {
+                unreachable!("{row}: no profile produces a probed capacity")
+            }
+        }
     }
     assert!(
         rows_with_a_signal * 2 > rows.len(),
         "only {rows_with_a_signal} of {} rows carried a signal to strip, so \
          the identity above was mostly a row compared with itself",
         rows.len(),
+    );
+    assert_eq!(presumed_rows + measured_rows, rows.len());
+    assert!(
+        presumed_rows_with_a_reading * 2 > presumed_rows,
+        "only {presumed_rows_with_a_reading} of {presumed_rows} presumed rows carried \
+         a reading to strip, so the presumed-arm identity was mostly a row compared \
+         with itself",
+    );
+    assert!(
+        measured_rows_whose_pool_or_room_moved * 2 > measured_rows,
+        "only {measured_rows_whose_pool_or_room_moved} of {measured_rows} measured rows \
+         moved the pool or the room against their presumed twin, so the measured arm \
+         was mostly not exercised",
     );
 }
 
@@ -902,6 +1089,161 @@ fn a_software_rasteriser_is_not_promoted_by_what_it_reports() {
         resolve(&profile),
         resolve(&shipped_profile(BudgetLimits::DESKTOP)),
         "a software rasteriser was handed a discrete GPU's budgets",
+    );
+}
+
+/// **A reading is a measurement only where the platform and the class make it
+/// one** — [`DeviceProfile::gpu_capacity_bytes`], cell by cell. Every
+/// platform, every class, VRAM read or not, RAM read or not, an adapter at the
+/// WebGL2 guarantee and one at the desktop-class line: 2 x 5 x 2 x 2 x 2 = 80
+/// cells, every one carrying a 32 GiB `deviceMemory` declaration so that a
+/// declaration counting as a measurement anywhere would show. The rows that
+/// carry the argument are named first; the sweep after them holds the rule on
+/// every cell and counts the 13 that measure.
+#[test]
+fn a_reading_is_a_measurement_only_where_the_platform_and_class_make_it_one() {
+    const VRAM: u64 = 24 << 30;
+    const RAM: u64 = 64 << 30;
+    let cell = |platform, class, vram, ram, adapter| DeviceProfile {
+        platform,
+        class,
+        adapter,
+        vram_bytes: vram,
+        system_ram_bytes: ram,
+        declared_ram_bytes: Some(32 << 30),
+        ..shipped_profile(if platform == Platform::Web {
+            BudgetLimits::WASM
+        } else {
+            BudgetLimits::DESKTOP
+        })
+    };
+    let guarantee = AdapterCeilings::WEBGL2_GUARANTEE;
+    let desktop_class = DESKTOP_CLASS_REPORT;
+    use DeviceClass::*;
+    use Platform::*;
+
+    // The lie-guard: a reading does not un-rasterise a rasteriser. This box's
+    // llvmpipe lists 93.9 GiB of system RAM as device-local.
+    let llvmpipe = cell(Native, Software, Some(VRAM), Some(RAM), desktop_class);
+    assert_eq!(llvmpipe.gpu_capacity_bytes(), None);
+    assert_eq!(
+        llvmpipe.capacity(),
+        Capacity::presumed(&BudgetLimits::DESKTOP),
+        "a software rasteriser reading 24 GiB was believed",
+    );
+    assert_eq!(
+        cell(Native, Virtual, Some(VRAM), Some(RAM), desktop_class).gpu_capacity_bytes(),
+        None,
+    );
+    // Nothing a browser reports is a measurement: not a heap a WebGPU adapter
+    // might one day list, not RAM, and never `deviceMemory`.
+    let firefox = cell(Web, Unknown, Some(VRAM), Some(RAM), desktop_class);
+    assert_eq!(firefox.gpu_capacity_bytes(), None);
+    assert_eq!(firefox.capacity(), Capacity::presumed(&BudgetLimits::WASM));
+    assert_eq!(
+        cell(Web, Discrete, Some(VRAM), Some(RAM), desktop_class).gpu_capacity_bytes(),
+        None,
+        "a browser that names its class is still a browser",
+    );
+    // A native discrete card is its VRAM and nothing else: RAM is not VRAM
+    // there, so a card whose reader answered nothing stays presumed.
+    let rtx_3090 = cell(
+        Native,
+        Discrete,
+        Some(24822 << 20),
+        Some(RAM),
+        desktop_class,
+    );
+    assert_eq!(rtx_3090.gpu_capacity_bytes(), Some(24822 << 20));
+    assert_eq!(
+        rtx_3090.capacity(),
+        Capacity::measured(24822 << 20, Some(RAM)),
+        "the host's RAM rides beside the GPU figure",
+    );
+    assert_eq!(
+        cell(Native, Discrete, None, Some(RAM), desktop_class).gpu_capacity_bytes(),
+        None,
+        "a discrete card with no reading is not half the host's RAM",
+    );
+    // A native integrated part is unified memory: Metal's own figure where it
+    // answered, else the host's RAM over the divisor.
+    let radeon_890m = cell(Native, Integrated, None, Some(RAM), desktop_class);
+    assert_eq!(radeon_890m.gpu_capacity_bytes(), Some(RAM / 2));
+    assert_eq!(
+        radeon_890m.gpu_capacity_bytes(),
+        Some(RAM / crate::constants::UNIFIED_MEMORY_GPU_DIVISOR),
+    );
+    let m_series = cell(Native, Integrated, Some(48 << 30), Some(RAM), desktop_class);
+    assert_eq!(
+        m_series.gpu_capacity_bytes(),
+        Some(48 << 30),
+        "Metal's working set replaces the divisor wherever it answers",
+    );
+    assert_eq!(
+        cell(Native, Integrated, None, None, guarantee).gpu_capacity_bytes(),
+        None,
+        "an integrated part on a host that would not say its RAM",
+    );
+    // An adapter the driver would not class: believed as unified memory only
+    // at the desktop-class line — the 3090 over GL is `Other` to wgpu.
+    let gl_3090 = cell(Native, Unknown, None, Some(RAM), desktop_class);
+    assert_eq!(gl_3090.gpu_capacity_bytes(), Some(RAM / 2));
+    assert_eq!(
+        cell(Native, Unknown, Some(VRAM), Some(RAM), guarantee).gpu_capacity_bytes(),
+        None,
+        "an unclassed adapter below the desktop-class line, whatever it read",
+    );
+
+    // The sweep: the rule as stated, on every cell.
+    let mut cells = 0usize;
+    let mut measuring = 0usize;
+    for platform in [Native, Web] {
+        for class in CLASSES {
+            for vram in [None, Some(VRAM)] {
+                for ram in [None, Some(RAM)] {
+                    for adapter in [guarantee, desktop_class] {
+                        cells += 1;
+                        let profile = cell(platform, class, vram, ram, adapter);
+                        let unified = vram.or(ram.map(|r| r / 2));
+                        let expected = match (platform, class) {
+                            (Web, _) | (_, Software | Virtual) => None,
+                            (Native, Discrete) => vram,
+                            (Native, Integrated) => unified,
+                            (Native, Unknown) if adapter == desktop_class => unified,
+                            (Native, Unknown) => None,
+                        };
+                        let got = profile.gpu_capacity_bytes();
+                        assert_eq!(
+                            got, expected,
+                            "{platform:?} / {class:?} / vram {vram:?} / ram {ram:?} / \
+                             {adapter:?}",
+                        );
+                        match got {
+                            Some(gpu_bytes) => {
+                                measuring += 1;
+                                assert_eq!(
+                                    profile.capacity(),
+                                    Capacity::measured(gpu_bytes, ram),
+                                    "{platform:?} / {class:?}",
+                                );
+                            }
+                            None => assert_eq!(
+                                profile.capacity(),
+                                Capacity::presumed(&profile.limits),
+                                "{platform:?} / {class:?}",
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cells, 80);
+    assert_eq!(
+        measuring, 13,
+        "native Discrete with VRAM (2 RAM x 2 adapters = 4), native Integrated with \
+         either reading (3 x 2 = 6), native Unknown at the desktop-class line with \
+         either reading (3)",
     );
 }
 
@@ -1427,7 +1769,7 @@ fn the_promoted_ceiling_is_spent_on_long_range_sweeps_and_on_nothing_else() {
 /// fills later; until it is filled, the two rungs above the floor resolve the
 /// same numbers, and a browser held at the step by its form factor loses
 /// nothing it had. Whoever fills the slot has to come past this line, and past
-/// the web rows of [`the_new_signals_change_no_budget_yet`], which stop being
+/// the web rows of [`the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where_measured`], which stop being
 /// an identity the moment the two rungs part.
 #[test]
 fn the_web_step_is_todays_ceiling_until_a_desktop_browser_tier_is_measured() {

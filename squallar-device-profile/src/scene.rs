@@ -11,7 +11,7 @@
 //! arithmetic.
 
 use crate::budget::{BudgetLimits, Promotion};
-use crate::constants::NEED_FRACTION;
+use crate::constants::{ECONOMY_FRACTION, NEED_FRACTION};
 use crate::quality::GroundPass;
 use squallar_radar::types::RenderView;
 
@@ -105,8 +105,10 @@ pub enum CapacitySource {
     /// Found by allocating until the API refused — a browser's per-tab
     /// allowance, which no API states.
     Probed,
-    /// Nothing answered, so the bracket's constant stands in — every WebGL2
-    /// browser, and every native adapter without a reader.
+    /// Nothing answered, or nothing that could be believed, so the bracket's
+    /// constant stands in — every browser, every native adapter without a
+    /// reader, and every software or virtual adapter whatever it read
+    /// (`crate::budget::DeviceProfile::gpu_capacity_bytes`).
     Presumed,
 }
 
@@ -134,8 +136,9 @@ impl Capacity {
         }
     }
 
-    /// A figure read from the driver. Constructible and priced here; the
-    /// application does not feed one in yet.
+    /// A figure read from the driver. What
+    /// `crate::budget::DeviceProfile::capacity` builds where the profile's
+    /// readings amount to a measurement.
     pub fn measured(gpu_bytes: u64, host_bytes: Option<u64>) -> Self {
         Self {
             gpu_bytes,
@@ -144,7 +147,9 @@ impl Capacity {
         }
     }
 
-    /// A figure a probe found by allocating until refused.
+    /// A figure a probe found by allocating until refused. Constructible and
+    /// priced here; the browser probe that will feed one in has not landed, so
+    /// no profile produces it.
     pub fn probed(gpu_bytes: u64) -> Self {
         Self {
             gpu_bytes,
@@ -178,6 +183,19 @@ impl Capacity {
             }
             CapacitySource::Presumed => self.gpu_bytes,
         }
+    }
+
+    /// What may be resident **beyond** `need` here: `ECONOMY_FRACTION` of the
+    /// capacity less the need itself, and nothing when the need already
+    /// reaches that line. The one figure that legitimately grows with the
+    /// machine — a bigger card keeps more tiles panned away from, more parsed
+    /// geometry, a larger render cache — and the first thing pressure evicts.
+    /// Computed and printed; its first consumer is the tile cache's budget,
+    /// which has not joined this arithmetic yet.
+    pub fn economy_allowance(&self, need: Need) -> u64 {
+        let ceiling = self.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0
+            + (self.gpu_bytes % ECONOMY_FRACTION.1) * ECONOMY_FRACTION.0 / ECONOMY_FRACTION.1;
+        ceiling.saturating_sub(need.gpu_bytes)
     }
 }
 

@@ -2,6 +2,7 @@
 
 use crate::constants;
 use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
+use crate::scene::{Capacity, CapacitySource};
 
 /// Which APIs exist. **Not** which machine this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -95,13 +96,17 @@ pub struct DeviceProfile {
     pub class: DeviceClass,
     /// What the adapter says it can hold.
     pub adapter: AdapterCeilings,
-    /// Measured VRAM, where a trustworthy signal exists. `None` is the
-    /// **majority** arm, not a fallback: wgpu 29.0.4 reports no capacity on any
-    /// backend, and no browser API answers the question at all.
+    /// Measured VRAM, where a trustworthy signal exists — read beside wgpu,
+    /// which reports no capacity on any backend: a Vulkan device-local heap
+    /// sum or DXGI's budget on a discrete card, Metal's recommended working
+    /// set on every class. `None` on every browser and on every adapter
+    /// without a reader. Spent by [`Self::capacity`], and by nothing in
+    /// [`resolve`].
     pub vram_bytes: Option<u64>,
     /// **Measured** system RAM: `/proc/meminfo`, `NSProcessInfo`,
     /// `GlobalMemoryStatusEx`. `None` where no API answers, which is every
-    /// browser.
+    /// browser. Stands in for the GPU's own figure on a unified-memory part
+    /// ([`Self::gpu_capacity_bytes`]); read by nothing in [`resolve`].
     pub system_ram_bytes: Option<u64>,
     /// **Declared** system RAM — a browser's `navigator.deviceMemory`, a
     /// coarse bucket the page reports about itself. Kept apart from
@@ -142,11 +147,7 @@ impl DeviceProfile {
     /// lower the rung, never raise it
     /// ([`constants::DECLARED_RAM_HANDHELD_BYTES`]).
     fn reported_promotion(&self) -> Promotion {
-        let desktop_class = self.adapter.max_texture_dimension_2d
-            >= DESKTOP_CLASS_REPORT.max_texture_dimension_2d
-            && self.adapter.max_texture_dimension_3d
-                >= DESKTOP_CLASS_REPORT.max_texture_dimension_3d;
-        if !desktop_class {
+        if !self.reports_desktop_class() {
             return Promotion::Floor;
         }
         let declared_small = self
@@ -159,9 +160,75 @@ impl DeviceProfile {
         }
     }
 
+    /// Whether the adapter's report clears both axes of [`DESKTOP_CLASS_REPORT`]
+    /// — the line that separates a real driver from a software rasteriser, on
+    /// the one signal every backend and every browser gives.
+    pub fn reports_desktop_class(&self) -> bool {
+        self.adapter.max_texture_dimension_2d >= DESKTOP_CLASS_REPORT.max_texture_dimension_2d
+            && self.adapter.max_texture_dimension_3d
+                >= DESKTOP_CLASS_REPORT.max_texture_dimension_3d
+    }
+
     /// Rungs of the ladder this machine has already surrendered. See [`demote`].
     fn steps_back(&self) -> u32 {
         self.memo.map_or(0, |memo| memo.steps_back)
+    }
+}
+
+impl DeviceProfile {
+    /// **The GPU capacity this profile's readings amount to**, or `None` where
+    /// nothing it carries is a measurement of the GPU. Matches on what the
+    /// adapter and the platform say, never on a `cfg`.
+    ///
+    /// A software or virtual adapter is `None` whatever it reads: a reading
+    /// does not un-rasterise a rasteriser, and llvmpipe's "24 GiB" is the
+    /// host's RAM wearing a heap flag. A browser is `None` whatever it reads:
+    /// nothing a page reports about memory is a measurement, and
+    /// `deviceMemory` is a declaration capped at 8 GiB. A native discrete card
+    /// is its measured VRAM — the Vulkan heap sum, DXGI's budget, Metal's
+    /// working set — and nothing else, so a card whose reader answered nothing
+    /// stays presumed. A native integrated part is unified memory: Metal's
+    /// figure where Metal answered, else the host's RAM over
+    /// [`constants::UNIFIED_MEMORY_GPU_DIVISOR`]. A native adapter the driver
+    /// would not class is believed as unified memory only when its report
+    /// clears the desktop-class line — a 3090 over GL is `Other` to wgpu — and
+    /// is `None` below it.
+    pub fn gpu_capacity_bytes(&self) -> Option<u64> {
+        match (self.platform, self.class) {
+            (_, DeviceClass::Software | DeviceClass::Virtual) => None,
+            (Platform::Web, _) => None,
+            (Platform::Native, DeviceClass::Discrete) => self.vram_bytes,
+            (Platform::Native, DeviceClass::Integrated) => self.unified_capacity(),
+            (Platform::Native, DeviceClass::Unknown) if self.reports_desktop_class() => {
+                self.unified_capacity()
+            }
+            (Platform::Native, DeviceClass::Unknown) => None,
+        }
+    }
+
+    /// What a unified-memory part is taken to hold: a reader's own figure
+    /// where one answered, else the host's RAM over the divisor.
+    fn unified_capacity(&self) -> Option<u64> {
+        self.vram_bytes.or_else(|| {
+            self.system_ram_bytes
+                .map(|ram| ram / constants::UNIFIED_MEMORY_GPU_DIVISOR)
+        })
+    }
+
+    /// **What the device can hold, as this profile knows it**: a measured
+    /// capacity where [`Self::gpu_capacity_bytes`] answers, carrying the host's
+    /// RAM beside it, else the bracket's presumption
+    /// ([`Capacity::presumed`]). The one function the application asks; the
+    /// probed arm is a browser's to fill, and no profile produces it.
+    pub fn capacity(&self) -> Capacity {
+        match self.gpu_capacity_bytes() {
+            Some(gpu_bytes) => Capacity {
+                gpu_bytes,
+                host_bytes: self.system_ram_bytes,
+                source: CapacitySource::Measured,
+            },
+            None => Capacity::presumed(&self.limits),
+        }
     }
 }
 

@@ -1076,19 +1076,48 @@ a device, not a constant to edit.
 
 ### 8.6 What every target prints
 
-*(plan D1)* One telemetry line on the 2 s tick, integers only, scraped by a
-`drive.py` regex:
+One telemetry line on the 2 s tick, integers only, scraped by a `drive.py`
+regex (`budget_state_re`) and by `native_row.py`'s own arm. **As the app
+prints it** (`squallar-app/src/budget_telemetry.rs`, pinned by
+`the_budget_state_line_reads_exactly_as_pinned` and held to the rig's regex by
+`the_rig_reads_the_budget_line_the_app_actually_writes`):
 
 ```text
-budget state: bracket desktop, cap 24576 MiB measured, need 1380 MiB, economy 512 MiB, rung 0, vram 24576, ram 65536, threads 32, form 1, linear 0/0 MiB, cause 0
+budget state: bracket desktop, rung 2, steps 0, pool 3456 MiB, ceiling 4032 MiB, vram 24822 MiB, ram 65536 MiB, declared 0 MiB, threads 32, form 2, linear 0/0 MiB, cap 24822 1
 ```
 
-— and the same as one row in the opt-in diagnostics overlay
+The fields, in order, every one mandatory and every byte figure MiB by integer
+division: `bracket` (the compile-time set), `rung` (the promotion resolved at:
+0 floor, 1 step, 2 ceiling), `steps` (the ladder rungs `fit` shed), `pool` (the
+**live** loop pool — what the loops need, capped by the room), `ceiling` (the
+whole-application texture ceiling, the bracket's constant), `vram`, `ram`,
+`declared` (three sources — measured VRAM, measured RAM, a browser's
+`deviceMemory` — never one figure, `0` for unread since 0 is not a possible
+measurement of any of them), `threads`, `form` (0 unknown, 1 handheld,
+2 desktop), `linear` page/worker (two wasm instances, two ceilings), `cap`
+(the **capacity in force this session** — measured where the readings amount
+to a measurement, the bracket's presumption where they do not, held to what
+pressure has taught the session) and its source (`0` presumed, `1` measured,
+`2` probed). `cap` is not `vram`: an integrated part on a 64 GiB host prints
+`vram 0 … cap 32768 1`; llvmpipe reading 24 GiB prints `vram 24576 … cap 3840 0`.
+A binary older than the last two groups matches nothing and the rig reads
+`null`/`n/a`, never `cap 0`.
+
+The earlier example in this section (`cap 24576 MiB measured, need 1380 MiB,
+economy 512 MiB, … cause 0`) was the plan's sketch, not the app's line: `need`,
+`economy` and `cause` are not printed here — need and the economy allowance
+appear in the `Budgets:` prose lines when a fit is adopted, and the pressure
+cause in the `pressure:` line — and the source is an integer, not a word.
+
+The same sentence is one row in the opt-in diagnostics overlay
 (`squallar-egui/src/ui_diagnostics.rs`). Ruling 4: this is a developer readout,
-not a control. The proof of no behaviour change when signals land before
-anything reads them (WO-2): the synthetic matrix gains a form-factor axis
-(720 → 2160 rows) and asserts budgets are **byte-identical with and without**
-the new inputs.
+not a control. The proof that signals moved nothing before anything read them
+(WO-2) has been re-argued at WO-9, when the measured arm went live: the 2160-row
+matrix now asserts that on the **presumed** arm every fit is byte-identical
+with and without the readings, and that on the **measured** arm (504 of the
+rows) only the pool and its room differ, every other difference being a rung of
+the one ladder
+(`the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where_measured`).
 
 ---
 
@@ -1161,6 +1190,62 @@ a presumed one**: the bracket's `APP_TEXTURE_BUDGET_BYTES` constant was argued
 with its own headroom and today's sum proof already spends up to it, so the
 fraction is not applied twice. `Capacity::presumed(limits)` is that constant at
 the bracket's floor (288 / 1024 / 3840 MiB) whatever rung the class earned.
+
+**Both arms are live** *(as landed, WO-9 2026-09-02)*. The one function the
+application asks is `DeviceProfile::capacity()`
+(`squallar-device-profile/src/budget.rs`), and it is a policy over the
+profile's readings, matched on data and never on a `cfg`:
+
+| platform, class | `gpu_capacity_bytes()` | arm |
+| --- | --- | --- |
+| any, `Software` or `Virtual` | `None` — the lie-guard: a reading does not un-rasterise a rasteriser (llvmpipe lists 93.9 GiB of system RAM device-local) | presumed |
+| `Web`, any | `None` — nothing a browser reports about memory is a measurement, `deviceMemory` included | presumed (the probe, WO-10, will be the browser's own arm) |
+| `Native`, `Discrete` | `vram_bytes` — the Vulkan heap sum, DXGI's budget, Metal's working set; a card whose reader answered nothing stays presumed, RAM is not VRAM there | measured where `Some` |
+| `Native`, `Integrated` | `vram_bytes` (Metal answers for every class) else `system_ram_bytes / UNIFIED_MEMORY_GPU_DIVISOR` (2 — a guard, not a measurement; Metal's own working set is ~75 % of RAM) | measured where either reads |
+| `Native`, `Unknown` at the desktop-class line | as `Integrated` — a 3090 over GL is `Other` to wgpu | measured where either reads |
+| `Native`, `Unknown` below it | `None` | presumed |
+
+`Some(bytes)` becomes `Capacity { gpu_bytes, host_bytes: system_ram_bytes,
+source: Measured }`; `None` becomes `Capacity::presumed(limits)`. `Probed` is
+constructible and priced but no profile produces it. The application's
+`App::capacity()` is that answer held to the session's pressure presumption,
+and every `fit`, `LoopPool::for_scene` and pressure re-fit runs against it —
+so the moment `update_device_profile` adopts a discrete card's reading, the
+scene is fitted to three quarters of it. Pinned cell by cell by
+`a_reading_is_a_measurement_only_where_the_platform_and_class_make_it_one`;
+the whole 2160-row matrix runs `check_invariants` on both arms
+(`every_synthetic_profile_satisfies_every_invariant`, 504 measured rows).
+
+What the measured arm changes, on the box's own RTX 3090 (24822 MiB read): six
+two-hour loops beside their renders cost 4992 MiB against an 18616.5 MiB
+allowance and fit at the class rung with every frame — the pool is the
+3456 MiB they need, **past the desktop bracket's 3072 MiB loop-pool ceiling,
+which is a presumption and binds only the presumed arm**
+(`LoopPoolLimits::on`) — and 17080.5 MiB of room is left. A 4 GiB card allows
+3072 MiB and the same scene sheds to 9 frames a pane: 8 × 259 s = thirty-four
+minutes of the two hours asked for
+(`a_measured_capacity_is_the_allowance_the_scene_is_fitted_to`,
+`what_five_real_machines_get`). Nothing but the pool, the room and the rungs
+shed moves: the fill-rate and wire-capped fields stay at the class rung on
+both arms.
+
+**Pressure lowers the capacity figure**, not the allowance, by one economy
+fraction per event (`App::refit_under_pressure`): on the presumed arm the two
+spellings agree, and on the measured arm lowering the allowance's figure and
+then allowing three quarters of *that* would compound the step to 0.675.
+
+**The economy allowance** is `Capacity::economy_allowance(need)` =
+`ECONOMY_FRACTION × gpu_bytes − need`, saturating at zero, on every arm. It is
+computed and printed in the `Budgets:` and `Loop pool:` lines; its first
+consumer is the tile cache's budget (WO-6), which has not joined this
+arithmetic yet.
+
+**The runtime clamp.** `fit_holds(scene, budgets, limits, cap)` is the
+invariant `fit` promises — need under the allowance or every rung at its stop
+— stated once so the application can check the answer it adopts
+(`App::fit_scene`). `fit` holds it by construction; a `false` is a defect in
+the arithmetic, so a debug build stops on it and a release build logs it once
+at warn and holds the loop pool at its floor from then on.
 
 `need` sums terms the tree already prices: `loop_frame_bytes`,
 `squallar_volumetric::raymarch::resident_grid_bytes` (read by

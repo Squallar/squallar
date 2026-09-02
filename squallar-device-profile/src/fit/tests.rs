@@ -574,3 +574,268 @@ fn the_same_scene_against_the_same_capacity_fits_the_same_twice() {
         }
     }
 }
+
+/// **A measured capacity is the allowance the scene is fitted to, and no
+/// bracket constant binds.** The box's own RTX 3090 reads 24822 MiB, so need
+/// may take three quarters of it, 18616.5 MiB: six two-hour loops beside their
+/// static renders cost 6 x (36 x 16 + 256) = 4992 MiB and fit at the class
+/// rung with every frame — where the 3840 MiB presumption halves the history
+/// to 18 ([`fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs`]). The
+/// pool is what the loops need, 3456 MiB, and the room beside it is
+/// 18616.5 - 1536 = 17080.5 MiB, stated in bytes because the halves are real.
+/// A 4 GiB card allows 3072 MiB: the same scene sheds the three 3D rungs that
+/// cost a 2D scene nothing and then two halvings, 36 to 18 to 9 frames —
+/// 6 x (18 x 16 + 256) = 3264 is still over, 6 x (9 x 16 + 256) = 2400 fits —
+/// and at the 259 s precipitation cadence nine frames are 8 x 259 = 2072 s of
+/// lookback, thirty-four minutes of the two hours asked for.
+#[test]
+fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
+    let discrete = |vram_mib: u64| DeviceProfile {
+        class: DeviceClass::Discrete,
+        vram_bytes: Some(vram_mib * MIB),
+        system_ram_bytes: Some(64 << 30),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let six = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None); 6]);
+
+    let rtx_3090 = discrete(24822);
+    let cap = rtx_3090.capacity();
+    assert_eq!(cap.source, CapacitySource::Measured);
+    assert_eq!(cap.gpu_bytes, 24822 * MIB);
+    assert_eq!(cap.host_bytes, Some(64 << 30));
+    assert_eq!(cap.allowance(), 19_520_815_104, "18616.5 MiB, exactly");
+    let top = resolve(&rtx_3090);
+    let fitted = fit(&six, &rtx_3090, &cap, stand_in_grid_bytes);
+    assert_eq!(fitted, top, "a scene that fits the card was shed anyway");
+    assert_eq!(fitted.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET);
+    assert_eq!(
+        need(&six, &fitted, stand_in_grid_bytes).gpu_bytes,
+        4992 * MIB
+    );
+    assert_eq!(
+        loop_pool_bytes(&six, &fitted, &cap, stand_in_grid_bytes),
+        3456 * MIB,
+        "the pool is what six two-hour loops need, past the 3072 MiB pool ceiling",
+    );
+    assert_eq!(
+        loop_room(&six, &fitted, &cap, stand_in_grid_bytes),
+        19_520_815_104 - 1536 * MIB,
+        "17080.5 MiB of room",
+    );
+    // The same scene against the presumption is shed: this is the difference
+    // a measurement makes, and the only one.
+    let presumed = fit(
+        &six,
+        &rtx_3090,
+        &Capacity::presumed(&BudgetLimits::DESKTOP),
+        stand_in_grid_bytes,
+    );
+    assert_eq!(
+        presumed.loop_render_budget,
+        DESKTOP_MAX_LOOP_RENDER_BUDGET / 2
+    );
+    assert_eq!(
+        Budgets {
+            steps_back: 0,
+            quality_ceiling: top.quality_ceiling,
+            offscreen_bytes: top.offscreen_bytes,
+            app_texture_ceiling_bytes: top.app_texture_ceiling_bytes,
+            loop_render_budget: top.loop_render_budget,
+            ..presumed
+        },
+        top,
+        "the two arms differ by ladder rungs and nothing else",
+    );
+
+    let four_gib = discrete(4096);
+    let cap = four_gib.capacity();
+    assert_eq!(cap.allowance(), 3072 * MIB);
+    let fitted = fit(&six, &four_gib, &cap, stand_in_grid_bytes);
+    assert_eq!(
+        fitted.steps_back, 5,
+        "lighting, resolution twice, two halvings of the history"
+    );
+    assert_eq!(fitted.loop_render_budget, 9);
+    assert_eq!(
+        need(&six, &fitted, stand_in_grid_bytes).gpu_bytes,
+        2400 * MIB
+    );
+    let mut one_less = resolve(&four_gib);
+    demote(&mut one_less, &BudgetLimits::DESKTOP, 4);
+    assert_eq!(
+        need(&six, &one_less, stand_in_grid_bytes).gpu_bytes,
+        3264 * MIB
+    );
+    assert!(need(&six, &one_less, stand_in_grid_bytes).gpu_bytes > cap.allowance());
+    assert_eq!(
+        loop_pool_bytes(&six, &fitted, &cap, stand_in_grid_bytes),
+        6 * 9 * 16 * MIB,
+        "min(864, 3072 - 1536)",
+    );
+    assert_eq!(
+        fitted.frames_for_span_of(TWO_HOURS, PRECIP),
+        9,
+        "the pane asked for 28 frames of two hours and holds nine: 2072 s",
+    );
+    assert_eq!(fitted.grid_cells, one_less.grid_cells);
+    assert_eq!(
+        fitted.raster_side_ceiling_px,
+        one_less.raster_side_ceiling_px
+    );
+    assert!(!fitted.tile_whole_zoom);
+
+    // A unified-memory part on a 64 GiB host: 32 GiB stands in for the GPU,
+    // one loop's pool is its need, and the offscreen stays at the Step the
+    // class earns — memory says nothing about fill rate.
+    let integrated = DeviceProfile {
+        class: DeviceClass::Integrated,
+        vram_bytes: None,
+        system_ram_bytes: Some(64 << 30),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let cap = integrated.capacity();
+    assert_eq!(cap.source, CapacitySource::Measured);
+    assert_eq!(cap.gpu_bytes, 32 << 30);
+    let one = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None)]);
+    let fitted = fit(&one, &integrated, &cap, stand_in_grid_bytes);
+    assert_eq!(fitted, resolve(&integrated));
+    assert_eq!(fitted.promotion, Promotion::Step);
+    assert_eq!(fitted.offscreen_bytes as u64, 20 * MIB);
+    assert_eq!(
+        loop_pool_bytes(&one, &fitted, &cap, stand_in_grid_bytes),
+        576 * MIB
+    );
+    assert_eq!(
+        loop_room(&one, &fitted, &cap, stand_in_grid_bytes),
+        (24 << 30) - 256 * MIB
+    );
+}
+
+/// **The economy allowance is what is left under nine tenths of the capacity
+/// once need is paid**, on every arm, and never negative. Under the 3090's
+/// measurement six two-hour loops leave 0.9 x 24822 - 4992 = 17347.8 MiB for
+/// tiles panned away from, parsed geometry and the render cache; under the
+/// 3840 MiB presumption the same scene, shed to 18 frames, leaves 3456 - 3264
+/// = 192 MiB, and a scene at the presumption's whole allowance leaves nothing.
+#[test]
+fn the_economy_allowance_is_what_is_left_under_nine_tenths_of_the_capacity() {
+    // Exact on small figures the denominator does not divide.
+    let thousand = Capacity::probed(1000);
+    let gpu = |gpu_bytes: u64| Need {
+        gpu_bytes,
+        host_bytes: 0,
+    };
+    assert_eq!(thousand.economy_allowance(Need::default()), 900);
+    assert_eq!(thousand.economy_allowance(gpu(100)), 800);
+    assert_eq!(thousand.economy_allowance(gpu(900)), 0);
+    assert_eq!(
+        thousand.economy_allowance(gpu(950)),
+        0,
+        "a need past the line saturates rather than wrapping",
+    );
+    assert_eq!(Capacity::probed(7).economy_allowance(Need::default()), 6);
+    assert_eq!(
+        Capacity::probed(u64::MAX).economy_allowance(Need::default()),
+        u64::MAX / 10 * 9 + (u64::MAX % 10) * 9 / 10,
+        "no overflow at the top of the range",
+    );
+
+    let rtx_3090 = DeviceProfile {
+        class: DeviceClass::Discrete,
+        vram_bytes: Some(24822 * MIB),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let six = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None); 6]);
+    let cap = rtx_3090.capacity();
+    let fitted = fit(&six, &rtx_3090, &cap, stand_in_grid_bytes);
+    let economy = economy_allowance(&six, &fitted, &cap, stand_in_grid_bytes);
+    assert_eq!(
+        economy,
+        24822 * MIB / 10 * 9 + (24822 * MIB % 10) * 9 / 10 - 4992 * MIB,
+    );
+    assert_eq!(economy / MIB, 17347, "17347.8 MiB, by integer division");
+    assert_eq!(
+        economy,
+        cap.economy_allowance(need(&six, &fitted, stand_in_grid_bytes)),
+        "the free function is the method at the scene's price",
+    );
+
+    let presumed = Capacity::presumed(&BudgetLimits::DESKTOP);
+    let profile = DeviceProfile {
+        class: DeviceClass::Discrete,
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let fitted = fit(&six, &profile, &presumed, stand_in_grid_bytes);
+    assert_eq!(
+        need(&six, &fitted, stand_in_grid_bytes).gpu_bytes,
+        3264 * MIB
+    );
+    assert_eq!(
+        economy_allowance(&six, &fitted, &presumed, stand_in_grid_bytes),
+        (3456 - 3264) * MIB,
+    );
+    // Four two-hour loops beside two still panes cost the whole 3840 MiB
+    // allowance and fit it exactly; they are past the nine-tenths line, so
+    // nothing may sit beyond them.
+    let mut exact = vec![plan_pane(HD, true, TWO_HOURS, None); 4];
+    exact.extend([plan_pane(HD, false, TWO_HOURS, None); 2]);
+    let exact = scene_of(exact);
+    let fitted = fit(&exact, &profile, &presumed, stand_in_grid_bytes);
+    assert_eq!(
+        need(&exact, &fitted, stand_in_grid_bytes).gpu_bytes,
+        3840 * MIB
+    );
+    assert_eq!(
+        economy_allowance(&exact, &fitted, &presumed, stand_in_grid_bytes),
+        0
+    );
+}
+
+/// **`fit_holds` is the invariant `fit` promises, and it can say no.** Every
+/// answer `fit` gives on either arm holds; the class rung handed a capacity it
+/// does not fit, with rungs left to shed, does not — that is the answer the
+/// runtime clamps and logs on rather than trusting.
+#[test]
+fn fit_holds_for_every_answer_fit_gives_and_refuses_a_budget_that_was_not_fitted() {
+    let six = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None); 6]);
+    for limits in BudgetLimits::SHIPPED {
+        let profile = DeviceProfile {
+            class: DeviceClass::Discrete,
+            vram_bytes: Some(4 << 30),
+            ..shipped_profile(limits)
+        };
+        for cap in [
+            Capacity::presumed(&limits),
+            profile.capacity(),
+            Capacity::probed(1),
+        ] {
+            for (name, scene) in scene_table() {
+                let fitted = fit(&scene, &profile, &cap, stand_in_grid_bytes);
+                assert!(
+                    fit_holds(&scene, &fitted, &limits, &cap, stand_in_grid_bytes),
+                    "{} / {name} / {:?}: fit's own answer does not hold",
+                    limits.name,
+                    cap.source,
+                );
+            }
+        }
+        // The class rung against one byte: over the allowance, rungs to spare.
+        let top = resolve(&profile);
+        let one_byte = Capacity::probed(1);
+        assert!(
+            !fit_holds(&six, &top, &limits, &one_byte, stand_in_grid_bytes),
+            "{}: a budget nothing fitted was accepted",
+            limits.name,
+        );
+        // The floor against one byte: still over, but nothing left to shed.
+        let mut floor = top;
+        demote(&mut floor, &limits, 64);
+        assert!(fit_holds(
+            &six,
+            &floor,
+            &limits,
+            &one_byte,
+            stand_in_grid_bytes
+        ));
+    }
+}

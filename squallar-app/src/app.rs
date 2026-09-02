@@ -528,10 +528,12 @@ impl App {
         let channels = ChannelHub::new();
         let mut device_profile = squallar_device_profile::budget::DeviceProfile::for_target();
         // What the host says about itself, copied in as plain data before the
-        // first resolve. Nothing spends these yet: `resolve` reads none of
-        // them, and the floor crate's matrix holds the budgets byte-identical
-        // with and without them. The adapter's own reading joins in
-        // `update_device_profile`, once there is an adapter to ask.
+        // first resolve. `resolve` reads none of them — the floor crate's
+        // matrix holds the class rung byte-identical with and without them.
+        // What spends a reading is `fit`, through `DeviceProfile::capacity`,
+        // and only once the adapter has answered in `update_device_profile`:
+        // the RAM figure stands in for the GPU's on a unified-memory part,
+        // and the GPU's own reading joins there.
         let signals = platform.host_signals();
         device_profile.system_ram_bytes = signals.system_ram_bytes;
         device_profile.declared_ram_bytes = signals.declared_ram_bytes;
@@ -1022,14 +1024,11 @@ impl App {
         self.adopt_gpu_capacity(capacity);
         // The class rung, shed for the scene on screen: `fit` starts where the
         // adapter's report puts the budgets and takes rungs only while the
-        // scene's need is over what this session presumes it can hold.
+        // scene's need is over what this session takes the card to hold —
+        // three quarters of the reading just adopted where it is a
+        // measurement, the bracket's presumption where it is not.
         let scene = self.scene_of();
-        let resolved = squallar_device_profile::fit::fit(
-            &scene,
-            &self.device_profile,
-            &self.capacity(),
-            crate::loop_pool::GRID_BYTES,
-        );
+        let resolved = self.fit_scene(&scene);
         if resolved != self.budgets {
             log::info!(
                 "Budgets: {:?} rung {} on a {class:?} adapter reporting {} px 2D and {} px 3D \
@@ -1050,20 +1049,29 @@ impl App {
     }
 
     /// Fold the bridge's GPU capacity reading into the profile, as plain data.
-    /// `fit` reads none of it yet — the floor crate's matrix holds the budgets
-    /// byte-identical with and without it — so this moves no budget; it is
-    /// the figure the `budget state:` line prints as `vram`. A reader that
-    /// stops answering leaves the field unread rather than stale.
+    /// Whether it is spent is the floor crate's policy
+    /// (`DeviceProfile::gpu_capacity_bytes`): a discrete card's reading is its
+    /// capacity and the next `fit` runs against three quarters of it; a
+    /// rasteriser's reading is not, and the presumption stands. `resolve`
+    /// reads none of it — the class rung is the adapter's — so the figure
+    /// moves the pool and the rungs `fit` sheds, and no other field. It is
+    /// also what the `budget state:` line prints as `vram`. A reader that
+    /// stops answering leaves the field unread rather than stale. The
+    /// bridge's own source tag is not kept: every reader that answers today
+    /// is a measurement, and which arm the figure lands on is decided from
+    /// the class and the platform, not from the reader's word.
     fn adopt_gpu_capacity(&mut self, reading: Option<(u64, GpuCapacitySource)>) {
         self.device_profile.vram_bytes = reading.map(|(bytes, _source)| bytes);
     }
 
-    /// **What this session takes the GPU to hold.** The presumed arm: the
-    /// bracket's whole-application constant, held to whatever pressure has
-    /// taught this session. The measured figure the profile carries
-    /// (`vram_bytes`) is not spent here yet.
+    /// **What this session takes the GPU to hold.** The profile's own answer
+    /// — measured where its readings amount to a measurement of the GPU, the
+    /// bracket's whole-application constant otherwise
+    /// (`DeviceProfile::capacity`) — held to whatever pressure has taught this
+    /// session.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
-        squallar_device_profile::scene::Capacity::presumed(&self.device_profile.limits)
+        self.device_profile
+            .capacity()
             .held_to(self.session_capacity)
     }
 
@@ -1117,18 +1125,22 @@ impl App {
         // Re-derived on every loop walk; sized here once so the first figure
         // is logged beside the adapter that earned the budgets it came from.
         let scene = self.scene_of();
-        self.loop_pool = crate::loop_pool::LoopPool::for_scene(
-            &scene,
-            &self.budgets,
-            &self.capacity(),
-            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
-        );
+        self.loop_pool = self.pool_for_scene(&scene);
+        let cap = self.capacity();
         log::info!(
-            "Loop pool: {} MiB for {} pane(s) on a {class:?} adapter at {:?}, {} MiB presumed",
+            "Loop pool: {} MiB for {} pane(s) on a {class:?} adapter at {:?}, {} MiB {}, \
+             {} MiB of economy allowance",
             self.loop_pool.bytes() / (1024 * 1024),
             scene.panes.len(),
             self.budgets.promotion,
-            self.capacity().gpu_bytes / (1024 * 1024),
+            cap.gpu_bytes / (1024 * 1024),
+            crate::budget_telemetry::capacity_source_word(cap.source),
+            squallar_device_profile::fit::economy_allowance(
+                &scene,
+                &self.budgets,
+                &cap,
+                crate::loop_pool::GRID_BYTES,
+            ) / (1024 * 1024),
         );
 
         let Some(state) = self.state.as_mut() else {

@@ -419,6 +419,16 @@ pub const NEED_FRACTION: (u64, u64) = (3, 4);
 /// allowance in force, less the economy the eviction just took.
 pub const ECONOMY_FRACTION: (u64, u64) = (9, 10);
 
+/// What a unified-memory GPU is taken to hold when nothing has measured it:
+/// the host's RAM divided by this. **A guard, not a measurement.** Vulkan's
+/// heap listing lies both ways on a UMA part — this box's llvmpipe flags 93.9
+/// GiB of system RAM device-local — so the two heap-listing backends are not
+/// believed for an integrated adapter and the RAM figure stands in. Metal's
+/// own recommended working set is ~75 % of RAM on M-series, so a half is
+/// conservative, and Metal answers for every class and replaces this wherever
+/// it does ([`crate::budget::DeviceProfile::gpu_capacity_bytes`]).
+pub const UNIFIED_MEMORY_GPU_DIVISOR: u64 = 2;
+
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
 #[cfg(mobile)]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = MOBILE_MAX_RENDER_CACHE_ENTRIES;
@@ -566,6 +576,8 @@ const _: () = const {
     // Need sits under economy: what the scene costs may not be allowed to
     // occupy more than what is resident is allowed to.
     assert!(NEED_FRACTION.0 * ECONOMY_FRACTION.1 <= ECONOMY_FRACTION.0 * NEED_FRACTION.1);
+    // A divisor under one would make the guard a raise.
+    assert!(UNIFIED_MEMORY_GPU_DIVISOR >= 1);
     assert!(MAX_RENDER_CACHE_ENTRIES > 0);
     assert!(MAX_CONCURRENT_RENDERS > 0);
     assert!(MAX_CONCURRENT_LOOP_DOWNLOADS > 0);

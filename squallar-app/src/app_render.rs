@@ -7,7 +7,7 @@ use squallar_device_profile::constants::{
     MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS, MAX_LOOP_VOLUME_BUILDS_PER_FRAME,
     MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
 };
-use squallar_device_profile::fit::{fit, need};
+use squallar_device_profile::fit::{economy_allowance, fit, fit_holds, need};
 use squallar_device_profile::scene::Scene;
 use squallar_egui::actions::GuiAction;
 use squallar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
@@ -23,7 +23,15 @@ use squallar_source::id::known;
 use squallar_radar::loop_downloads::LoopFrameData;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once `fit` has handed back an answer that does not hold
+/// ([`App::fit_scene`]); never cleared, because the arithmetic that broke does
+/// not heal within a process, and read where the pool is sized so the loops
+/// are held at the floor from then on. Process-global rather than a field:
+/// it is a defect flag, and a second `App` in the same process has the same
+/// arithmetic.
+static FIT_INVARIANT_BROKEN: AtomicBool = AtomicBool::new(false);
 
 // **Why every loop read in this file is `time_state(&known::RADAR)`, spelled
 // out rather than hidden behind an accessor (WO-T3.7).**
@@ -1684,6 +1692,7 @@ impl super::App {
                     &self.device_profile,
                     linear,
                     self.loop_pool.bytes(),
+                    &self.capacity(),
                 )),
         );
         // The wasm heap watermark, on the same tick. The bridge answers the
@@ -4010,17 +4019,63 @@ impl super::App {
         let (demand, counts, scene) = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
-        self.loop_pool = LoopPool::for_scene(
-            &scene,
-            &self.budgets,
-            &self.capacity(),
-            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
-        );
+        self.loop_pool = self.pool_for_scene(&scene);
         self.loop_pool_state.observe(
             self.loop_pool,
             LoopFrameModel::from_budgets(&self.budgets),
             demand,
         )
+    }
+
+    /// **`fit` for `scene` against this session's capacity, its answer
+    /// checked.** `fit` promises `fit_holds` — the scene's need under the
+    /// allowance, or every rung at its stop — by construction on both arms,
+    /// so a `false` here is a defect in the arithmetic, not a scene too large.
+    /// A debug build stops on it. A release build logs it once at warn and
+    /// marks [`FIT_INVARIANT_BROKEN`], which holds the loop pool at its floor
+    /// from then on ([`Self::pool_for_scene`]) rather than sizing loops from
+    /// budgets that were not fitted; the budgets themselves are still
+    /// adopted, since the floor of the ladder is the safest answer there is.
+    pub(super) fn fit_scene(&self, scene: &Scene) -> squallar_device_profile::budget::Budgets {
+        let cap = self.capacity();
+        let fitted = fit(scene, &self.device_profile, &cap, GRID_BYTES);
+        let holds = fit_holds(
+            scene,
+            &fitted,
+            &self.device_profile.limits,
+            &cap,
+            GRID_BYTES,
+        );
+        let needed = need(scene, &fitted, GRID_BYTES).gpu_bytes / (1024 * 1024);
+        debug_assert!(
+            holds,
+            "fit handed back {needed} MiB of need against a {} MiB allowance with rungs \
+             left to shed",
+            cap.allowance() / (1024 * 1024),
+        );
+        if !holds && !FIT_INVARIANT_BROKEN.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "Budgets: fit handed back {needed} MiB of need against a {} MiB allowance \
+                 with rungs left to shed, at rung {}; the loop pool is held at its floor \
+                 from here on",
+                cap.allowance() / (1024 * 1024),
+                fitted.steps_back,
+            );
+        }
+        fitted
+    }
+
+    /// **The pool the scene asks for** — what its loops need, capped by the
+    /// room the rest leaves under this session's capacity, held inside the
+    /// bracket's floor and, on the presumed arm, its ceiling — or the floor
+    /// alone once [`FIT_INVARIANT_BROKEN`] has been set.
+    pub(super) fn pool_for_scene(&self, scene: &Scene) -> LoopPool {
+        let cap = self.capacity();
+        let limits = crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets);
+        if FIT_INVARIANT_BROKEN.load(Ordering::Relaxed) {
+            return LoopPool::new(0, limits);
+        }
+        LoopPool::for_scene(scene, &self.budgets, &cap, limits)
     }
 
     /// **Re-fit the budgets to the scene**, adopting a different answer only
@@ -4030,7 +4085,7 @@ impl super::App {
     /// the 3D quality ceiling with it. A scene that shrinks gets its rungs back
     /// the same way — computed live from scene and capacity, no counter.
     pub(super) fn refit_to_scene(&mut self, scene: &Scene) {
-        let wanted = fit(scene, &self.device_profile, &self.capacity(), GRID_BYTES);
+        let wanted = self.fit_scene(scene);
         if wanted == self.budgets {
             self.pending_fit = None;
             return;
@@ -4044,14 +4099,18 @@ impl super::App {
             return;
         }
         self.pending_fit = None;
+        let cap = self.capacity();
         log::info!(
-            "Budgets: rung {} for the scene ({} panes, {} MiB of need against {} MiB presumed): \
-             {:?} 3D quality ceiling, {} MiB of offscreen, {:?} grid cells, {} textured loop \
-             frames",
+            "Budgets: rung {} for the scene ({} panes, {} MiB of need against {} MiB allowed \
+             of {} MiB {}, {} MiB of economy allowance): {:?} 3D quality ceiling, {} MiB of \
+             offscreen, {:?} grid cells, {} textured loop frames",
             wanted.steps_back,
             scene.panes.len(),
             need(scene, &wanted, GRID_BYTES).gpu_bytes / (1024 * 1024),
-            self.capacity().allowance() / (1024 * 1024),
+            cap.allowance() / (1024 * 1024),
+            cap.gpu_bytes / (1024 * 1024),
+            crate::budget_telemetry::capacity_source_word(cap.source),
+            economy_allowance(scene, &wanted, &cap, GRID_BYTES) / (1024 * 1024),
             wanted.quality_ceiling,
             wanted.offscreen_bytes / (1024 * 1024),
             wanted.grid_cells,
@@ -4119,18 +4178,25 @@ impl super::App {
     /// the wrong stand-in: nine tenths of a need can never be fitted by that
     /// same need, so a presumption set there would shed a rung on every event,
     /// including one whose whole cause was economy the eviction has already
-    /// taken. The wall is therefore taken to be at most the allowance in force,
+    /// taken. The wall is therefore taken to be at most the capacity in force,
     /// and the presumption comes down by one economy fraction: what sat above
     /// need at the event is what the eviction gave back. The scene then re-fits
     /// against it, which sheds rungs only when need alone no longer fits; when
     /// the eviction was the whole answer nothing moves and the log says so, and
     /// a second event lowers the presumption again. Never persisted: the
     /// presumption dies with the process.
+    ///
+    /// **The capacity figure is what comes down, not the allowance**, so the
+    /// step is one economy fraction on both arms: a presumed capacity is its
+    /// own allowance and the two spellings agree; a measured one allows three
+    /// quarters of itself, and lowering the allowance's figure and then
+    /// allowing three quarters of *that* would compound the step to 0.675 on
+    /// every event.
     fn refit_under_pressure(&mut self, cause: crate::pressure::Pressure) -> u32 {
-        let lowered = self.capacity().allowance() / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+        let lowered = self.capacity().gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
         self.session_capacity = Some(lowered);
         let scene = self.scene_of();
-        let refitted = fit(&scene, &self.device_profile, &self.capacity(), GRID_BYTES);
+        let refitted = self.fit_scene(&scene);
         let needed = need(&scene, &refitted, GRID_BYTES).gpu_bytes / (1024 * 1024);
         if refitted == self.budgets {
             log::info!(
@@ -4156,12 +4222,7 @@ impl super::App {
         );
         self.adopt_budgets(refitted);
         self.pending_fit = None;
-        self.loop_pool = LoopPool::for_scene(
-            &scene,
-            &self.budgets,
-            &self.capacity(),
-            crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets),
-        );
+        self.loop_pool = self.pool_for_scene(&scene);
         self.budgets.steps_back
     }
 

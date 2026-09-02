@@ -21,7 +21,7 @@ use squallar_device_profile::constants::{
     RENDER_WIDTH, VOLUME_GRID_CELLS,
 };
 use squallar_device_profile::fit::{GridBytes, loop_pool_bytes};
-use squallar_device_profile::scene::{Capacity, Scene};
+use squallar_device_profile::scene::{Capacity, CapacitySource, Scene};
 use squallar_radar::types::RenderView;
 
 /// The raymarch's own resident-grid arithmetic — every mip level as the
@@ -42,10 +42,13 @@ pub const LOOP_POOL_KEY: &str = "loop_pool";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopPoolLimits {
     /// What the pool is on a device that can tell us nothing, or that has
-    /// already refused an allocation. Never goes below this.
+    /// already refused an allocation. Never goes below this, on either arm.
     pub floor: usize,
-    /// The most this target will ever spend on loop textures, however much the
-    /// device claims to have.
+    /// The most this target will spend on loop textures **on the presumed
+    /// arm**, where nothing has measured the card. A static ceiling on VRAM
+    /// is exactly what a measurement retires, so where the capacity is
+    /// measured or probed this does not bind and the room `loop_pool_bytes`
+    /// already applied is the bound — see [`Self::on`].
     pub ceiling: usize,
 }
 
@@ -63,6 +66,22 @@ impl LoopPoolLimits {
         Self {
             floor: budgets.loop_pool_floor_bytes,
             ceiling: budgets.loop_pool_ceiling_bytes,
+        }
+    }
+
+    /// These bounds on `cap`'s arm. The floor holds everywhere. The ceiling is
+    /// a presumption — the most a bracket spends on loops when nothing has
+    /// measured the card — so it binds only a presumed capacity; against a
+    /// measured or probed one the bound is the room under the allowance,
+    /// which `loop_pool_bytes` has already applied, and no bracket constant
+    /// caps what a scene needs on a card that was seen to hold it.
+    pub fn on(self, cap: &Capacity) -> Self {
+        match cap.source {
+            CapacitySource::Presumed => self,
+            CapacitySource::Measured | CapacitySource::Probed => Self {
+                floor: self.floor,
+                ceiling: usize::MAX,
+            },
         }
     }
 
@@ -335,11 +354,14 @@ impl LoopPool {
     /// **The pool a scene asks for**: what its loops need — every looping
     /// pane's frames for its span at its frame's cost — capped by the room the
     /// rest of the scene leaves under `cap`'s allowance, and held inside
-    /// `limits`. One two-hour loop on the desktop bracket is 36 x 16 MiB =
-    /// 576 MiB whatever card it runs on; six are 3456 MiB, or the room if that
-    /// is less. The class of the machine is not an input: the same scene
-    /// costs the same bytes on every bracket, and what a bigger card buys is
-    /// room, never a longer loop than was asked for.
+    /// `limits` on `cap`'s arm ([`LoopPoolLimits::on`]). One two-hour loop on
+    /// the desktop bracket is 36 x 16 MiB = 576 MiB whatever card it runs on;
+    /// six are 3456 MiB, or the room if that is less — under the 3840 MiB
+    /// presumption the room is 2304 MiB, under a measured 3090 it is not the
+    /// bound and the 3072 MiB bracket ceiling is not either. The class of the
+    /// machine is not an input: the same scene costs the same bytes on every
+    /// bracket, and what a bigger card buys is room, never a longer loop than
+    /// was asked for.
     pub fn for_scene(
         scene: &Scene,
         budgets: &Budgets,
@@ -347,7 +369,7 @@ impl LoopPool {
         limits: LoopPoolLimits,
     ) -> Self {
         let bytes = loop_pool_bytes(scene, budgets, cap, GRID_BYTES);
-        Self::new(usize::try_from(bytes).unwrap_or(usize::MAX), limits)
+        Self::new(usize::try_from(bytes).unwrap_or(usize::MAX), limits.on(cap))
     }
 
     /// The pool, in bytes.

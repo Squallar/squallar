@@ -13,6 +13,15 @@
 //! over the allowance take the next rung of `budget::demote`'s own table. No
 //! rung counter is remembered and nothing is persisted; the same scene against
 //! the same capacity fits to the same budgets on every start.
+//!
+//! The capacity has two live arms and `fit` does not know which it is on. On
+//! the **measured** arm (`budget::DeviceProfile::capacity`, where the
+//! profile's readings amount to a measurement) the allowance is
+//! `NEED_FRACTION` of the card and no bracket constant binds the pool: a 3090
+//! holds what six two-hour loops cost and a 4 GiB card shortens them. On the
+//! **presumed** arm the bracket's constant is the capacity and the allowance,
+//! exactly as before a reader existed. [`fit_holds`] is the one invariant both
+//! arms promise, checked where the application adopts an answer.
 
 use crate::budget::{BudgetLimits, Budgets, DeviceProfile, resolve, step_down};
 use crate::quality::{GroundPass, offscreen_bytes};
@@ -169,6 +178,35 @@ pub fn fit(
 pub fn every_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool {
     let mut probe = *budgets;
     !step_down(&mut probe, limits)
+}
+
+/// **The invariant [`fit`] promises**, stated once so the runtime can check
+/// the answer it adopts: `scene`'s need at `budgets` fits `cap`'s allowance,
+/// or every rung is at its stop and there was nothing left to shed. `fit`
+/// holds it by construction on both arms; a `false` here is a defect in the
+/// arithmetic — a term that stopped being monotone down the ladder — and the
+/// application logs it and holds the pool at its floor rather than trusting
+/// the budgets.
+pub fn fit_holds(
+    scene: &Scene,
+    budgets: &Budgets,
+    limits: &BudgetLimits,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> bool {
+    need(scene, budgets, grid_bytes).gpu_bytes <= cap.allowance()
+        || every_rung_at_its_stop(budgets, limits)
+}
+
+/// What may be resident beyond `scene`'s need at `budgets` under `cap`:
+/// [`Capacity::economy_allowance`] at the scene's price.
+pub fn economy_allowance(
+    scene: &Scene,
+    budgets: &Budgets,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> u64 {
+    cap.economy_allowance(need(scene, budgets, grid_bytes))
 }
 
 /// One resident grid's cost, `u64::MAX` where the raymarch's arithmetic

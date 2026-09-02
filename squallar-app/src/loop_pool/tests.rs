@@ -1048,6 +1048,70 @@ mod budget_agreement {
         );
     }
 
+    /// **The pool ceiling is a presumption and does not bind a measured card;
+    /// the floor holds on both arms.** Six two-hour loops need 3456 MiB; under
+    /// the 3840 MiB presumption the room holds them to 2304, and under the
+    /// 3090's 24822 MiB they get every byte — past the 3072 MiB the desktop
+    /// bracket would spend on loops when nothing had measured the card. An
+    /// empty scene sits at the 576 MiB floor on either arm.
+    #[test]
+    fn the_pool_ceiling_is_a_presumption_and_does_not_bind_a_measured_card() {
+        use crate::loop_pool::{LoopPool, LoopPoolLimits};
+        use squallar_device_profile::constants::DESKTOP_LOOP_POOL_CEILING_BYTES;
+        use squallar_device_profile::fit::fit;
+
+        let rtx_3090 = DeviceProfile {
+            class: DeviceClass::Discrete,
+            vram_bytes: Some(24822 << 20),
+            system_ram_bytes: Some(64 << 30),
+            ..shipped_profile(BudgetLimits::DESKTOP)
+        };
+        let measured = rtx_3090.capacity();
+        let presumed = Capacity::presumed(&BudgetLimits::DESKTOP);
+        let six = super::scene_of(6);
+        let b = fit(&six, &rtx_3090, &measured, GRID_BYTES);
+        assert_eq!(
+            b,
+            resolve(&rtx_3090),
+            "six loops fit the card at the class rung"
+        );
+        let limits = LoopPoolLimits::from_budgets(&b);
+        assert_eq!(limits.ceiling, DESKTOP_LOOP_POOL_CEILING_BYTES);
+        assert_eq!(
+            limits.on(&presumed),
+            limits,
+            "the presumed arm keeps its ceiling"
+        );
+        assert_eq!(
+            limits.on(&measured),
+            LoopPoolLimits {
+                floor: limits.floor,
+                ceiling: usize::MAX,
+            },
+        );
+
+        let on_the_card = LoopPool::for_scene(&six, &b, &measured, limits).bytes();
+        assert_eq!(on_the_card, 3456 << 20, "what six two-hour loops need");
+        assert!(
+            on_the_card > DESKTOP_LOOP_POOL_CEILING_BYTES,
+            "the bracket's 3072 MiB loop ceiling bound a measured 3090",
+        );
+        assert_eq!(
+            LoopPool::for_scene(&six, &b, &presumed, limits).bytes(),
+            2304 << 20,
+            "min(3456, 3840 - 6 x 256) under the presumption",
+        );
+        let empty = super::scene_of(0);
+        for cap in [&measured, &presumed] {
+            assert_eq!(
+                LoopPool::for_scene(&empty, &b, cap, limits).bytes(),
+                limits.floor,
+                "{:?}: nothing looping sits at the floor",
+                cap.source,
+            );
+        }
+    }
+
     /// The stage's whole answer on one page, pinned so that a change to any rule has to
     /// come past a table someone can read.
     ///
@@ -1058,25 +1122,45 @@ mod budget_agreement {
     /// were capacity presumptions wearing the pool's name. What does move with
     /// the rung is the **room** column beside it: the allowance less the static
     /// renders, which the promoted raster side makes smaller.
+    ///
+    /// **The capacity column is what a reading buys, and it is room.** The box's
+    /// RTX 3090 reads 24822 MiB, so need may take 18616.5 MiB of it: six
+    /// two-hour loops beside their renders cost 4992 MiB and fit with every
+    /// frame, the pool is the 3456 MiB they need — past the 3072 MiB bracket
+    /// ceiling, which is a presumption — and 17080.5 MiB of room is left. A
+    /// 4 GiB card allows 3072 MiB and the same six panes shed two halvings to
+    /// 9 frames each: 6 x (9 x 16 + 256) = 2400 MiB, an 864 MiB pool, 1536 MiB
+    /// of room, and 8 x 259 s = thirty-four minutes of the two hours asked for.
+    /// An integrated desktop GPU on a 64 GiB host is unified memory, 32 GiB
+    /// measured: its pool is still one loop's need, and its offscreen still the
+    /// Step the class earns, because memory says nothing about fill rate. The
+    /// same 3090 over GL is `Other` to wgpu; with the host's RAM read it too is
+    /// unified memory at the desktop-class line, and with nothing read it is
+    /// the presumption. A browser is the presumption whatever it reads.
     #[test]
     fn what_five_real_machines_get() {
-        let row = |limits, class, two_d, three_d| {
+        use squallar_device_profile::fit::fit;
+        use squallar_device_profile::scene::CapacitySource;
+
+        let row = |limits, class, two_d, three_d, vram: Option<u64>, ram, panes| {
             let profile = DeviceProfile {
                 class,
                 adapter: AdapterCeilings {
                     max_texture_dimension_2d: two_d,
                     max_texture_dimension_3d: three_d,
                 },
+                vram_bytes: vram,
+                system_ram_bytes: ram,
                 // Every machine in this table has a mouse: a build fact natively, pointer
                 // media on the web. The ceiling asks for it since the form factor is read.
                 form_factor: Some(FormFactor::Desktop),
                 ..shipped_profile(limits)
             };
-            let b = resolve(&profile);
-            let cap = Capacity::presumed(&limits);
-            let one = super::scene_of(1);
+            let cap = profile.capacity();
+            let scene = super::scene_of(panes);
+            let b = fit(&scene, &profile, &cap, GRID_BYTES);
             let pool = crate::loop_pool::LoopPool::for_scene(
-                &one,
+                &scene,
                 &b,
                 &cap,
                 crate::loop_pool::LoopPoolLimits::from_budgets(&b),
@@ -1087,30 +1171,132 @@ mod budget_agreement {
                 b.grid_cells.iter().map(|&n| n as usize).product::<usize>(),
                 b.offscreen_bytes / (1024 * 1024),
                 pool / (1024 * 1024),
-                loop_room(&one, &b, &cap, GRID_BYTES) / (1024 * 1024),
+                loop_room(&scene, &b, &cap, GRID_BYTES) / (1024 * 1024),
                 b.raster_side_for_adapter(two_d),
+                cap.gpu_bytes / (1024 * 1024),
+                cap.source,
+                b.loop_render_budget,
             )
         };
         let d = BudgetLimits::DESKTOP;
         let w = BudgetLimits::WASM;
+        const RTX_3090_MIB: u64 = 24822;
+        let ram_64 = Some(64u64 << 30);
+        use CapacitySource::{Measured, Presumed};
 
-        // machine                       | rung     | cells     | offscreen | pool | room | raster
+        // machine | rung | cells | offscreen | pool | room | raster | cap | source | frames
         assert_eq!(
-            row(d, DeviceClass::Discrete, 32768, 16384),
-            (Promotion::Ceiling, 8_388_608, 48, 576, 3840 - 256, 8192),
-            "RTX 3090 over Vulkan",
+            row(d, DeviceClass::Discrete, 32768, 16384, None, None, 1),
+            (
+                Promotion::Ceiling,
+                8_388_608,
+                48,
+                576,
+                3840 - 256,
+                8192,
+                3840,
+                Presumed,
+                36
+            ),
+            "RTX 3090 over Vulkan before its reader has answered",
         );
         assert_eq!(
-            row(d, DeviceClass::Unknown, 32768, 16384),
-            (Promotion::Ceiling, 8_388_608, 48, 576, 3840 - 256, 8192),
+            row(
+                d,
+                DeviceClass::Discrete,
+                32768,
+                16384,
+                Some(RTX_3090_MIB << 20),
+                ram_64,
+                6,
+            ),
+            (
+                Promotion::Ceiling,
+                8_388_608,
+                48,
+                3456,
+                17080,
+                8192,
+                RTX_3090_MIB,
+                Measured,
+                36,
+            ),
+            "RTX 3090 over Vulkan, measured: six two-hour loops at the full render \
+             budget, 3456 MiB of pool, 18616.5 - 1536 = 17080.5 MiB of room",
+        );
+        assert_eq!(
+            row(
+                d,
+                DeviceClass::Discrete,
+                32768,
+                16384,
+                Some(4 << 30),
+                Some(16 << 30),
+                6
+            ),
+            (
+                Promotion::Ceiling,
+                8_388_608,
+                20,
+                864,
+                1536,
+                8192,
+                4096,
+                Measured,
+                9
+            ),
+            "a 4 GiB discrete card: the same six panes hold nine frames each, thirty-four \
+             minutes at the precipitation cadence; the offscreen is at its floor because \
+             the two resolution rungs were walked on the way to the loop history",
+        );
+        assert_eq!(
+            row(d, DeviceClass::Unknown, 32768, 16384, None, None, 1),
+            (
+                Promotion::Ceiling,
+                8_388_608,
+                48,
+                576,
+                3840 - 256,
+                8192,
+                3840,
+                Presumed,
+                36
+            ),
             "the same RTX 3090 over GL, where the driver names it `Other` — the \
-             case a class-only rule gets wrong on real hardware",
+             case a class-only rule gets wrong on real hardware — with nothing read",
         );
         assert_eq!(
-            row(d, DeviceClass::Integrated, 16384, 8192),
-            (Promotion::Step, 8_388_608, 20, 576, 3840 - 256, 8192),
-            "a desktop integrated GPU: promoted by nothing it reports, because \
-             what it reports is capacity and what holds it back is fill rate",
+            row(d, DeviceClass::Unknown, 32768, 16384, None, ram_64, 1),
+            (
+                Promotion::Ceiling,
+                8_388_608,
+                48,
+                576,
+                24576 - 256,
+                8192,
+                32768,
+                Measured,
+                36
+            ),
+            "the 3090 over GL with the host's 64 GiB read: an unclassed adapter at the \
+             desktop-class line is believed as unified memory, half the RAM",
+        );
+        assert_eq!(
+            row(d, DeviceClass::Integrated, 16384, 8192, None, ram_64, 1),
+            (
+                Promotion::Step,
+                8_388_608,
+                20,
+                576,
+                24576 - 256,
+                8192,
+                32768,
+                Measured,
+                36
+            ),
+            "a desktop integrated GPU on a 64 GiB host: 32 GiB of unified memory measured, \
+             the pool by need, and the offscreen at the Step — what holds it back is fill \
+             rate, which no memory figure speaks to",
         );
         // **The raster column moved from 2048 to 4096 at WS1**, on the four-leg
         // adapter measurement recorded at
@@ -1119,13 +1305,57 @@ mod budget_agreement {
         // guarantee — is unmoved, which is the half that says the software
         // path did not come with it.
         assert_eq!(
-            row(w, DeviceClass::Unknown, 16384, 16384),
-            (Promotion::Ceiling, 3_538_944, 5, 56, 288 - 64, 4096),
+            row(w, DeviceClass::Unknown, 16384, 16384, None, None, 1),
+            (
+                Promotion::Ceiling,
+                3_538_944,
+                5,
+                56,
+                288 - 64,
+                4096,
+                288,
+                Presumed,
+                14
+            ),
             "Firefox 153 on the RTX 3090, at what it will actually allocate",
         );
         assert_eq!(
-            row(w, DeviceClass::Unknown, 2048, 256),
-            (Promotion::Floor, 1_048_576, 5, 56, 288 - 16, 2048),
+            row(
+                w,
+                DeviceClass::Unknown,
+                16384,
+                16384,
+                Some(24 << 30),
+                ram_64,
+                1
+            ),
+            (
+                Promotion::Ceiling,
+                3_538_944,
+                5,
+                56,
+                288 - 64,
+                4096,
+                288,
+                Presumed,
+                14
+            ),
+            "the same browser handed a 24 GiB reading and 64 GiB of RAM: nothing a page \
+             reports is a measurement, so the presumption stands",
+        );
+        assert_eq!(
+            row(w, DeviceClass::Unknown, 2048, 256, None, None, 1),
+            (
+                Promotion::Floor,
+                1_048_576,
+                5,
+                56,
+                288 - 16,
+                2048,
+                288,
+                Presumed,
+                14
+            ),
             "a browser at the WebGL2 guarantee, which keeps every byte it had",
         );
     }

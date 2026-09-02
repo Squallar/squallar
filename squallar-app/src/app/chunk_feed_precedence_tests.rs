@@ -1221,10 +1221,8 @@ fn the_device_profile_is_folded_in_before_any_budget_is_spent() {
     let update = body
         .find("self.update_device_profile(")
         .expect("`install_volume_bridge` no longer re-resolves the budgets");
-    for spender in [
-        "LoopPoolLimits::from_budgets",
-        "self.budgets.quality_ceiling",
-    ] {
+    // The pool is sized off `self.budgets` inside `pool_for_scene`.
+    for spender in ["self.pool_for_scene(", "self.budgets.quality_ceiling"] {
         let at = body
             .find(spender)
             .unwrap_or_else(|| panic!("`{spender}` is no longer read there"));
@@ -2117,6 +2115,73 @@ fn tick(app: &mut App) {
 }
 
 const MIB: u64 = 1 << 20;
+
+/// **On the measured arm a pressure event lowers the capacity by one economy
+/// fraction of the card, and the allowance follows at three quarters.** A
+/// discrete class with a 24 GiB reading: one lost surface takes this session's
+/// capacity to 0.9 x 24576 = 22118 MiB and the allowance to three quarters of
+/// that, 16588 MiB — one economy fraction below the 18432 MiB it allowed
+/// before, which is the step the presumed arm takes too. Six two-hour loops
+/// cost 4992 MiB and still fit, so nothing is shed. Lowering the allowance's
+/// own figure and allowing three quarters of *that* would have compounded the
+/// step to 0.675 on every event.
+#[test]
+fn a_pressure_event_on_the_measured_arm_lowers_the_capacity_by_one_economy_fraction() {
+    use crate::platform::GpuCapacitySource;
+    use squallar_device_profile::constants::{ECONOMY_FRACTION, NEED_FRACTION};
+    use squallar_device_profile::quality::DeviceClass;
+    use squallar_device_profile::scene::CapacitySource;
+
+    let platform = TestBridge::desktop().with_gpu_capacity(24 << 30, GpuCapacitySource::Measured);
+    let mut app = app_with_looping_panes(platform, 6, 6);
+    app.device_profile.class = DeviceClass::Discrete;
+    app.adopt_gpu_capacity(Some((24 << 30, GpuCapacitySource::Measured)));
+    let before = app.capacity();
+    assert_eq!(before.source, CapacitySource::Measured);
+    assert_eq!(before.gpu_bytes, 24576 * MIB);
+    assert_eq!(before.allowance(), 18432 * MIB);
+
+    app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+
+    let after = app.capacity();
+    assert_eq!(
+        after.source,
+        CapacitySource::Measured,
+        "lowering keeps the arm"
+    );
+    assert_eq!(
+        after.gpu_bytes,
+        before.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0,
+        "the capacity figure came down by one economy fraction",
+    );
+    assert_eq!(app.session_capacity, Some(after.gpu_bytes));
+    assert_eq!(
+        after.allowance(),
+        after.gpu_bytes / NEED_FRACTION.1 * NEED_FRACTION.0,
+    );
+    // In MiB, because the two orders of integer division differ by a few
+    // bytes: 0.9 x 18432 = 16588.8. The compounded step would read 12441.
+    assert_eq!(
+        after.allowance() / MIB,
+        16588,
+        "the allowance fell by one economy fraction, not by one compounded with the \
+         need fraction",
+    );
+    assert_eq!(
+        before.allowance() / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0 / MIB,
+        16588
+    );
+    // 4992 MiB of need still fits 16588 MiB: the eviction was the whole answer.
+    let scene = app.scene_of();
+    assert_eq!(
+        squallar_device_profile::fit::need(&scene, &app.budgets, crate::loop_pool::GRID_BYTES)
+            .gpu_bytes,
+        4992 * MIB,
+    );
+    assert_eq!(app.budgets.steps_back, 0);
+    assert_eq!(app.budgets.loop_render_budget, 36);
+    assert_eq!(app.loop_pool.bytes() as u64, 3456 * MIB);
+}
 
 /// A heap reading with the worker instance at `worker_mib` and the page well
 /// under every line, so what is judged is the fuller of the two.
