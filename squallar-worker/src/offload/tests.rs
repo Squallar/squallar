@@ -3327,7 +3327,7 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
 /// A literal cells fixture for the reply codec: three occupied cells on a 4×2
 /// grid, one of them with two ids.
 fn a_hit_cells_fixture() -> squallar_overlays::render::rasterize::HitCells {
-    let mut cells = HashMap::new();
+    let mut cells = squallar_overlays::render::rasterize::HitCellMap::default();
     cells.insert(7u32, vec![2u32]);
     cells.insert(0u32, vec![0]);
     cells.insert(5u32, vec![1, 0]);

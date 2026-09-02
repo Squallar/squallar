@@ -1,6 +1,6 @@
 //! Rasterize overlay polygons to RGBA textures using tiny-skia.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use squallar_geo::lat_rad_to_mercator_y;
 use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
@@ -14,6 +14,23 @@ use crate::spc::reports::StormReportKind;
 use crate::types::OverlayFeature;
 use squallar_geo::{GeoBounds, GeoPolygonRing};
 
+/// Occupied cell index to the item indices drawn into it.
+///
+/// **Not hashed with `RandomState`.** The key is `qy * width + qx`, computed
+/// here from a pixel the rasterizer just drew, and it is bounded by the
+/// texture's own quarter-resolution grid — nothing outside this process picks
+/// it, and no feed can widen the key space past `width * height` however many
+/// features it sends. What `RandomState` buys is per-process seeding against an
+/// attacker who chooses keys; there is no such attacker at this key, and
+/// `HitCells::record` runs once per drawn point. `FxHashMap` is a multiply and
+/// a rotate instead of SipHash-1-3.
+///
+/// Iteration order changes with the hasher, and one place cares: the reply wire
+/// in [`crate::render::jobs::encode_overlay_out`], which already sorts by cell
+/// index for exactly this reason and is unaffected. Every other reader takes
+/// `values()`, `len()` or `is_empty()`.
+pub type HitCellMap = rustc_hash::FxHashMap<u32, Vec<u32>>;
+
 /// The portable half of click detection: which quarter-resolution cells the
 /// rasterizer drew which item **indices** into — positions in its input list,
 /// so both halves must come from one order.
@@ -21,7 +38,7 @@ use squallar_geo::{GeoBounds, GeoPolygonRing};
 pub struct HitCells {
     pub width: u32,
     pub height: u32,
-    pub cells: HashMap<u32, Vec<u32>>,
+    pub cells: HitCellMap,
 }
 
 impl HitCells {
@@ -29,7 +46,7 @@ impl HitCells {
         Self {
             width: full_width.div_ceil(4),
             height: full_height.div_ceil(4),
-            cells: HashMap::new(),
+            cells: HitCellMap::default(),
         }
     }
 
@@ -67,7 +84,18 @@ impl HitCells {
 #[derive(Clone)]
 pub struct HitMap {
     cells: HitCells,
-    id_map: HashMap<u32, Arc<dyn OverlayItem>>,
+    /// The items a cell's recorded indices name, **positionally**.
+    ///
+    /// This was a `HashMap<u32, Arc<dyn OverlayItem>>` whose keys were exactly
+    /// `0..items.len()` — a dense range hashed with SipHash to find a slot the
+    /// index already named. `Vec::get` answers the same question with a bounds
+    /// check, so the whole build hashes nothing.
+    ///
+    /// The clone gets cheaper too, but not free and not for that reason:
+    /// hashbrown's `Clone` never rehashes, it walks the control bytes and
+    /// clones each entry. What goes is the walk and the buckets' slack; the `n`
+    /// atomic increments the `Arc`s cost stay exactly as they were.
+    items: Vec<Arc<dyn OverlayItem>>,
 }
 
 impl HitMap {
@@ -76,11 +104,7 @@ impl HitMap {
     pub fn from_cells(cells: HitCells, items: &[Arc<dyn OverlayItem>]) -> Self {
         Self {
             cells,
-            id_map: items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| (i as u32, Arc::clone(item)))
-                .collect(),
+            items: items.to_vec(),
         }
     }
 
@@ -88,7 +112,7 @@ impl HitMap {
         self.cells
             .ids_at(u, v)
             .iter()
-            .filter_map(|id| self.id_map.get(id).cloned())
+            .filter_map(|id| self.items.get(*id as usize).cloned())
             .collect()
     }
 }

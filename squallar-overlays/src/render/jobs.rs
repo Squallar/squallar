@@ -8,7 +8,7 @@
 //! wire; nothing in this module may read a clock of its own — a worker that
 //! did would render a picture the direct call would not.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use squallar_source::job::{EncodeCtx, JobCodec, JobCost, JobGeometry, JobOutCodec, JobSpec};
 use squallar_source::wire::Reader;
@@ -600,9 +600,14 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// The overlay reply's bytes: a hit-cells tag, the framed cells when the tag
 /// says so, and the raw RGBA as the rest.
 ///
-/// The cells are written **sorted by cell index** — a `HashMap`'s iteration
-/// order is seeded per process, and these bytes have to be a function of the
-/// value for two encodes of one reply to agree. The RGBA takes the rest.
+/// The cells are written **sorted by cell index** — a hash map's iteration
+/// order is a function of its hasher, its capacity and the order things went
+/// in, none of which is the value, and these bytes have to be a function of the
+/// value for two encodes of one reply to agree. That was true when the map was
+/// seeded per process by `RandomState` and it stays true now that
+/// [`HitCellMap`](crate::render::rasterize::HitCellMap) is unseeded: the sort is
+/// what makes the encoding canonical, not the hasher.
+/// The RGBA takes the rest.
 pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>, out: &mut Vec<u8>) {
     out.reserve(rgba.len() + 64);
     match hit_cells {
@@ -642,7 +647,7 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<HitCells>)> {
             let height = r.u32()?;
             let grid = u64::from(width) * u64::from(height);
             let occupied = r.u32()? as usize;
-            let mut cells = HashMap::new();
+            let mut cells = crate::render::rasterize::HitCellMap::default();
             let mut previous: Option<u32> = None;
             for _ in 0..occupied {
                 let idx = r.u32()?;
@@ -1632,7 +1637,7 @@ mod tests {
 
     #[test]
     fn the_reply_round_trips_with_hit_cells() {
-        let mut cells = HashMap::new();
+        let mut cells = crate::render::rasterize::HitCellMap::default();
         cells.insert(0u32, vec![0u32, 2]);
         cells.insert(3u32, vec![1u32]);
         assert_reply_round_trips(
@@ -1654,9 +1659,9 @@ mod tests {
     #[test]
     fn two_encodes_of_one_reply_value_agree() {
         let indices = [21u32, 3, 17, 8, 30, 11, 26, 5];
-        let forward: HashMap<u32, Vec<u32>> =
+        let forward: crate::render::rasterize::HitCellMap =
             indices.iter().map(|&idx| (idx, vec![idx * 2])).collect();
-        let backward: HashMap<u32, Vec<u32>> = indices
+        let backward: crate::render::rasterize::HitCellMap = indices
             .iter()
             .rev()
             .map(|&idx| (idx, vec![idx * 2]))

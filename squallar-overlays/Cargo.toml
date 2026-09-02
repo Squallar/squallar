@@ -24,6 +24,19 @@ grib = { version = "=0.18.2", default-features = false, features = [
 # buffer. Equal to the version grib resolves, so the lock gains no package;
 # `decode::tests` pins that the two paths agree value for value.
 png = { version = "=0.18.1", default-features = false }
+# **`HitCellMap`'s hasher, and nothing else in this crate.** The rasterizer's
+# hit cells are keyed by a quarter-resolution cell index it computes itself, so
+# the key is internal, bounded by the texture's own grid, and not something a
+# feed can choose -- which is the entire property `RandomState` exists to
+# defend, and it is not needed here. `record` runs once per drawn point;
+# SipHash-1-3 over a `u32` was 1.31% of a 60 s native profile.
+#
+# **No new package.** This is the version `egui-wgpu` already resolves through
+# `type-map` on every target this workspace builds for, so naming it directly
+# adds a `[dependencies]` line and nothing to the lockfile -- the same argument
+# `png` above makes for grib's. Zero transitive dependencies of its own, and
+# `no_std`-capable, so nothing follows it onto wasm32 either.
+rustc-hash = "=2.1.3"
 squallar-units = { workspace = true }
 futures = "=0.3.34"
 # NetCDF4 reading and CF unpacking for the GLM and GMGSI granules, both of

@@ -318,7 +318,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     // 64/4 × 48/4, with one occupied cell naming item 1: the shape `execute` really answers
     // for this plan.
     let cells = |idx: u32, id: u32| {
-        let mut occupied = std::collections::HashMap::new();
+        let mut occupied = squallar_overlays::render::rasterize::HitCellMap::default();
         occupied.insert(idx, vec![id]);
         HitCells {
             width: 16,
@@ -393,7 +393,10 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 hit_cells: Some(HitCells {
                     width: 17,
                     height: 12,
-                    cells: std::collections::HashMap::from([(33u32, vec![1u32])]),
+                    cells: squallar_overlays::render::rasterize::HitCellMap::from_iter([(
+                        33u32,
+                        vec![1u32],
+                    )]),
                 }),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
             },
