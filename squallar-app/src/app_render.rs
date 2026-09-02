@@ -760,6 +760,37 @@ fn prep_costs_line(c: &squallar_gpu::egui_renderer::pass_costs::PassCosts) -> St
     )
 }
 
+/// The `frame prep geometry:` running-total line — the byte side of the
+/// `buffers` phase on the line above.
+///
+/// **A different denominator from `frame prep costs:`, and the two are never
+/// divided across.** `stagings` is every `update_buffers` call, which a pass
+/// that renders a pane mirror makes twice; `passes` on the line above is
+/// every pass ended. See
+/// [`squallar_gpu::egui_renderer::pass_costs::StagedGeometry`], whose fields
+/// these are.
+///
+/// **What it is for.** `B staged` over the same reading's `us buffers and
+/// callbacks` **plus its `us mirror`** is the effective bandwidth of the
+/// staging copy — the one question that path has never been able to answer,
+/// because every other figure on it is a clock and a clock cannot tell a
+/// large copy from a slow one. Both sides are running totals, so a windowed
+/// rate is a subtraction. The mirror term is in the divisor because the
+/// mirror's staging is timed into `us mirror`, not into `us buffers and
+/// callbacks`; with the mirror off it is zero and the rate is exact, and with
+/// it on the divisor over-states the time, so the rate is a lower bound and
+/// can never make a slow copy read fast.
+///
+/// `vertices` and `indices` are the staging identity: the same picture staged
+/// by a different route must read the same two counts, so a route that is
+/// quicker because it stages less cannot pass as quicker.
+fn prep_geometry_line(g: &squallar_gpu::egui_renderer::pass_costs::StagedGeometry) -> String {
+    format!(
+        "frame prep geometry: {} stagings, {} vertices, {} indices, {} B staged",
+        g.calls, g.vertices, g.indices, g.bytes,
+    )
+}
+
 /// The `gpu passes:` line — what each bracketed pass family costs the GPU.
 ///
 /// Three denominators share this line and are never added: each family's
@@ -1496,6 +1527,12 @@ impl super::App {
         }
         if let Some(state) = self.state.as_ref() {
             say_telemetry(loud, &prep_costs_line(&state.egui_renderer.pass_costs()));
+            // Immediately after the clocks it divides into, and never added to
+            // them: a byte total and a microsecond total on two denominators.
+            say_telemetry(
+                loud,
+                &prep_geometry_line(&state.egui_renderer.staged_geometry()),
+            );
             // The GPU pass family: real figures where a probe is installed,
             // the verbatim absence where this install asked (the probe is
             // built only for keyed-loud installs) and the adapter cannot

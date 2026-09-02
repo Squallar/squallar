@@ -148,6 +148,31 @@ impl PreparedFrame {
     }
 }
 
+/// Mesh vertices, mesh indices and the bytes they occupy, over the primitives
+/// about to be handed to `update_buffers`.
+///
+/// The same fold `egui_wgpu::Renderer::update_buffers` opens with
+/// (`egui-wgpu-0.35.0/src/renderer.rs:941-958`) and the same arithmetic it
+/// sizes its staging buffers with, so the byte figure is what actually crosses
+/// into the staging buffer rather than an estimate of it.
+/// `Primitive::Callback` carries no mesh and contributes nothing.
+fn staged_geometry(tris: &[egui::ClippedPrimitive]) -> (u64, u64, u64) {
+    use egui::epaint::Primitive;
+
+    let (vertices, indices) =
+        tris.iter()
+            .fold((0u64, 0u64), |acc, clipped| match &clipped.primitive {
+                Primitive::Mesh(mesh) => (
+                    acc.0 + mesh.vertices.len() as u64,
+                    acc.1 + mesh.indices.len() as u64,
+                ),
+                Primitive::Callback(_) => acc,
+            });
+    let bytes =
+        vertices * size_of::<egui::epaint::Vertex>() as u64 + indices * size_of::<u32>() as u64;
+    (vertices, indices, bytes)
+}
+
 /// A primitive's clip rect, narrowed to whichever source rect it belongs to;
 /// `Rect::ZERO` for none — a zero-size scissor, which `Renderer::render` skips
 /// while still advancing its buffer iterators. First match, not the union: the
@@ -483,6 +508,13 @@ impl EguiRenderer {
             self.render_mirror(device, queue, &mut tris, &request);
             mirror_us = micros_between(stamp_mirror, web_time::Instant::now());
         }
+        // **Before `stamp_buffers`, and that is the whole point of the
+        // placement.** This walk is the instrument for the phase the stamp
+        // below opens; counted inside it, the byte total would inflate the
+        // very microseconds it is divided by, and a before/after on
+        // `buffers_and_callbacks_us` would be comparing two different clocks.
+        let (vertices, indices, bytes) = staged_geometry(&tris);
+        self.pass_costs.note_staged(vertices, indices, bytes);
         // `update_buffers` also dispatches every callback's `prepare` and
         // returns their command buffers; they must reach the submit.
         let stamp_buffers = web_time::Instant::now();
@@ -579,6 +611,11 @@ impl EguiRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("egui pane mirror"),
         });
+        // Counted here as well as at the frame's own call: this stages the same
+        // geometry a second time, and a byte total that missed it would divide
+        // into a `buffers` figure that did not. See `pass_costs::StagedGeometry`.
+        let (vertices, indices, bytes) = staged_geometry(tris);
+        self.pass_costs.note_staged(vertices, indices, bytes);
         // Empty in practice, but carried to the submit: dropping a callback's
         // command buffers is a silent no-render.
         let user_command_buffers =
@@ -673,6 +710,14 @@ impl EguiRenderer {
     /// What this renderer's texture uploads have moved, asked unconditionally.
     pub fn upload_totals(&self) -> texture_upload::UploadTotals {
         self.uploads.totals()
+    }
+
+    /// The geometry this renderer has handed to egui's buffer staging, asked
+    /// unconditionally. See [`pass_costs::StagedGeometry`], which also says
+    /// what its denominator is — **every `update_buffers` call**, which a
+    /// mirror pass makes twice in one pass.
+    pub fn staged_geometry(&self) -> pass_costs::StagedGeometry {
+        self.pass_costs.staged()
     }
 
     /// What ending passes has cost this renderer's frame thread, asked

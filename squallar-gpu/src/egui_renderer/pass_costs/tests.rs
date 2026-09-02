@@ -59,3 +59,38 @@ fn if_moved_answers_once_per_pass() {
         .expect("a new pass went unreported");
     assert_eq!(again.passes, 2, "the second answer lost the running total");
 }
+
+/// Staging accumulates on its own counter, with a distinct value in every
+/// position so a transposed field cannot read as correct arithmetic.
+///
+/// **Two stagings against one pass**, which is the mirror frame's shape: a
+/// pass that renders a pane mirror hands the same geometry over twice. The
+/// two counters must therefore disagree, and a byte total divided by
+/// `passes` would be wrong by exactly that factor.
+#[test]
+fn staging_counts_calls_not_passes() {
+    let mut ledger = PassCostLedger::default();
+    ledger.note(11, 23, 37, 41);
+    ledger.note_staged(100, 200, 2400);
+    ledger.note_staged(1, 2, 24);
+    let staged = ledger.staged();
+    assert_eq!(staged.calls, 2, "a staging call went uncounted");
+    assert_eq!(staged.vertices, 101);
+    assert_eq!(staged.indices, 202);
+    assert_eq!(staged.bytes, 2424);
+    assert_eq!(
+        ledger.totals().passes,
+        1,
+        "the staging counter moved the pass count; the two denominators have \
+         been merged and every rate computed from them is now wrong",
+    );
+}
+
+/// A renderer that staged nothing reads zero on the floor, so an absent
+/// figure cannot be mistaken for a cheap one.
+#[test]
+fn an_unstaged_renderer_reads_a_readable_zero() {
+    let ledger = PassCostLedger::default();
+    assert_eq!(ledger.staged(), super::StagedGeometry::default());
+    assert_eq!(ledger.staged().calls, 0);
+}

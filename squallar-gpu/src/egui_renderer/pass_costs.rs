@@ -58,6 +58,65 @@ impl PassCosts {
     }
 }
 
+/// The geometry this renderer handed to egui's buffer staging.
+///
+/// **Product telemetry, not a campaign instrument.** Always on: one walk of
+/// the primitive list — the same walk `update_buffers` makes for itself
+/// immediately afterwards — and four `u64` adds per call.
+///
+/// # Denominator, and why it is not [`PassCosts`]'s
+///
+/// **Every `update_buffers` call**, which is *not* every pass ended. A pass
+/// that renders a pane mirror stages its geometry twice
+/// (`super::EguiRenderer::render_mirror` calls `update_buffers` a second time
+/// with the same primitives), so on a mirror frame [`Self::calls`] advances
+/// by two while [`PassCosts::passes`] advances by one. The two structs are
+/// kept apart for that reason alone: a byte total divided by the wrong count
+/// is a wrong figure that still looks like a figure.
+///
+/// # What it is for
+///
+/// [`Self::bytes`] over the matching clock is the **effective bandwidth of the
+/// staging copy**, which is the question `update_buffers` has never been able
+/// to answer: every other figure on that path is a clock, and a clock cannot
+/// tell a large copy from a slow one. Both sides are running totals, so a
+/// windowed rate is a subtraction — `(bytes_b - bytes_a) / (us_b - us_a)`.
+///
+/// **The matching clock is [`PassCosts::buffers_and_callbacks_us`] plus
+/// [`PassCosts::mirror_us`], not the first alone.** The mirror's staging is
+/// timed into `mirror_us` by the caller, so a rate that divided every byte by
+/// `buffers_and_callbacks_us` would credit the mirror's bytes to the frame's
+/// own clock. With the mirror off — `mirror_us == 0`, every scene measured so
+/// far — the sum is the first term and the rate is exact. With it on,
+/// `mirror_us` brackets the whole mirror pass rather than its staging alone,
+/// so the sum over-states the time and the rate is a **lower bound**: this
+/// figure can understate the copy's speed, never overstate it, which is the
+/// safe direction for a number whose job is to catch a slow path.
+///
+/// The two counts are also the **staging identity**: any change to how this
+/// geometry reaches the GPU must leave [`Self::vertices`] and
+/// [`Self::indices`] untouched, because it is the same geometry. A staging
+/// path that is faster because it stages less is not faster.
+///
+/// # Why a zero here is readable
+///
+/// [`Self::calls`] is the non-vacuity floor: `calls == 0` is a renderer that
+/// staged nothing; `calls > 0` with `vertices == 0` is a frame whose whole
+/// picture was paint callbacks, which contribute no mesh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagedGeometry {
+    /// `update_buffers` calls counted. What makes the three totals readable.
+    pub calls: u64,
+    /// Mesh vertices handed over, summed across calls.
+    pub vertices: u64,
+    /// Mesh indices handed over, summed across calls.
+    pub indices: u64,
+    /// Bytes those vertices and indices occupy — what actually crosses into
+    /// the staging buffer. `vertices * size_of::<Vertex>() + indices * 4`,
+    /// the same arithmetic `update_buffers` sizes its staging with.
+    pub bytes: u64,
+}
+
 /// The instants [`super::EguiRenderer::end_pass_and_upload`] crossed, handed
 /// back on the [`super::PreparedFrame`] so a caller can cut **its own**
 /// prepare span at the seams this function actually has.
@@ -110,6 +169,9 @@ pub struct PassPhaseStamps {
 #[derive(Default)]
 pub(super) struct PassCostLedger {
     totals: PassCosts,
+    /// See [`StagedGeometry`] — a different denominator, kept in its own
+    /// struct so it cannot be divided by [`PassCosts::passes`] by accident.
+    staged: StagedGeometry,
     /// [`PassCosts::passes`] at the last [`Self::totals_if_moved`] answer, so
     /// an unmoved ledger costs one compare and says nothing.
     reported: u64,
@@ -135,6 +197,21 @@ impl PassCostLedger {
     /// The running totals, asked unconditionally.
     pub(super) fn totals(&self) -> PassCosts {
         self.totals
+    }
+
+    /// Count one `update_buffers` call and the geometry it was handed.
+    /// Separate from [`Self::note`] because a mirror pass stages twice within
+    /// one pass; see [`StagedGeometry`].
+    pub(super) fn note_staged(&mut self, vertices: u64, indices: u64, bytes: u64) {
+        self.staged.calls += 1;
+        self.staged.vertices += vertices;
+        self.staged.indices += indices;
+        self.staged.bytes += bytes;
+    }
+
+    /// The running staging totals, asked unconditionally.
+    pub(super) fn staged(&self) -> StagedGeometry {
+        self.staged
     }
 
     /// The running totals, only when a pass has ended since the last time

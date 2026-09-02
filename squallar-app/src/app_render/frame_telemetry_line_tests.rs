@@ -1,4 +1,4 @@
-//! The five frame timing sentences, pinned word for word — twice.
+//! The six frame telemetry sentences, pinned word for word — twice.
 //!
 //! The browser rig reads telemetry sentences out of the console ring with
 //! regexes it owns, so a sentence is an interface: an extra space is not a
@@ -15,7 +15,7 @@
 //! under test.
 
 use squallar_device_profile::hist::Hist;
-use squallar_gpu::egui_renderer::pass_costs::PassCosts;
+use squallar_gpu::egui_renderer::pass_costs::{PassCosts, StagedGeometry};
 
 /// The rig driver, read at compile time so a moved or deleted file is a
 /// build failure rather than a skipped test.
@@ -188,6 +188,27 @@ fn the_prep_costs_line_reads_exactly_as_pinned() {
     );
 }
 
+/// The prep-geometry line carries its own non-vacuity floor and three
+/// distinct totals, so a transposed field cannot read as a correct line.
+///
+/// `stagings` deliberately exceeds what a pass count would be: eleven
+/// stagings is a run in which some passes rendered a pane mirror and staged
+/// twice. A formatter that printed `passes` here instead could not pass.
+#[test]
+fn the_prep_geometry_line_reads_exactly_as_pinned() {
+    let staged = StagedGeometry {
+        calls: 11,
+        vertices: 2222,
+        indices: 3333,
+        bytes: 57_776,
+    };
+    assert_eq!(
+        super::prep_geometry_line(&staged),
+        "frame prep geometry: 11 stagings, 2222 vertices, 3333 indices, \
+         57776 B staged",
+    );
+}
+
 /// The cadence line embeds its histogram like the interact line does, with
 /// the samples in the slots the edge formula puts them: 4 000 us in
 /// geometric bin 24 (slot 25), 16 667 us in bin 32 (slot 33).
@@ -314,6 +335,21 @@ fn the_rig_reads_the_frame_lines_the_app_actually_writes() {
             &["7", "1111", "2222", "3333", "4444"],
         ),
         "the `frame prep costs:` line and the rig's probe have drifted",
+    );
+
+    let staged = StagedGeometry {
+        calls: 11,
+        vertices: 2222,
+        indices: 3333,
+        bytes: 57_776,
+    };
+    assert_eq!(
+        super::prep_geometry_line(&staged),
+        rendered(
+            &pattern("prep_geometry_re"),
+            &["11", "2222", "3333", "57776"],
+        ),
+        "the `frame prep geometry:` line and the rig's probe have drifted",
     );
 
     use squallar_gpu::gpu_probe::{GpuPassReport, ProbedPass};

@@ -2766,6 +2766,17 @@ var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) 
 var svc_idle_re = /frame service \(idle\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var segments_re = /frame segments \(interact, p99 us\): pre=(\d+|none|over), pump=(\d+|none|over), ui=(\d+|none|over), prepare=(\d+|none|over), finish=(\d+|none|over), post=(\d+|none|over); acquire n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us/;
 var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply, (\d+) us mirror, (\d+) us buffers and callbacks/;
+// The byte side of `prep_costs_re`'s `buffers` phase, on its OWN
+// denominator: `stagings` is every `update_buffers` call, which a pass
+// rendering a pane mirror makes twice, so it is never `prep.passes`.
+// `bytes_staged` over the same reading's `buffers_and_callbacks_us` PLUS its
+// `mirror_us` is the staging copy's effective bandwidth -- the mirror stages
+// on its own clock, so dividing by the first term alone credits its bytes to
+// the wrong phase. Both sides are running totals, so a windowed rate is a
+// subtraction. Mirror off: exact. Mirror on: a lower bound, never an
+// overstatement. `vertices`/`indices` are the staging
+// identity -- the same picture staged by another route reads the same two.
+var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
@@ -2825,6 +2836,7 @@ var tile_phase_re = /tile phase \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d
 var gesture_begin_re = /gesture script ([a-z0-9-]+) begin/;
 var gesture_loop_re = /gesture script ([a-z0-9-]+) loop complete: (\d+) frames/;
 var interact = null, idle = null, segments = null, prep = null, gpu = null;
+var prep_geometry = null;
 var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
@@ -2857,6 +2869,11 @@ for (var i = 0; i < C.length; i++) {
                   upload_apply_us: parseInt(x[3], 10),
                   mirror_us: parseInt(x[4], 10),
                   buffers_and_callbacks_us: parseInt(x[5], 10) };
+  x = prep_geometry_re.exec(m);
+  if (x) prep_geometry = { t: t, stagings: parseInt(x[1], 10),
+                           vertices: parseInt(x[2], 10),
+                           indices: parseInt(x[3], 10),
+                           bytes_staged: parseInt(x[4], 10) };
   x = gpu_passes_re.exec(m);
   if (x) gpu = { t: t,
                  raymarch: { n: parseInt(x[1], 10), p50: x[2], p99: x[3] },
@@ -2933,6 +2950,7 @@ for (var j = 0; j < marks_src.length; j++) {
   if (y) loops.push({ t: mt, script: y[1], frames: parseInt(y[2], 10) });
 }
 return { interact: interact, idle: idle, segments: segments, prep: prep,
+         prep_geometry: prep_geometry,
          gpu: gpu, gpu_unavailable: gpu_unavailable, cadence: cadence,
          loop_state: loop_state, loop_state_all: loop_state_all,
          interact_all: interact_all, idle_all: idle_all,
