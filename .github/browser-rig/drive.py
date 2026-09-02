@@ -3593,14 +3593,27 @@ def _window_stats(watcher, t0, t1, out):
     return out
 
 
+# Every windowed named family the SUMMARY prints, by key prefix. The window
+# itself is built off `watcher.named_families()`, which is unfiltered -- so a
+# prefix missing from here does not lose the data, it makes the data INVISIBLE
+# to anyone reading stdout while the artifact quietly carries it. `prepare:`
+# was missing from the day the prepare split landed, and `dispatch:` would
+# have been missing from the day the dispatch split did.
+#
+# Keep this list equal to the set of families the app can emit. A family the
+# arm never produced still has no key, so an absent arm stays an ABSENCE and
+# not a zero -- that property is the dict's, not this list's.
+WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
+                          "take:", "phase:")
+
+
 def watcher_named_in(gw):
-    """The `segment:*` / `take:*` keys a finished gesture-window dict carries,
-    in a stable order. Read off the result rather than off a fixed list, so a
+    """The named-family keys a finished gesture-window dict carries, in a
+    stable order. Read off the result rather than off a fixed list, so a
     family the arm never produced is an ABSENCE and not a zero."""
     return sorted(k for k in (gw or {})
                   if isinstance(k, str)
-                  and (k.startswith("segment:") or k.startswith("take:")
-                       or k.startswith("phase:") or k.startswith("post:")))
+                  and k.startswith(WINDOW_FAMILY_PREFIXES))
 
 
 def _window_mean_us(a, b):
