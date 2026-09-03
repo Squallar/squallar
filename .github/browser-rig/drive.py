@@ -7018,10 +7018,26 @@ def run_smoke(args):
     # pooled across browsers, for the same reason the per-kind medians are not.
     tb = result.get("transport_bytes")
     if tb:
+        # Every field the pattern reads is printed. A figure parsed into the
+        # artifact and left out of the summary is not "less visible" -- it is
+        # INVISIBLE to whoever runs the leg and reads stdout, which is how a
+        # leg gets run, read, and believed to have measured nothing. That is
+        # the same defect this file already carried once in
+        # `watcher_named_in`, where two whole windowed cut families never
+        # printed; keep the regex, the consumer and this line in step.
+        #
+        # `us encoding` / `us posting` split the overlay job hand-off, which
+        # measured 73-96% of the web dispatch cut: encoding is the page's own
+        # CPU in `JobRequest::to_bytes` on the frame thread, posting is the
+        # browser's `postMessage`. CUMULATIVE FROM BOOT, unlike the windowed
+        # families -- boot traffic is in them, so they are a ratio to read and
+        # not a windowed cost. Measured 2026-09-02: 99.3% / 98.7% encoding.
         print("[%s] SUMMARY transport: %s replies, %s B out with %s B copied "
-              "out of the worker, %s B in with %s B copied out of the page"
+              "out of the worker, %s B in with %s B copied out of the page, "
+              "%s us encoding, %s us posting (cumulative from boot)"
               % (tag, tb.get("replies"), tb.get("out_moved"),
-                 tb.get("out_copied"), tb.get("in_moved"), tb.get("in_copied")))
+                 tb.get("out_copied"), tb.get("in_moved"), tb.get("in_copied"),
+                 tb.get("encode_us"), tb.get("post_us")))
     ovr = result.get("overlay_rasters")
     if ovr is not None:
         print("[%s] SUMMARY overlay rasters: %s%s"

@@ -102,3 +102,55 @@ fn the_transport_pattern_has_no_optional_groups() {
         );
     }
 }
+
+/// The `SUMMARY transport:` printer in drive.py, as one folded line.
+fn summary_printer() -> String {
+    let at = DRIVE
+        .find(r#"print("[%s] SUMMARY transport: %s replies"#)
+        .expect("drive.py no longer prints a transport summary");
+    let rest = &DRIVE[at..];
+    let end = rest.find("))").expect("the print call is unterminated");
+    rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **Every figure the rig PARSES, the rig also PRINTS.**
+///
+/// This gate exists because its absence already cost a measurement. The two
+/// timing fields were added to the regex and to its consumer and not to the
+/// summary, so they reached the artifact and never reached stdout — and the
+/// author of that change had, hours earlier the same day, fixed the identical
+/// defect elsewhere in this file (`watcher_named_in`, where two whole windowed
+/// cut families were computed and never printed).
+///
+/// A figure parsed and not printed is not "less visible". It is invisible to
+/// whoever runs the leg, and indistinguishable from a figure the app never
+/// emitted.
+///
+/// # What this deliberately does NOT cover, and why that is not an oversight
+///
+/// It counts `%s` in the format string, not the arguments supplied to it. A
+/// summary that keeps a `%s` and drops its argument is therefore invisible
+/// here — and it does not need to be caught here, because **Python raises**:
+/// `"%s %s" % ("a",)` is `TypeError: not enough arguments for format string`,
+/// and the reverse is `not all arguments converted`. Verified, not assumed.
+/// A leg would die loudly on the first summary it printed. The gap this test
+/// exists to close is the SILENT one: a field the pattern reads and the
+/// sentence never mentions, which no interpreter can see.
+#[test]
+fn every_transport_figure_the_rig_reads_is_also_printed() {
+    let printed = summary_printer();
+    let read = transport_re().matches(r"(\d+)").count();
+    let written = printed.matches("%s").count() - 1; // the leading `[%s]` tag
+    assert_eq!(
+        written, read,
+        "the rig reads {read} transport figures and prints {written}; a field \
+         was added to the pattern and not to the summary, so it reaches the \
+         artifact and never reaches stdout: {printed}",
+    );
+    for label in ["us encoding", "us posting"] {
+        assert!(
+            printed.contains(label),
+            "the transport summary does not print {label:?}: {printed}",
+        );
+    }
+}
