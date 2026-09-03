@@ -5,6 +5,11 @@ edition.workspace = true
 
 [dependencies]
 web-time = { workspace = true }
+# One copy per grid row instead of one call per value in `encode_f32s`, safely:
+# `f32` and `u8` are both `Pod`, so `cast_slice` needs no `unsafe`. Already in
+# this package's graph (wgpu pulls it), so the line adds no compiled package.
+bytemuck = "1"
+
 chrono = { workspace = true }
 flate2 = { workspace = true }
 # Keep this pin local: Cargo ignores a member's `default-features = false` when

@@ -688,11 +688,35 @@ fn flag(byte: u8) -> Option<bool> {
 }
 
 /// A row of `f32`s, little-endian, straight off the grid's own storage.
+/// **The job wire is little-endian by definition** — [`decode_f32s`] reads
+/// `f32::from_le_bytes` — and every target this ships to is little-endian, so
+/// an `f32` slice's own bytes ARE its wire form. A big-endian target would
+/// need a byte swap and this encoder would silently write the wrong bytes, so
+/// the build refuses there rather than guessing. Compile-time, and a
+/// `cfg!` in a body would be the forbidden behaviour fork.
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "the job wire is little-endian; a big-endian target needs a swapping f32 encoder",
+);
+
+/// Every value of a grid row in ONE copy.
+///
+/// This was a loop calling `extend_from_slice` with four bytes per value, and
+/// a gridded overlay job carries a window of them: MRMS and GMGSI both ride
+/// the `overlay/model` row, and one scene D leg moved **185.6 MB page->worker
+/// at an aggregate 3.3 GB/s** where a copy runs several times that. Measured
+/// 2026-09-02: `JobRequest::to_bytes` is **99.3 % (Firefox) / 98.7 %
+/// (Chromium)** of the overlay job hand-off, and that hand-off is 73-96 % of
+/// the web dispatch cut — all of it on the frame thread.
+///
+/// `cast_slice` is safe and total here: `f32` and `u8` are both `Pod`, the
+/// target alignment falls from 4 to 1, and the length is exact.
+/// Byte-for-byte identical to what the loop wrote, which
+/// `the_bulk_f32_encoding_is_byte_identical_to_the_value_at_a_time_form` pins
+/// over the values that would break a lazier equivalence — NaN, both
+/// infinities, negative zero and a subnormal.
 fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
-    out.reserve(values.len() * 4);
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
+    out.extend_from_slice(bytemuck::cast_slice(values));
 }
 
 /// The inverse of [`encode_f32s`] over exactly `count` values: `None` on a
@@ -1149,6 +1173,69 @@ impl HatchWire {
 
 #[cfg(test)]
 mod tests {
+    /// **The bulk encoding writes exactly what the value-at-a-time loop wrote.**
+    ///
+    /// The loop is kept here as the reference rather than deleted: an
+    /// optimisation of a WIRE FORMAT is only correct if it is invisible on the
+    /// wire, and "invisible" is a claim about bytes, not about intent. The
+    /// values are chosen to break a lazier equivalence — a NaN (whose bit
+    /// pattern a float comparison would call unequal to itself), both
+    /// infinities, negative zero (which `==` calls equal to positive zero, so
+    /// only the bytes can tell them apart) and a subnormal.
+    #[test]
+    fn the_bulk_f32_encoding_is_byte_identical_to_the_value_at_a_time_form() {
+        fn reference(values: &[f32]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for v in values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }
+        let values = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN,
+            f32::MAX,
+            f32::EPSILON,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(0x0000_0001), // subnormal
+            f32::from_bits(0x7FC0_0001), // a quiet NaN with a payload
+            35.7,
+            -122.4,
+        ];
+        // Whole slice, and every prefix: a bulk copy that mishandled a length
+        // would still pass on one convenient size.
+        for take in 0..=values.len() {
+            let slice = &values[..take];
+            let mut bulk = Vec::new();
+            super::encode_f32s(&mut bulk, slice);
+            assert_eq!(
+                bulk,
+                reference(slice),
+                "bulk encoding differs from the value-at-a-time form at len {take}",
+            );
+            assert_eq!(bulk.len(), take * 4, "wrong byte count at len {take}");
+        }
+    }
+
+    /// The round trip still closes: what the fast encoder writes, the decoder
+    /// reads back bit-for-bit. `to_bits` because `NAN != NAN`.
+    #[test]
+    fn the_bulk_encoded_values_decode_back_to_the_same_bits() {
+        let values = [f32::NAN, -0.0f32, f32::INFINITY, 1.5, f32::from_bits(1)];
+        let mut buf = Vec::new();
+        super::encode_f32s(&mut buf, &values);
+        let mut r = squallar_source::wire::Reader::new(&buf);
+        let back = super::decode_f32s(&mut r, values.len()).expect("decodes");
+        let got: Vec<u32> = back.iter().map(|v| v.to_bits()).collect();
+        let want: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got, want);
+    }
+
     use super::*;
     use crate::nws::alert::AlertCategory;
     use crate::render::rasterize::{

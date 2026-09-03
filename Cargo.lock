@@ -4847,6 +4847,7 @@ dependencies = [
 name = "squallar-overlays"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "chrono",
  "flate2",
  "futures",
