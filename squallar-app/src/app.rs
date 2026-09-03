@@ -1707,6 +1707,9 @@ impl App {
     /// This pane is holding nothing, on the host **and** on the GPU.
     fn handle_release_volume(&mut self, pane_idx: usize) {
         self.volume_store.release(pane_idx);
+        if let Some(painter) = self.volume_painter.as_ref() {
+            painter.forget_pane_picture(pane_idx);
+        }
         let live = self.volume_store.live_ids();
         if let Some(state) = self.state.as_mut()
             && let Some(resources) = state

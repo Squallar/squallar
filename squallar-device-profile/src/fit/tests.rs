@@ -133,6 +133,9 @@ fn every_term_is_the_cost_function_it_reuses() {
             .fit(HD, b.offscreen_bytes, GroundPass::Off)
             .bytes() as u64,
     );
+    // `HD` here is a pane's own size, not a window's: the application reports
+    // each 3D pane at what the painter last fitted its offscreen from, so a
+    // pane this large is a lone pane filling the window.
     assert_eq!(
         volume.offscreens,
         1920 * 1080 * 4,
@@ -285,7 +288,10 @@ fn the_same_scene_costs_the_same_bytes_on_every_bracket() {
     );
 
     // A 3D pane's grid is priced at the bracket's cell budget, a resolution
-    // constant, by the one pricer.
+    // constant, by the one pricer. `HD` is the pane's own size — the figure
+    // the application reports is the pane's, never the window's — and it is
+    // the same figure on every bracket, which is what keeps the offscreen
+    // difference below a pure resolution-rung ratio.
     let volume = scene_of(vec![volume_pane(HD, GroundPass::Off)]);
     for (b, cells) in [
         (&desktop, DESKTOP_VOLUME_GRID_CELLS),
@@ -1030,5 +1036,54 @@ fn the_tile_allowance_follows_the_economy_on_the_measured_arm_and_the_bracket_ot
             && inside.styled_bytes < limits.tile_styled_bytes.ceiling as u64,
         "fixture: the styled share must land strictly inside the bracket to prove the \
          arithmetic, not a clamp: {inside:?}"
+    );
+}
+
+/// **A pane is priced at its own size, not the window's.** Six 3D panes on a
+/// 1920 x 1080 window are six 640 x 540 offscreens, which together cost what
+/// one window-sized offscreen does; priced at the window they cost six times
+/// that. With ground on, the window figure takes the `Half` rung that no
+/// pane-sized offscreen needs — the ladder stepping down for a scene that
+/// never asked it to.
+#[test]
+fn six_pane_sized_offscreens_cost_a_sixth_of_six_window_sized_ones() {
+    let b = desktop();
+    assert_eq!(
+        b.offscreen_bytes,
+        20 * MIB as usize,
+        "fixture: the class rung"
+    );
+    let offscreens = |scene: Scene| need_terms(&scene, &b, stand_in_grid_bytes).offscreens;
+    const PANE: [u32; 2] = [640, 540];
+
+    let pane_priced = offscreens(scene_of(vec![volume_pane(PANE, GroundPass::Off); 6]));
+    let window_priced = offscreens(scene_of(vec![volume_pane(HD, GroundPass::Off); 6]));
+    assert_eq!(pane_priced, 6 * 640 * 540 * 4);
+    assert_eq!(pane_priced, 8_294_400);
+    assert_eq!(window_priced, 6 * 1920 * 1080 * 4);
+    assert_eq!(window_priced, 49_766_400);
+    assert_eq!(window_priced - pane_priced, 41_472_000);
+
+    let grounded = offscreens(scene_of(vec![volume_pane(PANE, GroundPass::On); 6]));
+    assert_eq!(
+        grounded,
+        6 * 640 * 540 * 16,
+        "six native pane-sized grounds"
+    );
+    assert_eq!(grounded, 33_177_600);
+    assert_eq!(
+        b.quality_ceiling
+            .fit(PANE, b.offscreen_bytes, GroundPass::On)
+            .quality
+            .resolution,
+        ResolutionRung::Native,
+    );
+    assert_eq!(
+        b.quality_ceiling
+            .fit(HD, b.offscreen_bytes, GroundPass::On)
+            .quality
+            .resolution,
+        ResolutionRung::Half,
+        "the window figure with ground takes a rung a pane-sized one never needs",
     );
 }

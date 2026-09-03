@@ -1322,6 +1322,11 @@ not call up into it"; `PaneNeed` carries `looping` and the pane's measured
 planned by a crate this one cannot see and pricing it as a radar frame is the
 4.6× under-price on wasm the pool's own tests refuse; and `fit` takes the
 `DeviceProfile` (whose `limits` it reads) so that it starts from `resolve`.
+`PaneNeed::px` and `ground` are what the volume painter last fitted the pane's
+offscreen from — the pane's own size and the ground pass it decided, read off
+the painter the app owns — so six 3D panes price six pane-sized offscreens
+(8,294,400 bytes on a 1920 × 1080 window, not the 49,766,400 six window-sized
+ones cost); the window's size stands in only until the first fit.
 
 **The allowance rule.** `Capacity::allowance()` is `NEED_FRACTION × gpu_bytes`
 for a **measured or probed** figure — raw hardware, needing headroom for the

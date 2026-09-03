@@ -4029,12 +4029,12 @@ impl super::App {
             advance_us: 0,
             ..crate::loop_telemetry::LoopState::default()
         };
-        // Every pane is priced at the window's own size. The offscreen a 3D
-        // pane raymarches into is held to the offscreen budget whatever size
-        // goes in, so a whole-window figure over-prices a split pane by at
-        // most that budget and never under-prices one. `[0, 0]` before a
+        // The window's size, which stands in for a 3D pane the painter has
+        // not fitted an offscreen for yet. The offscreen is held to the
+        // offscreen budget whatever size goes in, so the stand-in over-prices
+        // by at most that budget and never under-prices. `[0, 0]` before a
         // surface exists.
-        let px = self.state.as_ref().map_or([0, 0], |state| {
+        let window_px = self.state.as_ref().map_or([0, 0], |state| {
             [state.surface_config.width, state.surface_config.height]
         });
         let mut scene = Scene {
@@ -4062,6 +4062,18 @@ impl super::App {
             }
             counts.count_pane(pane);
             let view = pane.render_view();
+            // A 3D pane's offscreen is priced at what the painter last fitted
+            // it from: the pane's own size and the ground pass it decided,
+            // read off the painter this walk owns rather than off the Gui.
+            // Nothing is sized from a 2D pane's figure.
+            let (px, ground) = match view {
+                squallar_radar::types::RenderView::Volume => self
+                    .volume_painter
+                    .as_ref()
+                    .and_then(|painter| painter.pane_picture(pane_idx))
+                    .map_or((window_px, GroundPass::Off), |p| (p.px, p.ground)),
+                _ => ([0, 0], GroundPass::Off),
+            };
             let mut pane_need = PaneNeed {
                 px,
                 view,
@@ -4070,10 +4082,7 @@ impl super::App {
                 cadence_secs: None,
                 overlay_frame_bytes: 0,
                 volume_grids: usize::from(view == squallar_radar::types::RenderView::Volume),
-                // The terrain ground pass is decided by the volume bridge from
-                // the height field it holds, which this walk cannot see; the
-                // offscreen term is held to the offscreen budget either way.
-                ground: GroundPass::Off,
+                ground,
                 // No production caller dispatches a `BuildingMeshJob` yet, so
                 // no pane spends the prism row.
                 buildings: false,
@@ -6695,3 +6704,9 @@ pub(super) fn pump_dispatch_overlay_loop_renders(
 #[path = "app_render/idle_raster_tests.rs"]
 #[cfg(test)]
 mod idle_raster_tests;
+
+/// A 3D pane is priced at the size and ground pass the painter last fitted
+/// its offscreen from, not at the window's.
+#[path = "app_render/pane_need_px_tests.rs"]
+#[cfg(test)]
+mod pane_need_px_tests;

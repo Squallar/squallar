@@ -554,6 +554,23 @@ pub struct BridgeVolumePainter {
     /// The largest floor magnification any pane reported since this was last
     /// taken — what the adaptive mirror rung is chosen from.
     floor_demand: std::sync::atomic::AtomicU32,
+    /// What each pane's offscreen was last fitted from, by pane index: the
+    /// size the frame reported and the ground pass the fit priced. Written
+    /// by [`VolumePainter::paint`] beside the fit itself, so the application,
+    /// which owns this painter and cannot see the frame, prices a pane's
+    /// offscreen at the figures the painter used and not at the window's.
+    pictures: Mutex<HashMap<usize, PanePicture>>,
+}
+
+/// What one 3D pane's offscreen was fitted from on its last paint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanePicture {
+    /// The pane's size in physical pixels as the frame reported it, before any
+    /// quality rung was applied — `VolumeFrameState::size_px`.
+    pub px: [u32; 2],
+    /// The ground pass the fit priced, decided from the height field the
+    /// bridge holds for the pane's drawn box.
+    pub ground: GroundPass,
 }
 
 /// The bit pattern [`BridgeVolumePainter::floor_demand`] holds when no pane
@@ -573,7 +590,34 @@ impl BridgeVolumePainter {
             offscreen_bytes,
             probed,
             floor_demand: std::sync::atomic::AtomicU32::new(NO_FLOOR_DEMAND),
+            pictures: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// What `pane_idx`'s offscreen was fitted from on its last paint, or
+    /// `None` for a pane this painter has not fitted one for — every 2D pane,
+    /// a 3D pane whose grid has not landed, and a pane released since.
+    pub fn pane_picture(&self, pane_idx: usize) -> Option<PanePicture> {
+        self.pictures().get(&pane_idx).copied()
+    }
+
+    /// Record what `pane_idx`'s offscreen was just fitted from. The write
+    /// [`VolumePainter::paint`] makes beside the fit; public so the owner can
+    /// stand a frame in where no paint has run.
+    pub fn note_pane_picture(&self, pane_idx: usize, px: [u32; 2], ground: GroundPass) {
+        self.pictures().insert(pane_idx, PanePicture { px, ground });
+    }
+
+    /// Drop `pane_idx`'s record — the twin of `VolumeResources::release_pane`,
+    /// so a pane that has given its offscreen back is not still priced for it.
+    pub fn forget_pane_picture(&self, pane_idx: usize) {
+        self.pictures().remove(&pane_idx);
+    }
+
+    fn pictures(&self) -> std::sync::MutexGuard<'_, HashMap<usize, PanePicture>> {
+        self.pictures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The frame's floor magnification demand, clearing it for the next frame.
@@ -693,6 +737,10 @@ impl VolumePainter for BridgeVolumePainter {
                 GroundPass::Off
             },
         );
+        // What the fit was fed, kept for the owner's pricing — see
+        // `pane_picture`. The ground is read back off the fit rather than
+        // re-decided, for the reason `FittedOffscreen` carries it.
+        self.note_pane_picture(frame.pane_idx, frame.size_px, fitted.ground);
         let aspect = fitted.size[0] as f32 / fitted.size[1] as f32;
         let Some(view) = view_for(frame.camera, box_size_km, aspect) else {
             // Reached by a pane collapsed to nothing by a divider drag, and by a

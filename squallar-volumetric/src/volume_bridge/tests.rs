@@ -1731,3 +1731,74 @@ fn the_ground_pass_is_turned_on_by_a_placeable_field_and_by_nothing_else() {
          the flat lid out, and a hand-set pair does neither",
     );
 }
+
+/// **The fit's inputs are recorded beside the fit**, so the owner of this
+/// painter prices a pane's offscreen at the size and ground pass the painter
+/// used rather than at the window's. No headless test reaches the fit — see
+/// `the_guards_paint_cannot_be_tested_through_are_still_in_it` — so the write
+/// is pinned in the source, on the call the ground-pass test pins, and before
+/// anything else is derived from the fit.
+#[test]
+fn the_fit_records_what_it_was_fed_for_the_owner_to_price() {
+    let source = include_str!("../volume_bridge.rs");
+    let start = source
+        .find("        let fitted = self.quality.fit(")
+        .expect("the offscreen fit is no longer where this test looks for it");
+    let after = &source[start..];
+    let after = &after[after.find(");").expect("the fit call has no end") + 2..];
+    let note = after
+        .find("self.note_pane_picture(frame.pane_idx, frame.size_px, fitted.ground);")
+        .expect(
+            "`paint` no longer records what the fit was fed. Without it the \
+             application prices every 3D pane at the window's size and no \
+             ground pass, which is six window-sized offscreens for six panes",
+        );
+    let aspect = after
+        .find("let aspect = fitted.size")
+        .expect("the aspect is no longer derived from the fit");
+    assert!(
+        note < aspect,
+        "the record is written after the fit's result is already in use",
+    );
+}
+
+/// A pane's record is what the last paint wrote, says nothing about another
+/// pane, and is gone once the pane is forgotten.
+#[test]
+fn a_pane_picture_is_held_until_the_pane_is_forgotten() {
+    let painter = BridgeVolumePainter::new(
+        Arc::new(VolumeStore::new()),
+        VolumeQuality::BEST,
+        20 * 1024 * 1024,
+        VolumeSupport::Supported,
+    );
+    assert_eq!(painter.pane_picture(0), None, "nothing before a paint");
+    painter.note_pane_picture(0, [640, 540], GroundPass::On);
+    assert_eq!(
+        painter.pane_picture(0),
+        Some(PanePicture {
+            px: [640, 540],
+            ground: GroundPass::On,
+        }),
+    );
+    assert_eq!(
+        painter.pane_picture(1),
+        None,
+        "one pane's record says nothing about another"
+    );
+    painter.note_pane_picture(0, [1920, 1000], GroundPass::Off);
+    assert_eq!(
+        painter.pane_picture(0),
+        Some(PanePicture {
+            px: [1920, 1000],
+            ground: GroundPass::Off,
+        }),
+        "a later paint overwrites the earlier record",
+    );
+    painter.forget_pane_picture(0);
+    assert_eq!(
+        painter.pane_picture(0),
+        None,
+        "a released pane is not priced"
+    );
+}

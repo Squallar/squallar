@@ -45,8 +45,12 @@ impl Scene {
 /// One pane, in the terms the cost functions price.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneNeed {
-    /// The pane's size in physical pixels — the offscreen a 3D pane raymarches
-    /// into is sized from it. `[0, 0]` before a surface exists.
+    /// What a 3D pane's offscreen is fitted from: the pane's own size in
+    /// physical pixels as the painter was last told it, or the window's until
+    /// the painter has fitted one for the pane — a stand-in that over-prices
+    /// by at most the offscreen budget and never under-prices. `[0, 0]` for a
+    /// 2D pane, none of whose terms is sized from it, and before a surface
+    /// exists.
     pub px: [u32; 2],
     /// Which kind of picture the pane draws.
     pub view: RenderView,
@@ -71,7 +75,8 @@ pub struct PaneNeed {
     /// 3D pane, none for a 2D one. A second pane orbiting the same volume adds
     /// none — the grids live in one store keyed by target.
     pub volume_grids: usize,
-    /// Whether a 3D pane's offscreen carries the ground pass's attachments.
+    /// Whether a 3D pane's offscreen carries the ground pass's attachments —
+    /// the pass the painter decided on its last fit, `Off` until it has.
     pub ground: GroundPass,
     /// Whether the pane draws 3D buildings: prism geometry fitted inside
     /// `Budgets::prism_vram_bytes` and priced at that ceiling. `false` until a
