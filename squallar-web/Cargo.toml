@@ -67,6 +67,12 @@ log = { workspace = true }
 # wasm-bindgen into the graph at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 squallar-app = { workspace = true }
+# `worker_port` times the two halves of a job hand-off -- the `to_bytes` encode
+# and the `postMessage` -- and `std::time::Instant` panics on wasm32. Named
+# directly for `squallar-overlays`' reason below: the crate is already in this
+# package's graph via squallar-app, so the line adds no compiled package
+# (274 before and after, `cargo tree --target wasm32-unknown-unknown`).
+web-time = { workspace = true }
 # `nws::zone_pack_source`, to name where the NWS zone pack is served from --
 # only the browser knows the origin the app was served from, so only this crate
 # can resolve the asset URL. Named directly rather than gated behind a

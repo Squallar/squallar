@@ -360,7 +360,7 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
     // copied out by now, and the worker is holding multiple MiB until it hears
     // so. Releasing after the delivery would hold them across it for no reason.
     release_to_worker(worker, loan);
-    account(moved, copied_at_worker, 0, 0);
+    account(moved, copied_at_worker, 0, 0, 0, 0);
 
     // `None` still delivers: the caller's slot is released either way.
     offload::deliver_encoded_reply(id as u64, reply);
@@ -406,6 +406,19 @@ struct Traffic {
     /// Of [`Self::in_moved`], how much this page copied out of its own memory
     /// to hand over, rather than lending in place.
     in_copied: u64,
+    /// Whole microseconds this page has spent in `JobRequest::to_bytes`, on the
+    /// FRAME THREAD, encoding requests for the worker. Cumulative.
+    ///
+    /// Split from [`Self::post_us`] because the two are different problems with
+    /// different fixes and the cut that contains them was measured holding
+    /// 73-96% of the web overlay dispatch: encoding is this page's own CPU and
+    /// answers to a smaller or lazier wire format, while posting is the
+    /// browser's and answers to sending less or sending it elsewhere. A single
+    /// figure over the pair names neither.
+    encode_us: u64,
+    /// Whole microseconds spent in `postMessage` itself, cumulative. See
+    /// [`Self::encode_us`].
+    post_us: u64,
 }
 
 impl Traffic {
@@ -415,6 +428,8 @@ impl Traffic {
         out_copied: 0,
         in_moved: 0,
         in_copied: 0,
+        encode_us: 0,
+        post_us: 0,
     };
 }
 
@@ -427,7 +442,19 @@ impl Traffic {
 /// `out_copied` would climb — and so that a transport that moved NOTHING
 /// cannot satisfy it either, because the assertion also requires `out_moved`
 /// to be positive.
-fn account(out_moved: usize, out_copied: usize, in_moved: usize, in_copied: usize) {
+/// Whole microseconds from `a` to `b`, saturating.
+fn us(a: web_time::Instant, b: web_time::Instant) -> u64 {
+    b.duration_since(a).as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn account(
+    out_moved: usize,
+    out_copied: usize,
+    in_moved: usize,
+    in_copied: usize,
+    encode_us: u64,
+    post_us: u64,
+) {
     let totals = TRAFFIC.with(|traffic| {
         let mut totals = traffic.get();
         if out_moved > 0 || out_copied > 0 {
@@ -437,17 +464,21 @@ fn account(out_moved: usize, out_copied: usize, in_moved: usize, in_copied: usiz
         totals.out_copied += out_copied as u64;
         totals.in_moved += in_moved as u64;
         totals.in_copied += in_copied as u64;
+        totals.encode_us += encode_us;
+        totals.post_us += post_us;
         traffic.set(totals);
         totals
     });
     log::info!(
         "transport: {} replies, {} B out with {} B copied out of the worker, \
-         {} B in with {} B copied out of this page",
+         {} B in with {} B copied out of this page, {} us encoding, {} us posting",
         totals.replies,
         totals.out_moved,
         totals.out_copied,
         totals.in_moved,
         totals.in_copied,
+        totals.encode_us,
+        totals.post_us,
     );
 }
 
@@ -474,7 +505,9 @@ impl JobSink for Port {
         proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
         proto::set_loan(&message, crate::shared_loan::NO_LOAN);
 
+        let encode_start = web_time::Instant::now();
         let bytes = request.to_bytes();
+        let encode_us = us(encode_start, web_time::Instant::now());
         let moved = bytes.len();
         let transfer = js_sys::Array::new();
         let (loan, copied) = match crate::shared_loan::lend(vec![bytes]) {
@@ -494,9 +527,21 @@ impl JobSink for Port {
                 (crate::shared_loan::NO_LOAN, moved)
             }
         };
-        account(0, 0, moved, copied);
+        // The post is hoisted out of the `match` so this call's own encode and
+        // post figures reach `account` on the line it writes, rather than
+        // trailing a dispatch behind into the next one.
+        let post_start = web_time::Instant::now();
+        let posted = self.worker.post_message_with_transfer(&message, &transfer);
+        account(
+            0,
+            0,
+            moved,
+            copied,
+            encode_us,
+            us(post_start, web_time::Instant::now()),
+        );
 
-        match self.worker.post_message_with_transfer(&message, &transfer) {
+        match posted {
             Ok(()) => Ok(()),
             Err(e) => {
                 // The funnel runs the job here instead; `onerror` retires a dead worker.

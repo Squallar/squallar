@@ -2687,7 +2687,7 @@ var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
 // TOTALS, so the newest line is the whole answer and an older one is a prefix
 // of it. Scanning forward and overwriting is what makes that true.
-var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page/;
+var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting/;
 // The two raster-telemetry lines, written once a frame by
 // `App::report_raster_telemetry` and only on a frame where something moved.
 // Running totals, so the LAST match wins here for the same reason it does for
@@ -2821,7 +2821,14 @@ for (var i = 0; i < C.length; i++) {
                         out_moved: parseInt(tm[2], 10),
                         out_copied: parseInt(tm[3], 10),
                         in_moved: parseInt(tm[4], 10),
-                        in_copied: parseInt(tm[5], 10) };
+                        in_copied: parseInt(tm[5], 10),
+                        // The two halves of the overlay dispatch's hand-off,
+                        // cumulative us on the FRAME THREAD. Never added to
+                        // each other's bytes and never to any frame segment:
+                        // these are a SUBSET of `frame dispatch (offload)`,
+                        // which is itself a cut of `frame post (dispatch)`.
+                        encode_us: parseInt(tm[6], 10),
+                        post_us: parseInt(tm[7], 10) };
   var rm2 = rasters_re.exec(m);
   if (rm2) rasters = { dispatched: parseInt(rm2[1], 10),
                        arrived: parseInt(rm2[2], 10),
