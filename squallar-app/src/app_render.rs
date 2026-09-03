@@ -4481,12 +4481,15 @@ impl super::App {
             squallar_source::id::LayerId,
             squallar_source::time::FrameStamp,
         )> = Vec::new();
-        // Frames whose **granule** is missing, as `(pane, layer, instant)`.
+        // Frames whose **granule** is missing, as `(pane, layer, stamp)`.
         // Filled by the same walk and spent below, after the render asks: a
         // frame that can be drawn now is worth more than one that has to
         // travel first.
-        let mut owed_data: Vec<(usize, squallar_source::id::LayerId, chrono::NaiveDateTime)> =
-            Vec::new();
+        let mut owed_data: Vec<(
+            usize,
+            squallar_source::id::LayerId,
+            squallar_source::time::FrameStamp,
+        )> = Vec::new();
         {
             let (panes, overlays) = self.gui.visible_panes_and_overlays_mut();
             for (pane_idx, pane) in panes.iter_mut().enumerate() {
@@ -4568,7 +4571,30 @@ impl super::App {
                             // described a job off it. Both are the same
                             // question — ask again — and neither used to be
                             // asked at all.
-                            owed_data.push((pane_idx, id.clone(), frame.timestamp));
+                            //
+                            // Asked for as the stamp the LISTING named, run
+                            // and all, not one rebuilt from the instant: the
+                            // layer is not holding this frame, so its own
+                            // stamp is not there to take, and the listing is
+                            // the answer this slot was chosen from. A model
+                            // layer's `fetch_frame` declines a stamp with no
+                            // run, so a bare instant would leave the frame
+                            // owed for the life of the loop. The bare instant
+                            // is the fallback for a listing that does not
+                            // name it, which is what every observed layer's
+                            // stamp is anyway.
+                            let stamp = ls
+                                .listing
+                                .as_ref()
+                                .and_then(|listing| {
+                                    listing.frames.iter().find(|s| s.valid == frame.timestamp)
+                                })
+                                .copied()
+                                .unwrap_or(squallar_source::time::FrameStamp {
+                                    valid: frame.timestamp,
+                                    run: None,
+                                });
+                            owed_data.push((pane_idx, id.clone(), stamp));
                             continue;
                         };
                         asks.push((pane_idx, id.clone(), *stamp));
@@ -4630,9 +4656,21 @@ impl super::App {
     ///
     /// The layer still has the last word: `fetch_frame` answers `None` for a
     /// stamp no listing of its own named and for one it already holds.
+    ///
+    /// **The ask carries the whole stamp, run included.** The marks and the
+    /// ladder are keyed on the instant alone — a pane's frames never share
+    /// one — but the fetch is not: a model layer's frame is `(run, hour)`, its
+    /// `fetch_frame` resolves the run off the stamp and answers `None`
+    /// without one, so a re-ask built from the bare instant was declined
+    /// every pass and the frame stayed owed for the life of the loop. The
+    /// caller takes the stamp from the listing the frame was chosen from.
     fn refetch_owed_loop_frames(
         &mut self,
-        owed: Vec<(usize, squallar_source::id::LayerId, chrono::NaiveDateTime)>,
+        owed: Vec<(
+            usize,
+            squallar_source::id::LayerId,
+            squallar_source::time::FrameStamp,
+        )>,
     ) {
         // Over the WHOLE owed set, before any of it is spent: a ladder is
         // dropped the moment its frame stops being owed, and doing that as the
@@ -4642,12 +4680,13 @@ impl super::App {
             chrono::NaiveDateTime,
         )> = owed
             .iter()
-            .map(|(_, id, valid)| (id.clone(), *valid))
+            .map(|(_, id, stamp)| (id.clone(), stamp.valid))
             .collect();
         self.render.retain_loop_frame_retries(&still_owed);
 
         let config = self.fetch_config();
-        for (pane_idx, id, valid) in owed {
+        for (pane_idx, id, stamp) in owed {
+            let valid = stamp.valid;
             // The two guards below come first on purpose: a pass on which the
             // pane cannot draw this layer, or on which the granule is already
             // travelling, is not a pass this frame sat out, and burning a rung
@@ -4660,7 +4699,6 @@ impl super::App {
             if !self.render.loop_frame_retry_due(&id, valid) {
                 continue;
             }
-            let stamp = squallar_source::time::FrameStamp { valid, run: None };
             let task = self
                 .with_layer_pane(pane_idx, &id, |overlays, pane_ref| {
                     overlays.fetch_frame(&id, &config, pane_ref, &stamp)

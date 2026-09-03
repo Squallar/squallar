@@ -84,10 +84,13 @@ pub(super) struct Asked {
     fetched: Vec<FrameStamp>,
 }
 
-/// A `FrameSeries` texture layer that lists frames, holds all of them, and
-/// writes down every stamp it is asked to prepare or fetch.
+/// A `FrameSeries` texture layer that lists frames, holds all of them but
+/// `unheld`, and writes down every stamp it is asked to prepare or fetch.
 struct FrameLayer {
     listed: Vec<chrono::NaiveDateTime>,
+    /// Listed but never resident: a frame the loop holds a slot for and is
+    /// owed the data of, however often it is fetched.
+    unheld: Vec<chrono::NaiveDateTime>,
     asked: Arc<Mutex<Asked>>,
 }
 
@@ -157,11 +160,13 @@ impl FrameSource for FrameLayer {
         }
     }
 
-    /// Everything it listed is held. The suite is about the raster, not about
-    /// the fetch, so residency is arranged rather than driven.
+    /// Everything it listed is held, less `unheld`. The suite is about the
+    /// raster, not about the fetch, so residency is arranged rather than
+    /// driven.
     fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
         self.listed
             .iter()
+            .filter(|valid| !self.unheld.contains(valid))
             .map(|valid| FrameStamp {
                 valid: *valid,
                 run: Some(run()),
@@ -301,17 +306,41 @@ fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
 }
 
 /// A one-pane app whose model slot is the double, with `listed` frames on
-/// offer.
+/// offer and every one of them held.
 pub(super) fn app_with_frames(
     listed: Vec<chrono::NaiveDateTime>,
+) -> (crate::app::App, Arc<Mutex<Asked>>) {
+    app_with_unheld_frames(listed, Vec::new())
+}
+
+/// [`app_with_frames`], with the `unheld` stamps listed but never resident.
+fn app_with_unheld_frames(
+    listed: Vec<chrono::NaiveDateTime>,
+    unheld: Vec<chrono::NaiveDateTime>,
 ) -> (crate::app::App, Arc<Mutex<Asked>>) {
     let asked: Arc<Mutex<Asked>> = Default::default();
     let mut app = crate::app::tests::headless(crate::platform_double::TestBridge::desktop());
     app.gui.overlays = OverlayRegistry::with_handlers(vec![Box::new(FrameLayer {
         listed,
+        unheld,
         asked: Arc::clone(&asked),
     })]);
     (app, asked)
+}
+
+/// Take delivery of one frame fetch's answer on the production arrival path,
+/// carrying nothing: the double stages no data, so the frame is owed exactly
+/// as much as before, and the in-flight mark the dispatch set for it clears.
+fn deliver_fetch_answer(app: &mut crate::app::App, stamp: FrameStamp) {
+    app.channels
+        .overlay_fetch_sender
+        .send(SourceEvent::FrameReady {
+            id: known::MODEL_DATA,
+            stamp,
+            data: Box::new(()) as FetchPayload,
+        })
+        .expect("the receiver is alive");
+    app.poll_overlay_fetch_results();
 }
 
 /// Put pane 0's model layer into a loop waiting on a listing over `range`, then
@@ -574,6 +603,100 @@ fn a_forecast_loops_frames_each_get_their_own_picture_end_to_end() {
         "two frames at two stamps are holding the SAME texture. This is the \
          assertion a presence check cannot make: the loop would animate, and \
          every frame of it would be the same picture.",
+    );
+}
+
+// ── The re-ask ──────────────────────────────────────────────────────────────
+
+/// **A frame owed its grid is re-asked for as the exact run it holds a slot
+/// for.**
+///
+/// The listing's own burst carries the run (the end-to-end claim above pins
+/// it), but a frame whose grid was never staged — a fetch that failed, a grid
+/// the byte budget evicted before anything rasterized it, or a slot a
+/// re-sample to a larger allocation added after the burst — is asked for
+/// again by `refetch_owed_loop_frames`, and that ask was built from the
+/// frame's bare instant. The model layer's `frame_target` answers `None` for
+/// a stamp with no run, so every re-ask of a model frame was declined and
+/// the frame stayed blank for the life of the loop, with nothing in flight
+/// and nothing logged.
+///
+/// The instrument is the stamp the layer is handed, read off the double —
+/// not whether a task was spawned, which the double answers for any stamp.
+/// The two held frames are the control: they are asked for their picture,
+/// never their data.
+///
+/// **Floor — `bare_instant_re_ask`:** put `FrameStamp { valid, run:
+/// None }` back in the owed arm of `dispatch_overlay_loop_renders`. The
+/// re-ask arrives carrying no run.
+#[test]
+fn a_frame_owed_its_grid_is_re_asked_for_as_the_run_it_holds_a_slot_for() {
+    let taken = Arc::new(Mutex::new(0usize));
+    let _guard = squallar_worker::offload::install_test_worker(Box::new(TakeAll {
+        taken: Arc::clone(&taken),
+    }));
+
+    let (mut app, asked) = app_with_unheld_frames(vec![ts(0), ts(1), ts(2)], vec![ts(1)]);
+    build_loop(&mut app, (ts(0), ts(2)));
+    assert_eq!(
+        frame_stamps(&app),
+        vec![ts(0), ts(1), ts(2)],
+        "premise: the unheld stamp is a frame the loop holds a slot for",
+    );
+
+    // The listing's own burst, taken delivery of so every mark it set is
+    // cleared and the wire is quiet before the pass under test runs.
+    let burst = asked.lock().expect("no poisoned lock").fetched.clone();
+    assert_eq!(
+        burst.len(),
+        3,
+        "premise: one fetch per frame on the listing"
+    );
+    for stamp in burst {
+        deliver_fetch_answer(&mut app, stamp);
+    }
+    asked.lock().expect("no poisoned lock").fetched.clear();
+
+    // The pane's live raster, which is what lets the loop ask at all.
+    app.spawn_overlay_render(vec![0], known::MODEL_DATA, a_render_request(), None);
+    asked.lock().expect("no poisoned lock").prepared.clear();
+
+    app.dispatch_overlay_loop_renders();
+
+    let re_asked = asked.lock().expect("no poisoned lock").fetched.clone();
+    assert_eq!(
+        re_asked,
+        vec![stamp(1)],
+        "the frame owed its grid was re-asked for as {re_asked:?}, not as the \
+         run the listing named for it. The model layer resolves a frame to \
+         `(run, hour)` off the stamp and declines one with no run, so this \
+         frame would stay blank for the life of the loop.",
+    );
+
+    // Control: the held frames were asked for their picture, not their data.
+    let mut prepared: Vec<FrameStamp> = asked
+        .lock()
+        .expect("no poisoned lock")
+        .prepared
+        .iter()
+        .map(|f| f.expect("a loop dispatch that named no frame"))
+        .collect();
+    prepared.sort_by_key(|f| f.valid);
+    assert_eq!(
+        prepared,
+        vec![stamp(0), stamp(2)],
+        "a frame the layer holds is owed its picture and nothing else",
+    );
+
+    // And once its answer lands with nothing on it, the frame is owed again:
+    // the second pass asks the same stamp, run and all.
+    deliver_fetch_answer(&mut app, stamp(1));
+    app.dispatch_overlay_loop_renders();
+    let again = asked.lock().expect("no poisoned lock").fetched.clone();
+    assert_eq!(
+        again,
+        vec![stamp(1), stamp(1)],
+        "the second re-ask must carry the run the first one did",
     );
 }
 
