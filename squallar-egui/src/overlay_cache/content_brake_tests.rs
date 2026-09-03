@@ -49,6 +49,7 @@ fn plan() -> OverlayTexturePlan {
         height: 1,
         overdraw: 0.0,
         pixels_per_point: 1.0,
+        pane_px: [0, 0],
     }
 }
 

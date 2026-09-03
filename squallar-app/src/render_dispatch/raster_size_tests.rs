@@ -264,6 +264,7 @@ fn overlay_picture_sizes_land_on_their_own_pane_and_nowhere_else() {
             height: h,
             overdraw: 0.0,
             pixels_per_point: 1.0,
+            pane_px: [0, 0],
         },
         data_generation: 1,
         zoom: 32,

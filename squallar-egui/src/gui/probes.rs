@@ -157,6 +157,10 @@ impl Gui {
         self.concurrent_renders
     }
 
+    pub(crate) fn overlay_overdraw_for_test(&self) -> f32 {
+        self.overlay_overdraw
+    }
+
     pub(crate) fn tile_cache_budget_for_test(
         &self,
     ) -> squallar_device_profile::budget::TileCacheBudget {

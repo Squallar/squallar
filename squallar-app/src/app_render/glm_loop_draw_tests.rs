@@ -164,6 +164,7 @@ fn plan() -> squallar_egui::overlay_cache::OverlayTexturePlan {
         height: 64,
         overdraw: 0.0,
         pixels_per_point: 1.0,
+        pane_px: [0, 0],
     }
 }
 

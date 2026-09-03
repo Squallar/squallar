@@ -72,6 +72,7 @@ const RECORDED_PLAN: OverlayTexturePlan = OverlayTexturePlan {
     height: 48,
     overdraw: 0.125,
     pixels_per_point: 2.0,
+    pane_px: [0, 0],
 };
 const RECORDED_ZOOM: i32 = 37;
 

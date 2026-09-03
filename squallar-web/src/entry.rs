@@ -20,6 +20,9 @@ const CANVAS_ID: &str = "squallar-canvas";
 #[wasm_bindgen]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    // And the other way an instance dies: an allocation the engine refuses,
+    // which says nothing without this (`crate::alloc_failure`).
+    crate::alloc_failure::hook::install();
     // `Info`, not `Debug`: per-frame paths log at debug and the browser console
     // is synchronous enough that logging every frame is a measurable cost.
     console_log::init_with_level(log::Level::Info)

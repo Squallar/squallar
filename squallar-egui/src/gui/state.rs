@@ -383,6 +383,11 @@ pub struct Gui {
     /// many overlay rasters one pane and layer may have out; see
     /// [`crate::overlay_cache::RendersInFlight`].
     pub(super) concurrent_renders: usize,
+    /// The overdraw fraction a whole-picture overlay raster asks for, per
+    /// side, pushed in by the frontend — see
+    /// [`crate::shell_api::FrameInputs::overlay_overdraw`]. Handed to
+    /// `crate::overlay_cache::plan_overlay_texture` for every pane's plan.
+    pub(super) overlay_overdraw: f32,
     /// Whether the top bar's ☰ dropdown was open on the last frame it drew.
     pub(super) menu_popup_open: bool,
     /// A dismiss was consumed against the open dropdown; the top bar honours
@@ -645,6 +650,8 @@ impl Gui {
             // pushed facts into behaves like this target rather than like a
             // device with no render budget at all.
             concurrent_renders: squallar_device_profile::constants::MAX_CONCURRENT_RENDERS,
+            // The renderer's own ceiling, which is the ladder's top rung.
+            overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
             menu_popup_open: false,
             menu_popup_close_requested: false,
             menu_open: false,

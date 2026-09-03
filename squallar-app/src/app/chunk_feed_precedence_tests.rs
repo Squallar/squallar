@@ -1564,11 +1564,17 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
         "twelve lost surfaces resolved to rung {settled}, which is either no \
          ladder at all or a failure counter wearing one as a hat",
     );
+    // Re-argued when the overlay-oversampling rung landed between the
+    // history and the snap: a lost surface is the GPU axis, and the rung
+    // lowers both axes — the picture is a GPU texture — so a GPU walk takes
+    // its two steps (1.5x to 1.25x to 1x) after the history's four halvings
+    // and before the tiles snap, exactly where the counted ladder has them.
     assert_eq!(
-        settled, 9,
-        "lighting, resolution twice, four halvings of the history, the snap, a pinned \
-         grid that costs no step, the raster: {rungs:?}",
+        settled, 11,
+        "lighting, resolution twice, four halvings of the history, two of the overlay \
+         margin, the snap, a pinned grid that costs no step, the raster: {rungs:?}",
     );
+    assert_eq!(app.budgets.overlay_oversample_percent, 100);
     assert!(
         rungs.windows(2).all(|pair| pair[0] <= pair[1]),
         "the rung came back up under pressure: {rungs:?}",
@@ -2184,7 +2190,7 @@ fn a_pressure_event_on_the_measured_arm_lowers_the_capacity_by_one_economy_fract
 }
 
 /// A heap reading with the worker instance at `worker_mib` and the page well
-/// under every line, so what is judged is the fuller of the two.
+/// under every line, so what is judged is the worker's own watermark.
 fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
     crate::platform::LinearMemory {
         page_bytes: 100 * MIB,
@@ -2192,19 +2198,20 @@ fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
     }
 }
 
-/// **The heap watermark at the action line evicts economy and lowers the
-/// session's presumption once**, on the telemetry tick, from a reading rather
-/// than a failure — and a second tick at the same reading does nothing more,
-/// because a wasm heap that has acted once would otherwise act on every tick
-/// for the rest of the session. Nothing is written to the store.
+/// **The worker's watermark at the action line evicts economy and holds
+/// every presumption**, on the telemetry tick, from a reading rather than a
+/// failure — and a second tick at the same reading does nothing more, because
+/// a wasm heap that has acted once would otherwise act on every tick for the
+/// rest of the session. Nothing is written to the store.
 ///
-/// The per-event observable is the presumption, not a rung: the headless
-/// scene is one still pane, 256 MiB against a presumption that comes down to
-/// 3456 MiB, so the re-fit moves no budget and the eviction is the whole
-/// answer — the case ruling 5 anticipates.
+/// Re-argued when the two instances stopped being judged as one: no lever of
+/// this application reaches the worker's heap (its consumer is an MRMS grid
+/// decode, answered upstream), so lowering the page's host presumption or the
+/// card's for it would trade the page's picture for a wall the page is not
+/// against. The economy is evicted as for any event; both presumptions stand;
+/// the worker's own watch remembers the mark and the page's watch is untouched.
 #[test]
 fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_once() {
-    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_kv::KvStore;
 
     let platform = TestBridge::web().with_linear_memory(worker_heap(891));
@@ -2213,34 +2220,37 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
     seed_render_cache(&mut app);
     assert_eq!(app.budgets.steps_back, 0);
     assert_eq!(app.session_capacity, None);
-    let presumed = app.capacity().allowance();
-    let lowered_once = presumed / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+    assert_eq!(app.session_host_capacity, None);
 
     tick(&mut app);
 
     assert_eq!(
-        app.session_capacity,
-        Some(lowered_once),
-        "a reading at the action line did not lower the presumption",
+        app.session_capacity, None,
+        "a worker heap reading lowered the card's presumption",
     );
     assert_eq!(
-        app.budgets.steps_back, 0,
-        "one still pane fits the lowered presumption; the eviction was the whole answer",
+        app.session_host_capacity, None,
+        "a worker heap reading lowered the page's presumption",
     );
+    assert!(
+        !app.tile_economy_squeezed,
+        "a worker heap reading squeezed the page's tile economy",
+    );
+    assert_eq!(app.budgets.steps_back, 0);
     assert_eq!(
         app.render.render_cache.entry_count(),
         0,
         "economy survived the watermark: the render cache still holds its entry",
     );
-    assert_eq!(app.linear_memory_watch.last_acted_at(), Some(891 * MIB));
+    assert_eq!(app.worker_memory_watch.last_acted_at(), Some(891 * MIB));
+    assert_eq!(
+        app.linear_memory_watch,
+        crate::pressure::LinearMemoryWatch::default(),
+        "the page's watch moved on the worker's reading",
+    );
 
     seed_render_cache(&mut app);
     tick(&mut app);
-    assert_eq!(
-        app.session_capacity,
-        Some(lowered_once),
-        "the same reading on the next tick lowered the presumption again",
-    );
     assert_eq!(
         app.render.render_cache.entry_count(),
         1,
@@ -2251,12 +2261,20 @@ fn a_heap_watermark_at_the_act_line_evicts_economy_and_lowers_the_presumption_on
     assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
 }
 
-/// **A heap that grows past the refire step acts again**; one that grows less
-/// does not. The page instance is the fuller one here, so both arms of the
-/// `max(page, worker)` are exercised across this test and the one above.
+/// **A page heap that grows past the refire step acts again**; one that
+/// grows less does not. The page instance is the one judged here, so both
+/// instances are exercised across this test and the one above.
+///
+/// What a page-heap action moves on this bridge: the tile economies are
+/// squeezed (once), the render cache goes, and the page's watch remembers
+/// the mark. The host presumption does not move, and that is the bracket's
+/// doing rather than the event's: the headless bridge resolves the host's
+/// desktop bracket, which carries no host figure, so there is nothing to
+/// hold down — `a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket`
+/// is the arm where there is. The card's presumption is never touched by
+/// a page-heap event.
 #[test]
 fn a_heap_that_grows_past_the_refire_step_acts_again() {
-    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
     use squallar_kv::KvStore;
 
@@ -2271,29 +2289,41 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
     };
     gauge.set(page(891 * MIB));
     let mut app = headless(platform);
-    let lowered = |events: u32| {
-        let mut cap = app.capacity().allowance();
-        for _ in 0..events {
-            cap = cap / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
-        }
-        Some(cap)
-    };
-    let (once, twice) = (lowered(1), lowered(2));
+    seed_render_cache(&mut app);
+    assert_eq!(
+        app.capacity().host_bytes,
+        None,
+        "precondition: the desktop bracket"
+    );
 
     tick(&mut app);
-    assert_eq!(app.session_capacity, once);
+    assert_eq!(app.linear_memory_watch.last_acted_at(), Some(891 * MIB));
+    assert!(
+        app.tile_economy_squeezed,
+        "the first page-heap action did not squeeze"
+    );
+    assert_eq!(app.render.render_cache.entry_count(), 0);
+    assert_eq!(
+        app.session_capacity, None,
+        "a page-heap event lowered the card's presumption"
+    );
+    assert_eq!(app.session_host_capacity, None);
+    assert_eq!(app.worker_memory_watch.last_acted_at(), None);
 
+    seed_render_cache(&mut app);
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES - 1));
     tick(&mut app);
     assert_eq!(
-        app.session_capacity, once,
+        app.render.render_cache.entry_count(),
+        1,
         "growth short of the refire step acted again",
     );
 
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
     tick(&mut app);
     assert_eq!(
-        app.session_capacity, twice,
+        app.render.render_cache.entry_count(),
+        0,
         "growth past the refire step did not act again",
     );
     assert_eq!(
@@ -2301,6 +2331,90 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
         Some(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES),
     );
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+}
+
+/// **A page-heap event lowers the host presumption, and only that one**,
+/// on the bracket that has a host figure: the wasm bracket's declared 1 GiB.
+/// Once by the economy fraction (966,367,641 B), twice (869,730,876 B); the
+/// card's presumption never moves; the squeeze fires once and the tile
+/// allowances the next loop walk hands the caches are nothing but the rung.
+/// The headless scene shows no picture, so its headroom is zero and the
+/// action line is the percentage line — the same 891 MiB the fixed line
+/// pinned. Nothing is written to the store.
+#[test]
+fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
+    use squallar_device_profile::budget::BudgetLimits;
+    use squallar_device_profile::linear_memory::LINEAR_MEMORY_REFIRE_STEP_BYTES;
+    use squallar_kv::KvStore;
+
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let store = platform.store();
+    let page = |bytes: u64| {
+        Some(crate::platform::LinearMemory {
+            page_bytes: bytes,
+            worker_bytes: None,
+        })
+    };
+    let mut app = headless(platform);
+    app.device_profile.limits = BudgetLimits::WASM;
+    app.adopt_budgets(squallar_device_profile::budget::resolve(
+        &app.device_profile,
+    ));
+    assert_eq!(
+        app.capacity().host_bytes,
+        Some(1 << 30),
+        "precondition: the page's ceiling"
+    );
+    assert_eq!(
+        app.host_headroom_bytes, 0,
+        "a scene with no picture has no batch"
+    );
+    let before = app.budgets;
+    let tile_cache_before = app.tile_cache_budget;
+    assert!(
+        tile_cache_before.styled_bytes > 0,
+        "precondition: an allowance to squeeze"
+    );
+
+    // `host / 10 * 9`, floor first — the same spelling the card's presumption
+    // is lowered with, three bytes under the exact nine tenths.
+    gauge.set(page(891 * MIB));
+    tick(&mut app);
+    assert_eq!(app.session_host_capacity, Some(966_367_638));
+    assert_eq!(
+        app.session_capacity, None,
+        "the card's presumption moved for the page's heap"
+    );
+    assert_eq!(app.capacity().host_bytes, Some(966_367_638));
+    assert_eq!(
+        app.capacity().gpu_bytes,
+        before.app_texture_ceiling_bytes as u64
+    );
+    assert!(app.tile_economy_squeezed);
+    let _ = app.observe_loop_demand();
+    assert_eq!(
+        app.tile_cache_budget,
+        squallar_device_profile::budget::TileCacheBudget {
+            styled_bytes: 0,
+            parsed_bytes: 0,
+            terrain_bytes: 0,
+            whole_zoom: tile_cache_before.whole_zoom,
+        },
+        "the squeeze did not hold the tile allowances at nothing",
+    );
+    assert_eq!(
+        app.budgets, before,
+        "a still pane with no picture shed a rung"
+    );
+
+    gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
+    tick(&mut app);
+    assert_eq!(app.session_host_capacity, Some(869_730_867));
+    assert_eq!(app.session_capacity, None);
+
+    assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+    assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
 }
 
 /// **A native profile has no heap reading and is never pressured by the
@@ -2341,15 +2455,18 @@ fn a_heap_at_the_warn_line_is_noted_and_steps_nothing() {
     let store = platform.store();
     let mut app = headless(platform);
     seed_render_cache(&mut app);
-    assert!(!app.linear_memory_watch.has_warned());
+    assert!(!app.worker_memory_watch.has_warned());
 
     tick(&mut app);
     tick(&mut app);
 
+    // The worker's watch is the one that saw 800 MiB; the page's saw 100.
     assert!(
-        app.linear_memory_watch.has_warned(),
+        app.worker_memory_watch.has_warned(),
         "a reading past the warning line was not noted",
     );
+    assert_eq!(app.worker_memory_watch.last_acted_at(), None);
+    assert!(!app.linear_memory_watch.has_warned());
     assert_eq!(app.linear_memory_watch.last_acted_at(), None);
     assert_eq!(app.budgets.steps_back, 0, "a warning stepped the ladder");
     assert_eq!(app.render.render_cache.entry_count(), 1);

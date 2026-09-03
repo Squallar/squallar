@@ -119,6 +119,7 @@ fn dispatched(surfaces: PaneSurfaces, ground: GroundIsMesh) -> Vec<LayerId> {
         terrain_tiles: None,
         tile_zoom_bias: 0,
         overlay_render_limit: 1,
+        overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
         actions: &mut actions,
         pane_rect: canvas,
         surfaces,

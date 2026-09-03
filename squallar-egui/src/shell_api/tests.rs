@@ -58,6 +58,7 @@ fn every_frame_input_surfaces_and_persists() {
             terrain_bytes: 333_333,
             whole_zoom: true,
         },
+        overlay_overdraw: 0.125,
         location_settings_available: true,
         location: (squallar_location::LocationPermission::Denied, false),
         gps: Some((squallar_location::Fix::from_lat_lon(12.5, -34.25), gps_at)),
@@ -87,6 +88,11 @@ fn every_frame_input_surfaces_and_persists() {
             gui.loop_frame_budget_for_test(),
             7,
             "loop_frame_budget did not survive frame {frame}"
+        );
+        assert_eq!(
+            gui.overlay_overdraw_for_test(),
+            0.125,
+            "overlay_overdraw did not survive frame {frame}"
         );
         assert!(
             gui.location_settings_available(),
@@ -162,6 +168,7 @@ fn a_none_gps_clears_the_fix() {
         loop_frame_budget: 60,
         concurrent_renders: 1,
         tile_cache: crate::tile_source::default_tile_budget(),
+        overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
         location_settings_available: false,
         location: (squallar_location::LocationPermission::Granted, true),
         gps: Some((
@@ -189,6 +196,7 @@ fn a_none_gps_clears_the_fix() {
         loop_frame_budget: 60,
         concurrent_renders: 1,
         tile_cache: crate::tile_source::default_tile_budget(),
+        overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
         location_settings_available: false,
         user_heading: None,
         catalogue_pending: false,

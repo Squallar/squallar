@@ -82,6 +82,7 @@ fn a_render_request(generation: u64) -> super::OverlayRenderRequest {
             height: 48,
             overdraw: 0.0,
             pixels_per_point: 1.0,
+            pane_px: [0, 0],
         },
         data_generation: generation,
         zoom: 32,

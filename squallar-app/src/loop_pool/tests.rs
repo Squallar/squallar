@@ -766,6 +766,8 @@ fn looping_pane() -> squallar_device_profile::scene::PaneNeed {
         volume_grids: 0,
         ground: squallar_device_profile::quality::GroundPass::Off,
         buildings: false,
+        overlay_pictures: 0,
+        picture_px: [0, 0],
     }
 }
 
@@ -1445,6 +1447,8 @@ mod budget_agreement {
                     volume_grids: 1,
                     ground: squallar_device_profile::quality::GroundPass::Off,
                     buildings: false,
+                    overlay_pictures: 0,
+                    picture_px: [0, 0],
                 }],
                 tile_sources: Vec::new(),
                 mirror_px: [0, 0],

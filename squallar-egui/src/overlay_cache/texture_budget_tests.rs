@@ -29,6 +29,7 @@ fn plan_with_overdraw(overdraw: f32) -> OverlayTexturePlan {
         height: 1,
         overdraw,
         pixels_per_point: NO_SCALING,
+        pane_px: [0, 0],
     }
 }
 
@@ -90,7 +91,7 @@ fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
         "fixture must actually cross the limit: {unclamped} vs {WEBGL2_LIMIT}"
     );
 
-    let plan = plan_overlay_texture(pane(w, 400.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(pane(w, 400.0), WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     assert!(
         plan.width <= WEBGL2_LIMIT,
         "width {} exceeds the limit",
@@ -117,7 +118,7 @@ fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
 fn a_full_size_browser_pane_stays_within_the_limit() {
     let w = clamped_side(WEBGL2_LIMIT);
     let h = w * 10.0 / 16.0;
-    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
     assert!(
         plan.width + 1 >= WEBGL2_LIMIT,
@@ -134,7 +135,7 @@ fn a_full_size_browser_pane_stays_within_the_limit() {
 fn the_taller_axis_can_be_the_binding_one() {
     let h = clamped_side(WEBGL2_LIMIT);
     let w = h * 10.0 / 35.0;
-    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(pane(w, h), WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
     assert!(
         plan.height + 1 >= WEBGL2_LIMIT,
@@ -154,7 +155,7 @@ fn a_desktop_adapter_limit_changes_nothing() {
         (2560.0, 1440.0),
         (100.0, 100.0),
     ] {
-        let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT, NO_SCALING);
+        let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
         assert_eq!(
             plan.overdraw, OVERDRAW_FRACTION,
             "{w}x{h} should keep the full overdraw on a desktop adapter"
@@ -174,7 +175,7 @@ fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
         rect.width().min(rect.height()) > WEBGL2_LIMIT as f32,
         "fixture must overflow on both axes for both clamps to be reached"
     );
-    let plan = plan_overlay_texture(rect, WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(rect, WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     assert_eq!(plan.overdraw, 0.0, "nothing left to give up");
     assert_eq!(plan.width, WEBGL2_LIMIT);
     assert_eq!(plan.height, WEBGL2_LIMIT);
@@ -184,7 +185,12 @@ fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
 /// natural size. Clamping both to the limit would stretch the overlay.
 #[test]
 fn only_the_overflowing_axis_is_truncated() {
-    let plan = plan_overlay_texture(pane(3000.0, 900.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(
+        pane(3000.0, 900.0),
+        WEBGL2_LIMIT,
+        NO_SCALING,
+        OVERDRAW_FRACTION,
+    );
     assert_eq!(plan.overdraw, 0.0);
     assert_eq!(
         plan.width, WEBGL2_LIMIT,
@@ -198,7 +204,7 @@ fn only_the_overflowing_axis_is_truncated() {
 /// the product, so the general arithmetic stays finite.
 #[test]
 fn a_degenerate_pane_produces_a_finite_plan() {
-    let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     assert!(plan.overdraw.is_finite(), "got {}", plan.overdraw);
     assert_eq!(
         plan.overdraw, OVERDRAW_FRACTION,
@@ -211,7 +217,12 @@ fn a_degenerate_pane_produces_a_finite_plan() {
 /// normally rather than being dragged to zero or to `inf` by its neighbour.
 #[test]
 fn a_pane_with_one_zero_axis_still_sizes_the_other() {
-    let plan = plan_overlay_texture(pane(0.0, 3000.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(
+        pane(0.0, 3000.0),
+        WEBGL2_LIMIT,
+        NO_SCALING,
+        OVERDRAW_FRACTION,
+    );
     assert!(plan.overdraw.is_finite());
     assert_eq!(
         plan.overdraw, 0.0,
@@ -521,7 +532,12 @@ fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
     let vp = viewport();
     let (lat_range, _) = viewport_ranges();
     let w = clamped_side(WEBGL2_LIMIT);
-    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(
+        pane(w, w * 10.0 / 16.0),
+        WEBGL2_LIMIT,
+        NO_SCALING,
+        OVERDRAW_FRACTION,
+    );
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped one"
@@ -554,7 +570,12 @@ fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
 #[test]
 fn the_bounds_grow_by_the_plans_overdraw_not_the_constant() {
     let w = clamped_side(WEBGL2_LIMIT);
-    let plan = plan_overlay_texture(pane(w, w * 10.0 / 16.0), WEBGL2_LIMIT, NO_SCALING);
+    let plan = plan_overlay_texture(
+        pane(w, w * 10.0 / 16.0),
+        WEBGL2_LIMIT,
+        NO_SCALING,
+        OVERDRAW_FRACTION,
+    );
     assert!(
         plan.overdraw < OVERDRAW_FRACTION,
         "fixture must be a clamped plan, else this test cannot tell the two apart"
@@ -618,8 +639,8 @@ fn latitude_is_clamped_to_the_mercator_range() {
 #[test]
 fn a_hidpi_pane_is_planned_in_physical_pixels_not_points() {
     let rect = pane(600.0, 400.0);
-    let unscaled = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING);
-    let doubled = plan_overlay_texture(rect, DESKTOP_LIMIT, 2.0);
+    let unscaled = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
+    let doubled = plan_overlay_texture(rect, DESKTOP_LIMIT, 2.0, OVERDRAW_FRACTION);
 
     assert_eq!(doubled.width, unscaled.width * 2);
     assert_eq!(doubled.height, unscaled.height * 2);
@@ -630,8 +651,8 @@ fn a_hidpi_pane_is_planned_in_physical_pixels_not_points() {
     assert_eq!(doubled.pixels_per_point, 2.0);
 
     let tight = pane(narrowest_clamped(WEBGL2_LIMIT) / 2.0 + 1.0, 200.0);
-    let at_1x = plan_overlay_texture(tight, WEBGL2_LIMIT, NO_SCALING);
-    let at_2x = plan_overlay_texture(tight, WEBGL2_LIMIT, 2.0);
+    let at_1x = plan_overlay_texture(tight, WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
+    let at_2x = plan_overlay_texture(tight, WEBGL2_LIMIT, 2.0, OVERDRAW_FRACTION);
     assert_eq!(
         at_1x.overdraw, OVERDRAW_FRACTION,
         "fixture must not be clamped at 1x, or the comparison says nothing",
@@ -655,16 +676,66 @@ fn a_hidpi_pane_is_planned_in_physical_pixels_not_points() {
 #[test]
 fn a_density_that_is_not_a_positive_number_plans_an_unscaled_texture() {
     let rect = pane(600.0, 400.0);
-    let sane = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING);
+    let sane = plan_overlay_texture(rect, DESKTOP_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
     for (ppp, why) in [
         (0.0, "a zero density"),
         (-2.0, "a negative density"),
         (f32::NAN, "a density that is not a number"),
         (f32::INFINITY, "an infinite density"),
     ] {
-        let plan = plan_overlay_texture(rect, DESKTOP_LIMIT, ppp);
+        let plan = plan_overlay_texture(rect, DESKTOP_LIMIT, ppp, OVERDRAW_FRACTION);
         assert_eq!(plan.width, sane.width, "{why}");
         assert_eq!(plan.height, sane.height, "{why}");
         assert_eq!(plan.pixels_per_point, NO_SCALING, "{why}");
     }
+}
+
+/// **The renderer's margin and the ladder's top rung are one figure**, and
+/// the fraction the planner is handed for each rung is exact. `1 + 2 x
+/// OVERDRAW_FRACTION` is the 150 % the budget system starts every class at;
+/// `overdraw_for_oversample` turns 150 / 125 / 100 into 0.25 / 0.125 / 0.0
+/// with no rounding — dyadic rationals all — so the planned side is the
+/// budget system's integer side to the pixel. A margin under the ladder's
+/// floor asks for nothing, and a margin past the renderer's ceiling is held
+/// to it by the planner.
+#[test]
+fn the_planners_margin_is_the_ladders_top_rung_and_each_rung_is_exact() {
+    use squallar_device_profile::constants::OVERLAY_OVERSAMPLE_PERCENTS;
+    use squallar_device_profile::fit::picture_bytes;
+
+    assert_eq!(OVERLAY_OVERSAMPLE_PERCENTS[0], 150);
+    assert_eq!(1.0 + 2.0 * OVERDRAW_FRACTION, 1.5);
+    assert_eq!(overdraw_for_oversample(150), OVERDRAW_FRACTION);
+    assert_eq!(overdraw_for_oversample(125), 0.125);
+    assert_eq!(overdraw_for_oversample(100), 0.0);
+    assert_eq!(
+        overdraw_for_oversample(50),
+        0.0,
+        "under the floor asks for nothing"
+    );
+
+    // The user's own canvas, planned at each rung against a real adapter:
+    // the planner's pixels are the need model's, and the glass is carried.
+    let canvas = pane(2878.0, 1651.0);
+    for percent in OVERLAY_OVERSAMPLE_PERCENTS {
+        let plan =
+            plan_overlay_texture(canvas, 32768, NO_SCALING, overdraw_for_oversample(percent));
+        assert_eq!(
+            u64::from(plan.width) * u64::from(plan.height) * 4,
+            picture_bytes([2878, 1651], percent),
+            "{percent}%: the planner and the need model disagree on the picture",
+        );
+        assert_eq!(plan.pane_px, [2878, 1651]);
+    }
+    let asked_too_much = plan_overlay_texture(canvas, 32768, NO_SCALING, 0.4);
+    assert_eq!(
+        asked_too_much.overdraw, OVERDRAW_FRACTION,
+        "held to the renderer's ceiling"
+    );
+    let nan = plan_overlay_texture(canvas, 32768, NO_SCALING, f32::NAN);
+    assert_eq!(
+        nan.overdraw, 0.0,
+        "a fraction that is not a number asks for nothing"
+    );
+    assert_eq!(nan.width, 2878);
 }

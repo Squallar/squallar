@@ -83,6 +83,20 @@ pub struct PaneNeed {
     /// `BuildingMeshJob` is dispatched for the pane, which no production
     /// caller does yet.
     pub buildings: bool,
+    /// **Whole-picture overlay layers this pane shows**: every texture layer
+    /// with a picture on the glass or one on its way, radar excluded (its
+    /// raster is its own pipeline's and priced as the static render). Each is
+    /// one raster of the pane at the budget's oversampling, crossing the host
+    /// heap on its way to the GPU — see `crate::fit::picture_bytes`.
+    pub overlay_pictures: usize,
+    /// **The glass a whole-picture overlay of this pane covers**, in physical
+    /// pixels: the pane's rect as the planner was last handed it, before the
+    /// oversampling margin — the figure `crate::fit::picture_bytes` scales.
+    /// The window's size until the pane has dispatched a picture, which
+    /// over-prices a split pane by the pane count and a lone one by the top
+    /// bar, never under-prices. Kept apart from [`Self::px`], which a 2D pane
+    /// leaves at `[0, 0]` because none of its GPU terms is sized from it.
+    pub picture_px: [u32; 2],
 }
 
 /// One map tile source's working set.
@@ -102,7 +116,8 @@ pub struct TileNeed {
 pub struct Need {
     /// Textures: loop frames, grids, offscreens, static rasters, the mirror.
     pub gpu_bytes: u64,
-    /// Host memory: the tile working set.
+    /// Host memory: the tile working set, every shown overlay picture at the
+    /// budget's oversampling, and one more picture for the arrival in flight.
     pub host_bytes: u64,
 }
 
@@ -138,10 +153,13 @@ impl Capacity {
     /// The presumed arm: the bracket's whole-application texture constant **is**
     /// the capacity. Its floor, whatever rung the class earned — the three
     /// numbers 288 / 1024 / 3840 MiB are what those constants always were.
+    /// The host figure is the bracket's declared ceiling where it has one —
+    /// a browser's linear memory — and unknown otherwise
+    /// ([`BudgetLimits::presumed_host_bytes`]).
     pub fn presumed(limits: &BudgetLimits) -> Self {
         Self {
             gpu_bytes: limits.app_texture_ceiling_bytes.at(Promotion::Floor) as u64,
-            host_bytes: None,
+            host_bytes: limits.presumed_host_bytes.map(|bytes| bytes as u64),
             source: CapacitySource::Presumed,
         }
     }
@@ -176,6 +194,36 @@ impl Capacity {
             gpu_bytes: session_gpu_bytes.map_or(self.gpu_bytes, |cap| cap.min(self.gpu_bytes)),
             ..self
         }
+    }
+
+    /// The host side of [`Self::held_to`]: a page heap that reached its
+    /// watermark lowers what this session presumes the host holds, never
+    /// raises it, and the lowering dies with the process. A capacity with no
+    /// host figure stays without one — there is nothing to hold down.
+    pub fn host_held_to(self, session_host_bytes: Option<u64>) -> Self {
+        Self {
+            host_bytes: self
+                .host_bytes
+                .map(|own| session_host_bytes.map_or(own, |cap| cap.min(own))),
+            ..self
+        }
+    }
+
+    /// The most host memory the scene's need may occupy here, or `None`
+    /// where the host is unbounded because nothing reads it.
+    ///
+    /// `NEED_FRACTION` of the figure **on every arm**, the presumed one
+    /// included, and that is the difference from [`Self::allowance`]: the
+    /// GPU presumption is a bracket constant argued with its own headroom,
+    /// where a browser's linear memory is a wall the module header declares
+    /// with none — every byte the allocator, the transport's copies and the
+    /// picture in flight take is under it — and a native RAM reading is raw
+    /// hardware the way a VRAM reading is.
+    pub fn host_allowance(&self) -> Option<u64> {
+        self.host_bytes.map(|host| {
+            host / NEED_FRACTION.1 * NEED_FRACTION.0
+                + (host % NEED_FRACTION.1) * NEED_FRACTION.0 / NEED_FRACTION.1
+        })
     }
 
     /// The most GPU memory the scene's need may occupy here.
@@ -266,6 +314,33 @@ pub(crate) mod fixtures {
             volume_grids: 0,
             ground: GroundPass::Off,
             buildings: false,
+            overlay_pictures: 0,
+            picture_px: [0, 0],
+        }
+    }
+
+    /// The user's own window with `pictures` whole-picture overlay layers
+    /// shown on it, at the tile working set it needs between zooms: the
+    /// Tier-2 `huge` leg's scene (KTLX, seventeen layers of which thirteen
+    /// are texture pictures, the radar loop playing, 2878 x 1651 physical
+    /// pixels), which the page's 1 GiB linear memory could not hold at 1.5x.
+    /// The tile entry cost is the measured city-core tail
+    /// (`squallar_egui::tile_source::MEASURED_STYLED_ENTRY_BYTES`), restated
+    /// here because this crate sits under that one.
+    pub(crate) fn huge(pictures: usize) -> Scene {
+        const MEASURED_STYLED_ENTRY_BYTES: usize = 1_462_708;
+        Scene {
+            panes: vec![PaneNeed {
+                overlay_pictures: pictures,
+                picture_px: [2878, 1651],
+                ..plan_pane([0, 0], true, 2 * 60 * 60, Some(259))
+            }],
+            tile_sources: vec![TileNeed {
+                tiles_on_glass: 187,
+                ancestor_net: 6,
+                bytes_per_tile: MEASURED_STYLED_ENTRY_BYTES,
+            }],
+            mirror_px: [0, 0],
         }
     }
 
@@ -281,6 +356,8 @@ pub(crate) mod fixtures {
             volume_grids: 1,
             ground,
             buildings: false,
+            overlay_pictures: 0,
+            picture_px: [0, 0],
         }
     }
 
@@ -341,6 +418,10 @@ pub(crate) mod fixtures {
                     }],
                     mirror_px: [0, 0],
                 },
+            ),
+            (
+                "the huge leg: thirteen pictures on the user's canvas",
+                huge(13),
             ),
         ]
     }

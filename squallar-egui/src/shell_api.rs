@@ -100,6 +100,14 @@ pub struct FrameInputs<'a> {
     /// `cfg` can say. Applied to every tile source, live or parked, before the
     /// pane loop.
     pub tile_cache: squallar_device_profile::budget::TileCacheBudget,
+    /// **How much overdraw a whole-picture overlay raster asks for**, per
+    /// side, as the fraction `crate::overlay_cache::plan_overlay_texture`
+    /// takes — the device's `Budgets::overlay_oversample_percent` through
+    /// `crate::overlay_cache::overdraw_for_oversample`, composed here for the
+    /// reason [`Self::tile_cache`] is: the ladder's rung is the App's, decided
+    /// by `fit` against this session's capacity, and a browser's page heap is
+    /// what moves it. Held to `OVERDRAW_FRACTION` by the planner.
+    pub overlay_overdraw: f32,
     /// Whether this platform has a location settings page to offer.
     pub location_settings_available: bool,
     /// What the platform location service is doing: (permission, active).

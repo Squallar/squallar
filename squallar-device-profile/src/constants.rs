@@ -531,6 +531,29 @@ pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(448), mib(640), mib
 /// ([`crate::scene::Capacity::allowance`]).
 pub const NEED_FRACTION: (u64, u64) = (3, 4);
 
+/// **How much larger than its pane a whole-picture overlay raster is planned**,
+/// per side, in percent — the overlay-oversampling rung of the ladder, top
+/// first. `150` is the overdraw margin the renderer asks for
+/// (`squallar_egui::overlay_cache::OVERDRAW_FRACTION` = 0.25 of the viewport
+/// on each side, so 1.5x per side and 2.25x the pane's pixels); `125` halves
+/// the margin (1.5625x the pixels); `100` is the viewport alone (1x).
+///
+/// The margin is *cover under pan*: ground the pane can still draw on while
+/// the replacement raster is on its way. Giving it up costs nothing while the
+/// map stands still and a blank strip at the leading edge while it pans fast,
+/// until the next raster lands. It never costs a wrong pixel, never a frame
+/// of input latency, and never a raster the layer would not have drawn.
+///
+/// Every value is a dyadic rational (3/2, 5/4, 1/1), so the planner's `f32`
+/// side and the need model's integer side agree to the pixel on every pane
+/// width a real adapter can hold: `a_shown_picture_is_priced_at_the_planners_own_arithmetic`.
+///
+/// What the three steps buy on the user's own 2878x1651 canvas, per picture:
+/// 42,755,568 B, 29,682,444 B, 19,006,312 B of the page heap — and thirteen
+/// shown layers re-rasterise together on every move and every loop bucket,
+/// so a batch is 556, 386 or 247 MB of a 1 GiB linear memory.
+pub const OVERLAY_OVERSAMPLE_PERCENTS: [u16; 3] = [150, 125, 100];
+
 /// How full of economy — what is resident beyond need — a capacity may be
 /// filled, as `(numerator, denominator)`: nine tenths. The last tenth is the
 /// in-flight picture, the driver and the compositor. Also the step a session's

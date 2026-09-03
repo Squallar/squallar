@@ -1,5 +1,6 @@
 use super::*;
 use crate::budget::{BudgetLimits, Promotion, demote};
+use crate::constants::OVERLAY_OVERSAMPLE_PERCENTS;
 use crate::constants::{
     DESKTOP_APP_TEXTURE_BUDGET_BYTES, DESKTOP_LOOP_IMAGE_SIZE, DESKTOP_MAX_LOOP_RENDER_BUDGET,
     DESKTOP_RASTER_SIDE_CEILING, DESKTOP_VOLUME_GRID_CELLS, MIN_LOOP_FRAMES_PER_PANE,
@@ -9,7 +10,7 @@ use crate::constants::{
 };
 use crate::quality::{DeviceClass, GradientShading, ResolutionRung};
 use crate::scene::fixtures::{
-    plan_pane, scene_table, shipped_profile, stand_in_grid_bytes, volume_pane,
+    huge, plan_pane, scene_table, shipped_profile, stand_in_grid_bytes, volume_pane,
 };
 use crate::scene::{CapacitySource, TileNeed};
 use squallar_radar::xsect::{NATIVE_SECTION_WIDTH, WASM_SECTION_WIDTH};
@@ -384,7 +385,27 @@ fn the_allowance_is_the_constant_when_presumed_and_three_quarters_when_measured(
             "{}: the fraction was applied to a constant argued with its own headroom",
             limits.name,
         );
-        assert_eq!(cap.host_bytes, None);
+        // The host figure is the bracket's declared ceiling where it has one
+        // — the browser's linear memory — and, unlike the GPU presumption,
+        // the fraction IS applied to it: a wall the module header declares
+        // has no headroom of its own.
+        assert_eq!(
+            cap.host_bytes,
+            limits.presumed_host_bytes.map(|bytes| bytes as u64),
+            "{}",
+            limits.name,
+        );
+        assert_eq!(
+            cap.host_allowance(),
+            cap.host_bytes.map(|host| host / 4 * 3),
+            "{}",
+            limits.name,
+        );
+        if limits.name == "wasm32" {
+            assert_eq!(cap.host_bytes, Some(1 << 30));
+        } else {
+            assert_eq!(cap.host_bytes, None);
+        }
     }
     // The presumption is the bracket's floor constant whatever rung the class
     // earned: 3840 MiB on the desktop bracket, never the 4032 MiB ceiling.
@@ -471,6 +492,11 @@ fn fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs() {
     assert!(
         !fitted.tile_whole_zoom,
         "the tiles were not asked to give anything"
+    );
+    assert_eq!(
+        fitted.overlay_oversample_percent, OVERLAY_OVERSAMPLE_PERCENTS[0],
+        "a card over its allowance thinned the overlay margin before the history \
+         had paid, or for a byte the GPU model does not price",
     );
     assert_eq!(fitted.grid_cells, top.grid_cells);
     assert_eq!(fitted.raster_side_ceiling_px, top.raster_side_ceiling_px);
@@ -1086,4 +1112,183 @@ fn six_pane_sized_offscreens_cost_a_sixth_of_six_window_sized_ones() {
         ResolutionRung::Half,
         "the window figure with ground takes a rung a pane-sized one never needs",
     );
+}
+
+/// **A shown overlay picture is priced at the planner's own arithmetic.** The
+/// planner (`squallar_egui::overlay_cache::plan_overlay_texture`) sizes a
+/// side as `(side * scale) as u32` in `f32`; this crate sizes it as
+/// `side * percent / 100` in integers. For every entry of the oversampling
+/// table — 3/2, 5/4, 1/1, each exactly representable — and every side up to
+/// the largest 2D texture any adapter reports, the two truncate to the same
+/// pixel. On the user's own 2878 x 1651 canvas that is 42,755,568 B at 1.5x
+/// — the `overlay pictures:` line's figure for one pane — 29,682,444 B at
+/// 1.25x and 19,006,312 B at 1x.
+#[test]
+fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
+    let planner =
+        |side: u32, percent: u16| ((side as f32 * (f32::from(percent) / 100.0)) as u32) as u64;
+    for percent in OVERLAY_OVERSAMPLE_PERCENTS {
+        for side in (1..=16384u32).chain([2878, 1651, 32767, 32768]) {
+            assert_eq!(
+                picture_bytes([side, 1], percent) / 4,
+                planner(side, percent),
+                "side {side} at {percent}%: the integer side and the planner's f32 side \
+                 truncate to different pixels",
+            );
+        }
+    }
+    assert_eq!(picture_bytes([2878, 1651], 150), 42_755_568);
+    assert_eq!(picture_bytes([2878, 1651], 125), 29_682_444);
+    assert_eq!(picture_bytes([2878, 1651], 100), 19_006_312);
+    assert_eq!(picture_bytes([0, 1651], 150), 0);
+    assert_eq!(
+        picture_bytes([u32::MAX, u32::MAX], 150),
+        u64::MAX,
+        "saturates"
+    );
+}
+
+/// **The `huge` leg fits the page heap after one step of the oversampling
+/// rung, on both arms, and nothing else moves.** Thirteen pictures at 1.5x
+/// on the user's canvas plus the 193-tile working set plus one arrival are
+/// 880,880,596 B of host need against three quarters of a 1 GiB page heap
+/// (805,306,368 B) — over, which is the trap of 2026-09-02 priced. At 1.25x
+/// the same scene is 697,856,860 B and fits, so `fit` takes exactly that one
+/// step: the loop keeps its fourteen frames, the 3D ceiling, grid and raster
+/// side stay at the class rung, the tiles do not snap. The same bytes on the
+/// desktop bracket with a measured 1 GiB of RAM take the same one step: the
+/// scene costs what it costs, not what the bracket is. Under the session
+/// presumptions the watermark lowers to — nine tenths, then eighty-one
+/// hundredths — the rung stays at 1.25x and then goes to 1x, where the scene
+/// is 548,391,012 B against 652,298,157 B and fits again.
+#[test]
+fn the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms() {
+    let scene = huge(13);
+    let wasm = shipped_profile(BudgetLimits::WASM);
+    let top = resolve(&wasm);
+    let presumed = Capacity::presumed(&BudgetLimits::WASM);
+    assert_eq!(
+        presumed.host_bytes,
+        Some(1 << 30),
+        "the page's declared ceiling"
+    );
+    assert_eq!(presumed.host_allowance(), Some(805_306_368));
+
+    let at_top = need_terms(&scene, &top, stand_in_grid_bytes);
+    assert_eq!(at_top.tiles_host, 193 * 1_462_708);
+    assert_eq!(at_top.pictures_host, 13 * 42_755_568);
+    assert_eq!(at_top.picture_arrival_host, 42_755_568);
+    assert_eq!(at_top.total().host_bytes, 880_880_596);
+    assert_eq!(
+        over(&scene, &top, &presumed, stand_in_grid_bytes),
+        (false, true)
+    );
+
+    let fitted = fit(&scene, &wasm, &presumed, stand_in_grid_bytes);
+    assert_eq!(fitted.steps_back, 1, "one step of the oversampling rung");
+    assert_eq!(fitted.overlay_oversample_percent, 125);
+    assert_eq!(
+        need(&scene, &fitted, stand_in_grid_bytes).host_bytes,
+        697_856_860
+    );
+    assert_eq!(
+        over(&scene, &fitted, &presumed, stand_in_grid_bytes),
+        (false, false)
+    );
+    assert_eq!(
+        Budgets {
+            steps_back: 0,
+            overlay_oversample_percent: 150,
+            ..fitted
+        },
+        top,
+        "a page heap over its allowance moved something other than the margin",
+    );
+    assert_eq!(fitted.loop_render_budget, top.loop_render_budget);
+    assert!(!fitted.tile_whole_zoom);
+    assert!(fit_holds(
+        &scene,
+        &fitted,
+        &wasm.limits,
+        &presumed,
+        stand_in_grid_bytes
+    ));
+
+    // The same scene, the same host, the desktop bracket: the same step.
+    let desktop = DeviceProfile {
+        class: DeviceClass::Discrete,
+        vram_bytes: Some(24 << 30),
+        system_ram_bytes: Some(1 << 30),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let measured = desktop.capacity();
+    assert_eq!(measured.source, CapacitySource::Measured);
+    assert_eq!(measured.host_allowance(), Some(805_306_368));
+    let on_desktop = fit(&scene, &desktop, &measured, stand_in_grid_bytes);
+    assert_eq!(on_desktop.steps_back, 1);
+    assert_eq!(on_desktop.overlay_oversample_percent, 125);
+    assert_eq!(
+        need(&scene, &on_desktop, stand_in_grid_bytes).host_bytes,
+        need(&scene, &fitted, stand_in_grid_bytes).host_bytes,
+        "the same scene costs different host bytes on two brackets",
+    );
+
+    // The presumption the watermark lowers to, once and twice.
+    let lowered = |tenths: u64| presumed.host_held_to(Some((1u64 << 30) * tenths / 100));
+    let once = fit(&scene, &wasm, &lowered(90), stand_in_grid_bytes);
+    assert_eq!(
+        once.overlay_oversample_percent, 125,
+        "nine tenths still holds 1.25x"
+    );
+    let twice = fit(&scene, &wasm, &lowered(81), stand_in_grid_bytes);
+    assert_eq!(twice.steps_back, 2);
+    assert_eq!(twice.overlay_oversample_percent, 100);
+    assert_eq!(
+        need(&scene, &twice, stand_in_grid_bytes).host_bytes,
+        548_391_012
+    );
+    assert_eq!(lowered(81).host_allowance(), Some(652_298_157));
+    assert!(
+        !twice.tile_whole_zoom,
+        "the tiles snapped while the margin could still pay"
+    );
+
+    // A scene the host rungs cannot pay for stops at their stops and holds:
+    // the tiles snap after the margin is gone, and no GPU rung is touched.
+    let wall = presumed.host_held_to(Some(64 << 20));
+    let floor = fit(&scene, &wasm, &wall, stand_in_grid_bytes);
+    assert_eq!(floor.overlay_oversample_percent, 100);
+    assert!(floor.tile_whole_zoom);
+    assert_eq!(floor.steps_back, 3);
+    assert_eq!(floor.loop_render_budget, top.loop_render_budget);
+    assert_eq!(floor.grid_cells, top.grid_cells);
+    assert_eq!(floor.raster_side_ceiling_px, top.raster_side_ceiling_px);
+    assert!(every_host_rung_at_its_stop(&floor, &wasm.limits));
+    assert!(!every_rung_at_its_stop(&floor, &wasm.limits));
+    assert!(fit_holds(
+        &scene,
+        &floor,
+        &wasm.limits,
+        &wall,
+        stand_in_grid_bytes
+    ));
+}
+
+/// **A host figure nobody reads bounds nothing.** The native presumed arm
+/// carries no host capacity, so the same thirteen pictures are fitted on
+/// the GPU axis alone and stay at the class rung — exactly as before the
+/// host term existed — while the need itself is still priced.
+#[test]
+fn a_capacity_with_no_host_figure_never_sheds_for_the_host() {
+    let scene = huge(13);
+    for limits in [BudgetLimits::DESKTOP, BudgetLimits::MOBILE] {
+        let profile = shipped_profile(limits);
+        let cap = Capacity::presumed(&limits);
+        assert_eq!(cap.host_bytes, None, "{}", limits.name);
+        assert_eq!(cap.host_allowance(), None);
+        assert_eq!(cap.host_held_to(Some(1)).host_bytes, None);
+        let fitted = fit(&scene, &profile, &cap, stand_in_grid_bytes);
+        assert_eq!(fitted, resolve(&profile), "{}", limits.name);
+        assert!(need(&scene, &fitted, stand_in_grid_bytes).host_bytes > 800_000_000);
+    }
 }

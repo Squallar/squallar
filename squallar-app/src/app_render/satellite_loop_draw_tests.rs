@@ -173,6 +173,7 @@ fn a_render_request() -> crate::app::fetch::OverlayRenderRequest {
             height: 32,
             overdraw: 0.0,
             pixels_per_point: 1.0,
+            pane_px: [0, 0],
         },
         data_generation: 0,
         zoom: 32,

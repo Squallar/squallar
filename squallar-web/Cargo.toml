@@ -152,6 +152,10 @@ features = [
     # ends speak on a `MessagePort`.
     "MessageChannel",
     "MessagePort",
+    # `console.error`, the one channel the alloc-error hook can write to
+    # without allocating (`src/alloc_failure.rs`). Enabled transitively by
+    # `console_log` today; declared here for the reason `MediaQueryList` is.
+    "console",
 ]
 
 # For `tests/pwa_assets.rs`. Target-gated because a plain `[dev-dependencies]`

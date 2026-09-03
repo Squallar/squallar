@@ -580,11 +580,12 @@ degrade smoothly before degrading discretely.** Each rung names its knob.
 | 1 | **3D lighting model** | `GradientShading::On → Off` (`quality.rs:129`) | The app's first rung and the reasoning is measured: on a 3090 the cloud rung is 0.766 ms dense vs 0.263 ms for the flat march at 1440×900 (`quality.rs:8`). The cheapest large saving, and the one a user is least likely to name. `quality.rs:27`: "The ladder degrades lighting before resolution". |
 | 2 | **3D offscreen resolution** | `ResolutionRung::Native → Half → Quarter` (`quality.rs:93,101`) | ~3.4× per step at ~85 % efficiency (`quality.rs:14-15`). Blurrier, still correct, still interactive. |
 | 3 | **Loop *history*, 2D before 3D** | `loop_render_budget`, halved toward `MIN_LOOP_FRAMES_PER_PANE` one halving a step; `loop_span_secs` stays the demand *(knob as landed, WO-7 2026-09-02)* | A shorter loop is the least destructive thing in the app: nothing on screen gets worse, there is just less of it. The pool already divides smoothly and floors. **2D loop frames go before 3D grid resolution** — §4.4. |
-| 4 | **Tile sharpness** *(replaces "overlay texture area")* | whole-zoom snap: `tile_zoom = zoom.floor()` for the overrunning source | Fewer, larger tiles cover the same glass; the picture is less crisp, never wrong, and the ancestor net that keeps the map from going blank is never traded — §11. Placed above raster resolution because a coarser radar raster is a *wrong-looking* picture and a softer basemap is a *softer* one. |
-| 5 | **3D grid cell budget** | `grid_cells` down the named brackets | Now the picture itself gets coarser. This is the first rung the user will call "worse", so it is deliberately late. |
-| 6 | **2D raster side** | `raster_side_ceiling_px` → the long-range floor | Has a runtime path: `squallar-app/src/app_state.rs:90-98` resolves and logs "plan views may reach N px". Late because it is the most visible. |
-| 7 | **Concurrency** | `concurrent_renders → 1`, `render_cache_entries → 1` | Not a picture change; a *latency* change. Placed last among memory rungs because rung 7 makes the app feel slow, and slow-but-right beats fast-but-coarse for a radar viewer. |
-| 8 | **Pane count** | `WidthClass`-driven cap, tightened | Structural. The user loses a view they explicitly asked for, so it must be nearly last, and it must never silently rewrite their saved layout — `the_config_clamp_is_wider_than_a_compact_screen_offers` (`squallar-egui/src/ui_layout.rs:372`) pins exactly this. |
+| 4 | **Overlay oversampling** *(WO-25, 2026-09-02)* | `Budgets::overlay_oversample_percent` down `OVERLAY_OVERSAMPLE_PERCENTS` — 150 → 125 → 100 per side, one entry a step; the planner takes it as the overdraw fraction (0.25 → 0.125 → 0) | A whole-picture overlay is re-rasterised on every move at `(1 + 2f)²` of the pane's pixels, and the margin is *cover under pan* — ground the pane can still draw on while the replacement lands. Thinning it costs nothing while the map stands still and a blank strip at the leading edge of a fast pan until the next raster lands; never a wrong pixel, never input latency. After the history because a shorter loop is *less of the same picture* where this is a brief picture defect; before the tiles because a softened basemap is on every frame; and the largest lever per step in the table — thirteen shown layers on the user's canvas are 556 MB of a 1 GiB page heap at 1.5x, 386 at 1.25x, 247 at 1x. Lowers **both** axes: the picture is a GPU texture as well as a page buffer. |
+| 5 | **Tile sharpness** *(replaces "overlay texture area")* | whole-zoom snap: `tile_zoom = zoom.floor()` for the overrunning source | Fewer, larger tiles cover the same glass; the picture is less crisp, never wrong, and the ancestor net that keeps the map from going blank is never traded — §11. Placed above raster resolution because a coarser radar raster is a *wrong-looking* picture and a softer basemap is a *softer* one. |
+| 6 | **3D grid cell budget** | `grid_cells` down the named brackets | Now the picture itself gets coarser. This is the first rung the user will call "worse", so it is deliberately late. |
+| 7 | **2D raster side** | `raster_side_ceiling_px` → the long-range floor | Has a runtime path: `squallar-app/src/app_state.rs:90-98` resolves and logs "plan views may reach N px". Late because it is the most visible. |
+| 8 | **Concurrency** | `concurrent_renders → 1`, `render_cache_entries → 1` | Not a picture change; a *latency* change. Placed last among memory rungs because rung 8 makes the app feel slow, and slow-but-right beats fast-but-coarse for a radar viewer. |
+| 9 | **Pane count** | `WidthClass`-driven cap, tightened | Structural. The user loses a view they explicitly asked for, so it must be nearly last, and it must never silently rewrite their saved layout — `the_config_clamp_is_wider_than_a_compact_screen_offers` (`squallar-egui/src/ui_layout.rs:372`) pins exactly this. |
 | — | **Capability-gated rungs** | any rung whose knob needs a feature | **Not a rung position — a rule.** A rung that needs a format feature, a downlevel flag or a limit must ask `DeviceProfile`'s capability set for it, never ask whether this is the web build. When the capability is absent the rung is *skipped*. |
 | **Floor** | 3D view retired entirely | `squallar_volumetric::degrade::VolumeSupport` | Already exists and latches after `MAX_SURFACE_LOSSES_WITH_VOLUME = 2` surface losses (`squallar-volumetric/src/volume_degrade.rs:31`). The "garbage-ass version" the user wants to reach only as a last resort: 2D radar, correct, interactive, no 3D. |
 
@@ -614,6 +615,33 @@ steps on the desktop bracket (Native to Half to Quarter) and one on the other
 two: desktop 9 (1+2+4+1+0+1, its grid is pinned), mobile 5 (0+1+3+1+0+0),
 wasm32 7 (0+1+3+1+1+1). `deep` still has grid at floor and raster at the
 long-range floor.
+
+**What landed (WO-25, 2026-09-02).** One rung inserted between the history
+and the tiles — overlay oversampling, `Budgets::overlay_oversample_percent`
+down `constants::OVERLAY_OVERSAMPLE_PERCENTS` (150, 125, 100 per side), two
+steps on every bracket because the table is one constant and not a bracket:
+a picture's margin is the same three fractions of the same pane on every
+device. The egui planner takes it as the overdraw fraction
+(`overlay_cache::overdraw_for_oversample`, `plan_overlay_texture`'s fourth
+argument, delivered through `FrameInputs.overlay_overdraw` — zero new
+`self.gui.` reaches, the `tile_cache` pattern); `OVERDRAW_FRACTION` is the
+ceiling it is held to and the ladder's top rung, pinned equal
+(`the_planners_margin_is_the_ladders_top_rung_and_each_rung_is_exact`). **The
+ladder gained an axis with it.** Every rung now says which of the two needs it
+lowers (`budget::Lowers`): lighting, resolution, history, grid and raster the
+GPU's; oversampling and tiles both. `fit` takes a rung only against an axis
+that is over, so a page heap over its allowance never costs the loop its
+history, and a card over its allowance never thins a picture's margin for a
+byte the GPU model does not price — except that it may, because the picture
+*is* a GPU texture: the rung is tagged both, and a GPU walk takes its two steps
+after the history's halvings and before the snap. `demote`, the counted walk,
+takes every rung as before. The two pins above were re-argued again in the
+body: desktop 11 (1+2+4+2+1+0+1), mobile 7 (0+1+3+2+1+0+0), wasm32 9
+(0+1+3+2+1+1+1); `a_session_that_keeps_failing_settles_at_the_floor_and_never_writes`
+moved 9 → 11 on the same argument. `check_budgets` no longer asserts "tiles
+snapped ⇒ history at the floor" — a host-driven fit snaps the tiles with the
+history untouched, by design — and asserts instead the orders that hold of
+every walk: tiles snapped ⇒ margin at 1x, and no detail rung before the tiles.
 
 ### 4.4 The direct competition the brief flags: 2D loop frames vs 3D grid resolution
 
@@ -1167,6 +1195,24 @@ it. So the heap is *read*, not probed: the page via
 the hello and every reply (`LinearMemory { page_bytes, worker_bytes }`, plan
 D1). What is done with the reading is §10's watermark.
 
+**An allocation failure says its size** *(as landed, WO-25 2026-09-02)*. An
+allocation the engine refuses ends in `rust_oom` → `abort` → an `unreachable`
+trap, and the default alloc-error hook writes to a stderr the page does not
+have: the `huge` leg produced eight bare `RuntimeError: unreachable executed`
+lines and the proof they were out-of-memory took a disassembly. Both
+instances now install `squallar_web::alloc_failure::hook` (page in
+`entry::start`, worker in `worker::squallar_worker_main`), which prints
+`alloc failed: <bytes> B requested, <linear> of <max> MiB linear` through
+`console.error` and returns to the abort. **Nothing in it allocates** — a
+stack buffer for the line, a property read for the heap, a `&str` the glue
+copies — because the heap has just refused. `-Zoom=panic` was the other
+spelling and is not taken: it routes the failure through
+`console_error_panic_hook`, which formats a `String` at the moment allocation
+failed. The hook needs nightly's `alloc_error_hook`, which the wasm build is
+the one build on (`wasm-threads.sh`); the crate selects it with a `cfg_attr`
+on the wasm32 target and stays on stable for the host. The line is pure and
+host-tested (`the_line_names_the_request_and_the_heap_in_mib`).
+
 **The `--max-memory` evidence bar.** *(plan §Decisions)* The flag stays at 1 GiB
 until a phone boots at 2 GiB — raising it is a measurement someone has to make on
 a device, not a constant to edit.
@@ -1391,6 +1437,53 @@ invariant `fit` promises — need under the allowance or every rung at its stop
 (`App::fit_scene`). `fit` holds it by construction; a `false` is a defect in
 the arithmetic, so a debug build stops on it and a release build logs it once
 at warn and holds the loop pool at its floor from then on.
+
+**The host axis** *(as landed, WO-25 2026-09-02)*. `need` and `fit` price and
+fit **two** memories. The host need is the tile working set (§11), **every
+shown whole-picture overlay** at the budget's oversampling —
+`PaneNeed.overlay_pictures × fit::picture_bytes(picture_px, percent)`, the
+`overlay pictures:` line's own arithmetic, integer per side and pinned equal
+to the planner's `f32` truncation for every entry of the table
+(`a_shown_picture_is_priced_at_the_planners_own_arithmetic`) — and **one more
+picture for the arrival in flight** (`NeedTerms::picture_arrival_host`), because
+the worker's reply is decoded into a second buffer while the first is alive.
+A picture is a page buffer from the moment the reply is copied in until its
+last upload band has crossed to the GPU — four MiB a frame on a ringless
+device, so eleven frames for a 43 MB picture, and thirteen shown layers that
+re-rasterise together on every move and every loop bucket are all resident at
+once. That is what the `huge` leg's page heap was: 11, 522, 939, 1019 MiB
+across four ticks and `rust_oom` inside the frame, with 87 % of the wall
+acting at 939 and finding nothing its levers could free.
+
+**The host capacity** is `Capacity.host_bytes`: the profile's RAM on the
+measured arm, and on the presumed arm the bracket's declared ceiling where it
+has one — `BudgetLimits::presumed_host_bytes`, `Some(WASM_LINEAR_MEMORY_MAX_BYTES)`
+on wasm32 and `None` elsewhere. The browser is the one platform whose host
+capacity is *known* without a reader: the module header declares it (§8.5).
+The host allowance is `NEED_FRACTION` of that figure **on every arm, the
+presumed one included**, which is the one place the two axes differ: the GPU
+presumption is a bracket constant argued with its own headroom, where a linear
+memory is a wall declared with none — the allocator, the transport's copies
+and the picture in flight are all under it. A capacity with no host figure has
+no host allowance, and nothing is ever over one: the native presumed arm is
+fitted on the GPU axis alone, as before the term existed.
+
+**What the `huge` scene fits to**, pinned on both arms
+(`the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms`,
+fixture `scene::fixtures::huge`): thirteen pictures on 2878 × 1651 at 1.5x
+(42,755,568 B each) plus the 193-tile working set at the measured 1,462,708 B
+entry plus one arrival are 880,880,596 B against 805,306,368 B — over. `fit`
+takes one step of the oversampling rung and nothing else: at 1.25x the scene is
+697,856,860 B and fits, with the loop's fourteen frames, the 3D ceiling, the
+grid and the raster side at the class rung and the tiles unsnapped. The desktop
+bracket with a measured 1 GiB of RAM takes the same one step — the scene costs
+what it costs, not what the bracket is. Under the presumptions a page-heap
+event lowers to (nine tenths, then eighty-one hundredths) the rung holds at
+1.25x and then goes to 1x, where the scene is 548,391,012 B against
+652,298,157 B and fits again. A host the rungs cannot pay for stops at the host
+rungs' stops — margin at 1x, tiles snapped, three steps — and `fit_holds` holds
+per axis: need under the allowance, or every rung that lowers *that* axis at
+its stop.
 
 `need` sums terms the tree already prices: `loop_frame_bytes`,
 `squallar_volumetric::raymarch::resident_grid_bytes` (read by
@@ -1674,6 +1767,26 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
    `WASM_LINEAR_MEMORY_MAX_BYTES = 1 << 30`, pinned to the link flag by a test:
    **warn at 75 %, act at 87 %**; re-fire needs `used ≥ last + 32 MiB`.
 
+   *As landed (WO-25, 2026-09-02).* **The two instances are judged apart, and
+   the page's line is the scene's.** The percentage was the defect: 87 % is
+   133 MiB short of the wall, short of one 43 MB picture and long past a
+   batch of thirteen, so on the `huge` leg the heap stood under it on one tick
+   (522 MiB) and trapped before the next could act on the one after (939 →
+   1019). `linear_memory::act_line(max, headroom)` is the lower of the
+   percentage line and `max − headroom`, where the headroom is what the page
+   is about to allocate — the next picture batch plus one arrival, which the
+   need model already prices (`NeedTerms::pictures_host + picture_arrival_host`,
+   parked on the loop walk as `App::host_headroom_bytes`) — so the line is
+   453 MiB for that scene at 1.5x, 627 at 1.25x, 770 at 1x: the levers shrink
+   the batch and so raise the line. A batch past the wall puts it at zero,
+   every reading is pressure, and the re-fire step bounds how often that is
+   acted on. **Sampled where the page allocates**, not only on the tick: after
+   a frame's overlay arrivals (`poll_overlay_render_results`) and after its
+   Gui pass, where the tile pump puts (`App::sample_page_heap`) — one
+   `byteLength` read each. The worker's heap keeps the percentage line alone
+   and its own watch (`Pressure::WorkerMemory`): no lever of this application
+   reaches it, so its action is the economy eviction and no presumption moves.
+
 ### 10.3 Response, in order, all in-session
 
 *(plan D4)*
@@ -1693,6 +1806,30 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   whole cause was economy. The wall is therefore taken to be at most the
   allowance in force, less the economy the eviction just took; a second event
   lowers it again. `App::refit_under_pressure` carries the argument.
+
+  *As landed for the page heap (WO-25, 2026-09-02).* **Two walls, two
+  presumptions, and the page's levers in order.** A `LinearMemory` event
+  lowers the *host* figure (`App::session_host_capacity`) and only that: the
+  page's watermark says nothing about the card, and a GPU rung shed for it —
+  the loop's history first — would cost the picture for a byte the page never
+  gets back; every other cause lowers the GPU figure as before. Its levers,
+  each counted on the `budget pressure:` line, which gained two trailing
+  fields (`tile economy <MiB>, oversample <percent>`): **(1)** the render
+  cache and the extracts, as for any cause; **(2)** the tile economies
+  squeezed to nothing — styled, parsed and terrain allowances at zero from
+  then on (`App::tile_economy_squeezed`, applied on every loop walk through
+  the existing `TileCacheBudget` seam), the working set kept by the caches'
+  own floor, paid down one eviction per pump and never a frame; counted
+  once, a second event finds them given; **(3)** the host presumption down by
+  one economy fraction and the re-fit, which takes the oversampling rung
+  where the batch no longer fits (§9.2, "what the `huge` scene fits to");
+  **(4)** the loop caches' sweep, last, once the pool has been re-planned.
+  **Not a lever, and named so nobody looks for it:** "hidden-layer pictures".
+  A layer switched off has its picture released at the toggle
+  (`Pane::release_disabled_overlay_textures`) and only visible panes are
+  walked, so there is no hidden picture to release; a lever that frees zero
+  is the tell for waste, not a rung. A bracket with no host figure — every
+  native one — holds on a page-heap event and says so.
 - **(c) Restore economy and rungs** as pressure clears, in the shape
   `LoopPoolState::observe` already has (dwell, then hysteresis). *As landed
   for the tile rung (WO-12, 2026-09-02):* `squallar_egui::tile_source::snap`
@@ -1929,6 +2066,17 @@ host-cache allowance (§9.3). **Shed** = whole-zoom snapping.
   Firefox, then Chromium; if `style` dominates, a resumable `StyledCursor` in
   `vendor/walkers/src/mvt.rs`. Worker offload of tile styling is the structural
   follow-on, its own WO.
+- **WO-25, the economy under the page heap's watermark.** *As landed
+  (2026-09-02):* the first host lever a page-heap event pulls is this cache's
+  economy — styled history, parsed geometry and terrain rasters, their
+  allowances held at zero for the session through the same `TileCacheBudget`
+  seam the allowances arrive by (§10.3). Need is untouched: the working set is
+  the `ByteLru`'s own floor, so a squeeze evicts history and never a tile on
+  the glass, one entry per pump as every shrink is. What it gives back is what
+  the caches were holding beyond need — on the wasm floor 121 MiB of
+  allowance, and on the `huge` leg's log 128 MB resident — and the line says
+  so once (`tile economy <MiB>`); the tile working set itself is host *need*
+  (§9.2) and is paid for by the oversampling rung, not by this.
 
 ### 11.3 Why this is the whole model in one cache
 

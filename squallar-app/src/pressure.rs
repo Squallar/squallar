@@ -28,9 +28,19 @@ pub enum Pressure {
     /// The platform warned that memory is low — Android's `onLowMemory`, iOS's
     /// `didReceiveMemoryWarning`.
     MemoryWarning,
-    /// The fuller of the two wasm linear memories reached the action line of
-    /// its ceiling; both figures in bytes.
+    /// **The page instance's** wasm linear memory reached its action line —
+    /// the lower of the percentage and the wall less the scene's next batch
+    /// (`squallar_device_profile::linear_memory::act_line`); both figures in
+    /// bytes. The one cause whose levers are the host's: the tile economies,
+    /// the overlay-oversampling rung, the loop caches.
     LinearMemory { used: u64, max: u64 },
+    /// **The rasterization worker's** linear memory reached the percentage
+    /// line of its ceiling; both figures in bytes. Judged apart from the page
+    /// because no lever of this application reaches that heap — its big
+    /// consumer is an MRMS grid decode, answered upstream — so the answer
+    /// is the economy eviction alone: nothing of the page's picture is
+    /// traded for a wall the page is not against.
+    WorkerMemory { used: u64, max: u64 },
 }
 
 impl Pressure {
@@ -41,6 +51,7 @@ impl Pressure {
             Self::OutOfMemory => "out of memory",
             Self::MemoryWarning => "memory warning",
             Self::LinearMemory { .. } => "linear memory",
+            Self::WorkerMemory { .. } => "worker memory",
         }
     }
 
@@ -48,10 +59,23 @@ impl Pressure {
     fn describe(self) -> String {
         match self {
             Self::SurfaceLost | Self::OutOfMemory | Self::MemoryWarning => self.label().to_string(),
-            Self::LinearMemory { used, max } => {
+            Self::LinearMemory { used, max } | Self::WorkerMemory { used, max } => {
                 format!("{} {} of {} MiB", self.label(), mib(used), mib(max))
             }
         }
+    }
+
+    /// Whether this cause is the page heap's, and so lowers the session's
+    /// **host** presumption and takes the host levers; every other cause is
+    /// the GPU's.
+    pub fn is_page_heap(self) -> bool {
+        matches!(self, Self::LinearMemory { .. })
+    }
+
+    /// Whether this cause names a heap no lever of this application reaches,
+    /// so that economy is evicted and no presumption comes down.
+    pub fn is_beyond_reach(self) -> bool {
+        matches!(self, Self::WorkerMemory { .. })
     }
 }
 
@@ -78,18 +102,32 @@ pub struct Reclaimed {
     pub render_bytes: usize,
     /// Plan-view extraction payloads dropped.
     pub extracts: usize,
+    /// **Host bytes of tile economy released**: the styled, parsed and
+    /// terrain allowances the caches were holding history under, all taken
+    /// to zero by the squeeze — the working set is the caches' own floor and
+    /// stays. Zero on a cause that is not the page heap's, and zero on a
+    /// page-heap event after the first: the economy was already given back.
+    pub tile_economy_bytes: u64,
+    /// The overlay-oversampling rung in force once the event is answered,
+    /// in percent per side — `Budgets::overlay_oversample_percent`. The
+    /// lever the page heap's re-fit pulls; printed so a log says which rung
+    /// the next batch of pictures is planned at.
+    pub oversample_percent: u16,
 }
 
-/// The one line a pressure event logs: integers only, ASCII only.
+/// The one line a pressure event logs: integers only, ASCII only. The two
+/// host figures trail the rung, the field the line ended on before them.
 pub fn pressure_line(cause: Pressure, reclaimed: Reclaimed, rung: u32) -> String {
     format!(
         "budget pressure: {} -> evicted render cache {} entries {} MiB, extracts {}, \
-         ladder rung {}",
+         ladder rung {}, tile economy {} MiB, oversample {}",
         cause.describe(),
         reclaimed.render_entries,
         reclaimed.render_bytes / (1024 * 1024),
         reclaimed.extracts,
         rung,
+        mib(reclaimed.tile_economy_bytes),
+        reclaimed.oversample_percent,
     )
 }
 
@@ -127,9 +165,13 @@ pub struct LinearMemoryWatch {
 }
 
 impl LinearMemoryWatch {
-    /// Judge one reading and remember what was done about it.
-    pub fn observe(&mut self, used: u64, max: u64) -> LinearMemoryVerdict {
-        match linear_memory_verdict(used, max, self.last_acted_at) {
+    /// Judge one reading and remember what was done about it. `headroom` is
+    /// what the scene is about to allocate — the page's next picture batch
+    /// plus one arrival, as the need model prices it — and `0` for a heap
+    /// with no scene to price, which is judged by the percentage line alone
+    /// (`squallar_device_profile::linear_memory::act_line`).
+    pub fn observe(&mut self, used: u64, max: u64, headroom: u64) -> LinearMemoryVerdict {
+        match linear_memory_verdict(used, max, self.last_acted_at, headroom) {
             LinearMemoryVerdict::Act => {
                 self.last_acted_at = Some(used);
                 self.warned = true;
@@ -217,19 +259,25 @@ mod tests {
                 render_entries: 3,
                 render_bytes: 48 * 1024 * 1024,
                 extracts: 2,
+                tile_economy_bytes: 0,
+                oversample_percent: 150,
             },
             1,
         );
         assert_eq!(
             line,
             "budget pressure: out of memory -> evicted render cache 3 entries 48 MiB, \
-             extracts 2, ladder rung 1"
+             extracts 2, ladder rung 1, tile economy 0 MiB, oversample 150"
         );
         for cause in [
             Pressure::SurfaceLost,
             Pressure::OutOfMemory,
             Pressure::MemoryWarning,
             Pressure::LinearMemory {
+                used: 891 * MIB,
+                max: GIB,
+            },
+            Pressure::WorkerMemory {
                 used: 891 * MIB,
                 max: GIB,
             },
@@ -260,7 +308,45 @@ mod tests {
         assert_eq!(
             line,
             "budget pressure: linear memory 891 of 1024 MiB -> evicted render cache \
-             0 entries 0 MiB, extracts 0, ladder rung 1"
+             0 entries 0 MiB, extracts 0, ladder rung 1, tile economy 0 MiB, oversample 0"
+        );
+        let squeezed = pressure_line(
+            Pressure::LinearMemory {
+                used: 522 * MIB,
+                max: GIB,
+            },
+            Reclaimed {
+                tile_economy_bytes: 121 * MIB,
+                oversample_percent: 125,
+                ..Reclaimed::default()
+            },
+            1,
+        );
+        assert!(
+            squeezed.ends_with(", ladder rung 1, tile economy 121 MiB, oversample 125"),
+            "{squeezed}"
+        );
+        assert!(Pressure::LinearMemory { used: 1, max: 2 }.is_page_heap());
+        assert!(!Pressure::WorkerMemory { used: 1, max: 2 }.is_page_heap());
+        assert!(Pressure::WorkerMemory { used: 1, max: 2 }.is_beyond_reach());
+        for gpu in [
+            Pressure::SurfaceLost,
+            Pressure::OutOfMemory,
+            Pressure::MemoryWarning,
+        ] {
+            assert!(!gpu.is_page_heap() && !gpu.is_beyond_reach(), "{gpu:?}");
+        }
+        assert_eq!(
+            pressure_line(
+                Pressure::WorkerMemory {
+                    used: 891 * MIB,
+                    max: GIB,
+                },
+                Reclaimed::default(),
+                0,
+            ),
+            "budget pressure: worker memory 891 of 1024 MiB -> evicted render cache \
+             0 entries 0 MiB, extracts 0, ladder rung 0, tile economy 0 MiB, oversample 0"
         );
         assert_eq!(
             linear_memory_line(800 * MIB, GIB),
@@ -275,26 +361,26 @@ mod tests {
     #[test]
     fn the_warn_line_is_said_once_per_crossing() {
         let mut watch = LinearMemoryWatch::default();
-        assert_eq!(watch.observe(700 * MIB, GIB), Quiet);
+        assert_eq!(watch.observe(700 * MIB, GIB, 0), Quiet);
         assert!(!watch.has_warned());
-        assert_eq!(watch.observe(768 * MIB, GIB), Warn);
+        assert_eq!(watch.observe(768 * MIB, GIB, 0), Warn);
         assert!(watch.has_warned());
         assert_eq!(
-            watch.observe(768 * MIB, GIB),
+            watch.observe(768 * MIB, GIB, 0),
             Quiet,
             "said twice at one reading"
         );
         assert_eq!(
-            watch.observe(850 * MIB, GIB),
+            watch.observe(850 * MIB, GIB, 0),
             Quiet,
             "said twice on one crossing"
         );
-        assert_eq!(watch.observe(700 * MIB, GIB), Quiet);
+        assert_eq!(watch.observe(700 * MIB, GIB, 0), Quiet);
         assert!(
             !watch.has_warned(),
             "a reading back under the line did not re-arm it"
         );
-        assert_eq!(watch.observe(768 * MIB, GIB), Warn);
+        assert_eq!(watch.observe(768 * MIB, GIB, 0), Warn);
         assert_eq!(
             watch.last_acted_at(),
             None,
@@ -307,16 +393,16 @@ mod tests {
     #[test]
     fn an_action_records_its_mark_and_silences_the_warning() {
         let mut watch = LinearMemoryWatch::default();
-        assert_eq!(watch.observe(891 * MIB, GIB), Act);
+        assert_eq!(watch.observe(891 * MIB, GIB, 0), Act);
         assert_eq!(watch.last_acted_at(), Some(891 * MIB));
         assert!(watch.has_warned());
         assert_eq!(
-            watch.observe(891 * MIB, GIB),
+            watch.observe(891 * MIB, GIB, 0),
             Quiet,
             "acted twice at one reading"
         );
-        assert_eq!(watch.observe(891 * MIB + 31 * MIB, GIB), Quiet);
-        assert_eq!(watch.observe(891 * MIB + 32 * MIB, GIB), Act);
+        assert_eq!(watch.observe(891 * MIB + 31 * MIB, GIB, 0), Quiet);
+        assert_eq!(watch.observe(891 * MIB + 32 * MIB, GIB, 0), Act);
         assert_eq!(watch.last_acted_at(), Some(891 * MIB + 32 * MIB));
     }
 }

@@ -1116,6 +1116,26 @@ impl RenderDispatcher {
         sizes
     }
 
+    /// **The glass pane `pane_idx`'s last live dispatch was planned over**,
+    /// before the oversampling margin, in physical pixels —
+    /// `OverlayTexturePlan::pane_px`, `[0, 0]` for a pane that has dispatched
+    /// none. The footprint the budget system's host-picture term scales by
+    /// the oversampling in force, read off the record for the reason
+    /// [`Self::overlay_picture_sizes`] is: it is the size the planner was
+    /// handed, not a rect modelled from the window. The `max` over the
+    /// pane's layers is the same formality as there.
+    pub(crate) fn overlay_pane_px(&self, pane_idx: usize) -> [u32; 2] {
+        self.last_overlay_dispatch
+            .iter()
+            .filter(|((idx, _), _)| *idx == pane_idx)
+            .fold([0u32, 0u32], |acc, (_, req)| {
+                [
+                    acc[0].max(req.texture.pane_px[0]),
+                    acc[1].max(req.texture.pane_px[1]),
+                ]
+            })
+    }
+
     /// Record that job `job` is the raster on its way to `(pane, id)` for
     /// every pane in `panes`, and answer the jobs that supersession just
     /// orphaned: each returned id has **no** destination left that wants its

@@ -1,5 +1,10 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
+// The alloc-error hook (`alloc_failure::hook`) is nightly-only, and the
+// wasm build is the one build on nightly (`.github/scripts/wasm-threads.sh`):
+// a `cfg_attr` selects the feature for that target and leaves the host
+// build, which never installs the hook, on stable.
+#![cfg_attr(target_arch = "wasm32", feature(alloc_error_hook))]
 
 //! squallar in the browser: wasm32, WebGPU with a WebGL2 fallback.
 //!
@@ -145,6 +150,11 @@ pub mod rayon_pool;
 /// would put a recycled raster on the screen through. It is tested on the host.
 /// Only the part that builds `Uint8Array` views is gated.
 pub mod shared_loan;
+
+/// What an allocation failure says before the instance aborts. Not
+/// wasm32-gated for `shared_loan`'s reason: the line is pure and host-tested;
+/// only the hook that reads the instance's memory is gated.
+pub mod alloc_failure;
 
 /// `initThreadPool`, the JS half of `wasm-bindgen-rayon`'s pool. Re-exported
 /// because wasm-bindgen only emits a binding for an export this crate names:

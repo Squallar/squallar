@@ -232,6 +232,30 @@ pub struct App {
     /// the event less one economy fraction. Discarded at exit — nothing is
     /// learned across sessions.
     session_capacity: Option<u64>,
+    /// **This session's host capacity presumption** — the page heap's, on a
+    /// browser — lowered by a page-heap watermark event and never raised:
+    /// `None` until one, then the host figure in force less one economy
+    /// fraction. The GPU presumption above is untouched by such an event and
+    /// this one by every other cause: the two heaps are two walls. Discarded
+    /// at exit.
+    session_host_capacity: Option<u64>,
+    /// **Whether the tile economies have been squeezed to zero** by a
+    /// page-heap event this session: the styled, parsed and terrain
+    /// allowances the loop walk hands the tile caches are held at nothing
+    /// from then on, so the caches keep their working set — their own floor
+    /// — and no history. The first host lever, and the cheapest: one
+    /// refetch on the next pan, never a frame. Never written anywhere.
+    tile_economy_squeezed: bool,
+    /// **What the page's next picture batch will allocate**, as the last loop
+    /// walk priced it — every shown overlay picture at the budget's
+    /// oversampling plus one arrival — so the watermark's action line can be
+    /// derived from the scene on every reading without a second pane walk
+    /// (`squallar_device_profile::linear_memory::act_line`). Zero natively
+    /// and before the first walk.
+    host_headroom_bytes: u64,
+    /// The rasterization worker's own watermark, judged apart from the
+    /// page's ([`crate::pressure::Pressure::WorkerMemory`]).
+    worker_memory_watch: crate::pressure::LinearMemoryWatch,
     /// **Where the browser's WebGPU probe stands**, as the bridge last said:
     /// `Absent` natively and until the first ask, then skipped, pending, empty
     /// or found. A found figure is the per-tab allowance in bytes, which
@@ -542,7 +566,12 @@ pub(super) fn capacity_with_probe(
         probed_gpu_bytes,
     ) {
         (CapacitySource::Presumed, Platform::Web, DeviceClass::Unknown, Some(bytes)) => {
-            Capacity::probed(bytes)
+            // The probe answered for the GPU; the page heap is still the
+            // bracket's declared ceiling, and it rides along.
+            Capacity {
+                host_bytes: own.host_bytes,
+                ..Capacity::probed(bytes)
+            }
         }
         _ => own,
     }
@@ -716,6 +745,10 @@ impl App {
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
             session_capacity: None,
+            session_host_capacity: None,
+            tile_economy_squeezed: false,
+            host_headroom_bytes: 0,
+            worker_memory_watch: crate::pressure::LinearMemoryWatch::default(),
             gpu_probe: GpuProbeReport::Absent,
             gpu_probe_settled: false,
             pending_fit: None,
@@ -882,6 +915,10 @@ impl App {
         // The end of the present path: whatever the device's error sink noted
         // while this frame was encoded and presented is answered once, here.
         self.absorb_gpu_pressure();
+        // And the page heap, where this frame's Gui pass put its tiles: one
+        // `byteLength` read on a browser, nothing natively
+        // (`render::App::sample_page_heap`).
+        self.sample_page_heap();
         // The five stamps below cut the `post` segment into the six things
         // this tail does; `frame_ledger::PostHists` says what each one holds
         // and why the split exists. Taken here rather than handed back by a
@@ -1225,6 +1262,7 @@ impl App {
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
         capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
             .held_to(self.session_capacity)
+            .host_held_to(self.session_host_capacity)
     }
 
     /// Make `budgets` the budgets in force, and re-derive what hangs off them.

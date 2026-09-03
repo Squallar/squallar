@@ -42,6 +42,7 @@ fn plan(overdraw: f32) -> OverlayTexturePlan {
         height: SIDE,
         overdraw,
         pixels_per_point: 1.0,
+        pane_px: [0, 0],
     }
 }
 

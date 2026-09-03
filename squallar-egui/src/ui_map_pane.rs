@@ -402,6 +402,11 @@ pub(super) struct PaneRenderCtx<'a> {
     /// the device's `Budgets::concurrent_renders`. See
     /// [`crate::overlay_cache::RendersInFlight::admits`].
     pub overlay_render_limit: usize,
+    /// The overdraw fraction this pane's whole-picture overlays ask for, per
+    /// side — the ladder's oversampling rung, delivered through
+    /// `crate::shell_api::FrameInputs::overlay_overdraw` and handed to
+    /// [`plan_overlay_texture`].
+    pub overlay_overdraw: f32,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Which halves of the pane's content this pass is for. See
@@ -863,13 +868,18 @@ pub(super) fn render_pane_map_content(
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
         let qzoom = current_quantized_zoom(zoom);
-        // As much overdraw as the adapter's texture limit allows; egui only
-        // `debug_assert!`s the bound, so exceeding it is a wgpu validation error.
+        // As much overdraw as the ladder's rung asks for and the adapter's
+        // texture limit allows; egui only `debug_assert!`s the bound, so
+        // exceeding it is a wgpu validation error.
         let max_texture_side = ui.ctx().input(|i| i.max_texture_side) as u32;
         // In physical pixels, not points: an overlay sized in points is one
         // texel per `ppp²` physical pixels.
-        let tex_plan =
-            plan_overlay_texture(screen_rect, max_texture_side, ui.ctx().pixels_per_point());
+        let tex_plan = plan_overlay_texture(
+            screen_rect,
+            max_texture_side,
+            ui.ctx().pixels_per_point(),
+            ctx.overlay_overdraw,
+        );
         // Whether a gesture is moving the zoom on this frame — the settle
         // test's whole input. Read once for the window, because egui's input
         // is the window's; see `ZoomDrive`.

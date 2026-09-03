@@ -151,6 +151,9 @@ pub fn nominal_overlay_frame_bytes() -> usize {
         // maximum over every adapter rather than one adapter's.
         u32::MAX,
         1.0,
+        // The full margin, likewise: the nominal frame is the ladder's top
+        // rung, and a loop frame priced from it is never under-priced.
+        squallar_egui::overlay_cache::OVERDRAW_FRACTION,
     );
     plan.width as usize * plan.height as usize * 4
 }

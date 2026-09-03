@@ -271,6 +271,13 @@ pub struct OverlayTexturePlan {
     /// display density [`plan_overlay_texture`] was handed, after the same
     /// clamping the pixel counts got.
     pub pixels_per_point: f32,
+    /// The glass this picture covers before the margin, in physical pixels —
+    /// the pane rect at the density above, truncated. What the budget
+    /// system's host-picture term scales by the oversampling in force
+    /// (`squallar_device_profile::fit::picture_bytes`), carried on the plan
+    /// so the scene is described from the size the planner was handed and
+    /// not re-derived from a rect laid out on some other frame.
+    pub pane_px: [u32; 2],
 }
 
 impl OverlayTexturePlan {
@@ -289,12 +296,24 @@ impl OverlayTexturePlan {
     }
 }
 
-/// Size the overlay texture for `screen_rect`, giving up overdraw rather than
-/// exceeding `max_texture_side`.
+/// The overdraw fraction per side the budget's oversampling asks for —
+/// `Budgets::overlay_oversample_percent` (150, 125, 100 per side) as the
+/// fraction [`plan_overlay_texture`] takes: `(percent - 100) / 200`, so 0.25,
+/// 0.125 and 0.0. Exact in `f32` for every entry of the table, each a dyadic
+/// rational, which is what keeps the planned side equal to the budget
+/// system's integer side to the pixel. A percent under 100 asks for nothing.
+pub fn overdraw_for_oversample(percent: u16) -> f32 {
+    (f32::from(percent.max(100)) - 100.0) / 200.0
+}
+
+/// Size the overlay texture for `screen_rect`, asking for `overdraw` on each
+/// side — never more than [`OVERDRAW_FRACTION`] — and giving up overdraw
+/// rather than exceeding `max_texture_side`.
 pub fn plan_overlay_texture(
     screen_rect: egui::Rect,
     max_texture_side: u32,
     pixels_per_point: f32,
+    overdraw: f32,
 ) -> OverlayTexturePlan {
     // A density that is not a positive number is not a description of a
     // display. egui never reports one, but this value reaches a texture
@@ -308,12 +327,19 @@ pub fn plan_overlay_texture(
     let screen_w = screen_rect.width().max(0.0) * density;
     let screen_h = screen_rect.height().max(0.0) * density;
     let max_side = max_texture_side.max(1);
+    // The margin asked for: the ladder's, held to the renderer's own ceiling,
+    // and nothing for a fraction that is not a number.
+    let asked = if overdraw.is_finite() {
+        overdraw.clamp(0.0, OVERDRAW_FRACTION)
+    } else {
+        0.0
+    };
 
     // Largest overdraw this axis can afford: `side * (1 + 2f) == max_side`.
     // Negative when the viewport alone overflows the limit, hence the `max(0.0)`.
     // A zero side divides to `inf`, which `min` discards — no special case needed.
     let affordable = |side: f32| (max_side as f32 / side - 1.0) / 2.0;
-    let overdraw = OVERDRAW_FRACTION
+    let overdraw = asked
         .min(affordable(screen_w))
         .min(affordable(screen_h))
         .max(0.0);
@@ -329,6 +355,7 @@ pub fn plan_overlay_texture(
         height: ((screen_h * scale) as u32).min(max_side),
         overdraw,
         pixels_per_point: density,
+        pane_px: [screen_w as u32, screen_h as u32],
     }
 }
 

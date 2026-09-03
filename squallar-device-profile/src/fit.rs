@@ -24,7 +24,9 @@
 //! exactly as before a reader existed. [`fit_holds`] is the one invariant both
 //! arms promise, checked where the application adopts an answer.
 
-use crate::budget::{BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down};
+use crate::budget::{
+    BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down, step_down_for,
+};
 use crate::quality::{GroundPass, offscreen_bytes};
 use crate::scene::{Capacity, Need, PaneNeed, Scene};
 use squallar_radar::types::RenderView;
@@ -60,6 +62,21 @@ pub struct NeedTerms {
     pub buildings: u64,
     /// The tile working set, on the host.
     pub tiles_host: u64,
+    /// **Every shown overlay picture, on the host**: each pane's
+    /// `overlay_pictures` at [`picture_bytes`] for that pane at the budget's
+    /// oversampling. A picture is a page buffer from the moment the
+    /// worker's reply is copied in until its last upload band has crossed to
+    /// the GPU — on a ringless device four MiB a frame, so a 43 MB picture
+    /// is eleven frames of residency and thirteen shown layers that
+    /// re-rasterise together are all resident at once.
+    pub pictures_host: u64,
+    /// **One more picture, on the host, for the arrival in flight**: the
+    /// largest picture any pane shows, once. The reply is decoded into a
+    /// second buffer while the first is alive and then converted into the
+    /// image the GPU is handed while the second is alive, so at every
+    /// arrival one picture is resident twice for a moment. Zero where no
+    /// pane shows a picture.
+    pub picture_arrival_host: u64,
 }
 
 impl NeedTerms {
@@ -67,7 +84,10 @@ impl NeedTerms {
     pub fn total(&self) -> Need {
         Need {
             gpu_bytes: self.gpu_without_loops().saturating_add(self.loops),
-            host_bytes: self.tiles_host,
+            host_bytes: self
+                .tiles_host
+                .saturating_add(self.pictures_host)
+                .saturating_add(self.picture_arrival_host),
         }
     }
 
@@ -104,6 +124,13 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
         terms.buildings = terms
             .buildings
             .saturating_add(buildings_term(pane, budgets));
+        if pane.overlay_pictures > 0 {
+            let picture = picture_bytes(pane.picture_px, budgets.overlay_oversample_percent);
+            terms.pictures_host = terms
+                .pictures_host
+                .saturating_add((pane.overlay_pictures as u64).saturating_mul(picture));
+            terms.picture_arrival_host = terms.picture_arrival_host.max(picture);
+        }
     }
     terms.mirror = mirror_term(scene.mirror_px, budgets);
     for source in &scene.tile_sources {
@@ -118,6 +145,22 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
 /// What `scene` costs at `budgets`.
 pub fn need(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Need {
     need_terms(scene, budgets, grid_bytes).total()
+}
+
+/// **Bytes one whole-picture overlay raster of a pane of `px` costs at
+/// `oversample_percent` per side**: `(w * p / 100) * (h * p / 100) * 4`,
+/// integer division per side — the planner's own arithmetic
+/// (`squallar_egui::overlay_cache::plan_overlay_texture`: `(side * scale) as
+/// u32` in `f32`, which truncates the same way for every scale in
+/// `constants::OVERLAY_OVERSAMPLE_PERCENTS`, each a dyadic rational). It is
+/// the figure the application's `overlay pictures:` line reports per pane,
+/// restated here so the need model and the telemetry cannot disagree. The
+/// adapter's texture limit, which the planner also clamps to, is not known
+/// here: a pane wider than the limit is over-priced, never under — the side
+/// a budget resolved without probing the machine may be on.
+pub fn picture_bytes(px: [u32; 2], oversample_percent: u16) -> u64 {
+    let side = |n: u32| u64::from(n) * u64::from(oversample_percent) / 100;
+    side(px[0]).saturating_mul(side(px[1])).saturating_mul(4)
 }
 
 /// Frames one looping pane wants: its own lookback converted at its cadence and
@@ -190,15 +233,36 @@ pub fn loop_pool_bytes(
         .min(cap.allowance().saturating_sub(terms.gpu_without_loops()))
 }
 
-/// The largest budgets whose need for `scene` fits `cap`'s allowance.
+/// Which of a scene's two needs are over `cap`'s allowances at `budgets`:
+/// `(gpu, host)`. A capacity with no host figure has no host allowance, and
+/// nothing is ever over one.
+pub fn over(
+    scene: &Scene,
+    budgets: &Budgets,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> (bool, bool) {
+    let need = need(scene, budgets, grid_bytes);
+    (
+        need.gpu_bytes > cap.allowance(),
+        cap.host_allowance()
+            .is_some_and(|allowance| need.host_bytes > allowance),
+    )
+}
+
+/// The largest budgets whose need for `scene` fits `cap`'s allowances.
 ///
 /// Starts from `resolve(profile)` — the rung the class earns, so a scene that
-/// fits changes nothing — and while the need is over the allowance takes the
-/// next rung of the shed order `budget::demote` walks: 3D lighting, 3D
-/// offscreen resolution, loop span (halving toward the two-frame floor), tile
-/// sharpness, 3D grid, raster side. Stops when the scene fits, or when every
-/// rung is at its stop — then the floor budgets come back and the runtime
-/// clamps and logs. `steps_back` counts the rungs taken.
+/// fits changes nothing — and while a need is over its allowance takes the
+/// next rung of the shed order `budget::demote` walks **that lowers an axis
+/// which is over**: 3D lighting, 3D offscreen resolution, loop span (halving
+/// toward the two-frame floor), overlay oversampling, tile sharpness, 3D
+/// grid, raster side. A page heap over its allowance never costs the loop
+/// its history, and a card over its allowance never costs a picture its
+/// margin for a byte the GPU model does not price. Stops when the scene
+/// fits, or when every rung that could answer is at its stop — then the
+/// floor budgets come back and the runtime clamps and logs. `steps_back`
+/// counts the rungs taken.
 pub fn fit(
     scene: &Scene,
     profile: &DeviceProfile,
@@ -207,9 +271,12 @@ pub fn fit(
 ) -> Budgets {
     let limits = &profile.limits;
     let mut budgets = resolve(profile);
-    let allowance = cap.allowance();
-    while need(scene, &budgets, grid_bytes).gpu_bytes > allowance {
-        if !step_down(&mut budgets, limits) {
+    loop {
+        let (gpu_over, host_over) = over(scene, &budgets, cap, grid_bytes);
+        if !gpu_over && !host_over {
+            break;
+        }
+        if !step_down_for(&mut budgets, limits, gpu_over, host_over) {
             break;
         }
         budgets.steps_back = budgets.steps_back.saturating_add(1);
@@ -224,13 +291,25 @@ pub fn every_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool 
     !step_down(&mut probe, limits)
 }
 
+/// Whether no rung that lowers the GPU need can move `budgets` any further.
+pub fn every_gpu_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool {
+    let mut probe = *budgets;
+    !step_down_for(&mut probe, limits, true, false)
+}
+
+/// Whether no rung that lowers the host need can move `budgets` any further.
+pub fn every_host_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool {
+    let mut probe = *budgets;
+    !step_down_for(&mut probe, limits, false, true)
+}
+
 /// **The invariant [`fit`] promises**, stated once so the runtime can check
-/// the answer it adopts: `scene`'s need at `budgets` fits `cap`'s allowance,
-/// or every rung is at its stop and there was nothing left to shed. `fit`
-/// holds it by construction on both arms; a `false` here is a defect in the
-/// arithmetic — a term that stopped being monotone down the ladder — and the
-/// application logs it and holds the pool at its floor rather than trusting
-/// the budgets.
+/// the answer it adopts: on each axis, `scene`'s need at `budgets` fits
+/// `cap`'s allowance or every rung that lowers that axis is at its stop and
+/// there was nothing left to shed. `fit` holds it by construction on both
+/// arms; a `false` here is a defect in the arithmetic — a term that stopped
+/// being monotone down the ladder — and the application logs it and holds
+/// the pool at its floor rather than trusting the budgets.
 pub fn fit_holds(
     scene: &Scene,
     budgets: &Budgets,
@@ -238,8 +317,9 @@ pub fn fit_holds(
     cap: &Capacity,
     grid_bytes: GridBytes,
 ) -> bool {
-    need(scene, budgets, grid_bytes).gpu_bytes <= cap.allowance()
-        || every_rung_at_its_stop(budgets, limits)
+    let (gpu_over, host_over) = over(scene, budgets, cap, grid_bytes);
+    (!gpu_over || every_gpu_rung_at_its_stop(budgets, limits))
+        && (!host_over || every_host_rung_at_its_stop(budgets, limits))
 }
 
 /// What may be resident beyond `scene`'s need at `budgets` under `cap`:

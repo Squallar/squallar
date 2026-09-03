@@ -1165,6 +1165,12 @@ impl super::App {
                 // priced it against this session's capacity — see
                 // `Self::observe_loop_demand`.
                 tile_cache: self.tile_cache_budget,
+                // The overlay-oversampling rung in force, as the fraction the
+                // planner takes: the ladder's answer for this session's
+                // capacity, host axis included.
+                overlay_overdraw: squallar_egui::overlay_cache::overdraw_for_oversample(
+                    self.budgets.overlay_oversample_percent,
+                ),
                 location_settings_available: self.location_settings_available,
                 // Read off the gate each frame; the gate is the owner and
                 // `poll_platform_state` already redraws on a change.
@@ -1819,24 +1825,77 @@ impl super::App {
                 &self
                     .render
                     .overlay_picture_sizes(self.scene_of().panes.len()),
+                self.budgets.overlay_oversample_percent,
             ),
         );
-        // The wasm heap watermark, on the same tick. The bridge answers the
-        // platform question: a native bridge reads no heap and this arm is
-        // never entered there. The fuller of the two instances is judged —
-        // each has the same ceiling of its own, and the two are never added.
+        // The wasm heap watermarks, on the same tick. The bridge answers the
+        // platform question: a native bridge reads no heap and neither arm
+        // is entered there. The two instances are judged apart — each has
+        // the same ceiling of its own, the two are never added, and only
+        // the page's has levers — and the page's is also judged after every
+        // picture arrival and every frame's tile puts (`observe_page_heap`),
+        // so this tick is the worker's one reading and the page's slowest.
         if let Some(heap) = linear {
-            let used = heap.page_bytes.max(heap.worker_bytes.unwrap_or(0));
-            let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
-            match self.linear_memory_watch.observe(used, max) {
-                squallar_device_profile::linear_memory::LinearMemoryVerdict::Quiet => {}
-                squallar_device_profile::linear_memory::LinearMemoryVerdict::Warn => {
-                    log::info!("{}", crate::pressure::linear_memory_line(used, max));
-                }
-                squallar_device_profile::linear_memory::LinearMemoryVerdict::Act => {
-                    self.on_pressure(crate::pressure::Pressure::LinearMemory { used, max });
-                }
+            self.observe_page_heap(heap.page_bytes);
+            if let Some(worker) = heap.worker_bytes {
+                self.observe_worker_heap(worker);
             }
+        }
+    }
+
+    /// **Judge one reading of the page's linear memory** against the line
+    /// the scene sets — the wall less the next picture batch, never past
+    /// the percentage line (`squallar_device_profile::linear_memory::act_line`)
+    /// — and act on it: the host levers through [`Self::on_pressure`]. Called
+    /// where the page allocates, after the overlay arrivals of a frame and
+    /// after its tile puts, and on the telemetry tick; every call is one
+    /// `byteLength` read and a few compares, and an action is bounded by
+    /// what `on_pressure` does. The watch's re-fire step keeps a heap that
+    /// has acted once from acting on every frame.
+    pub(super) fn observe_page_heap(&mut self, used: u64) {
+        use squallar_device_profile::linear_memory::LinearMemoryVerdict;
+
+        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+        match self
+            .linear_memory_watch
+            .observe(used, max, self.host_headroom_bytes)
+        {
+            LinearMemoryVerdict::Quiet => {}
+            LinearMemoryVerdict::Warn => {
+                log::info!("{}", crate::pressure::linear_memory_line(used, max));
+            }
+            LinearMemoryVerdict::Act => {
+                self.on_pressure(crate::pressure::Pressure::LinearMemory { used, max });
+            }
+        }
+    }
+
+    /// **Judge one reading of the rasterization worker's linear memory**, by
+    /// the percentage line alone: no scene of this application is priced on
+    /// that heap and no lever reaches it, so an action there evicts economy
+    /// and lowers no presumption ([`crate::pressure::Pressure::WorkerMemory`]).
+    pub(super) fn observe_worker_heap(&mut self, used: u64) {
+        use squallar_device_profile::linear_memory::LinearMemoryVerdict;
+
+        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+        match self.worker_memory_watch.observe(used, max, 0) {
+            LinearMemoryVerdict::Quiet => {}
+            LinearMemoryVerdict::Warn => {
+                log::info!("worker {}", crate::pressure::linear_memory_line(used, max));
+            }
+            LinearMemoryVerdict::Act => {
+                self.on_pressure(crate::pressure::Pressure::WorkerMemory { used, max });
+            }
+        }
+    }
+
+    /// **Sample the page heap where a frame just allocated**: after the
+    /// overlay arrivals — each one a picture copied into this heap — and
+    /// after the Gui pass, which is where the tile pump puts its entries.
+    /// Nothing on a bridge that reads no heap.
+    pub(super) fn sample_page_heap(&mut self) {
+        if let Some(heap) = self.platform.linear_memory() {
+            self.observe_page_heap(heap.page_bytes);
         }
     }
 
@@ -2160,7 +2219,9 @@ impl super::App {
     fn poll_overlay_render_results(&mut self, ctx: &egui::Context) {
         use squallar_egui::overlay_cache::OverlayTextureData;
 
+        let mut arrived = 0usize;
         while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv() {
+            arrived += 1;
             let id = resp.overlay_kind.clone();
 
             // **One loop frame's raster, filed on the frame that asked** — the
@@ -2276,6 +2337,12 @@ impl super::App {
                     cache.hold(data, None);
                 }
             }
+        }
+        // Every arrival above was a picture copied into this heap; one
+        // reading now, where it grew, rather than on the tick two seconds
+        // hence. Nothing natively.
+        if arrived > 0 {
+            self.sample_page_heap();
         }
     }
 
@@ -4083,6 +4150,27 @@ impl super::App {
                     .map_or((window_px, GroundPass::Off), |p| (p.px, p.ground)),
                 _ => ([0, 0], GroundPass::Off),
             };
+            // **The whole-picture overlays this pane shows**, counted off the
+            // pane's own texture caches on this same walk: every texture
+            // layer with a picture on the glass or a raster on its way,
+            // radar excluded — its raster is its own pipeline's and the
+            // static term's. Each is one raster of the pane at the budget's
+            // oversampling crossing the page heap, and the glass it covers
+            // is what the last dispatch planned over (`[0, 0]` before one,
+            // when the window stands in — over-priced, never under).
+            let overlay_pictures = pane
+                .overlay_textures
+                .iter()
+                .filter(|(id, cache)| {
+                    **id != known::RADAR
+                        && !pane.overlay_texture_is_releasable(id)
+                        && (cache.current().is_some() || !cache.renders.is_empty())
+                })
+                .count();
+            let picture_px = match self.render.overlay_pane_px(pane_idx) {
+                [0, 0] => window_px,
+                planned => planned,
+            };
             let mut pane_need = PaneNeed {
                 px,
                 view,
@@ -4095,6 +4183,8 @@ impl super::App {
                 // No production caller dispatches a `BuildingMeshJob` yet, so
                 // no pane spends the prism row.
                 buildings: false,
+                overlay_pictures,
+                picture_px,
             };
             let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
@@ -4201,6 +4291,25 @@ impl super::App {
             &self.capacity(),
             GRID_BYTES,
         );
+        // Under a page-heap squeeze the economies are nothing: the caches
+        // keep their working set — their own floor — and hold no history.
+        // The rung rides along untouched; it is the ladder's, not the
+        // economy's.
+        if self.tile_economy_squeezed {
+            self.tile_cache_budget = squallar_device_profile::budget::TileCacheBudget {
+                styled_bytes: 0,
+                parsed_bytes: 0,
+                terrain_bytes: 0,
+                whole_zoom: self.tile_cache_budget.whole_zoom,
+            };
+        }
+        // What the page's next picture batch will allocate, for the
+        // watermark's line: priced here, on the walk that has the scene, so
+        // no reading of the heap walks the panes again.
+        let terms = squallar_device_profile::fit::need_terms(&scene, &self.budgets, GRID_BYTES);
+        self.host_headroom_bytes = terms
+            .pictures_host
+            .saturating_add(terms.picture_arrival_host);
         self.loop_pool = self.pool_for_scene(&scene);
         self.loop_pool_state
             .observe(
@@ -4287,7 +4396,8 @@ impl super::App {
         log::info!(
             "Budgets: rung {} for the scene ({} panes, {} MiB of need against {} MiB allowed \
              of {} MiB {}, {} MiB of economy allowance): {:?} 3D quality ceiling, {} MiB of \
-             offscreen, {:?} grid cells, {} textured loop frames",
+             offscreen, {:?} grid cells, {} textured loop frames, overlay oversampling {} \
+             percent against {} MiB of host need",
             wanted.steps_back,
             scene.panes.len(),
             need(scene, &wanted, GRID_BYTES).gpu_bytes / (1024 * 1024),
@@ -4299,6 +4409,8 @@ impl super::App {
             wanted.offscreen_bytes / (1024 * 1024),
             wanted.grid_cells,
             wanted.loop_render_budget,
+            wanted.overlay_oversample_percent,
+            need(scene, &wanted, GRID_BYTES).host_bytes / (1024 * 1024),
         );
         self.adopt_budgets(wanted);
     }
@@ -4327,26 +4439,51 @@ impl super::App {
     pub(super) fn on_pressure(&mut self, cause: crate::pressure::Pressure) {
         let (renders, render_bytes) = self.render.clear_render_cache();
         let extracts = self.render.clear_extract_cache();
-        let reclaimed = crate::pressure::Reclaimed {
-            render_entries: renders.len(),
-            render_bytes,
-            extracts: extracts.len(),
-        };
+        let (render_entries, extract_entries) = (renders.len(), extracts.len());
         squallar_worker::offload::discard_each("pressure-render-cache", renders);
         squallar_worker::offload::discard_each("pressure-extract-cache", extracts);
-        self.evict_unneeded_loop_scans();
+
+        // **The page heap's own levers, in order.** First the tile
+        // economies, the cheapest thing on that heap to give back — the
+        // styled history, the parsed geometry and the terrain rasters, all
+        // to zero, the working set kept by the caches' own floor, paid down
+        // one eviction per pump and never a frame (`Self::observe_loop_demand`
+        // holds the allowances at nothing from here on). Counted once: a
+        // second event finds them already given. Then the presumption and
+        // the rung below; the loop caches last, after the re-fit, because
+        // what a shorter history frees on the page is the decoded volumes
+        // no live frame names, and that set is known only once the pool has
+        // been re-planned.
+        let tile_economy_bytes = if cause.is_page_heap() && !self.tile_economy_squeezed {
+            self.tile_economy_squeezed = true;
+            let held = self.tile_cache_budget;
+            held.styled_bytes + held.parsed_bytes + held.terrain_bytes
+        } else {
+            0
+        };
 
         // An allocation the browser refused while the WebGPU probe was holding
         // its doubling textures is the probe's doing, not a wall of this
         // session's: the textures are destroyed the moment the probe reports,
         // and a presumption lowered here would hold the probed figure down for
         // the whole session (`crate::pressure::is_the_gpu_probes_own`). The
-        // economy is evicted all the same; the rung stands.
+        // economy is evicted all the same; the rung stands. A heap no lever
+        // reaches — the worker's — holds the rung the same way.
         let rung = if crate::pressure::is_the_gpu_probes_own(cause, self.gpu_probe) {
             log::warn!("pressure: oom during gpu probe, presumption held");
             self.budgets.steps_back
+        } else if cause.is_beyond_reach() {
+            self.budgets.steps_back
         } else {
             self.refit_under_pressure(cause)
+        };
+        self.evict_unneeded_loop_scans();
+        let reclaimed = crate::pressure::Reclaimed {
+            render_entries,
+            render_bytes,
+            extracts: extract_entries,
+            tile_economy_bytes,
+            oversample_percent: self.budgets.overlay_oversample_percent,
         };
         log::warn!("{}", crate::pressure::pressure_line(cause, reclaimed, rung));
     }
@@ -4387,12 +4524,43 @@ impl super::App {
     /// quarters of itself, and lowering the allowance's figure and then
     /// allowing three quarters of *that* would compound the step to 0.675 on
     /// every event.
+    ///
+    /// **Two walls, two presumptions.** A page-heap event lowers the host
+    /// figure and nothing else: the page's watermark says nothing about the
+    /// card, and a GPU rung shed for it would cost the loop its history for
+    /// a byte the page never gets back. Every other cause lowers the GPU
+    /// figure, as before, and leaves the host's where it stands.
     fn refit_under_pressure(&mut self, cause: crate::pressure::Pressure) -> u32 {
-        let lowered = self.capacity().gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
-        self.session_capacity = Some(lowered);
+        let cap = self.capacity();
+        let lowered = if cause.is_page_heap() {
+            // A bracket with no host figure has nothing to hold down: the
+            // economy went, the rung stands, and the log says why.
+            let Some(host) = cap.host_bytes else {
+                log::info!(
+                    "Budgets: held at rung {} after {}: no host figure on the {} bracket to \
+                     presume lower",
+                    self.budgets.steps_back,
+                    cause.label(),
+                    self.budgets.name,
+                );
+                return self.budgets.steps_back;
+            };
+            let host = host / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+            self.session_host_capacity = Some(host);
+            host
+        } else {
+            let gpu = cap.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+            self.session_capacity = Some(gpu);
+            gpu
+        };
         let scene = self.scene_of();
         let refitted = self.fit_scene(&scene);
-        let needed = need(&scene, &refitted, GRID_BYTES).gpu_bytes / (1024 * 1024);
+        let needed = need(&scene, &refitted, GRID_BYTES);
+        let needed = if cause.is_page_heap() {
+            needed.host_bytes
+        } else {
+            needed.gpu_bytes
+        } / (1024 * 1024);
         if refitted == self.budgets {
             log::info!(
                 "Budgets: held at rung {} after {}: the scene's {needed} MiB fits the {} MiB \
@@ -4406,7 +4574,7 @@ impl super::App {
         log::info!(
             "Budgets: re-fitted to rung {} after {}: {needed} MiB against the {} MiB this \
              session now presumes; {:?} 3D quality ceiling, {} MiB of offscreen, {} textured \
-             loop frames, {:?} grid cells",
+             loop frames, {:?} grid cells, overlay oversampling {} percent",
             refitted.steps_back,
             cause.label(),
             lowered / (1024 * 1024),
@@ -4414,6 +4582,7 @@ impl super::App {
             refitted.offscreen_bytes / (1024 * 1024),
             refitted.loop_render_budget,
             refitted.grid_cells,
+            refitted.overlay_oversample_percent,
         );
         self.adopt_budgets(refitted);
         self.pending_fit = None;

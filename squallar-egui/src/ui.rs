@@ -796,6 +796,7 @@ impl Gui {
         self.supports_exit = inputs.supports_exit;
         self.loop_frame_budget = inputs.loop_frame_budget;
         self.concurrent_renders = inputs.concurrent_renders;
+        self.overlay_overdraw = inputs.overlay_overdraw;
         self.location_settings_available = inputs.location_settings_available;
         let (permission, active) = inputs.location;
         self.location_permission = permission;

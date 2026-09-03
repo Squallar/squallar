@@ -43,6 +43,8 @@ fn six_two_hour_loops() -> Scene {
                 volume_grids: 0,
                 ground: squallar_device_profile::quality::GroundPass::Off,
                 buildings: false,
+                overlay_pictures: 0,
+                picture_px: [0, 0],
             };
             6
         ],
@@ -121,7 +123,15 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     app.adopt_probed_capacity(reading, wgpu::Backend::BrowserWebGpu);
 
     assert_eq!(app.gpu_probe.bytes(), Some(4032 << 20));
-    assert_eq!(app.capacity(), Capacity::probed(4032 << 20));
+    // The probe answered for the GPU; the page heap's declared ceiling
+    // rides along from the bracket's presumption.
+    assert_eq!(
+        app.capacity(),
+        Capacity {
+            host_bytes: Some(1 << 30),
+            ..Capacity::probed(4032 << 20)
+        }
+    );
     assert_eq!(
         app.capacity().allowance(),
         3024 << 20,
@@ -235,8 +245,12 @@ fn a_probe_on_a_native_profile_is_ignored() {
     web.limits = BudgetLimits::WASM;
     assert_eq!(
         capacity_with_probe(&web, Some(1 << 30)),
-        Capacity::probed(1 << 30),
-        "a web profile the driver would not class is the one arm the probe fills",
+        Capacity {
+            host_bytes: Some(1 << 30),
+            ..Capacity::probed(1 << 30)
+        },
+        "a web profile the driver would not class is the one arm the probe fills, \
+         and the page heap's declared ceiling rides along",
     );
     assert_eq!(
         capacity_with_probe(&web, None),
@@ -360,7 +374,10 @@ fn an_out_of_memory_during_the_probe_window_holds_the_presumption() {
     app.adopt_probed_capacity(a_probe_of(4032 << 20), wgpu::Backend::BrowserWebGpu);
     assert_eq!(
         app.capacity(),
-        Capacity::probed(4032 << 20),
+        Capacity {
+            host_bytes: Some(1 << 30),
+            ..Capacity::probed(4032 << 20)
+        },
         "the probed figure is spent in full, not held to a wall the probe built"
     );
 
@@ -460,6 +477,8 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
                 volume_grids: 0,
                 ground: squallar_device_profile::quality::GroundPass::Off,
                 buildings: false,
+                overlay_pictures: 0,
+                picture_px: [0, 0],
             };
             6
         ],

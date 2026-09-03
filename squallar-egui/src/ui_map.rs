@@ -115,6 +115,7 @@ impl super::Gui {
         // One read for every pane this frame draws: the figure is the
         // device's, not the pane's.
         let overlay_render_limit = self.concurrent_renders;
+        let overlay_overdraw = self.overlay_overdraw;
         let tile_zoom_biases: Vec<u8> = (0..pane_count)
             .map(|idx| self.tile_zoom_bias_for_pane(idx))
             .collect();
@@ -325,6 +326,7 @@ impl super::Gui {
                                             terrain_tiles: terrain_owned.as_mut(),
                                             tile_zoom_bias,
                                             overlay_render_limit,
+                                            overlay_overdraw,
                                             actions: &mut actions,
                                             pane_rect,
                                             surfaces: pane_render::PaneSurfaces::GroundAndGlass,
@@ -1679,6 +1681,7 @@ impl super::Gui {
         use walkers::Map;
 
         let overlay_render_limit = self.concurrent_renders;
+        let overlay_overdraw = self.overlay_overdraw;
 
         // `tiles` stays an `Option`: the strip is the pane's projector and
         // floor for every ground layer, not just the base tiles, so a released
@@ -1780,6 +1783,7 @@ impl super::Gui {
                     terrain_tiles: terrain,
                     tile_zoom_bias,
                     overlay_render_limit,
+                    overlay_overdraw,
                     actions,
                     pane_rect: strip,
                     surfaces: pane_render::PaneSurfaces::GroundOnly,

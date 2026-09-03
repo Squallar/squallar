@@ -467,6 +467,16 @@ pub struct BudgetLimits {
     /// [`Self::app_texture_ceiling_bytes`] bounds the GPU sum; `check_budgets`
     /// holds it within 1.25x of that sum.
     pub tile_host_ceiling_bytes: Bracket,
+    /// **What the host memory is presumed to hold where nothing reads it.**
+    /// `Some` only on the wasm32 bracket: the page's linear memory is a
+    /// ceiling the module header declares
+    /// ([`constants::WASM_LINEAR_MEMORY_MAX_BYTES`]) — read, never probed, and
+    /// no browser or device moves it — so a browser is the one platform whose
+    /// host capacity is *known* without a reader. A native bracket says
+    /// nothing here; its RAM reaches [`Capacity`] through the profile's own
+    /// `system_ram_bytes` on the measured arm, and on the presumed arm the
+    /// host is unbounded, as it always was.
+    pub presumed_host_bytes: Option<usize>,
 }
 
 /// The three tile allowances a set of budgets hands the tile caches, in
@@ -577,6 +587,8 @@ impl BudgetLimits {
         tile_parsed_bytes: rungs(constants::WASM_TILE_PARSED_BYTES),
         tile_terrain_bytes: rungs(constants::WASM_TILE_TERRAIN_BYTES),
         tile_host_ceiling_bytes: rungs(constants::WASM_TILE_HOST_CEILING_BYTES),
+        // The page instance's own ceiling, declared by the module header.
+        presumed_host_bytes: Some(constants::WASM_LINEAR_MEMORY_MAX_BYTES as usize),
     };
 
     /// The mobile bracket — native Android and iOS.
@@ -613,6 +625,9 @@ impl BudgetLimits {
         tile_parsed_bytes: Bracket::pinned(constants::MOBILE_TILE_PARSED_BYTES),
         tile_terrain_bytes: Bracket::pinned(constants::MOBILE_TILE_TERRAIN_BYTES),
         tile_host_ceiling_bytes: Bracket::pinned(constants::MOBILE_TILE_HOST_CEILING_BYTES),
+        // A native heap has no declared ceiling; RAM reaches the capacity
+        // through the profile's reading where one answers.
+        presumed_host_bytes: None,
     };
 
     /// The desktop bracket.
@@ -665,6 +680,7 @@ impl BudgetLimits {
         tile_parsed_bytes: rungs(constants::DESKTOP_TILE_PARSED_BYTES),
         tile_terrain_bytes: rungs(constants::DESKTOP_TILE_TERRAIN_BYTES),
         tile_host_ceiling_bytes: rungs(constants::DESKTOP_TILE_HOST_CEILING_BYTES),
+        presumed_host_bytes: None,
     };
 
     /// The bracket this build compiled.
@@ -758,6 +774,17 @@ pub struct Budgets {
     /// other is the source's own measured overrun), which snaps after a dwell
     /// and releases only once this is `false` again.
     pub tile_whole_zoom: bool,
+    /// **How much larger than its pane a whole-picture overlay raster is
+    /// planned**, per side, in percent — one of
+    /// [`constants::OVERLAY_OVERSAMPLE_PERCENTS`], `150` at every class rung.
+    /// The overlay-oversampling rung of the ladder steps it down one entry
+    /// at a time. Delivered to the planner
+    /// (`squallar_egui::overlay_cache::plan_overlay_texture`) as the overdraw
+    /// fraction in force, and priced by `crate::fit::need` as host bytes for
+    /// every picture a pane shows: a picture crosses the page heap on its
+    /// way to the GPU, and thirteen of them at 1.5x are half a browser's
+    /// linear memory.
+    pub overlay_oversample_percent: u16,
     /// Bytes the building geometry on one pane may occupy -- the `vram_bytes`
     /// ceiling a `BuildingMeshJob` is to be dispatched with once a production
     /// caller exists. Today no dispatch site reads it, so nothing spends it.
@@ -915,6 +942,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
             .at(promotion)
             .max(limits.long_range_image_side_px.floor),
         tile_whole_zoom: false,
+        overlay_oversample_percent: constants::OVERLAY_OVERSAMPLE_PERCENTS[0],
         prism_vram_bytes: limits.prism_geometry_bytes.at(promotion),
         tile_styled_bytes: limits.tile_styled_bytes.at(promotion),
         tile_parsed_bytes: limits.tile_parsed_bytes.at(promotion),
@@ -925,8 +953,47 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
     budgets
 }
 
-/// One rung: mutate, and say whether anything actually moved.
-type Rung = fn(&mut Budgets, &BudgetLimits) -> bool;
+/// One rung's knob: mutate, and say whether anything actually moved.
+type Step = fn(&mut Budgets, &BudgetLimits) -> bool;
+
+/// **Which of the two memories a rung can give back.** A scene is fitted on
+/// two axes — GPU textures and host bytes — and a rung is worth taking only
+/// against an axis it lowers: shedding the loop history frees not one byte
+/// of a browser's page heap, and shedding a picture's overdraw frees no VRAM
+/// the need model prices. `crate::fit::fit` takes a rung only when it lowers
+/// an axis that is over; [`demote`], a counted walk, takes every rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lowers {
+    /// The rung reduces a term of the GPU need.
+    pub gpu: bool,
+    /// The rung reduces a term of the host need.
+    pub host: bool,
+}
+
+impl Lowers {
+    const GPU: Self = Self {
+        gpu: true,
+        host: false,
+    };
+    const BOTH: Self = Self {
+        gpu: true,
+        host: true,
+    };
+
+    /// Whether this rung answers a scene over on `gpu_over` / `host_over`.
+    pub fn answers(self, gpu_over: bool, host_over: bool) -> bool {
+        (self.gpu && gpu_over) || (self.host && host_over)
+    }
+}
+
+/// One rung of the ladder: its knob and the axes it lowers.
+#[derive(Clone, Copy)]
+pub struct Rung {
+    /// The knob.
+    pub step: Step,
+    /// What taking it gives back.
+    pub lowers: Lowers,
+}
 
 /// The degradation ladder, in the order `docs/cross-platform-resource-limits.md`
 /// §4.3 fixes: degrade what the user is least likely to notice, and degrade
@@ -943,53 +1010,102 @@ type Rung = fn(&mut Budgets, &BudgetLimits) -> bool;
 ///    little over sheds a little history rather than a rung of detail. A
 ///    shorter loop is the least destructive thing in the application — nothing
 ///    on screen gets worse, there is just less of it.
-/// 4. **Tile sharpness**: fewer, larger tiles cover the same glass. Above the
+/// 4. **Overlay oversampling**, one entry of
+///    [`constants::OVERLAY_OVERSAMPLE_PERCENTS`] a step (1.5x, 1.25x, 1x per
+///    side). After the history because a shorter loop is *less of the same
+///    picture* where a thinner margin is a blank strip at the leading edge of
+///    a fast pan until the next raster lands — brief, and only while panning,
+///    but a picture defect where the history's loss is not one. Before the
+///    tiles because a softened basemap is on every frame for as long as the
+///    rung holds and this costs nothing while the map stands still; and
+///    because it is the largest lever per step in the table — a whole-picture
+///    overlay is re-rasterised on every move at 2.25x the pane's pixels, and
+///    thirteen of them at the user's canvas are 556 MB of a 1 GiB page heap.
+///    Lowers **both** axes: the picture is a GPU texture as well as a page
+///    buffer, even though only the host side is priced today.
+/// 5. **Tile sharpness**: fewer, larger tiles cover the same glass. Above the
 ///    grid because a softer basemap is a softer picture and a coarser grid is
-///    a wrong-looking one.
-/// 5. **3D grid cells**, and the volume texture budget with them: the first
+///    a wrong-looking one. Host bytes (the styled working set) — and taken
+///    for the GPU axis too, as it has been since it landed: the terrain
+///    rasters it shrinks are textures omitted from the GPU sum by name.
+/// 6. **3D grid cells**, and the volume texture budget with them: the first
 ///    rung a user calls "worse".
-/// 6. **Raster side**, to the long-range floor: the most visible, so last.
-const LADDER: [Rung; 6] = [
-    |b, _| {
-        let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
-        let moved = cheaper != b.quality_ceiling.shading;
-        b.quality_ceiling.shading = cheaper;
-        moved
+/// 7. **Raster side**, to the long-range floor: the most visible, so last.
+const LADDER: [Rung; 7] = [
+    Rung {
+        step: |b, _| {
+            let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
+            let moved = cheaper != b.quality_ceiling.shading;
+            b.quality_ceiling.shading = cheaper;
+            moved
+        },
+        lowers: Lowers::GPU,
     },
-    |b, limits| {
-        let coarser = b.quality_ceiling.resolution.next_coarser();
-        let floor = limits.offscreen_bytes.floor;
-        let moved = coarser.is_some() || b.offscreen_bytes > floor;
-        if let Some(coarser) = coarser {
-            b.quality_ceiling.resolution = coarser;
-        }
-        b.offscreen_bytes = floor;
-        // The bound the offscreen's promotion moved comes back with it.
-        b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
-        moved
+    Rung {
+        step: |b, limits| {
+            let coarser = b.quality_ceiling.resolution.next_coarser();
+            let floor = limits.offscreen_bytes.floor;
+            let moved = coarser.is_some() || b.offscreen_bytes > floor;
+            if let Some(coarser) = coarser {
+                b.quality_ceiling.resolution = coarser;
+            }
+            b.offscreen_bytes = floor;
+            // The bound the offscreen's promotion moved comes back with it.
+            b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
+            moved
+        },
+        lowers: Lowers::GPU,
     },
-    |b, _| {
-        let halved = (b.loop_render_budget / 2).max(constants::MIN_LOOP_FRAMES_PER_PANE);
-        let moved = halved < b.loop_render_budget;
-        b.loop_render_budget = halved;
-        moved
+    Rung {
+        step: |b, _| {
+            let halved = (b.loop_render_budget / 2).max(constants::MIN_LOOP_FRAMES_PER_PANE);
+            let moved = halved < b.loop_render_budget;
+            b.loop_render_budget = halved;
+            moved
+        },
+        lowers: Lowers::GPU,
     },
-    |b, _| {
-        let moved = !b.tile_whole_zoom;
-        b.tile_whole_zoom = true;
-        moved
+    Rung {
+        step: |b, _| {
+            let next = constants::OVERLAY_OVERSAMPLE_PERCENTS
+                .iter()
+                .copied()
+                .find(|percent| *percent < b.overlay_oversample_percent);
+            match next {
+                Some(percent) => {
+                    b.overlay_oversample_percent = percent;
+                    true
+                }
+                None => false,
+            }
+        },
+        lowers: Lowers::BOTH,
     },
-    |b, limits| {
-        let moved = b.grid_cells != limits.grid_cells.floor;
-        b.grid_cells = limits.grid_cells.floor;
-        b.volume_texture_bytes = limits.volume_texture_bytes.floor;
-        moved
+    Rung {
+        step: |b, _| {
+            let moved = !b.tile_whole_zoom;
+            b.tile_whole_zoom = true;
+            moved
+        },
+        lowers: Lowers::BOTH,
     },
-    |b, limits| {
-        let floor = limits.long_range_image_side_px.floor;
-        let moved = b.raster_side_ceiling_px > floor;
-        b.raster_side_ceiling_px = floor;
-        moved
+    Rung {
+        step: |b, limits| {
+            let moved = b.grid_cells != limits.grid_cells.floor;
+            b.grid_cells = limits.grid_cells.floor;
+            b.volume_texture_bytes = limits.volume_texture_bytes.floor;
+            moved
+        },
+        lowers: Lowers::GPU,
+    },
+    Rung {
+        step: |b, limits| {
+            let floor = limits.long_range_image_side_px.floor;
+            let moved = b.raster_side_ceiling_px > floor;
+            b.raster_side_ceiling_px = floor;
+            moved
+        },
+        lowers: Lowers::GPU,
     },
 ];
 
@@ -1007,7 +1123,22 @@ pub fn demote(budgets: &mut Budgets, limits: &BudgetLimits, steps: u32) {
 
 /// One step down the ladder: the first rung that moves, and whether one did.
 pub(crate) fn step_down(budgets: &mut Budgets, limits: &BudgetLimits) -> bool {
-    LADDER.iter().any(|rung| rung(budgets, limits))
+    step_down_for(budgets, limits, true, true)
+}
+
+/// One step down the ladder **against the axes that are over**: the first
+/// rung that both answers an over axis ([`Lowers::answers`]) and moves, and
+/// whether one did. With both axes over this is [`step_down`].
+pub(crate) fn step_down_for(
+    budgets: &mut Budgets,
+    limits: &BudgetLimits,
+    gpu_over: bool,
+    host_over: bool,
+) -> bool {
+    LADDER
+        .iter()
+        .filter(|rung| rung.lowers.answers(gpu_over, host_over))
+        .any(|rung| (rung.step)(budgets, limits))
 }
 
 #[path = "budget/tests.rs"]

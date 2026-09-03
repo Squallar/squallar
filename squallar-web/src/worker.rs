@@ -47,6 +47,10 @@ thread_local! {
 #[wasm_bindgen]
 pub fn squallar_worker_main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    // The worker is its own instance with its own heap — the MRMS grid's
+    // 93 MB refusal was here — so it installs its own hook
+    // (`crate::alloc_failure`).
+    crate::alloc_failure::hook::install();
     // Ignored rather than propagated: a second `init` is not a reason to
     // refuse jobs.
     let _ = console_log::init_with_level(log::Level::Info);
