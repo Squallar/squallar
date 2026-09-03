@@ -941,6 +941,21 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     neither INVALID nor a zero: the check did not run, and the row says so.
     `panes` is how many panes the scene seeded, when known; the app's own
     count is in the line, and the two disagreeing is a leg of another scene.
+
+    THREE stamps, and they never co-fire. UNCHECKED `line_absent` is the
+    above. UNCHECKED `no_pictures` is a well-formed line with panes (n > 0)
+    and NO picture drawn in the bracket: a 3D orbit (scene B) draws no
+    whole-picture overlay raster, so `pictures=0` on every such row, and
+    until 2026-09-02 that read `** INVALID **  surface not confirmed: no
+    pictures were drawn in the window` on every 3D row forever -- a
+    permanently-on validity marker stops being read. It fires whether the
+    line lists sized panes (the app allocates a picture it never rasters
+    into) or every pane as `0x0`; the list is the app's allocation, not its
+    drawing, and either way there are no bytes to hold against it. What it
+    does NOT cover: `n=0`, which stays a refusal -- a scene with no panes is
+    another scene -- and pictures drawn (`pictures > 0`) with no pane
+    reported to hold one, which is two of the app's own lines contradicting
+    each other. INVALID stays for those and for a real mismatch.
     """
     out = {
         "asked": "%dx%d" % asked if asked else None,
@@ -956,6 +971,7 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
         return out
     if reported is None:
         out["unchecked"] = True
+        out["unchecked_kind"] = "line_absent"
         out["why"] = (
             "overlay pictures line absent: the app did not report its picture "
             "sizes (a binary older than the line), so the bytes were checked "
@@ -989,6 +1005,16 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     drawn = [w * h * 4 for w, h in drawn_px]
     out["pane_picture_bytes"] = drawn
     if not drawn:
+        if reported["n"] and not pictures:
+            out["unchecked"] = True
+            out["unchecked_kind"] = "no_pictures"
+            out["why"] = (
+                "the app reports no pane with a picture (n=%d) and none was "
+                "drawn in the bracket: the scene draws no whole-picture "
+                "overlay raster, so there are no bytes to hold against the "
+                "line" % reported["n"]
+            )
+            return out
         out["why"] = "the app reports no pane with a picture (n=%d)" % reported["n"] + (
             ", yet %d pictures were drawn in the bracket" % pictures if pictures else ""
         )
@@ -1003,9 +1029,13 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     out["expected_label"] = ("%d" % lo) if lo == hi else "%d..%d" % (lo, hi)
     out["tolerance_bytes"] = tol
     if not pictures:
+        out["unchecked"] = True
+        out["unchecked_kind"] = "no_pictures"
         out["why"] = (
-            "no pictures were drawn in the window, so the surface cannot be "
-            "confirmed from the bytes"
+            "no pictures were drawn in the window though the app allocates "
+            "%s: the scene draws no whole-picture overlay raster (a 3D orbit "
+            "draws none), so the surface cannot be confirmed from the bytes "
+            "and they were checked against nothing" % out["reported_px"]
         )
         return out
     observed = picture_bytes / float(pictures)
@@ -1634,6 +1664,14 @@ def print_row(row):
     to be read in one table; a column that drifted would silently become two
     tables."""
     load = row["load"] or {}
+    # Three stamps, never co-firing: INVALID, and the two UNCHECKED kinds --
+    # a line the binary predates, and a scene that drew no overlay picture.
+    if not row.get("unchecked"):
+        unchecked_banner = ""
+    elif (row["surface"] or {}).get("unchecked_kind") == "no_pictures":
+        unchecked_banner = "  ** UNCHECKED: scene drew no overlay pictures **"
+    else:
+        unchecked_banner = "  ** UNCHECKED: overlay pictures line absent **"
     print(
         "ROW scene=%s browser=%s arm=%s adapter=%s backend=%s "
         "viewport=%s px=%s dpr=%s cross=%s hz~%s coi=%s panel=%s "
@@ -1649,9 +1687,7 @@ def print_row(row):
             row["commit"],
             load.get("start", "?"), load.get("end", "?"), load.get("max", "?"),
             row["quiet"], row["position"],
-            ("  ** INVALID **" if row["invalid"] else "")
-            + ("  ** UNCHECKED: overlay pictures line absent **"
-               if row.get("unchecked") else ""),
+            ("  ** INVALID **" if row["invalid"] else "") + unchecked_banner,
         )
     )
     s = row["surface"]
@@ -2232,11 +2268,19 @@ class SurfaceTests(unittest.TestCase):
         self.assertNotIn("observed_picture_bytes", s)
 
     def test_geometry_alone_does_not_confirm(self):
+        """A well-formed line with a sized pane and NO picture drawn in the
+        bracket: the 3D-orbit row (scene B draws no whole-picture overlay
+        raster). Not confirmed -- and not refused either, since 2026-09-02:
+        it is the check having nothing to run on, stamped as its own kind
+        of UNCHECKED, where before it was `** INVALID **` on every 3D row
+        forever."""
         s = surface_check((1920, 1080), (1920, 1080), 0, 0,
                           _reported([ONE_PANE_PICTURE]), panes=1)
         self.assertFalse(s["met"])
-        self.assertFalse(s["unchecked"])
+        self.assertTrue(s["unchecked"])
+        self.assertEqual(s["unchecked_kind"], "no_pictures")
         self.assertIn("no pictures were drawn", s["why"])
+        self.assertNotIn("observed_picture_bytes", s)
 
     def test_a_wrong_window_is_refused_on_the_apps_own_surface(self):
         """The failure that actually happened: a title-substring `wmctrl -r`
@@ -2364,7 +2408,22 @@ class SurfaceTests(unittest.TestCase):
         s = surface_check((1920, 1080), (1920, 1080), 10, ONE_PANE_PICTURE_BYTES * 10,
                           empty, panes=2)
         self.assertFalse(s["met"])
+        self.assertFalse(s["unchecked"], "pictures drawn but not reported is a refusal")
         self.assertIn("no pane with a picture", s["why"])
+        self.assertIn("yet 10 pictures were drawn", s["why"])
+        # Every pane empty and NOTHING drawn is the other 3D shape: the line
+        # is the app's allocation, not its drawing, and there is nothing to
+        # hold against it -- UNCHECKED, the same kind as a sized pane never
+        # rastered into.
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0, empty, panes=2)
+        self.assertFalse(s["met"])
+        self.assertTrue(s["unchecked"])
+        self.assertEqual(s["unchecked_kind"], "no_pictures")
+        # And `n=0` keeps its meaning: a scene with no panes is another scene.
+        s = surface_check((1920, 1080), (1920, 1080), 0, 0, _reported([]), panes=None)
+        self.assertFalse(s["met"])
+        self.assertFalse(s["unchecked"])
+        self.assertIn("no pane with a picture (n=0)", s["why"])
 
     def test_the_pane_count_comes_from_the_scene_seed(self):
         """Scene C seeds six panes and scene A one; the count is read out of
@@ -2381,12 +2440,14 @@ def _hist_first_bin(n):
     return ",".join(str(c) for c in counts)
 
 
-def _leg_log(per_picture, pictures_line):
-    """A whole leg's log, four loops, ten pictures a loop at `per_picture` B.
+def _leg_log(per_picture, pictures_line, per_loop=10):
+    """A whole leg's log, four loops, `per_loop` pictures a loop at
+    `per_picture` B.
 
     `pictures_line` is the app's `overlay pictures:` sentence, or None for a
     binary older than it. Skip 2, window 2: the bracket is loops 2..4, and
-    across it the app drew 20 pictures whose mean is exactly `per_picture`.
+    across it the app drew 20 pictures whose mean is exactly `per_picture`
+    -- or none at all at `per_loop=0`, the 3D-orbit scene's shape.
     """
     t = "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] "
     lines = [
@@ -2400,7 +2461,7 @@ def _leg_log(per_picture, pictures_line):
         lines.append(
             t + "frame service (interact): n=%d, p50=63 us, p90=63 us, p99=63 us, "
             "hist=%s" % (n, _hist_first_bin(n)))
-        pics = 10 * k
+        pics = per_loop * k
         lines.append(
             t + "overlay rasters: %d dispatched, %d arrived, %d pictures of %d B, "
             "%d inked, %d shown, 0 promoted, 0 dropped, 0 superseded, 0 cancelled"
@@ -2498,6 +2559,51 @@ class RowVerdictTests(unittest.TestCase):
         self.assertEqual(j["quiet_ceiling"], 8.0)
         self.assertNotIn("quiet_max", j)
 
+    def test_a_scene_that_draws_no_overlay_pictures_is_unchecked_not_invalid(self):
+        """The peer's scene B rows: `pictures=0`, `quiet=yes`, geometry met,
+        the app's line present and well-formed. Every such row read
+        `** INVALID **` with exit 1, forever. Now the third stamp."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, per_loop=0)
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        text = _capture(lambda: print_row(row))
+        first = text.splitlines()[0]
+        self.assertEqual(row["pictures"], 0)
+        self.assertEqual(row["quiet"], "yes")
+        self.assertTrue(row["surface"]["geometry_met"])
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(len(row["unchecked"]), 1)
+        self.assertEqual(row["cross"], "unchecked")
+        self.assertIn("pictures=0", first)
+        self.assertIn("** UNCHECKED: scene drew no overlay pictures **", first)
+        self.assertNotIn("line absent", first)
+        self.assertNotIn("INVALID", text)
+        self.assertIn("-> UNCHECKED", text)
+        self.assertIn("ROW   UNCHECKED: surface bytes not checked: no pictures were "
+                      "drawn in the window though the app allocates 2880x1555", text)
+
+    def test_the_three_stamps_are_distinct_and_never_co_fire(self):
+        """One case per stamp; each first line carries exactly its own
+        banner and neither of the other two."""
+        absent = "** UNCHECKED: overlay pictures line absent **"
+        none_drawn = "** UNCHECKED: scene drew no overlay pictures **"
+        invalid = "** INVALID **"
+        cases = (
+            (absent, ONE_PANE_PICTURE_BYTES, None, 10),
+            (none_drawn, ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0),
+            (invalid, MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10),
+        )
+        for want, per_picture, line, per_loop in cases:
+            lines = _leg_log(per_picture, line, per_loop=per_loop)
+            row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes),
+                            self.probes)
+            first = _capture(lambda: print_row(row)).splitlines()[0]
+            for banner in (absent, none_drawn, invalid):
+                if banner == want:
+                    self.assertIn(banner, first, "case %r" % want)
+                else:
+                    self.assertNotIn(banner, first, "case %r co-fired %r" % (want, banner))
+            self.assertEqual(first.count("**"), 2, first)
+
     def test_an_absent_line_stamps_unchecked_and_not_invalid(self):
         row, first, text = self._row(ONE_PANE_PICTURE_BYTES, None, 1)
         self.assertEqual(row["invalid"], [], row["invalid"])
@@ -2552,14 +2658,15 @@ class RowVerdictTests(unittest.TestCase):
 
     def test_the_analyser_exits_zero_on_unchecked_and_one_on_invalid(self):
         """`run_measure_native.sh` takes the exit code as the leg's verdict."""
-        for per_picture, line, want in (
-            (ONE_PANE_PICTURE_BYTES, None, 0),
-            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0),
-            (MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 1),
+        for per_picture, line, per_loop, want in (
+            (ONE_PANE_PICTURE_BYTES, None, 10, 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 10, 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0, 0),
+            (MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10, 1),
         ):
             log = os.path.join(self._tmp.name, "leg.log")
             with open(log, "w", encoding="utf-8") as fh:
-                fh.write("\n".join(_leg_log(per_picture, line)) + "\n")
+                fh.write("\n".join(_leg_log(per_picture, line, per_loop)) + "\n")
             rc = [None]
             _capture(lambda: rc.__setitem__(0, cmd_analyze(_leg_args(self.load, 1, log))))
             self.assertEqual(rc[0], want, "line=%r per_picture=%d" % (line, per_picture))
