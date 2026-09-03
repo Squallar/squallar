@@ -300,7 +300,14 @@ const INVENTORY_FIELD: &str = concat!("volumes: ", "crate::volume_inventory::");
 /// defect. `GuiEvent::PaneTimeSelected` carries the whole gesture, reached
 /// through one `App::select_instant`, so the sites lose their pushes and the
 /// door is written once.
-const SELF_GUI_MAX: usize = 164;
+///
+/// 164 -> 152 with the loop frame store: the twelve link gates in
+/// `app_render.rs` that decided whether a finished loop frame could reach a
+/// sibling pane went with the gate itself — sharing rides the picture's
+/// identity through an App-owned store now — and nothing came in through the
+/// seam to replace them. See `gui_seam_ratchet_tests.rs`, which fell 101 -> 89
+/// on the same land.
+const SELF_GUI_MAX: usize = 152;
 /// Row 1b — the same needle outside test-named paths.
 ///
 /// Everything on [`SELF_GUI_MAX`] applies here: permanent, falls only, sits on
@@ -319,7 +326,10 @@ const SELF_GUI_MAX: usize = 164;
 /// every site in that land is a production file.
 ///
 /// 162 -> 159 at WO-T3.10, again by exactly what [`SELF_GUI_MAX`] moved.
-const SELF_GUI_NON_TEST_MAX: usize = 159;
+///
+/// 159 -> 147 with the loop frame store, by exactly what [`SELF_GUI_MAX`]
+/// moved: all twelve gates were in `app_render.rs`.
+const SELF_GUI_NON_TEST_MAX: usize = 147;
 /// Row 2a — **`ui.rs`'s own `impl Gui` block, and only that file**.
 ///
 /// **0 since WO-E8b**, which is where the plan said it would land. The last

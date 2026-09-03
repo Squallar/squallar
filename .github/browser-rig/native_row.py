@@ -1769,10 +1769,14 @@ def print_row(row):
     # beside them would be a column that means nothing there.
     if row["scene"].startswith("E") and row["loop_state"]:
         ls = row["loop_state"]
+        # `shared` is pictures more than one pane holds -- a third
+        # denominator beside slots and textured frames, never added to
+        # `resident`.
         print(
             "ROW   loop %s panes, %s layers animating, %s frames listed, "
-            "%s resident (%s in flight, %s failed); cap=%s held=%s; advance=%s us"
-            % (ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[10], ls[11], ls[16])
+            "%s resident (%s in flight, %s failed); cap=%s held=%s; advance=%s us; "
+            "shared=%s"
+            % (ls[0], ls[1], ls[2], ls[3], ls[4], ls[5], ls[10], ls[11], ls[16], ls[17])
         )
     # The machine and the bracket the budgets came from, on every scene. A
     # LEVEL at the end of the log; `pool` is the LIVE loop pool in MiB and

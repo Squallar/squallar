@@ -140,6 +140,17 @@ fn no_production_file_pushes_through_a_gui_setter() {
 /// reach back on one line, so the raw row paid +1 for no change in coupling
 /// while this scrape — the one that describes the coupling — fell by two.
 ///
+/// # The loop frame store — `app_render.rs` 101 -> 89
+///
+/// Twelve reaches, every one of them a link gate: `pane_layer_linked` and
+/// `panes_layer_linked` decided whether a finished loop frame could reach a
+/// sibling pane, at the two arrival broadcasts, the two donor searches, the
+/// two queue dedups and the clone-apply's source lookup. Sharing now rides
+/// the picture's identity through an App-owned `LoopFrameStore`, which the
+/// dispatch reaches as `self.loop_frames` — the same shape as
+/// `self.volume_store` — so the gates went and nothing came in through the
+/// seam to replace them. The crate-wide rows fell by the same twelve.
+///
 /// # WO-T3.10 — `app_fetch.rs` 38 -> 35, and the shed is the fix
 ///
 /// A time selection was two `Gui::apply` pushes at three sites — and the
@@ -170,7 +181,7 @@ fn the_gui_coupling_only_ever_shrinks() {
     for (name, source, ceiling) in [
         ("app.rs", APP, 35),
         ("app_fetch.rs", APP_FETCH, 35),
-        ("app_render.rs", APP_RENDER, 101),
+        ("app_render.rs", APP_RENDER, 89),
         ("app_chunks.rs", APP_CHUNKS, 13),
     ] {
         let n = collapsed(source).matches(SELF_GUI).count();

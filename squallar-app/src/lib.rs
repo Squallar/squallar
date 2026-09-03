@@ -30,6 +30,7 @@ pub mod channels;
 pub(crate) mod frame_ledger;
 pub mod input;
 pub mod location_hint;
+pub(crate) mod loop_frame_store;
 pub mod loop_pool;
 pub(crate) mod loop_refill;
 pub(crate) mod loop_telemetry;

@@ -644,103 +644,6 @@ fn a_loop_takes_its_code_and_its_coordinates_from_one_site() {
     assert_eq!(geo.lon, koun.lon);
 }
 
-/// The dispatcher's donor search is a second, independent way one pane's image
-/// reaches another — it runs *before* rendering and suppresses the receiving pane's
-/// own render.
-#[test]
-fn a_donor_on_another_site_is_not_offered() {
-    let ctx = egui::Context::default();
-    let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
-    donor.frames[0].image = Some(dummy_texture(&ctx));
-    let frame_ts = donor.frames[0].timestamp;
-
-    assert_eq!(
-        donor.frame_donatable_to(
-            frame_ts,
-            &target(SITE, &radar_fields::known::REFLECTIVITY, 0.5)
-        ),
-        Some(0),
-        "a pane on the same target may take this texture"
-    );
-    assert_eq!(
-        donor.frame_donatable_to(
-            frame_ts,
-            &target("KOUN", &radar_fields::known::REFLECTIVITY, 0.5)
-        ),
-        None,
-        "a pane whose loop is on another site must render its own"
-    );
-}
-
-/// The dispatcher suppresses a pane's own render on the promise that the queued
-/// render's result will be broadcast to it.
-#[test]
-fn donor_and_broadcast_agree_on_who_may_serve_a_frame() {
-    let ctx = egui::Context::default();
-    let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
-    donor.frames[1].image = Some(dummy_texture(&ctx));
-    let frame_ts = donor.frames[1].timestamp;
-
-    let same_site = loop_with_frames(3, 0);
-    let mut same_site = same_site;
-    same_site.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
-
-    let mut other_site = loop_for_site(&site("KOUN", 35.2, -97.5), 3, 0);
-    other_site.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
-
-    for (label, receiver) in [("same site", &same_site), ("other site", &other_site)] {
-        let offered = donor
-            .frame_donatable_to(frame_ts, receiver.rendered_for.as_ref().unwrap())
-            .is_some();
-        let accepted = receiver
-            .frame_accepting_broadcast(frame_ts, donor.rendered_for.as_ref().unwrap(), same_sweep())
-            .is_some();
-        assert_eq!(
-            offered, accepted,
-            "{label}: donor offered={offered} but broadcast accepted={accepted}"
-        );
-    }
-
-    assert!(
-            same_site
-                .frame_accepting_broadcast(
-                    frame_ts,
-                    donor.rendered_for.as_ref().unwrap(),
-                    same_sweep(),
-                )
-                .is_some()
-        );
-}
-
-/// The donor mirror of `a_textured_frame_does_not_accept_a_broadcast`, and the
-/// guard is load-bearing in a way that does not announce itself: offering an
-/// untextured frame makes the dispatcher queue a clone and skip its own render, the
-/// clone then finds no texture to copy, and the frame ends up untextured, not in
-/// flight and not failed — which `render_set_settled` scores as unsettled, so the
-/// loop never reaches `Ready`.
-#[test]
-fn an_untextured_frame_is_not_donatable() {
-    let ctx = egui::Context::default();
-    let mut donor = loop_with_frames(3, 0);
-    donor.retarget_renders(&radar_fields::known::REFLECTIVITY, 0.5);
-    let current = target(SITE, &radar_fields::known::REFLECTIVITY, 0.5);
-    let frame_ts = donor.frames[0].timestamp;
-
-    assert_eq!(
-        donor.frame_donatable_to(frame_ts, &current),
-        None,
-        "a blank frame has nothing to give"
-    );
-    donor.frames[0].render_in_flight = true;
-    assert_eq!(donor.frame_donatable_to(frame_ts, &current), None);
-
-    donor.frames[0].render_in_flight = false;
-    donor.frames[0].image = Some(dummy_texture(&ctx));
-    assert_eq!(donor.frame_donatable_to(frame_ts, &current), Some(0));
-}
-
 /// A frame that already has an image gains nothing from an identical one, and
 /// overwriting it churns texture handles.
 #[test]
@@ -885,7 +788,13 @@ fn an_inactive_loop_takes_nothing_from_any_path() {
             .frame_awaiting_render_result(frame_ts, &current)
             .is_some()
     );
-    assert!(state.frame_donatable_to(textured_ts, &current).is_some());
+    assert!(
+        state
+            .frame_accepting_broadcast(textured_ts, &current, same_sweep())
+            .is_none(),
+        "control: the textured frame is refused for being textured, not for \
+         the phase — the phase check below has to be the one that fires"
+    );
 
     state.phase = LoopPhase::Inactive;
 
@@ -894,7 +803,6 @@ fn an_inactive_loop_takes_nothing_from_any_path() {
         state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
         None
     );
-    assert_eq!(state.frame_donatable_to(textured_ts, &current), None);
 }
 
 /// The `&mut` forms are what the response path uses; they must resolve to the same

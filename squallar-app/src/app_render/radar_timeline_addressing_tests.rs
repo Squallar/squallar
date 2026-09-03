@@ -38,7 +38,7 @@ const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
 const PRODUCT_ID: squallar_source::product::FieldId = squallar_radar::fields::known::REFLECTIVITY;
 const TILT: f32 = 0.5;
 
-fn at(minute: i64) -> chrono::NaiveDateTime {
+pub(super) fn at(minute: i64) -> chrono::NaiveDateTime {
     chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
         .unwrap()
         .and_hms_opt(18, 0, 0)
@@ -101,7 +101,7 @@ fn a_satellite_loop_takes_the_transport(app: &mut crate::app::App, pane_idx: usi
 }
 
 /// A plan-view loop over `stamps`, keyed to this suite's target.
-fn active_loop(stamps: &[chrono::NaiveDateTime]) -> LayerTimeState {
+pub(super) fn active_loop(stamps: &[chrono::NaiveDateTime]) -> LayerTimeState {
     let mut ls = squallar_egui::radar_layer::begin_loop(3600, &site(), RenderView::PlanView);
     ls.phase = LoopPhase::Rendering;
     ls.frames = stamps
@@ -121,7 +121,7 @@ fn active_loop(stamps: &[chrono::NaiveDateTime]) -> LayerTimeState {
     ls
 }
 
-fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
+pub(super) fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
     let mut product_elevations = std::collections::HashMap::new();
     product_elevations.insert(PRODUCT, vec![TILT]);
     let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
@@ -146,7 +146,7 @@ fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
 
 /// A loop frame texture, so a "did this frame get a picture" assertion is
 /// about a picture rather than about a flag.
-fn textured(ctx: &egui::Context) -> squallar_egui::pane::LoopFrameImage {
+pub(super) fn textured(ctx: &egui::Context) -> squallar_egui::pane::LoopFrameImage {
     let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
     squallar_egui::pane::LoopFrameImage::PlanView(squallar_egui::pane::RadarImageData {
         texture: ctx.load_texture("donor", image, egui::TextureOptions::NEAREST),
@@ -279,11 +279,12 @@ fn frames_holding_a_picture_after_a_render(park_on_the_satellite: bool) -> (bool
     let mut app = two_pane_app(SITE, SITE);
     point_at_site(&mut app, 0);
     point_at_site(&mut app, 1);
-    assert!(
-        app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
-        "precondition: both panes are layer-linked, or the broadcast half of \
-         this pin never runs",
-    );
+    // Deliberately **unlinked**: the broadcast rides the picture's identity,
+    // not the link, and a linked fixture could not tell the two apart.
+    app.gui
+        .pane_mut(1)
+        .expect("the fixture built two panes")
+        .layer_link = false;
     app.loop_mgr = squallar_radar::loop_downloads::LoopDownloadManager::new();
     app.loop_mgr.cache_scan(
         SITE,
@@ -457,11 +458,13 @@ fn a_sibling_texture_is_cloned(park_on_the_satellite: bool) -> bool {
     let mut app = two_pane_app(SITE, SITE);
     point_at_site(&mut app, 0);
     point_at_site(&mut app, 1);
-    assert!(
-        app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
-        "precondition: both panes are layer-linked, or no donor is ever \
-         looked for",
-    );
+    // Deliberately **unlinked**: the store hands the picture out on the
+    // picture's identity, not the link, and a linked fixture could not tell
+    // the two apart.
+    app.gui
+        .pane_mut(1)
+        .expect("the fixture built two panes")
+        .layer_link = false;
     app.loop_mgr = squallar_radar::loop_downloads::LoopDownloadManager::new();
     for idx in 0..2 {
         *app.gui

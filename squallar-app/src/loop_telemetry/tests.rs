@@ -82,6 +82,7 @@ fn distinct() -> LoopState {
         floor_bytes: 60_817_408,
         ceiling_bytes: 3_221_225_472,
         advance_us: 100_000,
+        shared: 7,
     }
 }
 
@@ -96,7 +97,7 @@ fn the_loop_state_line_reads_exactly_as_pinned() {
          47 resident, 6 in flight, 3 failed; allowed plan=14 section=28 \
          volume=4 overlay=9, cap 36, held 60; share 29360128 B, \
          pool 58720256 B, floor 60817408 B, ceiling 3221225472 B; \
-         advance 100000 us",
+         advance 100000 us; shared 7",
     );
 }
 
@@ -128,6 +129,7 @@ fn the_rig_reads_the_loop_line_the_app_actually_writes() {
                 "60817408",
                 "3221225472",
                 "100000",
+                "7",
             ],
         ),
         "the `loop state:` line and the rig's probe have drifted",
@@ -159,6 +161,7 @@ fn a_loop_line_that_drifted_by_one_space_is_not_accepted() {
             "60817408",
             "3221225472",
             "100000",
+            "7",
         ],
     );
     assert_eq!(loop_state_line(&distinct()), good);

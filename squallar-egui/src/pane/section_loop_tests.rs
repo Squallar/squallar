@@ -195,38 +195,6 @@ fn a_plan_view_broadcast_is_refused_by_a_section_loop_with_the_same_target() {
     );
 }
 
-/// Donation is the *before* half of the same pair — the dispatcher suppresses a
-/// render on the promise of it — so it has to refuse the same crossings.
-#[test]
-fn neither_kind_of_loop_donates_a_frame_to_the_other() {
-    let ctx = egui::Context::default();
-    let target = shared_target();
-
-    let mut section = loop_in(RenderView::CrossSection, 3);
-    section.frames[1].image = Some(section_picture(&ctx, 77));
-    assert_eq!(
-        section.frame_donatable_to(ts(1), &target),
-        None,
-        "a section loop offered its raster to a map pane's loop, which would \
-         have suppressed that pane's own render and left the frame served by \
-         a picture of the wrong thing"
-    );
-
-    let mut plan = loop_in(RenderView::PlanView, 3);
-    plan.frames[1].image = Some(plan_view_picture(&ctx));
-    assert_eq!(
-        plan.section_frame_donatable_to(ts(1), &target, &key(), 77),
-        None,
-        "a map pane's loop offered a plan-view raster to a section loop"
-    );
-
-    assert_eq!(plan.frame_donatable_to(ts(1), &target), Some(1));
-    assert_eq!(
-        section.section_frame_donatable_to(ts(1), &target, &key(), 77),
-        Some(1),
-    );
-}
-
 /// Redrawing the line makes every frame a picture of somewhere else, and the
 /// same call that notices a product change has to notice it.
 #[test]

@@ -28,6 +28,12 @@
 //! across every animating layer of every pane — what the listings became
 //! after sampling to the cap. `resident` is the subset of those holding a
 //! picture; `in flight` the subset with a render out; `failed` the subset a
+//! render already refused. `shared` is a different count again: PICTURES in
+//! the loop frame store that more than one pane holds — two slots on two
+//! panes drawing one shared picture are two `resident` and one `shared`, so
+//! it is never added to `resident` and never subtracted from it.
+//!
+//! (`resident`, `in flight` and `failed` are the three subsets of `listed`; a
 //! render already refused. Those three are disjoint subsets of `listed` and
 //! their sum is not it (a slot may be none of the three: listed, never
 //! dispatched). The `allowed` group is the pool's per-view answer — a
@@ -77,6 +83,9 @@ pub(crate) struct LoopState {
     pub(crate) ceiling_bytes: usize,
     /// The playback interval, in microseconds.
     pub(crate) advance_us: u64,
+    /// Pictures in the loop frame store held by more than one pane — see
+    /// the module note for the denominator.
+    pub(crate) shared: usize,
 }
 
 impl LoopState {
@@ -126,7 +135,7 @@ pub(crate) fn loop_state_line(s: &LoopState) -> String {
         "loop state: {} panes, {} layers animating, {} frames listed, \
          {} resident, {} in flight, {} failed; allowed plan={} section={} \
          volume={} overlay={}, cap {}, held {}; share {} B, pool {} B, \
-         floor {} B, ceiling {} B; advance {} us",
+         floor {} B, ceiling {} B; advance {} us; shared {}",
         s.panes,
         s.layers,
         s.listed,
@@ -144,6 +153,7 @@ pub(crate) fn loop_state_line(s: &LoopState) -> String {
         s.floor_bytes,
         s.ceiling_bytes,
         s.advance_us,
+        s.shared,
     )
 }
 

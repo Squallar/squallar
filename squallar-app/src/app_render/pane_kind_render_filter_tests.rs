@@ -466,10 +466,13 @@ fn the_loop_frame_broadcast_skips_a_pane_with_no_plan_view() {
         let mut app = two_pane_app(SITE, SITE);
         point_at_site(&mut app, 0);
         point_at_site(&mut app, 1);
-        assert!(
-            app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
-            "precondition: both panes are layer-linked by default"
-        );
+        // Unlinked on purpose: the broadcast below rides the picture's
+        // identity, so the filter under test is the only thing that can
+        // keep it out of a pane that draws no plan view.
+        app.gui
+            .pane_mut(1)
+            .expect("the fixture built two panes")
+            .layer_link = false;
         app.loop_mgr = LoopDownloadManager::new();
         app.loop_mgr.cache_scan(
             SITE,

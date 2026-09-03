@@ -252,25 +252,6 @@ fn a_queued_render_for_another_product_suppresses_nothing() {
 }
 
 #[test]
-fn a_donor_is_judged_against_the_receiving_panes_target() {
-    let ctx = egui::Context::default();
-    let ktlx = loop_on(&ctx, "KTLX", &[1]);
-    let koun = loop_on(&ctx, "KOUN", &[]);
-    let loops = [(0usize, &ktlx), (1usize, &koun)];
-
-    assert_eq!(
-        find_donor(loops, 1, ts(1), koun.rendered_for.as_ref().unwrap()),
-        None,
-        "a KTLX loop must not serve a KOUN loop"
-    );
-    assert_eq!(
-        find_donor(loops, 1, ts(1), ktlx.rendered_for.as_ref().unwrap()),
-        Some((0, 1)),
-        "precondition: only the target argument distinguishes these"
-    );
-}
-
-#[test]
 fn a_listing_for_the_site_the_loop_left_is_refused() {
     let ctx = egui::Context::default();
     let mut koun = loop_on(&ctx, "KOUN", &[]);
@@ -685,7 +666,7 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
     );
     assert_ne!(rr.site_lon, squallar_egui::radar_layer::coords(&ls).1);
 
-    let texture = accept_render_result(&mut ls, &mut rr, None, |_| dummy_texture(&ctx))
+    let placed = accept_render_result(&mut ls, &mut rr, None, |_| dummy_texture(&ctx))
         .expect("the loop is awaiting this result");
 
     let image = ls.frames[1]
@@ -704,8 +685,10 @@ fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
         "and the frame is no longer in flight"
     );
 
-    let broadcast = rendered_image(&rr, &texture, None);
-    assert_eq!((broadcast.lat, broadcast.lon), (image.lat, image.lon));
+    // The picture handed back for filing and broadcast is the one placed on
+    // the frame — same placement, same texture.
+    assert_eq!((placed.lat, placed.lon), (image.lat, image.lon));
+    assert_eq!(placed.texture.id(), image.texture.id());
 }
 
 #[test]
@@ -940,19 +923,6 @@ fn readiness_counts_only_this_loops_own_downloads() {
         !loop_batch_settled(&mgr, &koun, test_loop_allocation().plan_view_frames),
         "downloaded but unrendered frames must hold the loop out of Ready"
     );
-}
-
-#[test]
-fn a_donor_on_the_same_target_is_found_and_never_the_receiver_itself() {
-    let ctx = egui::Context::default();
-    let a = loop_on(&ctx, "KTLX", &[2]);
-    let b = loop_on(&ctx, "KTLX", &[]);
-    let loops = [(0usize, &a), (1usize, &b)];
-    let want = b.rendered_for.as_ref().unwrap();
-
-    assert_eq!(find_donor(loops, 1, ts(2), want), Some((0, 2)));
-    assert_eq!(find_donor(loops, 0, ts(2), want), None);
-    assert_eq!(find_donor(loops, 1, ts(0), want), None);
 }
 
 #[test]

@@ -3184,6 +3184,7 @@ impl super::App {
                     // foldable). Drop the entire rendering state so the next
                     // handle_redraw() lazily recreates it with a fresh surface.
                     self.render.clear_last_rendered();
+                    drop(self.loop_frames.clear());
                     self.gui.clear_graphics_state();
                     // The mirror texture died with the device; the strip
                     // cache was force-flagged by `clear_graphics_state`, and
@@ -3674,7 +3675,7 @@ impl super::App {
             };
 
             let counter = &mut self.texture_counter;
-            let Some(texture) = accept_render_result(
+            let Some(image) = accept_render_result(
                 pane.time_state_mut(&known::RADAR),
                 &mut rr,
                 gates,
@@ -3693,46 +3694,54 @@ impl super::App {
                 continue;
             };
 
-            // Broadcast to sibling panes with matching product+elevation+timestamp.
-            if self.gui.pane_layer_linked(origin_pane) {
-                for sibling_idx in 0..self.gui.pane_count() {
-                    if sibling_idx == origin_pane
-                        || self.gui.pane_has_no_plan_view(sibling_idx)
-                        || !self.gui.panes_layer_linked(origin_pane, sibling_idx)
-                    {
-                        continue;
-                    }
-                    let Some(sibling_pane) = self.gui.pane(sibling_idx) else {
-                        continue;
-                    };
-                    // **Radar-addressed, named.** The broadcast carries a radar
-                    // plan-view texture keyed by `RenderTarget`
-                    // (site+product+elevation), so the only frame list it can
-                    // land in is radar's. Reading the sibling's *transport*
-                    // here would offer a radar picture to a satellite timeline.
-                    let sibling_loop = sibling_pane.time_state(&known::RADAR);
-                    if !sibling_loop.is_rendered_for(&rr.target) {
-                        continue;
-                    }
-                    let sweep = broadcast_sweep(&self.loop_mgr, sibling_loop, &rr);
-
-                    let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
-                        continue;
-                    };
-                    let Some(sframe) = sibling
-                        .time_state_mut(&known::RADAR)
-                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target, sweep)
-                    else {
-                        continue;
-                    };
-                    // If the sibling had its own render running for this frame it is now
-                    // redundant: same target and timestamp means the same image, so its
-                    // result is simply dropped when it arrives.
-                    sframe.render_in_flight = false;
-                    sframe.image = Some(squallar_egui::pane::LoopFrameImage::PlanView(
-                        rendered_image(&rr, &texture, frame_gates(&self.loop_mgr, &rr)),
-                    ));
+            // **Filed once, under what it is a picture of.** Every pane on
+            // this site, product and tilt at this instant draws this one
+            // texture and reads this one hover source from here on —
+            // whatever the panes' link flags or groups say. The siblings
+            // keyed to it take it now rather than a pass later; a pane that
+            // arrives later takes it out of the store at dispatch.
+            let key =
+                crate::loop_frame_store::LoopFrameKey::plan_view(rr.target.clone(), rr.timestamp);
+            let picture = squallar_egui::pane::LoopFrameImage::PlanView(image);
+            if let Some(replaced) =
+                self.loop_frames
+                    .insert(key.clone(), picture.clone(), origin_pane)
+            {
+                crate::loop_frame_store::discard(vec![replaced]);
+            }
+            for sibling_idx in 0..self.gui.pane_count() {
+                if sibling_idx == origin_pane || self.gui.pane_has_no_plan_view(sibling_idx) {
+                    continue;
                 }
+                let Some(sibling_pane) = self.gui.pane(sibling_idx) else {
+                    continue;
+                };
+                // **Radar-addressed, named.** The broadcast carries a radar
+                // plan-view texture keyed by `RenderTarget`
+                // (site+product+elevation), so the only frame list it can
+                // land in is radar's. Reading the sibling's *transport*
+                // here would offer a radar picture to a satellite timeline.
+                let sibling_loop = sibling_pane.time_state(&known::RADAR);
+                if !sibling_loop.is_rendered_for(&rr.target) {
+                    continue;
+                }
+                let sweep = broadcast_sweep(&self.loop_mgr, sibling_loop, &rr);
+
+                let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
+                    continue;
+                };
+                let Some(sframe) = sibling
+                    .time_state_mut(&known::RADAR)
+                    .frame_accepting_broadcast_mut(rr.timestamp, &rr.target, sweep)
+                else {
+                    continue;
+                };
+                // If the sibling had its own render running for this frame it is now
+                // redundant: same target and timestamp means the same image, so its
+                // result is simply dropped when it arrives.
+                sframe.render_in_flight = false;
+                sframe.image = Some(picture.clone());
+                self.loop_frames.hold(sibling_idx, &key);
             }
         }
     }
@@ -4050,9 +4059,9 @@ impl super::App {
                 .mirror_plan_applied
                 .map_or([0, 0], |plan| plan.size_in_pixels),
         };
-        // Distinct 3D loops seen so far, each with the pane that owns it: a
-        // later pane on the same volume is an alias of that pane's loop.
-        let mut seen: Vec<(VolumeLoopIdentity, usize)> = Vec::new();
+        // Distinct loops seen so far, each with the pane that owns it: a
+        // later pane on the same identity is an alias of that pane's loop.
+        let mut seen: Vec<(LoopIdentity, usize)> = Vec::new();
         let model = LoopFrameModel::from_budgets(&self.budgets);
         for (pane_idx, pane) in self.gui.panes().iter().enumerate() {
             if counts.advance_us == 0 {
@@ -4121,31 +4130,29 @@ impl super::App {
                 scene.panes.push(pane_need);
                 continue;
             }
-            let owner = if ls.view == squallar_radar::types::RenderView::Volume {
-                let Some(product) = loop_product(ls) else {
+            let identity = loop_product(ls).map(|product| LoopIdentity::of(pane, ls, product));
+            let owner = match identity {
+                // A 3D pane with no product yet asks for nothing.
+                None if ls.view == squallar_radar::types::RenderView::Volume => {
                     scene.panes.push(pane_need);
                     continue;
-                };
-                let key = (
-                    radar_layer::site(ls).to_string(),
-                    product,
-                    ls.volume_key().cloned(),
-                );
-                match seen.iter().find(|(k, _)| *k == key) {
+                }
+                None => None,
+                Some(key) => match seen.iter().find(|(k, _)| *k == key) {
                     Some((_, owner)) => Some(*owner),
                     None => {
                         seen.push((key, pane_idx));
                         None
                     }
-                }
-            } else {
-                None
+                },
             };
             pane_need.cadence_secs = ls.cadence_secs;
             match owner {
-                // A second pane orbiting a volume already counted holds no
-                // set of its own: its frames and its live grid are the first
-                // pane's, and it reads that pane's grant.
+                // A second pane on a loop already counted — orbiting the
+                // same volume, or showing the same picture set over the same
+                // window — holds no set of its own: its frames (and, in 3D,
+                // its live grid) are the first pane's, and it reads that
+                // pane's grant.
                 Some(owner) => {
                     demand.alias(pane_idx, owner);
                     pane_need.looping = false;
@@ -4165,6 +4172,7 @@ impl super::App {
             }
             scene.panes.push(pane_need);
         }
+        counts.shared = self.loop_frames.shared();
         (demand, counts, scene)
     }
 
@@ -4708,6 +4716,9 @@ impl super::App {
         // `pane(idx).is_some_and(|p| !p.can_loop())`, so an index naming no
         // pane was false there and then dropped by `pane_mut` on the next
         // line — it never reached `remove_pending`, and it still does not.
+        // Every holder of a shared frame is re-stated inside this walk, so
+        // the store starts the pass holding nothing for anybody.
+        self.loop_frames.begin_pass();
         let panes = self.gui.panes_mut();
         for (pane_idx, pane) in panes.iter_mut().enumerate() {
             if !pane.can_loop() {
@@ -4808,14 +4819,33 @@ impl super::App {
                 continue;
             }
 
-            // Evict textures from frames far from the playhead to cap memory usage.
-            ls.evict_textures_outside_render_set(loop_render_budget(
-                &allocation,
-                pane_idx,
-                ls,
-                &budgets,
-            ));
+            // Evict textures from frames far from the playhead to cap memory usage...
+            let budget = loop_render_budget(&allocation, pane_idx, ls, &budgets);
+            ls.evict_textures_outside_render_set(budget);
+            // ...then re-state to the shared store what this pane still
+            // wants of it: its render set, and whatever it is holding under
+            // budget — filed, if the store has not seen it. A frame this pane
+            // scrubbed away from stays filed while any other pane names it;
+            // one nobody names is dropped after the walk. A 3D loop holds
+            // grids in the volume store and says nothing here.
+            if ls.view != squallar_radar::types::RenderView::Volume
+                && let Some(target) = ls.rendered_for.as_ref()
+            {
+                let keep = ls.render_set_indices(budget);
+                self.loop_frames.hold_frames(
+                    pane_idx,
+                    target,
+                    ls.view,
+                    ls.section_key(),
+                    ls.frames
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, frame)| frame.image.is_some() || keep.contains(idx))
+                        .map(|(_, frame)| (frame.timestamp, frame.image.as_ref())),
+                );
+            }
         }
+        crate::loop_frame_store::discard(self.loop_frames.end_pass());
         for pane_idx in drop_pending {
             self.loop_mgr.remove_pending(pane_idx);
         }
@@ -4877,9 +4907,9 @@ impl super::App {
         // product/elevation); `snapped` is that selection resolved to a sweep angle
         // present in this frame's own scan, which is what the renderer is given.
         let mut to_render: Vec<LoopRenderRequest> = Vec::new();
-        // Frames that can be satisfied by cloning a sibling's texture. Both frame
-        // indices are resolved here and used as-is below — re-finding either by
-        // timestamp would be a second lookup free to disagree with this one.
+        // Frames the store already holds a picture for. The frame index is
+        // resolved here and used as-is below — re-finding it by timestamp
+        // would be a second lookup free to disagree with this one.
         let mut to_clone: Vec<LoopCloneRequest> = Vec::new();
         // Frames whose scan carries no sweep for the selected product: (pane_idx, frame_idx).
         let mut to_mark_failed: Vec<(usize, usize)> = Vec::new();
@@ -4895,7 +4925,6 @@ impl super::App {
             if self.gui.pane_cannot_loop(pane_idx) {
                 continue;
             }
-            let linked = self.gui.pane_layer_linked(pane_idx);
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
@@ -4978,25 +5007,24 @@ impl super::App {
                         continue;
                     }
 
-                    if linked
-                        && let Some((src_pane, src_frame)) = find_section_donor(
-                            (0..pane_count)
-                                .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
-                                .filter_map(|i| {
-                                    self.gui.pane(i).map(|p| (i, p.time_state(&known::RADAR)))
-                                }),
-                            pane_idx,
-                            frame.timestamp,
-                            &target,
-                            &key,
-                            ladder,
-                        )
+                    // One copy, drawn twice: a cut any pane has finished for
+                    // this key through this ladder is taken from the store,
+                    // whatever the panes' links say.
+                    let filed = crate::loop_frame_store::LoopFrameKey::section(
+                        target.clone(),
+                        key.clone(),
+                        frame.timestamp,
+                    );
+                    if let Some(picture) = self
+                        .loop_frames
+                        .get(&filed)
+                        .filter(|p| p.section().is_some_and(|cut| cut.ladder == ladder))
                     {
                         to_clone.push(LoopCloneRequest {
                             dest_pane: pane_idx,
                             dest_frame: idx,
-                            src_pane,
-                            src_frame,
+                            key: filed,
+                            picture: picture.clone(),
                         });
                         continue;
                     }
@@ -5007,19 +5035,9 @@ impl super::App {
                         // goes on showing whatever has already landed.
                         break;
                     }
-                    // The queuing pane must be linked too, or the section
-                    // broadcast this lean relies on never runs — the same
-                    // linked-queuer filter as `render_already_queued`'s.
-                    if linked
-                        && section_already_queued(
-                            to_cut
-                                .iter()
-                                .filter(|r| self.gui.panes_layer_linked(pane_idx, r.pane_idx)),
-                            frame.timestamp,
-                            &target,
-                            &key,
-                        )
-                    {
+                    // A cut already queued this pass for the same key will be
+                    // filed and broadcast on arrival, so this frame leans on it.
+                    if section_already_queued(to_cut.iter(), frame.timestamp, &target, &key) {
                         continue;
                     }
                     to_cut.push(LoopSectionRequest {
@@ -5042,26 +5060,22 @@ impl super::App {
                     continue;
                 }
 
-                if linked {
-                    let donor = find_donor(
-                        (0..pane_count)
-                            .filter(|&i| self.gui.panes_layer_linked(pane_idx, i))
-                            .filter_map(|i| {
-                                self.gui.pane(i).map(|p| (i, p.time_state(&known::RADAR)))
-                            }),
-                        pane_idx,
-                        frame.timestamp,
-                        &target,
-                    );
-                    if let Some((src_pane, src_frame)) = donor {
-                        to_clone.push(LoopCloneRequest {
-                            dest_pane: pane_idx,
-                            dest_frame: idx,
-                            src_pane,
-                            src_frame,
-                        });
-                        continue;
-                    }
+                // One copy, drawn twice: a picture any pane has finished for
+                // this target at this instant is taken from the store,
+                // whatever the panes' links say. The render below is only for
+                // a picture nobody has.
+                let filed = crate::loop_frame_store::LoopFrameKey::plan_view(
+                    target.clone(),
+                    frame.timestamp,
+                );
+                if let Some(picture) = self.loop_frames.get(&filed) {
+                    to_clone.push(LoopCloneRequest {
+                        dest_pane: pane_idx,
+                        dest_frame: idx,
+                        key: filed,
+                        picture: picture.clone(),
+                    });
+                    continue;
                 }
 
                 // The sweep this frame's own data resolves the selection to, or
@@ -5069,16 +5083,12 @@ impl super::App {
                 // see `frame_sweep`.
                 match frame_sweep(&self.loop_mgr, &target, frame.timestamp) {
                     FrameSweep::At(snapped) => {
-                        if linked
-                            && render_already_queued(
-                                to_render
-                                    .iter()
-                                    .filter(|r| self.gui.panes_layer_linked(pane_idx, r.pane_idx)),
-                                frame.timestamp,
-                                &target,
-                                snapped,
-                            )
-                        {
+                        if render_already_queued(
+                            to_render.iter(),
+                            frame.timestamp,
+                            &target,
+                            snapped,
+                        ) {
                             continue;
                         }
                         to_render.push(LoopRenderRequest {
@@ -5108,22 +5118,11 @@ impl super::App {
             }
         }
 
-        // Apply cloned textures from sibling panes (no render needed). Both indices
-        // were resolved during planning; nothing since has reordered either frame list
-        // (`to_mark_failed` only sets a flag), so they are used directly.
+        // Hand out the pictures the store already had (no render needed). The
+        // frame index was resolved during planning; nothing since has
+        // reordered the frame list (`to_mark_failed` only sets a flag), so it
+        // is used directly.
         for req in to_clone {
-            let cloned = {
-                let Some(src) = self.gui.pane(req.src_pane) else {
-                    continue;
-                };
-                let Some(sframe) = src.time_state(&known::RADAR).frames.get(req.src_frame) else {
-                    continue;
-                };
-                let Some(image) = sframe.image.clone() else {
-                    continue;
-                };
-                image
-            };
             let Some(dest) = self.gui.pane_mut(req.dest_pane) else {
                 continue;
             };
@@ -5132,7 +5131,8 @@ impl super::App {
                 .frames
                 .get_mut(req.dest_frame)
             {
-                dframe.image = Some(cloned);
+                dframe.image = Some(req.picture);
+                self.loop_frames.hold(req.dest_pane, &req.key);
             }
         }
 
@@ -5331,14 +5331,25 @@ impl super::App {
                 continue;
             };
 
-            if !self.gui.pane_layer_linked(origin_pane) {
-                continue;
+            // Filed once under the cut's whole key — target, line and vector,
+            // instant — for the reason the plan-view arrival files its
+            // picture: every pane cutting this line through this volume
+            // draws this one raster, linked or not. A re-cut against a moved
+            // ladder replaces the stale one.
+            let key = crate::loop_frame_store::LoopFrameKey::section(
+                sr.target.clone(),
+                sr.key.clone(),
+                sr.timestamp,
+            );
+            let picture = squallar_egui::pane::LoopFrameImage::Section(placed);
+            if let Some(replaced) =
+                self.loop_frames
+                    .insert(key.clone(), picture.clone(), origin_pane)
+            {
+                crate::loop_frame_store::discard(vec![replaced]);
             }
             for sibling_idx in 0..self.gui.pane_count() {
-                if sibling_idx == origin_pane
-                    || self.gui.pane_cannot_loop(sibling_idx)
-                    || !self.gui.panes_layer_linked(origin_pane, sibling_idx)
-                {
+                if sibling_idx == origin_pane || self.gui.pane_cannot_loop(sibling_idx) {
                     continue;
                 }
                 let own_ladder = match frame_section(&self.loop_mgr, &sr.target, sr.timestamp) {
@@ -5364,7 +5375,8 @@ impl super::App {
                 // same volume means the same raster, so its reply is dropped on
                 // arrival by the target check.
                 sframe.render_in_flight = false;
-                sframe.image = Some(squallar_egui::pane::LoopFrameImage::Section(placed.clone()));
+                sframe.image = Some(picture.clone());
+                self.loop_frames.hold(sibling_idx, &key);
             }
         }
     }
@@ -5390,14 +5402,65 @@ fn section_source_refusal(
     Some(squallar_egui::pane::SectionUnavailable::AwaitingVolume)
 }
 
-/// What makes two 3D loops one resident set: the site, the product and the
-/// volume key — the ground the frames are resampled over and the vector they
-/// are derived with. Two panes agreeing on all three orbit one volume.
-type VolumeLoopIdentity = (
-    String,
-    squallar_radar::types::RadarProduct,
-    Option<squallar_egui::pane::VolumeLoopKey>,
-);
+/// **What makes two panes' radar loops one loop for the pool.** Two panes
+/// agreeing on every term of an arm hold one set of frames — one resident
+/// grid set in the volume store, one set of pictures in the loop frame store
+/// — and the pool charges it once, the second pane an alias of the first
+/// ([`LoopDemand::alias`]).
+#[derive(Clone, Debug, PartialEq)]
+enum LoopIdentity {
+    /// Site, product, and the ground and vector the grids are resampled with.
+    Volume {
+        site: String,
+        product: squallar_radar::types::RadarProduct,
+        key: Option<squallar_egui::pane::VolumeLoopKey>,
+    },
+    /// The picture's identity — site, product, the tilt where it selects the
+    /// picture (by the render's own tenths bucket), a section's line and
+    /// vector — **over the same window**: the pane's lookback and the instant
+    /// it depicts. Two panes on one picture set at different lookbacks, or
+    /// parked at different instants, list different frames: they share what
+    /// overlaps through the loop frame store and are priced as two, since one
+    /// grant would under-price the frames only one of them holds.
+    Raster {
+        site: String,
+        product: squallar_radar::types::RadarProduct,
+        elevation_tenths: Option<i32>,
+        section: Option<squallar_egui::pane::SectionLoopKey>,
+        span_secs: u64,
+        mode: squallar_egui::pane::TimeMode,
+    },
+}
+
+impl LoopIdentity {
+    fn of(
+        pane: &squallar_egui::pane::PaneState,
+        ls: &squallar_egui::pane::LayerTimeState,
+        product: squallar_radar::types::RadarProduct,
+    ) -> Self {
+        let site = radar_layer::site(ls).to_string();
+        match ls.view {
+            squallar_radar::types::RenderView::Volume => Self::Volume {
+                site,
+                product,
+                key: ls.volume_key().cloned(),
+            },
+            squallar_radar::types::RenderView::PlanView
+            | squallar_radar::types::RenderView::CrossSection => Self::Raster {
+                site,
+                product,
+                elevation_tenths: ls
+                    .rendered_for
+                    .as_ref()
+                    .filter(|_| ls.view.elevation_selects_picture(product))
+                    .map(|target| squallar_egui::pane::elevation_tenths(target.elevation)),
+                section: ls.section_key().cloned(),
+                span_secs: pane.time.span_secs,
+                mode: pane.time.mode,
+            },
+        }
+    }
+}
 
 /// **One frame listing that landed**, and what the loop builder has to match
 /// it against a pane with.
@@ -5726,13 +5789,14 @@ fn frame_gates(
 }
 
 /// Place a finished loop render on the frame of `ls` that asked for it, returning
-/// the texture that was uploaded so the caller can offer it to sibling panes.
+/// the placed picture — texture and hover source, built once — so the caller can
+/// file it and hand the same one to every sibling pane.
 fn accept_render_result(
     ls: &mut squallar_egui::pane::LayerTimeState,
     rr: &mut crate::channels::LoopRenderResponse,
     gates: Option<squallar_radar::hover::SweepGates>,
     upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
-) -> Option<egui::TextureHandle> {
+) -> Option<squallar_egui::pane::RadarImageData> {
     let frame = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target)?;
     frame.render_in_flight = false;
 
@@ -5742,10 +5806,9 @@ fn accept_render_result(
     };
 
     let texture = upload(color_image);
-    frame.image = Some(squallar_egui::pane::LoopFrameImage::PlanView(
-        rendered_image(rr, &texture, gates),
-    ));
-    Some(texture)
+    let image = rendered_image(rr, &texture, gates);
+    frame.image = Some(squallar_egui::pane::LoopFrameImage::PlanView(image.clone()));
+    Some(image)
 }
 
 /// [`accept_render_result`] for a finished cross-section cut.
@@ -6276,27 +6339,6 @@ pub(crate) struct LoopSectionRequest {
     pub(crate) site_lon: f64,
 }
 
-/// A section frame another pane's loop can donate to `receiver`, as
-/// `(pane, frame)`.
-fn find_section_donor<'a>(
-    loops: impl IntoIterator<Item = (usize, &'a squallar_egui::pane::LayerTimeState)>,
-    receiver: usize,
-    timestamp: chrono::NaiveDateTime,
-    target: &RenderTarget,
-    key: &squallar_egui::pane::SectionLoopKey,
-    wanted_ladder: u64,
-) -> Option<(usize, usize)> {
-    loops
-        .into_iter()
-        .filter(|&(idx, _)| idx != receiver)
-        .find_map(|(idx, ls)| {
-            Some((
-                idx,
-                ls.section_frame_donatable_to(timestamp, target, key, wanted_ladder)?,
-            ))
-        })
-}
-
 /// Whether a cut for this frame and key is already queued in this dispatch pass.
 fn section_already_queued<'a>(
     mut queued: impl Iterator<Item = &'a LoopSectionRequest>,
@@ -6341,26 +6383,13 @@ impl LoopRenderRequest {
     }
 }
 
-/// A loop frame that a sibling pane's already-rendered texture can satisfy.
+/// A loop frame the store can satisfy without a render: the picture, and the
+/// key it was filed under so the receiving pane is recorded as a holder.
 struct LoopCloneRequest {
     dest_pane: usize,
     dest_frame: usize,
-    src_pane: usize,
-    src_frame: usize,
-}
-
-/// The `(pane, frame)` that can serve `timestamp` for a pane keyed to `target`
-/// without a new render, or `None` if nobody can.
-fn find_donor<'a>(
-    loops: impl IntoIterator<Item = (usize, &'a squallar_egui::pane::LayerTimeState)>,
-    receiver: usize,
-    timestamp: chrono::NaiveDateTime,
-    target: &RenderTarget,
-) -> Option<(usize, usize)> {
-    loops
-        .into_iter()
-        .filter(|&(idx, _)| idx != receiver)
-        .find_map(|(idx, ls)| Some((idx, ls.frame_donatable_to(timestamp, target)?)))
+    key: crate::loop_frame_store::LoopFrameKey,
+    picture: squallar_egui::pane::LoopFrameImage,
 }
 
 /// Whether `queued` already covers a render for `timestamp` at `target`.
@@ -6470,6 +6499,12 @@ mod loop_supply_tests;
 #[path = "app_render/loop_overlay_render_tests.rs"]
 #[cfg(test)]
 mod loop_overlay_render_tests;
+
+/// One copy of a 2D loop frame, drawn on every pane that shows it, linked or
+/// not: the store, the broadcast, the eviction union and the pool's price.
+#[path = "app_render/loop_frame_sharing_tests.rs"]
+#[cfg(test)]
+mod loop_frame_sharing_tests;
 
 /// Playback on the transport layer: the gate, the start frame, the flip and
 /// radar's unchanged tick.

@@ -38,7 +38,7 @@ fn site() -> RadarSite {
         .clone()
 }
 
-fn line() -> SectionLine {
+pub(super) fn line() -> SectionLine {
     SectionLine::new(
         GeoPoint {
             lat: 35.0,
@@ -52,7 +52,7 @@ fn line() -> SectionLine {
     .expect("two distinct points on Earth")
 }
 
-fn key() -> SectionLoopKey {
+pub(super) fn key() -> SectionLoopKey {
     SectionLoopKey::new(line(), None, squallar_radar::srv::SrvFallback::default())
 }
 
@@ -425,6 +425,11 @@ fn a_frame_is_recut_when_its_volume_resolves_a_different_ladder() {
         .time_state_mut(&known::RADAR)
         .frames[0]
         .image = Some(section_picture(&ctx, current.wrapping_add(1)));
+    // The first pass filed the fresh cut in the shared store, and a pane
+    // whose own cut is stale would take it from there. A volume moving on
+    // stales the store's cut with the pane's — which this fixture, faking
+    // the stale cut on the pane alone, spells by emptying the store.
+    drop(app.loop_frames.clear());
     app.dispatch_loop_renders();
     assert!(
         app.gui.pane(0).unwrap().time_state(&known::RADAR).frames[0].render_in_flight,
@@ -593,7 +598,7 @@ fn a_satellite_loop_takes_the_transport(app: &mut crate::app::App, pane_idx: usi
 
 /// Two layer-linked, aimed cross-section panes running the same section loop
 /// over `minutes`, and no volumes cached.
-fn two_section_panes(minutes: &[u32]) -> crate::app::App {
+pub(super) fn two_section_panes(minutes: &[u32]) -> crate::app::App {
     let mut app = crate::app::tests::two_pane_app(SITE, SITE);
     app.render.ensure_pane_count(2);
     app.loop_mgr = LoopDownloadManager::new();
@@ -620,11 +625,13 @@ fn two_section_panes(minutes: &[u32]) -> crate::app::App {
         ls.retarget_renders_for(&PRODUCT_ID, TILT, Some(key()));
         *pane.time_state_mut(&known::RADAR) = ls;
     }
-    assert!(
-        app.gui.pane_layer_linked(0) && app.gui.pane_layer_linked(1),
-        "precondition: both panes are layer-linked, or neither the donor \
-         search nor the broadcast ever runs",
-    );
+    // Deliberately **unlinked**: a finished cut reaches the second pane on
+    // the cut's identity, not the link, and a linked fixture could not tell
+    // the two apart.
+    app.gui
+        .pane_mut(1)
+        .expect("the fixture built two panes")
+        .layer_link = false;
     app
 }
 

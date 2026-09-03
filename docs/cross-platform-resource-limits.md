@@ -1574,6 +1574,63 @@ follows the span, unaffected. The `budget state:` line carries the balloon as
 its last, mandatory field — `balloon <MiB>`, Σ bytes above every base, a subset
 of `pool` and never added to it — so a deflation is a figure on every row.
 
+### 9.8 The same data, once
+
+Ruling, verbatim: *"the same data on both should deduplicate both resident
+memory and the work done to render."* Two panes showing one site, product and
+tilt at one instant hold **one** copy of each loop frame texture and rasterise
+and upload it **once**, whether or not the panes are layer-linked or in one
+group. Linking still synchronises *time*; it no longer decides *sharing*.
+
+**What is shared, and how.** Finished 2D radar loop frames live in
+`squallar-app`'s `LoopFrameStore` (`loop_frame_store.rs`), an App field beside
+the volume store and built on its model: entries keyed by what built them,
+refcounted by the panes holding them, dropped when the last holder lets go.
+The key is the `RenderTarget` — site, product, and the tilt where the view says
+it selects the picture, compared by the render's own tenths bucket — plus the
+instant, plus for a section its `SectionLoopKey` (line, storm-motion vector,
+SRV fallback); the view is in the key because a plan view and a section of one
+target are two pictures. A finished render or cut is filed on arrival and
+handed to every pane keyed to it in the same poll; a pane that arrives later
+takes the picture out of the store at dispatch instead of rendering, and a
+render already queued this pass for the same key suppresses the duplicate
+whatever pane queued it. What a pane holds is a clone of the image — the
+`egui::TextureHandle` is a retain-counted id, so every clone is one GPU texture
+and it is freed when the last handle drops — and the one `Arc<HoverSource>`
+behind the texture is shared the same way. Holders are re-stated on every
+dispatch pass, the way `VolumeStore::retain_set` holders state their set: each
+2D loop names the frames its render set wants and the ones it still holds under
+budget, and an entry nobody named is dropped, its hover payload through
+`offload::discard`. So **eviction is over the union of the holders' render
+sets**: a pane scrubbing away from a frame cannot take it from a pane still
+showing it, and a pane scrubbing back to one takes it from the store for free.
+
+**The pool prices one loop per identity.** `App::loop_demand` keys each radar
+loop by a `LoopIdentity` — for 3D the site, product and volume key as before;
+for 2D the site, product, selecting tilt and section key **over the same
+window**, the pane's lookback and the instant it depicts — and a second pane on
+an identity already seen is an alias of the first (`LoopDemand::alias`, the
+mechanism §9.7 built for volumes): it reads the first pane's grant, `fit` does
+not charge its frames, and the pool sees one loop. Two panes on one picture set
+at different lookbacks or parked at different instants list different frames;
+they share what overlaps through the store and are priced as two, since one
+grant would under-price the frames only one of them holds.
+
+**What still duplicates, and why.** Overlay (non-radar) loop frames: their
+pictures are placed rasters cut for a pane's own bounds and zoom, so two panes
+share one only under the whole-picture grouping, which is its own work. 3D loop
+frames: already one resident set per volume in the volume store; the raymarch
+offscreen is per pane by construction. Two 2D panes at *different* tilts of one
+sweep-selecting product, or on different lines of one volume, are two pictures
+and hold two.
+
+**Telemetry.** The `loop state:` line ends in `shared <n>`: pictures in the
+store held by more than one pane. A third denominator beside frame *slots*
+(`listed` and its subsets) and frames *textured* (`allowed`/`cap`/`held`): two
+slots on two panes drawing one shared picture are two `resident` and one
+`shared`, never added to or taken from each other. `drive.py`'s
+`loop_state_re` and `native_row.py`'s loop row carry it as one trailing group.
+
 ---
 
 ## 10. Pressure: reclaim, then re-fit, within the session

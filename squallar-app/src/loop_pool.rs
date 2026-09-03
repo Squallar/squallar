@@ -278,12 +278,12 @@ impl LoopKind {
 
 /// **One loop's identity in the pool**: the pane it runs on. A pane runs at
 /// most one loop the pool can see — its radar loop, or one overlay loop when
-/// radar is off — so the pane index is the whole key. Two 3D panes orbiting
-/// one volume are one loop under the first pane's key, and the second is an
-/// **alias** of it ([`LoopDemand::alias`]), so both read the same grant while
-/// the pool charges the set once. A frame identity shared across panes can
-/// join this key later; it is a struct rather than a bare index so that it
-/// can.
+/// radar is off — so the pane index is the whole key. Two panes on one loop
+/// identity — 3D panes orbiting one volume, or 2D panes on one picture set
+/// over one window — are one loop under the first pane's key, and the second
+/// is an **alias** of it ([`LoopDemand::alias`]), so both read the same grant
+/// while the pool charges the set once. It is a struct rather than a bare
+/// index so that a term can join it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoopKey {
     /// The pane the loop runs on.
@@ -366,8 +366,9 @@ pub fn loop_ceiling_frames(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoopDemand {
     needs: Vec<LoopNeed>,
-    /// `(pane, owner)`: `pane` orbits the volume `owner`'s loop already holds,
-    /// so it reads `owner`'s grant and asks for nothing of its own.
+    /// `(pane, owner)`: `pane` shows what `owner`'s loop already holds — the
+    /// same volume, or the same 2D picture set — so it reads `owner`'s grant
+    /// and asks for nothing of its own.
     aliases: Vec<(usize, usize)>,
 }
 
@@ -382,8 +383,9 @@ impl LoopDemand {
         }
     }
 
-    /// Record that `pane` shares `owner`'s loop — a second 3D pane on one
-    /// volume, which is one resident set in one store and so one loop here.
+    /// Record that `pane` shares `owner`'s loop — a second pane on one
+    /// volume or one 2D picture set, which is one resident set in one store
+    /// and so one loop here.
     pub fn alias(&mut self, pane: usize, owner: usize) {
         if !self.aliases.contains(&(pane, owner)) {
             self.aliases.push((pane, owner));

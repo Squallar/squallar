@@ -272,6 +272,11 @@ pub struct App {
     channels: ChannelHub,
     render: RenderDispatcher,
     platform: Box<dyn PlatformBridge>,
+    /// The finished 2D loop frames, one copy each however many panes show
+    /// one — see [`crate::loop_frame_store`]. An App field like
+    /// [`Self::volume_store`], so the dispatch reaches it without going
+    /// through the Gui.
+    loop_frames: crate::loop_frame_store::LoopFrameStore,
     texture_counter: u32,
     /// A rendering state has been built and the rasters it dropped have not
     /// been put back yet. Set where the state is created, spent inside the
@@ -721,6 +726,7 @@ impl App {
             channels,
             render,
             platform,
+            loop_frames: crate::loop_frame_store::LoopFrameStore::default(),
             texture_counter: 0,
             restore_pending: false,
             cached_dark_theme: None,
@@ -2805,6 +2811,9 @@ impl ApplicationHandler for App {
         }
         self.render.clear_last_rendered();
         self.texture_counter = 0;
+        // The shared loop frames' handles are the dying device's too; every
+        // pane's copies go in `clear_graphics_state`, and the store's here.
+        drop(self.loop_frames.clear());
         self.gui.clear_graphics_state(); // Keep cached_render intact so we can re-upload the texture
         self.window = None;
         self.state = None;

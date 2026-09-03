@@ -2966,7 +2966,10 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // denominator from slots. Bytes: `share` is one loop's slice, `pool` the
 // application's whole allowance, and floor/ceiling the tier's bracket -- a
 // pool below the value it booted at is `LoopPool::back_off` having fired.
-var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us/;
+// `shared` is PICTURES in the loop frame store held by more than one pane --
+// a third denominator: two slots on two panes drawing one picture are two
+// `resident` and one `shared`, never added to or taken from `resident`.
+var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us; shared (\d+)/;
 // The `budget state:` line: the bracket and rung the budgets were resolved
 // at, and every host signal the device profile carries beside them. A LEVEL,
 // every group MANDATORY: the app prints every field on every tick, with 0
@@ -3148,7 +3151,8 @@ for (var i = 0; i < C.length; i++) {
                    pool_bytes: parseInt(x[14], 10),
                    floor_bytes: parseInt(x[15], 10),
                    ceiling_bytes: parseInt(x[16], 10),
-                   advance_us: parseInt(x[17], 10) };
+                   advance_us: parseInt(x[17], 10),
+                   shared: parseInt(x[18], 10) };
     loop_state_all.push(loop_state);
   }
   x = budget_state_re.exec(m);
@@ -7193,7 +7197,7 @@ def run_smoke(args):
               "%s layers animating, %s frames listed, %s resident "
               "(%s in flight, %s failed); allowed plan=%s section=%s "
               "volume=%s overlay=%s, cap %s, held %s; share %s B, pool %s B "
-              "in [%s, %s]; advance %s us"
+              "in [%s, %s]; advance %s us; shared %s pictures"
               % (tag, alabel, s.get("panes"), s.get("layers"),
                  s.get("listed"), s.get("resident"), s.get("in_flight"),
                  s.get("failed"), s.get("allowed_plan"),
@@ -7201,7 +7205,7 @@ def run_smoke(args):
                  s.get("allowed_overlay"), s.get("cap"), s.get("held"),
                  s.get("share_bytes"), s.get("pool_bytes"),
                  s.get("floor_bytes"), s.get("ceiling_bytes"),
-                 s.get("advance_us")))
+                 s.get("advance_us"), s.get("shared")))
     if fl.get("budget_state"):
         b = fl["budget_state"]
         # A LEVEL at the end of the leg. `pool` is the live loop pool in MiB

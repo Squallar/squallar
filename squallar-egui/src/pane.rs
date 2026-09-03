@@ -1339,21 +1339,6 @@ impl LayerTimeState {
         Some(&mut self.frames[idx])
     }
 
-    /// The index of a frame this loop can hand to a pane keyed to `target`, letting
-    /// that pane skip a render it would otherwise dispatch.
-    pub fn frame_donatable_to(
-        &self,
-        timestamp: NaiveDateTime,
-        target: &RenderTarget,
-    ) -> Option<usize> {
-        if self.view != RenderView::PlanView || !self.is_active() || !self.is_rendered_for(target) {
-            return None;
-        }
-        self.frames.iter().position(|f| {
-            f.timestamp == timestamp && f.image.as_ref().is_some_and(|i| i.plan_view().is_some())
-        })
-    }
-
     /// Whether this loop's frames are cut for `target` **and** `key` — the
     /// section counterpart of [`Self::is_rendered_for`].
     pub fn is_cut_for(&self, target: &RenderTarget, key: &SectionLoopKey) -> bool {
@@ -1438,30 +1423,6 @@ impl LayerTimeState {
         let idx =
             self.frame_accepting_section_broadcast(timestamp, target, key, ladder, own_ladder)?;
         Some(&mut self.frames[idx])
-    }
-
-    /// The index of a **section** frame this loop can hand to a pane keyed to
-    /// `target`/`key`, letting that pane skip a cut it would otherwise dispatch.
-    pub fn section_frame_donatable_to(
-        &self,
-        timestamp: NaiveDateTime,
-        target: &RenderTarget,
-        key: &SectionLoopKey,
-        wanted_ladder: u64,
-    ) -> Option<usize> {
-        if self.view != RenderView::CrossSection
-            || !self.is_active()
-            || !self.is_cut_for(target, key)
-        {
-            return None;
-        }
-        self.frames.iter().position(|f| {
-            f.timestamp == timestamp
-                && f.image
-                    .as_ref()
-                    .and_then(LoopFrameImage::section)
-                    .is_some_and(|s| s.ladder == wanted_ladder)
-        })
     }
 
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
