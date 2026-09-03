@@ -143,8 +143,16 @@ mod tests {
         use fmt::Write;
 
         let longest = line(usize::MAX, Some(u64::MAX), u64::MAX);
-        assert!(longest.as_str().len() < LINE_CAPACITY, "{}", longest.as_str());
-        assert!(longest.as_str().starts_with("alloc failed: 18446744073709551615 B requested, "));
+        assert!(
+            longest.as_str().len() < LINE_CAPACITY,
+            "{}",
+            longest.as_str()
+        );
+        assert!(
+            longest
+                .as_str()
+                .starts_with("alloc failed: 18446744073709551615 B requested, ")
+        );
 
         let mut full = Line::new();
         for _ in 0..LINE_CAPACITY {
