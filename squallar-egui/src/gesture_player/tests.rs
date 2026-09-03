@@ -113,6 +113,188 @@ fn net_drag_and_wheel(frames: &[(f64, Vec<egui::Event>)]) -> (egui::Vec2, f32) {
     (net, wheel)
 }
 
+/// The native window the scene C legs run at; the pan-zoom press point is
+/// its centre, (960, 540).
+const NATIVE: egui::Rect = egui::Rect {
+    min: egui::pos2(0.0, 0.0),
+    max: egui::pos2(1920.0, 1080.0),
+};
+
+/// A 60 fps cadence in which every stroke's first frame lands 40 ms late —
+/// the frame gap that put a press 25–40 pt down its stroke on the 2026-09-02
+/// scene C legs. `period` is the stroke period the gaps straddle.
+fn late_first_frames(period: f64, until: f64) -> Vec<f64> {
+    let dt = 1.0 / 60.0;
+    let mut out = Vec::new();
+    let mut t = 0.0;
+    while t < until {
+        let next = t + dt;
+        let boundary = (next / period).floor() * period;
+        t = if boundary > t { boundary + 0.04 } else { next };
+        out.push(t);
+    }
+    out
+}
+
+/// One press as the stream shows it: where it said, whether its batch moved
+/// the pointer, where the pointer rested going into that frame, where the
+/// batch left it (egui's hit-test point), and the displacement to its
+/// release.
+#[derive(Debug, PartialEq)]
+struct Stroke {
+    press: egui::Pos2,
+    moved_in_press_batch: bool,
+    rest_before: Option<egui::Pos2>,
+    batch_final: egui::Pos2,
+    net: egui::Vec2,
+}
+
+fn strokes(frames: &[(f64, Vec<egui::Event>)]) -> Vec<Stroke> {
+    let mut out = Vec::new();
+    let mut pos: Option<egui::Pos2> = None;
+    let mut open: Option<usize> = None;
+    for (_, events) in frames {
+        let rest_before = pos;
+        let mut moved = false;
+        let mut pressed: Option<egui::Pos2> = None;
+        for event in events {
+            match event {
+                egui::Event::PointerMoved(p) => {
+                    moved = true;
+                    pos = Some(*p);
+                }
+                egui::Event::PointerButton {
+                    pos: p,
+                    pressed: true,
+                    ..
+                } => {
+                    pressed = Some(*p);
+                    pos = Some(*p);
+                }
+                egui::Event::PointerButton {
+                    pos: p,
+                    pressed: false,
+                    ..
+                } => {
+                    pos = Some(*p);
+                    if let Some(i) = open.take() {
+                        let s: &mut Stroke = &mut out[i];
+                        s.net = *p - s.press;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(press) = pressed {
+            open = Some(out.len());
+            out.push(Stroke {
+                press,
+                moved_in_press_batch: moved,
+                rest_before,
+                batch_final: pos.expect("a press sets the position"),
+                net: egui::Vec2::ZERO,
+            });
+        }
+    }
+    out
+}
+
+fn replay(script: &str, times: &[f64], screen: egui::Rect) -> Vec<(f64, Vec<egui::Event>)> {
+    let mut p = player(script);
+    times
+        .iter()
+        .map(|t| (*t, p.events_with_targets(*t, screen, &BTreeMap::new())))
+        .collect()
+}
+
+/// egui hit-tests a press at its batch's final pointer position and hands a
+/// starting drag last frame's delta; so a press goes out alone, on a frame
+/// after the one that parked the pointer at the press point, and the batch
+/// leaves the pointer exactly where the press said — under a steady cadence
+/// and under 40 ms first-frame gaps alike. On the scene C legs of
+/// 2026-09-02 the batched press+move landed in the divider strip 17.67 pt
+/// below (960, 540) and dragged it to its floor.
+#[test]
+fn a_press_goes_out_alone_where_the_pointer_already_rests() {
+    for (script, period) in [
+        ("pan-zoom-2d", pan_zoom_2d::STROKE_PERIOD),
+        ("orbit-3d", LOOP_SECONDS),
+    ] {
+        for (cadence, times) in [
+            ("jittered", jittered_times(1500)),
+            (
+                "late first frames",
+                late_first_frames(period, 2.0 * LOOP_SECONDS),
+            ),
+        ] {
+            let found = strokes(&replay(script, &times, NATIVE));
+            assert!(!found.is_empty(), "{script}/{cadence}: no press at all");
+            for (i, s) in found.iter().enumerate() {
+                assert_eq!(s.press, NATIVE.center(), "{script}/{cadence}: press {i}");
+                assert!(
+                    !s.moved_in_press_batch,
+                    "{script}/{cadence}: press {i}'s batch also moved the pointer"
+                );
+                assert_eq!(
+                    s.rest_before,
+                    Some(s.press),
+                    "{script}/{cadence}: press {i} found the pointer somewhere else"
+                );
+                assert_eq!(
+                    s.batch_final, s.press,
+                    "{script}/{cadence}: press {i} would be hit-tested off its point"
+                );
+            }
+        }
+    }
+}
+
+/// The release pins each stroke's end, so the displacement from press to
+/// release is the schedule's whatever the cadence: the same list of nets
+/// from a steady 60 fps replay and from one whose first frames are 40 ms
+/// late. For the orbit the one stroke per loop closes on itself.
+#[test]
+fn a_strokes_net_is_the_same_whatever_the_frame_gap() {
+    for (script, period) in [
+        ("pan-zoom-2d", pan_zoom_2d::STROKE_PERIOD),
+        ("orbit-3d", LOOP_SECONDS),
+    ] {
+        // Two whole loops, cut in the second loop's quiet tail so neither
+        // cadence opens a third loop's first stroke.
+        let until = 2.0 * LOOP_SECONDS - 1.0;
+        let steady: Vec<f64> = (1..=(until * 60.0) as usize)
+            .map(|i| i as f64 / 60.0)
+            .collect();
+        let a: Vec<egui::Vec2> = strokes(&replay(script, &steady, NATIVE))
+            .iter()
+            .map(|s| s.net)
+            .collect();
+        let b: Vec<egui::Vec2> =
+            strokes(&replay(script, &late_first_frames(period, until), NATIVE))
+                .iter()
+                .map(|s| s.net)
+                .collect();
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{script}: a cadence changed the stroke count"
+        );
+        assert!(a.len() >= 2, "{script}: fewer than two strokes to compare");
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (*x - *y).length() < 1e-3,
+                "{script}: stroke {i} nets {x:?} at 60 fps but {y:?} with late first frames"
+            );
+        }
+        if script == "orbit-3d" {
+            assert!(
+                a.iter().all(|n| n.length() < 1e-3),
+                "{script}: an orbit did not close: {a:?}"
+            );
+        }
+    }
+}
+
 /// The spike measured 2744 km of drift from un-mirrored strokes; the mirrored
 /// pairs and the equal in/out notch legs are what re-centre each loop.
 #[test]

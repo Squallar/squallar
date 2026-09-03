@@ -258,6 +258,10 @@ pub struct GesturePlayer {
     frames_this_loop: u32,
     /// Whether the synthetic primary button is down, and where it last was.
     down_at: Option<egui::Pos2>,
+    /// Where the synthetic pointer was last put, pressed or not — the
+    /// position egui already holds for it when the next frame's events
+    /// arrive. `None` before the first event.
+    pointer_at: Option<egui::Pos2>,
     /// Signed wheel notches already emitted this loop.
     notches_emitted: i64,
     /// Last two-finger positions emitted, for the pinch release.
@@ -287,6 +291,7 @@ impl GesturePlayer {
             loops_completed: 0,
             frames_this_loop: 0,
             down_at: None,
+            pointer_at: None,
             notches_emitted: 0,
             pinch_last: None,
             pinch_end_gap: pinch_2d::GAP_MIN,
@@ -402,6 +407,7 @@ impl GesturePlayer {
         }
         if let Some(pos) = self.down_at.take() {
             input_fidelity::mouse_release(events, pos);
+            self.pointer_at = Some(pos);
         }
         if let Some((a, b)) = self.pinch_last.take() {
             input_fidelity::web_second_finger_up(events, b);
@@ -409,22 +415,62 @@ impl GesturePlayer {
         }
     }
 
-    fn press_at(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) {
-        input_fidelity::mouse_press(events, pos);
+    /// Put the pointer at `pos`, unpressed, unless it already rests there.
+    /// Returns whether it was already there.
+    fn park(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) -> bool {
+        if self.pointer_at == Some(pos) {
+            return true;
+        }
+        input_fidelity::mouse_move(events, pos);
+        self.pointer_at = Some(pos);
+        false
+    }
+
+    /// Press at `pos` **only once the pointer already rests there**: a call
+    /// that finds it elsewhere parks it and presses nothing, so the press
+    /// itself goes out alone, with no movement in its batch. Returns whether
+    /// the press was emitted.
+    ///
+    /// Two egui facts make the alone-ness load-bearing, both measured on the
+    /// 2026-09-02 scene C legs, where a divider 21.67 pt below the press
+    /// point was dragged to its floor:
+    /// - a `Pressed` event is hit-tested at the **batch's final** pointer
+    ///   position (`context.rs` computes `hits` once per pass from
+    ///   `interact_pos()` after ingesting every event), so a press batched
+    ///   with a stroke's first move lands `speed × t_in` along the stroke —
+    ///   tens of points after a 25–65 ms frame gap;
+    /// - the frame a drag starts on hands the widget `pointer.delta()`, this
+    ///   frame's position minus **last frame's**, which for a pointer that
+    ///   teleports from the previous stroke's release point is that whole
+    ///   stroke over again.
+    ///
+    /// Parking a frame ahead zeroes the second; pressing alone zeroes the
+    /// first, whatever the frame gap.
+    fn press_parked(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) -> bool {
+        if !self.park(events, pos) {
+            return false;
+        }
+        input_fidelity::mouse_press_in_place(events, pos);
         self.down_at = Some(pos);
+        true
     }
 
     fn move_to(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) {
         input_fidelity::mouse_move(events, pos);
+        self.pointer_at = Some(pos);
         if self.down_at.is_some() {
             self.down_at = Some(pos);
         }
     }
 
-    fn release_if_down(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) {
+    /// Release at `pos` if the button is down. Returns whether it was.
+    fn release_if_down(&mut self, events: &mut Vec<egui::Event>, pos: egui::Pos2) -> bool {
         if self.down_at.take().is_some() {
             input_fidelity::mouse_release(events, pos);
+            self.pointer_at = Some(pos);
+            return true;
         }
+        false
     }
 
     /// Emit one Line-unit wheel notch per unit the signed schedule crossed
@@ -441,6 +487,7 @@ impl GesturePlayer {
                 egui::MouseWheelUnit::Line,
                 egui::vec2(0.0, step),
             );
+            self.pointer_at = Some(screen.center());
         }
         self.notches_emitted = due;
     }
@@ -473,7 +520,12 @@ impl GesturePlayer {
             let reach = |dt: f64| (speed * dt as f32).min(reach_cap);
             if t_in < STROKE_HOLD {
                 if self.down_at.is_none() {
-                    self.press_at(events, center);
+                    // Park, press alone, then reach — three frames, never
+                    // one batch (`press_parked`). The reach is a function of
+                    // `t_in`, so the frame after the press catches up to
+                    // where the stroke is by then; nothing is lost.
+                    self.press_parked(events, center);
+                    return;
                 }
                 let pos = center + egui::vec2(angle.cos(), angle.sin()) * reach(t_in);
                 self.move_to(events, pos);
@@ -482,7 +534,12 @@ impl GesturePlayer {
                 // cadence did: the release carries its own move, so the net
                 // stroke displacement is cadence-independent.
                 let pos = center + egui::vec2(angle.cos(), angle.sin()) * reach(STROKE_HOLD);
-                self.release_if_down(events, pos);
+                if !self.release_if_down(events, pos) {
+                    // Already released: use the rest of the gap to park at
+                    // the next stroke's press point, so its press can go out
+                    // on that stroke's first frame.
+                    self.park(events, center);
+                }
             }
         } else {
             self.release_if_down(events, center);
@@ -505,7 +562,11 @@ impl GesturePlayer {
         let center = screen.center();
         if t < DRAG_END - 0.05 {
             if self.down_at.is_none() {
-                self.press_at(events, center);
+                // Park, press alone, then orbit — see `press_parked`. The
+                // path is a function of `t`, so the frame after the press
+                // picks it up where it is by then.
+                self.press_parked(events, center);
+                return;
             }
             let a = 0.22 * screen.width();
             let b = 0.18 * screen.height();
@@ -671,7 +732,9 @@ impl GesturePlayer {
         }
 
         // The slider drag: press, ramp out, ramp back, release where it
-        // started.
+        // started. The press goes out with no ramp in its batch — the ramp
+        // starts on the next frame — for the reason `press_parked` gives.
+        let mut slider_pressed_now = false;
         if crossed(SLIDER_PRESS)
             && let Some((id, rect)) = targets
                 .iter()
@@ -681,9 +744,12 @@ impl GesturePlayer {
             let pos = rect.center();
             input_fidelity::mouse_press(events, pos);
             self.slider = Some(SliderDrag { start: pos, id });
+            slider_pressed_now = true;
         }
         if let Some(drag) = self.slider.as_ref() {
-            if to < SLIDER_RELEASE {
+            if slider_pressed_now && to < SLIDER_RELEASE {
+                // The ramp waits a frame.
+            } else if to < SLIDER_RELEASE {
                 let out = (SLIDER_OUT_END - SLIDER_PRESS).max(f64::EPSILON);
                 let u = if to <= SLIDER_OUT_END {
                     (to - SLIDER_PRESS) / out

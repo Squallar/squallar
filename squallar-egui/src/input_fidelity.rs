@@ -90,6 +90,17 @@ pub(crate) fn mouse_press(events: &mut Vec<egui::Event>, pos: egui::Pos2) {
     events.push(pointer_button(pos, true));
 }
 
+/// A press with no cursor motion in the same report — what `egui-winit`
+/// emits for a button pressed on a mouse that did not move (`MouseInput`
+/// alone, no `CursorMoved`). The caller has already put the pointer at `pos`
+/// on an earlier frame. egui hit-tests a press at the **batch's final**
+/// pointer position (`context.rs`, one `hit_test` per pass from
+/// `interact_pos()`), so a press batched with a move lands wherever the move
+/// ended, not where the press said; a press alone lands where it says.
+pub(crate) fn mouse_press_in_place(events: &mut Vec<egui::Event>, pos: egui::Pos2) {
+    events.push(pointer_button(pos, true));
+}
+
 pub(crate) fn mouse_release(events: &mut Vec<egui::Event>, pos: egui::Pos2) {
     mouse_move(events, pos);
     events.push(pointer_button(pos, false));
