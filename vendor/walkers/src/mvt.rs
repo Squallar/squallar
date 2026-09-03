@@ -384,95 +384,238 @@ pub fn render(data: &[u8], style: &Style, zoom: u8) -> Result<Vec<ShapeOrText>, 
 /// everything that can fail — the byte decode — happened in [`parse`];
 /// a polygon the tessellator rejects is logged and skipped, exactly as the
 /// fused path logged and skipped it.
+///
+/// A [`StyledCursor`] run to the end in one call. There is no second walk:
+/// a caller that styles in slices and one that styles at once run the same
+/// code, which is what makes their output identical by construction rather
+/// than by test.
 pub fn styled(tile: &ParsedTile, style: &Style, zoom: u8) -> Vec<ShapeOrText> {
-    let mut shapes = Vec::new();
-    // **One tessellator for the whole tile**, not one per polygon. See
-    // [`PolygonTessellator`] for what it holds and why the scope is the tile.
-    let mut tessellator = PolygonTessellator::new();
-
-    for layer in &style.layers {
-        // **The zoom gate, before anything reads a feature.** A style layer
-        // declares the zooms it draws at; outside them it can produce no shape,
-        // so visiting its source layer is pure waste. Skipping here rather than
-        // inside the arms is what makes it a skip of the *scan* and not just of
-        // the tessellation: measured on the committed dark style over Monaco's
-        // z14 tile, the walk made 36,921 feature scans at every zoom from 0 to
-        // 16 -- the same number at zoom 0, where 14 of the 95 layers are live,
-        // as at zoom 16, where 78 are.
-        if !layer.visible_at(zoom) {
-            continue;
+    let mut cursor = StyledCursor::new(tile, style, zoom);
+    loop {
+        if let Step::Done(shapes) = cursor.advance(usize::MAX) {
+            return shapes;
         }
+    }
+}
 
-        match layer {
-            Layer::Background { paint, .. } => {
-                let context = Context::new("None", HashMap::new(), zoom);
+/// What one [`StyledCursor::advance`] came back with.
+#[derive(Debug)]
+pub enum Step {
+    /// The allowance was spent before the walk reached the style's last
+    /// layer; call [`StyledCursor::advance`] again.
+    More,
+    /// The walk is over and these are the tile's shapes. A cursor that has
+    /// answered this answers `Done` of an empty list from then on.
+    Done(Vec<ShapeOrText>),
+}
 
-                let bg_color = if let Some(color) = &paint.background_color {
-                    color.evaluate(&context)
-                } else {
-                    Color32::WHITE
-                };
+/// The style walk of one tile, resumable between features.
+///
+/// [`styled`] is this cursor advanced to the end; this is the same walk with
+/// a place to stop. Its unit is **one feature considered by one style
+/// layer** — a [`Context`] built over it and, when the layer carries one, a
+/// filter evaluated against it, which is what the tests' `scans` counter
+/// counts — plus a `background` layer, which reads no feature and counts as
+/// one. The position is the raw index into the source layer, so a stop
+/// between two features neither re-reads nor re-filters one already visited.
+///
+/// A frame that styles a tile inline can therefore pay for a bounded number
+/// of features and finish next frame, where before it paid for the whole
+/// tile. The largest single feature is the floor no allowance cuts under;
+/// nothing else is.
+///
+/// `T` and `S` are what hold the tile and the style: borrows for a caller
+/// with the walk in one stack frame ([`styled`]), `Arc`s for one that parks
+/// the cursor between frames.
+pub struct StyledCursor<T = Arc<ParsedTile>, S = Arc<Style>>
+where
+    T: std::ops::Deref<Target = ParsedTile>,
+    S: std::ops::Deref<Target = Style>,
+{
+    tile: T,
+    style: S,
+    zoom: u8,
+    /// The style layer the walk is in.
+    layer: usize,
+    /// The raw index of the next feature to consider in that layer's source
+    /// layer. Zero at every layer's start.
+    feature: usize,
+    /// Units spent so far; see the type's doc for what one is.
+    visited: usize,
+    /// **One tessellator for the whole tile**, not one per polygon. See
+    /// [`PolygonTessellator`] for what it holds and why the scope is the tile.
+    tessellator: PolygonTessellator,
+    /// The shapes so far, in the order the style put them.
+    shapes: Vec<ShapeOrText>,
+    done: bool,
+}
 
-                let rect = Rect::from_min_size(
-                    pos2(0.0, 0.0),
-                    vec2(ONLY_SUPPORTED_EXTENT as f32, ONLY_SUPPORTED_EXTENT as f32),
-                );
-                shapes.push(Shape::rect_filled(rect, 0.0, bg_color).into());
-            }
-            Layer::Fill {
-                source_layer,
-                filter,
-                paint,
-                ..
-            } => {
-                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
-                {
-                    if let Err(err) =
-                        render_polygon(geometry, &context, &mut shapes, paint, &mut tessellator)
-                    {
-                        warn!("{err}");
-                    }
-                }
-            }
-            Layer::Line {
-                source_layer,
-                filter,
-                paint,
-                ..
-            } => {
-                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
-                {
-                    if let Err(err) = render_line(geometry, &context, &mut shapes, paint) {
-                        warn!("{err}");
-                    }
-                }
-            }
-            Layer::Symbol {
-                source_layer,
-                filter,
-                layout,
-                paint,
-                ..
-            } => {
-                for (geometry, context) in layer_features(tile, zoom, source_layer, filter.as_ref())
-                {
-                    if let Err(err) = render_symbol(geometry, &context, &mut shapes, layout, paint)
-                    {
-                        warn!("{err}");
-                    }
-                }
-            }
-            layer => {
-                log::warn!("Unsupported layer type in style: {layer:?}");
-                continue;
-            }
+impl<T, S> StyledCursor<T, S>
+where
+    T: std::ops::Deref<Target = ParsedTile>,
+    S: std::ops::Deref<Target = Style>,
+{
+    /// A cursor at the first style layer, nothing drawn.
+    pub fn new(tile: T, style: S, zoom: u8) -> Self {
+        Self {
+            tile,
+            style,
+            zoom,
+            layer: 0,
+            feature: 0,
+            visited: 0,
+            tessellator: PolygonTessellator::new(),
+            shapes: Vec::new(),
+            done: false,
         }
     }
 
-    let shapes = coalesce_adjacent_meshes(shapes);
+    /// Units the walk has spent since [`Self::new`].
+    pub fn visited(&self) -> usize {
+        self.visited
+    }
 
-    log::trace!("Rendered {} shapes", shapes.len());
-    shapes
+    /// Walk on for at most `features` units, stopping earlier only at the
+    /// end of the style.
+    ///
+    /// No clock is read here; the caller decides between calls whether it
+    /// can afford another.
+    pub fn advance(&mut self, features: usize) -> Step {
+        if self.done {
+            return Step::Done(Vec::new());
+        }
+        let mut left = features;
+        while left > 0 {
+            let Some(layer) = self.style.layers.get(self.layer) else {
+                self.done = true;
+                let shapes = coalesce_adjacent_meshes(std::mem::take(&mut self.shapes));
+                log::trace!("Rendered {} shapes", shapes.len());
+                return Step::Done(shapes);
+            };
+
+            // **The zoom gate, before anything reads a feature.** A style layer
+            // declares the zooms it draws at; outside them it can produce no
+            // shape, so visiting its source layer is pure waste. Skipping here
+            // rather than inside the arms is what makes it a skip of the *scan*
+            // and not just of the tessellation: measured on the committed dark
+            // style over Monaco's z14 tile, the walk made 36,921 feature scans
+            // at every zoom from 0 to 16 -- the same number at zoom 0, where 14
+            // of the 95 layers are live, as at zoom 16, where 78 are.
+            if !layer.visible_at(self.zoom) {
+                self.next_layer();
+                continue;
+            }
+
+            match layer {
+                Layer::Background { paint, .. } => {
+                    let context = Context::new("None", HashMap::new(), self.zoom);
+
+                    let bg_color = if let Some(color) = &paint.background_color {
+                        color.evaluate(&context)
+                    } else {
+                        Color32::WHITE
+                    };
+
+                    let rect = Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(ONLY_SUPPORTED_EXTENT as f32, ONLY_SUPPORTED_EXTENT as f32),
+                    );
+                    self.shapes
+                        .push(Shape::rect_filled(rect, 0.0, bg_color).into());
+                    self.visited += 1;
+                    left -= 1;
+                    self.next_layer();
+                }
+                Layer::Fill {
+                    source_layer,
+                    filter,
+                    paint,
+                    ..
+                } => {
+                    let features = source_features(&self.tile, source_layer);
+                    let end = self.feature.saturating_add(left).min(features.len());
+                    for feature in &features[self.feature..end] {
+                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                            && let Err(err) = render_polygon(
+                                &feature.geometry,
+                                &context,
+                                &mut self.shapes,
+                                paint,
+                                &mut self.tessellator,
+                            )
+                        {
+                            warn!("{err}");
+                        }
+                    }
+                    self.spent(end, features.len(), &mut left);
+                }
+                Layer::Line {
+                    source_layer,
+                    filter,
+                    paint,
+                    ..
+                } => {
+                    let features = source_features(&self.tile, source_layer);
+                    let end = self.feature.saturating_add(left).min(features.len());
+                    for feature in &features[self.feature..end] {
+                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                            && let Err(err) =
+                                render_line(&feature.geometry, &context, &mut self.shapes, paint)
+                        {
+                            warn!("{err}");
+                        }
+                    }
+                    self.spent(end, features.len(), &mut left);
+                }
+                Layer::Symbol {
+                    source_layer,
+                    filter,
+                    layout,
+                    paint,
+                    ..
+                } => {
+                    let features = source_features(&self.tile, source_layer);
+                    let end = self.feature.saturating_add(left).min(features.len());
+                    for feature in &features[self.feature..end] {
+                        if let Some(context) = scan(feature, self.zoom, filter.as_ref())
+                            && let Err(err) = render_symbol(
+                                &feature.geometry,
+                                &context,
+                                &mut self.shapes,
+                                layout,
+                                paint,
+                            )
+                        {
+                            warn!("{err}");
+                        }
+                    }
+                    self.spent(end, features.len(), &mut left);
+                }
+                layer => {
+                    log::warn!("Unsupported layer type in style: {layer:?}");
+                    self.next_layer();
+                }
+            }
+        }
+        Step::More
+    }
+
+    /// Account for the features just considered — up to `end` of the source
+    /// layer's `len` — and leave the layer once it is exhausted.
+    fn spent(&mut self, end: usize, len: usize, left: &mut usize) {
+        let considered = end - self.feature;
+        self.visited += considered;
+        *left -= considered;
+        self.feature = end;
+        if end >= len {
+            self.next_layer();
+        }
+    }
+
+    fn next_layer(&mut self) {
+        self.layer += 1;
+        self.feature = 0;
+    }
 }
 
 /// Fold each run of neighbouring [`Shape::Mesh`]es into one mesh.
@@ -573,13 +716,9 @@ pub(crate) mod scans {
     }
 }
 
-fn layer_features<'a>(
-    tile: &'a ParsedTile,
-    zoom: u8,
-    name: &str,
-    filter: Option<&'a Filter>,
-) -> impl Iterator<Item = (&'a Geometry<f32>, Context)> + 'a {
-    let features = match tile.layers.iter().find(|layer| layer.name == name) {
+/// The features of the tile's source layer called `name`, or none.
+fn source_features<'a>(tile: &'a ParsedTile, name: &str) -> &'a [ParsedFeature] {
+    match tile.layers.iter().find(|layer| layer.name == name) {
         Some(layer) if layer.extent_supported => layer.features.as_slice(),
         _ => {
             // **`trace!`, not `warn!`, because a tile without a source layer is
@@ -607,29 +746,31 @@ fn layer_features<'a>(
             trace!("Source layer '{name}' not found. Skipping.");
             &[]
         }
-    };
+    }
+}
 
-    features.iter().filter_map(move |feature| {
-        #[cfg(test)]
-        scans::bump();
+/// Consider one feature for one style layer: build its [`Context`] and, if
+/// the layer has a filter, evaluate it. `Some` is a feature the layer draws.
+fn scan(feature: &ParsedFeature, zoom: u8, filter: Option<&Filter>) -> Option<Context> {
+    #[cfg(test)]
+    scans::bump();
 
-        // The property bag is *shared* into the context, not rebuilt in it.
-        // Converting it to JSON up front cost a `HashMap` allocation and a
-        // `String` clone per string-valued property for every feature the
-        // source layer holds -- including the ones the filter is about to
-        // reject, which read no property at all. `Properties::Mvt` converts a
-        // value when a lookup asks for it instead, and the `Arc` is what lets
-        // one parse serve every styling without copying a bag.
-        let context = Context::with_properties(
-            geometry_type_to_str(&feature.geometry),
-            Properties::Mvt(Arc::clone(&feature.properties)),
-            zoom,
-        );
+    // The property bag is *shared* into the context, not rebuilt in it.
+    // Converting it to JSON up front cost a `HashMap` allocation and a
+    // `String` clone per string-valued property for every feature the
+    // source layer holds -- including the ones the filter is about to
+    // reject, which read no property at all. `Properties::Mvt` converts a
+    // value when a lookup asks for it instead, and the `Arc` is what lets
+    // one parse serve every styling without copying a bag.
+    let context = Context::with_properties(
+        geometry_type_to_str(&feature.geometry),
+        Properties::Mvt(Arc::clone(&feature.properties)),
+        zoom,
+    );
 
-        filter
-            .is_none_or(|filter| filter.matches(&context))
-            .then_some((&feature.geometry, context))
-    })
+    filter
+        .is_none_or(|filter| filter.matches(&context))
+        .then_some(context)
 }
 
 pub(crate) fn mvt_value_to_json_value(value: &Value) -> JsonValue {
@@ -1559,6 +1700,99 @@ mod tests {
         );
 
         assert_eq!(format!("{shapes:?}"), GOLDEN);
+    }
+
+    /// **A walk cut anywhere is the walk.** [`styled`] is the cursor run to
+    /// the end, so a cut at every allowance from one feature up has to
+    /// reproduce the recording field for field, and take exactly the calls
+    /// its allowance implies — one per full slice and one to find the end.
+    /// The scans are counted too: a resume that re-filtered the feature it
+    /// stopped before would read the same shapes at more scans.
+    #[test]
+    fn a_cursor_cut_at_any_allowance_reproduces_the_recorded_shapes_exactly() {
+        let tile = parse(&fixture()).expect("fixture tile parses");
+        let style = Style::from_json(STYLE).expect("fixture style parses");
+        let (whole, whole_scans) = scans::counted(|| styled(&tile, &style, ZOOM));
+        assert_eq!(format!("{whole:?}"), GOLDEN);
+
+        let mut units = 0;
+        for allowance in [1usize, 7, 64, usize::MAX] {
+            let mut cursor = StyledCursor::new(&tile, &style, ZOOM);
+            let mut calls = 0usize;
+            let (shapes, scans) = scans::counted(|| {
+                loop {
+                    calls += 1;
+                    if let Step::Done(shapes) = cursor.advance(allowance) {
+                        break shapes;
+                    }
+                }
+            });
+            assert_eq!(
+                format!("{shapes:?}"),
+                GOLDEN,
+                "an allowance of {allowance} features drew something else"
+            );
+            assert_eq!(
+                scans, whole_scans,
+                "an allowance of {allowance} features scanned a feature twice"
+            );
+            assert_eq!(
+                calls,
+                cursor.visited() / allowance + 1,
+                "an allowance of {allowance} features took the wrong number of calls"
+            );
+            assert!(
+                matches!(cursor.advance(1), Step::Done(shapes) if shapes.is_empty()),
+                "a finished cursor must stay finished"
+            );
+            units = cursor.visited();
+        }
+
+        // Non-vacuity: the two smallest allowances must actually cut the
+        // fixture, or the loop above is `styled` four times over.
+        assert!(
+            units > 7,
+            "the fixture spans only {units} units, so an allowance of 7 never stopped"
+        );
+    }
+
+    /// **An advance considers at most its allowance**, and its unit is the
+    /// scan: the units a walk spends are its feature scans plus one per
+    /// `background` layer, which is what lets a caller bound a frame's share
+    /// of a tile in the quantity the style walk actually spends.
+    #[test]
+    fn an_advance_considers_at_most_its_allowance() {
+        let tile = parse(&fixture()).expect("fixture tile parses");
+        let style = Style::from_json(STYLE).expect("fixture style parses");
+        let backgrounds = style
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer, Layer::Background { .. }) && layer.visible_at(ZOOM))
+            .count();
+        assert_eq!(backgrounds, 1, "the fixture style draws one background");
+
+        for allowance in [1usize, 2, 3, 5, 8] {
+            let mut cursor = StyledCursor::new(&tile, &style, ZOOM);
+            let ((), scans) = scans::counted(|| {
+                loop {
+                    let before = cursor.visited();
+                    let step = cursor.advance(allowance);
+                    assert!(
+                        cursor.visited() - before <= allowance,
+                        "an advance of {allowance} considered {} features",
+                        cursor.visited() - before
+                    );
+                    if let Step::Done(_) = step {
+                        break;
+                    }
+                }
+            });
+            assert_eq!(
+                cursor.visited(),
+                scans + backgrounds,
+                "a unit is one feature scan or one background layer"
+            );
+        }
     }
 
     /// **The stroke width the style asked for arrives, at every tile side.**

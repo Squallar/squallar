@@ -969,7 +969,9 @@ fn note_archive_decode(kind: ArchiveTileKind) {
     }
 }
 
-/// Style a parsed tile into the value the tile cache holds.
+/// Style a parsed tile into the value the tile cache holds — the native
+/// arm's whole styling; the wasm32 pump styles through [`PendingStyle`].
+#[cfg(not(target_arch = "wasm32"))]
 fn styled_tile(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> Tile {
     timed_styled(parsed, style, zoom)
 }
@@ -1009,8 +1011,10 @@ fn timed_styled(parsed: &walkers::mvt::ParsedTile, style: &Style, zoom: u8) -> T
 /// touches neither the network nor the bytes. The raster arms delegate
 /// unchanged — there is nothing style-independent to keep for a pixel body.
 ///
-/// Runs where [`decode_archive_tile`] runs: the IO runtime's blocking pool on
-/// native, the frame pump's [`WASM_TILE_DECODES_PER_PUMP`] budget on wasm32.
+/// Runs on the IO runtime's blocking pool, native only: the wasm32 pump
+/// takes the parse half alone ([`remember_parsed`]) and styles it in slices
+/// under its own budget ([`PendingStyle`]).
+#[cfg(not(target_arch = "wasm32"))]
 fn decode_archive_tile_remembering(
     bytes: &[u8],
     kind: ArchiveTileKind,
@@ -1022,30 +1026,44 @@ fn decode_archive_tile_remembering(
 ) -> Result<Tile, String> {
     match kind {
         ArchiveTileKind::Vector => {
-            let parsed = Arc::new(timed_parse(bytes)?);
-            let charge = parsed.heap_bytes() as u64;
-            let (held, held_bytes) = {
-                let mut parsed_tiles = parsed_tiles
-                    .lock()
-                    .expect("the parsed-tile cache is not poisoned");
-                // What the byte bound lets go of is freed here, on the thread
-                // that just paid for a parse of the same order: the IO
-                // runtime's blocking pool on native, the pump's decode budget
-                // on wasm32. The frame-paced trim is `HttpsTiles::pump`'s.
-                let mut evicted = Vec::new();
-                parsed_tiles.put(tile_id, Arc::clone(&parsed), charge, &mut evicted);
-                (parsed_tiles.len() as u64, parsed_tiles.resident_bytes())
-            };
-            // A level, stored where the parse lands: the only site that
-            // grows this cache, on either target.
-            cache_ledger::set_parsed(role, held, held_bytes);
-            // The vector arm does not delegate, so it counts for itself; the
-            // raster arms are counted inside `decode_archive_tile`.
-            note_archive_decode(ArchiveTileKind::Vector);
+            let parsed = remember_parsed(bytes, tile_id, parsed_tiles, role)?;
             Ok(timed_styled(&parsed, style, tile_id.zoom))
         }
         raster => decode_archive_tile(bytes, raster, style, tile_id.zoom, ctx),
     }
+}
+
+/// The parse half of [`decode_archive_tile_remembering`]: decode a vector
+/// body and land the parse in `parsed_tiles`, answering it for the styling
+/// that follows — whole, on native, or in slices under the wasm32 pump's
+/// budget ([`PendingStyle`]).
+fn remember_parsed(
+    bytes: &[u8],
+    tile_id: TileId,
+    parsed_tiles: &SharedParsedTiles,
+    role: cache_ledger::CacheRole,
+) -> Result<Arc<walkers::mvt::ParsedTile>, String> {
+    let parsed = Arc::new(timed_parse(bytes)?);
+    let charge = parsed.heap_bytes() as u64;
+    let (held, held_bytes) = {
+        let mut parsed_tiles = parsed_tiles
+            .lock()
+            .expect("the parsed-tile cache is not poisoned");
+        // What the byte bound lets go of is freed here, on the thread
+        // that just paid for a parse of the same order: the IO
+        // runtime's blocking pool on native, the pump's decode budget
+        // on wasm32. The frame-paced trim is `HttpsTiles::pump`'s.
+        let mut evicted = Vec::new();
+        parsed_tiles.put(tile_id, Arc::clone(&parsed), charge, &mut evicted);
+        (parsed_tiles.len() as u64, parsed_tiles.resident_bytes())
+    };
+    // A level, stored where the parse lands: the only site that
+    // grows this cache, on either target.
+    cache_ledger::set_parsed(role, held, held_bytes);
+    // The vector arm does not delegate, so it counts for itself; the
+    // raster arms are counted inside `decode_archive_tile`.
+    note_archive_decode(ArchiveTileKind::Vector);
+    Ok(parsed)
 }
 
 /// The `max_zoom` value that means "not read yet", not "zero".
@@ -1120,7 +1138,10 @@ pub const WASM_TILE_DECODES_PER_PUMP: usize = MAX_PARALLEL_DOWNLOADS + 1;
 ///
 /// Checked *before* each take and never mid-take, so the true worst case is
 /// this plus one take. Bounding one take's own cost is not something this
-/// constant can do — that is the deferred worker-side decode (C5p2).
+/// constant can do — except for the styling half of a vector take, which
+/// [`PendingStyle`] cuts into slices this deadline is asked between: for a
+/// vector body the worst case is this plus one parse plus one slice, and the
+/// tile's tessellation no longer has to fit in one frame.
 ///
 /// **A pass always takes at least one completion per source**, however far past
 /// the deadline the frame already is. A budget that can round down to zero work
@@ -1595,6 +1616,12 @@ pub struct HttpsTiles {
     #[cfg(target_arch = "wasm32")]
     batch: TileBatch,
 
+    /// wasm32 only: the vector body whose styling the pass deadline cut
+    /// short, resumed at the head of the next pump. See [`PendingStyle`]
+    /// for why there is one and not a queue.
+    #[cfg(target_arch = "wasm32")]
+    styling: Option<PendingStyle>,
+
     /// wasm32 only: where a finished batch lands. A channel and not a shared
     /// cell because the delivery closure runs outside this source's borrow —
     /// it cannot touch the cache, so it hands the reply to the next pump,
@@ -1928,6 +1955,226 @@ impl TileBatch {
     }
 }
 
+// ── Styling a vector body in slices ──────────────────────────────────────
+
+/// Features a parked styling walks between two looks at the clock.
+///
+/// The pass deadline is asked between slices and never inside one, so a
+/// frame's overshoot past [`PUMP_TIME_BUDGET`] is one slice. Measured on the
+/// committed Monaco z14 building tile under the committed dark style
+/// (native, release, 2026-09-02): 88 units in all at 22 us each on average,
+/// so a slice of sixteen is 174 us at the median and 635 us at most — and
+/// the most is the largest single feature, 478 us, which no slice size cuts
+/// under. Sixteen rather than one because each look at the clock is a
+/// `performance.now()` on the web, and one per feature would be thousands
+/// per tile for a bound the largest feature sets anyway.
+#[cfg(any(test, target_arch = "wasm32"))]
+const STYLE_SLICE_FEATURES: usize = 16;
+
+/// One vector body's styling, parked between frames.
+///
+/// The wasm32 pump styles a body on the frame thread whenever the offload
+/// funnel holds anything but this source's own batch — which on a scene
+/// with a loop playing is every body: 108 of 108 on the `huge` leg of
+/// 2026-09-02, style mean 4.7 ms and p99 22.6 ms in Firefox, 4.1 ms mean in
+/// Chromium. [`PUMP_TIME_BUDGET`] is asked between takes and could not see
+/// inside one, so each of those bodies was a whole tile's tessellation on
+/// one frame. This is what a take becomes when the deadline passes
+/// mid-style: the parsed tile and a [`walkers::mvt::StyledCursor`] over it,
+/// resumed at the head of the next pump and finished there or later — a
+/// frame pays the budget plus one slice of [`STYLE_SLICE_FEATURES`] and
+/// never a whole tile. A body that finishes within its first take never
+/// parks at all.
+///
+/// **One per source, not a queue**, and the drain takes no new body while
+/// one is parked: a second cursor would be a second partially styled tile
+/// resident for nothing, and a frame's styling is bounded only if the resume
+/// is the one thing the pump spends its budget on. The tile's request stays
+/// open in [`TileCache::in_flight`] the whole time, so it is not asked for
+/// again; the put at the finish is what closes it. A body's three ledger
+/// entries — its `style` phase sample, its `take` sample and its place in
+/// `tile bodies` — are recorded once, at the finish, over the summed slices.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct PendingStyle {
+    tile_id: TileId,
+    /// Kept beside the cursor so a restyle can start the walk over without
+    /// asking the parsed cache, which may have let the tile go meanwhile.
+    parsed: Arc<walkers::mvt::ParsedTile>,
+    cursor: walkers::mvt::StyledCursor,
+    /// The style generation the cursor walks under. A bump discards the walk
+    /// and restarts it over the same parse under the new style: the tile is
+    /// wanted under the new generation, and a slot put under the old one
+    /// would be re-asked for on the very next pass.
+    epoch: u64,
+    /// The take family this body is, decided when it was taken.
+    kind: take_ledger::TakeKind,
+    /// Frame-thread microseconds spent on the body so far: the parse, every
+    /// slice styled — including slices a restyle discarded, which the frame
+    /// paid for all the same — and nothing else.
+    take_micros: u32,
+    /// The style phase's share of [`Self::take_micros`].
+    style_micros: u32,
+}
+
+/// A parked body, styled: what the cache slot is built from and what the
+/// take ledger is told once the slot is in.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct StyledBody {
+    tile_id: TileId,
+    tile: Tile,
+    kind: take_ledger::TakeKind,
+    /// [`PendingStyle::take_micros`] at the finish; the flatten and the put
+    /// are the caller's to add before the take is recorded.
+    take_micros: u32,
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+impl PendingStyle {
+    /// A body whose parse is done and whose walk has not begun.
+    /// `take_micros` is what the take has cost so far — the parse.
+    fn start(
+        tile_id: TileId,
+        parsed: Arc<walkers::mvt::ParsedTile>,
+        style: Arc<Style>,
+        epoch: u64,
+        kind: take_ledger::TakeKind,
+        take_micros: u32,
+    ) -> Self {
+        let cursor = walkers::mvt::StyledCursor::new(Arc::clone(&parsed), style, tile_id.zoom);
+        Self {
+            tile_id,
+            parsed,
+            cursor,
+            epoch,
+            kind,
+            take_micros,
+            style_micros: 0,
+        }
+    }
+
+    /// Walk on, one slice at a time, until the walk is done or `over` says
+    /// the frame cannot afford another slice. `over` is asked between slices
+    /// and never before the first, so every call moves the body by at least
+    /// one slice: a pass that is already over its budget still moves the
+    /// map, which is the same rule the drain's unconditional first take
+    /// keeps.
+    ///
+    /// `current_epoch` is the source's style generation now; a walk begun
+    /// under an older one starts over under `style`.
+    fn resume(
+        &mut self,
+        current_epoch: u64,
+        style: &Arc<Style>,
+        mut over: impl FnMut() -> bool,
+    ) -> Option<Vec<walkers::ShapeOrText>> {
+        if self.epoch != current_epoch {
+            self.cursor = walkers::mvt::StyledCursor::new(
+                Arc::clone(&self.parsed),
+                Arc::clone(style),
+                self.tile_id.zoom,
+            );
+            self.epoch = current_epoch;
+        }
+        let (shapes, micros) = micros_of(|| {
+            loop {
+                match self.cursor.advance(STYLE_SLICE_FEATURES) {
+                    walkers::mvt::Step::Done(shapes) => break Some(shapes),
+                    walkers::mvt::Step::More => {
+                        if over() {
+                            break None;
+                        }
+                    }
+                }
+            }
+        });
+        self.style_micros = self.style_micros.saturating_add(micros);
+        self.take_micros = self.take_micros.saturating_add(micros);
+        shapes
+    }
+
+    /// Units the walk has spent under the current generation.
+    #[cfg(test)]
+    fn visited(&self) -> usize {
+        self.cursor.visited()
+    }
+
+    /// The walk is over: record the body's style phase — **one sample, the
+    /// summed slices**, so `tile phase (style)` keeps one entry per body
+    /// however many frames it took — and hand back what the slot is built
+    /// from.
+    fn finish(self, shapes: Vec<walkers::ShapeOrText>) -> StyledBody {
+        take_ledger::note_vector_phase(take_ledger::VectorPhase::Style, self.style_micros);
+        StyledBody {
+            tile_id: self.tile_id,
+            tile: Tile::Vector(Arc::new(shapes)),
+            kind: self.kind,
+            take_micros: self.take_micros,
+        }
+    }
+}
+
+/// What a pump has left for the channel once the parked body, if there is
+/// one, has had the pass's budget first.
+#[cfg(any(test, target_arch = "wasm32"))]
+struct AfterResume {
+    /// The parked body, if this pump finished it.
+    finished: Option<StyledBody>,
+    /// Takes the drain may still perform: the allowance, less the resume,
+    /// and **zero while a body stays parked** — see [`PendingStyle`].
+    budget: usize,
+    /// Whether the drain still owes the pass its unconditional first take.
+    first_take_free: bool,
+}
+
+/// Give the parked body the pump's budget before any new body is taken.
+///
+/// The order is the whole point: a body already parsed and half styled is
+/// the cheapest tile this source can put, and a new body taken ahead of it
+/// would be a second cursor. `over` is the pass deadline, asked between
+/// slices; a later pump of a pass whose first take is spent and whose
+/// deadline has passed leaves the body parked, so six panes drawing one
+/// source walk one slice between them and not six — the rule
+/// [`PumpBudget`] holds for takes, held here for slices.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn resume_before_drain(
+    styling: &mut Option<PendingStyle>,
+    current_epoch: u64,
+    style: &Arc<Style>,
+    allowance: &PassAllowance,
+    mut over: impl FnMut() -> bool,
+) -> AfterResume {
+    let Some(mut pending) = styling.take() else {
+        return AfterResume {
+            finished: None,
+            budget: allowance.budget,
+            first_take_free: allowance.first_take_free,
+        };
+    };
+    if !allowance.first_take_free && over() {
+        *styling = Some(pending);
+        return AfterResume {
+            finished: None,
+            budget: 0,
+            first_take_free: false,
+        };
+    }
+    match pending.resume(current_epoch, style, over) {
+        Some(shapes) => AfterResume {
+            finished: Some(pending.finish(shapes)),
+            budget: allowance.budget.saturating_sub(1),
+            first_take_free: false,
+        },
+        None => {
+            *styling = Some(pending);
+            AfterResume {
+                finished: None,
+                budget: 0,
+                first_take_free: false,
+            }
+        }
+    }
+}
+
 /// One take decoded **on this thread**, which is what the wasm arm did for
 /// every tile before the offload existed and still does for every tile the
 /// dispatch gate declines.
@@ -1938,10 +2185,14 @@ impl TileBatch {
 /// claim is only as good as the two paths being one body.
 #[cfg(target_arch = "wasm32")]
 struct InlineDecode<'a> {
-    style: &'a Style,
+    style: &'a Arc<Style>,
     archive_kind: Option<&'a Arc<OnceLock<ArchiveTileKind>>>,
     parsed: Option<&'a SharedParsedTiles>,
     egui_ctx: &'a Context,
+    /// The pass deadline, asked between the slices of a vector body's
+    /// styling: past it the body parks as a [`PendingStyle`] instead of
+    /// finishing on this frame.
+    deadline: web_time::Instant,
     /// The generation the pump is styling against — current by construction
     /// on this path, because the styling happens inside this call.
     epoch: u64,
@@ -1958,15 +2209,28 @@ struct InlineDecode<'a> {
     role: cache_ledger::CacheRole,
 }
 
+/// What a wasm32 take has once the bytes are dealt with: a tile, or a parse
+/// still owed its styling.
+#[cfg(target_arch = "wasm32")]
+enum Decoded {
+    Tile(Tile),
+    Parsed(Arc<walkers::mvt::ParsedTile>),
+}
+
 #[cfg(target_arch = "wasm32")]
 impl InlineDecode<'_> {
+    /// Answers the take's family, or `None` for a vector body that parked
+    /// in `pending` with its styling unfinished: no family sample is
+    /// recorded for it now — the finish records one, over every slice.
     fn take(
         &self,
         cache: &mut TileCache,
         put_generation: &mut u64,
         tile_id: TileId,
         payload: FetchPayload,
-    ) -> take_ledger::TakeKind {
+        pending: &mut Option<PendingStyle>,
+    ) -> Option<take_ledger::TakeKind> {
+        let began = web_time::Instant::now();
         // The family this take belongs to, decided before the work rather
         // than after it, so a decode that FAILS is still charged to what it
         // attempted. Classified by the archive header's declared kind and
@@ -1994,11 +2258,12 @@ impl InlineDecode<'_> {
             // A restyle served from the parsed cache: no bytes were fetched,
             // only the styling is owed — still under this budget, because it
             // is the tessellation half.
-            FetchPayload::Parsed(parse) => Ok(styled_tile(&parse, self.style, tile_id.zoom)),
+            FetchPayload::Parsed(parse) => Ok(Decoded::Parsed(parse)),
             FetchPayload::Bytes(bytes) => match self.archive_kind {
                 // A raster HTTP source: the body is whatever image the
                 // provider serves, sniffed as it always was.
                 None => Tile::new(&bytes, self.style, tile_id.zoom, self.egui_ctx)
+                    .map(Decoded::Tile)
                     .map_err(|error| error.to_string()),
                 // An archive source: the header's word decides. The IO task
                 // writes the slot at open, before any tile is served, so an
@@ -2007,26 +2272,52 @@ impl InlineDecode<'_> {
                 // rather than a guess of this code's.
                 Some(kind) => {
                     let kind = kind.get().copied().unwrap_or(ArchiveTileKind::Undeclared);
-                    match self.parsed {
-                        Some(parsed) => decode_archive_tile_remembering(
-                            &bytes,
-                            kind,
-                            self.style,
-                            tile_id,
-                            self.egui_ctx,
-                            parsed,
-                            self.role,
-                        ),
-                        None => decode_archive_tile(
+                    match (self.parsed, kind) {
+                        // A vector body with a parsed cache to remember it
+                        // in: the parse now, the styling in slices below.
+                        (Some(parsed), ArchiveTileKind::Vector) => {
+                            remember_parsed(&bytes, tile_id, parsed, self.role).map(Decoded::Parsed)
+                        }
+                        // A raster body, or a vector body with nothing to
+                        // remember it in: decoded whole, as it always was.
+                        (_, kind) => decode_archive_tile(
                             &bytes,
                             kind,
                             self.style,
                             tile_id.zoom,
                             self.egui_ctx,
-                        ),
+                        )
+                        .map(Decoded::Tile),
                     }
                 }
             },
+        };
+        let decoded = match decoded {
+            Ok(Decoded::Tile(tile)) => Ok(tile),
+            Ok(Decoded::Parsed(parsed)) => {
+                let spent = began.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+                let mut body = PendingStyle::start(
+                    tile_id,
+                    parsed,
+                    Arc::clone(self.style),
+                    self.epoch,
+                    kind,
+                    spent,
+                );
+                let deadline = self.deadline;
+                match body.resume(self.epoch, self.style, || {
+                    web_time::Instant::now() >= deadline
+                }) {
+                    Some(shapes) => Ok(body.finish(shapes).tile),
+                    // Parked, unfinished: the put, the take sample and the
+                    // disposition count are the finish's, on a later pump.
+                    None => {
+                        *pending = Some(body);
+                        return None;
+                    }
+                }
+            }
+            Err(error) => Err(error),
         };
         match decoded {
             Ok(tile) => {
@@ -2041,14 +2332,15 @@ impl InlineDecode<'_> {
                 log::warn!("decoding tile {tile_id:?}: {error}");
             }
         }
-        // Counted here and nowhere else, against the same population
-        // `note_tiles_offloaded` counts: one **vector body** disposed of. A
-        // restyle carries no body and a raster is not vector, so neither is in
-        // this denominator. See [`take_ledger::Disposition`].
+        // Counted against the same population `note_tiles_offloaded`
+        // counts: one **vector body** disposed of. A restyle carries no body
+        // and a raster is not vector, so neither is in this denominator. A
+        // body that parked above is counted where it finishes, at the head of
+        // a later `drain_completed_fetches`. See [`take_ledger::Disposition`].
         if kind == take_ledger::TakeKind::Vector {
             take_ledger::note_tiles_decoded_inline(1);
         }
-        kind
+        Some(kind)
     }
 }
 
@@ -2214,6 +2506,8 @@ impl HttpsTiles {
             archive_kind: None,
             #[cfg(target_arch = "wasm32")]
             batch: TileBatch::default(),
+            #[cfg(target_arch = "wasm32")]
+            styling: None,
             #[cfg(target_arch = "wasm32")]
             batch_tx,
             #[cfg(target_arch = "wasm32")]
@@ -2691,13 +2985,43 @@ impl HttpsTiles {
             put_generation,
             takes,
             batch,
+            styling,
             ..
         } = self;
+        let feathering = flatten_feathering(*feathering);
+        let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
+
+        // **The parked body first**, with the pass's budget, before the
+        // channel is looked at — see [`resume_before_drain`]. While it stays
+        // parked the drain below gets a budget of zero.
+        let deadline = allowance.deadline;
+        let resumed = resume_before_drain(styling, *style_epoch, style, &allowance, || {
+            web_time::Instant::now() >= deadline
+        });
+        let mut finished = 0usize;
+        if let Some(body) = resumed.finished {
+            let took = micros_of(|| {
+                *put_generation += 1;
+                cache.put(body.tile_id, slot_for(body.tile, *style_epoch, feathering));
+            })
+            .1;
+            // The body's take sample, recorded here and not in `drain_up_to`
+            // because the take that started it answered no family: the
+            // parse, every slice and the put, summed — the same span an
+            // unparked take's sample covers.
+            take_ledger::note_take(body.kind, body.take_micros.saturating_add(took));
+            if body.kind == take_ledger::TakeKind::Vector {
+                take_ledger::note_tiles_decoded_inline(1);
+            }
+            finished = 1;
+        }
+
         let inline = InlineDecode {
             style,
             archive_kind: archive_kind.as_ref(),
             parsed: parsed.as_ref(),
             egui_ctx,
+            deadline,
             // The pump styles against the frame's current style, so what it
             // puts is current by construction.
             epoch: *style_epoch,
@@ -2706,12 +3030,11 @@ impl HttpsTiles {
             // `HttpsTiles::set_feathering`, which bumps the style generation
             // for that reason, so a change re-asks rather than leaving a
             // mismatched flatten in the cache.
-            feathering: flatten_feathering(*feathering),
+            feathering,
             role: cache.role,
         };
 
-        let allowance = pump_budget.open(egui_ctx.cumulative_pass_nr());
-        let budget = allowance.budget;
+        let budget = resumed.budget;
         // A body staged for a flight that will not happen — see
         // [`TileBatch::take_one_staged`]. Taken before the channel so the
         // oldest body is served first, and charged to this pass's allowance
@@ -2721,7 +3044,13 @@ impl HttpsTiles {
             && budget > 0
             && let Some((tile_id, bytes)) = batch.take_one_staged()
         {
-            inline.take(cache, put_generation, tile_id, FetchPayload::Bytes(bytes));
+            inline.take(
+                cache,
+                put_generation,
+                tile_id,
+                FetchPayload::Bytes(bytes),
+                styling,
+            );
             reclaimed = 1;
         }
         let taken = reclaimed
@@ -2729,9 +3058,9 @@ impl HttpsTiles {
                 tile_rx,
                 budget - reclaimed,
                 allowance.deadline,
-                // The pass's unconditional first take is spent if the reclaim
-                // above took it.
-                allowance.first_take_free && reclaimed == 0,
+                // The pass's unconditional first take is spent if the resume
+                // or the reclaim above took it.
+                resumed.first_take_free && reclaimed == 0,
                 io_task_gone_reported,
                 |(tile_id, answer): Fetched| match (answer, staging) {
                     // The IO side's word that no body is coming: the request
@@ -2755,18 +3084,24 @@ impl HttpsTiles {
                     }
                     // Everything else, unchanged: a restyle from the parsed
                     // cache, a raster body, a sniffed body, and every vector body
-                    // on a pass that is not offloading.
+                    // on a pass that is not offloading. A vector body the
+                    // deadline cuts mid-style parks in `styling` and answers no
+                    // family yet; the drain's next look at the deadline is what
+                    // stops a second body from being taken behind it.
                     (Some(payload), _) => {
-                        Some(inline.take(cache, put_generation, tile_id, payload))
+                        inline.take(cache, put_generation, tile_id, payload, styling)
                     }
                 },
             );
-        pump_budget.record(taken);
+        // The resume counts as the pass's first take, so a later pump of the
+        // same pass owes no unconditional slice or take of its own.
+        pump_budget.record(taken + finished);
         *takes += taken as u64;
 
-        if budget > 0 && taken == budget {
-            // The whole allowance went, so more completions may be waiting.
-            // Ask for a frame so a backlog drains while the user is idle.
+        if (budget > 0 && taken == budget) || styling.is_some() {
+            // The whole allowance went, or a body is parked mid-style: more
+            // work is waiting either way. Ask for a frame so it drains while
+            // the user is idle.
             egui_ctx.request_repaint();
         }
 
@@ -3706,6 +4041,8 @@ impl HttpsTiles {
             #[cfg(target_arch = "wasm32")]
             batch: TileBatch::default(),
             #[cfg(target_arch = "wasm32")]
+            styling: None,
+            #[cfg(target_arch = "wasm32")]
             batch_tx,
             #[cfg(target_arch = "wasm32")]
             batch_rx,
@@ -3779,6 +4116,8 @@ impl HttpsTiles {
             archive_kind: None,
             #[cfg(target_arch = "wasm32")]
             batch: TileBatch::default(),
+            #[cfg(target_arch = "wasm32")]
+            styling: None,
             #[cfg(target_arch = "wasm32")]
             batch_tx,
             #[cfg(target_arch = "wasm32")]

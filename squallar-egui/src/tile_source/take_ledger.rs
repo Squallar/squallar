@@ -262,7 +262,44 @@ static PHASE_COSTS: [AtomicHist; PHASES.len()] = [AtomicHist::new(), AtomicHist:
 
 /// Record one vector body's `phase` at `micros`.
 pub fn note_vector_phase(phase: VectorPhase, micros: u32) {
+    #[cfg(test)]
+    samples::bump(phase);
     PHASE_COSTS[phase.index()].record(micros);
+}
+
+/// Phase samples counted per thread, for the tests that pin how many a body
+/// records.
+///
+/// The histograms above are process-global and every test in the binary
+/// records into them, so a test that asserts "exactly one `style` sample"
+/// on a `diff` of two readings is red under a parallel neighbour and green
+/// when it runs alone — a result that depends on the schedule. A
+/// thread-local count sees only the thread that made it, which is the same
+/// reason `walkers::mvt`'s `scans` counter is thread-local.
+#[cfg(test)]
+pub(crate) mod samples {
+    use super::{PHASES, VectorPhase};
+    use std::cell::Cell;
+
+    thread_local! {
+        static SAMPLES: Cell<[usize; PHASES.len()]> = const { Cell::new([0; PHASES.len()]) };
+    }
+
+    pub(crate) fn bump(phase: VectorPhase) {
+        SAMPLES.with(|samples| {
+            let mut counts = samples.get();
+            counts[phase.index()] += 1;
+            samples.set(counts);
+        });
+    }
+
+    /// Run `body`, answering what it returned and the samples this thread
+    /// recorded per phase while it ran, in [`PHASES`] order.
+    pub(crate) fn counted<T>(body: impl FnOnce() -> T) -> (T, [usize; PHASES.len()]) {
+        SAMPLES.with(|samples| samples.set([0; PHASES.len()]));
+        let value = body();
+        (value, SAMPLES.with(Cell::get))
+    }
 }
 
 /// A reading of both phases.

@@ -1701,6 +1701,24 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   spare, for fifteen consecutive passes (`TILE_SNAP_DWELL_PASSES`,
   `TILE_SNAP_RELEASE_HYSTERESIS` = 5/4) — the same two figures as the pool's,
   restated for a pass; §11.2.
+- **(d) The frame thread's own long task, on the web.** Not a memory rung but
+  the same discipline: the wasm32 tile pump styles a vector body inline
+  whenever the offload funnel holds anyone else's job, which on a scene with a
+  loop playing is every body (108 of 108 on the `huge` leg, 2026-09-02; style
+  mean 4.7 ms, p99 22.6 ms in Firefox, 4.1 ms mean in Chromium), and
+  `PUMP_TIME_BUDGET` is asked between takes and could not see inside one. *As
+  landed (WO-21):* `walkers::mvt::styled` is a `StyledCursor` advanced to the
+  end, and the pump advances the same cursor in slices of
+  `STYLE_SLICE_FEATURES` (16 features considered) with the pass deadline asked
+  between slices; a body the deadline cuts parks in `HttpsTiles::styling`, is
+  resumed before the channel is looked at on the next pump, and is finished
+  there or later — one body per source, never a queue. A frame's styling is
+  then the budget plus one slice (174 us median, 635 us max on the committed
+  Monaco z14 tile, native release) and the floor is the largest single feature
+  (478 us there), not the tile. The parse is the remaining unbounded unit (p99
+  2.8 ms in Firefox); its finest unit is a source layer, and a parse cursor
+  would be the next cut. Ledger: one `style` sample per body over the summed
+  slices, so `tile phase (style)` keeps its denominator.
 
 ### 10.4 Nothing persisted, and why
 

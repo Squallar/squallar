@@ -4419,3 +4419,326 @@ fn a_batch_installed_tile_is_counted_on_the_basemap_ledger() {
          tile that skips it makes a working map read as a dead archive.",
     );
 }
+
+/// Styling in slices, as a property rather than a browser session.
+///
+/// [`PendingStyle`] and [`resume_before_drain`] are compiled on native for
+/// the reason [`TileBatch`] is: what they hold — a frame pays one budget plus
+/// one slice for a vector body and never a whole tile, and a parked body is
+/// finished before any new one is taken — could only ever be exercised by a
+/// human with a browser open if it were spelled inside the wasm32 drain.
+/// Every assertion here is on a count of features, never on a clock.
+mod sliced_styling {
+    use super::super::take_ledger::{self, PHASES, TakeKind, VectorPhase};
+    use super::super::{
+        PassAllowance, PendingStyle, PumpBudget, STYLE_SLICE_FEATURES, resume_before_drain,
+    };
+    use super::*;
+    use walkers::mvt::{ParsedTile, Step, StyledCursor, parse, styled};
+
+    /// z14/8529/5974 of `squallar-egui/testdata/monaco.pmtiles`, the tile
+    /// `tests/styled_cursor_parity.rs` pins slice parity on.
+    const TILE: &[u8] =
+        include_bytes!("../../../squallar-buildings/testdata/monaco-building-z14-8529-5974.mvt");
+    const DARK: &str = include_str!("../../../www/styles/dark.json");
+    const LIGHT: &str = include_str!("../../../www/styles/light.json");
+
+    fn tile_id() -> TileId {
+        TileId {
+            zoom: 14,
+            x: 8529,
+            y: 5974,
+        }
+    }
+
+    fn parsed() -> Arc<ParsedTile> {
+        Arc::new(parse(TILE).expect("the committed fixture decodes"))
+    }
+
+    fn style(json: &str) -> Arc<Style> {
+        Arc::new(Style::from_json(json).expect("a committed style parses"))
+    }
+
+    fn drawn(shapes: &[walkers::ShapeOrText]) -> String {
+        format!("{shapes:?}")
+    }
+
+    /// Units the whole walk spends — what a resume must never exceed.
+    fn units(parsed: &Arc<ParsedTile>, style: &Arc<Style>) -> usize {
+        let mut cursor = StyledCursor::new(Arc::clone(parsed), Arc::clone(style), 14);
+        loop {
+            if let Step::Done(_) = cursor.advance(usize::MAX) {
+                break cursor.visited();
+            }
+        }
+    }
+
+    fn parked(parsed: &Arc<ParsedTile>, style: &Arc<Style>, epoch: u64) -> PendingStyle {
+        PendingStyle::start(
+            tile_id(),
+            Arc::clone(parsed),
+            Arc::clone(style),
+            epoch,
+            TakeKind::Vector,
+            0,
+        )
+    }
+
+    /// An allowance with the pass's first take still owed.
+    fn fresh_pass() -> PassAllowance {
+        PumpBudget::new().open(1)
+    }
+
+    /// **A pump's share of a parked body is one budget plus one slice.** With
+    /// the deadline already passed the pump still walks one slice — the
+    /// anti-stall rule the drain's first take keeps — and no more; with the
+    /// deadline answering "not yet" `k` times it walks at most `k + 1`.
+    #[test]
+    fn a_pump_walks_one_slice_past_its_deadline_and_never_a_whole_tile() {
+        let parsed = parsed();
+        let dark = style(DARK);
+        let whole = units(&parsed, &dark);
+        let mut styling = Some(parked(&parsed, &dark, 1));
+        let allowance = fresh_pass();
+
+        let after = resume_before_drain(&mut styling, 1, &dark, &allowance, || true);
+        assert!(
+            after.finished.is_none(),
+            "a pump past its deadline finished a whole tile"
+        );
+        let one = styling.as_ref().expect("the body stays parked").visited();
+        assert!(
+            (1..=STYLE_SLICE_FEATURES).contains(&one),
+            "a pump past its deadline walked {one} units; one slice is {STYLE_SLICE_FEATURES}"
+        );
+
+        let mut not_yet = 3usize;
+        let after = resume_before_drain(&mut styling, 1, &dark, &allowance, || {
+            if not_yet > 0 {
+                not_yet -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        assert!(after.finished.is_none());
+        let four = styling.as_ref().expect("the body stays parked").visited();
+        assert!(
+            four > one && four - one <= 4 * STYLE_SLICE_FEATURES,
+            "three 'not yet's walked {} units; the bound is four slices",
+            four - one
+        );
+
+        // Non-vacuity: the tile is bigger than what was walked, so the walks
+        // above were cut and not merely finished.
+        assert!(
+            whole > four,
+            "the fixture spans {whole} units and the pump walked {four}: nothing was cut"
+        );
+    }
+
+    /// **The unconditional slice is the pass's, not the pump's.** A source
+    /// drawn in six panes is pumped six times a pass; once the pass's first
+    /// take is spent and the deadline has passed, a later pump leaves the
+    /// body where it is rather than walking a slice per pane.
+    #[test]
+    fn a_later_pump_of_a_spent_pass_leaves_the_body_parked() {
+        let parsed = parsed();
+        let dark = style(DARK);
+        let mut budget = PumpBudget::new();
+        let _first = budget.open(1);
+        budget.record(1);
+        let spent = budget.open(1);
+        assert!(
+            !spent.first_take_free,
+            "control: the pass's first take is spent"
+        );
+
+        let mut styling = Some(parked(&parsed, &dark, 1));
+        let after = resume_before_drain(&mut styling, 1, &dark, &spent, || true);
+        assert!(after.finished.is_none());
+        assert_eq!(after.budget, 0);
+        assert_eq!(
+            styling.as_ref().expect("still parked").visited(),
+            0,
+            "a spent pass walked a slice for a later pane"
+        );
+
+        // And with time left in the pass, the same call walks on.
+        let after = resume_before_drain(&mut styling, 1, &dark, &spent, || false);
+        assert!(
+            after.finished.is_some(),
+            "with time left the body must finish"
+        );
+    }
+
+    /// **A parked body is finished before any new body is taken**: while it
+    /// is parked the drain is handed no budget at all, and the pump that
+    /// finishes it hands the drain the rest of the allowance less the resume.
+    #[test]
+    fn a_parked_body_is_finished_before_any_new_body_is_taken() {
+        let parsed = parsed();
+        let dark = style(DARK);
+        let mut styling = Some(parked(&parsed, &dark, 1));
+        let allowance = fresh_pass();
+        assert!(
+            allowance.budget > 1,
+            "control: the allowance must have room for a take"
+        );
+
+        let after = resume_before_drain(&mut styling, 1, &dark, &allowance, || true);
+        assert_eq!(
+            after.budget, 0,
+            "the drain was handed budget while a body was parked: a second cursor"
+        );
+        assert!(!after.first_take_free);
+        assert!(styling.is_some());
+
+        let after = resume_before_drain(&mut styling, 1, &dark, &allowance, || false);
+        let body = after.finished.expect("with time left the body finishes");
+        assert!(styling.is_none(), "a finished body stayed parked");
+        assert_eq!(
+            after.budget,
+            allowance.budget - 1,
+            "the resume is the pass's take"
+        );
+        assert!(!after.first_take_free);
+        assert_eq!(body.tile_id, tile_id());
+        assert_eq!(body.kind, TakeKind::Vector);
+        let Tile::Vector(shapes) = body.tile else {
+            panic!("a styled vector body came back as a raster");
+        };
+        assert_eq!(
+            drawn(&shapes),
+            drawn(&styled(&parsed, &dark, 14)),
+            "a body styled across two pumps differs from the tile styled at once"
+        );
+
+        // Nothing parked: the drain gets the whole allowance, first take and all.
+        let after = resume_before_drain(&mut styling, 1, &dark, &allowance, || true);
+        assert!(after.finished.is_none());
+        assert_eq!(after.budget, allowance.budget);
+        assert!(after.first_take_free);
+    }
+
+    /// **A restyle discards the walk and starts it over under the new style**
+    /// from the parse it already holds — the tile is wanted under the new
+    /// generation, and a slot put under the old one would be re-asked for
+    /// on the next pass.
+    #[test]
+    fn a_restyle_discards_the_walk_and_restarts_it_under_the_new_style() {
+        let parsed = parsed();
+        let dark = style(DARK);
+        let light = style(LIGHT);
+        let under_light = drawn(&styled(&parsed, &light, 14));
+        assert_ne!(
+            under_light,
+            drawn(&styled(&parsed, &dark, 14)),
+            "the two committed styles draw the fixture alike, so a restart is \
+             indistinguishable from a walk that carried on"
+        );
+
+        let mut pending = parked(&parsed, &dark, 1);
+        assert!(pending.resume(1, &dark, || true).is_none());
+        let walked = pending.visited();
+        assert!(walked > 0, "control: the walk under the old style began");
+
+        // Generation 2, the light style: one slice, from the start.
+        assert!(pending.resume(2, &light, || true).is_none());
+        assert!(
+            pending.visited() <= STYLE_SLICE_FEATURES,
+            "the walk carried on from {walked} units under the old style instead \
+             of starting over: {} units",
+            pending.visited()
+        );
+
+        let shapes = pending.resume(2, &light, || false).expect("finishes");
+        assert_eq!(drawn(&shapes), under_light);
+    }
+
+    /// **One `style` sample per body, however many frames it took.** The
+    /// slices are summed into the sample at the finish; a per-slice sample
+    /// would make `tile phase (style)`'s `n` count frames and its percentiles
+    /// describe slices, which is neither the denominator the line states nor
+    /// a figure comparable with the native arm's.
+    #[test]
+    fn a_body_styled_across_several_frames_records_one_style_sample() {
+        let parsed = parsed();
+        let dark = style(DARK);
+        let ((frames, style_micros), samples) = take_ledger::samples::counted(|| {
+            let mut pending = parked(&parsed, &dark, 1);
+            let mut frames = 0u32;
+            let shapes = loop {
+                frames += 1;
+                if let Some(shapes) = pending.resume(1, &dark, || true) {
+                    break shapes;
+                }
+            };
+            let style_micros = pending.style_micros;
+            let body = pending.finish(shapes);
+            assert!(
+                body.take_micros >= style_micros,
+                "the take's cost does not carry the style's"
+            );
+            (frames, style_micros)
+        });
+        assert!(
+            frames >= 3,
+            "the fixture finished in {frames} frames of one slice, so 'several \
+             frames' was not exercised"
+        );
+        let style = PHASES
+            .iter()
+            .position(|phase| *phase == VectorPhase::Style)
+            .expect("the style phase is reported");
+        let parse = PHASES
+            .iter()
+            .position(|phase| *phase == VectorPhase::Parse)
+            .expect("the parse phase is reported");
+        assert_eq!(
+            samples[style], 1,
+            "a body styled over {frames} frames recorded {} style samples",
+            samples[style]
+        );
+        assert_eq!(samples[parse], 0, "a resume recorded a parse sample");
+        // The sample is the body's, not the last slice's: the cost was summed.
+        // (A clock figure, so only its existence is asserted, never its size.)
+        let _ = style_micros;
+    }
+
+    /// **The wasm32 drain is wired in the order the property above assumes**:
+    /// the parked body before the channel, and the parked body's finish
+    /// counted where `InlineDecode::take` no longer counts it. Native cannot
+    /// compile that arm, so its wiring is read.
+    #[test]
+    fn the_wasm_drain_resumes_the_parked_body_before_it_drains_the_channel() {
+        const SOURCE: &str = include_str!("../tile_source.rs");
+
+        let (_, after) = SOURCE
+            .split_once(
+                "#[cfg(target_arch = \"wasm32\")]\n    fn drain_completed_fetches(&mut self)",
+            )
+            .expect("the wasm32 `drain_completed_fetches` is no longer written here");
+        let body = after
+            .split_once("\n    }\n")
+            .map(|(body, _)| body)
+            .expect("the wasm32 drain has no recognisable body");
+
+        let resume = body
+            .find("resume_before_drain(")
+            .expect("the wasm32 drain does not resume a parked body at all");
+        let drain = body
+            .find("drain_up_to(")
+            .expect("control: the wasm32 drain no longer calls `drain_up_to`");
+        assert!(
+            resume < drain,
+            "the wasm32 drain takes from the channel before it resumes the parked body"
+        );
+        assert!(
+            body.contains("note_tiles_decoded_inline(1)") && body.contains("note_take(body.kind"),
+            "a body finished at the head of the drain is not counted as a take and \
+             a disposed body; `tile bodies:` and `tile take (vector)` would under-read \
+             by every body that parked"
+        );
+    }
+}
