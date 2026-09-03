@@ -7,7 +7,7 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-app/src/app.rs	1565	1144
 squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1935	1609
+squallar-app/src/app_fetch.rs	1935	1621
 squallar-app/src/app_render.rs	3506	2887
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
@@ -83,7 +83,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	278	241
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1534	1469
+squallar-egui/src/tile_source.rs	1534	1470
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	162	122
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -233,7 +233,7 @@ squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	160
 squallar-radar/src/chunk_feed.rs	271	257
 squallar-radar/src/chunk_notify.rs	340	309
-squallar-radar/src/chunks.rs	975	805
+squallar-radar/src/chunks.rs	975	809
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	311	294
 squallar-radar/src/dpprep.rs	1022	956
@@ -439,8 +439,8 @@ vendor/nexrad-decode/src/messages/rda_status_data/snapshot_test.rs	5	5
 vendor/nexrad-decode/src/messages/rda_status_data/volume_coverage_pattern.rs	12	0
 vendor/nexrad-decode/src/messages/request_for_data/message.rs	32	6
 vendor/nexrad-decode/src/messages/request_for_data/snapshot_test.rs	5	5
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	77
-vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	52
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/elevation_data_block.rs	164	76
+vendor/nexrad-decode/src/messages/volume_coverage_pattern/header.rs	90	51
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/message.rs	24	24
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/raw/elevation_data_block.rs	19	18
 vendor/nexrad-decode/src/messages/volume_coverage_pattern/snapshot_test.rs	5	5
