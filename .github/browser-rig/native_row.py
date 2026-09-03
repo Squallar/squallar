@@ -30,6 +30,16 @@ The readings only this half takes -- the app's surface line and its
 and pinned from the Rust side (`native_seed_pin_tests.rs`) against THIS file,
 for the same reason.
 
+The per-family lines (`frame segment (pre):`, `frame post (dispatch):`,
+`tile take (vector):`, and every sibling the app grows) are read through ONE
+pattern DERIVED from `drive.py`'s: the tail after the `(<name>): ` group is
+read out of `drive.py`, every `drive.py` probe carrying that tail is checked
+to agree, and the prefix is generalised. So which families a row carries is
+discovered from the log lines present, never from a table. A fixed table
+that must equal what the app emits is what silently dropped `prepare:` and
+`dispatch:` from the browser rig's summary; here a family nobody listed is a
+printed row.
+
 ---- Two instrument facts this file is built around -----------------------
 
 1. `Hist` is FOUR BINS PER OCTAVE. A one-bin difference is 0-19%, and any
@@ -50,7 +60,11 @@ for the same reason.
 Histograms are cumulative from boot. A windowed reading is the DIFFERENCE of
 two of them, bracketed by the gesture player's own `loop complete` markers so
 the bracket is whole script loops. Cumulative-from-boot figures contaminated
-an entire early scoreboard; nothing here ever quotes one as a window.
+an entire early scoreboard; nothing here ever quotes one as a window. That
+holds for EVERY family: the per-family lines carry a running `sum`, which is
+differenced exactly (the percentiles are bin-quantised and are never
+differenced), and a family absent at the LEFT bracket is a genuine zero --
+the counters start at zero -- while one absent at the right is an error.
 
 ---- The runner's decisions live here, not in the shell ---------------------
 
@@ -174,9 +188,64 @@ PROBE_NAMES = (
 )
 
 
+# The per-family lines share ONE shape, the app's `named_hist_line`:
+# `<prefix> (<name>): n=, sum= us, p50=, p90=, p99=, hist=`. `drive.py`
+# spells it once per prefix it knows; this half reads the shape out of the
+# seed probe below, checks every other `drive.py` probe carrying that tail
+# agrees, and generalises the prefix into a capture. The families a log
+# carries are then whatever lines are present.
+NAMED_HIST_SEED = "frame_segment_re"
+NAMED_HIST_NAME_GROUP = r"\(([a-z0-9-]+)\): "
+NAMED_HIST_PREFIX = r"(?<![A-Za-z0-9_:.\-])([a-z]+(?: [a-z]+)*) "
+
+
+def named_hist_pattern(source=None):
+    """The one per-family regex, derived from `drive.py`'s.
+
+    Groups: prefix, name, n, sum, p50, p90, p99, hist. Refuses when the seed
+    lost its name group or when two of `drive.py`'s per-family probes no
+    longer share a tail -- the shape stopped being one, and a row windowed
+    on the wrong shape would print empty families as absences.
+    """
+    text = source if source is not None else _read(DRIVE_PY)
+    seed = drive_pattern(NAMED_HIST_SEED, text)
+    at = seed.find(NAMED_HIST_NAME_GROUP)
+    if at < 0:
+        raise SystemExit(
+            "drive.py's `%s` no longer carries a `(<name>): ` group; the "
+            "per-family line shape cannot be read out of it" % NAMED_HIST_SEED
+        )
+    tail = seed[at + len(NAMED_HIST_NAME_GROUP):]
+    for needed in (r"n=(\d+), sum=(\d+) us", r"hist=([0-9,]+)"):
+        if needed not in tail:
+            raise SystemExit(
+                "drive.py's `%s` no longer carries `%s`; every windowed "
+                "per-family figure here is a difference of it"
+                % (NAMED_HIST_SEED, needed)
+            )
+    for m in re.finditer(r"var ([a-z_]+_re) = /(.*)/;", text):
+        body = m.group(2)
+        if body.endswith(tail) and not body[:-len(tail)].endswith(NAMED_HIST_NAME_GROUP):
+            raise SystemExit(
+                "drive.py's `%s` carries the per-family tail behind something "
+                "other than a `(<name>): ` group; the shape is no longer one "
+                "and this file cannot read it as one" % m.group(1)
+            )
+    return re.compile(NAMED_HIST_PREFIX + NAMED_HIST_NAME_GROUP + tail)
+
+
+def named_key(prefix, name):
+    """`frame segment (pre)` -> `segment:pre`; `tile take (vector)` ->
+    `take:vector`: the last prefix word, then the name -- the browser rig's
+    spelling, derived rather than listed."""
+    return "%s:%s" % (prefix.split()[-1], name)
+
+
 def compile_probes(source=None):
     text = source if source is not None else _read(DRIVE_PY)
-    return {n: re.compile(drive_pattern(n, text)) for n in PROBE_NAMES}
+    out = {n: re.compile(drive_pattern(n, text)) for n in PROBE_NAMES}
+    out["named_hist"] = named_hist_pattern(text)
+    return out
 
 
 # ------------------------------------------------------------- row columns --
@@ -343,15 +412,18 @@ def cmd_seed(args):
 
 
 class Reading(object):
-    __slots__ = ("idx", "n", "p50", "p90", "p99", "hist")
+    # `sum` is the running sum of samples in whole microseconds, carried by
+    # the per-family lines and by nothing else: None on interact/idle/cadence.
+    __slots__ = ("idx", "n", "p50", "p90", "p99", "hist", "sum")
 
-    def __init__(self, idx, n, p50, p90, p99, hist):
+    def __init__(self, idx, n, p50, p90, p99, hist, sum=None):
         self.idx = idx
         self.n = n
         self.p50 = p50
         self.p90 = p90
         self.p99 = p99
         self.hist = hist
+        self.sum = sum
 
 
 def parse_hist(text):
@@ -449,6 +521,11 @@ def scrape(lines, probes):
         "tile_cache": [],
         "overlay_pictures": [],
         "segments": [],
+        # `{key: [Reading]}` for every per-family line present, keyed the
+        # browser rig's way (`segment:pre`, `dispatch:hitmap`), and the line
+        # prefix each key was read from. Discovered, never listed.
+        "named": {},
+        "named_prefixes": {},
         "begins": [],
         "loops": [],
         "backend": None,
@@ -519,6 +596,24 @@ def scrape(lines, probes):
         m = probes["segments_re"].search(line)
         if m:
             out["segments"].append((idx, list(m.groups())))
+        # The per-family lines, whichever the app wrote: each carries the
+        # running `sum` the windowed mean is exact from. A family nobody
+        # listed is a family, not a dropped line.
+        m = probes["named_hist"].search(line)
+        if m:
+            g = m.groups()
+            key = named_key(g[0], g[1])
+            seen = out["named_prefixes"].setdefault(key, g[0])
+            if seen != g[0]:
+                raise ValueError(
+                    "two per-family lines, `%s` and `%s`, share the key `%s`; "
+                    "the app grew a prefix this keying cannot tell apart"
+                    % (seen, g[0], key)
+                )
+            out["named"].setdefault(key, []).append(
+                Reading(idx, int(g[2]), g[4], g[5], g[6], parse_hist(g[7]),
+                        sum=int(g[3]))
+            )
         m = probes["gesture_begin_re"].search(line)
         if m:
             out["begins"].append((idx, m.group(1)))
@@ -597,19 +692,37 @@ def bracket(loops, skip_loops, window_loops):
     return (start, end), None
 
 
-def diff_window(series, start_idx, end_idx):
-    """A family's windowed reading: the difference of two cumulative ones."""
+def diff_window(series, start_idx, end_idx, absent_left_is_zero=False):
+    """A family's windowed reading: the difference of two cumulative ones.
+
+    With `absent_left_is_zero`, a family with no reading at or before the
+    bracket start is differenced from zero and says so in `basis`: the
+    counters start at zero, so a family first written inside the bracket
+    (a `tile take (put)` whose first put landed there) is a window from
+    boot, not a missing measurement. No reading at or before the END is an
+    error either way. Where the readings carry a running `sum` it is
+    differenced exactly into `sum_us`, and `mean_us` is derived from it --
+    the percentiles are bin-quantised and are never differenced.
+    """
     base = at_or_before(series, start_idx)
     final = at_or_before(series, end_idx)
-    if base is None or final is None:
+    basis = None
+    if final is None:
         return {"error": "no reading inside the bracket"}
+    if base is None:
+        if not absent_left_is_zero:
+            return {"error": "no reading inside the bracket"}
+        base = Reading(-1, 0, None, None, None, [0] * SLOTS,
+                       sum=0 if final.sum is not None else None)
+        basis = ("boot: no reading at or before the bracket start; the "
+                 "counters start at zero, so the window is from boot")
     if final.idx == base.idx:
         return {"error": "only one reading inside the bracket; nothing to diff"}
     hist = [f - b for f, b in zip(final.hist, base.hist)]
     if any(h < 0 for h in hist):
         return {"error": "a cumulative histogram went backwards across the bracket"}
     n = final.n - base.n
-    return {
+    out = {
         "n": n,
         "hist": hist,
         "p50_us": fmt_pctl(percentile_upper_micros(hist, 0.50)),
@@ -617,6 +730,15 @@ def diff_window(series, start_idx, end_idx):
         "p99_us": fmt_pctl(percentile_upper_micros(hist, 0.99)),
         "max_us": fmt_pctl(percentile_upper_micros(hist, 1.0)),
     }
+    if final.sum is not None and base.sum is not None:
+        total = final.sum - base.sum
+        if total < 0:
+            return {"error": "a cumulative sum went backwards across the bracket"}
+        out["sum_us"] = total
+        out["mean_us"] = (total // n) if n > 0 else None
+    if basis:
+        out["basis"] = basis
+    return out
 
 
 def diff_totals(series, start_idx, end_idx):
@@ -1276,6 +1398,16 @@ def build_row(args, scraped, probes):
     windows = {}
     for family in ("interact", "idle", "cadence"):
         windows[family] = diff_window(scraped[family], start_idx, end_idx)
+    # Every per-family line the log carries, on the SAME bracket. Before this
+    # loop existed the only native reading for a cut family was the last
+    # tick's cumulative-from-boot total -- the contamination the bracket
+    # exists to remove, re-imported for exactly the families the split was
+    # built to read.
+    for key in sorted(scraped["named"]):
+        w = diff_window(scraped["named"][key], start_idx, end_idx,
+                        absent_left_is_zero=True)
+        w["line"] = scraped["named_prefixes"][key]
+        windows[key] = w
 
     rasters = diff_totals(scraped["rasters"], start_idx, end_idx)
     pictures = rasters[2] if rasters else 0
@@ -1401,7 +1533,16 @@ def build_row(args, scraped, probes):
         "load": load,
         "quiet": quiet,
         "quiet_verdict": qv,
-        "quiet_max": quiet_max,
+        # OBSERVED, flat, under the ROW line's own spellings -- so a JSON
+        # reader and a ROW reader get the same figure under the same name.
+        # The ceiling is under its own name. This row used to carry the
+        # ceiling as `quiet_max`, the only flat field with `max` in its
+        # name, and a reader quoted `loadavg_max=8.0` beside an INVALID
+        # stamp that said the load reached 10.28.
+        "loadavg_start": load["start"] if load else None,
+        "loadavg_end": load["end"] if load else None,
+        "loadavg_max": load["max"] if load else None,
+        "quiet_ceiling": quiet_max,
         # The platform the leg ran on and every capability it had to do
         # without. A row measured with geometry unpinned is not the same
         # measurement as one measured with it pinned, and the matrix has to be
@@ -1409,6 +1550,7 @@ def build_row(args, scraped, probes):
         "platform": args.platform,
         "degraded": [d for d in (args.degraded or "").split(",") if d],
         "windows": windows,
+        "named_families": sorted(scraped["named"]),
         "window_basis": basis,
         "loops": row_loops,
         "settled": row_settled,
@@ -1555,6 +1697,37 @@ def print_row(row):
         "the figure a run pair's divergence is adjudicated on]"
         % row["throughput_interact_frames"]
     )
+    # Every per-family line the log carried, windowed on the same bracket.
+    # Read off the row rather than off a list, so a family nobody listed is
+    # a printed row and an arm that never wrote one is an absence.
+    named = sorted(k for k in row["windows"] if k not in ("interact", "idle", "cadence"))
+    if named:
+        print(
+            "ROW   families: %d per-family lines windowed on the same bracket "
+            "[`sum` differenced exactly; percentiles BINNED]: %s"
+            % (len(named), ", ".join(named))
+        )
+        for key in named:
+            w = row["windows"][key] or {}
+            if w.get("error"):
+                print("ROW   family %-18s ERROR: %s" % (key, w["error"]))
+                continue
+            print(
+                "ROW   family %-18s n=%-6s sum=%s us mean=%s us p50=%s us "
+                "p90=%s us p99=%s us max=%s us%s"
+                % (
+                    key, w.get("n"), w.get("sum_us"), w.get("mean_us"),
+                    w.get("p50_us"), w.get("p90_us"), w.get("p99_us"),
+                    w.get("max_us"),
+                    (" [%s]" % w["basis"]) if w.get("basis") else "",
+                )
+            )
+    else:
+        print(
+            "ROW   families: none (no `<prefix> (<name>): n=, sum=` line in "
+            "this log -- a binary older than the per-family lines, not a "
+            "zero reading)"
+        )
     # The loop denominators, on the scenes whose question they are. A..D run
     # with loops OFF, so their `loop state` line is all zeroes and printing it
     # beside them would be a column that means nothing there.
@@ -1668,7 +1841,7 @@ def cmd_diverge(args):
         print(
             "  %s: interact n=%s p99=%s us [binned] quiet=%s loadavg_max=%s"
             % (p, w.get("n"), w.get("p99_us"), r.get("quiet"),
-               (r.get("load") or {}).get("max"))
+               r.get("loadavg_max", (r.get("load") or {}).get("max")))
         )
     return 0
 
@@ -2281,6 +2454,50 @@ class RowVerdictTests(unittest.TestCase):
         self.assertEqual(row["window_basis"], "2 whole loops, 2 skipped")
         self.assertEqual(row["pictures"], 20)
 
+    def test_a_loud_leg_carries_the_observed_maximum_under_the_maximum_name(self):
+        """A smoke row's JSON was quoted as `quiet=no loadavg_max=8.0` while
+        its INVALID line said the load reached 10.28. The only flat field
+        with `max` in its name was `quiet_max`, and it held the CEILING
+        (`--quiet-max`); the observed maximum lived only inside `load`. Now
+        every flat field named as a maximum holds the observed figure, under
+        the ROW line's own spelling, and the ceiling has its own name."""
+        loud = os.path.join(self._tmp.name, "loud")
+        with open(loud, "w", encoding="utf-8") as fh:
+            for i, v in enumerate((1.0, 2.0, 10.28, 9.5, 1.5, 1.0)):
+                fh.write("%d\t%s\n" % (1_000_000 + 5 * i, v))
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        args = _leg_args(loud, 1)
+        self.assertEqual(args.quiet_max, 8.0, "the fixture's ceiling")
+        row = build_row(args, scrape(lines, self.probes), self.probes)
+        text = _capture(lambda: print_row(row))
+        first = text.splitlines()[0]
+        self.assertEqual(row["quiet"], "no")
+        self.assertEqual(row["loadavg_max"], 10.28)
+        self.assertEqual(row["loadavg_start"], 1.0)
+        self.assertEqual(row["loadavg_end"], 1.0)
+        self.assertEqual(row["quiet_ceiling"], 8.0)
+        self.assertNotIn("quiet_max", row, "the ceiling under a maximum's name")
+        for key, value in row.items():
+            if "max" in key:
+                self.assertEqual(
+                    value, 10.28,
+                    "flat field `%s` is named as a maximum and holds %r, not "
+                    "the observed maximum" % (key, value))
+        self.assertIn("loadavg_max=10.28 quiet=no", first)
+        self.assertIn("** INVALID **", first)
+        self.assertIn("reached 10.28 MID-LEG against a ceiling of 8.0", text)
+        # And the JSON the runner keeps says the same as the ROW line.
+        log = os.path.join(self._tmp.name, "loud.log")
+        out = os.path.join(self._tmp.name, "loud.json")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        _capture(lambda: cmd_analyze(_leg_args(loud, 1, log, out)))
+        with open(out, "r", encoding="utf-8") as fh:
+            j = json.load(fh)
+        self.assertEqual(j["loadavg_max"], 10.28)
+        self.assertEqual(j["quiet_ceiling"], 8.0)
+        self.assertNotIn("quiet_max", j)
+
     def test_an_absent_line_stamps_unchecked_and_not_invalid(self):
         row, first, text = self._row(ONE_PANE_PICTURE_BYTES, None, 1)
         self.assertEqual(row["invalid"], [], row["invalid"])
@@ -2391,6 +2608,161 @@ class WindowTests(unittest.TestCase):
         self.assertIn("not held open", v["verdict"])
 
 
+FAMILY_TICKS = (
+    # (prefix, name, n per loop, sum per loop): cumulative-from-boot readings
+    # at loop k are k times these. Four families the app emits, one it does
+    # not (`frame zorp`), so the table is what the LOG says, not a list.
+    ("frame segment", "pre", 100, 1000),
+    ("frame post", "dispatch", 100, 7000),
+    ("frame dispatch", "hitmap", 10, 3000),
+    ("tile take", "vector", 5, 50000),
+    ("frame zorp", "thing", 1, 10),
+)
+
+
+def _family_line(t, prefix, name, n, total):
+    return (t + "%s (%s): n=%d, sum=%d us, p50=63 us, p90=63 us, p99=63 us, "
+            "hist=%s" % (prefix, name, n, total, _hist_first_bin(n)))
+
+
+def _family_leg_log():
+    """`_leg_log` with a per-family tick before every loop marker, plus a
+    `tile take (put)` family first written at loop 3 -- INSIDE the bracket
+    (loops 2..4), so its left reading is absent and its window is from
+    boot."""
+    t = "[2026-09-02T00:00:00Z INFO  squallar_app::app::render] "
+    out = []
+    k = 0
+    for line in _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE):
+        if "loop complete" in line:
+            k += 1
+            for prefix, name, n, total in FAMILY_TICKS:
+                out.append(_family_line(t, prefix, name, n * k, total * k))
+            if k >= 3:
+                out.append(_family_line(t, "tile take", "put", 7 + 2 * (k - 3),
+                                        70 + 20 * (k - 3)))
+        out.append(line)
+    return out
+
+
+class FamilyWindowTests(unittest.TestCase):
+    """Every per-family line the log carries is windowed on the bracket.
+
+    Before these, `windows` held `interact`, `idle` and `cadence` and nothing
+    else: no `segment:`/`prepare:`/`post:`/`dispatch:` family reached the
+    JSON, and the only native reading for a cut family was the last tick's
+    cumulative-from-boot total -- the contamination the bracket exists to
+    remove."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+        self.lines = _family_leg_log()
+        self.row = build_row(_leg_args(self.load, 1),
+                             scrape(self.lines, self.probes), self.probes)
+        self.text = _capture(lambda: print_row(self.row))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_every_per_family_line_the_log_carries_is_windowed_on_the_bracket(self):
+        self.assertEqual(self.row["window_basis"], "2 whole loops, 2 skipped")
+        w = self.row["windows"]
+        for prefix, name, n, total in FAMILY_TICKS:
+            key = named_key(prefix, name)
+            self.assertIn(key, w, "family `%s (%s)` reached no window" % (prefix, name))
+            self.assertNotIn("error", w[key], w[key])
+            # Loops 2..4: the difference of the loop-4 and loop-2 readings.
+            self.assertEqual(w[key]["n"], 2 * n, key)
+            self.assertEqual(w[key]["sum_us"], 2 * total, key)
+            self.assertEqual(w[key]["mean_us"], (2 * total) // (2 * n), key)
+            self.assertEqual(w[key]["line"], prefix)
+            # NOT the last tick's cumulative-from-boot total.
+            self.assertNotEqual(w[key]["n"], 4 * n, "cumulative, not windowed")
+            self.assertNotEqual(w[key]["sum_us"], 4 * total, "cumulative, not windowed")
+            self.assertIn("ROW   family %-18s n=%-6s sum=%s us mean=%s us"
+                          % (key, 2 * n, 2 * total, (2 * total) // (2 * n)),
+                          self.text)
+        expected = sorted([named_key(p, nm) for p, nm, _n, _s in FAMILY_TICKS]
+                          + ["take:put"])
+        self.assertEqual(self.row["named_families"], expected)
+        self.assertIn("ROW   families: 6 per-family lines windowed on the same "
+                      "bracket", self.text)
+
+    def test_a_family_the_rig_never_listed_is_a_printed_row_not_a_dropped_line(self):
+        """`frame zorp (thing)` is a family no probe in drive.py spells. A
+        fixed name table that must equal what the app emits is the failure
+        the browser side just fixed; here the table is the log."""
+        self.assertIn("zorp:thing", self.row["windows"])
+        self.assertEqual(self.row["windows"]["zorp:thing"]["sum_us"], 20)
+        self.assertIn("ROW   family zorp:thing", self.text)
+
+    def test_a_family_first_written_inside_the_bracket_windows_from_zero(self):
+        """`tile take (put)` first appears at loop 3. Its left reading is
+        absent, and absence at the LEFT bracket is a genuine zero: the
+        counters start at zero. Absence at the RIGHT stays an error."""
+        w = self.row["windows"]["take:put"]
+        self.assertNotIn("error", w, w)
+        self.assertEqual(w["n"], 9)
+        self.assertEqual(w["sum_us"], 90)
+        self.assertIn("boot", w["basis"])
+        self.assertIn("ROW   family take:put           n=9      sum=90 us "
+                      "mean=10 us", self.text)
+        self.assertIn("[boot: no reading at or before the bracket start", self.text)
+        # The right edge: a family whose only reading is AFTER the bracket.
+        late = [Reading(95, 3, "1", "1", "1", [0] * SLOTS, sum=30)]
+        self.assertIn("error", diff_window(late, 10, 90, absent_left_is_zero=True))
+
+    def test_the_interact_and_segments_lines_are_not_per_family_lines(self):
+        """Non-vacuity for the derived pattern: the families it discovers are
+        the `sum`-carrying lines and nothing else -- `frame service
+        (interact)` and `frame segments (interact, p99 us)` do not match it,
+        so interact is windowed once, under its own name."""
+        pat = self.probes["named_hist"]
+        hist = ",".join(["0"] * SLOTS)
+        self.assertIsNone(pat.search(
+            "frame service (interact): n=7, p50=100 us, p90=200 us, "
+            "p99=300 us, hist=" + hist))
+        self.assertIsNone(pat.search(
+            "frame segments (interact, p99 us): pre=1, pump=1, ui=1, "
+            "prepare=1, finish=1, post=1; acquire n=1, p50=1 us, p99=1 us"))
+        # And a family drive.py spells no probe for, in the app's shape.
+        m = pat.search("[2026-09-02T00:00:00Z INFO  squallar_app::app_render] "
+                       "frame ui (chrome): n=12, sum=340 us, p50=63 us, "
+                       "p90=63 us, p99=63 us, hist=" + hist)
+        self.assertIsNotNone(m)
+        self.assertEqual((m.group(1), m.group(2), m.group(3), m.group(4)),
+                         ("frame ui", "chrome", "12", "340"))
+        self.assertFalse(any(k.startswith("interact") or k.startswith("service")
+                             for k in self.row["named_families"]))
+
+    def test_the_per_family_shape_is_read_out_of_drive_py_and_refused_when_it_splits(self):
+        """The one pattern is DERIVED: the tail after the `(<name>): ` group
+        is read from drive.py's seed probe and every sibling carrying that
+        tail must put it behind a name group. A drive.py whose seed lost its
+        `sum=` or whose siblings disagree is refused, not read as empty."""
+        real = _read(DRIVE_PY)
+        self.assertIsNotNone(named_hist_pattern(real))
+        seed_line = next(l for l in real.splitlines()
+                         if l.startswith("var %s = /" % NAMED_HIST_SEED))
+        no_sum = real.replace(seed_line, seed_line.replace(r"sum=(\d+) us, ", ""))
+        self.assertNotEqual(no_sum, real)
+        with self.assertRaises(SystemExit):
+            named_hist_pattern(no_sum)
+        post_line = next(l for l in real.splitlines()
+                         if l.startswith("var frame_post_re = /"))
+        split = real.replace(post_line, post_line.replace(
+            r"frame post \(([a-z0-9-]+)\): ", "frame post [a-z]+: "))
+        self.assertNotEqual(split, real)
+        with self.assertRaises(SystemExit):
+            named_hist_pattern(split)
+
+
 class SharedFormatTests(unittest.TestCase):
     """The pin: this file's row and the web rig's row are one table.
 
@@ -2469,7 +2841,9 @@ class SharedFormatTests(unittest.TestCase):
 
     def test_every_probe_is_still_declared_by_drive_py(self):
         probes = compile_probes()
-        self.assertEqual(len(probes), len(PROBE_NAMES))
+        # The named probes, plus the one per-family pattern derived from them.
+        self.assertEqual(len(probes), len(PROBE_NAMES) + 1)
+        self.assertIn("named_hist", probes)
         # A positive: the interact probe must actually match a real sentence.
         sample = (
             "[2026-08-31T00:00:00Z INFO  squallar_app] frame service "
@@ -2984,7 +3358,9 @@ def _fixture_row(clamp=False, panes=1, reported="one"):
         "pictures": 10, "mb_per_picture": "%.2f" % (b / 1e6), "commit": "deadbeef",
         "position": "A1",
         "load": {"start": 1.0, "end": 1.2, "max": 1.4, "samples": 9},
-        "quiet": "yes", "quiet_max": 8.0,
+        "quiet": "yes",
+        "loadavg_start": 1.0, "loadavg_end": 1.2, "loadavg_max": 1.4,
+        "quiet_ceiling": 8.0,
         "quiet_verdict": quiet_verdict(
             {"start": 1.0, "end": 1.2, "max": 1.4, "samples": 9}, 8.0),
         "platform": "linux", "degraded": [],

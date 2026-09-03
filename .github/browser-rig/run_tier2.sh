@@ -1164,6 +1164,25 @@ for leg in legs:
     cve = r.get("canvas_expect")
     if cve is not None and not cve.get("ok"):
         print("%-18s   canvas EXPECT FAILED: %s" % ("", cve.get("error")))
+    tcs = r.get("tile_cache_settles")
+    if tcs is not None:
+        # The tilecache leg's own figure: three deltas over the settle
+        # window, never added, and how many times the base source snapped
+        # to the whole zoom. One snap opens the window at its own tick; two
+        # fail the leg.
+        fams = tcs.get("families") or {}
+        print("%-18s   tile cache settles %s over %s; snap flips %s; %s"
+              % ("", "OK" if tcs.get("ok") else "FAILED",
+                 tcs.get("window_basis") or ("the last %ss" % tcs.get("window_s")),
+                 tcs.get("snap_flips", "-"),
+                 ", ".join("%s delta %s" % (name.split(":")[-1].strip(),
+                                            fam.get("delta"))
+                           for name, fam in fams.items()) or "no families"))
+        if tcs.get("error"):
+            print("%-18s   tile cache settles: %s" % ("", tcs["error"]))
+        for name, fam in fams.items():
+            if not fam.get("ok"):
+                print("%-18s   %s: %s" % ("", name, fam.get("error")))
     if fp is not None:
         # The long leg's own figure, and the only thing it gates on: how many
         # frames the app's own counter gained over the last window, and how

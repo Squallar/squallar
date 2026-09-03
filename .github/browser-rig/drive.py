@@ -2893,7 +2893,11 @@ for (var i = 0; i < C.length; i++) {
                evicted_bytes: parseInt(tcm[11], 10),
                resident_entries: parseInt(tcm[12], 10),
                resident_bytes: parseInt(tcm[13], 10),
-               parsed_entries: parseInt(tcm[14], 10) };
+               parsed_entries: parseInt(tcm[14], 10),
+               // A LEVEL: 1 while the role's source is held at the whole
+               // zoom below the fractional one. The settle assertion counts
+               // its flips; nothing differences it.
+               snap: parseInt(tcm[15], 10) };
     if (!tile_cache) tile_cache = {};
     tile_cache[tcm[1]] = tc;
     tile_cache_all.push(tc);
@@ -3412,10 +3416,53 @@ class RunningTotalsWatcher:
         return rs
 
 
+# The telemetry lines are written at most once per 2 s and only when their
+# ledger moved, and the lines of one tick are stamped within milliseconds of
+# each other. So a base placed this far after a tick's first line lands on
+# that whole tick for every family and never on the next; and a settle
+# window shorter than two ticks has not had the chance to see a line, so its
+# silence proves nothing.
+TELEMETRY_TICK_MS = 2000
+TELEMETRY_TICK_SLACK_MS = 1000
+MIN_SETTLED_MS = 2 * TELEMETRY_TICK_MS
+
+
+def snap_flips(readings):
+    """How many times `tile cache (<role>): snap` changed level across
+    `readings` (oldest first), and the page stamp of the reading that first
+    showed the newest level. A reading without the field -- a bundle older
+    than it -- is skipped, never read as 0."""
+    flips, last_t, prev = 0, None, None
+    for r in readings:
+        s = r.get("snap")
+        if s is None:
+            continue
+        if prev is not None and s != prev:
+            flips += 1
+            last_t = r.get("t")
+        prev = s
+    return flips, last_t
+
+
 def tile_cache_settles(watcher, span_s, now_ms):
     """THE SETTLE ASSERTION: over the last `span_s` seconds of a static
     viewport, `tile cache (base): refetch after eviction`, `ground tiles:
-    uploads` and `basemap tiles: vector` all moved by ZERO.
+    uploads` and `basemap tiles: vector` all moved by ZERO -- and the base
+    source snapped to the whole zoom at most ONCE over the leg.
+
+    A whole-zoom snap is a regime change, not a thrash: a source whose
+    working set overruns its allowance for a dwell drops the fractional
+    level and adopts the whole zoom, asking for that level's tiles once
+    (first-sight asks, decodes, uploads) and trimming the finer level's
+    history (`evicted resident` moves, and those tiles are not on the
+    glass). `refetch after eviction` stays at zero through it, and `snap`
+    flips 0 -> 1 exactly once. Measured on the user's canvas at z13.5,
+    2026-09-02: the snap landed INSIDE the 30 s window and the flat-deltas
+    basis read it as FAIL. So when the leg's ONE flip lies inside the
+    window, the window opens at the flip's own tick instead: that tick's
+    figures are the base, and what follows must be flat. A second flip is
+    the source oscillating between zooms, and no window after that is a
+    settled one -- FAIL, whatever the deltas.
 
     Three denominators, never added and each asserted on its own: a cache
     ask the cache remembers evicting, a mesh buffer upload in the GPU store,
@@ -3439,7 +3486,37 @@ def tile_cache_settles(watcher, span_s, now_ms):
     nothing either, and only the app's own frame counter tells the two apart.
     """
     window_start = now_ms - span_s * 1000.0
-    out = {"ok": True, "window_s": span_s, "families": {}}
+    base_rs = watcher.readings("tile_cache", role="base")
+    flips, flip_t = snap_flips(base_rs)
+    out = {"ok": True, "window_s": span_s, "families": {},
+           "snap_flips": flips, "snap_flip_t": flip_t,
+           "window_basis": "the last %.0f s" % span_s,
+           "settled_s": span_s}
+    if flips >= 2:
+        out["ok"] = False
+        out["error"] = (
+            "`tile cache (base): snap` changed level %d times over the leg: "
+            "one whole-zoom snap is a regime change, two is the source "
+            "oscillating between zooms, and no window after that is a "
+            "settled one" % flips)
+    elif flips == 1 and flip_t is not None and flip_t >= window_start:
+        window_start = flip_t + TELEMETRY_TICK_SLACK_MS
+        settled_ms = now_ms - window_start
+        out["settled_s"] = settled_ms / 1000.0
+        out["window_basis"] = (
+            "the %.1f s after the one snap flip (t=%s), which lay inside the "
+            "last %.0f s; the flip's own tick -- its first-sight asks and the "
+            "finer level's trimmed history -- is the base, not a move"
+            % (out["settled_s"], flip_t, span_s))
+        if settled_ms < MIN_SETTLED_MS:
+            out["ok"] = False
+            out["error"] = (
+                "the one snap flip (t=%s) left only %.1f s of the window "
+                "after it, under the %.0f s two telemetry ticks need: the "
+                "lines had no chance to move, so their silence proves "
+                "nothing. Lengthen --data-window" % (
+                    flip_t, out["settled_s"], MIN_SETTLED_MS / 1000.0))
+    out["window_start_ms"] = window_start
     checks = (
         ("tile cache (base): refetch after eviction",
          watcher.readings("tile_cache", role="base"), "refetch_after_eviction"),
@@ -5590,10 +5667,147 @@ def selftest_adapters():
     return fails
 
 
+class _TotalsRing:
+    """A `RunningTotalsWatcher` stand-in for the selftest: the readings are
+    given, oldest first, in the shape the probe records them."""
+
+    def __init__(self, tile_cache, ground, basemap):
+        self._src = {"tile_cache": tile_cache, "ground": ground,
+                     "basemap": basemap}
+
+    def readings(self, family, role=None):
+        return [r for r in self._src[family]
+                if role is None or r.get("role") == role]
+
+
+def selftest_tile_cache_settles():
+    """The settle basis, offline, on fixture rings.
+
+    The case it exists for: ONE snap flip inside the window, with the
+    flip's own first-sight asks and history trim on the flip's tick, must
+    PASS; two flips must FAIL; a refetch after the flip must FAIL. And the
+    boundaries: a flip before the window changes nothing, a bundle without
+    the field counts no flips, and a flip too near the end proves nothing."""
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append("tile_cache_settles: " + msg)
+
+    now = 100_000
+    span = 30.0                      # window_start = 70_000
+
+    def tc(t, snap, refetch=0, asks=100, evicted=10):
+        return {"t": t, "role": "base", "asks": asks,
+                "refetch_after_eviction": refetch,
+                "evicted_resident": evicted, "snap": snap}
+
+    def gr(t, uploads):
+        return {"t": t, "uploads": uploads, "evicted": 0}
+
+    def bm(t, vector):
+        return {"t": t, "vector_tiles": vector}
+
+    # No flip, everything flat: the basis before this change, unchanged.
+    v = tile_cache_settles(_TotalsRing(
+        [tc(60_000, 0), tc(80_000, 0)], [gr(60_000, 50)], [bm(60_000, 50)]),
+        span, now)
+    check(v["ok"], "a flat ring failed: %r" % v)
+    check(v["snap_flips"] == 0, "a flat ring counted %s flips" % v["snap_flips"])
+    check(v["window_basis"] == "the last 30 s", "basis %r" % v["window_basis"])
+    check(v["settled_s"] == span, "settled_s %r" % v["settled_s"])
+
+    # THE CASE: one flip at t=75000, inside the window. The flip's tick
+    # carries +47 first-sight asks and +116 evicted resident, and the same
+    # tick's ground/basemap lines carry the arrival; refetch stays 0.
+    one = _TotalsRing(
+        [tc(60_000, 0), tc(75_000, 1, asks=147, evicted=126),
+         tc(85_000, 1, asks=147, evicted=126)],
+        [gr(60_000, 50), gr(75_040, 97)],
+        [bm(60_000, 50), bm(75_030, 97)])
+    v = tile_cache_settles(one, span, now)
+    check(v["ok"], "one snap flip inside the window failed: %r" % v)
+    check(v["snap_flips"] == 1, "counted %s flips, not 1" % v["snap_flips"])
+    check(v["snap_flip_t"] == 75_000, "flip t %r" % v["snap_flip_t"])
+    check(v["window_start_ms"] == 76_000, "window start %r" % v["window_start_ms"])
+    check(abs(v["settled_s"] - 24.0) < 1e-9, "settled_s %r" % v["settled_s"])
+    check("after the one snap flip" in v["window_basis"], v["window_basis"])
+    fams = v["families"]
+    check(fams["ground tiles: uploads"]["delta"] == 0,
+          "the flip tick's uploads counted as a move: %r" % fams)
+    check(fams["basemap tiles: vector"]["delta"] == 0,
+          "the flip tick's decodes counted as a move: %r" % fams)
+    check(fams["tile cache (base): refetch after eviction"]["delta"] == 0, "%r" % fams)
+
+    # Non-vacuity, and the boundary of the tolerance: the SAME flip, and
+    # uploads that moved on a LATER tick, fail as they always did.
+    trailing = _TotalsRing(
+        [tc(60_000, 0), tc(75_000, 1, asks=147, evicted=126)],
+        [gr(60_000, 50), gr(75_040, 97), gr(79_000, 99)],
+        [bm(60_000, 50), bm(75_030, 97)])
+    v = tile_cache_settles(trailing, span, now)
+    check(not v["ok"], "uploads moving a tick after the flip passed: %r" % v)
+    check(v["families"]["ground tiles: uploads"]["delta"] == 2, "%r" % v["families"])
+
+    # Two flips, every delta flat: FAIL on the flips alone.
+    two = _TotalsRing(
+        [tc(60_000, 0), tc(75_000, 1), tc(85_000, 0)],
+        [gr(60_000, 50)], [bm(60_000, 50)])
+    v = tile_cache_settles(two, span, now)
+    check(not v["ok"], "two flips passed: %r" % v)
+    check(v["snap_flips"] == 2, "counted %s flips, not 2" % v["snap_flips"])
+    check("oscillating" in (v.get("error") or ""), "error %r" % v.get("error"))
+
+    # A refetch after the flip: FAIL. The snap never produces one.
+    refetch = _TotalsRing(
+        [tc(60_000, 0), tc(75_000, 1, asks=147, evicted=126),
+         tc(85_000, 1, asks=150, evicted=126, refetch=3)],
+        [gr(60_000, 50), gr(75_040, 97)],
+        [bm(60_000, 50), bm(75_030, 97)])
+    v = tile_cache_settles(refetch, span, now)
+    check(not v["ok"], "a refetch after the flip passed: %r" % v)
+    check(v["families"]["tile cache (base): refetch after eviction"]["delta"] == 3,
+          "%r" % v["families"])
+    check(v["snap_flips"] == 1, "counted %s flips" % v["snap_flips"])
+
+    # A flip BEFORE the window: the window is the last 30 s, as before.
+    early = _TotalsRing(
+        [tc(40_000, 0), tc(50_000, 1, asks=147, evicted=126), tc(80_000, 1, asks=147, evicted=126)],
+        [gr(50_040, 97)], [bm(50_030, 97)])
+    v = tile_cache_settles(early, span, now)
+    check(v["ok"], "a flip before the window failed: %r" % v)
+    check(v["snap_flips"] == 1 and v["window_start_ms"] == 70_000,
+          "flips %s start %s" % (v["snap_flips"], v["window_start_ms"]))
+    check(v["window_basis"] == "the last 30 s", v["window_basis"])
+
+    # A bundle older than the field: no flips counted, never read as 0.
+    older = _TotalsRing(
+        [{"t": 60_000, "role": "base", "refetch_after_eviction": 0},
+         {"t": 80_000, "role": "base", "refetch_after_eviction": 0}],
+        [gr(60_000, 50)], [bm(60_000, 50)])
+    v = tile_cache_settles(older, span, now)
+    check(v["ok"] and v["snap_flips"] == 0 and v["snap_flip_t"] is None,
+          "an older bundle: %r" % v)
+
+    # A flip in the leg's last seconds: the silence after it proves nothing.
+    late = _TotalsRing(
+        [tc(60_000, 0), tc(98_000, 1, asks=147, evicted=126)],
+        [gr(60_000, 50), gr(98_040, 97)], [bm(60_000, 50), bm(98_030, 97)])
+    v = tile_cache_settles(late, span, now)
+    check(not v["ok"], "a flip 2 s before the end passed: %r" % v)
+    check("proves nothing" in (v.get("error") or ""), "error %r" % v.get("error"))
+
+    # `snap_flips` on its own: the other role's flips are not the base's.
+    flips, t = snap_flips([tc(1, 0), tc(2, 1), tc(3, 1), tc(4, 0)])
+    check((flips, t) == (2, 4), "snap_flips counted %r" % ((flips, t),))
+    return fails
+
+
 def selftest():
     failures = []
     failures += selftest_android()
     failures += selftest_adapters()
+    failures += selftest_tile_cache_settles()
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -6291,6 +6505,7 @@ def run_smoke(args):
                                      now_ms)
             result["tile_cache_settles"] = tcs
             stage("tile-cache-settles", ok=tcs["ok"], window_s=tcs["window_s"],
+                  snap_flips=tcs["snap_flips"], settled_s=tcs["settled_s"],
                   **{"delta_" + name.split(":")[-1].strip().replace(" ", "_"):
                      fam.get("delta") for name, fam in tcs["families"].items()})
         fl_last = frames_watch.last or {}
@@ -6874,20 +7089,24 @@ def run_smoke(args):
                   "are levels]: %s asks, %s restyle asks, %s refetch after "
                   "eviction, %s puts first, %s restyle, %s duplicate, %s orphan, "
                   "%s evicted pending, %s evicted resident of %s B, %s entries, "
-                  "%s B resident, %s parsed"
+                  "%s B resident, %s parsed, snap %s"
                   % (tag, role, c.get("asks"), c.get("restyle_asks"),
                      c.get("refetch_after_eviction"), c.get("puts_first"),
                      c.get("puts_restyle"), c.get("puts_duplicate"),
                      c.get("puts_orphan"), c.get("evicted_pending"),
                      c.get("evicted_resident"), c.get("evicted_bytes"),
                      c.get("resident_entries"), c.get("resident_bytes"),
-                     c.get("parsed_entries")))
+                     c.get("parsed_entries"), c.get("snap", "-")))
     tcs = result.get("tile_cache_settles")
     if tcs is not None:
-        print("[%s] SUMMARY tile cache settles [last %.0f s of a static "
-              "viewport; three deltas, never added]: %s"
-              % (tag, tcs.get("window_s") or 0,
+        print("[%s] SUMMARY tile cache settles [%s of a static viewport; "
+              "three deltas, never added; snap flips %s]: %s"
+              % (tag, tcs.get("window_basis") or
+                 ("last %.0f s" % (tcs.get("window_s") or 0)),
+                 tcs.get("snap_flips", "-"),
                  "OK" if tcs.get("ok") else "FAILED"))
+        if tcs.get("error"):
+            print("[%s] SUMMARY   %s" % (tag, tcs["error"]))
         for name, fam in (tcs.get("families") or {}).items():
             print("[%s] SUMMARY   %s: delta %s over %s readings in the window "
                   "(%s)%s"
@@ -7287,7 +7506,11 @@ def main(argv=None):
                          "again. Silence inside the window is a zero (the "
                          "lines are written only when their ledger moves); a "
                          "line never written at all is an ERROR, never a "
-                         "zero. Needs the squallar.raster_telemetry seed. "
+                         "zero. The base source may snap to the whole zoom "
+                         "ONCE over the leg: a flip inside the window opens "
+                         "the window at the flip's own tick; a second flip "
+                         "fails the leg. Needs the squallar.raster_telemetry "
+                         "seed. "
                          "Pair with --expect-frame-progress: a dead frame "
                          "loop is silent too, and only the app's own frame "
                          "counter tells the two apart")
