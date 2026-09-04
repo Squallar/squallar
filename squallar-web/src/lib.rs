@@ -156,6 +156,11 @@ pub mod shared_loan;
 /// only the hook that reads the instance's memory is gated.
 pub mod alloc_failure;
 
+/// **What ceiling this instance's linear memory was constructed with**, as JS
+/// decided it per device before the module existed. Not wasm32-gated: it is
+/// two atomics and a truth about them, and the host tests read them.
+pub mod heap_max;
+
 /// `initThreadPool`, the JS half of `wasm-bindgen-rayon`'s pool. Re-exported
 /// because wasm-bindgen only emits a binding for an export this crate names:
 /// the symbol is defined in the dependency, and without this line `worker.js`
@@ -179,8 +184,12 @@ mod entry_probes {
     #[test]
     fn nothing_asks_the_browser_for_a_position_at_page_load() {
         let entry = include_str!("entry.rs");
+        // `pub fn start(` and not `pub fn start()`: the entry point takes the
+        // two per-device linear-memory ceilings JS chose before the module
+        // existed (`crate::heap_max`). A search for the empty parameter list
+        // would silently find nothing and pass vacuously.
         let start = entry
-            .find("pub fn start()")
+            .find("pub fn start(")
             .map(|i| &entry[i..])
             .expect("entry::start is gone");
         for asked in ["watch_position", "start_watch", "request_location"] {

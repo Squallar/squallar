@@ -281,6 +281,10 @@ pub(crate) mod fixtures {
             declared_ram_bytes: None,
             parallelism: None,
             form_factor: None,
+            // Nothing said, so the bracket's own presumption stands — which
+            // for the wasm bracket is the bound the module was linked with.
+            // A browser page that chose a smaller wall would carry it here.
+            linear_memory_max_bytes: None,
             memo: None,
         }
     }

@@ -645,6 +645,13 @@ impl App {
         device_profile.declared_ram_bytes = signals.declared_ram_bytes;
         device_profile.parallelism = signals.parallelism;
         device_profile.form_factor = signals.form_factor;
+        // The one signal that could NOT have been read here: it describes a
+        // `WebAssembly.Memory` constructed before this module was
+        // instantiated, and no engine will say what a memory's maximum is. It
+        // travels as a value the page plumbed in (`squallar_web::heap_max`),
+        // and `DeviceProfile::capacity` prefers it to the bracket's link-flag
+        // presumption. `None` natively and on any bridge that never said.
+        device_profile.linear_memory_max_bytes = signals.linear_memory_max_bytes;
         // Nothing is learned across sessions: every launch resolves the class
         // rung and lets `fit` shed from there for the scene it finds, and what
         // pressure teaches lowers this session's capacity presumption only.

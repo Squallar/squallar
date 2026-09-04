@@ -11,6 +11,16 @@ const CANVAS_ID: &str = "squallar-canvas";
 /// Boot squallar into the canvas named by [`CANVAS_ID`]. Exported to JS and
 /// called by `index.html` once the DOM exists.
 ///
+/// `page_heap_max_bytes` and `worker_heap_max_bytes` are the two linear-memory
+/// ceilings `squallar-web/heap.js` chose for this device before the module was
+/// instantiated — the page's own, and the one the rasterization worker will be
+/// started under. **They are arguments because nothing can read them back**:
+/// no engine implements `WebAssembly.Memory.prototype.type()`, so a maximum
+/// that is not handed over is unknowable to the code living inside it
+/// ([`crate::heap_max`]). Non-finite or non-positive figures are dropped, and
+/// the app then judges its heap against no ceiling rather than against a
+/// constant that would be a guess.
+///
 /// Not `run_app`: it never returns, and winit's web backend implements that
 /// signature by throwing a JS exception. [`EventLoopExtWebSys::spawn_app`]
 /// returns normally.
@@ -18,8 +28,12 @@ const CANVAS_ID: &str = "squallar-canvas";
 /// teardown via `AbortController.abort()` is a large fraction of Firefox
 /// main-thread time.
 #[wasm_bindgen]
-pub fn start() -> Result<(), JsValue> {
+pub fn start(page_heap_max_bytes: f64, worker_heap_max_bytes: f64) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    // Before the alloc hook, which prints this instance's ceiling beside the
+    // request that could not be served, and before `worker_port::attach`,
+    // which needs the worker's figure to name the Worker with.
+    crate::heap_max::declare(page_heap_max_bytes, worker_heap_max_bytes);
     // And the other way an instance dies: an allocation the engine refuses,
     // which says nothing without this (`crate::alloc_failure`).
     crate::alloc_failure::hook::install(crate::alloc_failure::Instance::Page);

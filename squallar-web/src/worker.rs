@@ -44,9 +44,19 @@ thread_local! {
 /// announce readiness. Called by `worker.js` after `init()`, under a
 /// distinctive name because it shares an export namespace with
 /// [`crate::start`].
+///
+/// `heap_max_bytes` is the ceiling this worker's memory was constructed with.
+/// It arrives here rather than being read because no engine will say what a
+/// memory's maximum is, and it is a separate figure from the page's: the page
+/// chose it (a worker global has neither `matchMedia` nor `maxTouchPoints`)
+/// and handed it over on this Worker's `name`, and `worker.js` passes on what
+/// it actually got — which differs from what was asked for exactly when the
+/// engine refused the supplied memory and the glue built its own.
 #[wasm_bindgen]
-pub fn squallar_worker_main() -> Result<(), JsValue> {
+pub fn squallar_worker_main(heap_max_bytes: f64) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
+    // Before the hook, which prints this ceiling beside the refused request.
+    crate::heap_max::declare_this(heap_max_bytes);
     // The worker is its own instance with its own heap — the MRMS grid's
     // 93 MB refusal was here — so it installs its own hook
     // (`crate::alloc_failure`).
@@ -77,6 +87,7 @@ pub fn squallar_worker_main() -> Result<(), JsValue> {
     let threads = rayon::current_num_threads();
     proto::set_field(&hello, proto::THREADS, &JsValue::from_f64(threads as f64));
     say_memory(&hello);
+    say_memory_max(&hello);
 
     // The lane's port rides the hello, transferred. A lane that could not be
     // started is a hello without one, which the page reads as "no lane":
@@ -182,6 +193,15 @@ pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue
 fn say_memory(message: &js_sys::Object) {
     if let Some(bytes) = crate::shared_loan::memory_bytes() {
         proto::set_field(message, proto::MEM, &JsValue::from_f64(bytes as f64));
+    }
+}
+
+/// The worker's own CEILING, said once on the hello rather than on every
+/// reply: unlike [`say_memory`]'s reading it cannot change for the life of the
+/// instance, and a `DONE` is the hot path.
+fn say_memory_max(message: &js_sys::Object) {
+    if let Some(bytes) = crate::heap_max::this_instance() {
+        proto::set_field(message, proto::MEMMAX, &JsValue::from_f64(bytes as f64));
     }
 }
 

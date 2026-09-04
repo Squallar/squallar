@@ -9,22 +9,29 @@
 //! not merely to still stand above the line. Without that a heap that acted
 //! once would act on every tick for the rest of the session.
 //!
-//! The ceiling itself is [`crate::constants::WASM_LINEAR_MEMORY_MAX_BYTES`], a
-//! build constant; the reading is the bridge's (`memory().buffer().byteLength`
-//! on the page, the worker's own figure on its envelopes), and the two module
-//! instances are judged by the fuller of the two, never by their sum. A native
+//! **The ceiling is an argument, not a constant.** It is whatever maximum the
+//! instance's `WebAssembly.Memory` was constructed with, chosen per device by
+//! `squallar-web/heap.js` before the module was instantiated and at or below
+//! [`crate::constants::WASM_LINEAR_MEMORY_MAX_BYTES`], the bound the module is
+//! linked with. The reading is the bridge's (`memory().buffer().byteLength` on
+//! the page, the worker's own figure on its envelopes), the two instances have
+//! two ceilings and are judged separately, and neither their readings nor
+//! their walls are ever added. A ceiling of 0 is "nobody said" and is
+//! [`LinearMemoryVerdict::Quiet`] whatever the reading — never a wall of zero,
+//! and never silently replaced with the link flag, which on a handheld would
+//! be double the truth. A native
 //! bridge reads no heap, so nothing here is reached natively — that is the
 //! caller's job, held in `squallar-app` by
 //! `a_native_profile_with_no_heap_reading_is_never_pressured_by_the_tick`.
 
 /// Percent of the ceiling at which a reading is worth one line in the log:
-/// 768 MiB of the 1 GiB build.
+/// 768 MiB of a 1 GiB instance, 384 MiB of a 512 MiB one.
 pub const LINEAR_MEMORY_WARN_PERCENT: u64 = 75;
 
 /// Percent of the ceiling **past which a reading is pressure whatever the
-/// scene**: 891 MiB of the 1 GiB build (the first whole MiB at or past the
-/// line, which falls at 890.88 MiB). The ceiling of the action line, not the
-/// line itself — see [`act_line`].
+/// scene**: 891 MiB of a 1 GiB instance (the first whole MiB at or past the
+/// line, which falls at 890.88 MiB), 446 MiB of a 512 MiB one. The ceiling of
+/// the action line, not the line itself — see [`act_line`].
 ///
 /// The measured Tier-2 `firefox.huge` trap of 2026-08-31 was an MRMS decode's
 /// 98 MB request failing **at** the ceiling
@@ -117,14 +124,44 @@ mod tests {
     use LinearMemoryVerdict::{Act, Quiet, Warn};
 
     const MIB: u64 = 1 << 20;
+    /// The bound the module is LINKED with, which is also the ceiling a
+    /// desktop-classified browser is given (`squallar-web/heap.js`), so it is
+    /// still the figure the lines below are named for.
     const MAX: u64 = crate::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+    /// **What a handheld's page instance is given instead.** Written out
+    /// rather than imported: `squallar-device-profile` has no dependency on
+    /// `squallar-web`, and the equality between this and `heap.js`'s
+    /// `HANDHELD_PAGE_BYTES` is held where the rest of that file's figures
+    /// are, in `squallar-web/tests/linear_memory_ceiling.rs`. If that pin
+    /// reddens, this row is what it is telling you to re-derive.
+    const HANDHELD_MAX: u64 = 512 * MIB;
 
-    /// The lines fall where the percentages say against the shipped ceiling,
-    /// and a reading is judged at, below and above each. With no headroom
-    /// asked for, the action line is the percentage alone.
+    /// **The lines are a fraction of the instance's own ceiling, not of a
+    /// constant** — 768 and 891 MiB of a 1 GiB heap, 384 and 445 MiB of a
+    /// 512 MiB one — and a reading is judged at, below and above each.
+    ///
+    /// # Why this pin reads differently than it used to
+    ///
+    /// It used to open `assert_eq!(MAX, 1024 * MIB, "the ceiling is 1 GiB")`
+    /// and every row after it was arithmetic against that one number, because
+    /// `WASM_LINEAR_MEMORY_MAX_BYTES` was the only ceiling any instance could
+    /// have. **That premise is gone**: a page chooses its linear memory's
+    /// maximum per device before the module is instantiated, at or below the
+    /// link flag, and `linear_memory_verdict` was already written to take that
+    /// ceiling as an argument — it never read the constant. So nothing in the
+    /// function under test changed, and the pin did not need to be edited to
+    /// pass. What it needed was a second arm, because a pin taken at one
+    /// ceiling cannot distinguish "75 % of the ceiling" from "768 MiB": both
+    /// readings of the old rows are consistent with every figure in them.
+    /// The handheld arm is what separates them, and it is the reason to keep
+    /// the desktop arm's literals rather than replace them with `MAX * 3 / 4`
+    /// — an assertion written in the same arithmetic as the code cannot
+    /// disagree with it.
+    ///
+    /// With no headroom asked for, the action line is the percentage alone.
     #[test]
-    fn the_warn_and_act_lines_fall_at_768_and_891_mib_of_the_build() {
-        assert_eq!(MAX, 1024 * MIB, "the ceiling is 1 GiB");
+    fn the_warn_and_act_lines_are_75_and_87_percent_of_whatever_ceiling_the_instance_got() {
+        assert_eq!(MAX, 1024 * MIB, "the desktop ceiling is 1 GiB");
         // 75 % of 1024 MiB is exactly 768 MiB.
         assert_eq!(linear_memory_verdict(768 * MIB - 1, MAX, None, 0), Quiet);
         assert_eq!(linear_memory_verdict(768 * MIB, MAX, None, 0), Warn);
@@ -139,6 +176,38 @@ mod tests {
             934_155_386,
             "890.88 MiB, floored to the byte"
         );
+
+        // The handheld arm, same percentages, half the ceiling. 75 % of
+        // 512 MiB is exactly 384 MiB; 87 % is 445.44 MiB, so 445 is under it
+        // and 446 is past.
+        assert_eq!(HANDHELD_MAX, 512 * MIB);
+        assert_eq!(
+            linear_memory_verdict(384 * MIB - 1, HANDHELD_MAX, None, 0),
+            Quiet
+        );
+        assert_eq!(
+            linear_memory_verdict(384 * MIB, HANDHELD_MAX, None, 0),
+            Warn
+        );
+        assert_eq!(
+            linear_memory_verdict(445 * MIB, HANDHELD_MAX, None, 0),
+            Warn
+        );
+        assert_eq!(linear_memory_verdict(446 * MIB, HANDHELD_MAX, None, 0), Act);
+        assert_eq!(
+            act_line(HANDHELD_MAX, 0),
+            467_077_693,
+            "445.44 MiB, floored to the byte"
+        );
+
+        // **And the row that makes the pin mean what it says**: a reading of
+        // 768 MiB is the WARNING line of a desktop heap and is past the wall
+        // of a handheld one. One number, two verdicts, decided entirely by
+        // the ceiling the instance was constructed with -- which is why the
+        // ceiling has to reach this function as a value and why the alloc
+        // hook, the telemetry line and the pressure line all carry it too.
+        assert_eq!(linear_memory_verdict(768 * MIB, MAX, None, 0), Warn);
+        assert_eq!(linear_memory_verdict(768 * MIB, HANDHELD_MAX, None, 0), Act);
     }
 
     /// **The action line is the lower of the percentage and the wall less

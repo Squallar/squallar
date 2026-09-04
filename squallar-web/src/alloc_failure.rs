@@ -171,7 +171,6 @@ impl Instance {
 pub mod hook {
     use super::Instance;
     use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
-    use squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
 
     /// Which instance this module is running as, for [`report`] to name.
     ///
@@ -214,12 +213,18 @@ pub mod hook {
     fn report(layout: std::alloc::Layout) {
         let instance = Instance::from_code(INSTANCE.load(Relaxed));
         let linear = crate::shared_loan::memory_bytes();
-        let line = super::line(
-            layout.size(),
-            linear,
-            WASM_LINEAR_MEMORY_MAX_BYTES,
-            instance.as_str(),
-        );
+        // **This instance's own ceiling, not the build's.** The two parted
+        // when the maximum became a per-device choice made in JS before the
+        // module existed (`crate::heap_max`); printing the link flag here
+        // would say `of 1024 MiB` on a phone that was refused at 512, which
+        // is the one figure a reader of this line would act on. And it is
+        // per INSTANCE in the same sense the name beside it is: the page,
+        // the worker and the lane are named separately here because their
+        // heaps are separate, and on a handheld their ceilings differ too.
+        // An instance that was never told judges against 0 and prints
+        // `of 0 MiB`, which says "nobody said" rather than inventing a wall.
+        let max = crate::heap_max::this_instance().unwrap_or(0);
+        let line = super::line(layout.size(), linear, max, instance.as_str());
         web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(line.as_str()));
 
         let mut census = super::Line::<{ squallar_egui::heap_census::CENSUS_LINE_CAPACITY }>::new();
@@ -281,6 +286,28 @@ mod tests {
         assert_eq!(
             line(98_000_000, None, 1 << 30, "raster worker").as_str(),
             "alloc failed: 98000000 B requested, unread of 1024 MiB linear in raster worker"
+        );
+
+        // **The wall on the line is the INSTANCE's, and the same request
+        // against a handheld's worker heap says so.** The hook reads
+        // `heap_max::this_instance()` and not the link flag, which on this
+        // arm would print `of 1024 MiB` beside a refusal that happened at
+        // 256 -- the one figure a reader of this line would act on.
+        assert_eq!(
+            line(
+                98_000_000,
+                Some(255 * (1 << 20)),
+                256 << 20,
+                "raster worker"
+            )
+            .as_str(),
+            "alloc failed: 98000000 B requested, 255 of 256 MiB linear in raster worker"
+        );
+        // An instance nobody told judges against nothing, and says nothing
+        // rather than inventing a wall.
+        assert_eq!(
+            line(98_000_000, Some(300 << 20), 0, "tile lane").as_str(),
+            "alloc failed: 98000000 B requested, 300 of 0 MiB linear in tile lane"
         );
     }
 

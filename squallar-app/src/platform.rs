@@ -32,6 +32,17 @@ pub struct HostSignals {
     /// A build fact natively (the desktop bridge is a desktop; Android and
     /// iOS are handheld); a pointer-media classification in a browser.
     pub form_factor: Option<FormFactor>,
+    /// **The maximum this instance's wasm linear memory was constructed
+    /// with**, in bytes. `None` natively — a native heap declares no ceiling —
+    /// and `None` in a browser instance nobody told, which is not the same as
+    /// the build's link flag and must never be replaced by it.
+    ///
+    /// A browser is the one platform whose host capacity is *known* without a
+    /// reader, and this is that figure. It used to be a constant; it is a
+    /// value because the page chooses it per device before the module is
+    /// instantiated, so the same binary can give a 2 GiB phone a small wall
+    /// and a desktop the full one (`squallar-web/heap.js`).
+    pub linear_memory_max_bytes: Option<u64>,
 }
 
 /// How full the wasm linear memories are. **Two instances, two ceilings**: the
@@ -42,6 +53,16 @@ pub struct HostSignals {
 pub struct LinearMemory {
     /// `memory().buffer().byteLength` of the instance the bridge runs in.
     pub page_bytes: u64,
+    /// **What that instance's memory was constructed with**, in bytes — the
+    /// wall [`Self::page_bytes`] is judged against. Carried beside the reading
+    /// rather than looked up, because no engine will say what a memory's
+    /// maximum is and the two instances need not have the same one.
+    pub page_max_bytes: u64,
+    /// **What the worker's memory was constructed with**, in bytes, as it
+    /// reported on its hello — or what the page chose for it before one
+    /// answered. 0 where nobody has said, which the watermark reads as no
+    /// ceiling rather than as a wall of zero.
+    pub worker_max_bytes: u64,
     /// The worker's own reading, as it last reported on its hello or a reply
     /// envelope. `None` until a worker has said.
     pub worker_bytes: Option<u64>,

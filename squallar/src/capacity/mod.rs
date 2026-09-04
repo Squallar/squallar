@@ -118,13 +118,15 @@ pub fn parallelism() -> Option<usize> {
 /// Every host signal a native bridge hands over. `form_factor` is the one
 /// term the bridge knows and this module does not: a build fact, spelled by
 /// whichever bridge was compiled. Declared RAM is a browser's notion and is
-/// `None` on every native target.
+/// `None` on every native target, as is the linear-memory ceiling: a native
+/// heap declares no maximum, and the presumed arm's host is unbounded.
 pub fn host_signals(form_factor: FormFactor) -> HostSignals {
     HostSignals {
         system_ram_bytes: system_ram_bytes(),
         declared_ram_bytes: None,
         parallelism: parallelism(),
         form_factor: Some(form_factor),
+        linear_memory_max_bytes: None,
     }
 }
 

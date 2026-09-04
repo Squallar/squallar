@@ -84,7 +84,7 @@ const META_KEY = new URL("__squallar_sw_meta__", ROOT).href;
 const PINS_KEY = new URL("__squallar_sw_pins__", ROOT).href;
 
 /*
- * The app shell, relative to ROOT. Eleven entries, but the wasm module
+ * The app shell, relative to ROOT. Twelve entries, but the wasm module
  * (10,161,914 B) and its glue (117,911 B) are essentially all of it — index.html
  * and the icons together are under 260 KB.
  *
@@ -104,10 +104,18 @@ const PINS_KEY = new URL("__squallar_sw_pins__", ROOT).href;
  * worker starts on its own memory for the basemap's vector tiles. Same
  * argument, one step down: absent from the precache, an offline load styles
  * every vector tile on the main thread. It too loads only the `pkg/` pair.
+ *
+ * `heap.js` is imported by BOTH the page and `worker.js`, and it is imported
+ * before either instantiates the module: it decides how big this device's
+ * linear memory may grow. Absent from the precache it is a network fetch on
+ * the boot path of an offline load, and a failed one is a page that does not
+ * boot at all -- a static `import` that 404s rejects the whole module graph.
+ * It is under 8 KB and loads nothing of its own.
  */
 const SHELL_PATHS = [
   "",
   "manifest.webmanifest",
+  "heap.js",
   "worker.js",
   "tile-lane.js",
   "pkg/squallar_web.js",

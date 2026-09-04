@@ -31,14 +31,50 @@ import init, {
   squallarRayonSerialPool,
   squallar_worker_main,
 } from "./pkg/squallar_web.js";
+import {
+  DESKTOP_PAGE_BYTES,
+  heapFromName,
+  initWithHeap,
+} from "./heap.js";
+
+/*
+ * This worker's own linear-memory ceiling, as the PAGE chose it. It arrives on
+ * `self.name` because that is the only channel a worker can read
+ * synchronously at the top of its own script -- and it has to be the page's
+ * answer, not one computed here: a `WorkerNavigator` carries
+ * `hardwareConcurrency` and `deviceMemory` and neither `matchMedia` nor
+ * `maxTouchPoints`, so a worker classifying itself would read "unknown" on
+ * Firefox, which governs, and take the handheld arm on every desktop.
+ *
+ * The heap is a SEPARATE choice from the page's and on a handheld a smaller
+ * one: this instance holds the jobs in flight (bounded by
+ * `WASM_MAX_CONCURRENT_RENDERS`) plus the tile lane's scratch, never the
+ * caches. See `heap.js`.
+ *
+ * `null` -- a worker opened directly, or started by a page from a build
+ * before this -- falls back to the module's declared bound, which is what the
+ * glue would have built anyway.
+ */
+const heapMaxBytes = heapFromName(self.name) ?? DESKTOP_PAGE_BYTES;
+
+/* Set by `initWithHeap` below, before `squallar_worker_main` is handed it. */
+let heapMaxInForce = heapMaxBytes;
 
 /*
  * No top-level await: a rejected TLA leaves the worker alive but inert, and the
  * page would sit waiting for a `hello` that is never coming. Reporting the
  * failure lets it give up and rasterize on the main thread immediately.
  */
-init()
-  .then(function () {
+initWithHeap(init, heapMaxBytes)
+  .then(function (actual) {
+    /*
+     * What the instance ACTUALLY got, which differs from what was asked for
+     * only when the engine refused the supplied memory and the glue built one
+     * at the declared bound. It rides back to the page on the hello
+     * (`worker_protocol::MEMMAX`), because the page's copy is the one that
+     * would otherwise be wrong.
+     */
+    heapMaxInForce = actual;
     /*
      * Rayon's threads (WS3b). `initThreadPool` spawns `squallarRayonThreads()`
      * NESTED Workers over this worker's own shared linear memory, which needs
@@ -63,7 +99,7 @@ init()
     });
   })
   .then(function () {
-    squallar_worker_main();
+    squallar_worker_main(heapMaxInForce);
   })
   .catch(function (e) {
     self.postMessage({ kind: "fatal", error: String(e) });

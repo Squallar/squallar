@@ -1857,9 +1857,9 @@ impl super::App {
         // picture arrival and every frame's tile puts (`observe_page_heap`),
         // so this tick is the worker's one reading and the page's slowest.
         if let Some(heap) = linear {
-            self.observe_page_heap(heap.page_bytes);
+            self.observe_page_heap(heap.page_bytes, heap.page_max_bytes);
             if let Some(worker) = heap.worker_bytes {
-                self.observe_worker_heap(worker);
+                self.observe_worker_heap(worker, heap.worker_max_bytes);
             }
         }
     }
@@ -1902,10 +1902,16 @@ impl super::App {
     /// `byteLength` read and a few compares, and an action is bounded by
     /// what `on_pressure` does. The watch's re-fire step keeps a heap that
     /// has acted once from acting on every frame.
-    pub(super) fn observe_page_heap(&mut self, used: u64) {
+    ///
+    /// `max` is **this instance's own wall**, carried in on the reading
+    /// (`platform::LinearMemory::page_max_bytes`) rather than read off a
+    /// constant: the page chooses its memory's maximum per device before the
+    /// module is instantiated, so on a handheld the warn and act lines fall at
+    /// 75 % and 87 % of a smaller number. A `max` of 0 is "nobody said", and
+    /// `linear_memory_verdict` spells that `Quiet`.
+    pub(super) fn observe_page_heap(&mut self, used: u64, max: u64) {
         use squallar_device_profile::linear_memory::LinearMemoryVerdict;
 
-        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
         match self
             .linear_memory_watch
             .observe(used, max, self.host_headroom_bytes)
@@ -1924,10 +1930,15 @@ impl super::App {
     /// the percentage line alone: no scene of this application is priced on
     /// that heap and no lever reaches it, so an action there evicts economy
     /// and lowers no presumption ([`crate::pressure::Pressure::WorkerMemory`]).
-    pub(super) fn observe_worker_heap(&mut self, used: u64) {
+    ///
+    /// `max` is the **worker's** wall and not the page's. The two instances
+    /// are chosen separately and on a handheld they differ: the worker holds
+    /// jobs in flight rather than caches, so it is given less
+    /// (`squallar-web/heap.js`). It arrives with the reading, from the
+    /// worker's own hello.
+    pub(super) fn observe_worker_heap(&mut self, used: u64, max: u64) {
         use squallar_device_profile::linear_memory::LinearMemoryVerdict;
 
-        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
         match self.worker_memory_watch.observe(used, max, 0) {
             LinearMemoryVerdict::Quiet => {}
             LinearMemoryVerdict::Warn => {
@@ -1945,7 +1956,7 @@ impl super::App {
     /// Nothing on a bridge that reads no heap.
     pub(super) fn sample_page_heap(&mut self) {
         if let Some(heap) = self.platform.linear_memory() {
-            self.observe_page_heap(heap.page_bytes);
+            self.observe_page_heap(heap.page_bytes, heap.page_max_bytes);
         }
     }
 

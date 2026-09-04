@@ -125,12 +125,23 @@ impl PlatformBridge for WebPlatform {
 
     /// What the browser will say about the machine: a declared RAM bucket
     /// (Chromium exposes one, Firefox does not), the thread count the
-    /// hardware reports, and the form factor from pointer media. Measured RAM
-    /// is `None` on every browser, because no API answers.
+    /// hardware reports, the form factor from pointer media, and the ceiling
+    /// this page's linear memory was built with. Measured RAM is `None` on
+    /// every browser, because no API answers.
+    ///
+    /// **Ordering**: this is called from `App::new`, at the end of boot, and
+    /// three of the four signals could be read there. The heap ceiling could
+    /// not — the memory it describes was constructed before the module was
+    /// instantiated — which is why it travels as a value plumbed in through
+    /// `entry::start` rather than as a read here.
     fn host_signals(&self) -> HostSignals {
         HostSignals {
             system_ram_bytes: None,
             declared_ram_bytes: declared_ram_bytes(),
+            // Chosen per device by `heap.js` before this module existed and
+            // handed to `entry::start`; see `crate::heap_max` for why it
+            // cannot be read back off the memory object.
+            linear_memory_max_bytes: crate::heap_max::this_instance(),
             parallelism: navigator_number("hardwareConcurrency")
                 .filter(|n| *n >= 1.0)
                 .map(|n| n as usize),
@@ -149,7 +160,12 @@ impl PlatformBridge for WebPlatform {
     fn linear_memory(&self) -> Option<LinearMemory> {
         Some(LinearMemory {
             page_bytes: crate::shared_loan::memory_bytes()?,
+            page_max_bytes: crate::heap_max::this_instance().unwrap_or(0),
             worker_bytes: crate::worker_port::worker_memory_bytes(),
+            // What the worker reported on its hello where it has said, else
+            // what this page asked for it. A zero is "nobody said", which the
+            // watermark spells `Quiet` rather than guessing a wall.
+            worker_max_bytes: crate::heap_max::worker_instance().unwrap_or(0),
         })
     }
 

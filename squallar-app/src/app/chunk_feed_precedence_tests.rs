@@ -2122,6 +2122,17 @@ fn tick(app: &mut App) {
 
 const MIB: u64 = 1 << 20;
 
+/// The linear-memory ceiling these web-bridge readings are judged against.
+///
+/// **A value the page reported, not a constant it looked up.** A browser
+/// instance's maximum is chosen per device before the module exists
+/// (`squallar-web/heap.js`), so what the app judges a reading against is
+/// whatever arrived on that reading. The full declared bound is what a
+/// desktop-classified device gets, which is the arm these fixtures model; a
+/// handheld's page would carry 512 MiB here and its worker 256, and every
+/// line below would fall proportionally.
+const WEB_HEAP_MAX: u64 = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+
 /// **On the measured arm a pressure event lowers the capacity by one economy
 /// fraction of the card, and the allowance follows at three quarters.** A
 /// discrete class with a 24 GiB reading: one lost surface takes this session's
@@ -2194,7 +2205,9 @@ fn a_pressure_event_on_the_measured_arm_lowers_the_capacity_by_one_economy_fract
 fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
     crate::platform::LinearMemory {
         page_bytes: 100 * MIB,
+        page_max_bytes: WEB_HEAP_MAX,
         worker_bytes: Some(worker_mib * MIB),
+        worker_max_bytes: WEB_HEAP_MAX,
     }
 }
 
@@ -2284,7 +2297,9 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
     let page = |bytes: u64| {
         Some(crate::platform::LinearMemory {
             page_bytes: bytes,
+            page_max_bytes: WEB_HEAP_MAX,
             worker_bytes: Some(50 * MIB),
+            worker_max_bytes: WEB_HEAP_MAX,
         })
     };
     gauge.set(page(891 * MIB));
@@ -2364,7 +2379,9 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
     let page = |bytes: u64| {
         Some(crate::platform::LinearMemory {
             page_bytes: bytes,
+            page_max_bytes: WEB_HEAP_MAX,
             worker_bytes: None,
+            worker_max_bytes: 0,
         })
     };
     let mut app = headless(platform);
@@ -2708,7 +2725,9 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
     let ninety = 1024 * MIB / 10 * 9;
     gauge.set(Some(crate::platform::LinearMemory {
         page_bytes: ninety,
+        page_max_bytes: WEB_HEAP_MAX,
         worker_bytes: Some(50 * MIB),
+        worker_max_bytes: WEB_HEAP_MAX,
     }));
     tick(&mut app);
 
@@ -2748,7 +2767,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
     let line = crate::pressure::pressure_line(
         crate::pressure::Pressure::LinearMemory {
             used: ninety,
-            max: squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES,
+            max: WEB_HEAP_MAX,
         },
         crate::pressure::Reclaimed {
             render_entries: 1,

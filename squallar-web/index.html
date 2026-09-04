@@ -328,12 +328,22 @@
 
     <script type="module">
       import init, { start } from "./pkg/squallar_web.js";
+      import { chooseHeapMaxBytes, initWithHeap } from "./heap.js";
 
       const status = document.getElementById("squallar-status");
 
       try {
-        await init();
-        start();
+        // The linear-memory ceiling is chosen HERE, before the module is
+        // instantiated, because a `shared` WebAssembly.Memory fixes its
+        // maximum at construction and no engine will say what it is
+        // afterwards. `heap.js` carries the rule, the figures and the
+        // measurements; this page reads the signals only a document has
+        // (pointer media, touch points) and hands the answer for the
+        // rasterization worker down with it, since a worker global has
+        // neither.
+        const heap = chooseHeapMaxBytes();
+        const pageMax = await initWithHeap(init, heap.page);
+        start(pageMax, heap.worker);
         // Removing it means a later failure shows a blank page rather than a
         // stale "Loading" message.
         status.remove();

@@ -68,6 +68,19 @@ pub const THREADS: &str = "threads";
 /// unknown, never as 0: a worker from a build before this field never sets
 /// it, and the page's `linear_memory` answers `None` for the worker half.
 pub const MEM: &str = "mem";
+/// Worker → page, on `HELLO` only: **the maximum the worker's own linear
+/// memory was constructed with**, in bytes.
+///
+/// The page chose this figure and handed it over on the Worker's `name`
+/// (`squallar-web/heap.js`), so it is mostly a confirmation — except when the
+/// engine refused the supplied memory and the glue built one at the module's
+/// declared bound instead, which is the one case the page's own copy is
+/// wrong. Nothing can read a memory's maximum back
+/// (`WebAssembly.Memory.prototype.type()` exists in neither engine), so this
+/// message is the only witness. Absent reads as "what we asked for", never as
+/// 0. On the hello alone because a ceiling cannot change for the life of an
+/// instance and a `DONE` is the hot path.
+pub const MEMMAX: &str = "memmax";
 /// Worker → page, on `HELLO`: the page's end of the **tile lane** — a
 /// `MessagePort` into a nested Worker that shares the rasterization worker's
 /// memory and runs the `basemap/tiles` row on a thread of its own, so a

@@ -153,19 +153,34 @@ pub const WASM_MAX_CONCURRENT_RENDERS: usize = 1;
 /// overcommit.
 pub const WASM_MAX_RAYON_THREADS: usize = 8;
 
-/// The ceiling of one wasm linear memory, in bytes: the `--max-memory` the
-/// module is linked with (`.github/scripts/wasm-threads.sh`), which is why its
-/// memory section declares the `maximum=16384 pages` quoted above.
+/// **The largest wasm linear memory this build can ever be given**, in bytes:
+/// the `--max-memory` the module is linked with
+/// (`.github/scripts/wasm-threads.sh`), which is why its memory section
+/// declares the `maximum=16384 pages` quoted above.
 ///
-/// **A build constant, not a device reading.** A `shared` memory has to state
-/// a maximum at link time because it cannot be relocated on growth, so the
-/// module declares its own wall and no browser and no device moves it. The
-/// page and the rasterization worker are two module instances, each with its
-/// own memory under this same ceiling; the two figures are never added.
+/// **A validation bound, not a device reading and no longer the wall itself.**
+/// A `shared` memory has to state a maximum at link time because it cannot be
+/// relocated on growth, so the module declares one — but that declaration is
+/// what a *supplied* memory is matched against, and the match permits
+/// shrinking: a memory whose maximum is at or below this instantiates, one
+/// above it raises `LinkError: imported Memory with incompatible maximum
+/// size` (54 cells plus negative controls on Firefox and Chromium,
+/// 2026-09-03). So `squallar-web/heap.js` chooses per device *underneath* this
+/// figure before the module is instantiated, a desktop gets exactly this and a
+/// handheld gets less, and the choice reaches the application as a value on
+/// `budget::DeviceProfile::linear_memory_max_bytes` because nothing can read a
+/// memory's maximum back — `WebAssembly.Memory.prototype.type()` exists in
+/// neither engine.
 ///
-/// Held equal to the link flag by `the_linear_memory_ceiling_is_the_link_flag`
-/// in `squallar-web/tests/linear_memory_ceiling.rs`, which reads the script.
-/// What a reading against it means is [`crate::linear_memory`].
+/// The page and the rasterization worker are two module instances with two
+/// memories, **and since the choice is made per instance the two ceilings need
+/// not be equal** (on a handheld they are not). Neither the readings nor the
+/// walls are ever added.
+///
+/// Held equal to the link flag, and held above every per-device figure, by
+/// `squallar-web/tests/linear_memory_ceiling.rs`, which reads both the script
+/// and `heap.js`. What a reading against a ceiling means is
+/// [`crate::linear_memory`].
 pub const WASM_LINEAR_MEMORY_MAX_BYTES: u64 = 1 << 30;
 
 pub const MOBILE_MAX_CONCURRENT_RENDERS: usize = 3;
@@ -468,9 +483,11 @@ pub const fn mib(n: usize) -> usize {
 /// floor is that working set to the mebibyte, and its own floor in entries
 /// carries the difference).
 ///
-/// **Per bracket.** wasm32 is a browser tab whose linear memory is one
-/// gigabyte (`WASM_LINEAR_MEMORY_MAX_BYTES`) shared with every other heap in
-/// the page: 48/48/25 MiB at the floor is 121 MiB, an eighth of it. The step
+/// **Per bracket.** wasm32 is a browser tab whose linear memory is at most one
+/// gigabyte (`WASM_LINEAR_MEMORY_MAX_BYTES`, the bound the module is linked
+/// with — a handheld is given half of it) shared with every other heap in the
+/// page: 48/48/25 MiB at the floor is 121 MiB, an eighth of the full bound and
+/// a quarter of a handheld's. The step
 /// — a desktop-class adapter report — buys 64/64/32, 160 MiB, because a tab
 /// on a real driver has the RAM and the window that wants a longer history.
 /// **The wasm ceiling is the wasm step**, as it is for every other field of

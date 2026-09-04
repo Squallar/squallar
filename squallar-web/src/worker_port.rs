@@ -61,6 +61,11 @@ use wasm_bindgen::prelude::*;
 /// Relative on purpose: the site is served from a project-Pages subpath.
 const WORKER_URL: &str = "./worker.js";
 
+/// The prefix of the `name` a rasterization worker is started under, the rest
+/// of which is its linear-memory ceiling in bytes. Held equal to `heap.js`'s
+/// own `WORKER_NAME_PREFIX` by `tests/linear_memory_ceiling.rs`.
+const WORKER_NAME_PREFIX: &str = "squallar-raster:";
+
 /// How long a job will wait for a worker that has just been started, before it
 /// gives up and runs on the page's own thread.
 ///
@@ -138,6 +143,18 @@ fn spawn() {
     // A module worker, because `worker.js` `import`s the wasm-bindgen glue that
     // `--target web` emits. Classic workers cannot.
     options.set_type(web_sys::WorkerType::Module);
+    // **How the worker learns its own linear-memory ceiling.** `worker.js`
+    // constructs its `WebAssembly.Memory` before it can receive a message, and
+    // a `WorkerNavigator` carries neither `matchMedia` nor `maxTouchPoints`, so
+    // a worker left to classify the device for itself would read a handheld on
+    // every desktop. `name` is the one channel that is synchronous, present at
+    // the top of the worker's own script, and costs no URL: a query string
+    // would work too (`sw.js` matches the shell with `ignoreSearch`) at the
+    // price of a second spelling of a precached asset. A respawn re-reads the
+    // cell, so a worker that comes back comes back at the same ceiling.
+    if let Some(bytes) = crate::heap_max::worker_instance() {
+        options.set_name(&format!("{WORKER_NAME_PREFIX}{bytes}"));
+    }
 
     let worker = match web_sys::Worker::new_with_options(WORKER_URL, &options) {
         Ok(worker) => worker,
@@ -259,6 +276,15 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
             // After the token check: a worker of another build is not the one
             // whose heap this page reports.
             note_worker_memory(data);
+            // And its CEILING, which the page chose but the worker is the only
+            // one that knows it got — a refused memory leaves it at the
+            // module's declared bound instead (`heap.js`, `initWithHeap`).
+            if let Some(bytes) = proto::field(data, proto::MEMMAX)
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                crate::heap_max::note_worker_reported(bytes as u64);
+            }
             // The ladder resets **here**, on a worker that has proved itself.
             BACKOFF.with(|backoff| {
                 let mut ladder = backoff.get();

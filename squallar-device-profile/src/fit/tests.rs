@@ -386,9 +386,12 @@ fn the_allowance_is_the_constant_when_presumed_and_three_quarters_when_measured(
             limits.name,
         );
         // The host figure is the bracket's declared ceiling where it has one
-        // — the browser's linear memory — and, unlike the GPU presumption,
-        // the fraction IS applied to it: a wall the module header declares
-        // has no headroom of its own.
+        // — the bound the browser's module is LINKED with — and, unlike the
+        // GPU presumption, the fraction IS applied to it: a wall the module
+        // header declares has no headroom of its own. What a particular
+        // browser instance was actually constructed with may be smaller and
+        // outranks this; that is `DeviceProfile::capacity`'s job and is
+        // pinned by `a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket`.
         assert_eq!(
             cap.host_bytes,
             limits.presumed_host_bytes.map(|bytes| bytes as u64),

@@ -2443,3 +2443,68 @@ fn a_mac_browser_resolves_on_its_own_3d_cap() {
         );
     }
 }
+
+/// **A page that said what its heap was actually built with outranks the
+/// bracket's link-flag presumption**, and only the host figure moves.
+///
+/// `BudgetLimits::WASM.presumed_host_bytes` is the bound the module was LINKED
+/// with. It is not what an instance necessarily got: the page chooses its
+/// `WebAssembly.Memory`'s maximum per device before the module is
+/// instantiated, at or below that bound (`squallar-web/heap.js`), and nothing
+/// can read the choice back off the memory object, so the figure travels as a
+/// value on the profile. A profile nobody told keeps the bracket's
+/// presumption — that is every native arm and every test written before the
+/// plumbing existed — which is the control arm here.
+#[test]
+fn a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket() {
+    let mut silent = DeviceProfile::for_target();
+    silent.platform = Platform::Web;
+    silent.limits = BudgetLimits::WASM;
+    let linked = BudgetLimits::WASM
+        .presumed_host_bytes
+        .expect("the wasm bracket declares a host presumption") as u64;
+    assert_eq!(
+        silent.capacity().host_bytes,
+        Some(linked),
+        "a profile nobody told did not keep the bracket's presumption",
+    );
+
+    // The handheld page's own wall, half the linked bound.
+    let mut handheld = silent;
+    handheld.linear_memory_max_bytes = Some(512 << 20);
+    let capacity = handheld.capacity();
+    assert_eq!(capacity.host_bytes, Some(512 << 20));
+    assert_eq!(
+        capacity.host_allowance(),
+        Some((512 << 20) / 4 * 3),
+        "the allowance follows the instance's wall, not the link flag",
+    );
+    // Nothing but the host figure moved: the linear memory is not the GPU.
+    assert_eq!(capacity.gpu_bytes, silent.capacity().gpu_bytes);
+    assert_eq!(capacity.source, silent.capacity().source);
+
+    // And it is not clamped to the bracket on the way up either: the bracket
+    // is a presumption to be replaced, not a ceiling to be held inside. What
+    // holds a figure at or below the link flag is the engine, which refuses
+    // to instantiate above it -- so a value above the bound cannot reach here
+    // from a browser at all, and inventing a clamp would hide that if one
+    // ever did.
+    let mut generous = silent;
+    generous.linear_memory_max_bytes = Some(linked * 2);
+    assert_eq!(generous.capacity().host_bytes, Some(linked * 2));
+
+    // A measured GPU capacity takes the other arm entirely, where the host
+    // figure is the machine's RAM: nothing about a native heap is declared.
+    let mut native = DeviceProfile::for_target();
+    native.platform = Platform::Native;
+    native.limits = BudgetLimits::DESKTOP;
+    native.class = DeviceClass::Discrete;
+    native.vram_bytes = Some(24 << 30);
+    native.system_ram_bytes = Some(64 << 30);
+    native.linear_memory_max_bytes = Some(512 << 20);
+    assert_eq!(
+        native.capacity().host_bytes,
+        Some(64 << 30),
+        "a measured capacity's host figure was overwritten by a wasm ceiling",
+    );
+}

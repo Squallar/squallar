@@ -120,6 +120,17 @@ pub struct DeviceProfile {
     /// What the platform can say about the shape of the device: a build fact
     /// natively, a pointer-media classification in a browser.
     pub form_factor: Option<FormFactor>,
+    /// **The maximum this instance's wasm linear memory was constructed
+    /// with**, in bytes. `None` natively, and `None` in a browser instance
+    /// nobody told.
+    ///
+    /// Outranks [`BudgetLimits::presumed_host_bytes`] in [`Self::capacity`],
+    /// and that is the whole point of it: the bracket's figure is the bound
+    /// the module was LINKED with, and the instance's is the wall this device
+    /// actually got, which may be smaller. Nothing in [`resolve`] reads it —
+    /// like every other reading here it is spent by `fit`, through
+    /// [`Self::capacity`].
+    pub linear_memory_max_bytes: Option<u64>,
     /// See [`BudgetMemo`]. Wins outright when present.
     pub memo: Option<BudgetMemo>,
 }
@@ -227,7 +238,20 @@ impl DeviceProfile {
                 host_bytes: self.system_ram_bytes,
                 source: CapacitySource::Measured,
             },
-            None => Capacity::presumed(&self.limits),
+            None => {
+                let mut presumed = Capacity::presumed(&self.limits);
+                // **The instance's own wall outranks the bracket's.** The
+                // bracket states what the module was LINKED with; a browser
+                // page chooses its memory's maximum per device below that
+                // bound before the module is instantiated, and it is that
+                // figure the scene has to fit inside. A profile nobody told
+                // keeps the bracket's presumption, which is what every native
+                // arm and every pre-plumbing test does.
+                if let Some(bytes) = self.linear_memory_max_bytes {
+                    presumed.host_bytes = Some(bytes);
+                }
+                presumed
+            }
         }
     }
 }
@@ -249,6 +273,7 @@ impl DeviceProfile {
             declared_ram_bytes: None,
             parallelism: None,
             form_factor: None,
+            linear_memory_max_bytes: None,
             memo: None,
         }
     }
@@ -468,14 +493,21 @@ pub struct BudgetLimits {
     /// holds it within 1.25x of that sum.
     pub tile_host_ceiling_bytes: Bracket,
     /// **What the host memory is presumed to hold where nothing reads it.**
-    /// `Some` only on the wasm32 bracket: the page's linear memory is a
+    /// `Some` only on the wasm32 bracket: the page's linear memory has a
     /// ceiling the module header declares
-    /// ([`constants::WASM_LINEAR_MEMORY_MAX_BYTES`]) — read, never probed, and
-    /// no browser or device moves it — so a browser is the one platform whose
-    /// host capacity is *known* without a reader. A native bracket says
-    /// nothing here; its RAM reaches [`Capacity`] through the profile's own
-    /// `system_ram_bytes` on the measured arm, and on the presumed arm the
-    /// host is unbounded, as it always was.
+    /// ([`constants::WASM_LINEAR_MEMORY_MAX_BYTES`]) — read, never probed — so
+    /// a browser is the one platform whose host capacity is *known* without a
+    /// reader. A native bracket says nothing here; its RAM reaches
+    /// [`Capacity`] through the profile's own `system_ram_bytes` on the
+    /// measured arm, and on the presumed arm the host is unbounded, as it
+    /// always was.
+    ///
+    /// **This is the bound the module was LINKED with, and it is the ceiling
+    /// of the per-device choice rather than the choice itself.** A page picks
+    /// its memory's maximum at or below it before the module is instantiated
+    /// and tells the app what it picked, and
+    /// [`DeviceProfile::linear_memory_max_bytes`] outranks this figure
+    /// wherever one arrived.
     pub presumed_host_bytes: Option<usize>,
 }
 
@@ -587,7 +619,8 @@ impl BudgetLimits {
         tile_parsed_bytes: rungs(constants::WASM_TILE_PARSED_BYTES),
         tile_terrain_bytes: rungs(constants::WASM_TILE_TERRAIN_BYTES),
         tile_host_ceiling_bytes: rungs(constants::WASM_TILE_HOST_CEILING_BYTES),
-        // The page instance's own ceiling, declared by the module header.
+        // The bound the module header declares. A page that told us what its
+        // own memory was built with outranks this — see the field's doc.
         presumed_host_bytes: Some(constants::WASM_LINEAR_MEMORY_MAX_BYTES as usize),
     };
 

@@ -98,6 +98,19 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// absent explicitly as 0 ([`gpu_probe_code`]). `balloon` is 0 whenever no
 /// loop holds more than its base, which is a real zero: nothing was granted.
 ///
+/// **`heap max <page>/<worker>` is the only witness there is** to the ceiling
+/// each wasm instance was actually constructed with. The page picks both per
+/// device before the module is instantiated (`squallar-web/heap.js`), and no
+/// engine implements `WebAssembly.Memory.prototype.type()`, so nothing can
+/// read a maximum back off a memory object: a leg that wants to assert the
+/// page came up at 512 MiB rather than 1024 has this field and nothing else.
+/// Both print 0 natively and on any bridge that reported none, which is an
+/// absence and not a wall of zero. It rides at the END, after `page heap
+/// acts`, for that field's own reason: `drive.py`'s `budget_state_re` and
+/// `native_row.py`'s copy of it read this line by positional groups and are
+/// unanchored at their end, so a trailing field is the only safe place to add
+/// one.
+///
 /// A free function returning a `String` for the reason every other telemetry
 /// sentence in this tree is one: `.github/browser-rig/drive.py` scrapes it
 /// with a regex in another language in another directory, and
@@ -132,7 +145,7 @@ pub(crate) fn budget_state_line(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
-         page heap acts {} at {} MiB",
+         page heap acts {} at {} MiB, heap max {}/{} MiB",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -149,6 +162,8 @@ pub(crate) fn budget_state_line(
         mib(balloon_bytes as u64),
         page_heap.acts(),
         mib(page_heap.last_acted_at().unwrap_or(0)),
+        mib(linear.map_or(0, |l| l.page_max_bytes)),
+        mib(linear.map_or(0, |l| l.worker_max_bytes)),
     )
 }
 
@@ -358,6 +373,7 @@ mod tests {
             declared_ram_bytes: Some(8 << 30),
             parallelism: Some(32),
             form_factor: Some(FormFactor::Desktop),
+            linear_memory_max_bytes: None,
             memo: Some(BudgetMemo {
                 loop_pool_bytes: None,
                 steps_back: 3,
@@ -375,7 +391,9 @@ mod tests {
         assert_eq!(budgets.steps_back, 3);
         let linear = Some(LinearMemory {
             page_bytes: 300 << 20,
+            page_max_bytes: 900 << 20,
             worker_bytes: Some(700 << 20),
+            worker_max_bytes: 1100 << 20,
         });
         (budgets, profile, linear)
     }
@@ -395,7 +413,7 @@ mod tests {
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
-             balloon 7 MiB, page heap acts 0 at 0 MiB",
+             balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
@@ -414,8 +432,10 @@ mod tests {
         // And the balloon follows what it is handed: a scene holding every
         // base and nothing more reads a real 0, last on the line.
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE, WATCH)
-                .ends_with(", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB"),
+            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE, WATCH).ends_with(
+                ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
+                 heap max 900/1100 MiB"
+            ),
         );
         // And the capacity follows what it is handed: this profile's own
         // measured 24 GiB reads `24576 1`, a session presumption lowered to
@@ -431,7 +451,10 @@ mod tests {
                 GpuProbeReport::Absent,
                 WATCH,
             )
-            .ends_with(", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB"),
+            .ends_with(
+                ", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
+                 heap max 900/1100 MiB"
+            ),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
         assert!(
@@ -445,7 +468,10 @@ mod tests {
                 GpuProbeReport::Skipped,
                 WATCH,
             )
-            .ends_with(", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB"),
+            .ends_with(
+                ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
+                 heap max 900/1100 MiB"
+            ),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
         assert_eq!(capacity_source_code(CapacitySource::Measured), 1);
@@ -515,12 +541,13 @@ mod tests {
         assert_eq!(
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
-             cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB",
+             cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
+             heap max 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            14,
-            "fifteen comma-separated groups, fourteen separators: a field was dropped or \
+            15,
+            "sixteen comma-separated groups, fifteen separators: a field was dropped or \
              gained",
         );
     }
@@ -538,9 +565,13 @@ mod tests {
     ///
     /// A **prefix**, not an equality, and the difference is deliberate. The
     /// rig's `budget_state_re` is unanchored at its end, so the line may
-    /// carry fields after `balloon` that the scraper does not read - today
-    /// the page heap's act count, which exists precisely because it must
-    /// survive on a line the rig already parses. What the seam still holds
+    /// carry fields after `balloon` that the scraper does not read - the page
+    /// heap's act count, which exists precisely because it must survive on a
+    /// line the rig already parses, and now the two per-instance heap
+    /// ceilings, which are the only witness there is to a maximum no engine
+    /// will report. Both were appended rather than inserted, and the
+    /// assertion below moved to match rather than the line being reshaped to
+    /// keep it. What the seam still holds
     /// is everything that matters: every one of the sixteen groups the rig
     /// DOES read, in order, spelled the way it expects, with the tail pinned
     /// separately so it cannot drift unnoticed either.
@@ -558,7 +589,7 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB",
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB",
             "the tail the rig does not read drifted",
         );
     }
@@ -609,7 +640,7 @@ mod tests {
         let budgets = resolve(&profile);
         let never = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, WATCH);
         assert!(
-            never.ends_with(", page heap acts 0 at 0 MiB"),
+            never.ends_with(", page heap acts 0 at 0 MiB, heap max 0/0 MiB"),
             "a watch that never acted must still print its zero: {never}",
         );
 
@@ -617,13 +648,17 @@ mod tests {
         // reading the `huge` legs sat at while every pressure line of theirs
         // was already out of every window.
         let mut watch = crate::pressure::LinearMemoryWatch::default();
+        // The wall a desktop-classified browser is given, which is the bound
+        // the module is linked with. A handheld's page is judged against 512
+        // MiB and its worker against 256, which is exactly why the line now
+        // ends by printing both walls.
         let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
         let _ = watch.observe(900 << 20, max, 0);
         let _ = watch.observe(1011 << 20, max, 0);
         assert_eq!(watch.acts(), 2);
         let acted = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, watch);
         assert!(
-            acted.ends_with(", page heap acts 2 at 1011 MiB"),
+            acted.ends_with(", page heap acts 2 at 1011 MiB, heap max 0/0 MiB"),
             "the act count and the mark are not both on the line: {acted}",
         );
 
