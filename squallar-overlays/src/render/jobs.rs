@@ -568,20 +568,41 @@ impl JobSpec for GriddedJob {
     /// thread, which is the entire point.
     fn resident_payload(
         input: &GriddedInput,
-        _ctx: &squallar_source::job::EncodeCtx,
+        ctx: &squallar_source::job::EncodeCtx,
     ) -> Option<squallar_source::job::ResidentBytes> {
         use squallar_source::job::ResidentBytes;
+        // Only the ROWS the window spans, not the whole grid. A row is `ni`
+        // values wide and rows sit end to end, so rows `j0..j1` are one
+        // unbroken run at `values[j0 * ni .. j1 * ni]` — lendable as a single
+        // view exactly as the whole grid was, and on a zoomed pane a small
+        // fraction of it. The columns are still cut at the far end, and the
+        // head still names the window, so nothing about the far end changes
+        // except where row `j0` starts.
+        let (ni, _) = input.shape();
+        let win = input.window_for(
+            &ctx.geometry.bounds,
+            ctx.geometry.width,
+            ctx.geometry.height,
+        );
+        let start = win.j0.saturating_mul(ni).saturating_mul(4);
+        let len = win
+            .j1
+            .saturating_sub(win.j0)
+            .saturating_mul(ni)
+            .saturating_mul(4);
         match input {
-            GriddedInput::Whole(grid) => {
-                Some(ResidentBytes::of(std::sync::Arc::clone(grid), |g| {
-                    bytemuck::cast_slice(&g.values)
-                }))
-            }
-            GriddedInput::Resident(grid) => {
-                Some(ResidentBytes::of(std::sync::Arc::clone(grid), |g| {
-                    bytemuck::cast_slice(&g.values)
-                }))
-            }
+            GriddedInput::Whole(grid) => Some(ResidentBytes::of_range(
+                std::sync::Arc::clone(grid),
+                |g| bytemuck::cast_slice(&g.values),
+                start,
+                len,
+            )),
+            GriddedInput::Resident(grid) => Some(ResidentBytes::of_range(
+                std::sync::Arc::clone(grid),
+                |g| bytemuck::cast_slice(&g.values),
+                start,
+                len,
+            )),
             GriddedInput::Window(_) => None,
         }
     }
@@ -608,7 +629,19 @@ impl JobSpec for GriddedJob {
     ) -> Option<(GriddedInput, JobGeometry)> {
         use crate::render::rasterize::GridWindow;
         let (field, ni, nj, coords, win) = decode_gridded_head(r)?;
-        if payload.len() != ni.checked_mul(nj)?.checked_mul(4)? {
+        let _ = nj;
+        // The payload is the window's ROWS, so its length is a function of the
+        // window the head just named — not of the whole grid. Checked rather
+        // than trusted: a payload of any other length is a different band than
+        // the envelope describes, and cutting columns out of it would
+        // rasterize the wrong values with nothing to say so.
+        if payload.len()
+            != win
+                .j1
+                .checked_sub(win.j0)?
+                .checked_mul(ni)?
+                .checked_mul(4)?
+        {
             return None;
         }
         // Read through `from_le_bytes` rather than casting the slice: the
@@ -618,8 +651,10 @@ impl JobSpec for GriddedJob {
         // is little-endian by the assertion beside `encode_f32s`.
         let mut values = Vec::with_capacity(win.area());
         for j in win.j0..win.j1 {
-            let start = (j * ni + win.i0) * 4;
-            let end = (j * ni + win.i1) * 4;
+            // `j - win.j0`: row `win.j0` is the FIRST row of the payload,
+            // because only the window's band was lent.
+            let start = ((j - win.j0) * ni + win.i0) * 4;
+            let end = ((j - win.j0) * ni + win.i1) * 4;
             values.extend(
                 payload
                     .get(start..end)?
@@ -1363,7 +1398,9 @@ mod tests {
             head.extend_from_slice(&(edge as u32).to_le_bytes());
         }
 
-        let payload: &[u8] = bytemuck::cast_slice(&values);
+        // The payload is the window's BAND, rows j0..j1, exactly as
+        // `resident_payload` now lends it — not the whole grid.
+        let payload: &[u8] = bytemuck::cast_slice(&values[j0 * ni..j1 * ni]);
         let geo = JobGeometry {
             width: 8,
             height: 8,

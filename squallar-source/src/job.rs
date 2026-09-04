@@ -148,6 +148,26 @@ struct Projected<T: std::any::Any + Send + Sync> {
     project: fn(&T) -> &[u8],
 }
 
+/// A contiguous sub-run of another region, holding the same owner.
+struct Ranged<T: std::any::Any + Send + Sync> {
+    inner: Projected<T>,
+    start: usize,
+    len: usize,
+}
+
+impl<T: std::any::Any + Send + Sync> ResidentSlice for Ranged<T> {
+    fn bytes(&self) -> &[u8] {
+        let whole = self.inner.bytes();
+        let start = self.start.min(whole.len());
+        let end = start.saturating_add(self.len).min(whole.len());
+        &whole[start..end]
+    }
+
+    fn owner(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self.inner.owner()
+    }
+}
+
 impl<T: std::any::Any + Send + Sync> ResidentSlice for Projected<T> {
     fn bytes(&self) -> &[u8] {
         (self.project)(&self.owner)
@@ -166,6 +186,30 @@ impl ResidentBytes {
     ) -> Self {
         Self {
             inner: std::sync::Arc::new(Projected { owner, project }),
+        }
+    }
+
+    /// Hold `owner` alive and describe only `bytes[start..start + len]` of what
+    /// `project` picks out of it.
+    ///
+    /// For a payload that is a CONTIGUOUS RUN inside a larger allocation — a
+    /// band of whole grid rows inside a whole grid — so the peer is handed the
+    /// rows it asked for rather than the rows that happen to share the buffer.
+    /// A range past the end clamps to the end rather than refusing: the caller
+    /// derived it from a shape the far end re-checks against the head anyway,
+    /// and a panic here would be on the dispatch path.
+    pub fn of_range<T: std::any::Any + Send + Sync>(
+        owner: std::sync::Arc<T>,
+        project: fn(&T) -> &[u8],
+        start: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(Ranged {
+                inner: Projected { owner, project },
+                start,
+                len,
+            }),
         }
     }
 
