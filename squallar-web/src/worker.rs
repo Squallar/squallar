@@ -156,13 +156,20 @@ fn spawn_tile_lane(
 /// three; these calls are the no-ops they are documented to be on a second
 /// call, kept so the lane is correct on a build where the order ever changes.
 ///
-/// The allocation hook is here for that reason and no other. This is a third
-/// wasm entry point but **not** a third heap: the lane is initialised on the
+/// The allocation hook is here for two reasons. This is a third wasm entry
+/// point but **not** a third heap: the lane is initialised on the
 /// rasterization worker's own memory, so a refusal reaching it is a refusal
 /// of the same linear memory the worker's hook already names, and
 /// `set_alloc_error_hook` is a pointer store either way. What the call buys
-/// is that the lane cannot be the entry that runs first with no hook set --
-/// the same thing the two lines above buy, by the same argument.
+/// first is that the lane cannot be the entry that runs first with no hook
+/// set -- the same thing the two lines above buy, by the same argument. What
+/// it buys second is the only fact about this entry point that its memory
+/// cannot already state: `crate::alloc_failure::hook::install` reads
+/// `Instance::TileLane` as "this THREAD is the lane's" and marks a
+/// thread-local, leaving the memory's own name where the worker put it. A
+/// wasm static is per memory, so storing the lane's name there instead --
+/// which is what this line used to do -- renamed every refusal on that heap,
+/// the worker's own thread and its whole rayon pool included.
 #[wasm_bindgen]
 pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
