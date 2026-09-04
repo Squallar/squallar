@@ -2770,6 +2770,21 @@ var tile_cache_re = /tile cache \(([a-z0-9-]+)\): (\d+) asks, (\d+) restyle asks
 // `incomplete` tracking `paints` is a completeness latch stuck open rather
 // than a key that is moving. Running totals, so the LAST match wins.
 var floor_re = /floor strips: (\d+) paints, (\d+) mirror renders, (\d+) key moves, (\d+) on a stable key, (\d+) incomplete/;
+// A SEVENTH, and the one that makes the two `tile phase` families readable
+// at all. `tile phase (parse)` and `(style)` are TAKE families, and a take
+// family with no samples is not printed -- so once the pump offloads, those
+// lines fall towards n=0 and then go silent, and a reader cannot tell work
+// that left the frame thread from a line that was never collected. This
+// counts one vector tile body DISPOSED OF, split by where it was paid for
+// (`squallar_app::app_render::tile_disposition_line`), and the app emits it
+// UNCONDITIONALLY for exactly that reason: a count has nothing to diff
+// against and no reason to go quiet, so `0 offloaded, 0 inline` is a reading.
+//
+// It is the denominator the two `tile phase` lines should be read against and
+// is never added to either of them, nor to any figure above: those are
+// microseconds on the frame thread, this is bodies. Running totals, so the
+// LAST match wins, as for `basemap` and `floor`.
+var tile_bodies_re = /tile bodies: (\d+) offloaded, (\d+) decoded on the frame thread/;
 // THE SKEW READING, and it is what makes a red on the three lines above
 // mean anything at all. Each strict pattern above names a FIELD LIST, and
 // that list is a property of the BUNDLE BEING DRIVEN rather than of this
@@ -2798,6 +2813,7 @@ var rasters = null, uploads = null, basemap = null, ground = null, floor = null;
 // The settle assertion's history: every match, page-stamped, so a window can
 // be differenced. `tile_cache` is the headline reading, last match PER ROLE.
 var tile_cache = null, tile_cache_all = [], ground_all = [], basemap_all = [];
+var tile_bodies = null;
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
   if (m.indexOf("rasterization worker attached") !== -1) attached.push(C[i].t);
@@ -2902,6 +2918,9 @@ for (var i = 0; i < C.length; i++) {
     tile_cache[tcm[1]] = tc;
     tile_cache_all.push(tc);
   }
+  var tbm = tile_bodies_re.exec(m);
+  if (tbm) tile_bodies = { offloaded: parseInt(tbm[1], 10),
+                           inline: parseInt(tbm[2], 10) };
   var fm = floor_re.exec(m);
   if (fm) floor = { paints: parseInt(fm[1], 10),
                     mirror_renders: parseInt(fm[2], 10),
@@ -2914,6 +2933,7 @@ return { attached: attached, different: different, off_frame: off_frame,
          transport: transport, rasters: rasters, uploads: uploads,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
+         tile_bodies: tile_bodies,
          ground_all: ground_all, basemap_all: basemap_all,
          rasters_unparsed: rasters_unparsed,
          uploads_unparsed: uploads_unparsed,
@@ -6328,6 +6348,20 @@ def run_smoke(args):
         # supposed to move. Reported per browser and never pooled across them:
         # Chromium runs SwiftShader here and Firefox runs Xvfb/llvmpipe, and a
         # median over both would describe neither.
+        #
+        # **An empty `by_kind` NEVER means no job crossed.** This family is the
+        # only one here read from PER-EVENT lines, and `__rig_console` is a
+        # 1200-entry ring the app's per-frame telemetry evicts: the eviction
+        # rate follows the LOG rate, which is why an absent family looks
+        # browser-correlated when it is an instrument artifact. It is the same
+        # mechanism that made `loops_completed` a function of log rate until
+        # the markers moved to `__rig_marks`.
+        #
+        # So the row says which. `transport: <n> replies` is the page's own
+        # RUNNING TOTAL from `worker_port::account` -- re-said, never evicted --
+        # so replies with no samples is proof of eviction rather than a guess
+        # at it, and `why_empty` is written from the two readings rather than
+        # left to the reader.
         _sig = session.execute(WORKER_SIGNAL_PROBE) or {}
         _kinds = {}
         for _k, _vals in (_sig.get("off_frame_by_kind") or {}).items():
@@ -6336,14 +6370,40 @@ def run_smoke(args):
                 continue
             _kinds[_k] = {"n": len(_ms), "samples": _ms, "min": _ms[0],
                           "median": _ms[len(_ms) // 2], "max": _ms[-1]}
+        _replies = ((_sig.get("transport") or {}).get("replies"))
+        _why_empty = None
+        if not _kinds:
+            if _replies:
+                _why_empty = (
+                    "not seen, NOT zero: %d job replies crossed the wire by the "
+                    "page's own running total, so the per-event lines this "
+                    "family is read from were evicted from the 1200-entry "
+                    "console ring (%d entries logged)"
+                    % (_replies, _sig.get("console_total") or 0))
+            elif _replies == 0:
+                _why_empty = (
+                    "no job reply crossed the wire at all (transport reports 0 "
+                    "replies), so there was nothing for this family to say")
+            else:
+                _why_empty = (
+                    "not seen, and the transport running total was not seen "
+                    "either, so nothing here can say whether a job crossed")
         result["rasterization_ms"] = {
             "by_kind": _kinds,
             "rayon_threads": (max(_sig.get("rayon_threads") or [0]) or None),
+            # Read from a per-event line in an evicting ring. `{}` is "not
+            # seen in the surviving window", never "did not happen".
+            "evictable": True,
+            "console_total": _sig.get("console_total"),
+            "console_ring_entries": 1200,
+            "transport_replies": _replies,
+            "why_empty": _why_empty,
         }
         stage("rasterization",
               rayon_threads=result["rasterization_ms"]["rayon_threads"],
-              **{k: "n=%d med=%d" % (v["n"], v["median"])
-                 for k, v in _kinds.items()})
+              **({k: "n=%d med=%d" % (v["n"], v["median"])
+                  for k, v in _kinds.items()}
+                 or {"by_kind": _why_empty}))
 
         # What the worker wire actually moved and what it actually copied, in
         # bytes, as the page's own running totals (worker_port::account).
@@ -6399,6 +6459,16 @@ def run_smoke(args):
         result["floor_strip_totals"] = _sig.get("floor")
         if result["floor_strip_totals"]:
             stage("floor-strips", **result["floor_strip_totals"])
+
+        # Where this page's vector tile bodies were paid for. `null` says the
+        # line was never seen, which on this line means a binary older than it
+        # -- the app emits it unconditionally, so a running page that decoded
+        # nothing says `0 offloaded, 0 inline` rather than going quiet. It is
+        # the denominator the `phase:parse` / `phase:style` families are read
+        # against and is never added to them.
+        result["tile_body_totals"] = _sig.get("tile_bodies")
+        if result["tile_body_totals"]:
+            stage("tile-bodies", **result["tile_body_totals"])
         # The skew reading beside the totals, and it is what keeps the `-` in
         # the summary honest. A null total is TWO different facts — "the app
         # never wrote the line" and "the app wrote a line this rig cannot

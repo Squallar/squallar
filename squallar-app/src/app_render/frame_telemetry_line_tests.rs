@@ -1120,6 +1120,50 @@ fn a_windowable_line_that_drifted_by_one_space_is_not_accepted() {
     );
 }
 
+/// The `tile bodies:` sentence, pinned at both ends.
+///
+/// It is the line the two `tile phase` families cannot do without. Those are
+/// take families, and a take family with no samples is not printed — so once
+/// the pump offloads they fall towards `n = 0` and then go quiet, and a
+/// reader cannot tell work that left the frame thread from a line nobody
+/// collected. This is emitted unconditionally for that reason, so `0
+/// offloaded, 0 decoded on the frame thread` is a reading.
+///
+/// Both halves of the rig went without it: `drive.py` scraped `tile phase`
+/// alone, which is precisely the family that goes silent, so the measurement
+/// an offload change needs was unparsed on the web and absent from every
+/// native row.
+#[test]
+fn the_tile_bodies_line_reads_exactly_as_pinned() {
+    use squallar_egui::tile_source::take_ledger::Disposition;
+
+    assert_eq!(
+        super::tile_disposition_line(&Disposition {
+            offloaded: 41,
+            inline: 7,
+        }),
+        "tile bodies: 41 offloaded, 7 decoded on the frame thread",
+    );
+    assert_eq!(
+        super::tile_disposition_line(&Disposition {
+            offloaded: 41,
+            inline: 7,
+        }),
+        rendered(&pattern("tile_bodies_re"), &["41", "7"]),
+        "the `tile bodies:` line and the rig's probe have drifted",
+    );
+    // The all-zero reading is a SENTENCE, not a silence: it is the whole
+    // reason this line is emitted unconditionally where the phase families
+    // are not.
+    assert_eq!(
+        super::tile_disposition_line(&Disposition {
+            offloaded: 0,
+            inline: 0,
+        }),
+        "tile bodies: 0 offloaded, 0 decoded on the frame thread",
+    );
+}
+
 /// The `tile phase (…)` sentence, pinned at both ends, and the identity that
 /// keeps it a decomposition rather than a sixth take family.
 ///

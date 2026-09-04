@@ -183,6 +183,7 @@ PROBE_NAMES = (
     "loop_state_re",
     "budget_state_re",
     "tile_cache_re",
+    "tile_bodies_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -555,6 +556,7 @@ def scrape(lines, probes):
         "loop_state": [],
         "budget_state": [],
         "tile_cache": [],
+        "tile_bodies": [],
         "overlay_pictures": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
@@ -597,6 +599,7 @@ def scrape(lines, probes):
             ("basemap", "basemap_re"),
             ("ground", "ground_re"),
             ("floor", "floor_re"),
+            ("tile_bodies", "tile_bodies_re"),
             ("loop_state", "loop_state_re"),
         ):
             m = probes[probe].search(line)
@@ -1566,6 +1569,33 @@ def build_row(args, scraped, probes):
     if quiet != "yes":
         invalid.append("not quiet: %s" % qv["why"])
 
+    # Where this leg's vector tile bodies were paid for, as a WINDOWED
+    # difference over the bracket like every other running total here. It is
+    # the denominator the `phase:parse` / `phase:style` families are read
+    # against and is never added to them -- those are microseconds on the
+    # frame thread, this is bodies. None when the log has no `tile bodies:`
+    # line, which on this line means a binary older than it: the app emits it
+    # unconditionally, so a leg that decoded nothing says `0 offloaded,
+    # 0 inline` rather than going quiet. That asymmetry is the whole reason
+    # the line exists -- the two phase families DO go quiet when the work
+    # leaves the frame thread, which is exactly when a reader most needs to
+    # know whether it left or never happened.
+    #
+    # MEASURED 2026-09-04, and the row is printing it rather than vouching for
+    # it: on every native leg replayed (rd-wo28-legs/fixed-c/C.main.r1 among
+    # them) this line reads `0 offloaded, 0 decoded on the frame thread` while
+    # the SAME log says `tile phase (parse): n=155`, `tile phase (style):
+    # n=155`, `tile take (put): n=155` and `basemap tiles: 155 vector`. 155
+    # bodies were parsed and styled on the frame thread and the disposition
+    # counters saw none of them. So a `0, 0` reading here is currently NOT
+    # evidence that no body was decoded, and must not be quoted as one; the
+    # counters and the phase families disagree, and that is a defect in the
+    # ledger, not in this arm. Scraping the line is what makes the
+    # disagreement visible on every row instead of nowhere at all.
+    tb = diff_totals(scraped["tile_bodies"], start_idx, end_idx)
+    tile_bodies = (None if tb is None
+                   else {"offloaded": tb[0], "inline": tb[1]})
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -1647,6 +1677,7 @@ def build_row(args, scraped, probes):
         "liveness": live,
         "surface": surf,
         "loop_state": (scraped["loop_state"][-1][1] if scraped["loop_state"] else None),
+        "tile_bodies": tile_bodies,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -1862,6 +1893,27 @@ def print_row(row):
         print(
             "ROW   budget: n/a (no `budget state:` line in this log -- a binary "
             "older than the line, not a zero reading)"
+        )
+    # Where the vector tile bodies were paid for, over the same bracket. The
+    # `phase:parse` / `phase:style` families above go SILENT once the work
+    # leaves the frame thread -- a take family with no samples is not printed
+    # -- so this count is what tells a silent phase family from a phase that
+    # never ran. Never added to those families: they are microseconds, this is
+    # bodies. Absent when the log has no line, which means a binary older than
+    # it and never a leg that decoded nothing.
+    tb = row.get("tile_bodies")
+    if tb is None:
+        print(
+            "ROW   tile bodies: n/a (no `tile bodies:` line in this log -- a "
+            "binary older than the line. The app emits it unconditionally, so "
+            "this is never a leg that decoded nothing)"
+        )
+    else:
+        print(
+            "ROW   tile bodies: %s offloaded, %s decoded on the frame thread "
+            "[over the bracket; the denominator the tile phase families are "
+            "read against, never added to them]"
+            % (tb["offloaded"], tb["inline"])
         )
     # Events AT the tile cache, per role: what `ground tiles:`' GPU-store
     # uploads and evictions cannot classify. `refetch` is a subset of `asks`;
@@ -3549,6 +3601,100 @@ class RowScaleTests(unittest.TestCase):
         self.assertTrue(
             any("more than one window scale factor" in n for n in row["notes"]),
             row["notes"])
+
+
+class TileBodiesTests(unittest.TestCase):
+    """The count that tells a silent phase family from a phase that never ran.
+
+    `tile phase (parse)` and `(style)` are take families, and a take family
+    with no samples is not printed. Once the pump offloads they fall to n=0
+    and then go quiet -- the exact moment a reader needs to know whether the
+    work left the frame thread or never happened. Nothing scraped this line
+    on either half of the rig.
+    """
+
+    LINE = "[..] INFO tile bodies: %d offloaded, %d decoded on the frame thread"
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_probe_is_drive_pys_own(self):
+        """Read out of drive.py at run time, never restated here, so the two
+        halves of the rig cannot come to read different lines."""
+        self.assertEqual(
+            drive_pattern("tile_bodies_re"),
+            r"tile bodies: (\d+) offloaded, (\d+) decoded on the frame thread")
+
+    def test_the_line_scrapes_with_every_group_mandatory(self):
+        m = self.probes["tile_bodies_re"].search(self.LINE % (41, 7))
+        self.assertIsNotNone(m)
+        self.assertEqual([int(g) for g in m.groups()], [41, 7])
+        self.assertIsNone(
+            self.probes["tile_bodies_re"].search("[..] INFO tile bodies: 41 offloaded"))
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_row_windows_the_running_total_over_the_bracket(self):
+        """A running total, differenced across the bracket like every other
+        one here -- not the last level, which would carry the whole process."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        seen = 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self.LINE % (10 * seen, seen))
+        row, text = self._row(out)
+        self.assertIsNotNone(row["tile_bodies"])
+        self.assertGreater(row["tile_bodies"]["offloaded"], 0)
+        self.assertIn("ROW   tile bodies: ", text)
+        self.assertIn("offloaded", text)
+
+    def test_a_binary_older_than_the_line_says_so_rather_than_zero(self):
+        """None, and the row says which. The app emits this line
+        unconditionally, so an absent line is never a leg that decoded
+        nothing -- and printing `0 offloaded` for it would be the exact
+        reading the line was added to make impossible."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["tile_bodies"])
+        self.assertIn("ROW   tile bodies: n/a", text)
+        self.assertIn("binary older than the line", text)
+        self.assertNotIn("ROW   tile bodies: 0 offloaded", text)
+
+
+class OffFrameEvictionTests(unittest.TestCase):
+    """`rasterization_ms.by_kind == {}` must never read as zero.
+
+    It is the only family the web half reads from PER-EVENT lines, and
+    `__rig_console` is a 1200-entry ring the app's per-frame telemetry evicts.
+    The eviction rate follows the LOG rate, which is why an empty family looks
+    browser-correlated when it is an instrument artifact.
+    """
+
+    def test_drive_py_cross_checks_an_empty_family_against_the_running_total(self):
+        text = _read(DRIVE_PY)
+        self.assertIn('"why_empty": _why_empty,', text,
+                      "drive.py no longer records WHY the off-frame family was "
+                      "empty, so `{}` reads as zero again")
+        self.assertIn('_replies = ((_sig.get("transport") or {}).get("replies"))', text,
+                      "drive.py no longer cross-checks the evictable per-event "
+                      "family against `transport:`, the page's own running "
+                      "total -- which is the only reading that can tell "
+                      "eviction from absence")
+        self.assertIn("not seen, NOT zero", text)
+        self.assertIn('"evictable": True,', text)
 
 
 class GateSetTests(unittest.TestCase):
