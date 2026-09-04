@@ -614,3 +614,71 @@ fn the_profile_update_folds_the_bridges_reading_through_the_tested_seam() {
         "`update_device_profile` no longer fits the scene through the checked seam",
     );
 }
+
+/// **The modulation term leaves `capacity()` bit-identical on every source
+/// arm while nothing produces one, and can only lower it when something
+/// does.** Three arms, built the way the tests above build them: the
+/// presumption (a headless desktop app), a measured 24 GiB on a discrete
+/// class, and the browser probe's 4032 MiB. On each, the default term is the
+/// identity against the two-term chain it was appended to; a term that names
+/// a ceiling above the figure changes nothing; one below it lowers both pools
+/// and keeps the source; and a term on the host pool of a capacity with no
+/// host figure invents none.
+#[test]
+fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
+    use squallar_device_profile::scene::Modulation;
+
+    let presumed = headless(TestBridge::desktop());
+
+    let reading = (24u64 << 30, GpuCapacitySource::Measured);
+    let mut measured = headless(TestBridge::desktop().with_gpu_capacity(reading.0, reading.1));
+    measured.device_profile.class = DeviceClass::Discrete;
+    measured.adopt_gpu_capacity(Some(reading));
+    assert_eq!(measured.capacity().source, CapacitySource::Measured);
+
+    let mut probed = web_app(TestBridge::web());
+    probed.adopt_probed_capacity(a_probe_of(4032 << 20), wgpu::Backend::BrowserWebGpu);
+    assert_eq!(probed.capacity().source, CapacitySource::Probed);
+
+    for mut app in [presumed, measured, probed] {
+        assert_eq!(
+            app.capacity_modulation,
+            Modulation::NONE,
+            "nothing produces one yet"
+        );
+        let two_terms = capacity_with_probe(&app.device_profile, app.gpu_probe.bytes())
+            .held_to(app.session_capacity)
+            .host_held_to(app.session_host_capacity);
+        let three_terms = app.capacity();
+        assert_eq!(
+            three_terms, two_terms,
+            "the default term moved the capacity on the {:?} arm",
+            two_terms.source
+        );
+
+        app.capacity_modulation = Modulation {
+            gpu_ceiling: Some(u64::MAX),
+            host_ceiling: Some(u64::MAX),
+        };
+        assert_eq!(
+            app.capacity(),
+            two_terms,
+            "a ceiling above the figure raised the {:?} arm",
+            two_terms.source
+        );
+
+        app.capacity_modulation = Modulation {
+            gpu_ceiling: Some(two_terms.gpu_bytes / 2),
+            host_ceiling: Some(1 << 20),
+        };
+        let lowered = app.capacity();
+        assert_eq!(lowered.gpu_bytes, two_terms.gpu_bytes / 2);
+        assert_eq!(
+            lowered.host_bytes,
+            two_terms.host_bytes.map(|_| 1 << 20),
+            "a host ceiling holds a host figure down and invents none where there is none"
+        );
+        assert_eq!(lowered.source, two_terms.source);
+        assert!(lowered.allowance() < two_terms.allowance());
+    }
+}

@@ -239,6 +239,13 @@ pub struct App {
     /// this one by every other cause: the two heaps are two walls. Discarded
     /// at exit.
     session_host_capacity: Option<u64>,
+    /// **The third clamp term** on [`Self::capacity`], beside the two
+    /// presumptions above: a ceiling per pool that can be re-derived and can
+    /// LIFT, where a presumption is latched for the session. Nothing produces
+    /// one yet — it is `Modulation::NONE`, the identity, for the life of the
+    /// process — and when the dwell-based recovery lands it writes here and
+    /// nowhere else, so the chain it feeds is already the one every fit reads.
+    capacity_modulation: squallar_device_profile::scene::Modulation,
     /// **Whether the tile economies have been squeezed to zero** by a
     /// page-heap event this session: the styled, parsed and terrain
     /// allowances the loop walk hands the tile caches are held at nothing
@@ -766,6 +773,7 @@ impl App {
             ),
             session_capacity: None,
             session_host_capacity: None,
+            capacity_modulation: squallar_device_profile::scene::Modulation::NONE,
             tile_economy_squeezed: false,
             host_headroom_bytes: 0,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
@@ -1280,11 +1288,14 @@ impl App {
     /// bracket's whole-application constant otherwise
     /// (`DeviceProfile::capacity`) — or the browser probe's figure where the
     /// profile has only a presumption to offer ([`capacity_with_probe`]),
-    /// held to whatever pressure has taught this session.
+    /// held to whatever pressure has taught this session, and under whatever
+    /// modulation is in force ([`Self::capacity_modulation`] — none today).
+    /// Three terms, each of which can only lower the one before it.
     pub(super) fn capacity(&self) -> squallar_device_profile::scene::Capacity {
         capacity_with_probe(&self.device_profile, self.gpu_probe.bytes())
             .held_to(self.session_capacity)
             .host_held_to(self.session_host_capacity)
+            .modulated_by(self.capacity_modulation)
     }
 
     /// Make `budgets` the budgets in force, and re-derive what hangs off them.

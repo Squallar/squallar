@@ -797,6 +797,72 @@ fn holding_a_capacity_to_a_session_only_lowers_it() {
     );
 }
 
+/// **A modulation is the identity when it names nothing, and can only lower
+/// when it does** — on both pools, on every source arm, with the source and
+/// an absent host figure both left as they were. The third clamp term has to
+/// be a no-op today (nothing produces one yet) and unable to promise more
+/// than the hardware tomorrow.
+#[test]
+fn a_modulation_names_nothing_or_lowers_and_never_raises() {
+    use crate::scene::Modulation;
+
+    let arms = [
+        Capacity::presumed(&BudgetLimits::DESKTOP),
+        Capacity::presumed(&BudgetLimits::WASM),
+        Capacity::measured(24 << 30, Some(64 << 30)),
+        Capacity::measured(4 << 30, None),
+        Capacity::probed(4032 << 20),
+    ];
+    for cap in arms {
+        assert_eq!(cap.modulated_by(Modulation::NONE), cap, "{cap:?}");
+        assert_eq!(cap.modulated_by(Modulation::default()), cap, "{cap:?}");
+        assert_eq!(
+            cap.modulated_by(Modulation {
+                gpu_ceiling: Some(u64::MAX),
+                host_ceiling: Some(u64::MAX),
+            }),
+            cap,
+            "a ceiling above the figure raised it: {cap:?}"
+        );
+
+        let halved = Modulation {
+            gpu_ceiling: Some(cap.gpu_bytes / 2),
+            host_ceiling: cap.host_bytes.map(|host| host / 2),
+        };
+        let lowered = cap.modulated_by(halved);
+        assert_eq!(lowered.gpu_bytes, cap.gpu_bytes / 2, "{cap:?}");
+        assert_eq!(
+            lowered.host_bytes,
+            cap.host_bytes.map(|host| host / 2),
+            "{cap:?}"
+        );
+        assert_eq!(
+            lowered.source, cap.source,
+            "lowering does not change how the figure was learned: {cap:?}"
+        );
+        assert!(
+            lowered.allowance() <= cap.allowance(),
+            "the allowance rose under a lower ceiling: {cap:?}"
+        );
+
+        // A host ceiling on a capacity with no host figure has nothing to
+        // hold down, and must not invent one.
+        let none = Capacity {
+            host_bytes: None,
+            ..cap
+        };
+        assert_eq!(
+            none.modulated_by(Modulation {
+                gpu_ceiling: None,
+                host_ceiling: Some(1),
+            })
+            .host_bytes,
+            None,
+            "{cap:?}"
+        );
+    }
+}
+
 /// **`fit` sheds down the ladder only as far as the scene needs.** Six two-hour
 /// loops on the desktop bracket cost 6 x (36 x 16 MiB + 256 MiB) = 4992 MiB
 /// against a 3840 MiB presumption; the first three steps are 3D rungs that take

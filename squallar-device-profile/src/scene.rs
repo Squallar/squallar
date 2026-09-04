@@ -204,6 +204,37 @@ pub enum CapacitySource {
     Presumed,
 }
 
+/// **A ceiling a governor may put under the capacity in force, per pool** —
+/// the third clamp term in the application's `capacity()` chain, beside the
+/// two session presumptions (`held_to`, `host_held_to`).
+///
+/// The seam and not yet its producer: `NONE` (the `Default`) is the identity,
+/// and nothing in the tree writes anything else yet. What will: a dwell-based
+/// step on the GPU axis after an out-of-memory event and a host step on a
+/// platform memory warning, both of which come back UP when their dwell
+/// expires — which is exactly why this is a separate term and not another
+/// `session_capacity`: a presumption is latched down for the session, a
+/// modulation is re-derived and can lift. Whatever produces it, a modulation
+/// can only LOWER — it is `min`'d against the capacity, never substituted for
+/// it — so a producer's bug cannot promise more than the hardware.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modulation {
+    /// The most GPU texture memory the term allows, in bytes; `None` leaves
+    /// the figure in force alone.
+    pub gpu_ceiling: Option<u64>,
+    /// The most host memory the term allows, in bytes; `None` leaves the
+    /// figure in force alone, and a capacity with no host figure keeps none.
+    pub host_ceiling: Option<u64>,
+}
+
+impl Modulation {
+    /// No modulation: the identity on every capacity.
+    pub const NONE: Self = Self {
+        gpu_ceiling: None,
+        host_ceiling: None,
+    };
+}
+
 /// What the device can hold. It only ever limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
@@ -274,6 +305,16 @@ impl Capacity {
                 .map(|own| session_host_bytes.map_or(own, |cap| cap.min(own))),
             ..self
         }
+    }
+
+    /// This capacity under a [`Modulation`]: each pool held to the ceiling the
+    /// term names, the way [`Self::held_to`] and [`Self::host_held_to`] hold
+    /// it to the session's — `min`, never a substitution, so the term can
+    /// only lower and [`Modulation::NONE`] is the identity. The source is
+    /// untouched: a modulated figure was learned the way it was learned.
+    pub fn modulated_by(self, modulation: Modulation) -> Self {
+        self.held_to(modulation.gpu_ceiling)
+            .host_held_to(modulation.host_ceiling)
     }
 
     /// The most host memory the scene's need may occupy here, or `None`
