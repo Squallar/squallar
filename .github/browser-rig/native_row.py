@@ -1592,16 +1592,35 @@ class SubjectField(object):
     kind of pair. `gated_when` names the relation under which a DIFFERENCE is a
     defect rather than the comparison's declared axis. `may_pin` says whether
     this field is allowed to carry the positive verdict on its own.
+
+    `shape` PINS THE SPELLING the value is recorded in, and it is a stronger
+    gate than equality on its own. Equality only asks whether two recorded
+    values agree; a field that quietly changes SHAPE -- a string becoming an
+    object, a version losing its dotted number -- can go on comparing equal, or
+    stop being read at all, while every comparison across the change is
+    invalid. The rig has already had to work around this one level down: an
+    app line keeps `since_boot=N us` as a literal token specifically so that
+    prefix matches survive a change to the rest of the sentence. A shape that
+    no longer holds costs the field its verdict (UNCHECKED, never INVALID --
+    an unfamiliar spelling is not evidence of a defect), so a reshaped field
+    stops reading as agreement.
     """
 
-    __slots__ = ("name", "read", "gated_when", "may_pin", "why")
+    __slots__ = ("name", "read", "gated_when", "may_pin", "shape", "shape_is",
+                 "why")
 
-    def __init__(self, name, read, gated_when, may_pin, why):
+    def __init__(self, name, read, gated_when, may_pin, shape, shape_is, why):
         self.name = name
         self.read = read
         self.gated_when = gated_when
         self.may_pin = may_pin
+        self.shape = shape
+        self.shape_is = shape_is
         self.why = why
+
+    def misshapen(self, value):
+        """Is this a value the table no longer recognises the spelling of?"""
+        return value is not None and not self.shape.search(value)
 
 
 def _clean(value):
@@ -1672,9 +1691,18 @@ def subject_composite(value):
     return len(set(_SHA_TOKEN.findall(value))) > 1
 
 
+# The shapes, pinned. Loose enough that every spelling on disk today passes --
+# `Mozilla Firefox 154.0`, `Chromium 151.0.7922.173 Arch Linux`, the bare
+# `155.0` the w3c session reports -- and tight enough that a value which stops
+# naming a build stops counting as one.
+SHAPE_DOTTED_VERSION = re.compile(r"\d+\.\d+")
+SHAPE_NONEMPTY_LINE = re.compile(r"\S")
+SHAPE_SHA = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{7,40}(?![0-9a-zA-Z])")
+
 SUBJECT_FIELDS = (
     SubjectField(
         "browser_version", _read_browser_version, "same-browser", True,
+        SHAPE_DOTTED_VERSION, "one line carrying a dotted version number",
         "the browser build the leg ran in. It moves WITHOUT anyone asking -- "
         "an installed browser applies a staged update on its next launch -- "
         "so it is checked on every pair of legs that named the same browser. "
@@ -1682,6 +1710,7 @@ SUBJECT_FIELDS = (
     ),
     SubjectField(
         "driver_version", _read_driver_version, None, False,
+        SHAPE_NONEMPTY_LINE, "one non-empty line",
         "the automation driver. REPORTED, NEVER GATED, and never the positive "
         "verdict: geckodriver is versioned independently of Firefox, which is "
         "why `binary.version_match` is None on every Firefox leg and True on "
@@ -1689,6 +1718,7 @@ SUBJECT_FIELDS = (
     ),
     SubjectField(
         "commit", _read_commit, "same-arm", True,
+        SHAPE_SHA, "a 7-40 character hex sha, possibly with a lane suffix",
         "the app build the leg measured. Two runs of the SAME arm on "
         "different commits is the defect; two DIFFERENT arms on different "
         "commits is what an A/B pair is for",
@@ -1730,13 +1760,17 @@ def subject_pin(a, b):
       `moved`        a field differed where a difference is a defect. The
                      comparison is INVALID: whatever delta it prints, the
                      subject changed underneath it.
-      `unrecorded` / `unresolvable`
+      `unrecorded` / `unresolvable` / `misshapen`
                      the rig cannot vouch either way. UNCHECKED, never
-                     INVALID -- and the two are kept apart because they are
+                     INVALID -- and all three are kept apart because they are
                      different findings with different remedies. `unrecorded`
                      is a rig that did not write the field down; `unresolvable`
                      is a field that was written down and names two builds, so
-                     it cannot say which one this row measured.
+                     it cannot say which one this row measured; `misshapen` is
+                     a field recorded in a spelling the table no longer pins,
+                     which is the failure equality alone cannot see -- two
+                     reshaped values go on comparing equal while nothing that
+                     reads the old spelling is reading a version at all.
     """
     relation = subject_relation(a, b)
     fields, invalid, unchecked, pinned_by, declared_by = [], [], [], [], []
@@ -1746,6 +1780,8 @@ def subject_pin(a, b):
         gated = bool(field.gated_when) and relation[field.gated_when]
         if a_val is None or b_val is None:
             state = "unrecorded"
+        elif field.misshapen(a_val) or field.misshapen(b_val):
+            state = "misshapen"
         elif subject_composite(a_val) or subject_composite(b_val):
             state = "unresolvable"
         elif a_val == b_val:
@@ -1769,6 +1805,14 @@ def subject_pin(a, b):
             unchecked.append(
                 "%s names more than one build (a=%r b=%r), so it cannot say "
                 "which build either row measured" % (field.name, a_val, b_val))
+        elif state == "misshapen":
+            unchecked.append(
+                "%s is recorded (a=%r b=%r) in a spelling the table does not "
+                "pin -- it should be %s. A field that changed shape may still "
+                "compare equal while every comparison across the change is "
+                "invalid, so it stops carrying a verdict until the table is "
+                "updated deliberately"
+                % (field.name, a_val, b_val, field.shape_is))
 
     if invalid:
         state = "moved"
@@ -1776,6 +1820,8 @@ def subject_pin(a, b):
         state = "pinned"
     elif declared_by:
         state = "declared"
+    elif any(f["state"] == "misshapen" for f in fields):
+        state = "misshapen"
     elif unchecked:
         state = "unresolvable"
     else:
@@ -1800,6 +1846,7 @@ SUBJECT_BANNER = {
     "moved": "  ** INVALID **",
     "unrecorded": "  ** UNCHECKED: subject not recorded **",
     "unresolvable": "  ** UNCHECKED: subject not resolvable **",
+    "misshapen": "  ** UNCHECKED: subject field changed shape **",
     "pinned": "",
     "declared": "",
 }
@@ -4741,7 +4788,7 @@ class SubjectTests(unittest.TestCase):
                         self._native("59f08766-p1abl"))
         self.assertEqual(v["state"], "pinned")
 
-    def test_the_three_unpinned_verdicts_never_co_fire(self):
+    def test_the_verdicts_never_co_fire(self):
         """One question, one answer -- the shape `surface` already uses."""
         cases = (
             subject_pin(self._browser("Mozilla Firefox 155.0"),
@@ -4750,11 +4797,61 @@ class SubjectTests(unittest.TestCase):
             subject_pin(self._native("a1b2c3d-vs-e4f5a6b", label="x"),
                         self._native("a1b2c3d-vs-e4f5a6b", label="y")),
             subject_pin(self._native("17b9c917"), self._native("17b9c917")),
+            subject_pin(self._browser("nightly"), self._browser("nightly")),
         )
         states = [c["state"] for c in cases]
-        self.assertEqual(states, ["moved", "unrecorded", "unresolvable", "pinned"])
+        self.assertEqual(
+            states,
+            ["moved", "unrecorded", "unresolvable", "pinned", "misshapen"])
         for c in cases:
             self.assertFalse(c["invalid"] and c["unchecked"])
+
+    # ---- the shape pin: equality alone is not enough --------------------
+
+    def test_every_spelling_on_disk_today_passes_its_shape(self):
+        """The shape pin, from the over-fire side FIRST.
+
+        A shape tight enough to reject a real recorded value would turn every
+        honest pair into an UNCHECKED one. These are verbatim from artefacts on
+        disk: `binary.browser_version` for both desktop browsers, the bare
+        `session.browserVersion` the w3c session reports, geckodriver's and
+        chromedriver's `--version` first lines, and four real commits.
+        """
+        by_name = {f.name: f for f in SUBJECT_FIELDS}
+        for value in ("Mozilla Firefox 154.0", "Mozilla Firefox 155.0.1",
+                      "Chromium 151.0.7922.173 Arch Linux", "155.0"):
+            self.assertFalse(by_name["browser_version"].misshapen(value), value)
+        for value in ("geckodriver 0.37.1 (300705c65d1b 2026-07-17 09:25 +0000)",
+                      "ChromeDriver 151.0.7922.173 (a96602f30358e9b5d)"):
+            self.assertFalse(by_name["driver_version"].misshapen(value), value)
+        for value in ("17b9c917", "ed569ae7", "6e936c6a-vs-9fcccaae",
+                      "59f08766-p1abl"):
+            self.assertFalse(by_name["commit"].misshapen(value), value)
+
+    def test_a_field_that_changed_shape_stops_carrying_a_verdict(self):
+        """Equality alone cannot see a reshaping; the shape pin can.
+
+        Two legs recording `{'name': 'Firefox', 'version': '155.0'}` compare
+        EQUAL as strings and would print a clean pin, while nothing downstream
+        that reads the old spelling is reading a version at all. The rig has
+        had to hand-work this one level down already: an app line keeps
+        `since_boot=N us` as a literal token so prefix matches survive a change
+        to the rest of the sentence.
+        """
+        reshaped = "{'name': 'Firefox'}"
+        v = subject_pin(self._browser(reshaped), self._browser(reshaped))
+        self.assertEqual(v["state"], "misshapen")
+        self.assertEqual(v["pinned_by"], [])
+        self.assertFalse(v["invalid"], "an unfamiliar spelling is not a defect")
+        text = _capture(lambda: self.assertEqual(print_subject(v), 0))
+        self.assertIn("** UNCHECKED: subject field changed shape **", text)
+        self.assertIn("dotted version number", text)
+
+    def test_the_shape_pin_says_what_the_shape_is(self):
+        """A caption nobody can act on is a defect; every row names its shape."""
+        for f in SUBJECT_FIELDS:
+            self.assertTrue(f.shape_is, "%s pins a shape it cannot name" % f.name)
+            self.assertTrue(hasattr(f.shape, "search"))
 
     # ---- the table itself ----------------------------------------------
 

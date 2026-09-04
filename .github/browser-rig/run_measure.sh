@@ -875,6 +875,10 @@ import native_row
 panel_reading = panel_hz
 
 legs = []
+# What every leg in this run RAN, for the subject census below. Collected
+# here rather than re-read afterwards, because a leg the loop refused as
+# stale or missing must not enter the census either.
+census_legs = []
 with open(ledger_path) as f:
     for line in f:
         line = line.rstrip("\n")
@@ -909,6 +913,7 @@ for leg in legs:
               "that happened just now."
               % (tag, p, got, want, r.get("started_utc"), r.get("total_s")))
         continue
+    census_legs.append((tag, r))
     env = r.get("env") or {}
     ad = r.get("adapter") or {}
     v = r.get("verdict") or {}
@@ -1223,6 +1228,41 @@ for leg in legs:
         print("ROW   gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)")
     for why in invalid:
         print("ROW   INVALID: %s" % why)
+
+# ---- the run's own subject: did every leg run the SAME browser build? ----
+#
+# The pairwise check (`native_row.py subject A B`) adjudicates a comparison
+# somebody assembled. This one catches the case that has no pair to adjudicate:
+# an installed browser that applies a staged update BETWEEN two legs of one
+# run, leaving that run holding two populations under one heading. The Mac's
+# Firefox moved 155.0 -> 155.0.1 mid-campaign on 2026-09-04.
+#
+# Three states, never co-firing, and the middle one is the point: `pinned` is a
+# build recorded on the legs and equal, `moved` is two builds in one run, and
+# `unrecorded` is a run whose legs never wrote the field down -- which is NOT a
+# pass. An empty census reads as `unrecorded` rather than as agreement.
+print()
+for entry in native_row.subject_census(census_legs):
+    builds = entry["builds"]
+    detail = "; ".join(
+        "%s <- %s" % (build, ",".join(sorted(tags)))
+        for build, tags in sorted(builds.items())
+    )
+    banner = {
+        "moved": "  ** INVALID **",
+        "unrecorded": "  ** UNCHECKED: no leg recorded a browser build **",
+        "pinned": "",
+    }[entry["state"]]
+    print("SUBJECT browser=%s %s: %s%s"
+          % (entry["browser"], entry["state"], detail or "no legs", banner))
+    if entry["state"] == "moved":
+        print("SUBJECT   INVALID: this run's %s legs did not all run one "
+              "build, so figures from it are two populations under one "
+              "heading. Any delta across the boundary is unattributable"
+              % entry["browser"])
+if not census_legs:
+    print("SUBJECT unrecorded  ** UNCHECKED: no leg produced a readable "
+          "artefact, so this run has no subject to check **")
 EOF
 
 echo
