@@ -49,7 +49,31 @@ catches a DLL that fails to **load**, not one that loads and is **too old**.
 **The rule: build under `vcvars64`, then run the binary in a shell WITHOUT it.**
 
 The correct reading is 32,945,209,344 B = 31,419 MiB, against WMI's truncated
-4,293,918,720 B — the reader beats the naive source by 7.67×.
+4,293,918,720 B — the reader beats the naive source by 7.67×. Vulkan on the same
+box reads 33,750,515,712 B, also un-truncated; `nvidia-smi` reports 34,190,917,632 B
+total, so the DXGI budget is 96.4 % of the card and the Vulkan heap sum 98.7 %.
+
+Five cases were run on the box to establish this, same session, same binary:
+stock `PATH` and the VS `VCPackages` entry alone both fall back to FXC and create
+DX12; only the full `vcvars64` environment kills it, with
+`source: Some(Device(Unexpected))` naming the too-old DLL. The figure never moved
+across any of them, so there is no second reading to reconcile.
+
+**Backend preference is Vulkan here regardless.** `request_adapter` returned
+Vulkan / RTX 5090 in all five cases, including the two where DX12 was dead. So a
+working DX12 is not what this box chooses; the real exposure of the residual hole
+is a Windows machine with **no Vulkan ICD**, which falls to GL — where
+`capacity/mod.rs` maps `Backend::Gl => None` and the app runs on a presumed
+capacity instead of a measured one.
+
+The residual hole itself is narrow and still open: `Auto` dies on a
+`dxcompiler.dll` that loads *and* is too old, reachable via the app directory,
+System32, cwd or `PATH`. No stock consumer machine has one; some third-party
+installers do.
+
+**A DX12 arm reports max 3D texture 2048 against Vulkan's 16384** (2D 16384 vs
+32768). The volume grid fits under both today, so it does not bite — but it would
+on a larger grid, and the difference is invisible unless you look for it.
 
 Note the shape of this failure, because it is the dangerous kind: the workaround
 that followed produced a *correct-looking number*, which made the false premise
@@ -84,3 +108,8 @@ and no scheduled tasks left behind. Say what you removed.
 
 Windows figures are their **own arm** — never merged with Linux headed, Mac, or
 headless Tier-2.
+
+**The lie-guard is load-bearing on this box.** The "Microsoft Basic Render Driver"
+CPU adapter reports a 33,348,044,800 B local budget — machine RAM wearing a GPU's
+name. `trust_local_heaps` correctly rejects it. If you add an adapter path here,
+check it against that adapter before believing any figure it hands you.
