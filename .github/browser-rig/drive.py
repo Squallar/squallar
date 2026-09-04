@@ -2753,7 +2753,7 @@ var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
-var frame_worst = null;
+var frame_worst_all = [];
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2762,8 +2762,8 @@ var rayon_re = /rayon: (\d+) threads/;
 // The anatomy of ONE frame -- the worst presented this period -- plus the
 // never-cleared since-boot maximum. Re-said every tick, so the LAST match in
 // the window is the answer; not a histogram family and not windowed.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us/;
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
 var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting/;
 // The two raster-telemetry lines, written once a frame by
 // `App::report_raster_telemetry` and only on a frame where something moved.
@@ -2910,14 +2910,21 @@ for (var i = 0; i < C.length; i++) {
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
   var wm = frame_worst_re.exec(m);
-  if (wm) frame_worst = { service: parseInt(wm[1], 10), family: wm[2],
+  if (wm) frame_worst_all.push({ t: t, service: parseInt(wm[1], 10), family: wm[2],
                           since_boot: parseInt(wm[3], 10),
                           pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
                           ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
-                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10) };
+                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10),
+                          boot_family: wm[10],
+                          boot_pre: parseInt(wm[11], 10), boot_pump: parseInt(wm[12], 10),
+                          boot_ui: parseInt(wm[13], 10), boot_prepare: parseInt(wm[14], 10),
+                          boot_finish: parseInt(wm[15], 10), boot_post: parseInt(wm[16], 10) });
   var wn = frame_worst_none_re.exec(m);
-  if (wn) frame_worst = { service: null, family: null,
-                          since_boot: parseInt(wn[1], 10) };
+  if (wn) frame_worst_all.push({ t: t, service: null, family: null,
+                                 since_boot: parseInt(wn[1], 10), boot_family: wn[2],
+                                 boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
+                                 boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
+                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10) });
   var tm = transport_re.exec(m);
   if (tm) transport = { replies: parseInt(tm[1], 10),
                         out_moved: parseInt(tm[2], 10),
@@ -3017,7 +3024,7 @@ for (var i = 0; i < C.length; i++) {
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
-         frame_worst: frame_worst,
+         frame_worst_all: frame_worst_all,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -3444,6 +3451,9 @@ class FrameLineWatcher:
         # hard-coded them would report an absent arm as a broken one.
         self.named = {}
         self.begins = {}
+        # One entry per telemetry tick: the period's worst frame, with the
+        # since-boot maximum's anatomy beside it. Windowed by max service.
+        self.worst = []
         self.loops = {}
         self.last = {}
 
@@ -3465,6 +3475,8 @@ class FrameLineWatcher:
             for r in sig.get(prefix) or []:
                 family = "%s:%s" % (key, r.get("name"))
                 self.named.setdefault(family, {})[(r.get("t"), r.get("n"))] = r
+        for r in sig.get("frame_worst_all") or []:
+            self.worst.append(r)
         for r in sig.get("gesture_begins") or []:
             self.begins[(r.get("t"), r.get("script"))] = r
         for r in sig.get("gesture_loops") or []:
@@ -3800,6 +3812,17 @@ def _window_stats(watcher, t0, t1, out):
         # can be asked of a finished run without re-measuring it.
         stats["bins"] = d
         out[family] = stats
+    # The p99-shaped frame: of every period's worst inside the bracket, the one
+    # with the largest service. Boot is excluded by construction -- a since-boot
+    # maximum that predates t0 never enters -- which is what separates a
+    # first-frame compile from a tail. `None`-service entries are periods that
+    # presented nothing and cannot be a worst frame.
+    ws = [r for r in getattr(watcher, "worst", [])
+          if r.get("service") is not None
+          and (t0 is None or r.get("t", 0) >= t0)
+          and (t1 is None or r.get("t", 0) <= t1)]
+    out["worst_frame"] = max(ws, key=lambda r: r["service"]) if ws else None
+    out["worst_frame_periods"] = len(ws)
     return out
 
 
@@ -6775,7 +6798,7 @@ def run_smoke(args):
         # a measurement round wants the number when nothing is gating on it,
         # and `null` says the line was never seen rather than "zero bytes".
         result["transport_bytes"] = _sig.get("transport")
-        result["frame_worst"] = _sig.get("frame_worst")
+        result["frame_worst_all"] = _sig.get("frame_worst_all")
         if result["transport_bytes"]:
             stage("transport", **result["transport_bytes"])
 
@@ -7502,19 +7525,28 @@ def run_smoke(args):
                  "" if zc.get("ok") else "; " + str(zc.get("error"))))
     # The WS3c measurement, printed whether or not it was gated -- and never
     # pooled across browsers, for the same reason the per-kind medians are not.
-    fw = result.get("frame_worst")
+    # The WINDOWED worst frame -- max service over the gesture window, boot
+    # excluded -- is the p99 verdict's own instrument. The since-boot maximum
+    # and its anatomy are printed beside it and never called a tail.
+    gw_ = result.get("gesture_window") or {}
+    fw = gw_.get("worst_frame")
+    if fw is None:
+        alls = result.get("frame_worst_all") or []
+        fw = next((r for r in reversed(alls) if r.get("service") is not None), None)
+        src = "last period (no gesture window)"
+    else:
+        src = "max service over %s windowed periods" % gw_.get("worst_frame_periods")
     if fw:
-        if fw.get("service") is None:
-            print("[%s] SUMMARY frame worst: no frame presented in the last period; "
-                  "since_boot=%s us" % (tag, fw.get("since_boot")))
-        else:
-            # ONE frame's anatomy, not a distribution -- the p99 verdict's own
-            # instrument; its six segments telescope to `service`.
-            print("[%s] SUMMARY frame worst: service=%s us family=%s since_boot=%s us | "
-                  "pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
-                  % (tag, fw.get("service"), fw.get("family"), fw.get("since_boot"),
-                     fw.get("pre"), fw.get("pump"), fw.get("ui"),
-                     fw.get("prepare"), fw.get("finish"), fw.get("post")))
+        print("[%s] SUMMARY frame worst [%s]: service=%s us family=%s | "
+              "pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
+              % (tag, src, fw.get("service"), fw.get("family"),
+                 fw.get("pre"), fw.get("pump"), fw.get("ui"),
+                 fw.get("prepare"), fw.get("finish"), fw.get("post")))
+        print("[%s] SUMMARY frame worst since boot (NOT a tail; may be boot): service=%s us "
+              "family=%s | pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
+              % (tag, fw.get("since_boot"), fw.get("boot_family"),
+                 fw.get("boot_pre"), fw.get("boot_pump"), fw.get("boot_ui"),
+                 fw.get("boot_prepare"), fw.get("boot_finish"), fw.get("boot_post")))
     tb = result.get("transport_bytes")
     if tb:
         # Every field the pattern reads is printed. A figure parsed into the

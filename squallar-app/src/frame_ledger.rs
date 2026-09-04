@@ -499,7 +499,11 @@ pub(crate) struct FrameLedger {
     /// a run that never had a bad frame — and "absent" reading as "it never
     /// happened" is the failure this campaign keeps finding. A running total
     /// that is re-said every tick cannot be evicted into a false negative.
-    worst_since_boot: u32,
+    ///
+    /// The WHOLE frame, not its service: the p99 verdict needs the anatomy of
+    /// the frame that set the maximum, and a `u32` here was the instrument
+    /// throwing away the one frame it existed to describe.
+    worst_since_boot: Option<WorstFrame>,
     /// The last presented frame's start, cadence's left stamp.
     last_presented_start: Option<Instant>,
 }
@@ -901,7 +905,13 @@ impl FrameLedger {
                 interact: interacted,
             },
         ));
-        self.worst_since_boot = self.worst_since_boot.max(service);
+        if self.worst_since_boot.is_none_or(|w| service > w.service) {
+            self.worst_since_boot = Some(WorstFrame {
+                service,
+                segments,
+                interact: interacted,
+            });
+        }
 
         if let Some(previous) = self.last_presented_start {
             self.cadence.record(micros(previous, start));
@@ -956,10 +966,11 @@ impl FrameLedger {
         self.worst.take()
     }
 
-    /// The largest service any presented frame has cost this session. Never
-    /// cleared, so it survives a console ring that has dropped the tick the
-    /// frame happened in — see the field.
-    pub(crate) fn worst_service_since_boot(&self) -> u32 {
+    /// The largest-service frame any presented frame has cost this session —
+    /// its family and six segments — or `None` before the first presented frame.
+    /// Never cleared, so it survives a console ring that has dropped the tick
+    /// the frame happened in; see the field.
+    pub(crate) fn worst_frame_since_boot(&self) -> Option<WorstFrame> {
         self.worst_since_boot
     }
 

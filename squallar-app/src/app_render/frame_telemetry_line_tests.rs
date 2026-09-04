@@ -863,19 +863,31 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         segments: [64, 55, 9_514, 2_829, 700, 293],
         interact: true,
     };
+    // The since-boot maximum is a whole frame too: a boot-time compile spike
+    // reads here as `boot: idle, prepare=<nearly all>` rather than as a bare
+    // number nobody can attribute.
+    let boot = crate::frame_ledger::WorstFrame {
+        service: 22_628,
+        segments: [100, 90, 300, 21_000, 800, 338],
+        interact: false,
+    };
     assert_eq!(
-        super::frame_worst_line(Some(w), 22_628),
+        super::frame_worst_line(Some(w), Some(boot)),
         rendered(
             &pattern("frame_worst_re"),
             &[
-                "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293"
+                "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "idle",
+                "100", "90", "300", "21000", "800", "338",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
     );
     assert_eq!(
-        super::frame_worst_line(None, 22_628),
-        rendered(&pattern("frame_worst_none_re"), &["22628"]),
+        super::frame_worst_line(None, Some(boot)),
+        rendered(
+            &pattern("frame_worst_none_re"),
+            &["22628", "idle", "100", "90", "300", "21000", "800", "338"],
+        ),
         "the no-frame spelling and the rig's probe have drifted",
     );
 }
@@ -1450,11 +1462,17 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         "the fixture's segments do not telescope to its service, so the pin \
          below would pin a line describing no frame that could exist",
     );
+    let boot = crate::frame_ledger::WorstFrame {
+        service: 9_513,
+        segments: [1, 2, 3, 9_500, 4, 3],
+        interact: false,
+    };
     assert_eq!(
-        super::frame_worst_line(Some(worst), 9_513),
+        super::frame_worst_line(Some(worst), Some(boot)),
         "frame worst: service=6728 us, family=idle, since_boot=9513 us, \
          pre=61 us, pump=54 us, ui=4402 us, prepare=1580 us, finish=611 us, \
-         post=20 us",
+         post=20 us, boot: idle, pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, \
+         finish=4 us, post=3 us",
     );
 }
 
@@ -1468,7 +1486,7 @@ fn the_worst_frame_line_names_the_interact_family_too() {
         interact: true,
     };
     assert!(
-        super::frame_worst_line(Some(worst), 600).contains("family=interact"),
+        super::frame_worst_line(Some(worst), None).contains("family=interact"),
         "an interact worst frame is not reported as one, so the column \
          cannot distinguish the two cases it exists to distinguish",
     );
@@ -1479,13 +1497,20 @@ fn the_worst_frame_line_names_the_interact_family_too() {
 /// claims and a reader cannot be asked to tell them apart from six zeros.
 #[test]
 fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
-    let line = super::frame_worst_line(None, 9_513);
+    let boot = crate::frame_ledger::WorstFrame {
+        service: 9_513,
+        segments: [1, 2, 3, 9_500, 4, 3],
+        interact: false,
+    };
+    let line = super::frame_worst_line(None, Some(boot));
     assert!(
         !line.contains("service=0 us"),
         "an empty period reads as a frame that cost nothing: {line:?}",
     );
     assert_eq!(
-        line, "frame worst: no frame presented this period, since_boot=9513 us",
+        line,
+        "frame worst: no frame presented this period, since_boot=9513 us, boot: idle, \
+         pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, finish=4 us, post=3 us",
         "an empty period must still carry the session maximum, or a console \
          ring that dropped the bad tick reads as a run with no bad frame",
     );
@@ -1506,7 +1531,7 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         segments: [100; 6],
         interact: true,
     };
-    let worst_line = super::frame_worst_line(Some(worst), 600);
+    let worst_line = super::frame_worst_line(Some(worst), None);
     assert!(
         worst_line.starts_with("frame worst: "),
         "the worst-frame line is not under its own prefix: {worst_line:?}",

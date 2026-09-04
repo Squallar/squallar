@@ -826,17 +826,43 @@ fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
 /// A period in which nothing presented prints the absence rather than a zero
 /// frame, on [`frame_segment_lines`]' terms inverted: a zero here would be a
 /// frame that cost nothing, which is a different claim from no frame at all.
-fn frame_worst_line(worst: Option<crate::frame_ledger::WorstFrame>, since_boot: u32) -> String {
+fn frame_worst_line(
+    worst: Option<crate::frame_ledger::WorstFrame>,
+    since_boot: Option<crate::frame_ledger::WorstFrame>,
+) -> String {
+    // The since-boot maximum's own anatomy rides the same line, so a boot-time
+    // spike reads as `boot: idle, prepare=<nearly all>` instead of as a bare
+    // number nobody can attribute. `since_boot=<service> us` keeps its place
+    // so a reader matching the prefix is unchanged.
+    let boot = match since_boot {
+        None => "boot: none".to_string(),
+        Some(b) => {
+            let [pre, pump, ui, prepare, finish, post] = b.segments;
+            format!(
+                "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, post={} us",
+                if b.interact { "interact" } else { "idle" },
+                pre,
+                pump,
+                ui,
+                prepare,
+                finish,
+                post,
+            )
+        }
+    };
+    let since_boot_us = since_boot.map_or(0, |b| b.service);
     let Some(w) = worst else {
-        return format!("frame worst: no frame presented this period, since_boot={since_boot} us");
+        return format!(
+            "frame worst: no frame presented this period, since_boot={since_boot_us} us, {boot}"
+        );
     };
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us",
+         ui={} us, prepare={} us, finish={} us, post={} us, {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
-        since_boot,
+        since_boot_us,
         pre,
         pump,
         ui,
@@ -1737,7 +1763,7 @@ impl super::App {
         // above — see `frame_worst_line`.
         say_telemetry(
             loud,
-            &frame_worst_line(worst, ledger.worst_service_since_boot()),
+            &frame_worst_line(worst, ledger.worst_frame_since_boot()),
         );
         // What one tile take cost, per family. Read unconditionally rather
         // than through an `_if_moved` arm, for the same reason the frame
