@@ -84,8 +84,11 @@ const JOB_MEMO_ROWS: usize = 4;
 /// owns a discard seam for retired generations; [`Self::take_retired`] hands
 /// the parked rows to whoever drains it. Until something does, the slot holds
 /// the rows of the most recent rollover only — an undrained older batch is
-/// dropped when the next one arrives, so the parked footprint is bounded by
-/// one generation's rows.
+/// dropped when the next one arrives. Evictions inside one generation park
+/// too, and the slot is capped at `JOB_MEMO_ROWS` there as well: past that
+/// the oldest parked input is freed inline, which is what happened before
+/// this memo existed. So the parked footprint never exceeds `JOB_MEMO_ROWS`
+/// inputs by either path, drained or not.
 pub(crate) struct BuiltMemo<T> {
     generation: Cell<u64>,
     /// (view_key, value) rows for the current generation, oldest first.
@@ -139,7 +142,15 @@ impl<T: Clone> BuiltMemo<T> {
         let mut rows = self.rows.borrow_mut();
         if rows.len() >= JOB_MEMO_ROWS {
             let (_, evicted) = rows.remove(0);
-            self.retired.borrow_mut().push(evicted);
+            let mut retired = self.retired.borrow_mut();
+            if retired.len() >= JOB_MEMO_ROWS {
+                // The slot is full and nothing has drained it. Free the
+                // oldest here, which is exactly what happened before this
+                // memo existed, rather than holding a parked input per
+                // eviction for the whole generation.
+                retired.remove(0);
+            }
+            retired.push(evicted);
         }
         rows.push((view_key, value.clone()));
         Some(value)
@@ -263,6 +274,27 @@ mod job_memo_tests {
         assert_eq!(memo.builds.get(), 2);
         assert_eq!(memo.held(), 2, "two views, two rows, no eviction");
         assert!(memo.take_retired().is_empty());
+    }
+
+    /// The parked slot is bounded too. A rollover replaces it, but an
+    /// eviction pushes, and nothing drains it in production yet: a gesture
+    /// that walks many view keys inside one data generation must not park one
+    /// input per eviction for the whole generation.
+    #[test]
+    fn eviction_does_not_park_without_bound_inside_one_generation() {
+        let memo = JobMemo::new();
+        // One generation, many distinct views — a zoom gesture's quanta.
+        for key in 0..64u64 {
+            memo.get_or_build(7, key, || job(key));
+        }
+        assert_eq!(memo.held(), JOB_MEMO_ROWS, "the live table stays capped");
+        let parked = memo.take_retired().len();
+        assert!(
+            parked <= JOB_MEMO_ROWS,
+            "the parked slot holds {parked} inputs after 64 views in one \
+             generation; it must never exceed {JOB_MEMO_ROWS}, the bound this \
+             type's own doc claims",
+        );
     }
 
     /// The table is bounded: past `JOB_MEMO_ROWS` views the oldest is parked.
