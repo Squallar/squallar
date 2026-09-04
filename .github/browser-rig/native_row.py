@@ -912,17 +912,19 @@ def surface_check(asked, achieved, pictures, picture_bytes, reported, panes=None
     The expected picture size is READ from the app, not modelled. The model
     was `(W * 1.5) * ((H - 40) * 1.5) * 4` with 40 as "the top bar in points",
     and it was EXACT when written -- verified to the byte at three surfaces
-    on 2026-08-31 -- because the bar then rested on its floor: 40 is
-    `MIN_BAR_HEIGHT`, `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, a minimum the
-    layout may sit on or above. Then the bar rose 3.33 points off it, with no
-    signal: at 1920x1080 a one-pane leg uploads 2880x1555 pictures
-    (17,913,600 B) where the model still said 2880x1560 (17,971,200 B), five
-    texel rows and 57,600 B on every picture, and every multi-pane row read
-    `** INVALID **` against a figure the app no longer produced. A floor used
-    as an equality holds exactly until content grows, then stops; and no
-    constant repairs that, because the bar's height is layout over content
-    and moves with DPI, font and width class, none of which the harness can
-    know. So the app says what it allocated -- `overlay pictures:`, one entry
+    on 2026-08-31, all of them at display scale 1.0, where a point is a pixel.
+    The 40 is right and has not moved: it is `MIN_BAR_HEIGHT`,
+    `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, and the bar lays out on it. What
+    the model has no term for is the scale factor, and no leg recorded one. A
+    headed X11 leg on 2026-09-02 ran at 13/12 -- winit quantizes an X11 scale
+    to twelfths -- which is 43.333 px of bar: at 1920x1080 a one-pane leg
+    uploaded 2880x1555 pictures (17,913,600 B) where the model still said
+    2880x1560 (17,971,200 B), five texel rows and 57,600 B on every picture,
+    and every multi-pane row read `** INVALID **` against a figure the app no
+    longer produced. `run_measure_native.sh` now pins the scale at 1 so a
+    native leg's points are its pixels, but the check does not lean on that:
+    a figure in points cannot predict pixels on a surface whose scale the
+    harness never sees. So the app says what it allocated -- `overlay pictures:`, one entry
     per pane, physical pixels -- and the check compares the bracket's uploads
     against THAT. What it still refuses is real: a bracket whose pictures are
     not the size the app says it draws.

@@ -76,14 +76,17 @@
 # 1248x714 -> 7,570,368 B.
 #
 # **STALE AS OF 2026-09-02, AND THE WAY IT WENT STALE IS THE POINT.** The 40
-# is not the top bar: it is `MIN_BAR_HEIGHT` in squallar-egui's topbar,
-# `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, which is a FLOOR and is
-# `#[cfg(test)]`-only. It happened to equal the bar's laid-out height on
-# 2026-08-31, which is why all three surfaces verified. Native 1920x1080 now
-# measures 17,913,600 B -- 2880 x 1555, i.e. (1080 - 43.333) x 1.5 -- so the
-# bar now lays out 3.33 points above its own minimum and the identity broke
-# with no signal. Every scene D row read `** INVALID **` by exactly 57,600 B,
-# five texel rows, until this was found.
+# is the top bar in POINTS: `MIN_BAR_HEIGHT` in squallar-egui's topbar,
+# `2 * VERTICAL_MARGIN + INTERACT_HEIGHT`, a FLOOR the bar has sat on
+# throughout. What the formula has no term for is the DISPLAY SCALE, and no
+# leg recorded one. All three 2026-08-31 surfaces ran at scale 1.0, where a
+# point is a pixel, which is why they verified. A headed X11 native leg on
+# 2026-09-02 ran at 13/12 -- winit quantizes an X11 scale to twelfths -- which
+# puts a 40-point bar at 43.333 px: 1920x1080 measures 17,913,600 B, i.e.
+# 2880 x 1555, i.e. (1080 - 43.333) x 1.5, and every scene D row read
+# `** INVALID **` by exactly 57,600 B, five texel rows, until this was found.
+# The bar never grew; the arms ran at different scales. `run_measure_native.sh`
+# now pins `WINIT_X11_SCALE_FACTOR=1` so a native leg's points are its pixels.
 #
 # The app now REPORTS the size it allocated, on its own `overlay pictures:`
 # telemetry line, and `native_row.py` reads that instead of computing this.

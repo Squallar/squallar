@@ -69,10 +69,14 @@
 # figures (a recorded six-pane bracket averaged 732 B under its pane -- a
 # minority of pictures a row or a column short as the layout settled). The
 # analyser used to MODEL that figure from the surface and a 40-point top bar
-# -- exact at three surfaces on 2026-08-31, because the bar then rested on
-# its floor (40 is `MIN_BAR_HEIGHT`, a minimum); when the bar rose 3.33 pt
-# off it the identity expired with no signal, and every multi-pane row read
-# `** INVALID **` against a picture the app no longer drew. A log with no
+# -- exact at three surfaces on 2026-08-31, which were taken at display scale
+# 1.0, where a point is a pixel. The bar lays out at 40 points then and now
+# (40 is `MIN_BAR_HEIGHT`, a floor, and the bar sits on it). What the model
+# omits is the scale factor: a headed X11 leg on 2026-09-02 ran at 13/12, so
+# the bar measured 43.33 px, and every multi-pane row read `** INVALID **`
+# against a picture the app no longer drew. Legs now launch with
+# `WINIT_X11_SCALE_FACTOR=1`, and the analyser reads the app's own figure
+# either way, which is what makes the two dates comparable at all. A log with no
 # `overlay pictures:` line -- a binary older than it -- reads
 # `** UNCHECKED: overlay pictures line absent **`, which is NOT `** INVALID **`:
 # the bytes were checked against nothing and the row is not refused for it.
@@ -493,7 +497,7 @@ REFRESH="${REFRESH:-?}"
 ADAPTER="unknown(app never logged an adapter)"
 
 echo "commit=$COMMIT scenes=[$SCENES] geom=${W}x${H} runs=$RUNS arms=[${ARMS[*]}]"
-echo "counterbalance=$COUNTERBALANCE quiet_max=$QUIET_MAX display=$DISPLAY_ARG"
+echo "counterbalance=$COUNTERBALANCE quiet_max=$QUIET_MAX display=$DISPLAY_ARG scale=1(WINIT_X11_SCALE_FACTOR)"
 echo "refresh=$REFRESH out=$OUT_DIR (adapter is read per leg from the app's own log)"
 report_platform
 
@@ -606,15 +610,52 @@ run_leg() {
   # 2. Launch. XDG redirected, telemetry seeded, gesture armed by env (which
   #    outranks the stored key). Stderr is the readout: env_logger writes the
   #    telemetry sentences there at info.
+  #
+  #    WINIT_X11_SCALE_FACTOR=1 pins the leg to one physical pixel per point.
+  #    Left unset, winit takes the X server's scale and quantizes it to
+  #    twelfths, and this box answers 13/12: every figure the app reports in
+  #    pixels is then 1.0833x its size in points, a 40-point top bar reads as
+  #    43.33 px, and a one-pane 1920x1080 leg draws 2880x1555 pictures where a
+  #    scale-1 leg draws 2880x1560. No leg recorded a scale factor, so two
+  #    arms taken at different scales were incomparable and nothing said so.
+  #    The launch env is written to the leg's own env.txt beside its app.log,
+  #    so a row's provenance carries the value rather than assuming it.
+  #
+  #    The pair that confirms it, on a headed X11 box (NOT RUN YET). Pinned:
+  #
+  #      .github/browser-rig/run_measure_native.sh --scenes A --runs 1 \
+  #        --out-dir /tmp/wo23b-pinned
+  #      grep -h "overlay pictures:" /tmp/wo23b-pinned/*/app.log | tail -1
+  #      # expect  overlay pictures: n=1, px=2880x1560, bytes=17971200
+  #
+  #    Unpinned control, from a copy that keeps RIG_DIR resolving and is
+  #    deleted again (never committed):
+  #
+  #      cp .github/browser-rig/run_measure_native.sh \
+  #         .github/browser-rig/run_measure_native.unpinned.sh
+  #      sed -i '/"WINIT_X11_SCALE_FACTOR=1"/d' \
+  #         .github/browser-rig/run_measure_native.unpinned.sh
+  #      bash .github/browser-rig/run_measure_native.unpinned.sh --scenes A \
+  #        --runs 1 --out-dir /tmp/wo23b-unpinned
+  #      grep -h "overlay pictures:" /tmp/wo23b-unpinned/*/app.log | tail -1
+  #      # expect  overlay pictures: n=1, px=2880x1555, bytes=17913600
+  #      rm .github/browser-rig/run_measure_native.unpinned.sh
+  #
+  #    The control's 1555 is a claim about THIS display: it needs the X scale
+  #    to actually be 13/12. On a scale-1.0 display both arms print 2880x1560
+  #    and the pair proves only that the pin is harmless, not that it bites.
   local -a env_args=(
     "XDG_CONFIG_HOME=$dir/config"
     "XDG_CACHE_HOME=$dir/cache"
     "RUST_LOG=info"
     "DISPLAY=$DISPLAY_ARG"
+    "WINIT_X11_SCALE_FACTOR=1"
   )
   if [ "$script" != none ]; then
     env_args+=("SQUALLAR_GESTURE_SCRIPT=$script")
   fi
+  printf '%s\n' "${env_args[@]}" > "$dir/env.txt"
+  echo "  launch env in $dir/env.txt (WINIT_X11_SCALE_FACTOR=1: points are pixels)"
   env "${env_args[@]}" "$bin" > "$log" 2>&1 &
   pid=$!
 

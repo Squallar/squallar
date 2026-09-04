@@ -182,12 +182,13 @@ fn the_runner_pins_the_window_the_app_actually_opens() {
 /// It used to encode `(W * 1.5) * ((H - 40) * 1.5) * 4`, and this test held
 /// that as "the picture size this app's overdraw and top bar actually
 /// produce". It was — on 2026-08-31, at three surfaces, to the byte — because
-/// the bar then rested on its floor: 40 is `MIN_BAR_HEIGHT`, a minimum, not a
-/// height. When the bar rose 3.33 pt off it the identity expired with no
-/// signal: a one-pane leg at the default window uploads 2880x1555 pictures
-/// (17,913,600 B) against the model's 17,971,200 B, and every multi-pane
-/// native row read INVALID against a figure the app no longer produced. A
-/// floor used as an equality. What is pinned now is the mechanism that
+/// those legs ran at display scale 1.0, where a point is a pixel. The bar
+/// lays out at 40 points then and now; what the model has no term for is the
+/// scale factor. A headed X11 leg on 2026-09-02 ran at 13/12, which puts the
+/// bar at 43.33 px: a one-pane leg at the default window uploaded 2880x1555
+/// pictures (17,913,600 B) against the model's 17,971,200 B, and every
+/// multi-pane native row read INVALID against a figure the app no longer
+/// produced. A figure in points read as a figure in pixels. What is pinned now is the mechanism that
 /// replaced it: the analyser scrapes the app's `overlay pictures:` line
 /// (`budget_telemetry::overlay_pictures_line`) in the spelling the app prints
 /// — prefix, field order, and an empty `px=` at `n=0` — every group
@@ -206,9 +207,10 @@ fn the_surface_check_reads_the_apps_own_picture_sizes() {
     assert!(
         !NATIVE_ROW.contains("int((h - 40) * 1.5)"),
         "native_row.py models the overlay picture from a 40-point top bar \
-         again. 40 is MIN_BAR_HEIGHT, a floor, not the bar's height; that \
-         model was exact until the bar rose off its floor and then refused \
-         every multi-pane row against a picture the app no longer drew",
+         again. 40 is the bar in points, and a leg's pixels are that times a \
+         display scale the harness never sees; the model was exact only \
+         while every leg ran at scale 1, and then refused every multi-pane \
+         row against a picture the app no longer drew",
     );
 }
 

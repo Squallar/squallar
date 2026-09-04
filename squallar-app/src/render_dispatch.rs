@@ -1092,9 +1092,10 @@ impl RenderDispatcher {
     /// Read off the recorded `OverlayTexturePlan` rather than recomputed from
     /// a pane rect: this is the size the app actually allocated, which is the
     /// figure a harness comparing against uploaded bytes needs. A harness that
-    /// models it instead has to model the top bar, and `native_row.py` did —
-    /// with `MIN_BAR_HEIGHT`, which is a floor and not a height, so every
-    /// scene D row read `** INVALID **` by a stable 57,600 B.
+    /// models it instead has to model the top bar *and the display scale*, and
+    /// `native_row.py` did only the first: 40 points of bar is 43.33 pixels on
+    /// a leg that ran at 13/12, so every scene D row read `** INVALID **` by a
+    /// stable 57,600 B.
     ///
     /// Loop-frame dispatches are not in here at all: `spawn_overlay_render`
     /// writes the record only when `frame.is_none()`, so this is the live
