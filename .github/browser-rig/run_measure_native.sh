@@ -387,7 +387,16 @@ plat_refresh() {
               }
             }'
       ;;
-    *) echo "" ;;
+    # NO READER ON THIS ARM -- which is NOT the same thing as a display that
+    # answered with nothing. `PLAT_REFRESH` is empty when `platform_plan`
+    # found no `xrandr`/`system_profiler`, or did not recognise the platform
+    # at all; the rig never asked, so nothing here is a finding about the
+    # monitor. Emitted as `native_row.py`'s `PANEL_NO_READER` sentinel, which
+    # refuses the leg with a reason naming the RIG. Until 2026-09-04 this
+    # branch echoed nothing and the caller turned it into `?`, which is the
+    # spelling for a DEAD DISPLAY: a box without xrandr reported a monitor
+    # failure it had no way to have observed.
+    *) echo "no-reader" ;;
   esac
 }
 

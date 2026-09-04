@@ -943,25 +943,58 @@ def scene_pane_count(scene, panel="off"):
 # So the check is on the PANEL wherever there is a panel reading, and falls
 # back to the achieved cadence only where there is not.
 #
-# THE FALLBACK CEILING, AND WHY IT IS NOT 165 OR 175. Losing vblank does not
-# stop an engine: it drives rAF off a software timer at a nominal 60 Hz.
-# Measured on the void run of 2026-09-04, `rd-0f-encodesplit-after-.../d-ff`
-# read p50 = 17.06 ms -> 59 Hz on a box whose live Firefox legs read 165-166.
-# A check spelled "is hz present?" PASSES that leg, and it is exactly as void
-# as the ones reading `?`. So the ceiling below is pinned to the FALLBACK's own
-# rate -- 60 Hz, plus room for the jitter that makes a true 60 Hz vsync measure
-# 59.x or 60.x -- and NOT to this box's panel. A ceiling near 165 would encode
-# one monitor into the rig and would fire on every 60 Hz machine that ever runs
-# it.
+# WHY THERE IS NO CADENCE THRESHOLD HERE, AND WHY THERE USED TO BE.
+# Losing vblank does not stop an engine: it drives rAF off a software timer at
+# a nominal 60 Hz. On the void run of 2026-09-04,
+# `rd-0f-encodesplit-after-.../d-ff` read p50 = 17.06 ms -> 59 Hz on a box
+# whose live Firefox legs read 165-166, so a check spelled "is hz present?"
+# passes a leg that measured nothing. The first cut of this gate answered that
+# with a ceiling -- 62 Hz, the fallback's own rate plus jitter -- applied to
+# legs carrying no panel reading.
 #
-# WHAT THE CEILING CANNOT DO, SAID PLAINLY. On an arm whose panel really is
-# 60 Hz the fallback timer and the panel are the same number, and no threshold
-# separates them. That is precisely why this is a FALLBACK, reached only when
-# a leg carries no panel reading at all (an artefact older than this check, or
-# a platform with no tool to read one), and why a panel-backed leg is expected
-# to record `panel_hz` from here on. On such an arm, `RIG_PANEL_HZ` declares it
-# and the exact branch takes over.
-FALLBACK_TIMER_CEILING_HZ = 62.0
+# THAT CEILING WAS RETIRED ON 2026-09-04, and its own message text said why:
+# on an arm whose panel really is 60 Hz the fallback timer and the panel are
+# THE SAME NUMBER and no threshold separates them. That is not an edge case,
+# it is the platform default -- most laptops, the Mac mini in this fleet,
+# plenty of phones -- and every one of them was unquotable on that path.
+# Measured on this box the same day, both halves of the pair, one hour apart:
+# a genuine `xrandr`-selected 59.96 Hz mode read `hz~59.96`, and the void
+# Firefox leg read `hz~59`. Nothing in the two cadences tells them apart. What
+# tells them apart is the PANEL READING, which both supported platforms can now
+# take -- Linux through `xrandr`, macOS through `system_profiler`, both wired
+# into both runners -- so the reading is required rather than approximated.
+#
+# THE COST, STATED. This is stricter than the threshold it replaces, and it
+# marks INVALID some historical legs that were probably fine: every browser leg
+# recorded before `run_measure.sh` learned to read the panel, including the
+# 175 Hz Chromium leg in `~/.cache/rd-0f-encodesplit-2026-09-02-2155/`, which
+# almost certainly ran against this box's live monitor. The trade is deliberate:
+# a rule that refuses a leg it cannot vouch for beats one that passes a leg on a
+# threshold that cannot do the job, and the escape for an arm with no reader is
+# `RIG_PANEL_HZ`, which is exact.
+
+# THE THIRD PANEL STATE. Two were designed; there are three.
+#
+#   `''` (also `?`, `0`, `n/a`)  the rig ASKED and the display answered with no
+#                                active mode. The dead panel of 2026-09-03.
+#   `-` (or no field at all)     the rig MEANT to ask and did not get an answer:
+#                                the display would not open, or the artefact
+#                                predates the reading entirely.
+#   `no-reader`                  the rig NEVER ASKED, because this arm has no
+#                                reader to ask with -- an unknown platform, a
+#                                box without `xrandr`/`system_profiler`, or a
+#                                branch that reads no panel at all.
+#
+# The third wore the second's clothes and that made A RIG BUG INDISTINGUISHABLE
+# FROM A DEAD DISPLAY. It cost every macOS browser leg: that arm is headed
+# without an X display, `run_measure.sh` keyed the panel read off "needs an X
+# display" and so never asked, and a healthy 60 Hz Mac was then refused with a
+# message about a monitor that was fine. The reader was wired up; the CLASS had
+# no stamp, so the next arm without one would have read the same way.
+#
+# All three states refuse a panel-backed leg. They refuse it for three
+# different reasons, and only one of them is about the monitor.
+PANEL_NO_READER = "no-reader"
 
 # A chromium `binary.gpu_mode` / firefox `binary.ff_mode` that means "this leg
 # presented onto the machine's own display".
@@ -1017,66 +1050,109 @@ def panel_backed_leg(arm, gpu_mode="", ff_mode=""):
     return (gpu_mode or "").strip().lower() in PANEL_BACKED_GPU_MODES
 
 
+def panel_state(panel_hz):
+    """Which of the FOUR things a panel reading can be.
+
+    `live` a rate. `dead` a display asked and answering with no active mode.
+    `no-reader` the rig never asked -- see `PANEL_NO_READER`. `absent` the rig
+    meant to ask and carries no answer, which is also what an artefact recorded
+    before the reading existed looks like.
+
+    `absent` and `no-reader` produce the same VERDICT and never the same
+    REASON: one is a run that lost its reading, the other is an arm that has no
+    reader, and telling a lane to fix the wrong one is what this split exists
+    to stop.
+    """
+    if panel_hz is None:
+        return "absent"
+    s = str(panel_hz).strip()
+    if s == PANEL_NO_READER:
+        return "no-reader"
+    if s == "-":
+        return "absent"
+    return "live" if parse_hz(s) is not None else "dead"
+
+
+PANEL_BASIS = {
+    "live": "the display's own advertised mode",
+    "dead": "the display was read and reported no active mode",
+    "absent": "no panel reading reached this leg",
+    "no-reader": "this arm has no panel reader, so none was attempted",
+}
+
+_WHY_DEAD = (
+    "the display advertises no active mode (read back %r). With no output "
+    "there is no vblank: a headed browser gets no animation callback at a "
+    "display cadence and a headed native app presents into nothing, so this "
+    "leg measured nothing -- whatever figures it printed")
+
+_WHY_ABSENT = (
+    "this leg presented onto a display and carries NO PANEL READING, so the "
+    "rig cannot say whether it ran against a monitor or against the ~60 Hz "
+    "software timer both engines fall back to when they lose vblank. A "
+    "threshold on the achieved cadence used to stand in for the reading and "
+    "was retired on 2026-09-04: a genuine 60 Hz panel and that fallback are "
+    "the same number, so it made every 60 Hz machine unquotable. Record the "
+    "panel -- a runner new enough to read it, or RIG_PANEL_HZ")
+
+_WHY_NO_READER = (
+    "the rig NEVER READ A PANEL for this leg: this arm has no reader to read "
+    "one with (an unknown platform, or a box without xrandr / "
+    "system_profiler). This says nothing about the monitor, which may be "
+    "perfectly alive -- it is a fact about the RIG. It still refuses the leg, "
+    "because a cadence the rig cannot vouch for is not a denominator. Give the "
+    "arm a reader, or declare RIG_PANEL_HZ, which is exact")
+
+_WHY_NO_CADENCE = (
+    "no refresh rate could be read for a leg that presented onto a display. "
+    "This is not a missing column: it is a leg with no measured cadence, and "
+    "a cadence is the denominator of every frame figure on the row")
+
+
 def refresh_verdict(panel_backed, hz, panel_hz=None):
     """Did this leg run against a real vblank?
 
-    `panel_hz` is the display's own advertised rate, `None` when the leg
-    carries no such reading AT ALL -- which is a different thing from `""` or
-    `"?"`, both of which mean the reading was attempted and the display had
-    no active mode to report. The first falls back; the second is the defect.
+    `panel_hz` is the display's own advertised rate in one of the four
+    spellings `panel_state` names. `hz` is the row's own column: the panel rate
+    on a native row, the achieved rAF cadence on a web one.
 
-    `hz` is the row's own column: the panel rate on a native row, the achieved
-    rAF cadence on a web one.
+    Every reason that applies is collected in `reasons`; `why` is the first of
+    them, which is the one worth printing. A leg with no panel reading AND no
+    cadence has two things wrong with it and the row should not have to pick.
     """
     achieved = parse_hz(hz)
-    reading = parse_hz(panel_hz)
-    out = {"ok": True, "why": None, "panel_hz": reading, "hz": achieved}
+    state = panel_state(panel_hz)
+    out = {"ok": True, "why": None, "reasons": [], "panel_state": state,
+           "panel_hz": parse_hz(panel_hz), "hz": achieved}
     if not panel_backed:
         out["basis"] = ("not a panel-backed leg: it presents to no display, "
                         "so there is no refresh rate to hold it to")
         return out
-    out["basis"] = ("the display's own advertised mode" if panel_hz is not None
-                    else "no panel reading on this leg; falling back to the "
-                         "achieved cadence, which can only rule out the "
-                         "software timer")
+    out["basis"] = PANEL_BASIS[state]
+    reasons = []
     # Most specific first: a display with no mode explains everything else on
-    # the row, so it is the reason worth printing when it applies.
-    if panel_hz is not None and reading is None:
-        out["ok"] = False
-        out["why"] = (
-            "the display advertises no active mode (read back %r). With no "
-            "output there is no vblank: a headed browser gets no animation "
-            "callback at a display cadence and a headed native app presents "
-            "into nothing, so this leg measured nothing -- whatever figures "
-            "it printed" % (panel_hz,))
-        return out
+    # the row, so it is the reason worth printing when it applies. The two
+    # no-reading states come next -- ahead of the cadence, because on a native
+    # row the panel reading IS the cadence column and a missing cadence there
+    # is the SYMPTOM of the missing reading rather than a second finding.
+    if state == "dead":
+        reasons.append(_WHY_DEAD % (panel_hz,))
+    elif state == "no-reader":
+        reasons.append(_WHY_NO_READER)
+    elif state == "absent":
+        reasons.append(_WHY_ABSENT)
     # ABSENT IS A HARD REFUSAL EVEN UNDER A LIVE PANEL. A leg whose rAF sample
     # timed out measured no cadence at all, and a declared panel does not
     # supply one: `rd-0f-cr-retake-0132` is that shape.
     if achieved is None:
+        reasons.append(_WHY_NO_CADENCE)
+    # A live panel and a measured cadence need not MATCH: rAF falling below
+    # vblank is the app being slow, which is the thing these legs exist to
+    # measure, not a reason to refuse one.
+    if reasons:
         out["ok"] = False
-        out["why"] = (
-            "no refresh rate could be read for a leg that presented onto a "
-            "display. This is not a missing column: it is a leg with no "
-            "measured cadence, and a cadence is the denominator of every "
-            "frame figure on the row")
-        return out
-    if panel_hz is not None:
-        # A live panel is declared and a cadence was measured. The two need
-        # not match: rAF falling below vblank is the app being slow, which is
-        # the thing these legs exist to measure, not a reason to refuse one.
-        return out
-    if achieved <= FALLBACK_TIMER_CEILING_HZ:
-        out["ok"] = False
-        out["why"] = (
-            "cadence %.4g Hz is at or below the %.4g Hz ceiling of the software "
-            "timer both engines fall back to when they lose vblank (Firefox on "
-            "this box read 59 Hz with the panel gone and 165-166 Hz with it "
-            "alive), and this leg carries no panel reading to tell that apart "
-            "from a genuine 60 Hz display -- or from an app simply running "
-            "slowly. Record the panel (RIG_PANEL_HZ, or a rig new enough to "
-            "read it) and this becomes an exact check"
-            % (achieved, FALLBACK_TIMER_CEILING_HZ))
+        out["reasons"] = reasons
+        out["why"] = reasons[0]
     return out
 
 
@@ -3043,15 +3119,19 @@ class RowVerdictTests(unittest.TestCase):
 
 
 class VblankTests(unittest.TestCase):
-    """The dead-panel gate, against the SEVEN REAL LEGS that straddle it.
+    """The dead-panel gate, against the NINE REAL LEGS that straddle it.
 
     Every row below is the field shape of a recorded artefact, not an invented
-    one: the native legs are `~/.cache/rd-wo28-legs/*` (`hz` is the xrandr
-    reading `run_measure_native.sh` passed through `--refresh`), the browser
-    legs are `~/.cache/rd-0f-*` (`hz` is `1000 / p50(rAF)` and the panel was
-    never recorded, so `panel_hz` is None for all of them). The panel died on
-    2026-09-03 at 11:34:52; the 09-02 legs are real measurements and everything
-    after it is void.
+    one: the native legs are `~/.cache/rd-wo28-legs/*` and WO-47's two own legs
+    (`hz` is the xrandr reading `run_measure_native.sh` passed through
+    `--refresh`), the browser legs are `~/.cache/rd-0f-*` (`hz` is
+    `1000 / p50(rAF)`; the panel was never recorded on any of them, because
+    `run_measure.sh` did not read one until 2026-09-04, so `panel_hz` is None).
+    The panel died on 2026-09-03 at 11:34:52 and came back on 2026-09-04; the
+    09-02 legs are real measurements, everything between is void, and the two
+    09-04 legs were taken on the live monitor to exercise this gate in the
+    direction it had never been exercised in -- the direction where it must
+    STAY QUIET.
     """
 
     # (name, arm, gpu_mode, ff_mode, hz, panel_hz, valid?)
@@ -3062,9 +3142,24 @@ class VblankTests(unittest.TestCase):
         ("fixed-c/C.main.r3  09-02 22:51", "native", "", "", "174.96", "174.96", True),
         ("fixed-b/B.main.r1  09-03 23:40", "native", "", "", "?", "", False),
         ("prefix-b/B.prefix.r1 09-03 23:45", "native", "", "", "?", "", False),
+        # WO-47, 2026-09-04 11:11, THE PANEL ALIVE. The healthy leg this gate
+        # had never once been shown: `hz~174.96`, `invalid: []`, no stamp.
+        ("wo47-healthy/A.main.r1 09-04 11:11", "native", "", "", "174.96", "174.96", True),
+        # WO-47, 2026-09-04 11:16, the same box with `xrandr` switched to the
+        # monitor's own 59.96 Hz mode and switched back. THE NEAREST HEALTHY
+        # NEIGHBOUR to the refusal below: a GENUINE 60 Hz leg, one hour from a
+        # void leg reading 59. Nothing in the two cadences separates them; the
+        # panel reading does, which is the whole argument for requiring one.
+        ("wo47-neighbour-60/A.main.r1 09-04 11:16", "native", "", "", "59.96", "59.96", True),
         # --- browser, `hz` is the ACHIEVED rAF cadence -----------------------
+        # WAS TRUE UNTIL 2026-09-04, and this flip is the cost of retiring the
+        # cadence threshold, recorded rather than glossed. This leg almost
+        # certainly ran against the live monitor -- 175 is this box's panel --
+        # but it carries no reading to say so, and "the number looks like our
+        # monitor" is the encoding-one-monitor-into-the-rig reasoning the
+        # threshold was written to avoid in the first place.
         ("rd-0f-encodesplit-2155/d-cr  09-02",
-         "hardware", "headed-host-display", "", "175", None, True),
+         "hardware", "headed-host-display", "", "175", None, False),
         ("rd-0f-encodesplit-after-0125/d-ff  09-04",
          "hardware", "", "host", "59", None, False),
     )
@@ -3074,6 +3169,19 @@ class VblankTests(unittest.TestCase):
             v = refresh_verdict(panel_backed_leg(arm, gpu, ff), hz, panel_hz)
             self.assertEqual(v["ok"], want, "%s -> %s" % (name, v["why"]))
 
+    def test_the_healthy_legs_are_quiet_for_the_RIGHT_reason(self):
+        """An over-fire is the expensive direction and it had never been
+        observed: this gate was verified only against the case it rejects.
+        Both 09-04 legs are here green ON THE PANEL BRANCH -- not by some
+        accident of the cadence -- and neither carries a reason at all."""
+        for name, arm, gpu, ff, hz, panel_hz, want in self.LEGS:
+            if not want:
+                continue
+            v = refresh_verdict(panel_backed_leg(arm, gpu, ff), hz, panel_hz)
+            self.assertEqual(v["panel_state"], "live", name)
+            self.assertEqual(v["reasons"], [], name)
+            self.assertIsNone(v["why"], name)
+
     def test_the_leg_a_presence_check_would_have_passed(self):
         """THE CASE THIS GATE EXISTS FOR, spelled out.
 
@@ -3082,16 +3190,31 @@ class VblankTests(unittest.TestCase):
         refresh rate, it falls back to a ~60 Hz software timer. A check spelled
         "is hz present?" passes that leg, and it is exactly as void as the ones
         reading `?`.
+
+        It is refused, and SINCE 2026-09-04 NOT BY ITS CADENCE. The reason is
+        that it carries no panel reading; the 59 is not consulted, because the
+        very next test shows a genuine panel that reads 59.96.
         """
         headed = panel_backed_leg("hardware", "", "host")
         self.assertTrue(headed)
         self.assertIsNotNone(parse_hz("59"), "a presence check passes it")
         v = refresh_verdict(headed, "59", None)
         self.assertFalse(v["ok"])
-        self.assertIn("software timer", v["why"])
-        # And the live legs of the same browser on the same box are untouched.
+        self.assertEqual(v["panel_state"], "absent")
+        self.assertIn("NO PANEL READING", v["why"])
+        # The fast legs of the same browser on the same box are refused for the
+        # SAME reason, and that is deliberate: the rig cannot tell 165 Hz on a
+        # live monitor from 165 Hz on a monitor it never looked at. What it
+        # costs is stated where the rule is; what it buys is that no leg is
+        # ever passed on a number that resembles this box's panel.
         for live in ("165", "166"):
-            self.assertTrue(refresh_verdict(headed, live, None)["ok"], live)
+            u = refresh_verdict(headed, live, None)
+            self.assertFalse(u["ok"], live)
+            self.assertEqual(u["panel_state"], "absent", live)
+        # Record the panel and the whole family becomes exact -- fast and slow.
+        for hz, panel in (("59", "60"), ("165", "165.00"), ("59", "174.96")):
+            self.assertTrue(refresh_verdict(headed, hz, panel)["ok"],
+                            "%s/%s" % (hz, panel))
 
     def test_the_other_two_void_browser_legs_read_nothing_at_all(self):
         """`rd-0f-cr-retake-0132` and `rd-0f-2point-0143`: rAF timed out, so
@@ -3102,7 +3225,11 @@ class VblankTests(unittest.TestCase):
         for spelling in ("?", "", "-", None):
             v = refresh_verdict(headed, spelling, None)
             self.assertFalse(v["ok"], repr(spelling))
-            self.assertIn("no measured cadence", v["why"])
+            # TWO things are wrong with these legs and the row picks neither
+            # for the reader: both are collected. `why` is the panel one
+            # because it is the more general failure of the run.
+            self.assertIn(_WHY_NO_CADENCE, v["reasons"], repr(spelling))
+            self.assertIn("NO PANEL READING", v["why"], repr(spelling))
 
     # ------------------------------------------------------------ Tier-2 ----
 
@@ -3112,11 +3239,15 @@ class VblankTests(unittest.TestCase):
         rate. Nothing this gate can be handed may redden it."""
         headed = panel_backed_leg("software", "headless-swiftshader", "")
         self.assertFalse(headed)
-        for hz in (None, "", "?", "-", "59", "0", "175"):
-            for panel_hz in (None, "", "?", "60"):
+        # EVERY spelling this file knows, including the two the WO-47 pass
+        # added: an arm with no display cannot be reddened by a rule about
+        # displays, whatever the panel field happens to say.
+        for hz in (None, "", "?", "-", "59", "0", "175", PANEL_NO_READER):
+            for panel_hz in (None, "", "?", "-", "60", PANEL_NO_READER):
                 v = refresh_verdict(headed, hz, panel_hz)
                 self.assertTrue(v["ok"], "hz=%r panel_hz=%r -> %s"
                                 % (hz, panel_hz, v["why"]))
+                self.assertEqual(v["reasons"], [])
                 self.assertIn("no display", v["basis"])
 
     def test_the_headless_hardware_and_xvfb_arms_are_not_touched_either(self):
@@ -3146,7 +3277,11 @@ class VblankTests(unittest.TestCase):
         for panel_hz in (None, "174.96", "60"):
             v = refresh_verdict(headed, "?", panel_hz)
             self.assertFalse(v["ok"], repr(panel_hz))
-            self.assertIn("no measured cadence", v["why"])
+            self.assertIn(_WHY_NO_CADENCE, v["reasons"], repr(panel_hz))
+        # Under a DECLARED panel it is the only reason, so it is also `why`.
+        for panel_hz in ("174.96", "60"):
+            self.assertIn("no measured cadence",
+                          refresh_verdict(headed, "?", panel_hz)["why"])
 
     def test_a_declared_60hz_panel_is_valid_at_60hz(self):
         """The limitation, and its escape hatch, both pinned. On a genuine
@@ -3165,22 +3300,152 @@ class VblankTests(unittest.TestCase):
         kept a stale framebuffer after `Setting mode \"NULL\"` still reported a
         size; what it stopped reporting was a mode."""
         headed = panel_backed_leg("native", "", "")
-        for spelling in ("", "?", "-", "0"):
+        # `-` is NOT in this list, and that is the WO-47 correction: it was,
+        # and it meant this test was asserting that a reading which was never
+        # taken proved the display was dead. Its own state now.
+        for spelling in ("", "?", "0", "n/a"):
             v = refresh_verdict(headed, "175", spelling)
             self.assertFalse(v["ok"], repr(spelling))
+            self.assertEqual(v["panel_state"], "dead", repr(spelling))
             self.assertIn("no vblank", "no vblank: " + v["why"])
             self.assertIn("advertises no active mode", v["why"])
+        self.assertEqual(refresh_verdict(headed, "175", "-")["panel_state"],
+                         "absent")
 
-    def test_the_ceiling_is_pinned_to_the_fallback_not_to_this_monitor(self):
-        """62 Hz, and the reason it is not 165 or 175: those are one box's
-        panel. 60 is the rate of the timer every engine falls back to, and the
-        two extra Hz are the jitter that makes a true 60 Hz vsync measure
-        59.x or 60.x."""
-        self.assertEqual(FALLBACK_TIMER_CEILING_HZ, 62.0)
-        self.assertLess(FALLBACK_TIMER_CEILING_HZ, 165.0)
+    def test_the_cadence_threshold_is_gone_and_stays_gone(self):
+        """RETIRED 2026-09-04. The threshold could not do the one job it was
+        put there for, and its own message text said so: on a genuine 60 Hz
+        arm the fallback timer and the panel are the same number.
+
+        The pair, both halves MEASURED on this box: a real `xrandr`-selected
+        59.96 Hz mode, and the void Firefox leg that read 59 with no monitor
+        attached at all. No function of the cadence alone separates those, so
+        the cadence alone no longer decides anything -- the reading does.
+        """
+        self.assertNotIn("FALLBACK_TIMER_CEILING_HZ", globals(),
+                         "the retired threshold is back")
+        headed = panel_backed_leg("hardware", "", "host")
+        genuine_60, fallback_60 = "59.96", "59"
+        # Without a reading, indistinguishable -- so BOTH are refused, and
+        # neither refusal mentions a rate.
+        for cadence in (genuine_60, fallback_60, "62.0", "62.1", "175"):
+            v = refresh_verdict(headed, cadence, None)
+            self.assertFalse(v["ok"], cadence)
+            self.assertEqual(v["panel_state"], "absent", cadence)
+        # WITH a reading, separated exactly, and the 60 Hz machine -- the
+        # commonest refresh rate there is -- becomes quotable rather than
+        # unquotable.
+        self.assertTrue(refresh_verdict(headed, genuine_60, "59.96")["ok"])
+        self.assertFalse(refresh_verdict(headed, fallback_60, "")["ok"])
+
+    def test_the_three_panel_states_are_three_different_reasons(self):
+        """A rig that never looked must not be reported as a dead display.
+
+        This is the class the macOS over-fire belonged to: `run_measure.sh`
+        keyed the panel read off "needs an X display", the macOS browser arm is
+        headed WITHOUT one, so the rig never asked -- and every healthy Mac leg
+        was then refused with a message about a monitor that was fine. The
+        instance is fixed; this is the class, stamped.
+        """
         headed = panel_backed_leg("native", "", "")
-        self.assertFalse(refresh_verdict(headed, "62.0", None)["ok"])
-        self.assertTrue(refresh_verdict(headed, "62.1", None)["ok"])
+        seen = {}
+        for spelling, want_state in (("", "dead"), ("?", "dead"),
+                                     ("0", "dead"),
+                                     ("-", "absent"), (None, "absent"),
+                                     (PANEL_NO_READER, "no-reader")):
+            v = refresh_verdict(headed, "175", spelling)
+            self.assertEqual(v["panel_state"], want_state, repr(spelling))
+            self.assertFalse(v["ok"], repr(spelling))
+            # The DEAD message quotes the spelling it read back, so the
+            # reasons are compared by their opening clause rather than whole.
+            head = v["why"].split(" (read back")[0]
+            seen.setdefault(want_state, head)
+            self.assertEqual(seen[want_state], head, repr(spelling))
+        # Three states, three DISTINCT reasons -- the property, not three
+        # strings restated here where they could drift into agreement.
+        self.assertEqual(len(set(seen.values())), 3, seen)
+        self.assertIn("advertises no active mode", seen["dead"])
+        self.assertIn("NO PANEL READING", seen["absent"])
+        self.assertIn("NEVER READ A PANEL", seen["no-reader"])
+        # And the one that is NOT about the monitor says so, so a lane reading
+        # it does not go looking at cables.
+        self.assertIn("says nothing about the monitor", seen["no-reader"])
+        self.assertIn("about the RIG", seen["no-reader"])
+        # `panel_state` is not the same question as `panel_backed_leg`: Tier-2
+        # is exempt at the arm, long before any of this is consulted.
+        self.assertTrue(refresh_verdict(
+            panel_backed_leg("software", "headless-swiftshader", ""),
+            "?", PANEL_NO_READER)["ok"])
+
+    def test_every_panel_literal_the_shells_emit_is_in_this_vocabulary(self):
+        """The seam, checked as a SET rather than as a mention.
+
+        `PANEL_NO_READER` is a contract between this file and two shell scripts
+        that never import it, so it is checked by text -- the same drift guard
+        `test_both_runners_read_the_panel_the_same_way` is. The first cut of
+        this test asked only whether the string appeared SOMEWHERE in each
+        shell, and a tamper proved it worthless: misspelling one of the three
+        emission sites left the other two, the substring was still found, and
+        the tamper stayed green. A near-miss sentinel does not fail loudly --
+        `panel_state` classifies it as `dead`, so a box with no reader reports
+        a monitor failure, which is the exact defect this state exists to end.
+
+        So: every LITERAL either shell can emit as a panel reading must be a
+        spelling this file knows. A typo is not in the set.
+        """
+        vocabulary = {"", "-", PANEL_NO_READER}
+
+        def read(path):
+            with open(os.path.join(RIG_DIR, path), encoding="utf-8") as fh:
+                return fh.read()
+
+        def panel_fn(text, name):
+            """Just the reader function's body -- `plat_window_resolve` has a
+            `*) echo "" ;;` of its own and it is not a panel reading."""
+            at = text.index("%s() {" % name)
+            return text[at:text.index("\n}", at)]
+
+        # EVERY SITE, COUNTED. A set alone is not enough and a tamper showed
+        # why twice: misspelling one of three sites made that site stop
+        # MATCHING THE SCRAPE, and dropping the never-asks stamp left the
+        # sentinel visible at the other sites. Both read green on a set check.
+        # The count is what makes a lost site and a lost scrape the same red.
+        measure = read("run_measure.sh")
+        native = read("run_measure_native.sh")
+        sites = {
+            # (where, expected number of literal emission sites)
+            "run_measure.sh panel_refresh": (re.findall(
+                r'echo "([^"$]*)"; return; \}', panel_fn(measure, "panel_refresh")), 3),
+            "run_measure.sh PANEL_HZ=": (re.findall(
+                r'PANEL_HZ="([^"$]*)"', measure), 2),
+            "run_measure_native.sh plat_refresh": (re.findall(
+                r'\*\) echo "([^"$]*)" ;;', panel_fn(native, "plat_refresh")), 1),
+        }
+        for where, (found, want_n) in sites.items():
+            self.assertEqual(len(found), want_n,
+                             "%s: scraped %d literal panel emission site(s), "
+                             "expected %d (%r). Either a site was added or "
+                             "removed -- classify it here -- or the scrape "
+                             "stopped matching, which is an instrument failure "
+                             "and never a green" % (where, len(found), want_n, found))
+            self.assertLessEqual(set(found), vocabulary,
+                                 "%s emits %s, which this file cannot classify"
+                                 % (where, sorted(set(found) - vocabulary)))
+        # And each of the three states is actually reachable from the shells.
+        all_emitted = [v for found, _ in sites.values() for v in found]
+        self.assertEqual({panel_state(v) for v in all_emitted},
+                         {"absent", "no-reader"},
+                         "the shells no longer stamp both no-reading states")
+        # Four: `run_measure.sh` has no xrandr, has no system_profiler, and
+        # the branch that never asks; `run_measure_native.sh` has no reader in
+        # its plan. Every one of them is an arm that DID NOT LOOK.
+        self.assertEqual(all_emitted.count(PANEL_NO_READER), 4, all_emitted)
+        self.assertEqual(panel_state(PANEL_NO_READER), "no-reader")
+        # It must not be parseable as a rate, or it would read as a live panel.
+        self.assertIsNone(parse_hz(PANEL_NO_READER))
+        # And every spelling in the vocabulary lands somewhere real.
+        self.assertEqual({panel_state(v) for v in vocabulary},
+                         {"dead", "absent", "no-reader"})
 
     def test_a_native_leg_on_xvfb_is_refused_and_the_escape_is_named(self):
         """MEASURED 2026-09-04: `Xvfb :77` advertises its mode as `0.00`, which

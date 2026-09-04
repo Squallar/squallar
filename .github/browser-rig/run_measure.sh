@@ -456,6 +456,10 @@ panel_refresh() {
   if [ -n "${RIG_PANEL_HZ:-}" ]; then echo "$RIG_PANEL_HZ"; return; fi
   case "$(uname -s)" in
     Darwin)
+      command -v system_profiler >/dev/null 2>&1 || {
+        echo "panel: no system_profiler on this box; this arm has NO PANEL " \
+             "READER and never asked. Declare RIG_PANEL_HZ" >&2
+        echo "no-reader"; return; }
       system_profiler SPDisplaysDataType 2>/dev/null \
         | awk '
             /Refresh Rate/ {
@@ -471,9 +475,10 @@ panel_refresh() {
       ;;
     *)
       command -v xrandr >/dev/null 2>&1 || {
-        echo "panel: no xrandr on this box; the rig cannot see the panel and " \
-             "falls back to each leg's achieved cadence" >&2
-        echo "-"; return; }
+        echo "panel: no xrandr on this box; this arm has NO PANEL READER and " \
+             "never asked. Every headed leg of this run is INVALID unless " \
+             "RIG_PANEL_HZ declares the panel" >&2
+        echo "no-reader"; return; }
       local q
       q="$(DISPLAY="${PANEL_DISPLAY:-${DISPLAY:-}}" \
            XAUTHORITY="${PANEL_XAUTHORITY:-${XAUTHORITY:-}}" \
@@ -518,24 +523,41 @@ echo "measurement arm panel: ${PANEL_HZ:-NONE (the display advertises no active 
 else
   DISPLAY_INFO='{"display": null, "why": "not needed: no X11 browser requested"}'
   echo "measurement arm display: skipped (browsers=[$BROWSERS] need no X display)"
-  # NOT ATTEMPTED, which is a different thing from attempted and empty. `-`
-  # says so; the analyser falls back to the achieved cadence for a leg that
-  # carries no panel reading, and refuses one whose reading came back empty.
+  # NOT ATTEMPTED is a different thing from attempted and empty, and BOTH are
+  # different from an arm that has no reader to attempt with. All three refuse
+  # a headed leg; `native_row.py`'s `panel_state` keeps them three reasons.
   #
   # **macOS is headed WITHOUT an X display, and still has a panel.** Keying the
   # panel read off "needs an X display" conflated two different questions and
   # made every macOS browser leg unquotable: the arm renders on a real 60 Hz
-  # display, the analyser saw no panel reading, and 60 Hz is under the 62 Hz
-  # software-timer ceiling -- so a healthy leg was refused as a lost vblank.
-  # `RIG_PANEL_HZ` could not rescue it either, because the escape lived in the
-  # branch this arm never takes.
+  # display, the analyser saw no panel reading, and the cadence threshold that
+  # then stood in for one could not tell 60 Hz of monitor from 60 Hz of
+  # software timer -- so a healthy leg was refused as a lost vblank, with a
+  # message about a display that was fine. `RIG_PANEL_HZ` could not rescue it
+  # either, because the escape lived in the branch this arm never takes.
+  #
+  # That was an OVER-FIRE, and it is the second this gate produced: the first
+  # read the panel from whatever DISPLAY the shell had inherited, got an empty
+  # string with no X cookie, and would have refused every leg of a healthy run.
+  # Neither was caught by a tamper, because tampers only ever asked whether the
+  # gate goes red on the bad input. The threshold is retired (see
+  # `native_row.py`), the reader is wired on both platforms, and the arm below
+  # now says which of the three states it is in rather than borrowing one.
   case "$(uname -s)" in
     Darwin)
       PANEL_HZ="$(panel_refresh)"
       [ -n "$PANEL_HZ" ] || PANEL_HZ="-"
       echo "measurement arm panel: ${PANEL_HZ}"
       ;;
-    *) PANEL_HZ="-" ;;
+    # THE ARM THAT NEVER ASKS. Not a run whose reading went missing: a branch
+    # with no reader in it at all, reached when no X11 browser was requested.
+    # Every leg it can produce is exempt at `panel_backed_leg` anyway -- the
+    # Tier-2 software arm and the Android arm both present to something that
+    # is not this box's monitor -- but the STATE is stamped for its own sake,
+    # because the macOS case proved what happens when this class is spelled
+    # like a dead display: a healthy arm gets refused with a message about a
+    # monitor, and the rig bug is invisible underneath it.
+    *) PANEL_HZ="no-reader" ;;
   esac
 fi
 
@@ -844,9 +866,13 @@ out, commit, panel, scene_b_cols, ledger_path, rig_dir, panel_hz = sys.argv[1:8]
 # panel differently.
 sys.path.insert(0, rig_dir)
 import native_row
-# `-` is "not attempted" (a run with no X display, or a box with no xrandr);
-# anything else -- including the empty string -- is a reading that was taken.
-panel_reading = None if panel_hz == "-" else panel_hz
+# Passed through VERBATIM. The four spellings a panel reading can have are
+# `native_row.py`'s `panel_state` to classify -- `-` not attempted,
+# `no-reader` never attempted because this arm has no reader, `` attempted and
+# dead, a number alive -- and a translation here would be a second place for
+# that vocabulary to live and to drift. It used to fold `-` into None, which
+# merged two of the four before the analyser ever saw them.
+panel_reading = panel_hz
 
 legs = []
 with open(ledger_path) as f:
