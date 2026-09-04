@@ -8,13 +8,30 @@ description: Run squallar browser measurement legs on the Mac (jacobs-mac-mini).
 `ssh mac` — jacobs-mac-mini, Apple M2, 10 GPU cores, 8 GiB unified, macOS 26.4.1
 arm64. No VPN, no wake step, `BatchMode=yes` works.
 
+**The Mac's display is a ghost unless the KVM is on the Mac.** There is one
+physical panel — the 175 Hz monitor the Linux box drives as DP-0 (3440x1440 @
+174.96 Hz) — shared with the Mac over a KVM, so a headed leg on the Mac and a
+headed leg on Linux are mutually exclusive, and whichever box the KVM is not on
+has no real EDID. With the KVM on Linux, the Mac presents to a virtual
+1920x1080 @ 60.00 Hz display — `Vendor Apple`, `Online Yes`, `Main Display Yes`
+— a ghost it drives when nothing real is attached, read on both boxes at one
+instant on 2026-09-04. The 16.67 ms rAF cadence and the 19,028 us native cadence
+recorded below were taken on that ghost, not on the panel, and a `finish`
+segment on the ghost is not a compositor's vblank. A real-panel Mac leg needs the
+KVM switched to the Mac, which takes the user's screen — get their word first.
+Before any headed or cadence leg, read the display state on the Mac itself
+(`system_profiler SPDisplaysDataType`, or the rAF cadence as the presentation
+evidence), and put `ghost 1080p60` or `panel 175 Hz via KVM` in every Mac
+cadence figure's denominator; a figure carrying neither cannot be placed against
+anything. Interleaved CPU-side comparisons on the ghost stay internally valid.
+
 **Browser legs run headed over a plain ssh session** — verified: rAF fires at
-16.67 ms on the 60 Hz panel, which is presentation, not boot. webdriver launches
-the browser itself, which is why this works.
+16.67 ms on the 60 Hz ghost display, which is presentation, not boot. webdriver
+launches the browser itself, which is why this works.
 
 **The native app also reaches its render loop over ssh, with no `launchctl
 asuser` and no sudo** — on presentation evidence, not on a surface line. Three
-legs, `frame cadence`:
+legs, `frame cadence`, on the 1080p60 ghost display:
 
 | scene | samples | p50 |
 |---|---|---|
@@ -22,13 +39,16 @@ legs, `frame cadence`:
 | C | n=8754 | 19028 us |
 | E2 | n=11934 | 19028 us |
 
-19,028 us is 52.6 Hz against that box's 60 Hz panel, sustained for minutes, with
+19,028 us is 52.6 Hz against the 60 Hz ghost display, sustained for minutes, with
 a populated concentrated histogram climbing monotonically across 75 readings.
 Compare the dead-display signature on the Linux box — `cadence n=182 p50=OVER` —
-roughly forty-eight times fewer frames from the same field. Also `overlay
-pictures` filling in real pixel dimensions and resident bytes two seconds after
-starting at `px=0x0, bytes=0`, and 74 `budget state:` lines, which are composed
-only after GPU init inside the redraw path.
+roughly forty-eight times fewer frames from the same field. That signature is
+also exactly what Linux reads when the KVM is on the Mac, so it is a KVM
+candidate as much as a dead display, and the panel state must be read with
+`XAUTHORITY` set before either is concluded. Also `overlay pictures` filling in
+real pixel dimensions and resident bytes two seconds after starting at
+`px=0x0, bytes=0`, and 74 `budget state:` lines, which are composed only after
+GPU init inside the redraw path.
 
 **What is NOT established: nobody looked at the glass.** No screenshot was taken
 in any of those legs. The claim that survives is "reached and sustained its
@@ -188,4 +208,8 @@ Budget ~1.4 GiB for source + target + legs.
 - Measured GPU capacity is 5,461 MiB and the budget ladder shed no rung on any
   scene tried (`steps 0`). An 8 GiB M2 is **not** a constrained device for our
   budgets; if a scene behaves differently there, capacity is not why.
+- The observation that the same build reads 1.7x different across two windows
+  on the idle Mac has the display as a candidate cause — re-check whether each
+  window was on the ghost or on the panel via KVM before quoting it as the Mac's
+  own drift.
 - Firefox governs over Chrome, on whichever box.

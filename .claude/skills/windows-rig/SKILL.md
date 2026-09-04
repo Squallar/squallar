@@ -6,7 +6,10 @@ description: Run squallar builds and probes on the Windows box (ssh sim). Use wh
 # Working on the Windows box
 
 `ssh sim` — Win11 Enterprise 10.0.26200 build 26200, 16 logical CPUs, ~68 GB RAM,
-RTX 5090 (driver 591.86 / 32.0.15.9186). No VPN, no wake step.
+RTX 5090 (driver 591.86 / 32.0.15.9186). No VPN, no wake step. It has its own
+display, always on, so it is the one headed arm never contended for by the KVM
+the Linux box and the Mac share (see `mac-browser-rig`) — which changes nothing
+about session 0 below, since a display is not a session.
 
 **Provenance:** these facts were established by another session and relayed, not
 verified first-hand here. The Mac equivalents in `mac-browser-rig` were verified
