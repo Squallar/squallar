@@ -184,15 +184,18 @@ fn the_runner_pins_the_window_the_app_actually_opens() {
 /// produce". It was — on 2026-08-31, at three surfaces, to the byte — because
 /// those legs ran at display scale 1.0, where a point is a pixel. The bar
 /// lays out at 40 points then and now; what the model has no term for is the
-/// scale factor. A headed X11 leg on 2026-09-02 ran at 13/12, which puts the
-/// bar at 43.33 px: a one-pane leg at the default window uploaded 2880x1555
-/// pictures (17,913,600 B) against the model's 17,971,200 B, and every
-/// multi-pane native row read INVALID against a figure the app no longer
-/// produced. A figure in points read as a figure in pixels. What is pinned now is the mechanism that
-/// replaced it: the analyser scrapes the app's `overlay pictures:` line
+/// scale factor. winit guessed 13/12 on a headed X11 leg of 2026-09-02, which
+/// puts the bar at 43.33 px: a one-pane leg at the default window uploaded
+/// 2880x1555 pictures (17,913,600 B) against the model's 17,971,200 B, and
+/// every multi-pane native row read INVALID against a figure the app no
+/// longer produced. A figure in points read as a figure in pixels. What is
+/// pinned now is the mechanism that replaced it: the analyser scrapes the
+/// app's `overlay pictures:` line
 /// (`budget_telemetry::overlay_pictures_line`) in the spelling the app prints
 /// — prefix, field order, and an empty `px=` at `n=0` — every group
-/// mandatory, and the model is gone.
+/// mandatory, and the model is gone. The unit those pixels are in is no
+/// longer left to the reader either: every row records the scale winit
+/// guessed for the leg, so a row can never again be quoted in unknown units.
 #[test]
 fn the_surface_check_reads_the_apps_own_picture_sizes() {
     assert!(
@@ -211,6 +214,19 @@ fn the_surface_check_reads_the_apps_own_picture_sizes() {
          display scale the harness never sees; the model was exact only \
          while every leg ran at scale 1, and then refused every multi-pane \
          row against a picture the app no longer drew",
+    );
+    // The compiled PATTERN, not the sentence. Asserting the sentence passes
+    // on the prose beside the arm: this guard was written that way, and a
+    // deliberately broken regex kept it green.
+    assert!(
+        NATIVE_ROW.contains(
+            r#"WINIT_SCALE_RE = re.compile(r"Guessed window scale factor: (\d+(?:\.\d+)?)")"#
+        ),
+        "native_row.py no longer reads the scale factor winit guessed for a \
+         leg. Every pixel figure on a native row is in that unit, and the \
+         same binary on the same display has drawn 2880x1555 pictures at \
+         13/12 and 2880x1560 at 1 minutes apart; a row that does not carry \
+         the scale cannot be compared with any other row",
     );
 }
 

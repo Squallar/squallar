@@ -459,6 +459,23 @@ def parse_hist(text):
 # event, no line, no confirmable surface -- which is the CORRECT case.
 SURFACE_RE = re.compile(r"(?:Window resized to|Surface configured to) (\d+)x(\d+)")
 
+# winit's own line, not the app's:
+# `winit-0.30.13/src/platform_impl/linux/x11/window.rs:192`
+#   info!("Guessed window scale factor: {}", scale_factor);
+#
+# It is the pixels-per-point ratio EVERY pixel figure on this row was measured
+# in, and without it a picture size is uninterpretable. The same binary on the
+# same display drew one-pane pictures of 2880x1555 on legs that guessed 13/12
+# and 2880x1560 on legs that guessed 1, minutes apart, with nothing on either
+# row saying which unit it was in.
+#
+# X11 only -- the line exists in no other winit backend -- so a Wayland or
+# macOS leg leaves the field None. None, never 0 and never a default of 1:
+# "the leg did not say" and "the leg ran at one" are different facts and only
+# one of them is a measurement. The value is winit's `{}` of an f64, so plain
+# decimal, and `1` and `1.0833333333333333` are both real observed spellings.
+WINIT_SCALE_RE = re.compile(r"Guessed window scale factor: (\d+(?:\.\d+)?)")
+
 # The app's own report of the overlay picture it allocates for EACH pane:
 # `overlay pictures: n=<panes>, px=<w>x<h>[;<w>x<h>...], bytes=<sum>`
 # (`squallar_app::budget_telemetry::overlay_pictures_line`), said once a
@@ -500,6 +517,25 @@ def app_surface(lines):
     return found
 
 
+def window_scale(lines):
+    """Every window scale factor winit guessed in this leg, or None.
+
+    `{"scale": <the last>, "seen": [...], "differ": <bool>}`. The LAST is the
+    row's, on `app_surface`'s reasoning: a later window supersedes an earlier
+    one. `differ` is kept rather than averaged away -- a leg whose windows were
+    guessed at two scales measured its pixels in two units, which is a finding
+    about the row and not a detail.
+    """
+    seen = []
+    for line in lines:
+        m = WINIT_SCALE_RE.search(line)
+        if m:
+            seen.append(float(m.group(1)))
+    if not seen:
+        return None
+    return {"scale": seen[-1], "seen": seen, "differ": len(set(seen)) > 1}
+
+
 def scrape(lines, probes):
     """Every scraped family, in line order.
 
@@ -531,6 +567,7 @@ def scrape(lines, probes):
         "backend": None,
         "adapter": None,
         "surface": None,
+        "window_scale": None,
         "gpu_unavailable": False,
     }
     fam = (
@@ -644,6 +681,7 @@ def scrape(lines, probes):
         if "gpu passes: unavailable (adapter lacks TIMESTAMP_QUERY)" in line:
             out["gpu_unavailable"] = True
     out["surface"] = app_surface(lines)
+    out["window_scale"] = window_scale(lines)
     return out
 
 
@@ -1479,6 +1517,21 @@ def build_row(args, scraped, probes):
         notes.append("the seeded pane count was not held against the app's: %s"
                      % panes_source)
     surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, reported, panes)
+    # The unit every pixel figure above was measured in, read from winit's own
+    # line and never assumed. It rides with the geometry because it is part of
+    # the geometry: `achieved=1920x1080` at 13/12 and at 1 are two different
+    # surfaces in pixels, and two rows that do not both carry this are not
+    # comparable however alike their columns look.
+    ws = scraped["window_scale"]
+    scale = ws["scale"] if ws else None
+    surf["scale"] = scale
+    surf["scale_seen"] = ws["seen"] if ws else None
+    if ws and ws["differ"]:
+        notes.append(
+            "winit guessed more than one window scale factor in this leg (%s). "
+            "The row carries the last; the pixel figures on it are not all in "
+            "one unit" % ", ".join("%s" % v for v in ws["seen"])
+        )
     surf["panes_source"] = panes_source if panes is not None else None
     surf["reported_line"] = reported_at[0] if reported_at else None
     surf["source"] = "app" if app_geom else ("wm" if wm_geom else None)
@@ -1551,7 +1604,11 @@ def build_row(args, scraped, probes):
         "backend": scraped["backend"] or "UNKNOWN",
         "viewport": "%dx%d" % (aw, ah),
         "px": aw * ah,
-        "dpr": args.dpr,
+        # MEASURED, not defaulted. `--dpr` is the fallback for a leg
+        # whose log carries no scale line (Wayland, macOS); the native
+        # runner never passes it, so a hardcoded `dpr=1` used to be
+        # printed on rows that were measured at 13/12.
+        "dpr": ("%s" % scale) if scale is not None else args.dpr,
         "cross": "yes" if surf["met"] else ("unchecked" if surf["unchecked"] else "no"),
         "hz": args.refresh or "?",
         "coi": "n/a",
@@ -1695,10 +1752,11 @@ def print_row(row):
     s = row["surface"]
     reported_panes = s.get("reported_panes", s.get("panes"))
     print(
-        "ROW   surface asked=%s achieved=%s (from the %s) panes=%s "
+        "ROW   surface asked=%s achieved=%s (from the %s) scale=%s panes=%s "
         "app_pictures=%s expected=%s B/picture (+-%s) observed=%s B/picture -> %s"
         % (
             s.get("asked"), s.get("achieved"), s.get("source") or "?",
+            s["scale"] if s.get("scale") is not None else "absent",
             reported_panes if reported_panes is not None else "?",
             s.get("reported_px") or "absent",
             s.get("expected_label", "-"),
@@ -3398,6 +3456,99 @@ class AppSurfaceTests(unittest.TestCase):
             "the wrong size -- rather than for an unexplained byte mismatch",
         )
         self.assertIn("3440x1440", app["why"])
+
+
+class WindowScaleTests(unittest.TestCase):
+    """The unit a row's pixel figures are in, read from winit's own line.
+
+    The three fixtures are the three spellings real legs of 2026-09-03/04
+    wrote on this box, same display and same binary family: `1` on the WO-23c
+    pair and on the `fixed-b`/`prefix-b` legs, `1.0833333333333333` on the
+    six `abc-native` legs and on `fixed-c`, and nothing at all from a backend
+    that does not log it.
+    """
+
+    LOG = "[2026-09-04T05:16:13Z INFO  winit::platform_impl::linux::x11::window] "
+
+    def test_a_scale_one_leg_reads_back_one(self):
+        r = window_scale([self.LOG + "Guessed window scale factor: 1"])
+        self.assertEqual(r["scale"], 1.0)
+        self.assertFalse(r["differ"])
+
+    def test_a_thirteen_twelfths_leg_reads_back_its_own_fraction(self):
+        """The value that made a one-pane leg draw 2880x1555 where a scale-1
+        leg drew 2880x1560, and the reason a row cannot be read without it."""
+        r = window_scale([self.LOG + "Guessed window scale factor: 1.0833333333333333"])
+        self.assertEqual(r["scale"], 13.0 / 12.0)
+
+    def test_a_log_without_the_line_has_no_scale(self):
+        """None, not 1. A Wayland or macOS leg never says, and a default of
+        one is a measurement nobody took."""
+        self.assertIsNone(window_scale([self.LOG + "Guessed nothing at all"]))
+
+    def test_two_guesses_report_the_last_and_say_they_differed(self):
+        r = window_scale([
+            self.LOG + "Guessed window scale factor: 1.0833333333333333",
+            self.LOG + "Guessed window scale factor: 1",
+        ])
+        self.assertEqual(r["scale"], 1.0)
+        self.assertEqual(r["seen"], [13.0 / 12.0, 1.0])
+        self.assertTrue(r["differ"])
+
+
+class RowScaleTests(unittest.TestCase):
+    """Where the scale lands once a whole leg goes through the row."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, scale_lines):
+        lines = scale_lines + _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def _guess(self, v):
+        return ["[..] INFO  winit::platform_impl::linux::x11::window] "
+                "Guessed window scale factor: %s" % v]
+
+    def test_the_row_carries_the_scale_beside_the_geometry(self):
+        row, text = self._row(self._guess("1.0833333333333333"))
+        self.assertEqual(row["surface"]["scale"], 13.0 / 12.0)
+        self.assertIn("achieved=1920x1080 (from the app) scale=1.0833333333333333",
+                      text)
+
+    def test_a_leg_that_never_said_prints_absent_rather_than_one(self):
+        row, text = self._row([])
+        self.assertIsNone(row["surface"]["scale"])
+        self.assertIsNone(row["surface"]["scale_seen"])
+        self.assertIn("(from the app) scale=absent", text)
+
+    def test_dpr_is_the_measured_scale_not_the_flags_default(self):
+        """`--dpr` defaults to 1 and the native runner never passes it, so
+        every native row printed `dpr=1` -- including six legs of 2026-09-02
+        that ran at 13/12 and drew 2880x1555 pictures."""
+        row, text = self._row(self._guess("1.0833333333333333"))
+        self.assertEqual(row["dpr"], "1.0833333333333333")
+        self.assertIn("dpr=1.0833333333333333", text.splitlines()[0])
+        # And the fallback survives for a leg whose log cannot say.
+        row, text = self._row([])
+        self.assertEqual(row["dpr"], "1")
+
+    def test_two_guesses_in_one_leg_are_a_note_on_the_row(self):
+        row, _text = self._row(self._guess("1.0833333333333333") + self._guess("1"))
+        self.assertEqual(row["surface"]["scale"], 1.0)
+        self.assertTrue(
+            any("more than one window scale factor" in n for n in row["notes"]),
+            row["notes"])
 
 
 class GateSetTests(unittest.TestCase):

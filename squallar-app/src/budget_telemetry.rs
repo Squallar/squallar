@@ -153,9 +153,10 @@ pub(crate) fn budget_state_line(
 /// and called the 40 "the top bar in points". The 40 is right: it is
 /// `MIN_BAR_HEIGHT` (`squallar_egui`'s topbar), `2 * VERTICAL_MARGIN +
 /// INTERACT_HEIGHT`, a **floor** the bar lays out on. What the model has no
-/// term for is the display scale. A headed X11 leg on 2026-09-02 ran at
-/// 13/12, winit's quantization of an X11 scale factor to twelfths, which
-/// puts those 40 points at 43.33 physical pixels, so every scene D row read
+/// term for is the display scale. On a headed X11 leg of 2026-09-02 winit
+/// guessed 13/12 — its quantization of a scale factor to twelfths, a value
+/// it guessed on those legs and not a property of the display — which puts
+/// those 40 points at 43.33 physical pixels, so every scene D row read
 /// `** INVALID **` by exactly 57,600 B — five texel rows.
 ///
 /// **And the model was exact when it was written.** `run_measure.sh` records
@@ -163,11 +164,15 @@ pub(crate) fn budget_state_line(
 /// canvases — and the formula still reproduces all three to the byte,
 /// because all three ran at scale 1.0 where a point is a pixel. The
 /// constants have not moved and neither has the bar; what differed between
-/// the two dates is a scale factor nothing recorded.
-/// `run_measure_native.sh` now pins `WINIT_X11_SCALE_FACTOR=1` on every
-/// native leg, which makes the arms comparable but is not what makes this
-/// line the right source: a figure in points cannot predict pixels without
-/// the scale of the surface, which a harness outside the app does not see.
+/// the two dates is a scale factor nothing recorded. Every native row now
+/// records it: `native_row.py` reads winit's own `Guessed window scale
+/// factor:` line and prints `scale=` beside the geometry, `absent` where the
+/// leg never said. `run_measure_native.sh` also pins
+/// `WINIT_X11_SCALE_FACTOR=1`, which on X11 overrides winit's guess outright,
+/// but the pin narrows the spread and the record is the remedy. Neither is
+/// what makes this line the right source: a figure in points cannot predict
+/// pixels without the scale of the surface, which a harness outside the app
+/// does not see.
 ///
 /// So this reports the size the app allocated. `px` lists every pane in
 /// pane-index order; a pane with no overlay picture prints `0x0`, which is an

@@ -72,11 +72,16 @@
 # -- exact at three surfaces on 2026-08-31, which were taken at display scale
 # 1.0, where a point is a pixel. The bar lays out at 40 points then and now
 # (40 is `MIN_BAR_HEIGHT`, a floor, and the bar sits on it). What the model
-# omits is the scale factor: a headed X11 leg on 2026-09-02 ran at 13/12, so
-# the bar measured 43.33 px, and every multi-pane row read `** INVALID **`
-# against a picture the app no longer drew. Legs now launch with
-# `WINIT_X11_SCALE_FACTOR=1`, and the analyser reads the app's own figure
-# either way, which is what makes the two dates comparable at all. A log with no
+# omits is the scale factor: winit guessed 13/12 on a headed X11 leg of
+# 2026-09-02, so the bar measured 43.33 px, and every multi-pane row read
+# `** INVALID **` against a picture the app no longer drew. Legs now launch
+# pinned to `WINIT_X11_SCALE_FACTOR=1` -- which on X11 overrides the guess
+# outright (see the leg env block for the winit code) -- and, more to the
+# point, EVERY ROW NOW RECORDS THE SCALE IT WAS MEASURED AT, off winit's own
+# `Guessed window scale factor:` line, printed as `scale=` beside the geometry
+# and carried in the JSON. That, not the pin, is what makes rows of different
+# dates comparable: the pin only narrows the spread, and an old row or an
+# unpinnable platform still gets read in the right unit. A log with no
 # `overlay pictures:` line -- a binary older than it -- reads
 # `** UNCHECKED: overlay pictures line absent **`, which is NOT `** INVALID **`:
 # the bytes were checked against nothing and the row is not refused for it.
@@ -183,6 +188,52 @@ COUNTERBALANCE=0
 ALLOW_UNPINNED=0
 PANEL="${RIG_PANEL:-off}"
 DISPLAY_ARG="${RIG_DISPLAY:-${DISPLAY:-:0}}"
+
+# The scale pin, in ONE place, because the header used to RESTATE it: it
+# printed `scale=1(WINIT_X11_SCALE_FACTOR)` unconditionally, and an unpinned
+# control -- a copy with the env entry deleted -- printed the same header as
+# the pinned arm. Every leg's env array is spliced from this one array and the
+# header reports whether the array is empty, so the two cannot disagree. Set
+# `RIG_SCALE_PIN=` (empty) for an unpinned control; there is then no copy of
+# this script to keep in step.
+#
+# What the pin does, from winit 0.30.13's source rather than from belief
+# (`src/platform_impl/linux/x11/util/randr.rs`, `get_output_info`): a parseable
+# `WINIT_X11_SCALE_FACTOR` takes the `EnvVarDPI::Scale` arm and is RETURNED AS
+# THE SCALE FACTOR, ahead of both XSETTINGS/`Xft.dpi` and the physical-size
+# calculation. It is not clamped to a range -- only rejected, by panic, when it
+# is not a normal positive float. So on X11 the pin decides, unconditionally.
+# It decides nothing anywhere else: no other backend reads the variable.
+#
+# The pin is still not the record. The row records the scale the leg was
+# MEASURED at, off winit's own `Guessed window scale factor:` line, whatever
+# this array holds -- which is what makes a pinned row and an older unpinned
+# one comparable at all.
+declare -a SCALE_PIN_ENV=()
+if [ -n "${RIG_SCALE_PIN-WINIT_X11_SCALE_FACTOR=1}" ]; then
+  SCALE_PIN_ENV=("${RIG_SCALE_PIN-WINIT_X11_SCALE_FACTOR=1}")
+fi
+
+# A headed leg needs the display's MIT-MAGIC-COOKIE-1 key. `env` is called
+# without `-i`, so a caller that already has XAUTHORITY passes it through
+# anyway; naming it here is for the two cases that bite. A shell that never had
+# one -- a detached session, a service, an agent -- opens no display at all:
+# the app dies at boot with `Invalid MIT-MAGIC-COOKIE-1 key` and
+# `XOpenDisplayFailed`, no surface line ever arrives, and the leg is REFUSED
+# with no row -- an instrument failure that looks exactly like a broken build.
+# And the runner's OWN X tools (xdotool, xrandr) need it for the same reason,
+# which is why it is exported rather than only handed to the leg.
+#
+# The cookie file's name is generated per session (`xauth_XXXXXX`), so it is
+# MATCHED, never hardcoded, and the newest match wins. Nothing here creates,
+# copies or edits a cookie: the display is the user's, and a rig that writes to
+# the thing it is measuring on has stopped measuring it.
+if [ -z "${XAUTHORITY:-}" ]; then
+  XAUTH_FOUND="$(ls -1t "/run/user/$(id -u)"/xauth_* 2>/dev/null | head -1)"
+  if [ -n "$XAUTH_FOUND" ]; then
+    export XAUTHORITY="$XAUTH_FOUND"
+  fi
+fi
 QUIET_MAX=""
 COMMIT=""
 SHOW_PLATFORM=0
@@ -497,7 +548,14 @@ REFRESH="${REFRESH:-?}"
 ADAPTER="unknown(app never logged an adapter)"
 
 echo "commit=$COMMIT scenes=[$SCENES] geom=${W}x${H} runs=$RUNS arms=[${ARMS[*]}]"
-echo "counterbalance=$COUNTERBALANCE quiet_max=$QUIET_MAX display=$DISPLAY_ARG scale=1(WINIT_X11_SCALE_FACTOR)"
+# Reported, not asserted: read off the array the legs are actually launched
+# with, and the row's own measured `scale=` is the figure that settles it.
+if [ "${#SCALE_PIN_ENV[@]}" -gt 0 ]; then
+  SCALE_REPORT="pinned(${SCALE_PIN_ENV[*]})"
+else
+  SCALE_REPORT="unpinned(winit guesses; each row records what it guessed)"
+fi
+echo "counterbalance=$COUNTERBALANCE quiet_max=$QUIET_MAX display=$DISPLAY_ARG scale=$SCALE_REPORT xauthority=${XAUTHORITY:-<none found>}"
 echo "refresh=$REFRESH out=$OUT_DIR (adapter is read per leg from the app's own log)"
 report_platform
 
@@ -611,51 +669,64 @@ run_leg() {
   #    outranks the stored key). Stderr is the readout: env_logger writes the
   #    telemetry sentences there at info.
   #
-  #    WINIT_X11_SCALE_FACTOR=1 pins the leg to one physical pixel per point.
-  #    Left unset, winit takes the X server's scale and quantizes it to
-  #    twelfths, and this box answers 13/12: every figure the app reports in
-  #    pixels is then 1.0833x its size in points, a 40-point top bar reads as
-  #    43.33 px, and a one-pane 1920x1080 leg draws 2880x1555 pictures where a
-  #    scale-1 leg draws 2880x1560. No leg recorded a scale factor, so two
-  #    arms taken at different scales were incomparable and nothing said so.
-  #    The launch env is written to the leg's own env.txt beside its app.log,
-  #    so a row's provenance carries the value rather than assuming it.
+  #    `SCALE_PIN_ENV` pins the leg to one physical pixel per point, and
+  #    XAUTHORITY is what lets it open the display at all. Both are set up at
+  #    the top of this file, in one place each, and both are written into the
+  #    leg's own env.txt beside its app.log -- provenance, not assumption.
   #
-  #    The pair that confirms it, on a headed X11 box (NOT RUN YET). Pinned:
+  #    Left unpinned, winit reads XSETTINGS or `Xft.dpi` if either answers, and
+  #    otherwise computes a factor from the monitor's physical size and
+  #    quantizes it to twelfths (`calc_dpi_factor`, winit 0.30.13). This box
+  #    has answered both ways: 13/12 on the six abc-native legs and on
+  #    fixed-c, and 1 on fixed-b, prefix-b and the WO-23c pair -- same display,
+  #    same binary family, minutes apart. At 13/12 every figure the app
+  #    reports in pixels is 1.0833x its size in points, a 40-point top bar
+  #    reads as 43.33 px, and a one-pane 1920x1080 leg draws 2880x1555
+  #    pictures where a scale-1 leg draws 2880x1560. 13/12 is a value winit
+  #    guessed on some legs, not a property of the display.
+  #
+  #    The remedy is the RECORD, not the pin: `native_row.py` reads winit's
+  #    own `Guessed window scale factor:` line and every row prints
+  #    `scale=<value>` beside its geometry (and `absent` where the leg never
+  #    said), so a row can never again be quoted in unknown units. The pin
+  #    narrows the spread; the record is what makes an old row readable.
+  #
+  #    The pin does bite where it applies. winit 0.30.13,
+  #    `src/platform_impl/linux/x11/util/randr.rs`: a parseable
+  #    WINIT_X11_SCALE_FACTOR takes the `EnvVarDPI::Scale` arm and is returned
+  #    as the scale factor ahead of XSETTINGS, `Xft.dpi` and the physical-size
+  #    calculation, unclamped (an unparseable or non-normal value panics).
+  #    X11 only; no other backend reads it.
+  #
+  #    UNPROVEN, and it needs a display that guesses something other than 1:
+  #    the WO-23c pair ran pinned and unpinned and BOTH guessed 1, so the pin
+  #    was never exercised. The pair, when a 13/12 guess is available again --
+  #    no copy of this script, so nothing can drift:
   #
   #      .github/browser-rig/run_measure_native.sh --scenes A --runs 1 \
-  #        --out-dir /tmp/wo23b-pinned
-  #      grep -h "overlay pictures:" /tmp/wo23b-pinned/*/app.log | tail -1
-  #      # expect  overlay pictures: n=1, px=2880x1560, bytes=17971200
-  #
-  #    Unpinned control, from a copy that keeps RIG_DIR resolving and is
-  #    deleted again (never committed):
-  #
-  #      cp .github/browser-rig/run_measure_native.sh \
-  #         .github/browser-rig/run_measure_native.unpinned.sh
-  #      sed -i '/"WINIT_X11_SCALE_FACTOR=1"/d' \
-  #         .github/browser-rig/run_measure_native.unpinned.sh
-  #      bash .github/browser-rig/run_measure_native.unpinned.sh --scenes A \
-  #        --runs 1 --out-dir /tmp/wo23b-unpinned
-  #      grep -h "overlay pictures:" /tmp/wo23b-unpinned/*/app.log | tail -1
-  #      # expect  overlay pictures: n=1, px=2880x1555, bytes=17913600
-  #      rm .github/browser-rig/run_measure_native.unpinned.sh
-  #
-  #    The control's 1555 is a claim about THIS display: it needs the X scale
-  #    to actually be 13/12. On a scale-1.0 display both arms print 2880x1560
-  #    and the pair proves only that the pin is harmless, not that it bites.
+  #        --out-dir /tmp/scale-pinned
+  #      RIG_SCALE_PIN= .github/browser-rig/run_measure_native.sh --scenes A \
+  #        --runs 1 --out-dir /tmp/scale-unpinned
+  #      grep -h "Guessed window scale factor" /tmp/scale-*/*/app.log
+  #      # the pin bites iff the two legs print different factors
   local -a env_args=(
     "XDG_CONFIG_HOME=$dir/config"
     "XDG_CACHE_HOME=$dir/cache"
     "RUST_LOG=info"
     "DISPLAY=$DISPLAY_ARG"
-    "WINIT_X11_SCALE_FACTOR=1"
   )
+  if [ -n "${XAUTHORITY:-}" ]; then
+    env_args+=("XAUTHORITY=$XAUTHORITY")
+  fi
+  if [ "${#SCALE_PIN_ENV[@]}" -gt 0 ]; then
+    env_args+=("${SCALE_PIN_ENV[@]}")
+  fi
   if [ "$script" != none ]; then
     env_args+=("SQUALLAR_GESTURE_SCRIPT=$script")
   fi
   printf '%s\n' "${env_args[@]}" > "$dir/env.txt"
-  echo "  launch env in $dir/env.txt (WINIT_X11_SCALE_FACTOR=1: points are pixels)"
+  echo "  launch env in $dir/env.txt ($SCALE_REPORT; the row records the scale" \
+       "the leg was measured at either way)"
   env "${env_args[@]}" "$bin" > "$log" 2>&1 &
   pid=$!
 
