@@ -351,23 +351,32 @@ pub fn prepare<'s>(
     Some(Prepared::Derived(derived))
 }
 
-/// Every velocity-carrying tilt of the volume, decoded once, each paired with
-/// the fold limit its cut declared — the shared walk SRV and NROT derive over.
-fn velocity_tilts(
-    volume: crate::nyquist::Volume<'_>,
-) -> Vec<(crate::velocity::VelocityTilt<'_>, Option<f64>)> {
-    crate::velocity::tilts(volume.scan())
-        .map(|tilt| {
-            let declared = volume.declared_nyquist().get(tilt.sweep.elevation_number());
-            (tilt, declared)
-        })
-        .collect()
+/// Every velocity-carrying tilt of the volume, decoded as it is reached, each
+/// paired with the fold limit its cut declared — the shared walk SRV and NROT
+/// derive over.
+///
+/// A stream, not a collection. A tilt decodes to an `f64` grid — a super-res
+/// cut is 720 × 1192 × 8 B, 6.55 MiB, plus a status byte per gate — and this
+/// walk used to collect every tilt of the volume before the first was used,
+/// so a derivation held the volume's grids for its whole length on top of the
+/// one tilt's dealias transients. The wind fit the walk seeds from needs every
+/// tilt twice, and takes them from [`crate::velocity::volume_wind_profile`],
+/// which decodes each tilt as it offers it; the walk here decodes each a third
+/// time. Three decodes of a tilt for one grid resident is the trade, and
+/// `tests/derive_tilt_residency.rs` is the pin on the residency.
+fn velocity_tilts<'v>(
+    volume: crate::nyquist::Volume<'v>,
+) -> impl Iterator<Item = (crate::velocity::VelocityTilt<'v>, Option<f64>)> {
+    let declared = volume.declared_nyquist();
+    crate::velocity::tilts(volume.scan()).map(move |tilt| {
+        let declared = declared.get(tilt.sweep.elevation_number());
+        (tilt, declared)
+    })
 }
 
 fn derive_srv(volume: crate::nyquist::Volume<'_>, motion: srv::MotionInputs) -> Option<Scan> {
     let scan = volume.scan();
-    let tilts = velocity_tilts(volume);
-    let profile = crate::velocity::wind_profile_of(tilts.iter().map(|(tilt, _)| tilt));
+    let profile = crate::velocity::volume_wind_profile(scan);
     // No vector, no SRV: base velocity under a storm-relative label is the
     // failure this refusal exists to prevent.
     let Some(motion) = motion.resolve(profile.as_ref()) else {
@@ -379,8 +388,7 @@ fn derive_srv(volume: crate::nyquist::Volume<'_>, motion: srv::MotionInputs) -> 
         return None;
     };
 
-    let sweeps: Vec<Sweep> = tilts
-        .into_iter()
+    let sweeps: Vec<Sweep> = velocity_tilts(volume)
         .map(|(tilt, declared_nyquist_ms)| {
             let grid = srv::storm_relative_grid(
                 tilt.grid,
@@ -404,14 +412,12 @@ fn derive_srv(volume: crate::nyquist::Volume<'_>, motion: srv::MotionInputs) -> 
 
 fn derive_nrot(volume: crate::nyquist::Volume<'_>) -> Option<Scan> {
     let scan = volume.scan();
-    let tilts = velocity_tilts(volume);
-    let profile = crate::velocity::wind_profile_of(tilts.iter().map(|(tilt, _)| tilt));
-    let sweeps: Vec<Sweep> = tilts
-        .iter()
+    let profile = crate::velocity::volume_wind_profile(scan);
+    let sweeps: Vec<Sweep> = velocity_tilts(volume)
         .map(|(tilt, declared_nyquist_ms)| {
             let grid = &tilt.grid;
             let values = nrot::compute_nrot_grid_with_profile(
-                &grid.sweep(*declared_nyquist_ms),
+                &grid.sweep(declared_nyquist_ms),
                 tilt.elevation_deg,
                 profile.as_ref(),
             );
