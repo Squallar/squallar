@@ -96,6 +96,9 @@ pub(crate) struct SpcDiscussionHandler {
     /// The "MD 1234" map labels, rebuilt whenever `state.data` is — never per frame.
     labels: Vec<OverlayLabel>,
     signature_memo: crate::render::signature_memo::SignatureMemo,
+    /// The last built paint input per (generation, admitted set, device
+    /// scale) — see [`Self::prepare_job`].
+    pub(crate) job_memo: crate::render::signature_memo::JobMemo,
     /// How many items [`Self::content_signature`]'s fold has walked, for the
     /// memo gate: an unchanged (generation, view) call must add zero.
     #[cfg(test)]
@@ -109,6 +112,7 @@ impl SpcDiscussionHandler {
             enabled: true,
             labels: Vec::new(),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(),
             #[cfg(test)]
             sig_item_visits: std::cell::Cell::new(0),
         }
@@ -123,16 +127,7 @@ impl SpcDiscussionHandler {
                 .state
                 .data
                 .iter()
-                // **The as-of filter**: two `Option` comparisons against the
-                // window parsed once at fetch time from the product's own
-                // `VALID` line. A discussion unbounded on a side passes on that
-                // side. On a live pane `as_of` is the wall clock and the feed
-                // only carries discussions that are in force, so the rows are
-                // exactly what they were before this filter existed.
-                .filter(|i| {
-                    i.md.valid_from.is_none_or(|from| from <= ctx.as_of)
-                        && i.md.valid_until.is_none_or(|until| ctx.as_of < until)
-                })
+                .filter(|i| Self::admitted(i, ctx.as_of))
                 .map(|i| rasterize::DiscussionPaint {
                     md_type: i.md.md_type,
                     polygon: i.md.polygon.clone(),
@@ -140,6 +135,29 @@ impl SpcDiscussionHandler {
                 .collect(),
             device_scale: ctx.device_scale,
         })
+    }
+}
+
+impl SpcDiscussionHandler {
+    /// **The as-of filter**: two `Option` comparisons against the window
+    /// parsed once at fetch time from the product's own `VALID` line. A
+    /// discussion unbounded on a side passes on that side. On a live pane
+    /// `as_of` is the wall clock and the feed only carries discussions that
+    /// are in force, so the rows are exactly what they were before this
+    /// filter existed.
+    ///
+    /// One predicate for [`Self::paint_input`], [`Self::as_of_signature`] and
+    /// the job memo's key.
+    fn admitted(item: &DiscussionItem, as_of: chrono::NaiveDateTime) -> bool {
+        item.md.valid_from.is_none_or(|from| from <= as_of)
+            && item.md.valid_until.is_none_or(|until| as_of < until)
+    }
+
+    /// The admitted set at `as_of`, as one number — O(items), no allocation.
+    fn admitted_identity(&self, as_of: chrono::NaiveDateTime) -> u64 {
+        crate::render::signature_memo::as_of_identity(
+            self.state.data.iter().map(|i| Self::admitted(i, as_of)),
+        )
     }
 }
 
@@ -210,12 +228,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         if self.state.data.is_empty() {
             return None;
         }
-        Some(crate::render::signature_memo::as_of_identity(
-            self.state.data.iter().map(|i| {
-                i.md.valid_from.is_none_or(|from| from <= as_of)
-                    && i.md.valid_until.is_none_or(|until| as_of < until)
-            }),
-        ))
+        Some(self.admitted_identity(as_of))
     }
 
     /// **One instant per stop, and that is the whole ask.**
@@ -375,8 +388,19 @@ impl OverlayHandler for SpcDiscussionHandler {
         });
     }
 
+    /// **Built once per picture, not once per dispatch.** The input clones
+    /// every in-force discussion's polygon; its terms are the generation, the
+    /// set `as_of` admits and the device scale. No pane term: the layer's one
+    /// view input is the toggle, and a disabled layer is never dispatched.
     fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx).map(DescribedJob::new)
+        let key = crate::render::signature_memo::fold_key(
+            self.admitted_identity(ctx.as_of),
+            u64::from(ctx.device_scale.to_bits()),
+        );
+        self.job_memo
+            .get_or_build(self.state.data_generation, key, || {
+                self.paint_input(ctx).map(DescribedJob::new)
+            })
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -706,5 +730,59 @@ mod tests {
             reversed.content_signature(&PaneRef::bare(0)),
             "the same MDs in another order draw the same picture",
         );
+    }
+
+    fn at(h: u32, m: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+    }
+
+    fn live_ctx(clock: chrono::NaiveDateTime) -> RasterizeContext {
+        RasterizeContext {
+            is_dark: false,
+            zoom: 7.0,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        }
+    }
+
+    /// **The dispatch's build, memoised.** The input clones every polygon;
+    /// a live pane's clock moving with the admitted set unchanged is a hit,
+    /// and crossing a discussion's expiry is a rebuild.
+    #[test]
+    fn the_built_input_is_reused_until_the_admitted_set_moves() {
+        let mut expiring = md(101);
+        expiring.valid_until = Some(at(19, 30));
+        let handler = handler_with(vec![expiring, md(102)]);
+        let pane = PaneRef::bare(0);
+        let first = handler.prepare_job(&live_ctx(at(19, 0)), &pane).unwrap();
+        let second = handler.prepare_job(&live_ctx(at(19, 29)), &pane).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.0, &second.0),
+            "same admitted set: a refcount clone, not a rebuild",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 1);
+
+        let after = handler.prepare_job(&live_ctx(at(19, 30)), &pane).unwrap();
+        assert_eq!(handler.job_memo.builds.get(), 2, "the set moved at expiry");
+        assert_eq!(
+            after
+                .downcast_ref::<rasterize::DiscussionsInput>()
+                .unwrap()
+                .discussions
+                .len(),
+            1,
+        );
+
+        let scaled = RasterizeContext {
+            device_scale: 2.0,
+            ..live_ctx(at(19, 30))
+        };
+        handler.prepare_job(&scaled, &pane);
+        assert_eq!(handler.job_memo.builds.get(), 3, "device scale is a term");
     }
 }

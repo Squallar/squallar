@@ -198,6 +198,9 @@ pub(crate) struct SpcOutlookHandler {
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: OutlookPaneState,
+    /// The last built paint input per (combined generation, scope, in-force
+    /// set, theme, device scale) — see [`Self::prepare_job`].
+    pub(crate) job_memo: crate::render::signature_memo::JobMemo,
 }
 
 impl SpcOutlookHandler {
@@ -211,6 +214,7 @@ impl SpcOutlookHandler {
             round_answered_in_scope: false,
             round_stray_failures: Vec::new(),
             defaults: OutlookPaneState::new(false),
+            job_memo: crate::render::signature_memo::JobMemo::new(),
         }
     }
 
@@ -418,22 +422,48 @@ impl SpcOutlookHandler {
         view: &OutlookPaneState,
         as_of: chrono::NaiveDateTime,
     ) -> Vec<crate::types::OverlayFeature> {
-        let day = view.selected_day;
         let mut features = Vec::new();
-        for &product in day.products() {
-            if !view.enabled_products.contains(&product) {
-                continue;
-            }
-            if let Some(outlook) = self.state.data.get(&(day, product)) {
-                if !(outlook.valid.is_none_or(|valid| valid <= as_of)
-                    && outlook.expire.is_none_or(|expire| as_of < expire))
-                {
-                    continue;
-                }
-                features.extend(outlook.features.iter().cloned());
-            }
+        for (_, outlook) in self.in_force_in_paint_order(view, as_of) {
+            features.extend(outlook.features.iter().cloned());
         }
         features
+    }
+
+    /// The enabled products whose held issuance is in force at `as_of`, in
+    /// paint order, with the product each came from. The one walk behind
+    /// [`Self::features_in_paint_order`] and the job memo's key, so the rows
+    /// that travel are the rows that are keyed.
+    fn in_force_in_paint_order(
+        &self,
+        view: &OutlookPaneState,
+        as_of: chrono::NaiveDateTime,
+    ) -> impl Iterator<Item = (OutlookProduct, &SpcOutlook)> + '_ {
+        let day = view.selected_day;
+        let enabled = view.enabled_products.clone();
+        day.products()
+            .iter()
+            .filter(move |product| enabled.contains(product))
+            .filter_map(move |&product| {
+                let outlook = self.state.data.get(&(day, product))?;
+                let in_force = outlook.valid.is_none_or(|valid| valid <= as_of)
+                    && outlook.expire.is_none_or(|expire| as_of < expire);
+                in_force.then_some((product, outlook))
+            })
+    }
+
+    /// Every term of the picture other than the data itself: the day, the
+    /// products in force at `as_of` in paint order, the theme (the hatch
+    /// colour reads it) and the device scale. O(products), no allocation.
+    fn paint_key(&self, view: &OutlookPaneState, ctx: &RasterizeContext) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        view.selected_day.hash(&mut hasher);
+        for (product, _) in self.in_force_in_paint_order(view, ctx.as_of) {
+            product.hash(&mut hasher);
+        }
+        ctx.is_dark.hash(&mut hasher);
+        ctx.device_scale.to_bits().hash(&mut hasher);
+        hasher.finish()
     }
 
     fn paint_input(
@@ -745,9 +775,16 @@ impl OverlayHandler for SpcOutlookHandler {
         // not on a data ID.
     }
 
+    /// **Built once per picture, not once per dispatch.** The input deep-clones
+    /// every feature of every in-force product — polygons and both labels —
+    /// and its terms are the combined generation and [`Self::paint_key`].
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx, self.view(pane))
-            .map(DescribedJob::new)
+        let view = self.view(pane);
+        self.job_memo.get_or_build(
+            self.combined_generation(),
+            self.paint_key(view, ctx),
+            || self.paint_input(ctx, view).map(DescribedJob::new),
+        )
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -2136,6 +2173,89 @@ mod tests {
             live,
             unwindowed.paint_input(&paint_ctx(now), &unwindowed.defaults),
             "the as-of window leaked into the live pane's paint input",
+        );
+    }
+
+    /// **The dispatch's build, memoised.** The input deep-clones every
+    /// in-force feature; a second dispatch under the same day, products,
+    /// in-force set, theme and scale hands back the first's allocation. The
+    /// theme is a term here — the hatch colour reads it — and so is the
+    /// window: an instant past `expire` describes no job, and an instant
+    /// back inside it is a hit on the held row, not a rebuild.
+    #[test]
+    fn the_built_input_is_reused_until_a_term_of_the_picture_moves() {
+        let mut handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+        let pane = PaneRef::bare(0);
+        let first = handler.prepare_job(&paint_ctx(at(22, 14)), &pane).unwrap();
+        let second = handler.prepare_job(&paint_ctx(at(22, 20)), &pane).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.0, &second.0),
+            "same picture, same allocation"
+        );
+        assert_eq!(handler.job_memo.builds.get(), 1);
+
+        // A `None` answer runs the closure and counts as a build; it is not
+        // remembered, so the count below steps on every such ask.
+        assert!(
+            handler.prepare_job(&paint_ctx(at(23, 12)), &pane).is_none(),
+            "past expire nothing is in force and no job is described",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 2);
+        let back = handler.prepare_job(&paint_ctx(at(22, 21)), &pane).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.0, &back.0),
+            "the in-force row was still held"
+        );
+
+        let dark = RasterizeContext {
+            is_dark: true,
+            ..paint_ctx(at(22, 21))
+        };
+        handler.prepare_job(&dark, &pane);
+        assert_eq!(
+            handler.job_memo.builds.get(),
+            3,
+            "the theme reaches the hatch colour"
+        );
+
+        handler
+            .defaults
+            .enabled_products
+            .remove(&OutlookProduct::Categorical);
+        assert!(
+            handler.prepare_job(&dark, &pane).is_none(),
+            "no enabled product draws nothing",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 4);
+        handler
+            .defaults
+            .enabled_products
+            .insert(OutlookProduct::Categorical);
+        handler.prepare_job(&dark, &pane);
+        assert_eq!(
+            handler.job_memo.builds.get(),
+            4,
+            "the dark row was still held"
+        );
+
+        land(
+            &mut handler,
+            OutlookProduct::Categorical,
+            Ok(SpcOutlook {
+                day: OutlookDay::Day1,
+                product: OutlookProduct::Categorical,
+                valid: None,
+                expire: None,
+                features: Vec::new(),
+            }),
+        );
+        assert!(
+            handler.prepare_job(&dark, &pane).is_none(),
+            "a refetch that landed an empty issuance draws nothing",
+        );
+        assert!(
+            !handler.job_memo.take_retired().is_empty(),
+            "the refetch moved the generation and parked the old rows",
         );
     }
 }

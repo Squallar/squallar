@@ -267,6 +267,9 @@ pub(crate) struct NwsAlertHandler {
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: AlertPaneState,
     signature_memo: crate::render::signature_memo::SignatureMemo,
+    /// The last built paint input per (generation, view, admitted set,
+    /// device scale) — see [`Self::prepare_job`].
+    pub(crate) job_memo: crate::render::signature_memo::JobMemo,
     /// How many items [`Self::content_signature`]'s fold has walked, for the
     /// memo gate: an unchanged (generation, view) call must add zero.
     #[cfg(test)]
@@ -280,6 +283,7 @@ impl NwsAlertHandler {
             hidden_alerts: HashSet::new(),
             defaults: AlertPaneState::new(true),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(),
             #[cfg(test)]
             sig_item_visits: std::cell::Cell::new(0),
         }
@@ -356,20 +360,7 @@ impl NwsAlertHandler {
                 .state
                 .data
                 .iter()
-                // **The as-of filter, and the whole of it**: two `Option`
-                // comparisons against fields parsed once at fetch time. An
-                // alert unbounded on a side passes on that side. Nothing is
-                // parsed, formatted or allocated here.
-                .filter(|i| {
-                    i.alert.valid_from.is_none_or(|from| from <= ctx.as_of)
-                        && i.alert.valid_until.is_none_or(|until| ctx.as_of < until)
-                        // A departed item is history (WB-4): visible only
-                        // before the poll that lost it. On a live pane
-                        // `as_of` is the wall clock, which is never before a
-                        // past departure — so the live rows are exactly the
-                        // active feed's rows and the bytes are unchanged.
-                        && i.departed.is_none_or(|gone| ctx.as_of < gone)
-                })
+                .filter(|i| Self::admitted(i, ctx.as_of))
                 .map(|i| rasterize::AlertPaint {
                     id: i.alert.id.clone(),
                     category: i.alert.category,
@@ -392,6 +383,52 @@ impl NwsAlertHandler {
             hidden_ids: self.hidden_alerts.clone(),
             device_scale: ctx.device_scale,
         })
+    }
+
+    /// **The as-of filter, and the whole of it**: two `Option` comparisons
+    /// against fields parsed once at fetch time. An alert unbounded on a side
+    /// passes on that side. Nothing is parsed, formatted or allocated here.
+    ///
+    /// A departed item is history (WB-4): visible only before the poll that
+    /// lost it. On a live pane `as_of` is the wall clock, which is never
+    /// before a past departure — so the live rows are exactly the active
+    /// feed's rows and the bytes are unchanged.
+    ///
+    /// One predicate for [`Self::paint_input`], [`Self::as_of_signature`] and
+    /// the job memo's key: the rows that travel are the rows that are folded,
+    /// so two instants share a key exactly when they share a picture.
+    fn admitted(item: &AlertItem, as_of: chrono::NaiveDateTime) -> bool {
+        item.alert.valid_from.is_none_or(|from| from <= as_of)
+            && item.alert.valid_until.is_none_or(|until| as_of < until)
+            && item.departed.is_none_or(|gone| as_of < gone)
+    }
+
+    /// The admitted set at `as_of`, as one number — O(items), no allocation.
+    fn admitted_identity(&self, as_of: chrono::NaiveDateTime) -> u64 {
+        crate::render::signature_memo::as_of_identity(
+            self.state.data.iter().map(|i| Self::admitted(i, as_of)),
+        )
+    }
+
+    /// The two filter inputs a caller can change **without** a generation
+    /// bump — the pane's category set and the dismissed ids — folded
+    /// order-free, O(categories + dismissed). Shared by the signature memo
+    /// and the job memo so the two cannot disagree about what a view is.
+    fn view_key(&self, view: &AlertPaneState) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut view_key = 0u64;
+        for category in &view.enabled_categories {
+            let mut hasher = DefaultHasher::new();
+            category.hash(&mut hasher);
+            view_key ^= hasher.finish();
+        }
+        for id in &self.hidden_alerts {
+            let mut hasher = DefaultHasher::new();
+            id.hash(&mut hasher);
+            // Rotated so a dismissed id and a category cannot cancel.
+            view_key ^= hasher.finish().rotate_left(1);
+        }
+        view_key
     }
 
     /// **The one encoder** for a category set, so the registry's copy and a
@@ -498,13 +535,7 @@ impl OverlayHandler for NwsAlertHandler {
         if self.state.data.is_empty() {
             return None;
         }
-        Some(crate::render::signature_memo::as_of_identity(
-            self.state.data.iter().map(|i| {
-                i.alert.valid_from.is_none_or(|from| from <= as_of)
-                    && i.alert.valid_until.is_none_or(|until| as_of < until)
-                    && i.departed.is_none_or(|gone| as_of < gone)
-            }),
-        ))
+        Some(self.admitted_identity(as_of))
     }
 
     /// **One instant per stop, and that is the whole ask.**
@@ -604,20 +635,8 @@ impl OverlayHandler for NwsAlertHandler {
     fn content_signature(&self, pane: &PaneRef<'_>) -> u64 {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let view = self.view(pane);
-        let mut view_key = 0u64;
-        for category in &view.enabled_categories {
-            let mut hasher = DefaultHasher::new();
-            category.hash(&mut hasher);
-            view_key ^= hasher.finish();
-        }
-        for id in &self.hidden_alerts {
-            let mut hasher = DefaultHasher::new();
-            id.hash(&mut hasher);
-            // Rotated so a dismissed id and a category cannot cancel.
-            view_key ^= hasher.finish().rotate_left(1);
-        }
         self.signature_memo
-            .get_or_compute(self.state.data_generation, view_key, || {
+            .get_or_compute(self.state.data_generation, self.view_key(view), || {
                 let mut folded = 0u64;
                 let mut visible = 0u64;
                 for item in &self.state.data {
@@ -779,9 +798,23 @@ impl OverlayHandler for NwsAlertHandler {
         });
     }
 
+    /// **Built once per picture, not once per dispatch.** The input is a
+    /// `String` and an `Arc` clone per admitted alert plus the dismissed set,
+    /// on the frame thread, and its terms are the data generation, the view
+    /// ([`Self::view_key`]), the set `as_of` admits and the device scale —
+    /// `now` reaches none of the bytes, so a live pane whose clock moved but
+    /// whose admitted set did not is a hit.
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx, self.view(pane))
-            .map(DescribedJob::new)
+        use crate::render::signature_memo::fold_key;
+        let view = self.view(pane);
+        let key = fold_key(
+            fold_key(self.view_key(view), self.admitted_identity(ctx.as_of)),
+            u64::from(ctx.device_scale.to_bits()),
+        );
+        self.job_memo
+            .get_or_build(self.state.data_generation, key, || {
+                self.paint_input(ctx, view).map(DescribedJob::new)
+            })
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -1270,6 +1303,106 @@ mod tests {
             handler.sig_item_visits.get() - before,
             2,
             "three asks after one poll must fold the two items exactly once",
+        );
+    }
+
+    /// **The dispatch's build, memoised.** A live pane's clock moves every
+    /// frame but its admitted set does not, so the second dispatch hands back
+    /// the first's allocation and builds nothing.
+    #[test]
+    fn a_live_pane_whose_admitted_set_did_not_move_reuses_the_built_input() {
+        let handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let first = handler
+            .prepare_job(&live_ctx(at(19, 0)), &PaneRef::bare(0))
+            .expect("one alert draws");
+        let second = handler
+            .prepare_job(&live_ctx(at(19, 1)), &PaneRef::bare(0))
+            .expect("still draws a minute later");
+        assert!(
+            Arc::ptr_eq(&first.0, &second.0),
+            "a minute later with the same admitted set must be a refcount clone",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 1, "the input was built once");
+    }
+
+    /// Every term that reaches the bytes moves the key: the category set, a
+    /// dismissal, the device scale, and a poll.
+    #[test]
+    fn every_input_the_bytes_depend_on_rebuilds_the_input() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let ctx = live_ctx(at(19, 0));
+        let pane = PaneRef::bare(0);
+        handler.prepare_job(&ctx, &pane);
+        assert_eq!(handler.job_memo.builds.get(), 1);
+
+        handler
+            .defaults
+            .enabled_categories
+            .remove(&AlertCategory::Warning);
+        handler.prepare_job(&ctx, &pane);
+        assert_eq!(
+            handler.job_memo.builds.get(),
+            2,
+            "a category toggle rebuilds"
+        );
+
+        handler.hidden_alerts.insert("a".to_owned());
+        handler.prepare_job(&ctx, &pane);
+        assert_eq!(handler.job_memo.builds.get(), 3, "a dismissal rebuilds");
+
+        let scaled = RasterizeContext {
+            device_scale: 2.0,
+            ..ctx
+        };
+        handler.prepare_job(&scaled, &pane);
+        assert_eq!(
+            handler.job_memo.builds.get(),
+            4,
+            "a device scale change rebuilds"
+        );
+
+        handler.apply_fetch_result(
+            whole(vec![alert("a", "Tornado Warning")]),
+            &PaneRef::across(&[]),
+        );
+        handler.prepare_job(&scaled, &pane);
+        assert_eq!(handler.job_memo.builds.get(), 5, "a poll rebuilds");
+        assert!(
+            !handler.job_memo.take_retired().is_empty(),
+            "the poll parked the previous generation's inputs for the discard seam",
+        );
+    }
+
+    /// The admitted set is a term: a clock that crosses an alert's expiry
+    /// changes which rows travel, and the memo must not hand back the
+    /// picture from before it lapsed.
+    #[test]
+    fn a_clock_that_crosses_an_expiry_rebuilds_the_input() {
+        let mut a = alert("a", "Tornado Warning");
+        a.valid_until = Some(at(19, 30));
+        let handler = handler_with(vec![a, alert("b", "Severe Thunderstorm Warning")]);
+        let pane = PaneRef::bare(0);
+        let before = handler.prepare_job(&live_ctx(at(19, 0)), &pane).unwrap();
+        handler.prepare_job(&live_ctx(at(19, 29)), &pane);
+        assert_eq!(handler.job_memo.builds.get(), 1, "inside the window: a hit");
+        let after = handler.prepare_job(&live_ctx(at(19, 30)), &pane).unwrap();
+        assert_eq!(handler.job_memo.builds.get(), 2, "at expiry the set moved");
+        assert_eq!(
+            before
+                .downcast_ref::<rasterize::AlertsInput>()
+                .unwrap()
+                .alerts
+                .len(),
+            2
+        );
+        assert_eq!(
+            after
+                .downcast_ref::<rasterize::AlertsInput>()
+                .unwrap()
+                .alerts
+                .len(),
+            1,
+            "the rebuilt input dropped the lapsed alert",
         );
     }
 

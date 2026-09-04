@@ -32,6 +32,9 @@ pub(crate) struct RadarCoverageHandler {
     /// **The layer's own default**, for a caller that supplied no pane.
     /// Nothing reads it into a pane.
     pub enabled: bool,
+    /// The last built paint input per (generation, device scale) — see
+    /// [`Self::prepare_job`].
+    pub(crate) job_memo: crate::render::signature_memo::JobMemo,
 }
 
 impl RadarCoverageHandler {
@@ -39,6 +42,7 @@ impl RadarCoverageHandler {
         Self {
             state: OverlayState::new(),
             enabled: false,
+            job_memo: crate::render::signature_memo::JobMemo::new(),
         }
     }
 }
@@ -100,22 +104,32 @@ impl OverlayHandler for RadarCoverageHandler {
     /// connection at all. Nothing in the input is read from the pane: the wash
     /// is the whole network, so it does not depend on which station the pane is
     /// on, and two panes at the same viewport share a raster.
+    ///
+    /// Built once per (generation, device scale): the table is installed at
+    /// boot and never polled, so after the first dispatch every ask is a
+    /// refcount clone.
     fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         if self.state.data.is_empty() {
             return None;
         }
-        Some(DescribedJob::new(rasterize::CoverageInput {
-            sites: self
-                .state
-                .data
-                .iter()
-                .map(|site| rasterize::CoverageSite {
-                    lat: site.lat,
-                    lon: site.lon,
-                })
-                .collect(),
-            device_scale: ctx.device_scale,
-        }))
+        self.job_memo.get_or_build(
+            self.state.data_generation,
+            u64::from(ctx.device_scale.to_bits()),
+            || {
+                Some(DescribedJob::new(rasterize::CoverageInput {
+                    sites: self
+                        .state
+                        .data
+                        .iter()
+                        .map(|site| rasterize::CoverageSite {
+                            lat: site.lat,
+                            lon: site.lon,
+                        })
+                        .collect(),
+                    device_scale: ctx.device_scale,
+                }))
+            },
+        )
     }
 
     fn job_codec(&self) -> Option<&'static JobCodec> {
@@ -175,5 +189,72 @@ impl OverlayHandler for RadarCoverageHandler {
 
     fn serialize_pane_state(&self, state: &dyn std::any::Any) -> serde_json::Value {
         PaneToggle::save(state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler_with_sites(n: usize) -> RadarCoverageHandler {
+        let mut handler = RadarCoverageHandler::new();
+        handler.apply_fetch_result(
+            Box::new(RadarSitesFetchResult(
+                (0..n)
+                    .map(|i| SiteRow {
+                        name: format!("K{i:03}"),
+                        lat: 30.0 + i as f64 * 0.1,
+                        lon: -100.0 + i as f64 * 0.1,
+                    })
+                    .collect(),
+            )),
+            &PaneRef::across(&[]),
+        );
+        handler
+    }
+
+    fn ctx(device_scale: f32) -> RasterizeContext {
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(19, 0, 0)
+            .unwrap();
+        RasterizeContext {
+            is_dark: false,
+            zoom: 5.0,
+            device_scale,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        }
+    }
+
+    /// The site table never polls, so after the first dispatch every ask at
+    /// the same device scale is a refcount clone of one built input.
+    #[test]
+    fn the_built_input_is_reused_until_the_device_scale_moves() {
+        let handler = handler_with_sites(160);
+        let pane = PaneRef::bare(0);
+        let first = handler.prepare_job(&ctx(1.0), &pane).unwrap();
+        let second = handler.prepare_job(&ctx(1.0), &pane).unwrap();
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert_eq!(handler.job_memo.builds.get(), 1);
+        assert_eq!(
+            first
+                .downcast_ref::<rasterize::CoverageInput>()
+                .unwrap()
+                .sites
+                .len(),
+            160,
+        );
+
+        handler.prepare_job(&ctx(2.0), &pane);
+        assert_eq!(handler.job_memo.builds.get(), 2, "device scale is a term");
+    }
+
+    #[test]
+    fn an_empty_table_describes_no_job_and_holds_nothing() {
+        let handler = RadarCoverageHandler::new();
+        assert!(handler.prepare_job(&ctx(1.0), &PaneRef::bare(0)).is_none());
+        assert_eq!(handler.job_memo.builds.get(), 0);
     }
 }

@@ -222,6 +222,9 @@ pub(crate) struct SpcFireOutlookHandler {
     /// **The registry's own copy**, used only where no pane is supplied. Every
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: FirePaneState,
+    /// The last built paint input per (combined generation, scope, in-force
+    /// set, device scale) — see [`Self::prepare_job`].
+    pub(crate) job_memo: crate::render::signature_memo::JobMemo,
 }
 
 impl SpcFireOutlookHandler {
@@ -235,6 +238,7 @@ impl SpcFireOutlookHandler {
             round_answered_in_scope: false,
             round_stray_failures: Vec::new(),
             defaults: FirePaneState::new(false),
+            job_memo: crate::render::signature_memo::JobMemo::new(),
         }
     }
 
@@ -436,20 +440,44 @@ impl SpcFireOutlookHandler {
         view: &FirePaneState,
         as_of: chrono::NaiveDateTime,
     ) -> Vec<crate::types::OverlayFeature> {
-        let mut scope = Vec::new();
-        view.extend_scope(&mut scope);
         let mut features = Vec::new();
-        for key in scope {
-            if let Some(outlook) = self.state.data.get(&key) {
-                if !(outlook.valid.is_none_or(|valid| valid <= as_of)
-                    && outlook.expire.is_none_or(|expire| as_of < expire))
-                {
-                    continue;
-                }
-                features.extend(outlook.features.iter().cloned());
-            }
+        for (_, outlook) in self.in_force_in_paint_order(view, as_of) {
+            features.extend(outlook.features.iter().cloned());
         }
         features
+    }
+
+    /// The selected files whose held issuance is in force at `as_of`, in
+    /// paint order, with the key each came from. The one walk behind
+    /// [`Self::features_in_paint_order`] and the job memo's key, so the rows
+    /// that travel are the rows that are keyed.
+    fn in_force_in_paint_order(
+        &self,
+        view: &FirePaneState,
+        as_of: chrono::NaiveDateTime,
+    ) -> impl Iterator<Item = (Key, &SpcFireOutlook)> + '_ {
+        let mut scope = Vec::new();
+        view.extend_scope(&mut scope);
+        scope.into_iter().filter_map(move |key| {
+            let outlook = self.state.data.get(&key)?;
+            let in_force = outlook.valid.is_none_or(|valid| valid <= as_of)
+                && outlook.expire.is_none_or(|expire| as_of < expire);
+            in_force.then_some((key, outlook))
+        })
+    }
+
+    /// Every term of the picture other than the data itself: the files in
+    /// force at `as_of` in paint order and the device scale. Not the theme —
+    /// `paint_input` deliberately does not read it. O(files), one small
+    /// scope allocation.
+    fn paint_key(&self, view: &FirePaneState, ctx: &RasterizeContext) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        for (key, _) in self.in_force_in_paint_order(view, ctx.as_of) {
+            key.hash(&mut hasher);
+        }
+        ctx.device_scale.to_bits().hash(&mut hasher);
+        hasher.finish()
     }
 
     fn paint_input(
@@ -799,9 +827,16 @@ impl OverlayHandler for SpcFireOutlookHandler {
         // and label, not on a data ID.
     }
 
+    /// **Built once per picture, not once per dispatch.** The input deep-clones
+    /// every feature of every in-force file — polygons and both labels — and
+    /// its terms are the combined generation and [`Self::paint_key`].
     fn prepare_job(&self, ctx: &RasterizeContext, pane: &PaneRef<'_>) -> Option<DescribedJob> {
-        self.paint_input(ctx, self.view(pane))
-            .map(DescribedJob::new)
+        let view = self.view(pane);
+        self.job_memo.get_or_build(
+            self.combined_generation(),
+            self.paint_key(view, ctx),
+            || self.paint_input(ctx, view).map(DescribedJob::new),
+        )
     }
 
     /// **Shared with the convective layer, deliberately.** A fire outlook and
@@ -2027,6 +2062,55 @@ mod tests {
             live,
             unwindowed.paint_input(&paint_ctx(now), &unwindowed.defaults),
             "the as-of window leaked into the live pane's paint input",
+        );
+    }
+
+    /// **The dispatch's build, memoised** — and the theme is NOT a term,
+    /// because `paint_input` deliberately never reads it: a dark dispatch
+    /// after a light one is a hit on the same allocation.
+    #[test]
+    fn the_built_input_is_reused_across_the_theme_and_the_clock() {
+        let mut handler = day1_with_window(Some(at(22, 13)), Some(at(23, 12)));
+        let pane = PaneRef::bare(0);
+        let light = handler.prepare_job(&paint_ctx(at(22, 14)), &pane).unwrap();
+        let dark = handler
+            .prepare_job(
+                &RasterizeContext {
+                    is_dark: true,
+                    ..paint_ctx(at(22, 20))
+                },
+                &pane,
+            )
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&light.0, &dark.0),
+            "the theme reaches no byte of a fire outlook, so it must not miss",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 1);
+
+        // A `None` answer runs the closure and counts as a build; it is not
+        // remembered, so the count below steps on every such ask.
+        assert!(
+            handler.prepare_job(&paint_ctx(at(23, 12)), &pane).is_none(),
+            "past expire nothing is in force",
+        );
+        assert_eq!(handler.job_memo.builds.get(), 2);
+        let scaled = RasterizeContext {
+            device_scale: 2.0,
+            ..paint_ctx(at(22, 20))
+        };
+        handler.prepare_job(&scaled, &pane);
+        assert_eq!(handler.job_memo.builds.get(), 3, "device scale is a term");
+
+        handler.defaults.enabled_hazards.clear();
+        assert!(handler.prepare_job(&scaled, &pane).is_none());
+        assert_eq!(handler.job_memo.builds.get(), 4);
+        handler.defaults = FirePaneState::new(true);
+        handler.prepare_job(&scaled, &pane);
+        assert_eq!(
+            handler.job_memo.builds.get(),
+            4,
+            "the scaled row was still held"
         );
     }
 }
