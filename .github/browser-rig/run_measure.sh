@@ -427,6 +427,67 @@ if [ "$ANDROID" = 1 ]; then
   NEEDS_X11=0
 fi
 
+# ------------------------------------------------------------ the panel ----
+#
+# What the DISPLAY advertises, which is NOT what the `hz~` column on a web row
+# holds. That column is `1000 / p50(rAF)`, the cadence the page achieved; this
+# is the mode the output is running. The two agree on a healthy leg and part
+# company on a dead one -- see native_row.py's `vblank` section for the night
+# that made this necessary, and for why the achieved figure alone cannot carry
+# the check.
+#
+# Read here, once, for the whole run: every headed leg of a run shares one
+# display, and a panel that vanishes mid-run reddens the legs after it through
+# their own rAF cadence.
+#
+# THE AWK IS `run_measure_native.sh`'s `plat_refresh`, VERBATIM. The two are
+# held identical by `test_both_runners_read_the_panel_the_same_way` in
+# native_row.py, so a fix to one cannot leave the other reading a different
+# display.
+# `-` means NOT ATTEMPTED, and every path that cannot see the panel returns it
+# rather than an empty string. An empty reading is a display with no active
+# mode -- the dead panel -- and refuses the leg; an instrument that could not
+# look is not a finding about the panel, and printing one as the other is this
+# repo's oldest recurring defect. Reading through the display `resolve_host_display`
+# resolved, xauthority included, is part of the same point: without the cookie
+# `xrandr` fails to OPEN the display, and reading that as "no active mode" would
+# refuse every leg of a run whose panel was fine.
+panel_refresh() {
+  if [ -n "${RIG_PANEL_HZ:-}" ]; then echo "$RIG_PANEL_HZ"; return; fi
+  case "$(uname -s)" in
+    Darwin)
+      system_profiler SPDisplaysDataType 2>/dev/null \
+        | awk '
+            /Refresh Rate/ {
+              n = $0; sub(/.*Refresh Rate: */, "", n); gsub(/[^0-9.]/, "", n)
+              if (n != "") { print n; exit }
+            }
+            /UI Looks like/ {
+              if (match($0, /@ *[0-9.]+ *Hz/)) {
+                s = substr($0, RSTART, RLENGTH); gsub(/[^0-9.]/, "", s)
+                if (s != "") { print s; exit }
+              }
+            }'
+      ;;
+    *)
+      command -v xrandr >/dev/null 2>&1 || {
+        echo "panel: no xrandr on this box; the rig cannot see the panel and " \
+             "falls back to each leg's achieved cadence" >&2
+        echo "-"; return; }
+      local q
+      q="$(DISPLAY="${PANEL_DISPLAY:-${DISPLAY:-}}" \
+           XAUTHORITY="${PANEL_XAUTHORITY:-${XAUTHORITY:-}}" \
+           xrandr --query 2>/dev/null)" || {
+        echo "panel: xrandr could not query ${PANEL_DISPLAY:-${DISPLAY:-none}}" \
+             "-- an instrument failure, not a dead panel; falling back to each" \
+             "leg's achieved cadence" >&2
+        echo "-"; return; }
+      printf '%s\n' "$q" \
+        | awk '/\*/ { for (i = 1; i <= NF; i++) if ($i ~ /\*/) { gsub(/[*+]/, "", $i); print $i; exit } }'
+      ;;
+  esac
+}
+
 # ------------------------------------------------------- display check ----
 if [ "$NEEDS_X11" = 1 ]; then
 DISPLAY_INFO="$("$PY" - "$RIG_DIR" "${RIG_DISPLAY:-}" <<'EOF'
@@ -445,9 +506,22 @@ if [ -z "$DISPLAY_INFO" ] || ! echo "$DISPLAY_INFO" | grep -q '"display": ":'; t
   exit 1
 fi
 echo "measurement arm display: $DISPLAY_INFO"
+# The panel is read through the display the legs will actually use, with the
+# same cookie -- not through whatever DISPLAY this shell happened to inherit.
+eval "$("$PY" -c 'import json,shlex,sys
+d = json.loads(sys.argv[1])
+print("PANEL_DISPLAY=%s" % shlex.quote(d.get("display") or ""))
+print("PANEL_XAUTHORITY=%s" % shlex.quote(d.get("xauthority") or ""))' "$DISPLAY_INFO")"
+export PANEL_DISPLAY PANEL_XAUTHORITY
+PANEL_HZ="$(panel_refresh)"
+echo "measurement arm panel: ${PANEL_HZ:-NONE (the display advertises no active mode)}"
 else
   DISPLAY_INFO='{"display": null, "why": "not needed: no X11 browser requested"}'
   echo "measurement arm display: skipped (browsers=[$BROWSERS] need no X display)"
+  # NOT ATTEMPTED, which is a different thing from attempted and empty. `-`
+  # says so; the analyser falls back to the achieved cadence for a leg that
+  # carries no panel reading, and refuses one whose reading came back empty.
+  PANEL_HZ="-"
 fi
 
 SKIP_BUILD=0
@@ -747,9 +821,17 @@ done
 # -------------------------------------------------------------- summary ----
 echo
 echo "================ measure summary (NOT A GATE; no figure here gates) ================"
-"$PY" - "$OUT_DIR" "$COMMIT" "$PANEL" "$SCENE_B_COLS" "$MEASURE_LEDGER" <<'EOF'
+"$PY" - "$OUT_DIR" "$COMMIT" "$PANEL" "$SCENE_B_COLS" "$MEASURE_LEDGER" "$RIG_DIR" "$PANEL_HZ" <<'EOF'
 import json, os, sys
-out, commit, panel, scene_b_cols, ledger_path = sys.argv[1:6]
+out, commit, panel, scene_b_cols, ledger_path, rig_dir, panel_hz = sys.argv[1:8]
+# The vblank rule lives in native_row.py, which is where its tests are. It is
+# imported rather than restated so the two arms cannot classify the same dead
+# panel differently.
+sys.path.insert(0, rig_dir)
+import native_row
+# `-` is "not attempted" (a run with no X display, or a box with no xrandr);
+# anything else -- including the empty string -- is a reading that was taken.
+panel_reading = None if panel_hz == "-" else panel_hz
 
 legs = []
 with open(ledger_path) as f:
@@ -814,6 +896,17 @@ for leg in legs:
                        "configuration the app never ships in" % coi)
     if v.get("hardware_ok") is False:
         invalid.append("adapter is %s, not a GPU" % ad.get("renderer"))
+    # THE VBLANK CHECK. Only for a leg that presented onto a display this box
+    # drives: the Tier-2 software arm (`headless-swiftshader`) and the headless
+    # hardware arm present to nothing by design and have no panel to read, and
+    # a gate that fired on them would break the arms that keep working when the
+    # monitor does not.
+    binfo = r.get("binary") or {}
+    panel_backed = native_row.panel_backed_leg(
+        r.get("arm"), binfo.get("gpu_mode"), binfo.get("ff_mode"))
+    rv = native_row.refresh_verdict(panel_backed, hz, panel_reading)
+    if not rv["ok"]:
+        invalid.append("no vblank: %s" % rv["why"])
     # E1 is unarmed BY DESIGN (a loop playing, nobody touching it), so it
     # carries no interact assert and its window is the wall-clock quiet
     # bracket. Its OWN validity check is that the loop actually ran: a row
@@ -843,6 +936,14 @@ for leg in legs:
     ort = r.get("overlay_raster_totals") or {}
     pics = ort.get("pictures") or 0
     mbpp = ("%.2f" % (ort.get("picture_bytes", 0) / pics / 1e6)) if pics else "-"
+
+    # A scene whose seed lays out a 2D pane rasters whole-picture overlays. One
+    # that drew none measured nothing -- the same promotion native_row.py makes,
+    # and for the same reason.
+    if panel_backed and pics == 0 and native_row.scene_draws_pictures(scene, panel):
+        invalid.append(
+            "no pictures drawn: the scene %s seed lays out a 2D pane, which "
+            "rasters whole-picture overlays, and this leg drew none" % scene)
 
     # Viewport PIXELS, not a resolution string: pixels are what the picture is
     # sized from, and two rows at 1280x779 and 1248x714 look alike written out

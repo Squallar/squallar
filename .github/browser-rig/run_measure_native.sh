@@ -357,6 +357,11 @@ plat_cpu_time() {
 # rather than inferred from the cadence histogram: a binned p50 would print a
 # refresh that is a bin edge.
 plat_refresh() {
+  # An arm may DECLARE its refresh, and on a box with no xrandr (or no
+  # system_profiler) that declaration is the only way to run at all: an empty
+  # reading is now a hard INVALID, because a rig that cannot see the panel
+  # cannot tell a live one from the dead one this box had on 2026-09-03.
+  if [ -n "${RIG_PANEL_HZ:-}" ]; then echo "$RIG_PANEL_HZ"; return; fi
   case "${PLAT_REFRESH:-}" in
     xrandr)
       DISPLAY="$DISPLAY_ARG" xrandr --query 2>/dev/null \

@@ -910,6 +910,206 @@ def scene_pane_count(scene, panel="off"):
     return pane_count_of_seed(json.loads(scene_from_shell(scene, panel)))
 
 
+# ------------------------------------------------------------------ vblank ---
+#
+# WHY THIS EXISTS. On 2026-09-03 at 11:34:52 this box's panel stopped being
+# probed as connected and the X server logged `Setting mode "NULL"`. X kept the
+# stale 3440x1440 framebuffer, so nothing downstream failed: the server stayed
+# up, browsers still opened headed, the GPU was still real, and screenshots
+# still came out with content in them. But with no output there is no vblank,
+# so a headed browser gets no animation callback at a display cadence and a
+# headed native app presents into nothing. Two sessions then measured on that
+# arm for hours -- one of them bisected a 65x "frame-time regression" across 24
+# commits that did not exist -- and every void leg carries `invalid: []`. The
+# harness never said a word, which is the defect this section is.
+#
+# TWO READINGS, AND THEY ARE NOT THE SAME FIGURE. Confusing them is what makes
+# a naive version of this check wrong.
+#
+#   `panel_hz` is what the DISPLAY advertises: xrandr's starred mode, or
+#   macOS's `system_profiler`. It is a property of the output, not of the app.
+#   On a native leg it is what the `hz~` column ALREADY holds --
+#   `run_measure_native.sh`'s `plat_refresh` feeds it straight into
+#   `--refresh` -- which is why the native arm needs no new reading to be
+#   checked, only a rule.
+#
+#   `hz` on a WEB row is something else: `1000 / p50(rAF)`, the cadence the
+#   page ACHIEVED. rAF is clamped to vblank, so on a healthy leg the two agree
+#   -- but a slow app on a live panel and a fast app on a dead one both read
+#   low, so the achieved figure ALONE cannot carry this check without red-
+#   gating legitimately heavy scenes.
+#
+# So the check is on the PANEL wherever there is a panel reading, and falls
+# back to the achieved cadence only where there is not.
+#
+# THE FALLBACK CEILING, AND WHY IT IS NOT 165 OR 175. Losing vblank does not
+# stop an engine: it drives rAF off a software timer at a nominal 60 Hz.
+# Measured on the void run of 2026-09-04, `rd-0f-encodesplit-after-.../d-ff`
+# read p50 = 17.06 ms -> 59 Hz on a box whose live Firefox legs read 165-166.
+# A check spelled "is hz present?" PASSES that leg, and it is exactly as void
+# as the ones reading `?`. So the ceiling below is pinned to the FALLBACK's own
+# rate -- 60 Hz, plus room for the jitter that makes a true 60 Hz vsync measure
+# 59.x or 60.x -- and NOT to this box's panel. A ceiling near 165 would encode
+# one monitor into the rig and would fire on every 60 Hz machine that ever runs
+# it.
+#
+# WHAT THE CEILING CANNOT DO, SAID PLAINLY. On an arm whose panel really is
+# 60 Hz the fallback timer and the panel are the same number, and no threshold
+# separates them. That is precisely why this is a FALLBACK, reached only when
+# a leg carries no panel reading at all (an artefact older than this check, or
+# a platform with no tool to read one), and why a panel-backed leg is expected
+# to record `panel_hz` from here on. On such an arm, `RIG_PANEL_HZ` declares it
+# and the exact branch takes over.
+FALLBACK_TIMER_CEILING_HZ = 62.0
+
+# A chromium `binary.gpu_mode` / firefox `binary.ff_mode` that means "this leg
+# presented onto the machine's own display".
+PANEL_BACKED_GPU_MODES = ("headed-host-display", "macos-quartz-headed")
+PANEL_BACKED_FF_MODES = ("host",)
+
+
+def parse_hz(text):
+    """A refresh reading -> float, or None for every way of saying "nothing".
+
+    `''` is xrandr finding no starred mode, `?` is the ROW column's own
+    spelling for the same, and `-` is `run_measure.sh`'s. None of the three is
+    a rate.
+    """
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s or s in ("?", "-", "n/a", "unknown", "None"):
+        return None
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)", s)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return v if v > 0 else None
+
+
+def panel_backed_leg(arm, gpu_mode="", ff_mode=""):
+    """Did this leg present onto a display this box drives?
+
+    The arms that answer NO, and why none of them is an oversight:
+
+      `headless-swiftshader` is TIER-2. It never opens X, has no display and
+      no panel, and legitimately has no refresh rate to read. A vblank gate
+      that fired there would break the one arm that still worked on the night
+      the panel died, so it is excluded by name and by test.
+
+      `headless-angle-egl` is the headless hardware arm: a real GPU presenting
+      to nothing, by design rather than by accident.
+
+      `xvfb` is a virtual display. It advertises a mode of its own and was
+      never driven by this box's monitor, so the monitor's absence cannot void
+      it. (It has its own well-known artefacts -- a native pan-lag figure on
+      this repo turned out to be an Xvfb `present()` artefact -- but that is a
+      different defect and not one a refresh reading can see.)
+
+    A native leg answers YES: `run_measure_native.sh` runs the app headed on
+    whatever `DISPLAY` it is given, and reads that display's own refresh.
+    """
+    if (arm or "").strip().lower() == "native":
+        return True
+    if (ff_mode or "").strip().lower() in PANEL_BACKED_FF_MODES:
+        return True
+    return (gpu_mode or "").strip().lower() in PANEL_BACKED_GPU_MODES
+
+
+def refresh_verdict(panel_backed, hz, panel_hz=None):
+    """Did this leg run against a real vblank?
+
+    `panel_hz` is the display's own advertised rate, `None` when the leg
+    carries no such reading AT ALL -- which is a different thing from `""` or
+    `"?"`, both of which mean the reading was attempted and the display had
+    no active mode to report. The first falls back; the second is the defect.
+
+    `hz` is the row's own column: the panel rate on a native row, the achieved
+    rAF cadence on a web one.
+    """
+    achieved = parse_hz(hz)
+    reading = parse_hz(panel_hz)
+    out = {"ok": True, "why": None, "panel_hz": reading, "hz": achieved}
+    if not panel_backed:
+        out["basis"] = ("not a panel-backed leg: it presents to no display, "
+                        "so there is no refresh rate to hold it to")
+        return out
+    out["basis"] = ("the display's own advertised mode" if panel_hz is not None
+                    else "no panel reading on this leg; falling back to the "
+                         "achieved cadence, which can only rule out the "
+                         "software timer")
+    # Most specific first: a display with no mode explains everything else on
+    # the row, so it is the reason worth printing when it applies.
+    if panel_hz is not None and reading is None:
+        out["ok"] = False
+        out["why"] = (
+            "the display advertises no active mode (read back %r). With no "
+            "output there is no vblank: a headed browser gets no animation "
+            "callback at a display cadence and a headed native app presents "
+            "into nothing, so this leg measured nothing -- whatever figures "
+            "it printed" % (panel_hz,))
+        return out
+    # ABSENT IS A HARD REFUSAL EVEN UNDER A LIVE PANEL. A leg whose rAF sample
+    # timed out measured no cadence at all, and a declared panel does not
+    # supply one: `rd-0f-cr-retake-0132` is that shape.
+    if achieved is None:
+        out["ok"] = False
+        out["why"] = (
+            "no refresh rate could be read for a leg that presented onto a "
+            "display. This is not a missing column: it is a leg with no "
+            "measured cadence, and a cadence is the denominator of every "
+            "frame figure on the row")
+        return out
+    if panel_hz is not None:
+        # A live panel is declared and a cadence was measured. The two need
+        # not match: rAF falling below vblank is the app being slow, which is
+        # the thing these legs exist to measure, not a reason to refuse one.
+        return out
+    if achieved <= FALLBACK_TIMER_CEILING_HZ:
+        out["ok"] = False
+        out["why"] = (
+            "cadence %.4g Hz is at or below the %.4g Hz ceiling of the software "
+            "timer both engines fall back to when they lose vblank (Firefox on "
+            "this box read 59 Hz with the panel gone and 165-166 Hz with it "
+            "alive), and this leg carries no panel reading to tell that apart "
+            "from a genuine 60 Hz display -- or from an app simply running "
+            "slowly. Record the panel (RIG_PANEL_HZ, or a rig new enough to "
+            "read it) and this becomes an exact check"
+            % (achieved, FALLBACK_TIMER_CEILING_HZ))
+    return out
+
+
+def flat_panes_of_seed(web_seed):
+    """How many of a seed's panes raster WHOLE-PICTURE overlays.
+
+    A pane with `"render": "Volume"` is the 3D view, which draws no
+    whole-picture overlay raster at all; every other pane is the 2D map, which
+    does. The seed is the ONLY source, for the same reason `pane_count_of_seed`
+    gives: a list restated in the runner is a second place for a scene to be
+    wrong. Scene B is one Volume pane (no pictures, by design); scene C is
+    three Volume and three 2D (1068-1080 pictures on a recorded leg).
+    """
+    ui = json.loads(web_seed.get("squallar.ui") or "{}")
+    panes = ui.get("panes")
+    if not isinstance(panes, list):
+        # `pane_count` with no list is the app's default pane, which is 2D.
+        return int(ui.get("pane_count", 1))
+    return sum(1 for p in panes
+               if not (isinstance(p, dict) and p.get("render") == "Volume"))
+
+
+def scene_draws_pictures(scene, panel="off"):
+    """True/False, or None when the scene's own seed cannot be read."""
+    try:
+        seed = json.loads(scene_from_shell(scene, panel))
+    except (SystemExit, ValueError, KeyError, TypeError):
+        return None
+    try:
+        return flat_panes_of_seed(seed) > 0
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def resolve_pane_count(args):
     """`(panes, source)`, or `(None, why)` when nothing can say."""
     given = getattr(args, "panes", None)
@@ -1255,7 +1455,7 @@ PLATFORM_TOOLS = {
         "window":  ("xdotool", "geometry PINNING: the leg runs at whatever "
                                "size the app opened, and is refused unless "
                                "that already matches"),
-        "refresh": ("xrandr", "the hz~ column, which prints ?"),
+        "refresh": ("xrandr", "the vblank check AND the hz~ column: with no reading the rig cannot tell a live panel from a dead one, so the row is marked INVALID rather than quietly trusted. Declare RIG_PANEL_HZ to run without it"),
         "cputime": ("ps", "the wedged-vs-working distinction on a silent log"),
     },
     "macos": {
@@ -1265,7 +1465,7 @@ PLATFORM_TOOLS = {
                                  "permission for the process running this, "
                                  "and System Events resolves the window by "
                                  "`unix id`, never by title"),
-        "refresh": ("system_profiler", "the hz~ column, which prints ?"),
+        "refresh": ("system_profiler", "the vblank check AND the hz~ column: with no reading the rig cannot tell a live panel from a dead one, so the row is marked INVALID rather than quietly trusted. Declare RIG_PANEL_HZ to run without it"),
         "cputime": ("ps", "the wedged-vs-working distinction on a silent log"),
     },
 }
@@ -1520,6 +1720,8 @@ def build_row(args, scraped, probes):
         notes.append("the seeded pane count was not held against the app's: %s"
                      % panes_source)
     surf = surface_check(args.asked_geom, achieved, pictures, picture_bytes, reported, panes)
+    # Native legs open a real window on whatever DISPLAY they were given.
+    panel_backed = panel_backed_leg("native")
     # The unit every pixel figure above was measured in, read from winit's own
     # line and never assumed. It rides with the geometry because it is part of
     # the geometry: `achieved=1920x1080` at 13/12 and at 1 are two different
@@ -1551,8 +1753,36 @@ def build_row(args, scraped, probes):
     # UNCHECKED is its own list, never an entry in `invalid`: a row whose
     # bytes could not be checked is not a row that failed the check, and the
     # two stamps are kept apart so a grep for either finds only its own.
+    #
+    # ONE PROMOTION, and it is the only way the `no_pictures` UNCHECKED can
+    # become a refusal. That stamp exists because scene B is one 3D pane and
+    # draws no whole-picture overlay raster BY DESIGN, so `pictures=0` there is
+    # a fact about the scene rather than about the leg. It is NOT a fact about
+    # a scene whose seed lays out a 2D pane: scene C drew 1068-1080 pictures on
+    # every live leg and 0 on every leg taken after the panel died. A 2D scene
+    # that drew none measured nothing, and on a panel-backed leg that is a
+    # refusal. The stamps still never co-fire -- the promotion REPLACES the
+    # UNCHECKED rather than joining it.
     unchecked = []
-    if surf["unchecked"]:
+    promoted = None
+    if (surf["unchecked"] and surf.get("unchecked_kind") == "no_pictures"
+            and panel_backed and scene_draws_pictures(args.scene, args.panel)):
+        promoted = (
+            "no pictures drawn: the scene %s seed lays out a 2D pane, which "
+            "rasters whole-picture overlays, and the bracket holds none. That "
+            "is a leg that drew nothing, not a 3D scene with nothing to draw"
+            % args.scene
+        )
+        surf["unchecked"] = False
+        surf["unchecked_kind"] = None
+    if promoted:
+        invalid.append(promoted)
+        if not surf["geometry_met"]:
+            invalid.append(
+                "surface not confirmed: the app ran at %s, not the %s the leg "
+                "asked for" % (surf["achieved"], surf["asked"])
+            )
+    elif surf["unchecked"]:
         unchecked.append("surface bytes not checked: %s" % surf["why"])
         if not surf["geometry_met"]:
             invalid.append(
@@ -1561,6 +1791,14 @@ def build_row(args, scraped, probes):
             )
     elif not surf["met"]:
         invalid.append("surface not confirmed: %s" % surf["why"])
+
+    # THE VBLANK CHECK. A native leg is always panel-backed and its `--refresh`
+    # IS the panel's own advertised mode, so it takes the exact branch and the
+    # achieved-cadence fallback never runs here. An empty reading means xrandr
+    # found no starred mode, which on 2026-09-03 meant the monitor was gone.
+    refresh = refresh_verdict(panel_backed, args.refresh, args.refresh)
+    if not refresh["ok"]:
+        invalid.append("no vblank: %s" % refresh["why"])
 
     load = load_samples(args.load_file)
     quiet_max = args.quiet_max
@@ -1686,6 +1924,8 @@ def build_row(args, scraped, probes):
         # role, or None when the log has no `tile cache (...)` line -- a binary
         # older than the line, kept apart from a cache that recorded nothing.
         "tile_cache": tile_cache_by_role(scraped["tile_cache"]),
+        "panel_backed": panel_backed,
+        "refresh": refresh,
         "gpu_unavailable": scraped["gpu_unavailable"],
         "throughput_interact_frames": throughput,
         "percentiles_clamped": clamped,
@@ -1756,6 +1996,11 @@ def print_row(row):
     load = row["load"] or {}
     # Three stamps, never co-firing: INVALID, and the two UNCHECKED kinds --
     # a line the binary predates, and a scene that drew no overlay picture.
+    # "Never co-firing" is about the SURFACE check's three outcomes, which are
+    # three answers to one question. An INVALID raised elsewhere -- a loud box,
+    # a dead panel -- can and should stand beside a surface UNCHECKED: the
+    # recorded scene B legs of 2026-09-03 have no bytes to check AND no vblank,
+    # and suppressing either reading would hide a real fact about the leg.
     if not row.get("unchecked"):
         unchecked_banner = ""
     elif (row["surface"] or {}).get("unchecked_kind") == "no_pictures":
@@ -2591,11 +2836,15 @@ def _leg_log(per_picture, pictures_line, per_loop=10):
     return lines
 
 
-def _leg_args(load_file, panes, log="", json_out=""):
+def _leg_args(load_file, panes, log="", json_out="", scene="A", refresh="60"):
+    # SCENE IS LOAD-BEARING NOW, not decoration. `pictures=0` is a fact about
+    # scene B (one 3D pane, nothing to raster) and a refusal on scene A (a 2D
+    # pane that drew nothing), so a fixture that says A while its docstring
+    # says B is testing the wrong branch.
     return argparse.Namespace(
-        log=log, scene="A", script="pan-zoom-2d", commit="deadbeef",
+        log=log, scene=scene, script="pan-zoom-2d", commit="deadbeef",
         asked_geom=(1920, 1080), achieved_geom=None, panes=panes, dpr="1",
-        refresh="60", adapter="unknown", panel="off", position="p1(a)",
+        refresh=refresh, adapter="unknown", panel="off", position="p1(a)",
         load_file=load_file, quiet_max=8.0, skip_loops=2, window_loops=2,
         platform="linux", degraded="", json=json_out,
     )
@@ -2680,7 +2929,8 @@ class RowVerdictTests(unittest.TestCase):
         the app's line present and well-formed. Every such row read
         `** INVALID **` with exit 1, forever. Now the third stamp."""
         lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, per_loop=0)
-        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        row = build_row(_leg_args(self.load, 1, scene="B"),
+                        scrape(lines, self.probes), self.probes)
         text = _capture(lambda: print_row(row))
         first = text.splitlines()[0]
         self.assertEqual(row["pictures"], 0)
@@ -2704,14 +2954,14 @@ class RowVerdictTests(unittest.TestCase):
         none_drawn = "** UNCHECKED: scene drew no overlay pictures **"
         invalid = "** INVALID **"
         cases = (
-            (absent, ONE_PANE_PICTURE_BYTES, None, 10),
-            (none_drawn, ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0),
-            (invalid, MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10),
+            (absent, ONE_PANE_PICTURE_BYTES, None, 10, "A"),
+            (none_drawn, ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0, "B"),
+            (invalid, MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10, "A"),
         )
-        for want, per_picture, line, per_loop in cases:
+        for want, per_picture, line, per_loop, scene in cases:
             lines = _leg_log(per_picture, line, per_loop=per_loop)
-            row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes),
-                            self.probes)
+            row = build_row(_leg_args(self.load, 1, scene=scene),
+                            scrape(lines, self.probes), self.probes)
             first = _capture(lambda: print_row(row)).splitlines()[0]
             for banner in (absent, none_drawn, invalid):
                 if banner == want:
@@ -2774,18 +3024,324 @@ class RowVerdictTests(unittest.TestCase):
 
     def test_the_analyser_exits_zero_on_unchecked_and_one_on_invalid(self):
         """`run_measure_native.sh` takes the exit code as the leg's verdict."""
-        for per_picture, line, per_loop, want in (
-            (ONE_PANE_PICTURE_BYTES, None, 10, 0),
-            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 10, 0),
-            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0, 0),
-            (MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10, 1),
+        for per_picture, line, per_loop, scene, want in (
+            (ONE_PANE_PICTURE_BYTES, None, 10, "A", 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 10, "A", 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0, "B", 0),
+            (ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE, 0, "A", 1),
+            (MODEL_ONE_PANE_BYTES, OVERLAY_PICTURES_ONE, 10, "A", 1),
         ):
             log = os.path.join(self._tmp.name, "leg.log")
             with open(log, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(_leg_log(per_picture, line, per_loop)) + "\n")
             rc = [None]
-            _capture(lambda: rc.__setitem__(0, cmd_analyze(_leg_args(self.load, 1, log))))
-            self.assertEqual(rc[0], want, "line=%r per_picture=%d" % (line, per_picture))
+            _capture(lambda: rc.__setitem__(
+                0, cmd_analyze(_leg_args(self.load, 1, log, scene=scene))))
+            self.assertEqual(rc[0], want, "scene=%s line=%r per_picture=%d"
+                             % (scene, line, per_picture))
+
+
+class VblankTests(unittest.TestCase):
+    """The dead-panel gate, against the SEVEN REAL LEGS that straddle it.
+
+    Every row below is the field shape of a recorded artefact, not an invented
+    one: the native legs are `~/.cache/rd-wo28-legs/*` (`hz` is the xrandr
+    reading `run_measure_native.sh` passed through `--refresh`), the browser
+    legs are `~/.cache/rd-0f-*` (`hz` is `1000 / p50(rAF)` and the panel was
+    never recorded, so `panel_hz` is None for all of them). The panel died on
+    2026-09-03 at 11:34:52; the 09-02 legs are real measurements and everything
+    after it is void.
+    """
+
+    # (name, arm, gpu_mode, ff_mode, hz, panel_hz, valid?)
+    LEGS = (
+        # --- native, `hz` IS the panel's advertised mode ---------------------
+        ("fixed-c/C.main.r1  09-02 22:47", "native", "", "", "174.96", "174.96", True),
+        ("fixed-c/C.main.r2  09-02 22:49", "native", "", "", "174.96", "174.96", True),
+        ("fixed-c/C.main.r3  09-02 22:51", "native", "", "", "174.96", "174.96", True),
+        ("fixed-b/B.main.r1  09-03 23:40", "native", "", "", "?", "", False),
+        ("prefix-b/B.prefix.r1 09-03 23:45", "native", "", "", "?", "", False),
+        # --- browser, `hz` is the ACHIEVED rAF cadence -----------------------
+        ("rd-0f-encodesplit-2155/d-cr  09-02",
+         "hardware", "headed-host-display", "", "175", None, True),
+        ("rd-0f-encodesplit-after-0125/d-ff  09-04",
+         "hardware", "", "host", "59", None, False),
+    )
+
+    def test_every_recorded_leg_classifies_correctly(self):
+        for name, arm, gpu, ff, hz, panel_hz, want in self.LEGS:
+            v = refresh_verdict(panel_backed_leg(arm, gpu, ff), hz, panel_hz)
+            self.assertEqual(v["ok"], want, "%s -> %s" % (name, v["why"]))
+
+    def test_the_leg_a_presence_check_would_have_passed(self):
+        """THE CASE THIS GATE EXISTS FOR, spelled out.
+
+        `rd-0f-encodesplit-after-2026-09-04-0125/d-ff` reads `hz~59`. Not `?`
+        -- an actual number, because Firefox does not stop when it loses the
+        refresh rate, it falls back to a ~60 Hz software timer. A check spelled
+        "is hz present?" passes that leg, and it is exactly as void as the ones
+        reading `?`.
+        """
+        headed = panel_backed_leg("hardware", "", "host")
+        self.assertTrue(headed)
+        self.assertIsNotNone(parse_hz("59"), "a presence check passes it")
+        v = refresh_verdict(headed, "59", None)
+        self.assertFalse(v["ok"])
+        self.assertIn("software timer", v["why"])
+        # And the live legs of the same browser on the same box are untouched.
+        for live in ("165", "166"):
+            self.assertTrue(refresh_verdict(headed, live, None)["ok"], live)
+
+    def test_the_other_two_void_browser_legs_read_nothing_at_all(self):
+        """`rd-0f-cr-retake-0132` and `rd-0f-2point-0143`: rAF timed out, so
+        `run_measure.sh` prints `hz~?`. Absent is a hard INVALID, not an
+        UNCHECKED: it is not a leg with a missing field, it is a leg that
+        measured no cadence."""
+        headed = panel_backed_leg("hardware", "headed-host-display", "")
+        for spelling in ("?", "", "-", None):
+            v = refresh_verdict(headed, spelling, None)
+            self.assertFalse(v["ok"], repr(spelling))
+            self.assertIn("no measured cadence", v["why"])
+
+    # ------------------------------------------------------------ Tier-2 ----
+
+    def test_the_tier2_software_arm_is_never_touched(self):
+        """THE ARM THAT STILL WORKED THE NIGHT THE PANEL DIED. Tier-2 never
+        opens X, has no display and no panel, and legitimately has no refresh
+        rate. Nothing this gate can be handed may redden it."""
+        headed = panel_backed_leg("software", "headless-swiftshader", "")
+        self.assertFalse(headed)
+        for hz in (None, "", "?", "-", "59", "0", "175"):
+            for panel_hz in (None, "", "?", "60"):
+                v = refresh_verdict(headed, hz, panel_hz)
+                self.assertTrue(v["ok"], "hz=%r panel_hz=%r -> %s"
+                                % (hz, panel_hz, v["why"]))
+                self.assertIn("no display", v["basis"])
+
+    def test_the_headless_hardware_and_xvfb_arms_are_not_touched_either(self):
+        """Both present to something that is not this box's monitor, so the
+        monitor's absence cannot void them."""
+        for gpu, ff in (("headless-angle-egl", ""), ("", "xvfb"),
+                        ("", "headless")):
+            self.assertFalse(panel_backed_leg("hardware", gpu, ff),
+                             "%s/%s" % (gpu, ff))
+            self.assertTrue(refresh_verdict(
+                panel_backed_leg("hardware", gpu, ff), "?", "")["ok"])
+
+    def test_the_headed_modes_are_recognised_by_their_recorded_spelling(self):
+        """Read off the artefacts: chromium records `binary.gpu_mode`, firefox
+        records `binary.ff_mode`, and a native row has neither."""
+        self.assertTrue(panel_backed_leg("hardware", "headed-host-display", ""))
+        self.assertTrue(panel_backed_leg("hardware", "macos-quartz-headed", ""))
+        self.assertTrue(panel_backed_leg("hardware", "", "host"))
+        self.assertTrue(panel_backed_leg("native", "", ""))
+
+    # ------------------------------------------------------- the threshold ---
+
+    def test_a_live_panel_does_not_excuse_a_leg_with_no_cadence(self):
+        """`rd-0f-cr-retake-0132`: rAF timed out. Declaring the panel says the
+        display was fine; it says nothing about a leg that sampled nothing."""
+        headed = panel_backed_leg("hardware", "headed-host-display", "")
+        for panel_hz in (None, "174.96", "60"):
+            v = refresh_verdict(headed, "?", panel_hz)
+            self.assertFalse(v["ok"], repr(panel_hz))
+            self.assertIn("no measured cadence", v["why"])
+
+    def test_a_declared_60hz_panel_is_valid_at_60hz(self):
+        """The limitation, and its escape hatch, both pinned. On a genuine
+        60 Hz arm the fallback timer and the panel are the same number and no
+        threshold separates them -- so declaring the panel (RIG_PANEL_HZ) moves
+        the leg onto the exact branch, where the achieved cadence is not used
+        at all and a slow app is a slow app rather than a void leg."""
+        headed = panel_backed_leg("hardware", "headed-host-display", "")
+        self.assertFalse(refresh_verdict(headed, "59.9", None)["ok"])
+        self.assertTrue(refresh_verdict(headed, "59.9", "60")["ok"])
+        # And a heavy scene on a live fast panel is likewise not void.
+        self.assertTrue(refresh_verdict(headed, "31", "174.96")["ok"])
+
+    def test_an_empty_panel_reading_refuses_however_good_the_cadence_looks(self):
+        """The exact branch does not consult the cadence. An X server that
+        kept a stale framebuffer after `Setting mode \"NULL\"` still reported a
+        size; what it stopped reporting was a mode."""
+        headed = panel_backed_leg("native", "", "")
+        for spelling in ("", "?", "-", "0"):
+            v = refresh_verdict(headed, "175", spelling)
+            self.assertFalse(v["ok"], repr(spelling))
+            self.assertIn("no vblank", "no vblank: " + v["why"])
+            self.assertIn("advertises no active mode", v["why"])
+
+    def test_the_ceiling_is_pinned_to_the_fallback_not_to_this_monitor(self):
+        """62 Hz, and the reason it is not 165 or 175: those are one box's
+        panel. 60 is the rate of the timer every engine falls back to, and the
+        two extra Hz are the jitter that makes a true 60 Hz vsync measure
+        59.x or 60.x."""
+        self.assertEqual(FALLBACK_TIMER_CEILING_HZ, 62.0)
+        self.assertLess(FALLBACK_TIMER_CEILING_HZ, 165.0)
+        headed = panel_backed_leg("native", "", "")
+        self.assertFalse(refresh_verdict(headed, "62.0", None)["ok"])
+        self.assertTrue(refresh_verdict(headed, "62.1", None)["ok"])
+
+    def test_a_native_leg_on_xvfb_is_refused_and_the_escape_is_named(self):
+        """MEASURED 2026-09-04: `Xvfb :77` advertises its mode as `0.00`, which
+        is what a virtual framebuffer with no vblank should say. A native leg
+        run on one is panel-backed by `panel_backed_leg` (the native runner
+        opens a real window on whatever DISPLAY it is handed) and is therefore
+        refused -- deliberately: this repo already lost a pan-lag figure to an
+        Xvfb `present()` artefact. Neither runner is in CI, so nothing green
+        turns red on this; an arm that wants it declares RIG_PANEL_HZ.
+
+        A BROWSER leg on Xvfb is a different case and is exempt earlier, at
+        `panel_backed_leg`, because geckodriver records `ff_mode: xvfb` and the
+        rig can see that it never asked for this box's monitor.
+        """
+        self.assertIsNone(parse_hz("0.00"))
+        self.assertFalse(refresh_verdict(panel_backed_leg("native"),
+                                         "0.00", "0.00")["ok"])
+        # RIG_PANEL_HZ short-circuits `plat_refresh`, so BOTH readings become
+        # the declared figure -- on a native row `hz` and `panel_hz` are one
+        # reading, and a test that fed them different values would be testing a
+        # combination the runner cannot produce.
+        self.assertTrue(refresh_verdict(panel_backed_leg("native"),
+                                        "60", "60")["ok"], "RIG_PANEL_HZ=60")
+        self.assertTrue(refresh_verdict(
+            panel_backed_leg("hardware", "", "xvfb"), "0.00", "0.00")["ok"])
+
+    def test_parse_hz_rejects_every_spelling_of_nothing(self):
+        for nothing in (None, "", "   ", "?", "-", "n/a", "unknown", "0",
+                        "0.0", "None", "abc"):
+            self.assertIsNone(parse_hz(nothing), repr(nothing))
+        self.assertEqual(parse_hz("174.96"), 174.96)
+        self.assertEqual(parse_hz(" 60 "), 60.0)
+        self.assertEqual(parse_hz("165.00Hz"), 165.0)
+
+    # -------------------------------------------------- the two runners ------
+
+    def test_both_runners_read_the_panel_the_same_way(self):
+        """`run_measure.sh` grew its own reader; it must be the native one.
+
+        The same drift guard `shared_row_keys()` is: two files that must agree
+        are compared by their text rather than trusted to.
+        """
+        def xrandr_awk(path):
+            with open(os.path.join(RIG_DIR, path), encoding="utf-8") as fh:
+                text = fh.read()
+            at = text.index("xrandr --query")
+            line = text[text.index("awk", at):]
+            return line[:line.index("\n")].strip().rstrip("\\").strip()
+        self.assertEqual(xrandr_awk("run_measure_native.sh"),
+                         xrandr_awk("run_measure.sh"))
+
+    # ------------------------------------------------------ the seed rule ----
+
+    def test_the_scene_seeds_say_which_scenes_raster_pictures(self):
+        """Read out of `run_measure.sh`'s own seeds, never restated here.
+
+        B and E3 are one `render: Volume` pane -- the 3D view, which draws no
+        whole-picture overlay raster, which is why `pictures=0` there is a fact
+        about the scene. C is three Volume panes and three 2D ones, and drew
+        1068-1080 pictures on every live leg.
+        """
+        self.assertEqual(flat_panes_of_seed(json.loads(scene_from_shell("B"))), 0)
+        self.assertEqual(flat_panes_of_seed(json.loads(scene_from_shell("E3"))), 0)
+        self.assertEqual(flat_panes_of_seed(json.loads(scene_from_shell("C"))), 3)
+        for scene in ("A", "D", "E1", "E2"):
+            self.assertEqual(
+                flat_panes_of_seed(json.loads(scene_from_shell(scene))), 1, scene)
+        self.assertIs(scene_draws_pictures("B"), False)
+        self.assertIs(scene_draws_pictures("C"), True)
+        self.assertIsNone(scene_draws_pictures("nosuchscene"))
+
+
+class VblankRowTests(unittest.TestCase):
+    """The same rule where it is PRINTED: a whole log through `build_row`."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _row(self, scene="A", refresh="60", per_loop=10):
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE,
+                         per_loop=per_loop)
+        row = build_row(_leg_args(self.load, 1, scene=scene, refresh=refresh),
+                        scrape(lines, self.probes), self.probes)
+        text = _capture(lambda: print_row(row))
+        return row, text.splitlines()[0], text
+
+    def test_a_live_panel_stamps_nothing(self):
+        row, first, _ = self._row(refresh="174.96")
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertTrue(row["refresh"]["ok"])
+        self.assertEqual(row["refresh"]["panel_hz"], 174.96)
+        self.assertNotIn("**", first, first)
+
+    def test_a_dead_panel_stamps_a_hard_invalid_on_the_row(self):
+        """The `hz~?` legs of 2026-09-03 23:40 onward, which carried
+        `invalid: []` and were read as measurements for hours."""
+        row, first, text = self._row(refresh="")
+        self.assertTrue(row["panel_backed"])
+        self.assertFalse(row["refresh"]["ok"])
+        self.assertEqual([w for w in row["invalid"] if w.startswith("no vblank")],
+                         row["invalid"], row["invalid"])
+        self.assertEqual(row["unchecked"], [], "a hard INVALID, not an UNCHECKED")
+        self.assertIn("hz~?", first)
+        self.assertIn("** INVALID **", first)
+        self.assertNotIn("UNCHECKED", first)
+        self.assertIn("ROW   INVALID: no vblank: the display advertises no "
+                      "active mode", text)
+
+    def test_the_analyser_exits_one_on_a_dead_panel(self):
+        """`run_measure_native.sh` takes the exit code as the leg's verdict, so
+        a rule that does not reach the exit code does not reach the runner."""
+        log = os.path.join(self._tmp.name, "leg.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(_leg_log(ONE_PANE_PICTURE_BYTES,
+                                        OVERLAY_PICTURES_ONE)) + "\n")
+        for refresh, want in (("174.96", 0), ("", 1), ("?", 1)):
+            rc = [None]
+            args = _leg_args(self.load, 1, log, refresh=refresh)
+            _capture(lambda: rc.__setitem__(0, cmd_analyze(args)))
+            self.assertEqual(rc[0], want, "refresh=%r" % refresh)
+
+    def test_a_2d_scene_that_drew_nothing_is_invalid_not_unchecked(self):
+        """Scene C drew 1068-1080 pictures on every live leg and 0 on every
+        leg after the panel died. Zero on a scene that rasters is a leg that
+        drew nothing."""
+        row, first, text = self._row(scene="A", refresh="174.96", per_loop=0)
+        self.assertEqual(row["pictures"], 0)
+        self.assertEqual(row["unchecked"], [], "the promotion REPLACES it")
+        self.assertEqual(len(row["invalid"]), 1, row["invalid"])
+        self.assertIn("no pictures drawn", row["invalid"][0])
+        self.assertIn("** INVALID **", first)
+        self.assertNotIn("UNCHECKED", first)
+        self.assertEqual(first.count("**"), 2, "the stamps still never co-fire")
+
+    def test_a_dead_panel_stands_beside_a_surface_unchecked(self):
+        """The recorded `fixed-b/B.main.r*` shape exactly: scene B has nothing
+        to raster (UNCHECKED, correctly) AND ran with no vblank (INVALID). Two
+        answers to two questions; neither may swallow the other."""
+        row, first, text = self._row(scene="B", refresh="", per_loop=0)
+        self.assertEqual(len(row["unchecked"]), 1, row["unchecked"])
+        self.assertEqual(len(row["invalid"]), 1, row["invalid"])
+        self.assertIn("no vblank", row["invalid"][0])
+        self.assertIn("** INVALID **", first)
+        self.assertIn("** UNCHECKED: scene drew no overlay pictures **", first)
+
+    def test_a_3d_scene_that_drew_nothing_stays_unchecked(self):
+        """And the branch the promotion must not swallow: scene B is one
+        Volume pane and has nothing to raster."""
+        row, first, _ = self._row(scene="B", refresh="174.96", per_loop=0)
+        self.assertEqual(row["pictures"], 0)
+        self.assertEqual(row["invalid"], [], row["invalid"])
+        self.assertEqual(len(row["unchecked"]), 1)
+        self.assertIn("** UNCHECKED: scene drew no overlay pictures **", first)
 
 
 class WindowTests(unittest.TestCase):
