@@ -469,5 +469,6 @@ mod js {
 
 #[cfg(target_arch = "wasm32")]
 pub use js::{
-    bytes_outstanding, can_lend, is_foreign_shared, lend, memory_bytes, release, release_all,
+    bytes_outstanding, can_lend, is_foreign_shared, lend, lend_parts, memory_bytes, release,
+    release_all,
 };

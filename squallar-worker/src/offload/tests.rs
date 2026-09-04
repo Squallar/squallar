@@ -2320,7 +2320,7 @@ fn the_height_field_is_byte_identical_direct_and_via_the_wire() {
 #[test]
 fn a_height_field_comes_back_under_its_own_out_kind() {
     let (code, head, tails) =
-        execute_encoded(&a_height_job().to_bytes()).expect("the fixture job answers");
+        execute_encoded(&a_height_job().to_bytes(), None).expect("the fixture job answers");
     assert_eq!(
         code, 14,
         "the reply is tagged with the height row's own code"
@@ -2535,7 +2535,7 @@ fn the_building_mesh_is_byte_identical_direct_and_via_the_wire() {
 #[test]
 fn a_building_mesh_comes_back_under_its_own_out_kind() {
     let (code, head, tails) =
-        execute_encoded(&a_building_job().to_bytes()).expect("the fixture job answers");
+        execute_encoded(&a_building_job().to_bytes(), None).expect("the fixture job answers");
     assert_eq!(
         code, 15,
         "the reply is tagged with the buildings row's own code",
@@ -4487,5 +4487,30 @@ fn a_described_overlay_job_rides_the_interactive_lane() {
         radar_lane.starts_with("rd-job"),
         "the radar control delivered on {radar_lane}, so the routing is not \
          by deadline and the assertions above prove nothing",
+    );
+}
+
+/// **A row that nominates no payload splits to exactly the bytes it already
+/// wrote.** The split path is opt-in per row, and every row but the gridded one
+/// declines it, so `to_parts` has to be a pure refactor for them: same bytes,
+/// no payload, and a transport free to post the head exactly as it posted the
+/// whole message before.
+///
+/// Byte equality, not length: a head that reordered the envelope would keep the
+/// length and change the wire, and the far end reads fields positionally.
+#[test]
+fn a_row_with_no_resident_payload_splits_to_exactly_its_own_bytes() {
+    let job = a_height_job();
+    let (head, payload) = job.to_parts();
+    assert!(
+        payload.is_none(),
+        "a terrain-height job has no resident grid to lend, so nominating one \
+         would send a head with its values missing",
+    );
+    assert_eq!(
+        head,
+        job.to_bytes(),
+        "the split head diverged from the whole message on a row that declined \
+         the split",
     );
 }

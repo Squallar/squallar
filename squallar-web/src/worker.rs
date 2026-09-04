@@ -212,7 +212,7 @@ impl Poster for web_sys::MessagePort {
 
 /// How a job's bytes are run: the worker's arm is [`execute_encoded`] on the
 /// global pool; the lane's is [`execute_serially`].
-type Run = fn(&[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)>;
+type Run = fn(&[u8], Option<&[u8]>) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)>;
 
 /// Rasterize one job and post the answer back. A message this build cannot
 /// read is answered with a failed job rather than dropped: the page holds a
@@ -246,7 +246,7 @@ fn handle_lane_message(port: &web_sys::MessagePort, data: &JsValue) {
 /// job of an `install` on the caller, so the batch is serial and never waits
 /// on the pool. A pool that cannot be built falls back to the global one,
 /// said once: slower under contention, never wrong.
-fn execute_serially(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
+fn execute_serially(bytes: &[u8], payload: Option<&[u8]>) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
     LANE_POOL.with(|cell| {
         let pool = cell.get_or_init(|| {
             rayon::ThreadPoolBuilder::new()
@@ -259,8 +259,10 @@ fn execute_serially(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
                 .ok()
         });
         match pool {
-            Some(pool) => pool.install(|| squallar_worker::offload::execute_encoded(bytes)),
-            None => squallar_worker::offload::execute_encoded(bytes),
+            Some(pool) => {
+                pool.install(|| squallar_worker::offload::execute_encoded(bytes, payload))
+            }
+            None => squallar_worker::offload::execute_encoded(bytes, payload),
         }
     })
 }
@@ -280,6 +282,13 @@ fn handle_job(poster: &dyn Poster, data: &JsValue, run: Run) {
         .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok())
         .map(|v| v.to_vec())
         .unwrap_or_default();
+    // Absent is the ordinary case: the request is whole in `REQUEST`, as every
+    // build before the split wrote it. Present means the page LENT its payload
+    // in place rather than copying it into the message, and `REQUEST` is the
+    // head alone.
+    let payload = proto::field(data, proto::REQ_PAYLOAD)
+        .and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok())
+        .map(|v| v.to_vec());
 
     // `to_vec` above IS the copy the borrower owes, and it has happened, so the
     // page may free the request now — **before** the job runs, not after.
@@ -287,7 +296,7 @@ fn handle_job(poster: &dyn Poster, data: &JsValue, run: Run) {
     // length of the rasterization would double the peak for the whole job.
     release_to_page(poster, proto::loan_field(data));
 
-    let result = run(&request);
+    let result = run(&request, payload.as_deref());
     if result.is_none() {
         log::debug!("worker job {id} produced no frame");
     }

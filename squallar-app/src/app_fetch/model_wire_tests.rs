@@ -174,6 +174,51 @@ fn the_model_dispatch_is_a_described_job_of_the_whole_grid() {
         "the posted model job paints differently through its own wire form",
     );
 
+    // The SPLIT wire: a whole-grid model job nominates its grid to be lent in
+    // place, so the head carries no values block and the grid never gets
+    // memcpy'd into a message buffer on the frame thread.
+    let whole = request.to_bytes();
+    let (head, resident) = request.to_parts();
+    let payload = resident.expect(
+        "a whole-grid model job must nominate its grid; without a payload the \
+         split path is never taken and this gate is measuring the copying wire",
+    );
+    assert!(
+        head.len() < whole.len(),
+        "the head still carries the values block the payload was supposed to \
+         replace: head {} vs whole {}",
+        head.len(),
+        whole.len(),
+    );
+    assert!(
+        payload.len() >= whole.len() - head.len(),
+        "the payload is smaller than the values the head stopped carrying, so \
+         some of the grid is on neither side of the split",
+    );
+
+    let split_request = squallar_worker::offload::JobRequest::from_parts(&head, payload.bytes())
+        .expect("the split wire form reassembles into a job");
+    let via_split = squallar_worker::offload::execute(&split_request)
+        .and_then(|out| out.take::<squallar_overlays::render::rasterize::RasterizeOutput>())
+        .expect("the model job survives the split wire form")
+        .rgba;
+    assert_eq!(
+        via_split, direct,
+        "the model job paints differently when its grid is LENT rather than \
+         written -- the window the head names and the window the payload is \
+         cut to have come apart",
+    );
+
+    // A payload that is not the grid the head describes is refused rather than
+    // cut down: cutting a window out of the wrong grid rasterizes the wrong
+    // values with nothing anywhere to say so.
+    let mut short = payload.bytes().to_vec();
+    short.truncate(short.len() - 4);
+    assert!(
+        squallar_worker::offload::JobRequest::from_parts(&head, &short).is_none(),
+        "a payload one value short of the grid the head names was accepted",
+    );
+
     drop(posted);
     assert!(
         in_flight(&mut app),

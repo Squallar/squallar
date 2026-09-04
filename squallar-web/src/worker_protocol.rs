@@ -27,6 +27,14 @@ pub const ID: &str = "id";
 /// (codes 1..=15, 0 unallocated), then the canonical envelope every kind
 /// shares.
 pub const REQUEST: &str = "req";
+/// Page -> worker: a job's payload, when the row nominated one to be LENT in
+/// place rather than written into [`REQUEST`].
+///
+/// Absent is the ordinary case and means the request is whole in `REQUEST`, as
+/// every build before the split wrote it. Present means `REQUEST` is the head
+/// alone and these bytes are the row's payload; the two are reassembled by
+/// `JobRequest::from_parts`, never by concatenation.
+pub const REQ_PAYLOAD: &str = "reqpay";
 pub const TOKEN: &str = "token";
 pub const ERROR: &str = "error";
 /// The [`crate::shared_loan::LoanId`] a `JOB`, a `DONE` or a `RELEASE` names.

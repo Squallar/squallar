@@ -156,6 +156,11 @@ pub struct JobRequest {
     pub geometry: squallar_source::job::JobGeometry,
 }
 
+/// Re-exported so a transport can name a nominated payload without taking a
+/// direct dependency on `squallar-source`: the job funnel is what defines the
+/// split, so the funnel is where the type is spelled for its callers.
+pub use squallar_source::job::ResidentBytes;
+
 impl JobRequest {
     /// Describe `input` under `geometry` — the one construction every dispatch
     /// site uses.
@@ -231,25 +236,71 @@ impl JobRequest {
             geometry: self.geometry,
         };
         let mut out = Vec::new();
-        out.push(wire_code(row));
-        out.extend_from_slice(&self.geometry.width.to_le_bytes());
-        out.extend_from_slice(&self.geometry.height.to_le_bytes());
-        out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
-        out.extend_from_slice(&self.geometry.bounds.max_lat.to_le_bytes());
-        out.extend_from_slice(&self.geometry.bounds.min_lon.to_le_bytes());
-        out.extend_from_slice(&self.geometry.bounds.max_lon.to_le_bytes());
-        out.extend_from_slice(&self.geometry.side_ceiling_px.to_le_bytes());
+        self.write_envelope(row, &mut out);
         (row.encode)(&self.job, &ctx, &mut out);
         out
+    }
+
+    /// The message as a head plus the payload it did NOT write.
+    ///
+    /// The split exists because a gridded overlay job's payload IS the message
+    /// — a whole model grid — and [`Self::to_bytes`] has to memcpy all of it
+    /// into a fresh buffer **on the frame thread**, at the dispatch site.
+    /// Measured on browser legs 2026-09-02, that copy was 99.3 % (Firefox) /
+    /// 98.7 % (Chromium) of the overlay job hand-off.
+    ///
+    /// `None` for the payload is the ordinary answer and the one every row but
+    /// the gridded one gives: the head is then the whole message, byte-identical
+    /// to [`Self::to_bytes`], and a transport may post it exactly as before.
+    /// That equivalence is pinned by
+    /// `a_row_with_no_resident_payload_splits_to_exactly_its_own_bytes`.
+    pub fn to_parts(&self) -> (Vec<u8>, Option<squallar_source::job::ResidentBytes>) {
+        let row = row_for(&self.job);
+        let ctx = squallar_source::job::EncodeCtx {
+            geometry: self.geometry,
+        };
+        let payload = (row.resident_payload)(&self.job, &ctx);
+        let mut out = Vec::new();
+        self.write_envelope(row, &mut out);
+        if payload.is_some() {
+            (row.encode_resident_head)(&self.job, &ctx, &mut out);
+        } else {
+            (row.encode)(&self.job, &ctx, &mut out);
+        }
+        (out, payload)
     }
 
     /// `None` on an unallocated code or a payload this build cannot read — the
     /// two ends of a message port can be different builds.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (row, mut r, geometry) = Self::split_envelope(bytes)?;
+        // The row decodes its own payload; the envelope passes through unchanged.
+        let (job, geometry) = (row.decode)(&mut r, geometry)?;
+        if row.label.starts_with("overlay/") {
+            // Every overlay input's lists are length-counted, so trailing bytes
+            // mean the two builds' layouts disagree. The radar-family tails ARE
+            // the rest, so there is nothing to check on those rows.
+            r.rest().is_empty().then_some(())?;
+        }
+        Some(Self { job, geometry })
+    }
+
+    /// The leading code and canonical envelope, read once for both decoders.
+    ///
+    /// Hands back the row, a reader positioned at the row's own payload, and
+    /// the geometry — so `from_bytes` and `from_parts` cannot come to disagree
+    /// about where a message's envelope ends.
+    fn split_envelope(
+        bytes: &[u8],
+    ) -> Option<(
+        &'static squallar_source::job::JobCodec,
+        squallar_source::wire::Reader<'_>,
+        squallar_source::job::JobGeometry,
+    )> {
         let (code, rest) = bytes.split_first()?;
         let row = row_for_code(*code)?;
         let mut r = squallar_source::wire::Reader::new(rest);
-        // The canonical envelope, mirroring `to_bytes` field for field.
+        // The canonical envelope, mirroring `write_envelope` field for field.
         let width = r.u32()?;
         let height = r.u32()?;
         let bounds = squallar_geo::GeoBounds {
@@ -261,28 +312,50 @@ impl JobRequest {
         let side_ceiling_px = r.u32()?;
         if row.label.starts_with("overlay/") {
             // These bytes arrive on a message port, and the pair is what
-            // [`execute`]'s output allocates a `width × height` pixmap from: no
+            // [`execute`]'s output allocates a `width x height` pixmap from: no
             // ceiling would make a malformed job a multi-gigabyte allocation.
-            // The ceiling is the largest raster any target affords (the desktop
-            // plan-view side, squared). Zero sides are refused with it.
             let ceiling = squallar_device_profile::constants::DESKTOP_RASTER_SIDE_CEILING as u64;
             let pixels = u64::from(width) * u64::from(height);
             if width == 0 || height == 0 || pixels > ceiling * ceiling {
                 return None;
             }
         }
-        let geometry = squallar_source::job::JobGeometry {
-            width,
-            height,
-            bounds,
-            side_ceiling_px,
-        };
-        // The row decodes its own payload; the envelope passes through unchanged.
-        let (job, geometry) = (row.decode)(&mut r, geometry)?;
+        Some((
+            row,
+            r,
+            squallar_source::job::JobGeometry {
+                width,
+                height,
+                bounds,
+                side_ceiling_px,
+            },
+        ))
+    }
+
+    /// The canonical envelope, written once for both encoders so a field
+    /// cannot be added to one spelling and missed by the other.
+    fn write_envelope(&self, row: &squallar_source::job::JobCodec, out: &mut Vec<u8>) {
+        out.push(wire_code(row));
+        out.extend_from_slice(&self.geometry.width.to_le_bytes());
+        out.extend_from_slice(&self.geometry.height.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.min_lat.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.max_lat.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.min_lon.to_le_bytes());
+        out.extend_from_slice(&self.geometry.bounds.max_lon.to_le_bytes());
+        out.extend_from_slice(&self.geometry.side_ceiling_px.to_le_bytes());
+    }
+
+    /// Rebuild a request whose payload travelled BESIDE the head rather than
+    /// inside it — the far end of [`Self::to_parts`].
+    ///
+    /// Refuses, rather than falling back to [`Self::from_bytes`], when the row
+    /// has no `decode_resident`: a head that was written without its values
+    /// would otherwise decode to an input with an empty window and rasterize
+    /// nothing, which is a blank layer and no error anywhere.
+    pub fn from_parts(bytes: &[u8], payload: &[u8]) -> Option<Self> {
+        let (row, mut r, geometry) = Self::split_envelope(bytes)?;
+        let (job, geometry) = (row.decode_resident)(&mut r, geometry, payload)?;
         if row.label.starts_with("overlay/") {
-            // Every overlay input's lists are length-counted, so trailing bytes
-            // mean the two builds' layouts disagree. The radar-family tails ARE
-            // the rest, so there is nothing to check on those rows.
             r.rest().is_empty().then_some(())?;
         }
         Some(Self { job, geometry })
@@ -397,8 +470,19 @@ pub fn execute_bytes(bytes: &[u8]) -> JobResult {
 /// direction speaks (`wire_code`). `None` for a payload this build cannot read
 /// and for a job that produced nothing — both mean "nothing to draw", and the
 /// caller still posts the explicit-null reply that keeps the pane from wedging.
-pub fn execute_encoded(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
-    let request = JobRequest::from_bytes(bytes)?;
+pub fn execute_encoded(
+    bytes: &[u8],
+    payload: Option<&[u8]>,
+) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
+    // `payload` present means the row nominated its payload to be LENT rather
+    // than written, so `bytes` is the head alone. The two are reassembled by
+    // the row's own `decode_resident` — never by concatenation, because the
+    // head was written without a values block and the joined bytes would land
+    // in a layout no decoder reads.
+    let request = match payload {
+        Some(payload) => JobRequest::from_parts(bytes, payload)?,
+        None => JobRequest::from_bytes(bytes)?,
+    };
     let row = row_for(&request.job);
     let out = execute(&request)?;
     // The head is scalars and framing — 64 covers every current row's fixed

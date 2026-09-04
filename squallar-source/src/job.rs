@@ -109,6 +109,112 @@ pub enum JobCost {
 
 /// One row of the job registry, as plain function pointers so a registry can be
 /// a `static`. Built only through [`JobCodec::of`].
+/// Bytes that are ALREADY resident, and can therefore cross to the worker
+/// without being copied into a message buffer first.
+///
+/// The problem this exists for: a gridded overlay job's payload IS the message
+/// — a whole model grid, megabytes of `f32` — and building the wire buffer
+/// meant one memcpy of all of it **on the frame thread**, at the dispatch
+/// site. Measured on browser legs 2026-09-02, `JobRequest::to_bytes` was 99.3 %
+/// (Firefox) / 98.7 % (Chromium) of the overlay job hand-off.
+///
+/// A row that has such a payload nominates it here instead of writing it, and
+/// the transport lends a VIEW onto it. `owner` is what makes that sound: it is
+/// never read through, and is held only so the allocation cannot be freed
+/// while the peer is reading it.
+pub struct ResidentBytes {
+    inner: std::sync::Arc<dyn ResidentSlice>,
+}
+
+/// A region some live owner can hand out as bytes.
+///
+/// Object-safe on purpose: [`ResidentBytes`] holds one of these rather than an
+/// address, so the slice is re-derived from the owner that is still alive at
+/// the moment it is read. A cached pointer would be a second statement of
+/// where the bytes are, able to disagree with the handle beside it.
+trait ResidentSlice: Send + Sync {
+    fn bytes(&self) -> &[u8];
+    fn owner(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync>;
+}
+
+/// One owner plus the projection that picks its bytes out.
+///
+/// The projection is a plain `fn`, not a closure: every projection in the tree
+/// is "cast this field to bytes", so nothing needs to capture, and refusing
+/// captures keeps this constructible in a `const`-friendly, allocation-free
+/// way.
+struct Projected<T: std::any::Any + Send + Sync> {
+    owner: std::sync::Arc<T>,
+    project: fn(&T) -> &[u8],
+}
+
+impl<T: std::any::Any + Send + Sync> ResidentSlice for Projected<T> {
+    fn bytes(&self) -> &[u8] {
+        (self.project)(&self.owner)
+    }
+
+    fn owner(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        std::sync::Arc::clone(&self.owner) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+    }
+}
+
+impl ResidentBytes {
+    /// Hold `owner` alive and describe the bytes `project` picks out of it.
+    pub fn of<T: std::any::Any + Send + Sync>(
+        owner: std::sync::Arc<T>,
+        project: fn(&T) -> &[u8],
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(Projected { owner, project }),
+        }
+    }
+
+    /// The bytes themselves, read through the owner that is holding them.
+    pub fn bytes(&self) -> &[u8] {
+        self.inner.bytes()
+    }
+
+    /// Where they are, for building a view onto them.
+    pub fn addr(&self) -> usize {
+        self.bytes().as_ptr() as usize
+    }
+
+    /// How many travel.
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    /// Whether none do.
+    pub fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+
+    /// The handle keeping the region alive, so a transport can hold it for as
+    /// long as its own loan is outstanding.
+    pub fn owner(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self.inner.owner()
+    }
+}
+
+/// Hand-written because the owner is deliberately opaque: the interesting
+/// facts are the extent.
+impl std::fmt::Debug for ResidentBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidentBytes")
+            .field("addr", &self.addr())
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+/// A row's split-wire decoder: the head's reader, the envelope it was read
+/// under, and the payload that travelled beside it.
+///
+/// Spelled as an alias because the row stores it as a bare `fn` pointer and the
+/// three-argument form is past clippy's complexity bar inline.
+pub type DecodeResident =
+    fn(&mut crate::wire::Reader<'_>, JobGeometry, &[u8]) -> Option<(DescribedJob, JobGeometry)>;
+
 pub struct JobCodec {
     pub label: &'static str,
     /// The row's input `TypeId` as a function, because `TypeId::of` is not
@@ -121,6 +227,15 @@ pub struct JobCodec {
     pub decode:
         fn(&mut crate::wire::Reader<'_>, JobGeometry) -> Option<(DescribedJob, JobGeometry)>,
     pub run: fn(&DescribedJob, &JobGeometry) -> Option<DescribedOut>,
+    /// The row's already-resident payload, if it has one. `None` means this
+    /// row builds its whole message and there is nothing to lend in place.
+    pub resident_payload: fn(&DescribedJob, &EncodeCtx) -> Option<ResidentBytes>,
+    /// Encode everything EXCEPT the resident payload. Only called when
+    /// [`Self::resident_payload`] answered `Some`, and paired with
+    /// [`Self::decode_resident`] at the far end.
+    pub encode_resident_head: fn(&DescribedJob, &EncodeCtx, &mut Vec<u8>),
+    /// Decode a message whose payload arrived beside it rather than inside it.
+    pub decode_resident: DecodeResident,
     /// Reply-direction encoder. CONSUMES the out and splits it across a head
     /// sink and a tails sink; see [`JobOutCodec`].
     pub encode_out: fn(DescribedOut, &mut Vec<u8>, &mut Vec<Vec<u8>>),
@@ -143,6 +258,36 @@ pub trait JobSpec: 'static {
     /// [`JobCodec::decode`].
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(Self::In, JobGeometry)>;
     fn run(input: &Self::In, geo: &JobGeometry) -> Option<Self::Out>;
+
+    /// This input's already-resident payload, if lending it beats writing it.
+    ///
+    /// Defaults to `None`, which is the whole registry except the gridded row:
+    /// a row whose message is a few dozen bytes of scalars has nothing worth
+    /// lending, and the default keeps it out of the split path entirely.
+    fn resident_payload(_input: &Self::In, _ctx: &EncodeCtx) -> Option<ResidentBytes> {
+        None
+    }
+
+    /// Everything [`Self::encode`] writes except the resident payload.
+    ///
+    /// The default is `encode` itself, which is correct for every row whose
+    /// [`Self::resident_payload`] is `None` — it is never called for those.
+    fn encode_resident_head(input: &Self::In, ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        Self::encode(input, ctx, out);
+    }
+
+    /// Rebuild the input from a head plus the payload that travelled beside it.
+    ///
+    /// Defaults to REFUSING rather than falling back to [`Self::decode`]: a row
+    /// that nominates a payload but cannot reassemble one would otherwise
+    /// decode a head with its values missing and rasterize nothing, silently.
+    fn decode_resident(
+        _r: &mut Reader<'_>,
+        _geo: JobGeometry,
+        _payload: &[u8],
+    ) -> Option<(Self::In, JobGeometry)> {
+        None
+    }
 }
 
 /// The reply-direction codecs. A row cannot be built without this half, so
@@ -167,6 +312,9 @@ impl JobCodec {
             encode: encode_shim::<S>,
             decode: decode_shim::<S>,
             run: run_shim::<S>,
+            resident_payload: resident_payload_shim::<S>,
+            encode_resident_head: encode_resident_head_shim::<S>,
+            decode_resident: decode_resident_shim::<S>,
             encode_out: encode_out_shim::<S>,
             decode_out: decode_out_shim::<S>,
             cost: S::COST,
@@ -186,6 +334,36 @@ fn encode_shim<S: JobSpec>(job: &DescribedJob, ctx: &EncodeCtx, out: &mut Vec<u8
         )
     });
     S::encode(input, ctx, out);
+}
+
+/// A job routed to the wrong row has no payload to nominate rather than
+/// panicking: the encode shim below it panics on the same mismatch, so the
+/// defect still surfaces, and answering `None` here keeps this off the panic
+/// path for a question whose honest answer is "I do not know".
+fn resident_payload_shim<S: JobSpec>(job: &DescribedJob, ctx: &EncodeCtx) -> Option<ResidentBytes> {
+    S::resident_payload(job.downcast_ref::<S::In>()?, ctx)
+}
+
+/// Panics on a mismatch exactly as [`encode_shim`] does, and for the same
+/// reason: a head encoded as zero bytes would read as a green send.
+fn encode_resident_head_shim<S: JobSpec>(job: &DescribedJob, ctx: &EncodeCtx, out: &mut Vec<u8>) {
+    let input = job.downcast_ref::<S::In>().unwrap_or_else(|| {
+        panic!(
+            "a `{}` codec row was asked to encode the head of {job:?} — the \
+             registry routed a job to the wrong row",
+            S::LABEL,
+        )
+    });
+    S::encode_resident_head(input, ctx, out);
+}
+
+fn decode_resident_shim<S: JobSpec>(
+    r: &mut Reader<'_>,
+    geo: JobGeometry,
+    payload: &[u8],
+) -> Option<(DescribedJob, JobGeometry)> {
+    let (input, geo) = S::decode_resident(r, geo, payload)?;
+    Some((DescribedJob::new(input), geo))
 }
 
 fn decode_shim<S: JobSpec>(

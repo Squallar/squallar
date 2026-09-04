@@ -657,26 +657,53 @@ impl JobSink for Port {
         proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
         proto::set_loan(&message, crate::shared_loan::NO_LOAN);
 
+        // `to_parts`, not `to_bytes`: a row whose payload is ALREADY resident
+        // nominates it instead of writing it, so the grid is not memcpy'd into
+        // a wire buffer here — on the frame thread, at the dispatch site.
+        // Every other row answers `None` and the head IS the whole message,
+        // byte-identical to what `to_bytes` wrote.
         let encode_start = web_time::Instant::now();
-        let bytes = request.to_bytes();
+        let (head, resident) = request.to_parts();
         let encode_us = us(encode_start, web_time::Instant::now());
-        let moved = bytes.len();
+        let moved = head.len() + resident.as_ref().map_or(0, |p| p.len());
         let transfer = js_sys::Array::new();
-        let (loan, copied) = match crate::shared_loan::lend(vec![bytes]) {
+        // The three pieces come from ONE `ResidentBytes`, which captured them
+        // from its own owner — so they describe one allocation by construction
+        // rather than by this call site getting the pairing right.
+        let parts: Vec<crate::shared_loan::Lent> =
+            std::iter::once(crate::shared_loan::Lent::Owned(head))
+                .chain(
+                    resident
+                        .as_ref()
+                        .map(|p| crate::shared_loan::Lent::Borrowed {
+                            owner: p.owner(),
+                            addr: p.addr(),
+                            len: p.len(),
+                        }),
+                )
+                .collect();
+        let split = parts.len() > 1;
+        let (loan, copied) = match crate::shared_loan::lend_parts(parts) {
             Ok((loan, views)) => {
                 proto::set_loan(&message, loan);
                 proto::set_field(&message, proto::REQUEST, &views.get(0));
+                if split {
+                    proto::set_field(&message, proto::REQ_PAYLOAD, &views.get(1));
+                }
                 (loan, 0)
             }
-            Err(mut bytes) => {
-                // One buffer went in, so one comes back; an empty `Vec` here
-                // would be a bookkeeping bug rather than a case, and the empty
-                // request it produces is answered as a failed job.
-                let bytes = bytes.pop().unwrap_or_default();
+            Err(_) => {
+                // No lending on this deployment, so the payload has to be
+                // written after all. `to_bytes` rather than concatenating the
+                // parts: the head was encoded WITHOUT its values and the two
+                // spellings put them in different places, so joining them would
+                // produce a message no decoder reads.
+                let bytes = request.to_bytes();
+                let sent = bytes.len();
                 let payload = js_sys::Uint8Array::from(bytes.as_slice());
                 transfer.push(&payload.buffer());
                 proto::set_field(&message, proto::REQUEST, &payload);
-                (crate::shared_loan::NO_LOAN, moved)
+                (crate::shared_loan::NO_LOAN, sent)
             }
         };
         // The post is hoisted out of the `match` so this call's own encode and

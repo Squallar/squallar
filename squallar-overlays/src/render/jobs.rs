@@ -498,19 +498,7 @@ impl JobSpec for GriddedJob {
         // `as_str` code the persisted pane config already round-trips), the
         // grid shape, the coordinates, the window, and then the window's values
         // as the one bulk block.
-        encode_str(out, input.field().as_str());
-        let (ni, nj) = input.shape();
-        out.extend_from_slice(&(ni as u32).to_le_bytes());
-        out.extend_from_slice(&(nj as u32).to_le_bytes());
-        encode_grid_coords(out, input.coords());
-        let win = input.window_for(
-            &ctx.geometry.bounds,
-            ctx.geometry.width,
-            ctx.geometry.height,
-        );
-        for edge in [win.i0, win.i1, win.j0, win.j1] {
-            out.extend_from_slice(&(edge as u32).to_le_bytes());
-        }
+        let win = encode_gridded_head(input, ctx, out);
         // No count: the length is the window's area, already on the wire
         // as the four edges, and a second statement of it could lie. The
         // same fact is what makes the reservation below computable before
@@ -543,34 +531,11 @@ impl JobSpec for GriddedJob {
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(GriddedInput, JobGeometry)> {
-        use crate::render::rasterize::{GridWindow, IndexWindow};
-        // The field code is believed only if this build **registers** it —
-        // `field_paint` answering is exactly the condition under which
-        // `rasterize_gridded` can paint it. A code this build does not know is
-        // a newer build's field, and defaulting it would rasterize one field's
-        // values through another's colours with nothing to say so.
-        let code = decode_str(r)?;
-        let field = crate::render::gridded::paint_for_code(&code)?.id.clone();
-        let ni = r.u32()? as usize;
-        let nj = r.u32()? as usize;
-        let coords = decode_grid_coords(r)?;
-        let win = IndexWindow {
-            i0: r.u32()? as usize,
-            i1: r.u32()? as usize,
-            j0: r.u32()? as usize,
-            j1: r.u32()? as usize,
-        };
-        // A window past the grid it indexes, or inside-out, is a layout
-        // this build never writes: refused, not clamped, so a raster of
-        // it cannot silently draw a different region than was asked. An
-        // empty window (a viewport the grid never reaches) is legitimate
-        // and its area — and so its values block — is zero.
-        if win.i0 > win.i1 || win.j0 > win.j1 || win.i1 > ni || win.j1 > nj {
-            return None;
-        }
-        // The values length is the window's own area — no second count
-        // on the wire to disagree with it, and `take` inside refuses a
-        // buffer shorter than the area claims before anything allocates.
+        use crate::render::rasterize::GridWindow;
+        let (field, ni, nj, coords, win) = decode_gridded_head(r)?;
+        // The values length is the window's own area — no second count on the
+        // wire to disagree with it, and `take` inside refuses a buffer shorter
+        // than the area claims before anything allocates.
         let values = decode_f32s(r, win.area())?;
         Some((
             GriddedInput::Window(GridWindow {
@@ -588,6 +553,156 @@ impl JobSpec for GriddedJob {
     fn run(input: &GriddedInput, geo: &JobGeometry) -> Option<RasterizeOutput> {
         Some(rasterize_gridded(input, &geo.bounds, geo.width, geo.height))
     }
+
+    /// The grid this input already holds, lent rather than written.
+    ///
+    /// **Only the whole-grid arms.** A [`GriddedInput::Window`] has already
+    /// been cut — its values are owned by the input itself, there is no
+    /// longer-lived handle to hold, and it is the arm a DECODED job is in, so
+    /// answering `Some` here would try to lend the worker's own copy back.
+    ///
+    /// What travels is the WHOLE grid, not the window: it is one contiguous
+    /// allocation, so it is lendable as a single view, whereas the window's
+    /// rows are strided and are not. The window still rides the head, and
+    /// [`Self::decode_resident`] cuts to it at the far end — off the frame
+    /// thread, which is the entire point.
+    fn resident_payload(
+        input: &GriddedInput,
+        _ctx: &squallar_source::job::EncodeCtx,
+    ) -> Option<squallar_source::job::ResidentBytes> {
+        use squallar_source::job::ResidentBytes;
+        match input {
+            GriddedInput::Whole(grid) => {
+                Some(ResidentBytes::of(std::sync::Arc::clone(grid), |g| {
+                    bytemuck::cast_slice(&g.values)
+                }))
+            }
+            GriddedInput::Resident(grid) => {
+                Some(ResidentBytes::of(std::sync::Arc::clone(grid), |g| {
+                    bytemuck::cast_slice(&g.values)
+                }))
+            }
+            GriddedInput::Window(_) => None,
+        }
+    }
+
+    fn encode_resident_head(
+        input: &GriddedInput,
+        ctx: &squallar_source::job::EncodeCtx,
+        out: &mut Vec<u8>,
+    ) {
+        let _ = encode_gridded_head(input, ctx, out);
+    }
+
+    /// The head's envelope plus a payload that is the WHOLE grid, cut here.
+    ///
+    /// The length check is the wire's own statement of what arrived: the
+    /// payload has to be exactly `ni * nj` f32s, because that is the grid the
+    /// head just described. A payload of any other length is a different grid
+    /// than the envelope names, and cutting a window out of it would rasterize
+    /// the wrong values with nothing to say so.
+    fn decode_resident(
+        r: &mut Reader<'_>,
+        geo: JobGeometry,
+        payload: &[u8],
+    ) -> Option<(GriddedInput, JobGeometry)> {
+        use crate::render::rasterize::GridWindow;
+        let (field, ni, nj, coords, win) = decode_gridded_head(r)?;
+        if payload.len() != ni.checked_mul(nj)?.checked_mul(4)? {
+            return None;
+        }
+        // Read through `from_le_bytes` rather than casting the slice: the
+        // payload arrives as a `Uint8Array::to_vec`, whose allocation carries
+        // no f32 alignment, so a cast would refuse on exactly the platforms
+        // this path exists for. The bytes are the same either way — the wire
+        // is little-endian by the assertion beside `encode_f32s`.
+        let mut values = Vec::with_capacity(win.area());
+        for j in win.j0..win.j1 {
+            let start = (j * ni + win.i0) * 4;
+            let end = (j * ni + win.i1) * 4;
+            values.extend(
+                payload
+                    .get(start..end)?
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+            );
+        }
+        Some((
+            GriddedInput::Window(GridWindow {
+                field,
+                ni,
+                nj,
+                coords,
+                win,
+                values,
+            }),
+            geo,
+        ))
+    }
+}
+
+/// The gridded envelope, written once for both encoders.
+///
+/// Returns the window it wrote so the value-writing encoder does not recompute
+/// it — and, more to the point, so the two encoders cannot come to disagree
+/// about which window the head names.
+fn encode_gridded_head(
+    input: &GriddedInput,
+    ctx: &squallar_source::job::EncodeCtx,
+    out: &mut Vec<u8>,
+) -> crate::render::rasterize::IndexWindow {
+    encode_str(out, input.field().as_str());
+    let (ni, nj) = input.shape();
+    out.extend_from_slice(&(ni as u32).to_le_bytes());
+    out.extend_from_slice(&(nj as u32).to_le_bytes());
+    encode_grid_coords(out, input.coords());
+    let win = input.window_for(
+        &ctx.geometry.bounds,
+        ctx.geometry.width,
+        ctx.geometry.height,
+    );
+    for edge in [win.i0, win.i1, win.j0, win.j1] {
+        out.extend_from_slice(&(edge as u32).to_le_bytes());
+    }
+    win
+}
+
+/// The gridded envelope, read once for both decoders.
+#[allow(clippy::type_complexity)]
+fn decode_gridded_head(
+    r: &mut Reader<'_>,
+) -> Option<(
+    squallar_source::product::FieldId,
+    usize,
+    usize,
+    crate::hrrr::GridCoords,
+    crate::render::rasterize::IndexWindow,
+)> {
+    use crate::render::rasterize::IndexWindow;
+    // The field code is believed only if this build **registers** it —
+    // `field_paint` answering is exactly the condition under which
+    // `rasterize_gridded` can paint it. A code this build does not know is a
+    // newer build's field, and defaulting it would rasterize one field's
+    // values through another's colours with nothing to say so.
+    let code = decode_str(r)?;
+    let field = crate::render::gridded::paint_for_code(&code)?.id.clone();
+    let ni = r.u32()? as usize;
+    let nj = r.u32()? as usize;
+    let coords = decode_grid_coords(r)?;
+    let win = IndexWindow {
+        i0: r.u32()? as usize,
+        i1: r.u32()? as usize,
+        j0: r.u32()? as usize,
+        j1: r.u32()? as usize,
+    };
+    // A window past the grid it indexes, or inside-out, is a layout this build
+    // never writes: refused, not clamped, so a raster of it cannot silently
+    // draw a different region than was asked. An empty window (a viewport the
+    // grid never reaches) is legitimate and its area is zero.
+    if win.i0 > win.i1 || win.j0 > win.j1 || win.i1 > ni || win.j1 > nj {
+        return None;
+    }
+    Some((field, ni, nj, coords, win))
 }
 
 impl JobOutCodec for GriddedJob {
@@ -1199,6 +1314,82 @@ impl HatchWire {
 
 #[cfg(test)]
 mod tests {
+    /// **A lent grid is cut to the window its head names, origin included.**
+    ///
+    /// The end-to-end model-wire parity gate cannot see this. Its dispatched
+    /// pane windows the full grid width, so `i0` and `j0` are zero there and a
+    /// cut that ignored the window's origin produces byte-identical pixels —
+    /// verified by tampering `start` to drop `win.i0`, which that gate passed.
+    /// Here the window is deliberately interior on BOTH axes, so an origin the
+    /// cut forgets reads a different rectangle out of the payload.
+    ///
+    /// This is the arithmetic the split wire moved: the copying encoder cut the
+    /// window on the sending side, and the lending one cuts it here instead.
+    #[test]
+    fn a_lent_grid_is_cut_to_the_window_its_head_names() {
+        use super::*;
+        use crate::hrrr::GridCoords;
+        use crate::render::rasterize::GriddedInput;
+
+        let (ni, nj) = (6usize, 5usize);
+        // Every cell says where it is, so a cut from the wrong origin lands on
+        // values that name the place it actually read.
+        let values: Vec<f32> = (0..nj)
+            .flat_map(|j| (0..ni).map(move |i| (j * 10 + i) as f32))
+            .collect();
+        let coords = GridCoords::Regular {
+            lat0: 30.0,
+            lon0: -100.0,
+            dlat: 0.5,
+            dlon: 0.5,
+            ni,
+            nj,
+            scan_mode: 0,
+        };
+        // A code this build registers, because `decode_resident` refuses one it
+        // does not — the same check the copying decoder makes.
+        let field = crate::render::gridded::paint_for_code("vis")
+            .expect("this build registers the `vis` field")
+            .id
+            .clone();
+
+        let (i0, i1, j0, j1) = (2usize, 5, 1, 4);
+        let mut head = Vec::new();
+        encode_str(&mut head, field.as_str());
+        head.extend_from_slice(&(ni as u32).to_le_bytes());
+        head.extend_from_slice(&(nj as u32).to_le_bytes());
+        encode_grid_coords(&mut head, &coords);
+        for edge in [i0, i1, j0, j1] {
+            head.extend_from_slice(&(edge as u32).to_le_bytes());
+        }
+
+        let payload: &[u8] = bytemuck::cast_slice(&values);
+        let geo = JobGeometry {
+            width: 8,
+            height: 8,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 30.0,
+                max_lat: 32.0,
+                min_lon: -100.0,
+                max_lon: -98.0,
+            },
+            side_ceiling_px: 0,
+        };
+        let mut r = Reader::new(&head);
+        let (input, _) = <GriddedJob as JobSpec>::decode_resident(&mut r, geo, payload)
+            .expect("a whole grid and the window naming part of it decode");
+
+        let GriddedInput::Window(window) = input else {
+            panic!("a lent grid decodes to the cut window, not to a whole-grid carry");
+        };
+        assert_eq!(
+            window.values,
+            vec![12.0, 13.0, 14.0, 22.0, 23.0, 24.0, 32.0, 33.0, 34.0],
+            "the cut read the wrong rectangle out of the lent grid",
+        );
+        assert_eq!((window.win.i0, window.win.j0), (i0, j0));
+    }
+
     /// **The bulk encoding writes exactly what the value-at-a-time loop wrote.**
     ///
     /// The loop is kept here as the reference rather than deleted: an
