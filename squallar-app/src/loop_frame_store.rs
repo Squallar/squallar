@@ -247,25 +247,29 @@ impl LoopFrameStore {
     /// on this heap and countable here is each plan-view frame's resident
     /// hover field and each section's tilt vectors.
     ///
-    /// **Three things this deliberately does not count, and each is a real
-    /// allocation.** A loop frame's `HoverSource` is built by
-    /// `HoverSource::from_volume`, which keeps the `Arc<Scan>` the frame was
-    /// drawn from so the readout can decode a gate on demand;
-    /// `HoverSource::resident_bytes` reports the polar field alone and says
-    /// nothing about that volume, so a frame pinning tens of MB of decoded
-    /// radar prices here at kilobytes. The loop volume cache
-    /// (`LoopDownloadManager::cached_scan_bytes`) is what names those bytes,
-    /// and a frame outliving its cache entry is bytes neither figure sees.
-    /// An `Overlay` frame carries an `OverlayTextureData` whose hit map is a
-    /// per-cell index nothing prices. And a `Volume` frame's grid is the
-    /// volume store's, priced there.
+    /// **The decoded volumes a plan-view frame pins are NOT in this figure**,
+    /// deliberately: they are `Arc<Scan>`s the loop download cache may hold
+    /// too, and folding them in here would put radar bytes inside a family
+    /// whose name says they are elsewhere. [`Self::pinned_volume_bytes`] is
+    /// that figure, and it is published into the census beside the other
+    /// decoded-volume families, where shared ownership is already declared.
+    ///
+    /// **One thing this still does not count**: a `Volume` frame's grid is
+    /// the volume store's, priced there.
+    ///
+    /// An `Overlay` frame used to be named here as carrying an unpriced hit
+    /// map. It does not: `App::place_overlay_loop_frame` sets `hit_map: None`
+    /// on every overlay loop frame (`app_render.rs`), because a frame is a
+    /// picture and hovers are answered from the live layer state. The
+    /// unpriced hit maps are real but they are the **live pane textures'** and
+    /// the in-flight dispatch closures', neither of which this store holds.
     ///
     /// O(entries), O(1) apiece.
     pub fn resident_host_bytes(&self) -> u64 {
         self.entries.iter().fold(0u64, |sum, entry| {
             let bytes = match &entry.image {
                 squallar_egui::pane::LoopFrameImage::PlanView(image) => {
-                    image.hover.resident_bytes() as u64
+                    image.hover.field_bytes() as u64
                 }
                 squallar_egui::pane::LoopFrameImage::Section(image) => {
                     (image.tilt_elevations_deg.len() * size_of::<f64>()
@@ -273,6 +277,45 @@ impl LoopFrameStore {
                         as u64
                 }
                 squallar_egui::pane::LoopFrameImage::Volume(_)
+                | squallar_egui::pane::LoopFrameImage::Overlay(_) => 0,
+            };
+            sum.saturating_add(bytes)
+        })
+    }
+
+    /// **Decoded Level II volumes the stored plan-view frames are keeping
+    /// alive**, summed.
+    ///
+    /// A loop frame's `HoverSource` is built by `HoverSource::from_volume`
+    /// and holds the `Arc<Scan>` the frame was drawn from, so the readout
+    /// can decode a gate on demand. Until this figure existed nothing
+    /// reported it: `HoverSource::resident_bytes` returned the polar field
+    /// alone, so a frame pinning tens of MB of decoded radar priced at the
+    /// 5.8 KiB of its geometry, invisible to the census that gates this
+    /// campaign's decisions.
+    ///
+    /// **This overlaps the loop download cache on purpose.** The `Arc` is
+    /// cloned out of that cache, so while the entry lives both figures name
+    /// the same bytes — the census's stated convention for the decoded-volume
+    /// families, each reporting what it would free if it alone let go. The
+    /// case that makes this figure load-bearing rather than redundant is the
+    /// other one: `App::retain_loop_volumes` evicts by the timestamps panes
+    /// currently list, while a stored frame is kept by whether a pane still
+    /// holds it, so **a frame can outlive its cache entry** — and those bytes
+    /// were priced by nothing at all.
+    ///
+    /// Two frames drawn from the same volume count it twice; the census's
+    /// radar families are an upper bound, not a partition.
+    ///
+    /// O(entries), O(1) apiece — every volume was priced once at arrival.
+    pub fn pinned_volume_bytes(&self) -> u64 {
+        self.entries.iter().fold(0u64, |sum, entry| {
+            let bytes = match &entry.image {
+                squallar_egui::pane::LoopFrameImage::PlanView(image) => {
+                    image.hover.pinned_volume_bytes() as u64
+                }
+                squallar_egui::pane::LoopFrameImage::Section(_)
+                | squallar_egui::pane::LoopFrameImage::Volume(_)
                 | squallar_egui::pane::LoopFrameImage::Overlay(_) => 0,
             };
             sum.saturating_add(bytes)

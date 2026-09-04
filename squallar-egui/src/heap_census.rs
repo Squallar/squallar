@@ -123,6 +123,12 @@ families! {
          cache are holding together.";
     DERIVE_MEMO_BYTES, derive_memo_bytes, set_derive_memo_bytes,
         "Derived volumes the derivation memo is holding.";
+    LOOP_FRAME_SCAN_BYTES, loop_frame_scan_bytes, set_loop_frame_scan_bytes,
+        "Decoded volumes the stored 2D loop frames are PINNING - each \
+         plan-view frame's hover source holds the `Arc<Scan>` it was drawn \
+         from so the readout can decode a gate on demand. Overlaps the loop \
+         download cache while the entry lives, and is the only figure naming \
+         these bytes once it is evicted.";
     RENDER_CACHE_BYTES, render_cache_bytes, set_render_cache_bytes,
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
@@ -205,15 +211,18 @@ impl Census {
 
     /// **The decoded-volume families, summed as an upper bound.**
     ///
-    /// Four caches hold `Arc`s of the same volumes, so a volume two of them
-    /// name is counted twice here. Stated rather than corrected: the figure
-    /// that matters for "what would emptying these free" is this one, and the
-    /// partition it is not would take a graph walk on the frame thread.
+    /// Five holders keep `Arc`s of the same volumes — the loop download
+    /// cache, the still inventory, the derivation memo, and the stored loop
+    /// frames' hover sources — so a volume two of them name is counted twice
+    /// here. Stated rather than corrected: the figure that matters for "what
+    /// would emptying these free" is this one, and the partition it is not
+    /// would take a graph walk on the frame thread.
     pub fn radar_total(&self) -> u64 {
         self.loop_scan_bytes
             .saturating_add(self.loop_l3_bytes)
             .saturating_add(self.still_scan_bytes)
             .saturating_add(self.derive_memo_bytes)
+            .saturating_add(self.loop_frame_scan_bytes)
     }
 
     /// **What this census does not account for**, against a real reading of
@@ -256,14 +265,15 @@ pub fn write_line<W: core::fmt::Write>(
     write!(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
-         derive memo {} B, render cache {} B, overlay pictures {} B, overlay grids {} B, \
-         loop frames {} B, upload pending {} B, tile bodies {} B, tile parsed {} B, \
+         derive memo {} B, loop frame scans {} B, render cache {} B, overlay pictures {} B, \
+         overlay grids {} B, loop frames {} B, upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B; \
          resident total {} B of ",
         census.loop_scan_bytes,
         census.loop_l3_bytes,
         census.still_scan_bytes,
         census.derive_memo_bytes,
+        census.loop_frame_scan_bytes,
         census.render_cache_bytes,
         census.overlay_picture_bytes,
         census.overlay_grid_bytes,

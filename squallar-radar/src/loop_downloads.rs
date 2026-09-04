@@ -310,6 +310,19 @@ impl LoopDownloadManager {
         self.scan_bytes_cached
     }
 
+    /// **What one cached volume was priced at**, the figure
+    /// [`Self::cache_scan`] computed at arrival. `None` where this cache is
+    /// not holding that volume.
+    ///
+    /// It exists so a holder that outlives the cache entry — a loop frame's
+    /// `HoverSource`, which `Arc::clone`s the volume out of here — can carry
+    /// the figure instead of walking the radials again on the frame thread.
+    /// O(1): one map lookup, and the `String` its key wants is a four-letter
+    /// site name.
+    pub fn cached_scan_price(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<usize> {
+        self.scan_prices.get(&(site.to_string(), *ts)).copied()
+    }
+
     /// **Host bytes the loop's paired Level III objects are holding** — the
     /// product buffers. O(1), for [`Self::cached_scan_bytes`]'s reason.
     pub fn cached_l3_bytes(&self) -> usize {

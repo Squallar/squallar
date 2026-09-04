@@ -88,6 +88,7 @@ fn a_loop_frame_reads_the_same_number_the_render_painted() {
         std::sync::Arc::clone(&scan),
         RadarProduct::Reflectivity,
         ELEVATION,
+        crate::scan_size::scan_bytes(&scan),
     )
     .expect("reflectivity is a wire moment and the fixture carries it");
 
@@ -126,6 +127,7 @@ fn a_looping_pane_and_a_still_pane_read_one_point_alike() {
         std::sync::Arc::clone(&scan),
         RadarProduct::Reflectivity,
         ELEVATION,
+        crate::scan_size::scan_bytes(&scan),
     )
     .unwrap();
 
@@ -167,7 +169,8 @@ fn a_loop_frame_of_a_derived_product_says_its_numbers_are_not_resident() {
         SweepGates::new(
             std::sync::Arc::clone(&scan),
             RadarProduct::NormalizedRotation,
-            ELEVATION
+            ELEVATION,
+            crate::scan_size::scan_bytes(&scan),
         )
         .is_none(),
         "shear is computed, not measured"
@@ -289,6 +292,7 @@ fn the_hover_lookup_does_not_walk_the_gates() {
                 std::sync::Arc::clone(&scan),
                 RadarProduct::Reflectivity,
                 ELEVATION,
+                crate::scan_size::scan_bytes(&scan),
             ),
         )
     };
@@ -345,4 +349,187 @@ fn the_hover_lookup_does_not_walk_the_gates() {
              `note_gate_reads` is still called from.",
         );
     }
+}
+
+/// A volume of `n_sweeps` cuts, each `n_radials` radials of `n_gates` gates
+/// carrying reflectivity **and** velocity — the shape a real VCP volume has,
+/// so the pinned-volume figure below is a real number of megabytes rather
+/// than a token one. Every cut declares `ELEVATION` so
+/// [`crate::render::sweep_index_for`] resolves against it.
+fn sized_volume(n_sweeps: usize, n_radials: usize, n_gates: usize) -> Scan {
+    let sweeps = (0..n_sweeps)
+        .map(|s| {
+            let radials = (0..n_radials)
+                .map(|i| {
+                    let bytes = |k: usize| {
+                        (0..n_gates)
+                            .map(|g| ((i * 7 + g * 3 + s * 11 + k) % 254) as u8)
+                            .collect::<Vec<u8>>()
+                    };
+                    let moment = |k: usize| {
+                        MomentData::from_fixed_point(
+                            n_gates as u16,
+                            0,
+                            (GATE_KM * 1000.0) as u16,
+                            8,
+                            SCALE,
+                            OFFSET,
+                            bytes(k),
+                        )
+                    };
+                    Radial::new(
+                        0,
+                        i as u16,
+                        i as f32,
+                        1.0,
+                        RadialStatus::IntermediateRadialData,
+                        1,
+                        ELEVATION,
+                        Some(moment(0)),
+                        Some(moment(1)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(s as u8 + 1, radials)
+        })
+        .collect();
+    Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        sweeps,
+    )
+}
+
+/// **A loop frame prices the decoded volume it pins, not just its geometry.**
+///
+/// `HoverSource::from_volume` keeps the `Arc<Scan>` the frame was drawn from
+/// alive so the readout can decode a gate on demand, and `resident_bytes`
+/// once reported the polar field alone — so a frame holding megabytes of
+/// decoded radar priced at the few KB of its wedge table, invisible to the
+/// census and to every budget that evicts on bytes.
+///
+/// **This asserts against the volume's own measured size, not `> 0`.** A
+/// `> 0` assertion passed the broken code, because the geometry was never
+/// zero; what makes this a gate is the multiple. The figures are compared to
+/// `scan_size::scan_bytes` — the same function the loop cache prices with —
+/// rather than to a recorded constant, so a change to what a `Scan` holds
+/// moves both sides together and this test stays about the accounting.
+#[test]
+fn a_loop_frame_prices_the_volume_it_pins() {
+    // 4 cuts × 720 radials × 1000 gates × 2 moments ≈ 5.8 MB of gate bytes.
+    let scan = std::sync::Arc::new(sized_volume(4, 720, 1000));
+    let volume_bytes = crate::scan_size::scan_bytes(&scan);
+    assert!(
+        volume_bytes > 5_000_000,
+        "the fixture must be volume-shaped to be worth pricing; it is {volume_bytes} B"
+    );
+
+    let out = render(&scan, RadarProduct::Reflectivity);
+    let mut field = out.polar;
+    // A loop frame's field carries no values: the numbers come back out of
+    // the volume. This is the exact shape the undercount hid in.
+    field.strip_values();
+    let field_bytes = crate::render::polar::PolarField::resident_bytes(&field);
+
+    let looping = HoverSource::from_volume(
+        field,
+        SweepGates::new(
+            std::sync::Arc::clone(&scan),
+            RadarProduct::Reflectivity,
+            ELEVATION,
+            volume_bytes,
+        ),
+    );
+
+    assert_eq!(
+        looping.pinned_volume_bytes(),
+        volume_bytes,
+        "the pinned volume must price at what the volume holds"
+    );
+    assert_eq!(
+        looping.resident_bytes(),
+        field_bytes + volume_bytes,
+        "the reported cost must be the field AND the volume it pins"
+    );
+    // The defect, stated as a ratio so it cannot be satisfied by a token
+    // addend: the volume is three orders of magnitude past the geometry.
+    assert!(
+        looping.resident_bytes() > 100 * field_bytes,
+        "a frame pinning {volume_bytes} B priced at {} B, barely past its \
+         {field_bytes} B of geometry — the volume is not in the figure",
+        looping.resident_bytes()
+    );
+    assert!(
+        looping.resident_bytes() >= 5_000_000,
+        "a frame pinning a multi-megabyte volume priced at {} B",
+        looping.resident_bytes()
+    );
+}
+
+/// **The other direction: a source that legitimately pins nothing stays
+/// small.** A still pane's source keeps its own values and holds no volume,
+/// so its cost is its field and exactly its field. A fix that priced every
+/// hover source as if it held a scan would over-report the render cache's
+/// budget and evict pictures that fit — the worse failure of the two, and
+/// the one a gate proven only against the defect would not catch.
+#[test]
+fn a_source_holding_no_volume_prices_only_its_field() {
+    let scan = std::sync::Arc::new(sized_volume(4, 720, 1000));
+    let out = render(&scan, RadarProduct::Reflectivity);
+    let field_bytes = crate::render::polar::PolarField::resident_bytes(&out.polar);
+
+    let still = HoverSource::resident(out.polar);
+    assert_eq!(
+        still.pinned_volume_bytes(),
+        0,
+        "a still pane pins no volume"
+    );
+    assert_eq!(
+        still.resident_bytes(),
+        field_bytes,
+        "a source over a resident field costs its field and nothing else"
+    );
+    // And the volume it was rendered from is NOT in the figure: the render
+    // read the scan, it did not retain it.
+    assert!(
+        still.resident_bytes() < crate::scan_size::scan_bytes(&scan),
+        "a still source priced as if it held the volume it was drawn from"
+    );
+
+    // The empty source is the floor: no field, no volume, no bytes.
+    assert_eq!(HoverSource::empty().pinned_volume_bytes(), 0);
+
+    // A loop frame whose product the volume cannot answer for holds no
+    // `SweepGates` at all — `from_volume` with `None` — and must price as
+    // small as the still source, not as a volume.
+    let out = render(&scan, RadarProduct::Reflectivity);
+    let mut stripped_field = out.polar;
+    stripped_field.strip_values();
+    let stripped_bytes = crate::render::polar::PolarField::resident_bytes(&stripped_field);
+    let volume_less = HoverSource::from_volume(stripped_field, None);
+    assert_eq!(
+        volume_less.pinned_volume_bytes(),
+        0,
+        "a volume-less loop source must not be charged for a volume"
+    );
+    assert_eq!(volume_less.resident_bytes(), stripped_bytes);
 }

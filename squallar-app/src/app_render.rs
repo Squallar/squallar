@@ -1906,9 +1906,10 @@ impl super::App {
     /// web layer publishes the loan book.
     ///
     /// **The radar families overlap and the census says so.** The loop
-    /// cache, the still inventory and the derivation memo hold `Arc`s of the
-    /// same `Scan`s, so each reports what emptying it alone would free and
-    /// their sum is an upper bound, not a partition.
+    /// cache, the still inventory, the derivation memo and the stored loop
+    /// frames' hover sources hold `Arc`s of the same `Scan`s, so each reports
+    /// what emptying it alone would free and their sum is an upper bound, not
+    /// a partition.
     fn publish_heap_census(&mut self) {
         use squallar_egui::heap_census as census;
 
@@ -1919,6 +1920,7 @@ impl super::App {
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
         census::set_overlay_picture_bytes(self.render.resident_overlay_pictures().1);
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
+        census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
     }
 
@@ -6118,7 +6120,25 @@ fn frame_gates(
 ) -> Option<squallar_radar::hover::SweepGates> {
     let (scan, _) = loop_mgr.get_cached(&rr.target.site, &rr.timestamp)?;
     let product = crate::render_key::radar_field(&rr.target.product)?;
-    squallar_radar::hover::SweepGates::new(Arc::clone(scan), product, rr.snapped)
+    // The volume's price comes from the cache that already computed it at
+    // arrival, not from a second walk of the radials: this runs on the frame
+    // thread, once per landed loop frame, and `scan_bytes` is O(radials).
+    //
+    // `get_cached` just answered for this key, and `cache_scan` files the
+    // volume and its price together while `retain_scans` removes both by one
+    // predicate — so the price is present whenever the volume is. The assert
+    // is there because the fallback is a ZERO: if that invariant ever breaks,
+    // this frame would price its pinned volume at nothing, which is the exact
+    // silent undercount this whole change exists to remove.
+    let priced = loop_mgr.cached_scan_price(&rr.target.site, &rr.timestamp);
+    debug_assert!(
+        priced.is_some(),
+        "a cached volume with no price: {} at {}",
+        rr.target.site,
+        rr.timestamp
+    );
+    let scan_bytes = priced.unwrap_or(0);
+    squallar_radar::hover::SweepGates::new(Arc::clone(scan), product, rr.snapped, scan_bytes)
 }
 
 /// Place a finished loop render on the frame of `ls` that asked for it, returning

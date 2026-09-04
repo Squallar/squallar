@@ -27,12 +27,28 @@ pub struct SweepGates {
     /// not a second one.
     sweep: usize,
     product: RadarProduct,
+    /// **Host bytes the pinned `scan` is holding**, by
+    /// [`crate::scan_size::scan_bytes`] — carried rather than computed on
+    /// demand, because that function is a walk of every radial and the
+    /// readers of this figure are a telemetry tick and a cache's byte
+    /// budget, both of which ride the frame thread.
+    ///
+    /// Supplied by the caller because the caller already has it for free:
+    /// the loop download cache priced the volume once at arrival
+    /// (`LoopDownloadManager::cached_scan_price`), so pinning it here is a
+    /// map lookup rather than a second walk.
+    scan_bytes: usize,
 }
 
 impl SweepGates {
     /// The gates of the sweep `product` at `elevation_deg` was drawn from, or
     /// `None` where this volume cannot answer for that picture.
-    pub fn new(scan: Arc<Scan>, product: RadarProduct, elevation_deg: f32) -> Option<Self> {
+    pub fn new(
+        scan: Arc<Scan>,
+        product: RadarProduct,
+        elevation_deg: f32,
+        scan_bytes: usize,
+    ) -> Option<Self> {
         if !product.is_wire_moment() {
             return None;
         }
@@ -41,7 +57,13 @@ impl SweepGates {
             scan,
             sweep,
             product,
+            scan_bytes,
         })
+    }
+
+    /// What the volume this pins is holding, bytes. O(1) — see the field.
+    pub fn scan_bytes(&self) -> usize {
+        self.scan_bytes
     }
 
     /// The value at a gate, decoded on demand.
@@ -109,9 +131,44 @@ impl HoverSource {
         self.field.geometry()
     }
 
-    /// What holding this costs, bytes — what the render cache bounds itself by.
-    pub fn resident_bytes(&self) -> usize {
+    /// **The polar field alone** — the geometry and, where the render kept
+    /// them, the values. Not the volume a loop frame's source pins; that is
+    /// [`Self::pinned_volume_bytes`], and [`Self::resident_bytes`] is the
+    /// two together.
+    ///
+    /// Spelled separately because the two land in different census families:
+    /// a field is this source's own allocation, a pinned volume is a
+    /// decoded `Scan` three other caches may hold `Arc`s of, and summing
+    /// them into one family would smuggle radar bytes into a family whose
+    /// name says they are not there.
+    pub fn field_bytes(&self) -> usize {
         self.field.resident_bytes()
+    }
+
+    /// **Host bytes the decoded volume this source keeps alive is holding**,
+    /// zero for a source over a render that kept its own numbers.
+    ///
+    /// A loop frame's source is built by [`Self::from_volume`] and holds an
+    /// `Arc<Scan>` so the readout can decode a gate on demand. That volume
+    /// is tens of MB and this source is one of its owners: while the loop
+    /// download cache still holds the same `Arc` the bytes are priced there
+    /// too, and **once that cache evicts the entry this is the only figure
+    /// that names them.** Reporting it is not a claim to sole ownership —
+    /// see the shared-ownership note on `squallar_egui::heap_census`.
+    ///
+    /// O(1): the figure was priced once where the volume arrived.
+    pub fn pinned_volume_bytes(&self) -> usize {
+        self.sweep.as_ref().map_or(0, SweepGates::scan_bytes)
+    }
+
+    /// What holding this costs, bytes — the field **and** the volume it pins.
+    ///
+    /// The volume used to be missing from this figure, which priced a loop
+    /// frame pinning a whole decoded scan at the 5.8 KiB of its geometry.
+    /// O(1).
+    pub fn resident_bytes(&self) -> usize {
+        self.field_bytes()
+            .saturating_add(self.pinned_volume_bytes())
     }
 }
 
