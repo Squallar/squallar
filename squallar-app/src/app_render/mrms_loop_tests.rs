@@ -345,7 +345,7 @@ fn a_mosaic_pane_loops_thirteen_frames_each_with_its_own_picture_end_to_end() {
 
     // 2, 3, 4. Arrive, draw, arrive, draw — the order the serialised fetch
     // and the one-granule staging area impose in production. Residency is NOT
-    // asserted here: the shipped staging budget is one 98 MB mosaic and these
+    // asserted here: the shipped staging budget is one 49 MB mosaic and these
     // granules are sixteen bytes, so an eviction assertion over them could
     // not fail. It is pinned where the budget can be injected —
     // `the_layer_stages_one_granule_however_many_frames_the_loop_holds` in
