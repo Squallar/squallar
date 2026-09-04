@@ -174,7 +174,13 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 ///
 /// Panics on a pinned row whose label is not in the registry.
 ///
-/// # The folds are not gated, and that is a live gap
+/// # The folds are gated (closed 2026-09-04; the gap below was live from 2026-08-30)
+///
+/// The fold runs in [`digest_over`], over the lists it is handed, so
+/// `digest_fold_tests` perturbs one list at a time and asserts the token moves.
+/// Deleting any one loop, or replacing the body with a constant, reddens the
+/// test for that list. What follows is the gap as it was recorded, kept so the
+/// reason for the split is beside the split.
 ///
 /// **Recorded 2026-08-30, found by adversarial review of the buildings row and
 /// pre-existing to it.** Every row list above is pinned to what the encoder
@@ -193,8 +199,31 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 /// the answer, which means a way to perturb them that is not a source edit.
 /// Left named rather than left silent.
 pub fn wire_digest() -> u64 {
+    digest_over(
+        WIRE_FRAMING_ROWS,
+        CANONICAL_ENVELOPE_LAYOUT,
+        WIRE_REPLY_ROWS,
+        WIRE_FRAME_REPLY_ROWS,
+        WIRE_HEIGHT_REPLY_ROWS,
+        WIRE_BUILDING_REPLY_ROWS,
+    )
+}
+
+/// The fold itself, over the lists it is handed rather than the pinned
+/// constants, so a test can perturb one list and assert the answer moves.
+/// That is the gate the doc above recorded as missing: with the fold inlined
+/// over the constants, the only way to perturb a list was a source edit, and
+/// nothing could assert that each `for` loop below is load-bearing.
+fn digest_over(
+    framing: &[&str],
+    envelope: &str,
+    reply: &[&str],
+    frame_reply: &[&str],
+    height_reply: &[&str],
+    building_reply: &[&str],
+) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for row in WIRE_FRAMING_ROWS {
+    for row in framing {
         let label = row
             .split(" | ")
             .next()
@@ -207,18 +236,147 @@ pub fn wire_digest() -> u64 {
         hash = fnv1a64(hash, &[u8::try_from(index).expect("15 kinds fit a byte")]);
         hash = fnv1a64(hash, row.as_bytes());
     }
-    hash = fnv1a64(hash, CANONICAL_ENVELOPE_LAYOUT.as_bytes());
-    for row in WIRE_REPLY_ROWS {
+    hash = fnv1a64(hash, envelope.as_bytes());
+    for row in reply {
         hash = fnv1a64(hash, row.as_bytes());
     }
-    for row in WIRE_FRAME_REPLY_ROWS {
+    for row in frame_reply {
         hash = fnv1a64(hash, row.as_bytes());
     }
-    for row in WIRE_HEIGHT_REPLY_ROWS {
+    for row in height_reply {
         hash = fnv1a64(hash, row.as_bytes());
     }
-    for row in WIRE_BUILDING_REPLY_ROWS {
+    for row in building_reply {
         hash = fnv1a64(hash, row.as_bytes());
     }
     hash
+}
+
+#[cfg(test)]
+mod digest_fold_tests {
+    //! Each pinned list is load-bearing in the digest: perturb one, and the
+    //! token moves. Deleting any one `for` loop in `digest_over`, or replacing
+    //! its body with a constant, reddens the test for that list -- which is
+    //! exactly what the worker suite could not say before these existed.
+    use super::*;
+
+    fn real() -> u64 {
+        digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+        )
+    }
+
+    /// A perturbation that is not a perturbation would make every test below
+    /// vacuous, so each one goes through here and is checked to differ.
+    fn perturbed(rows: &[&str]) -> Vec<String> {
+        assert!(
+            rows.len() >= 2,
+            "a list of fewer than two rows cannot be reordered"
+        );
+        let mut out: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        out.swap(0, 1);
+        assert_ne!(out[0], rows[0], "the perturbation must actually move a row");
+        out
+    }
+
+    fn as_strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn the_pinned_digest_is_what_wire_digest_reports() {
+        assert_eq!(real(), wire_digest());
+    }
+
+    /// Framing rows are reordered rather than rewritten: the fold looks each
+    /// label up in the composed registry and panics on an unknown one, so the
+    /// perturbation keeps every label valid and moves only their order --
+    /// which the registry index prefix makes visible.
+    #[test]
+    fn a_moved_framing_row_moves_the_digest() {
+        let p = perturbed(WIRE_FRAMING_ROWS);
+        let moved = digest_over(
+            &as_strs(&p),
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+        );
+        assert_ne!(moved, real(), "the framing fold is not load-bearing");
+    }
+
+    #[test]
+    fn a_moved_envelope_layout_moves_the_digest() {
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            "h:u32 w:u32 bounds:4xf64 ceil:u32",
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+        );
+        assert_ne!(moved, real(), "the envelope fold is not load-bearing");
+    }
+
+    #[test]
+    fn a_moved_reply_row_moves_the_digest() {
+        let p = perturbed(WIRE_REPLY_ROWS);
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            &as_strs(&p),
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+        );
+        assert_ne!(moved, real(), "the reply fold is not load-bearing");
+    }
+
+    #[test]
+    fn a_moved_frame_reply_row_moves_the_digest() {
+        let p = perturbed(WIRE_FRAME_REPLY_ROWS);
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            &as_strs(&p),
+            WIRE_HEIGHT_REPLY_ROWS,
+            WIRE_BUILDING_REPLY_ROWS,
+        );
+        assert_ne!(moved, real(), "the frame-reply fold is not load-bearing");
+    }
+
+    #[test]
+    fn a_moved_height_reply_row_moves_the_digest() {
+        let p = perturbed(WIRE_HEIGHT_REPLY_ROWS);
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            &as_strs(&p),
+            WIRE_BUILDING_REPLY_ROWS,
+        );
+        assert_ne!(moved, real(), "the height-reply fold is not load-bearing");
+    }
+
+    #[test]
+    fn a_moved_building_reply_row_moves_the_digest() {
+        let p = perturbed(WIRE_BUILDING_REPLY_ROWS);
+        let moved = digest_over(
+            WIRE_FRAMING_ROWS,
+            CANONICAL_ENVELOPE_LAYOUT,
+            WIRE_REPLY_ROWS,
+            WIRE_FRAME_REPLY_ROWS,
+            WIRE_HEIGHT_REPLY_ROWS,
+            &as_strs(&p),
+        );
+        assert_ne!(moved, real(), "the building-reply fold is not load-bearing");
+    }
 }
