@@ -12,20 +12,42 @@ arm64. No VPN, no wake step, `BatchMode=yes` works.
 16.67 ms on the 60 Hz panel, which is presentation, not boot. webdriver launches
 the browser itself, which is why this works.
 
-**The NATIVE app over ssh is UNVERIFIED and should not be assumed.** An earlier
-note here claimed it runs headed with no `launchctl asuser`, citing `Surface
-configured to 1920x1018` and `wgpu selected the Metal backend`. Those are BOOT
-signals, not presentation signals — the same class of evidence that reads green
-in the Windows session-0 trap, where the app creates its window, spins its event
-loop and autosaves its config while `RedrawRequested` never fires.
+**The native app also reaches its render loop over ssh, with no `launchctl
+asuser` and no sudo** — on presentation evidence, not on a surface line. Three
+legs, `frame cadence`:
 
-There is also a reason to expect trouble: WindowServer access is gated on the
-`gui/$UID` bootstrap domain and an ssh session lands in `user/$UID`, which is
-what `launchctl asuser` exists to bridge. "It just works" needs an explanation
-and nobody has produced one.
+| scene | samples | p50 |
+|---|---|---|
+| A | n=5906 | 19028 us |
+| C | n=8754 | 19028 us |
+| E2 | n=11934 | 19028 us |
 
-Before running a native leg here, prove PRESENTATION and not boot: frames
-actually cadencing, a non-empty frame telemetry window — not a surface line.
+19,028 us is 52.6 Hz against that box's 60 Hz panel, sustained for minutes, with
+a populated concentrated histogram climbing monotonically across 75 readings.
+Compare the dead-display signature on the Linux box — `cadence n=182 p50=OVER` —
+roughly forty-eight times fewer frames from the same field. Also `overlay
+pictures` filling in real pixel dimensions and resident bytes two seconds after
+starting at `px=0x0, bytes=0`, and 74 `budget state:` lines, which are composed
+only after GPU init inside the redraw path.
+
+**What is NOT established: nobody looked at the glass.** No screenshot was taken
+in any of those legs. The claim that survives is "reached and sustained its
+render loop at panel-adjacent cadence", not "a scene was seen to render". If you
+need the second thing, capture an image; do not infer it from this.
+
+**The mechanism is unexplained and that is worth recording rather than
+papering over.** WindowServer access is gated on the `gui/$UID` bootstrap domain,
+an ssh session lands in `user/$UID`, and `launchctl asuser` exists to bridge
+exactly that — so the prediction was trouble and the observation was none. The
+most likely hidden precondition is that the console user is logged in AND
+unlocked; record that state on any future leg.
+
+Note the browser path says nothing about this one: webdriver launches the browser
+itself, so those legs never tested the ssh-to-WindowServer question.
+
+The evidence that does NOT settle this, and did not: `Surface configured to
+...` and `wgpu selected the Metal backend`. Both are boot signals. The Windows
+box produces their equivalents and never presents a frame — see `windows-rig`.
 
 ## What is ALREADY there — do not install these
 
