@@ -22,8 +22,16 @@ are never composed. Confirmed at `squallar_app=debug`, and re-confirmed launchin
 the exe directly rather than through `start /B`.
 
 **Anything needing a presented frame is unreachable over plain ssh here.**
-Reaching session 1 needs `schtasks /create … /it`, which the permission layer has
-denied twice — **do not route around it**.
+Reaching session 1 needs `schtasks /create … /it`. **That is the right tool, not
+a hack** — it is how you launch into an interactive desktop session on Windows,
+and if you need a presented frame here you need it or something like it.
+
+What happened in this repo is narrower than "don't use it": the permission layer
+denied it twice, and the lane **did not route around the denial**. That is a fact
+about one session's permissions, not a property of the command. If you hold
+permission for it, use it. If you are denied, **stop and surface it** — ask the
+user to allow `schtasks` over `ssh sim`, or to run one command at the console —
+rather than reaching for another way in. A denial is an answer, not an obstacle.
 
 If a leg on this box reads "the app started and then did nothing", suspect
 session 0 before suspecting the app.

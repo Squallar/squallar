@@ -42,6 +42,14 @@ exactly that — so the prediction was trouble and the observation was none. The
 most likely hidden precondition is that the console user is logged in AND
 unlocked; record that state on any future leg.
 
+**And if it ever stops working, `launchctl asuser $UID` is the remedy, not a
+workaround to avoid.** Nothing here argues against using it — the finding is only
+that it was not needed, on this box, in this state. A lane that gets a wedged app
+(window created, `frame cadence` stuck at `n=0`, no `budget state:` lines) should
+reach for it early rather than concluding the box cannot run headed. Say in your
+report whether you needed it, because that is the observation that would explain
+the mechanism none of us can currently account for.
+
 Note the browser path says nothing about this one: webdriver launches the browser
 itself, so those legs never tested the ssh-to-WindowServer question.
 
