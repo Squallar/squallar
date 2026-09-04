@@ -343,8 +343,16 @@ pub fn phase_totals() -> PhaseTotals {
 
 // ── Where a vector take was paid ──────────────────────────────────────────
 
-/// Vector tile bodies handed to the worker, beside bodies the frame thread
-/// decoded itself.
+/// Vector tile bodies paid for OFF the frame thread, beside bodies the frame
+/// thread decoded itself.
+///
+/// "Off the frame thread" is one fact reached by three roads, and all three
+/// are in `OFFLOADED`: the browser's **tile lane** (a nested Worker on the
+/// rasterization worker's memory), the browser pump's batch post, and
+/// **native's IO runtime blocking pool**, where `decode_archive_tile` does
+/// the parse and the style before the frame thread ever sees the tile. The
+/// third was missing until 2026-09-04, which made the denominator claim
+/// below false on every native leg — 0 + 0 against 155 bodies disposed of.
 ///
 /// **Counts, not clocks, and that is the whole point.** When the browser's
 /// tile pump offloads, `parse` and `style` stop happening on the frame thread,
@@ -364,18 +372,30 @@ pub fn phase_totals() -> PhaseTotals {
 /// it is the denominator both `tile phase` lines should be read against.
 ///
 /// The worker's own parse and style microseconds are deliberately **not**
-/// carried home into [`VectorPhase`]. That family's denominator is
-/// frame-thread cost; folding off-thread work into it would corrupt a
-/// denominator rather than fill a gap, and `squallar-worker`'s
+/// carried home into [`VectorPhase`]. On the browser that family's
+/// denominator is frame-thread cost; folding the lane's work into it would
+/// corrupt a denominator rather than fill a gap, and `squallar-worker`'s
 /// `no_run_body_reads_a_clock` forbids the row timing itself in any case —
 /// a duration is as nondeterministic as an instant, and the byte-identity
 /// parity gates depend on the row not being either.
+///
+/// **[`VectorPhase`] is a different denominator on each target, and the two
+/// lines must not be read across one.** On the browser the phases are timed
+/// on the frame thread, so `offloaded` rising drives them towards `n = 0`:
+/// MEASURED on the `huge` leg 2026-09-04, Firefox, `161 offloaded, 5 decoded
+/// on the frame thread` beside `tile phase (parse): n=5` and `(style): n=5`
+/// — the five inline bodies exactly, and `tile take (vector): n=166` over
+/// both. On native the phases are timed on the IO pool inside
+/// [`decode_archive_tile`], so they count the SAME bodies `offloaded` counts
+/// and the two lines run together instead of apart. Neither reading is
+/// wrong; a comparison across the pair would be.
 static OFFLOADED: AtomicU64 = AtomicU64::new(0);
 
 /// See [`OFFLOADED`].
 static DECODED_INLINE: AtomicU64 = AtomicU64::new(0);
 
-/// Record `n` vector bodies handed to the worker.
+/// Record `n` vector bodies decoded off the frame thread — handed to the
+/// browser's tile lane, or delivered already-decoded by native's IO pool.
 pub fn note_tiles_offloaded(n: u64) {
     OFFLOADED.fetch_add(n, Relaxed);
 }

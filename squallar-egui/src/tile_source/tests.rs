@@ -4558,6 +4558,87 @@ fn a_batch_installed_tile_is_counted_on_the_basemap_ledger() {
     );
 }
 
+/// **A native arrival is a vector body paid for OFF the frame thread, and the
+/// disposition line has to say so.**
+///
+/// MEASURED 2026-09-04: every native leg reported `tile bodies: 0 offloaded,
+/// 0 decoded on the frame thread` beside `tile phase (parse): n=155`,
+/// `tile phase (style): n=155`, `tile take (put): n=155` and `basemap tiles:
+/// 155 vector`. Both disposition calls sat on the wasm32 pump's paths and the
+/// native arm reached neither, so the line read as "this process disposed of
+/// no vector bodies" while it had disposed of a hundred and fifty-five — and
+/// [`take_ledger::Disposition`]'s own doc claimed in prose that
+/// `offloaded + inline` IS that denominator.
+///
+/// A scrape for the reason `a_batch_installed_tile_is_counted_on_the_basemap_ledger`
+/// is one: driving the arm needs a live IO task and an HTTP fixture, and what
+/// is at stake is a single call on a path whose absence is invisible to every
+/// other assertion in this file.
+#[test]
+fn a_native_arrival_counts_on_the_disposition_ledger() {
+    const SOURCE: &str = include_str!("../tile_source.rs");
+
+    let (_, after) = SOURCE
+        .split_once(
+            "#[cfg(not(target_arch = \"wasm32\"))]\n    fn drain_completed_fetches(&mut self)",
+        )
+        .expect("the native `drain_completed_fetches` is no longer written here");
+    let body = after
+        .split_once("\n    }")
+        .map(|(body, _)| body)
+        .expect("the native `drain_completed_fetches` has no recognisable body");
+
+    // Control: the scrape is over the right arm.
+    assert!(
+        body.contains("TakeKind::Put"),
+        "control: the native drain no longer records `Put`, so the check \
+         below is reading the wrong function",
+    );
+    assert!(
+        body.contains("note_tiles_offloaded(1)"),
+        "the native drain puts vector bodies into the cache without counting \
+         them on the disposition ledger. `tile bodies:` then reads `0 \
+         offloaded, 0 decoded on the frame thread` on a leg that decoded \
+         hundreds — a figure that looks like a measurement and is a silence.",
+    );
+    assert!(
+        body.contains("Some(Tile::Vector(_))"),
+        "the native drain counts arrivals that are not vector bodies. This \
+         arm's one take family covers vector, raster and restyle alike, so \
+         an ungated count would put rasters into a vector denominator.",
+    );
+}
+
+/// The two disposition counters are not each other.
+///
+/// The native gap above was half a bug; counting into the WRONG half would
+/// have been the other half, and it would have read as a perfect win — every
+/// native leg reporting its bodies as "decoded on the frame thread" is
+/// exactly the reading this whole work order exists to drive to zero.
+///
+/// Natively these two statics have exactly one writer (the drain arm above),
+/// so a delta over a direct call is deterministic here.
+#[test]
+fn offloaded_and_inline_are_separate_counters() {
+    use super::take_ledger;
+    let before = take_ledger::disposition();
+    take_ledger::note_tiles_offloaded(1);
+    let after = take_ledger::disposition();
+    assert_eq!(
+        (after.offloaded, after.inline),
+        (before.offloaded + 1, before.inline),
+        "an offloaded body moved the inline counter, or moved nothing",
+    );
+
+    take_ledger::note_tiles_decoded_inline(1);
+    let last = take_ledger::disposition();
+    assert_eq!(
+        (last.offloaded, last.inline),
+        (after.offloaded, after.inline + 1),
+        "an inline body moved the offloaded counter, or moved nothing",
+    );
+}
+
 /// Styling in slices, as a property rather than a browser session.
 ///
 /// [`PendingStyle`] and [`resume_before_drain`] are compiled on native for

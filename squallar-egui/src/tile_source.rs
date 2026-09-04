@@ -2942,6 +2942,31 @@ impl HttpsTiles {
                     cache.answered(&tile_id);
                     return None;
                 };
+                // **This arm's disposition count.** The body's parse and
+                // style ran on the IO runtime's blocking pool
+                // ([`decode_archive_tile`], native-only), so a vector body
+                // arriving here was paid for OFF the frame thread — the same
+                // fact `note_tiles_offloaded` records for the browser's tile
+                // lane, reached by a different road.
+                //
+                // Counted here because there was nowhere else it could be:
+                // both other disposition calls sit on the wasm32 pump's
+                // paths, and this arm reaches neither. Until 2026-09-04 that
+                // left every native leg reporting `tile bodies: 0 offloaded,
+                // 0 decoded on the frame thread` beside `tile phase (parse):
+                // n=155` and `basemap tiles: 155 vector` — 0 + 0 against 155
+                // bodies, while [`take_ledger::Disposition`] claimed in
+                // prose to BE that denominator.
+                //
+                // Before the put, which moves the slot; and whether or not
+                // the epoch check below drops it, for the reason the take
+                // family is recorded either way — the body was decoded and
+                // disposed of regardless of whether its pixels survived a
+                // restyle. Raster arrivals and markers are not vector bodies
+                // and are not in this denominator.
+                if matches!(slot.tile, Some(Tile::Vector(_))) {
+                    take_ledger::note_tiles_offloaded(1);
+                }
                 // A tile styled under a generation a restyle has replaced is
                 // dropped, not drawn: its slot keeps showing the old style and
                 // [`Self::request_once`] re-asks under the current one, which
