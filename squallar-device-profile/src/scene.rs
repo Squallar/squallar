@@ -322,8 +322,18 @@ pub(crate) mod fixtures {
     /// The user's own window with `pictures` whole-picture overlay layers
     /// shown on it, at the tile working set it needs between zooms: the
     /// Tier-2 `huge` leg's scene (KTLX, seventeen layers of which thirteen
-    /// are texture pictures, the radar loop playing, 2878 x 1651 physical
-    /// pixels), which the page's 1 GiB linear memory could not hold at 1.5x.
+    /// are texture pictures, the radar loop playing, a 2878 x 1651 window),
+    /// which the page's 1 GiB linear memory could not hold at 1.5x.
+    ///
+    /// **The pane is 2878 x 1611, not the window.** The forty rows between
+    /// them are the top bar, which on a web canvas at device pixel ratio 1
+    /// is forty physical pixels. Neither figure is modelled here: the leg's
+    /// own `overlay pictures:` line reported 4317 x 2416, and 2416 is
+    /// `1611 * 150 / 100`. The two legs' allocation failures name the same
+    /// picture from the other side — twelve of the twenty `alloc failed:`
+    /// lines Firefox printed asked for exactly 41,719,488 B, which is
+    /// `4317 * 2416 * 4`. Measured on both sides, derived on neither.
+    ///
     /// The tile entry cost is the measured city-core tail
     /// (`squallar_egui::tile_source::MEASURED_STYLED_ENTRY_BYTES`), restated
     /// here because this crate sits under that one.
@@ -332,7 +342,7 @@ pub(crate) mod fixtures {
         Scene {
             panes: vec![PaneNeed {
                 overlay_pictures: pictures,
-                picture_px: [2878, 1651],
+                picture_px: [2878, 1611],
                 ..plan_pane([0, 0], true, 2 * 60 * 60, Some(259))
             }],
             tile_sources: vec![TileNeed {

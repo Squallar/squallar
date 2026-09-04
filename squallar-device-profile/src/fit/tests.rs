@@ -1120,9 +1120,11 @@ fn six_pane_sized_offscreens_cost_a_sixth_of_six_window_sized_ones() {
 /// `side * percent / 100` in integers. For every entry of the oversampling
 /// table — 3/2, 5/4, 1/1, each exactly representable — and every side up to
 /// the largest 2D texture any adapter reports, the two truncate to the same
-/// pixel. On the user's own 2878 x 1651 canvas that is 42,755,568 B at 1.5x
-/// — the `overlay pictures:` line's figure for one pane — 29,682,444 B at
-/// 1.25x and 19,006,312 B at 1x.
+/// pixel. On the user's own 2878 x 1651 window that is 42,755,568 B at 1.5x,
+/// 29,682,444 B at 1.25x and 19,006,312 B at 1x; on the 2878 x 1611 PANE
+/// inside it — the window less its forty-point top bar, and the rect the
+/// planner is actually handed — 41,719,488 B, which is what the
+/// `overlay pictures:` line reported on both Tier-2 `huge` legs.
 #[test]
 fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
     let planner =
@@ -1140,6 +1142,11 @@ fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
     assert_eq!(picture_bytes([2878, 1651], 150), 42_755_568);
     assert_eq!(picture_bytes([2878, 1651], 125), 29_682_444);
     assert_eq!(picture_bytes([2878, 1651], 100), 19_006_312);
+    assert_eq!(
+        picture_bytes([2878, 1611], 150),
+        41_719_488,
+        "the leg's own"
+    );
     assert_eq!(picture_bytes([0, 1651], 150), 0);
     assert_eq!(
         picture_bytes([u32::MAX, u32::MAX], 150),
@@ -1150,17 +1157,25 @@ fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
 
 /// **The `huge` leg fits the page heap after one step of the oversampling
 /// rung, on both arms, and nothing else moves.** Thirteen pictures at 1.5x
-/// on the user's canvas plus the 193-tile working set plus one arrival are
-/// 880,880,596 B of host need against three quarters of a 1 GiB page heap
-/// (805,306,368 B) — over, which is the trap of 2026-09-02 priced. At 1.25x
-/// the same scene is 697,856,860 B and fits, so `fit` takes exactly that one
-/// step: the loop keeps its fourteen frames, the 3D ceiling, grid and raster
-/// side stay at the class rung, the tiles do not snap. The same bytes on the
-/// desktop bracket with a measured 1 GiB of RAM take the same one step: the
-/// scene costs what it costs, not what the bracket is. Under the session
-/// presumptions the watermark lowers to — nine tenths, then eighty-one
-/// hundredths — the rung stays at 1.25x and then goes to 1x, where the scene
-/// is 548,391,012 B against 652,298,157 B and fits again.
+/// on the leg's own 2878 x 1611 pane plus the 193-tile working set plus one
+/// arrival are 866,375,476 B of host need against three quarters of a 1 GiB
+/// page heap (805,306,368 B) — over, which is the trap of 2026-09-02 priced.
+/// At 1.25x the same scene is 687,785,260 B and fits, so `fit` takes exactly
+/// that one step: the loop keeps its fourteen frames, the 3D ceiling, grid
+/// and raster side stay at the class rung, the tiles do not snap. The same
+/// bytes on the desktop bracket with a measured 1 GiB of RAM take the same
+/// one step: the scene costs what it costs, not what the bracket is. Under
+/// the session presumptions the watermark lowers to — nine tenths, then
+/// eighty-one hundredths — the rung stays at 1.25x and then goes to 1x,
+/// where the scene is 541,944,292 B against 652,298,157 B and fits again.
+///
+/// **This is the arithmetic that failed to run on the leg**, and the reason
+/// is one figure: the need was priced at ONE picture per pane, not thirteen.
+/// 41,719,488 B plus an arrival plus the tiles is 365,741,620 B, well inside
+/// the 805,306,368 B allowance, so `fit` correctly answered "nothing to
+/// shed" to a question that was 500 MB short of the scene. The leg's last
+/// telemetry read `steps 0` and `oversample 150` at 1011 of 1024 MiB of
+/// page heap, which is that answer, printed.
 #[test]
 fn the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms() {
     let scene = huge(13);
@@ -1174,11 +1189,25 @@ fn the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms() {
     );
     assert_eq!(presumed.host_allowance(), Some(805_306_368));
 
+    // **The undercount, priced.** One picture per pane — the figure a walk
+    // over panes produces, and the figure the leg was fitted at — is
+    // 365,741,620 B and fits the same allowance with 440 MB to spare, so the
+    // ladder never moves. The difference between these two lines is the
+    // whole defect; neither the allowance nor the tile term is in it.
+    let undercounted = need(&huge(1), &top, stand_in_grid_bytes).host_bytes;
+    assert_eq!(undercounted, 365_741_620);
+    assert_eq!(
+        over(&huge(1), &top, &presumed, stand_in_grid_bytes),
+        (false, false),
+        "counting a pane's pictures as one is what let the `huge` leg fit at \
+         the top rung and then trap at 1011 of 1024 MiB",
+    );
+
     let at_top = need_terms(&scene, &top, stand_in_grid_bytes);
     assert_eq!(at_top.tiles_host, 193 * 1_462_708);
-    assert_eq!(at_top.pictures_host, 13 * 42_755_568);
-    assert_eq!(at_top.picture_arrival_host, 42_755_568);
-    assert_eq!(at_top.total().host_bytes, 880_880_596);
+    assert_eq!(at_top.pictures_host, 13 * 41_719_488);
+    assert_eq!(at_top.picture_arrival_host, 41_719_488);
+    assert_eq!(at_top.total().host_bytes, 866_375_476);
     assert_eq!(
         over(&scene, &top, &presumed, stand_in_grid_bytes),
         (false, true)
@@ -1189,7 +1218,7 @@ fn the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms() {
     assert_eq!(fitted.overlay_oversample_percent, 125);
     assert_eq!(
         need(&scene, &fitted, stand_in_grid_bytes).host_bytes,
-        697_856_860
+        687_785_260
     );
     assert_eq!(
         over(&scene, &fitted, &presumed, stand_in_grid_bytes),
@@ -1245,7 +1274,7 @@ fn the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms() {
     assert_eq!(twice.overlay_oversample_percent, 100);
     assert_eq!(
         need(&scene, &twice, stand_in_grid_bytes).host_bytes,
-        548_391_012
+        541_944_292
     );
     assert_eq!(lowered(81).host_allowance(), Some(652_298_157));
     assert!(

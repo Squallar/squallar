@@ -32,7 +32,7 @@ pub const LINEAR_MEMORY_WARN_PERCENT: u64 = 75;
 /// engine cannot serve aborts without unwinding. Acting 133 MiB short of the
 /// wall left room for that one allocation in flight. It did not leave room
 /// for the page's own next batch: the same leg on 2026-09-02, with thirteen
-/// overlay pictures of 43.5 MB re-rasterising together, climbed 11, 522, 939,
+/// overlay pictures of 41.7 MB re-rasterising together, climbed 11, 522, 939,
 /// 1019 MiB across four two-second ticks, acted at 939 with nothing left that
 /// the levers could free, and trapped in `rust_oom` inside the frame.
 pub const LINEAR_MEMORY_ACT_PERCENT: u64 = 87;
@@ -50,7 +50,7 @@ pub const LINEAR_MEMORY_REFIRE_STEP_BYTES: u64 = 32 << 20;
 /// (`crate::fit::NeedTerms::pictures_host` and `picture_arrival_host`).
 ///
 /// The percentage alone was the defect: a line 133 MiB short of a 1 GiB wall
-/// is short of one 43.5 MB picture and long past a batch of thirteen, so the
+/// is short of one 41.7 MB picture and long past a batch of thirteen, so the
 /// heap could stand under it on one tick and trap before the next. Deriving
 /// the line from the batch says what is true — a scene whose next batch is
 /// 581 MB is pressure from 443 MiB up, and the levers (the oversampling
@@ -142,26 +142,32 @@ mod tests {
     }
 
     /// **The action line is the lower of the percentage and the wall less
-    /// the scene's headroom**, pinned at the `huge` leg's own figures: on
-    /// the user's 2878 x 1651 canvas with thirteen pictures shown, a batch
-    /// plus one arrival is 14 pictures at the rung's oversampling —
-    /// 598,577,952 B at 1.5x (the trap's own scene: the line falls to
-    /// 453 MiB, 438 MiB short of the percentage, which is why 87 % acted too
-    /// late), 415,554,216 B at 1.25x (627 MiB), 266,088,368 B at 1x (770
-    /// MiB). A headroom past the wall puts the line at zero and every
-    /// reading past it; the percentage stays the ceiling of the line.
+    /// the scene's headroom**, pinned at the `huge` leg's own figures: the
+    /// leg's PANE is 2878 x 1611 — the window less its forty-point top bar,
+    /// forty physical pixels at device pixel ratio 1 — and with thirteen
+    /// pictures shown, a batch plus one arrival is 14 pictures at the rung's
+    /// oversampling. 584,072,832 B at 1.5x (the trap's own scene: the line
+    /// falls to 466 MiB, 425 MiB short of the percentage, which is why 87 %
+    /// acted too late), 405,482,616 B at 1.25x (637 MiB), 259,641,648 B at
+    /// 1x (776 MiB). A headroom past the wall puts the line at zero and
+    /// every reading past it; the percentage stays the ceiling of the line.
+    ///
+    /// The per-picture figure is not modelled: both legs reported
+    /// `overlay pictures: ... px=4317x2416`, and Firefox's allocation
+    /// failures asked for exactly `4317 * 2416 * 4` = 41,719,488 B twelve
+    /// times over.
     #[test]
     fn the_act_line_is_the_lower_of_the_percentage_and_the_wall_less_the_batch() {
-        let picture = |percent: u64| (2878 * percent / 100) * (1651 * percent / 100) * 4;
+        let picture = |percent: u64| (2878 * percent / 100) * (1611 * percent / 100) * 4;
         let batch = |percent: u64| 14 * picture(percent);
-        assert_eq!(picture(150), 42_755_568);
-        assert_eq!(batch(150), 598_577_952);
-        assert_eq!(batch(125), 415_554_216);
-        assert_eq!(batch(100), 266_088_368);
-        assert_eq!(act_line(MAX, batch(150)), MAX - 598_577_952);
-        assert_eq!(act_line(MAX, batch(150)) / MIB, 453);
-        assert_eq!(act_line(MAX, batch(125)) / MIB, 627);
-        assert_eq!(act_line(MAX, batch(100)) / MIB, 770);
+        assert_eq!(picture(150), 41_719_488, "the leg's own reported picture");
+        assert_eq!(batch(150), 584_072_832);
+        assert_eq!(batch(125), 405_482_616);
+        assert_eq!(batch(100), 259_641_648);
+        assert_eq!(act_line(MAX, batch(150)), MAX - 584_072_832);
+        assert_eq!(act_line(MAX, batch(150)) / MIB, 466);
+        assert_eq!(act_line(MAX, batch(125)) / MIB, 637);
+        assert_eq!(act_line(MAX, batch(100)) / MIB, 776);
         // At the trap's second tick — 522 MiB — the scene line is pressure
         // where the percentage line was quiet.
         assert_eq!(linear_memory_verdict(522 * MIB, MAX, None, batch(150)), Act);

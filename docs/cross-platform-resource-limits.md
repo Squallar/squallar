@@ -1470,20 +1470,49 @@ fitted on the GPU axis alone, as before the term existed.
 
 **What the `huge` scene fits to**, pinned on both arms
 (`the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms`,
-fixture `scene::fixtures::huge`): thirteen pictures on 2878 × 1651 at 1.5x
-(42,755,568 B each) plus the 193-tile working set at the measured 1,462,708 B
-entry plus one arrival are 880,880,596 B against 805,306,368 B — over. `fit`
-takes one step of the oversampling rung and nothing else: at 1.25x the scene is
-697,856,860 B and fits, with the loop's fourteen frames, the 3D ceiling, the
-grid and the raster side at the class rung and the tiles unsnapped. The desktop
-bracket with a measured 1 GiB of RAM takes the same one step — the scene costs
-what it costs, not what the bracket is. Under the presumptions a page-heap
-event lowers to (nine tenths, then eighty-one hundredths) the rung holds at
-1.25x and then goes to 1x, where the scene is 548,391,012 B against
-652,298,157 B and fits again. A host the rungs cannot pay for stops at the host
-rungs' stops — margin at 1x, tiles snapped, three steps — and `fit_holds` holds
-per axis: need under the allowance, or every rung that lowers *that* axis at
-its stop.
+fixture `scene::fixtures::huge`): thirteen pictures on the leg's 2878 × 1611
+pane at 1.5x (41,719,488 B each — what both legs reported allocating, and what
+Firefox's allocation failures asked for twelve times) plus the 193-tile working
+set at the measured 1,462,708 B entry plus one arrival are 866,375,476 B
+against 805,306,368 B — over. `fit` takes one step of the oversampling rung and
+nothing else: at 1.25x the scene is 687,785,260 B and fits, with the loop's
+fourteen frames, the 3D ceiling, the grid and the raster side at the class rung
+and the tiles unsnapped. The desktop bracket with a measured 1 GiB of RAM takes
+the same one step — the scene costs what it costs, not what the bracket is.
+Under the presumptions a page-heap event lowers to (nine tenths, then
+eighty-one hundredths) the rung holds at 1.25x and then goes to 1x, where the
+scene is 541,944,292 B against 652,298,157 B and fits again. A host the rungs
+cannot pay for stops at the host rungs' stops — margin at 1x, tiles snapped,
+three steps — and `fit_holds` holds per axis: need under the allowance, or
+every rung that lowers *that* axis at its stop.
+
+**The count is per `(pane, layer)`, and reading it per pane is a measured
+defect.** The Tier-2 `huge` legs of 2026-09-03 ran the whole ladder at rung 0
+and `oversample 150` with their page at 1011 of 1024 MiB, then trapped in
+`rust_oom`. One pane showing thirteen texture layers priced as one picture is
+365,741,620 B of host need, which fits the 805,306,368 B allowance with 440 MB
+to spare, so `fit` correctly answered "nothing to shed" to a question 500 MB
+short of the scene. Both the need term
+(`PaneNeed::overlay_pictures`) and the `overlay pictures:` line's `resident`
+field now come from the same record, `RenderDispatcher::last_overlay_dispatch`,
+keyed `(pane, LayerId)` — so the figure a reader sees and the figure the fit
+prices cannot disagree. `n` and `px` on that line stay **per pane**: they are
+the size a pane's picture is, which is what a surface check holds a bracket's
+uploaded bytes against, and `resident` is the count and weight of the pictures
+themselves. The two are never added and never the same question.
+
+**And a page-heap event lowers the presumption from the mark, not from the
+constant** (`refit_under_pressure`). The scene's host terms — tiles and
+pictures — are a minority of what a page holds: the module's statics, egui's
+tessellation buffers, the decoded volumes behind the loop and every transfer in
+flight are on the same heap and in no term this crate can name. A presumption
+stepped down from a declared 1 GiB the page is nowhere near therefore stays
+above every need the fit can price, and the ladder stalls at its top rung while
+the heap traps. A wasm linear memory only grows, so a reading is a floor under
+what this page has already needed; holding the presumption to nine tenths of
+`min(figure in force, mark)` prices the whole heap through the one figure in
+reach, and each event lowers it again from a newer, higher mark, so the ladder
+converges rather than stalling.
 
 `need` sums terms the tree already prices: `loop_frame_bytes`,
 `squallar_volumetric::raymarch::resident_grid_bytes` (read by

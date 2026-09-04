@@ -548,10 +548,13 @@ pub const NEED_FRACTION: (u64, u64) = (3, 4);
 /// side and the need model's integer side agree to the pixel on every pane
 /// width a real adapter can hold: `a_shown_picture_is_priced_at_the_planners_own_arithmetic`.
 ///
-/// What the three steps buy on the user's own 2878x1651 canvas, per picture:
-/// 42,755,568 B, 29,682,444 B, 19,006,312 B of the page heap — and thirteen
-/// shown layers re-rasterise together on every move and every loop bucket,
-/// so a batch is 556, 386 or 247 MB of a 1 GiB linear memory.
+/// What the three steps buy on the user's own 2878x1651 window, whose pane is
+/// 2878x1611 under a forty-point top bar, per picture: 41,719,488 B,
+/// 28,963,044 B, 18,545,832 B of the page heap — and thirteen shown layers
+/// re-rasterise together on every move and every loop bucket, so a batch is
+/// 542, 377 or 241 MB of a 1 GiB linear memory. The 1.5x figure is the one
+/// both Tier-2 `huge` legs reported allocating and the one Firefox's
+/// allocation failures named twelve times.
 pub const OVERLAY_OVERSAMPLE_PERCENTS: [u16; 3] = [150, 125, 100];
 
 /// How full of economy — what is resident beyond need — a capacity may be

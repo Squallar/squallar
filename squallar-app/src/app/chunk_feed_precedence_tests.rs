@@ -2335,8 +2335,19 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
 
 /// **A page-heap event lowers the host presumption, and only that one**,
 /// on the bracket that has a host figure: the wasm bracket's declared 1 GiB.
-/// Once by the economy fraction (966,367,641 B), twice (869,730,876 B); the
-/// card's presumption never moves; the squeeze fires once and the tile
+///
+/// **From the mark, not from the constant.** The reading is 891 MiB, so the
+/// presumption becomes nine tenths of THAT (840,853,089 B) rather than nine
+/// tenths of the declared ceiling (966,367,638 B), and the second event
+/// takes nine tenths of the first (756,767,772 B). A wasm heap only grows,
+/// so a reading is a floor under what this page has already needed, and a
+/// presumption stepped down from a constant the page is nowhere near stays
+/// above every need the fit can price — which is how the Tier-2 `huge` leg
+/// of 2026-09-03 ran the whole ladder at rung 0 while its page sat at 1011
+/// of 1024 MiB. The scene's own terms are a minority of a page heap; the
+/// mark is the only figure in reach that prices the rest.
+///
+/// The card's presumption never moves; the squeeze fires once and the tile
 /// allowances the next loop walk hands the caches are nothing but the rung.
 /// The headless scene shows no picture, so its headroom is zero and the
 /// action line is the percentage line — the same 891 MiB the fixed line
@@ -2377,16 +2388,17 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
         "precondition: an allowance to squeeze"
     );
 
-    // `host / 10 * 9`, floor first — the same spelling the card's presumption
-    // is lowered with, three bytes under the exact nine tenths.
+    // `min(host, mark) / 10 * 9`, floor first. The mark is the lower of the
+    // two here, so it is the mark that is stepped down — nine tenths of the
+    // 891 MiB read, not nine tenths of the declared GiB.
     gauge.set(page(891 * MIB));
     tick(&mut app);
-    assert_eq!(app.session_host_capacity, Some(966_367_638));
+    assert_eq!(app.session_host_capacity, Some(840_853_089));
     assert_eq!(
         app.session_capacity, None,
         "the card's presumption moved for the page's heap"
     );
-    assert_eq!(app.capacity().host_bytes, Some(966_367_638));
+    assert_eq!(app.capacity().host_bytes, Some(840_853_089));
     assert_eq!(
         app.capacity().gpu_bytes,
         before.app_texture_ceiling_bytes as u64
@@ -2410,7 +2422,7 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
 
     gauge.set(page(891 * MIB + LINEAR_MEMORY_REFIRE_STEP_BYTES));
     tick(&mut app);
-    assert_eq!(app.session_host_capacity, Some(869_730_867));
+    assert_eq!(app.session_host_capacity, Some(756_767_772));
     assert_eq!(app.session_capacity, None);
 
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
@@ -2471,4 +2483,160 @@ fn a_heap_at_the_warn_line_is_noted_and_steps_nothing() {
     assert_eq!(app.budgets.steps_back, 0, "a warning stepped the ladder");
     assert_eq!(app.render.render_cache.entry_count(), 1);
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);
+}
+
+/// **A page at 90 % of its wall, with a scene whose pictures the ladder can
+/// shrink, acts: it says `budget pressure:` and frees.**
+///
+/// The gate the `huge` leg needed and did not have. Its last telemetry read
+/// `steps 0` and `oversample 150` at 1011 of 1024 MiB, and the whole page
+/// path was reachable — this test is what would have gone red before that
+/// leg ran rather than after.
+///
+/// Three things are asserted and they are three different failures. That the
+/// watermark **acted at all** on the page's own instance (its watch
+/// remembers the mark, and the worker's is untouched). That the levers
+/// **freed something** — the render cache is emptied and the tile economies
+/// squeezed, both of them page-heap bytes. And that the presumption came
+/// down **from the mark**, which is the arithmetic that makes the ladder
+/// converge: nine tenths of 922 MiB, not nine tenths of the declared GiB.
+///
+/// The scene is thirteen whole-picture layers on one 2878 x 1611 pane, the
+/// `huge` leg's own, and the batch that prices the action line is what the
+/// walk read off the dispatch record: fourteen pictures of 41,719,488 B, the
+/// figure both legs reported and Firefox's allocation failures named. Which
+/// rung a scene of that size then takes is the fit's arithmetic and is pinned
+/// where the fit lives
+/// (`squallar_device_profile::fit::tests::the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms`);
+/// what is pinned here is that the page path reaches it.
+#[test]
+fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
+    use squallar_device_profile::budget::BudgetLimits;
+
+    let platform = TestBridge::web();
+    let gauge = platform.linear_memory_gauge();
+    let mut app = headless(platform);
+    app.device_profile.limits = BudgetLimits::WASM;
+    app.adopt_budgets(squallar_device_profile::budget::resolve(
+        &app.device_profile,
+    ));
+
+    // The leg's thirteen whole-picture layers on its one pane, recorded the
+    // way the application records them.
+    let huge_plan = crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        texture: squallar_egui::overlay_cache::OverlayTexturePlan {
+            width: 4317,
+            height: 2416,
+            overdraw: 0.5,
+            pixels_per_point: 1.0,
+            pane_px: [2878, 1611],
+        },
+        data_generation: 1,
+        zoom: 32,
+    };
+    for id in [
+        squallar_source::id::known::NWS_ALERTS,
+        squallar_source::id::known::STORM_REPORTS,
+        squallar_source::id::known::SPC_OUTLOOK,
+        squallar_source::id::known::SPC_FIRE_OUTLOOK,
+        squallar_source::id::known::SPC_DISCUSSIONS,
+        squallar_source::id::known::MRMS,
+        squallar_source::id::known::GMGSI,
+        squallar_source::id::known::MODEL_DATA,
+        squallar_source::id::known::LIGHTNING,
+        squallar_source::id::known::METAR,
+        squallar_source::id::known::CITY_LABELS,
+        squallar_source::id::known::RADAR_SITES,
+        squallar_source::id::known::RADAR_COVERAGE,
+    ] {
+        app.render
+            .record_overlay_dispatch(0, &id, huge_plan.clone());
+    }
+    assert_eq!(
+        app.render.resident_overlay_pictures(),
+        (13, 542_353_344),
+        "precondition: the leg's own picture load",
+    );
+
+    // The walk prices the batch the action line is derived from. A pane walk
+    // that counted panes would put 41,719,488 x 2 here and the line 500 MB
+    // too high.
+    let _ = app.observe_loop_demand();
+    assert_eq!(
+        app.host_headroom_bytes, 584_072_832,
+        "the scene's next picture batch is not fourteen pictures: this is the \
+         figure the action line is the wall less, and pricing it per pane is \
+         what let the `huge` leg trap under a quiet watermark",
+    );
+    assert_eq!(app.session_host_capacity, None);
+    seed_render_cache(&mut app);
+    assert_eq!(app.render.render_cache.entry_count(), 1);
+    assert!(app.tile_cache_budget.styled_bytes > 0);
+
+    // Ninety percent of the page's declared wall.
+    let ninety = 1024 * MIB / 10 * 9;
+    gauge.set(Some(crate::platform::LinearMemory {
+        page_bytes: ninety,
+        worker_bytes: Some(50 * MIB),
+    }));
+    tick(&mut app);
+
+    assert_eq!(
+        app.linear_memory_watch.last_acted_at(),
+        Some(ninety),
+        "the page's watermark did not act at 90 % of its wall with a 557 MiB \
+         batch in front of it",
+    );
+    assert_eq!(
+        app.worker_memory_watch.last_acted_at(),
+        None,
+        "the worker's watch moved on the page's reading",
+    );
+    assert_eq!(
+        app.render.render_cache.entry_count(),
+        0,
+        "the action freed nothing: the render cache still holds its entry",
+    );
+    assert!(
+        app.tile_economy_squeezed,
+        "the action freed nothing: the tile economies were not squeezed",
+    );
+    assert_eq!(
+        app.session_host_capacity,
+        Some(ninety / 10 * 9),
+        "the host presumption was not lowered from the mark the heap reached",
+    );
+    assert_eq!(
+        app.session_capacity, None,
+        "a page-heap event lowered the card's presumption",
+    );
+
+    // The sentence the reader gets. A `budget pressure:` line with a page
+    // cause, the economy it took and the rung in force — the line whose
+    // absence from both `huge` legs was the first thing that was looked for.
+    let line = crate::pressure::pressure_line(
+        crate::pressure::Pressure::LinearMemory {
+            used: ninety,
+            max: squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES,
+        },
+        crate::pressure::Reclaimed {
+            render_entries: 1,
+            render_bytes: 0,
+            extracts: 0,
+            tile_economy_bytes: 0,
+            oversample_percent: app.budgets.overlay_oversample_percent,
+        },
+        app.budgets.steps_back,
+    );
+    assert!(
+        line.starts_with("budget pressure: linear memory"),
+        "the page's action does not announce itself as one: {line}",
+    );
+    assert!(line.contains("oversample "), "{line}");
 }
