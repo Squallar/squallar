@@ -13,6 +13,32 @@ const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 /// and retried.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a socket must stay open before its drop counts as a fresh failure
+/// rather than a continuing one.
+const STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Backoff for the nth consecutive failure, doubling to [`RECONNECT_MAX`].
+fn retry_delay(failures: u32) -> std::time::Duration {
+    let shift = failures.saturating_sub(1).min(6);
+    (RECONNECT_BASE * (1 << shift)).min(RECONNECT_MAX)
+}
+
+/// The failure count to carry into the retry after a socket drops.
+///
+/// A socket that stayed open past [`STABLE_AFTER`] has shown the endpoint works,
+/// so its drop starts the ramp over. One that closed straight after the
+/// handshake has shown nothing: `ewebsock` reports `Opened` on the HTTP upgrade,
+/// before any application traffic, so a server that accepts and then closes
+/// would otherwise reset the count every cycle and retry at [`RECONNECT_BASE`]
+/// forever.
+fn failures_after_drop(state: LinkState, held_for: std::time::Duration, failures: u32) -> u32 {
+    if state == LinkState::Open && held_for >= STABLE_AFTER {
+        1
+    } else {
+        failures.saturating_add(1)
+    }
+}
+
 /// A chunk the service says now exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkAvailable {
@@ -124,8 +150,9 @@ struct Subscription {
     receiver: WsReceiver,
     state: LinkState,
     failures: u32,
-    /// When this socket was opened, so [`CONNECT_TIMEOUT`] can tell a handshake
-    /// still in progress from one that will never finish.
+    /// When this socket entered `state`, so [`CONNECT_TIMEOUT`] can tell a
+    /// handshake still in progress from one that will never finish, and
+    /// [`STABLE_AFTER`] can tell a connection that held from one that did not.
     since: web_time::Instant,
 }
 
@@ -136,6 +163,10 @@ pub struct ChunkNotifier {
     /// Subscriptions waiting out a backoff, kept out of `subs` so a dead socket
     /// is not held open.
     backoff: HashMap<(String, Feed), (u32, web_time::Instant)>,
+    /// The endpoint the live sockets were opened against. A socket is bound to
+    /// the URL it dialled, so a changed endpoint has to be reconnected rather
+    /// than left talking to the old host.
+    endpoint: String,
 }
 
 impl ChunkNotifier {
@@ -152,6 +183,14 @@ impl ChunkNotifier {
         endpoint: &str,
         wake: impl Fn() + Send + Sync + Clone + 'static,
     ) {
+        if self.endpoint != endpoint {
+            endpoint.clone_into(&mut self.endpoint);
+            // Nothing here can be kept: every socket and every pending retry
+            // belongs to the host that just stopped being the one in use.
+            self.subs.clear();
+            self.backoff.clear();
+        }
+
         let wanted =
             |site: &String, feed: &Feed| sites.iter().any(|s| s == site) && feeds.contains(feed);
         self.subs.retain(|(site, feed), _| wanted(site, feed));
@@ -247,11 +286,9 @@ impl ChunkNotifier {
     }
 
     fn schedule_retry(&mut self, site: &str, feed: Feed, failures: u32) {
-        let shift = failures.saturating_sub(1).min(6);
-        let delay = (RECONNECT_BASE * (1 << shift)).min(RECONNECT_MAX);
         self.backoff.insert(
             (site.to_string(), feed),
-            (failures, web_time::Instant::now() + delay),
+            (failures, web_time::Instant::now() + retry_delay(failures)),
         );
     }
 
@@ -266,7 +303,7 @@ impl ChunkNotifier {
                     WsEvent::Opened => {
                         log::info!("{site}: {feed:?} notifications connected");
                         sub.state = LinkState::Open;
-                        sub.failures = 0;
+                        sub.since = web_time::Instant::now();
                     }
                     WsEvent::Message(WsMessage::Text(text)) => match parse_message(*feed, &text) {
                         Some(notified) => out.push(notified),
@@ -277,14 +314,18 @@ impl ChunkNotifier {
                     WsEvent::Message(_) => {}
                     WsEvent::Error(e) => {
                         log::warn!("{site}: {feed:?} notification socket error: {e}");
+                        let failures =
+                            failures_after_drop(sub.state, sub.since.elapsed(), sub.failures);
                         sub.state = LinkState::Down;
-                        dropped.push(((site.clone(), *feed), sub.failures + 1));
+                        dropped.push(((site.clone(), *feed), failures));
                         break;
                     }
                     WsEvent::Closed => {
                         log::info!("{site}: {feed:?} notification socket closed");
+                        let failures =
+                            failures_after_drop(sub.state, sub.since.elapsed(), sub.failures);
                         sub.state = LinkState::Down;
-                        dropped.push(((site.clone(), *feed), sub.failures + 1));
+                        dropped.push(((site.clone(), *feed), failures));
                         break;
                     }
                 }
@@ -493,6 +534,91 @@ mod tests {
         assert!(
             !n.is_backing_off("KTLX", Feed::Chunk) && !n.is_backing_off("KTLX", Feed::Archive),
             "backoff outlived the site"
+        );
+    }
+
+    /// `ewebsock` reports `Opened` on the HTTP upgrade, before any application
+    /// traffic, so a server that accepts the connection and then closes it —
+    /// bad route, unknown site, an error raised after the upgrade — used to
+    /// reset the failure count every cycle and retry forever at the base delay.
+    #[test]
+    fn a_socket_that_closes_straight_after_the_handshake_still_backs_off() {
+        let mut failures = 0;
+        let mut delays = Vec::new();
+        for _ in 0..5 {
+            // Opened, then closed again immediately.
+            failures = failures_after_drop(
+                LinkState::Open,
+                std::time::Duration::from_millis(50),
+                failures,
+            );
+            delays.push(retry_delay(failures));
+        }
+        assert!(
+            delays.windows(2).all(|w| w[1] > w[0]),
+            "backoff never grew across repeated accept-then-close cycles: {delays:?}"
+        );
+        assert_eq!(delays[0], RECONNECT_BASE);
+    }
+
+    /// The counterweight: a connection that actually held must not be punished
+    /// for a later drop, or a long-lived socket would come back slower every
+    /// time the network hiccuped.
+    #[test]
+    fn a_socket_that_held_starts_the_ramp_over() {
+        assert_eq!(
+            retry_delay(failures_after_drop(LinkState::Open, STABLE_AFTER, 6)),
+            RECONNECT_BASE,
+            "a socket that stayed open past STABLE_AFTER must retry at the base delay"
+        );
+        // And a socket that never opened at all is always a continuing failure.
+        assert!(
+            failures_after_drop(LinkState::Connecting, STABLE_AFTER * 10, 3) > 3,
+            "a handshake that never completed must not earn a clean slate"
+        );
+    }
+
+    /// The delay is bounded, and never zero — a zero would spin the frame loop.
+    #[test]
+    fn the_retry_delay_is_bounded() {
+        for failures in 0..64u32 {
+            let d = retry_delay(failures);
+            assert!(
+                d >= RECONNECT_BASE && d <= RECONNECT_MAX,
+                "retry_delay({failures}) = {d:?} outside [{RECONNECT_BASE:?}, {RECONNECT_MAX:?}]"
+            );
+        }
+        assert_eq!(retry_delay(u32::MAX), RECONNECT_MAX);
+    }
+
+    /// A socket is bound to the URL it dialled, so editing the endpoint has to
+    /// reconnect it — otherwise it keeps talking to the old host until the site
+    /// changes or the connection happens to drop.
+    #[test]
+    fn changing_the_endpoint_reconnects_the_sockets() {
+        let mut n = ChunkNotifier::new();
+        let sites = ["KTLX".to_string()];
+        n.sync_sites(&sites, &[Feed::Chunk], "wss://127.0.0.1:1", || {});
+        assert_eq!(n.subscription_count(), 1);
+
+        // Strand this socket on a backoff, so there is state belonging to the
+        // old host for the endpoint change to have to clear.
+        n.backdate_handshake("KTLX", Feed::Chunk, CONNECT_TIMEOUT + RECONNECT_BASE);
+        n.sync_sites(&sites, &[Feed::Chunk], "wss://127.0.0.1:1", || {});
+        assert!(
+            n.is_backing_off("KTLX", Feed::Chunk),
+            "precondition: the aged socket should be waiting out a retry"
+        );
+
+        n.sync_sites(&sites, &[Feed::Chunk], "wss://127.0.0.1:2", || {});
+        assert!(
+            !n.is_backing_off("KTLX", Feed::Chunk),
+            "the old host's backoff outlived the endpoint change"
+        );
+        assert_eq!(
+            n.subscription_count(),
+            1,
+            "a changed endpoint must dial the new host straight away"
         );
     }
 
