@@ -1145,8 +1145,14 @@ impl super::App {
         let ticket =
             squallar_egui::overlay_cache::RenderTicket::whole(data_generation, render_bounds);
 
-        if self.gui.overlays.render_mode(&id)
-            != Some(squallar_overlays::render::overlay_state::RenderMode::Texture)
+        // `has_texture()`, not `== Texture`: a hybrid layer's geometry rides a
+        // picture too. `is_some_and` keeps the unregistered-id exit — `None`
+        // still falls through to the warning below.
+        if !self
+            .gui
+            .overlays
+            .render_mode(&id)
+            .is_some_and(|mode| mode.has_texture())
         {
             // Also the unregistered-id exit: `render_mode` answers `None` for an id no
             // handler owns.
@@ -1450,8 +1456,9 @@ impl super::App {
             if !pane.is_overlay_enabled(&id) {
                 continue;
             }
-            if overlays.render_mode(&id)
-                != Some(squallar_overlays::render::overlay_state::RenderMode::Texture)
+            if !overlays
+                .render_mode(&id)
+                .is_some_and(|mode| mode.has_texture())
             {
                 continue;
             }

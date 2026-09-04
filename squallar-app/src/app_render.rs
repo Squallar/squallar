@@ -4778,8 +4778,9 @@ impl super::App {
                 // list is settled onto the pane's own clock.
                 let clock = pane.time.mode;
                 for id in ids {
-                    if overlays.render_mode(&id)
-                        != Some(squallar_overlays::render::overlay_state::RenderMode::Texture)
+                    if !overlays
+                        .render_mode(&id)
+                        .is_some_and(|mode| mode.has_texture())
                     {
                         continue;
                     }

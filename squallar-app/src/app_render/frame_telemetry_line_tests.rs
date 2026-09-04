@@ -814,6 +814,37 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
     }
 }
 
+/// **No dispatch site asks `== RenderMode::Texture`; every one asks
+/// `has_texture()`.**
+///
+/// Three sites in this crate compared the mode to `Texture` by equality, so
+/// when `TextureAndPoint` landed the dispatcher skipped it: METAR's geometry
+/// left the frame thread and arrived nowhere — an 81 % drop in vertices per
+/// frame that read as a win until the picture-dispatch log was checked and
+/// `overlay/metar` appeared zero times. The overlays crate had the same idiom
+/// in six pins and they were widened; these three were one crate over and
+/// were not. This is the gate that would have caught it.
+#[test]
+fn every_dispatch_site_asks_has_texture_not_texture_equality() {
+    for (name, src) in [
+        ("app_fetch.rs", include_str!("../app_fetch.rs")),
+        ("app_render.rs", include_str!("../app_render.rs")),
+    ] {
+        let hits: Vec<usize> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("RenderMode::Texture)") && !l.trim_start().starts_with("//"))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "{name} compares a render mode to `Texture` by equality at lines \
+             {hits:?}; a hybrid layer has a texture too, and this idiom is how \
+             its picture stopped being dispatched. Ask `has_texture()`.",
+        );
+    }
+}
+
 /// The `frame post (…)` sentence, pinned as a literal.
 ///
 /// Same formatter as `frame segment (…)` and deliberately a **different
