@@ -6781,6 +6781,13 @@ mod native_seed_pin_tests;
 #[cfg(test)]
 mod frame_telemetry_line_tests;
 
+/// The JavaScript those probes are written in, checked by a JS engine: every
+/// embedded block parses, and every console scrape executes without throwing
+/// and hands back every family it was fed.
+#[path = "app_render/rig_js_tests.rs"]
+#[cfg(test)]
+mod rig_js_tests;
+
 /// The gesture player's arming seam: absent key and variable arm nothing —
 /// the non-vacuity pair's dormant half — and the key is pinned.
 #[path = "app_render/gesture_arming_tests.rs"]
