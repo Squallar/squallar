@@ -2753,11 +2753,17 @@ var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
+var frame_worst = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
 // TOTALS, so the newest line is the whole answer and an older one is a prefix
 // of it. Scanning forward and overwriting is what makes that true.
+// The anatomy of ONE frame -- the worst presented this period -- plus the
+// never-cleared since-boot maximum. Re-said every tick, so the LAST match in
+// the window is the answer; not a histogram family and not windowed.
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us/;
 var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting/;
 // The two raster-telemetry lines, written once a frame by
 // `App::report_raster_telemetry` and only on a frame where something moved.
@@ -2903,6 +2909,15 @@ for (var i = 0; i < C.length; i++) {
   }
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
+  var wm = frame_worst_re.exec(m);
+  if (wm) frame_worst = { service: parseInt(wm[1], 10), family: wm[2],
+                          since_boot: parseInt(wm[3], 10),
+                          pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
+                          ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
+                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10) };
+  var wn = frame_worst_none_re.exec(m);
+  if (wn) frame_worst = { service: null, family: null,
+                          since_boot: parseInt(wn[1], 10) };
   var tm = transport_re.exec(m);
   if (tm) transport = { replies: parseInt(tm[1], 10),
                         out_moved: parseInt(tm[2], 10),
@@ -3002,6 +3017,7 @@ for (var i = 0; i < C.length; i++) {
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
+         frame_worst: frame_worst,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -6759,6 +6775,7 @@ def run_smoke(args):
         # a measurement round wants the number when nothing is gating on it,
         # and `null` says the line was never seen rather than "zero bytes".
         result["transport_bytes"] = _sig.get("transport")
+        result["frame_worst"] = _sig.get("frame_worst")
         if result["transport_bytes"]:
             stage("transport", **result["transport_bytes"])
 
@@ -7485,6 +7502,19 @@ def run_smoke(args):
                  "" if zc.get("ok") else "; " + str(zc.get("error"))))
     # The WS3c measurement, printed whether or not it was gated -- and never
     # pooled across browsers, for the same reason the per-kind medians are not.
+    fw = result.get("frame_worst")
+    if fw:
+        if fw.get("service") is None:
+            print("[%s] SUMMARY frame worst: no frame presented in the last period; "
+                  "since_boot=%s us" % (tag, fw.get("since_boot")))
+        else:
+            # ONE frame's anatomy, not a distribution -- the p99 verdict's own
+            # instrument; its six segments telescope to `service`.
+            print("[%s] SUMMARY frame worst: service=%s us family=%s since_boot=%s us | "
+                  "pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
+                  % (tag, fw.get("service"), fw.get("family"), fw.get("since_boot"),
+                     fw.get("pre"), fw.get("pump"), fw.get("ui"),
+                     fw.get("prepare"), fw.get("finish"), fw.get("post")))
     tb = result.get("transport_bytes")
     if tb:
         # Every field the pattern reads is printed. A figure parsed into the

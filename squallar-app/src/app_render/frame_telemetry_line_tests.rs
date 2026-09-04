@@ -833,7 +833,9 @@ fn every_dispatch_site_asks_has_texture_not_texture_equality() {
         let hits: Vec<usize> = src
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains("RenderMode::Texture)") && !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| {
+                l.contains("RenderMode::Texture)") && !l.trim_start().starts_with("//")
+            })
             .map(|(i, _)| i + 1)
             .collect();
         assert!(
@@ -843,6 +845,102 @@ fn every_dispatch_site_asks_has_texture_not_texture_equality() {
              its picture stopped being dispatched. Ask `has_texture()`.",
         );
     }
+}
+
+/// The rig's `frame worst` probe reads what the app writes.
+///
+/// **This is the p99 instrument, and no browser leg has ever seen it.** Phase 1
+/// landed `frame worst:` — one frame's six segments plus the never-cleared
+/// since-boot maximum, outside the `if interacted` arm — precisely because the
+/// scene D verdict is p99 AND max, and every windowed histogram is a
+/// distribution that cannot name the frame. The rig had no regex for it. The
+/// enumeration that found this (`"frame [a-z]+` in `app_render.rs` against
+/// `var frame_[a-z]+_re` in `drive.py`) read ten families against five.
+#[test]
+fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
+    let w = crate::frame_ledger::WorstFrame {
+        service: 13_455,
+        segments: [64, 55, 9_514, 2_829, 700, 293],
+        interact: true,
+    };
+    assert_eq!(
+        super::frame_worst_line(Some(w), 22_628),
+        rendered(
+            &pattern("frame_worst_re"),
+            &[
+                "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293"
+            ],
+        ),
+        "the `frame worst:` line and the rig's probe have drifted",
+    );
+    assert_eq!(
+        super::frame_worst_line(None, 22_628),
+        rendered(&pattern("frame_worst_none_re"), &["22628"]),
+        "the no-frame spelling and the rig's probe have drifted",
+    );
+}
+
+/// **Every `frame <name>` line family the app writes has a rig probe that reads
+/// it — by an explicit table, so a NEW family fails here until it is claimed.**
+///
+/// The per-family pins each hold one probe in step with one formatter, so a
+/// family with no probe at all passes every one of them by never being named.
+/// That is how `ui` (the largest segment) and then `worst` (the p99 instrument)
+/// each went unscraped for weeks. This enumerates the app's own `"frame …`
+/// literals and demands a named regex for each; an unlisted family reddens it.
+#[test]
+fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
+    const APP: &str = include_str!("../app_render.rs");
+    let carried_by: &[(&str, &[&str])] = &[
+        ("cadence", &["cadence_re"]),
+        ("dispatch", &["frame_dispatch_re"]),
+        ("post", &["frame_post_re"]),
+        ("prep", &["prep_costs_re", "prep_geometry_re"]),
+        ("prepare", &["frame_prepare_re"]),
+        ("segment", &["frame_segment_re"]),
+        ("segments", &["segments_re"]),
+        ("service", &["svc_interact_re", "svc_idle_re"]),
+        ("ui", &["frame_ui_re"]),
+        ("worst", &["frame_worst_re", "frame_worst_none_re"]),
+    ];
+    let mut families: Vec<&str> = APP
+        .match_indices("\"frame ")
+        .map(|(at, _)| {
+            let rest = &APP[at + 7..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_lowercase())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .filter(|f| !f.is_empty())
+        .collect();
+    families.sort_unstable();
+    families.dedup();
+    for family in &families {
+        let probes = carried_by
+            .iter()
+            .find(|(f, _)| f == family)
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the app writes a `frame {family}` line and this table does not say \
+                     which rig regex reads it — claim it here, and add the regex to \
+                     drive.py if there is none; an unclaimed family is invisible to \
+                     every leg"
+                )
+            });
+        for probe in probes {
+            assert!(
+                DRIVE_PY.contains(&format!("var {probe} = /")),
+                "`frame {family}` is claimed by `{probe}` but drive.py has no such regex",
+            );
+        }
+    }
+    assert_eq!(
+        families.len(),
+        carried_by.len(),
+        "the table names families the app no longer writes: {families:?}",
+    );
 }
 
 /// The `frame post (…)` sentence, pinned as a literal.
