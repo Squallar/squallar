@@ -1751,7 +1751,8 @@ def subject_relation(a, b):
 def subject_pin(a, b):
     """Adjudicate the SUBJECT of a two-row comparison.
 
-    Four states, and like this file's other stamp sets they never co-fire:
+    SIX verdicts, and like this file's other stamp sets the refusal and the
+    unvouchable ones never co-fire as the row's answer:
 
       `pinned`       at least one may-pin field was recorded on BOTH rows and
                      agreed. This is the positive, and it is not satisfiable by

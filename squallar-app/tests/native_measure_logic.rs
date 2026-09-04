@@ -124,7 +124,6 @@ fn the_native_measurement_decision_rules_still_hold() {
     );
 }
 
-
 /// The rig's own record of what a browser leg RAN, mapped to where each field
 /// is checked — the same shape as `drive.py`'s frame-family table, and for the
 /// same reason.
@@ -156,7 +155,10 @@ fn the_native_measurement_decision_rules_still_hold() {
 #[test]
 fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
     let drive = std::fs::read_to_string(
-        native_row_py().parent().expect("no rig dir").join("drive.py"),
+        native_row_py()
+            .parent()
+            .expect("no rig dir")
+            .join("drive.py"),
     )
     .expect("drive.py is not readable");
     let analyser = std::fs::read_to_string(native_row_py()).expect("analyser unreadable");
@@ -168,22 +170,26 @@ fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
         (
             "browser_version",
             Some("browser_version"),
-            "the build under test. Gated between rows naming the same browser;              across firefox and chromium a difference is the comparison",
+            "the build under test. Gated between rows naming the same browser; across firefox and \
+             chromium a difference is the comparison",
         ),
         (
             "driver_version",
             Some("driver_version"),
-            "reported on the pair, never gated: geckodriver versions              independently of Firefox",
+            "reported on the pair, never gated: geckodriver versions independently of Firefox",
         ),
         (
             "binary",
             None,
-            "a filesystem path. Two boxes install the same build at different              paths and one box installs different builds at the same path, so              it identifies no build",
+            "a filesystem path. Two boxes install the same build at different paths and one box \
+             installs different builds at the same path, so it identifies no build",
         ),
         (
             "version_match",
             None,
-            "browser-against-driver WITHIN one leg, not one leg against              another. It is `None` on every Firefox leg by construction, so a              pair check on it would refuse Firefox and pass nothing",
+            "browser-against-driver WITHIN one leg, not one leg against another. It is `None` on \
+             every Firefox leg by construction, so a pair check on it would refuse Firefox and \
+             pass nothing",
         ),
     ];
 
@@ -240,12 +246,15 @@ fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
     // that cannot fail, which this tree has been bitten by repeatedly.
     assert!(
         recorded.len() >= 4,
-        "only {} build-identity fields were parsed out of drive.py ({recorded:?});          the parse broke and this gate would otherwise pass vacuously",
+        "only {} build-identity fields were parsed out of drive.py ({recorded:?}); the parse broke \
+         and this gate would otherwise pass vacuously",
         recorded.len(),
     );
     assert!(
         recorded.iter().any(|k| k == "browser_version"),
-        "drive.py no longer records `browser_version` under that spelling; the          browser build is what moved under a live campaign on 2026-09-04 and          this is the field that catches it: {recorded:?}",
+        "drive.py no longer records `browser_version` under that spelling; the browser build is \
+         what moved under a live campaign on 2026-09-04 and this is the field that catches it: \
+         {recorded:?}",
     );
 
     for field in &recorded {
@@ -254,20 +263,25 @@ fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
             .find(|(name, _, _)| name == field)
             .unwrap_or_else(|| {
                 panic!(
-                    "drive.py records `{field}` to describe the browser a leg ran,                      and this table does not say whether it is part of a                      measurement's SUBJECT. Claim it here — either name the                      `SUBJECT_FIELDS` entry that checks it, or say why it                      identifies no build. An unclaimed identity field is one                      nothing compares, which is how a browser update crosses a                      before/after pair in silence"
+                    "drive.py records `{field}` to describe the browser a leg ran, and this table \
+                     does not say whether it is part of a measurement's SUBJECT. Claim it here — \
+                     either name the `SUBJECT_FIELDS` entry that checks it, or say why it \
+                     identifies no build. An unclaimed identity field is one nothing compares, \
+                     which is how a browser update crosses a before/after pair in silence"
                 )
             });
         if let Some(entry) = claim.1 {
             assert!(
                 analyser.contains(&format!("\"{entry}\", _read_")),
-                "`{field}` is claimed to be checked by native_row.py's                  `SUBJECT_FIELDS` entry `{entry}`, and no such entry exists",
+                "`{field}` is claimed to be checked by native_row.py's `SUBJECT_FIELDS` entry \
+                 `{entry}`, and no such entry exists",
             );
         }
     }
     assert_eq!(
         recorded.len(),
         claimed.len(),
-        "this table claims fields drive.py no longer records; drive.py has          {recorded:?}",
+        "this table claims fields drive.py no longer records; drive.py has {recorded:?}",
     );
 
     // Equality is not the whole gate. Each row pins the spelling its value is
@@ -286,14 +300,20 @@ fn every_recorded_build_identity_field_is_claimed_by_the_subject_table() {
     // drives no browser — it is stamped per ARM by `run_measure_native.sh`.
     assert!(
         analyser.contains("\"commit\", _read_commit"),
-        "native_row.py's `SUBJECT_FIELDS` no longer claims `commit`. A          before/after pair on two app commits is the error this campaign hits          most, and three distinct bases were in play on 2026-09-03 alone",
+        "native_row.py's `SUBJECT_FIELDS` no longer claims `commit`. A before/after pair on two \
+         app commits is the error this campaign hits most, and three distinct bases were in play \
+         on 2026-09-03 alone",
     );
     let runner = std::fs::read_to_string(
-        native_row_py().parent().expect("no rig dir").join("run_measure_native.sh"),
+        native_row_py()
+            .parent()
+            .expect("no rig dir")
+            .join("run_measure_native.sh"),
     )
     .expect("run_measure_native.sh is not readable");
     assert!(
         runner.contains("--commit \"$leg_commit\""),
-        "run_measure_native.sh no longer stamps a per-arm commit on its rows,          so the subject check has nothing to read",
+        "run_measure_native.sh no longer stamps a per-arm commit on its rows, so the subject check \
+         has nothing to read",
     );
 }
