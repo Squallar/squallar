@@ -372,6 +372,18 @@ fn the_ring_route_draws_the_same_picture_out_of_the_same_bytes() {
 /// memory type is reachable through any public API. The replication is
 /// therefore exact whenever a buffer may use every host-visible type, which is
 /// the ordinary case and is what both routes' buffers ask for.
+///
+/// **Which devices assert and which skip.** The property is a discrete-GPU
+/// one: it needs a host-visible memory type that is *not* `DEVICE_LOCAL`, so
+/// that a ring slot has somewhere to live other than the BAR window. A
+/// discrete card (the NVIDIA and AMD desktop parts) exposes such a type and
+/// takes the assertion arm. A device with one unified heap — Mesa's llvmpipe,
+/// Apple Silicon, most integrated GPUs — marks every host-visible type
+/// `DEVICE_LOCAL` as well; there the property cannot hold by construction,
+/// whichever type the allocator picks, and the test prints why and asserts
+/// nothing. The other skip, a device with no `HOST_CACHED` type at all, is the
+/// same shape: no cached heap exists to move into, so there is nothing to
+/// check.
 #[cfg(any(
     target_os = "windows",
     target_os = "linux",
@@ -436,6 +448,26 @@ fn the_ring_and_the_queue_allocate_out_of_different_heaps() {
         );
         return;
     };
+
+    // A unified-memory device: every host-visible type is also DEVICE_LOCAL,
+    // so "not in the BAR window" has no type to be true of. The assertion
+    // below would then report the allocator's pick as wrong when no pick could
+    // be right.
+    let host_only = flags
+        .iter()
+        .any(|&have| have & HOST_VISIBLE != 0 && have & DEVICE_LOCAL == 0);
+    if !host_only {
+        let listed: Vec<String> = flags.iter().map(|have| format!("{have:#x}")).collect();
+        eprintln!(
+            "{} exposes a single unified heap: every HOST_VISIBLE memory type is also \
+             DEVICE_LOCAL ([{}]). A ring slot cannot leave the BAR window here because \
+             there is nowhere else to go; the change is a no-op on this device and the \
+             byte figures will say so. Nothing asserted.",
+            info.name,
+            listed.join(", "),
+        );
+        return;
+    }
 
     assert_eq!(
         flags[ring] & DEVICE_LOCAL,
