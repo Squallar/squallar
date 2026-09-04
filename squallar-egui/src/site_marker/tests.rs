@@ -33,23 +33,32 @@ fn on_glass_radius_at(zoom: f64) -> f32 {
     draw_site_marker(&painter, canvas().center(), zoom, MarkerRole::Ordinary);
     let output = ctx.end_pass();
 
-    let mut filled = output
+    // The marker is a textured quad pair; its disc's radius on glass is the
+    // quad's half side less the ring and the sprite's edge ramp, which are
+    // the two things the quad is wider than the disc by.
+    let mut quads = output
         .shapes
         .iter()
-        .filter_map(|clipped| match clipped.shape {
-            egui::Shape::Circle(circle) if circle.fill == MarkerRole::Ordinary.fill() => {
-                Some(circle.radius)
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Mesh(mesh)
+                if mesh
+                    .vertices
+                    .iter()
+                    .any(|v| v.color == MarkerRole::Ordinary.fill()) =>
+            {
+                Some(mesh.calc_bounds())
             }
             _ => None,
         });
-    let radius = filled
+    let bounds = quads
         .next()
-        .expect("the marker must put a filled disc on glass");
+        .expect("the marker must put a disc in its role's colour on glass");
     assert!(
-        filled.next().is_none(),
-        "one station drew more than one filled disc",
+        quads.next().is_none(),
+        "one station drew more than one marker",
     );
-    radius
+    let half = bounds.width() / 2.0;
+    half - marker_shape(zoom).stroke - SPRITE_EDGE_PX / ctx.pixels_per_point()
 }
 
 /// The user's report, as an assertion.

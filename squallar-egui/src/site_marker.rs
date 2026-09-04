@@ -203,12 +203,142 @@ pub(crate) fn draw_site_marker(
     role: MarkerRole,
 ) {
     let shape = marker_shape(zoom);
-    painter.circle_filled(center, shape.radius, role.fill());
-    painter.circle_stroke(
-        center,
-        shape.radius,
-        egui::Stroke::new(shape.stroke, egui::Color32::WHITE),
+    let sprite = marker_sprite(painter.ctx(), shape);
+    // Snapped to the pixel grid so each texel lands on one pixel: the quad's
+    // side is a whole number of pixels, and an origin off the grid would put
+    // the ring's one-pixel core across two pixels at half strength.
+    let ppp = painter.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let min = egui::pos2(
+        snap(center.x - sprite.half_points),
+        snap(center.y - sprite.half_points),
     );
+    let rect = egui::Rect::from_min_size(min, egui::Vec2::splat(2.0 * sprite.half_points));
+    let mut mesh = egui::Mesh::with_texture(sprite.texture.id());
+    mesh.add_rect_with_uv(rect, sprite.disc_uv, role.fill());
+    mesh.add_rect_with_uv(rect, sprite.ring_uv, egui::Color32::WHITE);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// A marker on glass is two textured quads — a disc and a ring, tinted — off
+/// one small sprite, rather than a filled circle and a stroked circle.
+///
+/// Measured why (native scene D, 1920x1080, 60 stations in view): the two
+/// circles at radius 12 tessellated to 152 vertices and 678 indices **per
+/// station**, 9.1k vertices and 40.7k indices a frame, half the frame's
+/// indices — epaint's own prerasterized discs stop at 8 texels
+/// (`LARGEST_CIRCLE_RADIUS`), so nothing above that radius was a sprite, and a
+/// stroke never is. The quads are 8 vertices and 12 indices, and the tint
+/// carries the role so all three colours share one texture.
+///
+/// The sprite is rasterized at the marker's on-glass size in **pixels**
+/// (radius and stroke both scale with `pixels_per_point`), with a one-pixel
+/// coverage ramp at each edge — the same width epaint feathers a path with —
+/// so the disc reads as it did. One texture holds both halves, disc on the
+/// left and ring on the right, so every station in a frame shares a
+/// `TextureId` and the tessellator keeps them in one mesh.
+#[derive(Clone)]
+struct MarkerSprite {
+    texture: egui::TextureHandle,
+    disc_uv: egui::Rect,
+    ring_uv: egui::Rect,
+    /// Half the quad's side in points: the marker's outer radius plus the
+    /// sprite's edge ramp and padding.
+    half_points: f32,
+}
+
+/// Sprites by their pixel size, kept in the context's memory so a handle
+/// outlives the frame that made it — a dropped [`egui::TextureHandle`] frees
+/// its texture.
+#[derive(Clone, Default)]
+struct MarkerSprites(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SpriteKey, MarkerSprite>>>,
+);
+
+/// Radius and stroke in quarter pixels: a zoom ramps the radius continuously,
+/// and a sprite per distinct float would be a texture per frame.
+type SpriteKey = (u32, u32);
+
+/// How many distinct sizes are kept before the set is dropped and rebuilt.
+/// The radius spans 4 to 12 points at a stroke it fixes, so a session at one
+/// scale factor needs a few dozen at most; each is a few kilobytes.
+const MARKER_SPRITE_CAP: usize = 48;
+
+/// The one-pixel ramp plus one pixel of pad, each side.
+const SPRITE_EDGE_PX: f32 = 1.5;
+
+fn marker_sprite(ctx: &egui::Context, shape: MarkerShape) -> MarkerSprite {
+    let ppp = ctx.pixels_per_point();
+    let radius_px = shape.radius * ppp;
+    let stroke_px = shape.stroke * ppp;
+    let key: SpriteKey = (
+        (radius_px * 4.0).round() as u32,
+        (stroke_px * 4.0).round() as u32,
+    );
+    let sprites = ctx.data_mut(|d| {
+        d.get_temp_mut_or_insert_with(
+            egui::Id::new("squallar.site_marker.sprites"),
+            MarkerSprites::default,
+        )
+        .clone()
+    });
+    let mut map = sprites
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sprite) = map.get(&key) {
+        return sprite.clone();
+    }
+    if map.len() >= MARKER_SPRITE_CAP {
+        map.clear();
+    }
+    let radius_px = key.0 as f32 / 4.0;
+    let stroke_px = key.1 as f32 / 4.0;
+    let (image, half_px) = rasterize_marker_sprite(radius_px, stroke_px);
+    let texture = ctx.load_texture(
+        format!("squallar.site_marker.{}.{}", key.0, key.1),
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    let sprite = MarkerSprite {
+        texture,
+        disc_uv: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 1.0)),
+        ring_uv: egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 1.0)),
+        half_points: half_px / ppp,
+    };
+    map.insert(key, sprite.clone());
+    sprite
+}
+
+/// The sprite's pixels: a white disc of `radius_px` in the left square, a white
+/// ring from `radius_px` out to `radius_px + stroke_px` in the right one — the
+/// stroke sits outside the disc, as epaint drew it — each with a one-pixel
+/// coverage ramp. Alpha only; the tint supplies the colour. Returns the image
+/// and half the square's side in pixels.
+fn rasterize_marker_sprite(radius_px: f32, stroke_px: f32) -> (egui::ColorImage, f32) {
+    let outer = radius_px + stroke_px;
+    let side = (2.0 * (outer + SPRITE_EDGE_PX)).ceil().max(2.0) as usize;
+    let half = side as f32 / 2.0;
+    let ramp = |signed_inside: f32| (signed_inside + 0.5).clamp(0.0, 1.0);
+    let mut pixels = Vec::with_capacity(side * side * 2);
+    for y in 0..side {
+        for tile in 0..2 {
+            for x in 0..side {
+                let dx = x as f32 + 0.5 - half;
+                let dy = y as f32 + 0.5 - half;
+                let d = (dx * dx + dy * dy).sqrt();
+                let coverage = if tile == 0 {
+                    ramp(radius_px - d)
+                } else {
+                    ramp((d - radius_px).min(outer - d))
+                };
+                pixels.push(egui::Color32::from_white_alpha(
+                    (coverage * 255.0).round() as u8
+                ));
+            }
+        }
+    }
+    (egui::ColorImage::new([side * 2, side], pixels), half)
 }
 
 /// How badly a station wants the screen its name needs.
