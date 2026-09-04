@@ -83,6 +83,10 @@ pub struct Gui {
     /// the same reason nothing else here is a thread-local: one owner, visible
     /// lifetime, and a test can build its own.
     pub(super) galley_cache: walkers::GalleyCache,
+    /// The point pass's text, kept tessellated per pane and layer between
+    /// frames. Owned here for the same reason the galley memo is: it exists to
+    /// outlive the frame. See [`crate::point_painter::PointTextMeshes`].
+    pub(super) point_text_meshes: crate::point_painter::PointTextMeshes,
     /// The floor-strip cache: per-pane content keys, the all-or-nothing
     /// frame verdict, and the repaint-force latch. See
     /// [`map::FloorStrips`].
@@ -586,6 +590,7 @@ impl Gui {
             color_scale_orientation: ColorScaleOrientation::default(),
             map_pane_geo: HashMap::new(),
             galley_cache: walkers::GalleyCache::default(),
+            point_text_meshes: crate::point_painter::PointTextMeshes::default(),
             floor_strips: map::FloorStrips::default(),
             volume_empty_states: HashMap::new(),
             mirror_size_points: egui::Vec2::ZERO,

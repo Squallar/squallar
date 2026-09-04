@@ -381,6 +381,10 @@ pub(super) struct PaneRenderCtx<'a> {
     /// again on every one of them, and a cache built and dropped inside a
     /// frame would answer nothing. See [`walkers::GalleyCache`].
     pub galley_cache: &'a mut walkers::GalleyCache,
+    /// The point pass's text kept tessellated between frames, per pane and
+    /// layer. Lent for the frame for the same reason the galley memo is. See
+    /// [`crate::point_painter::PointTextMeshes`].
+    pub point_text_meshes: &'a mut crate::point_painter::PointTextMeshes,
     /// The base tile source, taken out of `tiles::MapTileState` for the
     /// frame. `None` while the BasemapTiles layer is off in every visible
     /// pane (the slot is then released — a disabled layer costs zero
@@ -759,9 +763,11 @@ pub(super) fn render_pane_map_content(
                     if mode.draws_points() {
                         selected.extend(render_per_frame_overlay(
                             ctx.galley_cache,
+                            ctx.point_text_meshes,
                             ui,
                             projector,
                             &PerFrameOverlayCtx {
+                                pane_idx: ctx.pane_idx,
                                 overlays: ctx.overlays,
                                 id,
                                 zoom,
@@ -2786,6 +2792,8 @@ fn interpolate_legend_color(thresholds: &[(f32, [u8; 3])], value: f32) -> [u8; 3
 
 /// Context for per-frame point overlay rendering.
 struct PerFrameOverlayCtx<'a> {
+    /// Which pane this is, so a kept mesh is this pane's and no other's.
+    pane_idx: usize,
     overlays: &'a OverlayRegistry,
     id: &'a LayerId,
     zoom: f64,
@@ -2800,6 +2808,7 @@ struct PerFrameOverlayCtx<'a> {
 /// Per-frame rendering for point overlays (e.g. METAR station model plots).
 fn render_per_frame_overlay(
     galleys: &mut walkers::GalleyCache,
+    point_text: &mut crate::point_painter::PointTextMeshes,
     ui: &egui::Ui,
     projector: &walkers::Projector,
     pf: &PerFrameOverlayCtx<'_>,
@@ -2808,6 +2817,14 @@ fn render_per_frame_overlay(
     if points.is_empty() {
         return Vec::new();
     }
+    galleys.begin_frame(ui.ctx());
+    // A layer that rasterizes a picture has already drawn its geometry in
+    // the worker. Asking the registry rather than naming the layer means a
+    // layer that gains a picture stops double-drawing on the frame thread
+    // the moment it does, with nothing here to remember. Asked once for the
+    // layer, not once per point: the registry answers by scanning its
+    // handlers, and the answer does not change between points.
+    let text_only = pf.overlays.job_codec(pf.id).is_some();
 
     let zoom_f32 = pf.zoom as f32;
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
@@ -2837,6 +2854,30 @@ fn render_per_frame_overlay(
     let mut selected = Vec::new();
     let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
 
+    // **When the picture carries the geometry, the text is one kept mesh.**
+    // A station model at the middle zoom tier is two one-to-three glyph
+    // numbers per station; on a one-pane scene that is on the order of a
+    // thousand `TextShape`s a frame, each laid out, added under the context
+    // lock and tessellated again, on a map that has not moved. The text is
+    // a pure function of the layer's data, the zoom, the theme and where the
+    // projector puts each station — everything `PointTextKey` names — so it
+    // is tessellated once per key into a single mesh and re-added while the
+    // key holds. Hit-testing below still walks every point every frame; only
+    // the drawing is kept. A layer without a picture draws as it always did.
+    let key = text_only.then(|| {
+        crate::point_painter::PointTextKey::new(
+            ui.ctx(),
+            projector,
+            expanded,
+            pf.overlays.data_generation(pf.id),
+            zoom_f32,
+            is_dark,
+        )
+    });
+    let kept = key.and_then(|key| point_text.lookup(pf.pane_idx, pf.id, key));
+    let collecting = text_only && kept.is_none();
+    let mut sink: Vec<egui::Shape> = Vec::new();
+
     for pt in points {
         // Fast geo-bounds rejection before the costly projection.
         if !geo_bounds.contains_point(pt.lat, pt.lon) {
@@ -2851,17 +2892,16 @@ fn render_per_frame_overlay(
             continue;
         }
 
-        // A layer that rasterizes a picture has already drawn its geometry in
-        // the worker. Asking the registry rather than naming the layer means a
-        // layer that gains a picture stops double-drawing on the frame thread
-        // the moment it does, with nothing here to remember.
-        let mut ep = EguiPointPainter {
-            painter,
-            center: screen,
-            galleys,
-            text_only: pf.overlays.job_codec(pf.id).is_some(),
-        };
-        pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
+        if !text_only || collecting {
+            let mut ep = EguiPointPainter {
+                painter,
+                center: screen,
+                galleys,
+                text_only,
+                sink: collecting.then_some(&mut sink),
+            };
+            pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
+        }
 
         // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
         if let Some(click_pos) = click_pos {
@@ -2882,6 +2922,20 @@ fn render_per_frame_overlay(
             {
                 closest_hover = Some((d2, pt.id));
             }
+        }
+    }
+
+    if let Some(key) = key {
+        let mesh = match kept {
+            Some(mesh) => mesh,
+            None => {
+                let mesh = crate::point_painter::tessellate_text_shapes(ui.ctx(), sink);
+                point_text.store(pf.pane_idx, pf.id, key, mesh.clone());
+                mesh
+            }
+        };
+        if let Some(mesh) = mesh {
+            painter.add(egui::Shape::Mesh(mesh));
         }
     }
 

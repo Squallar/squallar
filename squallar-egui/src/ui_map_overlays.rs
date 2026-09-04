@@ -785,6 +785,7 @@ pub(super) fn paint_labels(
     if labels.is_empty() {
         return;
     }
+    galleys.begin_frame(painter.ctx());
 
     let mut occupied = walkers::OccupiedAreas::new();
     // Where each name has already been drawn, so a fragmented river is named

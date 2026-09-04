@@ -289,6 +289,9 @@ impl OccupiedAreas {
 #[derive(Default)]
 pub struct GalleyCache {
     pixels_per_point: f32,
+    /// The font atlas as it stood when the table was last checked against it.
+    /// See [`Self::begin_frame`].
+    atlas: AtlasStamp,
     entries: std::collections::HashMap<GalleyKey, std::sync::Arc<egui::Galley>>,
     /// The point-label table, keyed in two levels so a lookup can borrow.
     ///
@@ -394,10 +397,65 @@ impl GalleyCache {
         }
     }
 
+    /// Check the table against egui's font atlas, once per frame.
+    ///
+    /// **A kept galley points into the atlas by pixel position, and egui
+    /// rebuilds the atlas.** `Fonts::begin_pass` replaces the whole atlas when
+    /// it is over 80 % full or the text options change; every glyph is then
+    /// re-rasterized wherever the new cursor puts it, and a galley laid out
+    /// against the old atlas draws the wrong pixels. egui's own galley cache is
+    /// replaced in the same breath, which is why egui never notices; this one
+    /// outlives the pass on purpose and has to look. Grown atlases are dropped
+    /// too — over-invalidation a handful of times as the atlas doubles at
+    /// startup, and nothing after.
+    ///
+    /// Once per frame per caller and not per lookup, because
+    /// `Context::fonts` is a write lock on the whole context.
+    pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        let stamp = AtlasStamp::read(ctx);
+        if stamp.invalidates(self.atlas) {
+            self.drop_all();
+        }
+        self.atlas = stamp;
+    }
+
     fn drop_all(&mut self) {
         self.entries.clear();
         self.points.clear();
         self.points_len = 0;
+    }
+}
+
+/// The font atlas as seen from outside egui: its size and how full it is.
+///
+/// egui exposes no atlas generation. What it does expose moves in a usable
+/// way: between rebuilds the atlas only ever allocates, so its fill ratio is
+/// non-decreasing and its size only grows; a rebuild starts a fresh atlas
+/// whose fill is what this pass alone has placed. A stamp whose fill fell or
+/// whose size changed therefore means glyphs may now sit at other positions.
+/// The one case this cannot see — a rebuild that re-placed the identical glyph
+/// set in the identical order — puts every glyph back where it was, because
+/// allocation is cursor-driven and deterministic, so a mesh or galley kept
+/// across it is still right.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct AtlasStamp {
+    pub size: [usize; 2],
+    pub fill: f32,
+}
+
+impl AtlasStamp {
+    /// One `Context::fonts` read — a write lock on the context; call it once
+    /// per frame, not per lookup.
+    pub fn read(ctx: &egui::Context) -> Self {
+        ctx.fonts(|f| Self {
+            size: f.font_image_size(),
+            fill: f.font_atlas_fill_ratio(),
+        })
+    }
+
+    /// Whether glyph positions recorded under `earlier` may no longer hold.
+    pub fn invalidates(self, earlier: Self) -> bool {
+        self.size != earlier.size || self.fill < earlier.fill
     }
 }
 
@@ -433,6 +491,42 @@ struct GalleyKey {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fallen_atlas_fill_drops_kept_galleys_and_a_risen_one_keeps_them() {
+        let ctx = egui::Context::default();
+        let mut cache = super::GalleyCache::default();
+        ctx.begin_pass(Default::default());
+        {
+            let ctx = &ctx;
+            cache.begin_frame(ctx);
+            let _ = cache.galley_for_point(
+                ctx,
+                "72",
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            assert_eq!(cache.len(), 1);
+            // The same atlas, or one that only allocated more: kept.
+            cache.begin_frame(ctx);
+            assert_eq!(cache.len(), 1);
+            let mut fuller = cache.atlas;
+            fuller.fill += 0.1;
+            assert!(!fuller.invalidates(cache.atlas));
+            // A fresh atlas reads emptier than the one the galley was laid out
+            // against, and everything laid out against the old one goes.
+            let mut rebuilt = cache.atlas;
+            rebuilt.fill = 0.0;
+            assert!(rebuilt.invalidates(cache.atlas));
+            cache.atlas = super::AtlasStamp {
+                size: cache.atlas.size,
+                fill: 1.0,
+            };
+            cache.begin_frame(ctx);
+            assert_eq!(cache.len(), 0, "a fallen fill must drop the table");
+        }
+        let _ = ctx.end_pass();
+    }
+
     use super::*;
     use egui::pos2;
     use std::f32::consts::FRAC_PI_4;
