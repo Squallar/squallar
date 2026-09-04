@@ -4183,17 +4183,17 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
         "an inside-out window was accepted",
     );
 
-    // A value byte: the first value (bytes 169..173) moved decodes and reads
-    // back moved.
+    // A value byte: the first value (bytes 170..174, past the one-byte width
+    // tag that closes the head) moved decodes and reads back moved.
     let mut revalued = bytes;
-    revalued[169..173].copy_from_slice(&123.5f32.to_le_bytes());
+    revalued[170..174].copy_from_slice(&123.5f32.to_le_bytes());
     let model = decoded_model(&revalued).expect("the revalued control decodes");
     match &model {
         squallar_overlays::render::rasterize::GriddedInput::Window(w) => {
             assert_eq!(
                 w.values.get(0),
                 Some(123.5),
-                "bytes 169..173 are not value 0",
+                "bytes 170..174 are not value 0",
             );
         }
         other => panic!("the wire only ever decodes the window form, got {other:?}"),

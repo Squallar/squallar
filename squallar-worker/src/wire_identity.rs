@@ -44,7 +44,7 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     // cull rides the wire.
     "overlay/reports | 200 | 0x8b8cebdb5011dbc0",
     "overlay/glm | 243 | 0xf628cffc30d313df",
-    "overlay/model | 265 | 0x01f0be29a2ccb24f",
+    "overlay/model | 266 | 0xcdf1f34fa989cc4b",
     // Added when METAR left the frame thread: the station geometry — wind
     // barbs, cloud cover, weather symbols — is a picture now, and this row is
     // the twelve observation fields the drawing reads. It lands at the end of
