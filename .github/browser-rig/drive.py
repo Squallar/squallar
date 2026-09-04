@@ -3166,6 +3166,13 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // it cannot say WHICH of the six things the tail does was the event.
 var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame finish (*)` decomposes the frame tail. **Its denominator is not
+// the others': it is recorded for EVERY presented frame, idle included,
+// outside `finalize`'s interacted arm. So its `n` is LARGER than
+// `segment:finish`'s and the two are never added or ratio'd. `finish:whole`
+// is this family's own parent -- the eight cuts telescope to it -- so shares
+// are computable without borrowing another family's count.
+var frame_finish_re = /frame finish \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame segment (pump)` opened up, on `frame post`'s terms exactly: EIGHT
 // contiguous cuts of that ONE span, same denominator (presented interact
 // frames), so their sums telescope to its sum. A DECOMPOSITION, never a
@@ -3222,6 +3229,7 @@ var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
 var frame_pump_all = [];
 var frame_ui_all = [];
+var frame_finish_all = [];
 var frame_worst_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
@@ -3337,6 +3345,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
                                p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_finish_re.exec(m);
+  if (x) frame_finish_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                                 sum: parseInt(x[3], 10), p50: x[4],
+                                 p90: x[5], p99: x[6], hist: x[7] });
   x = frame_dispatch_re.exec(m);
   if (x) frame_dispatch_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                    sum: parseInt(x[3], 10), p50: x[4],
@@ -3396,6 +3408,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_ui_all: frame_ui_all,
          frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
+         frame_finish_all: frame_finish_all,
          frame_dispatch_all: frame_dispatch_all,
          frame_worst_all: frame_worst_all,
          gesture_begins: begins, gesture_loops: loops,
@@ -3518,6 +3531,7 @@ class FrameLineWatcher:
                             ("frame_ui_all", "ui"),
                             ("frame_pump_all", "pump"),
                             ("frame_post_all", "post"),
+                            ("frame_finish_all", "finish"),
                             ("frame_dispatch_all", "dispatch"),
                             ("tile_take_all", "take"),
                             ("tile_phase_all", "phase")):
@@ -3932,7 +3946,7 @@ def _window_stats(watcher, t0, t1, out):
 # arm never produced still has no key, so an absent arm stays an ABSENCE and
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
-                          "ui:", "pump:", "take:", "phase:")
+                          "ui:", "pump:", "finish:", "take:", "phase:")
 
 
 def watcher_named_in(gw):

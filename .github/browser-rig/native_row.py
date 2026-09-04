@@ -556,6 +556,9 @@ def scrape(lines, probes):
         "floor": [],
         "loop_state": [],
         "budget_state": [],
+        # Lines whose marker is present but whose positional regex did not
+        # match -- a reader breakage, kept apart from an absent family.
+        "unparsed": [],
         "tile_cache": [],
         "tile_bodies": [],
         "overlay_pictures": [],
@@ -615,6 +618,15 @@ def scrape(lines, probes):
         if m:
             g = m.groups()
             out["budget_state"].append((idx, g[0], [int(x) for x in g[1:]]))
+        elif "budget state:" in line:
+            # **The line is here and did not parse.** Every group is mandatory
+            # and the pattern is positional, so a field inserted anywhere
+            # before `balloon` stops the match dead. Without this arm that
+            # reads as an EMPTY family, which the row prints as absent, whose
+            # documented meaning is a binary older than the line: a broken
+            # reader would impersonate an old build while every budget figure
+            # silently vanished from a green run. Recorded so it can say so.
+            out["unparsed"].append((idx, "budget_state_re", line.strip()[:200]))
         # `tile cache (<role>)` is running totals with a WORD first, like
         # `budget state`: its own arm, the role kept as text and the fourteen
         # figures after it as ints. No match leaves the family empty, which the
@@ -2420,6 +2432,11 @@ def build_row(args, scraped, probes):
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
         "budget_state": (scraped["budget_state"][-1] if scraped["budget_state"] else None),
+        # Non-empty when a line's marker was present but its regex did not
+        # match. `budget_state: None` with this non-empty means the READER
+        # broke, not that the binary predates the line -- the two used to be
+        # indistinguishable.
+        "unparsed": scraped["unparsed"],
         # `{role: (line, [fourteen ints])}` for the LAST reading of each cache
         # role, or None when the log has no `tile cache (...)` line -- a binary
         # older than the line, kept apart from a cache that recorded nothing.
