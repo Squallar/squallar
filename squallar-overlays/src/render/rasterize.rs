@@ -769,7 +769,7 @@ pub fn rasterize_metar_stations(
     }
 
     RasterizeOutput {
-        rgba: pixmap.take().to_vec(),
+        rgba: pixmap.take(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
     }
