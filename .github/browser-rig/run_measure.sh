@@ -308,7 +308,7 @@ PY=python3
 # worst-frame selector is the p99 verdict's instrument, and one of the pins is
 # structural -- every family the frame watcher ingests must be returned by the
 # probe it polls. Nothing else here executes the rig's Python.
-"$PY" "$RIG_DIR/drive.py" --self-test || { echo "drive.py --self-test FAILED"; exit 1; }
+"$PY" "$RIG_DIR/drive.py" --selftest || { echo "drive.py --selftest FAILED"; exit 1; }
 
 # RIG_COMMIT lets a leg run from an exported bundle that has no .git -- which
 # is how the macOS rows are taken: the tree is copied to the Mac, not cloned.

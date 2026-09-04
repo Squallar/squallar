@@ -2753,6 +2753,8 @@ var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
+var uploads_all = [];
+var rasters_all = [];
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2927,14 +2929,32 @@ for (var i = 0; i < C.length; i++) {
                        dropped: parseInt(rm2[8], 10),
                        superseded: parseInt(rm2[9], 10),
                        cancelled: parseInt(rm2[10], 10) };
+  // Per tick as well as last-wins, for the SAME reason as `uploads_all`: the
+  // picture count of a period is the shared term that a raw
+  // finish-against-bytes correlation cannot divide out.
+  if (rm2) rasters_all.push({ t: C[i].t, dispatched: rasters.dispatched,
+                              arrived: rasters.arrived,
+                              pictures: rasters.pictures,
+                              picture_bytes: rasters.picture_bytes,
+                              inked: rasters.inked, shown: rasters.shown });
   else if (rasters_loose_re.test(m)) rasters_unparsed = m;
   var um = uploads_re.exec(m);
-  if (um) uploads = { deltas: parseInt(um[1], 10),
-                      bytes: parseInt(um[2], 10),
-                      whole_bytes: parseInt(um[3], 10),
-                      bands: parseInt(um[4], 10),
-                      staged_bytes: parseInt(um[5], 10),
-                      blocking_bytes: parseInt(um[6], 10) };
+  if (um) {
+    uploads = { deltas: parseInt(um[1], 10),
+                bytes: parseInt(um[2], 10),
+                whole_bytes: parseInt(um[3], 10),
+                bands: parseInt(um[4], 10),
+                staged_bytes: parseInt(um[5], 10),
+                blocking_bytes: parseInt(um[6], 10) };
+    // KEPT PER TICK as well as last-wins: these running totals are written on
+    // the same 2 s tick as `frame worst:`, so consecutive ticks difference to
+    // the upload VOLUME of exactly the period whose worst frame the matching
+    // worst-tick reports. One scalar at end of run can pair with nothing.
+    uploads_all.push({ t: C[i].t, deltas: uploads.deltas, bytes: uploads.bytes,
+                       whole_bytes: uploads.whole_bytes, bands: uploads.bands,
+                       staged_bytes: uploads.staged_bytes,
+                       blocking_bytes: uploads.blocking_bytes });
+  }
   else if (uploads_loose_re.test(m)) uploads_unparsed = m;
   var bm = basemap_re.exec(m);
   if (bm) basemap = { vector_tiles: parseInt(bm[1], 10),
@@ -3002,6 +3022,7 @@ for (var i = 0; i < C.length; i++) {
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
+         uploads_all: uploads_all, rasters_all: rasters_all,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -3531,6 +3552,8 @@ class RunningTotalsWatcher:
         self.tile_cache = {}
         self.ground = {}
         self.basemap = {}
+        self.uploads = {}
+        self.rasters = {}
 
     def poll(self):
         sig = self.session.execute(WORKER_SIGNAL_PROBE) or {}
@@ -3540,12 +3563,17 @@ class RunningTotalsWatcher:
             self.ground[r.get("t")] = r
         for r in sig.get("basemap_all") or []:
             self.basemap[r.get("t")] = r
+        for r in sig.get("uploads_all") or []:
+            self.uploads[r.get("t")] = r
+        for r in sig.get("rasters_all") or []:
+            self.rasters[r.get("t")] = r
         return sig
 
     def readings(self, family, role=None):
         """Every reading of `family` (optionally of one `role`), oldest first."""
         source = {"tile_cache": self.tile_cache, "ground": self.ground,
-                  "basemap": self.basemap}[family]
+                  "basemap": self.basemap, "uploads": self.uploads,
+                  "rasters": self.rasters}[family]
         rs = [r for r in source.values() if role is None or r.get("role") == role]
         rs.sort(key=lambda r: r.get("t") or 0)
         return rs
@@ -6258,6 +6286,8 @@ def selftest():
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
     failures += selftest_export_window()
+    if selftest_worst_frame_window():
+        failures.append("worst-frame window selector (see [self-test] lines)")
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -7027,6 +7057,15 @@ def run_smoke(args):
         result["frame_worst_all"] = sorted(
             {r["t"]: r for r in getattr(frames_watch, "worst", [])
              if r.get("t") is not None}.values(), key=lambda r: r["t"])
+        # The running upload totals per tick, on the SAME 2 s tick as the
+        # worst-frame line, so the two difference to one period each: the
+        # upload volume of the period whose worst frame that tick reports.
+        result["texture_upload_all"] = sorted(
+            (r for r in getattr(totals_watch, "uploads", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
+        result["overlay_raster_all"] = sorted(
+            (r for r in getattr(totals_watch, "rasters", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
@@ -7921,13 +7960,26 @@ class _FixtureWatcher:
         return []
 
 
-def self_test(window_stats=None):
+def selftest_worst_frame_window(window_stats=None):
     """Executable pins on the windowed worst-frame selector -- the p99
     verdict's own instrument. Run by `--self-test` (and by run_tier2.sh before
     any leg), because nothing else in this rig executes Python under test and a
     selector that silently returns None has already cost two Mac legs. Takes
     the function under test so the same fixture can be pointed at an older
-    drive.py to show it red. Returns the number of failed pins."""
+    drive.py to show it red. Returns the number of failed pins.
+
+    SEAMS COVERED, and no others: the host-side window selector's arithmetic
+    (Python fixtures, no JS engine anywhere in this function); the
+    probe-to-watcher seam (a family a watcher ingests must be a return key of
+    the probe it polls); and the declaration-to-return seam (a probe must not
+    return a bare name it never declares). It does NOT execute the embedded
+    JavaScript, so a scrape that parses and then throws on a real line shape
+    is outside it -- that is the JS execution gate's seam, and neither gate
+    subsumes the other. A static check of a dynamic language can also
+    over-fire, which this one did on first write by reading only the first
+    declarator of `var a = [], b = null;`; an execution check cannot over-fire
+    on that particular question, and cannot see it without reaching the
+    return path."""
     ws_fn = window_stats or _window_stats
     failed = 0
 
@@ -8026,14 +8078,57 @@ def self_test(window_stats=None):
                     bool(text) and not missing)
         pin("the audit found watchers to audit at all", audited >= 2)
 
+        # Today's other cross-artefact break, from the other side: a probe
+        # returning a name it never declares. A half-applied edit added
+        # `uploads_all:` to the return without its `var`, every pin stayed
+        # green (they check ingest-against-return, not return-against-declare)
+        # and the browser answered `ReferenceError: uploads_all is not
+        # defined` at the first stage that ran the probe.
+        for name, text in sorted(probes.items()):
+            ret = text.rfind("return {")
+            if ret < 0:
+                continue
+            names = set(re.findall(r"[\n,{]\s*([a-z_][a-z0-9_]*): ", text[ret:]))
+            # `var a = [], b = null, c;` declares three, so the whole
+            # statement is split rather than its first declarator taken --
+            # reading only the first is how this pin first over-fired on
+            # eleven healthy names, and an over-firing gate is the worse
+            # direction: it blocks measurement instead of allowing a defect.
+            declared = set(re.findall(r"\bfunction\s+([a-z_][a-z0-9_]*)", text))
+            for stmt in re.findall(r"\bvar\s+([^;]*);", text):
+                depth = 0
+                buf = ""
+                parts = []
+                for ch in stmt:
+                    if ch in "([{":
+                        depth += 1
+                    elif ch in ")]}":
+                        depth -= 1
+                    if ch == "," and depth == 0:
+                        parts.append(buf)
+                        buf = ""
+                    else:
+                        buf += ch
+                parts.append(buf)
+                for part in parts:
+                    m2 = re.match(r"\s*([a-z_][a-z0-9_]*)", part)
+                    if m2:
+                        declared.add(m2.group(1))
+            # A key whose value is a literal or an expression is not a bare
+            # name reference, so only same-name pairs are checked: `foo: foo`.
+            same = {k for k in names
+                    if re.search(r"[\n,{]\s*%s: %s\s*[,}\n]" % (k, k), text[ret:])}
+            missing = sorted(k for k in same if k not in declared)
+            if missing:
+                pin("%s returns only names it declares (missing: %s)"
+                    % (name, ", ".join(missing)), False)
+        pin("every probe returns only names it declares", True)
+
     print("[self-test] %d pin(s) failed" % failed)
     return failed
 
 
 def main(argv=None):
-    # The executable pins, before argparse can object to the missing --browser.
-    if "--self-test" in (sys.argv[1:] if argv is None else argv):
-        return 1 if self_test() else 0
     ap = LoudArgumentParser(
         description="headless WebDriver smoke/measurement rig for squallar-web")
     ap.add_argument("--browser", choices=("chromium", "firefox", "safari"))
