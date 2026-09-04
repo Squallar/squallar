@@ -130,11 +130,30 @@ pub mod fetch;
 pub mod fields;
 pub mod staging;
 
-/// One mosaic's shape, in points: 3000 x 5000.
+/// **The mosaic shape this build's byte budgets are sized for**, in points:
+/// 3000 x 5000. A nominal figure, deliberately kept, and **not a claim about
+/// what the product publishes today**.
 ///
-/// The one definition. The handler's byte budgets and the staging pool's slot
-/// are both derived from it, so a product whose grid changes shape moves them
-/// together or not at all.
+/// It was written as "the one definition" of the product's shape, and it is
+/// not one: every GMGSI granule dated 2026-09-03 is `[1, 3000, 4999]` on all
+/// four channels (LW, SW, VIS, WV), against `[1, 3000, 5000]` on the 2025-06
+/// and 2026-07 granules. The product's grid width moved and no build failed,
+/// because nothing here is a shape the decoder enforces — [`decode::decode_in`]
+/// reads `nj` and `ni` off the granule's own `data` variable.
+///
+/// **What it still means.** `GLOBAL_GRID_BYTES` (and through it
+/// `GRID_CACHE_BYTES` and `FRAME_STAGING_BYTES`) is `GRID_POINTS` times four,
+/// so this is the size one resident channel is priced at. A 4999-wide mosaic is
+/// 59,988,000 B against the 60,000,000 B priced here: **12,000 B per grid, over
+/// a budget of four of them**, so it over-provisions by 0.02 % and nothing is
+/// under-counted. Held at the round shape on purpose — a budget that follows a
+/// product's width from release to release buys nothing and moves four
+/// `const _` pins every time it does.
+///
+/// **What it no longer means.** It is not the staging pool's capacity. That is
+/// discovered at runtime from the granule being decoded; [`staging`] and
+/// [`crate::staging`] carry the account. A reader who needs the shape a granule
+/// actually has must read it off the granule.
 pub const GRID_POINTS: usize = 3000 * 5000;
 
 /// The four channels of the mosaic.

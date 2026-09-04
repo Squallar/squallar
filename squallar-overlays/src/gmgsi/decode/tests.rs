@@ -716,3 +716,105 @@ fn a_granule_storing_different_coordinate_arrays_is_read_and_gets_its_own_axes()
     assert_eq!(cache.totals(), AxisCacheTotals { hits: 0, misses: 6 });
     assert_eq!(axes(&again).0.len(), SYN_NY);
 }
+
+// -- The staging slot, through the decode ------------------------------------
+
+/// **A granule whose shape is not the constant the pool was declared with is
+/// still decoded into the retained buffer.**
+///
+/// This is the shipping defect at the level it actually bites: not a buffer
+/// handed to a pool by a test, but `decode_in` taking a buffer for the shape
+/// it read off `data` and handing it back afterwards. Every GMGSI granule
+/// dated 2026-09-03 is `[1, 3000, 4999]` against a pool declared at
+/// `3000 * 5000`, so before the shape key every one of them allocated a fresh
+/// 60 MB block and every recycle was refused. The synthetic granule stands in
+/// for that here because it can be built in a test; what makes it the same
+/// case is only that its point count is not [`crate::gmgsi::GRID_POINTS`].
+///
+/// Observed red before the fix: `allocated` 2, `reused` 0, `declined` 1.
+#[test]
+fn a_granule_that_is_not_the_declared_shape_is_decoded_into_the_retained_buffer() {
+    let separable = |j: usize, i: usize, ny: usize, _nx: usize| {
+        (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
+    };
+    // A pool declared exactly as the shipped one is, so the only thing this
+    // test changes is the shape of the granule going through it.
+    let pool: crate::gmgsi::staging::StagingPool =
+        crate::gmgsi::staging::StagingPool::new(crate::gmgsi::staging::STAGING_POINTS);
+    let cache = AxisCache::new();
+    assert_ne!(
+        SYN_NY * SYN_NX,
+        pool.nominal_points(),
+        "premise: the granule's shape is not the one the pool was declared for",
+    );
+
+    let first = decode_in(
+        synthetic_granule(separable),
+        GmgsiChannel::LongwaveIr,
+        &pool,
+        &cache,
+    )
+    .expect("a separable granule decodes");
+    assert_eq!(
+        pool.totals().allocated,
+        1,
+        "premise: the first granule of a process has nothing to be handed",
+    );
+    let crate::render::gridded::GridValues::F32(raster) = &first.grid.values else {
+        panic!("a GMGSI raster is f32");
+    };
+    assert_eq!(raster.len(), SYN_NY * SYN_NX);
+    let address = raster.as_ptr() as usize;
+
+    // The eviction the frame cache performs on the next arrival.
+    crate::gmgsi::staging::recycle(&pool, first.grid);
+    assert_eq!(
+        pool.totals().declined,
+        0,
+        "the decode's own buffer must reach the slot: it is the shape the \
+         product publishes, whatever the constant says",
+    );
+    assert_eq!(pool.retained_points(), SYN_NY * SYN_NX);
+
+    let second = decode_in(
+        synthetic_granule(separable),
+        GmgsiChannel::LongwaveIr,
+        &pool,
+        &cache,
+    )
+    .expect("a separable granule decodes");
+    assert_eq!(
+        pool.totals(),
+        crate::gmgsi::staging::StagingTotals {
+            allocated: 1,
+            reused: 1,
+            declined: 0
+        },
+        "the second granule must be decoded into the first one's block",
+    );
+    assert_eq!(
+        pool.health(),
+        crate::gmgsi::staging::StagingHealth::Reusing,
+        "and the pool must read as working",
+    );
+    let crate::render::gridded::GridValues::F32(reused) = &second.grid.values else {
+        panic!("a GMGSI raster is f32");
+    };
+    assert_eq!(
+        reused.as_ptr() as usize,
+        address,
+        "and it must be the same block, not a fresh one of the same size: a \
+         pool that reallocated would satisfy every count above and leave the \
+         fragmentation it exists to remove exactly as it was",
+    );
+    assert_eq!(
+        reused.len(),
+        SYN_NY * SYN_NX,
+        "with the decode's own values in it and nothing inherited",
+    );
+    assert!(
+        reused.iter().all(|v| (*v - 50.0).abs() < 1e-5),
+        "the synthetic granule's `data` is 50.0 everywhere; a value that is \
+         not is content the decode did not write",
+    );
+}

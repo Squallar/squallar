@@ -25,14 +25,21 @@ use std::sync::Arc;
 
 use crate::render::gridded::{GridValues, ResidentGrid};
 
-/// How many `f32` one staged mosaic holds — [`super::GRID_POINTS`], the one
-/// definition of the product's shape.
+/// **The mosaic width this build's budgets were sized for**, in `f32` —
+/// [`super::GRID_POINTS`].
+///
+/// **Not the slot's capacity.** It was, and that was the defect: the product
+/// now publishes `[1, 3000, 4999]` and a slot keyed on 15,000,000 reused
+/// nothing and accepted nothing back. [`crate::staging`] takes its one capacity
+/// from the granule that hands a buffer back, and this figure is what it
+/// reports as [`crate::staging::StagingPool::nominal_points`] — the reference a
+/// [`crate::staging::StagingPool::retained_points`] reading is compared against.
 pub const STAGING_POINTS: usize = super::GRID_POINTS;
 
-/// The pool over one GMGSI mosaic, by element and by count.
+/// The pool over one GMGSI mosaic, by element.
 pub type StagingPool = crate::staging::StagingPool<f32>;
 
-pub use crate::staging::StagingTotals;
+pub use crate::staging::{StagingHealth, StagingTotals};
 
 /// The process-wide staging area — what every shipped decode uses.
 ///
