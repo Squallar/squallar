@@ -47,6 +47,8 @@ fn metar_client(
 #[derive(Debug)]
 pub(crate) struct MetarItem {
     pub ob: MetarOb,
+    /// Formatted once here, read every frame. See [`station_model::StationText`].
+    pub text: station_model::StationText,
 }
 
 impl OverlayItem for MetarItem {
@@ -323,7 +325,10 @@ impl OverlayHandler for MetarHandler {
                 let items = round
                     .observations
                     .into_iter()
-                    .map(|ob| Arc::new(MetarItem { ob }))
+                    .map(|ob| {
+                        let text = station_model::StationText::of(&ob);
+                        Arc::new(MetarItem { ob, text })
+                    })
                     .collect();
                 self.state.set_data_with_coverage(items, coverage);
             }
@@ -379,7 +384,7 @@ impl OverlayHandler for MetarHandler {
 
     fn draw_point(&self, id: u32, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
         if let Some(item) = self.state.data.get(id as usize) {
-            station_model::draw_metar_station(&item.ob, painter, ctx);
+            station_model::draw_metar_station(&item.ob, &item.text, painter, ctx);
         }
     }
 
@@ -586,7 +591,8 @@ mod tests {
             speed: SpeedUnit::Knots,
             ..Default::default()
         };
-        MetarItem { ob }
+        let text = station_model::StationText::of(&ob);
+        MetarItem { ob, text }
             .popup_content(&prefs)
             .sections
             .into_iter()

@@ -1749,8 +1749,18 @@ mod tests {
             };
             let mut a = CallLog::default();
             let mut b = CallLog::default();
-            station_model::draw_metar_station(&full, &mut a, &ctx);
-            station_model::draw_metar_station(&stripped, &mut b, &ctx);
+            station_model::draw_metar_station(
+                &full,
+                &station_model::StationText::of(&full),
+                &mut a,
+                &ctx,
+            );
+            station_model::draw_metar_station(
+                &stripped,
+                &station_model::StationText::of(&stripped),
+                &mut b,
+                &ctx,
+            );
             assert_eq!(
                 a, b,
                 "at zoom {zoom} the station model read a field the wire does \

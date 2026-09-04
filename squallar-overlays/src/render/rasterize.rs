@@ -739,7 +739,10 @@ pub fn rasterize_metar_stations(
                 pixmap: &mut pixmap,
                 center: (px, py),
             };
-            crate::render::station_model::draw_metar_station(ob, &mut painter, &ctx);
+            // Text is a no-op in this painter, but the draw still asks for
+            // it; building it here is per station per PICTURE, in the worker.
+            let text = crate::render::station_model::StationText::of(ob);
+            crate::render::station_model::draw_metar_station(ob, &text, &mut painter, &ctx);
         }
         // The station's position in the input list **is** its id, the same
         // contract `hit_items` is index-aligned against. Stepped by 4 because

@@ -53,7 +53,43 @@ fn pressure_code(mslp_hpa: Option<f64>) -> Option<i32> {
 
 // ── Public entry point ────────────────────────────────────────────────────
 
-pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
+/// The station model's text, formatted ONCE per observation.
+///
+/// These five strings are pure functions of the observation; zoom only decides
+/// whether each is drawn. Formatting them inside the draw meant `format!` ran
+/// per station per frame — 799 stations at 175 Hz — and a `perf` profile on the
+/// live panel put `core::num::flt2dec::strategy::dragon::format_exact` and
+/// `Big32x40::mul_pow2` at 2.05 % of the whole app: Rust's SLOW float formatter,
+/// on the frame thread, for observations that change every twenty minutes.
+///
+/// Built at fetch and held on the item, so the frame thread reads and the
+/// worker (which has the decoded observation and no item) builds its own, once
+/// per station per picture, off the frame thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationText {
+    pub temp_f: Option<String>,
+    pub dewp_f: Option<String>,
+    pub pressure_code: Option<String>,
+    pub visibility: Option<String>,
+}
+
+impl StationText {
+    pub fn of(ob: &MetarOb) -> Self {
+        Self {
+            temp_f: ob.temp_c.map(|tc| format!("{:.0}", tc * 9.0 / 5.0 + 32.0)),
+            dewp_f: ob.dewp_c.map(|td| format!("{:.0}", td * 9.0 / 5.0 + 32.0)),
+            pressure_code: pressure_code(ob.mslp_hpa).map(|code| format!("{code:03}")),
+            visibility: ob.visibility.map(|vis| vis.label()),
+        }
+    }
+}
+
+pub fn draw_metar_station(
+    ob: &MetarOb,
+    text: &StationText,
+    painter: &mut dyn PointPainter,
+    ctx: &DrawPointContext,
+) {
     let zoom = ctx.zoom;
     let fc_color = flight_category_color(ob.flight_category);
     let text_color = if ctx.is_dark {
@@ -72,22 +108,20 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     }
 
     // ── Tier 2 ────────────────────────────────────────────────────────
-    if let Some(tc) = ob.temp_c {
-        let tf = tc * 9.0 / 5.0 + 32.0;
+    if let Some(tf) = &text.temp_f {
         painter.text(
             TEMP_OFFSET,
-            &format!("{tf:.0}"),
+            tf,
             text_color,
             font_size,
             TextAnchor::BottomRight,
         );
     }
 
-    if let Some(td) = ob.dewp_c {
-        let tdf = td * 9.0 / 5.0 + 32.0;
+    if let Some(tdf) = &text.dewp_f {
         painter.text(
             DEWP_OFFSET,
-            &format!("{tdf:.0}"),
+            tdf,
             text_color,
             font_size,
             TextAnchor::TopRight,
@@ -101,20 +135,20 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     }
 
     // ── Tier 3 ────────────────────────────────────────────────────────
-    if let Some(code) = pressure_code(ob.mslp_hpa) {
+    if let Some(code) = &text.pressure_code {
         painter.text(
             PRESSURE_OFFSET,
-            &format!("{code:03}"),
+            code,
             text_color,
             font_size * 0.85,
             TextAnchor::BottomLeft,
         );
     }
 
-    if let Some(vis) = ob.visibility {
+    if let Some(vis) = &text.visibility {
         painter.text(
             VIS_OFFSET,
-            &vis.label(),
+            vis,
             text_color,
             font_size * 0.85,
             TextAnchor::CenterRight,
@@ -640,6 +674,57 @@ mod tests {
     use crate::metar::types::Visibility;
     use squallar_units::{SpeedUnit, UserPreferences};
 
+    /// **The precomputed text is exactly what the inline `format!`s produced.**
+    ///
+    /// The formatting moved from the draw (per station, per frame) to
+    /// `StationText::of` (per observation, once). That is a refactor of
+    /// user-visible strings, so the old spellings are pinned here as LITERALS
+    /// rather than re-derived: `{:.0}` of the Fahrenheit conversion, `{:03}` of
+    /// `(mslp * 10).round() % 1000`, and `Visibility::label`'s `{:.0}`/`{:.1}`
+    /// with its `+`. A change to any of them — precision, rounding, the
+    /// `+` — reads as a different station on the glass, and this is the one
+    /// place that would say so.
+    #[test]
+    fn the_precomputed_text_is_what_the_draw_used_to_format() {
+        let mut o = ob(None);
+        o.temp_c = Some(21.5); // 70.7 F
+        o.dewp_c = Some(-3.5); // 25.7 F
+        o.mslp_hpa = Some(1011.8); // 10118 % 1000
+        o.visibility = Some(Visibility {
+            miles: 10.0,
+            or_greater: true,
+        });
+        assert_eq!(
+            StationText::of(&o),
+            StationText {
+                temp_f: Some("71".into()),
+                dewp_f: Some("26".into()),
+                pressure_code: Some("118".into()),
+                visibility: Some("10+".into()),
+            },
+        );
+
+        let mut o = ob(None);
+        o.temp_c = None;
+        o.dewp_c = Some(0.0); // exactly 32 F
+        o.mslp_hpa = Some(999.96); // 9999.6 -> 10000 % 1000 = 0 -> "000"
+        o.visibility = Some(Visibility {
+            miles: 2.5,
+            or_greater: false,
+        });
+        assert_eq!(
+            StationText::of(&o),
+            StationText {
+                temp_f: None,
+                dewp_f: Some("32".into()),
+                pressure_code: Some("000".into()),
+                visibility: Some("2.5".into()),
+            },
+            "the zero-padded pressure group and the fractional visibility are \
+             the two spellings a naive reformat gets wrong",
+        );
+    }
+
     #[derive(Default)]
     struct RecordingPainter {
         texts: Vec<String>,
@@ -744,7 +829,7 @@ mod tests {
         o.altimeter_hpa = Some(1010.16);
         o.mslp_hpa = None;
         let mut p = RecordingPainter::default();
-        draw_metar_station(&o, &mut p, &tier3());
+        draw_metar_station(&o, &StationText::of(&o), &mut p, &tier3());
         assert!(
             !p.texts.iter().any(|t| t.len() == 3 && t.starts_with('0')),
             "no three-digit pressure code may be drawn without an MSLP, got {:?}",
@@ -758,7 +843,7 @@ mod tests {
         o.altimeter_hpa = Some(1010.16);
         o.mslp_hpa = Some(1008.2);
         let mut p = RecordingPainter::default();
-        draw_metar_station(&o, &mut p, &tier3());
+        draw_metar_station(&o, &StationText::of(&o), &mut p, &tier3());
         assert!(
             p.texts.iter().any(|t| t == "082"),
             "expected the conventional code 082, got {:?}",
@@ -824,7 +909,8 @@ mod tests {
             zoom: 12.0,
             is_dark: true,
         };
-        draw_metar_station(&ob(vis), &mut p, &ctx);
+        let o = ob(vis);
+        draw_metar_station(&o, &StationText::of(&o), &mut p, &ctx);
         p
     }
 
