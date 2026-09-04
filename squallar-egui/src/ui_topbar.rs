@@ -485,9 +485,46 @@ impl super::Gui {
 /// What the left-hand run's roomy form needs, measured from the real galleys at the
 /// real style — no width constant to drift from the fonts, and nothing for a theme
 /// change to silently invalidate.
+/// One measured run width and the signature it was measured under.
+#[derive(Clone)]
+struct RoomyWidth {
+    signature: u64,
+    width: f32,
+}
+
 fn roomy_run_width(ui: &egui::Ui, pane_count: usize) -> f32 {
     let body = egui::TextStyle::Body.resolve(ui.style());
     let button_font = egui::TextStyle::Button.resolve(ui.style());
+    // Signature-memoised on the house pattern (see `legend_ramp::ramp`),
+    // because the run below shapes a galley per label -- the wordmark, two
+    // buttons, every pane-count digit, and at more than one pane every split
+    // label and pane index, fifteen to twenty of them -- to answer one
+    // comparison against the available width. The answer moves only when the
+    // two fonts, the button padding or the pane count move, all of which are
+    // rare -- the SCALE is deliberately not in it, because a galley's
+    // `size().x` is points and does not move with `pixels_per_point`, and it was being recomputed every frame: `ui:topbar`
+    // measured 285 us mean on a 4757 us median frame (Mac 60 Hz, Firefox,
+    // scene D, n=107). A font DEFINITION swapped underneath an unchanged
+    // `FontId` is not in the signature and would be missed; nothing in this
+    // app does that outside boot, and the alternative is hashing the font
+    // atlas every frame to save fifteen galleys.
+    let signature = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        pane_count.hash(&mut h);
+        body.size.to_bits().hash(&mut h);
+        body.family.hash(&mut h);
+        button_font.size.to_bits().hash(&mut h);
+        button_font.family.hash(&mut h);
+        ui.spacing().button_padding.x.to_bits().hash(&mut h);
+        h.finish()
+    };
+    let slot = egui::Id::new("top_bar_roomy_run_width");
+    if let Some(memo) = ui.ctx().data(|d| d.get_temp::<RoomyWidth>(slot))
+        && memo.signature == signature
+    {
+        return memo.width;
+    }
     let text = |font: &egui::FontId, s: &str| -> f32 {
         ui.painter()
             .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
@@ -516,7 +553,10 @@ fn roomy_run_width(ui: &egui::Ui, pane_count: usize) -> f32 {
             widths.push(text(&button_font, &format!("{}", i + 1)) + button_pad);
         }
     }
-    widths.iter().sum::<f32>() + ROOMY_ITEM_SPACING * widths.len() as f32
+    let width = widths.iter().sum::<f32>() + ROOMY_ITEM_SPACING * widths.len() as f32;
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(slot, RoomyWidth { signature, width }));
+    width
 }
 
 /// The wordmark: SQUALLAR with the accent on "AR".
@@ -542,4 +582,80 @@ fn render_wordmark(ui: &mut egui::Ui) {
         },
     );
     ui.label(job);
+}
+
+#[cfg(test)]
+mod roomy_width_memo_tests {
+    /// A `Ui` on a live context, the shape `ui_map_overlays`'s tests use.
+    fn ui_on(ctx: &egui::Context) -> egui::Ui {
+        egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("roomy_width_memo_test"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(2000.0, 40.0),
+                )),
+        )
+    }
+
+    /// The memo must not outlive what it was measured under. Pane count is the
+    /// input that moves in normal use -- every pane adds a numbered button to
+    /// the run -- so a stale answer here would misjudge roomy against compact
+    /// for the rest of the session. Two counts, two widths, and the second is
+    /// the wider because it carries more buttons.
+    #[test]
+    fn the_memo_is_rebuilt_when_the_pane_count_moves() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        let ui = ui_on(&ctx);
+        let one = super::roomy_run_width(&ui, 1);
+        let four = super::roomy_run_width(&ui, 4);
+        let one_again = super::roomy_run_width(&ui, 1);
+        let _ = ctx.end_pass();
+        assert!(
+            four > one,
+            "four panes carry more buttons than one, so the run is wider: \
+             one={one} four={four}"
+        );
+        assert_eq!(
+            one, one_again,
+            "the same pane count must give the same width, memo or not"
+        );
+    }
+
+    /// The other half: a signature input that is NOT the pane count. Text size
+    /// is the one a user can move at runtime, and every measured galley moves
+    /// with it, so a memo keyed only on pane count would answer for the old
+    /// font for the rest of the session.
+    ///
+    /// The SCALE is deliberately absent from both the signature and this test:
+    /// a galley's `size().x` is in points, so `pixels_per_point` does not move
+    /// this width, and a signature input that cannot change the answer is an
+    /// invalidation nobody can justify. Checked, not assumed -- an earlier
+    /// version of this test asserted the opposite and went red.
+    #[test]
+    fn the_memo_is_rebuilt_when_the_text_size_moves() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        let ui = ui_on(&ctx);
+        let small = super::roomy_run_width(&ui, 2);
+        let _ = ctx.end_pass();
+
+        ctx.all_styles_mut(|style| {
+            for font in style.text_styles.values_mut() {
+                font.size *= 2.0;
+            }
+        });
+        ctx.begin_pass(egui::RawInput::default());
+        let ui = ui_on(&ctx);
+        let large = super::roomy_run_width(&ui, 2);
+        let _ = ctx.end_pass();
+        assert!(
+            large > small,
+            "doubled text is a wider run, and a memo that missed it would \
+             answer for the old font: small={small} large={large}"
+        );
+    }
 }
