@@ -684,6 +684,65 @@ fn a_static_viewport_uploads_each_tile_once_however_many_frames_it_draws() {
     );
 }
 
+/// **A frame of many ground draws writes the uniform ring once.**
+///
+/// The per-draw `queue.write_buffer` this replaced was half of
+/// `update_buffers` on the scene-D profile (see `PlacementBatch`). Sixty-two
+/// callbacks — that scene's per-pass draw count — are placed in one frame; the
+/// store must have laid sixty-two placements and made exactly one ring write,
+/// and the picture must still be that of the same draws placed on the CPU.
+/// The picture is the control for the count: the store is fresh, so a slot
+/// the batch failed to write reads as zeros — a scale of zero, a draw
+/// collapsed to a point — and the compare reddens.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_frame_of_many_ground_draws_writes_the_ring_once() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    const DRAWS: u64 = 62;
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+    let meshes = flat();
+    let shapes: Vec<egui::Shape> = (0..DRAWS)
+        .flat_map(|_| callback_shapes(&meshes, 0))
+        .collect();
+    assert_eq!(
+        shapes.len() as u64,
+        DRAWS,
+        "the fixture is one run per callback"
+    );
+
+    let gpu = frame(&device, &queue, &mut renderer, format, shapes);
+    let cpu = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        (0..DRAWS).flat_map(|_| cpu_shape(&meshes)).collect(),
+    );
+    assert!(
+        painted(&gpu) > (SIDE * SIDE / 4) as usize,
+        "the batched frame painted too little for a match to mean anything"
+    );
+    assert_eq!(
+        gpu, cpu,
+        "the batched placements do not draw the picture of the same draws placed          on the CPU"
+    );
+
+    let store = renderer
+        .callback_resources
+        .get::<TileMeshStore>()
+        .expect("the store is installed");
+    assert_eq!(
+        store.placement_writes(),
+        (DRAWS, 1),
+        "{DRAWS} ground draws in one pass were not one ring write"
+    );
+}
+
 /// **Residency ends with the tile, and the bytes come back.**
 ///
 /// The tile cache owns the flattened buffers; the store holds a weak handle

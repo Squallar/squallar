@@ -30,13 +30,20 @@
 //! # The uniform ring
 //!
 //! Every draw needs its own placement, and `paint` takes `&self` — so the
-//! slot cannot be handed over through the store. It is written in `prepare`,
+//! slot cannot be handed over through the store. It is claimed in `prepare`,
 //! which runs for **every** callback of a frame before **any** of them paints
-//! (`Renderer::update_buffers` dispatches all the prepares; `Renderer::render`
-//! runs afterwards), and remembered on the callback in an [`AtomicU32`]. The
-//! ring is monotonic and wraps, so no frame boundary has to be found: a slot
-//! is written and read inside one frame, and [`RING_SLOTS`] is the bound on
-//! how many ground draws one frame may make before slots would alias.
+//! (`Renderer::update_buffers` dispatches all the prepares, then all the
+//! `finish_prepare`s; `Renderer::render` runs afterwards), and remembered on
+//! the callback in an [`AtomicU32`]. The ring is monotonic and wraps, so no
+//! frame boundary has to be found: a slot is written and read inside one
+//! frame, and [`RING_SLOTS`] is the bound on how many ground draws one frame
+//! may make before slots would alias.
+//!
+//! The bytes reach the ring **once per pass, not once per draw**: `prepare`
+//! lays each placement into a [`PlacementBatch`], and the first
+//! `finish_prepare` of the pass writes the whole contiguous range with one
+//! `queue.write_buffer`. See [`PlacementBatch`] for what a per-draw write
+//! cost.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -120,6 +127,72 @@ fn locals_bytes(
     out
 }
 
+/// One pass's placements, gathered so the ring is written once per pass
+/// rather than once per draw.
+///
+/// `queue.write_buffer` is not a memcpy. wgpu creates a staging buffer per
+/// call, maps it, records the copy, and destroys the staging buffer at a later
+/// device poll. At the sixty-odd ground draws a frame of scene D makes
+/// (`ground tiles:` draws over `frame prep costs:` passes, 2026-09-04) that
+/// was sixty-odd allocations and sixty-odd deferred destroys per frame, and
+/// `TileMeshCallback::prepare` was half of `update_buffers` on the profile —
+/// 4.25 of 8.55 percent of main-thread samples, Linux, scene D, 174.96 Hz —
+/// with the destroys landing under the geometry staging ring's poll.
+///
+/// Slots are consecutive until the ring wraps, so a pass's placements are one
+/// contiguous byte range: each is padded to the slot stride and the range goes
+/// out as one write. A wrap inside a pass splits it into two, the second
+/// starting at slot zero.
+struct PlacementBatch {
+    stride: u32,
+    /// The next slot to hand out.
+    cursor: u32,
+    /// The slot `bytes` begins at.
+    first: u32,
+    /// The gathered placements, each padded to `stride`.
+    bytes: Vec<u8>,
+}
+
+impl PlacementBatch {
+    fn new(stride: u32) -> Self {
+        Self {
+            stride,
+            cursor: 0,
+            first: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    /// Take the next slot for `locals`. When the ring wraps behind it the
+    /// gathered range is no longer contiguous with the next slot, so it goes
+    /// out through `write` now; otherwise it waits for [`Self::flush`].
+    fn push(&mut self, locals: [u8; LOCALS_BYTES as usize], write: impl FnOnce(u64, &[u8])) -> u32 {
+        let slot = self.cursor;
+        if self.bytes.is_empty() {
+            self.first = slot;
+        }
+        self.bytes.extend_from_slice(&locals);
+        let padded = self.bytes.len() + (self.stride as usize - LOCALS_BYTES as usize);
+        self.bytes.resize(padded, 0);
+        self.cursor = (self.cursor + 1) % RING_SLOTS;
+        if self.cursor == 0 {
+            self.flush(write);
+        }
+        slot
+    }
+
+    /// Hand the gathered range to `write` as one ring write — the byte offset
+    /// and the bytes — if there is one. Answers whether a write went out.
+    fn flush(&mut self, write: impl FnOnce(u64, &[u8])) -> bool {
+        if self.bytes.is_empty() {
+            return false;
+        }
+        write(u64::from(self.first) * u64::from(self.stride), &self.bytes);
+        self.bytes.clear();
+        true
+    }
+}
+
 /// One tile's fills, resident on the GPU.
 struct Resident {
     /// The fill buffer pair and the stroke buffer pair — each absent for a
@@ -148,7 +221,7 @@ pub struct TileMeshStore {
     /// Bytes between two ring slots — the adapter's uniform offset alignment,
     /// never smaller than one [`Locals`].
     stride: u32,
-    cursor: u32,
+    batch: PlacementBatch,
     dithering: bool,
     resident: HashMap<u64, Resident>,
     resident_bytes: u64,
@@ -157,6 +230,11 @@ pub struct TileMeshStore {
     /// assert on without another test in the same process moving them.
     uploads: u64,
     upload_bytes: u64,
+    /// Placements laid into the ring, and the `write_buffer` calls that
+    /// carried them. The second is what shows the ring is written per pass
+    /// and not per draw; see [`PlacementBatch`].
+    placements: u64,
+    ring_writes: u64,
     /// The pass the last sweep ran for, so the sweep is once per frame rather
     /// than once per draw.
     swept_pass: Option<u64>,
@@ -290,12 +368,14 @@ impl TileMeshStore {
             bind_group,
             ring,
             stride,
-            cursor: 0,
+            batch: PlacementBatch::new(stride),
             dithering,
             resident: HashMap::new(),
             resident_bytes: 0,
             uploads: 0,
             upload_bytes: 0,
+            placements: 0,
+            ring_writes: 0,
             swept_pass: None,
         }
     }
@@ -363,17 +443,38 @@ impl TileMeshStore {
         ledger::set_mesh_resident_bytes(self.resident_bytes);
     }
 
-    /// Write one draw's placement into the ring and answer which slot it went
-    /// in.
+    /// Lay one draw's placement into the pass's batch and answer which ring
+    /// slot it will occupy. The bytes reach the ring at [`Self::flush`], or
+    /// here when the ring wraps.
     fn slot(&mut self, queue: &wgpu::Queue, screen_size: [f32; 2], place: Placement) -> u32 {
-        let slot = self.cursor;
-        self.cursor = (self.cursor + 1) % RING_SLOTS;
-        queue.write_buffer(
-            &self.ring,
-            u64::from(slot) * u64::from(self.stride),
-            &locals_bytes(screen_size, place, self.dithering),
-        );
-        slot
+        self.placements += 1;
+        let ring = &self.ring;
+        let ring_writes = &mut self.ring_writes;
+        self.batch.push(
+            locals_bytes(screen_size, place, self.dithering),
+            |offset, bytes| {
+                queue.write_buffer(ring, offset, bytes);
+                *ring_writes += 1;
+            },
+        )
+    }
+
+    /// Write the pass's gathered placements into the ring as one
+    /// `write_buffer`. Once per pass, from the first `finish_prepare`; every
+    /// later one of the same pass finds nothing gathered.
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        let ring = &self.ring;
+        let ring_writes = &mut self.ring_writes;
+        self.batch.flush(|offset, bytes| {
+            queue.write_buffer(ring, offset, bytes);
+            *ring_writes += 1;
+        });
+    }
+
+    /// Placements laid into the ring, and the `write_buffer` calls that
+    /// carried them — one per pass with ground draws in it, not one per draw.
+    pub fn placement_writes(&self) -> (u64, u64) {
+        (self.placements, self.ring_writes)
     }
 
     /// Bytes this store is holding for tiles. The always-on figure the
@@ -567,6 +668,22 @@ impl egui_wgpu::CallbackTrait for TileMeshCallback {
         ];
         let slot = store.slot(queue, points, self.place);
         self.slot.store(slot, Ordering::Relaxed);
+        Vec::new()
+    }
+
+    fn finish_prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        // Every callback of the pass is asked; the first finds the batch full
+        // and writes it, the rest find it empty. A store-less callback was
+        // already counted in `prepare`.
+        if let Some(store) = callback_resources.get_mut::<TileMeshStore>() {
+            store.flush(queue);
+        }
         Vec::new()
     }
 

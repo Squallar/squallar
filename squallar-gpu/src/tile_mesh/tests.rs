@@ -144,3 +144,101 @@ fn the_stroke_vertex_layout_is_the_one_the_flattener_writes() {
     // run can address a vertex the index cannot name.
     assert_eq!(stroke::STROKE_RUN_VERTICES, u32::from(u16::MAX) + 1);
 }
+
+/// A pass's placements are one write. Sixty-two draws — scene D's per-pass
+/// count on 2026-09-04 — lay sixty-two padded slots into the batch, nothing
+/// reaches the ring while they are gathered, and the flush is one write of
+/// the whole range with each placement at its own slot's offset.
+#[test]
+fn a_pass_of_placements_reaches_the_ring_as_one_write() {
+    const DRAWS: u32 = 62;
+    const STRIDE: u32 = 256;
+    let mut batch = PlacementBatch::new(STRIDE);
+    let locals = |i: u32| {
+        locals_bytes(
+            [1920.0, 1080.0],
+            Placement {
+                scale: 0.5,
+                translation: [i as f32, -(i as f32)],
+            },
+            false,
+        )
+    };
+    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+    for i in 0..DRAWS {
+        let slot = batch.push(locals(i), |offset, bytes| {
+            writes.push((offset, bytes.to_vec()))
+        });
+        assert_eq!(slot, i, "slots are handed out in order");
+    }
+    assert!(
+        writes.is_empty(),
+        "a placement was written before the pass was gathered"
+    );
+
+    assert!(batch.flush(|offset, bytes| writes.push((offset, bytes.to_vec()))));
+    assert_eq!(writes.len(), 1, "the pass was not one write");
+    let (offset, bytes) = &writes[0];
+    assert_eq!(*offset, 0);
+    assert_eq!(
+        bytes.len(),
+        (DRAWS * STRIDE) as usize,
+        "every slot is padded to the stride"
+    );
+    for i in 0..DRAWS {
+        let at = (i * STRIDE) as usize;
+        assert_eq!(
+            &bytes[at..at + LOCALS_BYTES as usize],
+            &locals(i)[..],
+            "placement {i} is not at its slot's offset"
+        );
+    }
+    assert!(
+        !batch.flush(|_, _| panic!("a second flush of the same pass wrote again")),
+        "the batch was not emptied by its flush"
+    );
+}
+
+/// The ring wraps inside a pass: the range gathered so far is no longer
+/// contiguous with slot zero, so it goes out at the wrap and the rest of the
+/// pass starts a new range at zero. Two writes, both at the offsets the slots
+/// name — never one write that runs off the end of the ring.
+#[test]
+fn a_wrap_inside_a_pass_splits_it_into_two_contiguous_writes() {
+    const STRIDE: u32 = 64;
+    let mut batch = PlacementBatch::new(STRIDE);
+    batch.cursor = RING_SLOTS - 2;
+    let locals = locals_bytes(
+        [1.0, 1.0],
+        Placement {
+            scale: 1.0,
+            translation: [0.0, 0.0],
+        },
+        true,
+    );
+    let mut writes: Vec<(u64, usize)> = Vec::new();
+    let slots: Vec<u32> = (0..3)
+        .map(|_| batch.push(locals, |offset, bytes| writes.push((offset, bytes.len()))))
+        .collect();
+    assert_eq!(slots, [RING_SLOTS - 2, RING_SLOTS - 1, 0]);
+    assert_eq!(
+        writes,
+        [(
+            u64::from(RING_SLOTS - 2) * u64::from(STRIDE),
+            2 * STRIDE as usize
+        )],
+        "the wrap did not write the range gathered before it"
+    );
+    assert!(batch.flush(|offset, bytes| writes.push((offset, bytes.len()))));
+    assert_eq!(
+        writes[1],
+        (0, STRIDE as usize),
+        "the rest of the pass does not start at slot zero"
+    );
+    let end = writes[0].0 + writes[0].1 as u64;
+    assert_eq!(
+        end,
+        u64::from(RING_SLOTS) * u64::from(STRIDE),
+        "the first write does not end at the ring's end"
+    );
+}
