@@ -560,10 +560,22 @@ fn every_console_scrape_executes_and_hands_back_every_family_it_was_fed() {
 #[test]
 fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
     let blocks = embedded_blocks(DRIVE_PY);
+    // `FRAME_LINE_PROBE` and not `WORKER_SIGNAL_PROBE`: `60a889f0` moved the
+    // worst-frame scrape into the probe the frame watcher POLLS, because the
+    // one it lived in runs once and so no windowed worst frame was ever
+    // selected. This test kept naming the old probe and read an empty family
+    // out of it, which is the exact reading a broken scrape gives — the
+    // instrument's own breakage printed as a result.
     let probe = blocks
         .iter()
-        .find(|b| b.name == "WORKER_SIGNAL_PROBE")
-        .expect("drive.py no longer declares WORKER_SIGNAL_PROBE");
+        .find(|b| b.name == "FRAME_LINE_PROBE")
+        .expect("drive.py no longer declares FRAME_LINE_PROBE");
+    assert!(
+        probe.src.contains("frame_worst_all"),
+        "the worst-frame scrape has moved out of FRAME_LINE_PROBE again; \
+         point this test at the probe the frame watcher polls, never at one \
+         that runs once",
+    );
     let Some(engine) = js_engine() else {
         eprintln!("{NO_ENGINE}");
         return;
@@ -685,13 +697,17 @@ fn each_gate_rejects_a_driver_it_should_reject() {
         "an unbalanced brace did not redden the parse checker: {bad:?}",
     );
 
-    // RED ARM 2 — the 2026-09-04 defect itself, put back: `frame_worst_all`
-    // lives in the loop that stamps `C[i].t`, and `var t` belongs to a loop in
-    // another probe entirely.
-    let unbound = DRIVE_PY.replace(
-        "frame_worst_all.push({ t: C[i].t,",
-        "frame_worst_all.push({ t: t,",
-    );
+    // RED ARM 2 — the 2026-09-04 defect's CLASS, put back: an identifier a
+    // scrape reads that nothing in its scope binds.
+    //
+    // Not the original tamper any more, and that is the repair rather than a
+    // weakening. The defect was `frame_worst_all.push({ t: t, …)` in a probe
+    // whose loop bound no `t`; `a9336df0` moved that push into the loop that
+    // DOES bind one, so re-spelling it `t: t` now names a live binding and
+    // throws nothing. The tamper was a silent no-op and the gate read green
+    // while proving nothing. Unbinding the loop's own `t` reproduces the
+    // class at the same site.
+    let unbound = DRIVE_PY.replace("  var t = C[i].t;", "  var t_unused = C[i].t;");
     assert_ne!(
         unbound, DRIVE_PY,
         "the unbound-identifier tamper matched nothing"
@@ -705,7 +721,7 @@ fn each_gate_rejects_a_driver_it_should_reject() {
     let bad = exec_failures(engine, &unbound);
     assert!(
         bad.iter()
-            .any(|f| f.contains("WORKER_SIGNAL_PROBE") && f.contains("THREW")),
+            .any(|f| f.contains("FRAME_LINE_PROBE") && f.contains("THREW")),
         "an unbound identifier in a scrape did not redden the execution \
          checker: {bad:?}",
     );
