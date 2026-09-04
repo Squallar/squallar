@@ -19,7 +19,7 @@ chrono = { workspace = true }
 # granules are deflate-compressed, so dropping `deflate` takes every consumer
 # dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`, which
 # is C and breaks wasm32/iOS cross-compilation.
-hdf5-pure = "=0.43.1"
+hdf5-pure = "=0.44.0"
 # A malformed `valid_range` is warned about and ignored rather than being made
 # fatal; see `cf::unpack`.
 log = { workspace = true }
