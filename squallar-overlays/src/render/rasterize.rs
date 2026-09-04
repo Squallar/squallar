@@ -51,6 +51,21 @@ impl HitCells {
     }
 
     pub fn record(&mut self, px: f32, py: f32, item_id: u32) {
+        // **A float-to-int `as` cast saturates**: -12.0 and NaN both become 0,
+        // which passes the bound below as cell column 0 rather than failing it.
+        // A stamp whose disc lies entirely off the left or top edge therefore
+        // recorded its hits against the edge cells, and a click on that edge
+        // answered an item that is nowhere near the pointer. Reachable: GLM
+        // culls a flash only at `px < -base_size` while its hit disc is
+        // `0.72 * base_size` at the widest, so a flash just inside the cull
+        // draws no ink at all and still recorded a column of hits.
+        //
+        // Only the near edges need the guard. A coordinate past `width` casts
+        // to a number past `width`, and infinity saturates to `u32::MAX`, so
+        // the `>=` tests below already reject those.
+        if px.is_nan() || py.is_nan() || px < 0.0 || py < 0.0 {
+            return;
+        }
         let qx = (px as u32) / 4;
         let qy = (py as u32) / 4;
         if qx >= self.width || qy >= self.height {
@@ -1296,11 +1311,25 @@ pub fn rasterize_glm_strikes(
         let item_id = i as u32;
         let r = bolt_size * 0.6;
         let r2 = r * r;
-        let mut sy = (py - r) as i32;
-        let sy_end = (py + r) as i32;
+        // **Clamped into the texture, as the station and report loops are.**
+        // Unclamped, `(px - r) as i32` truncates *toward zero*, so a bolt
+        // within `r` of the west or north edge sampled at negative texel
+        // coordinates — which `HitCells::record` then saturated back into
+        // column or row 0. The answer came out nearly right by that accident
+        // and not by the arithmetic: over a 5400-position sweep of the four
+        // edges, 52 positions recorded a cell that the clamped sampling
+        // reaches directly and the unclamped one only reached through the
+        // cast. Sampling inside the texture is what makes the cast's
+        // behaviour stop mattering.
+        let min_x = (px - r).max(0.0) as i32;
+        let max_x = ((px + r) as i32).min(width as i32 - 1);
+        let min_y = (py - r).max(0.0) as i32;
+        let max_y = ((py + r) as i32).min(height as i32 - 1);
+        let mut sy = min_y;
+        let sy_end = max_y;
         while sy <= sy_end {
-            let mut sx = (px - r) as i32;
-            let sx_end = (px + r) as i32;
+            let mut sx = min_x;
+            let sx_end = max_x;
             while sx <= sx_end {
                 let dx = sx as f32 - px;
                 let dy = sy as f32 - py;
@@ -2156,3 +2185,6 @@ mod device_scale_tests;
 
 #[cfg(test)]
 mod sites_marker_tests;
+
+#[cfg(test)]
+mod hit_cells_tests;
