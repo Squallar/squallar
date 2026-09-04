@@ -2910,7 +2910,7 @@ for (var i = 0; i < C.length; i++) {
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
   var wm = frame_worst_re.exec(m);
-  if (wm) frame_worst_all.push({ t: t, service: parseInt(wm[1], 10), family: wm[2],
+  if (wm) frame_worst_all.push({ t: C[i].t, service: parseInt(wm[1], 10), family: wm[2],
                           since_boot: parseInt(wm[3], 10),
                           pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
                           ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
@@ -2920,7 +2920,7 @@ for (var i = 0; i < C.length; i++) {
                           boot_ui: parseInt(wm[13], 10), boot_prepare: parseInt(wm[14], 10),
                           boot_finish: parseInt(wm[15], 10), boot_post: parseInt(wm[16], 10) });
   var wn = frame_worst_none_re.exec(m);
-  if (wn) frame_worst_all.push({ t: t, service: null, family: null,
+  if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
                                  since_boot: parseInt(wn[1], 10), boot_family: wn[2],
                                  boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
                                  boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
