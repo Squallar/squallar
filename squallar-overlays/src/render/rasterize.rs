@@ -1633,6 +1633,11 @@ fn projection_window(
 /// [`projection_window`], so this is an enum over how much of the grid is in
 /// hand: [`Self::Whole`] carries it by `Arc`, [`Self::Window`] carries the
 /// window and exactly its values (the wire).
+// `Window` is ~240 B against `Whole`'s 8 (it carries `GridCoords` and the
+// tagged `GridValues`, not a `Vec<f32>`). It is built once per job and handed
+// to `DescribedJob::new`, which boxes it; a `Box` here would be a second
+// pointer to chase on every raster read for nothing saved.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum GriddedInput {
     Whole(std::sync::Arc<HrrrGridData>),

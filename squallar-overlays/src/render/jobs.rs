@@ -1272,8 +1272,8 @@ fn flag(byte: u8) -> Option<bool> {
 }
 
 /// A row of `f32`s, little-endian, straight off the grid's own storage.
-/// **The job wire is little-endian by definition** — [`decode_f32s`] reads
-/// `f32::from_le_bytes` — and every target this ships to is little-endian, so
+/// **The job wire is little-endian by definition** — [`f32s_from_bytes`]
+/// reads `f32::from_le_bytes` — and every target this ships to is little-endian, so
 /// an `f32` slice's own bytes ARE its wire form. A big-endian target would
 /// need a byte swap and this encoder would silently write the wrong bytes, so
 /// the build refuses there rather than guessing. Compile-time, and a
@@ -1303,19 +1303,11 @@ fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
     out.extend_from_slice(bytemuck::cast_slice(values));
 }
 
-/// The inverse of [`encode_f32s`] over exactly `count` values: `None` on a
-/// short buffer, checked by [`Reader::take`] **before** anything is sized
-/// from `count` — so a count claiming four billion points fails on the first
-/// short read rather than reserving for it.
-fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
-    Some(f32s_from_bytes(r.take(count.checked_mul(4)?)?))
-}
-
-/// The byte-level half of [`decode_f32s`], shared with
-/// [`WireValues::values_from`] so the wide arm of the tagged reader and the
-/// count-led reader cannot come to disagree about what an `f32` on this wire
-/// is. Read through `from_le_bytes` rather than cast: a lent payload arrives
-/// as a `Uint8Array::to_vec`, whose allocation carries no alignment at all.
+/// The inverse of [`encode_f32s`]: the wide arm of [`WireValues::values_from`]
+/// reads through this, and the length it is handed is [`Reader::take`]'s,
+/// checked against the head's window **before** anything is sized from it.
+/// Read through `from_le_bytes` rather than cast: a lent payload arrives as a
+/// `Uint8Array::to_vec`, whose allocation carries no alignment at all.
 fn f32s_from_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -1499,7 +1491,8 @@ fn decode_grid_coords(r: &mut Reader) -> Option<crate::hrrr::GridCoords> {
     }
 }
 
-/// [`decode_f32s`]'s shape at `f64` width, for the explicit coordinate arrays.
+/// [`f32s_from_bytes`]'s shape at `f64` width and count-led, for the explicit
+/// coordinate arrays.
 fn decode_f64s(r: &mut Reader, count: usize) -> Option<Vec<f64>> {
     let bytes = r.take(count.checked_mul(8)?)?;
     Some(
@@ -2044,8 +2037,20 @@ mod tests {
         let (ni, nj) = (6usize, 5usize);
         // MRMS's own composite packing, and code 0 is its −999 no-coverage
         // sentinel, so the grid carries a reserved code as well as readings.
+        //
+        // **The sentinel is planted at flat index 15, which is inside the cut
+        // window below, and that placement is the whole point.** A plain
+        // `(0..30)` ramp puts code 0 at index 0 — outside both the lent band
+        // (rows 1..4) and the compared window (i 2..5, j 1..4) — so the `NaN`
+        // half of the `to_bits` comparison would never be reached and the
+        // failure this test names (a reserved code arriving as the reading
+        // −999.0 because `nan_codes` did not cross the wire) could not fire.
+        // A real mosaic has no-coverage holes scattered through it; this is
+        // one.
         let scaled = ScaledU16 {
-            codes: (0..(ni * nj) as u16).collect(),
+            codes: (0..(ni * nj) as u16)
+                .map(|c| if c == 15 { 0 } else { c })
+                .collect(),
             ref_val: -9990.0,
             two_pow: 1.0,
             dig_factor: 0.1,
@@ -2128,10 +2133,26 @@ mod tests {
                 );
             }
         }
-        // Non-vacuity: the window really does span the sentinel and readings.
+        // Non-vacuity, **both halves**: the window really does span readings
+        // AND the reserved code, so the loop above crossed each of them.
+        let (mut readings, mut sentinels) = (0usize, 0usize);
+        for j in j0..j1 {
+            for i in i0..i1 {
+                match page.get(j * ni + i).expect("inside the grid") {
+                    v if v.is_finite() => readings += 1,
+                    _ => sentinels += 1,
+                }
+            }
+        }
         assert!(
-            (j0..j1).any(|j| (i0..i1).any(|i| page.get(j * ni + i).is_some_and(|v| v.is_finite()))),
+            readings > 0,
             "a window of nothing but sentinels would satisfy the loop above",
+        );
+        assert!(
+            sentinels > 0,
+            "the window spans no reserved code, so the loop above never \
+             compared a `NaN` and a `nan_codes` list that failed to cross the \
+             wire would read back as the finite −999.0 unnoticed",
         );
     }
 
@@ -2191,8 +2212,9 @@ mod tests {
         let values = [f32::NAN, -0.0f32, f32::INFINITY, 1.5, f32::from_bits(1)];
         let mut buf = Vec::new();
         super::encode_f32s(&mut buf, &values);
+        // Through the reader that ships: the wide arm of `values_from`.
         let mut r = squallar_source::wire::Reader::new(&buf);
-        let back = super::decode_f32s(&mut r, values.len()).expect("decodes");
+        let back = super::f32s_from_bytes(r.take(values.len() * 4).expect("decodes"));
         let got: Vec<u32> = back.iter().map(|v| v.to_bits()).collect();
         let want: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
         assert_eq!(got, want);
