@@ -1583,6 +1583,80 @@ mod tests {
         );
     }
 
+    /// **The gridded row's bytes are exactly the fields it names, in the order
+    /// it names them** — which is what makes reserving capacity for the values
+    /// block a no-op on the wire.
+    ///
+    /// `Vec::reserve` sets capacity and never length, so the reservation cannot
+    /// move a byte by construction. This holds that: the expected sequence is
+    /// spelled out here from the fixture's own numbers rather than replayed
+    /// through `encode_str` and `encode_grid_coords`, so it reddens if anyone
+    /// ever "presizes" by writing into a sized buffer, if a field's width on
+    /// the wire changes, or if the order of the row's parts moves. The window
+    /// edges are the carried ones because `window_for` clamps a carried window
+    /// to the grid shape and 4x3 does not clamp `1..3, 0..2`.
+    #[test]
+    fn a_gridded_job_encodes_to_the_wire_bytes_its_fields_name() {
+        let field = crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
+            .id
+            .clone();
+        let lats = [30.0f64, 30.5, 31.0, 31.5];
+        let lons = [-99.0f64, -98.5, -98.0, -97.5];
+        let values = [100.0f32, 250.0, 500.0, 1250.0];
+
+        let job = DescribedJob::new(GriddedInput::Window(GridWindow {
+            field: field.clone(),
+            ni: 4,
+            nj: 3,
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: lats.to_vec(),
+                lons: lons.to_vec(),
+            },
+            win: IndexWindow {
+                i0: 1,
+                i1: 3,
+                j0: 0,
+                j1: 2,
+            },
+            values: values.to_vec(),
+        }));
+        let mut bytes = Vec::new();
+        (JOB_CODECS[6].encode)(
+            &job,
+            &EncodeCtx {
+                geometry: test_geometry(),
+            },
+            &mut bytes,
+        );
+
+        let code = field.as_str();
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        want.extend_from_slice(code.as_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
+        // The explicit-coordinates tag, spelled as the byte that travels.
+        want.push(2);
+        want.extend_from_slice(&(lats.len() as u32).to_le_bytes());
+        for v in lats {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+        want.extend_from_slice(&(lons.len() as u32).to_le_bytes());
+        for v in lons {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+        for edge in [1u32, 3, 0, 2] {
+            want.extend_from_slice(&edge.to_le_bytes());
+        }
+        for v in values {
+            want.extend_from_slice(&v.to_le_bytes());
+        }
+
+        assert_eq!(
+            bytes, want,
+            "the gridded row's encoded bytes are not the fields it names, in order"
+        );
+    }
     #[test]
     fn the_model_row_round_trips_an_explicit_grid_window() {
         let job = DescribedJob::new(GriddedInput::Window(GridWindow {
