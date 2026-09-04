@@ -3135,6 +3135,7 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // on 79% of interact frames and 8 ms at p99 over the same 475 frames. A
 // percentile of a distribution that shape says an occasional event happened;
 // it cannot say WHICH of the six things the tail does was the event.
+var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame post (dispatch)` opened up, one level below `frame post` on exactly
 // its terms: six named cuts plus a residual, contiguous within that one span,
@@ -3172,6 +3173,7 @@ var budget_state = null, budget_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
+var frame_ui_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -3274,6 +3276,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_prepare_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                   sum: parseInt(x[3], 10), p50: x[4],
                                   p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_ui_re.exec(m);
+  if (x) frame_ui_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                             sum: parseInt(x[3], 10), p50: x[4],
+                             p90: x[5], p99: x[6], hist: x[7] });
   x = frame_post_re.exec(m);
   if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
@@ -3318,6 +3324,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          cadence_all: cadence_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
+         frame_ui_all: frame_ui_all,
          frame_post_all: frame_post_all,
          frame_dispatch_all: frame_dispatch_all,
          gesture_begins: begins, gesture_loops: loops,
@@ -3434,6 +3441,7 @@ class FrameLineWatcher:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
                             ("frame_prepare_all", "prepare"),
+                            ("frame_ui_all", "ui"),
                             ("frame_post_all", "post"),
                             ("frame_dispatch_all", "dispatch"),
                             ("tile_take_all", "take"),
@@ -3790,7 +3798,7 @@ def _window_stats(watcher, t0, t1, out):
 # arm never produced still has no key, so an absent arm stays an ABSENCE and
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
-                          "take:", "phase:")
+                          "ui:", "take:", "phase:")
 
 
 def watcher_named_in(gw):

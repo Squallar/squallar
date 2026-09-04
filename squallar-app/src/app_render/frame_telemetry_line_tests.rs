@@ -762,6 +762,58 @@ fn the_rig_reads_the_prepare_lines_the_app_actually_writes() {
     );
 }
 
+/// The rig's `frame ui` probe reads what the app writes.
+///
+/// **This gate is why the family exists on the wire at all.** The app has
+/// written six `frame ui (…)` cuts since the ui split landed, and the rig
+/// scraped none of them: there was no `frame_ui_re`, and `ui:` was missing from
+/// the window prefixes, so the LARGEST segment of an interact frame was the one
+/// nobody could see. The conviction chain went to `post` partly because `post`
+/// was decomposed and visible and this was not.
+#[test]
+fn the_rig_reads_the_ui_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame ui", "layout", &h),
+        rendered(
+            &pattern("frame_ui_re"),
+            &["layout", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame ui (…)` line and the rig's probe have drifted",
+    );
+}
+
+/// **Every cut family the app writes is one the rig both scrapes and windows.**
+///
+/// The per-family gates above each pin one name, so a family added with no
+/// probe at all passes every one of them by not being mentioned. That is how
+/// `ui` stayed invisible: nothing asserted the SET matched. This does, so the
+/// next family cannot arrive half-wired.
+#[test]
+fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
+    for (family, key) in [
+        ("frame prepare", "prepare"),
+        ("frame ui", "ui"),
+        ("frame post", "post"),
+        ("frame dispatch", "dispatch"),
+    ] {
+        let re = family.replace(' ', "_") + "_re";
+        assert!(
+            DRIVE_PY.contains(&re),
+            "the app writes `{family} (…)` lines and the rig has no `{re}` to \
+             read them, so the family is invisible to every leg",
+        );
+        assert!(
+            DRIVE_PY.contains(&format!("\"{key}:\"")),
+            "`{key}:` is not in the rig's window prefixes, so `{family}` is \
+             scraped and then dropped before any window reports it",
+        );
+    }
+}
+
 /// The `frame post (…)` sentence, pinned as a literal.
 ///
 /// Same formatter as `frame segment (…)` and deliberately a **different
