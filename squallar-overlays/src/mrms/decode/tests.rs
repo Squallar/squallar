@@ -739,3 +739,112 @@ fn a_westward_domain_wraps_its_origin_and_keeps_its_step() {
     assert!((lon0 - -129.995).abs() < 1e-6, "{lon0}");
     assert!(dlon > 0.0 && (dlon - 0.01).abs() < 1e-9, "{dlon}");
 }
+
+/// **Every value the mosaic holds is a function of a 16-bit code and three
+/// per-granule scalars** — so an `f32` per point is a *widening of the source's
+/// own width*, and storing the code beside `(ref_val, exp, dec)` would be a
+/// repacking rather than a quantisation.
+///
+/// The premise a halved [`ResidentGrid`](crate::render::gridded::ResidentGrid)
+/// would rest on, checked rather than assumed. What it pins, per shipped
+/// product and over the **whole** 24.5 M-point mosaic:
+///
+/// * **the code is 16 bits.** `num_bits == 16` and `orig_field_type == 0`, so a
+///   `u16` holds every code section 7 can carry. Not decoration:
+///   [`png_stream_plan`] admits any non-zero multiple of eight, and a granule
+///   published at 24 or 32 bits would need a wider code — a scaled-integer
+///   store must select its width off this field, never assume it;
+/// * **the value is recovered exactly.** `(ref_val + code * 2^exp) * 10^-dec`
+///   run over the streamed code reproduces the shipped `f32` **bit for bit**
+///   (`to_bits`, so a `NaN` by another route and a `-0.0` against `0.0` are
+///   both differences), including the reserved codes
+///   [`reading`] turns into `NaN`.
+///
+/// **The arithmetic on both sides is deliberately the same expression**, and
+/// that is the point rather than a weakness: what is being pinned is that the
+/// shipped `f32` carries no information the `(code, ref_val, exp, dec)` tuple
+/// does not, not that two implementations agree. The claim that could fail here
+/// is the *width* one, and it fails loudly.
+///
+/// Streamed row by row rather than collected: a `Vec<u16>` of the mosaic is
+/// 49,000,000 B, which is exactly the buffer this module exists to not
+/// allocate.
+///
+/// Non-vacuity: the full point count on both sides, at least a million finite
+/// readings, and at least a hundred distinct codes — a granule of one repeated
+/// code would satisfy every equality above.
+#[test]
+fn every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars() {
+    for &product in MrmsProduct::all() {
+        let name = product.as_str();
+        let missing = product.missing_codes();
+        let shipped = &fixture(product).grid.values;
+        let points = 7000 * 3500;
+        assert_eq!(shipped.len(), points, "{name}: not the whole mosaic");
+
+        let bytes = gunzip(gz_for(product)).expect("gzip member");
+        let grib2 = grib::from_reader(std::io::Cursor::new(&bytes)).expect("GRIB2 parses");
+        let (_index, submessage) = grib2.iter().next().expect("one submessage");
+        let plan = png_stream_plan(&bytes, &submessage, points)
+            .unwrap_or_else(|| panic!("{name}: not on the streaming arm"));
+
+        assert_eq!(
+            plan.simple.num_bits, 16,
+            "{name}: a {} -bit code does not fit a u16",
+            plan.simple.num_bits,
+        );
+        assert_eq!(plan.sample_bytes, 2, "{name}: 16 bits is two bytes");
+
+        let two_pow = 2_f32.powi(i32::from(plan.simple.exp));
+        let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
+        let ref_val = plan.simple.ref_val;
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(plan.payload));
+        let mut reader = decoder.read_info().expect("section 7 is a PNG");
+        let line = reader
+            .output_line_size(reader.info().width)
+            .expect("a line size");
+        let mut row = vec![0u8; line];
+        let mut seen = std::collections::HashSet::new();
+        let mut finite = 0usize;
+        let mut checked = 0usize;
+        while reader.read_row(&mut row).expect("a PNG row").is_some() {
+            for sample in row.chunks_exact(2) {
+                let code = u16::from_be_bytes([sample[0], sample[1]]);
+                let rebuilt = reading(missing, (ref_val + f32::from(code) * two_pow) * dig_factor);
+                let held = shipped[checked];
+                assert_eq!(
+                    rebuilt.to_bits(),
+                    held.to_bits(),
+                    "{name}: point {checked} holds {held} and code {code} \
+                     rebuilds {rebuilt}",
+                );
+                if held.is_finite() {
+                    finite += 1;
+                }
+                seen.insert(code);
+                checked += 1;
+            }
+        }
+
+        assert_eq!(
+            checked, points,
+            "{name}: {checked} codes for {points} points"
+        );
+        assert!(
+            finite > 1_000_000,
+            "{name}: only {finite} finite readings; a mosaic of holes would \
+             satisfy every equality above",
+        );
+        println!(
+            "{name}: {} distinct codes over {points} points, {finite} finite",
+            seen.len(),
+        );
+        assert!(
+            seen.len() > 100,
+            "{name}: only {} distinct codes; a granule of one repeated code \
+             proves nothing about the map",
+            seen.len(),
+        );
+    }
+}
