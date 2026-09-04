@@ -32,6 +32,10 @@
 //! 15.7 MB on any volume but leaves it growing on a fixture this small. The
 //! held walk and the streamed walk pay both identically on the same volume,
 //! so their difference is the retained tilts and nothing else.
+//!
+//! The second pin is inside one tilt: what the dealiaser itself holds beside
+//! the grid it is handed. That one is an absolute, in grids, because the
+//! transients are what it is about.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -360,5 +364,48 @@ fn the_instrument_reads_the_held_walk_as_a_grid_per_tilt() {
         "the held walk grew by {growth} B for {extra} more tilts, under a grid \
          ({GRID_BYTES} B) each: the instrument cannot see a retained tilt, so \
          the streaming pin beside this proves nothing — few {few:?}, many {many:?}",
+    );
+}
+
+/// **Inside one tilt.** The dealiaser used to take two grid-sized copies of
+/// the field it was handed — the field as reported, then the same field with
+/// the refused gates punched to NaN — and hold both for the whole pass beside
+/// the grid itself, which nothing wrote to until the end. The punched field
+/// is now the grid in place and the refused gates' reported values are kept
+/// aside sparsely, so the pass holds two grids fewer.
+///
+/// Measured 2026-09-04 on this fixture, the NROT pipeline on one tilt peaked
+/// at 5.68 grids with the copies and 4.17 without — less than the two grids
+/// removed, because the peak moved: without them the dealiaser is no longer
+/// the tilt's peak phase, the stencil is. The pin sits at five, 0.8 above the
+/// latter and 0.7 under the former. The refused-gate store is zero here (a
+/// clean VAD field refuses nothing) and a grid in the worst case of every
+/// gate refused — still one grid under the old shape's two.
+#[test]
+fn one_tilts_dealias_holds_no_copy_of_the_reported_field() {
+    use squallar_radar::nrot::compute_nrot_grid_with_profile;
+    use squallar_radar::velocity::tilts;
+    let _lock = serialised();
+    let scan = vad_volume(1);
+    let tilt = tilts(&scan)
+        .next()
+        .expect("the fixture's one velocity tilt");
+    let run =
+        || compute_nrot_grid_with_profile(&tilt.grid.sweep(None), tilt.elevation_deg, None).len();
+    run();
+    let (_, window) = peak_during(run);
+    eprintln!(
+        "one tilt NROT: peak {} B = {:.2} grids",
+        window.peak,
+        window.peak as f64 / GRID_BYTES as f64,
+    );
+    const CEILING_GRIDS: usize = 5;
+    assert!(
+        window.peak <= CEILING_GRIDS * GRID_BYTES,
+        "one tilt's NROT pipeline peaked at {} B ({:.2} grids of {GRID_BYTES} B), \
+         over the {CEILING_GRIDS}-grid ceiling: the dealiaser is copying the field \
+         it was handed again",
+        window.peak,
+        window.peak as f64 / GRID_BYTES as f64,
     );
 }

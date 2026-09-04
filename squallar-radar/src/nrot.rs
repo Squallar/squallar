@@ -1652,21 +1652,28 @@ pub(crate) fn dealias_with_knobs(
     let az_rad: Vec<Option<f64>> = (0..n)
         .map(|i| sweep.azimuths_deg.get(i).map(|a| a.to_radians()))
         .collect();
-    let reported: Vec<Vec<f64>> = vel_grid.to_vec();
     let refused = if knobs.refuse_incoherent {
-        incoherent_velocity(&reported, rows, gc, sweep.gate_interval_km, nyquist)
+        incoherent_velocity(vel_grid, rows, gc, sweep.gate_interval_km, nyquist)
     } else {
         vec![false; n * gc]
     };
-    let mut raw = reported.clone();
-    for (i, row) in raw.iter_mut().enumerate() {
+    // The raw field every pass below reads is the caller's grid with the
+    // refused gates punched to NaN — punched IN PLACE, the values they held
+    // kept aside in row-major order and put back at the write-back. This was
+    // two grid-sized copies, the field as reported and then the punched one,
+    // 13 MiB per super-res tilt held for the whole pass beside a grid nothing
+    // wrote to. Nothing between here and the write-back reads the caller's
+    // grid except through `raw`, and nothing writes it.
+    let mut reported_at_refused: Vec<f64> = Vec::new();
+    for (i, row) in vel_grid.iter_mut().enumerate() {
         for (j, v) in row.iter_mut().enumerate() {
             if refused[i * gc + j] {
+                reported_at_refused.push(*v);
                 *v = f64::NAN;
             }
         }
     }
-    let raw = raw;
+    let raw: &[Vec<f64>] = vel_grid;
     // value[i][j] holds the dealiased velocity once valid[i][j].
     let mut valid = vec![false; n * gc];
     let mut value = vec![f64::NAN; n * gc];
@@ -1876,7 +1883,7 @@ pub(crate) fn dealias_with_knobs(
     // The region arm's own place in the order.
     if let Some(k) = knobs.region.filter(|k| k.before_passes) {
         region_done = true;
-        region_stats = region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
+        region_stats = region_assign(raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
     }
     for _pass in 0..DA_PASSES {
         let mut changed = false;
@@ -2069,7 +2076,7 @@ pub(crate) fn dealias_with_knobs(
                 Some(k) => {
                     region_done = true;
                     region_stats =
-                        region_assign(&raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
+                        region_assign(raw, rows, gc, nyquist, &mut valid, &mut value, &predict, k);
                 }
                 None => break,
             }
@@ -2135,19 +2142,26 @@ pub(crate) fn dealias_with_knobs(
             }
         }
     }
-    for i in 0..n {
-        for j in 0..gc {
-            vel_grid[i][j] = if refused[idx(i, j)] {
-                reported[i][j]
-            } else if valid[idx(i, j)] {
-                value[idx(i, j)]
-            } else if keep_raw[idx(i, j)] {
-                raw[i][j]
-            } else {
-                f64::NAN
-            };
+    // A refused gate goes back exactly as the radar reported it; a kept-raw
+    // gate already holds what `raw` holds, because `raw` is this grid.
+    let mut reported_at_refused = reported_at_refused.into_iter();
+    for (i, row) in vel_grid.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            let g = idx(i, j);
+            if refused[g] {
+                *v = reported_at_refused
+                    .next()
+                    .expect("one kept value per refused gate, in the order they were punched");
+            } else if valid[g] {
+                *v = value[g];
+            } else if !keep_raw[g] {
+                *v = f64::NAN;
+            }
         }
     }
+    // The field is in the caller's grid now and nothing below reads `value`;
+    // the censor pass is about to take a grid-sized snapshot.
+    drop(value);
     if knobs.censor_vny_frac.is_infinite() {
         return knobs.refuse_incoherent.then_some(refused);
     }
