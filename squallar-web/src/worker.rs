@@ -140,14 +140,23 @@ fn spawn_tile_lane(
 /// Called by `tile-lane.js` after `init({module, memory})` on the
 /// rasterization worker's memory, with the lane's end of the port.
 ///
-/// The panic hook and the logger are process statics in that shared memory
-/// and the worker's thread has installed both; these calls are the no-ops
-/// they are documented to be on a second call, kept so the lane is correct
-/// on a build where the order ever changes.
+/// The panic hook, the logger and the allocation-error hook are process
+/// statics in that shared memory and the worker's thread has installed all
+/// three; these calls are the no-ops they are documented to be on a second
+/// call, kept so the lane is correct on a build where the order ever changes.
+///
+/// The allocation hook is here for that reason and no other. This is a third
+/// wasm entry point but **not** a third heap: the lane is initialised on the
+/// rasterization worker's own memory, so a refusal reaching it is a refusal
+/// of the same linear memory the worker's hook already names, and
+/// `set_alloc_error_hook` is a pointer store either way. What the call buys
+/// is that the lane cannot be the entry that runs first with no hook set --
+/// the same thing the two lines above buy, by the same argument.
 #[wasm_bindgen]
 pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
+    crate::alloc_failure::hook::install();
 
     let handler_port = port.clone();
     let on_message =
