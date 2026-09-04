@@ -712,7 +712,7 @@ fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
     ]
 }
 
-/// The six `frame ui (<name>):` lines — the `ui` segment, opened up.
+/// The nine `frame ui (<name>):` lines — the `ui` segment, opened up.
 ///
 /// Denominator: **exactly `frame segment (ui)`'s** — presented interact
 /// frames — and the six are contiguous cuts of that one span, so their sums
@@ -728,11 +728,14 @@ fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms:
 /// none of the six is ever structurally absent, and a `chrome` cut of zero on
 /// a desktop layout with no phone bar is a figure, not an absence.
-fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 6] {
+fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
     [
         named_hist_line("frame ui", "poll", &u.poll),
         named_hist_line("frame ui", "layout", &u.layout),
-        named_hist_line("frame ui", "shell", &u.shell),
+        named_hist_line("frame ui", "topbar", &u.topbar),
+        named_hist_line("frame ui", "statusbar", &u.statusbar),
+        named_hist_line("frame ui", "stack", &u.stack),
+        named_hist_line("frame ui", "dialog", &u.dialog),
         named_hist_line("frame ui", "panes", &u.panes),
         named_hist_line("frame ui", "apply", &u.apply),
         named_hist_line("frame ui", "chrome", &u.chrome),

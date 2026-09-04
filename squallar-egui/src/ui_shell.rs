@@ -84,6 +84,21 @@ pub(super) struct SurfaceSlot {
 }
 
 /// What the shell produced this frame.
+/// [`Gui::render_shell_phased`]'s output plus where it crossed its own
+/// boundaries.
+///
+/// The shell is ~1 ms of every interact frame and was one undivided cut, so
+/// nothing said whether that was the top bar, the status bar or the layer
+/// stack. Three parts, two instants: the third is the span's own end, which the
+/// caller already holds.
+pub(super) struct ShellPhased {
+    pub out: ShellOutput,
+    /// After `render_top_bar`.
+    pub topbar: web_time::Instant,
+    /// After `render_status_bar`; the remainder is the stack and inspector.
+    pub statusbar: web_time::Instant,
+}
+
 pub(super) struct ShellOutput {
     pub actions: Vec<GuiAction>,
     /// Screen rects of floating chrome drawn *over* the map, which map click
@@ -99,23 +114,29 @@ pub(super) struct ShellOutput {
 impl super::Gui {
     /// Draw all the chrome around the map: the one docked panel first, then
     /// the floating surfaces positioned in what it left.
-    pub(super) fn render_shell(&mut self, ui: &mut egui::Ui) -> ShellOutput {
+    pub(super) fn render_shell_phased(&mut self, ui: &mut egui::Ui) -> ShellPhased {
         let mut actions = Vec::new();
 
         self.render_top_bar(ui, &mut actions);
+        let topbar = web_time::Instant::now();
 
         // Everything the top bar did not claim is the map's — the full-bleed
         // rect every floating surface positions itself in.
         let map_rect = ui.available_rect_before_wrap();
 
         self.render_status_bar(ui.ctx(), map_rect, &mut actions);
+        let statusbar = web_time::Instant::now();
 
         self.render_stack_and_inspector(ui.ctx(), map_rect, &mut actions);
 
-        ShellOutput {
-            actions,
-            excluded_rects: Vec::new(),
-            map_rect,
+        ShellPhased {
+            out: ShellOutput {
+                actions,
+                excluded_rects: Vec::new(),
+                map_rect,
+            },
+            topbar,
+            statusbar,
         }
     }
 

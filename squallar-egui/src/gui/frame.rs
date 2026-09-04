@@ -112,15 +112,16 @@ impl Gui {
         );
         let laid_out = web_time::Instant::now();
 
-        let shell = self.render_shell(&mut root_ui);
-        actions.extend(shell.actions);
+        let shell = self.render_shell_phased(&mut root_ui);
+        actions.extend(shell.out.actions);
         let shell_done = web_time::Instant::now();
 
         if let Some(action) = self.render_time_dialog(ctx) {
             actions.push(action);
         }
+        let dialog_done = web_time::Instant::now();
 
-        actions.extend(self.render_panes(&mut root_ui, &shell.excluded_rects));
+        actions.extend(self.render_panes(&mut root_ui, &shell.out.excluded_rects));
         let panes = web_time::Instant::now();
 
         self.apply_pending_pane_view(&mut actions);
@@ -131,24 +132,24 @@ impl Gui {
         self.apply_fade_toggle(ctx);
         let applied = web_time::Instant::now();
 
-        self.render_pane_pills(ctx, shell.map_rect, &mut actions);
+        self.render_pane_pills(ctx, shell.out.map_rect, &mut actions);
 
         let phone_bar_top = (self.layout.width == crate::ui_layout::WidthClass::Compact)
-            .then(|| self.render_bottom_bar(ctx, shell.map_rect));
+            .then(|| self.render_bottom_bar(ctx, shell.out.map_rect));
         self.phone_bar_height =
-            phone_bar_top.map_or(0.0, |top| (shell.map_rect.bottom() - top).max(0.0));
+            phone_bar_top.map_or(0.0, |top| (shell.out.map_rect.bottom() - top).max(0.0));
 
-        self.render_timeline(ctx, shell.map_rect, phone_bar_top, &mut actions);
+        self.render_timeline(ctx, shell.out.map_rect, phone_bar_top, &mut actions);
 
         if let Some(bar_top) = phone_bar_top {
-            self.render_phone_error_toast(ctx, shell.map_rect, true);
-            self.render_phone_sheet(ctx, shell.map_rect, bar_top, &mut actions);
+            self.render_phone_error_toast(ctx, shell.out.map_rect, true);
+            self.render_phone_sheet(ctx, shell.out.map_rect, bar_top, &mut actions);
         } else {
-            self.render_phone_error_toast(ctx, shell.map_rect, self.ui_faded);
+            self.render_phone_error_toast(ctx, shell.out.map_rect, self.ui_faded);
         }
 
         self.pump_download_area(ctx);
-        self.render_download_area(ctx, shell.map_rect);
+        self.render_download_area(ctx, shell.out.map_rect);
 
         self.render_overlay_popup(ctx);
 
@@ -163,7 +164,10 @@ impl Gui {
             UiPhaseStamps {
                 polled,
                 laid_out,
+                topbar: shell.topbar,
+                statusbar: shell.statusbar,
                 shell: shell_done,
+                dialog: dialog_done,
                 panes,
                 applied,
             },

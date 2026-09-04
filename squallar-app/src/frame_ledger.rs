@@ -185,7 +185,15 @@ pub(crate) struct UiHists {
     pub(crate) layout: Hist,
     /// `render_shell`: topbar, layer stack, drawer. **The eye click the
     /// UiSweep scene drives is read here**, and acted on in `panes`.
-    pub(crate) shell: Hist,
+    /// `render_top_bar`.
+    pub(crate) topbar: Hist,
+    /// `render_status_bar`.
+    pub(crate) statusbar: Hist,
+    /// `render_stack_and_inspector` — the remainder of the shell.
+    pub(crate) stack: Hist,
+    /// The time dialog, between the shell and the panes. Its own cut because
+    /// a dialog that is not open should not be charged to the map surfaces.
+    pub(crate) dialog: Hist,
     /// The time dialog and `render_panes` — every map surface, and on a
     /// toggle frame the pane that acts on the click `shell` just read.
     pub(crate) panes: Hist,
@@ -606,9 +614,14 @@ fn prepare_phase_micros(
     ]
 }
 
-/// The six contiguous cuts of the `ui` segment, in call order:
-/// `[poll, layout, shell, panes, apply, chrome]` — see [`UiHists`], whose
-/// fields these are.
+/// The nine contiguous cuts of the `ui` segment, in call order:
+/// `[poll, layout, topbar, statusbar, stack, dialog, panes, apply, chrome]` —
+/// see [`UiHists`], whose fields these are.
+///
+/// Nine where it was six. `shell` was ~1 ms of every interact frame as ONE cut
+/// covering the top bar, the status bar and the layer stack, so nothing said
+/// which of the three it was; and the time dialog was charged to `panes`, so a
+/// dialog that is not open was counted against the map surfaces.
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
 /// pair at the ends are `ui`'s own boundaries, so the six sum to
@@ -618,12 +631,15 @@ fn ui_phase_micros(
     ui_start: Instant,
     phases: &squallar_egui::shell_api::UiPhaseStamps,
     ui_end: Instant,
-) -> [u32; 6] {
+) -> [u32; 9] {
     [
         micros(ui_start, phases.polled),
         micros(phases.polled, phases.laid_out),
-        micros(phases.laid_out, phases.shell),
-        micros(phases.shell, phases.panes),
+        micros(phases.laid_out, phases.topbar),
+        micros(phases.topbar, phases.statusbar),
+        micros(phases.statusbar, phases.shell),
+        micros(phases.shell, phases.dialog),
+        micros(phases.dialog, phases.panes),
         micros(phases.panes, phases.applied),
         micros(phases.applied, ui_end),
     ]
@@ -815,11 +831,23 @@ impl FrameLedger {
             // the prepare block: a different segment, a different set of
             // stamps, the same denominator rule.
             if let Some(phases) = m.ui_phases.as_ref() {
-                let [poll, layout, shell, panes, apply, chrome] =
-                    ui_phase_micros(ui_start, phases, ui_end);
+                let [
+                    poll,
+                    layout,
+                    topbar,
+                    statusbar,
+                    stack,
+                    dialog,
+                    panes,
+                    apply,
+                    chrome,
+                ] = ui_phase_micros(ui_start, phases, ui_end);
                 self.ui.poll.record(poll);
                 self.ui.layout.record(layout);
-                self.ui.shell.record(shell);
+                self.ui.topbar.record(topbar);
+                self.ui.statusbar.record(statusbar);
+                self.ui.stack.record(stack);
+                self.ui.dialog.record(dialog);
                 self.ui.panes.record(panes);
                 self.ui.apply.record(apply);
                 self.ui.chrome.record(chrome);
@@ -1044,18 +1072,21 @@ mod tests {
     /// `ui_start`, so a test can state its stamps as arithmetic. Named apart
     /// from the `prepare` split's `phases_at`: the two decompositions share
     /// this module and answer with different stamp types.
-    fn ui_phases_at(ui_start: Instant, offsets: [u64; 5]) -> UiPhaseStamps {
+    fn ui_phases_at(ui_start: Instant, offsets: [u64; 8]) -> UiPhaseStamps {
         let at = |us: u64| ui_start + std::time::Duration::from_micros(us);
         UiPhaseStamps {
             polled: at(offsets[0]),
             laid_out: at(offsets[1]),
-            shell: at(offsets[2]),
-            panes: at(offsets[3]),
-            applied: at(offsets[4]),
+            topbar: at(offsets[2]),
+            statusbar: at(offsets[3]),
+            shell: at(offsets[4]),
+            dialog: at(offsets[5]),
+            panes: at(offsets[6]),
+            applied: at(offsets[7]),
         }
     }
 
-    /// **The six cuts are a decomposition of `ui`, not a sample of it.**
+    /// **The nine cuts are a decomposition of `ui`, not a sample of it.**
     ///
     /// The sum telescopes to `micros(ui_start, ui_end)` — the very span
     /// [`super::SegmentHists::ui`] records — so "what is in ui" is answered by
@@ -1064,14 +1095,17 @@ mod tests {
     #[test]
     fn the_ui_phases_telescope_to_ui() {
         let ui_start = Instant::now();
-        let phases = ui_phases_at(ui_start, [300, 1_900, 24_100, 39_400, 39_450]);
+        let phases = ui_phases_at(
+            ui_start,
+            [300, 1_900, 9_000, 12_000, 24_100, 24_600, 39_400, 39_450],
+        );
         let ui_end = ui_start + std::time::Duration::from_micros(41_000);
 
         let cuts = ui_phase_micros(ui_start, &phases, ui_end);
         assert_eq!(
             cuts,
-            [300, 1_600, 22_200, 15_300, 50, 1_550],
-            "a cut moved: the six no longer bracket the phases they are named \
+            [300, 1_600, 7_100, 3_000, 12_100, 500, 14_800, 50, 1_550],
+            "a cut moved: the nine no longer bracket the phases they are named \
              for",
         );
         assert_eq!(
@@ -1102,21 +1136,21 @@ mod tests {
         // Its own fixture, not the telescoping test's: every cut here is
         // wider than the 100 us nudge, so a stamp that fails to move a cut
         // fails this test rather than underflowing it.
-        let base_offsets = [500u64, 2_500, 25_000, 38_000, 39_000];
+        let base_offsets = [500u64, 2_500, 9_000, 14_000, 25_000, 30_000, 38_000, 39_000];
         let ui_end = ui_start + std::time::Duration::from_micros(41_000);
         let base = ui_phase_micros(ui_start, &ui_phases_at(ui_start, base_offsets), ui_end);
 
-        for stamp in 0..5 {
+        for stamp in 0..8 {
             let mut moved = base_offsets;
             moved[stamp] -= 100;
             let cuts = ui_phase_micros(ui_start, &ui_phases_at(ui_start, moved), ui_end);
-            let changed: Vec<usize> = (0..6).filter(|&i| cuts[i] != base[i]).collect();
+            let changed: Vec<usize> = (0..9).filter(|&i| cuts[i] != base[i]).collect();
             assert_eq!(
                 changed,
                 vec![stamp, stamp + 1],
                 "moving stamp {stamp} did not move exactly the two cuts it \
                  bounds, so one of them is not reading it and the split is \
-                 narrower than its six names claim",
+                 narrower than its nine names claim",
             );
             assert_eq!(
                 (cuts[stamp], cuts[stamp + 1]),
@@ -1132,18 +1166,21 @@ mod tests {
     ///
     /// [`every_ui_stamp_is_load_bearing_in_two_cuts`] holds that the
     /// boundaries are real; this holds that the *regions* are. A split whose
-    /// six names covered `ui` but where five were pinned at zero would pass
-    /// the telescoping test and report a single opaque number under six
+    /// nine names covered `ui` but where eight were pinned at zero would pass
+    /// the telescoping test and report a single opaque number under nine
     /// headings — which is the instrument this replaces, renamed.
     #[test]
     fn no_ui_cut_is_structurally_pinned_to_zero() {
         let ui_start = Instant::now();
-        let phases = ui_phases_at(ui_start, [300, 1_900, 24_100, 39_400, 39_450]);
+        let phases = ui_phases_at(
+            ui_start,
+            [300, 1_900, 9_000, 12_000, 24_100, 24_600, 39_400, 39_450],
+        );
         let ui_end = ui_start + std::time::Duration::from_micros(41_000);
         let cuts = ui_phase_micros(ui_start, &phases, ui_end);
         assert!(
             cuts.iter().all(|&c| c > 0),
-            "a cut is zero on stamps chosen to make all six non-zero, so it \
+            "a cut is zero on stamps chosen to make all nine non-zero, so it \
              cannot be reading the span it is named for: {cuts:?}",
         );
     }

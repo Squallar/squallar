@@ -972,7 +972,10 @@ fn every_ui_phase_is_reported_under_its_own_name() {
     for (slot, hist) in [
         &mut phases.poll,
         &mut phases.layout,
-        &mut phases.shell,
+        &mut phases.topbar,
+        &mut phases.statusbar,
+        &mut phases.stack,
+        &mut phases.dialog,
         &mut phases.panes,
         &mut phases.apply,
         &mut phases.chrome,
@@ -985,7 +988,17 @@ fn every_ui_phase_is_reported_under_its_own_name() {
         }
     }
     let lines = super::frame_ui_lines(&phases);
-    let names = ["poll", "layout", "shell", "panes", "apply", "chrome"];
+    let names = [
+        "poll",
+        "layout",
+        "topbar",
+        "statusbar",
+        "stack",
+        "dialog",
+        "panes",
+        "apply",
+        "chrome",
+    ];
     assert_eq!(lines.len(), names.len());
     for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
         assert!(

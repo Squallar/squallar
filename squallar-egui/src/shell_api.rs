@@ -63,9 +63,21 @@ pub struct UiPhaseStamps {
     /// expiry and the fade invariants — the root `Ui` is built and the
     /// frame's geometry is settled.
     pub laid_out: web_time::Instant,
+    /// After `render_top_bar`.
+    pub topbar: web_time::Instant,
+    /// After `render_status_bar`.
+    pub statusbar: web_time::Instant,
     /// After `render_shell`: the topbar, the layer stack and the drawer.
     /// **The frame's eye click is read here** and acted on in the next cut.
+    ///
+    /// The two stamps above open this span up: `topbar`, then `statusbar`,
+    /// then the stack and inspector as the remainder. The shell was ~1 ms of
+    /// every interact frame as one undivided cut.
     pub shell: web_time::Instant,
+    /// After the time dialog, which sits between the shell and the panes and
+    /// was previously counted inside `panes` — a dialog that is not open at
+    /// all should not be charged to the map surfaces.
+    pub dialog: web_time::Instant,
     /// After the time dialog and `render_panes` — the map surfaces.
     pub panes: web_time::Instant,
     /// After the pending appliers (pane view, section line, region, section
