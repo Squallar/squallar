@@ -3217,10 +3217,12 @@ fn append_polled_frame_to_loops(
 /// **What one animating layer takes from one poll**, decided entirely off
 /// immutable reads so the timeline is borrowed mutably exactly once.
 struct LoopAppend {
-    /// The stamps this timeline should gain, ascending. Never empty — a plan
+    /// The stamps this timeline should gain, ascending by `valid` and whole:
+    /// the run each was published under travels with it, because the frame
+    /// list is keyed on the instant but the fetch is not. Never empty — a plan
     /// with nothing to add is `None`, which is what keeps a layer whose loop
     /// is on another site from evicting or re-sampling anything.
-    stamps: Vec<chrono::NaiveDateTime>,
+    stamps: Vec<squallar_source::time::FrameStamp>,
     /// This layer's share of the pane's frame cap.
     held: usize,
     /// The oldest instant to keep, or `None` for a timeline with no anchor to
@@ -3269,21 +3271,39 @@ fn plan_loop_append(
     // live pane's newest edge is wherever the source has got to.
     let parked = clock.as_of();
 
-    let mut stamps: Vec<chrono::NaiveDateTime> = overlays
+    // The handler's stamps are taken whole. `run` is the half of a model
+    // frame's identity the instant does not carry, and the handler is the
+    // only party here that knows it; reduced to its `valid` at this point it
+    // is gone from every later reader of the listing.
+    let mut stamps: Vec<squallar_source::time::FrameStamp> = overlays
         .frames_resident(layer, pane_ref)
         .into_iter()
-        .map(|stamp| stamp.valid)
-        .filter(|valid| parked.is_none_or(|instant| *valid <= instant))
+        .filter(|stamp| parked.is_none_or(|instant| stamp.valid <= instant))
         .collect();
     // `LayerTimeState::site` is the loop's *geometry* site, captured when the
     // loop was built — not the pane's live `site` field. A layer with no
-    // geometry reads `""` back, which no polled scan's site ever equals.
+    // geometry reads `""` back, which no polled scan's site ever equals. The
+    // polled volume is observed data, so `None` is its run.
     if squallar_egui::radar_layer::site(ls) == site {
-        stamps.push(timestamp);
+        stamps.push(squallar_source::time::FrameStamp {
+            valid: timestamp,
+            run: None,
+        });
     }
-    stamps.retain(|valid| !ls.frames.iter().any(|f| f.timestamp == *valid));
-    stamps.sort_unstable();
-    stamps.dedup();
+    stamps.retain(|stamp| !ls.frames.iter().any(|f| f.timestamp == stamp.valid));
+    // One stamp per instant, since a loop holds one frame per instant. Where
+    // two runs depict the same instant the later-filed wins, which is
+    // `newest_at_or_before`'s reading of the same tie. Stable, so "later
+    // filed" survives the sort.
+    stamps.sort_by_key(|stamp| stamp.valid);
+    stamps.dedup_by(|later, earlier| {
+        if later.valid == earlier.valid {
+            *earlier = *later;
+            true
+        } else {
+            false
+        }
+    });
     if stamps.is_empty() {
         return None;
     }
@@ -3299,7 +3319,7 @@ fn plan_loop_append(
             .last()
             .map(|f| f.timestamp)
             .into_iter()
-            .chain(stamps.last().copied())
+            .chain(stamps.last().map(|stamp| stamp.valid))
             .max()
     });
     let cutoff = anchor.map(|anchor| {
@@ -3312,7 +3332,7 @@ fn plan_loop_append(
             .frames
             .iter()
             .map(|f| f.timestamp)
-            .chain(stamps.iter().copied())
+            .chain(stamps.iter().map(|stamp| stamp.valid))
             .filter(|valid| *valid >= edge)
             .chain(std::iter::once(anchor))
             .collect();
@@ -3553,13 +3573,23 @@ fn depicted_frames_for_layer(
 ///
 /// **The decisions are all upstream, in [`plan_loop_append`]**: which stamps
 /// this timeline is owed, what its share of the frame cap is and how far back
-/// it retains. `stamps` is already ascending, already free of duplicates and
-/// already free of instants `ls` holds, so an empty list never reaches here —
-/// which is what keeps a poll for another site from evicting or re-sampling a
-/// timeline it has nothing to give.
+/// it retains. `stamps` is already ascending by `valid`, already one per
+/// instant and already free of instants `ls` holds, so an empty list never
+/// reaches here — which is what keeps a poll for another site from evicting or
+/// re-sampling a timeline it has nothing to give.
+///
+/// **The listing gains each stamp as the handler filed it, run and all.** A
+/// `LoopFrame` is the instant alone, and the listing is where the rest of a
+/// frame's identity is kept for the loop: `refetch_owed_loop_frames` re-asks
+/// for a frame whose data has gone as the stamp the listing names for its
+/// instant, and a model layer's `fetch_frame` declines a stamp with no run.
+/// Filed here as a bare instant, a model frame that joined by append rather
+/// than by listing was declined by every re-ask for the life of the loop. An
+/// observed layer's stamps carry `run: None` from the handler and are filed
+/// as such — the contract is "what the handler said", not "always `Some`".
 fn append_polled_frame(
     ls: &mut squallar_egui::pane::LayerTimeState,
-    stamps: &[chrono::NaiveDateTime],
+    stamps: &[squallar_source::time::FrameStamp],
     held: usize,
     cutoff: Option<chrono::NaiveDateTime>,
 ) -> bool {
@@ -3569,7 +3599,8 @@ fn append_polled_frame(
         return false;
     }
 
-    for &timestamp in stamps {
+    for stamp in stamps {
+        let timestamp = stamp.valid;
         let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
         ls.frames.insert(
             insert_pos,
@@ -3583,14 +3614,13 @@ fn append_polled_frame(
     }
     // The listing the frames were chosen from gains the same stamps, so a
     // later re-sample to a changed allocation can choose from what has
-    // published since the listing landed, not only from what it named.
+    // published since the listing landed, not only from what it named — and
+    // so a later re-ask for one of them finds the run it was published under.
     if let Some(listing) = ls.listing.as_mut() {
-        for &valid in stamps {
-            if !listing.frames.iter().any(|f| f.valid == valid) {
-                let at = listing.frames.partition_point(|f| f.valid < valid);
-                listing
-                    .frames
-                    .insert(at, squallar_source::time::FrameStamp { valid, run: None });
+        for stamp in stamps {
+            if !listing.frames.iter().any(|f| f.valid == stamp.valid) {
+                let at = listing.frames.partition_point(|f| f.valid < stamp.valid);
+                listing.frames.insert(at, *stamp);
             }
         }
     }

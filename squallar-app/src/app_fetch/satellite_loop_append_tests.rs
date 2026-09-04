@@ -26,6 +26,9 @@ type Published = Arc<Mutex<Vec<chrono::NaiveDateTime>>>;
 struct PublishingLayer {
     id: LayerId,
     published: Published,
+    /// The run every published stamp is filed under: `Some` for a model
+    /// layer, whose frame is `(run, hour)`, `None` for observed data.
+    run: Option<chrono::NaiveDateTime>,
 }
 
 impl PublishingLayer {
@@ -110,7 +113,10 @@ impl FrameSource for PublishingLayer {
         let stamps: Vec<FrameStamp> = self
             .resident()
             .into_iter()
-            .map(|valid| FrameStamp { valid, run: None })
+            .map(|valid| FrameStamp {
+                valid,
+                run: self.run,
+            })
             .collect();
         squallar_source::time::newest_at_or_before(&stamps, t)
     }
@@ -145,7 +151,10 @@ impl FrameSource for PublishingLayer {
     fn frames_resident(&self, _pane: &PaneRef<'_>) -> Vec<FrameStamp> {
         self.resident()
             .into_iter()
-            .map(|valid| FrameStamp { valid, run: None })
+            .map(|valid| FrameStamp {
+                valid,
+                run: self.run,
+            })
             .collect()
     }
 
@@ -198,20 +207,59 @@ fn satellite() -> LayerId {
 }
 
 /// A pane animating `satellite()` over `frames`, and the handler's published
-/// set, which starts as exactly those frames.
+/// set, which starts as exactly those frames. Observed data: no run.
 fn satellite_pane(frames: &[i64]) -> (squallar_egui::pane::PaneState, Published, OverlayRegistry) {
+    published_pane(frames, None)
+}
+
+/// [`satellite_pane`], with the handler filing every stamp under `run`, and
+/// the pane holding the listing its loop was built from — the same `frames`,
+/// under the same run — as a loop built from a landed listing does.
+fn published_pane(
+    frames: &[i64],
+    run: Option<chrono::NaiveDateTime>,
+) -> (squallar_egui::pane::PaneState, Published, OverlayRegistry) {
     let published: Published = Arc::new(Mutex::new(frames.iter().map(|&h| hour(h)).collect()));
     let registry = OverlayRegistry::with_handlers(vec![Box::new(PublishingLayer {
         id: satellite(),
         published: Arc::clone(&published),
+        run,
     })]);
     let mut pane = squallar_egui::pane::PaneState::with_site("KTLX".to_string());
     let ls = pane.time_state_mut(&satellite());
     ls.phase = squallar_egui::pane::LoopPhase::Ready;
     ls.span_secs = WIDE;
     ls.frames = frames.iter().map(|&h| frame(hour(h))).collect();
+    ls.listing = Some(FrameListing {
+        range: (
+            hour(frames.first().copied().unwrap_or(0)),
+            hour(frames.last().copied().unwrap_or(0)),
+        ),
+        frames: frames
+            .iter()
+            .map(|&h| FrameStamp {
+                valid: hour(h),
+                run,
+            })
+            .collect(),
+        complete: true,
+    });
     pane.set_transport_layer(satellite());
     (pane, published, registry)
+}
+
+/// The stamp a later re-ask for `at` reads off the listing — the lookup
+/// `refetch_owed_loop_frames`'s caller makes, spelled the same way, so this
+/// suite and that path read one answer.
+fn listed_as(
+    pane: &squallar_egui::pane::PaneState,
+    at: chrono::NaiveDateTime,
+) -> Option<FrameStamp> {
+    pane.time_state(&satellite())
+        .listing
+        .as_ref()
+        .and_then(|listing| listing.frames.iter().find(|s| s.valid == at))
+        .copied()
 }
 
 fn frame_times(pane: &squallar_egui::pane::PaneState, id: &LayerId) -> Vec<chrono::NaiveDateTime> {
@@ -379,5 +427,75 @@ fn a_radar_loop_appends_exactly_the_polled_stamp_and_nothing_else() {
         frame_times(&panes[0], &known::RADAR).len(),
         3,
         "a KOUN scan must not reach a KTLX loop",
+    );
+}
+
+/// **A model frame that joins a loop by append keeps the run it was published
+/// under.** A model layer's frame is `(run, hour)`; its `frames_resident`
+/// files each stamp with its run, and its `fetch_frame` declines a stamp
+/// with none. The loop's frame list is the instant alone, so the listing is
+/// the only place the run survives for a frame the loop later has to ask for
+/// again — and the append filed every stamp there as a bare instant, so a
+/// frame that arrived by append rather than by listing was declined by every
+/// re-ask for the life of the loop.
+///
+/// The instrument is the lookup the re-ask makes, not the frame list, which
+/// gained the instant either way.
+///
+/// **Floor:** file `FrameStamp { valid, run: None }` into the listing in
+/// `append_polled_frame`, or reduce the plan's stamps to their instants. The
+/// appended hour reads back with no run.
+#[test]
+fn an_appended_model_frame_keeps_the_run_it_was_published_under() {
+    let run = hour(-6);
+    let (pane, published, registry) = published_pane(&[0, 1, 2], Some(run));
+    let mut panes = [pane];
+    assert_eq!(
+        listed_as(&panes[0], hour(2)),
+        Some(FrameStamp {
+            valid: hour(2),
+            run: Some(run),
+        }),
+        "premise: a frame the listing named carries its run",
+    );
+
+    published.lock().expect("no poisoned lock").push(hour(3));
+    poll(&mut panes, &registry, "KTLX", hour(3));
+
+    assert_eq!(
+        frame_times(&panes[0], &satellite()).last().copied(),
+        Some(hour(3)),
+        "premise: the published hour joined the loop",
+    );
+    assert_eq!(
+        listed_as(&panes[0], hour(3)),
+        Some(FrameStamp {
+            valid: hour(3),
+            run: Some(run),
+        }),
+        "the hour that joined by append must be listed under the run the \
+         handler published it as, or a later re-ask for it is declined",
+    );
+}
+
+/// **An observed frame that joins by append is listed with no run**, because
+/// that is what its handler filed. The contract is "as the handler said",
+/// not "always some run": a fabricated run would be a stamp the layer never
+/// published.
+#[test]
+fn an_appended_observed_frame_is_listed_with_no_run() {
+    let (pane, published, registry) = published_pane(&[0, 1], None);
+    let mut panes = [pane];
+
+    published.lock().expect("no poisoned lock").push(hour(2));
+    poll(&mut panes, &registry, "KTLX", hour(2));
+
+    assert_eq!(
+        listed_as(&panes[0], hour(2)),
+        Some(FrameStamp {
+            valid: hour(2),
+            run: None,
+        }),
+        "observed data has no run, and the append must not invent one",
     );
 }
