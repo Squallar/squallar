@@ -4666,6 +4666,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "squallar-alloc",
  "squallar-basemap",
  "squallar-device-profile",
  "squallar-egui",

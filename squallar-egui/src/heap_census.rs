@@ -65,8 +65,15 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// the one moment it is the only evidence there is, and
 /// `the_widest_line_fits_the_hooks_buffer` fails rather than letting that
 /// land. Sized against every figure at `u64::MAX` and the longest instance
-/// name, not against a plausible reading.
-pub const CENSUS_LINE_CAPACITY: usize = 768;
+/// name, not against a plausible reading — and sized EXACTLY: the widest line
+/// is this many bytes, with no headroom, so a family added without re-deriving
+/// it is cut and the test says so. The arithmetic: eighteen families (the GPU
+/// one included), the resident total and the linear reading are twenty
+/// `u64::MAX` figures at 20 digits apiece, the residual is `0` when every
+/// family saturates, and the prose between them under `rasterization worker`
+/// makes up the rest; the `deferred drops` family added 39 (`, deferred drops `
+/// + 20 digits + ` B`) to the 768 before it.
+pub const CENSUS_LINE_CAPACITY: usize = 807;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -164,6 +171,15 @@ families! {
          and rasterizes. Published by the rasterization worker, the only \
          instance that runs a job off the wire; zero on the page, where it is \
          a real zero.";
+    DEFERRED_DROP_BYTES, deferred_drop_bytes, set_deferred_drop_bytes,
+        "Evicted and NOT YET FREED: what `squallar_worker::offload::discard` \
+         is holding for the frame-paced drain, at the prices its entries were \
+         filed at - an evicted volume's sweeps at their gate bytes, anything \
+         filed unpriced at its own struct size. A floor, and zero exactly when \
+         the queue is empty. Bytes an eviction has already taken out of the \
+         families above and that live bytes will not give back until the \
+         drain reaches them, so a reader of live bytes waits on this before \
+         calling a fall settled.";
     TILE_MESH_BYTES, tile_mesh_bytes, set_tile_mesh_bytes,
         "Tile mesh buffers the renderer is holding. **GPU**, kept beside the \
          others for the reader; [`Census::resident_total`] leaves it out.";
@@ -204,6 +220,7 @@ impl Census {
             self.loan_outstanding_bytes,
             self.volume_store_bytes,
             self.job_in_flight_bytes,
+            self.deferred_drop_bytes,
         ]
         .into_iter()
         .fold(0u64, u64::saturating_add)
@@ -267,8 +284,8 @@ pub fn write_line<W: core::fmt::Write>(
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
          derive memo {} B, loop frame scans {} B, render cache {} B, overlay pictures {} B, \
          overlay grids {} B, loop frames {} B, upload pending {} B, tile bodies {} B, tile parsed {} B, \
-         tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B; \
-         resident total {} B of ",
+         tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
+         deferred drops {} B; resident total {} B of ",
         census.loop_scan_bytes,
         census.loop_l3_bytes,
         census.still_scan_bytes,
@@ -285,6 +302,7 @@ pub fn write_line<W: core::fmt::Write>(
         census.loan_outstanding_bytes,
         census.volume_store_bytes,
         census.job_in_flight_bytes,
+        census.deferred_drop_bytes,
         census.resident_total(),
     )?;
     match linear {

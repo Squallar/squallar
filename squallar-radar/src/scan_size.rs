@@ -49,7 +49,13 @@ pub fn scan_bytes(scan: &Scan) -> usize {
 }
 
 /// A floor on the host bytes one sweep is holding, its radials included.
-fn sweep_bytes(sweep: &Sweep) -> usize {
+///
+/// Public for the eviction path: a volume this process held the last
+/// reference to is split at its sweep seam before it is filed for the
+/// frame-paced free (`squallar-app`'s `volume_drop_parts`), and each sweep
+/// is priced here as it is filed so the deferred-drop queue can say what it
+/// is holding. One walk per evicted sweep, at eviction — not per frame.
+pub fn sweep_bytes(sweep: &Sweep) -> usize {
     let radials = sweep.radials();
     radials.iter().fold(size_of_val(radials), |sum, radial| {
         sum.saturating_add(radial_bytes(radial))

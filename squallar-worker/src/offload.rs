@@ -46,8 +46,33 @@ pub fn discard_each<T: Send + 'static>(name: &'static str, payloads: impl IntoIt
     }
 }
 
-/// A payload awaiting its frame-paced free, and the name it was discarded under.
-type DeferredDrop = (&'static str, Box<dyn std::any::Any + Send>);
+/// A payload awaiting its frame-paced free, the name it was discarded under,
+/// and the bytes it was priced at when it was filed.
+type DeferredDrop = (&'static str, u64, Box<dyn std::any::Any + Send>);
+
+/// **A payload that says what freeing it will give back**, for a caller that
+/// knows — an evicted volume's sweep, priced at its gate bytes.
+///
+/// Hand one to [`discard`] / [`discard_each`] like any other payload: the
+/// queue recognises the type when it files it, takes `bytes` as the entry's
+/// price and queues `payload` itself, so no wrapper waits in the queue and the
+/// callers' spelling does not change. An unwrapped payload is priced at its
+/// own struct size, which is a floor and says so in [`deferred_drop_bytes`].
+pub struct Priced {
+    /// What dropping `payload` frees, as the caller knows it. A refcount
+    /// decrement that frees nothing certain is honestly 0.
+    pub bytes: u64,
+    pub payload: Box<dyn std::any::Any + Send>,
+}
+
+impl Priced {
+    pub fn new(bytes: u64, payload: impl Send + 'static) -> Self {
+        Self {
+            bytes,
+            payload: Box::new(payload),
+        }
+    }
+}
 
 thread_local! {
     /// What [`discard`] is holding until a frame can afford to free it.
@@ -55,18 +80,55 @@ thread_local! {
     /// A `VecDeque`, so the longest-waiting entry goes next.
     static DEFERRED_DROPS: RefCell<std::collections::VecDeque<DeferredDrop>> =
         const { RefCell::new(std::collections::VecDeque::new()) };
+
+    /// The prices of every entry in the queue, summed: added at
+    /// [`defer_drop`], subtracted as [`drain_deferred_drops`] frees. Kept
+    /// beside the queue rather than folded over it, so a reader on the
+    /// telemetry tick pays one load and not a walk.
+    static DEFERRED_DROP_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// File `payload` for [`drain_deferred_drops`] to retire. Reached on wasm for
 /// every discard and natively only for one the free lane could not take; the
 /// queue exists on both targets so a host test can drive it.
+///
+/// A [`Priced`] payload is unwrapped here and filed at its declared price;
+/// anything else is filed at the size of its own struct — a floor, so that
+/// **the total is zero exactly when the queue is empty** and never reads
+/// "settled" over entries nobody priced. A declared price below the struct's
+/// own size is raised to it for the same reason.
 pub fn defer_drop(name: &'static str, payload: Box<dyn std::any::Any + Send>) {
-    DEFERRED_DROPS.with(|q| q.borrow_mut().push_back((name, payload)));
+    let (declared, payload) = match payload.downcast::<Priced>() {
+        Ok(priced) => {
+            let Priced { bytes, payload } = *priced;
+            (bytes, payload)
+        }
+        Err(payload) => (0, payload),
+    };
+    let bytes = declared.max(std::mem::size_of_val(&*payload) as u64);
+    DEFERRED_DROP_BYTES.with(|total| total.set(total.get().saturating_add(bytes)));
+    DEFERRED_DROPS.with(|q| q.borrow_mut().push_back((name, bytes, payload)));
 }
 
 /// Whether this thread is still holding anything it has promised to free.
 pub fn has_deferred_drops() -> bool {
     DEFERRED_DROPS.with(|q| !q.borrow().is_empty())
+}
+
+/// **Bytes this thread has been handed to free and has not freed yet**: the
+/// queue's entries at the prices they were filed at (see [`defer_drop`]).
+///
+/// Zero exactly when the queue is empty. Otherwise a floor on what the drain
+/// will give back: a caller that knows what its payload holds says so with a
+/// [`Priced`] — an evicted volume's sweeps arrive priced at their gate bytes —
+/// and everything filed without a price (a render-cache entry, an extract, a
+/// tile body, a shared `Arc`) counts its own struct size and nothing behind
+/// it. Published as the heap
+/// census's `deferred drops` family, which is what a reader of live bytes
+/// waits on before calling a fall "settled": an eviction's bytes leave this
+/// figure over as many frames as the drain's budget takes to reach them.
+pub fn deferred_drop_bytes() -> u64 {
+    DEFERRED_DROP_BYTES.with(std::cell::Cell::get)
 }
 
 /// Free deferred payloads until `budget` is spent, and answer how many went.
@@ -93,10 +155,14 @@ pub fn drain_deferred_drops(budget: std::time::Duration) -> usize {
     let mut dearest: (&'static str, u128) = ("nothing", 0);
     // One at a time, with the borrow released before the payload is dropped: a
     // `Drop` that discards something of its own must find the queue borrowable.
-    while let Some((name, payload)) = DEFERRED_DROPS.with(|q| q.borrow_mut().pop_front()) {
+    while let Some((name, bytes, payload)) = DEFERRED_DROPS.with(|q| q.borrow_mut().pop_front()) {
         #[cfg(not(target_arch = "wasm32"))]
         let before = started.elapsed();
         drop(payload);
+        // After the drop, so the total reads "queued and not yet freed" to
+        // the byte; a `Drop` that files something of its own adds to the
+        // total in between, which is the truth of that moment.
+        DEFERRED_DROP_BYTES.with(|total| total.set(total.get().saturating_sub(bytes)));
         freed += 1;
         let elapsed = started.elapsed();
         #[cfg(not(target_arch = "wasm32"))]

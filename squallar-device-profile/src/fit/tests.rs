@@ -961,6 +961,103 @@ fn fit_returns_the_floor_when_no_rung_can_pay() {
     }
 }
 
+/// **`floor_need` is the scene's need at the ladder's floor** — the same
+/// budgets `fit` gives up at, priced for the scene — and never more than the
+/// need at the class rung, since every rung only sheds.
+#[test]
+fn the_floor_need_is_the_scenes_need_at_every_rungs_stop() {
+    for limits in BudgetLimits::SHIPPED {
+        let profile = DeviceProfile {
+            class: DeviceClass::Discrete,
+            ..shipped_profile(limits)
+        };
+        let scene = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None); 6]);
+        let at_floor = floor_need(&scene, &profile, stand_in_grid_bytes);
+
+        let mut floor = resolve(&profile);
+        demote(&mut floor, &limits, 64);
+        assert!(every_rung_at_its_stop(&floor, &limits), "{}", limits.name);
+        assert_eq!(
+            at_floor,
+            need(&scene, &floor, stand_in_grid_bytes),
+            "{}: the floor need is not the need at the ladder's floor",
+            limits.name
+        );
+
+        let at_class_rung = need(&scene, &resolve(&profile), stand_in_grid_bytes);
+        assert!(
+            at_floor.gpu_bytes <= at_class_rung.gpu_bytes
+                && at_floor.host_bytes <= at_class_rung.host_bytes,
+            "{}: shedding every rung cost more, {at_floor:?} against {at_class_rung:?}",
+            limits.name
+        );
+        assert!(
+            at_floor.gpu_bytes > 0,
+            "{}: six loops cost nothing at the floor",
+            limits.name
+        );
+    }
+}
+
+/// **The capacity for an allowance is the smallest figure whose allowance
+/// covers it**, on every source arm: one byte less allows one byte too few.
+/// This is what the pressure decay's floor is spelled through — a need in
+/// allowance terms, turned back into a capacity figure the arm can hold.
+#[test]
+fn a_capacity_for_an_allowance_is_the_smallest_that_covers_it() {
+    let arms = [
+        Capacity::presumed(&BudgetLimits::DESKTOP),
+        Capacity::measured(24 << 30, None),
+        Capacity::probed(4032 << 20),
+    ];
+    for cap in arms {
+        for allowance in [
+            1u64,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            100,
+            576 << 20,
+            3839 << 20,
+            3840 << 20,
+        ] {
+            let figure = cap.gpu_bytes_for_allowance(allowance);
+            let covers = |gpu_bytes: u64| Capacity { gpu_bytes, ..cap }.allowance();
+            assert!(
+                covers(figure) >= allowance,
+                "{:?}: {figure} allows {} for a need of {allowance}",
+                cap.source,
+                covers(figure)
+            );
+            assert!(
+                covers(figure - 1) < allowance,
+                "{:?}: {figure} is not the smallest figure covering {allowance}",
+                cap.source
+            );
+        }
+        assert_eq!(cap.gpu_bytes_for_allowance(0), 0, "{:?}", cap.source);
+        assert_eq!(
+            cap.gpu_bytes_for_allowance(u64::MAX),
+            u64::MAX,
+            "{:?}: the top of u64 wrapped",
+            cap.source
+        );
+    }
+    // The presumed arm's constant is its own allowance, so the figure is the
+    // need itself; the measured arm's is `NEED_FRACTION` of the card, so the
+    // figure is the need over three quarters, rounded up: 5 needs 7, as the
+    // allowance test above has it.
+    assert_eq!(
+        Capacity::presumed(&BudgetLimits::DESKTOP).gpu_bytes_for_allowance(5),
+        5
+    );
+    assert_eq!(Capacity::probed(1).gpu_bytes_for_allowance(5), 7);
+    assert_eq!(Capacity::measured(1, None).gpu_bytes_for_allowance(3), 4);
+}
+
 /// **The loop pool is what the loops need, capped by the room the rest of the
 /// scene leaves** — never the class's ceiling. On the desktop bracket one
 /// two-hour loop is 36 x 16 MiB = 576 MiB, not the 3072 MiB pool ceiling a

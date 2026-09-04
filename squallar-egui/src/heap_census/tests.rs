@@ -23,7 +23,8 @@ fn distinct() -> Census {
         loan_outstanding_bytes: 8192,
         volume_store_bytes: 16384,
         job_in_flight_bytes: 32768,
-        tile_mesh_bytes: 65536,
+        deferred_drop_bytes: 65536,
+        tile_mesh_bytes: 131072,
     }
 }
 
@@ -33,8 +34,8 @@ fn distinct() -> Census {
 #[test]
 fn the_resident_total_leaves_the_gpu_family_out() {
     let c = distinct();
-    let every_family = (1 << 17) - 1;
-    assert_eq!(c.resident_total(), every_family - 65536);
+    let every_family = (1 << 18) - 1;
+    assert_eq!(c.resident_total(), every_family - 131072);
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16);
 }
 
@@ -93,13 +94,14 @@ fn the_line_names_every_family_and_its_denominator() {
         "loans out 8192 B",
         "volume store 16384 B",
         "jobs in flight 32768 B",
+        "deferred drops 65536 B",
     ] {
         assert!(said.contains(field), "{field} missing from {said}");
     }
     assert!(said.starts_with("heap census (page): "), "{said}");
     assert!(said.contains("residual 900000000 B"), "{said}");
     assert!(
-        said.contains("tile meshes 65536 B (GPU, not in the total)"),
+        said.contains("tile meshes 131072 B (GPU, not in the total)"),
         "the GPU family must be on the line and marked out of the sum: {said}"
     );
 }
@@ -139,11 +141,20 @@ fn the_widest_line_fits_the_hooks_buffer() {
         volume_store_bytes: u64::MAX,
         loan_outstanding_bytes: u64::MAX,
         job_in_flight_bytes: u64::MAX,
+        deferred_drop_bytes: u64::MAX,
     };
     let said = line(&widest, Some(u64::MAX), "rasterization worker");
     assert!(
         said.len() <= CENSUS_LINE_CAPACITY,
         "the widest census line is {} bytes, past the hook's {CENSUS_LINE_CAPACITY}",
+        said.len()
+    );
+    // And the constant is the widest line EXACTLY, so its doc's arithmetic
+    // stays a derivation and not a figure with unstated headroom.
+    assert_eq!(
+        said.len(),
+        CENSUS_LINE_CAPACITY,
+        "the widest census line is {} bytes; re-derive CENSUS_LINE_CAPACITY",
         said.len()
     );
 }

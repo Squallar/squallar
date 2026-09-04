@@ -402,7 +402,8 @@ pub(crate) enum VolumeDropPart {
     Nyquist(Arc<DeclaredNyquist>),
 }
 
-/// Split evicted volumes at their sweep seam for the deferred-drop path.
+/// Split evicted volumes at their sweep seam for the deferred-drop path,
+/// **each part priced at what freeing it gives back**.
 ///
 /// Handed to `offload::discard_each`, which files every item separately: on
 /// wasm each part is its own queue entry, so one drain turn frees one sweep
@@ -410,19 +411,32 @@ pub(crate) enum VolumeDropPart {
 /// see [`MAX_RESIDENT_STILL_VOLUMES`]). The `Scan` shell left behind — site
 /// and coverage pattern, a few KiB — is dropped here, which is the price of
 /// upstream's model owning its sweeps.
+///
+/// The price is `offload::Priced`, so the queue's `deferred_drop_bytes` can
+/// say how much of an eviction is still waiting to be freed. An owned sweep is
+/// priced at its gate bytes (`scan_size::sweep_bytes`, one walk of its
+/// radials, at eviction and never per frame); a shared `Arc` and the
+/// Nyquist half are priced at 0 — dropping a shared reference frees nothing
+/// certain, and the queue raises a 0 to the struct's own size so the entry
+/// still counts as held.
 pub(crate) fn volume_drop_parts(
     volumes: impl IntoIterator<Item = Still>,
-) -> impl Iterator<Item = VolumeDropPart> {
+) -> impl Iterator<Item = squallar_worker::offload::Priced> {
+    use squallar_worker::offload::Priced;
+
     volumes.into_iter().flat_map(|(scan, nyquist)| {
-        let mut parts: Vec<VolumeDropPart> = match Arc::try_unwrap(scan) {
+        let mut parts: Vec<Priced> = match Arc::try_unwrap(scan) {
             Ok(scan) => scan
                 .into_sweeps()
                 .into_iter()
-                .map(VolumeDropPart::Sweep)
+                .map(|sweep| {
+                    let bytes = squallar_radar::scan_size::sweep_bytes(&sweep) as u64;
+                    Priced::new(bytes, VolumeDropPart::Sweep(sweep))
+                })
                 .collect(),
-            Err(scan) => vec![VolumeDropPart::Shared(scan)],
+            Err(scan) => vec![Priced::new(0, VolumeDropPart::Shared(scan))],
         };
-        parts.push(VolumeDropPart::Nyquist(nyquist));
+        parts.push(Priced::new(0, VolumeDropPart::Nyquist(nyquist)));
         parts
     })
 }
@@ -558,7 +572,8 @@ mod tests {
     fn a_volume_still_held_elsewhere_travels_whole_and_is_not_lost() {
         let scan = crate::volume_fixture::ready_scan();
         let second_holder = Arc::clone(&scan);
-        let parts: Vec<VolumeDropPart> = volume_drop_parts(vec![(scan, Arc::default())]).collect();
+        let parts: Vec<squallar_worker::offload::Priced> =
+            volume_drop_parts(vec![(scan, Arc::default())]).collect();
         assert_eq!(
             parts.len(),
             2,
@@ -567,10 +582,46 @@ mod tests {
         assert!(
             parts
                 .iter()
+                .filter_map(|part| part.payload.downcast_ref::<VolumeDropPart>())
                 .any(|part| matches!(part, VolumeDropPart::Shared(held)
                     if Arc::ptr_eq(held, &second_holder))),
             "the shared volume's reference was dropped on the spot instead of \
              being handed over",
+        );
+        // A reference something else still holds frees nothing certain, so
+        // it is priced at 0 and the queue's own floor is what makes it count.
+        assert!(
+            parts.iter().all(|part| part.bytes == 0),
+            "a shared reference was priced as if dropping it freed a volume",
+        );
+    }
+
+    /// **An owned sweep is priced at its gate bytes**, so the deferred-drop
+    /// census says what an eviction is still holding rather than counting
+    /// entries. The Nyquist half and any shared reference are priced at 0 —
+    /// what dropping them frees is not this process's to claim.
+    #[test]
+    fn an_owned_sweep_is_priced_at_its_gate_bytes() {
+        let volume: Still = (crate::volume_fixture::ready_scan(), Arc::default());
+        let expected: u64 = volume
+            .0
+            .sweeps()
+            .iter()
+            .map(|sweep| squallar_radar::scan_size::sweep_bytes(sweep) as u64)
+            .sum();
+        assert!(expected > 0, "fixture: a volume with no gate bytes");
+
+        let parts: Vec<squallar_worker::offload::Priced> =
+            volume_drop_parts(vec![volume]).collect();
+        let priced: u64 = parts.iter().map(|part| part.bytes).sum();
+        assert_eq!(
+            priced, expected,
+            "the split's prices do not sum to the volume's own gate bytes",
+        );
+        assert_eq!(
+            parts.iter().filter(|part| part.bytes == 0).count(),
+            1,
+            "exactly one part — the declared-Nyquist half — prices at zero",
         );
     }
 

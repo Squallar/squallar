@@ -28,6 +28,9 @@ fn budget_line(app: &App) -> String {
         app.gpu_probe,
         crate::pressure::LinearMemoryWatch::default(),
         &app.budget_readout,
+        // Not `live_bytes()`: this binary's own allocator figure moves with
+        // whatever the harness is holding, and these tests pin the line.
+        None,
     )
 }
 
@@ -506,6 +509,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             app.gpu_probe,
             crate::pressure::LinearMemoryWatch::default(),
             &app.budget_readout,
+            None,
         )
     };
     let six = squallar_device_profile::scene::Scene {

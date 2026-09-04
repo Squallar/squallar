@@ -437,6 +437,22 @@ pub fn every_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool 
     !step_down(&mut probe, limits)
 }
 
+/// **What `scene` costs at the ladder's floor** — every rung at its stop, the
+/// budgets [`fit`] hands back when nothing can pay. Below this figure a
+/// capacity presumption buys nothing: the ladder has nothing left to shed, so
+/// a presumption lowered past it only makes the readout lie about a wall the
+/// scene was never going to fit under. The application's pressure decay is
+/// floored here for exactly that reason.
+///
+/// Walks the ladder from the class rung rather than reading a constant: the
+/// floor is a configuration of every rung, and the need at it is the scene's
+/// (its panes, its loops, its grids) priced at that configuration.
+pub fn floor_need(scene: &Scene, profile: &DeviceProfile, grid_bytes: GridBytes) -> Need {
+    let mut floor = resolve(profile);
+    while step_down(&mut floor, &profile.limits) {}
+    need(scene, &floor, grid_bytes)
+}
+
 /// Whether no rung that lowers the GPU need can move `budgets` any further.
 pub fn every_gpu_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool {
     let mut probe = *budgets;

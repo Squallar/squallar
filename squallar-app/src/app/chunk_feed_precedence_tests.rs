@@ -1605,6 +1605,69 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
     assert_eq!(app.session_capacity, Some(expected));
 }
 
+/// **The GPU decay has a floor: what the ladder's floor rung needs for this
+/// scene.** The step is geometric with nothing under it — seven events halve
+/// the presumption, thirty leave about four percent of it — and below the
+/// floor rung's need the ladder has nothing left to shed, so every further
+/// lowering buys no rung and only makes the readout lie about a wall the
+/// scene was never going to fit under.
+///
+/// Thirty events on six two-hour loops: the presumption settles at the figure
+/// whose allowance covers the floor rung's need, stays there for the last
+/// events, and the rung is at every rung's stop. Without the floor the same
+/// thirty events land at `0.9^30` of the presumption — 4.2 % of 3840 MiB,
+/// which is 161 MiB, well under the floor need.
+#[test]
+fn thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below() {
+    use crate::loop_pool::GRID_BYTES;
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
+    use squallar_device_profile::fit::{every_rung_at_its_stop, floor_need};
+
+    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 6);
+    let scene = app.scene_of();
+    let floor = app
+        .capacity()
+        .gpu_bytes_for_allowance(floor_need(&scene, &app.device_profile, GRID_BYTES).gpu_bytes);
+    let presumed = app.capacity().gpu_bytes;
+    assert!(
+        floor > 0 && floor < presumed,
+        "fixture: the floor need ({floor}) must sit under the presumption ({presumed})",
+    );
+
+    let mut readings = Vec::new();
+    for _ in 0..30 {
+        app.on_pressure(crate::pressure::Pressure::SurfaceLost);
+        readings.push(app.session_capacity.expect("an event sets the presumption"));
+    }
+
+    assert_eq!(
+        app.session_capacity,
+        Some(floor),
+        "thirty events settled at {:?}, not at the floor rung's need {floor}: {readings:?}",
+        app.session_capacity,
+    );
+    assert!(
+        readings.windows(2).all(|pair| pair[0] >= pair[1]),
+        "the presumption came back up under pressure: {readings:?}",
+    );
+    assert!(
+        every_rung_at_its_stop(&app.budgets, &app.device_profile.limits),
+        "the ladder is not at its floor, so the presumption stopped early",
+    );
+
+    // What the unfloored geometric decay would have reached, so the floor is
+    // shown to bite rather than to coincide with where the decay stopped.
+    let mut unfloored = presumed;
+    for _ in 0..30 {
+        unfloored = unfloored / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+    }
+    assert!(
+        unfloored < floor,
+        "the unfloored decay ({unfloored}) did not go below the floor ({floor}), \
+         so this test cannot tell a floor from its absence",
+    );
+}
+
 /// **An out-of-memory error, however many times the device raised it in one
 /// frame, is one event on that frame — one lowering of the presumption, one
 /// re-fit — and writes nothing.** Six two-hour loops never fitted the 3840 MiB

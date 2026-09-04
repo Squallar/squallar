@@ -351,6 +351,28 @@ impl Capacity {
         }
     }
 
+    /// **The smallest capacity figure, learned the way this one was, whose
+    /// [`Self::allowance`] covers `allowance`** — the inverse of that
+    /// arithmetic, so a caller holding a need can say what capacity would
+    /// fit it. On the presumed arm the constant is its own allowance and the
+    /// figure is `allowance` itself; on a measured or probed arm it is the
+    /// ceiling of `allowance / NEED_FRACTION`, and one byte less allows one
+    /// byte too few (`a_capacity_for_an_allowance_is_the_smallest_that_covers_it`).
+    /// Saturates rather than wraps at the top of `u64`.
+    pub fn gpu_bytes_for_allowance(&self, allowance: u64) -> u64 {
+        match self.source {
+            // In `u128`: the product overflows a `u64` well before the
+            // quotient does, so saturating the multiply would answer a third
+            // of the truth for every figure above `u64::MAX / 4`.
+            CapacitySource::Measured | CapacitySource::Probed => u64::try_from(
+                (u128::from(allowance) * u128::from(NEED_FRACTION.1))
+                    .div_ceil(u128::from(NEED_FRACTION.0)),
+            )
+            .unwrap_or(u64::MAX),
+            CapacitySource::Presumed => allowance,
+        }
+    }
+
     /// What may be resident **beyond** `need` here: `ECONOMY_FRACTION` of the
     /// capacity less the need itself, and nothing when the need already
     /// reaches that line. The one figure that legitimately grows with the

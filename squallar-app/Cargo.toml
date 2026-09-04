@@ -14,6 +14,10 @@ edition.workspace = true
 
 [dependencies]
 web-time = { workspace = true }
+# `squallar_alloc::live_bytes`, the host figure that falls: read on the
+# telemetry tick and beside the page-heap high-water mark under pressure. The
+# reading only — the `#[global_allocator]` is declared by the binary crates.
+squallar-alloc = { workspace = true }
 squallar-egui = { workspace = true }
 # The device-class policy floor: budget cascades + the profile->budgets
 # resolver moved down at WO-RD; this crate reads its budgets from below.

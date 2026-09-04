@@ -10,7 +10,7 @@ use squallar_device_profile::constants::{
     MAX_LOOP_SECTION_CUTS_PER_FRAME, MAX_LOOP_SPEED_FPS, MAX_LOOP_VOLUME_BUILDS_PER_FRAME,
     MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
 };
-use squallar_device_profile::fit::{economy_allowance, fit, fit_holds, need};
+use squallar_device_profile::fit::{economy_allowance, fit, fit_holds, floor_need, need};
 use squallar_device_profile::scene::{OverlayGridNeed, Scene};
 use squallar_egui::actions::GuiAction;
 use squallar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
@@ -274,6 +274,68 @@ fn telemetry_is_due(said: Option<web_time::Instant>, now: web_time::Instant) -> 
 }
 
 /// Write one telemetry line at the level this install asked for.
+/// What the heap itself says about host spare, beside the model's own figure.
+///
+/// `wall` is `(declared maximum, current byteLength)` for an instance that has
+/// one — a browser page — and `None` for a native process, which has no
+/// declared wall and no linear memory to read. That is the arm selector, and
+/// it is a runtime reading rather than a `cfg`: the same binary answers both
+/// ways depending on what its bridge reported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostSpareInputs {
+    /// `(page_max_bytes, page_bytes)`, where a wall was declared.
+    pub wall: Option<(u64, u64)>,
+    /// What this instance's allocator has handed out and not been handed back
+    /// (`squallar_alloc::live_bytes`); `None` where nothing installed the
+    /// counter, which is every binary but the two that declare it.
+    pub live_bytes: Option<u64>,
+    /// The headroom the page-heap watermark reserves under the wall, which
+    /// sets where the act line falls.
+    pub headroom_bytes: u64,
+}
+
+/// **Host spare: the model's figure, bounded by what the heap actually says.**
+///
+/// `need()` has no term for loop scans, the extract cache, egui's own buffers
+/// or the deferred-drop queue, so `allowance - need` can read hundreds of MiB
+/// of model spare on a heap that is nearly full — which is exactly the reading
+/// that would admit one more layer into a trap. **The heap measurement bounds
+/// the model, never the other way round**, and the one figure that bounds it
+/// and can also FALL is what this instance's allocator is holding.
+///
+/// Two arms, by whether the instance has a declared wall:
+///
+/// * **A walled instance** (a browser page) is bounded by `max - byteLength`,
+///   which cannot fall, and by `act_line - live_bytes`, which can. The act
+///   line and not the wall, because the watermark acts below the wall: spare
+///   that reaches past it is spare the governor takes back on the next
+///   reading.
+/// * **An unwalled one** (native) is bounded by `allowance - live_bytes`.
+///   There is no second reading to take, and the allowance is the pool.
+///
+/// The result is the minimum over every bound that is present, so an absent
+/// one can only leave the answer where it was — never widen it. With no heap
+/// reading and no counter at all the model's own figure stands, which is what
+/// every build did before the counter existed.
+pub(crate) fn host_spare_bytes(model_spare: u64, allowance: u64, heap: HostSpareInputs) -> u64 {
+    let wall_room = heap.wall.map(|(max, used)| max.saturating_sub(used));
+    let act_room = heap.wall.zip(heap.live_bytes).map(|((max, _), live)| {
+        squallar_device_profile::linear_memory::act_line(max, heap.headroom_bytes)
+            .saturating_sub(live)
+    });
+    // Native's own live bound, and only where there is no wall, so a page is
+    // never bounded twice by the same allocator figure.
+    let allowance_room = heap
+        .live_bytes
+        .filter(|_| heap.wall.is_none())
+        .map(|live| allowance.saturating_sub(live));
+    [Some(model_spare), wall_room, act_room, allowance_room]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(model_spare)
+}
+
 fn say_telemetry(loud: bool, line: &str) {
     if loud {
         log::info!("{line}");
@@ -1895,6 +1957,7 @@ impl super::App {
                     self.gpu_probe,
                     self.linear_memory_watch,
                     &self.budget_readout,
+                    squallar_alloc::live_bytes(),
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
@@ -1976,6 +2039,10 @@ impl super::App {
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
         census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
+        // Evicted and not yet freed: what `offload::discard` is holding for
+        // the frame-paced drain. One `Cell` read; the queue prices itself at
+        // enqueue and de-prices at drop.
+        census::set_deferred_drop_bytes(squallar_worker::offload::deferred_drop_bytes());
     }
 
     /// **Judge one reading of the page's linear memory** against the line
@@ -4747,10 +4814,16 @@ impl super::App {
             requested_percent: None,
             effective_percent: None,
         };
-        let heap_room = self
-            .page_heap_reading
-            .filter(|heap| heap.page_max_bytes > 0)
-            .map(|heap| heap.page_max_bytes.saturating_sub(heap.page_bytes));
+        // See [`host_spare_bytes`]: the model's spare, bounded by what the
+        // heap and this instance's allocator actually say.
+        let heap = HostSpareInputs {
+            wall: self
+                .page_heap_reading
+                .filter(|heap| heap.page_max_bytes > 0)
+                .map(|heap| (heap.page_max_bytes, heap.page_bytes)),
+            live_bytes: squallar_alloc::live_bytes(),
+            headroom_bytes: self.host_headroom_bytes,
+        };
         readout.host = cap
             .host_bytes
             .zip(cap.host_allowance())
@@ -4769,7 +4842,7 @@ impl super::App {
                     },
                     allowance_bytes: allowance,
                     need_bytes: need.host_bytes,
-                    spare_bytes: Some(heap_room.map_or(model_spare, |room| model_spare.min(room))),
+                    spare_bytes: Some(host_spare_bytes(model_spare, allowance, heap)),
                     requested_percent: None,
                     effective_percent: None,
                 }
@@ -4987,8 +5060,29 @@ impl super::App {
     /// card, and a GPU rung shed for it would cost the loop its history for
     /// a byte the page never gets back. Every other cause lowers the GPU
     /// figure, as before, and leaves the host's where it stands.
+    ///
+    /// **The GPU decay has a floor: what the ladder's floor rung needs for
+    /// this scene.** The step is geometric — seven events halve the figure,
+    /// thirty leave four percent of it — and below the floor rung's need the
+    /// ladder has nothing left to shed, so a presumption lowered past it
+    /// buys no rung and only makes the readout lie about a wall this scene
+    /// was never going to fit under. The floor is `fit::floor_need`, priced
+    /// for the scene at every rung's stop and turned back into a capacity
+    /// figure on this arm (`Capacity::gpu_bytes_for_allowance`), and it is
+    /// never above the capacity in force: a scene whose floor need already
+    /// exceeds the capacity holds the presumption rather than raising it.
+    ///
+    /// **Beside the high-water mark, the figure that can fall.** The host
+    /// arm's `observed` is `byteLength`, which only grows; the same lines
+    /// now print this instance's live bytes (`squallar_alloc::live_bytes`)
+    /// beside it — logged, and not yet acted on. `0` there is an instance
+    /// that never installed the counter.
     fn refit_under_pressure(&mut self, cause: crate::pressure::Pressure) -> u32 {
+        const MIB: u64 = 1024 * 1024;
         let cap = self.capacity();
+        let scene = self.scene_of();
+        let live = squallar_alloc::live_bytes().unwrap_or(0) / MIB;
+        let mut beside = format!("live {live} MiB");
         let lowered = if cause.is_page_heap() {
             // A bracket with no host figure has nothing to hold down: the
             // economy went, the rung stands, and the log says why.
@@ -5021,15 +5115,21 @@ impl super::App {
             // event lowers it again from the newer, higher mark, so the
             // ladder converges instead of stalling.
             let observed = cause.page_heap_used().unwrap_or(host);
+            beside = format!("page heap mark {} MiB, {beside}", observed / MIB);
             let host = host.min(observed) / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
             self.session_host_capacity = Some(host);
             host
         } else {
-            let gpu = cap.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+            let lowered = cap.gpu_bytes / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+            let floor = cap
+                .gpu_bytes_for_allowance(
+                    floor_need(&scene, &self.device_profile, GRID_BYTES).gpu_bytes,
+                )
+                .min(cap.gpu_bytes);
+            let gpu = lowered.max(floor);
             self.session_capacity = Some(gpu);
             gpu
         };
-        let scene = self.scene_of();
         let refitted = self.fit_scene(&scene);
         let needed = need(&scene, &refitted, GRID_BYTES);
         let needed = if cause.is_page_heap() {
@@ -5040,20 +5140,20 @@ impl super::App {
         if refitted == self.budgets {
             log::info!(
                 "Budgets: held at rung {} after {}: the scene's {needed} MiB fits the {} MiB \
-                 this session now presumes",
+                 this session now presumes; {beside}",
                 self.budgets.steps_back,
                 cause.label(),
-                lowered / (1024 * 1024),
+                lowered / MIB,
             );
             return self.budgets.steps_back;
         }
         log::info!(
             "Budgets: re-fitted to rung {} after {}: {needed} MiB against the {} MiB this \
              session now presumes; {:?} 3D quality ceiling, {} MiB of offscreen, {} textured \
-             loop frames, {:?} grid cells, overlay oversampling {} percent",
+             loop frames, {:?} grid cells, overlay oversampling {} percent; {beside}",
             refitted.steps_back,
             cause.label(),
-            lowered / (1024 * 1024),
+            lowered / MIB,
             refitted.quality_ceiling,
             refitted.offscreen_bytes / (1024 * 1024),
             refitted.loop_render_budget,
@@ -7494,3 +7594,8 @@ mod idle_raster_tests;
 #[path = "app_render/pane_need_px_tests.rs"]
 #[cfg(test)]
 mod pane_need_px_tests;
+
+/// Host spare is the model's figure bounded by the heap's, on both arms.
+#[path = "app_render/host_spare_tests.rs"]
+#[cfg(test)]
+mod host_spare_tests;

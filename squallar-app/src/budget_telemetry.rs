@@ -36,15 +36,26 @@
 //! ran". `balloon` is what the loops hold **above their base** — the bytes
 //! the pool's planner spent on density past what `fit` charged, summed over
 //! every loop, 0 when every loop holds its base or less; it is a subset of
-//! `pool` and is never added to it. **After everything the rig reads**, one
-//! group per visible pane — `pane<i> gpu <n> MiB host <n> MiB shared <n> MiB
-//! own <n> MiB`: what the pane COSTS on each axis at the budgets in force
+//! `pool` and is never added to it.
+//!
+//! **After everything the rig reads**, in this order: `spare gpu <n> MiB host
+//! <n> MiB`, what each pool has left for one more pane or layer, `none` where
+//! the pool itself is unknown; then `live <page>/<worker> MiB`, what each wasm
+//! instance's allocator is holding — the one host figure here that can FALL,
+//! where `linear` only grows; then, LAST, one group per visible pane —
+//! `pane<i> gpu <n> MiB host <n> MiB shared <n> MiB own <n> MiB`: what the
+//! pane COSTS on each axis at the budgets in force
 //! (`fit::need_terms_for_pane`), then what its stores HOLD, split by whether
 //! another pane holds the same bytes — two families, priced and held, never
-//! added to each other — and last `spare gpu <n> MiB host <n> MiB`, what each
-//! pool has left for one more pane or layer, `none` where the pool itself is
-//! unknown. Every byte figure is MiB by integer division, because the rig's
-//! probe reads these sentences with `(\d+)` groups.
+//! added to each other.
+//!
+//! **That order is a rule, not a history: fixed-width fields first, the
+//! variable-arity group last.** Anything positioned BEHIND a group whose
+//! length varies is what a positional reader cannot find — with N pane rows
+//! in front of it, a fixed field sits at a different separator index on every
+//! scene. So the pane rows go where nothing follows them, and a new fixed
+//! field goes in front of them. Every byte figure is MiB by integer division,
+//! because the rig's probe reads these sentences with `(\d+)` groups.
 //!
 //! Product telemetry, not a campaign instrument: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, and no figure it prints
@@ -117,19 +128,43 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// unanchored at their end, so a trailing field is the only safe place to add
 /// one.
 ///
-/// **The pane rows and the spare pair ride after `heap max`**, for the same
-/// reason: `readout` is the budget system's own readout
-/// (`squallar_egui::shell_api::BudgetReadout`), one group per visible pane
-/// and then the two pools' spare, appended where the rig's unanchored regex
+/// **The spare pair, the live pair and the pane rows ride after `heap max`**,
+/// for the same reason: `readout` is the budget system's own readout
+/// (`squallar_egui::shell_api::BudgetReadout`), the two pools' spare and then
+/// one group per visible pane, appended where the rig's unanchored regex
 /// cannot see them. `none` for a spare the session has no pool figure for —
 /// spelled, because 0 is a real spare.
+///
+/// **`live <page>/<worker>` is the one host figure on the line that can
+/// fall**, and it rides LAST. What each instance's allocator has handed out
+/// and not been handed back (`squallar_alloc::live_bytes`), where `linear` is
+/// `byteLength` and only grows. The same two-instance shape as `linear` and
+/// `heap max`, never summed: the page's is read off this process's own
+/// counter — on native the same counter, the same figure — and the worker's
+/// is what it last said beside its `linear` reading, 0 until it has. 0 on the
+/// page is a binary that never installed the counter, not an empty heap.
+///
+/// **The ordering rule for everything appended here: fixed-width fields
+/// first, the variable-arity group LAST.** Anything positioned *behind* a
+/// group whose length varies is what a positional reader cannot find — with
+/// N pane rows in front of it, a fixed field sits at a different separator
+/// index on every scene — so the variable group belongs where nothing is
+/// behind it. `spare` and `live` are therefore in front of the `pane<i>`
+/// rows, and a future fixed field goes in front of them too.
+///
+/// This corrects the rationale recorded when the pane rows landed, which had
+/// the rule the wrong way round and put `spare` behind them; the pair moved
+/// in front here. What makes the line appendable at all is that every field
+/// is **self-describing by name**, so a reader searches for its label rather
+/// than counting separators — the fixed-first ordering is the belt to that
+/// braces, for anyone parsing positionally anyway.
 ///
 /// A free function returning a `String` for the reason every other telemetry
 /// sentence in this tree is one: `.github/browser-rig/drive.py` scrapes it
 /// with a regex in another language in another directory, and
 /// `the_rig_reads_the_budget_line_the_app_actually_writes` holds the two ends
 /// together.
-// Nine, and the line is the reason: every field on it is a different
+// Ten, and the line is the reason: every field on it is a different
 // subsystem's reading, and bundling any two of them into a struct would make
 // a type whose only purpose is to be destructured here.
 #[allow(clippy::too_many_arguments)]
@@ -143,6 +178,7 @@ pub(crate) fn budget_state_line(
     probe: GpuProbeReport,
     page_heap: crate::pressure::LinearMemoryWatch,
     readout: &squallar_egui::shell_api::BudgetReadout,
+    page_live_bytes: Option<u64>,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -181,8 +217,28 @@ pub(crate) fn budget_state_line(
         mib(linear.map_or(0, |l| l.page_max_bytes)),
         mib(linear.map_or(0, |l| l.worker_max_bytes)),
     );
+    // **Fixed-width fields first, the variable-arity group last.** See the
+    // note on this function: everything BEHIND a variable group is what a
+    // positional reader cannot find.
+    let spare = |pool: Option<&squallar_egui::shell_api::PoolReadout>| {
+        pool.and_then(|pool| pool.spare_bytes)
+            .map_or_else(|| "none".to_string(), |bytes| format!("{} MiB", mib(bytes)))
+    };
+    // Writing into a `String` cannot fail.
+    let _ = write!(
+        line,
+        ", spare gpu {} host {}",
+        spare(Some(&readout.gpu)),
+        spare(readout.host.as_ref()),
+    );
+    let _ = write!(
+        line,
+        ", live {}/{} MiB",
+        mib(page_live_bytes.unwrap_or(0)),
+        mib(linear.and_then(|l| l.worker_live_bytes).unwrap_or(0)),
+    );
+    // Last on the line, and the only group whose LENGTH varies.
     for (i, pane) in readout.panes.iter().enumerate() {
-        // Writing into a `String` cannot fail.
         let _ = write!(
             line,
             ", pane{i} gpu {} MiB host {} MiB shared {} MiB own {} MiB",
@@ -192,16 +248,6 @@ pub(crate) fn budget_state_line(
             mib(pane.own_bytes),
         );
     }
-    let spare = |pool: Option<&squallar_egui::shell_api::PoolReadout>| {
-        pool.and_then(|pool| pool.spare_bytes)
-            .map_or_else(|| "none".to_string(), |bytes| format!("{} MiB", mib(bytes)))
-    };
-    let _ = write!(
-        line,
-        ", spare gpu {} host {}",
-        spare(Some(&readout.gpu)),
-        spare(readout.host.as_ref()),
-    );
     line
 }
 
@@ -384,6 +430,10 @@ mod tests {
     /// bound, which prints `5` — a code no other position carries.
     /// A page-heap watch that has never acted: the state every case below
     /// but `the_budget_line_carries_the_page_heaps_act_count` is about.
+    /// The page's live bytes for the distinct line: 250 MiB, a figure no
+    /// other position carries, beside the worker's 600 in [`distinct`].
+    const LIVE: Option<u64> = Some(250 << 20);
+
     const WATCH: crate::pressure::LinearMemoryWatch =
         crate::pressure::LinearMemoryWatch::never_acted();
 
@@ -502,13 +552,14 @@ mod tests {
                 &CAP,
                 PROBE,
                 WATCH,
-                &no_readout()
+                &no_readout(),
+                LIVE,
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             spare gpu none host none",
+             spare gpu none host none, live 250/600 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
@@ -521,7 +572,8 @@ mod tests {
                 &CAP,
                 PROBE,
                 WATCH,
-                &no_readout()
+                &no_readout(),
+                LIVE,
             )
             .contains(", pool 576 MiB,"),
         );
@@ -537,11 +589,13 @@ mod tests {
                 &CAP,
                 PROBE,
                 WATCH,
-                &no_readout()
+                &no_readout(),
+                LIVE,
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none"
+                 heap max 900/1100 MiB, spare gpu none host none, \
+                 live 250/600 MiB"
             ),
         );
         // And the capacity follows what it is handed: this profile's own
@@ -558,10 +612,12 @@ mod tests {
                 GpuProbeReport::Absent,
                 WATCH,
                 &no_readout(),
+                LIVE,
             )
             .ends_with(
                 ", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none"
+                 heap max 900/1100 MiB, spare gpu none host none, \
+                 live 250/600 MiB"
             ),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
@@ -576,10 +632,12 @@ mod tests {
                 GpuProbeReport::Skipped,
                 WATCH,
                 &no_readout(),
+                LIVE,
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, spare gpu none host none"
+                 heap max 900/1100 MiB, spare gpu none host none, \
+                 live 250/600 MiB"
             ),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
@@ -644,6 +702,7 @@ mod tests {
             GpuProbeReport::Absent,
             WATCH,
             &no_readout(),
+            None,
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -652,12 +711,12 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, spare gpu none host none",
+             heap max 0/0 MiB, spare gpu none host none, live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            16,
-            "seventeen comma-separated groups with no pane rows, sixteen separators: a \
+            17,
+            "eighteen comma-separated groups with no pane rows, seventeen separators: a \
              field was dropped or gained",
         );
     }
@@ -698,6 +757,7 @@ mod tests {
             PROBE,
             WATCH,
             &no_readout(),
+            LIVE,
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -707,7 +767,8 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, spare gpu none host none",
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, spare gpu none host none, \
+             live 250/600 MiB",
             "the tail the rig does not read drifted",
         );
     }
@@ -735,6 +796,7 @@ mod tests {
             PROBE,
             WATCH,
             &two_pane_readout(),
+            LIVE,
         );
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -743,13 +805,38 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             spare gpu 3568 MiB host 601 MiB, live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
-             pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB, \
-             spare gpu 3568 MiB host 601 MiB",
+             pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB",
         );
         // The rig's own guarantee, restated where the rows depend on it: no
         // `$` closes the pattern, and its last literal is the balloon.
         assert!(pattern("budget_state_re").ends_with(r"balloon (\d+) MiB"));
+
+        // **The variable-arity group is LAST, and that is the rule.** Every
+        // fixed field sits at a separator index that does not depend on how
+        // many panes are open; anything placed behind the rows would not.
+        // Asserted over a changing pane count, because one count cannot tell
+        // "last" from "happens to be last here".
+        for panes in 0..3 {
+            let readout = BudgetReadout {
+                panes: two_pane_readout().panes.into_iter().take(panes).collect(),
+                ..two_pane_readout()
+            };
+            let line = budget_state_line(
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &readout, LIVE,
+            );
+            let (fixed, _) = line.split_once(", pane0 ").unwrap_or((line.as_str(), ""));
+            assert!(
+                fixed.ends_with(", live 250/600 MiB"),
+                "with {panes} pane row(s) the last fixed field is not `live`: {line}",
+            );
+            assert_eq!(
+                line.matches(", pane").count(),
+                panes,
+                "the rows are not one per pane: {line}",
+            );
+        }
         // A pool with a figure but nothing spare prints a real zero, and a
         // pool with no figure prints its absence.
         let exhausted = BudgetReadout {
@@ -762,9 +849,9 @@ mod tests {
         };
         assert!(
             budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &exhausted,
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &exhausted, LIVE,
             )
-            .ends_with(", spare gpu 0 MiB host none"),
+            .ends_with(", spare gpu 0 MiB host none, live 250/600 MiB"),
         );
     }
 
@@ -783,7 +870,8 @@ mod tests {
                 &CAP,
                 PROBE,
                 WATCH,
-                &no_readout()
+                &no_readout(),
+                LIVE,
             )
             .starts_with(&good)
         );
@@ -799,7 +887,8 @@ mod tests {
                 &CAP,
                 PROBE,
                 WATCH,
-                &no_readout()
+                &no_readout(),
+                LIVE,
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -838,10 +927,12 @@ mod tests {
             PROBE,
             WATCH,
             &no_readout(),
+            None,
         );
         assert!(
             never.ends_with(
-                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, spare gpu none host none"
+                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, spare gpu none host none, \
+                 live 0/0 MiB"
             ),
             "a watch that never acted must still print its zero: {never}",
         );
@@ -868,10 +959,12 @@ mod tests {
             PROBE,
             watch,
             &no_readout(),
+            None,
         );
         assert!(
             acted.ends_with(
-                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, spare gpu none host none"
+                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, spare gpu none host none, \
+                 live 0/0 MiB"
             ),
             "the act count and the mark are not both on the line: {acted}",
         );

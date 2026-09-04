@@ -104,6 +104,74 @@ fn a_queue_holding_anything_says_so() {
     assert!(!has_deferred_drops());
 }
 
+/// **The queue prices what it holds**: a [`Priced`] payload at its declared
+/// bytes, added when filed and subtracted when freed; an unpriced one at its
+/// own struct size, so the total is zero exactly when the queue is empty and
+/// never reads "settled" over entries nobody priced.
+#[test]
+fn the_queue_prices_its_entries_at_enqueue_and_deprices_them_at_the_drop() {
+    empty_the_queue();
+    assert_eq!(deferred_drop_bytes(), 0, "an emptied queue holds no bytes");
+
+    // Filed the way `discard` files a `Priced`: boxed as `dyn Any`, and
+    // recognised by the queue.
+    defer_drop(
+        "test-priced",
+        Box::new(Priced::new(47 << 20, vec![0u8; 16])),
+    );
+    assert_eq!(
+        deferred_drop_bytes(),
+        47 << 20,
+        "a price is taken as declared"
+    );
+
+    // An unpriced payload counts its own struct — the `Vec` header, not the
+    // sixteen bytes behind it — and never zero.
+    defer_drop("test-unpriced", Box::new(vec![0u8; 16]));
+    let header = std::mem::size_of::<Vec<u8>>() as u64;
+    assert_eq!(deferred_drop_bytes(), (47 << 20) + header);
+
+    // A declared price below the struct's own size is raised to it: an
+    // `Arc` a caller honestly prices at 0 still weighs its pointer.
+    defer_drop("test-underpriced", Box::new(Priced::new(0, Arc::new(()))));
+    let pointer = std::mem::size_of::<Arc<()>>() as u64;
+    assert_eq!(deferred_drop_bytes(), (47 << 20) + header + pointer);
+
+    // Oldest first, and each free takes exactly its own price back.
+    assert_eq!(drain_deferred_drops(Duration::ZERO), 1);
+    assert_eq!(deferred_drop_bytes(), header + pointer);
+    assert_eq!(drain_deferred_drops(Duration::ZERO), 1);
+    assert_eq!(deferred_drop_bytes(), pointer);
+    assert_eq!(drain_deferred_drops(Duration::ZERO), 1);
+    assert_eq!(deferred_drop_bytes(), 0, "an emptied queue holds no bytes");
+    assert!(!has_deferred_drops());
+}
+
+/// The queue files a [`Priced`]'s PAYLOAD, not the wrapper: what the drain
+/// frees is the thing the caller handed over, at the price it said.
+#[test]
+fn a_priced_payload_is_unwrapped_when_filed_and_freed_by_the_drain() {
+    empty_the_queue();
+    let sentinel = Arc::new(());
+    defer_drop(
+        "test-priced-sentinel",
+        Box::new(Priced::new(1 << 20, Arc::clone(&sentinel))),
+    );
+    assert_eq!(
+        Arc::strong_count(&sentinel),
+        2,
+        "the push must hold the payload"
+    );
+    assert_eq!(deferred_drop_bytes(), 1 << 20);
+    assert_eq!(drain_deferred_drops(AMPLE), 1);
+    assert_eq!(
+        Arc::strong_count(&sentinel),
+        1,
+        "the drain is where it dies"
+    );
+    assert_eq!(deferred_drop_bytes(), 0);
+}
+
 /// **Why [`discard_each`] exists**, asserted on the queue.
 #[test]
 fn a_collection_handed_over_whole_is_one_payload_and_per_item_is_many() {
