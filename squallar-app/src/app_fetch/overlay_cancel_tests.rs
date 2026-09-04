@@ -142,7 +142,7 @@ fn a_superseding_dispatch_withdraws_the_job_it_replaced() {
         .expect("withdrawing a job must still deliver, or its marks leak");
     assert_eq!(resp.generation, 5, "the withdrawn dispatch answers first");
     assert!(
-        resp.image.is_none(),
+        resp.picture.is_none(),
         "a withdrawn job must answer nothing — a picture here means it ran",
     );
 
@@ -207,7 +207,7 @@ fn a_grouped_job_survives_until_its_last_destination_supersedes() {
         .try_recv()
         .expect("the withdrawal delivers the grouped job as nothing");
     assert_eq!(resp.generation, 5);
-    assert!(resp.image.is_none());
+    assert!(resp.picture.is_none());
 }
 
 /// **A destination whose job already answered withdraws nothing.** The normal

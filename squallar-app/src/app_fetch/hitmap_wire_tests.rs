@@ -260,8 +260,13 @@ fn a_delivered_hit_map_resolves_clicks_to_the_dispatched_items() {
             .expect("the refused job ran here and delivered");
         assert_eq!(resp.overlay_kind, kind);
         assert!(
-            resp.image.is_some(),
-            "{kind:?}: the described render must answer a picture",
+            matches!(
+                resp.picture,
+                Some(crate::channels::OverlayPicture::Painted(_))
+            ),
+            "{kind:?}: the described render must answer a picture with ink in \
+             it — two rows were seeded, so a `Blank` here is a rasterizer \
+             that drew neither",
         );
         let hit_map = resp
             .hit_map
@@ -330,8 +335,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
 
     let deliver = |id_map, output| {
         let response = super::OverlayRenderResponse {
-            ink: false,
-            image: None,
+            picture: None,
             geo_bounds: a_render_request().geo_bounds,
             overlay_kind: known::STORM_REPORTS,
             generation: 5,
@@ -367,7 +371,13 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
         },
     );
-    assert!(ok.image.is_some(), "the well-shaped reply must deliver");
+    // An answer rather than a failure, which is the contrast every mismatch
+    // below draws. This fixture's buffer is deliberately all zeroes, so the
+    // answer is `Blank` — a hit map rides a reply whatever the pixels are.
+    assert!(
+        ok.picture.is_some(),
+        "the well-shaped reply must deliver an answer rather than a failure",
+    );
     let hit = ok
         .hit_map
         .expect("the well-shaped reply must zip")
@@ -442,7 +452,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
     for (what, id_map, output) in mismatches {
         let resp = deliver(id_map, output);
         assert!(
-            resp.image.is_none(),
+            resp.picture.is_none(),
             "{what} delivered a picture; a mismatched reply is another \
              build's, and its hit map zipped anyway would name wrong items",
         );
@@ -481,7 +491,10 @@ fn a_dead_worker_unwedges_a_reports_pane() {
         "a job the worker never answered sent nothing on the overlay \
          channel: the pane stays marked in flight forever",
     );
-    assert!(resp.image.is_none(), "a failed job answered with a picture");
+    assert!(
+        resp.picture.is_none(),
+        "a failed job answered with a picture"
+    );
     assert!(
         resp.hit_map.is_none(),
         "a failed job answered with a hit map"

@@ -149,7 +149,10 @@ fn the_coverage_dispatch_is_a_described_job_and_a_dead_worker_unwedges_it() {
          the pane stays marked in flight forever and the coverage layer \
          can never be asked for again",
     );
-    assert!(resp.image.is_none(), "a failed job answered with a picture",);
+    assert!(
+        resp.picture.is_none(),
+        "a failed job answered with a picture",
+    );
     assert_eq!(resp.overlay_kind, known::RADAR_COVERAGE);
     assert_eq!(
         resp.pane_indices,

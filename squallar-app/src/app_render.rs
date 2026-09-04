@@ -2417,7 +2417,7 @@ impl super::App {
                 continue;
             }
 
-            let Some(image) = resp.image else {
+            let Some(answer) = resp.picture.take() else {
                 // A render that produced no picture. Still an arrival, and
                 // still not a picture, so it is a drop for the balance's
                 // purposes.
@@ -2425,27 +2425,53 @@ impl super::App {
                 continue;
             };
 
-            // Load texture once, then clone handle to all target panes.
-            self.texture_counter += 1;
-            // The picture's own dimensions rather than a pair carried beside it:
-            let [width, height] = image.size;
-            let (width, height) = (width as u32, height as u32);
-            let tex_name = format!("overlay_{}", self.texture_counter);
-            let texture =
-                ctx.load_texture(tex_name, Arc::clone(&image), egui::TextureOptions::LINEAR);
-            // **Once per response, never once per pane.** This one handle is
-            // cloned to every pane below, so the pixels cross once however many
-            // panes asked; counting inside that loop would multiply the byte
-            // figure by the pane count.
-            // `as_raw()` is the picture's own buffer, so this is the real size
-            // rather than `w * h * 4` restated. `resp.ink` was decided on the
-            // offload thread that built those bytes and is only read here.
-            squallar_egui::overlay_cache::ledger::note_picture(
-                image.as_raw().len() as u64,
-                resp.ink,
-            );
+            // **The two answers part here, and only one of them costs a
+            // texture.** `Blank` is a raster that painted nothing: no buffer
+            // was built for it on the offload thread, so there is nothing to
+            // upload and nothing to clone to the panes below — what crosses is
+            // the shape it would have had. It is still a picture for the
+            // ledger's balance, and it carries no bytes, which is the whole of
+            // the saving stated as a figure.
+            let painted = match &answer {
+                crate::channels::OverlayPicture::Painted(image) => {
+                    // Load texture once, then clone handle to all target panes.
+                    self.texture_counter += 1;
+                    let tex_name = format!("overlay_{}", self.texture_counter);
+                    let texture =
+                        ctx.load_texture(tex_name, Arc::clone(image), egui::TextureOptions::LINEAR);
+                    // **Once per response, never once per pane.** This one
+                    // handle is cloned to every pane below, so the pixels
+                    // cross once however many panes asked; counting inside
+                    // that loop would multiply the byte figure by the pane
+                    // count. `as_raw()` is the picture's own buffer, so this
+                    // is the real size rather than `w * h * 4` restated.
+                    squallar_egui::overlay_cache::ledger::note_picture(
+                        image.as_raw().len() as u64,
+                        true,
+                    );
+                    Some(texture)
+                }
+                crate::channels::OverlayPicture::Blank { .. } => {
+                    // Zero bytes, and it is not an estimate: no `ColorImage`
+                    // was allocated, no texture was minted and nothing was
+                    // uploaded. `pictures - inked` is still the blank count.
+                    squallar_egui::overlay_cache::ledger::note_picture(0, false);
+                    None
+                }
+            };
 
-            // Every pane still named here wants the picture: the retain above is
+            // The picture's own dimensions rather than a pair carried beside
+            // it — and the blank's are the plan's, recorded by the deliver
+            // that decided not to build it.
+            let (width, height) = match &answer {
+                crate::channels::OverlayPicture::Painted(image) => {
+                    let [width, height] = image.size;
+                    (width as u32, height as u32)
+                }
+                crate::channels::OverlayPicture::Blank { width, height } => (*width, *height),
+            };
+
+            // Every pane still named here wants the answer: the retain above is
             // what decided that, and it also cleared every in-flight mark.
             for &pane_idx in &resp.pane_indices {
                 let Some(pane) = self.gui.pane_mut(pane_idx) else {
@@ -2453,12 +2479,33 @@ impl super::App {
                 };
 
                 let cache = pane.overlay_cache_mut(&id);
-
-                let data = OverlayTextureData {
-                    texture: texture.clone(),
+                let shape = squallar_egui::overlay_cache::PictureShape {
                     placed: squallar_geo::PlacedRaster::of(resp.geo_bounds),
                     data_generation: resp.generation,
                     render_zoom: resp.zoom,
+                    width,
+                    height,
+                };
+
+                let Some(texture) = &painted else {
+                    // **The clear**, and it lands whatever the pane was
+                    // drawing: a blank that only applied to an empty cache
+                    // would leave the ink of a layer whose data has gone away
+                    // on the glass for ever. Counted as a supersede on the
+                    // same terms `hold` is, because it throws away the same
+                    // started upload.
+                    if cache.is_holding() {
+                        squallar_egui::overlay_cache::ledger::note_superseded();
+                    }
+                    cache.show_blank(shape);
+                    continue;
+                };
+
+                let data = OverlayTextureData {
+                    texture: texture.clone(),
+                    placed: shape.placed,
+                    data_generation: shape.data_generation,
+                    render_zoom: shape.render_zoom,
                     width,
                     height,
                     radar_meta: None,
@@ -2513,13 +2560,22 @@ impl super::App {
         stamp: squallar_source::time::FrameStamp,
         resp: crate::channels::OverlayRenderResponse,
     ) {
-        let uploaded = resp.image.map(|image| {
-            self.texture_counter += 1;
-            let [width, height] = image.size;
-            let name = format!("overlay_loop_{}", self.texture_counter);
-            let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
-            (texture, width as u32, height as u32)
-        });
+        let uploaded = match resp.picture {
+            Some(crate::channels::OverlayPicture::Painted(image)) => {
+                self.texture_counter += 1;
+                let [width, height] = image.size;
+                let name = format!("overlay_loop_{}", self.texture_counter);
+                let texture = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+                Some((texture, width as u32, height as u32))
+            }
+            // **`Blank` cannot reach here** and is not silently equated with a
+            // failure: `overlay_job_deliver` builds a picture for every loop
+            // frame however empty it is, because a frame has no state for "draws
+            // nothing" — see the note there. If that ever changes, a frame with
+            // no picture is terminal, which is the answer a picture-less
+            // response has always had.
+            Some(crate::channels::OverlayPicture::Blank { .. }) | None => None,
+        };
         for pane_idx in resp.pane_indices {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
@@ -7058,6 +7114,13 @@ mod speculative_render_tests;
 #[path = "app_render/overlay_disable_race_tests.rs"]
 #[cfg(test)]
 mod overlay_disable_race_tests;
+
+/// A raster with no ink in it costs no picture and still clears the pane it
+/// reaches — the 10.8%-19.1% of Tier-2 pictures that were full-size
+/// transparent buffers.
+#[cfg(test)]
+#[path = "app_render/blank_raster_tests.rs"]
+mod blank_raster_tests;
 
 /// The overlay half of the hold: a pane keeps the layer picture it has —
 /// alerts, outlooks — until the next one's pixels have all landed, the swap

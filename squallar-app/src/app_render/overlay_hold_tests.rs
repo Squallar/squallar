@@ -49,8 +49,7 @@ fn deliver(
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
-            ink: true,
-            image: Some(raster(seed)),
+            picture: Some(crate::channels::OverlayPicture::Painted(raster(seed))),
             geo_bounds: bounds(),
             overlay_kind: KIND,
             generation,

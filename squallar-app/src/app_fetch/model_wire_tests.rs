@@ -255,7 +255,10 @@ fn a_dead_worker_unwedges_a_model_pane() {
          channel: the pane stays marked in flight forever and the model \
          layer can never be asked for again",
     );
-    assert!(resp.image.is_none(), "a failed job answered with a picture");
+    assert!(
+        resp.picture.is_none(),
+        "a failed job answered with a picture"
+    );
     assert_eq!(resp.overlay_kind, known::MODEL_DATA);
     assert_eq!(
         resp.pane_indices,

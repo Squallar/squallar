@@ -138,12 +138,23 @@ pub struct Level3Response {
     pub result: Result<Level3Product, String>,
 }
 
-pub struct OverlayRenderResponse {
+/// **What a finished overlay raster turned out to be** — the two answers a
+/// completed render can give, kept apart by the type so nothing downstream has
+/// to reconstruct which one it was.
+///
+/// The third answer, a render that *failed*, is `None` on
+/// [`OverlayRenderResponse::picture`] and is not a variant here: a failure is
+/// an arrival the pane must ignore, and a blank is an arrival the pane must
+/// obey. Collapsing the two is what would leave stale ink on the glass while
+/// every counter reported a saving.
+pub enum OverlayPicture {
+    /// Pixels with ink in them, ready for `Context::load_texture`.
+    ///
     /// Already in egui's pixel layout, and already an `Arc`, for the reason
     /// [`RenderedImage::image`] gives — and at the larger of the two sizes: an
     /// overlay texture is planned against the viewport plus overdraw, so it scales
-    /// with the window. At `OVERDRAW_FRACTION` 0.25 a 1920×1080 pane plans
-    /// 2880×1620, 17.8 MiB of `Color32`; a 4K pane plans 5760×3240, 71.2 MiB.
+    /// with the window. At `OVERDRAW_FRACTION` 0.25 a 1920x1080 pane plans
+    /// 2880x1620, 17.8 MiB of `Color32`; a 4K pane plans 5760x3240, 71.2 MiB.
     ///
     /// **Nothing on this path divides by alpha.** The polygon rasterisers hand
     /// over tiny-skia's own premultiplied bytes unconverted — pinned by
@@ -154,27 +165,44 @@ pub struct OverlayRenderResponse {
     /// `offload::execute` is left for the gridded rasterisers, the only ones
     /// still declaring `AlphaMode::Straight`, and runs inside the job rather
     /// than at delivery.
+    Painted(Arc<egui::ColorImage>),
+    /// **The raster ran and every pixel of it was transparent**, carrying the
+    /// size the picture would have been.
     ///
-    /// `None` is a render that failed, and it must still be sent: this message is
-    /// the only thing that retires the named panes' in-flight marks. It carries
-    /// the two terms those marks are keyed on — `generation` and `geo_bounds` —
-    /// so a failure retires the dispatch it answers and no other; see
+    /// Decided by `squallar_egui::overlay_cache::ledger::has_ink` **inside the
+    /// offload closure that produced the pixels**, which is where the buffer
+    /// already is: premultiplication makes "no non-zero byte" and "would
+    /// change no pixel of the frame" the same statement, so the pane can be
+    /// told to clear without any of those pixels being copied, transferred or
+    /// uploaded. The arrival runs inside `setup_egui_frame`, and the question
+    /// costs a pass over a buffer that is 17.8 MiB on a 1080p pane and 71.2
+    /// MiB on a 4K one — the same reason the premultiply moved off this
+    /// thread; see `no_poller_unmultiplies_on_the_frame_thread`.
+    ///
+    /// **It is a clear, not a saving.** A layer whose data goes away
+    /// rasterizes blank, and that blank is what replaces the ink the pane was
+    /// drawing — see `OverlayTextureCache::show_blank`. Skipping it would
+    /// leave the old picture on screen with every figure reading better.
+    Blank { width: u32, height: u32 },
+}
+
+impl OverlayPicture {
+    /// Whether this answer has any ink in it — see
+    /// `squallar_egui::overlay_cache::ledger::Totals::inked`.
+    pub fn ink(&self) -> bool {
+        matches!(self, Self::Painted(_))
+    }
+}
+
+pub struct OverlayRenderResponse {
+    /// What the render answered, or `None` for a render that failed.
+    ///
+    /// A failure must still be sent: this message is the only thing that
+    /// retires the named panes' in-flight marks. It carries the two terms
+    /// those marks are keyed on — `generation` and `geo_bounds` — so a failure
+    /// retires the dispatch it answers and no other; see
     /// `squallar_egui::overlay_cache::RenderTicket`.
-    pub image: Option<Arc<egui::ColorImage>>,
-    /// Whether [`image`](Self::image) has any ink in it — decided by
-    /// `squallar_egui::overlay_cache::ledger::has_ink` **inside the offload
-    /// closure that produced the pixels**, and carried here rather than asked
-    /// at the arrival.
-    ///
-    /// The arrival runs inside `setup_egui_frame`, and the question costs a
-    /// pass over a buffer that is 17.8 MiB on a 1080p pane and 71.2 MiB on a
-    /// 4K one. That is the same reason the premultiply moved off this thread;
-    /// see `no_poller_unmultiplies_on_the_frame_thread`, which names this
-    /// field's own doc as the rule.
-    ///
-    /// `false` where [`image`](Self::image) is `None`: a render that produced
-    /// no picture painted nothing, and is a drop rather than a blank picture.
-    pub ink: bool,
+    pub picture: Option<OverlayPicture>,
     pub geo_bounds: GeoBounds,
     /// Which layer this raster is for, carried back to find each pane's cache.
     pub overlay_kind: LayerId,

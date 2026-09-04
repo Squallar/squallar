@@ -429,8 +429,7 @@ fn deliver_live_raster(app: &mut crate::app::App, ctx: &egui::Context, side: usi
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
-            ink: true,
-            image: Some(image),
+            picture: Some(crate::channels::OverlayPicture::Painted(image)),
             geo_bounds: bounds(),
             overlay_kind: known::MODEL_DATA,
             generation: 5,
@@ -457,8 +456,7 @@ pub(super) fn deliver_raster(
     app.channels
         .overlay_render_sender
         .send(crate::channels::OverlayRenderResponse {
-            ink: true,
-            image: Some(image),
+            picture: Some(crate::channels::OverlayPicture::Painted(image)),
             geo_bounds: bounds(),
             overlay_kind: known::MODEL_DATA,
             generation: 5,

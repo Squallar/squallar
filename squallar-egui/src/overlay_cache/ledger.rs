@@ -36,9 +36,12 @@
 //!   reaches `Context::load_texture` or is thrown away before it, and the two
 //!   are counted on the two sides of that branch. A count that stops adding up
 //!   is a path that grew a third exit.
-//! * [`Totals::picture_bytes`] is zero with [`Totals::pictures`] positive only
-//!   if pictures are arriving with no pixels in them, which is a different
-//!   fault from "no pictures arrived".
+//! * [`Totals::picture_bytes`] is zero with [`Totals::pictures`] positive when
+//!   every arrival was a **blank** — see [`Totals::inked`]. That is a reading
+//!   and not a fault: a blank raster is charged no bytes because no buffer is
+//!   built for it. Read with [`Totals::inked`] beside it, the pair separates
+//!   "every layer drew nothing" from "pictures arrived and cost nothing",
+//!   which cannot both be true.
 //! * [`Totals::inked`] is zero with [`Totals::pictures`] positive when every
 //!   picture that arrived **painted nothing**. That is a fourth distinct
 //!   fault, and until 2026-08-31 nothing here could see it: a layer emitting a
@@ -46,6 +49,24 @@
 //!   [`note_picture`] counted the RGBA buffer whatever was in it. Measured on
 //!   a deliberately emptied raster: 6 dispatched, 6 arrived, 6 pictures, and
 //!   a map drawing nothing.
+//!
+//! # What a blank costs, since 2026-09-04
+//!
+//! `pictures - inked` is the count of arrivals that painted nothing, and each
+//! of them now costs **no picture at all**: `has_ink` decides on the offload
+//! thread, and where it answers `false` the transparent `ColorImage` is never
+//! built, never handed to `Context::load_texture` and never uploaded. What
+//! reaches the pane is a `Blank` carrying the size the picture would have had,
+//! and the pane clears on it exactly as it cleared on the transparent texture
+//! — `OverlayTextureCache::show_blank`. **A blank is a clear, not a skip**: it
+//! is what replaces the ink of a layer whose data has gone away, so a blank
+//! that did not reach the pane would leave that ink on the glass while every
+//! figure on this line improved.
+//!
+//! The share this removes, four Tier-2 legs on 2026-09-04 — **two targets,
+//! never added and never averaged**: Firefox 368/1928 (19.1%) and 266/1856
+//! (14.3%) blank at 8.92 MB a picture; Chromium 72/664 (10.8%) and 77/681
+//! (11.3%) at 8.26 MB.
 //!
 //! Pinned by `the_ledger_separates_a_path_that_never_ran_from_one_that_moved_nothing`
 //! and `every_arrival_is_either_a_picture_or_a_drop`.
@@ -109,10 +130,33 @@ pub struct Totals {
     /// Rasterized responses that came back. `dispatched > 0` with this at zero
     /// is a dispatch path whose answers never arrive.
     pub arrived: u64,
-    /// Of [`Self::arrived`], those thrown away before `Context::load_texture`:
-    /// every pane had moved past the dispatch or stopped drawing the layer, or
-    /// the render produced no picture at all. **Bytes that were rasterized and
-    /// never reached the GPU.**
+    /// Of [`Self::arrived`], those thrown away before `Context::load_texture`.
+    /// **Bytes that were rasterized and never reached the GPU.**
+    ///
+    /// **A zero here is the ordinary reading, not a dead path**, and the doc
+    /// used to leave that unsaid — it reads zero on every Tier-2 browser leg.
+    /// What raises it is an event, and each one is something a scene has to
+    /// *do*:
+    ///
+    /// * a pane closed while a raster was in the air — `Gui::close_pane`
+    ///   abandons every mark from that index up, so the answer arrives stale;
+    /// * the layer was switched off while its raster flew
+    ///   (`PaneState::overlay_texture_is_releasable`);
+    /// * the egui context died and the caches were released with rasters out;
+    /// * the render produced no picture at all — a worker that died, a reply
+    ///   of the wrong length, a hit map that does not fit its dispatch, or a
+    ///   job withdrawn at the WO-8 cancel seam.
+    ///
+    /// **What cannot raise it is a pane that merely moved.** The doc used to
+    /// name that first, and both dispatch doors refuse it: `ui_map_pane`'s
+    /// draw-loop ask and `App::arrived_overlay_asks` each gate on
+    /// [`RendersInFlight::admits`], which declines a second dispatch for a
+    /// destination that already has a raster out — so a live pane never has
+    /// two whole-picture rasters in the air to supersede one another, and
+    /// [`Self::cancelled`] is zero for the same reason. A leg that pans for a
+    /// minute and reads zero here is reading correctly.
+    ///
+    /// [`RendersInFlight::admits`]: super::RendersInFlight::admits
     pub dropped: u64,
     /// Of [`Self::arrived`], those whose pixels were handed to egui. One per
     /// response, not one per pane: a grouped dispatch is one upload shared by
@@ -123,8 +167,12 @@ pub struct Totals {
     /// size, taken at the call that hands the pixels over.
     ///
     /// **This is the size of the buffer, never a statement about what is in
-    /// it.** A picture of 8 MB of fully transparent pixels reports 8 MB here,
-    /// which is why [`Self::inked`] exists beside it.
+    /// it** — and a blank arrival has no buffer, so it adds nothing here. That
+    /// zero is exact rather than a convention: nothing was allocated, nothing
+    /// crossed to `Context::load_texture` and nothing was uploaded. Before
+    /// 2026-09-04 a picture of 8 MB of fully transparent pixels reported 8 MB
+    /// here, which is why [`Self::inked`] exists beside it and how the waste
+    /// was found.
     pub picture_bytes: u64,
     /// Of [`Self::pictures`], those with at least one non-zero byte — pictures
     /// that would actually change the frame they were drawn on. `inked <
@@ -134,7 +182,10 @@ pub struct Totals {
     ///
     /// Decided by [`has_ink`] on the offload thread that produced the pixels,
     /// never on the frame thread: see `App::overlay_job_deliver`, and
-    /// `no_poller_unmultiplies_on_the_frame_thread` for the rule.
+    /// `no_poller_unmultiplies_on_the_frame_thread` for the rule. **That same
+    /// answer is what decides whether a picture is built at all**, so
+    /// `pictures - inked` counts arrivals that cost no buffer, no texture and
+    /// no upload — see the module note.
     pub inked: u64,
     /// Pictures put straight on screen, because the pane was drawing nothing
     /// for that layer yet.
@@ -236,6 +287,9 @@ pub fn has_ink(rgba: &[u8]) -> bool {
 
 /// Record `bytes` of picture handed to egui, and whether [`has_ink`] found
 /// anything in it.
+///
+/// **`bytes` is zero for a blank arrival**, which is not the same event as a
+/// drop: the arrival reached a pane and cleared it. See the module note.
 pub fn note_picture(bytes: u64, inked: bool) {
     PICTURES.fetch_add(1, Relaxed);
     PICTURE_BYTES.fetch_add(bytes, Relaxed);

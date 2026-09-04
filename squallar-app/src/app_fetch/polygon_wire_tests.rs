@@ -269,7 +269,10 @@ fn a_dead_worker_unwedges_an_alert_pane() {
          channel: the pane stays marked in flight forever and the alert \
          layer can never be asked for again",
     );
-    assert!(resp.image.is_none(), "a failed job answered with a picture");
+    assert!(
+        resp.picture.is_none(),
+        "a failed job answered with a picture"
+    );
     assert_eq!(resp.overlay_kind, known::NWS_ALERTS);
     assert_eq!(
         resp.pane_indices,

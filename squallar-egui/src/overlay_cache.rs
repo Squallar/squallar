@@ -627,6 +627,44 @@ pub struct OverlayTextureData {
     pub hit_map: Option<HitMap>,
 }
 
+impl OverlayTextureData {
+    /// What this picture was rendered for, without the pixels — the form the
+    /// rebuild gate judges every answer in, picture-backed or blank.
+    pub fn shape(&self) -> PictureShape {
+        PictureShape {
+            placed: self.placed,
+            data_generation: self.data_generation,
+            render_zoom: self.render_zoom,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+/// **What a picture was rendered *for*, with no pixels under it** — every
+/// field [`OverlayTextureCache::needs_rerender_with_policy`] judges a picture
+/// by, and nothing else.
+///
+/// It exists because one of the two answers a rasterizer can give has no
+/// pixels to judge: a raster that painted nothing is a *clear*, and the pane
+/// that took it is as up to date as one holding a picture. Without a shape to
+/// remember, the gate's `else { return true }` would re-ask for that same
+/// empty picture on the very next frame and every frame after — a dispatch
+/// storm on exactly the layers that cost the least to draw.
+///
+/// Read [`OverlayTextureData::shape`] for the picture-backed half. The two are
+/// the same five fields, which is why the gate takes this and never the
+/// texture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PictureShape {
+    pub placed: PlacedRaster,
+    /// The cache token these pixels — or this absence of them — answer.
+    pub data_generation: u64,
+    pub render_zoom: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// A picture that has been handed to the GPU and is not yet all there.
 pub struct HeldOverlayTexture {
     pub data: OverlayTextureData,
@@ -640,6 +678,26 @@ pub struct OverlayTextureCache {
     /// Currently displayed texture (if any) — **whole**, always.
     current: Option<OverlayTextureData>,
     held: Option<HeldOverlayTexture>,
+    /// **The answer that painted nothing**, and the reason it is kept rather
+    /// than discarded.
+    ///
+    /// A raster with no ink in it is not a failure and not an absence of an
+    /// answer: it is the statement that this layer draws nothing here, and it
+    /// has to *replace* whatever the pane was drawing or stale ink stays on
+    /// the glass. [`Self::show_blank`] is that replacement, and it costs no
+    /// buffer, no texture and no upload — the picture is never built.
+    ///
+    /// What is left over is the bookkeeping the picture used to carry: the
+    /// token, the zoom, the plan size and the ground it covers, which is
+    /// exactly [`PictureShape`]. Kept here so
+    /// [`Self::needs_rerender_with_policy`] can tell "this pane is up to date
+    /// and the answer was empty" from "this pane has never been answered",
+    /// which are the same reading against [`Self::current`] alone and would
+    /// put every blank layer into a re-dispatch loop.
+    ///
+    /// Mutually exclusive with [`Self::current`] by construction: every
+    /// setter of one clears the other.
+    blank: Option<PictureShape>,
     /// Whether a picture that was still crossing to the GPU has already been
     /// thrown away since the last one reached the screen. Cleared the moment
     /// [`Self::held`] empties by any route; read by
@@ -716,6 +774,7 @@ impl OverlayTextureCache {
         Self {
             current: None,
             held: None,
+            blank: None,
             hold_superseded: false,
             renders: RendersInFlight::default(),
             last_seen_zoom: None,
@@ -737,7 +796,33 @@ impl OverlayTextureCache {
     pub fn show(&mut self, data: OverlayTextureData) {
         self.held = None;
         self.hold_superseded = false;
+        self.blank = None;
         self.current = Some(data);
+    }
+
+    /// **Take an answer that painted nothing**: the pane stops drawing this
+    /// layer, now, and `shape` is what the rebuild gate judges it by until the
+    /// next answer.
+    ///
+    /// This is [`Self::show`] for the picture that was never built. It clears
+    /// rather than draws, which is the whole of the behaviour a blank picture
+    /// used to buy at the price of a full-size transparent RGBA buffer, a
+    /// texture and an upload of it.
+    ///
+    /// **It clears a hold too**, and immediately rather than on the frame the
+    /// last band lands: a hold exists so the picture on screen is not replaced
+    /// by a half-uploaded one, and there is no upload here to be half of.
+    /// The caller counts that discarded hold — see `ledger::note_superseded`.
+    pub fn show_blank(&mut self, shape: PictureShape) {
+        self.held = None;
+        self.hold_superseded = false;
+        self.current = None;
+        self.blank = Some(shape);
+    }
+
+    /// Whether the last answer this cache took painted nothing.
+    pub fn is_blank(&self) -> bool {
+        self.blank.is_some()
     }
 
     /// Hold `data` until its pixels have all reached the GPU.
@@ -751,6 +836,7 @@ impl OverlayTextureCache {
         // asks and the discard would then never be seen at all. See
         // [`Self::sweep_discarded`].
         self.sweep_discarded |= discarding;
+        self.blank = None;
         self.held = Some(HeldOverlayTexture { data, data_time });
     }
 
@@ -778,6 +864,7 @@ impl OverlayTextureCache {
     pub fn clear(&mut self) {
         self.current = None;
         self.held = None;
+        self.blank = None;
         self.hold_superseded = false;
         self.sweep_discarded = false;
     }
@@ -877,11 +964,19 @@ impl OverlayTextureCache {
         // next picture should be*: it is what a dispatch would supersede. The
         // coverage arm at the end asks a different question and takes a
         // different picture; see there.
+        //
+        // **And the blank answer counts as a picture here**, which is the
+        // whole reason [`Self::blank`] is kept: it is the newest answer this
+        // cache has, it was rendered for a token, a zoom and a viewport like
+        // any other, and a pane that has one is exactly as up to date as a
+        // pane holding pixels. Falling through to the `return true` below
+        // would re-ask for it every frame for ever.
         let Some(tex) = self
             .held
             .as_ref()
-            .map(|held| &held.data)
-            .or(self.current.as_ref())
+            .map(|held| held.data.shape())
+            .or_else(|| self.current.as_ref().map(OverlayTextureData::shape))
+            .or(self.blank)
         else {
             return true;
         };
@@ -991,7 +1086,15 @@ impl OverlayTextureCache {
         // together change no sustainable pan speed anywhere on that grid, in
         // either direction, at any threshold at or above 0.3. What the tree
         // itself still checks is in `coverage_dispatch_tests`.
-        let displayed = self.current.as_ref().unwrap_or(tex);
+        // `blank` beside `current` for the reason it is beside them above: the
+        // pane really is drawing that answer, and it is the answer's own
+        // ground the margin is judged against.
+        let displayed = self
+            .current
+            .as_ref()
+            .map(OverlayTextureData::shape)
+            .or(self.blank)
+            .unwrap_or(tex);
 
         // **What is on screen has run out of margin**, by at least a texel of
         // itself. While it still has some, nothing is dispatched, whatever a
@@ -1007,7 +1110,7 @@ impl OverlayTextureCache {
         // the viewer is looking at. It governs the whole rule from here: the
         // three arms are ANDed, and a deadbanded `true` implies the undeadbanded
         // one, so nothing below can re-admit what this withheld.
-        if !pan_exceeds_coverage_visibly(displayed, viewport_bounds) {
+        if !pan_exceeds_coverage_visibly(&displayed, viewport_bounds) {
             return false;
         }
 
@@ -1063,7 +1166,7 @@ const MID_GESTURE_REBUILDS: bool = false;
 
 /// [`pan_exceeds_coverage`] asked of the picture on screen, deadbanded by
 /// [`COVERAGE_DEADBAND_TEXELS`] of that picture's own texels.
-fn pan_exceeds_coverage_visibly(texture: &OverlayTextureData, viewport_bounds: &GeoBounds) -> bool {
+fn pan_exceeds_coverage_visibly(texture: &PictureShape, viewport_bounds: &GeoBounds) -> bool {
     let (deadband_lat, deadband_lon) = coverage_deadband(texture, viewport_bounds);
     pan_exceeds_coverage_beyond(
         &texture.placed.geo,
@@ -1075,7 +1178,7 @@ fn pan_exceeds_coverage_visibly(texture: &OverlayTextureData, viewport_bounds: &
 
 /// The deadband in degrees, per axis, for `texture` judged against `viewport`.
 /// See [`COVERAGE_DEADBAND_TEXELS`] and [`COVERAGE_DEADBAND_VIEWPORT_CEILING`].
-fn coverage_deadband(texture: &OverlayTextureData, viewport: &GeoBounds) -> (f64, f64) {
+fn coverage_deadband(texture: &PictureShape, viewport: &GeoBounds) -> (f64, f64) {
     // A picture with no pixels on an axis has no texel to be smaller than, and
     // is not one to withhold a rebuild for.
     let deadband = |ground: f64, texels: u32, viewport_span: f64| {

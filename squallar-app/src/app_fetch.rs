@@ -1020,7 +1020,11 @@ impl super::App {
 
     /// The deliver every overlay job shares — sites and the six handler-backed kinds,
     /// which is every texture overlay.
-    fn overlay_job_deliver(
+    ///
+    /// `pub(super)` on the same terms [`Self::spawn_overlay_render`] is: the
+    /// arrival half of this path lives in `app::render`, and the tests that
+    /// pin the two ends against each other have to drive both.
+    pub(super) fn overlay_job_deliver(
         label: &'static str,
         width: u32,
         height: u32,
@@ -1073,17 +1077,49 @@ impl super::App {
                     Ok(hit_map) if sized => {
                         response.hit_map = hit_map;
                         // **Asked here, off the frame thread**, for the reason
-                        // `OverlayRenderResponse::ink` gives: this is a pass
-                        // over the same buffer the premultiply already walks,
-                        // and the arrival that consumes the answer runs inside
+                        // `OverlayPicture::Blank` gives: this is a pass over
+                        // the same buffer the premultiply already walks, and
+                        // the arrival that consumes the answer runs inside
                         // `setup_egui_frame`.
-                        response.ink = squallar_egui::overlay_cache::ledger::has_ink(&rgba);
-                        response.image = Some(std::sync::Arc::new(
-                            egui::ColorImage::from_rgba_premultiplied(
-                                [width as usize, height as usize],
-                                &rgba,
-                            ),
-                        ));
+                        //
+                        // **And it is what decides whether a picture is built
+                        // at all.** A buffer with no ink in it would otherwise
+                        // become a full-size transparent `ColorImage` — 8.3 to
+                        // 8.9 MB on the measured browser legs — copied out of
+                        // `rgba`, handed to `Context::load_texture` and
+                        // uploaded, in order to draw nothing. The pane still
+                        // has to be told, because the blank is what *replaces*
+                        // the ink it was drawing when a layer's data goes
+                        // away; `Blank` is that instruction at the price of
+                        // two `u32`s.
+                        //
+                        // **A loop frame keeps its picture whatever is in
+                        // it**, and the reason is the destination rather than
+                        // the pixels: a pane's overlay cache can hold "this
+                        // layer draws nothing here"
+                        // (`OverlayTextureCache::show_blank`), and a
+                        // `LoopFrameImage` has no such state — a frame with no
+                        // picture is one that failed or one still owed, and
+                        // filing a blank as either would either hold the
+                        // previous frame's ink on the glass or re-ask for the
+                        // same empty raster for ever. Loop frames are outside
+                        // the ledger's denominator, so this is the saving not
+                        // taken rather than a figure spoiled; see
+                        // `file_overlay_loop_frame`.
+                        response.picture = Some(
+                            if squallar_egui::overlay_cache::ledger::has_ink(&rgba)
+                                || response.frame.is_some()
+                            {
+                                crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
+                                    egui::ColorImage::from_rgba_premultiplied(
+                                        [width as usize, height as usize],
+                                        &rgba,
+                                    ),
+                                ))
+                            } else {
+                                crate::channels::OverlayPicture::Blank { width, height }
+                            },
+                        );
                     }
                     Ok(_) => {}
                     Err(what) => {
@@ -1316,9 +1352,9 @@ impl super::App {
                         height,
                         id_map,
                         OverlayRenderResponse {
-                            image: None,
-                            // Set by the deliver above if a picture is built.
-                            ink: false,
+                            // Set by the deliver above once the answer is
+                            // known; `None` is the render that failed.
+                            picture: None,
                             geo_bounds: render_bounds,
                             overlay_kind: id.clone(),
                             generation: data_generation,
