@@ -218,10 +218,46 @@ pub enum RenderMode {
     Texture,
     /// Per-frame via [`PointPainter`] (METAR station models).
     PerFramePoint,
+    /// **Both**: a rasterized picture for the geometry, plus a per-frame point
+    /// pass for the text.
+    ///
+    /// Not a convenience — it is the shape of any layer that plots a symbol
+    /// AND labels it. The geometry belongs in a picture: a station model is
+    /// tens of stroked shapes per item, and stroked paths are the
+    /// tessellator's expensive case, so at several hundred items it is the
+    /// frame's whole geometry budget. The text cannot follow it, because the
+    /// pictures are rasterized by `tiny_skia`, which has no fonts, and nothing
+    /// in the worker can lay out a galley.
+    ///
+    /// So the text stays on the frame thread and goes through the same
+    /// `walkers::GalleyCache` the map's place labels use — one text path for
+    /// everything the map labels, rather than a second one in the worker that
+    /// would have to match it.
+    ///
+    /// A layer in this mode must NOT draw its geometry twice: the point pass
+    /// asks the registry whether the layer has a picture and suppresses the
+    /// shapes when it does. See `EguiPointPainter::text_only`.
+    TextureAndPoint,
     /// Per-frame by the handler itself (UserLocation).
     PerFrameDirect,
     /// Streaming tiles owned by the map widget (BaseMap, CityLabels).
     Tile,
+}
+
+impl RenderMode {
+    /// Whether this layer is backed by a rasterized picture.
+    ///
+    /// The question almost every texture invariant actually wants — asked
+    /// instead of `== Texture` so a mode that gained a picture is covered by
+    /// them rather than silently skipped.
+    pub fn has_texture(self) -> bool {
+        matches!(self, Self::Texture | Self::TextureAndPoint)
+    }
+
+    /// Whether the frame's point walk visits this layer.
+    pub fn draws_points(self) -> bool {
+        matches!(self, Self::PerFramePoint | Self::TextureAndPoint)
+    }
 }
 
 /// Which of a pane's two content surfaces a layer draws onto: ground is drawn

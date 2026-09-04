@@ -8,7 +8,7 @@ use crate::pane::{LoopLoading, PaneState, RadarImageData, TimeMode};
 use crate::point_painter::EguiPointPainter;
 use squallar_overlays::render::draw::{DrawPointContext, HoverContext};
 use squallar_overlays::render::overlay_state::{
-    OverlayItem, OverlayLegend, OverlayRegistry, RenderMode, Signed, Surface,
+    OverlayItem, OverlayLegend, OverlayRegistry, Signed, Surface,
 };
 use squallar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
@@ -733,8 +733,14 @@ pub(super) fn render_pane_map_content(
                         ctx.preferences,
                     );
                 }
-                _ => match handler.render_mode() {
-                    RenderMode::Texture => {
+                // **Two `if`s, not a `match`.** A hybrid layer is BOTH: its
+                // geometry rides a picture and its text rides the point pass,
+                // and a match arm can only pick one. Asked as capabilities so
+                // the pure modes fall out unchanged — `Texture` takes the
+                // first, `PerFramePoint` the second, `TextureAndPoint` both.
+                _ => {
+                    let mode = handler.render_mode();
+                    if mode.has_texture() {
                         // Shared, not mutable: the clickable set is only asked
                         // for if a click needs resolving.
                         let overlays = &*ctx.overlays;
@@ -750,7 +756,7 @@ pub(super) fn render_pane_map_content(
                             || overlays.clickable_items(id, &ctx.pane.layer_ref(ctx.pane_idx, id)),
                         ));
                     }
-                    RenderMode::PerFramePoint => {
+                    if mode.draws_points() {
                         selected.extend(render_per_frame_overlay(
                             ctx.galley_cache,
                             ui,
@@ -766,8 +772,7 @@ pub(super) fn render_pane_map_content(
                             },
                         ));
                     }
-                    _ => {}
-                },
+                }
             }
             #[cfg(test)]
             ctx.paint_order.push((id.clone(), painted_layer));
@@ -896,7 +901,7 @@ pub(super) fn render_pane_map_content(
         let texture_ids: Vec<LayerId> = ctx
             .overlays
             .handlers()
-            .filter(|h| h.render_mode() == RenderMode::Texture)
+            .filter(|h| h.render_mode().has_texture())
             .map(|h| h.id())
             .collect();
         for id in &texture_ids {
@@ -2846,10 +2851,15 @@ fn render_per_frame_overlay(
             continue;
         }
 
+        // A layer that rasterizes a picture has already drawn its geometry in
+        // the worker. Asking the registry rather than naming the layer means a
+        // layer that gains a picture stops double-drawing on the frame thread
+        // the moment it does, with nothing here to remember.
         let mut ep = EguiPointPainter {
             painter,
             center: screen,
             galleys,
+            text_only: pf.overlays.job_codec(pf.id).is_some(),
         };
         pf.overlays.draw_point(pf.id, pt.id, &mut ep, &draw_ctx);
 

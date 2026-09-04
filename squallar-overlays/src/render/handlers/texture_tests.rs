@@ -14,7 +14,7 @@ use squallar_source::id::{LayerId, known};
 use squallar_source::job::DescribedJob;
 
 use super::sources;
-use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext, RenderMode};
+use crate::render::overlay_state::{FetchPayload, OverlayHandler, RasterizeContext};
 use crate::render::rasterize::{
     self, AlphaMode, GriddedInput, RasterizeOutput, rasterize_glm_strikes, rasterize_gridded,
     rasterize_nws_alerts, rasterize_radar_coverage, rasterize_spc_discussions,
@@ -111,6 +111,11 @@ fn run_described(
         )
     } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
         (known::LIGHTNING, rasterize_glm_strikes(input, bounds, w, h))
+    } else if let Some(input) = job.downcast_ref::<rasterize::MetarInput>() {
+        (
+            known::METAR,
+            rasterize::rasterize_metar_stations(input, bounds, w, h),
+        )
     } else if let Some(input) = job.downcast_ref::<GriddedInput>() {
         (known::MODEL_DATA, rasterize_gridded(input, bounds, w, h))
     } else if let Some(input) = job.downcast_ref::<rasterize::CoverageInput>() {
@@ -478,6 +483,40 @@ pub(super) fn seed(handler: &mut dyn OverlayHandler) -> bool {
                 lon: -98.0,
             },
         ])),
+        // A station in the middle of `BOUNDS`, plotted at a zoom the model
+        // draws its full form at — wind barb, cloud circle and weather symbol
+        // — so the walks below see the SHAPES, which are what this layer's
+        // picture carries. Its text is drawn on the frame thread and is
+        // deliberately not part of any picture; see `RenderMode::TextureAndPoint`.
+        id if *id == known::METAR => Box::new(super::metar::MetarFetchResult(Ok(
+            crate::metar::fetch::MetarRound {
+                observations: vec![crate::metar::types::MetarOb {
+                    station_id: "KTLX".into(),
+                    name: "Oklahoma City".into(),
+                    lat: 35.0,
+                    lon: -98.0,
+                    elev_m: Some(390.0),
+                    temp_c: Some(21.0),
+                    dewp_c: Some(-4.0),
+                    wind_dir: Some(crate::metar::types::WindDir::Degrees(230)),
+                    wind_speed_kt: Some(25),
+                    wind_gust_kt: None,
+                    visibility: None,
+                    altimeter_hpa: None,
+                    mslp_hpa: Some(1011.0),
+                    flight_category: Some(crate::metar::types::FlightCategory::MVFR),
+                    raw_ob: String::new(),
+                    clouds: vec![crate::metar::types::CloudLayer {
+                        cover: "BKN".into(),
+                        base_ft: Some(2500),
+                    }],
+                    wx_string: Some("RA".into()),
+                    obs_time: String::new(),
+                }],
+                failed_networks: Vec::new(),
+                networks_asked: 1,
+            },
+        ))),
         other => panic!(
             "{} is a texture overlay this fixture does not know how to \
              seed. Add it here — the walks in this file are what stop a new \
@@ -543,7 +582,7 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     let ctx = rctx();
     let mut checked = 0;
     for handler in sources().iter_mut() {
-        if handler.render_mode() != RenderMode::Texture {
+        if !handler.render_mode().has_texture() {
             continue;
         }
         if !seed(handler.as_mut()) {
@@ -586,11 +625,11 @@ fn every_texture_handler_declares_the_convention_its_own_bytes_are_in() {
     // `RadarSites`, which used to be rasterized by a dispatch arm of its own
     // in `app_fetch` — the handler could not see which site its pane was on,
     // so it had no `prepare_job` to be walked through. It has a pane now, the
-    // arm is gone, and the "ten described kinds" list in
-    // `spawn_overlay_render` is this same ten.
+    // arm is gone, and the "described kinds" list in `spawn_overlay_render` is
+    // this same set — eleven since METAR's station geometry became a picture.
     assert_eq!(
-        checked, 10,
-        "the ten texture handlers that rasterize through `prepare_job` \
+        checked, 11,
+        "the eleven texture handlers that rasterize through `prepare_job` \
          must all be covered; a new one is not exempt, and a removed one \
          should be removed from this count deliberately",
     );
@@ -682,7 +721,7 @@ fn every_fixture_draws_pixels_the_two_conventions_disagree_about() {
     let ctx = rctx();
     let mut opaque_only: Vec<LayerId> = Vec::new();
     for handler in sources().iter_mut() {
-        if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
+        if !handler.render_mode().has_texture() || !seed(handler.as_mut()) {
             continue;
         }
         let id = handler.id();
@@ -720,7 +759,7 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
     let ctx = rctx();
     let mut checked = 0;
     for handler in sources().iter_mut() {
-        if handler.render_mode() != RenderMode::Texture {
+        if !handler.render_mode().has_texture() {
             continue;
         }
         let id = handler.id();
@@ -758,8 +797,8 @@ fn every_texture_handler_agrees_with_its_own_rasterizer() {
         checked += 1;
     }
     assert_eq!(
-        checked, 10,
-        "the ten texture handlers that rasterize through `prepare_job` \
+        checked, 11,
+        "the eleven texture handlers that rasterize through `prepare_job` \
          must all be covered",
     );
 }
@@ -810,7 +849,11 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
 /// Whether `id` resolves clicks through a hit map, and therefore must answer
 /// [`OverlayHandler::hit_items`] exactly when it answers `prepare_job`.
 fn has_hit_map(id: &LayerId) -> bool {
-    *id == known::STORM_REPORTS || *id == known::LIGHTNING
+    // METAR is the third, and the first that is not a pure texture layer: its
+    // picture carries the station geometry and its cells index the same
+    // observations `hit_items` hands back, so a hover on a plotted station
+    // resolves through the map exactly as a storm report does.
+    *id == known::STORM_REPORTS || *id == known::LIGHTNING || *id == known::METAR
 }
 
 /// **Every texture kind that renders through a handler has a described job**
@@ -827,7 +870,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         // **No exemption since WO-M10c**: every texture kind is
         // handler-backed now that `RadarSites` answers `prepare_job` from the
         // table the shell installs in it.
-        let handler_backed = handler.render_mode() == RenderMode::Texture;
+        let handler_backed = handler.render_mode().has_texture();
 
         let agree = |h: &dyn OverlayHandler, state: &str| {
             if !handler_backed {
@@ -872,7 +915,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         };
 
         agree(handler.as_ref(), "empty");
-        if handler.render_mode() != RenderMode::Texture || !seed(handler.as_mut()) {
+        if !handler.render_mode().has_texture() || !seed(handler.as_mut()) {
             continue;
         }
         assert!(
@@ -889,7 +932,7 @@ fn every_texture_kind_rasterizes_as_a_described_job() {
         described += 1;
     }
     assert_eq!(
-        described, 10,
+        described, 11,
         "the four polygon kinds, the two hit-map kinds, the three gridded \
          rasters and the site table must all have been walked seeded; a kind \
          that stopped seeding is a kind whose described job was never tested",
@@ -917,7 +960,22 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
             .prepare_job(&ctx, &PaneRef::bare(0))
             .expect("seeded, and the agreement walk pins this");
         let items = handler.hit_items().expect("seeded");
-        if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
+        if let Some(input) = job.downcast_ref::<rasterize::MetarInput>() {
+            assert_eq!(items.len(), input.obs.len(), "one item per row");
+            for (i, (row, item)) in input.obs.iter().zip(&items).enumerate() {
+                let item = item
+                    .as_any()
+                    .downcast_ref::<super::metar::MetarItem>()
+                    .expect("a metar handler captures station items");
+                assert_eq!(
+                    (item.ob.lat, item.ob.lon),
+                    (row.lat, row.lon),
+                    "{name} row {i} and item {i} are different stations — a \
+                     hover here would name the wrong one, and no downstream \
+                     test can see it because they all zip with this very list",
+                );
+            }
+        } else if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
             assert_eq!(items.len(), input.reports.len(), "one item per row");
             for (i, (row, item)) in input.reports.iter().zip(&items).enumerate() {
                 let item = item
@@ -960,7 +1018,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
+    assert_eq!(checked, 3, "all three hit-map kinds must be walked seeded");
 }
 
 /// **The registry pairing gate, bidirectional.** Every texture handler that
@@ -985,7 +1043,7 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
     use crate::render::jobs::JOB_CODECS;
 
     // Deliberately spelled out. Do not regenerate this from the registry.
-    let expected: [(LayerId, &str); 10] = [
+    let expected: [(LayerId, &str); 11] = [
         (known::RADAR_COVERAGE, "overlay/coverage"),
         (known::NWS_ALERTS, "overlay/alerts"),
         (known::SPC_OUTLOOK, "overlay/outlooks"),
@@ -996,13 +1054,14 @@ fn every_texture_handler_owns_exactly_one_codec_row() {
         (known::MODEL_DATA, "overlay/model"),
         (known::MRMS, "overlay/model"),
         (known::GMGSI, "overlay/model"),
+        (known::METAR, "overlay/metar"),
     ];
 
     let mut claimed: Vec<(LayerId, &'static str)> = Vec::new();
     for handler in sources() {
         let id = handler.id();
         let name = id.as_str();
-        if handler.render_mode() != RenderMode::Texture {
+        if !handler.render_mode().has_texture() {
             assert!(
                 handler.job_codec().is_none(),
                 "{name} is not a texture layer and has no raster to frame, \
