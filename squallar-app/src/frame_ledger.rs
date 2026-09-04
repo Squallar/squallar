@@ -920,6 +920,15 @@ impl FrameLedger {
             acquire,
         );
 
+        // EVERY split below is interact-only, and that is a limit worth
+        // stating rather than rediscovering. A frame the renderer did not call
+        // interacted -- boot among them -- contributes to `service_idle` and
+        // to the worst-frame latch, and to nothing else: no segment, no `ui`,
+        // `prepare`, `post`, `pump` or `dispatch` cut. So a boot frame's
+        // anatomy is visible ONLY on the `frame worst:` line, and a search for
+        // the expensive row behind one will find every family empty. Measured
+        // instance, 2026-09-04: a 13 ms `pump` on a Mac Firefox boot frame,
+        // against a 203 us interact mean, attributable to no cut in the tree.
         if interacted {
             self.service_interact.record(service);
             let [pre, pump, ui, prepare, finish, post] = segments;
