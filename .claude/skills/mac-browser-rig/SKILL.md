@@ -148,6 +148,16 @@ update applies it and re-execs — the launched pid exits 0 and Marionette never
 comes up. Observed 2026-09-04: bundle mtime moved to 12:12, version 155.0 →
 155.0.1 under a 12:45 launch, the leg failed, the retry passed.
 
+**And the same text has a SECOND cause that persists after the update is done.**
+The rig's launch that "exited rc=0" can re-exec and keep running under a new pid
+— `--marionette -no-remote -profile ~/rd-<lane>-ab/<hash>/…` — holding that
+profile's lock. Every later launch into the same profile dir then exits 0 in ~4 s
+with the identical message, and a retry only passes if it happens to get a fresh
+profile path. Before blaming the updater twice, list Firefox processes carrying
+the rig's OWN `-profile` path and kill only those (they are the rig's; the user's
+Firefox has no such args). Observed 2026-09-04: pid launched 12:45 blocked the
+13:01 leg; killing it fixed the 13:05 one.
+
 Two consequences: **the browser version moves mid-campaign** — read
 `browser_version` off every row rather than trusting what was installed when the
 leg was queued; and **the user's own running Firefox may prompt to restart**,
