@@ -7,7 +7,7 @@
 //! through: every case below is a way the peer could get a region back that
 //! this instance had already handed to someone else.
 
-use super::{LoanBook, LoanId, NO_LOAN, next_after};
+use super::{Lent, LoanBook, LoanId, NO_LOAN, next_after};
 
 /// The id space never issues the value the wire reserves for "no loan", **and
 /// the case that matters is the wrap**, which no amount of lending in a test
@@ -48,11 +48,11 @@ fn releasing_one_loan_leaves_the_other_readable() {
     assert!(book.release(first).is_some());
     assert_eq!(book.outstanding(), 1);
     assert_eq!(
-        book.peek(second),
-        Some([vec![0xBB; 8]].as_slice()),
+        book.peek(second).map(bytes_of),
+        Some(vec![vec![0xBB; 8]]),
         "the loan that was not released must still own its bytes"
     );
-    assert_eq!(book.peek(first), None, "a released loan is gone");
+    assert!(book.peek(first).is_none(), "a released loan is gone");
 }
 
 /// **The violation the transport exists to catch.** A second release of the
@@ -152,4 +152,86 @@ fn ids_do_not_restart_after_a_sweep() {
         before, after,
         "a reused id would let a replaced worker's release free the new one's loan"
     );
+}
+
+/// The bytes each part of a loan puts on the wire, for comparing a peek.
+///
+/// Only meaningful for owned parts; a borrowed part's bytes live in the
+/// resident data and are not the book's to reproduce.
+fn bytes_of(parts: &[Lent]) -> Vec<Vec<u8>> {
+    parts
+        .iter()
+        .map(|part| match part {
+            Lent::Owned(bytes) => bytes.clone(),
+            Lent::Borrowed { .. } => Vec::new(),
+        })
+        .collect()
+}
+
+/// **The point of the borrowed arm: nothing is copied.** The view a borrowed
+/// part describes has to land on the SAME address as the data the owner holds,
+/// because "we lent it in place" is exactly the claim that the address is not a
+/// copy's address. A `Lent::borrowed` that copied would still pass every
+/// bookkeeping assertion above and would silently reinstate the memcpy this
+/// whole arm exists to remove.
+#[test]
+fn a_borrowed_part_views_the_owner_s_own_bytes_and_does_not_copy_them() {
+    let grid: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(vec![0xAB; 16]);
+    let want_addr = grid.as_ptr() as usize;
+    let want_len = grid.len();
+
+    let part = Lent::borrowed(grid.clone(), |g| &g[..]);
+
+    assert_eq!(
+        part.addr(),
+        want_addr,
+        "the view must start at the owner's own allocation, not at a copy"
+    );
+    assert_eq!(
+        part.len(),
+        want_len,
+        "the whole region travels, not a prefix of it"
+    );
+}
+
+/// A borrowed part keeps its owner alive for exactly as long as the loan is
+/// outstanding. This is the whole safety argument for viewing memory the book
+/// does not own: the peer reads that region asynchronously, so the region must
+/// not be freeable while the id is outstanding.
+#[test]
+fn an_outstanding_borrowed_loan_holds_its_owner_alive() {
+    let grid: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(vec![0u8; 128]);
+    let mut book = LoanBook::new();
+    let id = book.lend_parts(vec![Lent::borrowed(grid.clone(), |g| &g[..])]);
+
+    drop(grid);
+    assert_eq!(
+        book.bytes_outstanding(),
+        128,
+        "the region is still held down after every other handle is dropped"
+    );
+
+    let released = book.release(id).expect("the loan was outstanding");
+    assert_eq!(released.len(), 1, "release hands the parts back");
+    assert_eq!(book.bytes_outstanding(), 0, "and stops holding the region");
+}
+
+/// A mixed loan is the shape a gridded job actually posts: a small OWNED
+/// envelope the encoder built, beside a large BORROWED payload it did not.
+/// `bytes_outstanding` has to count both, because it is the leak instrument.
+#[test]
+fn a_mixed_loan_counts_the_envelope_and_the_payload() {
+    let grid: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(vec![0u8; 1024]);
+    let mut book = LoanBook::new();
+    let id = book.lend_parts(vec![
+        Lent::Owned(vec![0u8; 40]),
+        Lent::borrowed(grid, |g| &g[..]),
+    ]);
+
+    assert_eq!(
+        book.bytes_outstanding(),
+        40 + 1024,
+        "the envelope and the payload are both on the wire"
+    );
+    assert_eq!(book.peek(id).map(<[Lent]>::len), Some(2));
 }

@@ -64,7 +64,9 @@
 //! `cfg`: the same code runs on both, and [`can_lend`] is the one place that
 //! decides.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Names one outstanding loan on the wire.
 ///
@@ -75,6 +77,74 @@ pub type LoanId = u32;
 
 /// What a message that carries copies rather than views writes for its loan.
 pub const NO_LOAN: LoanId = 0;
+
+/// One buffer a loan holds down, and where its bytes live.
+///
+/// The two arms exist because a loan has two reasons to hold memory. An
+/// encoder that BUILT a wire buffer hands it over by value and the book frees
+/// it on release. A payload that was ALREADY resident — a grid the page holds
+/// behind an `Arc` — is not copied into a wire buffer at all; the book holds
+/// the `Arc` so the region cannot be freed while the peer reads it, and the
+/// view is built onto the bytes where they already sit.
+///
+/// The whole point of the second arm is that it costs no memcpy. A gridded
+/// overlay job's payload is the size of the message, so copying it into a wire
+/// buffer is the dominant cost of the hand-off, and it runs on the FRAME
+/// THREAD.
+#[derive(Debug)]
+pub enum Lent {
+    /// Bytes the book owns and will free on release.
+    Owned(Vec<u8>),
+    /// Bytes owned elsewhere, viewed in place.
+    ///
+    /// `owner` is never read through — it is held ONLY so the allocation
+    /// outlives the peer's read. `addr` and `len` are what the view is built
+    /// from, and both are captured FROM the owner by [`Lent::borrowed`] so
+    /// they cannot describe a different allocation than the one held.
+    Borrowed {
+        owner: Arc<dyn Any + Send + Sync>,
+        addr: usize,
+        len: usize,
+    },
+}
+
+impl Lent {
+    /// Hold `owner` alive and view the bytes `project` picks out of it.
+    ///
+    /// The slice is taken from the owner **inside** this function rather than
+    /// passed in beside it: that is what makes the address provably part of
+    /// the allocation the `Arc` is holding down, instead of a pairing the
+    /// caller has to get right.
+    pub fn borrowed<T: Any + Send + Sync>(
+        owner: Arc<T>,
+        project: impl FnOnce(&T) -> &[u8],
+    ) -> Self {
+        let bytes = project(&owner);
+        let (addr, len) = (bytes.as_ptr() as usize, bytes.len());
+        Self::Borrowed { owner, addr, len }
+    }
+
+    /// How many bytes this buffer puts on the wire.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Borrowed { len, .. } => *len,
+        }
+    }
+
+    /// Whether it puts none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Where the bytes are, for building the view.
+    pub fn addr(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.as_ptr() as usize,
+            Self::Borrowed { addr, .. } => *addr,
+        }
+    }
+}
 
 /// The allocations this instance has lent out and cannot free yet.
 ///
@@ -91,7 +161,7 @@ pub struct LoanBook {
     /// The id the next [`lend`](Self::lend) will hand out. Wraps past
     /// [`NO_LOAN`] rather than through it.
     next: LoanId,
-    outstanding: HashMap<LoanId, Vec<Vec<u8>>>,
+    outstanding: HashMap<LoanId, Vec<Lent>>,
 }
 
 impl Default for LoanBook {
@@ -114,6 +184,15 @@ impl LoanBook {
     /// caller has no handle to free the region early. The id is what the peer
     /// quotes back.
     pub fn lend(&mut self, buffers: Vec<Vec<u8>>) -> LoanId {
+        self.lend_parts(buffers.into_iter().map(Lent::Owned).collect())
+    }
+
+    /// Name a loan over buffers that may be owned, borrowed, or a mix.
+    ///
+    /// The mixed case is the one that matters: a gridded job lends a small
+    /// OWNED envelope beside a large BORROWED payload, so only the envelope
+    /// was ever built.
+    pub fn lend_parts(&mut self, buffers: Vec<Lent>) -> LoanId {
         let id = self.next;
         self.next = next_after(id);
         self.outstanding.insert(id, buffers);
@@ -127,7 +206,7 @@ impl LoanBook {
     /// second means the peer read a region that may already have been handed
     /// to another loan, which is the failure this whole module exists to make
     /// impossible. The caller logs it; `loan_book_tests` asserts it.
-    pub fn release(&mut self, id: LoanId) -> Option<Vec<Vec<u8>>> {
+    pub fn release(&mut self, id: LoanId) -> Option<Vec<Lent>> {
         self.outstanding.remove(&id)
     }
 
@@ -135,7 +214,7 @@ impl LoanBook {
     ///
     /// Borrowed, not cloned: the views are built from these addresses and the
     /// book keeps owning them.
-    pub fn peek(&self, id: LoanId) -> Option<&[Vec<u8>]> {
+    pub fn peek(&self, id: LoanId) -> Option<&[Lent]> {
         self.outstanding.get(&id).map(Vec::as_slice)
     }
 
@@ -152,7 +231,7 @@ impl LoanBook {
         self.outstanding
             .values()
             .flat_map(|buffers| buffers.iter())
-            .map(Vec::len)
+            .map(Lent::len)
             .sum()
     }
 
@@ -190,7 +269,7 @@ mod loan_book_tests;
 
 #[cfg(target_arch = "wasm32")]
 mod js {
-    use super::{LoanBook, LoanId, NO_LOAN};
+    use super::{Lent, LoanBook, LoanId, NO_LOAN};
     use std::cell::RefCell;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
@@ -279,10 +358,35 @@ mod js {
         if !can_lend() {
             return Err(buffers);
         }
+        lend_parts(buffers.into_iter().map(Lent::Owned).collect())
+            .map_err(|parts| parts.into_iter().map(owned_or_empty).collect())
+    }
+
+    /// A buffer's bytes back, for the hand-back arm.
+    ///
+    /// Only the OWNED arm can be handed back to a caller that will copy
+    /// instead: a borrowed region's bytes belong to the resident data and the
+    /// caller must re-read them from there, which is why the only caller of
+    /// the hand-back path lends owned buffers exclusively.
+    fn owned_or_empty(part: Lent) -> Vec<u8> {
+        match part {
+            Lent::Owned(bytes) => bytes,
+            Lent::Borrowed { .. } => Vec::new(),
+        }
+    }
+
+    /// Register `parts` as lent and build one `Uint8Array` view per part.
+    ///
+    /// The mixed arm: an owned envelope beside a borrowed payload, so the
+    /// payload is never copied into a wire buffer at all.
+    pub fn lend_parts(parts: Vec<Lent>) -> Result<(LoanId, js_sys::Array), Vec<Lent>> {
+        if !can_lend() {
+            return Err(parts);
+        }
         let Some(buffer) = memory_buffer().map(|b| b.0) else {
-            return Err(buffers);
+            return Err(parts);
         };
-        let id = BOOK.with(|book| book.borrow_mut().lend(buffers));
+        let id = BOOK.with(|book| book.borrow_mut().lend_parts(parts));
         let views = js_sys::Array::new();
         BOOK.with(|book| {
             let book = book.borrow();
@@ -290,8 +394,8 @@ mod js {
             // borrows above — but an `expect` here would panic a worker over a
             // bookkeeping slip, so the empty array falls out instead and the
             // caller sees a loan of no buffers.
-            for bytes in book.peek(id).unwrap_or(&[]) {
-                views.push(&view_onto(&buffer, bytes));
+            for part in book.peek(id).unwrap_or(&[]) {
+                views.push(&view_onto(&buffer, part.addr(), part.len()));
             }
         });
         Ok((id, views))
@@ -304,12 +408,8 @@ mod js {
     /// keeps it SOUND is the book: `bytes` is borrowed from a buffer the book
     /// owns and will not drop until the peer releases it, and the peer only
     /// ever reads.
-    fn view_onto(buffer: &JsValue, bytes: &[u8]) -> js_sys::Uint8Array {
-        js_sys::Uint8Array::new_with_byte_offset_and_length(
-            buffer,
-            bytes.as_ptr() as u32,
-            bytes.len() as u32,
-        )
+    fn view_onto(buffer: &JsValue, addr: usize, len: usize) -> js_sys::Uint8Array {
+        js_sys::Uint8Array::new_with_byte_offset_and_length(buffer, addr as u32, len as u32)
     }
 
     /// The peer has finished reading; free the region.
