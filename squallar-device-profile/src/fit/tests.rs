@@ -218,11 +218,14 @@ fn every_term_is_the_cost_function_it_reuses() {
     assert_eq!(tiles.total().host_bytes, 193 * 1_030_000);
 
     // Gridded overlays: each enabled layer's budget as its handler states
-    // it, once, on the host — MRMS's four desktop grids and GMGSI's four.
+    // it, once, on the host — MRMS's two desktop grids (49 MB apiece; its
+    // cache keys by product and there are two) and GMGSI's four (60 MB).
+    // Inputs, not reads of those constants: what is under test is that the
+    // term sums the budgets it is handed, once each.
     let gridded = terms(&Scene {
         overlay_grids: vec![
             OverlayGridNeed {
-                budget_bytes: 196_000_000,
+                budget_bytes: 98_000_000,
             },
             OverlayGridNeed {
                 budget_bytes: 240_000_000,
@@ -230,9 +233,9 @@ fn every_term_is_the_cost_function_it_reuses() {
         ],
         ..Scene::empty()
     });
-    assert_eq!(gridded.overlay_grids_host, 436_000_000);
+    assert_eq!(gridded.overlay_grids_host, 338_000_000);
     assert_eq!(gridded.total().gpu_bytes, 0);
-    assert_eq!(gridded.total().host_bytes, 436_000_000);
+    assert_eq!(gridded.total().host_bytes, 338_000_000);
 }
 
 /// **A loop's decoded volumes are priced at what they measured where the

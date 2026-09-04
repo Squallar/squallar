@@ -78,12 +78,20 @@ fn pane_state(channel: GmgsiChannel) -> Box<GmgsiPaneState> {
 
 // -- The byte budget --------------------------------------------------------
 
+/// A cache with its history at the value that never binds, so the byte-budget
+/// tests below exercise the ceiling alone. [`DESKTOP_GRID_HISTORY_ENTRIES`] is
+/// that value by construction: one short of the key space, and the arrival is
+/// never counted against the history.
+fn byte_budget_cache(budget: usize) -> GmgsiGridCache {
+    GmgsiGridCache::new(budget, DESKTOP_GRID_HISTORY_ENTRIES, staging::global())
+}
+
 /// **The instrument that makes every eviction test below non-vacuous.** A cache
 /// whose budget it cannot overflow proves nothing about eviction, and the
 /// shipped budget is 60 MB, which a test cannot fill.
 #[test]
 fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
-    let mut cache = GmgsiGridCache::new(4 * 100, staging::global());
+    let mut cache = byte_budget_cache(4 * 100);
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -96,7 +104,7 @@ fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
 #[test]
 fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
     // Room for two 100-value grids and no more.
-    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
+    let mut cache = byte_budget_cache(4 * 200);
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -127,7 +135,7 @@ fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
 /// *budget* and not a hidden entry cap.
 #[test]
 fn a_wider_budget_holds_every_grid() {
-    let mut cache = GmgsiGridCache::new(4 * 300, staging::global());
+    let mut cache = byte_budget_cache(4 * 300);
     for &c in &[
         GmgsiChannel::LongwaveIr,
         GmgsiChannel::ShortwaveIr,
@@ -143,7 +151,7 @@ fn a_wider_budget_holds_every_grid() {
 /// pane stops drawing and nothing re-asks.
 #[test]
 fn the_cache_never_evicts_a_pinned_channel() {
-    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
+    let mut cache = byte_budget_cache(4 * 200);
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -174,7 +182,7 @@ fn the_cache_never_evicts_a_pinned_channel() {
 
 #[test]
 fn a_refetch_of_a_resident_channel_replaces_its_own_key() {
-    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
+    let mut cache = byte_budget_cache(4 * 200);
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -208,6 +216,164 @@ fn one_global_mosaic_is_sixty_megabytes() {
         GRID_CACHE_BYTES % GLOBAL_GRID_BYTES,
         0,
         "the budget is spent in whole channels"
+    );
+}
+
+// -- The history budget -----------------------------------------------------
+
+/// Room for all four channels many times over, so nothing in this section is
+/// the byte ceiling's doing.
+const WIDE: usize = 16_000;
+
+fn wide_cache(history: usize) -> GmgsiGridCache {
+    GmgsiGridCache::new(WIDE, history, staging::global())
+}
+
+/// The whole key space, in the order a pane cycling the control walks it.
+const CYCLE: [GmgsiChannel; 4] = [
+    GmgsiChannel::LongwaveIr,
+    GmgsiChannel::ShortwaveIr,
+    GmgsiChannel::Visible,
+    GmgsiChannel::WaterVapor,
+];
+
+/// One pane cycles all four channels. On the wasm arm (history 0) exactly the
+/// pinned channel is resident — 60 MB in the tab, not 240; on the desktop arm
+/// all four stay. Same fixtures, same ceiling — the history is the only
+/// difference.
+#[test]
+fn a_single_pane_that_cycles_channels_keeps_what_the_arm_history_says() {
+    let mut wasm = wide_cache(WASM_GRID_HISTORY_ENTRIES);
+    for c in CYCLE {
+        wasm.insert(c, granule_of(c, 100), &[c]);
+    }
+    assert_eq!(wasm.len(), 1, "a history of 0 keeps nothing warm");
+    assert!(
+        wasm.get(GmgsiChannel::WaterVapor).is_some(),
+        "the pinned channel is the one resident",
+    );
+
+    let mut desktop = wide_cache(DESKTOP_GRID_HISTORY_ENTRIES);
+    for c in CYCLE {
+        desktop.insert(c, granule_of(c, 100), &[c]);
+    }
+    assert_eq!(desktop.len(), 4, "the desktop arm keeps every channel warm");
+    assert!(
+        desktop.resident_bytes() <= WIDE,
+        "non-triviality: the wasm evictions above were not the byte ceiling's",
+    );
+}
+
+/// Two panes on two channels with a history of 0: both stay while a third and a
+/// fourth channel pass through. The pin set is the floor of what is resident,
+/// and the history is only what may stay beyond it.
+#[test]
+fn two_panes_on_two_channels_keep_both_under_a_zero_history() {
+    let panes = [GmgsiChannel::LongwaveIr, GmgsiChannel::ShortwaveIr];
+    let mut cache = wide_cache(0);
+    for c in CYCLE {
+        cache.insert(c, granule_of(c, 100), &panes);
+    }
+    assert!(cache.get(GmgsiChannel::LongwaveIr).is_some());
+    assert!(cache.get(GmgsiChannel::ShortwaveIr).is_some());
+    assert!(
+        cache.get(GmgsiChannel::Visible).is_none(),
+        "non-triviality: the unpinned pass did evict, so the pin is what kept \
+         the two panes' channels rather than there having been room",
+    );
+    assert_eq!(
+        cache.len(),
+        3,
+        "the two pinned channels and the arrival, which is never its own victim",
+    );
+}
+
+/// Lowering the history evicts the excess at once — not on the next arrival,
+/// which is a poll away — least recently *used* first rather than least
+/// recently inserted, and raising it evicts nothing.
+#[test]
+fn lowering_the_history_evicts_the_least_recently_used_first_and_raising_evicts_nothing() {
+    let pinned = [GmgsiChannel::WaterVapor];
+    let mut cache = wide_cache(DESKTOP_GRID_HISTORY_ENTRIES);
+    for c in CYCLE {
+        cache.insert(c, granule_of(c, 100), &pinned);
+    }
+    assert_eq!(cache.len(), 4, "one pinned, three warm");
+    // Use shortwave, which was the *oldest* insert of the three unpinned
+    // channels: an implementation that trimmed by insert order would drop it.
+    assert!(cache.get(GmgsiChannel::ShortwaveIr).is_some());
+
+    cache.set_history(1, &pinned);
+    assert_eq!(cache.history(), 1);
+    assert_eq!(cache.len(), 2);
+    assert!(cache.get(GmgsiChannel::WaterVapor).is_some(), "pinned");
+    assert!(
+        cache.get(GmgsiChannel::ShortwaveIr).is_some(),
+        "the most recently used unpinned channel is the one kept",
+    );
+    assert!(cache.get(GmgsiChannel::LongwaveIr).is_none());
+    assert!(cache.get(GmgsiChannel::Visible).is_none());
+
+    cache.set_history(DESKTOP_GRID_HISTORY_ENTRIES, &pinned);
+    assert_eq!(cache.history(), DESKTOP_GRID_HISTORY_ENTRIES);
+    assert_eq!(
+        cache.len(),
+        2,
+        "raising the history restores capacity, not grids",
+    );
+}
+
+/// Every channel pinned, a history of 0 and a ceiling one grid wide: all four
+/// stay, the loop takes its `break` arm without panicking, and the bytes are
+/// over the ceiling — the pin rule holds against both budgets at once.
+#[test]
+fn the_pin_rule_holds_against_both_budgets_at_once() {
+    let mut cache = GmgsiGridCache::new(4 * 100, 0, staging::global());
+    for c in CYCLE {
+        cache.insert(c, granule_of(c, 100), &CYCLE);
+    }
+    assert_eq!(cache.len(), 4);
+    assert!(
+        cache.resident_bytes() > 4 * 100,
+        "non-triviality: this really is over the byte ceiling, so the break arm \
+         was taken rather than there having been room",
+    );
+}
+
+/// An arrival no pane is showing — the pane switched channels while the fetch
+/// was in flight — is held for its own insert and counted on the next.
+#[test]
+fn an_unpinned_arrival_is_held_for_its_own_insert_and_counted_on_the_next() {
+    let pinned = [GmgsiChannel::LongwaveIr];
+    let mut cache = wide_cache(0);
+    cache.insert(
+        GmgsiChannel::ShortwaveIr,
+        granule_of(GmgsiChannel::ShortwaveIr, 100),
+        &pinned,
+    );
+    assert!(
+        cache.get(GmgsiChannel::ShortwaveIr).is_some(),
+        "the arrival is never its own victim",
+    );
+    cache.insert(
+        GmgsiChannel::LongwaveIr,
+        granule_of(GmgsiChannel::LongwaveIr, 100),
+        &pinned,
+    );
+    assert!(
+        cache.get(GmgsiChannel::ShortwaveIr).is_none(),
+        "counted on the next insert, it is the excess",
+    );
+    assert!(cache.get(GmgsiChannel::LongwaveIr).is_some());
+}
+
+/// The shipped handler opens at the arm's history — the constant is wired, not
+/// merely declared.
+#[test]
+fn the_shipped_handler_opens_at_the_arm_history() {
+    assert_eq!(
+        GmgsiHandler::new().cached_grids.history(),
+        GRID_HISTORY_ENTRIES,
     );
 }
 
@@ -1918,7 +2084,11 @@ fn an_evicted_granule_a_job_still_holds_is_declined() {
 #[test]
 fn a_replaced_live_mosaic_is_offered_to_the_staging_pool() {
     static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
-    let mut cache = GmgsiGridCache::new(4 * staging::STAGING_POINTS * 4, &POOL);
+    let mut cache = GmgsiGridCache::new(
+        4 * staging::STAGING_POINTS * 4,
+        DESKTOP_GRID_HISTORY_ENTRIES,
+        &POOL,
+    );
     let channel = GmgsiChannel::LongwaveIr;
     cache.insert(channel, mosaic_granule(channel, 0), &[]);
     cache.insert(channel, mosaic_granule(channel, 1), &[]);

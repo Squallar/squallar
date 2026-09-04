@@ -29,10 +29,12 @@
 //!
 //! # Grids are a staging area; the loop holds textures
 //!
-//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] holds all
-//! four channels on every arm. A thirteen-frame loop is therefore **not**
-//! thirteen granules: a loop frame is a rasterized *texture*, held by the pane,
-//! and a granule is what one frame passes through on its way to becoming one.
+//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] may hold
+//! all four channels on every arm; how many of them a pane keeps warm after
+//! switching away is [`GRID_HISTORY_ENTRIES`]'s, and that is none on wasm. A
+//! thirteen-frame loop is therefore **not** thirteen granules: a loop frame is
+//! a rasterized *texture*, held by the pane, and a granule is what one frame
+//! passes through on its way to becoming one.
 //!
 //! So exactly **one granule has to be resident at a time** for the pipeline to
 //! advance — arrive, be described into a job (which takes its own refcount on
@@ -92,9 +94,10 @@ pub const GLOBAL_GRID_BYTES: usize = crate::gmgsi::GRID_POINTS * std::mem::size_
 /// wasm, two on mobile — did not make a browser tab hold less: below the key
 /// space `insert` runs out of unpinned victims and takes its `break` arm, so
 /// four panes on four channels held 240 MB under a constant that said 60.
-/// Stating the key space moved nothing at that peak; a pane that has switched
-/// channels now keeps the ones it left resident rather than refetching them.
-/// The `const _` below keeps every arm here.
+/// Stating the key space moved nothing at that peak. Whether a pane that has
+/// switched channels keeps the ones it left resident is not this ceiling's
+/// decision but [`GRID_HISTORY_ENTRIES`]'s. The `const _` below keeps every
+/// arm here.
 ///
 /// Spelled as a `cfg` cascade rather than resolved from `squallar-device-profile`
 /// because that crate sits **above** this one in the crate graph
@@ -133,6 +136,65 @@ const _: () = assert!(GRID_CACHE_BYTES >= GmgsiChannel::all().len() * GLOBAL_GRI
 const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRID_BYTES);
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
 const _: () = assert!(GLOBAL_GRID_BYTES == 60_000_000);
+
+/// How many grids a single pane that cycles selections keeps warm — the
+/// **unpinned history** the cache may retain beyond the pinned set: **none on
+/// wasm, one on mobile, every channel but the one showing on desktop**.
+///
+/// [`GRID_CACHE_BYTES`] is the ceiling and it is held at the key space, so on
+/// its own it lets one pane that has cycled through every channel keep every
+/// channel resident — 240 MB of GMGSI in a browser tab behind a pane that is
+/// showing 60. Those grids are the second tier of the memory model: switching
+/// back is faster with them, nothing is lost without them, and how many to keep
+/// is a governor's decision to lower and restore, not a constant's. This is
+/// that governor's lever — `GmgsiGridCache::set_history` — at its opening
+/// position. Retention is `max(pinned set, history)`: the pin set, the union of
+/// every visible pane's selection, is never evicted whatever this says; beyond
+/// it the least-recently-used unpinned grids go until at most this many remain.
+///
+/// Each arm is what that arm did before the byte budgets were raised to the key
+/// space, so no arm's residency moves today: wasm held one channel, so a pane
+/// that switched refetched on the way back (history 0); mobile held two, one
+/// showing and one warm (1); desktop held all four, everything warm
+/// (`all().len() - 1`). Named per arm, like the model cache's byte budgets, so
+/// the `const _` below holds on every build and a host test can state the wasm
+/// arm by name.
+pub const WASM_GRID_HISTORY_ENTRIES: usize = 0;
+/// See [`WASM_GRID_HISTORY_ENTRIES`].
+pub const MOBILE_GRID_HISTORY_ENTRIES: usize = 1;
+/// See [`WASM_GRID_HISTORY_ENTRIES`]. `all().len() - 1` is the value at which
+/// the history never binds: at least one channel is always pinned, so that is
+/// the most unpinned grids the cache can ever hold.
+pub const DESKTOP_GRID_HISTORY_ENTRIES: usize = GmgsiChannel::all().len() - 1;
+
+/// The arm this build selects — see [`WASM_GRID_HISTORY_ENTRIES`]. The same
+/// `cfg` cascade as [`GRID_CACHE_BYTES`], for the same reason.
+#[cfg(target_arch = "wasm32")]
+pub const GRID_HISTORY_ENTRIES: usize = WASM_GRID_HISTORY_ENTRIES;
+/// See the wasm arm.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "android", target_os = "ios")
+))]
+pub const GRID_HISTORY_ENTRIES: usize = MOBILE_GRID_HISTORY_ENTRIES;
+/// See the wasm arm.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+pub const GRID_HISTORY_ENTRIES: usize = DESKTOP_GRID_HISTORY_ENTRIES;
+
+// **Below the key space, on every arm.** `pinned_channels` never answers an
+// empty set (it falls back to the default channel), so the most unpinned grids
+// the cache can hold is `all().len() - 1`; a history at or above the key space
+// is a lever connected to nothing, and it would also price the pinned set plus
+// the history above the byte ceiling. Over the named arms rather than the
+// selected one, so every build checks all three.
+const _: () = {
+    assert!(WASM_GRID_HISTORY_ENTRIES < GmgsiChannel::all().len());
+    assert!(MOBILE_GRID_HISTORY_ENTRIES < GmgsiChannel::all().len());
+    assert!(DESKTOP_GRID_HISTORY_ENTRIES < GmgsiChannel::all().len());
+};
 
 /// **How many bytes of loop-frame granule may stage at once: one mosaic, on
 /// every arm.**
@@ -338,16 +400,22 @@ struct GmgsiGridCache {
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
+    /// How many unpinned grids may stay resident beyond the pinned set —
+    /// [`GRID_HISTORY_ENTRIES`] on the shipped handler, injected for the same
+    /// reason `budget` is, and the one field a governor moves at runtime
+    /// ([`Self::set_history`]).
+    history: usize,
     /// See [`GmgsiFrameCache::staging`].
     staging: &'static staging::StagingPool,
 }
 
 impl GmgsiGridCache {
-    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
+    fn new(budget: usize, history: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            history,
             staging,
         }
     }
@@ -405,6 +473,10 @@ impl GmgsiGridCache {
     /// takes the `break` arm, holding more than the budget says — which is why
     /// that floor is a build failure and not something this loop decides.
     ///
+    /// The pin set is the floor of what stays; [`Self::history`] is how many
+    /// unpinned grids may stay beyond it, least recently used first to go. Both
+    /// are applied by [`Self::evict_beyond`] once the entry has landed.
+    ///
     /// The poll replaces this channel's mosaic here, and the displaced one is
     /// offered to [`staging`] — with `Arc::into_inner` deciding, so a granule
     /// another pane's raster job is still reading is never taken out from
@@ -420,16 +492,64 @@ impl GmgsiGridCache {
         } else {
             self.recency.borrow_mut().push(channel);
         }
-        while self.resident_bytes() > self.budget {
+        self.evict_beyond(Some(channel), pinned);
+    }
+
+    /// How many unpinned grids the cache may keep beyond the pinned set.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the governor that reads and moves the history is a later landing; the lever ships ahead of its producer"
+        )
+    )]
+    fn history(&self) -> usize {
+        self.history
+    }
+
+    /// **The governor's lever.** Lowering it evicts the excess now, least
+    /// recently used first — the poll is too far away to leave the trim to the
+    /// next arrival — which is why it takes the pin set: what a visible pane is
+    /// showing is never the excess. Raising it evicts nothing. A value at or
+    /// above the key space never binds (at least one channel is always pinned),
+    /// so a runtime value there is harmless and is not clamped; the arm
+    /// constants are held below it at compile time above.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the governor that reads and moves the history is a later landing; the lever ships ahead of its producer"
+        )
+    )]
+    fn set_history(&mut self, history: usize, pinned: &[GmgsiChannel]) {
+        self.history = history;
+        self.evict_beyond(None, pinned);
+    }
+
+    /// Evict least-recently-used entries — never `held`, never anything in
+    /// `pinned` — until the cache is under `budget` **and** holds at most
+    /// `history` unpinned grids beyond `held`.
+    ///
+    /// `MrmsGridCache::evict_beyond` is the same loop and carries the whole
+    /// reasoning: one loop with two exit tests, bounded at `evictable -
+    /// history` iterations over a key space of four, which is why it is fine on
+    /// the frame thread's arrival path; `held` is the arrival and is never its
+    /// own victim; the `break` arm is reachable only below the key space, which
+    /// the `const _` above makes a build failure, and never by the history test
+    /// alone. Going over budget there is the lesser failure: dropping a pinned
+    /// channel blanks a pane that has nothing to re-ask.
+    fn evict_beyond(&mut self, held: Option<GmgsiChannel>, pinned: &[GmgsiChannel]) {
+        let evictable = |c: GmgsiChannel| Some(c) != held && !pinned.contains(&c);
+        loop {
+            let over_budget = self.resident_bytes() > self.budget;
+            let over_history =
+                self.entries.keys().filter(|c| evictable(**c)).count() > self.history;
+            if !over_budget && !over_history {
+                break;
+            }
             let victim = {
                 let mut recency = self.recency.borrow_mut();
-                let Some(pos) = recency
-                    .iter()
-                    .position(|c| *c != channel && !pinned.contains(c))
-                else {
-                    // Every remaining entry is the arrival or pinned. Going
-                    // over budget is the lesser failure: dropping a pinned
-                    // channel blanks a pane that has nothing to re-ask.
+                let Some(pos) = recency.iter().position(|c| evictable(*c)) else {
                     break;
                 };
                 recency.remove(pos)
@@ -490,7 +610,11 @@ impl GmgsiHandler {
         Self {
             state: OverlayState::new(),
             defaults: GmgsiPaneState::new(false),
-            cached_grids: GmgsiGridCache::new(GRID_CACHE_BYTES, staging::global()),
+            cached_grids: GmgsiGridCache::new(
+                GRID_CACHE_BYTES,
+                GRID_HISTORY_ENTRIES,
+                staging::global(),
+            ),
             last_error: None,
             frame_keys: HashMap::new(),
             covered: HashMap::new(),

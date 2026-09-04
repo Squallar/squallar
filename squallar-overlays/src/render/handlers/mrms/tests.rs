@@ -1,4 +1,5 @@
 use super::*;
+use crate::mrms::{DESKTOP_GRID_HISTORY_ENTRIES, WASM_GRID_HISTORY_ENTRIES};
 use crate::render::gridded::ResidentGrid;
 use squallar_geo::GeoBounds;
 
@@ -76,12 +77,20 @@ fn pane_state(product: MrmsProduct) -> Box<MrmsPaneState> {
 
 // ── The byte budget ─────────────────────────────────────────────────────────
 
+/// A cache with its history at the value that never binds, so the byte-budget
+/// tests below exercise the ceiling alone. [`DESKTOP_GRID_HISTORY_ENTRIES`] is
+/// that value by construction: one short of the key space, and the arrival is
+/// never counted against the history.
+fn byte_budget_cache(budget: usize) -> MrmsGridCache {
+    MrmsGridCache::new(budget, DESKTOP_GRID_HISTORY_ENTRIES, staging::global())
+}
+
 /// **The instrument that makes every eviction test below non-vacuous.** A cache
 /// whose budget it cannot overflow proves nothing about eviction.
 #[test]
 fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
     // Room for exactly one 100-value grid (400 bytes).
-    let mut cache = MrmsGridCache::new(400, staging::global());
+    let mut cache = byte_budget_cache(400);
     let a = Arc::new(sized(MrmsProduct::ReflectivityComposite, 100));
     assert_eq!(a.resident_bytes(), 400);
     cache.insert(MrmsProduct::ReflectivityComposite, a, &[]);
@@ -93,7 +102,7 @@ fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
 /// entry count anywhere in the decision.
 #[test]
 fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
-    let mut cache = MrmsGridCache::new(400, staging::global());
+    let mut cache = byte_budget_cache(400);
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -114,7 +123,7 @@ fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
 /// the *budget*, not a hidden entry cap.
 #[test]
 fn a_wider_budget_holds_both_grids() {
-    let mut cache = MrmsGridCache::new(800, staging::global());
+    let mut cache = byte_budget_cache(800);
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -134,7 +143,7 @@ fn a_wider_budget_holds_both_grids() {
 /// re-ask, which is worse than the memory.
 #[test]
 fn the_cache_never_evicts_a_pinned_product() {
-    let mut cache = MrmsGridCache::new(400, staging::global());
+    let mut cache = byte_budget_cache(400);
     cache.insert(
         MrmsProduct::ReflectivityComposite,
         Arc::new(sized(MrmsProduct::ReflectivityComposite, 100)),
@@ -160,7 +169,7 @@ fn the_cache_never_evicts_a_pinned_product() {
 /// A refetch replaces its own key rather than growing the cache.
 #[test]
 fn a_refetch_of_a_resident_product_replaces_its_own_key() {
-    let mut cache = MrmsGridCache::new(400, staging::global());
+    let mut cache = byte_budget_cache(400);
     let p = MrmsProduct::ReflectivityComposite;
     cache.insert(p, Arc::new(sized(p, 100)), &[]);
     cache.insert(p, Arc::new(sized(p, 100)), &[]);
@@ -173,6 +182,129 @@ fn a_refetch_of_a_resident_product_replaces_its_own_key() {
 #[test]
 fn the_shipped_budget_admits_a_full_conus_grid() {
     assert!(MrmsHandler::new().cached_grids.budget >= crate::mrms::CONUS_GRID_BYTES);
+}
+
+// ── The history budget ──────────────────────────────────────────────────────
+
+/// Room for both products many times over, so nothing in this section is the
+/// byte ceiling's doing.
+const WIDE: usize = 8_000;
+
+fn wide_cache(history: usize) -> MrmsGridCache {
+    MrmsGridCache::new(WIDE, history, staging::global())
+}
+
+/// One pane cycles both products. On the wasm arm (history 0) the product it
+/// left is gone and only the pinned one is resident; on the desktop arm both
+/// stay. Same fixtures, same ceiling — the history is the only difference.
+#[test]
+fn a_single_pane_that_cycles_products_keeps_what_the_arm_history_says() {
+    let (a, b) = (MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate);
+
+    let mut wasm = wide_cache(WASM_GRID_HISTORY_ENTRIES);
+    wasm.insert(a, Arc::new(sized(a, 100)), &[a]);
+    wasm.insert(b, Arc::new(sized(b, 100)), &[b]);
+    assert!(wasm.contains(b), "the pinned product is resident");
+    assert!(
+        !wasm.contains(a),
+        "the product the pane left is not: a history of 0 keeps nothing warm",
+    );
+    assert_eq!(wasm.len(), 1);
+
+    let mut desktop = wide_cache(DESKTOP_GRID_HISTORY_ENTRIES);
+    desktop.insert(a, Arc::new(sized(a, 100)), &[a]);
+    desktop.insert(b, Arc::new(sized(b, 100)), &[b]);
+    assert_eq!(desktop.len(), 2, "the desktop arm keeps every product warm");
+    assert!(
+        desktop.resident_bytes() <= WIDE,
+        "non-triviality: the wasm eviction above was not the byte ceiling's",
+    );
+}
+
+/// Two panes on two products with a history of 0: both stay. The pin set is the
+/// floor of what is resident, and the history is only what may stay beyond it.
+#[test]
+fn two_panes_on_two_products_keep_both_under_a_zero_history() {
+    let (a, b) = (MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate);
+    let mut cache = wide_cache(0);
+    cache.insert(a, Arc::new(sized(a, 100)), &[a, b]);
+    cache.insert(b, Arc::new(sized(b, 100)), &[a, b]);
+    assert_eq!(cache.len(), 2);
+    assert!(cache.contains(a) && cache.contains(b));
+}
+
+/// Lowering the history evicts the excess at once — not on the next arrival,
+/// which is a two-minute poll away — and raising it evicts nothing. Two
+/// products hold one unpinned grid at most, so least-recent-first order among
+/// several is the GMGSI suite's to show; this one shows the trim is immediate.
+#[test]
+fn lowering_the_history_evicts_the_excess_at_once_and_raising_evicts_nothing() {
+    let (a, b) = (MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate);
+    let mut cache = wide_cache(DESKTOP_GRID_HISTORY_ENTRIES);
+    cache.insert(a, Arc::new(sized(a, 100)), &[b]);
+    cache.insert(b, Arc::new(sized(b, 100)), &[b]);
+    assert_eq!(cache.len(), 2, "one pinned, one warm");
+
+    cache.set_history(0, &[b]);
+    assert_eq!(cache.history(), 0);
+    assert_eq!(cache.len(), 1);
+    assert!(cache.contains(b), "the pinned product stays");
+    assert!(
+        !cache.contains(a),
+        "the warm one is the excess and goes now"
+    );
+
+    cache.set_history(DESKTOP_GRID_HISTORY_ENTRIES, &[b]);
+    assert_eq!(cache.history(), DESKTOP_GRID_HISTORY_ENTRIES);
+    assert_eq!(
+        cache.len(),
+        1,
+        "raising the history restores capacity, not grids",
+    );
+}
+
+/// Every product pinned, a history of 0 and a ceiling one grid wide: both stay,
+/// the loop takes its `break` arm without panicking, and the bytes are over the
+/// ceiling — the pin rule holds against both budgets at once.
+#[test]
+fn the_pin_rule_holds_against_both_budgets_at_once() {
+    let (a, b) = (MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate);
+    let mut cache = MrmsGridCache::new(400, 0, staging::global());
+    cache.insert(a, Arc::new(sized(a, 100)), &[a, b]);
+    cache.insert(b, Arc::new(sized(b, 100)), &[a, b]);
+    assert_eq!(cache.len(), 2);
+    assert!(cache.contains(a) && cache.contains(b));
+    assert!(
+        cache.resident_bytes() > 400,
+        "non-triviality: this really is over the byte ceiling, so the break arm \
+         was taken rather than there having been room",
+    );
+}
+
+/// An arrival no pane is showing — the pane switched products while the fetch
+/// was in flight — is held for its own insert and counted on the next.
+#[test]
+fn an_unpinned_arrival_is_held_for_its_own_insert_and_counted_on_the_next() {
+    let (a, b) = (MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate);
+    let mut cache = wide_cache(0);
+    cache.insert(a, Arc::new(sized(a, 100)), &[b]);
+    assert!(cache.contains(a), "the arrival is never its own victim");
+    cache.insert(b, Arc::new(sized(b, 100)), &[b]);
+    assert!(
+        !cache.contains(a),
+        "counted on the next insert, it is the excess",
+    );
+    assert!(cache.contains(b));
+}
+
+/// The shipped handler opens at the arm's history — the constant is wired, not
+/// merely declared.
+#[test]
+fn the_shipped_handler_opens_at_the_arm_history() {
+    assert_eq!(
+        MrmsHandler::new().cached_grids.history(),
+        crate::mrms::GRID_HISTORY_ENTRIES,
+    );
 }
 
 // ── The raster carry ────────────────────────────────────────────────────────

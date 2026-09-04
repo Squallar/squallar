@@ -173,6 +173,23 @@ pub enum GmgsiChannel {
     WaterVapor,
 }
 
+// **The key space's tripwire**, for the reason `crate::mrms`'s copy of this
+// block states in full: the GMGSI grid cache is a `HashMap` keyed by this enum
+// and its byte budget is priced at one grid per entry of `all()`, so an `all()`
+// that under-counts the enum is a budget under the real key space with every
+// assert green. `index` is the exhaustive `match`; this block checks `all()` is
+// dense and ordered under it. It does not prove completeness — that check is
+// circular without a derive — so it is a tripwire at the point of change, and
+// the byte ceiling remains what bounds the heap if one is walked past.
+const _: () = {
+    let all = GmgsiChannel::all();
+    let mut i = 0;
+    while i < all.len() {
+        assert!(all[i].index() == i);
+        i += 1;
+    }
+};
+
 impl GmgsiChannel {
     pub const fn all() -> &'static [GmgsiChannel] {
         &[
@@ -181,6 +198,21 @@ impl GmgsiChannel {
             GmgsiChannel::Visible,
             GmgsiChannel::WaterVapor,
         ]
+    }
+
+    /// A dense index over the variants, by a `match` with **no wildcard arm**.
+    ///
+    /// Its only caller is the `const _` above, and that is the point: a channel
+    /// added to [`GmgsiChannel`] fails to compile *here*, one line from
+    /// [`Self::all`], which is the list the grid cache's key space is counted
+    /// from.
+    const fn index(self) -> usize {
+        match self {
+            GmgsiChannel::LongwaveIr => 0,
+            GmgsiChannel::ShortwaveIr => 1,
+            GmgsiChannel::Visible => 2,
+            GmgsiChannel::WaterVapor => 3,
+        }
     }
 
     /// The persisted spelling. This lands in a user's config file and on the

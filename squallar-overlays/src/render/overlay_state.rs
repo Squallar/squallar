@@ -643,7 +643,7 @@ impl OverlayRegistry {
     ///
     /// **Cost**: O(registered handlers), and each answer is a field read or a
     /// walk of a cache holding at most a handful of entries — those byte
-    /// budgets are one to four grids of 49-60 MB. No grid contents are
+    /// budgets are two or four grids of 49-60 MB. No grid contents are
     /// touched, so this is safe on the frame thread's telemetry tick.
     pub fn resident_source_bytes(&self) -> u64 {
         self.handlers()

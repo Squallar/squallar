@@ -87,12 +87,15 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
 /// | mobile | 192 MiB | 26 | 4 |
 /// | desktop | 512 MiB | 70 | 6 |
 ///
-/// **Never below the pane count.** Below it a pane loses its grid to another
-/// pane's arrival, and it fails *silently*: `prepare_job` answers `None` and
-/// the pane goes on drawing its last texture with nothing that will re-ask.
-/// `the_byte_budget_holds_at_least_one_grid_per_pane` holds that floor on all
-/// three arms from a host test, which is why each is a named constant rather
-/// than only a `cfg` arm.
+/// **Never below the pane count.** Below it the budget stops being one: every
+/// pane's key is pinned, `ModelGridCache::insert` runs out of unpinned victims
+/// and takes its `break` arm, and the cache holds one grid per pane anyway
+/// while this constant says less — a silent *overrun*, not a blank pane, since
+/// a pinned grid is never a victim and `prepare_job` keeps answering. The
+/// `const _` below holds the floor as a build failure;
+/// `the_byte_budget_holds_at_least_one_grid_per_pane` restates it from a host
+/// test, which is why each arm is a named constant rather than only a `cfg`
+/// arm.
 ///
 /// **Spelled here rather than read from `squallar-device-profile`**, where the
 /// rest of this application's budgets live. That crate declares
@@ -119,10 +122,11 @@ pub const MAX_PANES_MOBILE: usize = 4;
 /// drifting away from the function.
 pub const HRRR_CONUS_GRID_BYTES: usize = 1799 * 1059 * 4;
 
-/// **The floor, as a build failure.** A budget below one grid per pane starves
-/// a pane *silently* — `prepare_job` answers `None` and it goes on drawing its
-/// last texture — so it is caught here rather than in a test somebody has to
-/// have run on the right target.
+/// **The floor, as a build failure.** A budget below one grid per pane is
+/// overrun *silently* — the pinned keys are never victims, so the cache holds
+/// them past the figure and the figure under-reports the heap — so it is
+/// caught here rather than in a test somebody has to have run on the right
+/// target.
 const _: () = {
     assert!(WASM_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_DESKTOP);
     assert!(MOBILE_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES >= MAX_PANES_MOBILE);
@@ -144,9 +148,10 @@ const _: () = {
 /// frames cost 14 × 7,620,564 = 106,687,896 B = **101.75 MiB against a 96 MiB
 /// pool — 6.0 % over, with zero grids left for any other pane.** The floor
 /// above does not catch it: one grid per pane and N grids in one pane are
-/// different questions, and it only asks the first. The overrun is silent in
-/// exactly the way described above — `prepare_job` answers `None` and the pane
-/// goes on drawing its last texture.
+/// different questions, and it only asks the first. This overrun IS silent in
+/// the blanking way — a loop frame that is not the pane's current key is not
+/// pinned, so it is a victim like any other, and `prepare_job` then answers
+/// `None` and the pane goes on drawing its last texture.
 ///
 /// | arm | budget | grids | reserved | this cap | after the caller's clamp |
 /// |---|---:|---:|---:|---:|---:|
@@ -221,6 +226,14 @@ pub(crate) const MODEL_GRID_BUDGET_BYTES: usize = DESKTOP_MODEL_GRID_BUDGET_BYTE
 /// is behind a `RefCell` because every *reader* reaches it through an `&self`
 /// method of [`OverlayHandler`], and a lookup that did not count as a use would
 /// let the pane on screen age out.
+///
+/// **No history budget, unlike the MRMS and GMGSI grid caches.** Theirs key by
+/// the layer's selectable product — two and four — so "how many unpinned grids
+/// may stay beyond the pinned set" is a small count a governor can lower and
+/// restore. This cache keys by [`GridKey`]: parameter, run *and* forecast
+/// hour, and a scrub across a run's hours or a run rolling over mints keys
+/// without bound. An unpinned count is not a count of anything stable here, so
+/// the byte budget is the whole of the lever.
 struct ModelGridCache {
     entries: HashMap<GridKey, Arc<HrrrGridData>>,
     recency: RefCell<Vec<GridKey>>,
@@ -2504,9 +2517,10 @@ mod tests {
     }
 
     /// A full desktop layout is six unlinked panes, each free to select its own
-    /// parameter. This is the case a cap below the pane count breaks, and it
-    /// breaks *silently*: `prepare_job` answers `None` and the starved pane goes
-    /// on drawing its last texture, with nothing to re-ask.
+    /// parameter. This is the case a cache that let another pane's arrival take
+    /// a pinned grid would break, and it would break *silently*: `prepare_job`
+    /// answers `None` and the starved pane goes on drawing its last texture,
+    /// with nothing to re-ask.
     #[test]
     fn every_pane_of_a_full_desktop_layout_keeps_a_drawable_grid() {
         // Spelled, not imported: squallar-overlays cannot depend on squallar-egui.
@@ -2949,10 +2963,9 @@ mod tests {
             assert!(
                 grids >= panes,
                 "{name} budgets {budget} bytes = {grids} CONUS grids for \
-                 {panes} panes. Below one grid per pane a pane loses its grid \
-                 to another pane's arrival and there is no symptom: \
-                 `prepare_job` answers None and it keeps drawing the last \
-                 texture.",
+                 {panes} panes. Below one grid per pane the pinned keys are \
+                 never victims, so the cache overruns the budget and there is \
+                 no symptom: the figure says less than the heap holds.",
             );
         }
         assert_eq!(

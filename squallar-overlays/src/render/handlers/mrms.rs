@@ -4,9 +4,11 @@
 //! viewport at encode — with two differences that are the whole content of this
 //! file:
 //!
-//! * **the cache is bounded by bytes, not entries.** One CONUS grid is 49 MB,
-//!   so `crate::mrms::GRID_CACHE_BYTES` is the budget and the entry count falls
-//!   out of it;
+//! * **the cache's ceiling is bytes, not entries.** One CONUS grid is 49 MB, so
+//!   `crate::mrms::GRID_CACHE_BYTES` is the budget and the entry count falls out
+//!   of it. `crate::mrms::GRID_HISTORY_ENTRIES` is an entry count, but of a
+//!   different thing: how many *unpinned* grids may stay under that ceiling, so
+//!   a single pane cycling products does not fill the key space by itself;
 //! * **the raster input carries no source enum.** `prepare_job` describes a
 //!   [`rasterize::GriddedInput::Resident`], which is the field-identified carry
 //!   the gridded substrate introduced, so this layer rides the existing
@@ -60,8 +62,8 @@ use std::sync::Arc;
 
 use crate::fetch_policy::Whole;
 use crate::mrms::{
-    FRAME_STAGING_BYTES, GRID_CACHE_BYTES, MrmsFetchResult, MrmsFrameFetch, MrmsGrid, MrmsListing,
-    MrmsProduct, staging,
+    FRAME_STAGING_BYTES, GRID_CACHE_BYTES, GRID_HISTORY_ENTRIES, MrmsFetchResult, MrmsFrameFetch,
+    MrmsGrid, MrmsListing, MrmsProduct, staging,
 };
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
@@ -243,16 +245,22 @@ struct MrmsGridCache {
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
+    /// How many unpinned grids may stay resident beyond the pinned set —
+    /// [`GRID_HISTORY_ENTRIES`] on the shipped handler, injected for the same
+    /// reason `budget` is, and the one field a governor moves at runtime
+    /// ([`Self::set_history`]).
+    history: usize,
     /// See [`MrmsFrameCache::staging`].
     staging: &'static staging::StagingPool,
 }
 
 impl MrmsGridCache {
-    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
+    fn new(budget: usize, history: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            history,
             staging,
         }
     }
@@ -310,6 +318,11 @@ impl MrmsGridCache {
     /// of unpinned victims and takes the `break` arm, holding more than the
     /// budget says — which is why that floor is a build failure and not
     /// something this loop decides.
+    ///
+    /// The pin set is the floor of what stays; [`Self::history`] is how many
+    /// unpinned grids stay beyond it, least recently used first to go. Both
+    /// are applied by [`Self::evict_beyond`] once the entry has landed.
+    ///
     /// The two-minute poll replaces this product's mosaic here, and the
     /// displaced one is offered to [`staging`] — with `Arc::into_inner`
     /// deciding, so a granule another pane's raster job is still reading is
@@ -325,16 +338,75 @@ impl MrmsGridCache {
         } else {
             self.recency.borrow_mut().push(product);
         }
-        while self.resident_bytes() > self.budget {
+        self.evict_beyond(Some(product), pinned);
+    }
+
+    /// How many unpinned grids the cache may keep beyond the pinned set.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the governor that reads and moves the history is a later landing; the lever ships ahead of its producer"
+        )
+    )]
+    fn history(&self) -> usize {
+        self.history
+    }
+
+    /// **The governor's lever.** Lowering it evicts the excess now, least
+    /// recently used first — the two-minute poll is too far away to leave the
+    /// trim to the next arrival — which is why it takes the pin set: what a
+    /// visible pane is showing is never the excess. Raising it evicts nothing.
+    /// A value at or above the key space never binds (at least one product is
+    /// always pinned), so a runtime value there is harmless and is not clamped;
+    /// the arm constants are held below it at compile time in `crate::mrms`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the governor that reads and moves the history is a later landing; the lever ships ahead of its producer"
+        )
+    )]
+    fn set_history(&mut self, history: usize, pinned: &[MrmsProduct]) {
+        self.history = history;
+        self.evict_beyond(None, pinned);
+    }
+
+    /// Evict least-recently-used entries — never `held`, never anything in
+    /// `pinned` — until the cache is under `budget` **and** holds at most
+    /// `history` unpinned grids beyond `held`.
+    ///
+    /// One loop with two exit tests rather than two passes: both conditions
+    /// fall by one entry per iteration and the victim rule is the same for
+    /// both. **Bounded on the frame thread's arrival path:** every iteration
+    /// removes one evictable entry or takes the `break`, so it runs at most
+    /// `evictable - history` times, and `evictable` is at most the key space —
+    /// two products here, four channels for GMGSI — with an
+    /// O(key space × |pinned|) count per iteration. A few dozen comparisons at
+    /// the outside, which is why it is fine where it is.
+    ///
+    /// `held` is the arrival, which is never its own victim: with the history
+    /// at zero, an arrival no pane is showing any more (the pane switched
+    /// before the fetch landed) stays for this insert and is counted on the
+    /// next. The `break` arm is reached only when every remaining entry is
+    /// `held` or pinned and the bytes are still over the ceiling — the
+    /// below-key-space case the `const _` in `crate::mrms` makes a build
+    /// failure — and the history test alone can never reach it, because an
+    /// unpinned count over the history *is* the existence of a victim. Going
+    /// over budget there is the lesser failure: dropping a pinned product
+    /// blanks a pane that has nothing to re-ask.
+    fn evict_beyond(&mut self, held: Option<MrmsProduct>, pinned: &[MrmsProduct]) {
+        let evictable = |p: MrmsProduct| Some(p) != held && !pinned.contains(&p);
+        loop {
+            let over_budget = self.resident_bytes() > self.budget;
+            let over_history =
+                self.entries.keys().filter(|p| evictable(**p)).count() > self.history;
+            if !over_budget && !over_history {
+                break;
+            }
             let victim = {
                 let mut recency = self.recency.borrow_mut();
-                let Some(pos) = recency
-                    .iter()
-                    .position(|p| *p != product && !pinned.contains(p))
-                else {
-                    // Every remaining entry is the arrival or pinned. Going
-                    // over budget is the lesser failure: dropping a pinned
-                    // product blanks a pane that has nothing to re-ask.
+                let Some(pos) = recency.iter().position(|p| evictable(*p)) else {
                     break;
                 };
                 recency.remove(pos)
@@ -404,7 +476,7 @@ impl MrmsHandler {
         Self {
             state: OverlayState::new(),
             defaults: MrmsPaneState::new(false),
-            cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES, pool),
+            cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES, GRID_HISTORY_ENTRIES, pool),
             last_error: None,
             frame_keys: HashMap::new(),
             covered: HashMap::new(),

@@ -67,9 +67,47 @@ pub enum MrmsProduct {
     PrecipRate,
 }
 
+// **The key space's tripwire.** [`GRID_CACHE_BYTES`]'s `const _` prices one
+// grid per entry of [`MrmsProduct::all`], and the cache is a `HashMap` keyed by
+// this enum — so an `all()` that under-counts the enum is a budget under the
+// real key space with every assert green. `all()` is hand-written. `index` is
+// an exhaustive `match` with no wildcard arm, which makes adding a variant a
+// **compile error** rather than a silent under-count, and this block checks
+// that `all()` is dense and ordered under it: a duplicate, a reordering, or an
+// entry dropped from the list all fail the build here.
+//
+// **What it does not prove is completeness.** "Every variant is listed" needs
+// an enumeration of the variants, which is the very thing `all()` is, so the
+// check is circular without a derive (`strum::EnumCount`) or the unstable
+// `mem::variant_count` — and a band-2 crate standing on exactly
+// {squallar-geo, squallar-source, squallar-units} does not buy a dependency for
+// it. This is a tripwire at the point of change, not a proof; if one is ever
+// walked past, the byte ceiling is what still bounds the heap.
+const _: () = {
+    let all = MrmsProduct::all();
+    let mut i = 0;
+    while i < all.len() {
+        assert!(all[i].index() == i);
+        i += 1;
+    }
+};
+
 impl MrmsProduct {
     pub const fn all() -> &'static [MrmsProduct] {
         &[MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate]
+    }
+
+    /// A dense index over the variants, by a `match` with **no wildcard arm**.
+    ///
+    /// Its only caller is the `const _` above, and that is the point: a variant
+    /// added to [`MrmsProduct`] fails to compile *here*, one line from
+    /// [`Self::all`], which is the list the grid cache's key space is counted
+    /// from.
+    const fn index(self) -> usize {
+        match self {
+            MrmsProduct::ReflectivityComposite => 0,
+            MrmsProduct::PrecipRate => 1,
+        }
     }
 
     /// The persisted spelling **and** the `FieldId`: `serialize_pane_state`
@@ -219,23 +257,27 @@ pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 
 /// How many bytes of decoded MRMS grid may stay resident at once: **two grids
-/// on wasm and on mobile, four on desktop** — never fewer than the layer has
-/// products, which the `const _` below holds as a build failure.
+/// on every arm** — never fewer than the layer has products, which the
+/// `const _` below holds as a build failure, and no more than it has products,
+/// which is a decision recorded below rather than a floor.
 ///
 /// **A byte budget, not an entry count.** At 49 MB apiece, the six-entry shape
 /// the model cache uses would be 294 MB — and at the `f32` width this layer
 /// shipped with, 588 MB, more than the whole wasm32 address space has to spare
 /// once a `px_coords` buffer and a texture are in it.
 ///
-/// **The narrowing is BANKED here, not spent.** Stated as a multiple of
-/// [`CONUS_GRID_BYTES`], this budget halved with the store — desktop went
-/// 392,000,000 B to 196,000,000 B and is still stated as the same *four*
-/// grids. Leaving the byte figure where it was would have stated eight, and
-/// that trade is not reversible in practice: a constant can always be raised
-/// again to give a win back, but capacity a user has already been given cannot
-/// be taken away without removing something they can see. (The desktop figure
-/// is headroom over the key space, not granules the cache will hold: it keys
-/// by product and there are two.)
+/// **The narrowing was BANKED, and the desktop arm is now read down to what
+/// the key space can use.** Stated as a multiple of [`CONUS_GRID_BYTES`], this
+/// budget halved with the `u16` store — desktop went 392,000,000 B to
+/// 196,000,000 B and stayed *four* grids rather than becoming eight, on the
+/// argument that capacity a user has been given cannot be taken away without
+/// removing something they can see. Two of those four grids were never
+/// capacity: the cache keys by product and there are two, so the desktop arm
+/// priced 98 MB of headroom no insert could reach and nobody could see. It is
+/// two grids now, 98,000,000 B, and nothing resident changes — the cache's
+/// peak was two grids before and is two grids after. A third product added to
+/// `all()` moves this arm through the `const _` below, not by finding room in
+/// it.
 ///
 /// Spelled as a `cfg` cascade rather than resolved from `squallar-device-profile`
 /// because that crate sits **above** this one in the crate graph
@@ -254,9 +296,10 @@ pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 /// `break` arm, holding the key space anyway while this constant says
 /// otherwise. That is what the wasm arm did at one grid against two products —
 /// two panes held 98 MB under a figure that said 49. Stating the key space
-/// moved nothing at that peak; a pane that has switched products now keeps the
-/// one it left resident rather than refetching it. The `const _` below is what
-/// keeps every arm here.
+/// moved nothing at that peak. Whether a pane that has switched products keeps
+/// the one it left resident is not this ceiling's decision but
+/// [`GRID_HISTORY_ENTRIES`]'s. The `const _` below is what keeps every arm
+/// here.
 #[cfg(target_arch = "wasm32")]
 pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
 /// See the wasm arm.
@@ -270,7 +313,7 @@ pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
     not(target_arch = "wasm32"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-pub const GRID_CACHE_BYTES: usize = 4 * CONUS_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
 
 // **A build failure, not a test failure.** Every term here is a compile-time
 // constant, so a runtime assertion over them is one that cannot fail on a build
@@ -297,6 +340,65 @@ const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
 // restated in the old width — fails the BUILD here rather than showing up as a
 // doubled census figure nobody was looking at.
 const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
+
+/// How many grids a single pane that cycles selections keeps warm — the
+/// **unpinned history** the cache retains beyond the pinned set: **none on
+/// wasm, one on mobile, every product but the one showing on desktop**.
+///
+/// [`GRID_CACHE_BYTES`] is the ceiling and it is held at the key space, so on
+/// its own it lets one pane that has cycled through every product keep every
+/// product resident — 98 MB of MRMS behind a pane that is showing 49. Those
+/// grids are the second tier of the memory model: switching back is faster
+/// with them, nothing is lost without them, and how many to keep is a
+/// governor's decision to lower and restore, not a constant's. This is that
+/// governor's lever — `MrmsGridCache::set_history` — at its opening position.
+/// Retention is `max(pinned set, history)`: the pin set, the union of every
+/// visible pane's selection, is never evicted whatever this says; beyond it the
+/// least-recently-used unpinned grids go until at most this many remain.
+///
+/// Each arm is what that arm did before the byte budgets were raised to the
+/// key space, so the arms move nothing today: wasm held one grid, so a pane
+/// that switched refetched on the way back (history 0); mobile held two, one
+/// showing and one warm (1); desktop held four against two products,
+/// everything warm (`all().len() - 1`). Named per arm, like the model cache's
+/// byte budgets, so the `const _` below holds on every build and a host test
+/// can state the wasm arm by name.
+pub const WASM_GRID_HISTORY_ENTRIES: usize = 0;
+/// See [`WASM_GRID_HISTORY_ENTRIES`].
+pub const MOBILE_GRID_HISTORY_ENTRIES: usize = 1;
+/// See [`WASM_GRID_HISTORY_ENTRIES`]. `all().len() - 1` is the value at which
+/// the history never binds: at least one product is always pinned, so that is
+/// the most unpinned grids the cache can ever hold.
+pub const DESKTOP_GRID_HISTORY_ENTRIES: usize = MrmsProduct::all().len() - 1;
+
+/// The arm this build selects — see [`WASM_GRID_HISTORY_ENTRIES`]. The same
+/// `cfg` cascade as [`GRID_CACHE_BYTES`], for the same reason.
+#[cfg(target_arch = "wasm32")]
+pub const GRID_HISTORY_ENTRIES: usize = WASM_GRID_HISTORY_ENTRIES;
+/// See the wasm arm.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "android", target_os = "ios")
+))]
+pub const GRID_HISTORY_ENTRIES: usize = MOBILE_GRID_HISTORY_ENTRIES;
+/// See the wasm arm.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+pub const GRID_HISTORY_ENTRIES: usize = DESKTOP_GRID_HISTORY_ENTRIES;
+
+// **Below the key space, on every arm.** `pinned_products` never answers an
+// empty set (it falls back to the default product), so the most unpinned grids
+// the cache can hold is `all().len() - 1`; a history at or above the key space
+// is a lever connected to nothing, and it would also price the pinned set plus
+// the history above the byte ceiling. Over the named arms rather than the
+// selected one, so every build checks all three.
+const _: () = {
+    assert!(WASM_GRID_HISTORY_ENTRIES < MrmsProduct::all().len());
+    assert!(MOBILE_GRID_HISTORY_ENTRIES < MrmsProduct::all().len());
+    assert!(DESKTOP_GRID_HISTORY_ENTRIES < MrmsProduct::all().len());
+};
 
 /// **How many bytes of loop-frame granule may stage at once: one mosaic, on
 /// every arm.**
