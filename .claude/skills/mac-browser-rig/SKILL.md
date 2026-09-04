@@ -68,17 +68,28 @@ Error: Installing wasm-bindgen with cargo
 ```
 
 The wasm build itself succeeds first (295 crates), so this reads as a late,
-confusing failure of a build that already worked. Install it up front, with the
-wasm variables stripped, into the exact directory wasm-pack looks in:
+confusing failure of a build that already worked. Nothing in the message names
+`RUSTFLAGS`.
+
+**Do NOT pre-install into wasm-pack's own cache.** wasm-pack runs `cargo install
+--force`, and a `--force` that then fails **deletes that directory** — including
+a good binary put there beforehand. Tried: the whole
+`~/Library/Caches/.wasm-pack/.wasm-bindgen-cargo-install-<version>/` tree was
+gone afterwards, and the next run said `Not able to find or install a local
+wasm-bindgen`, which reads as a missing tool rather than a deleted one.
+
+Install it where wasm-pack does not manage anything, and tell it not to try:
 
 ```bash
 env -u RUSTFLAGS -u CARGO_UNSTABLE_BUILD_STD -u RUSTUP_TOOLCHAIN \
-  cargo install wasm-bindgen-cli --version <the version wasm-pack asks for> \
-  --root "$HOME/Library/Caches/.wasm-pack/.wasm-bindgen-cargo-install-<version>"
+  cargo install wasm-bindgen-cli --version <version> --root ~/rd-<lane>-arm
+
+PATH=~/rd-<lane>-arm/bin:$PATH .github/scripts/wasm-threads.sh \
+  wasm-pack build squallar-web --mode no-install ...
 ```
 
-The version is in the error text — take it from there rather than guessing, and
-note the cache directory is wasm-pack's own, so it counts as yours to clean up.
+`--mode no-install` is load-bearing: without it wasm-pack reinstalls over
+whatever is already there. Take the version from the error text.
 
 The pinned nightly is not optional: `.github/scripts/wasm-threads.sh` pins
 `nightly-2026-08-15` and installs the *target* and *components* itself, but it
