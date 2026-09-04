@@ -980,7 +980,7 @@ impl OverlayHandler for MrmsHandler {
         }
         let index = grid.grid.coords.nearest(lat, lon)?;
         let (glat, glon) = grid.grid.coords.at(index)?;
-        let value = *grid.grid.values.get(index)?;
+        let value = grid.grid.values.get(index)?;
         let (dlat, dlon) = (glat - lat, glon - lon);
         // ~0.02°, two cells of a 0.01° grid.
         if dlat * dlat + dlon * dlon > 0.02 * 0.02 {

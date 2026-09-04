@@ -774,7 +774,9 @@ pub(super) fn an_overlay_model_job() -> JobRequest {
                 j0: 10,
                 j1: 14,
             },
-            values: (0..24).map(|k| (k * 100) as f32).collect(),
+            values: squallar_overlays::render::gridded::GridValues::F32(
+                (0..24).map(|k| (k * 100) as f32).collect(),
+            ),
         })),
     }
 }
@@ -4041,7 +4043,7 @@ fn the_whole_model_grid_encodes_as_exactly_its_window() {
             nj: grid.nj,
             coords: grid.coords.clone(),
             win,
-            values,
+            values: squallar_overlays::render::gridded::GridValues::F32(values),
         }),
         "the decode is not the window of the whole grid that was encoded",
     );
@@ -4188,7 +4190,11 @@ fn a_malformed_model_job_is_refused_rather_than_misread() {
     let model = decoded_model(&revalued).expect("the revalued control decodes");
     match &model {
         squallar_overlays::render::rasterize::GriddedInput::Window(w) => {
-            assert_eq!(w.values[0], 123.5, "bytes 169..173 are not value 0");
+            assert_eq!(
+                w.values.get(0),
+                Some(123.5),
+                "bytes 169..173 are not value 0",
+            );
         }
         other => panic!("the wire only ever decodes the window form, got {other:?}"),
     }

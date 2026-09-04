@@ -8,9 +8,9 @@
 
 use super::*;
 
-/// A capacity-exact mosaic buffer, empty.
-fn mosaic_buffer() -> Vec<f32> {
-    let mut v: Vec<f32> = Vec::new();
+/// A capacity-exact mosaic buffer, empty — in the pool's own width.
+fn mosaic_buffer() -> Vec<u16> {
+    let mut v: Vec<u16> = Vec::new();
     v.try_reserve_exact(STAGING_POINTS)
         .expect("a mosaic buffer fits on a test host");
     v
@@ -103,7 +103,7 @@ fn a_grid_of_another_shape_is_never_given_the_mosaic_buffer() {
 #[test]
 fn a_buffer_of_another_capacity_is_refused_by_the_slot() {
     let pool = StagingPool::new();
-    let mut odd: Vec<f32> = Vec::new();
+    let mut odd: Vec<u16> = Vec::new();
     odd.try_reserve_exact(STAGING_POINTS - 1).expect("fits");
     pool.give(odd);
     assert_eq!(
@@ -184,7 +184,7 @@ fn a_grid_another_reference_still_holds_is_declined_not_reclaimed() {
          so instead of pretending it recycled",
     );
     assert_eq!(
-        still_reading.values.capacity(),
+        codes_capacity(&still_reading.values),
         STAGING_POINTS,
         "and the reference that kept it alive still has its buffer",
     );
@@ -218,7 +218,15 @@ fn mosaic_grid() -> crate::mrms::MrmsGrid {
                 nj: 2,
                 scan_mode: 0,
             },
-            values: mosaic_buffer(),
+            values: crate::render::gridded::GridValues::Scaled(crate::render::gridded::ScaledU16 {
+                codes: mosaic_buffer(),
+                // The shipped composite's own packing; see
+                // `mrms::decode::tests`.
+                ref_val: -9990.0,
+                two_pow: 1.0,
+                dig_factor: 0.1,
+                nan_codes: vec![0, 9000],
+            }),
         }),
         bounds: squallar_geo::GeoBounds::from_points([(0.0, 0.0), (1.0, 1.0)])
             .expect("two points make a box"),
@@ -261,7 +269,7 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
     );
     drop(buffer);
 
-    let mut odd: Vec<f32> = Vec::new();
+    let mut odd: Vec<u16> = Vec::new();
     odd.try_reserve_exact(STAGING_POINTS - 1).expect("fits");
     pool.give(odd);
     assert_eq!(
@@ -269,4 +277,15 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
         0,
         "a refused offer is dropped, not kept, and must not raise the level",
     );
+}
+
+/// The narrow arm's own capacity — what the slot's exact-capacity rule is
+/// stated in, and the only arm a mosaic grid is ever built on.
+fn codes_capacity(values: &crate::render::gridded::GridValues) -> usize {
+    match values {
+        crate::render::gridded::GridValues::Scaled(scaled) => scaled.codes.capacity(),
+        crate::render::gridded::GridValues::F32(_) => {
+            panic!("a mosaic grid is stored as codes, not as f32")
+        }
+    }
 }

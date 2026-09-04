@@ -1,9 +1,9 @@
 //! **The largest block one MRMS decode takes, once the staging buffer is
 //! warm.**
 //!
-//! The mosaic's values are 98,000,000 B and `super::staging` retains them
-//! between granules, so on the shipped path that block is allocated once per
-//! process. What was still allocated **per granule** is `grib`'s PNG stage:
+//! The mosaic's values are 49,000,000 B — 24,500,000 points at the 16-bit
+//! width MRMS publishes — and `super::staging` retains them between granules,
+//! so on the shipped path that block is allocated once per process. What was still allocated **per granule** is `grib`'s PNG stage:
 //! `read_image_buffer` does `vec![0; reader.output_buffer_size()]`, and at
 //! 7000 x 3500 samples of 16 bits that is **49,000,000 B**, measured, every
 //! granule, on all three committed fixtures.
@@ -37,12 +37,32 @@
 //! anything: the blocks a warm decode takes below it are the gunzipped GRIB2
 //! bytes (1,369,957 B) and `grib`'s all-ones dummy bitmap (3,062,500 B, then a
 //! 3,062,506 B grow), and the block above it was the image buffer at
-//! 49,000,000 B. Nothing measured lands between 3.1 MB and 49 MB.
+//! 49,000,000 B. Nothing measured lands between 3.1 MB and 49 MB. The values
+//! vector narrowed to 49,000,000 B from 98,000,000 B and is still far above the
+//! bar, so it is still counted if the warm decode ever misses the retained
+//! buffer — which is the direction that would make this measurement vacuous.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use squallar_overlays::mrms::{MrmsProduct, decode, staging};
+use squallar_overlays::render::gridded::GridValues;
+
+/// The staged buffer back out of a decoded grid, so the pool can retain it.
+///
+/// Panics on the `f32` arm rather than declining quietly: the pool's slot is a
+/// `Vec<u16>` and only the narrow arm's buffer can go back into it, so a
+/// shipped granule that stopped taking that arm would leave the pool cold and
+/// this measurement "warm" in name only.
+fn staged(values: GridValues) -> Vec<u16> {
+    match values {
+        GridValues::Scaled(scaled) => scaled.codes,
+        GridValues::F32(_) => panic!(
+            "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
+             fell to the f32 arm and can never be staged through the pool",
+        ),
+    }
+}
 
 /// See the header: a gap, not a bound anything sits near.
 const LARGE: usize = 16 * 1024 * 1024;
@@ -145,7 +165,7 @@ const POINTS: usize = 7000 * 3500;
 /// **No block in a warm decode scales with the grid.**
 ///
 /// Warm because that is the shipped steady state: the pool holds the mosaic
-/// buffer between granules, so the 98,000,000 B values vector is a
+/// buffer between granules, so the 49,000,000 B values vector is a
 /// once-per-process cost and the only per-granule block left above the bar was
 /// `grib`'s image buffer.
 ///
@@ -164,7 +184,7 @@ fn a_warm_decode_takes_no_grid_sized_block() {
         // cannot tell its own reuse from another test's leftovers.
         let pool = staging::StagingPool::new();
         let warm = decode::parse_grib2_raw_in(&grib, missing, &pool).expect("warm-up decodes");
-        pool.give(warm.values);
+        pool.give(staged(warm.values));
         assert_eq!(
             pool.totals().allocated,
             1,
@@ -196,7 +216,7 @@ fn a_warm_decode_takes_no_grid_sized_block() {
             pool.totals().reused,
             1,
             "{}: the measured decode did not take the retained buffer, so the \
-             98 MB block below would be in this figure",
+             49 MB values block below would be in this figure",
             product.as_str(),
         );
 
@@ -210,7 +230,7 @@ fn a_warm_decode_takes_no_grid_sized_block() {
             product.as_str(),
         );
 
-        pool.give(raw.values);
+        pool.give(staged(raw.values));
     }
 }
 

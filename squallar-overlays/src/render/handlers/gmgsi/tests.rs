@@ -33,7 +33,7 @@ fn grid_of(channel: GmgsiChannel, values: Vec<f32>) -> GmgsiGrid {
             ni,
             nj: 1,
             coords: GridCoords::Separable { lat_axis, lon_axis },
-            values,
+            values: crate::render::gridded::GridValues::F32(values),
         },
         bounds,
         valid_time: chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
@@ -43,7 +43,8 @@ fn grid_of(channel: GmgsiChannel, values: Vec<f32>) -> GmgsiGrid {
     }
 }
 
-/// A mosaic of exactly `n` values, so `resident_bytes()` is `4n`.
+/// A mosaic of exactly `n` values, so `resident_bytes()` is `4n` — GMGSI is
+/// genuinely `float` on disk and stays on the wide arm.
 fn sized(channel: GmgsiChannel, n: usize) -> GmgsiGrid {
     grid_of(channel, vec![82.0; n])
 }
@@ -681,7 +682,7 @@ fn job_values(job: &DescribedJob) -> Vec<f32> {
     let rasterize::GriddedInput::Resident(grid) = input else {
         panic!("GMGSI must describe a Resident carry, not {input:?}");
     };
-    grid.values.clone()
+    grid.values.to_f32()
 }
 
 /// A `FetchConfig` with nothing behind it: every test here stops before the

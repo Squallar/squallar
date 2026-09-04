@@ -244,11 +244,26 @@ pub const MISSING_CODES: [f32; 2] = [-999.0, -99.0];
 /// One stacked timestep's values, in bytes: 33 × 7000 × 3500 `f32` =
 /// **3 234 000 000**.
 ///
-/// Stated so that nothing has to derive it in a hurry. It is **33× the whole
+/// Stated so that nothing has to derive it in a hurry. It is **66× the whole
 /// wasm arm of [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES)**, and it does not
 /// fit in a wasm32 address space at all. Nothing in this module is reachable
 /// from a render path, and this constant is the reason.
-pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * super::CONUS_GRID_BYTES;
+///
+/// **Priced in `f32` and NOT off [`CONUS_GRID_BYTES`](super::CONUS_GRID_BYTES),
+/// which is a `u16` figure.** [`MrmsVolume::values`] really is a `Vec<f32>` —
+/// the stack widens each level at `push` and keeps one flat buffer, because
+/// nothing draws it and a second narrow store would be carried for no reader.
+/// Deriving this from the grid constant is what it used to do, and when that
+/// constant followed MRMS down to 16 bits this figure silently **halved while
+/// the allocation did not**: a budget that understates a 3.2 GB buffer by 2×
+/// is worse than no budget, because it reads as headroom. The doc above states
+/// a count and the value must keep honouring it.
+pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * 7000 * 3500 * std::mem::size_of::<f32>();
+
+// The stack's own width, restated as a build failure: `resident_bytes` counts
+// `values.len() * size_of::<f32>()`, and this constant is what that figure is
+// checked against.
+const _: () = assert!(CONUS_STACK_BYTES == 3_234_000_000);
 
 /// How many level GETs are in flight at once.
 ///
@@ -256,7 +271,7 @@ pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * super::CONUS_GRID_BYTES;
 /// 98 MB values vector and `super::staging`'s slot holds exactly one, so all
 /// but one of the concurrent decodes allocates its own; the stack being filled
 /// is already [`CONUS_STACK_BYTES`], so the peak is
-/// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 98 MB` — ~3.6 GB at four,
+/// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 49 MB` — ~3.4 GB at four,
 /// ~6.4 GB if all 33 ran at once.
 ///
 /// The figure was `× 147 MB` while `super::decode` also held grib's 49 MB PNG
@@ -666,7 +681,16 @@ impl VolumeAssembler {
             // Pinned by `tests::an_unfilled_level_is_nan_and_never_zero`.
             self.values = vec![f32::NAN; LEVEL_COUNT * n];
         }
-        self.values[level * n..(level + 1) * n].copy_from_slice(&grid.values);
+        // **Widened here, deliberately.** The stack is a `Vec<f32>` of all
+        // 33 levels and nothing draws it, so it is not worth a second narrow
+        // store; the granule's own values are read back through
+        // `GridValues::iter` one at a time, which allocates nothing.
+        for (slot, value) in self.values[level * n..(level + 1) * n]
+            .iter_mut()
+            .zip(grid.values.iter())
+        {
+            *slot = value;
+        }
         self.filled[level] = true;
         self.compressed_bytes[level] = compressed_bytes;
         self.grib_bytes[level] = grib_bytes;

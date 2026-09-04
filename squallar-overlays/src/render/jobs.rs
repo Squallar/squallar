@@ -771,17 +771,29 @@ impl JobSpec for GriddedJob {
         // `a_gridded_job_reserves_exactly_the_payload_it_then_writes` — if the
         // row loop ever writes something this does not price, the reservation
         // silently stops covering it and the growth comes back.
-        out.reserve(win.area().saturating_mul(4));
-        input.for_each_window_row(&win, |row| encode_f32s(out, row));
+        // **In the store's own width**, which is what the head has just
+        // named. Both arms write exactly what is reserved here.
+        let repr = WireValues::of(input.values_ref());
+        out.reserve(win.area().saturating_mul(repr.bytes_per_sample()));
+        match repr {
+            WireValues::F32 => input.for_each_window_row(&win, |row| encode_f32s(out, row)),
+            // **No expansion and no scratch.** This runs inside
+            // `JobRequest::to_bytes` on the FRAME THREAD, so a per-row
+            // widening buffer here would spend the footprint win on frame
+            // time. The codes are written exactly as stored.
+            WireValues::ScaledU16 { .. } => {
+                input.for_each_window_row_raw(&win, |row| out.extend_from_slice(row))
+            }
+        }
     }
 
     fn decode(r: &mut Reader<'_>, geo: JobGeometry) -> Option<(GriddedInput, JobGeometry)> {
         use crate::render::rasterize::GridWindow;
-        let (field, ni, nj, coords, win) = decode_gridded_head(r)?;
-        // The values length is the window's own area — no second count on the
-        // wire to disagree with it, and `take` inside refuses a buffer shorter
-        // than the area claims before anything allocates.
-        let values = decode_f32s(r, win.area())?;
+        let (field, ni, nj, coords, win, repr) = decode_gridded_head(r)?;
+        // The values length is the window's own area **in the tag's width** —
+        // no second count on the wire to disagree with it, and `take` refuses
+        // a buffer shorter than the area claims before anything allocates.
+        let values = repr.values_from(r.take(win.area().checked_mul(repr.bytes_per_sample())?)?)?;
         Some((
             GriddedInput::Window(GridWindow {
                 field,
@@ -829,12 +841,16 @@ impl JobSpec for GriddedJob {
             ctx.geometry.width,
             ctx.geometry.height,
         );
-        let start = win.j0.saturating_mul(ni).saturating_mul(4);
+        // **In the store's own width.** The lend is a byte range into the
+        // grid's own allocation, so a narrower store simply lends half as
+        // many bytes — the transport never learns what a sample is.
+        let bps = input.values_ref().bytes_per_sample();
+        let start = win.j0.saturating_mul(ni).saturating_mul(bps);
         let len = win
             .j1
             .saturating_sub(win.j0)
             .saturating_mul(ni)
-            .saturating_mul(4);
+            .saturating_mul(bps);
         match input {
             GriddedInput::Whole(grid) => Some(ResidentBytes::of_range(
                 std::sync::Arc::clone(grid),
@@ -844,7 +860,7 @@ impl JobSpec for GriddedJob {
             )),
             GriddedInput::Resident(grid) => Some(ResidentBytes::of_range(
                 std::sync::Arc::clone(grid),
-                |g| bytemuck::cast_slice(&g.values),
+                |g| g.values.stored_bytes(),
                 start,
                 len,
             )),
@@ -873,40 +889,39 @@ impl JobSpec for GriddedJob {
         payload: &[u8],
     ) -> Option<(GriddedInput, JobGeometry)> {
         use crate::render::rasterize::GridWindow;
-        let (field, ni, nj, coords, win) = decode_gridded_head(r)?;
+        let (field, ni, nj, coords, win, repr) = decode_gridded_head(r)?;
         let _ = nj;
         // The payload is the window's ROWS, so its length is a function of the
         // window the head just named — not of the whole grid. Checked rather
         // than trusted: a payload of any other length is a different band than
         // the envelope describes, and cutting columns out of it would
         // rasterize the wrong values with nothing to say so.
+        //
+        // **The width comes from the head's own tag**, never from a hardcoded
+        // four: the same head that named the window named the store's width,
+        // so the two cannot drift apart.
+        let bps = repr.bytes_per_sample();
         if payload.len()
             != win
                 .j1
                 .checked_sub(win.j0)?
                 .checked_mul(ni)?
-                .checked_mul(4)?
+                .checked_mul(bps)?
         {
             return None;
         }
-        // Read through `from_le_bytes` rather than casting the slice: the
-        // payload arrives as a `Uint8Array::to_vec`, whose allocation carries
-        // no f32 alignment, so a cast would refuse on exactly the platforms
-        // this path exists for. The bytes are the same either way — the wire
-        // is little-endian by the assertion beside `encode_f32s`.
-        let mut values = Vec::with_capacity(win.area());
+        // The columns are cut here, in the STORED width — the widening, if any,
+        // happens one value at a time at `GriddedInput::value_at`, so the
+        // worker's own copy of the band is the same size as the page's.
+        let mut cut: Vec<u8> = Vec::with_capacity(win.area() * bps);
         for j in win.j0..win.j1 {
             // `j - win.j0`: row `win.j0` is the FIRST row of the payload,
             // because only the window's band was lent.
-            let start = ((j - win.j0) * ni + win.i0) * 4;
-            let end = ((j - win.j0) * ni + win.i1) * 4;
-            values.extend(
-                payload
-                    .get(start..end)?
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
+            let start = ((j - win.j0) * ni + win.i0) * bps;
+            let end = ((j - win.j0) * ni + win.i1) * bps;
+            cut.extend_from_slice(payload.get(start..end)?);
         }
+        let values = repr.values_from(&cut)?;
         Some((
             GriddedInput::Window(GridWindow {
                 field,
@@ -918,6 +933,147 @@ impl JobSpec for GriddedJob {
             }),
             geo,
         ))
+    }
+}
+
+/// **How a gridded job's values travel: the wire's own statement of the store's
+/// width.**
+///
+/// A gridded grid is `f32` for a source whose values really are floats (HRRR,
+/// GMGSI) and 16-bit codes for one whose values are not (MRMS). Both ride this
+/// one row, so the head says which — and every length on the wire is derived
+/// from that tag rather than from a hardcoded four.
+///
+/// **`two_pow` and `dig_factor` travel as the precomputed operands**, never as
+/// `exp` and `dec`. The far end is a different build on a different target, and
+/// the whole losslessness claim is that its arithmetic is bit-identical to the
+/// decoder's; recomputing `2_f32.powi(exp)` there would rest that claim on two
+/// `powi` implementations agreeing in the last ULP. Carrying the operands makes
+/// it identical **by construction**.
+///
+/// A build that does not know a tag answers `None` all the way out through
+/// `JobRequest::from_parts`, which the caller reads as "nothing to draw" and
+/// the pane keeps its last texture. **Refuse, never misread**: the alternative
+/// is reading 16-bit codes as `f32` and painting a continent of noise.
+#[derive(Debug, Clone, PartialEq)]
+enum WireValues {
+    F32,
+    ScaledU16 {
+        ref_val: f32,
+        two_pow: f32,
+        dig_factor: f32,
+        nan_codes: Vec<u16>,
+    },
+}
+
+/// Values tag: one `f32` a point.
+const WIRE_VALUES_F32: u8 = 0;
+/// Values tag: one 16-bit code a point, plus the affine it reads back through.
+const WIRE_VALUES_SCALED_U16: u8 = 1;
+
+impl WireValues {
+    fn of(view: crate::render::gridded::ValuesRef<'_>) -> Self {
+        match view {
+            crate::render::gridded::ValuesRef::F32(_) => Self::F32,
+            crate::render::gridded::ValuesRef::Scaled(s) => Self::ScaledU16 {
+                ref_val: s.ref_val,
+                two_pow: s.two_pow,
+                dig_factor: s.dig_factor,
+                nan_codes: s.nan_codes.clone(),
+            },
+        }
+    }
+
+    /// **The multiplier every length on this wire is built from.**
+    fn bytes_per_sample(&self) -> usize {
+        match self {
+            Self::F32 => size_of::<f32>(),
+            Self::ScaledU16 { .. } => size_of::<u16>(),
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::F32 => out.push(WIRE_VALUES_F32),
+            Self::ScaledU16 {
+                ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+            } => {
+                out.push(WIRE_VALUES_SCALED_U16);
+                out.extend_from_slice(&ref_val.to_le_bytes());
+                out.extend_from_slice(&two_pow.to_le_bytes());
+                out.extend_from_slice(&dig_factor.to_le_bytes());
+                // A `u8` count, because the store refuses more than
+                // `MAX_NAN_CODES` of them; see `gridded::ScaledU16`.
+                out.push(nan_codes.len() as u8);
+                for code in nan_codes {
+                    out.extend_from_slice(&code.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Option<Self> {
+        match r.u8()? {
+            WIRE_VALUES_F32 => Some(Self::F32),
+            WIRE_VALUES_SCALED_U16 => {
+                let ref_val = r.f32()?;
+                let two_pow = r.f32()?;
+                let dig_factor = r.f32()?;
+                let count = usize::from(r.u8()?);
+                // The store's own ceiling, restated as a wire refusal: a head
+                // claiming more reserved codes than the narrow arm will ever
+                // hold is a head this build cannot honour.
+                if count > crate::render::gridded::MAX_NAN_CODES {
+                    return None;
+                }
+                let mut nan_codes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    nan_codes.push(r.u16()?);
+                }
+                Some(Self::ScaledU16 {
+                    ref_val,
+                    two_pow,
+                    dig_factor,
+                    nan_codes,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Rebuild `count` values from `bytes`, in this tag's width.
+    ///
+    /// Read through `from_le_bytes` rather than casting the slice: a lent
+    /// payload arrives as a `Uint8Array::to_vec`, whose allocation carries no
+    /// alignment at all, so a cast would refuse on exactly the platforms this
+    /// path exists for. The bytes are the same either way — the wire is
+    /// little-endian by the assertion beside [`encode_f32s`].
+    fn values_from(&self, bytes: &[u8]) -> Option<crate::render::gridded::GridValues> {
+        use crate::render::gridded::{GridValues, ScaledU16};
+        if !bytes.len().is_multiple_of(self.bytes_per_sample()) {
+            return None;
+        }
+        match self {
+            Self::F32 => Some(GridValues::F32(f32s_from_bytes(bytes))),
+            Self::ScaledU16 {
+                ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+            } => Some(GridValues::Scaled(ScaledU16 {
+                codes: bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+                ref_val: *ref_val,
+                two_pow: *two_pow,
+                dig_factor: *dig_factor,
+                nan_codes: nan_codes.clone(),
+            })),
+        }
     }
 }
 
@@ -944,6 +1100,10 @@ fn encode_gridded_head(
     for edge in [win.i0, win.i1, win.j0, win.j1] {
         out.extend_from_slice(&(edge as u32).to_le_bytes());
     }
+    // **Last in the head, and read back first by every values reader.** Both
+    // encoders write it, so neither can produce a payload whose width the head
+    // does not name.
+    WireValues::of(input.values_ref()).encode(out);
     win
 }
 
@@ -957,6 +1117,7 @@ fn decode_gridded_head(
     usize,
     crate::hrrr::GridCoords,
     crate::render::rasterize::IndexWindow,
+    WireValues,
 )> {
     use crate::render::rasterize::IndexWindow;
     // The field code is believed only if this build **registers** it —
@@ -982,7 +1143,9 @@ fn decode_gridded_head(
     if win.i0 > win.i1 || win.j0 > win.j1 || win.i1 > ni || win.j1 > nj {
         return None;
     }
-    Some((field, ni, nj, coords, win))
+    // Unknown tag -> `None`, which is the whole refusal: see `WireValues`.
+    let repr = WireValues::decode(r)?;
+    Some((field, ni, nj, coords, win, repr))
 }
 
 impl JobOutCodec for GriddedJob {
@@ -1145,13 +1308,19 @@ fn encode_f32s(out: &mut Vec<u8>, values: &[f32]) {
 /// from `count` — so a count claiming four billion points fails on the first
 /// short read rather than reserving for it.
 fn decode_f32s(r: &mut Reader, count: usize) -> Option<Vec<f32>> {
-    let bytes = r.take(count.checked_mul(4)?)?;
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().expect("chunks of four")))
-            .collect(),
-    )
+    Some(f32s_from_bytes(r.take(count.checked_mul(4)?)?))
+}
+
+/// The byte-level half of [`decode_f32s`], shared with
+/// [`WireValues::values_from`] so the wide arm of the tagged reader and the
+/// count-led reader cannot come to disagree about what an `f32` on this wire
+/// is. Read through `from_le_bytes` rather than cast: a lent payload arrives
+/// as a `Uint8Array::to_vec`, whose allocation carries no alignment at all.
+fn f32s_from_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("chunks of four")))
+        .collect()
 }
 
 /// Grid-coordinate tag: computed Lambert constants. The stored fields of
@@ -1818,6 +1987,7 @@ mod tests {
         for edge in [i0, i1, j0, j1] {
             head.extend_from_slice(&(edge as u32).to_le_bytes());
         }
+        WireValues::F32.encode(&mut head);
 
         // The payload is the window's BAND, rows j0..j1, exactly as
         // `resident_payload` now lends it — not the whole grid.
@@ -1841,11 +2011,128 @@ mod tests {
             panic!("a lent grid decodes to the cut window, not to a whole-grid carry");
         };
         assert_eq!(
-            window.values,
+            window.values.to_f32(),
             vec![12.0, 13.0, 14.0, 22.0, 23.0, 24.0, 32.0, 33.0, 34.0],
             "the cut read the wrong rectangle out of the lent grid",
         );
         assert_eq!((window.win.i0, window.win.j0), (i0, j0));
+    }
+
+    /// **A narrow grid survives the whole wire at its own width, bit for bit.**
+    ///
+    /// The half the decoder's own losslessness proof does not reach: that proof
+    /// (`mrms::decode::tests::every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars`)
+    /// stops at the store. This carries a `GridValues::Scaled` grid through the
+    /// lent path — head, tag, band, column cut — and asserts the far end reads
+    /// back the **identical `f32` bit patterns**, `NaN` sentinels included.
+    ///
+    /// What it pins that a value comparison would not:
+    ///
+    /// * the payload is **half** what the same grid would have lent as `f32`,
+    ///   so the wire really did narrow rather than widening at the boundary;
+    /// * the far end holds `Scaled` too, so the **worker's own copy** is narrow
+    ///   and the halving is three-for-one — page, wire and worker;
+    /// * `to_bits`, so a reserved code that arrived as a real reading instead
+    ///   of a `NaN` is a failure rather than a rounding difference.
+    #[test]
+    fn a_narrow_grid_crosses_the_wire_at_its_own_width_bit_for_bit() {
+        use super::*;
+        use crate::hrrr::GridCoords;
+        use crate::render::gridded::{GridValues, ScaledU16};
+        use crate::render::rasterize::GriddedInput;
+
+        let (ni, nj) = (6usize, 5usize);
+        // MRMS's own composite packing, and code 0 is its −999 no-coverage
+        // sentinel, so the grid carries a reserved code as well as readings.
+        let scaled = ScaledU16 {
+            codes: (0..(ni * nj) as u16).collect(),
+            ref_val: -9990.0,
+            two_pow: 1.0,
+            dig_factor: 0.1,
+            nan_codes: vec![0],
+        };
+        let coords = GridCoords::Regular {
+            lat0: 30.0,
+            lon0: -100.0,
+            dlat: 0.5,
+            dlon: 0.5,
+            ni,
+            nj,
+            scan_mode: 0,
+        };
+        let field = crate::render::gridded::paint_for_code("vis")
+            .expect("this build registers the `vis` field")
+            .id
+            .clone();
+
+        let (i0, i1, j0, j1) = (2usize, 5, 1, 4);
+        let mut head = Vec::new();
+        encode_str(&mut head, field.as_str());
+        head.extend_from_slice(&(ni as u32).to_le_bytes());
+        head.extend_from_slice(&(nj as u32).to_le_bytes());
+        encode_grid_coords(&mut head, &coords);
+        for edge in [i0, i1, j0, j1] {
+            head.extend_from_slice(&(edge as u32).to_le_bytes());
+        }
+        WireValues::of(GridValues::Scaled(scaled.clone()).view()).encode(&mut head);
+
+        // The band, lent exactly as `resident_payload` lends it: two bytes a
+        // sample, not four.
+        let codes = &scaled.codes[j0 * ni..j1 * ni];
+        let payload: &[u8] = bytemuck::cast_slice(codes);
+        assert_eq!(
+            payload.len(),
+            (j1 - j0) * ni * 2,
+            "the lent band must be two bytes a sample, or the narrowing never \
+             reached the wire",
+        );
+
+        let geo = JobGeometry {
+            width: 8,
+            height: 8,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 30.0,
+                max_lat: 32.0,
+                min_lon: -100.0,
+                max_lon: -98.0,
+            },
+            side_ceiling_px: 0,
+        };
+        let mut r = Reader::new(&head);
+        let (input, _) = <GriddedJob as JobSpec>::decode_resident(&mut r, geo, payload)
+            .expect("a narrow grid and the window naming part of it decode");
+
+        let GriddedInput::Window(window) = input else {
+            panic!("a lent grid decodes to the cut window");
+        };
+        assert!(
+            matches!(window.values, GridValues::Scaled(_)),
+            "the worker's own copy must stay narrow; widening at the boundary \
+             would give back a third of the win",
+        );
+
+        // Every value, against what the page would have read at the same point.
+        let page = GridValues::Scaled(scaled);
+        let row_w = i1 - i0;
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let far = window
+                    .values
+                    .get((j - j0) * row_w + (i - i0))
+                    .expect("inside the cut");
+                let here = page.get(j * ni + i).expect("inside the grid");
+                assert_eq!(
+                    far.to_bits(),
+                    here.to_bits(),
+                    "point ({i}, {j}) read back as {far} where the page holds {here}",
+                );
+            }
+        }
+        // Non-vacuity: the window really does span the sentinel and readings.
+        assert!(
+            (j0..j1).any(|j| (i0..i1).any(|i| page.get(j * ni + i).is_some_and(|v| v.is_finite()))),
+            "a window of nothing but sentinels would satisfy the loop above",
+        );
     }
 
     /// **The bulk encoding writes exactly what the value-at-a-time loop wrote.**
@@ -2196,7 +2483,7 @@ mod tests {
                     lons: vec![-99.0, -98.5, -98.0, -97.5],
                 },
                 win,
-                values,
+                values: crate::render::gridded::GridValues::F32(values),
             }));
             let mut bytes = Vec::new();
             (JOB_CODECS[6].encode)(
@@ -2251,6 +2538,10 @@ mod tests {
     /// the wire changes, or if the order of the row's parts moves. The window
     /// edges are the carried ones because `window_for` clamps a carried window
     /// to the grid shape and 4x3 does not clamp `1..3, 0..2`.
+    ///
+    /// **The head gained one byte when the store did**: the values tag closes
+    /// the head, so this sequence carries it between the window edges and the
+    /// values block.
     #[test]
     fn a_gridded_job_encodes_to_the_wire_bytes_its_fields_name() {
         let field = crate::hrrr::fields::spec(crate::hrrr::ModelParameter::SurfaceBasedCape)
@@ -2274,7 +2565,7 @@ mod tests {
                 j0: 0,
                 j1: 2,
             },
-            values: values.to_vec(),
+            values: crate::render::gridded::GridValues::F32(values.to_vec()),
         }));
         let mut bytes = Vec::new();
         (JOB_CODECS[6].encode)(
@@ -2304,6 +2595,11 @@ mod tests {
         for edge in [1u32, 3, 0, 2] {
             want.extend_from_slice(&edge.to_le_bytes());
         }
+        // The values tag, last in the head and spelled as the byte that
+        // travels rather than as `WIRE_VALUES_F32`: this fixture is an `f32`
+        // grid, so a store that silently changed arm — or a tag that moved out
+        // of the head's tail — reddens here.
+        want.push(0);
         for v in values {
             want.extend_from_slice(&v.to_le_bytes());
         }
@@ -2331,7 +2627,7 @@ mod tests {
                 j0: 0,
                 j1: 2,
             },
-            values: vec![100.0, 250.0, 500.0, 1250.0],
+            values: crate::render::gridded::GridValues::F32(vec![100.0, 250.0, 500.0, 1250.0]),
         }));
         assert_round_trips(&JOB_CODECS[6], &job);
     }
@@ -2370,7 +2666,9 @@ mod tests {
                 j0: 1,
                 j1: 3,
             },
-            values: vec![-25.0, -50.0, 0.0, -12.5, -75.0, -100.0, -6.25, -3.0],
+            values: crate::render::gridded::GridValues::F32(vec![
+                -25.0, -50.0, 0.0, -12.5, -75.0, -100.0, -6.25, -3.0,
+            ]),
         }));
         assert_round_trips(&JOB_CODECS[6], &job);
     }
@@ -2401,7 +2699,7 @@ mod tests {
                     j0: 0,
                     j1: 2,
                 },
-                values: vec![100.0, 250.0, 500.0, 1250.0],
+                values: crate::render::gridded::GridValues::F32(vec![100.0, 250.0, 500.0, 1250.0]),
             }));
             assert_round_trips(&JOB_CODECS[6], &job);
         }
@@ -2432,7 +2730,7 @@ mod tests {
                 j0: 0,
                 j1: 2,
             },
-            values: vec![100.0, 250.0, 500.0, 1250.0],
+            values: crate::render::gridded::GridValues::F32(vec![100.0, 250.0, 500.0, 1250.0]),
         }));
         assert_round_trips(&JOB_CODECS[6], &job);
 

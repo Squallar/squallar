@@ -68,7 +68,7 @@ use squallar_geo::GeoBounds;
 
 use super::{MrmsGrid, MrmsProduct};
 use crate::hrrr::{GridCoords, SCAN_ALTERNATING, SCAN_J_CONSECUTIVE};
-use crate::render::gridded::ResidentGrid;
+use crate::render::gridded::{GridValues, ResidentGrid, ScaledU16};
 
 /// MRMS's "no radar coverage" sentinel — the ocean, the gaps between umbrellas,
 /// and everything outside the radar network.
@@ -350,8 +350,11 @@ pub struct RawGrid {
     /// other. The category can: see `super::volume::PARAMETER`.
     pub parameter: Option<(u8, u8)>,
     /// In the grid's own scanning order, with `missing` already mapped to
-    /// `f32::NAN`.
-    pub values: Vec<f32>,
+    /// `f32::NAN` — as a reading, whichever width the store is in.
+    ///
+    /// [`GridValues::Scaled`] for every granule MRMS actually publishes; see
+    /// [`parse_grib2_raw_in`] for when it is not.
+    pub values: GridValues,
 }
 
 /// Decode one MRMS granule's GRIB2 bytes.
@@ -360,8 +363,10 @@ pub fn parse_grib2(bytes: &[u8], product: MrmsProduct) -> Result<MrmsGrid, Strin
 
     let paint = crate::render::gridded::field_paint(&super::fields::spec(product).id)
         .ok_or_else(|| format!("MRMS product {} registers no paint", product.as_str()))?;
-    let (visible_points, value_range) =
-        crate::hrrr::summarize_values(&raw.values, |v| paint.paints(v));
+    // `summarize` and not `summarize_values_iter(values.iter(), ..)`: this walks
+    // the whole mosaic — 24.5 M points at CONUS — and the former matches the
+    // storage arm once, outside the loop.
+    let (visible_points, value_range) = raw.values.summarize(|v| paint.paints(v));
 
     Ok(MrmsGrid {
         product,
@@ -474,34 +479,85 @@ pub fn parse_grib2_raw_in(
     let points = ni
         .checked_mul(nj)
         .ok_or_else(|| format!("MRMS: a {ni}×{nj} grid overflows this target's index width"))?;
-    let mut values: Vec<f32> = staging.take(points).map_err(|_| {
+
+    // **Which width this granule is stored in, decided from what section 5
+    // declares — never from which source is asking.**
+    //
+    // `png_stream_plan` admits any non-zero multiple of eight, so 8, 16, 24 and
+    // 32 all reach here. Only `num_bits <= 16` may take the narrow arm, and it
+    // takes it through a `Vec<u16>`: a 24-bit granule *cannot* be built into
+    // that arm, so it is stored whole as `f32` — **correct and unhalved, never
+    // truncated**. The grib fallback below is `f32` for a different reason
+    // again: `dispatch()` yields values with no code behind them at all.
+    //
+    // The reserved-code set is settled here too, before a mosaic is decoded
+    // into a buffer that might have to be widened again: it is a function of
+    // the packing alone, and a packing whose tolerance swallows more codes than
+    // `MAX_NAN_CODES` declines the narrow arm rather than putting a long list
+    // on the sampling path.
+    let plan = png_stream_plan(bytes, &submessage, points);
+    let narrow = plan
+        .as_ref()
+        .filter(|plan| plan.simple.num_bits <= 16)
+        .and_then(|plan| {
+            let two_pow = 2_f32.powi(i32::from(plan.simple.exp));
+            let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
+            ScaledU16::nan_codes_for(plan.simple.ref_val, two_pow, dig_factor, |v| {
+                !reading(missing, v).is_finite()
+            })
+            .map(|nan_codes| (two_pow, dig_factor, nan_codes))
+        });
+
+    let too_big = |width: usize| {
         format!(
             "MRMS: cannot hold a {ni}×{nj} grid ({} MB of values) in this \
              build's memory",
-            points.saturating_mul(size_of::<f32>()) / (1024 * 1024),
+            points.saturating_mul(width) / (1024 * 1024),
         )
-    })?;
-    // **The image half of the decode never materialises either.** Every MRMS
-    // granule takes the first arm; the second is what a granule `grib` knows
-    // how to read and [`png_stream_plan`] does not would take, and it is the
-    // path this crate shipped until the row walk landed.
-    // Bound before the match so the borrow of `submessage` ends here: the
-    // fallback arm consumes it.
-    let plan = png_stream_plan(bytes, &submessage, points);
-    match plan {
-        Some(plan) => decode_png_into(&plan, points, missing, &mut values)?,
-        None => {
+    };
+
+    let values = match (plan, narrow) {
+        (Some(plan), Some((two_pow, dig_factor, nan_codes))) => {
+            // The pooled buffer, in the store's own width. See `super::staging`.
+            let mut codes = staging
+                .take(points)
+                .map_err(|_| too_big(size_of::<u16>()))?;
+            decode_png_codes_into(&plan, points, &mut codes)?;
+            GridValues::Scaled(ScaledU16 {
+                codes,
+                ref_val: plan.simple.ref_val,
+                two_pow,
+                dig_factor,
+                nan_codes,
+            })
+        }
+        (Some(plan), None) => {
+            // Streamable, but wider than the narrow arm holds. Fallible for the
+            // reason the pool's own reserve is; see this module's header.
+            let mut floats: Vec<f32> = Vec::new();
+            floats
+                .try_reserve_exact(points)
+                .map_err(|_| too_big(size_of::<f32>()))?;
+            decode_png_into(&plan, points, missing, &mut floats)?;
+            GridValues::F32(floats)
+        }
+        (None, _) => {
             // Consumes the submessage, so it stays inside the arm that needs it.
             let decoder = Grib2SubmessageDecoder::from(submessage)
                 .map_err(|e| format!("MRMS decode init error: {e}"))?;
+            let mut floats: Vec<f32> = Vec::new();
+            floats
+                .try_reserve_exact(points)
+                .map_err(|_| too_big(size_of::<f32>()))?;
             for raw in decoder
                 .dispatch()
                 .map_err(|e| format!("MRMS decode error: {e}"))?
             {
-                values.push(reading(missing, raw));
+                floats.push(reading(missing, raw));
             }
+            GridValues::F32(floats)
         }
-    }
+    };
 
     if values.is_empty() {
         return Err("MRMS: no grid points decoded".into());
@@ -678,6 +734,84 @@ fn decode_png_into(
     missing: &[f32],
     values: &mut Vec<f32>,
 ) -> Result<(), String> {
+    // Hoisted out of the sample loop, and this is not a rearrangement of the
+    // arithmetic: `grib`'s `NonZeroSimplePackingDecoder` computes exactly
+    // `(ref_val + encoded * 2^exp) * 10^-dec` in this order, and recomputes
+    // both powers per value. Same operands, same order, same rounding.
+    //
+    // The same three operands are what `ScaledU16` stores when the narrow arm
+    // is taken, so the two arms are the same expression over the same numbers.
+    let two_pow = 2_f32.powi(i32::from(plan.simple.exp));
+    let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
+    let ref_val = plan.simple.ref_val;
+
+    png_rows(plan, points, |sample| {
+        // Big-endian, most significant bit first -- the order
+        // `NBitwiseIterator` reads the same bytes in.
+        let mut encoded: u32 = 0;
+        for &byte in sample {
+            encoded = (encoded << 8) | u32::from(byte);
+        }
+        let raw = (ref_val + encoded as f32 * two_pow) * dig_factor;
+        values.push(reading(missing, raw));
+    })
+}
+
+/// **The same walk, stopping at the code.**
+///
+/// What [`decode_png_into`] does minus the arithmetic and minus the sentinel
+/// test: the code IS the stored value on the narrow arm, and
+/// [`ScaledU16::value`] applies the identical expression at the far end of
+/// whatever the code travelled through. Splitting them is what makes the
+/// mosaic 49,000,000 B instead of 98,000,000 B without a second decoder
+/// existing to disagree with the first — both walk one [`png_rows`].
+///
+/// `sample` is one or two bytes here and never more: the caller has already
+/// established `num_bits <= 16`, which is what makes the accumulator a `u16`
+/// rather than a truncation of a wider one.
+fn decode_png_codes_into(
+    plan: &PngPlan<'_>,
+    points: usize,
+    codes: &mut Vec<u16>,
+) -> Result<(), String> {
+    png_rows(plan, points, |sample| {
+        let mut encoded: u16 = 0;
+        for &byte in sample {
+            encoded = (encoded << 8) | u16::from(byte);
+        }
+        codes.push(encoded);
+    })
+}
+
+/// **Stream `plan`'s PNG a row at a time, handing each sample's bytes to `f`.**
+///
+/// The row walk itself, and the three checks the whole streaming path rests on,
+/// written once so the two decoders above cannot come to disagree about which
+/// granules they will read.
+///
+/// The reason it exists at all: `grib`'s 5.41 arm materialises the **entire**
+/// decompressed image before it yields a single value --
+/// `read_image_buffer`'s `vec![0; output_buffer_size()]`, which at MRMS's
+/// 7000x3500 16-bit mosaic is **49,000,000 B, measured, per granule** -- and
+/// then hands back a lazy iterator over it. That buffer is `vec![0; n]`:
+/// infallible, and on wasm32 an infallible allocation the engine cannot serve
+/// calls `handle_alloc_error` against a memory with a hard 1 GiB ceiling on a
+/// target where **nothing unwinds**. `staging`'s account of what that does to
+/// the page applies here unchanged; the difference is that the staging buffer
+/// could be retained and this one cannot, because `grib` allocates it inside a
+/// private function and moves it into the iterator.
+///
+/// A row is `width` samples and nothing else is live, so the same decode's
+/// image-side cost is **14,000 B** at the mosaic's width. The `png` reader is
+/// asked to fill a buffer this function owns (`read_row`) rather than its own
+/// (`next_row`), so there is one row buffer in the process and not two.
+///
+/// This is the decision `regular_grid` already makes one section earlier, for
+/// the same reason: `grib` will answer with a materialised whole, section 3's
+/// coordinates or section 7's values, and at 24.5 M points neither fits a
+/// budget the browser gives us. Reading the seven numbers, or the one row, is
+/// what fits.
+fn png_rows(plan: &PngPlan<'_>, points: usize, mut f: impl FnMut(&[u8])) -> Result<(), String> {
     let decoder = png::Decoder::new(std::io::Cursor::new(plan.payload));
     let mut reader = decoder
         .read_info()
@@ -707,14 +841,6 @@ fn decode_png_into(
         ));
     }
 
-    // Hoisted out of the sample loop, and this is not a rearrangement of the
-    // arithmetic: `grib`'s `NonZeroSimplePackingDecoder` computes exactly
-    // `(ref_val + encoded * 2^exp) * 10^-dec` in this order, and recomputes
-    // both powers per value. Same operands, same order, same rounding.
-    let two_pow = 2_f32.powi(i32::from(plan.simple.exp));
-    let dig_factor = 10_f32.powi(-i32::from(plan.simple.dec));
-    let ref_val = plan.simple.ref_val;
-
     let mut row = vec![0u8; line];
     while reader
         .read_row(&mut row)
@@ -722,14 +848,7 @@ fn decode_png_into(
         .is_some()
     {
         for sample in row.chunks_exact(plan.sample_bytes) {
-            // Big-endian, most significant bit first -- the order
-            // `NBitwiseIterator` reads the same bytes in.
-            let mut encoded: u32 = 0;
-            for &byte in sample {
-                encoded = (encoded << 8) | u32::from(byte);
-            }
-            let raw = (ref_val + encoded as f32 * two_pow) * dig_factor;
-            values.push(reading(missing, raw));
+            f(sample);
         }
     }
     Ok(())

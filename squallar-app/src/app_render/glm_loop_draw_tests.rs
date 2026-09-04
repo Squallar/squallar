@@ -131,7 +131,7 @@ fn granule(k: i64) -> GmgsiGrid {
                 lat_axis: vec![35.0],
                 lon_axis: (0..4).map(|i| -99.0 + f64::from(i) * 0.072).collect(),
             },
-            values: vec![k as f32; 4],
+            values: squallar_overlays::render::gridded::GridValues::F32(vec![k as f32; 4]),
         },
         bounds: bounds(),
         valid_time: hour(k),

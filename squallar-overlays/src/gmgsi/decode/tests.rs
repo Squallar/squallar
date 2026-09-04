@@ -445,7 +445,7 @@ fn cell_span_degrees_covers_the_local_cell_at_every_latitude() {
 fn the_planted_fill_value_paints_nothing() {
     let g = grid();
     let scale = crate::gmgsi::fields::scale(GmgsiChannel::LongwaveIr);
-    let painted = color_for(scale, g.grid.values[FILL_ROW * NX + FILL_COL]);
+    let painted = color_for(scale, g.grid.values.get(FILL_ROW * NX + FILL_COL).unwrap());
     assert_eq!(
         painted[3], 0,
         "the fill cell painted {painted:?}; a fill must be invisible, not black"
@@ -453,7 +453,10 @@ fn the_planted_fill_value_paints_nothing() {
 
     // The neighbouring cell is ordinary data and DOES paint, so the assertion
     // above is not satisfied by a ramp that paints nothing anywhere.
-    let neighbour = color_for(scale, g.grid.values[FILL_ROW * NX + FILL_COL + 1]);
+    let neighbour = color_for(
+        scale,
+        g.grid.values.get(FILL_ROW * NX + FILL_COL + 1).unwrap(),
+    );
     assert_ne!(neighbour[3], 0, "the cell beside the fill painted nothing");
 }
 
@@ -468,13 +471,22 @@ fn the_fixture_carries_exactly_the_one_planted_fill() {
         missing, 1,
         "expected exactly the planted _FillValue at ({FILL_ROW}, {FILL_COL})"
     );
-    assert!(g.grid.values[FILL_ROW * NX + FILL_COL].is_nan());
+    assert!(
+        g.grid
+            .values
+            .get(FILL_ROW * NX + FILL_COL)
+            .unwrap()
+            .is_nan()
+    );
 }
 
 #[test]
 fn the_planted_equator_reading_survives_the_decode() {
     let g = grid();
-    assert_eq!(g.grid.values[EQUATOR_ROW * NX + PRIME_COL], EQUATOR_READING);
+    assert_eq!(
+        g.grid.values.get(EQUATOR_ROW * NX + PRIME_COL).unwrap(),
+        EQUATOR_READING
+    );
     let (lat, lon) = g.grid.coords.at(EQUATOR_ROW * NX + PRIME_COL).unwrap();
     assert!(lat.abs() < 1e-3, "the equator row read {lat}");
     assert!(lon.abs() < 0.1, "the prime column read {lon}");
@@ -509,7 +521,7 @@ fn the_decoded_granule_is_bit_for_bit_what_it_was() {
             h = h.wrapping_mul(PRIME);
         }
     };
-    for v in &g.grid.values {
+    for v in g.grid.values.iter() {
         feed(u64::from(v.to_bits()));
     }
     for v in lat_axis.iter().chain(lon_axis.iter()) {

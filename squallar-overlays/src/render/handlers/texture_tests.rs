@@ -319,7 +319,7 @@ fn mrms_grid() -> crate::mrms::MrmsGrid {
                 nj,
                 scan_mode: 0,
             },
-            values,
+            values: crate::render::gridded::GridValues::F32(values),
         }),
         bounds: BOUNDS,
         valid: chrono::NaiveDate::from_ymd_opt(2026, 8, 21)
@@ -364,7 +364,7 @@ fn gmgsi_grid() -> crate::gmgsi::decode::GmgsiGrid {
                     .map(|i| step(BOUNDS.min_lon, BOUNDS.max_lon, ni, i))
                     .collect(),
             },
-            values: vec![255.0f32; ni * nj],
+            values: crate::render::gridded::GridValues::F32(vec![255.0f32; ni * nj]),
         },
         bounds: BOUNDS,
         valid_time: chrono::NaiveDate::from_ymd_opt(2025, 6, 1)

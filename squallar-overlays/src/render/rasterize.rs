@@ -1473,6 +1473,7 @@ pub(crate) fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
 }
 
 use crate::hrrr::HrrrGridData;
+use crate::render::gridded::ValuesRef;
 
 fn merc_y_to_lat(merc_y: f64) -> f64 {
     squallar_geo::mercator_y_to_lat_rad(merc_y).to_degrees()
@@ -1662,7 +1663,12 @@ pub struct GridWindow {
     pub win: IndexWindow,
     /// Row-major within `win`: point `(i, j)` of the grid is
     /// `values[(j - win.j0) * (win.i1 - win.i0) + (i - win.i0)]`.
-    pub values: Vec<f32>,
+    ///
+    /// **In the sending grid's own storage width**, which is what keeps the
+    /// worker's copy the same size as the page's: a mosaic that is 16-bit
+    /// codes resident travels as codes and is held as codes here, and the
+    /// widening happens one value at a time at [`GriddedInput::value_at`].
+    pub values: crate::render::gridded::GridValues,
 }
 
 impl GriddedInput {
@@ -1696,12 +1702,25 @@ impl GriddedInput {
     /// indexed by — `None` for the windowed arm, which carries only a cut.
     ///
     /// The two whole arms differ in nothing the raster reads, so the readers
-    /// below take this rather than repeating an arm each.
-    fn whole_values(&self) -> Option<(&[f32], usize)> {
+    /// below take this rather than repeating an arm each. A
+    /// [`ValuesRef`] rather than a `&[f32]`: the storage width is the grid's
+    /// business and none of the raster's.
+    fn whole_values(&self) -> Option<(ValuesRef<'_>, usize)> {
         match self {
-            Self::Whole(grid) => Some((&grid.values, grid.ni)),
-            Self::Resident(grid) => Some((&grid.values, grid.ni)),
+            Self::Whole(grid) => Some((ValuesRef::F32(&grid.values), grid.ni)),
+            Self::Resident(grid) => Some((grid.values.view(), grid.ni)),
             Self::Window(_) => None,
+        }
+    }
+
+    /// How this input's values are stored, whichever arm holds them.
+    ///
+    /// What the wire tags itself with, and what the encoders dispatch on.
+    pub fn values_ref(&self) -> ValuesRef<'_> {
+        match self {
+            Self::Whole(grid) => ValuesRef::F32(&grid.values),
+            Self::Resident(grid) => grid.values.view(),
+            Self::Window(window) => window.values.view(),
         }
     }
 
@@ -1717,9 +1736,16 @@ impl GriddedInput {
 
     /// The value at grid point `(i, j)`, or `None` where there is none to read
     /// — past a short values vector, or outside the carried window.
+    ///
+    /// **The one place a stored value becomes an `f32`.** The whole rest of
+    /// `rasterize_gridded` reads coordinates, so a narrower store costs exactly
+    /// this call: a bounds-checked index plus, on the scaled arm, two flops and
+    /// a walk of at most `MAX_NAN_CODES` reserved codes — strictly less than
+    /// the `partition_point` the `color_for_value` on the next line already
+    /// pays. Nothing here allocates.
     fn value_at(&self, i: usize, j: usize) -> Option<f32> {
         if let Some((values, stride)) = self.whole_values() {
-            return values.get(j * stride + i).copied();
+            return values.get(j * stride + i);
         }
         let Self::Window(window) = self else {
             return None;
@@ -1731,17 +1757,27 @@ impl GriddedInput {
         window
             .values
             .get((j - win.j0) * (win.i1 - win.i0) + (i - win.i0))
-            .copied()
     }
 
-    /// One row of `win`'s values, exactly as the wire writes them; the whole
-    /// arm pads with NaN where its vector runs short, which paints nothing.
-    /// A callback per row so the encoder writes straight from the grid's storage.
+    /// One row of `win`'s values as `f32`; the whole arm pads with NaN where
+    /// its vector runs short, which paints nothing. A callback per row so the
+    /// encoder writes straight from the grid's storage.
+    ///
+    /// **The `f32`-store reader.** A grid whose values are stored narrower has
+    /// no `&[f32]` to lend and is written by
+    /// [`Self::for_each_window_row_raw`] instead; this yields nothing for one,
+    /// and the only production caller — `GriddedJob::encode` — dispatches on
+    /// [`Self::values_ref`] rather than calling this blind. Expanding here
+    /// instead would put a mosaic-row buffer on the **frame thread**, which is
+    /// where `JobRequest::to_bytes` runs.
     pub fn for_each_window_row(&self, win: &IndexWindow, mut f: impl FnMut(&[f32])) {
         if win.is_empty() {
             return;
         }
         if let Some((values, stride)) = self.whole_values() {
+            let ValuesRef::F32(values) = values else {
+                return;
+            };
             let mut padded: Vec<f32> = Vec::new();
             for j in win.j0..win.j1 {
                 let start = j * stride + win.i0;
@@ -1759,11 +1795,60 @@ impl GriddedInput {
         let Self::Window(window) = self else {
             return;
         };
+        let ValuesRef::F32(values) = window.values.view() else {
+            return;
+        };
         let carried = &window.win;
         let row_w = carried.i1 - carried.i0;
         for j in win.j0..win.j1 {
             let row = (j - carried.j0) * row_w;
-            f(&window.values[row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0)]);
+            f(&values[row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0)]);
+        }
+    }
+
+    /// One row of `win`'s values as **stored bytes**, in the storage's own
+    /// width — the shape the wire carries and the transport lends.
+    ///
+    /// **No expansion, no scratch, no allocation.** That is the point rather
+    /// than a detail: this runs inside `JobRequest::to_bytes` on the frame
+    /// thread, so a per-row widening buffer here would trade the footprint win
+    /// for frame time. Each row is handed out as a borrow of the grid's own
+    /// allocation.
+    ///
+    /// A row that runs past the end yields **nothing at all** rather than a
+    /// short run or a fabricated pad. The far end checks the payload length
+    /// against the window the head names, so a short write is refused as a
+    /// length mismatch — which is the honest answer for a values vector that
+    /// does not match the shape beside it, and is unreachable for a decoded
+    /// grid anyway (`parse_grib2_raw_in` refuses any other count).
+    pub fn for_each_window_row_raw(&self, win: &IndexWindow, mut f: impl FnMut(&[u8])) {
+        if win.is_empty() {
+            return;
+        }
+        if let Some((values, stride)) = self.whole_values() {
+            for j in win.j0..win.j1 {
+                let Some(bytes) = values.sample_bytes(j * stride + win.i0..j * stride + win.i1)
+                else {
+                    return;
+                };
+                f(bytes);
+            }
+            return;
+        }
+        let Self::Window(window) = self else {
+            return;
+        };
+        let carried = &window.win;
+        let row_w = carried.i1 - carried.i0;
+        let values = window.values.view();
+        for j in win.j0..win.j1 {
+            let row = (j - carried.j0) * row_w;
+            let Some(bytes) =
+                values.sample_bytes(row + (win.i0 - carried.i0)..row + (win.i1 - carried.i0))
+            else {
+                return;
+            };
+            f(bytes);
         }
     }
 }

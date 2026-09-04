@@ -60,7 +60,7 @@ fn the_row_walk_decodes_what_grib_decodes() {
     for &product in MrmsProduct::all() {
         let missing = product.missing_codes();
         let oracle = raw_for(product);
-        let shipped = &fixture(product).grid.values;
+        let shipped = fixture(product).grid.values.to_f32();
 
         assert_eq!(
             oracle.len(),
@@ -298,7 +298,7 @@ fn the_two_products_reserve_different_codes_and_each_fixture_shows_its_own() {
         .grid
         .values
         .iter()
-        .filter(|v| v.is_finite() && **v < 0.0)
+        .filter(|v| v.is_finite() && *v < 0.0)
         .count();
     assert!(
         composite_negative_readings > 1_000,
@@ -311,7 +311,7 @@ fn the_two_products_reserve_different_codes_and_each_fixture_shows_its_own() {
             .grid
             .values
             .iter()
-            .filter(|v| v.is_finite() && **v < 0.0)
+            .filter(|v| v.is_finite() && *v < 0.0)
             .count(),
         0,
         "a negative precipitation rate survived the rate's mapping",
@@ -326,7 +326,7 @@ fn the_two_products_reserve_different_codes_and_each_fixture_shows_its_own() {
 fn the_reserved_codes_became_nan_and_nothing_else_moved() {
     for &product in MrmsProduct::all() {
         let raw = raw_for(product);
-        let mapped = &fixture(product).grid.values;
+        let mapped = fixture(product).grid.values.to_f32();
         let name = product.as_str();
         assert_eq!(raw.len(), mapped.len());
 
@@ -464,7 +464,7 @@ fn no_drawn_point_of_the_real_mosaic_was_a_sentinel() {
         .grid
         .values
         .iter()
-        .filter(|v| paint.paints(**v))
+        .filter(|v| paint.paints(*v))
         .count();
     assert_eq!(
         drawn, FIXTURE.visible_points,
@@ -666,10 +666,16 @@ fn the_valid_time_is_the_one_in_the_key() {
 }
 
 /// The residency figure the cache budget is spent against is the real one.
+///
+/// **The literal moved 98,000,000 -> 49,000,000 with the store**, and both
+/// halves are here on purpose: the first line holds the *real decoded granule*
+/// against the constant every budget is stated in, and the second holds that
+/// constant against a figure written out by hand, so a store and a budget that
+/// drifted together still fail here.
 #[test]
-fn one_resident_grid_is_the_ninety_eight_megabytes_the_budget_assumes() {
+fn one_resident_grid_is_the_forty_nine_megabytes_the_budget_assumes() {
     assert_eq!(FIXTURE.resident_bytes(), crate::mrms::CONUS_GRID_BYTES);
-    assert_eq!(FIXTURE.resident_bytes(), 98_000_000);
+    assert_eq!(FIXTURE.resident_bytes(), 49_000_000);
 }
 
 // ── Refusals ────────────────────────────────────────────────────────────────
@@ -812,7 +818,7 @@ fn every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars() {
             for sample in row.chunks_exact(2) {
                 let code = u16::from_be_bytes([sample[0], sample[1]]);
                 let rebuilt = reading(missing, (ref_val + f32::from(code) * two_pow) * dig_factor);
-                let held = shipped[checked];
+                let held = shipped.get(checked).expect("inside the mosaic");
                 assert_eq!(
                     rebuilt.to_bits(),
                     held.to_bits(),

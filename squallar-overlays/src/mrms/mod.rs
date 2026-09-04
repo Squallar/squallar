@@ -33,10 +33,12 @@
 //! and [`MrmsProduct::missing_codes`] records the counts the table was measured
 //! from.
 //!
-//! **98 MB per grid.** `values` is 24.5 M `f32`. The decode streams grib's lazy
-//! iterator straight into a pre-sized buffer rather than collecting an
-//! intermediate, and the cache is bounded by [`GRID_CACHE_BYTES`] rather than by
-//! an entry count — six panes at an entry cap would be 588 MB.
+//! **49 MB per grid.** `values` is 24.5 M `u16` codes, the width section 5
+//! actually declares; it was 24.5 M `f32` until the store followed the source.
+//! The decode streams grib's lazy iterator straight into a pre-sized buffer
+//! rather than collecting an intermediate, and the cache is bounded by
+//! [`GRID_CACHE_BYTES`] rather than by an entry count — six panes at an entry
+//! cap would be 294 MB.
 
 use std::sync::Arc;
 
@@ -202,19 +204,35 @@ impl std::str::FromStr for MrmsProduct {
 /// behind, not the widest anyone has measured.
 pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 
-/// One CONUS mosaic's values, in bytes: 7000 × 3500 `f32` = **98 MB**.
+/// One CONUS mosaic's values, in bytes: 7000 × 3500 `u16` = **49 MB**.
 ///
 /// The budget below is stated as a multiple of this rather than as a round
 /// number of megabytes, so "one resident grid" stays one resident grid if the
 /// product's grid ever changes shape.
-pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<f32>();
+///
+/// **`u16`, because that is the width MRMS publishes.** Section 5 declares a
+/// 16-bit code and the value is `(ref_val + code * 2^exp) * 10^-dec`, so the
+/// `f32` this used to count was a widening of the source's own width and the
+/// mosaic was 98,000,000 B to hold 49,000,000 B of information. The store is
+/// [`GridValues::Scaled`](crate::render::gridded::GridValues::Scaled) now and
+/// this figure follows it.
+pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 
 /// How many bytes of decoded MRMS grid may stay resident at once: **one grid on
 /// wasm, two on mobile, four on desktop**.
 ///
-/// **A byte budget, not an entry count.** At 98 MB apiece, the six-entry shape
-/// the model cache uses would be 588 MB — more than the whole wasm32 address
-/// space has to spare once a `px_coords` buffer and a texture are in it.
+/// **A byte budget, not an entry count.** At 49 MB apiece, the six-entry shape
+/// the model cache uses would be 294 MB — and at the `f32` width this layer
+/// shipped with, 588 MB, more than the whole wasm32 address space has to spare
+/// once a `px_coords` buffer and a texture are in it.
+///
+/// **The narrowing is BANKED here, not spent.** Stated as a multiple of
+/// [`CONUS_GRID_BYTES`], this budget halved with the store — desktop went
+/// 392,000,000 B to 196,000,000 B and still holds the same *four* granules.
+/// Leaving the byte figure where it was would have bought eight instead, and
+/// that trade is not reversible in practice: a constant can always be raised
+/// again to give a win back, but temporal depth a user has already been given
+/// cannot be taken away without removing something they can see.
 ///
 /// Spelled as a `cfg` cascade rather than resolved from `squallar-device-profile`
 /// because that crate sits **above** this one in the crate graph
@@ -254,7 +272,10 @@ pub const GRID_CACHE_BYTES: usize = 4 * CONUS_GRID_BYTES;
 const _: () = assert!(GRID_CACHE_BYTES >= CONUS_GRID_BYTES);
 // And a whole number of grids, which is what the doc above claims.
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
-const _: () = assert!(CONUS_GRID_BYTES == 98_000_000);
+// **The width gate.** A store that silently went back to `f32` — or a budget
+// restated in the old width — fails the BUILD here rather than showing up as a
+// doubled census figure nobody was looking at.
+const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
 
 /// **How many bytes of loop-frame granule may stage at once: one mosaic, on
 /// every arm.**
@@ -294,7 +315,7 @@ const _: () = assert!(FRAME_STAGING_BYTES >= CONUS_GRID_BYTES);
 // The retained buffer is sized in points off this budget, so a budget that is
 // not a whole number of `f32` would silently round the staging grid down and
 // make every mosaic decode miss the pool.
-const _: () = assert!(FRAME_STAGING_BYTES.is_multiple_of(std::mem::size_of::<f32>()));
+const _: () = assert!(FRAME_STAGING_BYTES.is_multiple_of(std::mem::size_of::<u16>()));
 
 /// **What one frame listing found**, carried back to `apply_frame_listing` as
 /// its scope.
@@ -358,7 +379,7 @@ impl MrmsGrid {
     /// whether it covers 1.9 M points or 24.5 M, which is the whole reason MRMS
     /// never calls `latlons()`.
     pub fn resident_bytes(&self) -> usize {
-        self.grid.values.len() * std::mem::size_of::<f32>()
+        self.grid.values.resident_bytes()
     }
 
     /// Explain why this mosaic will render as nothing, when it will.

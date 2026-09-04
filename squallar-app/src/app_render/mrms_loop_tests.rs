@@ -92,7 +92,7 @@ fn granule(k: i64) -> MrmsGrid {
                 nj: 1,
                 scan_mode: 0,
             },
-            values: vec![k as f32; 4],
+            values: squallar_overlays::render::gridded::GridValues::F32(vec![k as f32; 4]),
         }),
         bounds: bounds(),
         valid: t(k),

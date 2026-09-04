@@ -36,7 +36,7 @@ fn window_form(grid: &HrrrGridData, bounds: &GeoBounds, w: u32, h: u32) -> GridW
         nj: grid.nj,
         coords: grid.coords.clone(),
         win,
-        values,
+        values: crate::render::gridded::GridValues::F32(values),
     }
 }
 
@@ -160,7 +160,7 @@ fn a_window_one_ring_too_tight_changes_the_picture() {
     let tight = rasterize_gridded(
         &GriddedInput::Window(GridWindow {
             win: tight_win,
-            values: tight_values,
+            values: crate::render::gridded::GridValues::F32(tight_values),
             ..honest
         }),
         &bounds,

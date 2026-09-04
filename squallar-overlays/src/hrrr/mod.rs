@@ -1769,9 +1769,23 @@ pub fn summarize_values(
     values: &[f32],
     paints: impl Fn(f32) -> bool,
 ) -> (usize, Option<(f32, f32)>) {
+    summarize_values_iter(values.iter().copied(), paints)
+}
+
+/// [`summarize_values`] over a stream rather than a slice.
+///
+/// The same pass, for a grid whose values are not `f32` in memory: a
+/// [`GridValues::Scaled`](crate::render::gridded::GridValues::Scaled) store
+/// reads back one value at a time and never materialises a slice of them, and
+/// materialising one here purely to summarise it would allocate the whole
+/// widened mosaic the narrow store exists to avoid.
+pub fn summarize_values_iter(
+    values: impl Iterator<Item = f32>,
+    paints: impl Fn(f32) -> bool,
+) -> (usize, Option<(f32, f32)>) {
     let mut visible = 0usize;
     let mut range: Option<(f32, f32)> = None;
-    for &v in values {
+    for v in values {
         if !v.is_finite() {
             continue;
         }

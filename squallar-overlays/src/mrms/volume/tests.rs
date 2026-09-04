@@ -151,10 +151,33 @@ fn a_level_key_is_the_stamp_under_its_own_level() {
     }
 }
 
+/// **The stack is priced in its own width, not the grid's.**
+///
+/// The second assertion used to read `33 * CONUS_GRID_BYTES` and was true only
+/// while both were `f32`. When the mosaic store followed MRMS down to 16-bit
+/// codes, that spelling would have halved this figure to 1,617,000,000 while
+/// `MrmsVolume::values` — a `Vec<f32>` the stack widens into at `push` — went
+/// on allocating 3,234,000,000. A budget that understates its buffer by 2×
+/// reads as headroom, so the relationship pinned here is now to the **stack's**
+/// own width and the grid constant is asserted to be the narrow one.
 #[test]
 fn the_stack_bytes_are_stated_rather_than_derived_in_a_hurry() {
     assert_eq!(CONUS_STACK_BYTES, 3_234_000_000);
-    assert_eq!(CONUS_STACK_BYTES, 33 * super::super::CONUS_GRID_BYTES);
+    assert_eq!(
+        CONUS_STACK_BYTES,
+        33 * 7000 * 3500 * std::mem::size_of::<f32>(),
+    );
+    assert_eq!(
+        super::super::CONUS_GRID_BYTES,
+        49_000_000,
+        "the grid is the narrow store; the stack deliberately is not",
+    );
+    assert_eq!(
+        CONUS_STACK_BYTES,
+        66 * super::super::CONUS_GRID_BYTES,
+        "33 levels of f32 against a u16 grid figure is 66x, not 33x — the \
+         factor that silently changed",
+    );
 }
 
 // ── The granules say their own height ───────────────────────────────────────
@@ -354,7 +377,7 @@ fn level(l: usize, ni: usize, nj: usize, valid: chrono::NaiveDateTime, fill: f32
             valid,
             first_fixed_surface: Some((SURFACE_TYPE_ALTITUDE_MSL, LEVELS_KM_MSL[l] * 1000.0)),
             parameter: Some(PARAMETER),
-            values: vec![fill; ni * nj],
+            values: crate::render::gridded::GridValues::F32(vec![fill; ni * nj]),
         },
     }
 }
@@ -760,7 +783,13 @@ fn the_occupancy_thresholds_are_a_ladder() {
         assert!(pair[1] > pair[0], "{pair:?}");
     }
     let raw = decoded(LEVEL_0_GZ);
-    let o = Occupancy::of(&raw.values);
+    // `Occupancy::of` counts an `f32` slab, which is what the stack genuinely
+    // is; a freshly decoded granule is now stored at its own 16-bit width, so
+    // the suite widens it here. `to_f32` is the sanctioned whole-grid widening
+    // and is lossless by
+    // `super::super::decode::tests::every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars`,
+    // so every count below is the figure it always was.
+    let o = Occupancy::of(&raw.values.to_f32());
     assert_eq!(o.cells, 7000 * 3500);
     for pair in o.at_or_above.windows(2) {
         assert!(pair[1] <= pair[0], "{:?} is not a ladder", o.at_or_above);

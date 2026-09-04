@@ -198,7 +198,7 @@ fn a_raster_of_an_unregistered_field_paints_nothing() {
                 j0: 0,
                 j1: 2,
             },
-            values: vec![4000.0; 4],
+            values: GridValues::F32(vec![4000.0; 4]),
         })
     };
     let painted = |input| {

@@ -19,6 +19,7 @@
 //! reporting -3 mm/h as a measurement.
 
 use squallar_overlays::mrms::{MrmsGrid, MrmsProduct, decode, staging};
+use squallar_overlays::render::gridded::GridValues;
 
 const COMPOSITE_GZ: &[u8] =
     include_bytes!("../testdata/MRMS_MergedReflectivityQCComposite_00.50_20260821-000039.grib2.gz");
@@ -36,13 +37,56 @@ fn decode_granule(product: MrmsProduct) -> MrmsGrid {
     decode::parse_grib2(&grib, product).expect("the committed granule decodes")
 }
 
-/// A byte no real reading can be, in every slot of a mosaic-sized buffer.
+/// The code the poisoned block is filled with.
 ///
-/// `give` clears the buffer rather than zeroing it, so these bytes stay in the
+/// **`0xDEADBEEF` is gone because the slot is no longer `f32`.** The staged
+/// buffer is a `Vec<u16>` of the source's own codes, and there is no such thing
+/// as a `u16` no packing could publish — "impossible by bit pattern" is not
+/// available at this width. What replaces it is a *checked* premise rather than
+/// a weaker one: [`no_cold_mosaic_carries_the_poison_code`] runs inside the gate
+/// below, over both shipped granules and all 24.5 M points, before any poison is
+/// fed in. While it holds, "anything that reaches the grid without having been
+/// written by the decode reads back as poison" is true at **every** point,
+/// exactly as the `f32` spelling made it true by construction.
+const POISON_CODE: u16 = 0xDEAD;
+
+/// A code neither granule carries, in every slot of a mosaic-sized buffer.
+///
+/// `give` clears the buffer rather than zeroing it, so these codes stay in the
 /// block the next decode is handed. Anything that reaches the grid without
 /// having been written by the decode reads back as this.
-fn poisoned_mosaic() -> Vec<f32> {
-    vec![f32::from_bits(0xDEAD_BEEF); staging::STAGING_POINTS]
+fn poisoned_mosaic() -> Vec<u16> {
+    vec![POISON_CODE; staging::STAGING_POINTS]
+}
+
+/// The stored codes of a granule that took the narrow arm.
+///
+/// Panics on [`GridValues::F32`], which is itself part of the premise: the pool
+/// is a `Vec<u16>` slot and only the narrow arm's buffer can round-trip through
+/// it, so a shipped product that stopped taking that arm must fail here loudly
+/// rather than turn this whole gate into a test of the unpooled path.
+fn codes(grid: &MrmsGrid) -> &[u16] {
+    match &grid.grid.values {
+        GridValues::Scaled(scaled) => &scaled.codes,
+        GridValues::F32(_) => panic!(
+            "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
+             fell to the f32 arm, so it can never be staged through the pool",
+        ),
+    }
+}
+
+/// What makes [`POISON_CODE`] stand in for `0xDEADBEEF`: it is in neither
+/// mosaic, so a surviving poisoned slot differs from the cold decode wherever
+/// it survives.
+fn no_cold_mosaic_carries_the_poison_code(a: &MrmsGrid, b: &MrmsGrid) {
+    for (name, grid) in [("composite", a), ("rate", b)] {
+        assert!(
+            !codes(grid).contains(&POISON_CODE),
+            "premise: the {name} mosaic carries code {POISON_CODE:#06x} itself, \
+             so poison surviving at those points would read as the real \
+             granule; pick another code",
+        );
+    }
 }
 
 /// How many values differ as **bit patterns** — `f32::NAN != f32::NAN`, and a
@@ -113,6 +157,8 @@ fn a_product_switch_through_the_retained_block_is_bit_identical() {
          readings of one granule agreeing with itself",
     );
 
+    no_cold_mosaic_carries_the_poison_code(&composite_cold, &rate_cold);
+
     // ── A poisoned block, then the composite through it ───────────────────
     staging::global().give(poisoned_mosaic());
     let composite_pooled = decode_granule(MrmsProduct::ReflectivityComposite);
@@ -124,8 +170,8 @@ fn a_product_switch_through_the_retained_block_is_bit_identical() {
     assert_eq!(
         differing(&composite_pooled, &composite_cold),
         0,
-        "a mosaic decoded into a block full of 0xDEADBEEF must be the mosaic, \
-         value for value and bit for bit",
+        "a mosaic decoded into a block full of the poison code must be the \
+         mosaic, value for value and bit for bit",
     );
 
     // ── Then the OTHER product, through the block the composite just filled ─

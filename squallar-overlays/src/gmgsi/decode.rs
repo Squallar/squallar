@@ -122,7 +122,12 @@ pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String
             ni,
             nj,
             coords: GridCoords::Separable { lat_axis, lon_axis },
-            values,
+            // **`F32`, and that is a fact about the source, not a default.**
+            // GMGSI's brightness values are genuinely `float` on disk, so the
+            // narrow arm MRMS takes would be a real quantisation here rather
+            // than the repacking it is there. Narrowing this needs its own
+            // losslessness proof or an explicit quality ruling.
+            values: crate::render::gridded::GridValues::F32(values),
         },
         bounds,
         valid_time,

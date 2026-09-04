@@ -5,7 +5,7 @@
 //! policy — *one grid stages at a time, on every arm* — and the handler's frame
 //! gate has always enforced the concurrency half of it. What the policy did
 //! **not** have was the allocation half: every granule built a **fresh**
-//! 98,000,000 B `Vec<f32>` and freed the last one, so "one staging area" meant
+//! 49,000,000 B `Vec<u16>` and freed the last one, so "one staging area" meant
 //! one *slot* and N *allocations*. This module makes the buffer itself the
 //! staging area, so the slot and the allocation are the same object.
 //!
@@ -59,7 +59,8 @@
 //!   the way in and [`StagingPool::take`] on the way out — and the decode
 //!   `push`es exactly `ni * nj` values into the empty buffer and refuses any
 //!   other count. `tests/mrms_staging_identity.rs` poisons a mosaic block with
-//!   `0xDEADBEEF`, feeds it back through the pool and decodes both shipped
+//!   a code neither shipped granule carries, feeds it back through the pool
+//!   and decodes both shipped
 //!   products through it; it is the check that fires if a `set_len` shortcut
 //!   ever lands (measured: half a mosaic of poison reaches the grid and the
 //!   summary moves).
@@ -67,12 +68,42 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// How many `f32` one staged mosaic holds —
+/// How many values one staged mosaic holds —
 /// [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) in points.
 ///
 /// Derived from the budget rather than restated, so a product whose grid
 /// changes shape moves both together or neither.
-pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / size_of::<f32>();
+///
+/// # The divisor is the slot's own element width, and getting it wrong is silent
+///
+/// **If you change what [`StagingPool`] holds, change this divisor in the same
+/// edit.** It is `size_of::<u16>()` because the slot is a `Vec<u16>`; it said
+/// `size_of::<f32>()` while the slot was a `Vec<f32>`. The two must name the
+/// same type, and nothing about the spelling makes that obvious — which is why
+/// this heading exists.
+///
+/// A mismatched divisor does **not** fail loudly. It sizes the slot at half a
+/// mosaic (or twice one), and [`StagingPool::give`] matches capacity
+/// **exactly**, never "big enough" — so every buffer offered back is refused,
+/// the slot stays empty for ever, and every decode allocates its own mosaic
+/// (49 MB at the narrow store; it was 98 MB at the wide one).
+/// That is precisely the defect this module exists to prevent, reintroduced
+/// through a constant nobody would think to look at, and the only symptom is
+/// the `declined` counter climbing where `reused` used to. On wasm32 it ends
+/// the way it ended before: a heap that only grows, fragmented past a
+/// contiguous mosaic-sized request, and a page that freezes with every
+/// screenshot and rAF check reporting it healthy.
+///
+/// The assertion below is the guard, because prose is not a gate: the slot
+/// holds one CONUS mosaic and that is a **point** count, so a divisor error
+/// moves it and fails the build.
+pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / size_of::<u16>();
+
+// One CONUS mosaic, in points — 7000 x 3500. Stated as a literal on purpose:
+// deriving it from `FRAME_STAGING_BYTES` again would be the same division
+// restated and could not disagree with itself. This is what catches a divisor
+// that stopped naming the slot's element type.
+const _: () = assert!(STAGING_POINTS == 24_500_000);
 
 /// **One retained mosaic-sized buffer, and the running count of what it saved.**
 ///
@@ -88,7 +119,7 @@ pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / size_of::<f32>();
 /// self-contained. The shipped path uses [`global`].
 pub struct StagingPool {
     /// `try_lock` only — see [`Self::take`].
-    slot: Mutex<Option<Vec<f32>>>,
+    slot: Mutex<Option<Vec<u16>>>,
     /// Mosaic-sized buffers this pool had to allocate. **The figure the
     /// shipping defect is about**: it was one per granule and is now one per
     /// process, per live block.
@@ -151,7 +182,7 @@ impl StagingPool {
     /// `with_capacity` here calls `handle_alloc_error` on failure, and on a
     /// `panic-strategy = "abort"` target that leaves winit's event loop
     /// borrowed for the life of the page.
-    pub fn take(&self, points: usize) -> Result<Vec<f32>, String> {
+    pub fn take(&self, points: usize) -> Result<Vec<u16>, String> {
         if points == STAGING_POINTS
             && let Ok(mut slot) = self.slot.try_lock()
             && let Some(mut buffer) = slot.take()
@@ -168,17 +199,17 @@ impl StagingPool {
                 // Both ends, deliberately. `give` clears on the way in, and a
                 // buffer is cleared again on the way out, so the "the decode
                 // starts from empty" invariant does not depend on any one
-                // caller having done the right thing. For an `f32` this is a
+                // caller having done the right thing. For a `u16` this is a
                 // store to `len` and nothing else.
                 buffer.clear();
                 return Ok(buffer);
             }
         }
-        let mut fresh: Vec<f32> = Vec::new();
+        let mut fresh: Vec<u16> = Vec::new();
         fresh.try_reserve_exact(points).map_err(|_| {
             format!(
                 "MRMS: cannot hold a {} MB staging grid in this build's memory",
-                points.saturating_mul(size_of::<f32>()) / (1024 * 1024),
+                points.saturating_mul(size_of::<u16>()) / (1024 * 1024),
             )
         })?;
         self.allocated.fetch_add(1, Ordering::Relaxed);
@@ -190,7 +221,7 @@ impl StagingPool {
     /// Refused — and counted as refused — unless the slot is empty and the
     /// capacity is exactly [`STAGING_POINTS`]. A refused buffer is dropped
     /// here, which is what every buffer did before this module existed.
-    pub fn give(&self, mut values: Vec<f32>) {
+    pub fn give(&self, mut values: Vec<u16>) {
         if values.capacity() != STAGING_POINTS {
             self.declined.fetch_add(1, Ordering::Relaxed);
             return;
@@ -207,7 +238,7 @@ impl StagingPool {
             return;
         }
         self.retained
-            .store(values.capacity() * size_of::<f32>(), Ordering::Relaxed);
+            .store(values.capacity() * size_of::<u16>(), Ordering::Relaxed);
         *slot = Some(values);
     }
 
@@ -219,9 +250,18 @@ impl StagingPool {
     /// from under it would be a use-after-free by another name. That case is
     /// counted as `declined` and the grid drops normally.
     pub fn recycle(&self, grid: super::MrmsGrid) {
+        // **Only the narrow arm's buffer fits this slot.** The pool is a
+        // `Vec<u16>` because that is what every shipped MRMS granule decodes
+        // into; a grid that fell to `GridValues::F32` — a packing wider than
+        // 16 bits, or one that went through grib's own `dispatch()` — holds a
+        // differently-typed allocation that this slot cannot take, and it is
+        // counted as declined rather than silently dropped uncounted.
         match std::sync::Arc::into_inner(grid.grid) {
-            Some(resident) => self.give(resident.values),
-            None => {
+            Some(crate::render::gridded::ResidentGrid {
+                values: crate::render::gridded::GridValues::Scaled(scaled),
+                ..
+            }) => self.give(scaled.codes),
+            _ => {
                 self.declined.fetch_add(1, Ordering::Relaxed);
             }
         }

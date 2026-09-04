@@ -12,10 +12,16 @@ const BOUNDS: GeoBounds = GeoBounds {
 /// A small mosaic over [`BOUNDS`], `points` values wide by one row, so a test
 /// can size a grid against a budget it can overflow.
 fn grid_of(product: MrmsProduct, values: Vec<f32>) -> MrmsGrid {
+    grid_of_values(product, crate::render::gridded::GridValues::F32(values))
+}
+
+/// [`grid_of`] over a store of either width, so a fixture can be built on the
+/// arm the thing under test actually needs.
+fn grid_of_values(product: MrmsProduct, values: crate::render::gridded::GridValues) -> MrmsGrid {
     let ni = values.len().max(2);
     let spec = crate::mrms::fields::spec(product);
     let paint = crate::render::gridded::field_paint(&spec.id).expect("registered");
-    let (visible_points, value_range) = crate::hrrr::summarize_values(&values, |v| paint.paints(v));
+    let (visible_points, value_range) = values.summarize(|v| paint.paints(v));
     MrmsGrid {
         product,
         grid: Arc::new(ResidentGrid {
@@ -43,7 +49,9 @@ fn grid_of(product: MrmsProduct, values: Vec<f32>) -> MrmsGrid {
     }
 }
 
-/// A mosaic of exactly `n` values, all drawable, so `resident_bytes()` is `4n`.
+/// A mosaic of exactly `n` values, all drawable. These fixtures are built on
+/// the **wide** arm, so `resident_bytes()` is `4n` here; a real decoded mosaic
+/// is on the narrow arm and is `2n`.
 fn sized(product: MrmsProduct, n: usize) -> MrmsGrid {
     grid_of(product, vec![45.0; n])
 }
@@ -644,7 +652,7 @@ fn job_values(job: &DescribedJob) -> Vec<f32> {
     let rasterize::GriddedInput::Resident(grid) = input else {
         panic!("MRMS must describe a Resident carry, not {input:?}");
     };
-    grid.values.clone()
+    grid.values.to_f32()
 }
 
 /// A `FetchConfig` with nothing behind it: every test here stops before the
@@ -738,9 +746,12 @@ fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
 /// the staging budget buys: one mosaic.
 ///
 /// The byte arithmetic, with its denominator: **one mosaic is
-/// `7000 * 3500 * 4` = 98,000,000 B (93.46 MiB)**, so thirty resident would be
-/// 2,940,000,000 B — 29x a 96 MiB wasm pool. The loop's own storage is thirty
-/// *textures*, which is a different budget in a different crate.
+/// `7000 * 3500 * 2` = 49,000,000 B (46.73 MiB)** at the 16-bit width MRMS
+/// publishes, so thirty resident would be 1,470,000,000 B — 14.6x a 96 MiB wasm
+/// pool. (It was `* 4` = 98,000,000 B and 29x while the store was `f32`; the
+/// narrowing halved the figure and did not change the conclusion.) The loop's
+/// own storage is thirty *textures*, which is a different budget in a different
+/// crate.
 ///
 /// **Floor — `stage_every_frame`:** delete the eviction loop in
 /// `MrmsFrameCache::insert`.
@@ -769,7 +780,7 @@ fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
             h.frame_grids.len(),
             1,
             "after {} granules the layer holds {}. One mosaic is \
-             7000 x 3500 x 4 = {} B, so {} resident is {} B against a 96 MiB \
+             7000 x 3500 x 2 = {} B, so {} resident is {} B against a 96 MiB \
              wasm pool. A loop holds textures, not grids.",
             k + 1,
             h.frame_grids.len(),
@@ -795,7 +806,7 @@ fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
     );
     assert_eq!(
         30 * crate::mrms::CONUS_GRID_BYTES,
-        2_940_000_000,
+        1_470_000_000,
         "thirty resident granules, spelled out"
     );
 }
@@ -1347,7 +1358,7 @@ fn a_listing_carries_the_mosaic_the_window_opened_after() {
 
 // ── The retained staging buffer ─────────────────────────────────────────────
 
-/// A mosaic-shaped grid: `resident_bytes()` is a real 98 MB and its buffer is
+/// A mosaic-shaped grid: `resident_bytes()` is a real 49 MB and its buffer is
 /// exactly what [`staging::StagingPool`] retains.
 ///
 /// The other grids in this file are one row wide, because the budgets they
@@ -1355,13 +1366,25 @@ fn a_listing_carries_the_mosaic_the_window_opened_after() {
 /// exercise **is** the mosaic capacity rule, and a 400-byte grid would be
 /// declined by the pool for exactly the reason the pool declines one in
 /// production.
+///
+/// **And it is built on the narrow arm, which is load-bearing.** The pool's
+/// slot is a `Vec<u16>`, so [`staging::StagingPool::recycle`] declines a
+/// [`GridValues::F32`](crate::render::gridded::GridValues::F32) grid by design.
+/// A wide fixture here would still compile and still run — it would simply
+/// measure the *decline* path under three test names that say "reached the
+/// pool", which is the shape a green vacuous gate takes.
 fn mosaic_grid(product: MrmsProduct, valid: chrono::NaiveDateTime) -> MrmsGrid {
-    let mut values: Vec<f32> = Vec::new();
-    values
+    let mut codes: Vec<u16> = Vec::new();
+    codes
         .try_reserve_exact(staging::STAGING_POINTS)
         .expect("a mosaic buffer fits on a test host");
-    values.resize(staging::STAGING_POINTS, 45.0);
-    let mut grid = grid_of(product, values);
+    codes.resize(staging::STAGING_POINTS, 0);
+    // An affine that reads every code back as 45.0 dBZ — drawable, and no code
+    // of it is a sentinel. The fixture's job is to be mosaic-sized, painted and
+    // recyclable, not to be a second decoder.
+    let scaled = crate::render::gridded::ScaledU16::new(codes, 45.0, 0.0, 1.0, |v| !v.is_finite())
+        .expect("a packing that reserves no code takes the narrow arm");
+    let mut grid = grid_of_values(product, crate::render::gridded::GridValues::Scaled(scaled));
     grid.valid = valid;
     grid
 }
@@ -1369,8 +1392,8 @@ fn mosaic_grid(product: MrmsProduct, valid: chrono::NaiveDateTime) -> MrmsGrid {
 /// **The eviction that feeds the pool.** `MrmsFrameCache::insert` is the hot
 /// path of a playing loop — one eviction per arriving granule — and it is where
 /// the retained buffer comes from. Before this, the victim was dropped and the
-/// next granule allocated a fresh 98 MB block; that churn is what fragmented
-/// the browser's 1 GiB heap until a 98 MB request failed with 192 MB free.
+/// next granule allocated a fresh mosaic block; that churn is what fragmented
+/// the browser's 1 GiB heap until a mosaic request failed with 192 MB free.
 ///
 /// Driven against a pool this test owns rather than the process-wide slot, for
 /// the reason [`MrmsFrameCache::staging`] records: this binary also decodes the
@@ -1432,7 +1455,7 @@ fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
             declined: 0
         },
         "the evicted granule's buffer must have reached the pool, so the next \
-         mosaic decode is handed it instead of taking a fresh 98 MB block off \
+         mosaic decode is handed it instead of taking a fresh 49 MB block off \
          an allocator that can only grow",
     );
     assert_eq!(staged.capacity(), staging::STAGING_POINTS);

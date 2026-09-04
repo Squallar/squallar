@@ -116,9 +116,11 @@ fn satellite_granule(valid: chrono::NaiveDateTime, hour: i64) -> GmgsiGrid {
             // on cold tops — so a ladder that walked out of it would hand
             // several hours the same picture and read as the defect. The
             // sixteen-step wrap keeps thirteen consecutive hours distinct.
-            values: (0..64)
-                .map(|_| 190.0 + hour.rem_euclid(16) as f32 * 3.0)
-                .collect(),
+            values: squallar_overlays::render::gridded::GridValues::F32(
+                (0..64)
+                    .map(|_| 190.0 + hour.rem_euclid(16) as f32 * 3.0)
+                    .collect(),
+            ),
         },
         bounds: bounds(),
         valid_time: valid,
@@ -145,7 +147,7 @@ fn mosaic_granule(valid: chrono::NaiveDateTime, step: i64) -> MrmsGrid {
                 nj: 1,
                 scan_mode: 0,
             },
-            values: vec![dbz; 4],
+            values: squallar_overlays::render::gridded::GridValues::F32(vec![dbz; 4]),
         }),
         bounds: bounds(),
         valid,

@@ -265,7 +265,7 @@ struct GmgsiGranule {
 
 impl GmgsiGranule {
     fn resident_bytes(&self) -> usize {
-        self.grid.values.len() * std::mem::size_of::<f32>()
+        self.grid.values.resident_bytes()
     }
 }
 
@@ -1019,7 +1019,7 @@ impl OverlayHandler for GmgsiHandler {
         }
         let index = granule.grid.coords.nearest(lat, lon)?;
         let (glat, glon) = granule.grid.coords.at(index)?;
-        let value = *granule.grid.values.get(index)?;
+        let value = granule.grid.values.get(index)?;
         if !value.is_finite() {
             return None;
         }
@@ -1275,9 +1275,7 @@ impl OverlayHandler for GmgsiHandler {
     /// textures those became, which are the GPU's.
     fn resident_source_bytes(&self) -> u64 {
         let carried = match &self.state.data {
-            Some(grid) if !self.cached_grids.holds(grid) => {
-                grid.values.len() * std::mem::size_of::<f32>()
-            }
+            Some(grid) if !self.cached_grids.holds(grid) => grid.values.resident_bytes(),
             _ => 0,
         };
         (self.cached_grids.resident_bytes() + self.frame_grids.resident_bytes() + carried) as u64

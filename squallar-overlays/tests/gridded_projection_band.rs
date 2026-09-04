@@ -121,7 +121,7 @@ fn whole_mosaic(values: Vec<f32>) -> GriddedInput {
             j0: 0,
             j1: NJ,
         },
-        values,
+        values: squallar_overlays::render::gridded::GridValues::F32(values),
     })
 }
 
