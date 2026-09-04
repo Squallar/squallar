@@ -237,16 +237,19 @@ impl Poster for web_sys::MessagePort {
     }
 }
 
-/// How a job's bytes are run: the worker's arm is [`execute_encoded`] on the
-/// global pool; the lane's is [`execute_serially`].
-type Run = fn(&[u8], Option<&[u8]>) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)>;
+/// How a job's bytes are run: the worker's arm is [`execute_owned`] on the
+/// global pool; the lane's is [`execute_serially`]. The buffers go in BY
+/// VALUE so the run can free them the moment the request is decoded.
+///
+/// [`execute_owned`]: squallar_worker::offload::execute_owned
+type Run = fn(Vec<u8>, Option<Vec<u8>>) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)>;
 
 /// Rasterize one job and post the answer back. A message this build cannot
 /// read is answered with a failed job rather than dropped: the page holds a
 /// render slot and a pane's in-flight mark against every id it posted.
 fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     match proto::string_field(data, proto::KIND).as_deref() {
-        Some(proto::JOB) => handle_job(scope, data, squallar_worker::offload::execute_encoded),
+        Some(proto::JOB) => handle_job(scope, data, squallar_worker::offload::execute_owned),
         // The page has finished copying a reply out of this worker's memory.
         Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
         _ => log::warn!("worker ignoring a message that is not a job"),
@@ -263,7 +266,7 @@ fn handle_lane_message(port: &web_sys::MessagePort, data: &JsValue) {
     }
 }
 
-/// [`squallar_worker::offload::execute_encoded`] on a rayon pool of exactly
+/// [`squallar_worker::offload::execute_owned`] on a rayon pool of exactly
 /// this thread.
 ///
 /// The lane shares the worker's global pool — one memory, one `static` — and
@@ -273,7 +276,10 @@ fn handle_lane_message(port: &web_sys::MessagePort, data: &JsValue) {
 /// job of an `install` on the caller, so the batch is serial and never waits
 /// on the pool. A pool that cannot be built falls back to the global one,
 /// said once: slower under contention, never wrong.
-fn execute_serially(bytes: &[u8], payload: Option<&[u8]>) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
+fn execute_serially(
+    bytes: Vec<u8>,
+    payload: Option<Vec<u8>>,
+) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
     LANE_POOL.with(|cell| {
         let pool = cell.get_or_init(|| {
             rayon::ThreadPoolBuilder::new()
@@ -287,9 +293,9 @@ fn execute_serially(bytes: &[u8], payload: Option<&[u8]>) -> Option<(u8, Vec<u8>
         });
         match pool {
             Some(pool) => {
-                pool.install(|| squallar_worker::offload::execute_encoded(bytes, payload))
+                pool.install(move || squallar_worker::offload::execute_owned(bytes, payload))
             }
-            None => squallar_worker::offload::execute_encoded(bytes, payload),
+            None => squallar_worker::offload::execute_owned(bytes, payload),
         }
     })
 }
@@ -326,15 +332,19 @@ fn handle_job(poster: &dyn Poster, data: &JsValue, run: Run) {
     // **What this instance is holding for jobs, while it holds it.** The
     // rasterization worker is a second module instance with a second 1 GiB
     // ceiling that no budget prices and no lever reaches, and these two
-    // buffers are what it holds off the wire: the head, and — since a row
+    // buffers are what it took off the wire: the head, and — since a row
     // may nominate an already-resident payload rather than write it — the
-    // whole grid behind it. The row then allocates again to cut its window,
-    // so this figure is the floor of the worker's peak for the job, not the
-    // peak. Counted around the call because a rayon pool can be running
-    // several, and the level has to be the sum of what is actually in flight.
+    // whole grid behind it. `run` owns them from here and frees them the
+    // moment the request is decoded, so what the run then holds is the
+    // decoded request — the same gate bytes, once, in the row's own layout —
+    // and the wire size is the figure that stands in for it. The row then
+    // allocates again to cut its window, so this is the floor of the worker's
+    // peak for the job, not the peak. Counted around the call because a rayon
+    // pool can be running several, and the level has to be the sum of what
+    // is actually in flight.
     let held = request.len() + payload.as_ref().map_or(0, Vec::len);
     jobs_in_flight::entered(held);
-    let result = run(&request, payload.as_deref());
+    let result = run(request, payload);
     jobs_in_flight::left(held);
     if result.is_none() {
         log::debug!("worker job {id} produced no frame");

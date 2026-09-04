@@ -4642,3 +4642,21 @@ fn a_row_with_no_resident_payload_splits_to_exactly_its_own_bytes() {
          the split",
     );
 }
+
+/// [`execute_owned`] frees the wire buffers on decode and answers exactly what
+/// [`execute_encoded`] answers from the same bytes: the same code, head and
+/// tails, on both the whole-request arm and the lent-payload arm.
+#[test]
+fn owned_wire_buffers_answer_exactly_what_borrowed_ones_do() {
+    let bytes = a_height_job().to_bytes();
+    let borrowed = execute_encoded(&bytes, None).expect("the fixture job answers");
+    let owned = execute_owned(bytes, None).expect("the fixture job answers");
+    assert_eq!(borrowed, owned, "the whole-request arm");
+
+    let (head, payload) = an_overlay_model_whole_job().to_parts();
+    let payload = payload.expect("the gridded row nominates its rows as a resident payload");
+    let borrowed = execute_encoded(&head, Some(payload.bytes())).expect("the fixture job answers");
+    let owned =
+        execute_owned(head, Some(payload.bytes().to_vec())).expect("the fixture job answers");
+    assert_eq!(borrowed, owned, "the lent-payload arm");
+}

@@ -474,17 +474,46 @@ pub fn execute_encoded(
     bytes: &[u8],
     payload: Option<&[u8]>,
 ) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
-    // `payload` present means the row nominated its payload to be LENT rather
-    // than written, so `bytes` is the head alone. The two are reassembled by
-    // the row's own `decode_resident` — never by concatenation, because the
-    // head was written without a values block and the joined bytes would land
-    // in a layout no decoder reads.
-    let request = match payload {
-        Some(payload) => JobRequest::from_parts(bytes, payload)?,
-        None => JobRequest::from_bytes(bytes)?,
-    };
+    encode_reply(&decode_wire(bytes, payload)?)
+}
+
+/// [`execute_encoded`] on wire buffers the caller OWNS, which it frees the
+/// moment the request is decoded — before the row runs, not after.
+///
+/// The request is copied out of the wire by the decode (`from_bytes` and
+/// `from_parts` borrow their input and build an owned [`JobRequest`]), so the
+/// wire bytes are dead from that point on. Holding them across the run kept a
+/// second copy of every gate byte of an `all_moments` decode job resident for
+/// the length of the rasterization, on top of the decoded request and the
+/// `Scan` the row builds from it.
+pub fn execute_owned(
+    bytes: Vec<u8>,
+    payload: Option<Vec<u8>>,
+) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
+    let request = decode_wire(&bytes, payload.as_deref())?;
+    drop(bytes);
+    drop(payload);
+    encode_reply(&request)
+}
+
+/// The request off the wire, reassembled the one way that decodes.
+///
+/// `payload` present means the row nominated its payload to be LENT rather
+/// than written, so `bytes` is the head alone. The two are reassembled by the
+/// row's own `decode_resident` — never by concatenation, because the head was
+/// written without a values block and the joined bytes would land in a layout
+/// no decoder reads.
+fn decode_wire(bytes: &[u8], payload: Option<&[u8]>) -> Option<JobRequest> {
+    match payload {
+        Some(payload) => JobRequest::from_parts(bytes, payload),
+        None => JobRequest::from_bytes(bytes),
+    }
+}
+
+/// Run a decoded request and frame its reply for the wire.
+fn encode_reply(request: &JobRequest) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
     let row = row_for(&request.job);
-    let out = execute(&request)?;
+    let out = execute(request)?;
     // The head is scalars and framing — 64 covers every current row's fixed
     // prefix. A row's LARGE FLAT buffers ride `tails`, each transferred to the
     // page as its own buffer: per widest 2048² still frame that is 26.08 MiB
