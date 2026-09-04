@@ -50,7 +50,7 @@ pub fn squallar_worker_main() -> Result<(), JsValue> {
     // The worker is its own instance with its own heap — the MRMS grid's
     // 93 MB refusal was here — so it installs its own hook
     // (`crate::alloc_failure`).
-    crate::alloc_failure::hook::install();
+    crate::alloc_failure::hook::install(crate::alloc_failure::Instance::RasterWorker);
     // Ignored rather than propagated: a second `init` is not a reason to
     // refuse jobs.
     let _ = console_log::init_with_level(log::Level::Info);
@@ -156,7 +156,7 @@ fn spawn_tile_lane(
 pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
-    crate::alloc_failure::hook::install();
+    crate::alloc_failure::hook::install(crate::alloc_failure::Instance::TileLane);
 
     let handler_port = port.clone();
     let on_message =
@@ -296,12 +296,59 @@ fn handle_job(poster: &dyn Poster, data: &JsValue, run: Run) {
     // length of the rasterization would double the peak for the whole job.
     release_to_page(poster, proto::loan_field(data));
 
+    // **What this instance is holding for jobs, while it holds it.** The
+    // rasterization worker is a second module instance with a second 1 GiB
+    // ceiling that no budget prices and no lever reaches, and these two
+    // buffers are what it holds off the wire: the head, and — since a row
+    // may nominate an already-resident payload rather than write it — the
+    // whole grid behind it. The row then allocates again to cut its window,
+    // so this figure is the floor of the worker's peak for the job, not the
+    // peak. Counted around the call because a rayon pool can be running
+    // several, and the level has to be the sum of what is actually in flight.
+    let held = request.len() + payload.as_ref().map_or(0, Vec::len);
+    jobs_in_flight::entered(held);
     let result = run(&request, payload.as_deref());
+    jobs_in_flight::left(held);
     if result.is_none() {
         log::debug!("worker job {id} produced no frame");
     }
     if let Err(e) = post_result(poster, id, result) {
         log::error!("worker could not answer job {id}: {e:?}");
+    }
+}
+
+/// **The bytes this instance's running jobs are holding**, as a level the
+/// heap census can print.
+///
+/// Its own counter rather than a `set` on the census directly, because a
+/// level is not what a caller has: several jobs run at once on the worker's
+/// rayon pool, so what each one knows is its own delta. The census stays a
+/// pure set of levels and this is where the arithmetic lives.
+///
+/// `Relaxed` is enough: every writer is adding or subtracting its own figure
+/// under `fetch_add`/`fetch_sub`, which are atomic whatever the ordering, and
+/// the only reader — the allocation-error hook, and the telemetry line —
+/// wants a recent figure rather than a synchronised one.
+mod jobs_in_flight {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static HELD: AtomicU64 = AtomicU64::new(0);
+
+    /// A job has taken its bytes off the wire and is about to run.
+    pub(super) fn entered(bytes: usize) {
+        publish(HELD.fetch_add(bytes as u64, Relaxed) + bytes as u64);
+    }
+
+    /// It has finished and its buffers are about to be dropped.
+    pub(super) fn left(bytes: usize) {
+        publish(
+            HELD.fetch_sub(bytes as u64, Relaxed)
+                .saturating_sub(bytes as u64),
+        );
+    }
+
+    fn publish(level: u64) {
+        squallar_egui::heap_census::set_job_in_flight_bytes(level);
     }
 }
 

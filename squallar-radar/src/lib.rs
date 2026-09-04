@@ -30,6 +30,8 @@ pub mod render;
 pub mod render_input;
 pub mod sampler;
 pub mod scan;
+/// What a decoded volume costs in host memory, for the caches that hold them.
+pub mod scan_size;
 pub mod site_position;
 pub mod sites;
 pub mod sounding;

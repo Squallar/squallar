@@ -236,8 +236,13 @@ impl RenderCache {
         )
     }
 
-    /// Bytes the resident entries occupy.
-    #[cfg(test)]
+    /// Bytes the resident entries occupy — the `Color32` pixel buffers and
+    /// the resident hover fields beside them, on the host heap.
+    ///
+    /// Maintained on every put, retain and clear whether or not anyone asks,
+    /// so this is a read of a field rather than a walk. It was
+    /// `#[cfg(test)]` until the page heap needed a name for every family
+    /// holding it: the number existed and nothing shipped could see it.
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
     }

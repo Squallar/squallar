@@ -1830,6 +1830,25 @@ impl super::App {
                 self.budgets.overlay_oversample_percent,
             ),
         );
+        // **What is holding this instance's heap, family by family.** Its own
+        // line, never appended to `budget state:` — that one is scraped by a
+        // positional regex, and these figures have a different denominator
+        // from every field on it: they are LEVELS of bytes resident now,
+        // where `pool` and `ceiling` are allowances and `overlay rasters:`
+        // are running totals. The census is also read by the
+        // allocation-error hook, which prints the same line at the instant a
+        // request is refused; this tick is the slow copy, and on a scene that
+        // climbs hundreds of MB between two ticks the hook's is the one to
+        // believe.
+        self.publish_heap_census();
+        say_telemetry(
+            loud,
+            &squallar_egui::heap_census::line(
+                &squallar_egui::heap_census::census(),
+                linear.map(|heap| heap.page_bytes),
+                "page",
+            ),
+        );
         // The wasm heap watermarks, on the same tick. The bridge answers the
         // platform question: a native bridge reads no heap and neither arm
         // is entered there. The two instances are judged apart — each has
@@ -1843,6 +1862,35 @@ impl super::App {
                 self.observe_worker_heap(worker);
             }
         }
+    }
+
+    /// **Publish every heap-census family this layer owns.**
+    ///
+    /// The census (`squallar_egui::heap_census`) is a set of always-on byte
+    /// levels the allocation-error hook can read without allocating, so
+    /// every publisher has to be a figure its owner already maintains. Each
+    /// call here is a field read or a fold over a store bounded at a couple
+    /// of dozen entries; nothing walks a volume, a raster or a grid. The
+    /// families the UI layer owns publish themselves (the gridded overlays
+    /// and the tile meshes from `Gui::ui_phased`, the tile caches from their
+    /// own ledger, the pending uploads from the renderer's sweep), and the
+    /// web layer publishes the loan book.
+    ///
+    /// **The radar families overlap and the census says so.** The loop
+    /// cache, the still inventory and the derivation memo hold `Arc`s of the
+    /// same `Scan`s, so each reports what emptying it alone would free and
+    /// their sum is an upper bound, not a partition.
+    fn publish_heap_census(&mut self) {
+        use squallar_egui::heap_census as census;
+
+        census::set_loop_scan_bytes(self.loop_mgr.cached_scan_bytes() as u64);
+        census::set_loop_l3_bytes(self.loop_mgr.cached_l3_bytes() as u64);
+        census::set_still_scan_bytes(self.volumes.resident_scan_bytes() as u64);
+        census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
+        census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
+        census::set_overlay_picture_bytes(self.render.resident_overlay_pictures().1);
+        census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
+        census::set_volume_store_bytes(self.volume_store.memory_bytes() as u64);
     }
 
     /// **Judge one reading of the page's linear memory** against the line

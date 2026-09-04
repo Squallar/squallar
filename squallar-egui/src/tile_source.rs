@@ -2696,10 +2696,16 @@ impl HttpsTiles {
             }
         }
         if let Some(bodies) = &self.bodies {
-            let gone = bodies
-                .lock()
-                .expect("the tile-body cache is not poisoned")
-                .trim_one();
+            let (gone, held_bytes) = {
+                let mut bodies = bodies.lock().expect("the tile-body cache is not poisoned");
+                (bodies.trim_one(), bodies.resident_bytes())
+            };
+            // The level where this cache shrinks, paired with the one
+            // [`remember_body`] stores where it grows. This arm is dead on
+            // native -- `bodies` is `None` there by construction, see
+            // [`IoTileBodies`] -- so the census family reads the zero it was
+            // born with, which is the true figure and not a missing one.
+            crate::heap_census::set_tile_body_bytes(held_bytes);
             if let Some(gone) = gone {
                 discard_slot("tile-body-trim", gone.value);
             }
@@ -4636,10 +4642,22 @@ fn remember_body(cache: &IoTileBodies, tile_id: TileId, bytes: &Arc<Vec<u8>>) {
     // `Vec`, freed here on the page thread as an O(1) free. The frame-paced
     // trim is `HttpsTiles::pump`'s.
     let mut evicted = Vec::new();
-    cache
-        .lock()
-        .expect("the tile-body cache is not poisoned")
-        .put(tile_id, Arc::clone(bytes), bytes.len() as u64, &mut evicted);
+    let held_bytes = {
+        let mut cache = cache.lock().expect("the tile-body cache is not poisoned");
+        cache.put(tile_id, Arc::clone(bytes), bytes.len() as u64, &mut evicted);
+        cache.resident_bytes()
+    };
+    // A level, stored on the one site that grows this cache, the way
+    // [`remember_parsed`] stores the parsed one. The whole family is
+    // wasm32-only and so is this function, which is what keeps the census
+    // figure at zero on native rather than a branch inside a body: see the
+    // native arm below and [`IoTileBodies`].
+    //
+    // Denominator: what the `ByteLru` charges, which is the sum of the
+    // undecoded MVT bodies' own lengths -- not the parses they become, and
+    // not the styled tiles the parses become. Each is a separate census
+    // family. One `Relaxed` store per body remembered.
+    crate::heap_census::set_tile_body_bytes(held_bytes);
 }
 
 /// See the wasm32 arm above.

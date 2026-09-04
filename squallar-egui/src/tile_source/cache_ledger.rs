@@ -368,6 +368,43 @@ pub fn set_resident(role: CacheRole, levels: Levels) {
     ledger.resident_bytes.store(levels.resident_bytes, Relaxed);
     ledger.overrun_bytes.store(levels.overrun_bytes, Relaxed);
     ledger.floor_entries.store(levels.floor_entries, Relaxed);
+    publish_styled_census();
+}
+
+/// Republish the styled-tile level of [`crate::heap_census`], **both roles
+/// summed**.
+///
+/// The census wants one figure per allocation family and a source knows only
+/// its own role, so the sum has to happen somewhere that can see both — and
+/// this module is the only such place. Doing it here rather than at the
+/// census's own read means no caller has to remember to add the two, which is
+/// the failure mode a per-role figure invites.
+///
+/// Denominator: exactly what the styled `ByteLru`s charge, which is the
+/// tessellated shapes each `CachedTile` holds on this instance's heap. The
+/// undecoded bodies and the parses are separate families with their own
+/// levels; the tile meshes are the GPU's and are on neither.
+///
+/// Two `Relaxed` loads and one store, on a path that has just done four
+/// stores to the same cache lines.
+fn publish_styled_census() {
+    let bytes = LEDGER
+        .iter()
+        .map(|ledger| ledger.resident_bytes.load(Relaxed))
+        .fold(0u64, u64::saturating_add);
+    crate::heap_census::set_tile_cache_bytes(bytes);
+}
+
+/// Republish the parsed-tile level of [`crate::heap_census`], **both roles
+/// summed**. See [`publish_styled_census`] for why the sum lives here;
+/// the denominator is `walkers::mvt::ParsedTile::heap_bytes`, which is what
+/// the parsed `ByteLru`s charge.
+fn publish_parsed_census() {
+    let bytes = LEDGER
+        .iter()
+        .map(|ledger| ledger.parsed_bytes.load(Relaxed))
+        .fold(0u64, u64::saturating_add);
+    crate::heap_census::set_tile_parsed_bytes(bytes);
 }
 
 /// What the last whole pass drawing one source of `role` wanted: cells at the
@@ -384,6 +421,7 @@ pub fn set_parsed(role: CacheRole, entries: u64, bytes: u64) {
     let ledger = &LEDGER[role.index()];
     ledger.parsed_entries.store(entries, Relaxed);
     ledger.parsed_bytes.store(bytes, Relaxed);
+    publish_parsed_census();
 }
 
 /// Whether the tile-sharpness rung holds one source of `role` at the whole

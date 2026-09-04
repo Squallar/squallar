@@ -283,6 +283,18 @@ impl MrmsGridCache {
         self.entries.values().map(|g| g.resident_bytes()).sum()
     }
 
+    /// Whether one of the resident entries **is this very allocation**.
+    ///
+    /// Deliberately not [`Self::contains`]: this is an accounting question
+    /// about a pointer, not a look at a picture, and answering it through the
+    /// keyed accessor would mark a product most-recently-used and reorder the
+    /// eviction queue behind a census read. Pointer identity rather than the
+    /// product key for the same reason — the pane's carry can outlive its
+    /// cache entry, and then the key matches while the allocation does not.
+    fn holds(&self, grid: &Arc<MrmsGrid>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(g, grid))
+    }
+
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
     /// `pinned` is the **union** of every pane's selected product, not one
@@ -1194,6 +1206,32 @@ impl OverlayHandler for MrmsHandler {
             "enabled": state.enabled,
             "product": state.selected_product.as_str(),
         })
+    }
+
+    /// **Three blocks, and one 98 MB mosaic is the unit of all of them**: the
+    /// live cache's decoded products, the staged loop granules, and the buffer
+    /// [`staging`] is retaining between decodes.
+    ///
+    /// The pool is counted once even though both caches were handed it — they
+    /// are handed the *same* pool, [`staging::global`] on every shipped path,
+    /// and one slot recycled by two callers is still one block.
+    ///
+    /// **What is excluded.** The pane's own carry
+    /// (`state.data`) is the same allocation as its live cache entry, so it is
+    /// added only when the cache has already let go of it — which happens when
+    /// an eviction is declined because this carry was still holding the grid.
+    /// Not counted at all: the rasters made from these grids, which are the
+    /// overlay picture family's, and the textures those became, which are the
+    /// GPU's.
+    fn resident_source_bytes(&self) -> u64 {
+        let carried = match &self.state.data {
+            Some(grid) if !self.cached_grids.holds(grid) => grid.resident_bytes(),
+            _ => 0,
+        };
+        (self.cached_grids.resident_bytes()
+            + self.frame_grids.resident_bytes()
+            + self.frame_grids.staging.retained_bytes()
+            + carried) as u64
     }
 }
 

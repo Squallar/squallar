@@ -625,6 +625,31 @@ impl OverlayRegistry {
         self.handler(layer).and_then(|h| h.hover_text(id, ctx))
     }
 
+    /// **Bytes of decoded SOURCE data every registered layer is holding on
+    /// this instance's heap**, summed —
+    /// [`OverlayHandler::resident_source_bytes`] over the handlers.
+    ///
+    /// The three gridded layers are the whole of it in practice: MRMS at
+    /// 98 MB a mosaic, GMGSI at 60 MB a blend, HRRR at 7.6 MB a grid. Every
+    /// other handler takes the trait's `0` default, which is a claim about
+    /// scale rather than an omission — a few hundred parsed alert polygons do
+    /// not move a figure read in megabytes.
+    ///
+    /// **What this is not**: the pictures rasterized from these grids (the
+    /// overlay picture batch prices those) and the textures those pictures
+    /// became (the GPU's). Nothing here is a worker instance's; the page's
+    /// handlers are the page's.
+    ///
+    /// **Cost**: O(registered handlers), and each answer is a field read or a
+    /// walk of a cache holding at most a handful of entries — those byte
+    /// budgets are one to four grids of 60-98 MB. No grid contents are
+    /// touched, so this is safe on the frame thread's telemetry tick.
+    pub fn resident_source_bytes(&self) -> u64 {
+        self.handlers()
+            .map(OverlayHandler::resident_source_bytes)
+            .fold(0u64, u64::saturating_add)
+    }
+
     // ── Config persistence ────────────────────────────────────────────
 
     /// Keyed by the layer id **string** ([`LayerId::as_str`]) — the exact

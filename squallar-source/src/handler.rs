@@ -1030,6 +1030,29 @@ pub trait SourceHandler: Send {
     fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
         None
     }
+
+    /// **Bytes of decoded SOURCE data this handler is holding on the host
+    /// heap** — the grids and granules themselves, not the pictures
+    /// rasterized from them and not the textures those pictures became.
+    ///
+    /// The denominator is the allocator's, on the instance the handler lives
+    /// on: a `Vec<f32>` mosaic counts, a `TextureHandle`'s pixels after upload
+    /// do not, and neither does anything a worker instance holds. A handler
+    /// whose data is a few hundred parsed features answers the default `0`
+    /// rather than pricing itself into a figure the caller is reading in
+    /// megabytes; what this exists to find is the three gridded layers whose
+    /// single granule is 60 to 98 MB.
+    ///
+    /// **Cheap, and read on the frame thread's telemetry tick**: an
+    /// implementation reads a maintained total or walks a cache whose entry
+    /// count is bounded by a byte budget of a handful of grids. It must not
+    /// walk grid contents, allocate, or take a blocking lock.
+    ///
+    /// A report, never a requirement: nothing here says what the layer would
+    /// need, only what it is holding right now.
+    fn resident_source_bytes(&self) -> u64 {
+        0
+    }
 }
 
 pub struct FetchConfig {

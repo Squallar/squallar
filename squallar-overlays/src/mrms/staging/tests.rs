@@ -230,3 +230,43 @@ fn mosaic_grid() -> crate::mrms::MrmsGrid {
         value_range: None,
     }
 }
+
+/// **The retained level is what the slot is holding right now**, not what it
+/// has ever held — the figure `resident_source_bytes` adds to the MRMS
+/// layer's two caches.
+///
+/// Both transitions, because only one of them is obvious. A block sitting in
+/// the slot is 98 MB nothing else is naming, and a census that missed it would
+/// under-report by a whole mosaic; a block that is *out* is already counted as
+/// the grid it is being decoded into, and counting it here as well would
+/// double it.
+#[test]
+fn the_retained_level_follows_the_slot_in_both_directions() {
+    let pool = StagingPool::new();
+    assert_eq!(pool.retained_bytes(), 0, "a cold pool is holding nothing");
+
+    pool.give(mosaic_buffer());
+    assert_eq!(
+        pool.retained_bytes(),
+        crate::mrms::FRAME_STAGING_BYTES,
+        "the capacity, not the length: the slot's buffer is always empty, so a \
+         level off `len` would read zero over a live 98 MB block",
+    );
+
+    let buffer = pool.take(STAGING_POINTS).expect("the slot is full");
+    assert_eq!(
+        pool.retained_bytes(),
+        0,
+        "the block left with the decode and is counted as the grid it becomes",
+    );
+    drop(buffer);
+
+    let mut odd: Vec<f32> = Vec::new();
+    odd.try_reserve_exact(STAGING_POINTS - 1).expect("fits");
+    pool.give(odd);
+    assert_eq!(
+        pool.retained_bytes(),
+        0,
+        "a refused offer is dropped, not kept, and must not raise the level",
+    );
+}

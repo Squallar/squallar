@@ -103,6 +103,27 @@ pub struct LoopDownloadManager {
     /// shared by the Level II and Level III paths so the network concurrency cap
     /// means one thing).
     in_flight_count: usize,
+    /// **What [`scan_cache`](Self::scan_cache) is holding, in host bytes**, by
+    /// [`crate::scan_size::scan_bytes`].
+    ///
+    /// A running total rather than a walk, because the answer is wanted every
+    /// telemetry tick and the walk is over every radial of every cached
+    /// volume: each volume is priced ONCE where it is filed, and the price is
+    /// kept beside it so eviction is a subtraction. The cache is bounded by
+    /// **frame count and nothing else** — one decoded volume per named loop
+    /// frame — and a volume was measured at 46.1-46.8 MiB median, 58.3 MiB
+    /// max over 208 real archive volumes, so on a 1 GiB wasm page heap this
+    /// is a figure that decides whether a scene fits.
+    scan_bytes_cached: usize,
+    /// The price of each cached volume, so [`Self::retain_scans`] subtracts
+    /// what it removes instead of re-walking it. Keyed exactly as
+    /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
+    /// one is a mutation of the other.
+    scan_prices: HashMap<(String, chrono::NaiveDateTime), usize>,
+    /// **What [`l3_cache`](Self::l3_cache) is holding, in host bytes** — each
+    /// product's `bytes` buffer, which is nearly all of it. O(1) to price, so
+    /// there is no price map beside it.
+    l3_bytes_cached: usize,
 }
 
 /// A pane's undispatched loop downloads, with the site they belong to.
@@ -171,6 +192,9 @@ impl LoopDownloadManager {
             l3_cache: HashMap::new(),
             l3_in_flight: HashSet::new(),
             in_flight_count: 0,
+            scan_bytes_cached: 0,
+            scan_prices: HashMap::new(),
+            l3_bytes_cached: 0,
         }
     }
 
@@ -251,11 +275,45 @@ impl LoopDownloadManager {
 
     /// Store a downloaded volume in the cache under the site it was downloaded
     /// for, with what its cuts declared.
+    ///
+    /// The volume is priced here and nowhere else. That is one walk of its
+    /// radials per arrival, on the path a decode has just finished — the one
+    /// moment the volume's bytes are already the expensive thing that
+    /// happened — rather than a walk per reading of
+    /// [`Self::cached_scan_bytes`], which is asked for every telemetry tick.
     pub fn cache_scan(&mut self, site: &str, ts: chrono::NaiveDateTime, volume: CachedVolume) {
+        let price = crate::scan_size::scan_bytes(&volume.0);
+        // A re-file under a key already held replaces the volume, so its old
+        // price leaves with it; `insert` returning the old price is what says
+        // whether there was one.
+        if let Some(was) = self.scan_prices.insert((site.to_string(), ts), price) {
+            self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(was);
+        }
+        self.scan_bytes_cached = self.scan_bytes_cached.saturating_add(price);
         self.scan_cache
             .entry(site.to_string())
             .or_default()
             .insert(ts, volume);
+    }
+
+    /// **Host bytes the loop's decoded volumes are holding**, by
+    /// [`crate::scan_size::scan_bytes`] — a floor, since the allocator's own
+    /// overhead is not reachable from a slice. O(1): the total is maintained
+    /// at the two places the cache changes.
+    ///
+    /// It is what emptying this cache would free **if nothing else held the
+    /// same volumes**, and something else usually does: the still inventory
+    /// and the derivation memo hold `Arc`s of the same `Scan`s. Summing this
+    /// with theirs gives an upper bound on the joint footprint, not a
+    /// partition of it.
+    pub fn cached_scan_bytes(&self) -> usize {
+        self.scan_bytes_cached
+    }
+
+    /// **Host bytes the loop's paired Level III objects are holding** — the
+    /// product buffers. O(1), for [`Self::cached_scan_bytes`]'s reason.
+    pub fn cached_l3_bytes(&self) -> usize {
+        self.l3_bytes_cached
     }
 
     /// Take out every cached volume whose `(site, timestamp)` fails `keep`, and
@@ -273,6 +331,14 @@ impl LoopDownloadManager {
             );
             !scans.is_empty()
         });
+        // The prices go by the same predicate, so the total falls by exactly
+        // what left rather than by a second walk of the volumes now removed.
+        for (_, price) in self
+            .scan_prices
+            .extract_if(|(site, ts), _| !keep(site.as_str(), ts))
+        {
+            self.scan_bytes_cached = self.scan_bytes_cached.saturating_sub(price);
+        }
         removed
     }
 
@@ -449,7 +515,11 @@ impl LoopDownloadManager {
     ) {
         let key = Self::l3_key(site, code, &ts);
         self.l3_in_flight.remove(&key);
-        self.l3_cache.insert(key, product);
+        let price = product.as_ref().map_or(0, |p| p.bytes.len());
+        if let Some(Some(was)) = self.l3_cache.insert(key, product) {
+            self.l3_bytes_cached = self.l3_bytes_cached.saturating_sub(was.bytes.len());
+        }
+        self.l3_bytes_cached = self.l3_bytes_cached.saturating_add(price);
     }
 
     /// Take out every paired Level III object whose `(site, volume start)` fails
@@ -466,6 +536,9 @@ impl LoopDownloadManager {
             // over.
             .filter_map(|(_, product)| product)
             .collect();
+        for product in &removed {
+            self.l3_bytes_cached = self.l3_bytes_cached.saturating_sub(product.bytes.len());
+        }
         for pending in self.pending_l3.values_mut() {
             pending
                 .queue
@@ -798,6 +871,113 @@ mod tests {
             mgr.is_in_flight("KOUN", &ts(0)),
             "KOUN is still downloading"
         );
+    }
+
+    /// A cached volume that actually carries gates, so it prices at something.
+    /// The shared `volume()` fixture declares no sweeps on purpose — every
+    /// other test here compares `Arc` pointers and never reads a gate — and a
+    /// volume of no sweeps correctly prices at zero, which is exactly the
+    /// value the byte assertions below could not tell from a broken total.
+    fn priced_volume() -> CachedVolume {
+        use nexrad_model::data::{MomentData, Radial, RadialStatus, Sweep};
+
+        let radials = (0..8)
+            .map(|i| {
+                Radial::new(
+                    1_700_000_000_000,
+                    i,
+                    f32::from(i),
+                    0.5,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    0.5,
+                    Some(MomentData::from_fixed_point(
+                        400,
+                        2125,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![3u8; 400],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        (
+            Arc::new(Scan::new(
+                VolumeCoveragePattern::new(
+                    212,
+                    0,
+                    0.5,
+                    PulseWidth::Short,
+                    false,
+                    0,
+                    false,
+                    0,
+                    false,
+                    false,
+                    0,
+                    false,
+                    false,
+                    Vec::new(),
+                ),
+                vec![Sweep::new(1, radials)],
+            )),
+            Arc::default(),
+        )
+    }
+
+    /// **The byte totals track what the caches hold**, over a file, a
+    /// replacement and an eviction.
+    ///
+    /// The totals exist because the caches are bounded by frame count and by
+    /// nothing else, so the only way to know what a loop is holding is to
+    /// keep the figure. A replacement that added instead of replacing, or an
+    /// eviction that forgot to subtract, would leave a monotonic number that
+    /// looked like a leak in the very instrument built to find one.
+    #[test]
+    fn the_cached_byte_totals_track_the_caches() {
+        let mut mgr = LoopDownloadManager::new();
+        assert_eq!(mgr.cached_scan_bytes(), 0);
+        assert_eq!(mgr.cached_l3_bytes(), 0);
+
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let one = mgr.cached_scan_bytes();
+        assert!(one > 0, "a filed volume priced at nothing");
+
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        assert_eq!(mgr.cached_scan_bytes(), 2 * one, "the second volume");
+
+        // A replacement under a held key swaps the price, it does not add one.
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            2 * one,
+            "re-filing a held key double-counted it"
+        );
+
+        let l3_product = l3();
+        mgr.cache_l3_product("KTLX", "EET", ts(0), Some(l3_product.clone()));
+        assert_eq!(mgr.cached_l3_bytes(), l3_product.bytes.len());
+        mgr.cache_l3_product("KTLX", "NMD", ts(0), None);
+        assert_eq!(
+            mgr.cached_l3_bytes(),
+            l3_product.bytes.len(),
+            "a gap paired to nothing was charged for bytes it has not got"
+        );
+
+        mgr.retain_scans(|_, at| *at == ts(0));
+        assert_eq!(mgr.cached_scan_bytes(), one, "eviction did not subtract");
+        mgr.retain_scans(|_, _| false);
+        assert_eq!(mgr.cached_scan_bytes(), 0, "an emptied cache still priced");
+        mgr.retain_l3(|_, _| false);
+        assert_eq!(mgr.cached_l3_bytes(), 0);
     }
 
     /// Re-downloading the same site's timestamp replaces the entry, which is what

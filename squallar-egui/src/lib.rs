@@ -33,6 +33,10 @@ pub mod floor_ledger;
 /// widgets through. Dormant unless armed by the `gesture_script` config key or
 /// the `SQUALLAR_GESTURE_SCRIPT` environment variable.
 pub mod gesture_player;
+/// **Bytes resident per allocation family on the page's wasm heap**, the
+/// instrument for "what fills the 1 GiB". Levels, not running totals, and
+/// read from the allocation-error hook as well as the telemetry tick.
+pub mod heap_census;
 /// The one copy of the integration-faithful event sequences, emitted by both
 /// the headless input harness and the gesture player.
 pub(crate) mod input_fidelity;

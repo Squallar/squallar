@@ -100,6 +100,14 @@ pub(crate) const MAX_RESIDENT_STILL_VOLUMES: usize = MAX_PANES_DESKTOP + 2;
 struct StillEntry {
     volume: Still,
     installed: u64,
+    /// The volume's host bytes by [`squallar_radar::scan_size::scan_bytes`],
+    /// priced once here at install.
+    ///
+    /// Carried with the entry rather than re-derived, because the reading is
+    /// wanted every telemetry tick and the price is a walk of every radial:
+    /// summing eight stored `usize`s is what a tick can afford, and eight
+    /// walks is not.
+    bytes: usize,
 }
 
 /// The decoded volumes held, and the one owner of both stores.
@@ -113,6 +121,14 @@ pub(crate) struct VolumeInventory {
     installs: u64,
     /// The most recent complete volume for each site, with its collection time.
     base: HashMap<String, Base>,
+    /// Each merge base's host bytes, keyed as [`base`](Self::base) is.
+    ///
+    /// Beside the store rather than inside it because [`Base`] is a tuple
+    /// several modules destructure; a fourth element would ripple through
+    /// every one of them for a figure only this file maintains. Every
+    /// mutation of `base` in this file is a mutation of this map, and the two
+    /// are pinned together by `the_inventorys_byte_total_tracks_both_stores`.
+    base_bytes: HashMap<String, usize>,
 }
 
 impl VolumeInventory {
@@ -145,10 +161,15 @@ impl VolumeInventory {
     ) -> Vec<Still> {
         self.installs += 1;
         let installed = self.installs;
-        self.still
-            .entry(site)
-            .or_default()
-            .insert(at, StillEntry { volume, installed });
+        let bytes = squallar_radar::scan_size::scan_bytes(&volume.0);
+        self.still.entry(site).or_default().insert(
+            at,
+            StillEntry {
+                volume,
+                installed,
+                bytes,
+            },
+        );
         self.enforce_still_cap(installed)
     }
 
@@ -186,6 +207,8 @@ impl VolumeInventory {
     /// `newest_still_for` never walk a husk.
     fn take_still(&mut self, site: &str, at: NaiveDateTime) -> Option<Still> {
         let times = self.still.get_mut(site)?;
+        // The price leaves with the entry: `StillEntry` is dropped whole here
+        // and in `retain_still`, so no store outlives the volume it priced.
         let gone = times.remove(&at).map(|entry| entry.volume);
         if times.is_empty() {
             self.still.remove(site);
@@ -243,6 +266,10 @@ impl VolumeInventory {
 
     /// Make `volume` `site`'s merge base.
     pub(crate) fn install_base(&mut self, site: String, volume: Base) {
+        self.base_bytes.insert(
+            site.clone(),
+            squallar_radar::scan_size::scan_bytes(&volume.0),
+        );
         self.base.insert(site, volume);
     }
 
@@ -279,7 +306,31 @@ impl VolumeInventory {
     /// [`retain_still`](Self::retain_still)'s site-keyed twin for the merge
     /// bases, which name the doomed rather than the wanted.
     pub(crate) fn evict_base(&mut self, doomed: &impl Fn(&String) -> bool) -> Vec<Base> {
+        self.base_bytes.retain(|site, _| !doomed(site));
         crate::app::evicted(&mut self.base, doomed)
+    }
+
+    /// **Host bytes both stores are holding**, by
+    /// [`squallar_radar::scan_size::scan_bytes`] — a floor, since the
+    /// allocator's own overhead is not reachable from a slice.
+    ///
+    /// The denominator is *these two stores*. It is what emptying them would
+    /// free **if nothing else held the same volumes**, and something else
+    /// often does: a loop's download cache and the derivation memo hold
+    /// `Arc`s of the same `Scan`s, so their figures and this one sum to an
+    /// upper bound on the joint footprint, never to a partition of it.
+    ///
+    /// A sum of at most [`MAX_RESIDENT_STILL_VOLUMES`] stills plus one base
+    /// per site holding one — a couple of dozen `usize` adds, no walk.
+    pub(crate) fn resident_scan_bytes(&self) -> usize {
+        let stills = self
+            .still
+            .values()
+            .flat_map(HashMap::values)
+            .fold(0usize, |sum, entry| sum.saturating_add(entry.bytes));
+        self.base_bytes
+            .values()
+            .fold(stills, |sum, bytes| sum.saturating_add(*bytes))
     }
 
     /// Every volume still held here, for the derived-product cache's retain
@@ -298,6 +349,7 @@ impl VolumeInventory {
     /// panes are showing.
     #[cfg(test)]
     pub(crate) fn forget_all_bases(&mut self) {
+        self.base_bytes.clear();
         self.base.clear();
     }
 
@@ -398,6 +450,68 @@ mod tests {
     /// Everything wanted; the shape most of these tests install with.
     fn keep_all(_: &str, _: NaiveDateTime) -> bool {
         true
+    }
+
+    /// **The byte total follows both stores**, over an install, a second
+    /// install, an eviction and a base.
+    ///
+    /// The stills carry their price inside `StillEntry` and the bases carry
+    /// theirs in a map beside `base`, so the two halves fail differently: a
+    /// still's price cannot outlive its entry (they are dropped together),
+    /// while a base's is a second mutation that a future edit could forget.
+    /// This is what would catch that — a `base_bytes` row left behind by
+    /// `evict_base` reads as a site still holding a volume it has dropped,
+    /// which on a heap census is a phantom nobody could find.
+    #[test]
+    fn the_inventorys_byte_total_tracks_both_stores() {
+        let mut inv = VolumeInventory::default();
+        assert_eq!(inv.resident_scan_bytes(), 0);
+
+        let (first, second) = two_volumes();
+        let one = squallar_radar::scan_size::scan_bytes(&first);
+        assert!(
+            one > 0,
+            "fixture: a volume of no gates cannot price anything"
+        );
+
+        let forced = inv.install_still("KTLX".into(), at(0), (first, Arc::default()));
+        assert!(forced.is_empty(), "fixture: one install cannot hit the cap");
+        assert_eq!(inv.resident_scan_bytes(), one);
+
+        let forced = inv.install_still("KTLX".into(), at(1), (second, Arc::default()));
+        assert!(forced.is_empty());
+        assert_eq!(inv.resident_scan_bytes(), 2 * one, "the second still");
+
+        inv.install_base(
+            "KTLX".into(),
+            (crate::volume_fixture::ready_scan(), Arc::default(), at(1)),
+        );
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            3 * one,
+            "a merge base is a whole decoded volume and is charged as one"
+        );
+
+        // The residency policy drops what no pane wants; the price goes with
+        // the entry.
+        let dropped = inv.retain_still(&|_, when| when == at(0));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(inv.resident_scan_bytes(), 2 * one);
+
+        inv.evict_base(&|_| true);
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            one,
+            "an evicted base left its price behind"
+        );
+
+        let dropped = inv.retain_still(&|_, _| false);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            inv.resident_scan_bytes(),
+            0,
+            "an emptied inventory still priced"
+        );
     }
 
     /// The drain frees at least one payload per turn whatever its budget, so

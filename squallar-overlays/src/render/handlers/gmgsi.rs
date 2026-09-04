@@ -325,6 +325,18 @@ impl GmgsiGridCache {
         self.entries.values().map(|g| g.resident_bytes()).sum()
     }
 
+    /// Whether one of the resident granules **is holding this very raster**.
+    ///
+    /// Deliberately not [`Self::contains`]: this is an accounting question
+    /// about a pointer, not a look at a picture, and answering it through the
+    /// keyed accessor would mark a channel most-recently-used and reorder the
+    /// eviction queue behind a census read. Pointer identity rather than the
+    /// channel key for the same reason — the pane's carry can outlive its
+    /// cache entry, and then the key matches while the allocation does not.
+    fn holds(&self, grid: &Arc<ResidentGrid>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(&g.grid, grid))
+    }
+
     /// Neither the entry going in nor anything in `pinned` is ever evicted.
     ///
     /// `pinned` is the **union** of every pane's selected channel, not one
@@ -1246,6 +1258,29 @@ impl OverlayHandler for GmgsiHandler {
             "enabled": state.enabled,
             "channel": state.selected_channel.as_str(),
         })
+    }
+
+    /// **Two blocks, and one 60 MB blend is the unit of both**: the live
+    /// cache's decoded channels and the staged loop granules. This layer
+    /// retains no staging buffer between decodes — MRMS's pool is the MRMS
+    /// handler's, and nothing here is offered to it.
+    ///
+    /// **What is excluded.** The pane's own carry (`state.data`) is the same
+    /// `Arc` the live cache's granule holds, so it is added only when the
+    /// cache has already dropped that granule while the carry kept the raster
+    /// alive. The `f64` coordinate axes are not counted: a separable grid's
+    /// axes are 64 KB against a 60 MB raster, and the budget this figure is
+    /// read beside prices values only. Not counted at all: the rasters made
+    /// from these grids, which are the overlay picture family's, and the
+    /// textures those became, which are the GPU's.
+    fn resident_source_bytes(&self) -> u64 {
+        let carried = match &self.state.data {
+            Some(grid) if !self.cached_grids.holds(grid) => {
+                grid.values.len() * std::mem::size_of::<f32>()
+            }
+            _ => 0,
+        };
+        (self.cached_grids.resident_bytes() + self.frame_grids.resident_bytes() + carried) as u64
     }
 }
 

@@ -290,6 +290,7 @@ impl TextureUploads {
             self.file(device, queue, renderer, *id, delta);
         }
         self.drain(device, queue, renderer);
+        self.publish_pending_level();
         !self.pending.is_empty()
     }
 
@@ -558,6 +559,60 @@ impl TextureUploads {
         true
     }
 
+    /// Publish what [`Self::pending`] is holding on this instance's own heap,
+    /// for `squallar_egui::heap_census`.
+    ///
+    /// # Denominator
+    ///
+    /// **The whole pixel buffer of every distinct image with a band still
+    /// queued**, at `as_raw().len()`, counted once however many bands name it.
+    /// Not the bytes still to move: [`Self::drain`] advances `done` and
+    /// nothing shrinks the `Arc<egui::ColorImage>` behind the band, so a
+    /// raster one row from finished is still holding all of itself — which is
+    /// the whole reason this family is on the census rather than being read
+    /// off [`UploadTotals`], whose figures are cumulative flow and never
+    /// residency. Distinct by `Arc::ptr_eq`, so two bands of one image are one
+    /// charge; charging each band its image would multiply-count a partial
+    /// delta stream that shares a buffer.
+    ///
+    /// The bytes are egui's `Arc` and this queue is what keeps it alive: egui
+    /// drops its own `TexturesDelta` at the end of the frame that produced it.
+    /// Nothing here is the GPU's — the texture the bands are filling is not on
+    /// this figure and is not on the census's page total either.
+    ///
+    /// # What it costs
+    ///
+    /// One allocation-free sweep, `n` slice-length reads and at most
+    /// `n(n-1)/2` pointer compares, where `n` is the number of large deltas
+    /// egui has filed and not yet finished — a band the drain re-queues is the
+    /// same entry, not a new one, so `n` counts outstanding rasters and not
+    /// their bands. Run once off [`Self::apply`] and once off [`Self::free`],
+    /// never per band and never inside the drain loop.
+    ///
+    /// A running total paid at each push and pop would be O(1) and was not
+    /// taken: the queue is mutated in [`Self::file`] (a retain and a push), in
+    /// [`Self::drain`] (a pop, two pushes and a drop) and in [`Self::free`]
+    /// (a retain), and each of those would owe a `ptr_eq` scan of its own to
+    /// decide whether the charge is the last one for its image. A level that
+    /// drifts because one site forgot to pay is a worse instrument than a
+    /// sweep that cannot drift.
+    fn publish_pending_level(&self) {
+        let bytes = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(seen, band)| {
+                !self
+                    .pending
+                    .iter()
+                    .take(*seen)
+                    .any(|earlier| Arc::ptr_eq(&earlier.image, &band.image))
+            })
+            .map(|(_, band)| band.image.as_raw().len() as u64)
+            .sum();
+        squallar_egui::heap_census::set_upload_pending_bytes(bytes);
+    }
+
     /// Forget everything egui retired this frame.
     pub fn free(&mut self, ids: &[egui::TextureId]) {
         for id in ids {
@@ -567,6 +622,7 @@ impl TextureUploads {
             self.delivered.remove(id);
         }
         self.pending.retain(|band| !ids.contains(&band.id));
+        self.publish_pending_level();
     }
 
     /// Whether every texel egui has handed over for `id` has reached the GPU.

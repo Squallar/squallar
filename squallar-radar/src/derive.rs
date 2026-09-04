@@ -52,6 +52,7 @@
 //! outside [`prepare`] rather than a duplication of it. NROT is the heavy one
 //! on both paths.
 
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use nexrad_model::data::{MomentData, Radial, RadialStatus, Scan, Sweep};
@@ -157,7 +158,10 @@ struct DeriveKey {
 /// The derivation memo: most-recently-used last, at most
 /// [`DERIVE_MEMO_CAPACITY`] entries.
 struct DeriveMemo {
-    entries: Vec<(DeriveKey, Arc<Scan>)>,
+    /// Most-recently-used last. The `usize` is the entry's price by
+    /// [`crate::scan_size::scan_bytes`], carried with it so an eviction
+    /// subtracts a figure instead of re-walking a volume it is about to drop.
+    entries: Vec<(DeriveKey, Arc<Scan>, usize)>,
 }
 
 /// **Capacity 3 is deliberate**: the live volume's section + 3D pair plus one
@@ -170,6 +174,35 @@ static DERIVE_MEMO: LazyLock<Mutex<DeriveMemo>> = LazyLock::new(|| {
         entries: Vec::new(),
     })
 });
+
+/// **What the memo is holding, in host bytes**, mirrored out of the lock.
+///
+/// An atomic beside the mutex rather than a sum under it, because the reader
+/// is the frame thread's telemetry tick and the writer is the derive path:
+/// a lock-free read cannot stall a frame behind a derivation, and cannot
+/// deadlock a caller that is already inside the memo. Written only where
+/// `entries` changes, always while the lock is held, so the two never
+/// disagree by more than the instant between the store and the unlock.
+static DERIVE_MEMO_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes the derivation memo is holding, by [`crate::scan_size::scan_bytes`]
+/// — a floor, and an upper bound on what emptying it would free: a derived
+/// volume the still inventory or a loop cache also names is counted by each
+/// of them. At most [`DERIVE_MEMO_CAPACITY`] whole synthetic scans.
+pub fn memo_bytes() -> usize {
+    DERIVE_MEMO_BYTES.load(Relaxed)
+}
+
+/// Re-total the memo and publish it. Called with the lock held, from every
+/// place `entries` changes — one pass over at most three prices.
+fn republish_memo_bytes(memo: &DeriveMemo) {
+    DERIVE_MEMO_BYTES.store(
+        memo.entries
+            .iter()
+            .fold(0usize, |sum, (_, _, bytes)| sum.saturating_add(*bytes)),
+        Relaxed,
+    );
+}
 
 /// FNV-1a, 64-bit — the digest [`DeriveKey::declared_digest`] carries.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -243,13 +276,14 @@ pub fn retain_volumes<'a>(live: impl IntoIterator<Item = &'a Scan>) {
         .filter(|&ms| ms > 0)
         .collect();
     memo.entries
-        .retain(|(key, _)| live_sweep_clocks.contains(&key.volume_start));
+        .retain(|(key, _, _)| live_sweep_clocks.contains(&key.volume_start));
+    republish_memo_bytes(&memo);
 }
 
 /// The memoized scan for `key`, marked most-recently-used.
 fn memo_get(key: &DeriveKey) -> Option<Arc<Scan>> {
     let mut memo = DERIVE_MEMO.lock().expect("the derive memo mutex");
-    let position = memo.entries.iter().position(|(held, _)| held == key)?;
+    let position = memo.entries.iter().position(|(held, _, _)| held == key)?;
     let entry = memo.entries.remove(position);
     let scan = Arc::clone(&entry.1);
     memo.entries.push(entry);
@@ -260,12 +294,14 @@ fn memo_get(key: &DeriveKey) -> Option<Arc<Scan>> {
 /// capacity. A racing duplicate insert keeps the newer allocation — the two
 /// are byte-identical.
 fn memo_insert(key: DeriveKey, scan: Arc<Scan>) {
+    let bytes = crate::scan_size::scan_bytes(&scan);
     let mut memo = DERIVE_MEMO.lock().expect("the derive memo mutex");
-    memo.entries.retain(|(held, _)| held != &key);
-    memo.entries.push((key, scan));
+    memo.entries.retain(|(held, _, _)| held != &key);
+    memo.entries.push((key, scan, bytes));
     while memo.entries.len() > DERIVE_MEMO_CAPACITY {
         memo.entries.remove(0);
     }
+    republish_memo_bytes(&memo);
 }
 
 /// Empty the memo — the determinism gate's "fresh compute" arm. Gated as the
@@ -278,6 +314,7 @@ pub(crate) fn memo_clear() {
         .expect("the derive memo mutex")
         .entries
         .clear();
+    DERIVE_MEMO_BYTES.store(0, Relaxed);
 }
 
 /// Prepare a volume for sampling under `product`: pass a native moment through,

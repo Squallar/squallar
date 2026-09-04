@@ -270,6 +270,24 @@ impl ModelGridCache {
         self.get(key).is_some()
     }
 
+    /// The maintained sum of [`grid_bytes`] over the resident entries — the
+    /// figure the budget is spent against, read rather than recomputed.
+    fn resident_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Whether one of the resident entries **is this very allocation**.
+    ///
+    /// Deliberately not [`Self::contains`]: this is an accounting question
+    /// about a pointer, not a look at a picture, and answering it through the
+    /// keyed accessor would mark a grid most-recently-used and reorder the
+    /// eviction queue behind a census read. Pointer identity rather than the
+    /// key for the same reason — the pane's carry can outlive its cache entry,
+    /// and then the key matches while the allocation does not.
+    fn holds(&self, grid: &Arc<HrrrGridData>) -> bool {
+        self.entries.values().any(|g| Arc::ptr_eq(g, grid))
+    }
+
     /// **The most recently used resident grid of `param`**, whatever run and
     /// hour it is off.
     ///
@@ -1879,6 +1897,30 @@ impl OverlayHandler for ModelDataHandler {
             map.insert("forecast_hour".into(), serde_json::json!(f_hour));
         }
         out
+    }
+
+    /// **One block**: the byte-budgeted grid cache, which is where this
+    /// layer's live pictures and its loop frames both live — a frame is a
+    /// `(param, run, hour)` key beside the others, not a second store.
+    ///
+    /// The figure is [`ModelGridCache::bytes`], maintained on every insert and
+    /// eviction, so this is a field read whatever the resident set — which
+    /// matters here more than for the mosaic layers: a desktop budget of
+    /// 512 MiB is seventy 7.6 MB grids, and a per-call walk of seventy entries
+    /// would be the only figure on the census that scaled with the scene.
+    ///
+    /// **What is included beyond the values**: each entry's coordinate axes
+    /// and the struct itself, exactly as [`grid_bytes`] prices them for the
+    /// budget. **Excluded**: the pane's own carry (`state.data`), which is the
+    /// same allocation as its cache entry and is added only when the cache has
+    /// already let go of it; and the rasters and textures made from these
+    /// grids, which belong to the overlay picture family and the GPU.
+    fn resident_source_bytes(&self) -> u64 {
+        let carried = match &self.state.data {
+            Some(grid) if !self.cached_grids.holds(grid) => grid_bytes(grid),
+            _ => 0,
+        };
+        (self.cached_grids.resident_bytes() + carried) as u64
     }
 }
 

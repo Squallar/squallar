@@ -238,6 +238,46 @@ impl LoopFrameStore {
     pub fn shared(&self) -> usize {
         self.entries.iter().filter(|e| e.holders.len() > 1).count()
     }
+
+    /// **What the stored frames hold on the HOST heap**, which is far less
+    /// than what they hold.
+    ///
+    /// A frame's pixels are the GPU's: `PlanView` and `Section` carry an
+    /// `egui::TextureHandle`, and `Volume` carries only a store id. What is
+    /// on this heap and countable here is each plan-view frame's resident
+    /// hover field and each section's tilt vectors.
+    ///
+    /// **Three things this deliberately does not count, and each is a real
+    /// allocation.** A loop frame's `HoverSource` is built by
+    /// `HoverSource::from_volume`, which keeps the `Arc<Scan>` the frame was
+    /// drawn from so the readout can decode a gate on demand;
+    /// `HoverSource::resident_bytes` reports the polar field alone and says
+    /// nothing about that volume, so a frame pinning tens of MB of decoded
+    /// radar prices here at kilobytes. The loop volume cache
+    /// (`LoopDownloadManager::cached_scan_bytes`) is what names those bytes,
+    /// and a frame outliving its cache entry is bytes neither figure sees.
+    /// An `Overlay` frame carries an `OverlayTextureData` whose hit map is a
+    /// per-cell index nothing prices. And a `Volume` frame's grid is the
+    /// volume store's, priced there.
+    ///
+    /// O(entries), O(1) apiece.
+    pub fn resident_host_bytes(&self) -> u64 {
+        self.entries.iter().fold(0u64, |sum, entry| {
+            let bytes = match &entry.image {
+                squallar_egui::pane::LoopFrameImage::PlanView(image) => {
+                    image.hover.resident_bytes() as u64
+                }
+                squallar_egui::pane::LoopFrameImage::Section(image) => {
+                    (image.tilt_elevations_deg.len() * size_of::<f64>()
+                        + image.tilt_collected_ms.len() * size_of::<i64>())
+                        as u64
+                }
+                squallar_egui::pane::LoopFrameImage::Volume(_)
+                | squallar_egui::pane::LoopFrameImage::Overlay(_) => 0,
+            };
+            sum.saturating_add(bytes)
+        })
+    }
 }
 
 /// Free pictures the store let go of.

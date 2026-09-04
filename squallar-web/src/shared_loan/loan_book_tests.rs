@@ -235,3 +235,40 @@ fn a_mixed_loan_counts_the_envelope_and_the_payload() {
     );
     assert_eq!(book.peek(id).map(<[Lent]>::len), Some(2));
 }
+
+/// **What the loans cost the heap is not what they put on the wire**, and the
+/// heap census reads the first.
+///
+/// A borrowed region is a view onto an allocation the instance was already
+/// holding for its own reasons, so it costs the loan book nothing; an owned
+/// one exists only because a message needed it. `bytes_outstanding` answers
+/// "what may the peer still be reading" and counts both. Adding that figure
+/// to a heap census would price the borrowed allocation twice — once under
+/// the family that owns it and once here — which is exactly the double count
+/// the census's denominators exist to prevent.
+#[test]
+fn only_the_owned_buffers_cost_this_heap_anything() {
+    let mut book = LoanBook::new();
+    assert_eq!(book.owned_bytes_outstanding(), 0);
+
+    let grid: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(vec![7; 4096]);
+    let mixed = book.lend_parts(vec![
+        Lent::Owned(vec![0; 64]),
+        Lent::borrowed(std::sync::Arc::clone(&grid), |g| g.as_slice()),
+    ]);
+
+    assert_eq!(
+        book.bytes_outstanding(),
+        64 + 4096,
+        "the wire figure must count every lent byte"
+    );
+    assert_eq!(
+        book.owned_bytes_outstanding(),
+        64,
+        "the borrowed grid is the grid cache's bytes, not the loan book's"
+    );
+
+    book.release(mixed);
+    assert_eq!(book.owned_bytes_outstanding(), 0);
+    assert_eq!(book.bytes_outstanding(), 0);
+}

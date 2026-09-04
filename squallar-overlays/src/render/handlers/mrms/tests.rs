@@ -1537,3 +1537,52 @@ fn the_live_mosaic_a_poll_replaces_is_offered_to_the_staging_pool() {
     );
     assert_eq!(POOL.totals().reused, 1);
 }
+
+/// **What the heap census reads**: the layer's own decoded bytes reach
+/// [`OverlayRegistry::resident_source_bytes`], and the pane's carry of the same
+/// mosaic is not added to the cache entry it *is*.
+///
+/// Against a pool of this test's own, not [`staging::global`]: the shipped slot
+/// is process-wide, so a mosaic another test in this binary left in it would
+/// add 98 MB to the figure asserted here and the failure would name the wrong
+/// module.
+#[test]
+fn the_registry_sums_what_each_handler_is_holding() {
+    static POOL: staging::StagingPool = staging::StagingPool::new();
+    let product = MrmsProduct::ReflectivityComposite;
+    let mut handler = MrmsHandler::with_staging(&POOL);
+    handler.defaults.enabled = true;
+    handler.defaults.selected_product = product;
+
+    assert_eq!(
+        handler.resident_source_bytes(),
+        0,
+        "a handler that has decoded nothing is holding nothing",
+    );
+
+    handler.apply_fetch_result(
+        Box::new(MrmsFetchResult(Ok(sized(product, 100)))),
+        &PaneRef::across(&[]),
+    );
+    assert_eq!(
+        handler.resident_source_bytes(),
+        400,
+        "one 100-value mosaic, once: the live cache's entry and the pane's \
+         carry are the same allocation, and adding both would price this \
+         layer at twice the block it holds",
+    );
+
+    use crate::render::overlay_state::OverlayRegistry;
+    let registry = OverlayRegistry::with_handlers(vec![Box::new(handler)]);
+    assert_eq!(
+        registry.resident_source_bytes(),
+        400,
+        "and the registry's sum is the handlers' figures, not a re-derivation",
+    );
+    assert_eq!(
+        OverlayRegistry::default().resident_source_bytes(),
+        0,
+        "every other registered layer takes the trait's zero, so a build that \
+         has fetched nothing prices its grids at nothing",
+    );
+}

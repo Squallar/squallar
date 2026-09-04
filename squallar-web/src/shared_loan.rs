@@ -137,6 +137,22 @@ impl Lent {
         self.len() == 0
     }
 
+    /// **How many bytes this buffer costs the heap that lent it.**
+    ///
+    /// Not [`Self::len`], and the difference is the whole point of the
+    /// borrowed arm. An owned buffer is an allocation that exists only
+    /// because a message needed one, so its bytes are the loan's own. A
+    /// borrowed one is a view onto an allocation the instance was already
+    /// holding for its own reasons — a model grid a layer cache is holding,
+    /// counted there — so the loan costs the heap nothing and adding its
+    /// length to a heap census would count those bytes twice.
+    pub fn owned_len(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Borrowed { .. } => 0,
+        }
+    }
+
     /// Where the bytes are, for building the view.
     pub fn addr(&self) -> usize {
         match self {
@@ -226,12 +242,29 @@ impl LoanBook {
     /// How much memory those loans are holding down.
     ///
     /// The leak instrument: a peer that stops releasing does not corrupt
-    /// anything, it just grows this without bound.
+    /// anything, it just grows this without bound. Every lent byte, borrowed
+    /// ones included, because what this answers is what the peer may still be
+    /// reading.
     pub fn bytes_outstanding(&self) -> usize {
         self.outstanding
             .values()
             .flat_map(|buffers| buffers.iter())
             .map(Lent::len)
+            .sum()
+    }
+
+    /// **What the outstanding loans are costing this instance's heap** — the
+    /// owned buffers only, by [`Lent::owned_len`].
+    ///
+    /// The figure the heap census wants, and it is not
+    /// [`Self::bytes_outstanding`]: a borrowed region's bytes belong to
+    /// whichever family is holding the owner, and are counted there. Summing
+    /// both figures would price one allocation twice.
+    pub fn owned_bytes_outstanding(&self) -> usize {
+        self.outstanding
+            .values()
+            .flat_map(|buffers| buffers.iter())
+            .map(Lent::owned_len)
             .sum()
     }
 
@@ -386,7 +419,12 @@ mod js {
         let Some(buffer) = memory_buffer().map(|b| b.0) else {
             return Err(parts);
         };
-        let id = BOOK.with(|book| book.borrow_mut().lend_parts(parts));
+        let id = BOOK.with(|book| {
+            let mut book = book.borrow_mut();
+            let id = book.lend_parts(parts);
+            republish_census(&book);
+            id
+        });
         let views = js_sys::Array::new();
         BOOK.with(|book| {
             let book = book.borrow();
@@ -421,7 +459,12 @@ mod js {
         if id == NO_LOAN {
             return;
         }
-        let released = BOOK.with(|book| book.borrow_mut().release(id).is_some());
+        let released = BOOK.with(|book| {
+            let mut book = book.borrow_mut();
+            let released = book.release(id).is_some();
+            republish_census(&book);
+            released
+        });
         if !released {
             log::error!(
                 "a peer released loan {id}, which this instance has no record of \
@@ -432,7 +475,12 @@ mod js {
 
     /// Drop every outstanding loan. For a peer that will never release again.
     pub fn release_all(reason: &str) {
-        let count = BOOK.with(|book| book.borrow_mut().release_all());
+        let count = BOOK.with(|book| {
+            let mut book = book.borrow_mut();
+            let count = book.release_all();
+            republish_census(&book);
+            count
+        });
         if count > 0 {
             log::debug!("released {count} loans still outstanding when {reason}");
         }
@@ -441,6 +489,23 @@ mod js {
     /// What the loans still out are holding down, for the diagnostics line.
     pub fn bytes_outstanding() -> usize {
         BOOK.with(|book| book.borrow().bytes_outstanding())
+    }
+
+    /// Publish what the book is costing this heap into
+    /// [`squallar_egui::heap_census`].
+    ///
+    /// Called at every change to the book, so the level is current when the
+    /// **allocation-error hook** reads it. The hook cannot call
+    /// [`bytes_outstanding`] itself: that borrows the thread-local
+    /// `RefCell`, and the refusal it is reporting can have come from inside
+    /// [`lend`], which is holding the same `RefCell` mutably while it
+    /// allocates. A panic there would replace the one line saying what
+    /// happened with a borrow error. An atomic the hook only loads cannot do
+    /// that.
+    fn republish_census(book: &LoanBook) {
+        squallar_egui::heap_census::set_loan_outstanding_bytes(
+            book.owned_bytes_outstanding() as u64
+        );
     }
 
     /// Whether `value` is a typed array whose buffer is a `SharedArrayBuffer`

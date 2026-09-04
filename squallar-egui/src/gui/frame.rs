@@ -36,6 +36,25 @@ impl Gui {
 
         self.check_auto_polls(&mut actions);
 
+        // **What the gridded layers are holding, published where the
+        // registry lives.** The figure belongs to the heap census
+        // (`crate::heap_census`), which the allocation-error hook reads at a
+        // refusal; it is published from here rather than from the shell's
+        // telemetry tick because the registry is the UI layer's and reaching
+        // across for it would grow the app layer's coupling for a counter.
+        //
+        // Cheap by construction: a fold over the registered handlers, each
+        // answering from a byte field or a walk of the one to four grid
+        // entries its budget allows. No grid contents are touched.
+        crate::heap_census::set_overlay_grid_bytes(self.overlays.resident_source_bytes());
+        // The tile mesh store publishes its own level into the mesh ledger
+        // every sweep; the census carries the same figure so one line names
+        // every family. GPU bytes, and the census keeps them out of its page
+        // total for that reason.
+        crate::heap_census::set_tile_mesh_bytes(
+            crate::tile_mesh::ledger::totals().mesh_resident_bytes,
+        );
+
         // A download finishes whether or not its screen is open, and the
         // record it publishes is what makes the area exist to the rest of the
         // app - so the publish rides the frame, not the screen.

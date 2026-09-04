@@ -100,6 +100,17 @@ pub struct StagingPool {
     /// the grid. Reported rather than hidden: a pool that silently never
     /// recycles reads exactly like one that does until the tab dies.
     declined: AtomicUsize,
+    /// **Bytes the slot is holding right now** — a level, not a total: one
+    /// mosaic's worth while a buffer is parked here, zero while it is out
+    /// being decoded into.
+    ///
+    /// Maintained at the two transitions inside the slot's own critical
+    /// section rather than read off the slot, because the one caller that
+    /// needs it is a frame-thread census and the slot is `try_lock`-only: a
+    /// reader that missed the lock would have to report either a stale figure
+    /// or a false zero, and a false zero on a 98 MB block is the exact shape
+    /// of mistake the census exists to stop.
+    retained: AtomicUsize,
 }
 
 /// Running totals off [`StagingPool`], in the order
@@ -123,6 +134,7 @@ impl StagingPool {
             allocated: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
             declined: AtomicUsize::new(0),
+            retained: AtomicUsize::new(0),
         }
     }
 
@@ -143,19 +155,24 @@ impl StagingPool {
         if points == STAGING_POINTS
             && let Ok(mut slot) = self.slot.try_lock()
             && let Some(mut buffer) = slot.take()
+        {
+            // The slot is empty from here whichever arm below runs, including
+            // the mismatch that drops the buffer.
+            self.retained.store(0, Ordering::Relaxed);
             // Belt and braces: `give` already refuses any other capacity, and
             // a buffer that somehow arrived at another one must not be handed
-            // out as if it were mosaic-sized.
-            && buffer.capacity() == STAGING_POINTS
-        {
-            self.reused.fetch_add(1, Ordering::Relaxed);
-            // Both ends, deliberately. `give` clears on the way in, and a
-            // buffer is cleared again on the way out, so the "the decode
-            // starts from empty" invariant does not depend on any one caller
-            // having done the right thing. For an `f32` this is a store to
-            // `len` and nothing else.
-            buffer.clear();
-            return Ok(buffer);
+            // out as if it were mosaic-sized. Falling out of this block drops
+            // it and allocates fresh below, exactly as a contended slot does.
+            if buffer.capacity() == STAGING_POINTS {
+                self.reused.fetch_add(1, Ordering::Relaxed);
+                // Both ends, deliberately. `give` clears on the way in, and a
+                // buffer is cleared again on the way out, so the "the decode
+                // starts from empty" invariant does not depend on any one
+                // caller having done the right thing. For an `f32` this is a
+                // store to `len` and nothing else.
+                buffer.clear();
+                return Ok(buffer);
+            }
         }
         let mut fresh: Vec<f32> = Vec::new();
         fresh.try_reserve_exact(points).map_err(|_| {
@@ -189,6 +206,8 @@ impl StagingPool {
             self.declined.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        self.retained
+            .store(values.capacity() * size_of::<f32>(), Ordering::Relaxed);
         *slot = Some(values);
     }
 
@@ -216,6 +235,19 @@ impl StagingPool {
                 self.declined.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// **What the slot is holding**, in bytes: one mosaic
+    /// ([`super::FRAME_STAGING_BYTES`]) while a buffer is parked, zero while
+    /// it is out with a decode.
+    ///
+    /// A level off the `retained` field, so this is one relaxed load and takes
+    /// no lock — safe to read on the frame thread and safe to read from an
+    /// allocation-error hook. It counts the retained buffer's **capacity**,
+    /// which is what the allocator is holding; the buffer is always empty
+    /// while it is in the slot, so its length would read zero and say nothing.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained.load(Ordering::Relaxed)
     }
 
     pub fn totals(&self) -> StagingTotals {
