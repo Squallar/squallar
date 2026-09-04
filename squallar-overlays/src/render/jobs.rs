@@ -511,6 +511,11 @@ impl JobSpec for GriddedJob {
         for edge in [win.i0, win.i1, win.j0, win.j1] {
             out.extend_from_slice(&(edge as u32).to_le_bytes());
         }
+        // No count: the length is the window's area, already on the wire
+        // as the four edges, and a second statement of it could lie. The
+        // same fact is what makes the reservation below computable before
+        // the first value is written.
+        //
         // **One allocation for the payload, before a byte of it is written.**
         // The values are `win.area()` f32s and nothing else in this row is
         // more than a few dozen bytes, so this is the size of the message.
@@ -519,10 +524,11 @@ impl JobSpec for GriddedJob {
         // starts from `Vec::new()`, and doubling from empty to a multi-MB
         // buffer copies about **133 % of the payload again** across ~23
         // reallocations — every one of them a memcpy on the FRAME THREAD,
-        // because `JobRequest::to_bytes` runs at the dispatch site. Measured
-        // 2026-09-02: `to_bytes` is 99.3 % (Firefox) / 98.7 % (Chromium) of
-        // the overlay job hand-off, and one scene D leg moved 185.6 MB
-        // page->worker.
+        // because `JobRequest::to_bytes` runs at the dispatch site. The
+        // figures below are OBSERVATIONS off browser legs, not derivations,
+        // measured 2026-09-02: `to_bytes` is 99.3 % (Firefox) / 98.7 %
+        // (Chromium) of the overlay job hand-off, and one scene D leg moved
+        // 185.6 MB page->worker.
         //
         // `saturating_mul` because the area is grid-derived: a corrupt or
         // hostile shape must fail the encode's own bounds later, not overflow
