@@ -29,10 +29,10 @@
 //!
 //! # Grids are a staging area; the loop holds textures
 //!
-//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] holds one
-//! to four of them. A thirteen-frame loop is therefore **not** thirteen
-//! granules: a loop frame is a rasterized *texture*, held by the pane, and a
-//! granule is what one frame passes through on its way to becoming one.
+//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] holds all
+//! four channels on every arm. A thirteen-frame loop is therefore **not**
+//! thirteen granules: a loop frame is a rasterized *texture*, held by the pane,
+//! and a granule is what one frame passes through on its way to becoming one.
 //!
 //! So exactly **one granule has to be resident at a time** for the pipeline to
 //! advance — arrive, be described into a job (which takes its own refcount on
@@ -77,25 +77,36 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 /// pool's slot, sized off the same constant, changes with it.
 pub const GLOBAL_GRID_BYTES: usize = crate::gmgsi::GRID_POINTS * std::mem::size_of::<f32>();
 
-/// How many bytes of decoded GMGSI raster may stay resident at once: **one
-/// channel on wasm, two on mobile, four on desktop**.
+/// How many bytes of decoded GMGSI raster may stay resident at once: **all four
+/// channels, on every arm**.
 ///
 /// **A byte budget, not an entry count**, for the reason
-/// [`crate::mrms::GRID_CACHE_BYTES`] states: all four channels resident is
-/// 240 MB, which is not a figure a browser tab has spare beside a `px_coords`
-/// buffer and a texture.
+/// [`crate::mrms::GRID_CACHE_BYTES`] states — and **never below the key
+/// space**, for the reason its `const _` states. The cache is keyed by channel
+/// and holds one grid per *distinct* channel some pane has selected; the pin
+/// set `GmgsiGridCache::insert` is handed is the union of every pane's
+/// selection, and every arm allows at least four panes
+/// (`super::model::MAX_PANES_MOBILE` is 4, `MAX_PANES_DESKTOP` 6, and wasm
+/// takes the desktop cap), so all four channels can be pinned at once and none
+/// of them is ever a victim. The arms that sat below that — one channel on
+/// wasm, two on mobile — did not make a browser tab hold less: below the key
+/// space `insert` runs out of unpinned victims and takes its `break` arm, so
+/// four panes on four channels held 240 MB under a constant that said 60.
+/// Stating the key space moved nothing at that peak; a pane that has switched
+/// channels now keeps the ones it left resident rather than refetching them.
+/// The `const _` below keeps every arm here.
 ///
 /// Spelled as a `cfg` cascade rather than resolved from `squallar-device-profile`
 /// because that crate sits **above** this one in the crate graph
 /// (`ARCHITECTURE.md` §1), so the dependency cannot run back.
 #[cfg(target_arch = "wasm32")]
-pub const GRID_CACHE_BYTES: usize = GLOBAL_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(target_os = "android", target_os = "ios")
 ))]
-pub const GRID_CACHE_BYTES: usize = 2 * GLOBAL_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -108,8 +119,17 @@ pub const GRID_CACHE_BYTES: usize = 4 * GLOBAL_GRID_BYTES;
 // as far as running tests — the arm that would be wrong is the one a *different*
 // target selects, and only the compiler ever sees that.
 //
-// A budget under one grid settles the cache empty: the arrival evicts itself,
-// `prepare_job` answers `None` for ever and every pane draws its last texture.
+// **The key space.** One grid per channel any pane can select, because that is
+// what the cache holds when every channel is on some pane and the pin set — the
+// union of every pane's selection — covers every entry. Below this figure
+// `GmgsiGridCache::insert` does not evict; it runs out of unpinned victims and
+// takes its `break` arm, so the cache overruns the budget silently and the
+// constant under-reports what the heap is carrying. Two arms sat below it —
+// wasm at one channel, mobile at two — for as long as the layer had four.
+const _: () = assert!(GRID_CACHE_BYTES >= GmgsiChannel::all().len() * GLOBAL_GRID_BYTES);
+// At least one grid — implied by the key space, kept as the plainer statement.
+// (Not "or the cache settles empty": the arrival is never its own victim, so a
+// budget under one grid overruns exactly as one under the key space does.)
 const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRID_BYTES);
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
 const _: () = assert!(GLOBAL_GRID_BYTES == 60_000_000);
@@ -377,10 +397,13 @@ impl GmgsiGridCache {
     /// `pinned` is the **union** of every pane's selected channel, not one
     /// pane's: this cache is shared, and evicting what another pane is showing
     /// to make room is the cross-pane collision the pane state exists to
-    /// prevent. Below the budget's capacity a miss costs a **picture** rather
-    /// than a refetch — `prepare_job` answers `None` and the pane goes on
-    /// drawing its last texture with nothing that will re-ask — so the pin is
-    /// what keeps a visible pane drawn when an arrival lands mid-cycle.
+    /// prevent. The pin decides *which* entry goes, never whether the union
+    /// fits: [`GRID_CACHE_BYTES`] is held at or above the key space by the
+    /// `const _` beside it, so every pinned channel has room and only a channel
+    /// no pane is showing is ever a victim. Below the key space this loop would
+    /// not evict a pinned channel either — it runs out of unpinned victims and
+    /// takes the `break` arm, holding more than the budget says — which is why
+    /// that floor is a build failure and not something this loop decides.
     ///
     /// The poll replaces this channel's mosaic here, and the displaced one is
     /// offered to [`staging`] — with `Arc::into_inner` deciding, so a granule

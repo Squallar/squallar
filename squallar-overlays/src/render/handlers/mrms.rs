@@ -302,10 +302,14 @@ impl MrmsGridCache {
     /// `pinned` is the **union** of every pane's selected product, not one
     /// pane's: this cache is shared, and evicting what another pane is showing
     /// to make room is the cross-pane collision the pane state exists to
-    /// prevent. Below the budget's capacity a miss costs a **picture** rather
-    /// than a refetch — `prepare_job` answers `None` and the pane goes on
-    /// drawing its last texture with nothing that will re-ask — so the pin is
-    /// what keeps a visible pane drawn when an arrival lands mid-cycle.
+    /// prevent. The pin decides *which* entry goes, never whether the union
+    /// fits: [`GRID_CACHE_BYTES`] is held at or above the key space by the
+    /// `const _` beside it in `crate::mrms`, so every pinned product has room
+    /// and only a product no pane is showing is ever a victim. Below the key
+    /// space this loop would not evict a pinned product either — it runs out
+    /// of unpinned victims and takes the `break` arm, holding more than the
+    /// budget says — which is why that floor is a build failure and not
+    /// something this loop decides.
     /// The two-minute poll replaces this product's mosaic here, and the
     /// displaced one is offered to [`staging`] — with `Arc::into_inner`
     /// deciding, so a granule another pane's raster job is still reading is

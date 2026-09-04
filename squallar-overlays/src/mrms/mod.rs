@@ -68,7 +68,7 @@ pub enum MrmsProduct {
 }
 
 impl MrmsProduct {
-    pub fn all() -> &'static [MrmsProduct] {
+    pub const fn all() -> &'static [MrmsProduct] {
         &[MrmsProduct::ReflectivityComposite, MrmsProduct::PrecipRate]
     }
 
@@ -218,8 +218,9 @@ pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 /// this figure follows it.
 pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 
-/// How many bytes of decoded MRMS grid may stay resident at once: **one grid on
-/// wasm, two on mobile, four on desktop**.
+/// How many bytes of decoded MRMS grid may stay resident at once: **two grids
+/// on wasm and on mobile, four on desktop** — never fewer than the layer has
+/// products, which the `const _` below holds as a build failure.
 ///
 /// **A byte budget, not an entry count.** At 49 MB apiece, the six-entry shape
 /// the model cache uses would be 294 MB — and at the `f32` width this layer
@@ -228,11 +229,13 @@ pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 ///
 /// **The narrowing is BANKED here, not spent.** Stated as a multiple of
 /// [`CONUS_GRID_BYTES`], this budget halved with the store — desktop went
-/// 392,000,000 B to 196,000,000 B and still holds the same *four* granules.
-/// Leaving the byte figure where it was would have bought eight instead, and
+/// 392,000,000 B to 196,000,000 B and is still stated as the same *four*
+/// grids. Leaving the byte figure where it was would have stated eight, and
 /// that trade is not reversible in practice: a constant can always be raised
-/// again to give a win back, but temporal depth a user has already been given
-/// cannot be taken away without removing something they can see.
+/// again to give a win back, but capacity a user has already been given cannot
+/// be taken away without removing something they can see. (The desktop figure
+/// is headroom over the key space, not granules the cache will hold: it keys
+/// by product and there are two.)
 ///
 /// Spelled as a `cfg` cascade rather than resolved from `squallar-device-profile`
 /// because that crate sits **above** this one in the crate graph
@@ -242,12 +245,20 @@ pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
 /// script and is invisible here. The rule is `is_mobile_target`'s, restated;
 /// the model cache spells `MAX_PANES_DESKTOP` locally on the same reasoning.
 ///
-/// Below the pane count a miss costs a **picture** rather than a refetch —
-/// `prepare_job` answers `None` and the pane goes on drawing its last texture
-/// with nothing that will re-ask — so the cache's pin on every pane's selected
-/// product is what keeps a visible pane drawn regardless.
+/// **Never below the key space.** The cache is keyed by product and holds one
+/// grid per *distinct* product some pane has selected; the pin set
+/// `MrmsGridCache::insert` is handed is the union of every pane's selection,
+/// so with the budget at the key space every entry can be pinned and no pinned
+/// entry is ever a victim. A budget below the key space does not make the
+/// cache hold less: `insert` runs out of unpinned victims and takes its
+/// `break` arm, holding the key space anyway while this constant says
+/// otherwise. That is what the wasm arm did at one grid against two products —
+/// two panes held 98 MB under a figure that said 49. Stating the key space
+/// moved nothing at that peak; a pane that has switched products now keeps the
+/// one it left resident rather than refetching it. The `const _` below is what
+/// keeps every arm here.
 #[cfg(target_arch = "wasm32")]
-pub const GRID_CACHE_BYTES: usize = CONUS_GRID_BYTES;
+pub const GRID_CACHE_BYTES: usize = 2 * CONUS_GRID_BYTES;
 /// See the wasm arm.
 #[cfg(all(
     not(target_arch = "wasm32"),
@@ -265,10 +276,20 @@ pub const GRID_CACHE_BYTES: usize = 4 * CONUS_GRID_BYTES;
 // constant, so a runtime assertion over them is one that cannot fail on a build
 // that got as far as running tests; the arm that would be wrong is one that a
 // *different* target selects, and only the compiler ever sees that. The model
-// cache's `MODEL_GRID_CACHE_ENTRIES >= 2` is spelled the same way.
+// cache's `const _` over `WASM_MODEL_GRID_BUDGET_BYTES / HRRR_CONUS_GRID_BYTES
+// >= MAX_PANES_DESKTOP` is spelled the same way.
 //
-// A budget under one grid settles the cache empty: the arrival evicts itself,
-// `prepare_job` answers `None` for ever and every pane draws its last texture.
+// **The key space.** One grid per product any pane can select, because that is
+// what the cache holds when every product is on some pane and the pin set —
+// the union of every pane's selection — covers every entry. Below this figure
+// `MrmsGridCache::insert` does not evict; it runs out of unpinned victims and
+// takes its `break` arm, so the cache overruns the budget silently and the
+// constant under-reports what the heap is carrying. The wasm arm sat one grid
+// under this for as long as the layer had two products.
+const _: () = assert!(GRID_CACHE_BYTES >= MrmsProduct::all().len() * CONUS_GRID_BYTES);
+// At least one grid — implied by the key space, kept as the plainer statement.
+// (Not "or the cache settles empty": the arrival is never its own victim, so a
+// budget under one grid overruns exactly as one under the key space does.)
 const _: () = assert!(GRID_CACHE_BYTES >= CONUS_GRID_BYTES);
 // And a whole number of grids, which is what the doc above claims.
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));

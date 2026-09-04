@@ -244,10 +244,11 @@ pub const MISSING_CODES: [f32; 2] = [-999.0, -99.0];
 /// One stacked timestep's values, in bytes: 33 × 7000 × 3500 `f32` =
 /// **3 234 000 000**.
 ///
-/// Stated so that nothing has to derive it in a hurry. It is **66× the whole
-/// wasm arm of [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES)**, and it does not
-/// fit in a wasm32 address space at all. Nothing in this module is reachable
-/// from a render path, and this constant is the reason.
+/// Stated so that nothing has to derive it in a hurry. It is **33× the whole
+/// wasm arm of [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES)** — two 49 MB
+/// products, 98 MB — and it does not fit in a wasm32 address space at all.
+/// Nothing in this module is reachable from a render path, and this constant
+/// is the reason.
 ///
 /// **Priced in `f32` and NOT off [`CONUS_GRID_BYTES`](super::CONUS_GRID_BYTES),
 /// which is a `u16` figure.** [`MrmsVolume::values`] really is a `Vec<f32>` —
