@@ -268,7 +268,7 @@ const _: () = assert!(CONUS_STACK_BYTES == 3_234_000_000);
 /// How many level GETs are in flight at once.
 ///
 /// A ceiling on **peak memory**, not on politeness. Every level decode needs a
-/// 98 MB values vector and `super::staging`'s slot holds exactly one, so all
+/// 49 MB values vector and `super::staging`'s slot holds exactly one, so all
 /// but one of the concurrent decodes allocates its own; the stack being filled
 /// is already [`CONUS_STACK_BYTES`], so the peak is
 /// `CONUS_STACK_BYTES + STACK_FETCH_CONCURRENCY × 49 MB` — ~3.4 GB at four,

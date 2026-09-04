@@ -177,7 +177,7 @@ fn the_shipped_budget_admits_a_full_conus_grid() {
 
 // ── The raster carry ────────────────────────────────────────────────────────
 
-/// `prepare_job` hands over an **`Arc` clone**, not a copy: a 98 MB memcpy per
+/// `prepare_job` hands over an **`Arc` clone**, not a copy: a 49 MB memcpy per
 /// described job would be one per pane per gesture-settle.
 #[test]
 fn prepare_job_describes_the_resident_grid_without_copying_it() {
@@ -199,7 +199,7 @@ fn prepare_job_describes_the_resident_grid_without_copying_it() {
     assert!(
         Arc::ptr_eq(carried, &resident.grid),
         "the described job carries a different allocation than the cache holds, \
-         so 98 MB was copied to describe it",
+         so 49 MB was copied to describe it",
     );
 }
 
@@ -644,7 +644,7 @@ fn frame_ctx(k: i64) -> RasterizeContext {
 }
 
 /// The values the job describes, so a raster's identity can be read without
-/// comparing 98 MB by hand.
+/// comparing 49 MB by hand.
 fn job_values(job: &DescribedJob) -> Vec<f32> {
     let input = job
         .downcast_ref::<rasterize::GriddedInput>()
@@ -994,9 +994,9 @@ fn retain_frames_drops_this_products_unkept_granules_and_no_others() {
 /// **The gate serialises, and it releases.** `MrmsHandler::fetch_frame`'s doc
 /// claims the whole render set may be dispatched at once while only one
 /// granule is ever in flight; this is the floor under that claim. The stakes
-/// are higher than GMGSI's: the staging slot holds one 98 MB values vector and
+/// are higher than GMGSI's: the staging slot holds one 49 MB values vector and
 /// every decode that misses it allocates its own, so thirty concurrent fetches
-/// — one slider-default hour — would be ~2.9 GB in flight before any cache saw
+/// — one slider-default hour — would be ~1.5 GB in flight before any cache saw
 /// a byte.
 ///
 /// Two fetch tasks are driven by hand inside one thread — `futures::poll!`
@@ -1186,8 +1186,8 @@ fn two_frame_fetches_share_one_gate_and_the_second_waits_for_the_first() {
             in_flight, 1,
             "the second frame's GET was issued while the first granule was \
              still in flight ({in_flight} request lines recorded). \
-             Unserialised, a thirty-frame render set holds a 98 MB values \
-             vector EACH — the staging slot can serve exactly one — so ~2.9 GB \
+             Unserialised, a thirty-frame render set holds a 49 MB values \
+             vector EACH — the staging slot can serve exactly one — so ~1.5 GB \
              in flight before any cache can evict anything.",
         );
 
@@ -1502,7 +1502,7 @@ fn a_retained_frame_set_offers_the_dropped_granules_to_the_staging_pool() {
 /// the two-minute poll's replacement has a second owner at the moment the
 /// cache hands it back, and `Arc::into_inner` answers `None`. Letting `state`
 /// go first leaves the cache the sole owner. One granule every 120 s is not
-/// what killed the page, but it is 98 MB back to an allocator that can only
+/// what killed the page, but it is 49 MB back to an allocator that can only
 /// grow, on the layer whose block size is the whole problem.
 ///
 /// **Floor — `cache_first`:** restore
@@ -1567,7 +1567,7 @@ fn the_live_mosaic_a_poll_replaces_is_offered_to_the_staging_pool() {
 ///
 /// Against a pool of this test's own, not [`staging::global`]: the shipped slot
 /// is process-wide, so a mosaic another test in this binary left in it would
-/// add 98 MB to the figure asserted here and the failure would name the wrong
+/// add 49 MB to the figure asserted here and the failure would name the wrong
 /// module.
 #[test]
 fn the_registry_sums_what_each_handler_is_holding() {

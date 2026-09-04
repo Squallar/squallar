@@ -14,7 +14,8 @@
 //! wasm32 linear memory only ever **grows**, and the browser build is capped at
 //! 1 GiB (`--max-memory=1073741824`, `.github/scripts/wasm-threads.sh`). A loop
 //! playing over the mosaic put ~147 MB of large-block churn on that heap per
-//! granule — the 98 MB values vector plus grib's 49 MB PNG image buffer,
+//! granule — the values vector, 98 MB at the `f32` width the store then
+//! had, plus grib's 49 MB PNG image buffer,
 //! allocated and freed in an interleaved order — and dlmalloc cannot coalesce
 //! across a live block. Measured 2026-08-31: a pane with the layer on and a
 //! loop playing, nobody touching the page, failed the 98 MB request at ~122 s
@@ -24,8 +25,9 @@
 //! failed for want of a *contiguous* 98 MB, not for want of 98 MB.
 //!
 //! Retaining the block removes the request rather than making room for it. Two
-//! 98 MB blocks end up permanently live in the steady state — the one a cache
-//! holds and the one waiting in the slot — and **neither is ever freed**.
+//! mosaic blocks — 49 MB each at the `u16` store — end up permanently live in
+//! the steady state — the one a cache holds and the one waiting in the slot —
+//! and **neither is ever freed**.
 //!
 //! That left grib's 49 MB PNG image buffer as the only large block still
 //! cycling. It has since stopped cycling too:
@@ -33,7 +35,7 @@
 //! of taking grib's whole-image `vec![0; n]`, so a warm decode's peak is
 //! **0.43 MB, measured**, with no block over 1 MiB in it
 //! (`tests/mrms_decode_image_buffer.rs`). The pool is still the fix for the
-//! 98 MB half; nothing here changes.
+//! values-vector half; nothing here changes.
 //!
 //! Widening the *fallible* reserve across more of the decode was considered and
 //! refused: fallibility converts a hard failure into constant degradation, a
@@ -51,7 +53,7 @@
 //!   [`StagingPool::take`] answers the pooled buffer only when the grid it is
 //!   about to hold has exactly [`STAGING_POINTS`] points, and
 //!   [`StagingPool::give`] accepts one back only at exactly that capacity. A
-//!   "≥" rule would hand a 400-byte test grid a 98 MB block whose `len` no
+//!   "≥" rule would hand a 400-byte test grid a 49 MB block whose `len` no
 //!   longer describes its footprint, which is the figure both byte budgets are
 //!   spent against
 //!   ([`MrmsGrid::resident_bytes`](super::MrmsGrid::resident_bytes));
@@ -139,7 +141,7 @@ pub struct StagingPool {
     /// section rather than read off the slot, because the one caller that
     /// needs it is a frame-thread census and the slot is `try_lock`-only: a
     /// reader that missed the lock would have to report either a stale figure
-    /// or a false zero, and a false zero on a 98 MB block is the exact shape
+    /// or a false zero, and a false zero on a 49 MB block is the exact shape
     /// of mistake the census exists to stop.
     retained: AtomicUsize,
 }
@@ -148,7 +150,7 @@ pub struct StagingPool {
 /// `(allocated, reused, declined)`.
 ///
 /// Always on, like `squallar_egui::overlay_cache::ledger` and `UploadTotals`:
-/// three relaxed counters cost nothing beside a 98 MB decode, and a figure that
+/// three relaxed counters cost nothing beside a 49 MB decode, and a figure that
 /// only exists under a `cfg` is a figure nobody reads when the tab dies in the
 /// field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,7 +310,7 @@ impl Default for StagingPool {
 /// The process-wide staging area — what every shipped decode uses.
 ///
 /// One slot for the whole application, not one per handler or one per thread. A
-/// thread-local would be 98 MB per worker thread on native for a path that runs
+/// thread-local would be 49 MB per worker thread on native for a path that runs
 /// one decode at a time by design, and the live fetch and the loop's frame
 /// fetch are exactly the two callers that must share the one slot the budget
 /// names.

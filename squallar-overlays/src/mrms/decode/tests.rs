@@ -13,7 +13,7 @@
 //! it reported −3 mm/h as a measurement. See
 //! [`MrmsProduct::missing_codes`].
 //!
-//! Each granule is decoded once for the whole file: 98 MB of values apiece, and
+//! Each granule is decoded once for the whole file: 49 MB of values apiece, and
 //! decoding per test would multiply that by the harness's thread count.
 
 use super::*;

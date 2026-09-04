@@ -282,7 +282,7 @@ const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
 ///
 /// Not a per-arm cascade, because the figure is not a guess about the device —
 /// it is what the pipeline needs. A loop frame's storage is its **texture**,
-/// held by the pane; the granule is a 98,000,000 B staging buffer a frame
+/// held by the pane; the granule is a 49,000,000 B staging buffer a frame
 /// passes through on its way to one. A described job takes its own refcount on
 /// the raster, so the slot is free again the moment `prepare_job` has run, and
 /// the handler's frame gate admits one fetch at a time so nothing else can ask
@@ -291,12 +291,13 @@ const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
 /// The gate matters even more here than at GMGSI: **the slot is one grid, and
 /// only one decode can be handed it.** [`staging::StagingPool::take`] answers
 /// the retained buffer to whoever asks first and every other caller allocates
-/// its own 98 MB, so N concurrent frame fetches hold N x 98 MB inside the
+/// its own 49 MB, so N concurrent frame fetches hold N x 49 MB inside the
 /// futures before any cache sees a byte. Thirty unthrottled fetches — one
-/// slider-default hour at the ~2-minute cadence — would be ~2.9 GB in flight.
+/// slider-default hour at the ~2-minute cadence — would be ~1.5 GB in flight.
 /// **And since 2026-08-31 it is one *allocation* as well as one slot.** The
 /// figure named a slot and nothing enforced the rest of what it says: each
-/// granule built a fresh 98 MB vector and freed the last one, so a playing loop
+/// granule built a fresh 98 MB vector (`f32` then) and freed the last one, so a
+/// playing loop
 /// put ~147 MB of large-block churn on a heap that only grows. [`staging`] holds
 /// the buffer between granules and refills it, which is what makes the code
 /// match this constant's claim; the freeze it fixes and why a wider budget
@@ -356,7 +357,7 @@ pub struct MrmsFrameFetch {
 /// One decoded MRMS mosaic.
 ///
 /// The grid itself is behind an `Arc` because that is what `prepare_job` hands
-/// to the raster: describing a job must cost a refcount, never a 98 MB copy.
+/// to the raster: describing a job must cost a refcount, never a 49 MB copy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MrmsGrid {
     pub product: MrmsProduct,

@@ -630,7 +630,7 @@ impl OverlayRegistry {
     /// [`OverlayHandler::resident_source_bytes`] over the handlers.
     ///
     /// The three gridded layers are the whole of it in practice: MRMS at
-    /// 98 MB a mosaic, GMGSI at 60 MB a blend, HRRR at 7.6 MB a grid. Every
+    /// 49 MB a mosaic, GMGSI at 60 MB a blend, HRRR at 7.6 MB a grid. Every
     /// other handler takes the trait's `0` default, which is a claim about
     /// scale rather than an omission — a few hundred parsed alert polygons do
     /// not move a figure read in megabytes.
@@ -642,7 +642,7 @@ impl OverlayRegistry {
     ///
     /// **Cost**: O(registered handlers), and each answer is a field read or a
     /// walk of a cache holding at most a handful of entries — those byte
-    /// budgets are one to four grids of 60-98 MB. No grid contents are
+    /// budgets are one to four grids of 49-60 MB. No grid contents are
     /// touched, so this is safe on the frame thread's telemetry tick.
     pub fn resident_source_bytes(&self) -> u64 {
         self.handlers()

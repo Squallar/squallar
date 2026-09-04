@@ -3,8 +3,8 @@
 //! The *decode* gates live in `tests/mrms_staging.rs`, where a counting global
 //! allocator watches the real shipped path. What is checked here is the half
 //! that decides whether a retained buffer can ever hand a grid the wrong bytes,
-//! and it is checked at the sizes a shipped mosaic uses — 24.5 M `f32` is
-//! 98 MB, so these allocate for real rather than at a toy width.
+//! and it is checked at the sizes a shipped mosaic uses — 24.5 M `u16` is
+//! 49 MB, so these allocate for real rather than at a toy width.
 
 use super::*;
 
@@ -67,8 +67,9 @@ fn a_returned_mosaic_buffer_is_the_next_mosaic_decodes_buffer() {
 ///
 /// The invariant that stops a pooled buffer from being a memory bug in the
 /// other direction: `MrmsGrid::resident_bytes` — the figure both byte budgets
-/// are spent against — is `len * 4`, so a 400-byte grid handed the 98 MB block
-/// would report 400 bytes while holding 98 MB, and the cache would go on
+/// are spent against — is `len * 2` at the stored width, so a 400-byte grid
+/// handed the 49 MB block would report 400 bytes while holding 49 MB, and the
+/// cache would go on
 /// filling until the tab died. Matching capacity *exactly* rather than "≥" is
 /// what forbids it.
 #[test]
@@ -244,7 +245,7 @@ fn mosaic_grid() -> crate::mrms::MrmsGrid {
 /// layer's two caches.
 ///
 /// Both transitions, because only one of them is obvious. A block sitting in
-/// the slot is 98 MB nothing else is naming, and a census that missed it would
+/// the slot is 49 MB nothing else is naming, and a census that missed it would
 /// under-report by a whole mosaic; a block that is *out* is already counted as
 /// the grid it is being decoded into, and counting it here as well would
 /// double it.
@@ -258,7 +259,7 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
         pool.retained_bytes(),
         crate::mrms::FRAME_STAGING_BYTES,
         "the capacity, not the length: the slot's buffer is always empty, so a \
-         level off `len` would read zero over a live 98 MB block",
+         level off `len` would read zero over a live 49 MB block",
     );
 
     let buffer = pool.take(STAGING_POINTS).expect("the slot is full");

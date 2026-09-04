@@ -4,7 +4,7 @@
 //! viewport at encode — with two differences that are the whole content of this
 //! file:
 //!
-//! * **the cache is bounded by bytes, not entries.** One CONUS grid is 98 MB,
+//! * **the cache is bounded by bytes, not entries.** One CONUS grid is 49 MB,
 //!   so `crate::mrms::GRID_CACHE_BYTES` is the budget and the entry count falls
 //!   out of it;
 //! * **the raster input carries no source enum.** `prepare_job` describes a
@@ -37,7 +37,7 @@
 //! # Grids are a staging area; the loop holds textures
 //!
 //! The same design as [`super::gmgsi`], at a heavier weight: one CONUS grid
-//! is 98,000,000 B and the staging slot holds exactly one, so
+//! is 49,000,000 B and the staging slot holds exactly one, so
 //! [`crate::mrms::FRAME_STAGING_BYTES`] stages **one** granule on every arm
 //! and [`MrmsHandler::frame_gate`] serialises the frame fetches. A loop frame
 //! is a rasterized *texture* held by the pane; the granule is what one frame
@@ -50,9 +50,9 @@
 //! retains the block for the next decode: the frame cache's byte-budget
 //! eviction on every arriving loop frame, and the live cache's replacement on
 //! every two-minute poll. Dropping them instead is what made the browser build
-//! take a fresh 98 MB block per granule and fragment its 1 GiB heap until a
-//! 98 MB request could not be served out of a free pool twice its size. That
-//! module carries the measurement.
+//! take a fresh 98 MB block per granule (the `f32` width the store then had)
+//! and fragment its 1 GiB heap until a 98 MB request could not be served out
+//! of a free pool twice its size. That module carries the measurement.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -79,14 +79,15 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 /// **One frame's granule at a time, application-wide** — the same shape as
 /// GMGSI's gate, needed harder here: `dispatch_loop_frame_fetches` has no
 /// throttle of its own, and `crate::mrms::staging`'s slot holds exactly one
-/// 98 MB values vector — every decode that does not get it allocates its own.
+/// 49 MB values vector — every decode that does not get it allocates its own.
 /// Thirty unthrottled fetches — one slider-default hour at the ~2-minute
-/// cadence — would hold ~2.9 GB in flight before any cache saw a byte.
+/// cadence — would hold ~1.5 GB in flight before any cache saw a byte.
 ///
-/// The figure was ~4.4 GB while a decode also held grib's 49 MB PNG image
-/// buffer; `crate::mrms::decode` streams section 7 a row at a time now. The
-/// gate is unaffected — what it bounds is the values vector, which is still
-/// 98 MB and still one per concurrent decode.
+/// The figure was ~2.9 GB at the `f32` width the store shipped with, and
+/// ~4.4 GB while a decode also held grib's 49 MB PNG image buffer beside it;
+/// `crate::mrms::decode` streams section 7 a row at a time now and the store
+/// is `u16`. The gate is unaffected by either — what it bounds is the values
+/// vector, whatever its width, and still one per concurrent decode.
 ///
 /// Serialising costs almost no wall time: the bytes are the bottleneck either
 /// way, and FIFO fairness means granules arrive in render-set order, which is
@@ -119,7 +120,7 @@ struct MrmsFrameCache {
     entries: HashMap<FrameKey, MrmsGrid>,
     recency: RefCell<Vec<FrameKey>>,
     /// Injected for the same reason [`MrmsGridCache::budget`] is: the shipped
-    /// budget is one 98 MB mosaic and no test can afford to overflow it.
+    /// budget is one 49 MB mosaic and no test can afford to overflow it.
     budget: usize,
     /// **Where an evicted granule's buffer goes** — [`staging::global`] on
     /// every shipped path.
@@ -161,7 +162,7 @@ impl MrmsFrameCache {
 
     /// **Nothing is pinned.** A staged granule evicted before its job is
     /// described costs one frame its picture until the next listing; a staged
-    /// granule *kept* past the budget costs 98 MB on an arm that has already
+    /// granule *kept* past the budget costs 49 MB on an arm that has already
     /// said it cannot spare it. The live cache makes the opposite trade
     /// because a pane with no live granule has nothing that will re-ask.
     ///
@@ -169,7 +170,8 @@ impl MrmsFrameCache {
     /// the hot eviction of the whole layer — one per arriving loop frame — and
     /// it is where the retained mosaic buffer comes from: dropping the victim
     /// instead is what made the browser build allocate a fresh 98 MB block per
-    /// granule and fragment its 1 GiB heap to death.
+    /// granule (at the `f32` width of the time) and fragment its 1 GiB heap to
+    /// death.
     fn insert(&mut self, key: FrameKey, grid: MrmsGrid) {
         if let Some(replaced) = self.entries.insert(key, grid) {
             self.touch(key);
@@ -237,7 +239,7 @@ struct MrmsGridCache {
     recency: RefCell<Vec<MrmsProduct>>,
     /// **Injected, not read from the constant.** The shipped handler passes
     /// [`GRID_CACHE_BYTES`]; a test passes a budget it can actually overflow.
-    /// A cache whose only budget was 98 MB × 4 could not have its eviction
+    /// A cache whose only budget was 49 MB × 4 could not have its eviction
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
@@ -409,7 +411,7 @@ impl MrmsHandler {
 
     /// The shipped handler with its staging area sized to `bytes` instead of
     /// [`FRAME_STAGING_BYTES`], for the reason [`MrmsGridCache::budget`] is
-    /// injected: the shipped figure is one 98 MB mosaic, no test can build
+    /// injected: the shipped figure is one 49 MB mosaic, no test can build
     /// one, and an eviction policy that is never overflowed is a policy
     /// nothing has checked.
     #[cfg(test)]
@@ -599,7 +601,7 @@ impl FrameSource for MrmsHandler {
     /// throttle. The throttle is inside the task: it takes the gate before it
     /// touches the network, so the whole render set may be dispatched at once
     /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
-    /// own) while only one 98 MB-peak decode exists at a time.
+    /// own) while only one 49 MB-peak decode exists at a time.
     fn fetch_frame(
         &self,
         ctx: &FetchConfig,
@@ -942,7 +944,7 @@ impl OverlayHandler for MrmsHandler {
                 // twice — by this cache and by `state.data` — so a cache
                 // insert made while `state` still points at it hands back an
                 // `Arc` with a second owner, `Arc::into_inner` answers `None`,
-                // and 98 MB goes back to an allocator that on wasm32 can only
+                // and 49 MB goes back to an allocator that on wasm32 can only
                 // grow. Letting `state` go first leaves the cache as the sole
                 // owner, and the eviction inside `insert` reclaims the buffer
                 // for the next decode. Nothing between these two lines reads
@@ -1013,7 +1015,7 @@ impl OverlayHandler for MrmsHandler {
 
     /// The [`Resident`](rasterize::GriddedInput::Resident) carry: an `Arc` clone
     /// of the resident mosaic, so describing the job costs a refcount and the
-    /// 98 MB never moves. The values memcpy happens only in the web encoder,
+    /// 49 MB never moves. The values memcpy happens only in the web encoder,
     /// which knows the texture's bounds and writes the window's rows alone.
     ///
     /// **A named frame is drawn from that frame's own granule.** `ctx.frame`
@@ -1208,7 +1210,7 @@ impl OverlayHandler for MrmsHandler {
         })
     }
 
-    /// **Three blocks, and one 98 MB mosaic is the unit of all of them**: the
+    /// **Three blocks, and one 49 MB mosaic is the unit of all of them**: the
     /// live cache's decoded products, the staged loop granules, and the buffer
     /// [`staging`] is retaining between decodes.
     ///

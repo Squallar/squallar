@@ -27,7 +27,8 @@
 //! | peak live | 98.4 MB | **0.43 MB** |
 //! | blocks ≥ 1 MiB | 1 (the values vector) | **0** |
 //!
-//! Neither half of the old 147 MB is left. The 98 MB values vector is not
+//! Neither half of the old 147 MB is left. The values vector — 49 MB at the
+//! `u16` store, 98 MB at the `f32` one the row was measured on — is not
 //! *allocated* per granule at all — it comes from [`super::staging`], the one
 //! retained mosaic buffer
 //! [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) has always described, so
@@ -49,7 +50,7 @@
 //! *correct* and would allocate 49 MB again.
 //!
 //! **Never `.collect()` an intermediate** and never grow the buffer from
-//! empty: either puts a second and third 98 MB block beside the first.
+//! empty: either puts a second and third 49 MB block beside the first.
 //!
 //! On the arm that must still allocate — a cold pool, a contended slot, a grid
 //! that is not mosaic-shaped — the reserve is **fallible**, and that is not
@@ -439,12 +440,13 @@ pub fn parse_grib2_raw_in(
         .zip(submessage.prod_def().parameter_number());
 
     // **Pre-sized, streamed, and — since the staging pool — usually not
-    // allocated at all.** `collect()` here would hold a fresh 98 MB result and
+    // allocated at all.** `collect()` here would hold a fresh 49 MB result and
     // the growth copies at once. See this module's header.
     //
     // `super::staging` carries the full reasoning for the retained buffer, and
-    // the short version is that a *fresh* 98 MB block per granule is what
-    // killed the page. wasm32 linear memory only grows; ~147 MB of large-block
+    // the short version is that a *fresh* 98 MB block per granule (the `f32`
+    // width of the time) is what killed the page. wasm32 linear memory only
+    // grows; ~147 MB of large-block
     // churn per granule — this vector, plus the 49 MB PNG image buffer the
     // decode below no longer takes — fragmented a 1 GiB heap until a 98 MB
     // request could not be served contiguously out of a free pool twice its
