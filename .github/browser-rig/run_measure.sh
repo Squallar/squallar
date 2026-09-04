@@ -521,7 +521,22 @@ else
   # NOT ATTEMPTED, which is a different thing from attempted and empty. `-`
   # says so; the analyser falls back to the achieved cadence for a leg that
   # carries no panel reading, and refuses one whose reading came back empty.
-  PANEL_HZ="-"
+  #
+  # **macOS is headed WITHOUT an X display, and still has a panel.** Keying the
+  # panel read off "needs an X display" conflated two different questions and
+  # made every macOS browser leg unquotable: the arm renders on a real 60 Hz
+  # display, the analyser saw no panel reading, and 60 Hz is under the 62 Hz
+  # software-timer ceiling -- so a healthy leg was refused as a lost vblank.
+  # `RIG_PANEL_HZ` could not rescue it either, because the escape lived in the
+  # branch this arm never takes.
+  case "$(uname -s)" in
+    Darwin)
+      PANEL_HZ="$(panel_refresh)"
+      [ -n "$PANEL_HZ" ] || PANEL_HZ="-"
+      echo "measurement arm panel: ${PANEL_HZ}"
+      ;;
+    *) PANEL_HZ="-" ;;
+  esac
 fi
 
 SKIP_BUILD=0
