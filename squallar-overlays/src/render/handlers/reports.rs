@@ -136,6 +136,10 @@ impl OverlayItem for StormReportItem {
 pub(crate) struct StormReportsHandler {
     pub state: OverlayState<Vec<Arc<StormReportItem>>, Assembled>,
     pub enabled: bool,
+    /// The report rows of the current generation, built once per poll and
+    /// shared by every dispatch since — see [`Self::paint_input`].
+    pub(crate) rows_memo:
+        crate::render::signature_memo::BuiltMemo<Arc<Vec<rasterize::ReportPaint>>>,
 }
 
 impl StormReportsHandler {
@@ -143,6 +147,7 @@ impl StormReportsHandler {
         Self {
             state: OverlayState::new(),
             enabled: false,
+            rows_memo: crate::render::signature_memo::BuiltMemo::new(),
         }
     }
 
@@ -151,26 +156,36 @@ impl StormReportsHandler {
     /// magnitude and comments are popup content the raster never draws.
     /// **Row `i` is `state.data[i]`'s report**, the indexing
     /// [`Self::hit_items`] answers.
+    ///
+    /// The rows depend on the generation alone — `as_of` and `zoom` ride
+    /// beside them as scalars and move per dispatch — so they are built once
+    /// per poll behind one `Arc` and every dispatch since shares them.
     fn paint_input(&self, ctx: &RasterizeContext) -> Option<rasterize::ReportsInput> {
         if self.state.data.is_empty() {
             return None;
         }
+        // **Every row travels, even one later than `as_of`** — the as-of
+        // cull is the rasterizer's, because a row's position is its
+        // hit-map id. Filtering here would desynchronize the map from
+        // [`Self::hit_items`], which has no instant to filter by.
+        let reports = self
+            .rows_memo
+            .get_or_build(self.state.data_generation, 0, || {
+                Some(Arc::new(
+                    self.state
+                        .data
+                        .iter()
+                        .map(|i| rasterize::ReportPaint {
+                            kind: i.report.kind,
+                            lat: i.report.lat,
+                            lon: i.report.lon,
+                            valid: i.report.valid,
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            })?;
         Some(rasterize::ReportsInput {
-            // **Every row travels, even one later than `as_of`** — the as-of
-            // cull is the rasterizer's, because a row's position is its
-            // hit-map id. Filtering here would desynchronize the map from
-            // [`Self::hit_items`], which has no instant to filter by.
-            reports: self
-                .state
-                .data
-                .iter()
-                .map(|i| rasterize::ReportPaint {
-                    kind: i.report.kind,
-                    lat: i.report.lat,
-                    lon: i.report.lon,
-                    valid: i.report.valid,
-                })
-                .collect(),
+            reports,
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             device_scale: ctx.device_scale,
@@ -1020,5 +1035,95 @@ mod as_of_tests {
             "a live pane's reports raster gained an as-of dependence it must \
              not have",
         );
+    }
+}
+
+#[cfg(test)]
+mod prepare_memo_tests {
+    use super::*;
+
+    fn report(i: usize) -> StormReport {
+        StormReport {
+            kind: StormReportKind::Wind,
+            time: "1930".into(),
+            valid: Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+                    .unwrap()
+                    .and_hms_opt(19, 30, 0)
+                    .unwrap(),
+            ),
+            magnitude: None,
+            location: format!("SITE {i}"),
+            county: "CLEVELAND".into(),
+            state: "OK".into(),
+            lat: 35.0 + i as f64 * 0.01,
+            lon: -97.0,
+            comments: String::new(),
+        }
+    }
+
+    fn handler_with(n: usize) -> StormReportsHandler {
+        let mut handler = StormReportsHandler::new();
+        handler.state.data = (0..n)
+            .map(|i| {
+                Arc::new(StormReportItem {
+                    report: report(i),
+                    index: i,
+                })
+            })
+            .collect();
+        handler
+    }
+
+    fn ctx(minute: u32) -> RasterizeContext {
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(19, minute, 0)
+            .unwrap();
+        RasterizeContext {
+            is_dark: false,
+            zoom: 7.0,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        }
+    }
+
+    fn rows_of(job: &DescribedJob) -> &Arc<Vec<rasterize::ReportPaint>> {
+        &job.downcast_ref::<rasterize::ReportsInput>()
+            .expect("a reports job")
+            .reports
+    }
+
+    /// **The rows are built once per poll.** A live pane's `as_of` is in
+    /// the input and moves every dispatch; the rows do not, so two
+    /// dispatches a minute apart share one row allocation.
+    #[test]
+    fn dispatches_at_two_instants_share_one_built_row_set() {
+        let handler = handler_with(40);
+        let pane = PaneRef::bare(0);
+        let first = handler.prepare_job(&ctx(0), &pane).unwrap();
+        let later = handler.prepare_job(&ctx(1), &pane).unwrap();
+        assert_ne!(first, later, "as_of is in the input and moved");
+        assert!(
+            Arc::ptr_eq(rows_of(&first), rows_of(&later)),
+            "the report rows must be one shared allocation",
+        );
+        assert_eq!(rows_of(&first).len(), 40);
+        assert_eq!(handler.rows_memo.builds.get(), 1);
+    }
+
+    #[test]
+    fn a_poll_rebuilds_the_rows_once_and_parks_the_old_ones() {
+        let mut handler = handler_with(3);
+        let pane = PaneRef::bare(0);
+        let before = handler.prepare_job(&ctx(0), &pane).unwrap();
+        handler.state.data_generation = handler.state.data_generation.wrapping_add(1);
+        let after = handler.prepare_job(&ctx(0), &pane).unwrap();
+        handler.prepare_job(&ctx(1), &pane);
+        assert!(!Arc::ptr_eq(rows_of(&before), rows_of(&after)));
+        assert_eq!(handler.rows_memo.builds.get(), 2);
+        assert_eq!(handler.rows_memo.take_retired().len(), 1);
     }
 }

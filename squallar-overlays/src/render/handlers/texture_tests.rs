@@ -667,12 +667,12 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     };
     let report = report_fixture();
     let reports_input = rasterize::ReportsInput {
-        reports: vec![rasterize::ReportPaint {
+        reports: std::sync::Arc::new(vec![rasterize::ReportPaint {
             kind: report.kind,
             lat: report.lat,
             lon: report.lon,
             valid: report.valid,
-        }],
+        }]),
         zoom: 7.0,
         is_dark: false,
         device_scale: 1.0,

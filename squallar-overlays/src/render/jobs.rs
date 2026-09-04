@@ -325,7 +325,7 @@ impl JobSpec for ReportsJob {
         // its own — the same rule as GLM's `now`.
         encode_datetime(out, &reports.as_of);
         out.extend_from_slice(&(reports.reports.len() as u32).to_le_bytes());
-        for report in &reports.reports {
+        for report in reports.reports.iter() {
             out.push(StormReportKindWire(report.kind).wire_code());
             out.extend_from_slice(&report.lat.to_le_bytes());
             out.extend_from_slice(&report.lon.to_le_bytes());
@@ -360,7 +360,7 @@ impl JobSpec for ReportsJob {
         }
         Some((
             crate::render::rasterize::ReportsInput {
-                reports,
+                reports: std::sync::Arc::new(reports),
                 zoom,
                 is_dark,
                 device_scale,
@@ -469,7 +469,7 @@ impl JobSpec for MetarJob {
         out.extend_from_slice(&(input.obs.len() as u32).to_le_bytes());
         // **Row order is load-bearing**: a row's position is its hit-map id,
         // so a reorder hands hovers to the wrong stations.
-        for ob in &input.obs {
+        for ob in input.obs.iter() {
             encode_str(out, &ob.station_id);
             out.extend_from_slice(&ob.lat.to_le_bytes());
             out.extend_from_slice(&ob.lon.to_le_bytes());
@@ -602,7 +602,7 @@ impl JobSpec for MetarJob {
         }
         Some((
             crate::render::rasterize::MetarInput {
-                obs,
+                obs: std::sync::Arc::new(obs),
                 zoom,
                 is_dark,
                 device_scale,
@@ -1806,7 +1806,7 @@ mod tests {
     fn a_metar_job_round_trips_every_field_the_picture_reads() {
         use super::*;
         let input = crate::render::rasterize::MetarInput {
-            obs: vec![a_full_station()],
+            obs: std::sync::Arc::new(vec![a_full_station()]),
             zoom: 8.5,
             is_dark: true,
             device_scale: 2.0,
@@ -2420,7 +2420,7 @@ mod tests {
     #[test]
     fn the_reports_row_round_trips_in_order() {
         let job = DescribedJob::new(ReportsInput {
-            reports: vec![
+            reports: std::sync::Arc::new(vec![
                 // Both wire arms of `valid`: dated rows and an undated one.
                 ReportPaint {
                     kind: StormReportKind::Wind,
@@ -2440,7 +2440,7 @@ mod tests {
                     lon: -96.5,
                     valid: Some(ts(1_755_219_600, 0)),
                 },
-            ],
+            ]),
             zoom: 6.0,
             is_dark: false,
             device_scale: 1.0,

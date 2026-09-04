@@ -199,6 +199,10 @@ pub(crate) struct MetarHandler {
     pub state: OverlayState<Vec<Arc<MetarItem>>, Assembled>,
     cached_points: Vec<MapPoint>,
     pub enabled: bool,
+    /// The observation rows of the current generation, built once per poll
+    /// and shared by every dispatch since — see [`Self::prepare_job`].
+    pub(crate) obs_memo:
+        crate::render::signature_memo::BuiltMemo<Arc<Vec<crate::metar::types::MetarOb>>>,
 }
 
 impl MetarHandler {
@@ -207,6 +211,7 @@ impl MetarHandler {
             state: OverlayState::new(),
             cached_points: Vec::new(),
             enabled: false,
+            obs_memo: crate::render::signature_memo::BuiltMemo::new(),
         }
     }
 
@@ -393,12 +398,31 @@ impl OverlayHandler for MetarHandler {
     /// **Row `i` is `state.data[i]`'s station**, the indexing
     /// [`Self::hit_items`] answers — the same contract the storm-reports and
     /// GLM rows keep, and the one `HitMap::from_cells` zips on.
+    ///
+    /// **The rows are built once per poll, not once per dispatch.** An
+    /// observation is three `String`s and a `Vec` of cloud layers, and the
+    /// network is a couple of thousand of them; the zoom-quantised dispatch
+    /// under a wheel gesture asked for that deep clone on every quantum. The
+    /// rows depend on the generation alone, so they sit behind one `Arc` the
+    /// memo hands out, and what is built per dispatch is the four-field
+    /// input around it.
     fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
         if self.state.data.is_empty() {
             return None;
         }
+        let obs = self
+            .obs_memo
+            .get_or_build(self.state.data_generation, 0, || {
+                Some(Arc::new(
+                    self.state
+                        .data
+                        .iter()
+                        .map(|i| i.ob.clone())
+                        .collect::<Vec<_>>(),
+                ))
+            })?;
         Some(DescribedJob::new(crate::render::rasterize::MetarInput {
-            obs: self.state.data.iter().map(|i| i.ob.clone()).collect(),
+            obs,
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             device_scale: ctx.device_scale,
@@ -771,5 +795,111 @@ mod round_tests {
         let line = line.expect("line");
         assert!(!line.starts_with("!"), "nothing failed: {line}");
         assert_eq!(note, None);
+    }
+}
+
+#[cfg(test)]
+mod prepare_memo_tests {
+    use super::*;
+    use crate::metar::types::MetarOb;
+
+    fn station(id: &str) -> MetarOb {
+        MetarOb {
+            station_id: id.into(),
+            name: format!("{id} field"),
+            lat: 35.0,
+            lon: -97.0,
+            elev_m: None,
+            temp_c: Some(21.0),
+            dewp_c: None,
+            wind_dir: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            visibility: None,
+            altimeter_hpa: None,
+            mslp_hpa: None,
+            flight_category: None,
+            raw_ob: format!("{id} 041953Z AUTO"),
+            clouds: Vec::new(),
+            wx_string: None,
+            obs_time: String::new(),
+        }
+    }
+
+    fn handler_with(n: usize) -> MetarHandler {
+        let mut handler = MetarHandler::new();
+        handler.state.data = (0..n)
+            .map(|i| {
+                let ob = station(&format!("K{i:03}"));
+                let text = station_model::StationText::of(&ob);
+                Arc::new(MetarItem { ob, text })
+            })
+            .collect();
+        handler
+    }
+
+    fn ctx(zoom: f64) -> RasterizeContext {
+        let clock = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(19, 0, 0)
+            .unwrap();
+        RasterizeContext {
+            is_dark: false,
+            zoom,
+            device_scale: 1.0,
+            now: clock,
+            as_of: clock,
+            frame: None,
+        }
+    }
+
+    fn obs_of(job: &DescribedJob) -> &Arc<Vec<MetarOb>> {
+        &job.downcast_ref::<crate::render::rasterize::MetarInput>()
+            .expect("a METAR job")
+            .obs
+    }
+
+    /// **The rows are built once per poll.** Two dispatches a zoom quantum
+    /// apart describe two inputs — the zoom differs — that share ONE row
+    /// allocation, and the deep clone of every observation ran once.
+    #[test]
+    fn dispatches_at_two_zooms_share_one_built_row_set() {
+        let handler = handler_with(50);
+        let pane = PaneRef::bare(0);
+        let near = handler.prepare_job(&ctx(7.0), &pane).unwrap();
+        let far = handler.prepare_job(&ctx(7.5), &pane).unwrap();
+        assert_ne!(near, far, "the zoom is in the input and moved");
+        assert!(
+            Arc::ptr_eq(obs_of(&near), obs_of(&far)),
+            "the observation rows must be one shared allocation",
+        );
+        assert_eq!(obs_of(&near).len(), 50);
+        assert_eq!(
+            handler.obs_memo.builds.get(),
+            1,
+            "fifty observations were cloned once, not once per dispatch",
+        );
+    }
+
+    /// A poll moves the generation and the rows rebuild — once — and the old
+    /// rows are parked for the discard seam.
+    #[test]
+    fn a_poll_rebuilds_the_rows_once_and_parks_the_old_ones() {
+        let mut handler = handler_with(3);
+        let pane = PaneRef::bare(0);
+        let before = handler.prepare_job(&ctx(7.0), &pane).unwrap();
+        handler.state.data_generation = handler.state.data_generation.wrapping_add(1);
+        let after = handler.prepare_job(&ctx(7.0), &pane).unwrap();
+        handler.prepare_job(&ctx(7.25), &pane);
+        assert!(!Arc::ptr_eq(obs_of(&before), obs_of(&after)));
+        assert_eq!(handler.obs_memo.builds.get(), 2);
+        assert_eq!(handler.obs_memo.take_retired().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_network_describes_no_job_and_builds_nothing() {
+        let handler = MetarHandler::new();
+        assert!(handler.prepare_job(&ctx(7.0), &PaneRef::bare(0)).is_none());
+        assert_eq!(handler.obs_memo.builds.get(), 0);
     }
 }

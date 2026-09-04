@@ -161,7 +161,7 @@ fn station(lat: f64, lon: f64) -> MetarOb {
 
 fn input(obs: Vec<MetarOb>) -> MetarInput {
     MetarInput {
-        obs,
+        obs: std::sync::Arc::new(obs),
         zoom: 8.0,
         is_dark: false,
         device_scale: 1.0,

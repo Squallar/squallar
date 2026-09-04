@@ -658,7 +658,10 @@ pub struct ReportPaint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportsInput {
-    pub reports: Vec<ReportPaint>,
+    /// Behind an `Arc` so the page can hold one built row set across the
+    /// dispatches whose only moving terms are the scalars below; the wire
+    /// carries the rows, never the sharing.
+    pub reports: Arc<Vec<ReportPaint>>,
     pub zoom: f64,
     pub is_dark: bool,
     pub device_scale: f32,
@@ -675,7 +678,10 @@ squallar_source::impl_job_input!(ReportsInput);
 pub struct MetarInput {
     /// The observations, in the handler's own order — **row `i` is
     /// `hit_items()[i]`**, the same index contract every hit-mapped row keeps.
-    pub obs: Vec<crate::metar::types::MetarOb>,
+    /// Behind an `Arc` so the page can hold one built row set across the
+    /// dispatches whose only moving terms are the scalars below; the wire
+    /// carries the rows, never the sharing.
+    pub obs: Arc<Vec<crate::metar::types::MetarOb>>,
     pub zoom: f64,
     pub is_dark: bool,
     pub device_scale: f32,

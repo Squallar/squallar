@@ -57,9 +57,12 @@ impl SignatureMemo {
 /// every row is a whole paint input held for the generation.
 const JOB_MEMO_ROWS: usize = 4;
 
-/// The last built [`DescribedJob`]s per (data generation, view key), so a
-/// dispatch whose inputs have not moved hands back a refcount clone and
-/// builds nothing.
+/// The last built values per (data generation, view key), so a dispatch
+/// whose inputs have not moved hands back a refcount clone and builds
+/// nothing. `T` is a whole [`DescribedJob`] where every term of the input is
+/// in the key ([`JobMemo`]), or the `Arc`'d row set alone where a scalar
+/// that moves per dispatch — METAR's and the storm reports' `zoom`, the
+/// reports' `as_of` — sits beside it in the input.
 ///
 /// `prepare_job` runs on the frame thread once per surviving request and its
 /// body is O(items) with an allocation per item — a `String` and an `Arc`
@@ -83,20 +86,23 @@ const JOB_MEMO_ROWS: usize = 4;
 /// the rows of the most recent rollover only — an undrained older batch is
 /// dropped when the next one arrives, so the parked footprint is bounded by
 /// one generation's rows.
-pub(crate) struct JobMemo {
+pub(crate) struct BuiltMemo<T> {
     generation: Cell<u64>,
-    /// (view_key, job) rows for the current generation, oldest first.
-    rows: RefCell<Vec<(u64, DescribedJob)>>,
+    /// (view_key, value) rows for the current generation, oldest first.
+    rows: RefCell<Vec<(u64, T)>>,
     /// The rows the last rollover or eviction retired, awaiting
     /// [`Self::take_retired`].
-    retired: RefCell<Vec<DescribedJob>>,
+    retired: RefCell<Vec<T>>,
     /// How many times the build closure ran — the mechanism's count, for the
     /// gate that an unchanged key builds nothing.
     #[cfg(test)]
     pub(crate) builds: Cell<u64>,
 }
 
-impl JobMemo {
+/// A memo over whole described jobs — the common case.
+pub(crate) type JobMemo = BuiltMemo<DescribedJob>;
+
+impl<T: Clone> BuiltMemo<T> {
     pub fn new() -> Self {
         Self {
             generation: Cell::new(0),
@@ -107,7 +113,7 @@ impl JobMemo {
         }
     }
 
-    /// The job for `(generation, view_key)`, running `build` only on the
+    /// The value for `(generation, view_key)`, running `build` only on the
     /// first ask since either moved. A `build` that answers `None` is not
     /// remembered: the layer had nothing to draw, and its next ask is as
     /// cheap as this one was.
@@ -115,28 +121,28 @@ impl JobMemo {
         &self,
         generation: u64,
         view_key: u64,
-        build: impl FnOnce() -> Option<DescribedJob>,
-    ) -> Option<DescribedJob> {
+        build: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
         if self.generation.get() != generation {
             let stale = std::mem::take(&mut *self.rows.borrow_mut());
             if !stale.is_empty() {
-                *self.retired.borrow_mut() = stale.into_iter().map(|(_, job)| job).collect();
+                *self.retired.borrow_mut() = stale.into_iter().map(|(_, value)| value).collect();
             }
             self.generation.set(generation);
         }
-        if let Some((_, job)) = self.rows.borrow().iter().find(|(key, _)| *key == view_key) {
-            return Some(job.clone());
+        if let Some((_, value)) = self.rows.borrow().iter().find(|(key, _)| *key == view_key) {
+            return Some(value.clone());
         }
         #[cfg(test)]
         self.builds.set(self.builds.get() + 1);
-        let job = build()?;
+        let value = build()?;
         let mut rows = self.rows.borrow_mut();
         if rows.len() >= JOB_MEMO_ROWS {
             let (_, evicted) = rows.remove(0);
             self.retired.borrow_mut().push(evicted);
         }
-        rows.push((view_key, job.clone()));
-        Some(job)
+        rows.push((view_key, value.clone()));
+        Some(value)
     }
 
     /// The inputs a rollover or an eviction retired since the last drain —
@@ -154,7 +160,7 @@ impl JobMemo {
             reason = "drained by the app's retired-generation seam, not yet wired"
         )
     )]
-    pub fn take_retired(&self) -> Vec<DescribedJob> {
+    pub fn take_retired(&self) -> Vec<T> {
         std::mem::take(&mut *self.retired.borrow_mut())
     }
 

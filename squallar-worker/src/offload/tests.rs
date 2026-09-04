@@ -510,7 +510,7 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
             side_ceiling_px: 0,
         },
         job: DescribedJob::new(ReportsInput {
-            reports: vec![
+            reports: Arc::new(vec![
                 // Dated an hour before the fixture clock: already happened,
                 // so it draws — and the instant rides the wire (WB-2).
                 ReportPaint {
@@ -548,7 +548,7 @@ pub(super) fn an_overlay_reports_job() -> JobRequest {
                     lon: -97.9,
                     valid: Some(glm_fixture_now() + chrono::Duration::hours(1)),
                 },
-            ],
+            ]),
             zoom: 6.5,
             is_dark: false,
             device_scale: 1.0,
@@ -734,13 +734,13 @@ pub(super) fn an_overlay_metar_job() -> JobRequest {
             side_ceiling_px: 0,
         },
         job: DescribedJob::new(MetarInput {
-            obs: vec![
+            obs: Arc::new(vec![
                 station("KTLX", 35.0, -98.0, 25, FlightCategory::MVFR),
                 station("KOKC", 34.2, -97.2, 10, FlightCategory::VFR),
                 station("KTUL", 36.2, -96.4, 40, FlightCategory::IFR),
                 // Far outside the box: draws nothing, records no cells.
                 station("KSEA", 47.4, -122.3, 5, FlightCategory::LIFR),
-            ],
+            ]),
             zoom: 8.0,
             is_dark: false,
             device_scale: 1.0,
@@ -3172,7 +3172,8 @@ fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
     // The kind byte is a live input through the wire, not a field a broken
     // codec could zero.
     let mut rekinded = reports.clone();
-    rekinded.reports[0].kind = squallar_overlays::spc::reports::StormReportKind::Hail;
+    Arc::make_mut(&mut rekinded.reports)[0].kind =
+        squallar_overlays::spc::reports::StormReportKind::Hail;
     let repainted = overlay_raster_via_wire(&JobRequest {
         geometry,
         job: DescribedJob::new(rekinded),
