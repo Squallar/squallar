@@ -139,6 +139,22 @@ The pinned nightly is not optional: `.github/scripts/wasm-threads.sh` pins
 `nightly-2026-08-15` and installs the *target* and *components* itself, but it
 cannot install the *toolchain*.
 
+### A Firefox leg that dies in ~4 s with rc=0 is the UPDATER, not the rig
+
+`firefox exited rc=0 before Marionette came up`, a 0-byte `D.firefox.firefox.log`,
+`adapter=None viewport=0x0`. The rig launches the user's INSTALLED
+`/Applications/Firefox.app`, and the first launch after Firefox has staged an
+update applies it and re-execs — the launched pid exits 0 and Marionette never
+comes up. Observed 2026-09-04: bundle mtime moved to 12:12, version 155.0 →
+155.0.1 under a 12:45 launch, the leg failed, the retry passed.
+
+Two consequences: **the browser version moves mid-campaign** — read
+`browser_version` off every row rather than trusting what was installed when the
+leg was queued; and **the user's own running Firefox may prompt to restart**,
+because it is still on the old image. Tell them; do not kill it. The rig's
+`-no-remote -profile <throwaway>` means it never touches their profile, and a
+running user Firefox is NOT what blocked the leg — check the bundle mtime first.
+
 ## Getting a tree over
 
 No clone, no git remote — **nothing AI-driven pushes**. Copy a tarball into a
