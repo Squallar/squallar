@@ -1697,7 +1697,10 @@ def subject_composite(value):
 # naming a build stops counting as one.
 SHAPE_DOTTED_VERSION = re.compile(r"\d+\.\d+")
 SHAPE_NONEMPTY_LINE = re.compile(r"\S")
-SHAPE_SHA = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{7,40}(?![0-9a-zA-Z])")
+# The same token the composite check counts. One definition: a rule that
+# decided what a sha LOOKS LIKE twice would eventually decide it twice
+# differently.
+SHAPE_SHA = _SHA_TOKEN
 
 SUBJECT_FIELDS = (
     SubjectField(
