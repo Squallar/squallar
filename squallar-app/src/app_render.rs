@@ -742,6 +742,29 @@ fn frame_ui_lines(u: &crate::frame_ledger::UiHists) -> [String; 9] {
     ]
 }
 
+/// The eight `frame pump (<name>):` lines — the `pump` segment, opened up.
+///
+/// Same denominator as `frame segment (pump)` — presented interact frames —
+/// and a DECOMPOSITION of that one span rather than a ninth segment:
+/// `frame pump (*)` is never added to `frame segment (pump)`.
+///
+/// `frame pump (dispatch)` is **not** `frame post (dispatch)`: this one is the
+/// `Dispatch` pump walk before the paint list is built, that one is
+/// `dispatch_overlay_renders` after the present. Different spans, different
+/// parents, never summed.
+fn frame_pump_lines(p: &crate::frame_ledger::PumpHists) -> [String; 8] {
+    [
+        named_hist_line("frame pump", "begin", &p.begin),
+        named_hist_line("frame pump", "restore", &p.restore),
+        named_hist_line("frame pump", "promote", &p.promote),
+        named_hist_line("frame pump", "raster", &p.raster),
+        named_hist_line("frame pump", "apply", &p.apply),
+        named_hist_line("frame pump", "advance", &p.advance),
+        named_hist_line("frame pump", "dispatch", &p.dispatch),
+        named_hist_line("frame pump", "settle", &p.settle),
+    ]
+}
+
 /// The seven `frame post (<name>):` lines — the `post` segment, opened up.
 ///
 /// Denominator: **exactly `frame segment (post)`'s** — presented interact
@@ -1115,6 +1138,7 @@ impl super::App {
         self.release_hidden_pane_volumes();
 
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+        let pump_began = web_time::Instant::now();
 
         // First use of the context this frame, and it has to be: `begin_frame`
         // above is the moment egui is told this device's real texture limit,
@@ -1122,18 +1146,24 @@ impl super::App {
         if self.restore_pending {
             self.restore_cached_render(&ctx);
         }
+        let pump_restored = web_time::Instant::now();
 
         // Before the pollers, which is before `Gui::ui` builds the paint list: a
         // raster whose last band landed on the previous frame goes on screen in
         // *this* frame's paint list rather than the next one. See the callee.
         self.promote_uploaded_rasters();
+        let pump_promoted = web_time::Instant::now();
         // After the promote, so a picture that reached the screen this frame is
         // in the line this frame writes rather than the next one's.
         self.report_raster_telemetry();
+        let pump_rastered = web_time::Instant::now();
 
         self.run_frame_pump(PumpPhase::Apply, Some(&ctx));
+        let pump_applied = web_time::Instant::now();
         self.run_frame_pump(PumpPhase::Advance, Some(&ctx));
+        let pump_advanced = web_time::Instant::now();
         self.run_frame_pump(PumpPhase::Dispatch, Some(&ctx));
+        let pump_dispatched = web_time::Instant::now();
         let volume_budget = self
             .loop_allocation()
             .volume_reserve_bytes()
@@ -1152,6 +1182,19 @@ impl super::App {
         // can never see half a frame's worth.
         self.push_frame_inputs();
 
+        // Every boundary this call crossed, handed over before `ui_start` is
+        // stamped: the eight cuts telescope to `pump` exactly, and the right
+        // boundary is the mark on the next line. See `frame_ledger::PumpHists`.
+        self.frame_ledger
+            .record_pump_phases(crate::frame_ledger::PumpPhaseStamps {
+                began: pump_began,
+                restored: pump_restored,
+                promoted: pump_promoted,
+                rastered: pump_rastered,
+                applied: pump_applied,
+                advanced: pump_advanced,
+                dispatched: pump_dispatched,
+            });
         // Last, so this frame is laid out over everything applied above.
         self.frame_ledger.mark_ui_start();
         let (gui_action, ui_phases) = self.gui.ui_phased(&ctx);
@@ -1745,6 +1788,12 @@ impl super::App {
         // denominator, six contiguous cuts of that one span — a decomposition
         // of the line above, never a seventh segment beside it.
         for line in frame_ui_lines(ledger.ui_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // The `pump` segment above, opened up at the seams `setup_egui_frame`
+        // has. Same denominator, eight contiguous cuts of that one span — a
+        // decomposition of the line above, never a ninth segment beside it.
+        for line in frame_pump_lines(ledger.pump_phases()) {
             say_telemetry(loud, &line);
         }
         // The `post` segment above, opened up at the seams `handle_redraw`'s

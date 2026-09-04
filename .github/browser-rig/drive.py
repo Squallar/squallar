@@ -3166,6 +3166,24 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // it cannot say WHICH of the six things the tail does was the event.
 var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// `frame segment (pump)` opened up, on `frame post`'s terms exactly: EIGHT
+// contiguous cuts of that ONE span, same denominator (presented interact
+// frames), so their sums telescope to its sum. A DECOMPOSITION, never a
+// ninth segment -- adding `frame pump (*)` to `frame segment (pump)`
+// double-counts the whole of it.
+//
+// `frame pump (dispatch)` is NOT `frame post (dispatch)`. This one is the
+// `Dispatch` pump walk inside `setup_egui_frame`, before the paint list is
+// built; that one is `dispatch_overlay_renders` in `handle_redraw`'s tail,
+// after the present. Different spans under different parents; the family keys
+// are `pump:dispatch` and `post:dispatch` and they are never added.
+//
+// Why this family exists: on the Mac 60 Hz arm, scene D, windowed worst
+// interact frame, app 995eecc0, `pump` read 11,800 us on Firefox against
+// 280 us on Chromium -- a factor of 42 on the same scene, with picture bytes
+// differing by only 2.25x. Read the answer off `sum`, never off a percentile:
+// Hist is four bins per octave.
+var frame_pump_re = /frame pump \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame post (dispatch)` opened up, one level below `frame post` on exactly
 // its terms: six named cuts plus a residual, contiguous within that one span,
 // same denominator, so their sums telescope to it. NEVER added to
@@ -3202,6 +3220,7 @@ var budget_state = null, budget_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
+var frame_pump_all = [];
 var frame_ui_all = [];
 var frame_worst_all = [];
 var begins = [], loops = [];
@@ -3310,6 +3329,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_ui_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                              sum: parseInt(x[3], 10), p50: x[4],
                              p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_pump_re.exec(m);
+  if (x) frame_pump_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                               sum: parseInt(x[3], 10), p50: x[4],
+                               p90: x[5], p99: x[6], hist: x[7] });
   x = frame_post_re.exec(m);
   if (x) frame_post_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                sum: parseInt(x[3], 10), p50: x[4],
@@ -3371,6 +3394,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          frame_ui_all: frame_ui_all,
+         frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
          frame_dispatch_all: frame_dispatch_all,
          frame_worst_all: frame_worst_all,
@@ -3492,6 +3516,7 @@ class FrameLineWatcher:
         for prefix, key in (("frame_segment_all", "segment"),
                             ("frame_prepare_all", "prepare"),
                             ("frame_ui_all", "ui"),
+                            ("frame_pump_all", "pump"),
                             ("frame_post_all", "post"),
                             ("frame_dispatch_all", "dispatch"),
                             ("tile_take_all", "take"),
@@ -3907,7 +3932,7 @@ def _window_stats(watcher, t0, t1, out):
 # arm never produced still has no key, so an absent arm stays an ABSENCE and
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
-                          "ui:", "take:", "phase:")
+                          "ui:", "pump:", "take:", "phase:")
 
 
 def watcher_named_in(gw):

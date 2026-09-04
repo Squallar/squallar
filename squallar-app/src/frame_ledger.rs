@@ -72,6 +72,10 @@ struct Marks {
     /// `PreparedFrame` the pass returned. `None` on a frame that never
     /// finished a pass, which is the same frame that leaves no acquire.
     prepare_phases: Option<squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps>,
+    /// Where `setup_egui_frame` crossed its own phase boundaries, taken by
+    /// that call on its way through. `None` on a frame that early-returned
+    /// before the pass, which is the same frame that leaves no `ui_start`.
+    pump_phases: Option<PumpPhaseStamps>,
     /// Where `Gui::ui` crossed its own phase boundaries, off the stamps it
     /// returned. `None` on a frame that never called it, which is the same
     /// frame that leaves no `ui_start`.
@@ -90,6 +94,86 @@ struct Marks {
     dispatch: Option<DispatchCuts>,
     /// The pass ended without a real present (a skipped or lost surface).
     skipped: bool,
+}
+
+/// Where `setup_egui_frame` crossed the seven boundaries between the eight
+/// things it does before `Gui::ui`. Taken by that call itself — like
+/// [`PostPhaseStamps`] and unlike the `prepare` and `ui` splits, this segment
+/// has no single callee to carry them back.
+#[derive(Clone, Copy)]
+pub(crate) struct PumpPhaseStamps {
+    /// The context clone's return: egui's pass is open, the theme is applied
+    /// and the per-pane vectors are sized.
+    pub(crate) began: Instant,
+    /// `restore_cached_render`'s return, or the instant the `restore_pending`
+    /// test answered no.
+    pub(crate) restored: Instant,
+    /// `promote_uploaded_rasters`' return.
+    pub(crate) promoted: Instant,
+    /// `report_raster_telemetry`'s return.
+    pub(crate) rastered: Instant,
+    /// The `Apply` pump walk's return.
+    pub(crate) applied: Instant,
+    /// The `Advance` pump walk's return.
+    pub(crate) advanced: Instant,
+    /// The `Dispatch` pump walk's return.
+    pub(crate) dispatched: Instant,
+}
+
+/// Where the `pump` segment's time went, cut at the seams `setup_egui_frame`
+/// has.
+///
+/// # Denominator
+///
+/// **Exactly [`SegmentHists::pump`]'s** — presented interact frames — and
+/// that equality is the whole design. The eight are contiguous cuts of the
+/// one span, so they telescope to it (`the_pump_phases_telescope_to_pump`),
+/// which makes the residual arithmetic rather than inference.
+///
+/// **Never added to `frame segment (pump)`.** These are not a seventh segment
+/// beside it; they *are* it, opened up — [`PostHists`]' own relationship to
+/// `frame segment (post)`. The reporting prefix is `frame pump`.
+///
+/// `frame pump (dispatch)` and `frame post (dispatch)` are **different spans
+/// under different parents** and are never added: this one is the `Dispatch`
+/// pump walk before the paint list is built, that one is
+/// `dispatch_overlay_renders` after the present.
+///
+/// # What this split was cut to answer
+///
+/// Measured on the Mac 60 Hz arm, scene D, windowed worst interact frame,
+/// app 995eecc0: `pump` was **11,800 µs on Firefox and 280 µs on Chromium**,
+/// a factor of 42 on the same scene with only a 2.25x difference in picture
+/// bytes. Nothing in the tree could say which of the eight things
+/// `setup_egui_frame` does that was.
+#[derive(Default)]
+pub(crate) struct PumpHists {
+    /// egui's `begin_frame`, the gesture player's event batch, the theme
+    /// apply, `ensure_pane_count`, `release_hidden_pane_volumes` and the
+    /// context clone. Scales with pane count, not with data.
+    pub(crate) begin: Hist,
+    /// `restore_cached_render` — an upload, and one-shot per session. Its own
+    /// cut so a boot-frame cost cannot be read as a steady-state one.
+    pub(crate) restore: Hist,
+    /// `promote_uploaded_rasters`: the band-complete sweep that puts a
+    /// finished raster into this frame's paint list. Scales with pictures.
+    pub(crate) promote: Hist,
+    /// `report_raster_telemetry`: one clock read on all but one frame per
+    /// telemetry period, and on that one frame up to a dozen formatted
+    /// `console.log` calls. Its own cut because a browser console is not a
+    /// free sink and this is the only writer inside the segment.
+    pub(crate) raster: Hist,
+    /// The `Apply` pump walk — every arrival channel drained and applied.
+    pub(crate) apply: Hist,
+    /// The `Advance` pump walk — loop playback.
+    pub(crate) advance: Hist,
+    /// The `Dispatch` pump walk — the refill and the four render
+    /// dispatchers. **Not** `frame post (dispatch)`; see the type doc.
+    pub(crate) dispatch: Hist,
+    /// The tail: the volume-store budget enforcement, `update_loop_readiness`
+    /// and `push_frame_inputs`. Named rather than folded so a `pump` residual
+    /// cannot hide in an unnamed remainder.
+    pub(crate) settle: Hist,
 }
 
 /// Where `handle_redraw`'s tail crossed the five boundaries between the six
@@ -472,6 +556,8 @@ pub(crate) struct FrameLedger {
     prepare: PrepareHists,
     /// See [`UiHists`] — `segments.ui`, opened up, same frames.
     ui: UiHists,
+    /// See [`PumpHists`] — `segments.pump`, opened up, same frames.
+    pump: PumpHists,
     /// See [`PostHists`] — `segments.post`, opened up, same frames.
     post: PostHists,
     /// See [`DispatchHists`] — `post.dispatch`, opened up, same frames.
@@ -649,6 +735,27 @@ fn ui_phase_micros(
     ]
 }
 
+/// The eight contiguous cuts of the `pump` segment, in call order:
+/// `[begin, restore, promote, raster, apply, advance, dispatch, settle]` —
+/// see [`PumpHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `pump`'s own boundaries, so the eight sum to
+/// `micros(setup, ui_start)` exactly. A free function so the telescoping is
+/// testable without a frame.
+fn pump_phase_micros(setup: Instant, phases: &PumpPhaseStamps, ui_start: Instant) -> [u32; 8] {
+    [
+        micros(setup, phases.began),
+        micros(phases.began, phases.restored),
+        micros(phases.restored, phases.promoted),
+        micros(phases.promoted, phases.rastered),
+        micros(phases.rastered, phases.applied),
+        micros(phases.applied, phases.advanced),
+        micros(phases.advanced, phases.dispatched),
+        micros(phases.dispatched, ui_start),
+    ]
+}
+
 /// The seven contiguous cuts of the `post` segment, in call order:
 /// `[handle, dispatch, back, wake, poll, repaint, close]` — see
 /// [`PostHists`], whose fields these are.
@@ -757,6 +864,12 @@ impl FrameLedger {
         self.cur.dispatch = cuts.any().then_some(cuts);
     }
 
+    /// The phase stamps `setup_egui_frame` took on its way through. Recorded
+    /// unconditionally; `finalize` decides whether this frame is a sample.
+    pub(crate) fn record_pump_phases(&mut self, stamps: PumpPhaseStamps) {
+        self.cur.pump_phases = Some(stamps);
+    }
+
     pub(crate) fn record_post_phases(&mut self, stamps: PostPhaseStamps) {
         self.cur.post_phases = Some(stamps);
     }
@@ -830,6 +943,29 @@ impl FrameLedger {
                 self.prepare.upload.record(upload);
                 self.prepare.mirror.record(mirror);
                 self.prepare.buffers.record(buffers);
+            }
+            // The same, for the `pump` segment recorded above — the eight
+            // cuts of `setup_egui_frame`, whose left boundary is the very
+            // `setup` stamp `pump` measures from.
+            if let Some(phases) = m.pump_phases.as_ref() {
+                let [
+                    begin,
+                    restore,
+                    promote,
+                    raster,
+                    apply,
+                    advance,
+                    dispatch,
+                    settle,
+                ] = pump_phase_micros(setup, phases, ui_start);
+                self.pump.begin.record(begin);
+                self.pump.restore.record(restore);
+                self.pump.promote.record(promote);
+                self.pump.raster.record(raster);
+                self.pump.apply.record(apply);
+                self.pump.advance.record(advance);
+                self.pump.dispatch.record(dispatch);
+                self.pump.settle.record(settle);
             }
             // The same, for the `ui` segment recorded above. Independent of
             // the prepare block: a different segment, a different set of
@@ -944,6 +1080,11 @@ impl FrameLedger {
         &self.dispatch
     }
 
+    /// See [`PumpHists`] — `segments.pump`, opened up.
+    pub(crate) fn pump_phases(&self) -> &PumpHists {
+        &self.pump
+    }
+
     pub(crate) fn post_phases(&self) -> &PostHists {
         &self.post
     }
@@ -1001,8 +1142,9 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchCuts, Instant, PostPhaseStamps, WorstFrame, dispatch_cut_micros, latch_worst,
-        micros, post_phase_micros, prepare_phase_micros, service_micros, ui_phase_micros,
+        DispatchCuts, Instant, PostPhaseStamps, PumpPhaseStamps, WorstFrame, dispatch_cut_micros,
+        latch_worst, micros, post_phase_micros, prepare_phase_micros, pump_phase_micros,
+        service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -1194,6 +1336,86 @@ mod tests {
             "a cut is zero on stamps chosen to make all nine non-zero, so it \
              cannot be reading the span it is named for: {cuts:?}",
         );
+    }
+
+    /// A `setup_egui_frame` whose boundaries land at the given microsecond
+    /// offsets from the `setup` stamp, so a test can state its stamps as
+    /// arithmetic. The `pump` sibling of `post_phases_at`.
+    fn pump_phases_at(setup: Instant, offsets: [u64; 7]) -> PumpPhaseStamps {
+        let at = |us: u64| setup + std::time::Duration::from_micros(us);
+        PumpPhaseStamps {
+            began: at(offsets[0]),
+            restored: at(offsets[1]),
+            promoted: at(offsets[2]),
+            rastered: at(offsets[3]),
+            applied: at(offsets[4]),
+            advanced: at(offsets[5]),
+            dispatched: at(offsets[6]),
+        }
+    }
+
+    /// **The eight cuts are a decomposition of `pump`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(setup, ui_start)` — the very span
+    /// [`super::SegmentHists::pump`] records — so "what is in pump" is
+    /// answered by subtraction rather than by inference. The sibling of
+    /// `the_post_phases_telescope_to_post`, and the reason this split exists:
+    /// `pump` was 11.8 ms on Firefox against 280 us on Chromium and nothing
+    /// could say which of the eight it was.
+    #[test]
+    fn the_pump_phases_telescope_to_pump() {
+        let setup = Instant::now();
+        let phases = pump_phases_at(setup, [120, 130, 4_130, 9_130, 11_130, 11_180, 11_600]);
+        let ui_start = setup + std::time::Duration::from_micros(11_700);
+
+        let cuts = pump_phase_micros(setup, &phases, ui_start);
+        assert_eq!(
+            cuts,
+            [120, 10, 4_000, 5_000, 2_000, 50, 420, 100],
+            "a cut moved: the eight no longer bracket the boundaries they are \
+             named for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(setup, ui_start),
+            "the eight cuts do not sum to the pump span they decompose, so a \
+             reading off this split is not a reading of pump",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 11_700);
+    }
+
+    /// **The non-vacuity floor: a cut may not trivially cover `pump`.**
+    ///
+    /// `every_post_stamp_is_load_bearing_in_two_cuts`' sibling, and needed for
+    /// the same reason: six of the eight cuts are near-zero on a healthy leg,
+    /// so a split whose stamps had been folded together would look exactly
+    /// like the reading everyone expects and would pass the telescoping test.
+    #[test]
+    fn every_pump_stamp_is_load_bearing_in_two_cuts() {
+        let setup = Instant::now();
+        let base_offsets = [500u64, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500];
+        let ui_start = setup + std::time::Duration::from_micros(4_000);
+        let base = pump_phase_micros(setup, &pump_phases_at(setup, base_offsets), ui_start);
+
+        for moved in 0..7 {
+            let mut offsets = base_offsets;
+            offsets[moved] += 100;
+            let cuts = pump_phase_micros(setup, &pump_phases_at(setup, offsets), ui_start);
+            let changed: Vec<usize> = (0..8).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![moved, moved + 1],
+                "moving stamp {moved} did not move exactly the two cuts it \
+                 bounds, so a boundary is folded away and the split reports \
+                 fewer spans than it names",
+            );
+            assert_eq!(
+                cuts.iter().sum::<u32>(),
+                base.iter().sum::<u32>(),
+                "moving stamp {moved} changed the total, so the eight no \
+                 longer telescope to pump",
+            );
+        }
     }
 
     /// A `handle_redraw` tail whose boundaries land at the given microsecond

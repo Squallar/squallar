@@ -798,6 +798,7 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
         ("frame prepare", "prepare"),
         ("frame ui", "ui"),
         ("frame post", "post"),
+        ("frame pump", "pump"),
         ("frame dispatch", "dispatch"),
     ] {
         let re = family.replace(' ', "_") + "_re";
@@ -909,6 +910,7 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         ("post", &["frame_post_re"]),
         ("prep", &["prep_costs_re", "prep_geometry_re"]),
         ("prepare", &["frame_prepare_re"]),
+        ("pump", &["frame_pump_re"]),
         ("segment", &["frame_segment_re"]),
         ("segments", &["segments_re"]),
         ("service", &["svc_interact_re", "svc_idle_re"]),
@@ -952,6 +954,141 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         families.len(),
         carried_by.len(),
         "the table names families the app no longer writes: {families:?}",
+    );
+}
+
+/// The `frame pump (…)` sentence, pinned as a literal.
+///
+/// Same formatter as `frame segment (…)` and deliberately a **different
+/// prefix**: the eight are cuts of the `pump` segment, and a reader who could
+/// mistake one for a ninth segment would add it to the very span it
+/// decomposes.
+#[test]
+fn the_frame_pump_line_reads_exactly_as_pinned() {
+    let mut h = Hist::new();
+    for _ in 0..3 {
+        h.record(100);
+    }
+    let mut slots = [0u32; 42];
+    slots[3] = 3;
+    let expected_hist = slots.map(|c| c.to_string()).join(",");
+    assert_eq!(
+        super::named_hist_line("frame pump", "apply", &h),
+        format!(
+            "frame pump (apply): n=3, sum=300 us, p50=106 us, \
+             p90=106 us, p99=106 us, hist={expected_hist}"
+        ),
+    );
+}
+
+/// All eight pump cuts are emitted, under their own names, every tick — and
+/// each carries its own histogram.
+///
+/// The `n` conjunct is what stops a mis-wired call from reading green, and it
+/// matters here for `post`'s reason exactly: most of the eight are near-zero
+/// on a healthy leg, so a `settle` line carrying `apply`'s histogram would
+/// look like the reading everyone expects.
+#[test]
+fn every_pump_phase_is_reported_under_its_own_name() {
+    let mut phases = crate::frame_ledger::PumpHists::default();
+    // A different sample count per cut, so a swapped pair cannot pass.
+    for (slot, hist) in [
+        &mut phases.begin,
+        &mut phases.restore,
+        &mut phases.promote,
+        &mut phases.raster,
+        &mut phases.apply,
+        &mut phases.advance,
+        &mut phases.dispatch,
+        &mut phases.settle,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for _ in 0..=slot {
+            hist.record(1_000);
+        }
+    }
+    let lines = super::frame_pump_lines(&phases);
+    let names = [
+        "begin", "restore", "promote", "raster", "apply", "advance", "dispatch", "settle",
+    ];
+    assert_eq!(lines.len(), names.len());
+    for (slot, (line, name)) in lines.iter().zip(names).enumerate() {
+        assert!(
+            line.starts_with(&format!("frame pump ({name}): n={}, ", slot + 1)),
+            "pump cut {slot} reported as {line:?}, which is not {name}'s line \
+             carrying {name}'s histogram",
+        );
+    }
+}
+
+/// **The pump cuts do not collide with the segment lines the rig already
+/// reads**, and `frame pump (dispatch)` does not collide with
+/// `frame post (dispatch)`.
+///
+/// The second conjunct is the sharp one: two different spans under two
+/// different parents share the cut name `dispatch`, and the only thing
+/// keeping them apart in the rig's family map is the prefix. A shared prefix
+/// would file the `Dispatch` pump walk and `dispatch_overlay_renders` under
+/// one key and let a reader sum them.
+#[test]
+fn the_pump_cuts_are_not_readable_as_frame_segments_or_post_cuts() {
+    let phases = crate::frame_ledger::PumpHists::default();
+    let segments = crate::frame_ledger::SegmentHists::default();
+    let pump_lines = super::frame_pump_lines(&phases);
+    let segment_lines = super::frame_segment_lines(&segments);
+
+    for line in &pump_lines {
+        assert!(
+            !line.starts_with("frame segment ("),
+            "a pump cut is written as a frame segment ({line:?}); the rig \
+             would file it beside the six that telescope to service",
+        );
+        assert!(
+            !line.starts_with("frame post ("),
+            "a pump cut is written as a post cut ({line:?}); `dispatch` is a \
+             name both splits use and they are different spans",
+        );
+    }
+    assert!(
+        pump_lines
+            .iter()
+            .any(|line| line.starts_with("frame pump (dispatch): ")),
+        "the pump walk's own dispatch cut is no longer written",
+    );
+    assert!(
+        super::frame_post_lines(&crate::frame_ledger::PostHists::default())
+            .iter()
+            .any(|line| line.starts_with("frame post (dispatch): ")),
+        "the tail's dispatch cut is no longer written, so the collision this \
+         test guards can no longer be checked",
+    );
+    assert!(
+        segment_lines
+            .iter()
+            .any(|line| line.starts_with("frame segment (pump): ")),
+        "the segment line these cuts decompose is no longer written, so \
+         nothing carries the total they sum to",
+    );
+}
+
+/// The rig's `frame pump` probe reads what the app writes, character for
+/// character — the same both-ends pin the post, segment, prepare and tile
+/// lines carry.
+#[test]
+fn the_rig_reads_the_pump_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame pump", "apply", &h),
+        rendered(
+            &pattern("frame_pump_re"),
+            &["apply", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame pump (…)` line and the rig's probe have drifted",
     );
 }
 
