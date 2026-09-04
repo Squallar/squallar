@@ -2511,11 +2511,37 @@ fn the_loop_caches_evictions_are_handed_over_and_the_sweep_is_called() {
          that never completes then exempts its site for the life of the tab, \
          and the leak resumes at full rate: {body}"
     );
-    // The queues are swept by the same predicate as the cache.
+    // The frame plan is swept by the loop's own frame list, and the decoded
+    // volumes by a predicate DERIVED from it rather than a second rule.
+    //
+    // These were one predicate until conditional retention landed. They are
+    // deliberately two now: the plan must keep every frame the user's span
+    // asked for (a loop is never shortened and never thinned), while the
+    // decoded volumes of a site no Level II loop reads are dead weight and go.
+    // What must not come back is a *third*, independent rule — `keep_scan` is
+    // written in terms of `keep`, so the volumes kept are always a subset of
+    // the frames planned and a re-plan can never queue a download for a
+    // volume this sweep would evict on sight.
     assert!(
-        body.contains("retain_plan_frames(keep)") && body.contains("retain_scans(keep)"),
-        "the frame plan and the cache are no longer swept by one predicate, so \
-         a re-plan can queue a download for a volume the sweep evicts: {body}"
+        body.contains("retain_plan_frames(keep)") && body.contains("retain_scans(keep_scan)"),
+        "the frame plan and the cache are no longer swept by the predicate and \
+         its own narrowing, so a re-plan can queue a download for a volume the \
+         sweep evicts: {body}"
+    );
+    assert!(
+        body.contains("let keep_scan =") && body.contains("keep(site, ts)"),
+        "the decoded volumes' predicate stopped being a narrowing OF `keep` \
+         and became a rule of its own, free to keep a volume no frame names or \
+         to drop one a playing frame does: {body}"
+    );
+    // Named rather than described: the peer's loop admission door and the
+    // table it publishes read this same function, and a second copy of the
+    // rule here is exactly the drift that costs a user a black frame.
+    assert!(
+        body.contains("site_needs_decoded_source"),
+        "conditional retention no longer asks the shared predicate, so this \
+         sweep and the loop admission door can now disagree about whether a \
+         site's decoded volumes are needed: {body}"
     );
     // And the Level III cache, by the same predicate object rather than a second rule free
     // to disagree with the first.

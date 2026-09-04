@@ -6429,7 +6429,12 @@ fn broadcast_sweep(
 }
 
 /// The product a loop's frames are keyed to, or `None` before the first dispatch.
-fn loop_product(
+///
+/// `pub(super)` for `App::evict_unneeded_loop_scans`, which asks
+/// `squallar_radar::loop_downloads::site_needs_decoded_source` what a site's
+/// running loops render and must read the product through the same accessor
+/// the dispatch path does.
+pub(super) fn loop_product(
     ls: &squallar_egui::pane::LayerTimeState,
 ) -> Option<squallar_radar::types::RadarProduct> {
     ls.rendered_for

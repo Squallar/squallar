@@ -47,6 +47,41 @@ pub struct LoopRenderContext {
     pub rpg_storm_motion: Option<(f32, f32)>,
 }
 
+/// **Whether `site`'s decoded Level II volumes are still needed by anything
+/// that loops** — the one predicate both retention and loop admission ask.
+///
+/// `live_loops` names every loop running right now as `(site, product)`, with
+/// `None` for a loop that has not dispatched yet and so has not said what it
+/// renders.
+///
+/// A loop's frames come from one of two sources, and
+/// [`LoopDownloadManager::plan_downloads_for`] already decides which by asking
+/// [`RadarProduct::level3_products`]: a product naming AWIPS codes queues
+/// Level III pairings and downloads no volume at all, and a product naming
+/// none downloads the Level II volume every one of its frames is derived
+/// from. This asks that same question of a whole site, so retention cannot
+/// disagree with the download planner about what a site's volumes are for.
+///
+/// One loop is enough: two panes share one site's cache, so a Level II loop
+/// on `site` keeps its volumes however many Level III loops sit beside it.
+///
+/// **`true` for a site whose loop has not said what it renders.** A loop that
+/// has not dispatched cannot be shown to need nothing, and the safe direction
+/// is the one that holds bytes rather than the one that costs a re-download.
+///
+/// **This is the peer-facing handle.** The loop admission door prices a loop
+/// on exactly this distinction — full decoded frames where this answers
+/// `true`, textures plus whatever single volume a pane is parked at where it
+/// answers `false` — and the table it publishes reads this function rather
+/// than a second copy of the rule that would be free to drift from it.
+///
+/// O(`live_loops`), which holds one entry per pane with a running loop.
+pub fn site_needs_decoded_source(site: &str, live_loops: &[(&str, Option<RadarProduct>)]) -> bool {
+    live_loops.iter().any(|&(loop_site, product)| {
+        loop_site == site && product.is_none_or(|p| p.level3_products().is_none())
+    })
+}
+
 /// One downloaded volume as the loop caches it: the sweeps, and what their cuts
 /// declared their Nyquist velocities to be.
 pub type CachedVolume = (
@@ -1540,6 +1575,57 @@ mod tests {
             mgr.available_slots(4),
             3,
             "the concurrency cap moved, so it no longer counts what is running",
+        );
+    }
+
+    /// **`site_needs_decoded_source` answers for the site it was asked
+    /// about, and for the product each loop on it renders.**
+    ///
+    /// Every arm matters to a caller: the Level II arm is what keeps a
+    /// playing loop's volumes, the Level III arm is the whole saving, the
+    /// undispatched arm is the safe direction, and the "another site's loop"
+    /// arm is what stops one site's Level II loop from paying for every other
+    /// site in the cache.
+    #[test]
+    fn a_site_needs_its_decoded_source_only_where_a_level_ii_loop_reads_it() {
+        use crate::types::RadarProduct;
+
+        // A Level II product: its frames are derived from the decoded volume.
+        assert!(
+            site_needs_decoded_source("KTLX", &[("KTLX", Some(RadarProduct::Reflectivity))]),
+            "a playing Level II loop stopped keeping its own volumes, which              re-downloads the whole window on every sweep",
+        );
+        // A Level III product: the frames are objects, and the volumes are
+        // dead weight — 47.99 MiB of it per frame, measured.
+        assert!(
+            !site_needs_decoded_source("KTLX", &[("KTLX", Some(RadarProduct::PrecipitationRate))]),
+            "a Level III loop still claims the decoded volumes nothing on this              site derives from",
+        );
+        // Not yet dispatched: nothing has said what it renders.
+        assert!(
+            site_needs_decoded_source("KTLX", &[("KTLX", None)]),
+            "a loop before its first dispatch was read as needing nothing, so              its window is evicted one frame before it is asked for",
+        );
+        // Another site's Level II loop says nothing about this one.
+        assert!(
+            !site_needs_decoded_source("KTLX", &[("KOUN", Some(RadarProduct::Reflectivity))]),
+            "one site's Level II loop kept a different site's volumes",
+        );
+        // Two loops on one site share one cache: the Level II one wins.
+        assert!(
+            site_needs_decoded_source(
+                "KTLX",
+                &[
+                    ("KTLX", Some(RadarProduct::PrecipitationRate)),
+                    ("KTLX", Some(RadarProduct::Velocity)),
+                ]
+            ),
+            "a second pane's Level II loop on the same site lost its volumes to              the first pane's Level III one; the cache is shared, so this is a              black frame on a playing loop",
+        );
+        // No loop at all: nothing that loops needs it.
+        assert!(
+            !site_needs_decoded_source("KTLX", &[]),
+            "a site with no loop running claimed its volumes anyway",
         );
     }
 }

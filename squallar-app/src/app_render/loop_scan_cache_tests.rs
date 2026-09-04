@@ -745,3 +745,300 @@ fn the_eviction_keep_set_is_keyed_off_radars_timeline_not_the_transports() {
          re-downloads on every pass",
     );
 }
+
+// ----------------------------------------------------------------------
+// Conditional retention: a frame's decoded volume is dead weight where no
+// loop on its site derives anything from it.
+// ----------------------------------------------------------------------
+
+/// A decoded volume that actually carries gates, so it prices at something.
+///
+/// The shared [`volume`] fixture declares no sweeps, and a volume of no
+/// sweeps correctly prices at zero — which is exactly the value a byte
+/// assertion could not tell from a broken total. Eight radials of 400 gates
+/// is the same shape `loop_downloads`' own byte suite uses.
+///
+/// The scan alone, not the cache's pair: naming that alias here would raise a
+/// coupling ceiling (`arch_ratchets::the_loop_frame_arms_stay_radars_own_vocabulary`),
+/// and the declarations half is `Default::default()` at every call anyway.
+fn priced_scan() -> Arc<nexrad_model::data::Scan> {
+    use nexrad_model::data::{
+        MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+    };
+
+    let radials = (0..8)
+        .map(|i| {
+            Radial::new(
+                1_700_000_000_000,
+                i,
+                f32::from(i),
+                0.5,
+                RadialStatus::IntermediateRadialData,
+                1,
+                0.5,
+                Some(MomentData::from_fixed_point(
+                    400,
+                    2125,
+                    250,
+                    8,
+                    2.0,
+                    66.0,
+                    vec![3u8; 400],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    Arc::new(Scan::new(
+        VolumeCoveragePattern::new(
+            212,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            Vec::new(),
+        ),
+        vec![Sweep::new(1, radials)],
+    ))
+}
+
+/// Say what this pane's loop renders, which is what `loop_product` reads and
+/// therefore what `site_needs_decoded_source` is asked about.
+fn set_loop_product(app: &mut crate::app::App, field: &squallar_source::product::FieldId) {
+    let target = test_keys::key(SITE, field, 0.5);
+    app.gui
+        .pane_mut(0)
+        .expect("a fresh Gui has one pane")
+        .time_state_mut(&known::RADAR)
+        .rendered_for = Some(target);
+}
+
+/// **The other in-application holders of a decoded `Arc<Scan>`**, summed the
+/// way `App::publish_heap_census` publishes them, so this figure and the
+/// census families agree by construction.
+///
+/// The census's radar families OVERLAP: the loop download cache, the still
+/// inventory and the stored loop frames' hover sources hold `Arc`s of the same
+/// `Scan`s, and each reports what it alone would free. So a loop-cache figure
+/// that falls proves nothing on its own — the bytes may simply have changed
+/// family. This is the other side of that sum, and the assertions below pin it
+/// at zero on both sides of the sweep.
+fn other_decoded_volume_holders(app: &crate::app::App) -> u64 {
+    app.volumes.resident_scan_bytes() as u64 + app.loop_frames.pinned_volume_bytes()
+}
+
+/// File `MINUTES`' volumes into the loop cache and hand back a clone of each
+/// scan, so the caller can prove who else is holding it.
+fn fill_priced_volumes(
+    app: &mut crate::app::App,
+    minutes: &[u32],
+) -> Vec<Arc<nexrad_model::data::Scan>> {
+    minutes
+        .iter()
+        .map(|&minute| {
+            let scan = priced_scan();
+            app.loop_mgr
+                .cache_scan(SITE, at(minute), (Arc::clone(&scan), Default::default()));
+            scan
+        })
+        .collect()
+}
+
+const LOOPED: [u32; 6] = [0, 4, 8, 12, 16, 20];
+
+/// **A loop whose product reads Level III objects drops the decoded Level II
+/// volumes nothing on its site derives from.**
+///
+/// This is the largest single family in the heap census — ~150-200 MB in the
+/// browser legs, ~650-700 MiB at desktop rungs, a measured 47.99 MiB median
+/// per volume over a corpus of 108 real archive volumes. A pane that retargets
+/// from Reflectivity to a Level III product keeps its frame list, and until
+/// this sweep asked `site_needs_decoded_source` it kept every one of those
+/// frames' decoded volumes too: `plan_downloads_for` had already stopped
+/// downloading them, but nothing ever dropped the ones already held.
+///
+/// **The frame set is untouched.** Loop lookback and frame density are both
+/// tier 1: this buys fewer bytes per frame, never fewer frames.
+///
+/// **And the bytes are freed, not moved.** The census's decoded-volume
+/// families overlap by design, so a falling loop-cache figure is consistent
+/// with the same `Arc`s simply being held somewhere else. The strong-count
+/// precondition is what rules that out: at 2, the only holders are this test
+/// and the loop cache, so the cache letting go is the last reference in the
+/// application going.
+#[test]
+fn a_level3_loop_drops_the_decoded_volumes_nothing_derives_from() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &LOOPED);
+    set_loop_product(&mut app, &squallar_radar::fields::known::PRECIPITATION_RATE);
+    let held = fill_priced_volumes(&mut app, &LOOPED);
+
+    let before = app.loop_mgr.cached_scan_bytes();
+    let one = before / LOOPED.len();
+    assert!(
+        one > 0 && before == one * LOOPED.len(),
+        "precondition: every frame's volume priced at something and the total \
+         is their sum — a fixture that prices at zero makes every assertion \
+         below vacuous ({before} bytes over {} volumes)",
+        LOOPED.len(),
+    );
+    for scan in &held {
+        assert_eq!(
+            Arc::strong_count(scan),
+            2,
+            "precondition: something other than this test and the loop cache \
+             is holding this volume, so dropping the cache entry would move \
+             the bytes between census families instead of freeing them",
+        );
+    }
+    assert_eq!(
+        other_decoded_volume_holders(&app),
+        0,
+        "precondition: the still inventory or a stored loop frame is already \
+         holding decoded volumes, so the sum below cannot separate a free from \
+         a transfer",
+    );
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_scan_bytes(),
+        0,
+        "a Level III loop is still holding {before} bytes of decoded Level II \
+         volumes its frames derive nothing from — at the measured 47.99 MiB \
+         median that is 672 MiB over a 14-frame loop, held for a retarget that \
+         may never come",
+    );
+    assert_eq!(
+        other_decoded_volume_holders(&app),
+        0,
+        "the decoded volumes left the loop cache and landed in another census \
+         family, so the census reads better and the heap has not moved",
+    );
+    assert_eq!(
+        frames(&app).len(),
+        LOOPED.len(),
+        "the sweep shortened the loop. Lookback and frame density are tier 1: \
+         this pass buys fewer BYTES per frame, never fewer frames",
+    );
+    assert_eq!(
+        app.loop_mgr.plan_frame_count(0),
+        0,
+        "sanity: this fixture never set a plan, so nothing here can claim the \
+         plan was pruned",
+    );
+}
+
+/// **The opposite direction: a site a Level II loop is playing keeps every
+/// frame's volume.**
+///
+/// The failure this guards is the expensive one. Over-firing costs a
+/// re-download and re-decode of the whole window on every sweep — a black
+/// loop that never finishes settling — where under-firing costs only the
+/// bytes this pass exists to save. A gate verified on the dropping arm alone
+/// would not see it.
+#[test]
+fn a_level2_loop_keeps_every_frames_decoded_volume() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &LOOPED);
+    set_loop_product(&mut app, &squallar_radar::fields::known::REFLECTIVITY);
+    fill_priced_volumes(&mut app, &LOOPED);
+
+    let before = app.loop_mgr.cached_scan_bytes();
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_scan_bytes(),
+        before,
+        "a playing Level II loop lost bytes to the conditional retention it is \
+         explicitly exempt from",
+    );
+    for minute in LOOPED {
+        assert!(
+            app.loop_mgr.get_cached(SITE, &at(minute)).is_some(),
+            "minute {minute}: the volume a playing Level II frame renders from \
+             was dropped, so every pass re-downloads and re-decodes it",
+        );
+    }
+}
+
+/// **A loop that has not dispatched yet keeps its window.**
+///
+/// `loop_product` answers `None` before the first dispatch, and a loop that
+/// has not said what it renders cannot be shown to need nothing. The safe
+/// direction is the one that holds bytes.
+#[test]
+fn a_loop_that_has_not_said_what_it_renders_keeps_its_volumes() {
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &LOOPED);
+    fill_priced_volumes(&mut app, &LOOPED);
+    assert!(
+        app.gui
+            .pane(0)
+            .expect("a fresh Gui has one pane")
+            .time_state(&known::RADAR)
+            .rendered_for
+            .is_none(),
+        "precondition: nothing has dispatched, so the product is unknown",
+    );
+
+    let before = app.loop_mgr.cached_scan_bytes();
+
+    app.evict_unshown_scans();
+
+    assert_eq!(
+        app.loop_mgr.cached_scan_bytes(),
+        before,
+        "a loop before its first dispatch was read as deriving nothing, so its \
+         window is evicted one frame before it is asked for",
+    );
+}
+
+/// **The one volume a pane is parked at survives on a site nothing loops
+/// from** — the peer's "textures plus one scan" rung, kept rather than
+/// swept with the rest.
+#[test]
+fn a_level3_loop_keeps_the_one_volume_its_pane_is_parked_at() {
+    const PARKED: u32 = 8;
+
+    let mut app = app_on_site();
+    begin_loop(&mut app, 3600);
+    install_listing(&mut app, &LOOPED);
+    set_loop_product(&mut app, &squallar_radar::fields::known::PRECIPITATION_RATE);
+    fill_priced_volumes(&mut app, &LOOPED);
+    let info = squallar_radar::types::ScanInfo::from_scan(&empty_scan(), SITE, at(PARKED), None);
+    app.gui
+        .apply(squallar_egui::shell_api::GuiEvent::ScanInfoForPane { pane_idx: 0, info });
+
+    app.evict_unshown_scans();
+
+    assert!(
+        app.loop_mgr.get_cached(SITE, &at(PARKED)).is_some(),
+        "the volume this pane is actually parked at was swept out from under \
+         it; a 3D pane served by `prepare_volume`'s loop-cache arm then answers \
+         `Waiting` for the rest of the session",
+    );
+    assert_eq!(
+        app.loop_mgr.cached_scan_count(SITE),
+        1,
+        "the parked entry is a one-volume exception, not a licence for the \
+         whole site's window",
+    );
+}

@@ -2315,6 +2315,17 @@ impl App {
         let mut needed: HashMap<&str, std::collections::HashSet<chrono::NaiveDateTime>> =
             HashMap::new();
         let mut settling: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // **Exactly what each pane is parked at**, the one volume a site keeps
+        // even when nothing loops from it. Named apart from `needed` because
+        // `needed` merges these with the loop's frames and the whole point
+        // below is to be able to keep one without the other. A `Vec` and a
+        // linear scan for the reason `evict_unshown_scans`' own `parked` is
+        // one: it holds at most one entry per pane.
+        let mut parked: Vec<(&str, chrono::NaiveDateTime)> = Vec::new();
+        // **Every loop running right now, and what it renders** — the argument
+        // to `site_needs_decoded_source`. `None` is a loop that has not
+        // dispatched, which that predicate reads as "keep".
+        let mut live_loops: Vec<(&str, Option<squallar_radar::types::RadarProduct>)> = Vec::new();
         // One instant for the whole sweep, so two panes fetching the same listing cannot be
         // judged against two different clocks.
         let now = web_time::Instant::now();
@@ -2331,6 +2342,7 @@ impl App {
                     .entry(info.site.name)
                     .or_default()
                     .insert(info.timestamp);
+                parked.push((info.site.name, info.timestamp));
             }
             // **Radar-addressed, and it stays that way** (WO-T3.7).
             // Everything this walk retains is radar's: `retain_plan_frames`,
@@ -2349,6 +2361,7 @@ impl App {
             }) {
                 settling.insert(radar_layer::site(ls));
             }
+            live_loops.push((radar_layer::site(ls), render::loop_product(ls)));
             let frames = needed.entry(radar_layer::site(ls)).or_default();
             for frame in &ls.frames {
                 frames.insert(frame.timestamp);
@@ -2357,10 +2370,42 @@ impl App {
         let keep = |site: &str, ts: &chrono::NaiveDateTime| {
             settling.contains(site) || needed.get(site).is_some_and(|frames| frames.contains(ts))
         };
+        // **The decoded volumes are kept by a narrower question than the
+        // frames are**, and that gap is the point rather than a divergence.
+        //
+        // `keep` asks "does a live loop frame name this moment", which is the
+        // right question for the frame plan, for the Level III objects a
+        // Level III loop actually renders, and for the bucket listings. It is
+        // the wrong question for the decoded Level II volumes: a loop whose
+        // product reads Level III objects derives nothing from them, so on a
+        // site with no Level II loop they are held for a retarget that may
+        // never come, at a measured 47.99 MiB median per frame — 672 MiB over
+        // a 14-frame loop, the largest single family in the census.
+        //
+        // So a site nothing derives from keeps only what a pane is parked at.
+        // The frame set is untouched — `retain_plan_frames` still takes
+        // `keep`, so the loop is never shortened and never thinned; a
+        // retarget back to Level II re-derives the same queue
+        // (`plan_downloads_for`) and the volumes come back down the worker
+        // pool's download path, never the frame thread's.
+        //
+        // `settling` still exempts a site whose listing is in flight, for the
+        // reason it exempts it from `keep`.
+        let keep_scan = |site: &str, ts: &chrono::NaiveDateTime| {
+            if settling.contains(site)
+                || squallar_radar::loop_downloads::site_needs_decoded_source(site, &live_loops)
+            {
+                keep(site, ts)
+            } else {
+                parked
+                    .iter()
+                    .any(|&(at_site, at)| at_site == site && at == *ts)
+            }
+        };
         self.loop_mgr.retain_plan_frames(keep);
         squallar_worker::offload::discard_each(
             "evicted-loop-volume",
-            crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep)),
+            crate::volume_inventory::volume_drop_parts(self.loop_mgr.retain_scans(keep_scan)),
         );
         squallar_worker::offload::discard_each(
             "evicted-loop-object",
