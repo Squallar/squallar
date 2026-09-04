@@ -111,6 +111,7 @@ pub(crate) fn budget_state_line(
     balloon_bytes: usize,
     cap: &Capacity,
     probe: GpuProbeReport,
+    page_heap: crate::pressure::LinearMemoryWatch,
 ) -> String {
     let mib = |bytes: u64| bytes / (1024 * 1024);
     let rung = match budgets.promotion {
@@ -126,7 +127,8 @@ pub(crate) fn budget_state_line(
     format!(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
-         linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB",
+         linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
+         page heap acts {} at {} MiB",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -141,6 +143,8 @@ pub(crate) fn budget_state_line(
         capacity_source_code(cap.source),
         gpu_probe_code(probe),
         mib(balloon_bytes as u64),
+        page_heap.acts(),
+        mib(page_heap.last_acted_at().unwrap_or(0)),
     )
 }
 
@@ -319,6 +323,11 @@ mod tests {
 
     /// The probe report for the distinct line: found at the probe's own
     /// bound, which prints `5` — a code no other position carries.
+    /// A page-heap watch that has never acted: the state every case below
+    /// but `the_budget_line_carries_the_page_heaps_act_count` is about.
+    const WATCH: crate::pressure::LinearMemoryWatch =
+        crate::pressure::LinearMemoryWatch::never_acted();
+
     const PROBE: GpuProbeReport = GpuProbeReport::Found(crate::platform::ProbedCapacity {
         bytes: 5 << 30,
         failed_at: None,
@@ -376,22 +385,22 @@ mod tests {
     fn the_budget_state_line_reads_exactly_as_pinned() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
-             balloon 7 MiB",
+             balloon 7 MiB, page heap acts 0 at 0 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
-            budget_state_line(&budgets, &profile, linear, 576 << 20, BALLOON, &CAP, PROBE)
+            budget_state_line(&budgets, &profile, linear, 576 << 20, BALLOON, &CAP, PROBE, WATCH)
                 .contains(", pool 576 MiB,"),
         );
         // And the balloon follows what it is handed: a scene holding every
         // base and nothing more reads a real 0, last on the line.
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE)
-                .ends_with(", probe 5, balloon 0 MiB"),
+            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE, WATCH)
+                .ends_with(", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB"),
         );
         // And the capacity follows what it is handed: this profile's own
         // measured 24 GiB reads `24576 1`, a session presumption lowered to
@@ -404,9 +413,10 @@ mod tests {
                 POOL,
                 BALLOON,
                 &profile.capacity(),
-                GpuProbeReport::Absent
+                GpuProbeReport::Absent,
+                WATCH,
             )
-            .ends_with(", cap 24576 1, probe 0, balloon 7 MiB"),
+            .ends_with(", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB"),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
         assert!(
@@ -417,9 +427,10 @@ mod tests {
                 POOL,
                 BALLOON,
                 &lowered,
-                GpuProbeReport::Skipped
+                GpuProbeReport::Skipped,
+                WATCH,
             )
-            .ends_with(", cap 3456 0, probe 1, balloon 7 MiB"),
+            .ends_with(", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB"),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
         assert_eq!(capacity_source_code(CapacitySource::Measured), 1);
@@ -481,6 +492,7 @@ mod tests {
             0,
             &cap,
             GpuProbeReport::Absent,
+                WATCH,
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -488,12 +500,12 @@ mod tests {
         assert_eq!(
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
-             cap 3840 0, probe 0, balloon 0 MiB",
+             cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            13,
-            "fourteen comma-separated groups, thirteen separators: a field was dropped or \
+            14,
+            "fifteen comma-separated groups, fourteen separators: a field was dropped or \
              gained",
         );
     }
@@ -508,13 +520,29 @@ mod tests {
     /// **The rig reads the budget line the app actually writes.** An extra
     /// space here turns the rig's whole budget reading into `null`, which a
     /// reader would take as "a bundle older than the line".
+    ///
+    /// A **prefix**, not an equality, and the difference is deliberate. The
+    /// rig's `budget_state_re` is unanchored at its end, so the line may
+    /// carry fields after `balloon` that the scraper does not read - today
+    /// the page heap's act count, which exists precisely because it must
+    /// survive on a line the rig already parses. What the seam still holds
+    /// is everything that matters: every one of the sixteen groups the rig
+    /// DOES read, in order, spelled the way it expects, with the tail pinned
+    /// separately so it cannot drift unnoticed either.
     #[test]
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
+        let line = budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH);
+        let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
+        assert!(
+            line.starts_with(&read_by_the_rig),
+            "the `budget state:` line and the rig's probe have drifted:\n  app: {line}\n  rig: \
+             {read_by_the_rig}",
+        );
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
-            rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS),
-            "the `budget state:` line and the rig's probe have drifted",
+            &line[read_by_the_rig.len()..],
+            ", page heap acts 0 at 0 MiB",
+            "the tail the rig does not read drifted",
         );
     }
 
@@ -523,17 +551,69 @@ mod tests {
     fn a_budget_line_that_drifted_by_one_space_is_not_accepted() {
         let (budgets, profile, linear) = distinct();
         let good = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
-        assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
-            good
+        assert!(
+            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH)
+                .starts_with(&good)
         );
         let drifted = good.replacen(" rung", "  rung", 1);
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
-        assert_ne!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE),
-            drifted,
+        assert!(
+            !budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH)
+                .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",
+        );
+    }
+
+    /// **The budget line carries the page heap's act count, always.**
+    ///
+    /// The counter exists because every other trace of a page-heap action is
+    /// evictable and was in fact evicted. `budget pressure:` is one
+    /// `log::warn!` per action; the browser console ring turns over in
+    /// seconds under frame telemetry and the rig reads its last 60 entries —
+    /// on the Tier-2 `huge` legs of 2026-09-04 that window held 4.8 s of a
+    /// 50 s leg. A search of every capture channel for `budget pressure:`
+    /// came back empty on four passes whose pages sat at 993-1018 of 1024
+    /// MiB, and an evicted line and an arm that never fired are the same
+    /// empty search. This field is re-said every telemetry period, so the
+    /// last tick of any leg answers it.
+    ///
+    /// It rides at the END, after `balloon`, because the rig's own scraper
+    /// (`drive.py`'s `budget_state_re`) reads this line by positional groups
+    /// and is unanchored at its end - the same contract the `overlay
+    /// pictures:` line's trailing fields keep.
+    #[test]
+    fn the_budget_line_carries_the_page_heaps_act_count() {
+        let profile = DeviceProfile::for_target();
+        let budgets = resolve(&profile);
+        let never = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, WATCH);
+        assert!(
+            never.ends_with(", page heap acts 0 at 0 MiB"),
+            "a watch that never acted must still print its zero: {never}",
+        );
+
+        // A watch that has acted twice, the second time at 1011 MiB - the
+        // reading the `huge` legs sat at while every pressure line of theirs
+        // was already out of every window.
+        let mut watch = crate::pressure::LinearMemoryWatch::default();
+        let max = squallar_device_profile::constants::WASM_LINEAR_MEMORY_MAX_BYTES;
+        let _ = watch.observe(900 << 20, max, 0);
+        let _ = watch.observe(1011 << 20, max, 0);
+        assert_eq!(watch.acts(), 2);
+        let acted = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, watch);
+        assert!(
+            acted.ends_with(", page heap acts 2 at 1011 MiB"),
+            "the act count and the mark are not both on the line: {acted}",
+        );
+
+        // The rig's scraper is unanchored at its end, which is what makes a
+        // field after `balloon` safe. A pattern that grew a `$` would read
+        // every line of every leg as absent, and an absent budget line is
+        // reported as an older bundle rather than as a broken scraper.
+        let rig = include_str!("../../.github/browser-rig/drive.py");
+        assert!(
+            rig.contains(r"probe (\d+), balloon (\d+) MiB/;"),
+            "the rig's `budget_state_re` no longer ends unanchored at              `balloon`: a trailing field is only safe while it does",
         );
     }
 

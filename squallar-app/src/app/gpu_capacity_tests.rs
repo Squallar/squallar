@@ -26,6 +26,7 @@ fn budget_line(app: &App) -> String {
         app.loop_pool_state.allocation().balloon_bytes(),
         &app.capacity(),
         app.gpu_probe,
+        crate::pressure::LinearMemoryWatch::default(),
     )
 }
 
@@ -463,6 +464,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             app.loop_pool_state.allocation().balloon_bytes(),
             &app.capacity(),
             app.gpu_probe,
+        crate::pressure::LinearMemoryWatch::default(),
         )
     };
     let six = squallar_device_profile::scene::Scene {

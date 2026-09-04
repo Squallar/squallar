@@ -177,6 +177,20 @@ fn mib(bytes: u64) -> u64 {
 pub struct LinearMemoryWatch {
     last_acted_at: Option<u64>,
     warned: bool,
+    /// **How many times this watch has acted**, ever, this session.
+    ///
+    /// An always-on counter because every other trace of an action is
+    /// evictable. `budget pressure:` is one `log::warn!` per action; a
+    /// browser console ring holds 1200 entries and the app writes frame
+    /// telemetry every frame, so it turns over in seconds, and the rig reads
+    /// the last 60. On the Tier-2 `huge` legs of 2026-09-04 that window was
+    /// 4.8 s of a 50 s leg. So a search of every capture channel for
+    /// `budget pressure:` came back empty on four passes whose pages sat at
+    /// 993-1018 of 1024 MiB, and the absence could not be told apart from an
+    /// arm that never fired. This counter rides the `budget state:` line,
+    /// which is re-said every telemetry period, so the answer is in the last
+    /// tick of any leg however short the window.
+    acts: u32,
 }
 
 impl LinearMemoryWatch {
@@ -190,6 +204,7 @@ impl LinearMemoryWatch {
             LinearMemoryVerdict::Act => {
                 self.last_acted_at = Some(used);
                 self.warned = true;
+                self.acts = self.acts.saturating_add(1);
                 LinearMemoryVerdict::Act
             }
             LinearMemoryVerdict::Warn if self.warned => LinearMemoryVerdict::Quiet,
@@ -207,6 +222,21 @@ impl LinearMemoryWatch {
     /// The mark the watermark last acted at, or `None` if it never has.
     pub fn last_acted_at(self) -> Option<u64> {
         self.last_acted_at
+    }
+
+    /// How many times this watch has acted this session ([`Self::acts`]).
+    pub fn acts(self) -> u32 {
+        self.acts
+    }
+
+    /// A watch that has never acted — `Default::default()` in a `const`
+    /// context, which the derive cannot give.
+    pub const fn never_acted() -> Self {
+        Self {
+            last_acted_at: None,
+            warned: false,
+            acts: 0,
+        }
     }
 
     /// Whether the warning has been said for the crossing in progress.

@@ -1811,6 +1811,7 @@ impl super::App {
                     self.loop_pool_state.allocation().balloon_bytes(),
                     &self.capacity(),
                     self.gpu_probe,
+                    self.linear_memory_watch,
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
@@ -4151,23 +4152,39 @@ impl super::App {
                     .map_or((window_px, GroundPass::Off), |p| (p.px, p.ground)),
                 _ => ([0, 0], GroundPass::Off),
             };
-            // **The whole-picture overlays this pane holds**, counted off the
-            // dispatch record — one entry per `(pane, layer)` the pane has a
-            // live whole-picture plan for, radar's own pipeline excluded
-            // because it never writes that record. Each is one raster of the
-            // pane at the budget's oversampling crossing the page heap, and
-            // the glass it covers is what the last dispatch planned over
-            // (`[0, 0]` before one, when the window stands in — over-priced,
-            // never under).
+            // **The whole-picture overlays this pane SHOWS**: every
+            // texture-mode layer with a cache slot on this pane that the
+            // pane's own layer stack has enabled, radar excluded — its raster
+            // is its own pipeline's and the static term's. Each is one raster
+            // of the pane at the budget's oversampling crossing the page
+            // heap, and the glass it covers is what the last dispatch planned
+            // over (`[0, 0]` before one, when the window stands in —
+            // over-priced, never under).
             //
-            // **Read from the same record the `overlay pictures:` line
-            // reports**, so the figure a reader sees and the figure this fit
-            // prices cannot disagree. The pane's texture caches were the
-            // first source tried and are the wrong one twice over: a picture
-            // is host-resident while its upload bands drain, which is
-            // `OverlayTextureCache::held` and not `current`, and a cache
-            // walk gives the reader no way to check what the fit counted.
-            let overlay_pictures = self.render.overlay_picture_count(pane_idx);
+            // **A need, not an observation, and the difference is a race.**
+            // `fit` asks what this scene COSTS, which must be a function of
+            // the scene alone; how many pictures happen to be on the heap at
+            // the instant the walk runs is a transient of the upload drain,
+            // which lands one band a frame and so passes through every count
+            // from one to the layer total on the way to steady state. Priced
+            // from that transient, two runs of one scene took different rungs
+            // — Chromium read rung 0 on one Tier-2 `huge` pass and rung 2 on
+            // the next, same bundle, same box — and the user sees the
+            // oversampling, so the race is visible as sharpness. The resident
+            // count is the watermark's question ("what is on the heap now")
+            // and stays on the telemetry line as the observation it is.
+            //
+            // The key set is the deterministic half: `overlay_cache_mut` is
+            // called for every texture-mode handler on every pane pass
+            // (`squallar_egui::ui_map_pane`, before `enabled` is consulted),
+            // so once a pane has drawn, its `overlay_textures` keys ARE the
+            // texture-mode roster. `enabled` is the pane's own saved slot
+            // state. Neither moves with an upload.
+            let overlay_pictures = pane
+                .overlay_textures
+                .keys()
+                .filter(|id| **id != known::RADAR && pane.is_overlay_enabled(id))
+                .count();
             let picture_px = match self.render.overlay_pane_px(pane_idx) {
                 [0, 0] => window_px,
                 planned => planned,
