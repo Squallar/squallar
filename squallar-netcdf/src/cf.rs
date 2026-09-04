@@ -225,7 +225,7 @@ pub struct UnpackedF32 {
 /// produce cannot disagree about a CF rule. Splitting them into two hand-written
 /// loops is exactly the change that would let `_Unsigned` be right in the form
 /// the tests read and wrong in the form the raster reads.
-struct Packing {
+pub(crate) struct Packing {
     /// `_FillValue`, already reinterpreted into the same domain as `raw`.
     fill: Option<f64>,
     /// `valid_range`, likewise, and only if it was well-formed.
@@ -243,7 +243,18 @@ impl Packing {
             unsigned,
             attrs,
         } = var;
-        let (vartype, unsigned) = (*vartype, *unsigned);
+        Self::resolve(*vartype, *unsigned, attrs, name)
+    }
+
+    /// [`Self::read`] from the parts a reader has in hand before it has read
+    /// a single storage value — what lets [`crate::h5`] decode straight from
+    /// the stored bytes into a caller's buffer without a [`RawVar`] in between.
+    pub(crate) fn resolve(
+        vartype: VarType,
+        unsigned: bool,
+        attrs: &BTreeMap<String, CfAttr>,
+        name: &str,
+    ) -> (Self, Option<String>) {
         let attr = |n: &str| attrs.get(n).cloned();
 
         // Step 3: missing-value markers, normalized into the same raw domain.
@@ -299,7 +310,7 @@ impl Packing {
 
     /// One raw storage value to its unpacked meaning, or `None` for missing.
     #[inline]
-    fn apply(&self, r: f64) -> Option<f64> {
+    pub(crate) fn apply(&self, r: f64) -> Option<f64> {
         if self.fill.is_some_and(|f| r == f) {
             return None;
         }

@@ -899,3 +899,258 @@ fn a_row_window_reads_into_the_raster_form_too() {
     );
     assert_eq!(element_bytes(&row.values), 4);
 }
+
+/// **The appending read is the owning read, bit for bit**, on both of its arms.
+///
+/// `read_unpacked_f32_into` decodes a standard 4-byte float straight from the
+/// stored bytes and takes the owning read for every other width, and a bit
+/// that differed between the two forms on either arm would be a raster reading
+/// a different number depending on which buffer it was decoded into. So each
+/// arm is driven with every CF rule live — a fill, an offset, a `valid_range`
+/// on the packed one — and compared by `to_bits`, since a mapped fill is a
+/// `NaN` and `==` would pass wherever the difference actually is.
+///
+/// The prefix check is the appending half: what was already in the buffer
+/// stays, and the variable lands after it.
+#[test]
+fn the_appending_read_is_the_owning_read_bit_for_bit() {
+    // Arm one: `float` storage with a fill and an offset — the fast path.
+    let float_bytes = {
+        let mut w = hdf5_pure::FileBuilder::new();
+        let b = w.create_dataset("v");
+        b.with_f32_data(&[1.5f32, -9999.0, -0.0, 0.1, f32::MAX, f32::MIN_POSITIVE]);
+        b.set_attr("_FillValue", hdf5_pure::AttrValue::F32(-9999.0));
+        b.set_attr("add_offset", hdf5_pure::AttrValue::F64(0.25));
+        w.finish().expect("write the float fixture")
+    };
+    // Arm two: packed unsigned `short` with every rule live — the owning read.
+    let short_bytes = short_var_file(&ShortVar {
+        values: &[-13585, 100, -1, 0, 11048],
+        unsigned: true,
+        scale: Some(0.001),
+        offset: Some(-90.0),
+        fill: Some(-1),
+        // `-5` reinterprets to 65531 through `_Unsigned`, so the range is live
+        // and the real sample stays inside it.
+        valid_range: Some(vec![0, -5]),
+        units: Some("degrees_north"),
+    });
+
+    for (what, bytes) in [("float", float_bytes), ("packed short", short_bytes)] {
+        let file = crate::h5::Granule::open(&bytes).expect("open");
+        let owning = file
+            .read_unpacked_f32("v")
+            .expect("read")
+            .expect("variable present");
+        assert!(
+            owning.values.iter().any(|v| v.is_nan()),
+            "premise ({what}): a fill reached the values, so the missing rule is live",
+        );
+
+        let prefix = [7.0f32, f32::NAN];
+        let mut out: Vec<f32> = prefix.to_vec();
+        let appended = file
+            .read_unpacked_f32_into("v", &mut out)
+            .expect("read")
+            .expect("variable present");
+
+        assert_eq!(appended, owning.values.len(), "({what}) the count appended");
+        assert_eq!(out.len(), prefix.len() + owning.values.len());
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&out[..prefix.len()]),
+            bits(&prefix),
+            "({what}) what the buffer already held stays where it was",
+        );
+        assert_eq!(
+            bits(&out[prefix.len()..]),
+            bits(&owning.values),
+            "({what}) the appended values must be the owning read's, bit for bit",
+        );
+    }
+
+    // An absent variable appends nothing and says so, on either form.
+    let file = crate::h5::Granule::open(&float_var_file(&[1.0], None)).expect("open");
+    let mut out = vec![1.0f32];
+    assert_eq!(
+        file.read_unpacked_f32_into("absent", &mut out)
+            .expect("read"),
+        None
+    );
+    assert_eq!(out, vec![1.0]);
+}
+
+/// Rows and columns of the one-chunk fixture below: 600 x 600 `f32` is
+/// 1,440,000 B, **over** `hdf5_pure`'s 1 MiB default chunk-cache budget, so a
+/// default handle cannot retain it and a sized one can. That gap is the whole
+/// reason [`crate::h5::Granule::variable`] exists.
+const ONE_CHUNK_ROWS: usize = 600;
+const ONE_CHUNK_COLS: usize = 600;
+const ONE_CHUNK_WINDOW: usize = 75;
+
+/// A 2-D `f32` variable stored as **one** shuffled, deflated chunk — the
+/// shape GMGSI's `lat`/`lon` are stored in — with position-encoded values.
+fn one_chunk_var_file() -> Vec<u8> {
+    let mut values = vec![0f32; ONE_CHUNK_ROWS * ONE_CHUNK_COLS];
+    for j in 0..ONE_CHUNK_ROWS {
+        for i in 0..ONE_CHUNK_COLS {
+            values[j * ONE_CHUNK_COLS + i] = (j * 1000 + i) as f32;
+        }
+    }
+    let mut w = hdf5_pure::FileBuilder::new();
+    let b = w.create_dataset("v");
+    b.with_f32_data(&values)
+        .with_shape(&[ONE_CHUNK_ROWS as u64, ONE_CHUNK_COLS as u64])
+        .with_chunks(&[ONE_CHUNK_ROWS as u64, ONE_CHUNK_COLS as u64])
+        .with_shuffle()
+        .with_deflate(5);
+    w.finish().expect("write the one-chunk fixture")
+}
+
+/// **A [`crate::h5::Variable`] serves every row window off one inflation of
+/// its chunk**, and reads the same bits a fresh handle per window would.
+///
+/// The control is the same walk over a plain `hdf5_pure` handle with the
+/// default cache: every window is an oversize rejection and a miss, which is
+/// what every windowed read in this crate did before the handle existed. The
+/// two are asserted side by side so the sized cache is shown to be the
+/// difference rather than assumed to be.
+#[test]
+fn a_variable_handle_serves_its_windows_off_one_inflation() {
+    let bytes = one_chunk_var_file();
+    let file = crate::h5::Granule::open(&bytes).expect("open");
+    let windows = ONE_CHUNK_ROWS / ONE_CHUNK_WINDOW;
+    assert!(
+        windows > 1,
+        "premise: more than one window, or nothing is shared"
+    );
+
+    let var = file.variable("v").expect("open").expect("present");
+    assert_eq!(var.shape(), [ONE_CHUNK_ROWS as u64, ONE_CHUNK_COLS as u64]);
+    for w in 0..windows {
+        let start = (w * ONE_CHUNK_WINDOW) as u64;
+        let through_handle = var
+            .read_unpacked_rows_f32(start, ONE_CHUNK_WINDOW as u64)
+            .expect("read");
+        let fresh = file
+            .read_unpacked_rows_f32("v", start, ONE_CHUNK_WINDOW as u64)
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            through_handle
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            fresh.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "window {w} through the held handle must be the window, bit for bit",
+        );
+        assert_eq!(
+            through_handle.values[0],
+            (w * ONE_CHUNK_WINDOW * 1000) as f32,
+            "and it must be the window that was asked for",
+        );
+    }
+    let stats = var.chunk_cache_stats();
+    assert_eq!(
+        (
+            stats.misses(),
+            stats.hits(),
+            stats.oversize_chunks(),
+            stats.cached_chunks()
+        ),
+        (1, windows as u64 - 1, 0, 1),
+        "one inflation, every later window a hit, the chunk admitted and held",
+    );
+
+    // Control: the default handle, and the fixture is over its budget by
+    // construction. Every window pays the pipeline again.
+    let plain = hdf5_pure::File::from_bytes(bytes.clone()).expect("open");
+    let ds = plain.dataset("v").expect("present");
+    for w in 0..windows {
+        ds.read_f32_rows((w * ONE_CHUNK_WINDOW) as u64, ONE_CHUNK_WINDOW as u64)
+            .expect("read");
+    }
+    let control = ds.chunk_cache_stats();
+    assert_eq!(
+        (control.hits(), control.cached_chunks()),
+        (0, 0),
+        "premise: a default handle never retains this chunk, so the hits above \
+         are the sized cache's doing and nothing else's",
+    );
+    assert!(
+        ONE_CHUNK_ROWS * ONE_CHUNK_COLS * size_of::<f32>()
+            > hdf5_pure::ChunkCacheConfig::new().max_bytes(),
+        "premise: the chunk is over the default budget, or the control proves nothing",
+    );
+}
+
+/// A 2-D chunked `f32` variable, **unfiltered**, so its stored bytes are its
+/// values' little-endian bytes and the fingerprint can be checked against
+/// the file rather than against itself.
+fn chunked_plain_var_file(values: &[f32]) -> Vec<u8> {
+    let mut w = hdf5_pure::FileBuilder::new();
+    let b = w.create_dataset("v");
+    b.with_f32_data(values)
+        .with_shape(&[4, 4])
+        .with_chunks(&[2, 4]);
+    b.set_attr(
+        "units",
+        hdf5_pure::AttrValue::String("degrees_north".into()),
+    );
+    w.finish().expect("write the chunked fixture")
+}
+
+/// **A stored fingerprint is the stored bytes** — equal for two files that
+/// store the same variable, different the moment one value differs, and
+/// absent for a variable that is not chunked.
+///
+/// The address arithmetic is the part that could be quietly wrong — a
+/// fingerprint over the wrong bytes is still self-consistent — so the
+/// chunks' bytes are compared against the values written, through the
+/// unfiltered fixture where stored bytes are values.
+#[test]
+fn a_stored_fingerprint_is_the_stored_bytes_and_moves_with_them() {
+    let values: Vec<f32> = (0..16).map(|k| k as f32 * 1.5).collect();
+    let one = crate::h5::Granule::open(&chunked_plain_var_file(&values)).expect("open");
+    let two = crate::h5::Granule::open(&chunked_plain_var_file(&values)).expect("open");
+    let fp_one = one
+        .stored_fingerprint("v")
+        .expect("read")
+        .expect("chunked, so fingerprintable");
+    let fp_two = two
+        .stored_fingerprint("v")
+        .expect("read")
+        .expect("likewise");
+    assert_eq!(
+        fp_one, fp_two,
+        "the same variable stored twice is one fingerprint"
+    );
+
+    let stored: Vec<u8> = fp_one.chunk_bytes().flatten().copied().collect();
+    let written: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    assert_eq!(
+        stored, written,
+        "the fingerprint's chunk bytes must be the file's stored bytes for \
+         this variable: an unfiltered chunk stores its values verbatim",
+    );
+    assert_eq!(fp_one.stored_bytes(), 16 * size_of::<f32>());
+
+    let mut moved = values.clone();
+    moved[9] += 1.0;
+    let other = crate::h5::Granule::open(&chunked_plain_var_file(&moved)).expect("open");
+    assert_ne!(
+        other
+            .stored_fingerprint("v")
+            .expect("read")
+            .expect("chunked"),
+        fp_one,
+        "one changed value is a different fingerprint",
+    );
+
+    // Not chunked: nothing to fingerprint, and it says so rather than
+    // inventing a key that would match every contiguous variable of a shape.
+    let contiguous = crate::h5::Granule::open(&float_var_file(&values, None)).expect("open");
+    assert_eq!(contiguous.stored_fingerprint("v").expect("read"), None);
+    assert_eq!(contiguous.stored_fingerprint("absent").expect("read"), None);
+}

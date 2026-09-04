@@ -45,4 +45,4 @@ pub use cf::{
     CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedVar, VarType, attr_is_true,
     parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,
 };
-pub use h5::Granule;
+pub use h5::{Granule, StoredFingerprint, Variable};
