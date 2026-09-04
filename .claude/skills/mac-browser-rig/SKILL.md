@@ -8,10 +8,24 @@ description: Run squallar browser measurement legs on the Mac (jacobs-mac-mini).
 `ssh mac` — jacobs-mac-mini, Apple M2, 10 GPU cores, 8 GiB unified, macOS 26.4.1
 arm64. No VPN, no wake step, `BatchMode=yes` works.
 
-**The app runs HEADED over a plain ssh session** when the same user is logged in
-at the console — no `launchctl asuser`, no sudo. A six-pane scene rendered that
-way with `wgpu selected the Metal backend: Apple M2 (IntegratedGpu)`. This is the
-opposite of the Windows box; see the `windows-rig` skill for why.
+**Browser legs run headed over a plain ssh session** — verified: rAF fires at
+16.67 ms on the 60 Hz panel, which is presentation, not boot. webdriver launches
+the browser itself, which is why this works.
+
+**The NATIVE app over ssh is UNVERIFIED and should not be assumed.** An earlier
+note here claimed it runs headed with no `launchctl asuser`, citing `Surface
+configured to 1920x1018` and `wgpu selected the Metal backend`. Those are BOOT
+signals, not presentation signals — the same class of evidence that reads green
+in the Windows session-0 trap, where the app creates its window, spins its event
+loop and autosaves its config while `RedrawRequested` never fires.
+
+There is also a reason to expect trouble: WindowServer access is gated on the
+`gui/$UID` bootstrap domain and an ssh session lands in `user/$UID`, which is
+what `launchctl asuser` exists to bridge. "It just works" needs an explanation
+and nobody has produced one.
+
+Before running a native leg here, prove PRESENTATION and not boot: frames
+actually cadencing, a non-empty frame telemetry window — not a surface line.
 
 ## What is ALREADY there — do not install these
 
