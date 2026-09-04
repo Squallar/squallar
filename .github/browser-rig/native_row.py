@@ -1506,6 +1506,378 @@ def divergence(count_a, count_b):
     }
 
 
+# ---------------------------------------------------------------- subject ---
+#
+# THE SUBJECT OF A MEASUREMENT: which build of which thing the leg ran.
+#
+# A browser updated itself out from under a live campaign on 2026-09-04. The
+# Mac's `/Applications/Firefox.app` moved 155.0 -> 155.0.1: the bundle's mtime
+# moved at 12:12 and the version string moved with it, both observed. That
+# alone is what this section is for, and it is enough -- a leg that DIES is
+# obvious, but a leg that SUCCEEDS on a browser build its counterpart never ran
+# prints a delta, and the delta gets attributed to the code change.
+#
+# **What this section does not claim is a cause for the leg failures that
+# followed.** They were first read as the updater re-execing under the rig's
+# launch, and that reading was wrong: the rig's own Firefox had re-exec'd and
+# was still RUNNING under a pid the watcher had lost, holding the profile lock,
+# so every later launch into that profile directory exited 0 in about four
+# seconds with the identical message. Two different defects printing one line,
+# and a THIRD state between them -- "succeeded, under a pid nobody is
+# watching" -- which is indistinguishable from the failure to a reader that
+# only has the exit code. That defect is somebody else's; only the version
+# change is this gate's, and writing the wrong mechanism into a durable file
+# is the failure this campaign keeps paying for.
+#
+# Every field needed to catch it was ALREADY RECORDED and nothing read it.
+# `binary.browser_version` and `binary.driver_version` ride on every browser
+# leg; `commit` rides on every native row. No comparison printed either and no
+# comparison asserted either.
+#
+# WHAT CONSTITUTES A SUBJECT IS A TABLE -- `SUBJECT_FIELDS` below -- and
+# deliberately neither of the two things it could have been:
+#
+#   * not a NAMING RULE ("every field whose name contains `version` must
+#     agree"). That demands `driver_version` match across a Firefox pair whose
+#     geckodriver is versioned independently of Firefox and is `None` in
+#     `version_match` for exactly that reason -- it would refuse every honest
+#     Firefox comparison -- and it misses `commit`, which carries no `version`
+#     in its name and is the more common error of the two.
+#   * not a BLANKET check ("some code somewhere compares builds"), which is
+#     satisfiable by anything and pins nothing.
+#
+# The table names each field, where it is read from, whether a DIFFERENCE in it
+# is a defect or the declared axis of the comparison, and whether it may carry
+# the positive verdict. Because the table names what must be PRESENT, two
+# absent fields cannot satisfy a match -- the sibling-positive property, for
+# free. That property is the one this file keeps having to relearn: a count of
+# 0 beside siblings at 14, 7 and 5 is a finding, and the same 0 alone is a
+# story.
+#
+# OVER-FIRING IS THE WORSE DIRECTION. A gate here that refused every valid
+# comparison would cost more than the silent defect it was built for, and the
+# panel gate that landed hours earlier over-fired twice before that was written
+# down. So a difference is only a defect IN SCOPE:
+#
+#   * a browser build may differ freely when the two rows name DIFFERENT
+#     browsers -- firefox against chromium is a comparison, not a moved
+#     subject;
+#   * an app commit may differ freely when the two rows are DIFFERENT ARMS --
+#     `before` against `after` is the entire point of an A/B pair. It may not
+#     differ between two runs of the SAME arm, which is what the mid-campaign
+#     update produces.
+
+# Spellings that mean "this field was not recorded", not "this field is empty".
+# `unknown` is `commit_for_arm`'s honest fallback and `?`/`-` are the row
+# printer's; all of them must read as absent, or a pair of `unknown`s would
+# satisfy an equality check and print a match nobody earned.
+SUBJECT_ABSENT = ("", "-", "?", "none", "null", "unknown", "unrecorded", "n/a")
+
+# A commit field naming MORE THAN ONE BUILD. `--commit <a>+<b>` and
+# `<a>-vs-<b>` are the two spellings two lanes independently invented on
+# 2026-09-02 to force one field to carry a two-arm run, which `commit_for_arm`
+# exists to replace. They are still on disk in recorded rows, and they are the
+# false green this whole check would otherwise print: `A.before` and `A.after`
+# both carry the literal string `6e936c6a-vs-9fcccaae`, so a plain equality
+# test calls a two-commit comparison MATCHED. Two sha-shaped tokens in one
+# field is the tell; one sha plus a lane's suffix (`59f08766-p1abl`) is not.
+_SHA_TOKEN = re.compile(r"(?<![0-9a-zA-Z])[0-9a-f]{7,40}(?![0-9a-zA-Z])")
+
+
+class SubjectField(object):
+    """One row of the subject table.
+
+    `read` pulls the value off a leg artefact -- native rows and browser legs
+    are different shapes and both are read here, so one rule adjudicates either
+    kind of pair. `gated_when` names the relation under which a DIFFERENCE is a
+    defect rather than the comparison's declared axis. `may_pin` says whether
+    this field is allowed to carry the positive verdict on its own.
+    """
+
+    __slots__ = ("name", "read", "gated_when", "may_pin", "why")
+
+    def __init__(self, name, read, gated_when, may_pin, why):
+        self.name = name
+        self.read = read
+        self.gated_when = gated_when
+        self.may_pin = may_pin
+        self.why = why
+
+
+def _clean(value):
+    """A recorded value, or None for one of the absent spellings."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in SUBJECT_ABSENT:
+        return None
+    return text
+
+
+def _read_browser_version(row):
+    """`binary.browser_version`, falling back to the w3c session's own answer.
+
+    Two independent recordings of the same fact. `binary` is what the rig ran;
+    `session.browserVersion` is what the browser told the driver it was. A leg
+    that carries only one of them is still pinnable.
+    """
+    binary = row.get("binary") or {}
+    got = _clean(binary.get("browser_version"))
+    if got:
+        return got
+    session = row.get("session") or {}
+    return _clean(session.get("browserVersion"))
+
+
+def _read_driver_version(row):
+    binary = row.get("binary") or {}
+    # geckodriver's `--version` is a paragraph with a licence in it. The first
+    # line is the version; the rest would make every comparison unreadable.
+    got = _clean(binary.get("driver_version"))
+    return got.splitlines()[0].strip() if got else None
+
+
+def _read_commit(row):
+    return _clean(row.get("commit"))
+
+
+def subject_browser(row):
+    """Which browser the leg ran in: `firefox`, `chromium`, `native`, ..."""
+    return _clean(row.get("browser"))
+
+
+_POSITION_LABEL = re.compile(r"^p\d+\((.+)\)$")
+
+
+def subject_arm_label(row):
+    """Which ARM of a multi-arm run this leg is, or None.
+
+    `run_measure_native.sh` writes `$scene.$label.rN.json` and stamps the leg's
+    matrix slot as `pN(label)`, so the arm label is recoverable from the row
+    itself rather than from the filename a caller happened to pass. A browser
+    leg has no matrix; its `tag` is the closest thing it has to an arm.
+    """
+    position = _clean(row.get("position"))
+    if position:
+        m = _POSITION_LABEL.match(position)
+        if m:
+            return m.group(1)
+    return _clean(row.get("tag"))
+
+
+def subject_composite(value):
+    """Does this field name more than one build? See `_SHA_TOKEN`."""
+    if not value:
+        return False
+    return len(set(_SHA_TOKEN.findall(value))) > 1
+
+
+SUBJECT_FIELDS = (
+    SubjectField(
+        "browser_version", _read_browser_version, "same-browser", True,
+        "the browser build the leg ran in. It moves WITHOUT anyone asking -- "
+        "an installed browser applies a staged update on its next launch -- "
+        "so it is checked on every pair of legs that named the same browser. "
+        "Across DIFFERENT browsers a difference is the comparison itself",
+    ),
+    SubjectField(
+        "driver_version", _read_driver_version, None, False,
+        "the automation driver. REPORTED, NEVER GATED, and never the positive "
+        "verdict: geckodriver is versioned independently of Firefox, which is "
+        "why `binary.version_match` is None on every Firefox leg and True on "
+        "Chromium ones. Gating it would refuse every honest Firefox pair",
+    ),
+    SubjectField(
+        "commit", _read_commit, "same-arm", True,
+        "the app build the leg measured. Two runs of the SAME arm on "
+        "different commits is the defect; two DIFFERENT arms on different "
+        "commits is what an A/B pair is for",
+    ),
+)
+
+
+def subject_relation(a, b):
+    """How two legs are related, which is what decides scope.
+
+    Unknown reads as NOT the same, in both directions, so an unreadable row
+    can only ever relax a gate -- never invent one. A missing field must not
+    be able to manufacture a refusal.
+    """
+    a_browser, b_browser = subject_browser(a), subject_browser(b)
+    a_arm, b_arm = subject_arm_label(a), subject_arm_label(b)
+    return {
+        "a_browser": a_browser,
+        "b_browser": b_browser,
+        "same-browser": bool(a_browser and b_browser and a_browser == b_browser),
+        "a_arm": a_arm,
+        "b_arm": b_arm,
+        "same-arm": bool(a_arm and b_arm and a_arm == b_arm),
+    }
+
+
+def subject_pin(a, b):
+    """Adjudicate the SUBJECT of a two-row comparison.
+
+    Four states, and like this file's other stamp sets they never co-fire:
+
+      `pinned`       at least one may-pin field was recorded on BOTH rows and
+                     agreed. This is the positive, and it is not satisfiable by
+                     absence: a field missing on either side is `unrecorded`
+                     and cannot pin.
+      `declared`     nothing moved out of scope, nothing pinned, but a field
+                     differs WITHIN scope-to-differ -- the pair's own axis, an
+                     A/B on two commits. A result, not a complaint.
+      `moved`        a field differed where a difference is a defect. The
+                     comparison is INVALID: whatever delta it prints, the
+                     subject changed underneath it.
+      `unrecorded` / `unresolvable`
+                     the rig cannot vouch either way. UNCHECKED, never
+                     INVALID -- and the two are kept apart because they are
+                     different findings with different remedies. `unrecorded`
+                     is a rig that did not write the field down; `unresolvable`
+                     is a field that was written down and names two builds, so
+                     it cannot say which one this row measured.
+    """
+    relation = subject_relation(a, b)
+    fields, invalid, unchecked, pinned_by, declared_by = [], [], [], [], []
+
+    for field in SUBJECT_FIELDS:
+        a_val, b_val = field.read(a), field.read(b)
+        gated = bool(field.gated_when) and relation[field.gated_when]
+        if a_val is None or b_val is None:
+            state = "unrecorded"
+        elif subject_composite(a_val) or subject_composite(b_val):
+            state = "unresolvable"
+        elif a_val == b_val:
+            state = "pinned" if field.may_pin else "reported"
+        elif gated:
+            state = "moved"
+        else:
+            state = "declared" if field.may_pin else "reported"
+        fields.append({"name": field.name, "a": a_val, "b": b_val,
+                       "state": state, "gated": gated, "why": field.why})
+        if state == "pinned":
+            pinned_by.append(field.name)
+        elif state == "declared":
+            declared_by.append(field.name)
+        elif state == "moved":
+            invalid.append(
+                "%s moved under the comparison: a=%r b=%r. These two rows did "
+                "not measure the same subject, so any delta between them is "
+                "unattributable" % (field.name, a_val, b_val))
+        elif state == "unresolvable":
+            unchecked.append(
+                "%s names more than one build (a=%r b=%r), so it cannot say "
+                "which build either row measured" % (field.name, a_val, b_val))
+
+    if invalid:
+        state = "moved"
+    elif pinned_by:
+        state = "pinned"
+    elif declared_by:
+        state = "declared"
+    elif unchecked:
+        state = "unresolvable"
+    else:
+        state = "unrecorded"
+        unchecked.append(
+            "no subject field was recorded on both rows (%s), so the rig "
+            "cannot tell whether these legs ran the same build"
+            % ", ".join(f.name for f in SUBJECT_FIELDS))
+
+    return {
+        "state": state,
+        "relation": relation,
+        "fields": fields,
+        "pinned_by": pinned_by,
+        "declared_by": declared_by,
+        "invalid": invalid,
+        "unchecked": unchecked,
+    }
+
+
+SUBJECT_BANNER = {
+    "moved": "  ** INVALID **",
+    "unrecorded": "  ** UNCHECKED: subject not recorded **",
+    "unresolvable": "  ** UNCHECKED: subject not resolvable **",
+    "pinned": "",
+    "declared": "",
+}
+
+
+def print_subject(verdict, a_path="a", b_path="b"):
+    """The SUBJECT block: the table first, then the verdict it follows from.
+
+    The table is printed on EVERY verdict, green included. A gate that prints
+    only when it fires cannot be read as evidence that it looked -- and the
+    positive here is the whole point, because `pinned` has to be visibly
+    carried by a value rather than by two blanks.
+    """
+    rel = verdict["relation"]
+    print("SUBJECT a=%s b=%s" % (a_path, b_path))
+    print("SUBJECT   relation: browser a=%s b=%s (%s); arm a=%s b=%s (%s)"
+          % (rel["a_browser"] or "-", rel["b_browser"] or "-",
+             "same" if rel["same-browser"] else "differ",
+             rel["a_arm"] or "-", rel["b_arm"] or "-",
+             "same" if rel["same-arm"] else "differ"))
+    for f in verdict["fields"]:
+        print("SUBJECT   %-16s %-12s a=%s b=%s%s"
+              % (f["name"], f["state"],
+                 ("%r" % f["a"]) if f["a"] is not None else "NOT RECORDED",
+                 ("%r" % f["b"]) if f["b"] is not None else "NOT RECORDED",
+                 "" if (f["gated"] or f["a"] is None or f["b"] is None)
+                 else "  [a difference here is not a defect: %s]"
+                 % ("different browsers" if f["name"] == "browser_version"
+                    else "different arms" if f["name"] == "commit"
+                    else "reported, never gated")))
+    for why in verdict["invalid"]:
+        print("SUBJECT   INVALID: %s" % why)
+    for why in verdict["unchecked"]:
+        print("SUBJECT   UNCHECKED: %s" % why)
+    if verdict["state"] == "pinned":
+        print("SUBJECT %s -> the pair agrees on %s"
+              % (verdict["state"], ", ".join(verdict["pinned_by"])))
+    elif verdict["state"] == "declared":
+        print("SUBJECT %s -> %s differs BY DESIGN across these arms; it is "
+              "the axis of the comparison, not a moved subject"
+              % (verdict["state"], ", ".join(verdict["declared_by"])))
+    else:
+        print("SUBJECT %s%s" % (verdict["state"], SUBJECT_BANNER[verdict["state"]]))
+    return 1 if verdict["state"] == "moved" else 0
+
+
+def subject_census(legs):
+    """One RUN's legs, grouped by browser: which builds did this run use?
+
+    The pairwise check adjudicates a comparison someone assembled. This one
+    catches the incident that produced this whole section, which happened
+    INSIDE a single run: a browser that updates itself between leg 3 and leg 4
+    leaves that run holding two populations, and nobody assembled a pair to
+    notice.
+
+    `legs` is an iterable of `(label, row)`.
+    """
+    seen = {}
+    for label, row in legs:
+        browser = subject_browser(row) or "?"
+        version = _read_browser_version(row)
+        seen.setdefault(browser, {}).setdefault(version, []).append(label)
+    out = []
+    for browser in sorted(seen):
+        builds = seen[browser]
+        recorded = {v: t for v, t in builds.items() if v is not None}
+        if len(recorded) > 1:
+            state = "moved"
+        elif recorded:
+            state = "pinned"
+        else:
+            state = "unrecorded"
+        out.append({"browser": browser, "state": state,
+                    "builds": {("NOT RECORDED" if v is None else v): tags
+                               for v, tags in builds.items()}})
+    return out
+
+
 # --------------------------------------------------------------- platform ---
 
 # What a leg needs from the machine it runs on, and what supplies it.
@@ -2292,11 +2664,34 @@ def cmd_analyze(args):
     return 1 if row["invalid"] else 0
 
 
-def cmd_diverge(args):
+def _load_rows(paths):
     rows = []
-    for p in args.rows:
+    for p in paths:
         with open(p, "r", encoding="utf-8") as fh:
             rows.append(json.load(fh))
+    return rows
+
+
+def cmd_subject(args):
+    """Adjudicate the SUBJECT of any two leg artefacts.
+
+    Separate from `diverge` because `diverge` needs a native row's
+    `throughput_interact_frames` and a browser leg has none -- and the browser
+    arm is where a browser build moves. `run_measure.sh` assembles no pair at
+    all, so without this subcommand there is nothing a web A/B could be run
+    through.
+    """
+    rows = _load_rows(args.rows)
+    return print_subject(subject_pin(rows[0], rows[1]), args.rows[0], args.rows[1])
+
+
+def cmd_diverge(args):
+    rows = _load_rows(args.rows)
+    # The subject FIRST, and its refusal outranks the figure. A pair that did
+    # not measure the same build has no divergence worth adjudicating: the
+    # number would still print, and it is the printing that gets transcribed.
+    subject_rc = print_subject(subject_pin(rows[0], rows[1]),
+                               args.rows[0], args.rows[1])
     counts = [r.get("throughput_interact_frames") for r in rows]
     d = divergence(counts[0], counts[1])
     if not d["ok"]:
@@ -2317,7 +2712,7 @@ def cmd_diverge(args):
             % (p, w.get("n"), w.get("p99_us"), r.get("quiet"),
                r.get("loadavg_max", (r.get("load") or {}).get("max")))
         )
-    return 0
+    return subject_rc
 
 
 def cmd_plan(args):
@@ -2410,6 +2805,11 @@ def main(argv):
     d = sub.add_parser("diverge", help="adjudicate a run pair")
     d.add_argument("rows", nargs=2)
     d.set_defaults(func=cmd_diverge)
+
+    sj = sub.add_parser("subject",
+                        help="did these two legs measure the same build?")
+    sj.add_argument("rows", nargs=2)
+    sj.set_defaults(func=cmd_subject)
 
     p = sub.add_parser("plan", help="the platform plan, as shell assignments")
     p.add_argument("--system", required=True, help="`uname -s`")
@@ -4182,6 +4582,247 @@ class CommitProvenanceTests(unittest.TestCase):
             commit_for_arm("a", ["a"], "", 2, "head"), "unknown",
             "`a` with no `=` is not a LABEL=SHA pair and must not match")
 
+
+class SubjectTests(unittest.TestCase):
+    """The subject pin: did these two legs measure the same build?
+
+    The fixtures are the real incident. On 2026-09-04 the Mac's installed
+    Firefox moved 155.0 -> 155.0.1 at 12:12, mid-campaign and unasked. A leg
+    taken after it would have measured a different browser than its
+    counterpart and said nothing. (The leg FAILURES that followed had a
+    different cause and are not this gate's -- see the section header.) The
+    commit fixtures are verbatim strings off rows still on disk.
+    """
+
+    @staticmethod
+    def _browser(version, tag="A.firefox", browser="firefox",
+                 driver="geckodriver 0.37.1"):
+        return {"browser": browser, "tag": tag,
+                "binary": {"browser_version": version, "driver_version": driver},
+                "session": {"browserVersion": version}}
+
+    @staticmethod
+    def _native(commit, label="main", scene="C"):
+        return {"browser": "native", "scene": scene, "commit": commit,
+                "position": "p1(%s)" % label, "binary": None}
+
+    # ---- the defect direction ------------------------------------------
+
+    def test_a_browser_that_updated_itself_mid_run_is_invalid(self):
+        v = subject_pin(self._browser("Mozilla Firefox 155.0"),
+                        self._browser("Mozilla Firefox 155.0.1"))
+        self.assertEqual(v["state"], "moved")
+        self.assertTrue(v["invalid"])
+        self.assertIn("155.0.1", v["invalid"][0])
+        self.assertFalse(v["unchecked"], "INVALID and UNCHECKED never co-fire")
+
+    def test_two_runs_of_one_arm_on_two_commits_are_invalid(self):
+        v = subject_pin(self._native("17b9c917"), self._native("5a275382"))
+        self.assertEqual(v["state"], "moved")
+        self.assertIn("commit moved", v["invalid"][0])
+
+    def test_the_invalid_verdict_is_a_nonzero_return(self):
+        """The banner is not the gate; the return code is.
+
+        A refusal that only prints is a caption. `run_measure_native.sh` runs
+        `diverge` from a shell loop, and a shell reads the status.
+        """
+        v = subject_pin(self._browser("Mozilla Firefox 155.0"),
+                        self._browser("Mozilla Firefox 155.0.1"))
+        text = _capture(lambda: self.assertEqual(print_subject(v), 1))
+        self.assertIn("** INVALID **", text)
+
+    # ---- the green direction: over-firing is the worse failure ----------
+
+    def test_a_pair_on_one_browser_build_passes(self):
+        v = subject_pin(self._browser("Mozilla Firefox 155.0"),
+                        self._browser("Mozilla Firefox 155.0"))
+        self.assertEqual(v["state"], "pinned")
+        self.assertEqual(v["pinned_by"], ["browser_version"])
+        self.assertEqual(_capture(lambda: print_subject(v)).count("INVALID"), 0)
+
+    def test_a_cross_browser_comparison_is_not_a_moved_subject(self):
+        """firefox against chromium is the comparison, not a defect.
+
+        This is the over-fire that would have refused every two-browser row
+        the campaign holds -- and `run_tier2.sh` runs per browser by design.
+        """
+        v = subject_pin(self._browser("Mozilla Firefox 154.0", browser="firefox"),
+                        self._browser("Chromium 151.0.7922.173 Arch Linux",
+                                      tag="A.chromium", browser="chromium"))
+        self.assertEqual(v["state"], "declared")
+        self.assertFalse(v["invalid"])
+
+    def test_an_ab_pair_on_two_commits_is_the_axis_not_a_defect(self):
+        """`before` vs `after` differ in commit ON PURPOSE.
+
+        Gating commit equality unconditionally would refuse every A/B the
+        native runner exists to run -- `--arm-commit LABEL=SHA` is the flag
+        that makes them differ.
+        """
+        v = subject_pin(self._native("6e936c6a", label="before"),
+                        self._native("9fcccaae", label="after"))
+        self.assertEqual(v["state"], "declared")
+        self.assertEqual(v["declared_by"], ["commit"])
+        self.assertFalse(v["invalid"])
+
+    def test_a_firefox_pair_is_never_refused_for_its_geckodriver(self):
+        """The naming rule this table exists instead of.
+
+        `binary.version_match` is None on every Firefox leg because
+        geckodriver 0.37.1 is not Firefox 155; a rule over fields named
+        `*_version` would call that a moved subject on every honest pair.
+        """
+        v = subject_pin(
+            self._browser("Mozilla Firefox 155.0", driver="geckodriver 0.37.1"),
+            self._browser("Mozilla Firefox 155.0", driver="geckodriver 0.36.0"))
+        self.assertEqual(v["state"], "pinned")
+        self.assertFalse(v["invalid"])
+
+    # ---- differs is not the same finding as not recorded ---------------
+
+    def test_two_unrecorded_fields_do_not_satisfy_a_match(self):
+        """The sibling-positive property, stated as a test.
+
+        Both rows carry nothing. Equality holds trivially and must NOT read as
+        agreement: the answer is that the rig cannot vouch, which is a
+        different finding with a different remedy from a mismatch.
+        """
+        v = subject_pin({"browser": "native"}, {"browser": "native"})
+        self.assertEqual(v["state"], "unrecorded")
+        self.assertFalse(v["invalid"], "an unvouchable pair is not an invalid one")
+        self.assertTrue(v["unchecked"])
+        self.assertEqual(v["pinned_by"], [])
+        text = _capture(lambda: self.assertEqual(print_subject(v), 0))
+        self.assertIn("** UNCHECKED: subject not recorded **", text)
+        self.assertNotIn("INVALID", text)
+
+    def test_the_absent_spellings_all_read_as_absent(self):
+        """`unknown` is `commit_for_arm`'s honest fallback for a multi-arm run.
+
+        Two of them are two admissions of ignorance, not a matched pair.
+        """
+        for spelling in ("unknown", "", "  ", "?", "-", "n/a"):
+            v = subject_pin(self._native(spelling), self._native(spelling))
+            self.assertEqual(v["state"], "unrecorded", spelling)
+
+    def test_one_side_recorded_and_one_side_not_cannot_pin(self):
+        v = subject_pin(self._native("17b9c917"), self._native("unknown"))
+        self.assertEqual(v["state"], "unrecorded")
+        self.assertFalse(v["invalid"])
+
+    def test_a_commit_naming_two_builds_is_unresolvable_not_matched(self):
+        """The false green this check would otherwise have printed.
+
+        `gl-native-legs/A.before.r1.json` and `A.after.r1.json` both carry the
+        literal string `6e936c6a-vs-9fcccaae` -- one field made to hold a
+        two-arm run, which `commit_for_arm` exists to replace. Plain equality
+        calls that pair MATCHED while it is the one pair on disk that most
+        needs saying it cannot be vouched for.
+        """
+        for composite in ("6e936c6a-vs-9fcccaae", "d1ab16d9+016054bf"):
+            v = subject_pin(self._native(composite, label="before"),
+                            self._native(composite, label="after"))
+            self.assertEqual(v["state"], "unresolvable", composite)
+            self.assertFalse(v["invalid"], "unvouchable is UNCHECKED, not INVALID")
+            text = _capture(lambda: print_subject(v))
+            self.assertIn("** UNCHECKED: subject not resolvable **", text)
+
+    def test_a_lane_suffix_on_one_sha_is_not_a_composite(self):
+        """`59f08766-p1abl` names ONE build with a lane's tag on it.
+
+        Read as a composite it would turn an honest pinned pair into an
+        UNCHECKED one -- the over-fire direction, inside the composite rule.
+        """
+        self.assertFalse(subject_composite("59f08766-p1abl"))
+        self.assertFalse(subject_composite("17b9c917"))
+        self.assertTrue(subject_composite("6e936c6a-vs-9fcccaae"))
+        v = subject_pin(self._native("59f08766-p1abl"),
+                        self._native("59f08766-p1abl"))
+        self.assertEqual(v["state"], "pinned")
+
+    def test_the_three_unpinned_verdicts_never_co_fire(self):
+        """One question, one answer -- the shape `surface` already uses."""
+        cases = (
+            subject_pin(self._browser("Mozilla Firefox 155.0"),
+                        self._browser("Mozilla Firefox 155.0.1")),
+            subject_pin({"browser": "native"}, {"browser": "native"}),
+            subject_pin(self._native("a1b2c3d-vs-e4f5a6b", label="x"),
+                        self._native("a1b2c3d-vs-e4f5a6b", label="y")),
+            subject_pin(self._native("17b9c917"), self._native("17b9c917")),
+        )
+        states = [c["state"] for c in cases]
+        self.assertEqual(states, ["moved", "unrecorded", "unresolvable", "pinned"])
+        for c in cases:
+            self.assertFalse(c["invalid"] and c["unchecked"])
+
+    # ---- the table itself ----------------------------------------------
+
+    def test_the_subject_table_is_populous_and_says_where_each_is_checked(self):
+        """Non-vacuity for the table, the way `shared_row_keys` has it.
+
+        An empty table would make every pair `unrecorded` and every gate
+        silent, which reads as a clean board.
+        """
+        names = [f.name for f in SUBJECT_FIELDS]
+        self.assertIn("browser_version", names)
+        self.assertIn("commit", names)
+        self.assertGreaterEqual(len(names), 3)
+        self.assertTrue(any(f.may_pin for f in SUBJECT_FIELDS))
+        for f in SUBJECT_FIELDS:
+            self.assertTrue(f.why, "%s says nothing about why" % f.name)
+            self.assertIn(f.gated_when, (None, "same-browser", "same-arm"))
+            rel = subject_relation({}, {})
+            if f.gated_when:
+                self.assertIn(f.gated_when, rel)
+
+    def test_an_unknown_relation_can_only_relax_a_gate(self):
+        """A missing field must never manufacture a refusal."""
+        rel = subject_relation({}, {})
+        self.assertFalse(rel["same-browser"])
+        self.assertFalse(rel["same-arm"])
+
+    def test_the_arm_label_comes_off_the_row_not_the_filename(self):
+        self.assertEqual(subject_arm_label({"position": "p2(ringoff)"}), "ringoff")
+        self.assertEqual(subject_arm_label({"tag": "A.firefox"}), "A.firefox")
+        self.assertIsNone(subject_arm_label({"position": "-"}))
+
+    def test_the_session_version_backstops_a_missing_binary_block(self):
+        row = {"browser": "firefox", "tag": "t", "binary": None,
+               "session": {"browserVersion": "155.0"}}
+        v = subject_pin(row, dict(row))
+        self.assertEqual(v["state"], "pinned")
+
+    def test_geckodrivers_licence_paragraph_does_not_reach_the_row(self):
+        long_driver = "geckodriver 0.37.1 (abc 2026-07-17)\n\nThe source code"
+        self.assertEqual(_read_driver_version({"binary": {"driver_version": long_driver}}),
+                         "geckodriver 0.37.1 (abc 2026-07-17)")
+
+    # ---- the run-level census ------------------------------------------
+
+    def test_a_run_whose_browser_updated_between_legs_is_caught(self):
+        """The incident happened INSIDE one run, where nobody assembles a pair."""
+        census = subject_census([
+            ("A.firefox", self._browser("Mozilla Firefox 155.0")),
+            ("B.firefox", self._browser("Mozilla Firefox 155.0")),
+            ("C.firefox", self._browser("Mozilla Firefox 155.0.1")),
+        ])
+        self.assertEqual([c["state"] for c in census], ["moved"])
+
+    def test_a_run_on_one_build_per_browser_is_pinned(self):
+        census = subject_census([
+            ("A.firefox", self._browser("Mozilla Firefox 155.0")),
+            ("A.chromium", self._browser("Chromium 151.0", tag="A.chromium",
+                                         browser="chromium")),
+        ])
+        self.assertEqual(sorted(c["browser"] for c in census),
+                         ["chromium", "firefox"])
+        self.assertEqual([c["state"] for c in census], ["pinned", "pinned"])
+
+    def test_a_census_over_legs_that_recorded_nothing_is_not_a_pass(self):
+        census = subject_census([("a", {"browser": "native"}),
+                                 ("b", {"browser": "native"})])
+        self.assertEqual([c["state"] for c in census], ["unrecorded"])
 
 class OrderTests(unittest.TestCase):
     """Counterbalancing is an equal mean position, not a four-letter word."""
