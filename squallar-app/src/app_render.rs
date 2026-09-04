@@ -851,6 +851,39 @@ fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
     ]
 }
 
+/// The nine `frame finish (<name>):` lines — the `finish` segment, opened up.
+///
+/// # Denominator, and it is the one thing to read before any figure here
+///
+/// **Every presented frame, interact and idle alike** — which is NOT the
+/// denominator of `frame segment (finish)` beside it, nor of any other split
+/// family this file prints. All four of those record inside `finalize`'s
+/// `if interacted` arm; this one records outside it, on purpose, because the
+/// frames on which `finish` is a p99 contributor are idle ones. See
+/// `frame_ledger::FinishHists`.
+///
+/// So the eight named cuts are **never added to `frame segment (finish)`**
+/// and are not a decomposition of it: they decompose the same span over a
+/// strictly larger frame set, and `n` here is larger than `n` there by the
+/// idle frames. `frame finish (whole)` is the parent on this family's own
+/// terms — the eight telescope to it exactly — so every share this family
+/// supports is computed without borrowing another family's count.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
+fn frame_finish_lines(f: &crate::frame_ledger::FinishHists) -> [String; 9] {
+    [
+        named_hist_line("frame finish", "file", &f.file),
+        named_hist_line("frame finish", "view", &f.view),
+        named_hist_line("frame finish", "draw", &f.draw),
+        named_hist_line("frame finish", "resolve", &f.resolve),
+        named_hist_line("frame finish", "submit", &f.submit),
+        named_hist_line("frame finish", "collect", &f.collect),
+        named_hist_line("frame finish", "free", &f.free),
+        named_hist_line("frame finish", "present", &f.present),
+        named_hist_line("frame finish", "whole", &f.whole),
+    ]
+}
+
 /// The seven `frame dispatch (<name>):` lines — `frame post (dispatch)`,
 /// opened up.
 ///
@@ -1865,6 +1898,14 @@ impl super::App {
         // tail has. Same denominator, six contiguous cuts of that one span — a
         // decomposition of the line above, never a seventh segment beside it.
         for line in frame_post_lines(ledger.post_phases()) {
+            say_telemetry(loud, &line);
+        }
+        // The `finish` segment above, opened up at the seams `present_frame`
+        // has — and on a WIDER denominator than every family above it: every
+        // presented frame, not the interact ones alone. Its own parent rides
+        // on `frame finish (whole)`; never add these to `frame segment
+        // (finish)`. See `frame_finish_lines`.
+        for line in frame_finish_lines(ledger.finish_phases()) {
             say_telemetry(loud, &line);
         }
         // One level below the seven above: which of the things the overlay
@@ -3534,23 +3575,46 @@ impl super::App {
             }
         };
 
+        // The eight stamps of the `finish` split. Seven clock reads on every
+        // presented frame, and unlike its four sibling splits this one is
+        // recorded for idle frames too — see `frame_ledger::FinishHists` for
+        // the measurement that made the wider denominator the point of it.
+        // The skipped/lost arm above takes none: `finalize` discards that
+        // frame outright, so a stamp there could never become a sample.
+        let filed = web_time::Instant::now();
         let surface_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let viewed = web_time::Instant::now();
 
         state
             .egui_renderer
             .draw(&mut encoder, &surface_view, &frame);
+        let drawn = web_time::Instant::now();
 
         // After the last pass of the frame, before its submit: the probe's
         // claimed brackets resolve in the same command stream that wrote
         // them. The collect after the submit never blocks — see the probe.
         state.egui_renderer.probe_end_frame(&mut encoder);
+        let resolved = web_time::Instant::now();
         frame.submit(&state.queue, encoder);
+        let submitted = web_time::Instant::now();
         state.egui_renderer.probe_collect();
+        let collected = web_time::Instant::now();
         state.egui_renderer.free_textures(frame.textures_to_free());
+        let freed = web_time::Instant::now();
         surface_texture.present();
         self.frame_ledger.mark_present_return();
+        self.frame_ledger
+            .record_finish_phases(crate::frame_ledger::FinishPhaseStamps {
+                filed,
+                viewed,
+                drawn,
+                resolved,
+                submitted,
+                collected,
+                freed,
+            });
         repaint_delay
     }
 

@@ -907,6 +907,7 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
     let carried_by: &[(&str, &[&str])] = &[
         ("cadence", &["cadence_re"]),
         ("dispatch", &["frame_dispatch_re"]),
+        ("finish", &["frame_finish_re"]),
         ("post", &["frame_post_re"]),
         ("prep", &["prep_costs_re", "prep_geometry_re"]),
         ("prepare", &["frame_prepare_re"]),

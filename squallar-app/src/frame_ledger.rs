@@ -4,16 +4,20 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is nineteen clock reads, about
-//! twenty-eight integer bin searches and two `u32` comparisons — the ledger's
+//! feature gate, and the per-frame cost is twenty-six clock reads, about
+//! thirty-seven integer bin searches and two `u32` comparisons — the ledger's
 //! own eight stamps, the one the egui pass takes on entry, the five
-//! `Gui::ui` takes on its way through and the five `handle_redraw` takes
-//! across its tail. Six of the bin searches are the `prepare` split
-//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]) and **seven**
-//! more the `post` split ([`PostHists`]); each records only on the frames its
-//! own segment does. The two comparisons are [`WorstFrame`]'s latch and its
-//! session maximum, and unlike everything else here they are offered EVERY
-//! presented frame.
+//! `Gui::ui` takes on its way through, the five `handle_redraw` takes
+//! across its tail and the **seven** `present_frame` takes across the frame's
+//! own tail. Six of the bin searches are the `prepare` split
+//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]), **seven**
+//! more the `post` split ([`PostHists`]) and **nine** more the `finish` split
+//! ([`FinishHists`]). Each of the first three records only on the frames its
+//! own segment does; the `finish` nine record on EVERY presented frame, which
+//! is the one denominator difference in this file and is the reason that
+//! split exists — see [`FinishHists`]. The two comparisons are
+//! [`WorstFrame`]'s latch and its session maximum, and like the `finish` nine
+//! they are offered EVERY presented frame.
 //!
 //! **A dispatching frame pays more, and only a dispatching frame.** The
 //! `dispatch` split ([`DispatchHists`]) adds two clock reads per
@@ -87,6 +91,11 @@ struct Marks {
     /// before the tail, which is the same frame that leaves no
     /// `present_return`.
     post_phases: Option<PostPhaseStamps>,
+    /// Where `present_frame`'s tail crossed its own phase boundaries, off the
+    /// stamps it took on its way through. `None` on a frame that returned
+    /// through the skipped/lost arm, which is the same frame `finalize`
+    /// discards outright.
+    finish_phases: Option<FinishPhaseStamps>,
     /// What this frame's `dispatch` cut spent, by sub-cut. `None` on a frame
     /// whose tail never dispatched, which is most of them — and an absence
     /// here is not a zero: a frame that dispatched nothing has no dispatch to
@@ -197,6 +206,86 @@ pub(crate) struct PostPhaseStamps {
     pub(crate) poll: Instant,
     /// The `repaint_action` match and any redraw ask its arms made.
     pub(crate) repaint: Instant,
+}
+
+/// Where `present_frame` crossed the seven boundaries between the eight things
+/// it does after the swapchain acquire returns. Taken by that call itself —
+/// like [`PostPhaseStamps`] and [`PumpPhaseStamps`], and unlike the `prepare`
+/// and `ui` splits, this segment has no single callee to carry them back.
+#[derive(Clone, Copy)]
+pub(crate) struct FinishPhaseStamps {
+    /// The ledger filing (`record_prepare_phases`, `record_acquire`), the
+    /// deferred-mirror repaint-delay choice and the surface-status match —
+    /// everything between the acquire's return and the first GPU call.
+    pub(crate) filed: Instant,
+    /// `create_view` on the acquired surface texture's return.
+    pub(crate) viewed: Instant,
+    /// `EguiRenderer::draw`'s return: the main render pass, **encoded**.
+    pub(crate) drawn: Instant,
+    /// `probe_end_frame`'s return — the GPU probe's claimed brackets resolved
+    /// into the encoder. A no-op on an arm with no timestamp probe installed,
+    /// and that zero is the reading.
+    pub(crate) resolved: Instant,
+    /// `PreparedFrame::submit`'s return: `encoder.finish()` plus the one
+    /// `queue.submit` that carries every command buffer this frame recorded.
+    pub(crate) submitted: Instant,
+    /// `probe_collect`'s return — the probe's ring harvested. Documented as
+    /// never blocking; this cut is what makes that claim checkable.
+    pub(crate) collected: Instant,
+    /// `free_textures`' return.
+    pub(crate) freed: Instant,
+}
+
+/// Where the `finish` segment's time went, cut at the seams `present_frame`
+/// has.
+///
+/// # Denominator, and it is NOT the other splits'
+///
+/// **Every presented frame, interact and idle alike** — deliberately wider
+/// than [`PrepareHists`], [`UiHists`], [`PumpHists`] and [`PostHists`], all
+/// of which record inside `finalize`'s `if interacted` arm. That choice is
+/// the whole reason this family is useful: the frames `finish` is a p99
+/// contributor on are **idle** ones. Measured on this box, Firefox, scene D,
+/// 3440x1440@174.96, n=107 interact frames: of the eight worst frames of a
+/// gesture window every one was family=idle, and `finish` was the largest
+/// segment on two of them, one at 14,179 us. A split recorded the way its
+/// four siblings are would have read EMPTY on exactly those frames.
+///
+/// So `frame finish (*)` is **never added to `frame segment (finish)`** and
+/// is not even a decomposition of it: it decomposes the same span over a
+/// strictly larger frame set. [`FinishHists::whole`] is that parent, recorded
+/// here on this family's own denominator, so every share this family supports
+/// is computable without borrowing another family's `n`.
+///
+/// The eight named cuts are contiguous, so they telescope to `whole`
+/// (`the_finish_phases_telescope_to_finish`).
+#[derive(Default)]
+pub(crate) struct FinishHists {
+    /// See [`FinishPhaseStamps::filed`].
+    pub(crate) file: Hist,
+    /// See [`FinishPhaseStamps::viewed`].
+    pub(crate) view: Hist,
+    /// See [`FinishPhaseStamps::drawn`].
+    pub(crate) draw: Hist,
+    /// See [`FinishPhaseStamps::resolved`].
+    pub(crate) resolve: Hist,
+    /// See [`FinishPhaseStamps::submitted`].
+    pub(crate) submit: Hist,
+    /// See [`FinishPhaseStamps::collected`].
+    pub(crate) collect: Hist,
+    /// See [`FinishPhaseStamps::freed`].
+    pub(crate) free: Hist,
+    /// `SurfaceTexture::present`'s return. **The wait candidate**: on a real
+    /// compositor this is where the frame thread meets the display's own
+    /// back-pressure, and a cost here is not one any code of ours can be made
+    /// faster to avoid.
+    pub(crate) present: Hist,
+    /// The `finish` segment itself on THIS family's denominator — every
+    /// presented frame, not just the interact ones `SegmentHists::finish`
+    /// counts. Carried so the eight cuts above have a parent that shares
+    /// their `n`; the two `finish` figures are the same span over different
+    /// frame sets and are never added.
+    pub(crate) whole: Hist,
 }
 
 /// Where the `prepare` segment's time went, cut at the seams the code has.
@@ -560,6 +649,9 @@ pub(crate) struct FrameLedger {
     pump: PumpHists,
     /// See [`PostHists`] — `segments.post`, opened up, same frames.
     post: PostHists,
+    /// See [`FinishHists`] — the `finish` span, opened up, over EVERY
+    /// presented frame rather than the interact ones alone.
+    finish: FinishHists,
     /// See [`DispatchHists`] — `post.dispatch`, opened up, same frames.
     dispatch: DispatchHists,
     /// The dispatch accumulator the current `dispatch_overlay_renders` call is
@@ -786,6 +878,31 @@ fn post_phase_micros(
     ]
 }
 
+/// The eight contiguous cuts of the `finish` segment, in call order:
+/// `[file, view, draw, resolve, submit, collect, free, present]` — see
+/// [`FinishHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `finish`'s own boundaries, so the eight sum to
+/// `micros(acquire_end, present_return)` exactly. A free function so the
+/// telescoping is testable without a frame.
+fn finish_phase_micros(
+    acquire_end: Instant,
+    phases: &FinishPhaseStamps,
+    present_return: Instant,
+) -> [u32; 8] {
+    [
+        micros(acquire_end, phases.filed),
+        micros(phases.filed, phases.viewed),
+        micros(phases.viewed, phases.drawn),
+        micros(phases.drawn, phases.resolved),
+        micros(phases.resolved, phases.submitted),
+        micros(phases.submitted, phases.collected),
+        micros(phases.collected, phases.freed),
+        micros(phases.freed, present_return),
+    ]
+}
+
 impl FrameLedger {
     /// Open a frame: stamp its start and forget the previous frame's marks.
     pub(crate) fn mark_frame_start(&mut self) {
@@ -872,6 +989,14 @@ impl FrameLedger {
 
     pub(crate) fn record_post_phases(&mut self, stamps: PostPhaseStamps) {
         self.cur.post_phases = Some(stamps);
+    }
+
+    /// The phase stamps `present_frame` took after the acquire returned.
+    /// Recorded unconditionally; `finalize` decides whether this frame is a
+    /// sample — and unlike every other split, its answer is yes for idle
+    /// frames too. See [`FinishHists`] for why.
+    pub(crate) fn record_finish_phases(&mut self, stamps: FinishPhaseStamps) {
+        self.cur.finish_phases = Some(stamps);
     }
 
     pub(crate) fn mark_present_return(&mut self) {
@@ -1036,6 +1161,25 @@ impl FrameLedger {
             self.service_idle.record(service);
         }
 
+        // **Outside the `interacted` arm on purpose, and the only split that
+        // is.** `finish`'s expensive frames are idle ones — see
+        // [`FinishHists`] for the measurement that says so — so this family
+        // records on every presented frame and carries its own parent
+        // (`whole`) rather than borrowing `segments.finish`'s narrower one.
+        if let Some(phases) = m.finish_phases.as_ref() {
+            let [file, view, draw, resolve, submit, collect, free, present] =
+                finish_phase_micros(acquire_end, phases, present_return);
+            self.finish.file.record(file);
+            self.finish.view.record(view);
+            self.finish.draw.record(draw);
+            self.finish.resolve.record(resolve);
+            self.finish.submit.record(submit);
+            self.finish.collect.record(collect);
+            self.finish.free.record(free);
+            self.finish.present.record(present);
+            self.finish.whole.record(segments[4]);
+        }
+
         // **Every presented frame, both families** — see [`WorstFrame`]. The
         // comparison is on service, which is the figure the bar is stated in,
         // and it is deliberately outside the `interacted` block above: the
@@ -1098,6 +1242,12 @@ impl FrameLedger {
         &self.post
     }
 
+    /// See [`FinishHists`] — the `finish` span opened up, over every
+    /// presented frame rather than the interact ones alone.
+    pub(crate) fn finish_phases(&self) -> &FinishHists {
+        &self.finish
+    }
+
     pub(crate) fn acquire(&self) -> &Hist {
         &self.acquire
     }
@@ -1151,9 +1301,9 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchCuts, Instant, PostPhaseStamps, PumpPhaseStamps, WorstFrame, dispatch_cut_micros,
-        latch_worst, micros, post_phase_micros, prepare_phase_micros, pump_phase_micros,
-        service_micros, ui_phase_micros,
+        DispatchCuts, FinishPhaseStamps, Instant, PostPhaseStamps, PumpPhaseStamps, WorstFrame,
+        dispatch_cut_micros, finish_phase_micros, latch_worst, micros, post_phase_micros,
+        prepare_phase_micros, pump_phase_micros, service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -1431,6 +1581,90 @@ mod tests {
     /// offsets from `present_return`, so a test can state its stamps as
     /// arithmetic. Named apart from the other two splits' fixtures: the three
     /// decompositions share this module and answer with different stamp types.
+    fn finish_phases_at(acquire_end: Instant, offsets: [u64; 7]) -> FinishPhaseStamps {
+        let at = |us: u64| acquire_end + std::time::Duration::from_micros(us);
+        FinishPhaseStamps {
+            filed: at(offsets[0]),
+            viewed: at(offsets[1]),
+            drawn: at(offsets[2]),
+            resolved: at(offsets[3]),
+            submitted: at(offsets[4]),
+            collected: at(offsets[5]),
+            freed: at(offsets[6]),
+        }
+    }
+
+    /// **The eight cuts are a decomposition of `finish`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(acquire_end, present_return)` — the very
+    /// span [`super::SegmentHists::finish`] records and the very span
+    /// [`super::FinishHists::whole`] records beside these eight — so a share
+    /// computed against `whole` is a share of the whole segment.
+    #[test]
+    fn the_finish_phases_telescope_to_finish() {
+        let acquire_end = Instant::now();
+        let phases = finish_phases_at(acquire_end, [20, 60, 210, 215, 900, 905, 910]);
+        let present_return = acquire_end + std::time::Duration::from_micros(1_400);
+
+        let cuts = finish_phase_micros(acquire_end, &phases, present_return);
+        assert_eq!(
+            cuts,
+            [20, 40, 150, 5, 685, 5, 5, 490],
+            "a cut moved: the eight no longer bracket the boundaries they are \
+             named for",
+        );
+        assert_eq!(
+            cuts.iter().sum::<u32>(),
+            micros(acquire_end, present_return),
+            "the eight cuts do not sum to the finish span they decompose, so \
+             a share of `whole` computed from them is not a share of finish",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 1_400);
+    }
+
+    /// **The non-vacuity floor: a cut may not trivially cover `finish`.**
+    ///
+    /// The sibling of `every_post_stamp_is_load_bearing_in_two_cuts`, and the
+    /// hazard is the same one: on an arm with no GPU probe installed
+    /// `resolve` and `collect` are genuinely near-zero, so a split whose
+    /// stamps had been folded together would look exactly like a real reading
+    /// and pass the telescoping test above. Held by perturbation instead.
+    #[test]
+    fn every_finish_stamp_is_load_bearing_in_two_cuts() {
+        let acquire_end = Instant::now();
+        let base_offsets = [4_500u64, 5_000, 5_500, 6_000, 6_500, 7_000, 7_500];
+        let present_return = acquire_end + std::time::Duration::from_micros(8_000);
+        let base = finish_phase_micros(
+            acquire_end,
+            &finish_phases_at(acquire_end, base_offsets),
+            present_return,
+        );
+
+        for moved in 0..7 {
+            let mut offsets = base_offsets;
+            offsets[moved] += 100;
+            let cuts = finish_phase_micros(
+                acquire_end,
+                &finish_phases_at(acquire_end, offsets),
+                present_return,
+            );
+            let changed: Vec<usize> = (0..8).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![moved, moved + 1],
+                "moving stamp {moved} did not move exactly the two cuts it \
+                 bounds, so a boundary is folded away and the split reports \
+                 fewer spans than it names",
+            );
+            assert_eq!(
+                cuts[moved] - base[moved],
+                base[moved + 1] - cuts[moved + 1],
+                "the two cuts stamp {moved} bounds did not trade the same 100 \
+                 us, so they are not contiguous across it",
+            );
+        }
+    }
+
     fn post_phases_at(present_return: Instant, offsets: [u64; 6]) -> PostPhaseStamps {
         let at = |us: u64| present_return + std::time::Duration::from_micros(us);
         PostPhaseStamps {
