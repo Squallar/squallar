@@ -55,6 +55,31 @@ Two traps, each of which costs a round trip:
   **`wasm-bindgen/wasm-pack`**. There is **no Homebrew** on this box, so the
   tarball is the only path.
 
+### wasm-bindgen-cli must be installed SEPARATELY, with a clean environment
+
+`wasm-pack` shells out to `cargo install wasm-bindgen-cli` when it cannot find a
+matching one — and it inherits the environment `wasm-threads.sh` set up for
+wasm32. Those `RUSTFLAGS` carry `-Clink-arg=--shared-memory` and friends, which
+reach the linker for a **host** binary and kill it:
+
+```
+error: linking with `cc` failed: exit status: 1
+Error: Installing wasm-bindgen with cargo
+```
+
+The wasm build itself succeeds first (295 crates), so this reads as a late,
+confusing failure of a build that already worked. Install it up front, with the
+wasm variables stripped, into the exact directory wasm-pack looks in:
+
+```bash
+env -u RUSTFLAGS -u CARGO_UNSTABLE_BUILD_STD -u RUSTUP_TOOLCHAIN \
+  cargo install wasm-bindgen-cli --version <the version wasm-pack asks for> \
+  --root "$HOME/Library/Caches/.wasm-pack/.wasm-bindgen-cargo-install-<version>"
+```
+
+The version is in the error text — take it from there rather than guessing, and
+note the cache directory is wasm-pack's own, so it counts as yours to clean up.
+
 The pinned nightly is not optional: `.github/scripts/wasm-threads.sh` pins
 `nightly-2026-08-15` and installs the *target* and *components* itself, but it
 cannot install the *toolchain*.
