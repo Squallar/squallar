@@ -297,3 +297,92 @@ fn overlay_picture_sizes_land_on_their_own_pane_and_nowhere_else() {
     render.record_overlay_dispatch(9, &squallar_source::id::known::NWS_ALERTS, plan(64, 64));
     assert_eq!(render.overlay_picture_sizes(4).len(), 4);
 }
+
+/// **The resident picture load is per `(pane, layer)`, and the per-pane list
+/// is not it folded up.**
+///
+/// These are two different questions off one record and the defect they gate
+/// is reading the first as the second. `overlay_picture_sizes` answers "how
+/// big is a pane's picture" — one entry per pane, which is what a surface
+/// check holds a bracket's uploaded bytes against. `resident_overlay_pictures`
+/// answers "how many pictures is this page carrying and what do they weigh",
+/// which is what the page heap pays and what the host need model prices.
+///
+/// The figures are the Tier-2 `huge` leg's own: one pane of 2878 x 1611
+/// physical pixels at 1.5x oversampling is a 4317 x 2416 picture of
+/// 41,719,488 B, and the leg showed thirteen texture layers on it. Reported
+/// per pane that is one picture of 41,719,488 B — 40 MiB, which fits three
+/// quarters of a 1 GiB page heap with room to spare. Reported per picture it
+/// is 542,353,344 B, 517 MiB, and with the arrival the model adds it is the
+/// 557 MiB the leg could not hold. Both figures are on the line; neither is
+/// the other.
+#[test]
+fn resident_pictures_count_every_layer_where_the_pane_list_counts_panes() {
+    use squallar_egui::overlay_cache::OverlayTexturePlan;
+
+    let huge = crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        texture: OverlayTexturePlan {
+            width: 4317,
+            height: 2416,
+            overdraw: 0.5,
+            pixels_per_point: 1.0,
+            pane_px: [2878, 1611],
+        },
+        data_generation: 1,
+        zoom: 32,
+    };
+
+    // The leg's thirteen texture layers on one pane. Any thirteen distinct
+    // ids: the record is keyed by `(pane, id)` and the count is of keys.
+    let ids = [
+        squallar_source::id::known::NWS_ALERTS,
+        squallar_source::id::known::STORM_REPORTS,
+        squallar_source::id::known::SPC_OUTLOOK,
+        squallar_source::id::known::SPC_FIRE_OUTLOOK,
+        squallar_source::id::known::SPC_DISCUSSIONS,
+        squallar_source::id::known::MRMS,
+        squallar_source::id::known::GMGSI,
+        squallar_source::id::known::MODEL_DATA,
+        squallar_source::id::known::LIGHTNING,
+        squallar_source::id::known::METAR,
+        squallar_source::id::known::CITY_LABELS,
+        squallar_source::id::known::RADAR_SITES,
+        squallar_source::id::known::RADAR_COVERAGE,
+    ];
+    let mut render = RenderDispatcher::new();
+    for id in &ids {
+        render.record_overlay_dispatch(0, id, huge.clone());
+    }
+
+    assert_eq!(
+        render.overlay_picture_sizes(1),
+        vec![(4317, 2416)],
+        "the per-pane list stopped being one entry per pane",
+    );
+    assert_eq!(
+        render.resident_overlay_pictures(),
+        (13, 542_353_344),
+        "the resident load is not every layer's picture: this is the figure \
+         the page heap pays and the host need model prices, and reading the \
+         pane list in its place is how the `huge` leg was fitted at 40 MiB \
+         of pictures when it held 517",
+    );
+    assert_eq!(render.overlay_picture_count(0), 13);
+    assert_eq!(
+        render.overlay_picture_count(1),
+        0,
+        "a pane that has dispatched nothing was charged for a picture",
+    );
+
+    // A second pane's layers are its own on both readings.
+    render.record_overlay_dispatch(1, &squallar_source::id::known::NWS_ALERTS, huge.clone());
+    assert_eq!(render.overlay_picture_count(0), 13);
+    assert_eq!(render.overlay_picture_count(1), 1);
+    assert_eq!(render.resident_overlay_pictures().0, 14);
+}

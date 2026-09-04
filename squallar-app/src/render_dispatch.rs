@@ -1116,6 +1116,51 @@ impl RenderDispatcher {
         sizes
     }
 
+    /// **Every whole-picture overlay raster this application holds a live
+    /// plan for**, as `(count, bytes)` over the record's `(pane, layer)`
+    /// keys at the size the planner was handed.
+    ///
+    /// [`Self::overlay_picture_sizes`] answers a different question and is
+    /// not this one folded up: it is **one entry per pane**, the size that
+    /// pane's pictures are, which is what a surface check holds a bracket's
+    /// uploaded bytes against. A pane showing thirteen texture layers is one
+    /// entry there and thirteen pictures here, and the page heap carries the
+    /// thirteen. Reading the pane figure as the picture load is how a scene
+    /// needing 557 MiB of pictures was fitted as though it needed 40, and
+    /// `overlay pictures:` now carries both so neither can be mistaken for
+    /// the other.
+    ///
+    /// A sum over a set, so the `HashMap`'s order does not reach the answer.
+    /// Loop-frame dispatches are not in the record at all — see
+    /// [`Self::overlay_picture_sizes`] — so this is the live rasters' load.
+    pub(crate) fn resident_overlay_pictures(&self) -> (usize, u64) {
+        self.last_overlay_dispatch
+            .values()
+            .fold((0usize, 0u64), |(n, bytes), req| {
+                (
+                    n + 1,
+                    bytes.saturating_add(
+                        u64::from(req.texture.width) * u64::from(req.texture.height) * 4,
+                    ),
+                )
+            })
+    }
+
+    /// **How many whole-picture overlays pane `pane_idx` holds a live plan
+    /// for**: the pane's share of [`Self::resident_overlay_pictures`], and
+    /// the count the budget system's host-picture term multiplies
+    /// (`squallar_device_profile::scene::PaneNeed::overlay_pictures`).
+    ///
+    /// Read off the same record the telemetry line reports from, so the
+    /// figure the reader sees and the figure the fit prices are the same
+    /// figure by construction rather than by two walks agreeing.
+    pub(crate) fn overlay_picture_count(&self, pane_idx: usize) -> usize {
+        self.last_overlay_dispatch
+            .keys()
+            .filter(|(idx, _)| *idx == pane_idx)
+            .count()
+    }
+
     /// **The glass pane `pane_idx`'s last live dispatch was planned over**,
     /// before the oversampling margin, in physical pixels —
     /// `OverlayTexturePlan::pane_px`, `[0, 0]` for a pane that has dispatched

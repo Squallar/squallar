@@ -1825,6 +1825,7 @@ impl super::App {
                 &self
                     .render
                     .overlay_picture_sizes(self.scene_of().panes.len()),
+                self.render.resident_overlay_pictures(),
                 self.budgets.overlay_oversample_percent,
             ),
         );
@@ -4150,23 +4151,23 @@ impl super::App {
                     .map_or((window_px, GroundPass::Off), |p| (p.px, p.ground)),
                 _ => ([0, 0], GroundPass::Off),
             };
-            // **The whole-picture overlays this pane shows**, counted off the
-            // pane's own texture caches on this same walk: every texture
-            // layer with a picture on the glass or a raster on its way,
-            // radar excluded — its raster is its own pipeline's and the
-            // static term's. Each is one raster of the pane at the budget's
-            // oversampling crossing the page heap, and the glass it covers
-            // is what the last dispatch planned over (`[0, 0]` before one,
-            // when the window stands in — over-priced, never under).
-            let overlay_pictures = pane
-                .overlay_textures
-                .iter()
-                .filter(|(id, cache)| {
-                    **id != known::RADAR
-                        && !pane.overlay_texture_is_releasable(id)
-                        && (cache.current().is_some() || !cache.renders.is_empty())
-                })
-                .count();
+            // **The whole-picture overlays this pane holds**, counted off the
+            // dispatch record — one entry per `(pane, layer)` the pane has a
+            // live whole-picture plan for, radar's own pipeline excluded
+            // because it never writes that record. Each is one raster of the
+            // pane at the budget's oversampling crossing the page heap, and
+            // the glass it covers is what the last dispatch planned over
+            // (`[0, 0]` before one, when the window stands in — over-priced,
+            // never under).
+            //
+            // **Read from the same record the `overlay pictures:` line
+            // reports**, so the figure a reader sees and the figure this fit
+            // prices cannot disagree. The pane's texture caches were the
+            // first source tried and are the wrong one twice over: a picture
+            // is host-resident while its upload bands drain, which is
+            // `OverlayTextureCache::held` and not `current`, and a cache
+            // walk gives the reader no way to check what the fit counted.
+            let overlay_pictures = self.render.overlay_picture_count(pane_idx);
             let picture_px = match self.render.overlay_pane_px(pane_idx) {
                 [0, 0] => window_px,
                 planned => planned,
@@ -4545,7 +4546,26 @@ impl super::App {
                 );
                 return self.budgets.steps_back;
             };
-            let host = host / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
+            // **Lowered from the mark, not from the constant.** The scene's
+            // host need is the tile working set and the picture batch, and
+            // those are a minority of what a page holds: the module's own
+            // statics, egui's tessellation buffers, the decoded volumes
+            // behind the loop and every transfer in flight are on the same
+            // heap and in no term here. So a presumption stepped down from
+            // the bracket's 1 GiB stays far above a need that was never the
+            // whole story, the fit finds nothing over its allowance, and the
+            // ladder stands at its top rung while the heap traps — measured
+            // on the Tier-2 `huge` leg of 2026-09-03, which read `steps 0`
+            // and `oversample 150` at 1011 of 1024 MiB.
+            //
+            // The reading is the fix. It is a high-water mark on a heap that
+            // only grows, so it is a floor under what this page has already
+            // needed, and holding the presumption to a fraction of it prices
+            // the whole heap rather than the part this crate can name. Each
+            // event lowers it again from the newer, higher mark, so the
+            // ladder converges instead of stalling.
+            let observed = cause.page_heap_used().unwrap_or(host);
+            let host = host.min(observed) / ECONOMY_FRACTION.1 * ECONOMY_FRACTION.0;
             self.session_host_capacity = Some(host);
             host
         } else {

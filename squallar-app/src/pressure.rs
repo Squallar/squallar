@@ -77,6 +77,21 @@ impl Pressure {
     pub fn is_beyond_reach(self) -> bool {
         matches!(self, Self::WorkerMemory { .. })
     }
+
+    /// **What the page heap was holding when this cause fired**, where the
+    /// cause is the page's — the reading the watermark judged, in bytes.
+    ///
+    /// A wasm linear memory only ever grows, so a reading is a high-water
+    /// mark by nature and the mark is a **lower bound on what this session's
+    /// page has already needed**. That is what makes it the right figure to
+    /// lower a host presumption to: a bracket constant argues what a page
+    /// might hold, and this says what one did.
+    pub fn page_heap_used(self) -> Option<u64> {
+        match self {
+            Self::LinearMemory { used, .. } => Some(used),
+            _ => None,
+        }
+    }
 }
 
 /// **Whether an out-of-memory event is the WebGPU probe's own doing.** While

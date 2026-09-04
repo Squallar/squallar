@@ -183,7 +183,11 @@ pub(crate) fn budget_state_line(
 /// console ring holds 1200 entries and a rig reads the last 60, so a line
 /// that spoke once is indistinguishable from a run in which nothing was
 /// rastered.
-pub(crate) fn overlay_pictures_line(sizes: &[(u32, u32)], oversample_percent: u16) -> String {
+pub(crate) fn overlay_pictures_line(
+    sizes: &[(u32, u32)],
+    resident: (usize, u64),
+    oversample_percent: u16,
+) -> String {
     let px = sizes
         .iter()
         .map(|(w, h)| format!("{w}x{h}"))
@@ -193,14 +197,32 @@ pub(crate) fn overlay_pictures_line(sizes: &[(u32, u32)], oversample_percent: u1
         .iter()
         .map(|(w, h)| u64::from(*w) * u64::from(*h) * 4)
         .sum();
-    // `oversample` trails `bytes`, the field the rig's regex ends on
-    // (`native_row.py`'s `OVERLAY_PICTURES_RE`, applied with `search`): the
-    // ladder's oversampling rung in force, in percent per side, so a leg
-    // reads which rung the pictures above were planned at rather than
+    // `resident` and `oversample` trail `bytes`, the field the rig's regex
+    // ends on (`native_row.py`'s `OVERLAY_PICTURES_RE`, applied with
+    // `search`), so the surface check reads exactly the fields it always
+    // read and the two figures after them are additions rather than a
+    // reinterpretation.
+    //
+    // **`n` and `resident` are different counts and are never the same
+    // question.** `n` is PANES and `px` lists one size per pane, because a
+    // surface check compares a bracket's uploaded bytes against the size the
+    // app says a pane's picture is. `resident` is PICTURES — every pane's
+    // every shown texture layer — because that is what crosses the page
+    // heap, and it is the figure the host need model prices
+    // (`squallar_device_profile::fit::NeedTerms::pictures_host`). One pane
+    // showing thirteen layers is `n=1` and `resident 13`, and reading the
+    // first as the second is how a scene needing 557 MiB of pictures was
+    // fitted as though it needed 40.
+    //
+    // `oversample` is the ladder's rung in force, in percent per side, so a
+    // leg reads which rung the pictures above were planned at rather than
     // inferring it from their sizes.
     format!(
-        "overlay pictures: n={}, px={px}, bytes={bytes}, oversample {oversample_percent}",
-        sizes.len()
+        "overlay pictures: n={}, px={px}, bytes={bytes}, resident {} of {} B, \
+         oversample {oversample_percent}",
+        sizes.len(),
+        resident.0,
+        resident.1,
     )
 }
 
@@ -525,17 +547,19 @@ mod tests {
     /// rig's row.
     #[test]
     fn the_overlay_pictures_line_keeps_its_prefix_and_field_order() {
-        let line = overlay_pictures_line(&[(2880, 1555), (0, 0), (1440, 780)], 150);
+        let line = overlay_pictures_line(&[(2880, 1555), (0, 0), (1440, 780)], (4, 29874400), 150);
         assert_eq!(
             line,
-            "overlay pictures: n=3, px=2880x1555;0x0;1440x780, bytes=22406400, oversample 150",
+            "overlay pictures: n=3, px=2880x1555;0x0;1440x780, bytes=22406400, \
+             resident 4 of 29874400 B, oversample 150",
         );
-        // The rung trails `bytes` — the field the rig's regex ends on — so
-        // the scraper's positional groups are what they were, and a leg that
-        // took a rung says so on the line rather than in the sizes alone.
-        let thinner = overlay_pictures_line(&[(2878, 1651)], 100);
+        // `resident` and the rung trail `bytes` — the field the rig's regex
+        // ends on — so the scraper's positional groups are what they were,
+        // and a leg that took a rung says so on the line rather than in the
+        // sizes alone.
+        let thinner = overlay_pictures_line(&[(2878, 1651)], (1, 19006312), 100);
         assert!(
-            thinner.ends_with(", bytes=19006312, oversample 100"),
+            thinner.ends_with(", bytes=19006312, resident 1 of 19006312 B, oversample 100"),
             "{thinner}"
         );
         let rig = include_str!("../../.github/browser-rig/native_row.py");
@@ -554,13 +578,13 @@ mod tests {
     /// zero would move an equality check.
     #[test]
     fn a_pane_with_no_picture_costs_nothing_and_is_still_listed() {
-        let none = overlay_pictures_line(&[(0, 0)], 150);
+        let none = overlay_pictures_line(&[(0, 0)], (0, 0), 150);
         assert!(
             none.contains("n=1") && none.contains("px=0x0") && none.contains("bytes=0"),
             "a pane with no picture is not reported as an empty slot: {none}",
         );
         // Listed, not skipped: position in `px` IS the pane index.
-        let mixed = overlay_pictures_line(&[(0, 0), (10, 10)], 150);
+        let mixed = overlay_pictures_line(&[(0, 0), (10, 10)], (1, 400), 150);
         assert!(
             mixed.contains("px=0x0;10x10"),
             "the empty pane was dropped from the list, so every pane after it \
@@ -574,8 +598,8 @@ mod tests {
     #[test]
     fn a_scene_with_no_panes_still_says_so() {
         assert_eq!(
-            overlay_pictures_line(&[], 150),
-            "overlay pictures: n=0, px=, bytes=0, oversample 150",
+            overlay_pictures_line(&[], (0, 0), 150),
+            "overlay pictures: n=0, px=, bytes=0, resident 0 of 0 B, oversample 150",
         );
     }
 
@@ -604,7 +628,7 @@ mod tests {
             "the case is not a case: {expected} fits a u32",
         );
         assert!(
-            overlay_pictures_line(&many, 150).contains(&format!("bytes={expected}")),
+            overlay_pictures_line(&many, (0, 0), 150).contains(&format!("bytes={expected}")),
             "the byte total wrapped",
         );
     }
