@@ -23,7 +23,13 @@ into it on failure), then measures and records:
     built-in pure-python PNG decoder (blank / near-blank detection)
   * error signal: injected window.__rig_errors / __rig_console (both
     browsers, provided by serve.py's /index-rig.html) plus chromedriver's
-    non-standard browser-log endpoint (chromium only; geckodriver has none)
+    non-standard browser-log endpoint (chromium only; geckodriver has none).
+    The console ring is exported WHOLE where it fits (`rig_signal.console`,
+    bounded by CONSOLE_EXPORT_BYTE_BUDGET); `rig_signal.console_tail` keeps
+    its old meaning, the last 60. Every windowed export carries a
+    `..._window` record -- kept, held, evicted, and the wall-clock span the
+    kept entries cover -- so an absence in the artifact can be told apart
+    from an absence in the log.
   * Tier-2 worker-wire assertions (opt-in): --expect-worker-round-trip fails
     the run unless the console ring shows a worker attach AND a "took N ms
     off the frame" job reply; --expect-doctored-respawn fails it unless the
@@ -2598,14 +2604,79 @@ return { domContentLoaded: Math.round(n.domContentLoadedEventEnd),
          responseEnd: Math.round(n.responseEnd) };
 """
 
+# The page-side console ring's capacity, as serve.py's PAGE_PRELUDE sets it.
+# Named here because two things read it: the export budget below (the ring is
+# its own natural entry cap) and `rasterization_ms.console_ring_entries`,
+# which used to carry a second copy of the literal.
+CONSOLE_RING_ENTRIES = 1200
+
+# The byte budget for the console export, applied PAGE-SIDE so a runaway line
+# cannot push megabytes over the driver wire before anything can trim it.
+#
+# THE ARITHMETIC, off the artifacts under ~/.cache/rustdar-fb-rig-out: 540
+# recorded entries average 201.3 B of JSON each (`{t, lvl, msg}`), the largest
+# single entry seen is 1105 B. A FULL 1200-entry ring is therefore ~236 KiB --
+# next to nothing beside legs whose JSON already runs 100 KB to 4.5 MB, and
+# the screenshots in the same directory are 4-5 MB each.
+#
+# So at the measured mean this budget would allow ~9900 entries and the ring's
+# own 1200 binds first: an ordinary leg ships the WHOLE ring. The budget binds
+# only when the mean line exceeds ~1.6 KB, i.e. when lines are near the
+# prelude's own 2000-char truncation, and even then it still ships ~1000
+# entries. Generous, and bounded.
+CONSOLE_EXPORT_BYTE_BUDGET = 2_000_000
+
+# What was wrong before: the driver shipped `console_tail`, the last SIXTY
+# entries, out of a ring holding up to 1200. On four `huge` passes measured
+# 2026-09-04 the ring held 452 / 877 / 458 / 1200 entries -- three of them had
+# never even filled, so every line the browser recorded was sitting there and
+# 87-95% of it was thrown away at scrape time for no reason at all.
+#
+# That is not a cosmetic loss. A reader took the 60-entry tail, found no line
+# from a page-pressure arm, and reported that the arm never fired; the reading
+# was repeated onward as a finding. The window read spanned 4.8 s of a 50 s
+# leg and the line it was reasoning from sat at t+2.5 s. **An absence in a
+# tail is not an absence in the log**, and the artifact could not tell the two
+# apart -- nothing in it said how much of the leg the tail covered.
+#
+# `console_tail` and `console_total` keep their exact old meanings (readers
+# depend on them). `console` is the fuller record beside them, and
+# `console_window` (built host-side by `console_window_record`) is what makes
+# the export legible: how many were kept, how many the ring held, how many the
+# ring had already evicted, and the wall-clock span the kept entries cover.
 RIG_ERRORS_PROBE = """
+var C = window.__rig_console || [];
+var E = window.__rig_errors || [];
+var CAP = %d, BUDGET = %d;
+// Walk NEWEST first and stop at the budget, so a bound that binds drops the
+// OLDEST -- the same end the ring itself evicts from, which keeps the
+// export's loss the same shape as the ring's. `keep.length` guards the first
+// entry so a single oversized line still ships one entry rather than none.
+var keep = [], used = 0;
+for (var i = C.length - 1; i >= 0 && keep.length < CAP; i--) {
+  var e = C[i];
+  var n = String((e && e.msg) || "").length + 48;
+  if (used + n > BUDGET && keep.length) break;
+  used += n;
+  keep.push(e);
+}
+keep.reverse();
 return {
   present: !!window.__rig,
-  errors: (window.__rig_errors || []).slice(-120),
-  console_tail: (window.__rig_console || []).slice(-60),
-  console_total: (window.__rig_console || []).length
+  errors: E.slice(-120),
+  errors_total: E.length,
+  errors_ring_evicted: E.evicted || 0,
+  console_tail: C.slice(-60),
+  console_total: C.length,
+  console: keep,
+  console_kept: keep.length,
+  console_ring_capacity: CAP,
+  console_ring_evicted: C.evicted || 0,
+  console_bytes_est: used,
+  page_t0: (window.__rig && window.__rig.t0) || null,
+  page_now: Date.now()
 };
-"""
+""" % (CONSOLE_RING_ENTRIES, CONSOLE_EXPORT_BYTE_BUDGET)
 
 # Did THIS BROWSER really apply the scene seed, or is it measuring a page that
 # chose its own scene?
@@ -2938,7 +3009,8 @@ return { attached: attached, different: different, off_frame: off_frame,
          rasters_unparsed: rasters_unparsed,
          uploads_unparsed: uploads_unparsed,
          basemap_unparsed: basemap_unparsed,
-         console_total: C.length };
+         console_total: C.length,
+         console_ring_evicted: C.evicted || 0 };
 """
 
 # The frame timing lines, written by App::report_frame_telemetry every 2 s
@@ -4708,9 +4780,151 @@ def raf_sample(session, frames):
                          "rAF is not firing): %s" % e}
 
 
+# --------------------------------------------------------------------------
+# Window legibility
+#
+# EVERY log export in this artifact is a window over something longer, and
+# before this the artifact never said so. A reader who found no line for some
+# behaviour could not tell "it did not happen" from "it happened outside the
+# 60 entries we shipped" -- and one such reader got it wrong, over a window
+# that turned out to be 4.8 s of a 50 s leg.
+#
+# So every windowed export carries a record built by `export_window`: how many
+# entries were kept, how many the source held, how many were already lost
+# before the export looked, the wall-clock span the kept entries cover, and a
+# plain-English `covers` sentence. `complete` is the one field a reader can
+# act on without arithmetic -- True means nothing was dropped at any stage, so
+# an absence in these entries IS an absence in the log.
+# --------------------------------------------------------------------------
+
+def _span(entries, tkey):
+    """(first, last, span_ms) over whichever entries carry a numeric time.
+
+    Entries without one are skipped rather than defaulting to zero: a single
+    missing timestamp read as 0 would stretch the span across the epoch and
+    make a partial window look like it covered the whole leg."""
+    ts = [e.get(tkey) for e in entries
+          if isinstance(e, dict) and isinstance(e.get(tkey), (int, float))
+          and not isinstance(e.get(tkey), bool)]
+    if not ts:
+        return (None, None, None)
+    return (min(ts), max(ts), max(ts) - min(ts))
+
+
+def export_window(entries, source_len, tkey, lost_before_export=0,
+                  capacity=None, t0=None, now=None, entries_key=None,
+                  source="ring"):
+    """The legibility record for one windowed export.
+
+    `source_len` is what the source held when the export ran; `entries` is
+    what shipped. `lost_before_export` is what the source had ALREADY dropped
+    (a ring's own eviction), which is the count that makes `source_len`
+    readable: a ring at capacity SATURATES, so "1200 of 1200" says nothing
+    about how many lines existed until this number sits beside it."""
+    entries = [e for e in entries if isinstance(e, dict)] if entries else []
+    kept = len(entries)
+    lost_before_export = int(lost_before_export or 0)
+    dropped = max(int(source_len or 0) - kept, 0)
+    first, last, span = _span(entries, tkey)
+    rec = {
+        "entries_key": entries_key,
+        "source": source,
+        "kept": kept,
+        "source_len": source_len,
+        "capacity": capacity,
+        "lost_before_export": lost_before_export,
+        "dropped_by_export": dropped,
+        "logged_total": (int(source_len) + lost_before_export
+                         if source_len is not None else None),
+        "complete": bool(source_len is not None and dropped == 0
+                         and lost_before_export == 0),
+        "first_t": first,
+        "last_t": last,
+        "span_ms": span,
+    }
+    leg_ms = None
+    if isinstance(t0, (int, float)) and isinstance(now, (int, float)):
+        leg_ms = now - t0
+        rec["page_t0"] = t0
+        rec["leg_ms"] = leg_ms
+        if first is not None:
+            rec["first_offset_ms"] = first - t0
+            rec["last_offset_ms"] = last - t0
+    # The sentence a reader needs and should never have to derive. It is
+    # written even when the window IS the whole thing, because "complete" is
+    # exactly as load-bearing a fact as "4.8 s of a 50 s leg", and the reader
+    # who needs one needs the other.
+    parts = []
+    if source_len is None:
+        parts.append("kept %d entries; the source length was not readable, so "
+                     "nothing here can say whether this is the whole log"
+                     % kept)
+    elif rec["complete"]:
+        parts.append("kept all %d entries the %s held" % (kept, source))
+    else:
+        parts.append("kept %d of the %d entries the %s held"
+                     % (kept, source_len, source))
+        if dropped:
+            parts.append("%d dropped by the export budget" % dropped)
+    if lost_before_export:
+        parts.append("%d more were logged and evicted by the %s before the "
+                     "export looked" % (lost_before_export, source))
+    if span is not None:
+        if leg_ms:
+            parts.append("covering %.1f s of a %.1f s leg (%.0f%%)"
+                         % (span / 1000.0, leg_ms / 1000.0,
+                            100.0 * span / leg_ms))
+        else:
+            parts.append("covering %.1f s" % (span / 1000.0))
+    rec["covers"] = "; ".join(parts)
+    return rec
+
+
+def console_window_record(sig):
+    """`export_window` over what RIG_ERRORS_PROBE brought back.
+
+    Tolerant of an OLD probe reading -- a rerun over a recorded artifact, or a
+    page whose prelude predates the eviction counter: the new keys fall back
+    to `console_tail`/`console_total`, so this describes the tail honestly
+    rather than refusing to describe anything."""
+    if not isinstance(sig, dict):
+        return None
+    entries = sig.get("console")
+    key = "console"
+    if entries is None:
+        entries = sig.get("console_tail")
+        key = "console_tail"
+    if entries is None:
+        return None
+    return export_window(
+        entries, sig.get("console_total"), "t",
+        lost_before_export=sig.get("console_ring_evicted") or 0,
+        capacity=sig.get("console_ring_capacity") or CONSOLE_RING_ENTRIES,
+        t0=sig.get("page_t0"), now=sig.get("page_now"),
+        entries_key="rig_signal.%s" % key, source="console ring")
+
+
+def errors_window_record(sig):
+    """The same for `rig_signal.errors`, which is also a window (last 120)."""
+    if not isinstance(sig, dict) or sig.get("errors") is None:
+        return None
+    return export_window(
+        sig.get("errors"), sig.get("errors_total"), "t",
+        lost_before_export=sig.get("errors_ring_evicted") or 0,
+        capacity=sig.get("console_ring_capacity") or CONSOLE_RING_ENTRIES,
+        t0=sig.get("page_t0"), now=sig.get("page_now"),
+        entries_key="rig_signal.errors", source="error ring")
+
+
 def collect_driver_browser_log(session, max_entries=200):
     """chromedriver's non-standard log endpoint; geckodriver has no
-    equivalent (returns None -> rely on the injected __rig hooks)."""
+    equivalent (returns None -> rely on the injected __rig hooks).
+
+    The endpoint DRAINS: each call returns what accumulated since the last
+    one, so `available` is what this call was handed and not what the browser
+    logged all leg. That is why the window record's source is named "driver
+    log batch" -- `complete` here means the batch shipped whole, never that
+    the leg's driver log did."""
     last_err = None
     for path in ("/se/log", "/log"):
         try:
@@ -4724,7 +4938,13 @@ def collect_driver_browser_log(session, max_entries=200):
                     out.append({"level": e.get("level"),
                                 "message": str(e.get("message"))[:2000],
                                 "timestamp": e.get("timestamp")})
-            return {"endpoint": path, "entries": out}
+            return {"endpoint": path, "entries": out,
+                    "available": len(entries),
+                    "max_entries": max_entries,
+                    "window": export_window(
+                        out, len(entries), "timestamp",
+                        entries_key="driver_browser_log.entries",
+                        source="driver log batch")}
         except WebDriverError as e:
             last_err = str(e)
     return {"endpoint": None, "entries": None, "note": last_err}
@@ -5827,11 +6047,128 @@ def selftest_tile_cache_settles():
     return fails
 
 
+def selftest_export_window():
+    """The window record, offline, on fixture rings.
+
+    The case it exists for: a reader must be able to tell a COMPLETE export
+    from a window, and must be able to compute "this window is 4.8 s of a
+    50 s leg" from the record alone. Both readings are asserted here, and so
+    is the one that was silently wrong before -- a full ring, whose length
+    SATURATES, is not a complete log."""
+    fails = []
+
+    def check(cond, msg):
+        if not cond:
+            fails.append("export_window: " + msg)
+
+    t0 = 1_000_000
+
+    def line(off, msg="x"):
+        return {"t": t0 + off, "lvl": "info", "msg": msg}
+
+    # 1. The whole ring shipped, nothing ever evicted: COMPLETE, and the
+    #    sentence says so without a fraction.
+    ring = [line(i * 100) for i in range(452)]
+    r = export_window(ring, 452, "t", lost_before_export=0, capacity=1200,
+                      t0=t0, now=t0 + 50_000, entries_key="rig_signal.console",
+                      source="console ring")
+    check(r["complete"] is True, "a whole un-evicted ring read incomplete: %r" % r)
+    check(r["kept"] == 452 and r["dropped_by_export"] == 0, "counts %r" % r)
+    check(r["logged_total"] == 452, "logged_total %r" % r["logged_total"])
+    check(r["span_ms"] == 45_100, "span %r" % r["span_ms"])
+    check(r["leg_ms"] == 50_000, "leg %r" % r["leg_ms"])
+    check("kept all 452" in r["covers"], r["covers"])
+    check("45.1 s of a 50.0 s leg (90%)" in r["covers"], r["covers"])
+
+    # 2. THE DEFECT: the old 60-entry tail out of a 452-entry ring. The record
+    #    must refuse to read complete, and must print the fraction a reader
+    #    once took for an absence.
+    r = export_window(ring[-60:], 452, "t", capacity=1200, t0=t0,
+                      now=t0 + 50_000, entries_key="rig_signal.console_tail",
+                      source="console ring")
+    check(r["complete"] is False, "a 60-of-452 tail read complete: %r" % r)
+    check(r["dropped_by_export"] == 392, "dropped %r" % r["dropped_by_export"])
+    check(r["span_ms"] == 5_900, "span %r" % r["span_ms"])
+    check("kept 60 of the 452" in r["covers"], r["covers"])
+    check("5.9 s of a 50.0 s leg (12%)" in r["covers"], r["covers"])
+
+    # 3. A FULL ring is not a complete log. `source_len` saturates at the cap,
+    #    so without `lost_before_export` this reads 1200-of-1200 and looks
+    #    whole -- which is the exact misreading the eviction counter exists to
+    #    stop.
+    full = [line(i * 10) for i in range(1200)]
+    r = export_window(full, 1200, "t", lost_before_export=3140, capacity=1200,
+                      t0=t0, now=t0 + 50_000, source="console ring")
+    check(r["complete"] is False, "a full evicting ring read complete: %r" % r)
+    check(r["dropped_by_export"] == 0, "dropped %r" % r["dropped_by_export"])
+    check(r["logged_total"] == 4340, "logged_total %r" % r["logged_total"])
+    check("3140 more were logged and evicted" in r["covers"], r["covers"])
+
+    # 4. No usable timestamps: a span of None, never a span of zero, and the
+    #    record still says how many were kept.
+    r = export_window([{"msg": "a"}, {"msg": "b"}], 2, "t")
+    check(r["span_ms"] is None, "span from timeless entries %r" % r["span_ms"])
+    check(r["complete"] is True, "timeless but whole read incomplete: %r" % r)
+    # A boolean is an int in python; it must not be mistaken for a timestamp.
+    r = export_window([{"t": True, "msg": "a"}], 1, "t")
+    check(r["span_ms"] is None, "a bool timestamp was counted: %r" % r)
+
+    # 5. An unreadable source length says so rather than claiming completeness.
+    r = export_window(ring[-60:], None, "t")
+    check(r["complete"] is False, "unknown source_len read complete: %r" % r)
+    check(r["logged_total"] is None, "logged_total %r" % r["logged_total"])
+    check("not readable" in r["covers"], r["covers"])
+
+    # 6. console_window_record over a NEW probe reading, and over an OLD one
+    #    that has only the tail keys (a rerun against a recorded artifact).
+    new_sig = {"console": ring, "console_total": 452,
+               "console_ring_evicted": 0, "console_ring_capacity": 1200,
+               "page_t0": t0, "page_now": t0 + 50_000}
+    r = console_window_record(new_sig)
+    check(r["entries_key"] == "rig_signal.console", "key %r" % r["entries_key"])
+    check(r["complete"] is True, "new-probe record %r" % r)
+    old_sig = {"console_tail": ring[-60:], "console_total": 452}
+    r = console_window_record(old_sig)
+    check(r["entries_key"] == "rig_signal.console_tail",
+          "old-probe key %r" % r["entries_key"])
+    check(r["complete"] is False, "old-probe record read complete: %r" % r)
+    check(console_window_record({}) is None, "an empty signal produced a record")
+    check(console_window_record(None) is None, "None produced a record")
+
+    # 7. The probe's own budget arithmetic, in python, against the same
+    #    constants the JS is built from: at the measured mean entry size the
+    #    RING is what binds, not the byte budget.
+    mean_entry_bytes = 201.3
+    check(CONSOLE_EXPORT_BYTE_BUDGET / mean_entry_bytes > CONSOLE_RING_ENTRIES,
+          "the byte budget binds before the ring does at the measured mean "
+          "entry size, so an ordinary leg would ship a window rather than the "
+          "whole ring")
+    check("var CAP = %d, BUDGET = %d;"
+          % (CONSOLE_RING_ENTRIES, CONSOLE_EXPORT_BYTE_BUDGET)
+          in RIG_ERRORS_PROBE,
+          "the probe was not built from the constants")
+    # Pinned WITH their terminators. `"console: keep" in probe` was satisfied
+    # by `console: keep.slice(-60)` -- a re-shrunk export reading green is the
+    # precise regression this whole change exists to stop, and a substring
+    # test cannot see it.
+    for key in ("\n  console_tail: C.slice(-60),\n",
+                "\n  console_total: C.length,\n",
+                "\n  console: keep,\n",
+                "\n  console_kept: keep.length,\n"):
+        check(key in RIG_ERRORS_PROBE, "probe lost %r" % key)
+    # The loop that fills `keep` must be bounded by CAP, not by a tail slice.
+    check("for (var i = C.length - 1; i >= 0 && keep.length < CAP; i--) {"
+          in RIG_ERRORS_PROBE,
+          "the export loop no longer walks the ring up to CAP")
+    return fails
+
+
 def selftest():
     failures = []
     failures += selftest_android()
     failures += selftest_adapters()
     failures += selftest_tile_cache_settles()
+    failures += selftest_export_window()
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -6377,9 +6714,11 @@ def run_smoke(args):
                 _why_empty = (
                     "not seen, NOT zero: %d job replies crossed the wire by the "
                     "page's own running total, so the per-event lines this "
-                    "family is read from were evicted from the 1200-entry "
-                    "console ring (%d entries logged)"
-                    % (_replies, _sig.get("console_total") or 0))
+                    "family is read from were evicted from the %d-entry "
+                    "console ring (%d entries held, %d already evicted)"
+                    % (_replies, CONSOLE_RING_ENTRIES,
+                       _sig.get("console_total") or 0,
+                       _sig.get("console_ring_evicted") or 0))
             elif _replies == 0:
                 _why_empty = (
                     "no job reply crossed the wire at all (transport reports 0 "
@@ -6395,7 +6734,8 @@ def run_smoke(args):
             # seen in the surviving window", never "did not happen".
             "evictable": True,
             "console_total": _sig.get("console_total"),
-            "console_ring_entries": 1200,
+            "console_ring_entries": CONSOLE_RING_ENTRIES,
+            "console_ring_evicted": _sig.get("console_ring_evicted"),
             "transport_replies": _replies,
             "why_empty": _why_empty,
         }
@@ -6665,6 +7005,21 @@ def run_smoke(args):
 
         stage("collect-errors")
         result["rig_signal"] = session.execute(RIG_ERRORS_PROBE)
+        # The console/error exports are windows; say so IN the artifact. Both
+        # records are written unconditionally, including when the window is
+        # the whole ring -- "complete: true" is what lets a later reader treat
+        # an absence in these entries as an absence in the log, and that
+        # reading is only safe because the record is always there to check.
+        if isinstance(result["rig_signal"], dict):
+            _cw = console_window_record(result["rig_signal"])
+            if _cw is not None:
+                result["rig_signal"]["console_window"] = _cw
+                stage("console-window", kept=_cw["kept"],
+                      ring=_cw["source_len"], evicted=_cw["lost_before_export"],
+                      complete=_cw["complete"], span_ms=_cw["span_ms"])
+            _ew = errors_window_record(result["rig_signal"])
+            if _ew is not None:
+                result["rig_signal"]["errors_window"] = _ew
         if args.browser == "chromium":
             result["driver_browser_log"] = collect_driver_browser_log(session)
         else:
@@ -6895,6 +7250,10 @@ def run_smoke(args):
                     result[key] = session.execute(script, timeout=20)
                 except Exception as diag:
                     result[key] = "unavailable: %s" % diag
+            if isinstance(result.get("rig_signal_at_failure"), dict):
+                _fw = console_window_record(result["rig_signal_at_failure"])
+                if _fw is not None:
+                    result["rig_signal_at_failure"]["console_window"] = _fw
             try:
                 p = os.path.join(out_dir, "%s.fail.png" % tag)
                 save_screenshot(session.screenshot_b64(), p)
@@ -6903,6 +7262,17 @@ def run_smoke(args):
                 pass
         if driver is not None:
             result["driver_log_tail"] = driver.log_tail(80)
+            result["driver_log_tail_window"] = {
+                "entries_key": "driver_log_tail",
+                "source": "driver process log",
+                "lines_kept": len(
+                    (result["driver_log_tail"] or "").splitlines()),
+                "max_lines": 80,
+                "whole_log_path": getattr(driver, "log_path", None),
+                "covers": "the last 80 lines only; the WHOLE driver log is "
+                          "kept on disk at the path above, so an absence here "
+                          "is never an absence in the driver log",
+            }
     finally:
         if session is not None:
             session.delete()
@@ -7066,6 +7436,23 @@ def run_smoke(args):
           % (tag, v.get("rig_error_count"),
              len(((result.get("driver_browser_log") or {}).get("entries"))
                  or [])))
+    # Every windowed export prints what it covers, whether or not anything
+    # gates on it. A reader who never opens the JSON still gets told when the
+    # log they are about to reason from is a fraction of the leg.
+    def _wr(section, key):
+        # `rig_signal` is a probe reading and can be None, or -- on the
+        # failure path -- the string the diagnostic collector left behind.
+        # A summary printer must never be the thing that raises.
+        sec = result.get(section)
+        return sec.get(key) if isinstance(sec, dict) else None
+
+    for _wname, _wrec in (("console", _wr("rig_signal", "console_window")),
+                          ("errors ", _wr("rig_signal", "errors_window")),
+                          ("drvlog ", _wr("driver_browser_log", "window"))):
+        if isinstance(_wrec, dict):
+            print("[%s] SUMMARY %s window: %s%s"
+                  % (tag, _wname, "COMPLETE, " if _wrec.get("complete")
+                     else "PARTIAL, ", _wrec.get("covers")))
     wrt = result.get("worker_round_trip")
     if wrt is not None:
         print("[%s] SUMMARY worker round-trip: %s (attach + off-the-frame "

@@ -172,6 +172,13 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
 (function () {
   "use strict";
   var E = (window.__rig_errors = []);
+  // 1200 entries, and it STAYS 1200. The cap is a page-memory bound, not a
+  // display window: `msg` is truncated at 2000 chars, so the ring's worst
+  // case is already ~2.4 MB of live page heap, and the scenes this rig runs
+  // hardest (`huge`) are the ones that trap the wasm allocator at a 1 GiB
+  // linear-memory ceiling. Growing the ring spends the budget of the leg
+  // being measured. What was actually broken was the EXPORT -- the driver
+  // shipped 60 of these -- and that costs nothing on the page.
   var C = (window.__rig_console = []);
   // The gesture player's markers, kept OUT of the console ring buffer.
   //
@@ -203,8 +210,23 @@ PAGE_PRELUDE = b"""<script>/* squallar rig prelude (injected by serve.py, repo u
       E.push({ t: Date.now(), kind: "rig.seed", msg: String(e) });
     }
   }
+  // `arr.evicted` is the count this ring has DROPPED, kept as a plain
+  // property on the array. `JSON.stringify` and the WebDriver value
+  // serializer both ignore non-index properties on an array, so nothing that
+  // reads the ring as a list sees it -- but a probe that asks for it by name
+  // can, and that is what lets the exporter say "1200 entries, and 3140 more
+  // were logged and evicted" instead of leaving the reader to infer a full
+  // ring is a complete one. Without it `arr.length` SATURATES at the cap, so
+  // "how many existed" is unanswerable from the artifact.
   function push(arr, o) {
-    try { arr.push(o); if (arr.length > 1200) arr.splice(0, arr.length - 1200); } catch (_) {}
+    try {
+      arr.push(o);
+      if (arr.length > 1200) {
+        var drop = arr.length - 1200;
+        arr.splice(0, drop);
+        arr.evicted = (arr.evicted || 0) + drop;
+      }
+    } catch (_) {}
   }
   function fmt(args) {
     try {

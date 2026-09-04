@@ -89,6 +89,7 @@ import unittest
 
 RIG_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVE_PY = os.path.join(RIG_DIR, "drive.py")
+SERVE_PY = os.path.join(RIG_DIR, "serve.py")
 RUN_MEASURE_SH = os.path.join(RIG_DIR, "run_measure.sh")
 
 # --------------------------------------------------------------- histogram --
@@ -4251,6 +4252,86 @@ class OffFrameEvictionTests(unittest.TestCase):
                       "eviction from absence")
         self.assertIn("not seen, NOT zero", text)
         self.assertIn('"evictable": True,', text)
+
+
+class ConsoleExportTests(unittest.TestCase):
+    """An absence in the exported console must not read as an absence in the log.
+
+    The rig used to ship `console_tail`, the last SIXTY entries, out of a ring
+    holding up to 1200 -- and on three of four `huge` passes measured
+    2026-09-04 the ring had never even filled, so nothing was evicted and the
+    export threw away 87-95% of what the ring held for nothing. A reader then
+    took that tail, found no line from a page-pressure arm, and reported the
+    arm never fired; the window was 4.8 s of a 50 s leg. Two things stop that
+    recurring and both are pinned here: the export is the WHOLE ring where it
+    fits, and every windowed export says what fraction it is.
+    """
+
+    def test_the_probe_exports_the_ring_not_a_sixty_entry_tail(self):
+        text = _read(DRIVE_PY)
+        # The newline terminators are load-bearing: `"console: keep"` alone
+        # is satisfied by `console: keep.slice(-60)`, which is the regression.
+        self.assertIn("\n  console: keep,\n", text,
+                      "RIG_ERRORS_PROBE no longer exports the fuller console "
+                      "record, so the artifact is back to a 60-entry tail")
+        self.assertIn(
+            "for (var i = C.length - 1; i >= 0 && keep.length < CAP; i--) {",
+            text,
+            "the export loop no longer walks the whole ring up to CAP")
+        self.assertIn("var CAP = %d, BUDGET = %d;", text,
+                      "the probe's bounds are no longer built from "
+                      "CONSOLE_RING_ENTRIES / CONSOLE_EXPORT_BYTE_BUDGET")
+        self.assertIn("CONSOLE_RING_ENTRIES = 1200", text)
+        self.assertIn("CONSOLE_EXPORT_BYTE_BUDGET = 2_000_000", text)
+
+    def test_the_old_keys_keep_their_old_meanings(self):
+        """`console_tail` is 60 and `console_total` is the ring length.
+
+        Readers depend on both. The fuller record was added BESIDE them; if a
+        later change repoints either, every existing reading silently changes
+        denominator."""
+        text = _read(DRIVE_PY)
+        self.assertIn("\n  console_tail: C.slice(-60),\n", text)
+        self.assertIn("\n  console_total: C.length,\n", text)
+
+    def test_every_windowed_export_carries_a_window_record(self):
+        text = _read(DRIVE_PY)
+        for key in ('result["rig_signal"]["console_window"] = _cw',
+                    'result["rig_signal"]["errors_window"] = _ew',
+                    '"window": export_window('):
+            self.assertIn(key, text,
+                          "a windowed export lost its legibility record: %s"
+                          % key)
+
+    def test_the_window_record_says_what_fraction_of_the_leg_it_covers(self):
+        """`covers` and `complete`, computable from the JSON alone.
+
+        The reading this exists for is "this window is 4.8 s of a 50 s leg" --
+        the artifact must carry it, not leave it to be re-derived from
+        timestamps a reader may not have."""
+        text = _read(DRIVE_PY)
+        self.assertIn('rec["covers"] = "; ".join(parts)', text)
+        self.assertIn('"complete": bool(source_len is not None', text)
+        self.assertIn('covering %.1f s of a %.1f s leg (%.0f%%)', text)
+
+    def test_a_full_ring_is_not_a_complete_log(self):
+        """The ring's length SATURATES at its cap, so the eviction count is
+        what makes it readable. Without it, 1200-of-1200 reads whole."""
+        self.assertIn("arr.evicted = (arr.evicted || 0) + drop;",
+                      _read(SERVE_PY),
+                      "serve.py's prelude no longer counts what the rings "
+                      "evict, so `console_total` saturates with nothing beside "
+                      "it to say how many lines existed")
+        text = _read(DRIVE_PY)
+        self.assertIn("console_ring_evicted: C.evicted || 0,", text)
+        self.assertIn('lost_before_export=sig.get("console_ring_evicted") or 0',
+                      text)
+
+    def test_the_ring_stays_a_page_memory_bound(self):
+        """1200 is a bound on the page under measurement, not a display
+        window. Growing it spends the heap of the leg being measured -- and
+        the scene this rig runs hardest is the one that traps at 1 GiB."""
+        self.assertIn("1200 entries, and it STAYS 1200", _read(SERVE_PY))
 
 
 class GateSetTests(unittest.TestCase):
