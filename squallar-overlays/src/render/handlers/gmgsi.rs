@@ -53,7 +53,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::fetch_policy::Whole;
-use crate::gmgsi::{GmgsiChannel, GmgsiFetchResult, GmgsiFrameFetch, GmgsiListing};
+use crate::gmgsi::{GmgsiChannel, GmgsiFetchResult, GmgsiFrameFetch, GmgsiListing, staging};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue,
 };
@@ -71,10 +71,11 @@ use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
 /// One mosaic's values, in bytes: 3000 x 5000 `f32` = **60 MB**.
 ///
-/// Stated as the product's own shape rather than as a round number of
-/// megabytes, so "one resident channel" stays one resident channel if the grid
-/// ever changes shape.
-pub const GLOBAL_GRID_BYTES: usize = 3000 * 5000 * std::mem::size_of::<f32>();
+/// Derived from the product's own shape ([`crate::gmgsi::GRID_POINTS`]) rather
+/// than stated as a round number of megabytes, so "one resident channel" stays
+/// one resident channel if the grid ever changes shape — and so the staging
+/// pool's slot, sized off the same constant, changes with it.
+pub const GLOBAL_GRID_BYTES: usize = crate::gmgsi::GRID_POINTS * std::mem::size_of::<f32>();
 
 /// How many bytes of decoded GMGSI raster may stay resident at once: **one
 /// channel on wasm, two on mobile, four on desktop**.
@@ -179,14 +180,23 @@ struct GmgsiFrameCache {
     /// Injected for the same reason [`GmgsiGridCache::budget`] is: the shipped
     /// budget is one 60 MB mosaic and no test can afford to overflow it.
     budget: usize,
+    /// **Where an evicted granule's buffer goes** — [`staging::global`] on
+    /// every shipped path.
+    ///
+    /// Injected for a reason the budget's own injection does not cover: the
+    /// shipped slot is process-wide, so a suite reading its counters inside a
+    /// test binary that also decodes fixtures cannot tell its own eviction
+    /// from another test's. A pool of the suite's own can.
+    staging: &'static staging::StagingPool,
 }
 
 impl GmgsiFrameCache {
-    fn new(budget: usize) -> Self {
+    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            staging,
         }
     }
 
@@ -214,9 +224,16 @@ impl GmgsiFrameCache {
     /// that has already said it cannot spare it. The live cache makes the
     /// opposite trade because a pane with no live granule has nothing that
     /// will re-ask.
+    ///
+    /// **Every granule that leaves here is offered to [`staging`].** This is
+    /// the hot eviction of the whole layer — one per arriving loop frame — and
+    /// it is where the retained mosaic buffer comes from: dropping the victim
+    /// instead is what made every granule take a fresh 60 MB block off a heap
+    /// that only grows.
     fn insert(&mut self, key: FrameKey, granule: GmgsiGranule) {
-        if self.entries.insert(key, granule).is_some() {
+        if let Some(replaced) = self.entries.insert(key, granule) {
             self.touch(key);
+            staging::recycle_shared(self.staging, replaced.grid);
         } else {
             self.recency.borrow_mut().push(key);
         }
@@ -232,13 +249,28 @@ impl GmgsiFrameCache {
                 };
                 recency.remove(pos)
             };
-            self.entries.remove(&victim);
+            if let Some(evicted) = self.entries.remove(&victim) {
+                staging::recycle_shared(self.staging, evicted.grid);
+            }
         }
     }
 
     /// Drop everything but `keep` — the [`FrameSource::retain_frames`] door.
+    ///
+    /// The dropped granules go to [`staging`] for the same reason
+    /// [`Self::insert`]'s evictions do.
     fn retain(&mut self, keep: impl Fn(FrameKey) -> bool) {
-        self.entries.retain(|key, _| keep(*key));
+        let dropped: Vec<FrameKey> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|key| !keep(*key))
+            .collect();
+        for key in dropped {
+            if let Some(granule) = self.entries.remove(&key) {
+                staging::recycle_shared(self.staging, granule.grid);
+            }
+        }
         self.recency.borrow_mut().retain(|key| keep(*key));
     }
 
@@ -286,14 +318,17 @@ struct GmgsiGridCache {
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
+    /// See [`GmgsiFrameCache::staging`].
+    staging: &'static staging::StagingPool,
 }
 
 impl GmgsiGridCache {
-    fn new(budget: usize) -> Self {
+    fn new(budget: usize, staging: &'static staging::StagingPool) -> Self {
         Self {
             entries: HashMap::new(),
             recency: RefCell::new(Vec::new()),
             budget,
+            staging,
         }
     }
 
@@ -346,9 +381,19 @@ impl GmgsiGridCache {
     /// than a refetch — `prepare_job` answers `None` and the pane goes on
     /// drawing its last texture with nothing that will re-ask — so the pin is
     /// what keeps a visible pane drawn when an arrival lands mid-cycle.
+    ///
+    /// The poll replaces this channel's mosaic here, and the displaced one is
+    /// offered to [`staging`] — with `Arc::into_inner` deciding, so a granule
+    /// another pane's raster job is still reading is never taken out from
+    /// under it. On the live path that usually declines, because
+    /// `OverlayState::data` holds a second `Arc` on the pane's own picture;
+    /// the frame cache is where the pool is really fed. Offering it anyway
+    /// costs a refcount read and catches every case where it is the last
+    /// reference.
     fn insert(&mut self, channel: GmgsiChannel, granule: GmgsiGranule, pinned: &[GmgsiChannel]) {
-        if self.entries.insert(channel, granule).is_some() {
+        if let Some(replaced) = self.entries.insert(channel, granule) {
             self.touch(channel);
+            staging::recycle_shared(self.staging, replaced.grid);
         } else {
             self.recency.borrow_mut().push(channel);
         }
@@ -366,7 +411,9 @@ impl GmgsiGridCache {
                 };
                 recency.remove(pos)
             };
-            self.entries.remove(&victim);
+            if let Some(evicted) = self.entries.remove(&victim) {
+                staging::recycle_shared(self.staging, evicted.grid);
+            }
         }
     }
 
@@ -420,11 +467,11 @@ impl GmgsiHandler {
         Self {
             state: OverlayState::new(),
             defaults: GmgsiPaneState::new(false),
-            cached_grids: GmgsiGridCache::new(GRID_CACHE_BYTES),
+            cached_grids: GmgsiGridCache::new(GRID_CACHE_BYTES, staging::global()),
             last_error: None,
             frame_keys: HashMap::new(),
             covered: HashMap::new(),
-            frame_grids: GmgsiFrameCache::new(FRAME_STAGING_BYTES),
+            frame_grids: GmgsiFrameCache::new(FRAME_STAGING_BYTES, staging::global()),
             frame_gate: Arc::new(futures::lock::Mutex::new(())),
         }
     }
@@ -437,8 +484,15 @@ impl GmgsiHandler {
     /// policy that is never overflowed is a policy nothing has checked.
     #[cfg(test)]
     fn with_frame_budget(bytes: usize) -> Self {
+        Self::with_frame_budget_and_staging(bytes, staging::global())
+    }
+
+    /// [`Self::with_frame_budget`] over a pool of the caller's own — see
+    /// [`GmgsiFrameCache::staging`] for why a suite needs one.
+    #[cfg(test)]
+    fn with_frame_budget_and_staging(bytes: usize, pool: &'static staging::StagingPool) -> Self {
         Self {
-            frame_grids: GmgsiFrameCache::new(bytes),
+            frame_grids: GmgsiFrameCache::new(bytes, pool),
             ..Self::new()
         }
     }

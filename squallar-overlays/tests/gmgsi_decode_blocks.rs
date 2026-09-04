@@ -33,9 +33,12 @@
 //! chunks are 1 x 793 x 1322.
 //!
 //! `OBSERVE` is lower, and only records: a red here should say what it saw
-//! rather than only that it saw something. It is also what shows that the
-//! 60,000,000 B blocks under the bar are many — a decode inflates the whole
-//! single-chunk `lat`/`lon` variable once per windowed row read.
+//! rather than only that it saw something. The 60,000,000 B blocks under the
+//! bar are what `tests/gmgsi_staging_blocks.rs` counts, and it is where the
+//! figure lives: they were 91 per decode while every windowed row read of
+//! `lat`/`lon` re-inflated the whole single chunk, and are 1 per decode in
+//! the steady state (debug build, the committed granule, measured
+//! 2026-09-04).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;

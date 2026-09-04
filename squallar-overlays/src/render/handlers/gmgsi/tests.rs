@@ -83,7 +83,7 @@ fn pane_state(channel: GmgsiChannel) -> Box<GmgsiPaneState> {
 /// shipped budget is 60 MB, which a test cannot fill.
 #[test]
 fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
-    let mut cache = GmgsiGridCache::new(4 * 100);
+    let mut cache = GmgsiGridCache::new(4 * 100, staging::global());
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -96,7 +96,7 @@ fn the_budget_is_spent_in_bytes_and_a_grid_that_fits_is_kept() {
 #[test]
 fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
     // Room for two 100-value grids and no more.
-    let mut cache = GmgsiGridCache::new(4 * 200);
+    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -127,7 +127,7 @@ fn a_grid_that_does_not_fit_evicts_the_least_recently_used_one() {
 /// *budget* and not a hidden entry cap.
 #[test]
 fn a_wider_budget_holds_every_grid() {
-    let mut cache = GmgsiGridCache::new(4 * 300);
+    let mut cache = GmgsiGridCache::new(4 * 300, staging::global());
     for &c in &[
         GmgsiChannel::LongwaveIr,
         GmgsiChannel::ShortwaveIr,
@@ -143,7 +143,7 @@ fn a_wider_budget_holds_every_grid() {
 /// pane stops drawing and nothing re-asks.
 #[test]
 fn the_cache_never_evicts_a_pinned_channel() {
-    let mut cache = GmgsiGridCache::new(4 * 200);
+    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -174,7 +174,7 @@ fn the_cache_never_evicts_a_pinned_channel() {
 
 #[test]
 fn a_refetch_of_a_resident_channel_replaces_its_own_key() {
-    let mut cache = GmgsiGridCache::new(4 * 200);
+    let mut cache = GmgsiGridCache::new(4 * 200, staging::global());
     cache.insert(
         GmgsiChannel::LongwaveIr,
         granule_of(GmgsiChannel::LongwaveIr, 100),
@@ -729,7 +729,7 @@ fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
     file_listing(&mut h, channel, 13, true);
     // A staging area with room for both, so what is asserted is the LOOKUP and
     // not the eviction policy, which has its own test below.
-    h.frame_grids = GmgsiFrameCache::new(4 * 8 * 4);
+    h.frame_grids = GmgsiFrameCache::new(4 * 8 * 4, staging::global());
     file_frame(&mut h, channel, 3, 8);
     file_frame(&mut h, channel, 9, 8);
 
@@ -1747,4 +1747,182 @@ fn a_satellite_pane_with_no_listing_asks_for_nothing_yet() {
     // about the state and not about the stops.
     file_listing(&mut h, GmgsiChannel::LongwaveIr, 13, true);
     assert_eq!(h.residency_for(&pane, &stops).ranges().len(), 13);
+}
+
+// -- The staging pool -------------------------------------------------------
+
+/// A mosaic-shaped granule whose buffer is capacity-exact, which is exactly
+/// what [`staging::StagingPool`] retains and what the decode hands over.
+fn mosaic_granule(channel: GmgsiChannel, k: i64) -> GmgsiGranule {
+    let mut values: Vec<f32> = Vec::new();
+    values
+        .try_reserve_exact(staging::STAGING_POINTS)
+        .expect("a mosaic buffer fits on a test host");
+    values.resize(staging::STAGING_POINTS, k as f32);
+    let spec = crate::gmgsi::fields::spec(channel);
+    GmgsiGranule {
+        grid: Arc::new(ResidentGrid {
+            field: spec.id.clone(),
+            ni: 5000,
+            nj: 3000,
+            coords: GridCoords::Separable {
+                lat_axis: vec![0.0; 3000],
+                lon_axis: vec![0.0; 5000],
+            },
+            values: crate::render::gridded::GridValues::F32(values),
+        }),
+        bounds: GeoBounds {
+            min_lat: -72.7,
+            max_lat: 72.7,
+            min_lon: -180.0,
+            max_lon: 180.0,
+        },
+        valid_time: hour(k),
+    }
+}
+
+/// **An evicted loop-frame granule's buffer reaches the staging pool**, so
+/// the next mosaic decode is handed it instead of taking a fresh 60 MB block
+/// off an allocator that can only grow.
+///
+/// Against a pool of this test's own, not [`staging::global`]: the shipped
+/// slot is process-wide and this binary decodes fixtures elsewhere.
+#[test]
+fn an_evicted_frame_granule_is_offered_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    // One mosaic of budget, which is the shipped `FRAME_STAGING_BYTES` — this
+    // is the one frame-cache test that can afford the real figure.
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    let channel = GmgsiChannel::LongwaveIr;
+
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: hour(0),
+        },
+        mosaic_granule(channel, 0),
+    );
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "premise: one granule fits the budget, so nothing has been evicted yet",
+    );
+
+    // The second arrival puts the store over one mosaic and evicts the first.
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: hour(1),
+        },
+        mosaic_granule(channel, 1),
+    );
+    assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
+    assert_eq!(
+        POOL.retained_bytes(),
+        FRAME_STAGING_BYTES,
+        "the evicted granule's buffer is what the slot now holds",
+    );
+
+    let staged = POOL
+        .take(staging::STAGING_POINTS)
+        .expect("the slot is full");
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 1,
+            declined: 0
+        },
+        "the evicted granule's buffer must have reached the pool",
+    );
+    assert_eq!(staged.capacity(), staging::STAGING_POINTS);
+    assert!(staged.is_empty(), "and it arrives with nothing in it");
+}
+
+/// And the other door out of the store — `retain_frames`, the [`FrameSource`]
+/// eviction authority — feeds the same pool.
+#[test]
+fn a_frame_dropped_by_retain_frames_is_offered_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    let channel = GmgsiChannel::LongwaveIr;
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: hour(0),
+        },
+        mosaic_granule(channel, 0),
+    );
+
+    h.retain_frames(&PaneRef::across(&[]), &[]);
+    assert_eq!(h.frame_grids.len(), 0, "premise: the door dropped it");
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 0
+        },
+        "a dropped granule is offered, not declined",
+    );
+    assert_eq!(POOL.retained_bytes(), FRAME_STAGING_BYTES);
+}
+
+/// **A granule a job is still reading is declined, not reclaimed.** The
+/// frame cache offers through `Arc::into_inner`, so the refcount a described
+/// job holds is what keeps its raster whole.
+#[test]
+fn an_evicted_granule_a_job_still_holds_is_declined() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(FRAME_STAGING_BYTES, &POOL);
+    let channel = GmgsiChannel::LongwaveIr;
+    let first = mosaic_granule(channel, 0);
+    let in_flight = Arc::clone(&first.grid);
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: hour(0),
+        },
+        first,
+    );
+    h.frame_grids.insert(
+        FrameKey {
+            channel,
+            valid: hour(1),
+        },
+        mosaic_granule(channel, 1),
+    );
+    assert_eq!(h.frame_grids.len(), 1, "premise: the budget evicted one");
+    assert_eq!(
+        POOL.totals(),
+        staging::StagingTotals {
+            allocated: 0,
+            reused: 0,
+            declined: 1
+        },
+        "the held granule is left alone and the pool says so",
+    );
+    assert_eq!(POOL.retained_bytes(), 0);
+    assert_eq!(in_flight.values.len(), staging::STAGING_POINTS);
+}
+
+/// The live cache's replacement — the poll landing this channel's next
+/// mosaic — offers the displaced one too, and reclaims it when nothing else
+/// holds it.
+#[test]
+fn a_replaced_live_mosaic_is_offered_to_the_staging_pool() {
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let mut cache = GmgsiGridCache::new(4 * staging::STAGING_POINTS * 4, &POOL);
+    let channel = GmgsiChannel::LongwaveIr;
+    cache.insert(channel, mosaic_granule(channel, 0), &[]);
+    cache.insert(channel, mosaic_granule(channel, 1), &[]);
+    assert_eq!(cache.len(), 1, "premise: the second replaced the first");
+    assert_eq!(POOL.retained_bytes(), FRAME_STAGING_BYTES);
+    assert_eq!(POOL.totals().declined, 0);
 }

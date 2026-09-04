@@ -599,3 +599,120 @@ fn synthetic_granule(coord: impl Fn(usize, usize, usize, usize) -> (f32, f32)) -
     }
     w.finish().expect("the synthetic granule builds")
 }
+
+// -- The axis cache ---------------------------------------------------------
+
+/// **The second granule that stores the same coordinate arrays is handed
+/// the axes without a read, and they are the axes.**
+///
+/// Against a cache of this test's own: the shipped one is process-global and
+/// every other test in this binary decodes the fixture through it.
+#[test]
+fn a_granule_storing_the_same_coordinate_arrays_is_handed_the_remembered_axes() {
+    let cache = AxisCache::new();
+    let first = decode_in(
+        GRANULE.to_vec(),
+        GmgsiChannel::LongwaveIr,
+        crate::gmgsi::staging::global(),
+        &cache,
+    )
+    .expect("decodes");
+    assert_eq!(
+        cache.totals(),
+        AxisCacheTotals { hits: 0, misses: 2 },
+        "premise: the first granule read both arrays",
+    );
+
+    let second = decode_in(
+        GRANULE.to_vec(),
+        GmgsiChannel::LongwaveIr,
+        crate::gmgsi::staging::global(),
+        &cache,
+    )
+    .expect("decodes");
+    assert_eq!(
+        cache.totals(),
+        AxisCacheTotals { hits: 2, misses: 2 },
+        "the second granule stores the same arrays byte for byte and must be \
+         handed both axes without a read",
+    );
+    let (lat_a, lon_a) = axes(&first);
+    let (lat_b, lon_b) = axes(&second);
+    assert_eq!(
+        lat_a
+            .iter()
+            .chain(lon_a)
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        lat_b
+            .iter()
+            .chain(lon_b)
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "and they are the axes the read produced, bit for bit",
+    );
+    assert!(
+        (lat_b[500] - LAT_500).abs() < 1e-4 && (lon_b[1] - LON_1).abs() < 1e-4,
+        "and those are the granule's own",
+    );
+}
+
+/// **A granule whose stored geometry differs is read, not remembered** —
+/// and a granule whose coordinate variables cannot be fingerprinted at all
+/// (the synthetic one stores them contiguous, not chunked) is read every
+/// time. Either way the axes are that granule's, never the last one's.
+#[test]
+fn a_granule_storing_different_coordinate_arrays_is_read_and_gets_its_own_axes() {
+    let cache = AxisCache::new();
+    let real = decode_in(
+        GRANULE.to_vec(),
+        GmgsiChannel::LongwaveIr,
+        crate::gmgsi::staging::global(),
+        &cache,
+    )
+    .expect("decodes");
+    let (real_lat, _) = axes(&real);
+    assert_eq!(cache.totals().misses, 2);
+
+    let synthetic = synthetic_granule(|j, i, ny, _nx| {
+        (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
+    });
+    let syn = decode_in(
+        synthetic.clone(),
+        GmgsiChannel::LongwaveIr,
+        crate::gmgsi::staging::global(),
+        &cache,
+    )
+    .expect("a separable synthetic granule decodes");
+    assert_eq!(
+        cache.totals(),
+        AxisCacheTotals { hits: 0, misses: 4 },
+        "a different granule must miss on both axes",
+    );
+    let (syn_lat, syn_lon) = axes(&syn);
+    assert_eq!((syn_lat.len(), syn_lon.len()), (SYN_NY, SYN_NX));
+    assert!(
+        (syn_lat[0] - 40.0).abs() < 1e-5 && (syn_lon[10] - (-99.0)).abs() < 1e-4,
+        "the synthetic granule's axes are its own: lat[0] {} lon[10] {}",
+        syn_lat[0],
+        syn_lon[10]
+    );
+    assert_ne!(
+        real_lat.len(),
+        syn_lat.len(),
+        "premise: the two granules' geometries differ, so a remembered axis \
+         would have been the wrong length as well as the wrong values",
+    );
+
+    // Contiguous coordinate variables carry no fingerprint, so the same
+    // synthetic granule again is a miss again, and still correct.
+    let again = decode_in(
+        synthetic,
+        GmgsiChannel::LongwaveIr,
+        crate::gmgsi::staging::global(),
+        &cache,
+    )
+    .expect("decodes");
+    assert_eq!(cache.totals(), AxisCacheTotals { hits: 0, misses: 6 });
+    assert_eq!(axes(&again).0.len(), SYN_NY);
+}

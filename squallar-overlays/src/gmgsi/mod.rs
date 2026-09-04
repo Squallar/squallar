@@ -128,6 +128,14 @@ use squallar_source::origins::DataSources;
 pub mod decode;
 pub mod fetch;
 pub mod fields;
+pub mod staging;
+
+/// One mosaic's shape, in points: 3000 x 5000.
+///
+/// The one definition. The handler's byte budgets and the staging pool's slot
+/// are both derived from it, so a product whose grid changes shape moves them
+/// together or not at all.
+pub const GRID_POINTS: usize = 3000 * 5000;
 
 /// The four channels of the mosaic.
 ///
