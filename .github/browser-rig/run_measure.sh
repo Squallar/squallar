@@ -304,6 +304,11 @@ ADB_SERIAL="${RIG_ADB_SERIAL:-}"
 # gestured leg now also reports. `GesturePlayer::LOOP_SECONDS` is 20 s.
 SKIP_LOOPS="${RIG_SKIP_LOOPS:-2}"
 PY=python3
+# The rig's own executable pins, before a browser starts: drive.py's windowed
+# worst-frame selector is the p99 verdict's instrument, and one of the pins is
+# structural -- every family the frame watcher ingests must be returned by the
+# probe it polls. Nothing else here executes the rig's Python.
+"$PY" "$RIG_DIR/drive.py" --self-test || { echo "drive.py --self-test FAILED"; exit 1; }
 
 # RIG_COMMIT lets a leg run from an exported bundle that has no .git -- which
 # is how the macOS rows are taken: the tree is copied to the Mac, not cloned.

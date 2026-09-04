@@ -2753,17 +2753,11 @@ var C = window.__rig_console || [];
 var attached = [], different = [], off_frame = [], rayon = [];
 var by_kind = {};
 var transport = null;
-var frame_worst_all = [];
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
 // TOTALS, so the newest line is the whole answer and an older one is a prefix
 // of it. Scanning forward and overwriting is what makes that true.
-// The anatomy of ONE frame -- the worst presented this period -- plus the
-// never-cleared since-boot maximum. Re-said every tick, so the LAST match in
-// the window is the answer; not a histogram family and not windowed.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
 var transport_re = /transport: (\d+) replies, (\d+) B out with (\d+) B copied out of the worker, (\d+) B in with (\d+) B copied out of this page, (\d+) us encoding, (\d+) us posting/;
 // The two raster-telemetry lines, written once a frame by
 // `App::report_raster_telemetry` and only on a frame where something moved.
@@ -2909,22 +2903,6 @@ for (var i = 0; i < C.length; i++) {
   }
   var rm = rayon_re.exec(m);
   if (rm) rayon.push(parseInt(rm[1], 10));
-  var wm = frame_worst_re.exec(m);
-  if (wm) frame_worst_all.push({ t: C[i].t, service: parseInt(wm[1], 10), family: wm[2],
-                          since_boot: parseInt(wm[3], 10),
-                          pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
-                          ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
-                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10),
-                          boot_family: wm[10],
-                          boot_pre: parseInt(wm[11], 10), boot_pump: parseInt(wm[12], 10),
-                          boot_ui: parseInt(wm[13], 10), boot_prepare: parseInt(wm[14], 10),
-                          boot_finish: parseInt(wm[15], 10), boot_post: parseInt(wm[16], 10) });
-  var wn = frame_worst_none_re.exec(m);
-  if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
-                                 since_boot: parseInt(wn[1], 10), boot_family: wn[2],
-                                 boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
-                                 boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
-                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10) });
   var tm = transport_re.exec(m);
   if (tm) transport = { replies: parseInt(tm[1], 10),
                         out_moved: parseInt(tm[2], 10),
@@ -3024,7 +3002,6 @@ for (var i = 0; i < C.length; i++) {
 return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
-         frame_worst_all: frame_worst_all,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -3071,6 +3048,14 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // subtraction. Mirror off: exact. Mirror on: a lower bound, never an
 // overstatement. `vertices`/`indices` are the staging
 // identity -- the same picture staged by another route reads the same two.
+// The anatomy of ONE frame -- the worst presented this period -- plus the
+// never-cleared since-boot maximum. Re-said every tick. It lives HERE, in the
+// probe the frame watcher polls, and not in the worker-signal probe that runs
+// once at the end: a family the watcher never ingests can only ever be read as
+// a last-period fallback, which is what silently voided every windowed
+// worst-frame reading this instrument produced.
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3197,6 +3182,7 @@ var interact_all = [], idle_all = [], cadence_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
 var frame_ui_all = [];
+var frame_worst_all = [];
 var begins = [], loops = [];
 for (var i = 0; i < C.length; i++) {
   var m = String(C[i].msg || "");
@@ -3311,6 +3297,22 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_dispatch_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                    sum: parseInt(x[3], 10), p50: x[4],
                                    p90: x[5], p99: x[6], hist: x[7] });
+  var wm = frame_worst_re.exec(m);
+  if (wm) frame_worst_all.push({ t: C[i].t, service: parseInt(wm[1], 10), family: wm[2],
+                          since_boot: parseInt(wm[3], 10),
+                          pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
+                          ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
+                          finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10),
+                          boot_family: wm[10],
+                          boot_pre: parseInt(wm[11], 10), boot_pump: parseInt(wm[12], 10),
+                          boot_ui: parseInt(wm[13], 10), boot_prepare: parseInt(wm[14], 10),
+                          boot_finish: parseInt(wm[15], 10), boot_post: parseInt(wm[16], 10) });
+  var wn = frame_worst_none_re.exec(m);
+  if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
+                                 since_boot: parseInt(wn[1], 10), boot_family: wn[2],
+                                 boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
+                                 boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
+                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10) });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -3350,6 +3352,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_ui_all: frame_ui_all,
          frame_post_all: frame_post_all,
          frame_dispatch_all: frame_dispatch_all,
+         frame_worst_all: frame_worst_all,
          gesture_begins: begins, gesture_loops: loops,
          marks_total: (MK ? MK.length : -1),
          console_total: C.length };
@@ -3812,17 +3815,56 @@ def _window_stats(watcher, t0, t1, out):
         # can be asked of a finished run without re-measuring it.
         stats["bins"] = d
         out[family] = stats
-    # The p99-shaped frame: of every period's worst inside the bracket, the one
-    # with the largest service. Boot is excluded by construction -- a since-boot
-    # maximum that predates t0 never enters -- which is what separates a
-    # first-frame compile from a tail. `None`-service entries are periods that
-    # presented nothing and cannot be a worst frame.
-    ws = [r for r in getattr(watcher, "worst", [])
+    # The p99-shaped frame: of every period's worst that REPORTS ON the bracket,
+    # the one with the largest service. A tick at time t reports the period
+    # ending at t, so the frames inside t0..t1 are carried by the ticks in
+    # (a, b] -- the same two ticks the histogram diff above subtracts -- and
+    # never by a tick strictly inside the window: the app ticks every 2 s and a
+    # scene-D gesture window is ~1.8 s, so "inside" was empty on every Mac leg
+    # while the ROW beside it counted 107 frames. Boot is excluded when a tick
+    # predates t0 (its frames sit at or before `a`); when none does, `b` alone
+    # bounds the set and the bracket string says so. `None`-service entries are
+    # periods that presented nothing and cannot be a worst frame.
+    # One entry per TICK: the watcher appends every poll's whole array, so the
+    # same tick arrives once per poll and a raw length would count polls.
+    by_t = {}
+    for r in getattr(watcher, "worst", []):
+        if r.get("t") is not None:
+            by_t.setdefault(r["t"], r)
+    all_w = sorted(by_t.values(), key=lambda r: r["t"])
+    a_w = None
+    if t0 is not None:
+        for r in all_w:
+            if r["t"] <= t0 and (a_w is None or r["t"] > a_w["t"]):
+                a_w = r
+    b_w = None
+    if t1 is not None:
+        for r in all_w:
+            if r["t"] >= t1 and (b_w is None or r["t"] < b_w["t"]):
+                b_w = r
+    if b_w is None and all_w:
+        b_w = all_w[-1]
+    ws = [r for r in all_w
           if r.get("service") is not None
-          and (t0 is None or r.get("t", 0) >= t0)
-          and (t1 is None or r.get("t", 0) <= t1)]
+          and (a_w is None or r["t"] > a_w["t"])
+          and (b_w is None or r["t"] <= b_w["t"])]
+    # Each tick reports the worst frame of the period ENDING at it, so with no
+    # tick at or before t0 the earliest surviving tick's period reaches back
+    # before the window and its frame cannot be attributed to the gesture. On
+    # a scene-D leg that period is the one containing boot, and it wins by an
+    # order of magnitude: 33,580 us against a 13,719 us runner-up, with
+    # pre=19,680 us. Dropping it is what keeps "boot excluded" true when the
+    # window opens before the app's first tick.
+    dropped_first = False
+    if a_w is None and ws:
+        ws = ws[1:]
+        dropped_first = True
     out["worst_frame"] = max(ws, key=lambda r: r["service"]) if ws else None
     out["worst_frame_periods"] = len(ws)
+    out["worst_frame_bracket"] = (
+        "a<t<=b" if a_w is not None
+        else "t<=b, first period dropped as unattributable"
+        if dropped_first else "t<=b (no period reports on the window)")
     return out
 
 
@@ -6798,7 +6840,6 @@ def run_smoke(args):
         # a measurement round wants the number when nothing is gating on it,
         # and `null` says the line was never seen rather than "zero bytes".
         result["transport_bytes"] = _sig.get("transport")
-        result["frame_worst_all"] = _sig.get("frame_worst_all")
         if result["transport_bytes"]:
             stage("transport", **result["transport_bytes"])
 
@@ -6978,6 +7019,14 @@ def run_smoke(args):
         # Recorded beside `loop_state`, and None -- never 0 -- when no
         # `budget state:` line matched: an older bundle, not a zero reading.
         result["frame_lines"]["budget_state"] = fl_last.get("budget_state")
+        # From the WATCHER, deduped by tick, and taken HERE rather than at the
+        # worker-signal hand-back: that runs before the last polls, so the
+        # artifact carried a list five ticks short of what the window was
+        # computed over. Not from the end-of-run snapshot either, whose console
+        # ring may have evicted the tick that carried the worst frame.
+        result["frame_worst_all"] = sorted(
+            {r["t"]: r for r in getattr(frames_watch, "worst", [])
+             if r.get("t") is not None}.values(), key=lambda r: r["t"])
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
@@ -7533,9 +7582,13 @@ def run_smoke(args):
     if fw is None:
         alls = result.get("frame_worst_all") or []
         fw = next((r for r in reversed(alls) if r.get("service") is not None), None)
-        src = "last period (no gesture window)"
+        # Two different failures, named apart: no window was built at all, or a
+        # window was built and not one tick reports on it.
+        src = ("last period (gesture window built, 0 periods report on it)" if gw_
+               else "last period (no gesture window)")
     else:
-        src = "max service over %s windowed periods" % gw_.get("worst_frame_periods")
+        src = "max service over %s periods bracketing the window [%s]" % (
+            gw_.get("worst_frame_periods"), gw_.get("worst_frame_bracket"))
     if fw:
         print("[%s] SUMMARY frame worst [%s]: service=%s us family=%s | "
               "pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
@@ -7854,7 +7907,133 @@ class LoudArgumentParser(argparse.ArgumentParser):
         sys.exit(EXIT_USAGE)
 
 
+class _FixtureWatcher:
+    """The least a watcher can be for `_window_stats`: no histogram families,
+    and a `worst` list handed in by the fixture."""
+
+    def __init__(self, worst):
+        self.worst = worst
+
+    def named_families(self):
+        return []
+
+    def readings(self, family):
+        return []
+
+
+def self_test(window_stats=None):
+    """Executable pins on the windowed worst-frame selector -- the p99
+    verdict's own instrument. Run by `--self-test` (and by run_tier2.sh before
+    any leg), because nothing else in this rig executes Python under test and a
+    selector that silently returns None has already cost two Mac legs. Takes
+    the function under test so the same fixture can be pointed at an older
+    drive.py to show it red. Returns the number of failed pins."""
+    ws_fn = window_stats or _window_stats
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def tick(t, service, family="interact"):
+        return {"t": t, "service": service, "family": family,
+                "pre": 0, "pump": 0, "ui": service, "prepare": 0,
+                "finish": 0, "post": 0}
+
+    # A 2 s tick period against a 1.4 s window that sits STRICTLY between two
+    # ticks -- the scene-D shape. The frames inside it are reported by the
+    # tick at 14, and nothing lands inside [12.5, 13.9].
+    ticks = [tick(10, None), tick(12, 99_999), tick(14, 9_000), tick(16, 7_000)]
+    out = ws_fn(_FixtureWatcher(ticks), 12.5, 13.9, {})
+    fw = out.get("worst_frame")
+    pin("a window between two ticks still selects a worst frame", fw is not None)
+    pin("it is the frame the closing tick (b) reports, not the boot-sized one at a",
+        fw is not None and fw["service"] == 9_000)
+    pin("periods counted = 1", out.get("worst_frame_periods") == 1)
+    pin("bracket is named a<t<=b", out.get("worst_frame_bracket") == "a<t<=b")
+
+    # Every poll re-appends the whole array; the count is of ticks, not polls.
+    out = ws_fn(_FixtureWatcher(ticks + ticks + ticks), 12.5, 13.9, {})
+    pin("three polls of the same ticks still count 1 period",
+        out.get("worst_frame_periods") == 1)
+
+    # A window spanning a tick takes that tick AND the closing one.
+    out = ws_fn(_FixtureWatcher(ticks), 12.5, 15.0, {})
+    pin("a window spanning a tick counts 2 periods and keeps the max",
+        out.get("worst_frame_periods") == 2
+        and (out.get("worst_frame") or {}).get("service") == 9_000)
+
+    # No tick before t0: the 99,999 us period straddling the window start is
+    # dropped, so the window's own worst frame wins instead of it.
+    out = ws_fn(_FixtureWatcher(ticks), 9.0, 13.9, {})
+    pin("with no tick before t0 the straddling period does not win",
+        (out.get("worst_frame") or {}).get("service") == 9_000)
+
+    # With no tick before t0 the earliest period straddles the window start:
+    # it is dropped, so a boot frame in it cannot win.
+    boot = [tick(10, 33_580), tick(12, 13_719), tick(14, 4_599)]
+    out = ws_fn(_FixtureWatcher(boot), 9.9, 13.0, {})
+    pin("the unattributable first period cannot win the window",
+        (out.get("worst_frame") or {}).get("service") == 13_719)
+    pin("and the bracket says the first period was dropped",
+        "first period dropped" in str(out.get("worst_frame_bracket")))
+    pin("dropping it is counted, not hidden", out.get("worst_frame_periods") == 2)
+
+    # Null-service ticks (periods that presented nothing) never win.
+    out = ws_fn(_FixtureWatcher([tick(10, None), tick(12, None)]), 10.5, 11.5, {})
+    pin("only null-service ticks -> no worst frame, 0 periods",
+        out.get("worst_frame") is None and out.get("worst_frame_periods") == 0)
+
+    # The defect the fixture above cannot see: a family a watcher INGESTS that
+    # the probe it POLLS never returns. `frame_worst_all` was parsed only in
+    # WORKER_SIGNAL_PROBE, which runs once at the end, while the frame watcher
+    # polls FRAME_LINE_PROBE -- so `watcher.worst` was empty on every leg ever
+    # taken and the windowed worst frame could not be selected at all, while
+    # the last-period fallback beside it printed a plausible frame. This is a
+    # CROSS-ARTEFACT invariant between two strings no compiler relates, so it
+    # is source-scanned, and it covers EVERY watcher: the audit that found the
+    # one defect is the gate, not a pin on the one family it found.
+    src = ""
+    try:
+        with open(os.path.abspath(__file__), "r") as fh:
+            src = fh.read()
+    except OSError:
+        pass
+    if src:
+        probes = dict(re.findall(
+            r'^([A-Z_]+_(?:PROBE|SCRIPT)) = r?"""(.*?)\n"""', src, re.S | re.M))
+        audited = 0
+        for m in re.finditer(
+                r'\n    def (\w*poll\w*|\w*sample\w*)\(self[^)]*\):(.*?)'
+                r'(?=\n    def |\nclass )', src, re.S):
+            name, body = m.group(1), m.group(2)
+            head = src[:m.start()].rfind("\nclass ")
+            cls = src[head + 7:src.index(":", head)].split("(")[0]
+            keys = sorted(set(re.findall(r'\.get\("([a-z_]+)"\)', body)))
+            execs = re.findall(r"execute\((\w+)\)", body)
+            if not keys or not execs:
+                continue
+            audited += 1
+            for pr in execs:
+                text = probes.get(pr, "")
+                missing = [k for k in keys
+                           if not re.search(r"[\n,{]\s*%s: " % re.escape(k), text)]
+                pin("every family %s.%s ingests is returned by %s%s"
+                    % (cls, name, pr,
+                       " (missing: %s)" % ", ".join(missing) if missing else ""),
+                    bool(text) and not missing)
+        pin("the audit found watchers to audit at all", audited >= 2)
+
+    print("[self-test] %d pin(s) failed" % failed)
+    return failed
+
+
 def main(argv=None):
+    # The executable pins, before argparse can object to the missing --browser.
+    if "--self-test" in (sys.argv[1:] if argv is None else argv):
+        return 1 if self_test() else 0
     ap = LoudArgumentParser(
         description="headless WebDriver smoke/measurement rig for squallar-web")
     ap.add_argument("--browser", choices=("chromium", "firefox", "safari"))

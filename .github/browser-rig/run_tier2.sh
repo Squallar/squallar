@@ -226,6 +226,10 @@ EXPECT_RAYON_THREADS="${RIG_EXPECT_RAYON_THREADS:-2}"
 # assertion, which is the same hole --expect-rayon-threads was added to close.
 EXPECT_ZERO_COPY="${RIG_EXPECT_ZERO_COPY:-1}"
 PY=python3
+# The rig's own executable pins run before any leg: drive.py's windowed
+# worst-frame selector is the p99 verdict's instrument, and nothing else in CI
+# executes the rig's Python. A red pin fails the gate before a browser starts.
+"$PY" "$RIG_DIR/drive.py" --self-test || { echo "drive.py --self-test FAILED"; exit 1; }
 
 # UiConfig is #[serde(default)], so a config this partial parses; the key is
 # the app's own real localStorage key. The site rides in a PANE, because that
