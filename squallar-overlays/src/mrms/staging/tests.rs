@@ -290,3 +290,39 @@ fn codes_capacity(values: &crate::render::gridded::GridValues) -> usize {
         }
     }
 }
+
+/// **The same lever the generic pool carries, so a memory governor's handle set
+/// covers this 49 MB too and not only GMGSI's 60 MB.**
+///
+/// MRMS keeps its own pool — `handlers::mrms` names this concrete type and
+/// calls `recycle`/`recycle_shared` on it as inherent methods, which a generic
+/// pool cannot carry — so the lever is spelled twice rather than shared. Same
+/// name, same signature, same `try_lock` rule.
+#[test]
+fn releasing_the_retained_mosaic_empties_the_slot_and_the_pool_still_works() {
+    let pool = StagingPool::new();
+    assert!(!pool.release_retained(), "an empty slot releases nothing");
+
+    pool.give(mosaic_buffer());
+    assert_eq!(
+        pool.retained_bytes(),
+        STAGING_POINTS * size_of::<u16>(),
+        "premise: one mosaic is parked",
+    );
+    assert!(pool.release_retained());
+    assert_eq!(pool.retained_bytes(), 0);
+    assert!(
+        !pool.release_retained(),
+        "and there is nothing left to find"
+    );
+
+    let after = pool
+        .take(STAGING_POINTS)
+        .expect("a decode after a release still runs");
+    assert_eq!(after.capacity(), STAGING_POINTS);
+    assert_eq!(pool.totals().allocated, 1);
+    pool.give(after);
+    let reused = pool.take(STAGING_POINTS).expect("and the slot refills");
+    assert_eq!(pool.totals().reused, 1);
+    drop(reused);
+}

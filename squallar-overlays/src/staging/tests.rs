@@ -341,3 +341,52 @@ fn a_pool_that_reuses_nothing_reads_as_inert_and_not_as_cold() {
     );
     drop(second);
 }
+
+/// **The lever drops the block and the pool goes on working afterwards.**
+///
+/// `retained_bytes` falling is not on its own evidence that anything was freed
+/// — a counter that falls while the block is still held is the vacuous shape —
+/// so what is checked here is the behaviour either side of it, and
+/// `tests/gmgsi_staging_release.rs` watches the real `free` through a counting
+/// global allocator at the shipped 60 MB width.
+#[test]
+fn releasing_the_retained_buffer_empties_the_slot_and_the_pool_still_works() {
+    let pool: StagingPool<f32> = StagingPool::new(POINTS);
+    assert!(
+        !pool.release_retained(),
+        "an empty slot has nothing to release, and says so rather than \
+         reporting a release a governor would then price",
+    );
+
+    pool.give(buffer());
+    assert_eq!(pool.retained_points(), POINTS, "premise: the slot is full");
+    assert!(pool.release_retained(), "and the lever finds it");
+    assert_eq!(pool.retained_points(), 0);
+    assert_eq!(pool.retained_bytes(), 0);
+    assert!(
+        !pool.release_retained(),
+        "a second pull has nothing left to find",
+    );
+
+    // The lever is not a teardown: a decode after it allocates, hands back and
+    // is pooled again exactly as a cold pool's first decode is.
+    let after = pool
+        .take(POINTS)
+        .expect("a decode after a release still runs");
+    assert_eq!(after.capacity(), POINTS);
+    assert_eq!(
+        pool.totals().allocated,
+        1,
+        "released means released: the next decode pays for its own block",
+    );
+    pool.give(after);
+    assert_eq!(pool.retained_points(), POINTS);
+    let reused = pool.take(POINTS).expect("and the slot refills");
+    assert_eq!(pool.totals().reused, 1);
+    assert_eq!(
+        pool.resizes(),
+        0,
+        "a release is not a shape change and must not read as one",
+    );
+    drop(reused);
+}

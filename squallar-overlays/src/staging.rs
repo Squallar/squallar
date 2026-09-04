@@ -284,6 +284,45 @@ impl<T: Copy> StagingPool<T> {
         *slot = Some(values);
     }
 
+    /// **Drop the retained buffer**, answering whether there was one to drop.
+    ///
+    /// The pool's one lever, and it is deliberately shaped for **two callers
+    /// with no knowledge of each other**: an idle policy in the layer that owns
+    /// the source, and a memory governor's tier-2 pressure step. Both want the
+    /// same thing — the grid-sized block the slot is holding while nothing is
+    /// decoding handed back to the allocator — and neither has to know the
+    /// other exists or to have run first. Two sources retain a grid apiece
+    /// (GMGSI ~60 MB, MRMS 49 MB), so this is ~109 MB resident whether or not
+    /// anything is decoding.
+    ///
+    /// `false` means nothing was released: the slot was empty, or —
+    /// vanishingly rarely — a decode held the lock. **`try_lock`, never
+    /// `lock`**, for the reason [`Self::take`] gives: on wasm32 with atomics
+    /// this path may not block the main thread. A caller that must have the
+    /// block back calls again; it is not a failure to report.
+    ///
+    /// **This is one `free` of one block** — the same free every declined offer
+    /// already performs — so it is not work in the sense the frame thread cares
+    /// about. The cost is entirely on the other side: the next decode allocates
+    /// a grid again, which is the allocation this module exists to remove. That
+    /// is why a *clock* is a poor trigger and *pressure* is a good one — under
+    /// pressure the block is worth more free than parked, whereas a short idle
+    /// threshold re-introduces exactly one mosaic-sized allocate-and-free per
+    /// poll, on a heap that cannot coalesce, for a layer that is still on.
+    pub fn release_retained(&self) -> bool {
+        let Ok(mut slot) = self.slot.try_lock() else {
+            return false;
+        };
+        match slot.take() {
+            Some(buffer) => {
+                self.retained_points.store(0, Ordering::Relaxed);
+                drop(buffer);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Count one offer that never reached [`Self::give`] because something
     /// else still held the grid — a source's `recycle` reports its
     /// `Arc::into_inner` miss through here so the totals stay one ledger.
