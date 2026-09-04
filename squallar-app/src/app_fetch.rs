@@ -1215,7 +1215,8 @@ impl super::App {
                 || *id == known::MODEL_DATA
                 || *id == known::MRMS
                 || *id == known::GMGSI
-                || *id == known::RADAR_COVERAGE =>
+                || *id == known::RADAR_COVERAGE
+                || *id == known::METAR =>
             {
                 let clock = chrono::Utc::now().naive_utc();
                 let rctx = squallar_overlays::render::overlay_state::RasterizeContext {

@@ -13,10 +13,11 @@ use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
-    PopupContent, PopupSection, RenderMode,
+    PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::station_model;
 use squallar_source::id::{LayerId, known};
+use squallar_source::job::{DescribedJob, JobCodec};
 use squallar_source::time::TimeAxis;
 
 pub(crate) struct MetarFetchResult(
@@ -249,7 +250,7 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn render_mode(&self) -> RenderMode {
-        RenderMode::PerFramePoint
+        RenderMode::TextureAndPoint
     }
 
     fn is_enabled(&self, pane: &PaneRef<'_>) -> bool {
@@ -380,6 +381,48 @@ impl OverlayHandler for MetarHandler {
         if let Some(item) = self.state.data.get(id as usize) {
             station_model::draw_metar_station(&item.ob, painter, ctx);
         }
+    }
+
+    /// What the rasterizer reads, captured once.
+    ///
+    /// **Row `i` is `state.data[i]`'s station**, the indexing
+    /// [`Self::hit_items`] answers — the same contract the storm-reports and
+    /// GLM rows keep, and the one `HitMap::from_cells` zips on.
+    fn prepare_job(&self, ctx: &RasterizeContext, _pane: &PaneRef<'_>) -> Option<DescribedJob> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(DescribedJob::new(crate::render::rasterize::MetarInput {
+            obs: self.state.data.iter().map(|i| i.ob.clone()).collect(),
+            zoom: ctx.zoom,
+            is_dark: ctx.is_dark,
+            device_scale: ctx.device_scale,
+        }))
+    }
+
+    fn job_codec(&self) -> Option<&'static JobCodec> {
+        crate::render::jobs::JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/metar")
+    }
+
+    /// Index-aligned with [`Self::prepare_job`]'s rows: `hit_items()[i]` **is**
+    /// the station whose observation travelled at row `i`.
+    ///
+    /// The items stay here, page-side, and never ride the wire — which is why
+    /// the six fields the picture does not need can be dropped from it. A
+    /// hover is answered from these, not from anything the worker decoded.
+    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
+        if self.state.data.is_empty() {
+            return None;
+        }
+        Some(
+            self.state
+                .data
+                .iter()
+                .map(|i| i.clone() as Arc<dyn OverlayItem>)
+                .collect(),
+        )
     }
 
     fn point_hit_radius(&self, zoom: f32) -> f32 {

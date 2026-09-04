@@ -38,6 +38,7 @@ pub static JOB_CODECS: &[JobCodec] = &[
     JobCodec::of::<ReportsJob>(),
     JobCodec::of::<GlmJob>(),
     JobCodec::of::<GriddedJob>(),
+    JobCodec::of::<MetarJob>(),
 ];
 
 /// The radar-network coverage row.
@@ -380,6 +381,250 @@ impl JobSpec for ReportsJob {
 }
 
 impl JobOutCodec for ReportsJob {
+    fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
+        encode_raster_reply(v, head);
+    }
+
+    fn decode_out(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutput> {
+        decode_raster_reply(head, tails)
+    }
+}
+
+/// The METAR station-model row.
+///
+/// **The last layer to leave the frame thread.** Every other data overlay
+/// already rasterizes into a picture; METAR alone drew per station through
+/// `egui`, and a scene D leg carries 799 of them at 46 shapes each — 28 lines,
+/// 7 stroked circles, 6 filled circles, 4 polygons and 5 texts. Measured on a
+/// 175 Hz leg that was 98,815 vertices and 401,072 indices staged EVERY FRAME,
+/// with `epaint::tessellator::stroke_and_fill_path` the largest symbol in the
+/// app, for observations that change every twenty minutes.
+///
+/// **The wire carries the twelve fields the drawing reads and no others.**
+/// `name`, `elev_m`, `wind_gust_kt`, `altimeter_hpa`, `raw_ob` and `obs_time`
+/// are hover content, answered page-side from the real items that
+/// `hit_items` holds, and `draw_metar_station` never reads them — which is a
+/// claim under test rather than a comment: see
+/// `two_observations_differing_only_in_dropped_fields_paint_identically`.
+pub struct MetarJob;
+
+/// The station's own `WindDir`, on the wire.
+struct WindDirWire(Option<crate::metar::types::WindDir>);
+
+impl WindDirWire {
+    fn write(&self, out: &mut Vec<u8>) {
+        use crate::metar::types::WindDir;
+        match self.0 {
+            None => out.push(0),
+            Some(WindDir::Calm) => out.push(1),
+            Some(WindDir::Variable) => out.push(2),
+            Some(WindDir::Degrees(d)) => {
+                out.push(3);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+        }
+    }
+
+    fn read(r: &mut Reader<'_>) -> Option<Option<crate::metar::types::WindDir>> {
+        use crate::metar::types::WindDir;
+        Some(match r.u8()? {
+            0 => None,
+            1 => Some(WindDir::Calm),
+            2 => Some(WindDir::Variable),
+            3 => Some(WindDir::Degrees(r.u16()?)),
+            _ => return None,
+        })
+    }
+}
+
+fn encode_opt_f64(out: &mut Vec<u8>, v: Option<f64>) {
+    match v {
+        None => out.push(0),
+        Some(x) => {
+            out.push(1);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+fn decode_opt_f64(r: &mut Reader<'_>) -> Option<Option<f64>> {
+    Some(match r.u8()? {
+        0 => None,
+        1 => Some(r.f64()?),
+        _ => return None,
+    })
+}
+
+impl JobSpec for MetarJob {
+    type In = crate::render::rasterize::MetarInput;
+    type Out = RasterizeOutput;
+    const LABEL: &'static str = "overlay/metar";
+    const COST: JobCost = JobCost::Raster;
+
+    fn encode(input: &crate::render::rasterize::MetarInput, _ctx: &EncodeCtx, out: &mut Vec<u8>) {
+        use crate::metar::types::FlightCategory;
+        out.extend_from_slice(&input.zoom.to_le_bytes());
+        out.push(u8::from(input.is_dark));
+        out.extend_from_slice(&input.device_scale.to_le_bytes());
+        out.extend_from_slice(&(input.obs.len() as u32).to_le_bytes());
+        // **Row order is load-bearing**: a row's position is its hit-map id,
+        // so a reorder hands hovers to the wrong stations.
+        for ob in &input.obs {
+            encode_str(out, &ob.station_id);
+            out.extend_from_slice(&ob.lat.to_le_bytes());
+            out.extend_from_slice(&ob.lon.to_le_bytes());
+            encode_opt_f64(out, ob.temp_c);
+            encode_opt_f64(out, ob.dewp_c);
+            encode_opt_f64(out, ob.mslp_hpa);
+            WindDirWire(ob.wind_dir).write(out);
+            match ob.wind_speed_kt {
+                None => out.push(0),
+                Some(kt) => {
+                    out.push(1);
+                    out.extend_from_slice(&kt.to_le_bytes());
+                }
+            }
+            match ob.visibility {
+                None => out.push(0),
+                Some(v) => {
+                    out.push(1);
+                    out.extend_from_slice(&v.miles.to_le_bytes());
+                    out.push(u8::from(v.or_greater));
+                }
+            }
+            out.push(match ob.flight_category {
+                None => 0,
+                Some(FlightCategory::VFR) => 1,
+                Some(FlightCategory::MVFR) => 2,
+                Some(FlightCategory::IFR) => 3,
+                Some(FlightCategory::LIFR) => 4,
+            });
+            match &ob.wx_string {
+                None => out.push(0),
+                Some(wx) => {
+                    out.push(1);
+                    encode_str(out, wx);
+                }
+            }
+            out.extend_from_slice(&(ob.clouds.len() as u32).to_le_bytes());
+            for layer in &ob.clouds {
+                encode_str(out, &layer.cover);
+                match layer.base_ft {
+                    None => out.push(0),
+                    Some(ft) => {
+                        out.push(1);
+                        out.extend_from_slice(&ft.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode(
+        r: &mut Reader<'_>,
+        geo: JobGeometry,
+    ) -> Option<(crate::render::rasterize::MetarInput, JobGeometry)> {
+        use crate::metar::types::{CloudLayer, FlightCategory, MetarOb, Visibility};
+        let zoom = r.f64()?;
+        let is_dark = flag(r.u8()?)?;
+        let device_scale = r.f32()?;
+        let count = r.u32()? as usize;
+        let mut obs = Vec::new();
+        for _ in 0..count {
+            let station_id = decode_str(r)?;
+            let lat = r.f64()?;
+            let lon = r.f64()?;
+            let temp_c = decode_opt_f64(r)?;
+            let dewp_c = decode_opt_f64(r)?;
+            let mslp_hpa = decode_opt_f64(r)?;
+            let wind_dir = WindDirWire::read(r)?;
+            let wind_speed_kt = match r.u8()? {
+                0 => None,
+                1 => Some(r.u16()?),
+                _ => return None,
+            };
+            let visibility = match r.u8()? {
+                0 => None,
+                1 => Some(Visibility {
+                    miles: r.f64()?,
+                    or_greater: flag(r.u8()?)?,
+                }),
+                _ => return None,
+            };
+            let flight_category = match r.u8()? {
+                0 => None,
+                1 => Some(FlightCategory::VFR),
+                2 => Some(FlightCategory::MVFR),
+                3 => Some(FlightCategory::IFR),
+                4 => Some(FlightCategory::LIFR),
+                _ => return None,
+            };
+            let wx_string = match r.u8()? {
+                0 => None,
+                1 => Some(decode_str(r)?),
+                _ => return None,
+            };
+            let cloud_count = r.u32()? as usize;
+            let mut clouds = Vec::new();
+            for _ in 0..cloud_count {
+                clouds.push(CloudLayer {
+                    cover: decode_str(r)?,
+                    base_ft: match r.u8()? {
+                        0 => None,
+                        1 => Some(r.u32()?),
+                        _ => return None,
+                    },
+                });
+            }
+            // The six fields the wire does not carry, defaulted. The drawing
+            // never reads them; the hover does, and the hover is answered
+            // page-side from `hit_items`, never from a decoded picture.
+            obs.push(MetarOb {
+                station_id,
+                name: String::new(),
+                lat,
+                lon,
+                elev_m: None,
+                temp_c,
+                dewp_c,
+                wind_dir,
+                wind_speed_kt,
+                wind_gust_kt: None,
+                visibility,
+                altimeter_hpa: None,
+                mslp_hpa,
+                flight_category,
+                raw_ob: String::new(),
+                clouds,
+                wx_string,
+                obs_time: String::new(),
+            });
+        }
+        Some((
+            crate::render::rasterize::MetarInput {
+                obs,
+                zoom,
+                is_dark,
+                device_scale,
+            },
+            geo,
+        ))
+    }
+
+    fn run(
+        input: &crate::render::rasterize::MetarInput,
+        geo: &JobGeometry,
+    ) -> Option<RasterizeOutput> {
+        Some(crate::render::rasterize::rasterize_metar_stations(
+            input,
+            &geo.bounds,
+            geo.width,
+            geo.height,
+        ))
+    }
+}
+
+impl JobOutCodec for MetarJob {
     fn encode_out(v: RasterizeOutput, head: &mut Vec<u8>, _tails: &mut Vec<Vec<u8>>) {
         encode_raster_reply(v, head);
     }
@@ -1349,6 +1594,172 @@ impl HatchWire {
 
 #[cfg(test)]
 mod tests {
+    /// A station with every field populated, so a round trip has something to
+    /// lose in each of them.
+    #[cfg(test)]
+    fn a_full_station() -> crate::metar::types::MetarOb {
+        use crate::metar::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
+        MetarOb {
+            station_id: "KTLX".into(),
+            name: "Oklahoma City".into(),
+            lat: 35.33,
+            lon: -97.28,
+            elev_m: Some(390.0),
+            temp_c: Some(21.5),
+            dewp_c: Some(-3.5),
+            wind_dir: Some(WindDir::Degrees(230)),
+            wind_speed_kt: Some(17),
+            wind_gust_kt: Some(25),
+            visibility: Some(Visibility {
+                miles: 10.0,
+                or_greater: true,
+            }),
+            altimeter_hpa: Some(1013.2),
+            mslp_hpa: Some(1011.8),
+            flight_category: Some(FlightCategory::MVFR),
+            raw_ob: "KTLX 121953Z 23017KT 10SM BKN025 22/M04 A2992".into(),
+            clouds: vec![
+                CloudLayer {
+                    cover: "BKN".into(),
+                    base_ft: Some(2500),
+                },
+                CloudLayer {
+                    cover: "CLR".into(),
+                    base_ft: None,
+                },
+            ],
+            wx_string: Some("RA".into()),
+            obs_time: "2026-09-04T19:53:00Z".into(),
+        }
+    }
+
+    /// **The twelve fields the picture needs survive the wire exactly.**
+    ///
+    /// Every nested shape is represented in the fixture — a `WindDir` variant
+    /// that carries a payload, a `Visibility` with its `or_greater` flag, a
+    /// `FlightCategory`, and two `CloudLayer`s of which one has no base — so a
+    /// codec that dropped or reordered any of them fails here rather than
+    /// drawing a subtly wrong station model.
+    #[test]
+    fn a_metar_job_round_trips_every_field_the_picture_reads() {
+        use super::*;
+        let input = crate::render::rasterize::MetarInput {
+            obs: vec![a_full_station()],
+            zoom: 8.5,
+            is_dark: true,
+            device_scale: 2.0,
+        };
+        let ctx = squallar_source::job::EncodeCtx {
+            geometry: test_geometry(),
+        };
+        let mut out = Vec::new();
+        <MetarJob as JobSpec>::encode(&input, &ctx, &mut out);
+        let mut r = Reader::new(&out);
+        let (back, _) = <MetarJob as JobSpec>::decode(&mut r, test_geometry())
+            .expect("a metar job decodes its own bytes");
+        assert!(r.rest().is_empty(), "the decode left bytes on the wire");
+
+        assert_eq!(back.zoom, input.zoom);
+        assert_eq!(back.is_dark, input.is_dark);
+        assert_eq!(back.device_scale, input.device_scale);
+        let (a, b) = (&input.obs[0], &back.obs[0]);
+        assert_eq!(b.station_id, a.station_id);
+        assert_eq!((b.lat, b.lon), (a.lat, a.lon));
+        assert_eq!(
+            (b.temp_c, b.dewp_c, b.mslp_hpa),
+            (a.temp_c, a.dewp_c, a.mslp_hpa)
+        );
+        assert_eq!(b.wind_dir, a.wind_dir);
+        assert_eq!(b.wind_speed_kt, a.wind_speed_kt);
+        assert_eq!(b.visibility, a.visibility);
+        assert_eq!(b.flight_category, a.flight_category);
+        assert_eq!(b.wx_string, a.wx_string);
+        assert_eq!(b.clouds, a.clouds);
+    }
+
+    /// Every call a station model makes, in order, as comparable data.
+    ///
+    /// Its own recorder rather than `station_model`'s: that one is private to
+    /// its module's tests, and reaching for it would mean widening a test-only
+    /// type's visibility to serve a different module's gate.
+    #[derive(Default, Debug, PartialEq)]
+    struct CallLog(Vec<String>);
+
+    impl crate::render::draw::PointPainter for CallLog {
+        fn circle_filled(&mut self, o: [f32; 2], r: f32, c: [u8; 4]) {
+            self.0.push(format!("circle_filled {o:?} {r} {c:?}"));
+        }
+
+        fn circle_stroke(&mut self, o: [f32; 2], r: f32, c: [u8; 4], w: f32) {
+            self.0.push(format!("circle_stroke {o:?} {r} {c:?} {w}"));
+        }
+
+        fn text(
+            &mut self,
+            o: [f32; 2],
+            t: &str,
+            c: [u8; 4],
+            size: f32,
+            anchor: crate::render::draw::TextAnchor,
+        ) {
+            self.0
+                .push(format!("text {o:?} {t:?} {c:?} {size} {anchor:?}"));
+        }
+
+        fn line(&mut self, from: [f32; 2], to: [f32; 2], c: [u8; 4], w: f32) {
+            self.0.push(format!("line {from:?} {to:?} {c:?} {w}"));
+        }
+
+        fn filled_polygon(&mut self, pts: &[[f32; 2]], c: [u8; 4]) {
+            self.0.push(format!("filled_polygon {pts:?} {c:?}"));
+        }
+    }
+
+    /// **The six fields the wire drops really are unread by the drawing.**
+    ///
+    /// The codec omits `name`, `elev_m`, `wind_gust_kt`, `altimeter_hpa`,
+    /// `raw_ob` and `obs_time` on the grounds that `draw_metar_station` never
+    /// reads them and a hover is answered page-side from `hit_items`. That is
+    /// a claim about behaviour, and a comment asserting it would rot the first
+    /// time somebody plots the gust. Here it is a test: two observations that
+    /// differ in ALL SIX and in nothing else must record the same calls.
+    ///
+    /// If this fails, the wire is dropping something the picture draws, and
+    /// the station model on screen is missing it.
+    #[test]
+    fn two_observations_differing_only_in_dropped_fields_paint_identically() {
+        use crate::render::draw::DrawPointContext;
+        use crate::render::station_model;
+
+        let full = a_full_station();
+        let mut stripped = full.clone();
+        stripped.name = String::new();
+        stripped.elev_m = None;
+        stripped.wind_gust_kt = None;
+        stripped.altimeter_hpa = None;
+        stripped.raw_ob = String::new();
+        stripped.obs_time = String::new();
+
+        // Every tier, because the model is zoom-gated and a field could be
+        // read at one zoom and not another.
+        for zoom in [3.0f32, 6.0, 9.0, 12.0] {
+            let ctx = DrawPointContext {
+                zoom,
+                is_dark: false,
+            };
+            let mut a = CallLog::default();
+            let mut b = CallLog::default();
+            station_model::draw_metar_station(&full, &mut a, &ctx);
+            station_model::draw_metar_station(&stripped, &mut b, &ctx);
+            assert_eq!(
+                a, b,
+                "at zoom {zoom} the station model read a field the wire does \
+                 not carry, so the picture would draw a different station than \
+                 the frame thread did",
+            );
+        }
+    }
+
     /// **A lent grid is cut to the window its head names, origin included.**
     ///
     /// The end-to-end model-wire parity gate cannot see this. Its dispatched
@@ -1580,7 +1991,7 @@ mod tests {
     /// The labels of the rows this build registers, spelled out as literals.
     /// **Deliberately not derived from `JOB_CODECS`** — a list read off the
     /// thing it checks cannot catch a row that moved.
-    const EXPECTED_LABELS: [&str; 7] = [
+    const EXPECTED_LABELS: [&str; 8] = [
         "overlay/coverage",
         "overlay/alerts",
         "overlay/outlooks",
@@ -1588,6 +1999,7 @@ mod tests {
         "overlay/reports",
         "overlay/glm",
         "overlay/model",
+        "overlay/metar",
     ];
 
     #[test]

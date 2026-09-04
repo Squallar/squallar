@@ -45,6 +45,12 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     "overlay/reports | 200 | 0x8b8cebdb5011dbc0",
     "overlay/glm | 243 | 0xf628cffc30d313df",
     "overlay/model | 265 | 0x01f0be29a2ccb24f",
+    // Added when METAR left the frame thread: the station geometry — wind
+    // barbs, cloud cover, weather symbols — is a picture now, and this row is
+    // the twelve observation fields the drawing reads. It lands at the end of
+    // the overlays chunk, so every row after it is renumbered by one; those
+    // three digests below moved for that reason and no other.
+    "overlay/metar | 402 | 0x88f409803fc25408",
     // The height row, chained last so no code before it is renumbered. Its
     // whole payload is framing: the tile bodies are opaque PNGs this codec
     // frames and never interprets, the same ruling `framing_of` gives an
@@ -57,8 +63,8 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     // and `decode` left these bytes identical and this row could not see it.
     // `x_km` and `y_km` now differ. The length is unchanged at 406 -- the field
     // widths did not move, only the values that make the swap visible.
-    "terrain/heights | 406 | 0xc776d09fd53b08e0",
-    "buildings/prisms | 239 | 0x607da6bb1409aaa8",
+    "terrain/heights | 406 | 0x7d1d06a4e408f2e5",
+    "buildings/prisms | 239 | 0xf8883249f73c1bb5",
     // The basemap row, chained last so no code before it is renumbered.
     // Its whole payload is framing too: the tile bodies are opaque MVT this
     // codec frames and never interprets, the same ruling `framing_of` gives an
@@ -66,7 +72,7 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     // Row-length arithmetic, independent of the encoder: 1 code byte + 44
     // envelope + 1 theme u8 + 4 disabled count + 2 names (4 + 8 "building",
     // 4 + 3 "poi") + 4 tile count + one tile of 13 header + 113 body = 199.
-    "basemap/tiles | 199 | 0xb09a70866af7ef06",
+    "basemap/tiles | 199 | 0x5e52dbc4796f3a91",
 ];
 
 /// The 2 overlay-reply framing rows, exactly as

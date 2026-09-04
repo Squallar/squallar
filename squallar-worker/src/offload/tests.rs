@@ -686,6 +686,68 @@ pub(super) fn an_overlay_model_whole_job() -> JobRequest {
 
 /// The model overlay job in its **wire form** — the window carry the decoder
 /// produces.
+/// Three stations inside the 33-37 / -99..-96 box and one well outside it.
+/// The outside one is what makes `ids_of` a real check: a cull that stopped
+/// working would record a fourth id, and a row renumbering would move the
+/// three that remain.
+pub(super) fn an_overlay_metar_job() -> JobRequest {
+    use squallar_overlays::metar::types::{
+        CloudLayer, FlightCategory, MetarOb, Visibility, WindDir,
+    };
+    use squallar_overlays::render::rasterize::MetarInput;
+    let station = |id: &str, lat: f64, lon: f64, kt: u16, fc: FlightCategory| MetarOb {
+        station_id: id.into(),
+        name: String::new(),
+        lat,
+        lon,
+        elev_m: None,
+        temp_c: Some(21.0),
+        dewp_c: Some(-4.0),
+        wind_dir: Some(WindDir::Degrees(230)),
+        wind_speed_kt: Some(kt),
+        wind_gust_kt: None,
+        visibility: Some(Visibility {
+            miles: 10.0,
+            or_greater: true,
+        }),
+        altimeter_hpa: None,
+        mslp_hpa: Some(1011.0),
+        flight_category: Some(fc),
+        raw_ob: String::new(),
+        clouds: vec![CloudLayer {
+            cover: "BKN".into(),
+            base_ft: Some(2500),
+        }],
+        wx_string: Some("RA".into()),
+        obs_time: String::new(),
+    };
+    JobRequest {
+        geometry: JobGeometry {
+            width: 96,
+            height: 64,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 33.0,
+                max_lat: 37.0,
+                min_lon: -99.0,
+                max_lon: -96.0,
+            },
+            side_ceiling_px: 0,
+        },
+        job: DescribedJob::new(MetarInput {
+            obs: vec![
+                station("KTLX", 35.0, -98.0, 25, FlightCategory::MVFR),
+                station("KOKC", 34.2, -97.2, 10, FlightCategory::VFR),
+                station("KTUL", 36.2, -96.4, 40, FlightCategory::IFR),
+                // Far outside the box: draws nothing, records no cells.
+                station("KSEA", 47.4, -122.3, 5, FlightCategory::LIFR),
+            ],
+            zoom: 8.0,
+            is_dark: false,
+            device_scale: 1.0,
+        }),
+    }
+}
+
 pub(super) fn an_overlay_model_job() -> JobRequest {
     use squallar_overlays::render::rasterize::{GridWindow, GriddedInput, IndexWindow};
     let lambert = squallar_overlays::hrrr::lambert::LambertGrid::from_parts(a_lambert_parts())
@@ -938,6 +1000,7 @@ fn every_job_kind_survives_the_wire_format() {
         // The window form; the whole-grid form deliberately does NOT
         // round-trip to itself.
         an_overlay_model_job(),
+        an_overlay_metar_job(),
         a_height_job(),
         a_building_job(),
         a_basemap_tiles_job(),
@@ -987,7 +1050,7 @@ fn an_unallocated_code_is_refused() {
 #[test]
 fn every_code_is_the_literal_index_and_label_this_registry_composes() {
     // Deliberately spelled out. Do not regenerate this from the constants.
-    let table: [(u8, &str); 16] = [
+    let table: [(u8, &str); 17] = [
         (1, "radar"),
         (2, "level3"),
         (3, "level3/vild"),
@@ -1001,9 +1064,10 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (11, "overlay/reports"),
         (12, "overlay/glm"),
         (13, "overlay/model"),
-        (14, "terrain/heights"),
-        (15, "buildings/prisms"),
-        (16, "basemap/tiles"),
+        (14, "overlay/metar"),
+        (15, "terrain/heights"),
+        (16, "buildings/prisms"),
+        (17, "basemap/tiles"),
     ];
 
     // Against the composed registry: row `i` is labelled what this table says
@@ -1031,7 +1095,7 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
 
     // And the encoder really posts those bytes — the table could agree with
     // the registry while the framing that writes the byte does not.
-    let framing: [(JobRequest, u8); 16] = [
+    let framing: [(JobRequest, u8); 17] = [
         (a_job(), 1),
         (a_level3_job(), 2),
         (a_level3_pair_job(), 3),
@@ -1045,9 +1109,10 @@ fn every_code_is_the_literal_index_and_label_this_registry_composes() {
         (an_overlay_reports_job(), 11),
         (an_overlay_glm_job(), 12),
         (an_overlay_model_job(), 13),
-        (a_height_job(), 14),
-        (a_building_job(), 15),
-        (a_basemap_tiles_job(), 16),
+        (an_overlay_metar_job(), 14),
+        (a_height_job(), 15),
+        (a_building_job(), 16),
+        (a_basemap_tiles_job(), 17),
     ];
     assert_eq!(
         framing.len(),
@@ -1867,6 +1932,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
         // is over stored bits and not over anything a platform's libm
         // computed.
         an_overlay_model_job(),
+        an_overlay_metar_job(),
         // Literal constants again, for the same reason: the fixture's box, its
         // cover and its one tile body are all spelled out, so nothing in this
         // row's digest is what a platform's `sin`/`atan2` answered.
@@ -1921,7 +1987,7 @@ fn the_job_framing_is_the_one_this_protocol_ships() {
 #[test]
 fn every_codec_row_has_a_parity_test() {
     // Deliberately spelled out, label beside test name, in registry order.
-    let named: [(&str, &str); 16] = [
+    let named: [(&str, &str); 17] = [
         (
             "radar",
             "the_radar_render_is_byte_identical_direct_and_via_the_wire",
@@ -1973,6 +2039,10 @@ fn every_codec_row_has_a_parity_test() {
         (
             "overlay/model",
             "the_model_render_is_byte_identical_direct_and_via_the_wire",
+        ),
+        (
+            "overlay/metar",
+            "the_metar_render_is_byte_identical_direct_and_via_the_wire",
         ),
         (
             "terrain/heights",
@@ -2322,7 +2392,7 @@ fn a_height_field_comes_back_under_its_own_out_kind() {
     let (code, head, tails) =
         execute_encoded(&a_height_job().to_bytes(), None).expect("the fixture job answers");
     assert_eq!(
-        code, 14,
+        code, 15,
         "the reply is tagged with the height row's own code"
     );
     assert_eq!(
@@ -2537,7 +2607,7 @@ fn a_building_mesh_comes_back_under_its_own_out_kind() {
     let (code, head, tails) =
         execute_encoded(&a_building_job().to_bytes(), None).expect("the fixture job answers");
     assert_eq!(
-        code, 15,
+        code, 16,
         "the reply is tagged with the buildings row's own code",
     );
     assert_eq!(
@@ -2994,6 +3064,58 @@ fn uv_of_cell(cells: &squallar_overlays::render::rasterize::HitCells, idx: u32) 
 }
 
 /// **The parity gate for the storm-reports render**.
+#[test]
+fn the_metar_render_is_byte_identical_direct_and_via_the_wire() {
+    let JobRequest { geometry, job } = an_overlay_metar_job();
+    let (width, height, bounds) = (geometry.width, geometry.height, geometry.bounds);
+    let input = job
+        .downcast_ref::<squallar_overlays::render::rasterize::MetarInput>()
+        .expect("the fixture is a metar job");
+
+    let direct = squallar_overlays::render::rasterize::rasterize_metar_stations(
+        input, &bounds, width, height,
+    );
+    assert_eq!(
+        direct.alpha,
+        squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+        "the metar rasterizer changed its alpha convention; the parity claim \
+         below is now comparing across a conversion",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the fixture painted nothing, so byte-identity would be vacuous",
+    );
+
+    let (via_wire, wire_cells) = overlay_reply_via_wire(&JobRequest {
+        geometry,
+        job: job.clone(),
+    });
+    assert_eq!(
+        via_wire.len(),
+        (width * height * 4) as usize,
+        "the reply's length is the one statement of shape the consumer checks",
+    );
+    assert_eq!(
+        via_wire, direct.rgba,
+        "the metar raster differs between the direct call and the wire — the \
+         two paths have stopped being one renderer",
+    );
+    let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
+    assert_eq!(
+        Some(&wire_cells),
+        direct.hit_cells.as_ref(),
+        "the hit cells differ between the direct call and the wire — same \
+         picture, different hover targets",
+    );
+    assert_eq!(
+        ids_of(&wire_cells),
+        HashSet::from([0, 1, 2]),
+        "the three in-box stations must each record cells and the culled \
+         fourth must not: the id space is the row order the dispatch captured \
+         its items in",
+    );
+}
+
 #[test]
 fn the_reports_render_is_byte_identical_direct_and_via_the_wire() {
     let JobRequest { geometry, job } = an_overlay_reports_job();

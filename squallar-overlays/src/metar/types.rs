@@ -100,7 +100,7 @@ impl WindDir {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct CloudLayer {
     pub cover: String,
     /// Feet AGL. `None` for CLR/SKC.
@@ -108,7 +108,10 @@ pub struct CloudLayer {
     pub base_ft: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+/// `PartialEq` so a picture job carrying these can be compared: the job
+/// funnel's input equality is what lets a re-dispatch of an unchanged
+/// observation set be recognised.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetarOb {
     pub station_id: String,
     pub name: String,

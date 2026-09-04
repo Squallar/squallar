@@ -671,6 +671,241 @@ pub struct ReportsInput {
 
 squallar_source::impl_job_input!(ReportsInput);
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetarInput {
+    /// The observations, in the handler's own order — **row `i` is
+    /// `hit_items()[i]`**, the same index contract every hit-mapped row keeps.
+    pub obs: Vec<crate::metar::types::MetarOb>,
+    pub zoom: f64,
+    pub is_dark: bool,
+    pub device_scale: f32,
+}
+
+squallar_source::impl_job_input!(MetarInput);
+
+/// The station models, drawn into a picture instead of onto the frame thread.
+///
+/// Everything except the text: see [`PixmapPointPainter`] for why the five
+/// texts a station draws stay behind, and what the 41 shapes that move were
+/// costing.
+pub fn rasterize_metar_stations(
+    input: &MetarInput,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+) -> RasterizeOutput {
+    let MetarInput {
+        obs,
+        zoom,
+        is_dark,
+        device_scale,
+    } = input;
+    let scale = sane_device_scale(*device_scale);
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!(
+            "Pixmap allocation failed in rasterize_metar_stations ({}x{})",
+            width,
+            height
+        );
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_cells: None,
+            alpha: AlphaMode::Premultiplied,
+        };
+    };
+    let mb = MercatorBounds::from_geo(bounds);
+    let (w, h) = (width as f32, height as f32);
+    let ctx = crate::render::draw::DrawPointContext {
+        zoom: *zoom as f32,
+        is_dark: *is_dark,
+    };
+    let hit_radius = crate::render::station_model::hit_radius_for_zoom(*zoom as f32) * scale;
+    let mut hit_cells = HitCells::new(width, height);
+
+    for (idx, ob) in obs.iter().enumerate() {
+        // Into the viewport's frame first, as every point row does.
+        let lon = mb.nearest_lon(ob.lon);
+        let (px, py) = mb.project(ob.lat, lon, w, h);
+        // A station model reaches well past its centre — wind barbs, cloud
+        // cover and the pressure group all sit off to one side — so the slack
+        // is generous. A symbol clipped at the edge is a drawing artifact; a
+        // symbol culled at the edge is a missing station.
+        let slack = 60.0 * scale;
+        if px < -slack || px > w + slack || py < -slack || py > h + slack {
+            continue;
+        }
+        {
+            let mut painter = PixmapPointPainter {
+                pixmap: &mut pixmap,
+                center: (px, py),
+            };
+            crate::render::station_model::draw_metar_station(ob, &mut painter, &ctx);
+        }
+        // The station's position in the input list **is** its id, the same
+        // contract `hit_items` is index-aligned against. Stepped by 4 because
+        // the cell grid is quarter resolution.
+        let item_id = idx as u32;
+        let min_x = (px - hit_radius).max(0.0) as i32;
+        let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
+        let min_y = (py - hit_radius).max(0.0) as i32;
+        let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
+        let r2 = hit_radius * hit_radius;
+        let mut sy = min_y;
+        while sy <= max_y {
+            let mut sx = min_x;
+            while sx <= max_x {
+                let dx = sx as f32 - px;
+                let dy = sy as f32 - py;
+                if dx * dx + dy * dy <= r2 {
+                    hit_cells.record(sx as f32, sy as f32, item_id);
+                }
+                sx += 4;
+            }
+            sy += 4;
+        }
+    }
+
+    RasterizeOutput {
+        rgba: pixmap.take().to_vec(),
+        hit_cells: Some(hit_cells),
+        alpha: AlphaMode::Premultiplied,
+    }
+}
+
+/// A [`PointPainter`](crate::render::draw::PointPainter) that draws into a
+/// `tiny_skia` pixmap, so a station model can be rasterized OFF the frame
+/// thread.
+///
+/// **Why this exists.** The METAR station model emits 46 shapes per station —
+/// 28 lines, 7 stroked circles, 6 filled circles, 4 polygons, 5 texts — and a
+/// scene D leg carries 799 observations. Drawn through `egui` that is ~36,750
+/// shapes per frame of which ~28,000 are STROKED, and a stroked path is the
+/// tessellator's expensive case: it feathers geometry along both edges. The
+/// measured cost was 98,815 vertices and 401,072 indices staged EVERY FRAME,
+/// with `epaint::tessellator::stroke_and_fill_path` the single largest symbol
+/// in the app at 11.75 %, for observations that change every twenty minutes.
+///
+/// **`text` is deliberately a no-op here.** `tiny_skia` has no font support and
+/// nothing in the worker can lay out a galley, so the five texts a station
+/// draws stay on the frame thread where the font atlas is. That is the split:
+/// the 41 geometric shapes — every stroked one — become a picture, and only
+/// the text remains. Moving the text as well needs a font rasterizer in the
+/// worker and is a separate question with its own dependency decision.
+struct PixmapPointPainter<'a> {
+    pixmap: &'a mut Pixmap,
+    /// The station's own position in pixels; every offset is relative to it.
+    center: (f32, f32),
+}
+
+impl PixmapPointPainter<'_> {
+    fn at(&self, offset: [f32; 2]) -> (f32, f32) {
+        (self.center.0 + offset[0], self.center.1 + offset[1])
+    }
+
+    /// `PointPainter` speaks straight (unmultiplied) RGBA, which is what
+    /// `from_rgba8` takes.
+    fn paint_of(color: [u8; 4]) -> Paint<'static> {
+        Paint {
+            shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(
+                color[0], color[1], color[2], color[3],
+            )),
+            anti_alias: true,
+            ..Default::default()
+        }
+    }
+}
+
+impl crate::render::draw::PointPainter for PixmapPointPainter<'_> {
+    fn circle_filled(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4]) {
+        let (x, y) = self.at(offset);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(x, y, radius);
+        if let Some(path) = pb.finish() {
+            self.pixmap.fill_path(
+                &path,
+                &Self::paint_of(color),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    fn circle_stroke(&mut self, offset: [f32; 2], radius: f32, color: [u8; 4], width: f32) {
+        let (x, y) = self.at(offset);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(x, y, radius);
+        if let Some(path) = pb.finish() {
+            self.pixmap.stroke_path(
+                &path,
+                &Self::paint_of(color),
+                &Stroke {
+                    width,
+                    line_cap: LineCap::Round,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    /// No-op: see the type's own note. The frame thread still draws the text.
+    fn text(
+        &mut self,
+        _offset: [f32; 2],
+        _text: &str,
+        _color: [u8; 4],
+        _size: f32,
+        _anchor: crate::render::draw::TextAnchor,
+    ) {
+    }
+
+    fn line(&mut self, from: [f32; 2], to: [f32; 2], color: [u8; 4], width: f32) {
+        let (x0, y0) = self.at(from);
+        let (x1, y1) = self.at(to);
+        let mut pb = PathBuilder::new();
+        pb.move_to(x0, y0);
+        pb.line_to(x1, y1);
+        if let Some(path) = pb.finish() {
+            self.pixmap.stroke_path(
+                &path,
+                &Self::paint_of(color),
+                &Stroke {
+                    width,
+                    line_cap: LineCap::Round,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    fn filled_polygon(&mut self, points: &[[f32; 2]], color: [u8; 4]) {
+        let Some((first, rest)) = points.split_first() else {
+            return;
+        };
+        let (x0, y0) = self.at(*first);
+        let mut pb = PathBuilder::new();
+        pb.move_to(x0, y0);
+        for p in rest {
+            let (x, y) = self.at(*p);
+            pb.line_to(x, y);
+        }
+        pb.close();
+        if let Some(path) = pb.finish() {
+            self.pixmap.fill_path(
+                &path,
+                &Self::paint_of(color),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+}
+
 /// Tornado = red, hail = green, wind = blue. Below a 5 px radius the symbols
 /// fall back to filled dots.
 pub fn rasterize_storm_reports(
