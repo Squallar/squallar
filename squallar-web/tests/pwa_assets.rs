@@ -640,6 +640,98 @@ fn every_shell_asset_that_is_not_build_output_exists() {
     }
 }
 
+/// The `cp … dist/…` lines of CI's `web-wasm32` staging step, each read as
+/// the `dist`-relative paths it produces.
+///
+/// A `cp a b dir/` lands each source at `dir/<basename>`; a `cp -R src dest`
+/// lands it at `dest`. Directories are kept as directories: `icons` staged
+/// whole covers every `icons/…` entry. The parse is strict about what it
+/// claims to have read — a step restructured so that no `cp` line targets
+/// `dist/` any more is a failure here, not a green.
+fn ci_staged_paths() -> BTreeSet<String> {
+    let workflow = web_dir().join("../.github/workflows/build.yaml");
+    let yaml = std::fs::read_to_string(&workflow)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", workflow.display()));
+
+    let mut staged = BTreeSet::new();
+    let mut cp_lines = 0;
+    for line in yaml.lines().map(str::trim) {
+        let Some(args) = line.strip_prefix("cp ") else {
+            continue;
+        };
+        let mut words: Vec<&str> = args
+            .split_whitespace()
+            .filter(|w| !w.starts_with('-'))
+            .collect();
+        let Some(dest) = words.pop() else {
+            continue;
+        };
+        let Some(under_dist) = dest.strip_prefix("dist/") else {
+            continue;
+        };
+        cp_lines += 1;
+        for source in words {
+            let base = source.rsplit('/').next().unwrap_or(source);
+            let landed = if under_dist.is_empty() || dest.ends_with('/') {
+                format!("{under_dist}{base}")
+            } else {
+                under_dist.to_string()
+            };
+            staged.insert(landed);
+        }
+    }
+    assert!(
+        cp_lines > 0,
+        "no `cp … dist/…` line found in {}; the staging step moved or was \
+         rewritten, and this test no longer reads it",
+        workflow.display()
+    );
+    assert!(
+        staged.contains("index.html"),
+        "the staging parse of {} read {cp_lines} cp line(s) but none stages \
+         index.html; the parse is wrong",
+        workflow.display()
+    );
+    staged
+}
+
+/// `sw.js` lists what the deploy must serve; `build.yaml` lists what the
+/// deploy ships. Nothing else pins them to each other. `heap.js` was added to
+/// the first and imported by the page and both workers, and the deploy went
+/// red on CI's own post-staging check — a check that runs after a wasm build,
+/// once per push. This is the same claim, readable from the source tree.
+#[test]
+fn every_path_sw_js_caches_is_named_by_the_ci_staging_step() {
+    let staged = ci_staged_paths();
+    let shell = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    let assets = js_string_list(SERVICE_WORKER, "const ASSET_PATHS = [");
+    assert!(shell.len() > 1, "SHELL_PATHS in sw.js parsed as near-empty");
+    assert!(!assets.is_empty(), "ASSET_PATHS in sw.js parsed as empty");
+
+    let covered = |path: &str| {
+        staged.contains(path)
+            || staged.iter().any(|dir| {
+                path.strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+    };
+
+    for (list, path) in shell
+        .iter()
+        .map(|p| ("SHELL_PATHS", p))
+        .chain(assets.iter().map(|p| ("ASSET_PATHS", p)))
+    {
+        // "" is the directory index, staged as index.html.
+        let path = if path.is_empty() { "index.html" } else { path };
+        assert!(
+            covered(path),
+            "sw.js lists {path:?} in {list}, but no `cp … dist/…` line of \
+             .github/workflows/build.yaml stages it. The deployed page would \
+             404 on it. Staged by that step: {staged:?}"
+        );
+    }
+}
+
 #[test]
 fn the_worker_precaches_the_manifest_and_both_halves_of_the_wasm_bundle() {
     let paths = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
