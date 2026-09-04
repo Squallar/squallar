@@ -26,6 +26,33 @@ pub mod sites;
 mod texture_tests;
 
 use super::overlay_state::OverlayHandler;
+use squallar_source::id::{LayerId, known};
+
+/// **The host bytes a gridded layer's handler keeps its decoded source
+/// under** — the key-space grid budget each handler states for itself on
+/// this build's arm: MRMS's `GRID_CACHE_BYTES`, GMGSI's `GRID_CACHE_BYTES`,
+/// the model layer's `MODEL_GRID_BUDGET_BYTES`. Zero for every other layer:
+/// a few hundred parsed polygons or station reports do not move a figure
+/// read in megabytes, which is the same claim `resident_source_bytes` makes
+/// through its default.
+///
+/// A budget, not a residency — what a pane enabling the layer asks the heap
+/// to be able to hold, so the budget system can price the layer before a
+/// grid has arrived and without reaching the handler instance (which lives on
+/// the UI layer's registry, behind a coupling ceiling). Keyed by id and spelled
+/// here, beside the registrations, so a gridded layer added to [`sources`]
+/// without a row here is a review question in one file.
+pub fn source_grid_budget_bytes(id: &LayerId) -> u64 {
+    if *id == known::MRMS {
+        crate::mrms::GRID_CACHE_BYTES as u64
+    } else if *id == known::GMGSI {
+        gmgsi::GRID_CACHE_BYTES as u64
+    } else if *id == known::MODEL_DATA {
+        model::MODEL_GRID_BUDGET_BYTES as u64
+    } else {
+        0
+    }
+}
 
 /// **This crate's layer registrations — fifteen rows, and the only place they
 /// are named.**
@@ -159,5 +186,57 @@ mod round_delivery_tests {
              or stopped must be accounted for here rather than silently \
              skipped",
         );
+    }
+}
+
+#[cfg(test)]
+mod grid_budget_tests {
+    use super::*;
+
+    /// **Each gridded layer answers the constant its handler holds its cache
+    /// to, and nothing else answers at all.** The three figures are whole
+    /// grids of the layer's own shape — the same property the handlers'
+    /// compile-time assertions hold — so a pane pricing a layer prices what
+    /// the handler would actually hold at its key space.
+    #[test]
+    fn a_gridded_layer_answers_its_handlers_budget_and_the_rest_answer_zero() {
+        let mrms = source_grid_budget_bytes(&known::MRMS);
+        assert_eq!(mrms, crate::mrms::GRID_CACHE_BYTES as u64);
+        assert!(mrms >= crate::mrms::CONUS_GRID_BYTES as u64);
+        assert_eq!(mrms % crate::mrms::CONUS_GRID_BYTES as u64, 0);
+
+        let gmgsi = source_grid_budget_bytes(&known::GMGSI);
+        assert_eq!(gmgsi, gmgsi::GRID_CACHE_BYTES as u64);
+        assert!(gmgsi >= gmgsi::GLOBAL_GRID_BYTES as u64);
+        assert_eq!(gmgsi % gmgsi::GLOBAL_GRID_BYTES as u64, 0);
+
+        let hrrr = source_grid_budget_bytes(&known::MODEL_DATA);
+        assert_eq!(hrrr, model::MODEL_GRID_BUDGET_BYTES as u64);
+        assert!(hrrr >= model::HRRR_CONUS_GRID_BYTES as u64);
+
+        for id in [
+            known::RADAR,
+            known::METAR,
+            known::NWS_ALERTS,
+            known::LIGHTNING,
+            known::CITY_LABELS,
+            known::SPC_OUTLOOK,
+        ] {
+            assert_eq!(source_grid_budget_bytes(&id), 0, "{}", id.as_str());
+        }
+    }
+
+    /// Every registered handler whose source is a grid has a row above: the
+    /// handlers that report source bytes are exactly the ones priced here.
+    /// A gridded layer registered without a row would be priced at one
+    /// picture, which is the undercount this function exists to end.
+    #[test]
+    fn every_registered_gridded_layer_is_priced() {
+        let priced: Vec<LayerId> = sources()
+            .iter()
+            .map(|h| h.id().clone())
+            .filter(|id| source_grid_budget_bytes(id) > 0)
+            .collect();
+        assert_eq!(priced, vec![known::MODEL_DATA, known::MRMS, known::GMGSI]);
     }
 }

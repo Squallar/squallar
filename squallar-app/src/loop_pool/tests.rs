@@ -768,6 +768,10 @@ fn looping_pane() -> squallar_device_profile::scene::PaneNeed {
         buildings: false,
         overlay_pictures: 0,
         picture_px: [0, 0],
+        loop_scans_shared: false,
+        loop_scans_resident_bytes: 0,
+        loop_scans_resident_frames: 0,
+        loop_scans_needed: true,
     }
 }
 
@@ -777,6 +781,7 @@ fn scene_of(panes: usize) -> Scene {
         panes: vec![looping_pane(); panes],
         tile_sources: Vec::new(),
         mirror_px: [0, 0],
+        overlay_grids: Vec::new(),
     }
 }
 
@@ -892,6 +897,7 @@ fn the_pool_follows_the_ceiling_not_the_base_when_the_room_allows() {
         ],
         tile_sources: Vec::new(),
         mirror_px: [0, 0],
+        overlay_grids: Vec::new(),
     };
     let rtx_3090 = DeviceProfile {
         class: DeviceClass::Discrete,
@@ -1449,9 +1455,14 @@ mod budget_agreement {
                     buildings: false,
                     overlay_pictures: 0,
                     picture_px: [0, 0],
+                    loop_scans_shared: false,
+                    loop_scans_resident_bytes: 0,
+                    loop_scans_resident_frames: 0,
+                    loop_scans_needed: true,
                 }],
                 tile_sources: Vec::new(),
                 mirror_px: [0, 0],
+                overlay_grids: Vec::new(),
             };
             let terms = need_terms(&scene, &arm, GRID_BYTES);
             assert_eq!(terms.grids, grid as u64, "{}: the live grid", arm.name);

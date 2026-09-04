@@ -36,9 +36,15 @@
 //! ran". `balloon` is what the loops hold **above their base** — the bytes
 //! the pool's planner spent on density past what `fit` charged, summed over
 //! every loop, 0 when every loop holds its base or less; it is a subset of
-//! `pool` and is never added to it. Every byte figure is MiB by integer
-//! division, because the rig's probe reads these sentences with `(\d+)`
-//! groups.
+//! `pool` and is never added to it. **After everything the rig reads**, one
+//! group per visible pane — `pane<i> gpu <n> MiB host <n> MiB shared <n> MiB
+//! own <n> MiB`: what the pane COSTS on each axis at the budgets in force
+//! (`fit::need_terms_for_pane`), then what its stores HOLD, split by whether
+//! another pane holds the same bytes — two families, priced and held, never
+//! added to each other — and last `spare gpu <n> MiB host <n> MiB`, what each
+//! pool has left for one more pane or layer, `none` where the pool itself is
+//! unknown. Every byte figure is MiB by integer division, because the rig's
+//! probe reads these sentences with `(\d+)` groups.
 //!
 //! Product telemetry, not a campaign instrument: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, and no figure it prints
@@ -111,12 +117,19 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// unanchored at their end, so a trailing field is the only safe place to add
 /// one.
 ///
+/// **The pane rows and the spare pair ride after `heap max`**, for the same
+/// reason: `readout` is the budget system's own readout
+/// (`squallar_egui::shell_api::BudgetReadout`), one group per visible pane
+/// and then the two pools' spare, appended where the rig's unanchored regex
+/// cannot see them. `none` for a spare the session has no pool figure for —
+/// spelled, because 0 is a real spare.
+///
 /// A free function returning a `String` for the reason every other telemetry
 /// sentence in this tree is one: `.github/browser-rig/drive.py` scrapes it
 /// with a regex in another language in another directory, and
 /// `the_rig_reads_the_budget_line_the_app_actually_writes` holds the two ends
 /// together.
-// Eight, and the line is the reason: every field on it is a different
+// Nine, and the line is the reason: every field on it is a different
 // subsystem's reading, and bundling any two of them into a struct would make
 // a type whose only purpose is to be destructured here.
 #[allow(clippy::too_many_arguments)]
@@ -129,7 +142,10 @@ pub(crate) fn budget_state_line(
     cap: &Capacity,
     probe: GpuProbeReport,
     page_heap: crate::pressure::LinearMemoryWatch,
+    readout: &squallar_egui::shell_api::BudgetReadout,
 ) -> String {
+    use std::fmt::Write as _;
+
     let mib = |bytes: u64| bytes / (1024 * 1024);
     let rung = match budgets.promotion {
         Promotion::Floor => 0,
@@ -141,7 +157,7 @@ pub(crate) fn budget_state_line(
         Some(FormFactor::Handheld) => 1,
         Some(FormFactor::Desktop) => 2,
     };
-    format!(
+    let mut line = format!(
         "budget state: bracket {}, rung {rung}, steps {}, pool {} MiB, ceiling {} MiB, \
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
@@ -164,7 +180,29 @@ pub(crate) fn budget_state_line(
         mib(page_heap.last_acted_at().unwrap_or(0)),
         mib(linear.map_or(0, |l| l.page_max_bytes)),
         mib(linear.map_or(0, |l| l.worker_max_bytes)),
-    )
+    );
+    for (i, pane) in readout.panes.iter().enumerate() {
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            line,
+            ", pane{i} gpu {} MiB host {} MiB shared {} MiB own {} MiB",
+            mib(pane.terms.gpu_bytes()),
+            mib(pane.terms.host_bytes()),
+            mib(pane.shared_bytes),
+            mib(pane.own_bytes),
+        );
+    }
+    let spare = |pool: Option<&squallar_egui::shell_api::PoolReadout>| {
+        pool.and_then(|pool| pool.spare_bytes)
+            .map_or_else(|| "none".to_string(), |bytes| format!("{} MiB", mib(bytes)))
+    };
+    let _ = write!(
+        line,
+        ", spare gpu {} host {}",
+        spare(Some(&readout.gpu)),
+        spare(readout.host.as_ref()),
+    );
+    line
 }
 
 /// The `overlay pictures:` line — what the whole-picture overlay rasters of
@@ -255,7 +293,9 @@ mod tests {
     use squallar_device_profile::budget::{
         AdapterCeilings, BudgetLimits, BudgetMemo, Platform, resolve,
     };
+    use squallar_device_profile::fit::PaneTerms;
     use squallar_device_profile::quality::DeviceClass;
+    use squallar_egui::shell_api::{BudgetReadout, PaneBudget, PoolReadout};
 
     /// The rig driver, read at compile time so a moved or deleted file is a
     /// build failure rather than a skipped test.
@@ -347,6 +387,51 @@ mod tests {
     const WATCH: crate::pressure::LinearMemoryWatch =
         crate::pressure::LinearMemoryWatch::never_acted();
 
+    /// A readout nothing has composed — no panes, no pool figures — which
+    /// appends only the spare pair, both `none`. What every case below but
+    /// `the_pane_rows_ride_after_everything_the_rig_reads` hands in.
+    fn no_readout() -> BudgetReadout {
+        BudgetReadout::default()
+    }
+
+    /// Two panes with a distinct figure in every position, and a spare on
+    /// each pool no other position carries: 272 / 0 / 0 / 272 MiB on pane 0
+    /// (a still 2D pane holding its own 256 MiB render and a 16 MiB frame),
+    /// 33 / 41 / 16 / 17 MiB on pane 1, 3568 MiB of GPU spare, 601 of host.
+    fn two_pane_readout() -> BudgetReadout {
+        BudgetReadout {
+            panes: vec![
+                PaneBudget {
+                    terms: PaneTerms {
+                        static_rasters: 256 << 20,
+                        loops: 16 << 20,
+                        ..PaneTerms::default()
+                    },
+                    shared_bytes: 0,
+                    own_bytes: 272 << 20,
+                },
+                PaneBudget {
+                    terms: PaneTerms {
+                        static_rasters: 33 << 20,
+                        pictures_host: 41 << 20,
+                        ..PaneTerms::default()
+                    },
+                    shared_bytes: 16 << 20,
+                    own_bytes: 17 << 20,
+                },
+            ],
+            gpu: PoolReadout {
+                spare_bytes: Some(3568 << 20),
+                ..PoolReadout::default()
+            },
+            host: Some(PoolReadout {
+                spare_bytes: Some(601 << 20),
+                ..PoolReadout::default()
+            }),
+            ..BudgetReadout::default()
+        }
+    }
+
     const PROBE: GpuProbeReport = GpuProbeReport::Found(crate::platform::ProbedCapacity {
         bytes: 5 << 30,
         failed_at: None,
@@ -408,12 +493,21 @@ mod tests {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
             budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH,
+                &no_readout()
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
-             balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB",
+             balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             spare gpu none host none",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
@@ -425,16 +519,28 @@ mod tests {
                 BALLOON,
                 &CAP,
                 PROBE,
-                WATCH
+                WATCH,
+                &no_readout()
             )
             .contains(", pool 576 MiB,"),
         );
         // And the balloon follows what it is handed: a scene holding every
         // base and nothing more reads a real 0, last on the line.
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, 0, &CAP, PROBE, WATCH).ends_with(
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                0,
+                &CAP,
+                PROBE,
+                WATCH,
+                &no_readout()
+            )
+            .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB"
+                 heap max 900/1100 MiB, spare gpu none host none"
             ),
         );
         // And the capacity follows what it is handed: this profile's own
@@ -450,10 +556,11 @@ mod tests {
                 &profile.capacity(),
                 GpuProbeReport::Absent,
                 WATCH,
+                &no_readout(),
             )
             .ends_with(
                 ", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB"
+                 heap max 900/1100 MiB, spare gpu none host none"
             ),
         );
         let lowered = Capacity::presumed(&BudgetLimits::DESKTOP).held_to(Some(3456 << 20));
@@ -467,10 +574,11 @@ mod tests {
                 &lowered,
                 GpuProbeReport::Skipped,
                 WATCH,
+                &no_readout(),
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB"
+                 heap max 900/1100 MiB, spare gpu none host none"
             ),
         );
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
@@ -534,6 +642,7 @@ mod tests {
             &cap,
             GpuProbeReport::Absent,
             WATCH,
+            &no_readout(),
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -542,13 +651,13 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB",
+             heap max 0/0 MiB, spare gpu none host none",
         );
         assert_eq!(
             line.matches(", ").count(),
-            15,
-            "sixteen comma-separated groups, fifteen separators: a field was dropped or \
-             gained",
+            16,
+            "seventeen comma-separated groups with no pane rows, sixteen separators: a \
+             field was dropped or gained",
         );
     }
 
@@ -579,7 +688,15 @@ mod tests {
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
         let line = budget_state_line(
-            &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH,
+            &budgets,
+            &profile,
+            linear,
+            POOL,
+            BALLOON,
+            &CAP,
+            PROBE,
+            WATCH,
+            &no_readout(),
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -589,8 +706,64 @@ mod tests {
         );
         assert_eq!(
             &line[read_by_the_rig.len()..],
-            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB",
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, spare gpu none host none",
             "the tail the rig does not read drifted",
+        );
+    }
+
+    /// **The pane rows and the spare pair ride after everything the rig
+    /// reads.** The rig's `budget_state_re` — read off `drive.py` here, not
+    /// copied — ends unanchored at `balloon`, so the sentence it describes is
+    /// a prefix of the line whatever is appended, and the appended groups are
+    /// pinned separately: one group per pane in pane order, gpu then host
+    /// (priced) then shared then own (held), all MiB, then the two spares.
+    /// The distinct fixture puts a different figure in every position so a
+    /// transposition cannot read as correct; a pool prints `none` only where
+    /// the pool itself is unknown, which the bare readout is.
+    #[test]
+    fn the_pane_rows_ride_after_everything_the_rig_reads() {
+        let (budgets, profile, linear) = distinct();
+        let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
+        let line = budget_state_line(
+            &budgets,
+            &profile,
+            linear,
+            POOL,
+            BALLOON,
+            &CAP,
+            PROBE,
+            WATCH,
+            &two_pane_readout(),
+        );
+        assert!(
+            line.starts_with(&read_by_the_rig),
+            "two pane rows moved a field the rig reads:\n  app: {line}\n  rig: {read_by_the_rig}",
+        );
+        assert_eq!(
+            &line[read_by_the_rig.len()..],
+            ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
+             pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
+             pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB, \
+             spare gpu 3568 MiB host 601 MiB",
+        );
+        // The rig's own guarantee, restated where the rows depend on it: no
+        // `$` closes the pattern, and its last literal is the balloon.
+        assert!(pattern("budget_state_re").ends_with(r"balloon (\d+) MiB"));
+        // A pool with a figure but nothing spare prints a real zero, and a
+        // pool with no figure prints its absence.
+        let exhausted = BudgetReadout {
+            gpu: PoolReadout {
+                spare_bytes: Some(0),
+                ..PoolReadout::default()
+            },
+            host: None,
+            ..BudgetReadout::default()
+        };
+        assert!(
+            budget_state_line(
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH, &exhausted,
+            )
+            .ends_with(", spare gpu 0 MiB host none"),
         );
     }
 
@@ -601,7 +774,15 @@ mod tests {
         let good = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
             budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH,
+                &no_readout()
             )
             .starts_with(&good)
         );
@@ -609,7 +790,15 @@ mod tests {
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
         assert!(
             !budget_state_line(
-                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+                &budgets,
+                &profile,
+                linear,
+                POOL,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH,
+                &no_readout()
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -638,9 +827,21 @@ mod tests {
     fn the_budget_line_carries_the_page_heaps_act_count() {
         let profile = DeviceProfile::for_target();
         let budgets = resolve(&profile);
-        let never = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, WATCH);
+        let never = budget_state_line(
+            &budgets,
+            &profile,
+            None,
+            POOL,
+            BALLOON,
+            &CAP,
+            PROBE,
+            WATCH,
+            &no_readout(),
+        );
         assert!(
-            never.ends_with(", page heap acts 0 at 0 MiB, heap max 0/0 MiB"),
+            never.ends_with(
+                ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, spare gpu none host none"
+            ),
             "a watch that never acted must still print its zero: {never}",
         );
 
@@ -656,9 +857,21 @@ mod tests {
         let _ = watch.observe(900 << 20, max, 0);
         let _ = watch.observe(1011 << 20, max, 0);
         assert_eq!(watch.acts(), 2);
-        let acted = budget_state_line(&budgets, &profile, None, POOL, BALLOON, &CAP, PROBE, watch);
+        let acted = budget_state_line(
+            &budgets,
+            &profile,
+            None,
+            POOL,
+            BALLOON,
+            &CAP,
+            PROBE,
+            watch,
+            &no_readout(),
+        );
         assert!(
-            acted.ends_with(", page heap acts 2 at 1011 MiB, heap max 0/0 MiB"),
+            acted.ends_with(
+                ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, spare gpu none host none"
+            ),
             "the act count and the mark are not both on the line: {acted}",
         );
 

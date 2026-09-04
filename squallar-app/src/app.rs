@@ -253,6 +253,19 @@ pub struct App {
     /// (`squallar_device_profile::linear_memory::act_line`). Zero natively
     /// and before the first walk.
     host_headroom_bytes: u64,
+    /// **The budget system's readout** — per pane, what the scene costs and
+    /// what the pane's stores hold; per pool, capacity, need and spare —
+    /// composed on every loop walk from the scene that walk already prices
+    /// ([`Self::observe_loop_demand`]) and handed to the Gui with the frame's
+    /// inputs (`squallar_egui::shell_api::BudgetReadout`). Its pane vector is
+    /// reused walk to walk, so past the first walk composing it allocates
+    /// nothing on the frame thread.
+    budget_readout: squallar_egui::shell_api::BudgetReadout,
+    /// The page heap as the frame last sampled it ([`Self::sample_page_heap`]
+    /// and the telemetry tick), kept so the readout's host spare is held to
+    /// the heap's own room without a second `byteLength` read. `None` on a
+    /// bridge that reads no heap.
+    page_heap_reading: Option<crate::platform::LinearMemory>,
     /// The rasterization worker's own watermark, judged apart from the
     /// page's ([`crate::pressure::Pressure::WorkerMemory`]).
     worker_memory_watch: crate::pressure::LinearMemoryWatch,
@@ -755,6 +768,8 @@ impl App {
             session_host_capacity: None,
             tile_economy_squeezed: false,
             host_headroom_bytes: 0,
+            budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
+            page_heap_reading: None,
             worker_memory_watch: crate::pressure::LinearMemoryWatch::default(),
             gpu_probe: GpuProbeReport::Absent,
             gpu_probe_settled: false,
@@ -2361,7 +2376,7 @@ impl App {
             }) {
                 settling.insert(radar_layer::site(ls));
             }
-            live_loops.push((radar_layer::site(ls), render::loop_product(ls)));
+            live_loops.push(render::live_loop_row(ls));
             let frames = needed.entry(radar_layer::site(ls)).or_default();
             for frame in &ls.frames {
                 frames.insert(frame.timestamp);

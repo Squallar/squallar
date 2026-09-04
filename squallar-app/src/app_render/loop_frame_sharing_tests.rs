@@ -13,7 +13,7 @@ use super::*;
 use crate::app::tests::{drain_uploads, two_pane_app};
 use crate::loop_frame_store::LoopFrameKey;
 use crate::loop_pool::{
-    LoopDemand, LoopKey, LoopKind, LoopNeed, LoopPool, LoopPoolLimits, LoopPoolState,
+    GRID_BYTES, LoopDemand, LoopKey, LoopKind, LoopNeed, LoopPool, LoopPoolLimits, LoopPoolState,
 };
 use squallar_device_profile::constants::LOOP_POOL_DWELL_FRAMES;
 use squallar_egui::pane::TimeMode;
@@ -188,7 +188,7 @@ fn two_unlinked_panes_on_one_picture_hold_one_texture_and_upload_it_once() {
     assert_eq!(frame_texture(&app, 1, 0), Some(sibling));
 
     // The re-said count sees it, on the same walk that counts residency.
-    let (_, counts, _) = app.loop_demand();
+    let counts = app.loop_demand().counts;
     assert_eq!(counts.shared, 1, "the `loop state:` line's `shared`");
     assert_eq!(
         counts.resident, 2,
@@ -355,6 +355,114 @@ fn a_pane_scrubbing_away_cannot_evict_the_frame_another_pane_shows() {
     );
 }
 
+/// **A loop rendered from Level III objects is priced for no decoded
+/// volumes, and one Level II loop on the site brings the whole charge back.**
+///
+/// The retention drops a site's decoded volumes when every live loop on it
+/// renders Level III (`squallar_radar::loop_downloads::site_needs_decoded_source`,
+/// the peer landing that measured 671.9 MiB going to zero on a 14-frame
+/// loop), so pricing every loop for a volume per frame would charge a scene
+/// hundreds of MB it does not hold. This drives the flag through the real
+/// walk: the scene the budget system is handed, not the predicate in
+/// isolation.
+///
+/// **Both arms, on one site.** Echo tops on both panes: nothing needs a
+/// volume, and the term is zero however many frames the loops name. Retarget
+/// one pane to reflectivity — a Level II render — and the site needs its
+/// volumes again for BOTH panes' frames, which is the sharing rule: one
+/// cache, one charge, and the pane that owns it carries it.
+#[test]
+fn a_level_three_loop_is_priced_for_no_volumes_until_a_level_two_loop_joins_its_site() {
+    const ECHO_TOPS: squallar_source::product::FieldId = squallar_radar::fields::known::ECHO_TOPS;
+    let mut app = two_unlinked_panes(&[at(0), at(1)]);
+    for idx in 0..2 {
+        app.gui
+            .pane_mut(idx)
+            .expect("the fixture built two panes")
+            .time_state_mut(&known::RADAR)
+            .retarget_renders(&ECHO_TOPS, TILT);
+    }
+
+    let scene = app.loop_demand().scene;
+    assert!(scene.panes[0].looping, "premise: the first pane loops");
+    assert!(
+        !scene.panes[0].loop_scans_needed,
+        "every live loop on the site renders Level III, so its volumes are dropped",
+    );
+    // **What it IS charged is what the site is holding this instant** — the
+    // two volumes the fixture cached, at their measured prices — and no
+    // reserve at all. The retention has not swept yet; the model prices what
+    // is there, which is why the grace window needs no modelling of its own.
+    let held = app.loop_mgr.cached_scan_bytes() as u64;
+    assert!(held > 0, "premise: the fixture cached this site's volumes");
+    assert_eq!(scene.panes[0].loop_scans_resident_bytes, held);
+    let terms = squallar_device_profile::fit::need_terms(&scene, &app.budgets, GRID_BYTES);
+    assert_eq!(
+        terms.loop_scans_host, held,
+        "a Level III loop was charged a reserve for volumes it will never fetch",
+    );
+    assert!(
+        terms.loop_scans_host < squallar_device_profile::constants::LOOP_SCAN_RESERVE_BYTES,
+        "the term is what the site holds, not a bound per frame",
+    );
+    assert!(
+        terms.total().gpu_bytes > 0,
+        "its frames' textures are still priced",
+    );
+
+    // **And the price follows the retention down.** The sweep drops the
+    // volumes of a site no Level II loop reads, keeping the one a pane is
+    // parked at — the other half of that rule — and the next walk prices
+    // exactly what is left, with the loop still playing every frame it
+    // played before. Price and residency, read by two independent readers.
+    app.evict_unneeded_loop_scans();
+    let after = app.loop_mgr.cached_scan_bytes() as u64;
+    assert!(
+        after > 0 && after < held,
+        "the sweep kept the parked still and dropped the rest: {after} of {held}",
+    );
+    let swept = app.loop_demand().scene;
+    assert!(swept.panes[0].looping, "the loop is untouched");
+    assert_eq!(swept.panes[0].loop_scans_resident_bytes, after);
+    assert_eq!(
+        squallar_device_profile::fit::need_terms(&swept, &app.budgets, GRID_BYTES).loop_scans_host,
+        after,
+        "the scene is priced for volumes the sweep has already dropped",
+    );
+
+    // One Level II loop on the site and the volumes are needed again — by
+    // the pane that carries the site's charge, whichever it is.
+    app.gui
+        .pane_mut(1)
+        .expect("the fixture built two panes")
+        .time_state_mut(&known::RADAR)
+        .retarget_renders(&PRODUCT_ID, TILT);
+    let scene = app.loop_demand().scene;
+    let owner = scene
+        .panes
+        .iter()
+        .find(|pane| !pane.loop_scans_shared && pane.looping)
+        .expect("one pane carries the site's volumes");
+    assert!(
+        owner.loop_scans_needed,
+        "a Level II loop on the site did not bring its volumes back",
+    );
+    let terms = squallar_device_profile::fit::need_terms(&scene, &app.budgets, GRID_BYTES);
+    assert!(
+        terms.loop_scans_host > 0,
+        "the site needs decoded volumes and none was priced",
+    );
+    assert_eq!(
+        scene
+            .panes
+            .iter()
+            .filter(|pane| !pane.loop_scans_shared && pane.looping)
+            .count(),
+        1,
+        "two panes on one site charged the one scan cache twice",
+    );
+}
+
 /// **The pool prices one loop per identity.** Two panes on one picture set
 /// over one window are one need and one grant, the second an alias of the
 /// first; another tilt, another lookback or another parked instant makes two.
@@ -362,7 +470,7 @@ fn a_pane_scrubbing_away_cannot_evict_the_frame_another_pane_shows() {
 fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
     let mut app = two_unlinked_panes(&[at(0)]);
 
-    let (demand, _, scene) = app.loop_demand();
+    let super::LoopWalk { demand, scene, .. } = app.loop_demand();
     assert_eq!(
         demand.shares(),
         1,
@@ -395,7 +503,7 @@ fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
         .expect("the fixture built two panes")
         .time_state_mut(&known::RADAR)
         .retarget_renders(&PRODUCT_ID, 1.5);
-    let (demand, _, scene) = app.loop_demand();
+    let super::LoopWalk { demand, scene, .. } = app.loop_demand();
     assert_eq!(demand.shares(), 2, "two tilts, two loops");
     assert!(scene.panes[0].looping && scene.panes[1].looping);
 
@@ -406,7 +514,7 @@ fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
         .time_state_mut(&known::RADAR)
         .retarget_renders(&PRODUCT_ID, TILT);
     assert_eq!(
-        app.loop_demand().0.shares(),
+        app.loop_demand().demand.shares(),
         1,
         "control: back on one tilt, one loop"
     );
@@ -415,14 +523,18 @@ fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
         .expect("the fixture built two panes")
         .time
         .span_secs *= 2;
-    assert_eq!(app.loop_demand().0.shares(), 2, "two lookbacks, two loops");
+    assert_eq!(
+        app.loop_demand().demand.shares(),
+        2,
+        "two lookbacks, two loops"
+    );
     app.gui
         .pane_mut(1)
         .expect("the fixture built two panes")
         .time
         .span_secs /= 2;
     assert_eq!(
-        app.loop_demand().0.shares(),
+        app.loop_demand().demand.shares(),
         1,
         "control: one lookback, one loop"
     );
@@ -432,7 +544,7 @@ fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
         .time
         .mode = TimeMode::AsOf(at(-30));
     assert_eq!(
-        app.loop_demand().0.shares(),
+        app.loop_demand().demand.shares(),
         2,
         "one live and one parked, two loops"
     );
@@ -447,7 +559,7 @@ fn two_section_panes_on_one_line_price_one_loop_and_two_lines_price_two() {
         .pane_mut(1)
         .expect("the fixture built two panes")
         .group = None;
-    assert_eq!(app.loop_demand().0.shares(), 1, "one line, one loop");
+    assert_eq!(app.loop_demand().demand.shares(), 1, "one line, one loop");
 
     let other = squallar_egui::pane::SectionLoopKey::new(
         squallar_egui::pane::SectionLine::new(
@@ -469,5 +581,5 @@ fn two_section_panes_on_one_line_price_one_loop_and_two_lines_price_two() {
         .expect("the fixture built two panes")
         .time_state_mut(&known::RADAR)
         .retarget_renders_for(&PRODUCT_ID, TILT, Some(other));
-    assert_eq!(app.loop_demand().0.shares(), 2, "two lines, two loops");
+    assert_eq!(app.loop_demand().demand.shares(), 2, "two lines, two loops");
 }

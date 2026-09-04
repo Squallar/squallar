@@ -246,6 +246,23 @@ pub const WASM_MAX_LOOP_FRAMES: usize = 14;
 pub const MOBILE_MAX_LOOP_FRAMES: usize = 20;
 pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 
+/// **Host bytes reserved per radar loop frame whose decoded Level II volume
+/// has not arrived yet** — what `crate::fit::NeedTerms::loop_scans_host`
+/// prices a pending frame at; a frame the download cache already holds is
+/// priced at the size it was measured at on arrival
+/// (`PaneNeed::loop_scans_resident_bytes`), never at this.
+///
+/// A reservation, not a measurement. `squallar-radar`'s loop download cache
+/// (`loop_downloads.rs`, the doc on `scan_bytes_cached`) measured a decoded
+/// volume at 46.1–46.8 MiB median and **58.3 MiB maximum over 208 real
+/// archive volumes**; a sample maximum is not a ceiling, so the reserve is
+/// that maximum rounded up to the next power of two. It over-states a median
+/// volume by 39 % and under-states nothing measured, so it over-prices only
+/// what has not arrived — the direction a reservation must err. The ladder
+/// answers the term with the host rungs alone: the span is the user's and no
+/// host rung shortens it.
+pub const LOOP_SCAN_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How many cross-section loop frames may be *dispatched* in one frame.
 /// `RenderInput::extract_volume_parts` runs on the frame thread (~1.0 ms on a
 /// VCP-212 reflectivity volume), so the cap is against the 16.7 ms frame budget
@@ -771,6 +788,11 @@ const _: () = const {
     assert!(MIN_LOOP_SPEED_FPS <= DEFAULT_LOOP_SPEED_FPS);
     assert!(DEFAULT_LOOP_SPEED_FPS <= MAX_LOOP_SPEED_FPS);
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
+    // The scan reserve prices one decoded Level II volume per radar loop
+    // frame on the host: 64 MiB in bytes, and never under the 58.3 MiB
+    // sample maximum it was rounded up from.
+    assert!(LOOP_SCAN_RESERVE_BYTES == 67_108_864);
+    assert!(LOOP_SCAN_RESERVE_BYTES >= 61_131_981);
     // The plan-view side is **not** required to be a power of two; what every
     // path shares is a floor and a ceiling, which is what
     // `raster_side_from_rgba_len` checks a finished buffer against.

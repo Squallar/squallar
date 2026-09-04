@@ -4,8 +4,107 @@
 //! out-direction, `GuiAction`, already had this shape and lives in
 //! [`crate::actions`]. The re-verbed `GuiAction` lands here at E5.
 
+use squallar_device_profile::fit::{NeedTerms, PaneTerms};
 use squallar_device_profile::hist::Hist;
+use squallar_device_profile::scene::CapacitySource;
 use squallar_radar::types::ScanInfo;
+use squallar_source::id::LayerId;
+
+/// **What the scene costs and what the machine holds, as the App last priced
+/// them** — the budget system's readout, composed in `squallar-app` on the
+/// loop walk that already prices the scene (`App::observe_loop_demand`) and
+/// crossing here as one field of [`FrameInputs`]. The UI reads it and paints
+/// it; it prices nothing, because pricing is `fit::need` over a `Scene` the
+/// App alone can describe (the loop aliasing, the tile ledger, the planned
+/// picture sizes).
+///
+/// Two families of figure, never added: the **priced** terms
+/// (`fit::need_terms_for_pane` per pane, `fit::need_terms` for the whole)
+/// are what the scene *costs* at the budgets in force — a loop's decoded
+/// volumes at their measured size where resident and at the reserve where
+/// still to come; the **held** figures (`shared` / `own`) are what a pane's
+/// stores are *holding* now, read off the refcounted stores and the loop
+/// pool's grants. Every byte figure is bytes; the telemetry line divides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BudgetReadout {
+    /// One entry per visible pane, in pane order.
+    pub panes: Vec<PaneBudget>,
+    /// The whole scene's terms — the panes folded plus the scene-level
+    /// terms: mirror, tiles, the arrival, the overlay grids.
+    pub terms: NeedTerms,
+    /// The GPU pool.
+    pub gpu: PoolReadout,
+    /// The host pool, where the session has a host figure at all — a
+    /// browser's declared heap, a measured RAM reading. `None` on a native
+    /// arm no reader has answered for, where nothing is ever over.
+    pub host: Option<PoolReadout>,
+    /// **Every gridded overlay layer enabled on any pane**, with the host
+    /// budget it is priced at — the per-layer read-out of
+    /// `NeedTerms::overlay_grids_host`, keyed for the layers menu.
+    pub overlay_grids: Vec<(LayerId, u64)>,
+}
+
+/// One pane's priced cost and held bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaneBudget {
+    /// What the pane costs, term by term, at the budgets in force —
+    /// `fit::need_terms_for_pane`, so a pane on a shared loop prices at its
+    /// own cost and no more.
+    pub terms: PaneTerms,
+    /// **Bytes this pane holds that another pane holds too**: a 3D pane's
+    /// grids in the volume store held by more than one pane, and a 2D loop's
+    /// grant where the pane is an alias of another pane's loop or has one.
+    /// Displayed, never attributed — ruling 8's `shared N`.
+    pub shared_bytes: u64,
+    /// **Bytes this pane holds alone**: the rest of the same two figures. The
+    /// loop frame store's picture sharing beyond the aliasing (two unlinked
+    /// panes whose windows overlap) is counted on `loop state:`'s `shared`
+    /// and not folded in here — a different denominator.
+    pub own_bytes: u64,
+}
+
+/// One pool — GPU or host — as the session sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolReadout {
+    /// The capacity in force this session, in bytes: the figure `fit` is
+    /// held to, after pressure has had its say.
+    pub capacity_bytes: u64,
+    /// How that figure was learned. The host pool has no probe: a probed
+    /// session's host figure is the bracket's presumption and says so.
+    pub source: CapacitySource,
+    /// What the scene's need may occupy of it.
+    pub allowance_bytes: u64,
+    /// What the scene needs of it now, at the budgets in force.
+    pub need_bytes: u64,
+    /// **What is left for one more pane or layer**: the allowance less the
+    /// need, and on a page heap never more than the heap's own room
+    /// (`max - byteLength`, as last read). The live-bytes bound the plan
+    /// names (`act_line - live_bytes`) has no producer yet and is not in the
+    /// minimum until it does; `None` only where the pool itself is unknown.
+    pub spare_bytes: Option<u64>,
+    /// The percentage of the pool the user asked for. No producer yet
+    /// (the setting lands later); `None` until it does.
+    pub requested_percent: Option<u8>,
+    /// The percentage in force after the hardware cap and the governor.
+    /// `None` until a producer exists.
+    pub effective_percent: Option<u8>,
+}
+
+impl Default for PoolReadout {
+    /// A pool nothing has priced: zero capacity, presumed. What a fresh
+    /// application carries before its first loop walk.
+    fn default() -> Self {
+        Self {
+            capacity_bytes: 0,
+            source: CapacitySource::Presumed,
+            allowance_bytes: 0,
+            need_bytes: 0,
+            spare_bytes: None,
+            requested_percent: None,
+            effective_percent: None,
+        }
+    }
+}
 
 /// The frame instrument's histograms, borrowed for one frame — what the
 /// diagnostics overlay windows. Cumulative-from-boot recorders; the overlay
@@ -157,6 +256,12 @@ pub struct FrameInputs<'a> {
     /// diagnostics overlay's input. `None` from a caller with no ledger (the
     /// test harness); the overlay then shows itself still collecting.
     pub frame_diagnostics: Option<FrameDiagnostics<'a>>,
+    /// **The budget system's readout** — per-pane priced terms and held
+    /// bytes, the two pools' capacity, need and spare — as the App's last
+    /// loop walk composed it ([`BudgetReadout`]). Borrowed for the frame;
+    /// the Gui takes a copy only when it changed. `None` from a caller that
+    /// prices no scene (the test harness).
+    pub budget_readout: Option<&'a BudgetReadout>,
 }
 
 /// Event-shaped pushes applied at the call site's existing control-flow

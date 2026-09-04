@@ -201,17 +201,17 @@ const _: () = {
 // rule is `squallar-device-profile/src/mobile_cfg.rs::is_mobile_target` —
 // `target_os` in {android, ios}. Selecting a value, never forking behaviour.
 #[cfg(target_arch = "wasm32")]
-const MODEL_GRID_BUDGET_BYTES: usize = WASM_MODEL_GRID_BUDGET_BYTES;
+pub(crate) const MODEL_GRID_BUDGET_BYTES: usize = WASM_MODEL_GRID_BUDGET_BYTES;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(target_os = "android", target_os = "ios")
 ))]
-const MODEL_GRID_BUDGET_BYTES: usize = MOBILE_MODEL_GRID_BUDGET_BYTES;
+pub(crate) const MODEL_GRID_BUDGET_BYTES: usize = MOBILE_MODEL_GRID_BUDGET_BYTES;
 #[cfg(all(
     not(target_arch = "wasm32"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-const MODEL_GRID_BUDGET_BYTES: usize = DESKTOP_MODEL_GRID_BUDGET_BYTES;
+pub(crate) const MODEL_GRID_BUDGET_BYTES: usize = DESKTOP_MODEL_GRID_BUDGET_BYTES;
 
 /// The resident grids, bounded by bytes and evicted least-recently-touched
 /// first.

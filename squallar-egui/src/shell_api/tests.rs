@@ -68,6 +68,7 @@ fn every_frame_input_surfaces_and_persists() {
         floor_tile_zoom_bias: 2,
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
+        budget_readout: None,
     });
 
     // Two frames, no re-application: the values must persist. Frame 1 lays the
@@ -181,6 +182,7 @@ fn a_none_gps_clears_the_fix() {
         floor_tile_zoom_bias: 0,
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
+        budget_readout: None,
     };
     h.gui_mut().apply_frame_inputs(base);
     assert!(
@@ -204,6 +206,7 @@ fn a_none_gps_clears_the_fix() {
         floor_tile_zoom_bias: 0,
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
+        budget_readout: None,
     });
     h.frame();
     assert!(

@@ -524,7 +524,7 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
     // history rung lowers the GPU need only, where the margin and the tiles
     // lower both, so a walk driven by the host axis thins the margin and
     // snaps the tiles with the loop's history untouched — by design, and
-    // pinned as such by `the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms`.
+    // pinned as such by `the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_no_host_rung`.
     // "History before margin, margin before tiles" therefore holds on the
     // GPU walk and the counted walk (`fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs`,
     // `the_ladder_surrenders_lighting_before_resolution_and_the_picture_last`),
@@ -923,14 +923,28 @@ fn the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where
                     let with = fit(&scene, profile, &cap, g);
                     let without = fit(&scene, &unread, &bare, g);
                     // Every difference between the arms is a ladder position
-                    // off the one class rung.
-                    for (arm, fitted) in [("measured", with), ("presumed", without)] {
+                    // off the one class rung, walked **against the axes that
+                    // were over** at each step: a scene over on the GPU takes
+                    // every rung in order, one over on the host alone takes
+                    // only the rungs that lower the host (the overlay margin,
+                    // the tile sharpness) and skips the rest — so a host-only
+                    // walk is not `demote`, and pricing the loop scans made
+                    // the measured rows with a RAM reading walk it.
+                    for (arm, fitted, arm_cap) in
+                        [("measured", with, &cap), ("presumed", without, &bare)]
+                    {
                         let mut walked = resolved;
-                        demote(
-                            &mut walked,
-                            &profile.limits,
-                            fitted.steps_back - resolved.steps_back,
-                        );
+                        for _ in resolved.steps_back..fitted.steps_back {
+                            let (gpu_over, host_over) = over(&scene, &walked, arm_cap, g);
+                            assert!(
+                                gpu_over || host_over,
+                                "{row} / {name} / {arm}: fit took a step on a scene that fit",
+                            );
+                            assert!(
+                                step_down_for(&mut walked, &profile.limits, gpu_over, host_over),
+                                "{row} / {name} / {arm}: fit counted a step no rung took",
+                            );
+                        }
                         assert_eq!(
                             Budgets {
                                 steps_back: fitted.steps_back,
@@ -938,7 +952,8 @@ fn the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where
                             },
                             fitted,
                             "{row} / {name} / {arm}: a fitted budget is not the class rung \
-                             walked {} rungs down the ladder — capacity raised a field",
+                             walked {} rungs down the ladder against the axes that were \
+                             over — capacity raised a field",
                             fitted.steps_back,
                         );
                     }

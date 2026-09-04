@@ -11,7 +11,7 @@ use squallar_device_profile::constants::{
     MAX_OVERLAY_LOOP_RENDERS_PER_PASS, MIN_LOOP_SPEED_FPS,
 };
 use squallar_device_profile::fit::{economy_allowance, fit, fit_holds, need};
-use squallar_device_profile::scene::Scene;
+use squallar_device_profile::scene::{OverlayGridNeed, Scene};
 use squallar_egui::actions::GuiAction;
 use squallar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use squallar_egui::radar_layer;
@@ -1259,6 +1259,9 @@ impl super::App {
                     budget_state: self.budget_state_panel_line.as_deref(),
                     ..self.frame_ledger.diagnostics()
                 }),
+                // As the last loop walk composed it — see
+                // `Self::compose_budget_readout`.
+                budget_readout: Some(&self.budget_readout),
             });
     }
 
@@ -1878,6 +1881,7 @@ impl super::App {
         // the panel and a captured log carry the same sentence. One heap
         // reading serves both the line and the watermark below it.
         let linear = self.platform.linear_memory();
+        self.page_heap_reading = linear.or(self.page_heap_reading);
         say_telemetry(
             loud,
             self.budget_state_panel_line
@@ -1890,6 +1894,7 @@ impl super::App {
                     &self.capacity(),
                     self.gpu_probe,
                     self.linear_memory_watch,
+                    &self.budget_readout,
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
@@ -2036,6 +2041,7 @@ impl super::App {
     /// Nothing on a bridge that reads no heap.
     pub(super) fn sample_page_heap(&mut self) {
         if let Some(heap) = self.platform.linear_memory() {
+            self.page_heap_reading = Some(heap);
             self.observe_page_heap(heap.page_bytes, heap.page_max_bytes);
         }
     }
@@ -4290,7 +4296,7 @@ impl super::App {
     /// alternative is more reaches into the `Gui` in a file whose coupling
     /// ceiling is permanent and already at its measured value. Both are a
     /// handful of integer reads over the layers this walk is touching anyway.
-    fn loop_demand(&self) -> (LoopDemand, crate::loop_telemetry::LoopState, Scene) {
+    fn loop_demand(&self) -> LoopWalk {
         use squallar_device_profile::quality::GroundPass;
         use squallar_device_profile::scene::PaneNeed;
 
@@ -4322,10 +4328,33 @@ impl super::App {
             mirror_px: self
                 .mirror_plan_applied
                 .map_or([0, 0], |plan| plan.size_in_pixels),
+            // Filled at the end of the walk from `overlay_grids` below.
+            overlay_grids: Vec::new(),
         };
         // Distinct loops seen so far, each with the pane that owns it: a
         // later pane on the same identity is an alias of that pane's loop.
         let mut seen: Vec<(LoopIdentity, usize)> = Vec::new();
+        // **Sites whose decoded loop volumes are already counted**, each with
+        // the pane counting them: the loop download cache holds one volume
+        // per named frame per site whatever product or view each pane draws
+        // from it, so a second pane on the site holds the first's.
+        let mut scan_sites: Vec<(String, usize)> = Vec::new();
+        // **Every gridded overlay layer some pane shows**, once, at the host
+        // budget its handler states — the scene's shared-grid term and its
+        // per-layer read-out. Once across panes, because the handler is one
+        // instance for the whole application.
+        let mut overlay_grids: Vec<(squallar_source::id::LayerId, u64)> = Vec::new();
+        // **Every loop running right now and what it renders**, and **what
+        // each pane is parked at** — the two the decoded-volume price is
+        // resolved from once the walk has seen every pane, exactly as
+        // `App::evict_unneeded_loop_scans` resolves the retention. A later
+        // pane's Level II loop makes an earlier pane's site need volumes, so
+        // neither question can be answered inside the walk.
+        let mut live_loops: Vec<(&str, Option<squallar_radar::types::RadarProduct>)> = Vec::new();
+        let mut parked: Vec<(&str, chrono::NaiveDateTime)> = Vec::new();
+        // The site and frame list of every pane that reached the radar arm,
+        // by its index in `scene.panes`, for that second pass.
+        let mut scan_owners: Vec<(usize, &str, &[squallar_egui::pane::LoopFrame])> = Vec::new();
         let model = LoopFrameModel::from_budgets(&self.budgets);
         for (pane_idx, pane) in self.gui.panes().iter().enumerate() {
             if counts.advance_us == 0 {
@@ -4334,6 +4363,12 @@ impl super::App {
                     .min(u128::from(u64::MAX)) as u64;
             }
             counts.count_pane(pane);
+            // The one volume a site keeps even when nothing loops from it —
+            // read here, on the walk, for the same reason the eviction sweep
+            // reads it on its own walk.
+            if let Some(info) = pane.scan_info.as_ref() {
+                parked.push((info.site.name, info.timestamp));
+            }
             let view = pane.render_view();
             // A 3D pane's offscreen is priced at what the painter last fitted
             // it from: the pane's own size and the ground pass it decided,
@@ -4380,6 +4415,19 @@ impl super::App {
                 .keys()
                 .filter(|id| **id != known::RADAR && pane.is_overlay_enabled(id))
                 .count();
+            for id in pane
+                .overlay_textures
+                .keys()
+                .filter(|id| **id != known::RADAR && pane.is_overlay_enabled(id))
+            {
+                if overlay_grids.iter().any(|(counted, _)| counted == id) {
+                    continue;
+                }
+                let bytes = squallar_overlays::render::handlers::source_grid_budget_bytes(id);
+                if bytes > 0 {
+                    overlay_grids.push((id.clone(), bytes));
+                }
+            }
             let picture_px = match self.render.overlay_pane_px(pane_idx) {
                 [0, 0] => window_px,
                 planned => planned,
@@ -4398,6 +4446,10 @@ impl super::App {
                 buildings: false,
                 overlay_pictures,
                 picture_px,
+                loop_scans_shared: false,
+                loop_scans_resident_bytes: 0,
+                loop_scans_resident_frames: 0,
+                loop_scans_needed: true,
             };
             let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
@@ -4433,6 +4485,7 @@ impl super::App {
                 scene.panes.push(pane_need);
                 continue;
             }
+            live_loops.push(live_loop_row(ls));
             let identity = loop_product(ls).map(|product| LoopIdentity::of(pane, ls, product));
             let owner = match identity {
                 // A 3D pane with no product yet asks for nothing.
@@ -4473,16 +4526,96 @@ impl super::App {
                     pane_need.looping = true;
                 }
             }
+            // **The site's decoded volumes are counted once**, under the pane
+            // with the widest lookback. A later pane on a counted site marks
+            // itself shared; a later pane looping wider takes the count over
+            // and marks the earlier pane instead — an alias never takes it,
+            // since it prices no loop of its own. Every pane pushes exactly
+            // one entry, so a pane's index is its index in `scene.panes`.
+            let site = radar_layer::site(ls);
+            match scan_sites.iter_mut().find(|(counted, _)| counted == site) {
+                Some((_, counted)) => {
+                    if pane_need.looping
+                        && pane_need.loop_span_secs > scene.panes[*counted].loop_span_secs
+                    {
+                        let earlier = &mut scene.panes[*counted];
+                        earlier.loop_scans_shared = true;
+                        earlier.loop_scans_resident_bytes = 0;
+                        earlier.loop_scans_resident_frames = 0;
+                        *counted = pane_idx;
+                    } else {
+                        pane_need.loop_scans_shared = true;
+                    }
+                }
+                None => scan_sites.push((site.to_string(), pane_idx)),
+            }
+            if pane_need.looping {
+                scan_owners.push((pane_idx, site, &ls.frames));
+            }
             scene.panes.push(pane_need);
         }
+        // **What each looping pane's decoded volumes cost**, resolved now
+        // that every live loop is known.
+        //
+        // The rule is the retention's, asked of the retention's own predicate
+        // rather than of a second copy of it: on a site some live loop renders
+        // Level II from, the cache holds one volume per named frame, so the
+        // frames it already holds are priced at what they measured and the
+        // rest at the reserve. On a site where every live loop is Level III —
+        // frames derived from paired objects, reading nothing from a volume —
+        // the sweep drops the volumes, so no reserve is charged for a fetch
+        // that will never come and what is left is whatever a pane parked at
+        // a still is keeping.
+        //
+        // **Resident is measured on both arms**, which is what makes the
+        // grace window need no modelling of its own: a site inside
+        // `LOOP_LISTING_GRACE` still holds its volumes and they are still
+        // counted, and the figure falls by itself on the sweep that drops
+        // them. The parked still's volume is counted once — the loop cache is
+        // the denominator here, and `volume_inventory` holding the same `Arc`
+        // is the census's declared overlap, not a second charge.
+        for (pane_idx, site, frames) in scan_owners {
+            let pane = &mut scene.panes[pane_idx];
+            if pane.loop_scans_shared {
+                continue;
+            }
+            pane.loop_scans_needed =
+                squallar_radar::loop_downloads::site_needs_decoded_source(site, &live_loops);
+            let (named_bytes, named_frames) = self
+                .loop_mgr
+                .cached_scan_bytes_for(site, frames.iter().map(|frame| frame.timestamp));
+            // The parked still, where it is not already one of the frames —
+            // counted in the bytes, never in the frame count, which is what
+            // the reserve subtracts from.
+            let (parked_bytes, _) = self.loop_mgr.cached_scan_bytes_for(
+                site,
+                parked.iter().filter_map(|&(at_site, at)| {
+                    (at_site == site && !frames.iter().any(|frame| frame.timestamp == at))
+                        .then_some(at)
+                }),
+            );
+            pane.loop_scans_resident_bytes = (named_bytes + parked_bytes) as u64;
+            pane.loop_scans_resident_frames = named_frames;
+        }
         counts.shared = self.loop_frames.shared();
-        (demand, counts, scene)
+        scene.overlay_grids = overlay_grids
+            .iter()
+            .map(|(_, budget_bytes)| OverlayGridNeed {
+                budget_bytes: *budget_bytes,
+            })
+            .collect();
+        LoopWalk {
+            demand,
+            counts,
+            scene,
+            overlay_grids,
+        }
     }
 
     /// What is on screen, in the terms the budget system prices — built on
     /// the one pane walk [`Self::loop_demand`] already makes.
     pub(super) fn scene_of(&self) -> Scene {
-        self.loop_demand().2
+        self.loop_demand().scene
     }
 
     /// The division of the pool in force, after the dwell and the dead band
@@ -4490,7 +4623,12 @@ impl super::App {
     /// need, capped by the room the rest of it leaves under this session's
     /// capacity — never the class's ceiling.
     pub(super) fn observe_loop_demand(&mut self) -> LoopAllocation {
-        let (demand, counts, scene) = self.loop_demand();
+        let LoopWalk {
+            demand,
+            counts,
+            scene,
+            overlay_grids,
+        } = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
         // The tile caches' allowance follows the same scene and the same
@@ -4524,13 +4662,119 @@ impl super::App {
             .pictures_host
             .saturating_add(terms.picture_arrival_host);
         self.loop_pool = self.pool_for_scene(&scene);
-        self.loop_pool_state
+        let allocation = self
+            .loop_pool_state
             .observe(
                 self.loop_pool,
                 LoopFrameModel::from_budgets(&self.budgets),
                 demand,
             )
-            .clone()
+            .clone();
+        self.compose_budget_readout(&scene, &terms, overlay_grids, &allocation);
+        allocation
+    }
+
+    /// **Compose the budget readout** from the scene this walk priced: per
+    /// pane, `fit::need_terms_for_pane` beside what the pane's stores hold;
+    /// per pool, the capacity in force, its allowance, the scene's need and
+    /// what is spare. On the loop walk, which is the cadence `fit` already
+    /// runs at — no second pane walk, and the pane vector is reused so this
+    /// allocates nothing past the first walk (the walk itself allocates one
+    /// site key per looping pane for the scan reconciliation); the Gui copies
+    /// the readout only when it changed. A few multiplications a pane and one
+    /// lock of the volume store's handful of entries.
+    ///
+    /// **Held bytes have two sources and one denominator each.** A 3D pane's
+    /// grids are in the volume store, which knows its holders — shared where
+    /// another pane holds the grid too. A 2D pane's loop is its grant from
+    /// the pool — shared where the plan aliased the pane to another's loop or
+    /// another to its. The loop frame store's picture sharing beyond aliasing
+    /// is `loop state:`'s `shared` and is not folded in.
+    ///
+    /// **Spare is the least of what bounds it.** The model's spare is the
+    /// allowance less the need; on a page heap the heap's own room — its
+    /// maximum less `byteLength`, as the frame last sampled it — bounds that
+    /// from above, since a model that has no term for something resident
+    /// cannot see the wall the heap can. The live-bytes bound the design
+    /// names has no producer yet and joins the minimum when it does.
+    fn compose_budget_readout(
+        &mut self,
+        scene: &Scene,
+        terms: &squallar_device_profile::fit::NeedTerms,
+        overlay_grids: Vec<(squallar_source::id::LayerId, u64)>,
+        allocation: &LoopAllocation,
+    ) {
+        use squallar_device_profile::scene::CapacitySource;
+        use squallar_egui::shell_api::{PaneBudget, PoolReadout};
+
+        let cap = self.capacity();
+        let need = terms.total();
+        let readout = &mut self.budget_readout;
+        readout.panes.clear();
+        for (pane_idx, pane) in scene.panes.iter().enumerate() {
+            let pane_terms =
+                squallar_device_profile::fit::need_terms_for_pane(pane, &self.budgets, GRID_BYTES);
+            let (shared_bytes, own_bytes) = match pane.view {
+                squallar_radar::types::RenderView::Volume => {
+                    let (shared, own) = self.volume_store.pane_texture_bytes(pane_idx);
+                    (shared as u64, own as u64)
+                }
+                squallar_radar::types::RenderView::PlanView
+                | squallar_radar::types::RenderView::CrossSection => {
+                    let held = allocation
+                        .grant_for_pane(pane_idx)
+                        .map_or(0, |grant| grant.bytes() as u64);
+                    if allocation.pane_shares_loop(pane_idx) {
+                        (held, 0)
+                    } else {
+                        (0, held)
+                    }
+                }
+            };
+            readout.panes.push(PaneBudget {
+                terms: pane_terms,
+                shared_bytes,
+                own_bytes,
+            });
+        }
+        readout.terms = *terms;
+        readout.gpu = PoolReadout {
+            capacity_bytes: cap.gpu_bytes,
+            source: cap.source,
+            allowance_bytes: cap.allowance(),
+            need_bytes: need.gpu_bytes,
+            spare_bytes: Some(cap.allowance().saturating_sub(need.gpu_bytes)),
+            requested_percent: None,
+            effective_percent: None,
+        };
+        let heap_room = self
+            .page_heap_reading
+            .filter(|heap| heap.page_max_bytes > 0)
+            .map(|heap| heap.page_max_bytes.saturating_sub(heap.page_bytes));
+        readout.host = cap
+            .host_bytes
+            .zip(cap.host_allowance())
+            .map(|(host, allowance)| {
+                let model_spare = allowance.saturating_sub(need.host_bytes);
+                PoolReadout {
+                    capacity_bytes: host,
+                    // The host has no probe: a probed session's host figure is
+                    // the bracket's presumption, and a measured session's is
+                    // the RAM reading beside the VRAM one.
+                    source: match cap.source {
+                        CapacitySource::Measured => CapacitySource::Measured,
+                        CapacitySource::Probed | CapacitySource::Presumed => {
+                            CapacitySource::Presumed
+                        }
+                    },
+                    allowance_bytes: allowance,
+                    need_bytes: need.host_bytes,
+                    spare_bytes: Some(heap_room.map_or(model_spare, |room| model_spare.min(room))),
+                    requested_percent: None,
+                    effective_percent: None,
+                }
+            });
+        readout.overlay_grids = overlay_grids;
     }
 
     /// **`fit` for `scene` against this session's capacity, its answer
@@ -5842,6 +6086,17 @@ fn section_source_refusal(
     Some(squallar_egui::pane::SectionUnavailable::AwaitingVolume)
 }
 
+/// **What one pane walk of [`App::loop_demand`] produced**: the loops' demand
+/// on the pool, the telemetry's count of what they hold, the scene the
+/// budget system prices, and the gridded overlays that scene's shared-grid
+/// term was built from, keyed for the readout.
+struct LoopWalk {
+    demand: LoopDemand,
+    counts: crate::loop_telemetry::LoopState,
+    scene: Scene,
+    overlay_grids: Vec<(squallar_source::id::LayerId, u64)>,
+}
+
 /// **What makes two panes' radar loops one loop for the pool.** Two panes
 /// agreeing on every term of an arm hold one set of frames — one resident
 /// grid set in the volume store, one set of pictures in the loop frame store
@@ -6440,6 +6695,23 @@ pub(super) fn loop_product(
     ls.rendered_for
         .as_ref()
         .and_then(|t| crate::render_key::radar_field(&t.product))
+}
+
+/// **One row of the `live_loops` slice
+/// [`squallar_radar::loop_downloads::site_needs_decoded_source`] reads**: the
+/// site a radar timeline is anchored to and the product it renders, `None`
+/// where the loop has not dispatched yet — which that predicate reads as
+/// "keep", the safe direction.
+///
+/// Spelled once and called from both walks that build the slice — the
+/// eviction sweep that retains by the predicate (`App::evict_unneeded_loop_scans`)
+/// and the pane walk that prices by it ([`App::loop_demand`]) — so the two
+/// cannot come to describe a different set of loops to the same function.
+/// The caller has already established that `ls` is active.
+pub(super) fn live_loop_row(
+    ls: &squallar_egui::pane::LayerTimeState,
+) -> (&str, Option<squallar_radar::types::RadarProduct>) {
+    (radar_layer::site(ls), loop_product(ls))
 }
 
 /// Whether every frame `ls` intends to render has settled, given what has arrived.

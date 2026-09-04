@@ -2630,7 +2630,7 @@ fn a_heap_at_the_warn_line_is_noted_and_steps_nothing() {
 /// figure both legs reported and Firefox's allocation failures named. Which
 /// rung a scene of that size then takes is the fit's arithmetic and is pinned
 /// where the fit lives
-/// (`squallar_device_profile::fit::tests::the_huge_leg_fits_the_page_heap_after_the_oversampling_rung_on_both_arms`);
+/// (`squallar_device_profile::fit::tests::the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_no_host_rung`);
 /// what is pinned here is that the page path reaches it.
 #[test]
 fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {

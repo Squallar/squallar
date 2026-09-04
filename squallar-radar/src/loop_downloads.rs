@@ -358,6 +358,50 @@ impl LoopDownloadManager {
         self.scan_prices.get(&(site.to_string(), *ts)).copied()
     }
 
+    /// **What a loop already holds decoded, at its measured size**: of the
+    /// frames it names (`stamps`, its frame list), the ones this cache holds
+    /// for `site`, as `(bytes, frames)` — the sum of the prices
+    /// [`Self::cache_scan`] gave them on arrival, and how many there were.
+    ///
+    /// The reconciliation half of the budget model's scan term
+    /// (`squallar_device_profile::fit::NeedTerms::loop_scans_host`): a
+    /// resident frame costs what it was measured at, a frame still to come
+    /// costs the reserve, so a bound is never charged for a measured thing
+    /// and a live allocation is never priced under its size.
+    ///
+    /// **Per named frame, not per site**, and that is the whole reason this
+    /// is a walk rather than a running total beside
+    /// [`Self::cached_scan_bytes`]. A per-site total would answer a different
+    /// question: the site's cache can hold a volume no live frame names any
+    /// more — every pass until `App::evict_unneeded_loop_scans` runs — and
+    /// two panes looping one site at different lookbacks name different
+    /// subsets of it, so a total would over-price the narrower loop by
+    /// exactly the frames it is not showing. It also could not say how many
+    /// of the loop's frames are still to come, which is the count the reserve
+    /// multiplies. A total maintained at the mutation sites would be cheaper
+    /// per read and would answer neither.
+    ///
+    /// One map probe per named stamp, and one key allocation for the whole
+    /// walk: the price map is keyed `(String, NaiveDateTime)` and a borrowed
+    /// key cannot be built for it, so the four-letter site name is allocated
+    /// once and the stamp rewritten per probe. Nothing is decoded and no
+    /// radial is walked — safe on the frame thread, where the loop walk asks
+    /// it once per looping pane.
+    pub fn cached_scan_bytes_for(
+        &self,
+        site: &str,
+        stamps: impl IntoIterator<Item = chrono::NaiveDateTime>,
+    ) -> (usize, usize) {
+        let mut key = (site.to_string(), chrono::NaiveDateTime::default());
+        stamps.into_iter().fold((0, 0), |(bytes, frames), at| {
+            key.1 = at;
+            match self.scan_prices.get(&key) {
+                Some(price) => (bytes.saturating_add(*price), frames + 1),
+                None => (bytes, frames),
+            }
+        })
+    }
+
     /// **Host bytes the loop's paired Level III objects are holding** — the
     /// product buffers. O(1), for [`Self::cached_scan_bytes`]'s reason.
     pub fn cached_l3_bytes(&self) -> usize {
@@ -1026,6 +1070,47 @@ mod tests {
         assert_eq!(mgr.cached_scan_bytes(), 0, "an emptied cache still priced");
         mgr.retain_l3(|_, _| false);
         assert_eq!(mgr.cached_l3_bytes(), 0);
+    }
+
+    /// **The reconciliation figure is the named frames this cache holds, at
+    /// their arrival prices, and nothing else.** Two of three named stamps
+    /// held: their two prices and a count of two. A volume the site holds
+    /// that the loop does not name is not in it — the case a per-site total
+    /// would get wrong — and neither is another site's volume at a named
+    /// stamp. An empty frame list is `(0, 0)`, and so is a site the cache has
+    /// never seen; the count is what the reserve is NOT charged for, so a
+    /// figure that drifted up would under-price a loop rather than over-.
+    #[test]
+    fn cached_scan_bytes_for_prices_the_named_frames_the_cache_holds() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_scan("KTLX", ts(5), priced_volume());
+        mgr.cache_scan("KTLX", ts(30), priced_volume());
+        mgr.cache_scan("KFWS", ts(10), priced_volume());
+        let one = mgr.cached_scan_price("KTLX", &ts(0)).expect("filed");
+        assert!(one > 0, "the fixture must price at something");
+
+        let named = [ts(0), ts(5), ts(10)];
+        assert_eq!(
+            mgr.cached_scan_bytes_for("KTLX", named),
+            (2 * one, 2),
+            "two of the three named frames are held, at their prices — the \
+             volume at ts(30) is the site's and is not named",
+        );
+        assert_eq!(
+            mgr.cached_scan_bytes_for("KFWS", named),
+            (one, 1),
+            "the other site holds one of the named stamps",
+        );
+        assert_eq!(mgr.cached_scan_bytes_for("KTLX", []), (0, 0));
+        assert_eq!(mgr.cached_scan_bytes_for("KDDC", named), (0, 0));
+
+        // Every KTLX volume named: the site's whole cache, which is the
+        // running total less the other site's one.
+        assert_eq!(
+            mgr.cached_scan_bytes_for("KTLX", [ts(0), ts(5), ts(30)]),
+            (mgr.cached_scan_bytes() - one, 3),
+        );
     }
 
     /// Re-downloading the same site's timestamp replaces the entry, which is what

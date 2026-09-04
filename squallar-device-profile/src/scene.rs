@@ -29,6 +29,13 @@ pub struct Scene {
     /// The pane-mirror texture's size in texels, `[0, 0]` when no 3D pane is
     /// drawing a floor and the mirror has been released.
     pub mirror_px: [u32; 2],
+    /// **One entry per gridded overlay layer enabled on any pane**, at the
+    /// host bytes its handler keeps decoded source under. Scene-level and
+    /// counted once however many panes show the layer: an overlay's handler
+    /// is one instance for the whole application, so its grids are shared by
+    /// construction. The figure is handed in the way [`crate::fit::GridBytes`]
+    /// is, because the handlers live in a crate this one sits under.
+    pub overlay_grids: Vec<OverlayGridNeed>,
 }
 
 impl Scene {
@@ -38,8 +45,22 @@ impl Scene {
             panes: Vec::new(),
             tile_sources: Vec::new(),
             mirror_px: [0, 0],
+            overlay_grids: Vec::new(),
         }
     }
+}
+
+/// One gridded overlay layer's decoded source, on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayGridNeed {
+    /// The key-space grid budget the layer's handler states for itself —
+    /// every product or channel a pane can select, resident at once, as the
+    /// handler's own `GRID_CACHE_BYTES` (or the model layer's budget)
+    /// declares on this build's arm. The budget rather than the bytes
+    /// resident now: what a pane on the layer asks the heap to be able to
+    /// hold, which is the admission question, and a figure that does not
+    /// move with the poll.
+    pub budget_bytes: u64,
 }
 
 /// One pane, in the terms the cost functions price.
@@ -97,6 +118,49 @@ pub struct PaneNeed {
     /// bar, never under-prices. Kept apart from [`Self::px`], which a 2D pane
     /// leaves at `[0, 0]` because none of its GPU terms is sized from it.
     pub picture_px: [u32; 2],
+    /// **Whether the decoded volumes this pane's radar loop plays from are
+    /// already counted under another pane's loop.** The loop scan cache
+    /// (`squallar-radar`'s `loop_downloads`) holds one decoded volume per
+    /// named frame per **site**, whatever product or view each pane draws
+    /// from it, so two panes looping one site — the same picture set (an
+    /// alias, priced as one loop) or two products (two loops, two texture
+    /// sets, one scan cache) — hold one set of volumes between them. The
+    /// application marks every pane on an already-counted site, leaving the
+    /// count with the pane whose lookback is widest; `false` for that pane
+    /// and for every pane looping nothing radar. Read by
+    /// `crate::fit::NeedTerms::loop_scans_host` and by nothing on the GPU
+    /// axis.
+    pub loop_scans_shared: bool,
+    /// **What this pane's radar loop already holds decoded, at its measured
+    /// size**: of the frames the loop names, the ones the download cache
+    /// holds, summed at the price each was given on arrival
+    /// (`squallar-radar`'s `LoopDownloadManager::cached_scan_bytes_for`).
+    /// The reconciliation half of the scan term — a resident frame costs
+    /// what it was measured at, a frame still to come costs the reserve —
+    /// handed in the way `crate::fit::GridBytes` is, because the cache lives
+    /// in a crate this one sits beside. Zero before the first volume arrives
+    /// and on every pane marked [`Self::loop_scans_shared`]; on a site no
+    /// Level II loop reads ([`Self::loop_scans_needed`] `false`) it is the
+    /// one volume a pane parked at a still is holding, or zero.
+    pub loop_scans_resident_bytes: u64,
+    /// How many of the loop's named frames [`Self::loop_scans_resident_bytes`]
+    /// covers — the frames the reserve is **not** charged for.
+    pub loop_scans_resident_frames: usize,
+    /// **Whether this loop's frames are rendered from decoded Level II
+    /// volumes at all.** A Level III loop derives its frames from the paired
+    /// objects and reads nothing from the volume, so on a site where every
+    /// live loop is Level III the download cache holds no volume for the loop
+    /// — only whatever single volume a pane parked at a still there is
+    /// keeping. The application answers this with
+    /// `squallar_radar::loop_downloads::site_needs_decoded_source`, the same
+    /// predicate the eviction sweep retains by, so the price and the
+    /// residency cannot disagree.
+    ///
+    /// `false` charges no reserve at all: the two resident fields then carry
+    /// the parked volume alone, which is what that site holds. `true` — a
+    /// Level II loop on the site, or a loop that has not dispatched yet, the
+    /// safe direction — prices every named frame.
+    pub loop_scans_needed: bool,
 }
 
 /// One map tile source's working set.
@@ -117,7 +181,10 @@ pub struct Need {
     /// Textures: loop frames, grids, offscreens, static rasters, the mirror.
     pub gpu_bytes: u64,
     /// Host memory: the tile working set, every shown overlay picture at the
-    /// budget's oversampling, and one more picture for the arrival in flight.
+    /// budget's oversampling, one more picture for the arrival in flight,
+    /// every enabled gridded overlay's source budget, and one decoded volume
+    /// per radar loop frame — resident frames at their measured size, pending
+    /// frames at the reserve.
     pub host_bytes: u64,
 }
 
@@ -320,6 +387,10 @@ pub(crate) mod fixtures {
             buildings: false,
             overlay_pictures: 0,
             picture_px: [0, 0],
+            loop_scans_shared: false,
+            loop_scans_resident_bytes: 0,
+            loop_scans_resident_frames: 0,
+            loop_scans_needed: true,
         }
     }
 
@@ -341,12 +412,23 @@ pub(crate) mod fixtures {
     /// The tile entry cost is the measured city-core tail
     /// (`squallar_egui::tile_source::MEASURED_STYLED_ENTRY_BYTES`), restated
     /// here because this crate sits under that one.
+    ///
+    /// **The loop had been playing the whole leg, so its named frames are
+    /// decoded**: [`HUGE_LEG_SCANS_HELD`] of them at [`HUGE_LEG_SCAN_BYTES`]
+    /// apiece — a **modelled** steady state, since the leg's own volumes were
+    /// never priced one by one: the size is the middle of the 46.1–46.8 MiB
+    /// median band of the same 208-volume measurement the reserve was rounded
+    /// up from. The same scene before its first volume arrives — every frame
+    /// pending, at the reserve — is [`huge_pending`], and the two together
+    /// are the same leg at its two prices.
     pub(crate) fn huge(pictures: usize) -> Scene {
         const MEASURED_STYLED_ENTRY_BYTES: usize = 1_462_708;
         Scene {
             panes: vec![PaneNeed {
                 overlay_pictures: pictures,
                 picture_px: [2878, 1611],
+                loop_scans_resident_frames: HUGE_LEG_SCANS_HELD,
+                loop_scans_resident_bytes: HUGE_LEG_SCANS_HELD as u64 * HUGE_LEG_SCAN_BYTES,
                 ..plan_pane([0, 0], true, 2 * 60 * 60, Some(259))
             }],
             tile_sources: vec![TileNeed {
@@ -355,7 +437,48 @@ pub(crate) mod fixtures {
                 bytes_per_tile: MEASURED_STYLED_ENTRY_BYTES,
             }],
             mirror_px: [0, 0],
+            overlay_grids: Vec::new(),
         }
+    }
+
+    /// One decoded volume of the `huge` leg's loop as [`huge`] models it:
+    /// 46.5 MiB, the middle of the measured median band. A stand-in for the
+    /// leg's own volumes, which were never priced one by one.
+    pub(crate) const HUGE_LEG_SCAN_BYTES: u64 = 48_758_784;
+
+    /// The frames the `huge` leg's loop holds decoded once it has settled:
+    /// **eleven**, every frame the leg's own arm names — 1 + 2700 / 259, the
+    /// two-hour lookback held to the web bracket's 45-minute span at the
+    /// precipitation cadence. The leg was a web leg and had been playing for
+    /// the whole capture, so its named frames had all arrived.
+    ///
+    /// It is a count of the leg's frames, not of the cache's entries, so on a
+    /// bracket that names more (desktop names 28) the same scene prices
+    /// eleven resident frames beside seventeen still to come — which is the
+    /// mixed case, and the one the reserve exists for.
+    pub(crate) const HUGE_LEG_SCANS_HELD: usize = 11;
+
+    /// **[`huge`] with a Level III loop**: the same leg, the same thirteen
+    /// pictures, playing a product derived from paired Level III objects. Its
+    /// frames read no decoded volume, so on that site the download cache
+    /// holds none and the scan term is nothing at all — the shape
+    /// `site_needs_decoded_source` answers `false` for.
+    pub(crate) fn huge_level3(pictures: usize) -> Scene {
+        let mut scene = huge(pictures);
+        scene.panes[0].loop_scans_needed = false;
+        scene.panes[0].loop_scans_resident_frames = 0;
+        scene.panes[0].loop_scans_resident_bytes = 0;
+        scene
+    }
+
+    /// [`huge`] before its first volume has arrived: every named frame still
+    /// pending, so the loop's scans are priced at the reserve alone — the
+    /// admission price of the same scene.
+    pub(crate) fn huge_pending(pictures: usize) -> Scene {
+        let mut scene = huge(pictures);
+        scene.panes[0].loop_scans_resident_frames = 0;
+        scene.panes[0].loop_scans_resident_bytes = 0;
+        scene
     }
 
     /// A 3D pane of `px` holding one live grid, drawing ground or not.
@@ -372,14 +495,53 @@ pub(crate) mod fixtures {
             buildings: false,
             overlay_pictures: 0,
             picture_px: [0, 0],
+            loop_scans_shared: false,
+            loop_scans_resident_bytes: 0,
+            loop_scans_resident_frames: 0,
+            loop_scans_needed: true,
+        }
+    }
+
+    /// **Two panes on one loop, as `App::loop_demand` describes them**: the
+    /// first owns the set — a two-hour plan-view loop at the precipitation
+    /// cadence — and the second is its alias: the same site, product, tilt
+    /// and window, so it is written down as not looping, with no grid of its
+    /// own and its scans counted under the first. Ruling 8 as the scene
+    /// encodes it: the second pane owes no loop cost at all.
+    pub(crate) fn two_panes_one_loop() -> Scene {
+        let owner = plan_pane([1920, 1080], true, 2 * 60 * 60, Some(259));
+        let alias = PaneNeed {
+            looping: false,
+            loop_scans_shared: true,
+            ..owner
+        };
+        Scene {
+            panes: vec![owner, alias],
+            ..Scene::empty()
+        }
+    }
+
+    /// **Two panes looping one site at two products**: two loops, so two
+    /// texture sets, but one scan cache — the second pane's frames are its
+    /// own and its decoded volumes are the first's.
+    pub(crate) fn two_panes_one_site() -> Scene {
+        let owner = plan_pane([1920, 1080], true, 2 * 60 * 60, Some(259));
+        let other_product = PaneNeed {
+            loop_scans_shared: true,
+            ..owner
+        };
+        Scene {
+            panes: vec![owner, other_product],
+            ..Scene::empty()
         }
     }
 
     /// The scenes every profile is fitted against: nothing; one loop; a full
     /// screen of two-hour loops; a 3D pane drawing ground; the same pane
-    /// drawing buildings too; and the user's own 2878 x 1651 window with the
+    /// drawing buildings too; the user's own 2878 x 1651 window with the
     /// 193 tiles it needs between zooms, at the 1.03 MB a styled entry was
-    /// measured to cost.
+    /// measured to cost; the `huge` leg; and the two shared-loop shapes,
+    /// an alias and a second product on one site.
     pub(crate) fn scene_table() -> Vec<(&'static str, Scene)> {
         const HD: [u32; 2] = [1920, 1080];
         const TWO_HOURS: usize = 2 * 60 * 60;
@@ -392,6 +554,7 @@ pub(crate) mod fixtures {
                     panes: vec![plan_pane(HD, true, TWO_HOURS, PRECIP)],
                     tile_sources: Vec::new(),
                     mirror_px: [0, 0],
+                    overlay_grids: Vec::new(),
                 },
             ),
             (
@@ -400,6 +563,7 @@ pub(crate) mod fixtures {
                     panes: vec![plan_pane(HD, true, TWO_HOURS, PRECIP); 6],
                     tile_sources: Vec::new(),
                     mirror_px: [0, 0],
+                    overlay_grids: Vec::new(),
                 },
             ),
             (
@@ -408,6 +572,7 @@ pub(crate) mod fixtures {
                     panes: vec![volume_pane([2560, 1440], GroundPass::On)],
                     tile_sources: Vec::new(),
                     mirror_px: [2560, 1440],
+                    overlay_grids: Vec::new(),
                 },
             ),
             (
@@ -419,6 +584,7 @@ pub(crate) mod fixtures {
                     }],
                     tile_sources: Vec::new(),
                     mirror_px: [2560, 1440],
+                    overlay_grids: Vec::new(),
                 },
             ),
             (
@@ -431,11 +597,22 @@ pub(crate) mod fixtures {
                         bytes_per_tile: 1_030_000,
                     }],
                     mirror_px: [0, 0],
+                    overlay_grids: Vec::new(),
                 },
             ),
             (
                 "the huge leg: thirteen pictures on the user's canvas",
                 huge(13),
+            ),
+            (
+                "the huge leg before its first volume arrived",
+                huge_pending(13),
+            ),
+            ("the huge leg playing a Level III product", huge_level3(13)),
+            ("two panes on one loop", two_panes_one_loop()),
+            (
+                "two panes looping one site at two products",
+                two_panes_one_site(),
             ),
         ]
     }

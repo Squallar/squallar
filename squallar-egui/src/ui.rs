@@ -820,6 +820,16 @@ impl Gui {
         // Cloned, not borrowed: each entry is an id plus an `Arc`, so a frame
         // that publishes an unchanged status re-states the same allocation.
         self.liveness = inputs.liveness.to_vec();
+        // Copied only when it moved: the readout is a handful of integers
+        // per pane, re-stated every frame by an App that recomputes it on
+        // every loop walk, and most frames it is the same readout.
+        match inputs.budget_readout {
+            Some(readout) if self.budget_readout.as_ref() != Some(readout) => {
+                self.budget_readout = Some(readout.clone());
+            }
+            Some(_) => {}
+            None => self.budget_readout = None,
+        }
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
         // Before the pane loop, when every slot is full: the live sources
         // and the parked ones are held to the device's allowance from here.
@@ -853,6 +863,14 @@ impl Gui {
     /// [`crate::radar_layer::current_volume_for`].
     pub fn liveness(&self) -> &[squallar_source::liveness::SourceLiveness] {
         &self.liveness
+    }
+
+    /// **The budget system's readout**, as the App last stated it — what the
+    /// scene costs per pane and what each pool has spare. The in-frame and
+    /// per-layer readouts paint from this and price nothing; `None` until the
+    /// App has walked a scene.
+    pub fn budget_readout(&self) -> Option<&crate::shell_api::BudgetReadout> {
+        self.budget_readout.as_ref()
     }
 
     /// The distinct sites some pane is watching live — the unit the chunk feed

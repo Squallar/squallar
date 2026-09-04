@@ -360,6 +360,28 @@ impl VolumeStore {
             .sum()
     }
 
+    /// **GPU texture bytes `pane_idx` is holding, split by who else holds
+    /// them**: `(shared, own)` — grids another pane also holds, and grids
+    /// this pane holds alone. The `shared N + own M` readout for a 3D pane,
+    /// read off the holders the store already keeps: two panes orbiting one
+    /// volume each read the whole set as shared, and neither is charged it
+    /// twice. Entries still building or refused hold no texture and count
+    /// nothing. O(entries), each a few multiplications.
+    pub fn pane_texture_bytes(&self, pane_idx: usize) -> (usize, usize) {
+        self.lock()
+            .entries
+            .iter()
+            .filter(|e| e.panes.contains(&pane_idx))
+            .fold((0, 0), |(shared, own), e| {
+                let bytes = e.texture_bytes();
+                if e.panes.len() > 1 {
+                    (shared.saturating_add(bytes), own)
+                } else {
+                    (shared, own.saturating_add(bytes))
+                }
+            })
+    }
+
     /// Record a synchronously-known result. `pane_idx` is attached to it and
     /// holds nothing else afterwards — this is for answers that need no build,
     /// like a refusal decided at dispatch time.

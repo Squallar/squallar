@@ -27,6 +27,7 @@ fn budget_line(app: &App) -> String {
         &app.capacity(),
         app.gpu_probe,
         crate::pressure::LinearMemoryWatch::default(),
+        &app.budget_readout,
     )
 }
 
@@ -46,11 +47,16 @@ fn six_two_hour_loops() -> Scene {
                 buildings: false,
                 overlay_pictures: 0,
                 picture_px: [0, 0],
+                loop_scans_shared: false,
+                loop_scans_resident_bytes: 0,
+                loop_scans_resident_frames: 0,
+                loop_scans_needed: true,
             };
             6
         ],
         tile_sources: Vec::new(),
         mirror_px: [0, 0],
+        overlay_grids: Vec::new(),
     }
 }
 
@@ -84,7 +90,9 @@ fn a_probe_of(bytes: u64) -> ProbedCapacity {
 /// 288 MiB presumption until the probe reports and prints `cap 288 0`; the
 /// fold then prints `cap 4032 2`, the capacity is `Capacity::probed`, and
 /// the scene is re-fitted once. Six two-hour loops that the presumption had
-/// to shorten fit at the class rung under a 3024 MiB allowance.
+/// to shorten keep every frame under a 3024 MiB allowance; the page heap the
+/// probe does not speak for still cannot hold their decoded volumes, and
+/// only the host rungs move for that.
 #[test]
 fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     let probe = a_probe_of(4032 << 20);
@@ -148,11 +156,43 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
         class_rung,
         "the probe moved no profile field; `resolve` reads none of it",
     );
+    // **The probe answered for the GPU, and on the GPU the six loops fit at
+    // the class rung**: the history the 288 MiB presumption halved is back at
+    // its fourteen frames, and no GPU rung is taken. The page heap is still
+    // the bracket's 1 GiB — the probe says nothing about it — and six loops'
+    // decoded volumes, 6 x 14 x 64 MiB = 5376 MiB of `loop_scans_host`, do
+    // not fit its 768 MiB allowance at any host rung, so the three host rungs
+    // (the margin twice, the tiles) are taken and the scene holds there. The
+    // two axes are two walls, and this is the probe moving exactly one.
     let probed = fit(&six, &app.device_profile, &app.capacity(), GRID_BYTES);
     assert_eq!(
-        probed, class_rung,
-        "six two-hour loops fit a 3024 MiB allowance at the class rung"
+        probed.loop_render_budget, class_rung.loop_render_budget,
+        "six two-hour loops fit a 3024 MiB allowance with every frame",
     );
+    assert!(
+        presumed.loop_render_budget < class_rung.loop_render_budget,
+        "the 288 MiB presumption had halved the history: {presumed:?}",
+    );
+    assert_eq!(probed.steps_back, 3, "the three host rungs, no GPU rung");
+    assert_eq!(
+        squallar_device_profile::budget::Budgets {
+            steps_back: 0,
+            tile_whole_zoom: false,
+            overlay_oversample_percent: 150,
+            ..probed
+        },
+        class_rung,
+        "a host wall moved something other than the host rungs",
+    );
+    assert_eq!(
+        squallar_device_profile::fit::over(&six, &probed, &app.capacity(), GRID_BYTES),
+        (false, true),
+        "the GPU fits; the page heap cannot hold six loops' volumes at any rung",
+    );
+    assert!(squallar_device_profile::fit::every_host_rung_at_its_stop(
+        &probed,
+        &app.device_profile.limits
+    ));
     assert_eq!(app.fit_scene(&six), probed);
 
     // Once: a second report, larger, changes nothing.
@@ -465,6 +505,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             &app.capacity(),
             app.gpu_probe,
             crate::pressure::LinearMemoryWatch::default(),
+            &app.budget_readout,
         )
     };
     let six = squallar_device_profile::scene::Scene {
@@ -481,11 +522,16 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
                 buildings: false,
                 overlay_pictures: 0,
                 picture_px: [0, 0],
+                loop_scans_shared: false,
+                loop_scans_resident_bytes: 0,
+                loop_scans_resident_frames: 0,
+                loop_scans_needed: true,
             };
             6
         ],
         tile_sources: Vec::new(),
         mirror_px: [0, 0],
+        overlay_grids: Vec::new(),
     };
 
     let plain = headless(TestBridge::desktop());

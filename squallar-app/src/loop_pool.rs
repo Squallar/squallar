@@ -523,6 +523,16 @@ impl LoopAllocation {
         self.grants.iter().find(|g| g.key.pane == owner)
     }
 
+    /// **Whether `pane`'s loop is one another pane reads too** — `pane` is an
+    /// alias of another pane's loop, or another pane is an alias of its. The
+    /// readout's `shared` for a 2D loop: the grant's bytes are held once and
+    /// shown on every pane of the set, attributed to none of them.
+    pub fn pane_shares_loop(&self, pane: usize) -> bool {
+        self.aliases
+            .iter()
+            .any(|(alias, owner)| *alias == pane || *owner == pane)
+    }
+
     /// Frames `pane`'s loop may hold, or `None` for a pane the plan has not
     /// seen — a loop that started inside the dwell, which the caller holds to
     /// the kind's ceiling ([`Self::frames_for`]) until the plan catches up.

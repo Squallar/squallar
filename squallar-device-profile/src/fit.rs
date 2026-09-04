@@ -5,9 +5,17 @@
 //! `Budgets::section_frame_bytes`, `Budgets::static_frame_bytes`, the raymarch's
 //! own resident-grid arithmetic handed in as [`GridBytes`],
 //! `quality::VolumeQuality::fit` for the offscreen, `quality::offscreen_bytes`
-//! for the mirror, the tile cache's measured entry cost, and
-//! `Budgets::prism_vram_bytes` for a pane that draws buildings. Nothing here
-//! invents a byte figure.
+//! for the mirror, the tile cache's measured entry cost,
+//! `Budgets::prism_vram_bytes` for a pane that draws buildings, each gridded
+//! overlay's own source budget handed in on the scene, and for the decoded
+//! volume behind each radar loop frame its measured size where the cache
+//! holds it and `LOOP_SCAN_RESERVE_BYTES` where it does not. Nothing here
+//! invents a byte figure: the one constant of this module's own is a measured
+//! maximum rounded up, charged only for what has not arrived, and says so.
+//!
+//! [`need_terms_for_pane`] prices one pane; [`need_terms`] is that over the
+//! panes plus the scene-level terms, and the two agree bit for bit by
+//! construction (`fit/tests.rs` folds them back).
 //!
 //! [`fit`] is the degradation ladder driven by arithmetic instead of a counter:
 //! start at the rung the class earns, price the scene, and while the price is
@@ -27,6 +35,7 @@
 use crate::budget::{
     BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down, step_down_for,
 };
+use crate::constants::LOOP_SCAN_RESERVE_BYTES;
 use crate::quality::{GroundPass, offscreen_bytes};
 use crate::scene::{Capacity, Need, PaneNeed, Scene};
 use squallar_radar::types::RenderView;
@@ -75,8 +84,38 @@ pub struct NeedTerms {
     /// second buffer while the first is alive and then converted into the
     /// image the GPU is handed while the second is alive, so at every
     /// arrival one picture is resident twice for a moment. Zero where no
-    /// pane shows a picture.
+    /// pane shows a picture. **A max across panes, not a sum** — the one
+    /// term of a scene's cost that is not one pane's plus the next's, which
+    /// is why [`PaneTerms`] carries its candidate apart from the pane's own
+    /// totals.
     pub picture_arrival_host: u64,
+    /// **Every enabled gridded overlay's decoded source, on the host**, at
+    /// the budget its handler states — counted once however many panes show
+    /// the layer, because the handler is one instance for the whole
+    /// application ([`Scene::overlay_grids`]). Nothing until a pane enables a
+    /// gridded layer; then MRMS, GMGSI or the model at their key-space grid
+    /// budgets, which is what a gridded layer asks the heap to be able to
+    /// hold.
+    pub overlay_grids_host: u64,
+    /// **One decoded Level II volume per radar loop frame, on the host** —
+    /// resident frames at their measured size, pending frames at the
+    /// reserve: every radar-looping pane's
+    /// [`PaneNeed::loop_scans_resident_bytes`] plus
+    /// [`LOOP_SCAN_RESERVE_BYTES`] for each frame of its base the cache does
+    /// not hold yet, a pane whose site is already counted
+    /// ([`PaneNeed::loop_scans_shared`]) contributing nothing. The loop
+    /// download cache holds these beside the textures the `loops` term
+    /// prices, and until this term existed the scene's largest host family
+    /// — some 650 MiB resting on desktop web — was priced at zero. A bound is
+    /// never charged for a measured thing, and a live allocation is never
+    /// priced under its size: a loop holding more frames than its base
+    /// charges every one of them.
+    ///
+    /// **A Level III loop charges nothing here**: its frames are rendered
+    /// from paired objects, so its site's volumes are dropped
+    /// ([`PaneNeed::loop_scans_needed`]) and only a pane parked at a still
+    /// keeps one.
+    pub loop_scans_host: u64,
 }
 
 impl NeedTerms {
@@ -87,8 +126,23 @@ impl NeedTerms {
             host_bytes: self
                 .tiles_host
                 .saturating_add(self.pictures_host)
-                .saturating_add(self.picture_arrival_host),
+                .saturating_add(self.picture_arrival_host)
+                .saturating_add(self.overlay_grids_host)
+                .saturating_add(self.loop_scans_host),
         }
+    }
+
+    /// Fold one pane's terms in: every additive term saturating-added, the
+    /// arrival candidate taken as a max.
+    fn fold_pane(&mut self, pane: &PaneTerms) {
+        self.static_rasters = self.static_rasters.saturating_add(pane.static_rasters);
+        self.loops = self.loops.saturating_add(pane.loops);
+        self.grids = self.grids.saturating_add(pane.grids);
+        self.offscreens = self.offscreens.saturating_add(pane.offscreens);
+        self.buildings = self.buildings.saturating_add(pane.buildings);
+        self.pictures_host = self.pictures_host.saturating_add(pane.pictures_host);
+        self.picture_arrival_host = self.picture_arrival_host.max(pane.picture_host);
+        self.loop_scans_host = self.loop_scans_host.saturating_add(pane.loop_scans_host);
     }
 
     /// Every GPU term but the loops — what the loop pool has to fit beside.
@@ -101,36 +155,72 @@ impl NeedTerms {
     }
 }
 
-/// What `scene` costs at `budgets`, term by term.
+/// **One pane's share of a scene's cost**, term by term — what
+/// [`need_terms_for_pane`] prices and [`need_terms`] sums over the panes
+/// before the scene-level terms (the mirror, the tiles, the overlay grids,
+/// the arrival) join. Every field but [`Self::picture_host`] adds across
+/// panes. That one is this pane's candidate for the scene's
+/// `picture_arrival_host` — a max across panes, not a sum — and is **not**
+/// in the pane's own totals: the arrival is one buffer for the whole
+/// application, and attributing it to a pane would make the parts sum to
+/// more than the whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaneTerms {
+    /// The pane's static render, if it is 2D.
+    pub static_rasters: u64,
+    /// Its loop's frames for its span, at its frame's cost — zero for a pane
+    /// that is an alias of another pane's loop.
+    pub loops: u64,
+    /// The live grid a 3D pane keeps beside its loop.
+    pub grids: u64,
+    /// The offscreen a 3D pane raymarches into.
+    pub offscreens: u64,
+    /// Its prism buffers, if it draws buildings.
+    pub buildings: u64,
+    /// Every whole-picture overlay it shows, on the host.
+    pub pictures_host: u64,
+    /// One decoded volume per frame of its radar loop, on the host — the
+    /// resident ones at their measured size, the pending ones at the
+    /// reserve; zero for a pane whose site another pane already counts, and
+    /// for a loop of a layer that is not radar.
+    pub loop_scans_host: u64,
+    /// One of its pictures, for the scene's arrival term to take the max of.
+    /// Not in [`Self::host_bytes`].
+    pub picture_host: u64,
+}
+
+impl PaneTerms {
+    /// What this pane costs the GPU.
+    pub fn gpu_bytes(&self) -> u64 {
+        self.static_rasters
+            .saturating_add(self.loops)
+            .saturating_add(self.grids)
+            .saturating_add(self.offscreens)
+            .saturating_add(self.buildings)
+    }
+
+    /// What this pane costs the host, the arrival excluded.
+    pub fn host_bytes(&self) -> u64 {
+        self.pictures_host.saturating_add(self.loop_scans_host)
+    }
+
+    /// The two totals.
+    pub fn total(&self) -> Need {
+        Need {
+            gpu_bytes: self.gpu_bytes(),
+            host_bytes: self.host_bytes(),
+        }
+    }
+}
+
+/// What `scene` costs at `budgets`, term by term: every pane's
+/// [`need_terms_for_pane`] folded in, then the scene-level terms — the
+/// mirror, the tile working set, the enabled gridded overlays' budgets.
 pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> NeedTerms {
     let grid = grid_cost(budgets, grid_bytes);
     let mut terms = NeedTerms::default();
     for pane in &scene.panes {
-        terms.static_rasters = terms
-            .static_rasters
-            .saturating_add(static_raster_bytes(pane, budgets));
-        if pane.looping {
-            terms.loops = terms.loops.saturating_add(
-                (loop_frames(pane, budgets) as u64)
-                    .saturating_mul(loop_frame_bytes(pane, budgets, grid)),
-            );
-        }
-        terms.grids = terms
-            .grids
-            .saturating_add((pane.volume_grids as u64).saturating_mul(grid));
-        terms.offscreens = terms
-            .offscreens
-            .saturating_add(offscreen_term(pane, budgets));
-        terms.buildings = terms
-            .buildings
-            .saturating_add(buildings_term(pane, budgets));
-        if pane.overlay_pictures > 0 {
-            let picture = picture_bytes(pane.picture_px, budgets.overlay_oversample_percent);
-            terms.pictures_host = terms
-                .pictures_host
-                .saturating_add((pane.overlay_pictures as u64).saturating_mul(picture));
-            terms.picture_arrival_host = terms.picture_arrival_host.max(picture);
-        }
+        terms.fold_pane(&pane_terms(pane, budgets, grid));
     }
     terms.mirror = mirror_term(scene.mirror_px, budgets);
     for source in &scene.tile_sources {
@@ -138,6 +228,62 @@ pub fn need_terms(scene: &Scene, budgets: &Budgets, grid_bytes: GridBytes) -> Ne
             ((source.tiles_on_glass + source.ancestor_net) as u64)
                 .saturating_mul(source.bytes_per_tile as u64),
         );
+    }
+    for layer in &scene.overlay_grids {
+        terms.overlay_grids_host = terms.overlay_grids_host.saturating_add(layer.budget_bytes);
+    }
+    terms
+}
+
+/// What one pane of a scene costs at `budgets`, term by term. Summed over
+/// the panes by [`need_terms`], so the two cannot disagree; priced alone
+/// where a per-pane figure is wanted — a readout, or the increment a pane
+/// being opened would add.
+pub fn need_terms_for_pane(pane: &PaneNeed, budgets: &Budgets, grid_bytes: GridBytes) -> PaneTerms {
+    pane_terms(pane, budgets, grid_cost(budgets, grid_bytes))
+}
+
+/// [`need_terms_for_pane`] with the grid already priced, so the scene walk
+/// prices it once.
+fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
+    let mut terms = PaneTerms {
+        static_rasters: static_raster_bytes(pane, budgets),
+        grids: (pane.volume_grids as u64).saturating_mul(grid),
+        offscreens: offscreen_term(pane, budgets),
+        buildings: buildings_term(pane, budgets),
+        ..PaneTerms::default()
+    };
+    if pane.looping {
+        let frames = loop_frames(pane, budgets) as u64;
+        terms.loops = frames.saturating_mul(loop_frame_bytes(pane, budgets, grid));
+        // A radar loop whose frames are rendered from decoded volumes holds
+        // one per frame: the ones already there at what they were measured
+        // at, the ones still to come at the reserve. Monotone down the ladder
+        // — the resident part is fixed and the pending count falls with the
+        // base — and never under the resident bytes, whatever the rung.
+        //
+        // Three loops charge nothing here. A loop of another layer holds its
+        // own rasters and no volume. A pane on a site already counted holds
+        // the first pane's. And a loop whose frames read Level III objects
+        // renders from no volume at all
+        // ([`PaneNeed::loop_scans_needed`]): its site holds only the volume a
+        // pane parked at a still is keeping, which the resident bytes carry,
+        // and no reserve is charged for frames that will never fetch one.
+        if pane.overlay_frame_bytes == 0 && !pane.loop_scans_shared {
+            let pending = if pane.loop_scans_needed {
+                frames.saturating_sub(pane.loop_scans_resident_frames as u64)
+            } else {
+                0
+            };
+            terms.loop_scans_host = pane
+                .loop_scans_resident_bytes
+                .saturating_add(pending.saturating_mul(LOOP_SCAN_RESERVE_BYTES));
+        }
+    }
+    if pane.overlay_pictures > 0 {
+        let picture = picture_bytes(pane.picture_px, budgets.overlay_oversample_percent);
+        terms.pictures_host = (pane.overlay_pictures as u64).saturating_mul(picture);
+        terms.picture_host = picture;
     }
     terms
 }

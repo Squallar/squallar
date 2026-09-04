@@ -16,6 +16,11 @@ pub struct Gui {
     /// and the per-site volume stamps — which is why nothing here names
     /// either.
     pub(super) liveness: Vec<squallar_source::liveness::SourceLiveness>,
+    /// **The budget system's readout**, as the App last composed it and this
+    /// Gui last saw it change ([`crate::shell_api::BudgetReadout`]). Held so
+    /// the in-frame and per-layer readouts can paint it without pricing
+    /// anything themselves; `None` until the first frame carrying one.
+    pub(super) budget_readout: Option<crate::shell_api::BudgetReadout>,
     pub(super) time_dialog: TimeDialogState,
     pub(super) initial_zoom_set: bool,
     pub(super) map_tiles: MapTileState,
@@ -551,6 +556,7 @@ impl Gui {
 
         let mut gui = Self {
             liveness: Vec::new(),
+            budget_readout: None,
             time_dialog: TimeDialogState {
                 timestamp,
                 date_string: timestamp.format("%Y-%m-%d").to_string(),

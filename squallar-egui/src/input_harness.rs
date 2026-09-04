@@ -472,6 +472,7 @@ impl InputHarness {
             floor_tile_zoom_bias: self.facts.floor_tile_zoom_bias,
             mirror_plan_stamp: self.facts.mirror_plan_stamp,
             frame_diagnostics: None,
+            budget_readout: None,
         });
     }
 
