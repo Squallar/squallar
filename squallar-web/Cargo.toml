@@ -43,6 +43,11 @@ wasm-opt = [
 # geolocation reading -> Fix) compile and are tested on the host; there is no
 # wasm test runner here, so gating the crate would make those tests never run.
 [dependencies]
+# The counting global allocator, DECLARED in `src/lib.rs`. Unconditional
+# rather than wasm32-gated so the declaration needs no `cfg`: the module is
+# the same on both instances, so the page and the rasterization worker each
+# count their own linear memory.
+squallar-alloc = { workspace = true }
 squallar-egui = { workspace = true }
 squallar-kv = { workspace = true }
 # `FormFactor`, the vocabulary `form_factor::classify` answers in, and

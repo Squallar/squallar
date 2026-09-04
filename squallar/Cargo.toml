@@ -36,6 +36,10 @@ crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+# The counting global allocator, DECLARED in `src/lib.rs` for every artifact
+# this package builds (the desktop bin links the lib; the Android cdylib and
+# the iOS staticlib are the lib), so one declaration covers all of them.
+squallar-alloc = { workspace = true }
 squallar-app = { workspace = true }
 squallar-egui = { workspace = true }
 squallar-kv = { workspace = true }

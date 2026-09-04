@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "squallar",
+    "squallar-alloc",
     "squallar-app",
     "squallar-basemap",
     "squallar-buildings",
@@ -147,6 +148,7 @@ edition = "2024"
 
 [workspace.dependencies]
 nexrad-level3 = { path = "nexrad-level3" }
+squallar-alloc = { path = "squallar-alloc" }
 squallar-app = { path = "squallar-app" }
 squallar-basemap = { path = "squallar-basemap" }
 squallar-buildings = { path = "squallar-buildings" }

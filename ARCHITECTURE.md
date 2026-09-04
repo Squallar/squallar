@@ -17,9 +17,9 @@ architecture or features change.
 ## 1. The crate graph
 
 Cargo workspace, `resolver = "2"`, edition 2024, toolchain `stable`
-(`rust-toolchain.toml`; edition 2024 needs 1.85+). Twenty-nine members:
-twenty first-party `squallar-*` crates, the `nexrad-level3` decoder, and eight
-vendored crates.io crates.
+(`rust-toolchain.toml`; edition 2024 needs 1.85+). Thirty members:
+twenty-one first-party `squallar-*` crates, the `nexrad-level3` decoder, and
+eight vendored crates.io crates.
 
 Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 
@@ -30,6 +30,7 @@ Read the graph bottom-up. Nothing in a lower band may depend on a higher one.
 | `squallar-geo` | Geographic primitives: `GeoPoint`, `GeoBounds`, `PlacedRaster`, Web Mercator, `MERCATOR_LAT_LIMIT_DEG`. Plus `min_elevation` — the one piece of *data* in the floor: the format, reader and builder for a global 1°×1° minimum-elevation grid. It is here and not with the crate whose builder emits it because `squallar-radar` reads it and the emitting crate stands above radar; the module's docs carry the cycle. |
 | `squallar-units` | Unit conversion and timezone formatting. `UserPreferences`, persisted in `ui.json`. Conversions happen at display boundaries only; internal data stays in original units. |
 | `squallar-kv` | Small named blobs across sessions. `KvStore` is `load`, `store`, `store_now` and deliberately nothing more. |
+| `squallar-alloc` | The counting global allocator: `Counting` wraps `std::alloc::System`, and `live_bytes()` is what it has handed out and not been handed back — the one host pressure figure that falls as well as rises. The only crate in the workspace that may spell `unsafe` for `GlobalAlloc` (`deny(unsafe_code)` plus one scoped `allow`); the `#[global_allocator]` declarations live in the binary crates (`squallar`, `squallar-web`). |
 | `squallar-nmea-serial` | NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
 | `nexrad-level3` | Level III product decoder — WMO headers, zlib/BZ2, radial packets. Byte slices in, model types out; no network, no filesystem. |
 | `squallar-netcdf` | NetCDF4-over-HDF5 reading and CF-convention unpacking (`_Unsigned`, `_FillValue`, `valid_range`, `scale_factor`, CF time units). Knows the format; knows nothing about satellites or lightning. Two shapes for a decoded variable — `Vec<Option<f64>>` for records, `Vec<f32>`/NaN for rasters — plus row-windowed reads. |

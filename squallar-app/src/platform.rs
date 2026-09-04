@@ -66,6 +66,15 @@ pub struct LinearMemory {
     /// The worker's own reading, as it last reported on its hello or a reply
     /// envelope. `None` until a worker has said.
     pub worker_bytes: Option<u64>,
+    /// **The worker's live bytes** — what its allocator has handed out and
+    /// not been handed back (`squallar_alloc::live_bytes` on that instance),
+    /// as it last reported beside [`Self::worker_bytes`]. The one figure of
+    /// the worker's heap that can fall: its memory never shrinks, so the gap
+    /// between the two is freed-but-reserved headroom. `None` until a worker
+    /// has said, and on a worker whose build predates the field. The page's
+    /// own live bytes are not here: the bridge reads the instance it runs in,
+    /// and the app reads its own allocator directly.
+    pub worker_live_bytes: Option<u64>,
 }
 
 /// What the browser's WebGPU probe found: the **per-tab allowance**, as the

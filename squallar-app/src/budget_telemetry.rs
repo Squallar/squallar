@@ -479,6 +479,7 @@ mod tests {
             page_max_bytes: 900 << 20,
             worker_bytes: Some(700 << 20),
             worker_max_bytes: 1100 << 20,
+            worker_live_bytes: Some(600 << 20),
         });
         (budgets, profile, linear)
     }

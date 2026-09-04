@@ -107,6 +107,19 @@
 
 pub mod kv;
 
+/// **Every allocation on this instance is counted** (`squallar_alloc::live_bytes`).
+///
+/// The page and the rasterization worker instantiate this same module, and a
+/// wasm static is per linear MEMORY, so each instance counts its own heap and
+/// neither can see the other's: the worker says its figure on the messages
+/// that already cross (`worker_protocol::LIVE`). Under `-Zbuild-std` the
+/// wrapped `std::alloc::System` is the atomics-aware allocator std ships for
+/// this target, and the allocation-error hook (`alloc_failure`) is
+/// untouched: a refused request returns null through the wrapper unchanged,
+/// std runs the hook, and the counters have not moved for it.
+#[global_allocator]
+static ALLOCATOR: squallar_alloc::Counting = squallar_alloc::Counting;
+
 /// How long the page waits before starting another rasterization worker.
 ///
 /// Not wasm32-gated: the ladder is pure arithmetic, `worker_port` is gated, and

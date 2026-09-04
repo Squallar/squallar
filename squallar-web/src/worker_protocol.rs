@@ -68,6 +68,14 @@ pub const THREADS: &str = "threads";
 /// unknown, never as 0: a worker from a build before this field never sets
 /// it, and the page's `linear_memory` answers `None` for the worker half.
 pub const MEM: &str = "mem";
+/// Worker → page, beside [`MEM`] on `HELLO` and every `DONE`: **live bytes**
+/// on the WORKER's own instance — what its allocator has handed out and not
+/// been handed back (`squallar_alloc::live_bytes`), in bytes. The figure
+/// that can fall where `MEM` cannot: a linear memory never shrinks, so
+/// `MEM − LIVE` is that heap's freed-but-reserved headroom. Absent reads as
+/// unknown, never as 0: a worker from a build before this field never sets
+/// it, and one whose counter was never installed says nothing either.
+pub const LIVE: &str = "live";
 /// Worker → page, on `HELLO` only: **the maximum the worker's own linear
 /// memory was constructed with**, in bytes.
 ///

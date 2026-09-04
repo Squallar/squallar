@@ -103,15 +103,38 @@ pub(crate) fn worker_memory_bytes() -> Option<u64> {
     }
 }
 
-/// Take the worker's heap reading off a message that carries one. A message
-/// without the field — a worker from a build before it — leaves the last
-/// reading alone rather than writing a zero.
+/// The worker's live bytes as it last reported beside its heap size — see
+/// `worker_protocol::LIVE`. 0 is "no worker has said yet", which
+/// [`worker_live_bytes`] spells as `None`; a running instance's allocator is
+/// never holding nothing.
+static WORKER_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The rasterization worker's live bytes — what its allocator has handed out
+/// and not been handed back — as it last reported; `None` until one has. The
+/// figure beside [`worker_memory_bytes`] that can fall, under the same rule
+/// for a replaced worker.
+pub(crate) fn worker_live_bytes() -> Option<u64> {
+    match WORKER_LIVE_BYTES.load(Ordering::Relaxed) {
+        0 => None,
+        bytes => Some(bytes),
+    }
+}
+
+/// Take the worker's heap reading — and its live bytes, where the message
+/// carries them — off a message that carries one. A message without a field
+/// — a worker from a build before it — leaves that last reading alone rather
+/// than writing a zero.
 fn note_worker_memory(data: &JsValue) {
-    if let Some(bytes) = proto::field(data, proto::MEM)
-        .and_then(|v| v.as_f64())
-        .filter(|v| v.is_finite() && *v > 0.0)
-    {
-        WORKER_MEMORY_BYTES.store(bytes as u64, Ordering::Relaxed);
+    for (key, cell) in [
+        (proto::MEM, &WORKER_MEMORY_BYTES),
+        (proto::LIVE, &WORKER_LIVE_BYTES),
+    ] {
+        if let Some(bytes) = proto::field(data, key)
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            cell.store(bytes as u64, Ordering::Relaxed);
+        }
     }
 }
 

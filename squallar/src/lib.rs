@@ -32,6 +32,15 @@ pub mod run;
 
 pub use crate::run::run;
 
+/// **Every allocation this process makes is counted**, so the budget system
+/// has a host figure that falls as well as rises (`squallar_alloc::live_bytes`).
+/// Declared here rather than in `main.rs` because this lib IS the Android
+/// `.so` and the iOS `staticlib`, and the desktop bin links it: one
+/// declaration, every artifact. The declaration is not `unsafe`; the impl
+/// behind it is, and lives in the one crate that may spell it.
+#[global_allocator]
+static ALLOCATOR: squallar_alloc::Counting = squallar_alloc::Counting;
+
 /// iOS entry point. `packaging/ios/Sources/main.m` calls this symbol out of the
 /// `staticlib`; it hands off to the shared winit loop, whose UIKit backend calls
 /// `UIApplicationMain` and never returns.

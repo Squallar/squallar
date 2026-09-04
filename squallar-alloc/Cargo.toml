@@ -1,0 +1,13 @@
+# The counting global allocator: live host bytes, the one pressure figure in
+# the tree that rises AND falls. A leaf on purpose: every crate above it is
+# `forbid(unsafe_code)`, and `GlobalAlloc` is an `unsafe impl`, so this is the
+# one place in the workspace that may spell it (`deny` + one scoped `allow`).
+[package]
+name = "squallar-alloc"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately nothing: the allocator wraps `std::alloc::System` and counts
+# through two atomics. A dependency here would be compiled into every binary
+# below the frame thread's first allocation.
+[dependencies]

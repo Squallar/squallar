@@ -4632,6 +4632,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "pollster",
  "rustls-platform-verifier",
+ "squallar-alloc",
  "squallar-app",
  "squallar-egui",
  "squallar-geo",
@@ -4645,6 +4646,10 @@ dependencies = [
  "windows",
  "winit",
 ]
+
+[[package]]
+name = "squallar-alloc"
+version = "0.1.0"
 
 [[package]]
 name = "squallar-app"
@@ -4950,6 +4955,7 @@ dependencies = [
  "log",
  "rayon",
  "serde_json",
+ "squallar-alloc",
  "squallar-app",
  "squallar-device-profile",
  "squallar-egui",

@@ -2208,6 +2208,7 @@ fn worker_heap(worker_mib: u64) -> crate::platform::LinearMemory {
         page_max_bytes: WEB_HEAP_MAX,
         worker_bytes: Some(worker_mib * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
+        worker_live_bytes: None,
     }
 }
 
@@ -2300,6 +2301,7 @@ fn a_heap_that_grows_past_the_refire_step_acts_again() {
             page_max_bytes: WEB_HEAP_MAX,
             worker_bytes: Some(50 * MIB),
             worker_max_bytes: WEB_HEAP_MAX,
+            worker_live_bytes: None,
         })
     };
     gauge.set(page(891 * MIB));
@@ -2382,6 +2384,7 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
             page_max_bytes: WEB_HEAP_MAX,
             worker_bytes: None,
             worker_max_bytes: 0,
+            worker_live_bytes: None,
         })
     };
     let mut app = headless(platform);
@@ -2728,6 +2731,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         page_max_bytes: WEB_HEAP_MAX,
         worker_bytes: Some(50 * MIB),
         worker_max_bytes: WEB_HEAP_MAX,
+        worker_live_bytes: None,
     }));
     tick(&mut app);
 

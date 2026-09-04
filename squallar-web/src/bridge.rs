@@ -162,6 +162,7 @@ impl PlatformBridge for WebPlatform {
             page_bytes: crate::shared_loan::memory_bytes()?,
             page_max_bytes: crate::heap_max::this_instance().unwrap_or(0),
             worker_bytes: crate::worker_port::worker_memory_bytes(),
+            worker_live_bytes: crate::worker_port::worker_live_bytes(),
             // What the worker reported on its hello where it has said, else
             // what this page asked for it. A zero is "nobody said", which the
             // watermark spells `Quiet` rather than guessing a wall.

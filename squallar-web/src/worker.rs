@@ -194,12 +194,16 @@ pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue
     Ok(())
 }
 
-/// Write this worker's own heap size onto `message` — see [`proto::MEM`].
-/// Skipped rather than zeroed when the memory cannot be read: absent is
-/// unknown, and 0 would read as a measurement.
+/// Write this worker's own heap size onto `message` — see [`proto::MEM`] —
+/// and its live bytes beside it ([`proto::LIVE`]), the reading that can fall
+/// where the heap size cannot. Each is skipped rather than zeroed when it
+/// cannot be read: absent is unknown, and 0 would read as a measurement.
 fn say_memory(message: &js_sys::Object) {
     if let Some(bytes) = crate::shared_loan::memory_bytes() {
         proto::set_field(message, proto::MEM, &JsValue::from_f64(bytes as f64));
+    }
+    if let Some(bytes) = squallar_alloc::live_bytes() {
+        proto::set_field(message, proto::LIVE, &JsValue::from_f64(bytes as f64));
     }
 }
 
