@@ -306,7 +306,11 @@ fn overlay_picture_sizes_land_on_their_own_pane_and_nowhere_else() {
 /// big is a pane's picture" — one entry per pane, which is what a surface
 /// check holds a bracket's uploaded bytes against. `resident_overlay_pictures`
 /// answers "how many pictures is this page carrying and what do they weigh",
-/// which is what the page heap pays and what the host need model prices.
+/// which is what the page heap pays and what the WATERMARK judges. It is not
+/// what the fit prices: a fit must be a function of the scene, and this count
+/// walks through every value from one to the layer total as the upload drain
+/// lands a band a frame. The fit prices the layers a pane SHOWS
+/// (`App::loop_demand`), which does not move with an upload.
 ///
 /// The figures are the Tier-2 `huge` leg's own: one pane of 2878 x 1611
 /// physical pixels at 1.5x oversampling is a 4317 x 2416 picture of
@@ -368,21 +372,18 @@ fn resident_pictures_count_every_layer_where_the_pane_list_counts_panes() {
     assert_eq!(
         render.resident_overlay_pictures(),
         (13, 542_353_344),
-        "the resident load is not every layer's picture: this is the figure \
-         the page heap pays and the host need model prices, and reading the \
-         pane list in its place is how the `huge` leg was fitted at 40 MiB \
-         of pictures when it held 517",
-    );
-    assert_eq!(render.overlay_picture_count(0), 13);
-    assert_eq!(
-        render.overlay_picture_count(1),
-        0,
-        "a pane that has dispatched nothing was charged for a picture",
+        "the resident load is not every layer's picture: this is what the page \
+         heap is carrying, and the pane list read in its place says 40 MiB \
+         where the page holds 517",
     );
 
-    // A second pane's layers are its own on both readings.
+    // A second pane's pictures are counted too: this is a load over the whole
+    // application, not over one pane.
     render.record_overlay_dispatch(1, &squallar_source::id::known::NWS_ALERTS, huge.clone());
-    assert_eq!(render.overlay_picture_count(0), 13);
-    assert_eq!(render.overlay_picture_count(1), 1);
     assert_eq!(render.resident_overlay_pictures().0, 14);
+    assert_eq!(
+        render.overlay_picture_sizes(2),
+        vec![(4317, 2416), (4317, 2416)],
+        "the per-pane list did not follow the second pane",
+    );
 }

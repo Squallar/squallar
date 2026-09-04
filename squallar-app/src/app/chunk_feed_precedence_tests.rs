@@ -2429,6 +2429,112 @@ fn a_page_heap_event_lowers_the_host_presumption_on_the_wasm_bracket() {
     assert_eq!(store.load(crate::loop_pool::LOOP_POOL_KEY), None);
 }
 
+/// **One scene, one rung — however much of it happens to be on the heap.**
+///
+/// The regression this gates was measured, not imagined. Two Tier-2 `huge`
+/// passes on 2026-09-04, same bundle and same box, read `steps 0 /
+/// oversample 150` and `steps 2 / oversample 100`: the fit was priced from
+/// how many pictures were resident when the walk ran, and the upload drain
+/// lands one band a frame, so that count passes through every value from one
+/// to the layer total on its way to steady state. The user sees the
+/// oversampling, so the race was visible as picture sharpness changing
+/// between runs of the same scene.
+///
+/// The fix is the distinction, not a lock: `fit` prices what the scene SHOWS
+/// (enabled texture layers, saved pane state) and the watermark judges what
+/// the heap HOLDS. So the assertion is that moving the resident count — one
+/// dispatch on the record, then thirteen — moves nothing about the budgets.
+/// The picture footprint is read off the record too, and every plan on a
+/// pane agrees by construction, so one recorded dispatch is enough to fix it
+/// and the twelve that follow add nothing.
+#[test]
+fn the_rung_is_the_same_however_many_pictures_are_resident() {
+    use squallar_device_profile::budget::BudgetLimits;
+
+    let shown = [
+        squallar_source::id::known::NWS_ALERTS,
+        squallar_source::id::known::STORM_REPORTS,
+        squallar_source::id::known::SPC_OUTLOOK,
+        squallar_source::id::known::SPC_FIRE_OUTLOOK,
+        squallar_source::id::known::SPC_DISCUSSIONS,
+        squallar_source::id::known::MRMS,
+        squallar_source::id::known::GMGSI,
+        squallar_source::id::known::MODEL_DATA,
+        squallar_source::id::known::LIGHTNING,
+        squallar_source::id::known::METAR,
+        squallar_source::id::known::CITY_LABELS,
+        squallar_source::id::known::RADAR_SITES,
+        squallar_source::id::known::RADAR_COVERAGE,
+    ];
+    let plan = crate::app::fetch::OverlayRenderRequest {
+        geo_bounds: squallar_geo::GeoBounds {
+            min_lat: 33.0,
+            max_lat: 37.0,
+            min_lon: -99.0,
+            max_lon: -96.0,
+        },
+        texture: squallar_egui::overlay_cache::OverlayTexturePlan {
+            width: 4317,
+            height: 2416,
+            overdraw: 0.5,
+            pixels_per_point: 1.0,
+            pane_px: [2878, 1611],
+        },
+        data_generation: 1,
+        zoom: 32,
+    };
+
+    let mut app = headless(TestBridge::web());
+    app.device_profile.limits = BudgetLimits::WASM;
+    app.adopt_budgets(squallar_device_profile::budget::resolve(
+        &app.device_profile,
+    ));
+    let pane = app
+        .gui
+        .pane_mut(0)
+        .expect("the headless app lays out a pane");
+    for id in &shown {
+        pane.set_overlay_enabled(id.clone(), true);
+        let _ = pane.overlay_cache_mut(id);
+    }
+
+    // One picture on the heap.
+    app.render
+        .record_overlay_dispatch(0, &shown[0], plan.clone());
+    assert_eq!(app.render.resident_overlay_pictures().0, 1);
+    let _ = app.observe_loop_demand();
+    let with_one = app.budgets;
+    let scene_with_one = app.scene_of();
+
+    // Thirteen on the heap, same scene.
+    for id in &shown[1..] {
+        app.render.record_overlay_dispatch(0, id, plan.clone());
+    }
+    assert_eq!(app.render.resident_overlay_pictures().0, 13);
+    let _ = app.observe_loop_demand();
+
+    assert_eq!(
+        app.scene_of().panes[0].overlay_pictures,
+        scene_with_one.panes[0].overlay_pictures,
+        "the scene's priced picture count moved with the upload drain, which \
+         is the race: it must be the layers the pane shows",
+    );
+    assert_eq!(
+        app.budgets.overlay_oversample_percent, with_one.overlay_oversample_percent,
+        "the oversampling rung moved with how much of the scene happened to \
+         be resident: the user sees this as sharpness changing between runs",
+    );
+    assert_eq!(
+        app.budgets, with_one,
+        "some budget moved with the resident count",
+    );
+    assert_eq!(
+        scene_with_one.panes[0].overlay_pictures, 13,
+        "the priced count is the thirteen layers the pane shows, not the one \
+         picture that had reached the heap",
+    );
+}
+
 /// **A native profile has no heap reading and is never pressured by the
 /// tick.** The bridge answers the platform question — `None` — and the
 /// watermark is never consulted, however many ticks pass.
@@ -2540,7 +2646,7 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         data_generation: 1,
         zoom: 32,
     };
-    for id in [
+    let shown = [
         squallar_source::id::known::NWS_ALERTS,
         squallar_source::id::known::STORM_REPORTS,
         squallar_source::id::known::SPC_OUTLOOK,
@@ -2554,9 +2660,23 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
         squallar_source::id::known::CITY_LABELS,
         squallar_source::id::known::RADAR_SITES,
         squallar_source::id::known::RADAR_COVERAGE,
-    ] {
-        app.render
-            .record_overlay_dispatch(0, &id, huge_plan.clone());
+    ];
+    // **Two seedings, because the two figures have two sources on purpose.**
+    // The pane's enabled slots and texture-cache keys are what the fit
+    // prices — a property of the scene, which is why it does not move with an
+    // upload. The dispatch record is what the telemetry reports resident and
+    // what the pane's picture footprint is read from. A test that seeded only
+    // the record would pass against the racing count this replaced.
+    let pane = app
+        .gui
+        .pane_mut(0)
+        .expect("the headless app lays out a pane");
+    for id in &shown {
+        pane.set_overlay_enabled(id.clone(), true);
+        let _ = pane.overlay_cache_mut(id);
+    }
+    for id in &shown {
+        app.render.record_overlay_dispatch(0, id, huge_plan.clone());
     }
     assert_eq!(
         app.render.resident_overlay_pictures(),
@@ -2567,6 +2687,11 @@ fn a_page_at_ninety_percent_with_levers_says_so_and_frees_something() {
     // The walk prices the batch the action line is derived from. A pane walk
     // that counted panes would put 41,719,488 x 2 here and the line 500 MB
     // too high.
+    //
+    // **And it is the same figure twice, from two independent seedings** —
+    // thirteen shown layers priced by the fit, thirteen dispatches reported
+    // resident — which is the agreement the reader needs and the racing
+    // version could not promise.
     let _ = app.observe_loop_demand();
     assert_eq!(
         app.host_headroom_bytes, 584_072_832,

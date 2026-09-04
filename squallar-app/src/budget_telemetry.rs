@@ -103,6 +103,10 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 /// with a regex in another language in another directory, and
 /// `the_rig_reads_the_budget_line_the_app_actually_writes` holds the two ends
 /// together.
+// Eight, and the line is the reason: every field on it is a different
+// subsystem's reading, and bundling any two of them into a struct would make
+// a type whose only purpose is to be destructured here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn budget_state_line(
     budgets: &Budgets,
     profile: &DeviceProfile,
@@ -385,7 +389,9 @@ mod tests {
     fn the_budget_state_line_reads_exactly_as_pinned() {
         let (budgets, profile, linear) = distinct();
         assert_eq!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH),
+            budget_state_line(
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+            ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
@@ -393,8 +399,17 @@ mod tests {
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
-            budget_state_line(&budgets, &profile, linear, 576 << 20, BALLOON, &CAP, PROBE, WATCH)
-                .contains(", pool 576 MiB,"),
+            budget_state_line(
+                &budgets,
+                &profile,
+                linear,
+                576 << 20,
+                BALLOON,
+                &CAP,
+                PROBE,
+                WATCH
+            )
+            .contains(", pool 576 MiB,"),
         );
         // And the balloon follows what it is handed: a scene holding every
         // base and nothing more reads a real 0, last on the line.
@@ -492,7 +507,7 @@ mod tests {
             0,
             &cap,
             GpuProbeReport::Absent,
-                WATCH,
+            WATCH,
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -532,7 +547,9 @@ mod tests {
     #[test]
     fn the_rig_reads_the_budget_line_the_app_actually_writes() {
         let (budgets, profile, linear) = distinct();
-        let line = budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH);
+        let line = budget_state_line(
+            &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH,
+        );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -552,14 +569,18 @@ mod tests {
         let (budgets, profile, linear) = distinct();
         let good = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
-            budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH)
-                .starts_with(&good)
+            budget_state_line(
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+            )
+            .starts_with(&good)
         );
         let drifted = good.replacen(" rung", "  rung", 1);
         assert_ne!(drifted, good, "the perturbation perturbed nothing");
         assert!(
-            !budget_state_line(&budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH)
-                .starts_with(&drifted),
+            !budget_state_line(
+                &budgets, &profile, linear, POOL, BALLOON, &CAP, PROBE, WATCH
+            )
+            .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
              seam test above cannot fail",
         );
