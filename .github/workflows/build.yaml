@@ -277,7 +277,7 @@ jobs:
               # Opt-in list. The old extension allowlist shipped `tests/*.mjs`
               # and carried `*.json` -- what a leaked service-account key wears.
               rm -rf dist && mkdir -p dist/pkg
-              cp squallar-web/index.html squallar-web/manifest.webmanifest squallar-web/sw.js squallar-web/worker.js dist/
+              cp squallar-web/index.html squallar-web/manifest.webmanifest squallar-web/sw.js squallar-web/worker.js squallar-web/tile-lane.js dist/
               cp -R squallar-web/icons dist/icons
               cp squallar-web/pkg/squallar_web.js squallar-web/pkg/squallar_web_bg.wasm dist/pkg/
               # wasm-bindgen emits this only for crates using JS snippets.

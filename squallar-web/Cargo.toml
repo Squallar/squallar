@@ -147,6 +147,11 @@ features = [
     "WorkerType",
     "DedicatedWorkerGlobalScope",
     "MessageEvent",
+    # The tile lane (`src/worker.rs`, `spawn_tile_lane`): the worker opens a
+    # `MessageChannel` between its nested lane Worker and the page, and both
+    # ends speak on a `MessagePort`.
+    "MessageChannel",
+    "MessagePort",
 ]
 
 # For `tests/pwa_assets.rs`. Target-gated because a plain `[dev-dependencies]`

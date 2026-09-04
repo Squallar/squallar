@@ -3,13 +3,47 @@
 //! runs, instantiated a second time. A second module would have meant a
 //! second `(glue, wasm)` pair for `sw.js`'s per-client shell pinning to keep
 //! atomic. Nothing here touches `window`: there is not one.
+//!
+//! # The tile lane
+//!
+//! `handle_job` runs a job to completion inside `onmessage`, so this worker's
+//! message loop is a FIFO and a model rasterization of 3.9-5.0 s (the `huge`
+//! leg, 2026-09-02) holds it for that long. The basemap's vector tile batches
+//! must not wait there — the tile pump measured that wait and chose the frame
+//! thread over it — so they ride a **lane**: one more nested Worker,
+//! instantiated on THIS worker's memory exactly as wasm-bindgen-rayon
+//! instantiates the pool's threads (`init({module, memory})`), with a
+//! `MessagePort` of its own to the page and [`squallar_tile_lane_main`] as
+//! its entry. Same heap, same statics, same codec rows; a message loop the
+//! jobs here cannot occupy. It runs its jobs **serially** on its own thread,
+//! through a one-thread rayon pool, so a batch never contends with a radar
+//! render for the pool's threads either.
 
 use crate::worker_protocol as proto;
+use std::cell::{OnceCell, RefCell};
 use wasm_bindgen::prelude::*;
 
-/// Boot the worker: install the message handler and announce readiness. Called
-/// by `worker.js` after `init()`, under a distinctive name because it shares
-/// an export namespace with [`crate::start`].
+/// Where the lane's bootstrap lives, relative to this worker's script.
+/// Relative for the reason `worker_port::WORKER_URL` is: a project-Pages
+/// subpath. Precached by `sw.js` beside `worker.js`.
+const LANE_URL: &str = "./tile-lane.js";
+
+thread_local! {
+    /// The lane's `Worker` handle, rooted for the life of this worker. Firefox
+    /// collects a Worker that shares this memory but is not held by a live
+    /// `Worker` object (bug 1702191); wasm-bindgen-rayon roots its helpers
+    /// for the same reason.
+    static LANE_WORKER: RefCell<Option<web_sys::Worker>> = const { RefCell::new(None) };
+
+    /// The lane thread's one-thread rayon pool, built on first use. See
+    /// [`execute_serially`].
+    static LANE_POOL: OnceCell<Option<rayon::ThreadPool>> = const { OnceCell::new() };
+}
+
+/// Boot the worker: install the message handler, start the tile lane and
+/// announce readiness. Called by `worker.js` after `init()`, under a
+/// distinctive name because it shares an export namespace with
+/// [`crate::start`].
 #[wasm_bindgen]
 pub fn squallar_worker_main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -39,9 +73,93 @@ pub fn squallar_worker_main() -> Result<(), JsValue> {
     let threads = rayon::current_num_threads();
     proto::set_field(&hello, proto::THREADS, &JsValue::from_f64(threads as f64));
     say_memory(&hello);
-    scope.post_message(&hello)?;
+
+    // The lane's port rides the hello, transferred. A lane that could not be
+    // started is a hello without one, which the page reads as "no lane":
+    // tiles stay on its own thread, exactly as before the lane existed.
+    let transfer = js_sys::Array::new();
+    match spawn_tile_lane(&scope) {
+        Ok(port) => {
+            proto::set_field(&hello, proto::LANE, &port);
+            transfer.push(&port);
+        }
+        Err(e) => log::warn!("no tile lane ({e:?}); vector tiles stay on the page's thread"),
+    }
+    scope.post_message_with_transfer(&hello, &transfer)?;
 
     log::info!("squallar rasterization worker ready (rayon: {threads} threads)");
+    Ok(())
+}
+
+/// Start the tile lane on this worker's memory and answer the page's end of
+/// its port.
+///
+/// The nested Worker gets one message: the module and memory to instantiate
+/// on — `wasm_bindgen::module()` and `memory()`, the pair wasm-bindgen-rayon
+/// hands its own helpers — and its end of a fresh `MessageChannel`. Its
+/// `onerror` tells the page the lane is lost, so the batches it owed are
+/// failed rather than waited for.
+fn spawn_tile_lane(
+    scope: &web_sys::DedicatedWorkerGlobalScope,
+) -> Result<web_sys::MessagePort, JsValue> {
+    let options = web_sys::WorkerOptions::new();
+    options.set_type(web_sys::WorkerType::Module);
+    let lane = web_sys::Worker::new_with_options(LANE_URL, &options)?;
+    let channel = web_sys::MessageChannel::new()?;
+
+    let on_error_scope = scope.clone();
+    let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        let lost = js_sys::Object::new();
+        proto::set_field(&lost, proto::KIND, &JsValue::from_str(proto::LANE_LOST));
+        if let Err(e) = on_error_scope.post_message(&lost) {
+            log::error!("the tile lane raised an error and the page could not be told: {e:?}");
+        }
+    });
+    lane.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    on_error.forget();
+
+    let init = js_sys::Object::new();
+    proto::set_field(&init, proto::KIND, &JsValue::from_str(proto::LANE_INIT));
+    proto::set_field(&init, proto::MODULE, &wasm_bindgen::module());
+    proto::set_field(&init, proto::MEMORY, &wasm_bindgen::memory());
+    let lane_end = channel.port1();
+    proto::set_field(&init, proto::PORT, &lane_end);
+    let transfer = js_sys::Array::new();
+    transfer.push(&lane_end);
+    lane.post_message_with_transfer(&init, &transfer)?;
+
+    LANE_WORKER.with(|w| *w.borrow_mut() = Some(lane));
+    Ok(channel.port2())
+}
+
+/// The tile lane's entry: install the port's message handler and say hello.
+/// Called by `tile-lane.js` after `init({module, memory})` on the
+/// rasterization worker's memory, with the lane's end of the port.
+///
+/// The panic hook and the logger are process statics in that shared memory
+/// and the worker's thread has installed both; these calls are the no-ops
+/// they are documented to be on a second call, kept so the lane is correct
+/// on a build where the order ever changes.
+#[wasm_bindgen]
+pub fn squallar_tile_lane_main(port: web_sys::MessagePort) -> Result<(), JsValue> {
+    console_error_panic_hook::set_once();
+    let _ = console_log::init_with_level(log::Level::Info);
+
+    let handler_port = port.clone();
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            handle_lane_message(&handler_port, &event.data());
+        });
+    // Setting `onmessage` starts the port; no explicit `start()` is owed.
+    port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget();
+
+    let hello = js_sys::Object::new();
+    proto::set_field(&hello, proto::KIND, &JsValue::from_str(proto::LANE_HELLO));
+    say_memory(&hello);
+    port.post_message(&hello)?;
+
+    log::info!("squallar tile lane ready (serial, on the rasterization worker's memory)");
     Ok(())
 }
 
@@ -60,19 +178,81 @@ fn worker_scope() -> Result<web_sys::DedicatedWorkerGlobalScope, JsValue> {
         .map_err(|_| JsValue::from_str("not running inside a dedicated worker"))
 }
 
+/// Where a reply goes: this worker's global scope, or the lane's port. Both
+/// post a message with a transfer list; the browser spells the method
+/// differently on each.
+trait Poster {
+    fn post(&self, message: &JsValue, transfer: &js_sys::Array) -> Result<(), JsValue>;
+}
+
+impl Poster for web_sys::DedicatedWorkerGlobalScope {
+    fn post(&self, message: &JsValue, transfer: &js_sys::Array) -> Result<(), JsValue> {
+        self.post_message_with_transfer(message, transfer)
+    }
+}
+
+impl Poster for web_sys::MessagePort {
+    fn post(&self, message: &JsValue, transfer: &js_sys::Array) -> Result<(), JsValue> {
+        self.post_message_with_transferable(message, transfer)
+    }
+}
+
+/// How a job's bytes are run: the worker's arm is [`execute_encoded`] on the
+/// global pool; the lane's is [`execute_serially`].
+type Run = fn(&[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)>;
+
 /// Rasterize one job and post the answer back. A message this build cannot
 /// read is answered with a failed job rather than dropped: the page holds a
 /// render slot and a pane's in-flight mark against every id it posted.
 fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     match proto::string_field(data, proto::KIND).as_deref() {
-        Some(proto::JOB) => handle_job(scope, data),
+        Some(proto::JOB) => handle_job(scope, data, squallar_worker::offload::execute_encoded),
         // The page has finished copying a reply out of this worker's memory.
         Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
         _ => log::warn!("worker ignoring a message that is not a job"),
     }
 }
 
-fn handle_job(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
+/// The lane's message loop: the same two kinds the worker answers, run
+/// serially, answered on the port.
+fn handle_lane_message(port: &web_sys::MessagePort, data: &JsValue) {
+    match proto::string_field(data, proto::KIND).as_deref() {
+        Some(proto::JOB) => handle_job(port, data, execute_serially),
+        Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
+        _ => log::warn!("tile lane ignoring a message that is not a job"),
+    }
+}
+
+/// [`squallar_worker::offload::execute_encoded`] on a rayon pool of exactly
+/// this thread.
+///
+/// The lane shares the worker's global pool — one memory, one `static` — and
+/// a `par_iter` submitted to it from here would queue behind whatever radar
+/// render holds its threads. `use_current_thread` with one thread builds a
+/// pool that spawns nothing (wasm has no `std::thread::spawn`) and runs every
+/// job of an `install` on the caller, so the batch is serial and never waits
+/// on the pool. A pool that cannot be built falls back to the global one,
+/// said once: slower under contention, never wrong.
+fn execute_serially(bytes: &[u8]) -> Option<(u8, Vec<u8>, Vec<Vec<u8>>)> {
+    LANE_POOL.with(|cell| {
+        let pool = cell.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build()
+                .map_err(|e| {
+                    log::warn!("tile lane: no serial pool ({e}); batches share the worker's pool")
+                })
+                .ok()
+        });
+        match pool {
+            Some(pool) => pool.install(|| squallar_worker::offload::execute_encoded(bytes)),
+            None => squallar_worker::offload::execute_encoded(bytes),
+        }
+    })
+}
+
+fn handle_job(poster: &dyn Poster, data: &JsValue, run: Run) {
     let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
         log::error!("worker got a job with no id; nothing to answer");
         return;
@@ -92,13 +272,13 @@ fn handle_job(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
     // page may free the request now — **before** the job runs, not after.
     // A decode request is the archive, up to ~47-69 MiB; holding it for the
     // length of the rasterization would double the peak for the whole job.
-    release_to_page(scope, proto::loan_field(data));
+    release_to_page(poster, proto::loan_field(data));
 
-    let result = squallar_worker::offload::execute_encoded(&request);
+    let result = run(&request);
     if result.is_none() {
         log::debug!("worker job {id} produced no frame");
     }
-    if let Err(e) = post_result(scope, id, result) {
+    if let Err(e) = post_result(poster, id, result) {
         log::error!("worker could not answer job {id}: {e:?}");
     }
 }
@@ -108,14 +288,14 @@ fn handle_job(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
 /// Best-effort by design: a failed post here costs the page one buffer held
 /// until the worker is retired, which `abandon_worker` sweeps. It must not
 /// abandon the job.
-fn release_to_page(scope: &web_sys::DedicatedWorkerGlobalScope, loan: crate::shared_loan::LoanId) {
+fn release_to_page(poster: &dyn Poster, loan: crate::shared_loan::LoanId) {
     if loan == crate::shared_loan::NO_LOAN {
         return;
     }
     let message = js_sys::Object::new();
     proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::RELEASE));
     proto::set_loan(&message, loan);
-    if let Err(e) = scope.post_message(&message) {
+    if let Err(e) = poster.post(&message, &js_sys::Array::new()) {
         log::warn!("worker could not release the page's loan {loan}: {e:?}");
     }
 }
@@ -141,10 +321,13 @@ fn release_to_page(scope: &web_sys::DedicatedWorkerGlobalScope, loan: crate::sha
 /// The page copies once either way; what the first arm removes is THIS side's
 /// copy, so the reply costs one memcpy instead of two.
 ///
+/// The loan book is thread-local, so a reply the lane lends is the lane's to
+/// release: the page answers `RELEASE` on the port the `DONE` arrived on.
+///
 /// `None` writes explicit nulls rather than posting nothing: the page holds a
 /// render slot against every id, and silence wedges it.
 fn post_result(
-    scope: &web_sys::DedicatedWorkerGlobalScope,
+    poster: &dyn Poster,
     id: u64,
     result: Option<(u8, Vec<u8>, Vec<Vec<u8>>)>,
 ) -> Result<(), JsValue> {
@@ -204,7 +387,7 @@ fn post_result(
         proto::set_field(&message, proto::OUT, &views.get(0));
         proto::set_field(&message, proto::TAILS, &views.slice(1, views.length()));
     }
-    let posted = scope.post_message_with_transfer(&message, &transfer);
+    let posted = poster.post(&message, &transfer);
     if posted.is_err() {
         crate::shared_loan::release(lent);
     }

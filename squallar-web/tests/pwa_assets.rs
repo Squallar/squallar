@@ -16,6 +16,7 @@ const RASTER_WORKER: &str = include_str!("../worker.js");
 const WORKER_PORT: &str = include_str!("../src/worker_port.rs");
 const WORKER_PROTOCOL: &str = include_str!("../src/worker_protocol.rs");
 const RASTER_WORKER_RS: &str = include_str!("../src/worker.rs");
+const TILE_LANE: &str = include_str!("../tile-lane.js");
 
 fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -767,6 +768,71 @@ fn the_rasterization_worker_uses_only_relative_paths() {
     }
 }
 
+/// The lane script `worker.rs` asks the browser for.
+fn requested_lane_url() -> String {
+    literal_after(RASTER_WORKER_RS, "worker.rs", "const LANE_URL: &str = \"")
+}
+
+/// The tile lane is the third file a Worker fetches, and it is fetched by the
+/// rasterization worker rather than the page: the same existence, precache
+/// and subpath rules as `worker.js`, checked against the URL the Rust side
+/// actually spells.
+#[test]
+fn the_tile_lane_script_exists_and_is_precached() {
+    let requested = requested_lane_url();
+    let relative = requested.trim_start_matches("./");
+    assert!(
+        web_dir().join(relative).is_file(),
+        "worker.rs starts {requested:?}, which is not a file in this crate. The \
+         browser would 404 and every vector tile would be styled on the page's \
+         thread."
+    );
+    let paths = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    assert!(
+        paths.iter().any(|p| p == relative),
+        "sw.js does not precache {relative:?}, which worker.rs starts. Offline, \
+         and on any load the shell answers, vector tiles would silently move \
+         back onto the main thread."
+    );
+}
+
+/// One module, instantiated a third time on the worker's memory: the lane
+/// must import the page's glue and hand the port to the Rust entry.
+#[test]
+fn the_tile_lane_loads_the_same_module_as_the_page_and_calls_its_entry() {
+    let glue = page_module_specifier();
+    assert!(
+        TILE_LANE.contains(&format!("from \"{glue}\"")),
+        "index.html imports {glue:?} but tile-lane.js does not; a second wasm \
+         artifact needs its own precache entries and its own place in sw.js's \
+         per-client shell pinning."
+    );
+    assert!(
+        TILE_LANE.contains("squallar_tile_lane_main"),
+        "tile-lane.js does not call the lane entry point"
+    );
+    assert!(
+        TILE_LANE.contains("memory: d.memory") && TILE_LANE.contains("module_or_path: d.module"),
+        "tile-lane.js does not instantiate on the memory it was handed; a fresh \
+         `init()` would be a third heap under a third 1 GiB ceiling"
+    );
+}
+
+#[test]
+fn the_tile_lane_uses_only_relative_paths() {
+    for (line_no, line) in TILE_LANE.lines().enumerate() {
+        for needle in ["from \"/", "import(\"/", "new URL(\"/", "importScripts(\"/"] {
+            assert!(
+                !line.contains(needle),
+                "tile-lane.js:{} uses a root-absolute path ({needle}...). It resolves \
+                 under `python3 -m http.server` and 404s under the project-Pages \
+                 subpath.",
+                line_no + 1
+            );
+        }
+    }
+}
+
 /// The protocol is versionless, and the **build token** names the build:
 /// `GITHUB_SHA` in CI, `wire_identity::wire_digest()` locally.
 /// `worker_protocol` is `wasm32`-only, so a source scrape is the only
@@ -864,7 +930,7 @@ fn the_frame_reply_rides_the_out_pair_and_transfers_its_buffer() {
         .split_once("if let Some((kind, head, tails)) = result")
         .expect("post_result no longer branches on the result")
         .1
-        .split_once("scope.post_message_with_transfer")
+        .split_once("poster.post(&message, &transfer)")
         .expect("post_result no longer ends by posting the message it built")
         .0;
 
@@ -959,7 +1025,7 @@ fn post_result_body() -> String {
     src.split_once("fn post_result(")
         .expect("worker.rs no longer has a post_result")
         .1
-        .split_once("scope.post_message_with_transfer")
+        .split_once("poster.post(&message, &transfer)")
         .expect("post_result no longer ends by posting the message it built")
         .0
         .to_string()

@@ -4143,29 +4143,30 @@ mod dispatch_gate {
     }
 
     /// **The property the whole change rests on.** Every reason not to
-    /// offload has to land on the inline path, because that path is what
-    /// ships today: an idle funnel is the only state that stages.
+    /// offload has to land on the inline path, because the inline path is the
+    /// sliced styling that ships either way: an idle lane is the only state
+    /// that stages.
     #[test]
-    fn only_an_idle_funnel_stages_and_every_other_answer_falls_through() {
+    fn only_an_idle_lane_stages_and_every_other_answer_falls_through() {
         let mut batch = TileBatch::default();
 
-        // No offloader installed, or no worker attached, or still inside the
-        // handshake window: `queued` is `None` and posting would run the job
-        // on this very thread, unbudgeted.
+        // No offloader installed, or no lane attached yet, or a lane lost
+        // with the worker it lives in: `queued` is `None` and there is
+        // nowhere to post.
         assert!(
             !batch.should_stage(None),
-            "a funnel with no worker must never be staged for: posting there \
-             runs the batch inline and unbudgeted, which is worse than the \
-             pump decoding it under PUMP_TIME_BUDGET",
+            "a seam with no lane must never be staged for: there is nothing \
+             to post to, and the body has to be styled here in slices under \
+             PUMP_TIME_BUDGET instead",
         );
 
-        // Somebody else's job is in the worker — a 160-190 ms radar
-        // rasterization, or an unbounded Level II decode. A batch posted now
-        // appears later than a tile decoded here.
+        // Somebody else's batch is on the lane. The lane runs its jobs
+        // serially, so a batch posted behind one appears later than a tile
+        // styled here.
         for busy in [1usize, 2, 7] {
             assert!(
                 !batch.should_stage(Some(busy)),
-                "{busy} queued job(s) was staged for; a batch behind one \
+                "{busy} queued batch(es) was staged for; a batch behind one \
                  makes tiles appear LATER, which is the objection the gate \
                  exists to answer",
             );
@@ -4174,26 +4175,94 @@ mod dispatch_gate {
         // Nothing owed at all: the one state that offloads.
         assert!(
             batch.should_stage(Some(0)),
-            "an idle funnel must stage, or the offload never happens",
+            "an idle lane must stage, or the offload never happens",
         );
 
-        // With a batch already out, "the funnel holds exactly mine" is the
-        // same answer as idle — so a second pass keeps staging instead of
-        // falling back to a tessellation it does not need to pay.
+        // With a batch already out, "the lane holds exactly mine" is the same
+        // answer as idle — so a second pass keeps staging instead of falling
+        // back to a tessellation it does not need to pay.
         batch.stage(a_tile(1), body(1));
         let _ = batch.open(0);
         assert!(
             batch.should_stage(Some(1)),
-            "a funnel holding only this source's own batch must keep staging",
+            "a lane holding only this source's own batch must keep staging",
         );
         assert!(
             !batch.should_stage(Some(2)),
-            "a funnel holding this source's batch AND something else must not",
+            "a lane holding this source's batch AND something else must not",
         );
+        assert!(!batch.should_stage(None), "and a lost lane still must not");
+    }
+
+    /// **A busy worker is not a busy lane, and that is the whole change.**
+    ///
+    /// The rule in [`TileBatch::should_stage`] never moved; the number handed
+    /// to it did. It used to be the funnel's whole queue (`jobs_in_worker`),
+    /// and on the user's `huge` scene with a loop playing that queue is never
+    /// idle — 18 jobs, 34.1 s of worker time, 8 outstanding at leg end
+    /// (2026-09-02) — so the gate declined and 108 of 108 vector bodies were
+    /// styled on the frame thread. It is now the tile lane's own count, and
+    /// the lane is a thread the worker's queue cannot occupy.
+    ///
+    /// Composed here from the two halves rather than asserted on the real
+    /// offloader, which is `cfg(target_arch = "wasm32")` and executes on no
+    /// native test. The half this crate owns is the rule; the half
+    /// `squallar-worker` owns — that `jobs_in_lane` counts none of the
+    /// worker's — is pinned by `offload::lane_tests`.
+    #[test]
+    fn a_worker_holding_eight_jobs_is_still_an_idle_lane() {
+        let batch = TileBatch::default();
+
+        // What the old gate read on that leg, and what it decided. The number
+        // has not changed meaning — a queue of eight is still a refusal.
+        let funnel_queue = 8usize;
         assert!(
-            !batch.should_stage(None),
-            "and a dead funnel still must not"
+            !batch.should_stage(Some(funnel_queue)),
+            "a queue of {funnel_queue} must still be a refusal",
         );
+
+        // What the lane reads on the same frame, and what it decides.
+        assert!(
+            batch.should_stage(Some(0)),
+            "with a lane attached and idle the pump must stage even while the \
+             worker owes {funnel_queue} jobs; reading the funnel here is what \
+             staged 0 of 108 bodies",
+        );
+    }
+
+    /// **A batch that outlived its style generation is dropped, not drawn.**
+    ///
+    /// The lane made this reachable rather than theoretical: a batch now
+    /// genuinely flies, and a restyle between the post and the reply is a
+    /// user dragging the style control while tiles are in the air. The rule
+    /// applies it in `install_batch_reply`, which is `wasm32`-only; the rule
+    /// itself is here.
+    #[test]
+    fn a_reply_from_a_superseded_generation_is_not_current() {
+        let mut batch = TileBatch::default();
+        batch.stage(a_tile(1), body(1));
+        let _ = batch.open(3);
+
+        let (posted_under, asked) = batch.close().expect("a batch was outstanding");
+        assert_eq!(posted_under, 3);
+        assert_eq!(
+            asked.len(),
+            1,
+            "the body comes back with it, to be re-styled"
+        );
+
+        assert!(
+            TileBatch::reply_is_current(posted_under, 3),
+            "a reply under the generation still in force must be installed",
+        );
+        for restyled in [4u64, 5, 99] {
+            assert!(
+                !TileBatch::reply_is_current(posted_under, restyled),
+                "a batch posted under generation 3 was installed against \
+                 generation {restyled}; the map would draw the styling the \
+                 user has already replaced",
+            );
+        }
     }
 
     /// At most one batch is outstanding. That is what keeps a backlog from
@@ -4319,7 +4388,9 @@ mod dispatch_gate {
 /// `squallar-app` and only compiles for wasm32. Without this the seam would be
 /// dead code on every native build, which is exactly what clippy said.
 mod offloader_seam {
-    use super::super::{TileOffloader, clear_tile_offloader, set_tile_offloader, with_offloader};
+    use super::super::{
+        TileBatch, TileOffloader, clear_tile_offloader, set_tile_offloader, with_offloader,
+    };
 
     /// An offloader that reports a fixed queue depth and accepts nothing.
     struct Fixed(Option<usize>);
@@ -4377,6 +4448,73 @@ mod offloader_seam {
 
         clear_tile_offloader();
         assert_eq!(with_offloader(|o| o.and_then(TileOffloader::queued)), None);
+    }
+
+    /// An offloader shaped like the real one: it answers the **lane's** count
+    /// when a lane is attached, and `None` when there is none — which is
+    /// `WorkerTileOffloader::queued`'s
+    /// `lane_attached().then(jobs_in_lane)` spelled where a native test can
+    /// run it. What the worker owes is carried too, and never read.
+    struct Lane {
+        attached: bool,
+        owed: usize,
+        worker_owes: usize,
+    }
+
+    impl TileOffloader for Lane {
+        fn queued(&self) -> Option<usize> {
+            let _ = self.worker_owes;
+            self.attached.then_some(self.owed)
+        }
+
+        fn post(
+            &self,
+            _job: squallar_basemap::jobs::BasemapTilesJob,
+            _deliver: Box<dyn FnOnce(Option<squallar_basemap::jobs::BasemapTiles>) + Send>,
+        ) -> bool {
+            self.attached
+        }
+    }
+
+    /// **The seam end to end, in the two states a leg passes through.**
+    ///
+    /// With the lane attached the pump stages while the rasterization worker
+    /// is saturated — the state the `huge` leg sat in for its whole run, and
+    /// the one the old gate refused. Lose the lane and the seam answers
+    /// `None`, which is the pump's instruction to style the body itself in
+    /// slices: the inline path is the fallback, never a dropped tile.
+    #[test]
+    fn the_lane_stages_under_a_saturated_worker_and_falls_back_when_it_is_lost() {
+        let batch = TileBatch::default();
+
+        clear_tile_offloader();
+        set_tile_offloader(Box::new(Lane {
+            attached: true,
+            owed: 0,
+            worker_owes: 8,
+        }));
+        let queued = with_offloader(|o| o.and_then(TileOffloader::queued));
+        assert_eq!(queued, Some(0), "an attached idle lane owes nothing");
+        assert!(
+            batch.should_stage(queued),
+            "the pump must offload while the worker owes eight jobs",
+        );
+
+        // The worker died and took the lane in its memory with it.
+        set_tile_offloader(Box::new(Lane {
+            attached: false,
+            owed: 0,
+            worker_owes: 8,
+        }));
+        let queued = with_offloader(|o| o.and_then(TileOffloader::queued));
+        assert_eq!(queued, None, "a lost lane must not read as an idle one");
+        assert!(
+            !batch.should_stage(queued),
+            "with no lane the pump must style the body itself; staging for a \
+             lane that is gone parks bodies for a flight that never happens",
+        );
+
+        clear_tile_offloader();
     }
 }
 

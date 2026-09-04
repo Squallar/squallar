@@ -347,6 +347,16 @@ That is a different question from this one.
   spelled-out expression — radar, overlays, elevation. **A new registry chains
   on the END**: a wire code is an index into the composition plus one, so a row
   inserted earlier renumbers every code after it.
+* **Two sinks, one registry.** `offload_job` posts to the worker; the basemap
+  tile pump posts to the **tile lane** (`offload_to_lane`, `set_lane`,
+  `jobs_in_lane`) — the same `JobSink` trait, a second installation with its
+  own sink id, so neither retires the other's jobs. On the browser the lane is
+  a nested Worker on the rasterization worker's memory (`squallar-web/tile-lane.js`,
+  `worker::squallar_tile_lane_main`) with its own `MessagePort`: the worker's
+  `onmessage` runs a job to completion, so its queue behind a multi-second
+  model job is a wait no priority order can remove, and the lane is a loop
+  that queue cannot occupy. A lane refusal hands the job back **unrun** —
+  its callers hold no render slot and have a cheaper inline path.
 * **The pin**: `squallar-app/tests/arch_ratchets.rs::offload_names_zero_source_crate_types`
   — `offload.rs` names **zero** `squallar_overlays::` or `squallar_radar::` paths,
   in either direction, prose included, with a presence control on

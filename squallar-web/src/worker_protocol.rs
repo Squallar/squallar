@@ -60,6 +60,29 @@ pub const THREADS: &str = "threads";
 /// unknown, never as 0: a worker from a build before this field never sets
 /// it, and the page's `linear_memory` answers `None` for the worker half.
 pub const MEM: &str = "mem";
+/// Worker → page, on `HELLO`: the page's end of the **tile lane** — a
+/// `MessagePort` into a nested Worker that shares the rasterization worker's
+/// memory and runs the `basemap/tiles` row on a thread of its own, so a
+/// batch of vector tiles never waits behind a multi-second job in this
+/// worker's message loop. Transferred, so it rides at most once. Absent on a
+/// build before the lane, and on a worker whose spawn failed; the page reads
+/// both as "no lane" and the tile pump keeps styling on the frame thread.
+pub const LANE: &str = "lane";
+/// Worker → lane, the first and only message the worker sends its nested
+/// Worker: the module and memory to instantiate on ([`MODULE`], [`MEMORY`])
+/// and the lane's end of the port ([`PORT`]). Read by `tile-lane.js`.
+pub const LANE_INIT: &str = "laneinit";
+pub const MODULE: &str = "module";
+pub const MEMORY: &str = "memory";
+pub const PORT: &str = "port";
+/// Lane → page, first message on the lane port: the module is instantiated
+/// on the worker's memory and the lane will answer `JOB`s. Carries [`MEM`],
+/// which on this port is the SAME heap the worker reports — one memory, two
+/// threads.
+pub const LANE_HELLO: &str = "lanehello";
+/// Worker → page: the lane's nested Worker raised an error. Its jobs are owed
+/// answers that will not come, and the page fails them.
+pub const LANE_LOST: &str = "lanelost";
 
 /// Worker → page: **the answer's HEAD** — scalars and framing in the dispatched
 /// codec row's own `encode_out` form, as one transferred `Uint8Array`; null

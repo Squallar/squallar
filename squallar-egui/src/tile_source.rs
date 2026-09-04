@@ -1790,15 +1790,20 @@ impl PumpBudget {
 /// reason about.
 #[cfg(any(test, target_arch = "wasm32"))]
 pub trait TileOffloader {
-    /// How many jobs the funnel currently owes, or `None` when it has no
-    /// worker to run them on.
+    /// How many batches the **tile lane** currently owes, or `None` when
+    /// there is no lane to post to.
     ///
-    /// **`None` is not "busy", it is "posting would run it HERE"** — with no
-    /// sink attached `offload_job` executes the job inline on the calling
-    /// thread, unbudgeted, which is strictly worse than the pump decoding it
-    /// under [`PUMP_TIME_BUDGET`]. A funnel still inside its handshake window
-    /// answers `None` too: a job posted then is *held* until a worker
-    /// attaches, and a held tile is a tile that appears later.
+    /// The lane is a sink of its own — on the browser a thread on the
+    /// rasterization worker's memory with a message loop the worker's jobs
+    /// cannot occupy — so this count is what the lane holds and nothing the
+    /// worker's queue holds figures in it. That is the whole point: on a
+    /// scene with a loop playing the worker's queue is never idle (18 jobs,
+    /// 34.1 s of them, 8 outstanding at leg end on `huge`, 2026-09-02), and
+    /// a gate that read it staged 0 of 108 bodies.
+    ///
+    /// **`None` is not "busy", it is "there is nowhere to post"**: the pump
+    /// styles the body itself, in slices under [`PUMP_TIME_BUDGET`]
+    /// ([`PendingStyle`]), which is the inline path this seam falls back to.
     fn queued(&self) -> Option<usize>;
 
     /// Hand `job` over, answering whether it was accepted. `deliver` runs
@@ -1898,18 +1903,18 @@ impl TileBatch {
     }
 
     /// Whether this pump should stage its vector bodies rather than decode
-    /// them, given what the funnel owes.
+    /// them, given what the lane owes.
     ///
-    /// **Every `false` here is today's code path**, which is the property the
+    /// **Every `false` here is the inline path**, which is the property the
     /// whole change rests on: the offload is a win when it happens and a
     /// no-op when it does not, never a trade.
     ///
-    /// `queued` is [`TileOffloader::queued`]. The comparison is against what
-    /// *this source* already has outstanding, so "the funnel holds exactly my
-    /// batch and nothing else" is the same answer as "the funnel is idle" —
-    /// and anything else in the queue (a 160-190 ms radar rasterization, an
-    /// unbounded Level II decode) means a batch posted now would appear
-    /// later than a tile decoded here.
+    /// `queued` is [`TileOffloader::queued`] — the **lane's** count. The
+    /// comparison is against what *this source* already has outstanding, so
+    /// "the lane holds exactly my batch and nothing else" is the same answer
+    /// as "the lane is idle"; with one vector source that is every pass a
+    /// lane is attached. Anything else on the lane is another source's batch,
+    /// and a batch behind it would appear later than a tile styled here.
     fn should_stage(&self, queued: Option<usize>) -> bool {
         let ours = usize::from(self.outstanding.is_some());
         queued == Some(ours)
@@ -1937,6 +1942,18 @@ impl TileBatch {
         self.outstanding
             .take()
             .map(|batch| (batch.epoch, batch.asked))
+    }
+
+    /// Whether a batch posted under `posted_under` may still be installed,
+    /// given the source's style generation `now`.
+    ///
+    /// A one-line rule with a name, because the caller that applies it
+    /// ([`HttpsTiles::install_batch_reply`]) is `cfg(target_arch = "wasm32")`
+    /// and so executes on no test on this side of a browser. Spelled here it
+    /// is driven natively, and inverting it reddens a test rather than
+    /// shipping a restyle that draws the generation it replaced.
+    fn reply_is_current(posted_under: u64, now: u64) -> bool {
+        posted_under == now
     }
 
     /// Take one staged body back, oldest first, for the caller to decode on
@@ -1973,13 +1990,15 @@ const STYLE_SLICE_FEATURES: usize = 16;
 
 /// One vector body's styling, parked between frames.
 ///
-/// The wasm32 pump styles a body on the frame thread whenever the offload
-/// funnel holds anything but this source's own batch — which on a scene
-/// with a loop playing is every body: 108 of 108 on the `huge` leg of
-/// 2026-09-02, style mean 4.7 ms and p99 22.6 ms in Firefox, 4.1 ms mean in
-/// Chromium. [`PUMP_TIME_BUDGET`] is asked between takes and could not see
-/// inside one, so each of those bodies was a whole tile's tessellation on
-/// one frame. This is what a take becomes when the deadline passes
+/// The wasm32 pump styles a body on the frame thread whenever it has no tile
+/// lane to post to — before the lane has said hello, and after it is lost.
+/// Until the lane existed the gate read the worker's whole queue instead,
+/// which on a scene with a loop playing is never idle, so this path styled
+/// every body: 108 of 108 on the `huge` leg of 2026-09-02, style mean
+/// 4.7 ms and p99 22.6 ms in Firefox, 4.1 ms mean in Chromium.
+/// [`PUMP_TIME_BUDGET`] is asked between takes and could not see inside one,
+/// so each of those bodies was a whole tile's tessellation on one frame.
+/// This is what a take becomes when the deadline passes
 /// mid-style: the parsed tile and a [`walkers::mvt::StyledCursor`] over it,
 /// resumed at the head of the next pump and finished there or later — a
 /// frame pays the budget plus one slice of [`STYLE_SLICE_FEATURES`] and
@@ -3225,7 +3244,7 @@ impl HttpsTiles {
             }
         }
 
-        if epoch == self.style_epoch {
+        if TileBatch::reply_is_current(epoch, self.style_epoch) {
             for (tile_id, shapes) in &styled {
                 // Counted where the tile lands, for the reason
                 // `note_archive_decode` records: the worker parsed this body,

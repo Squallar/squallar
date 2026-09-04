@@ -1719,6 +1719,29 @@ pub enum Pressure { SurfaceLost, OutOfMemory, MemoryWarning, LinearMemory { used
   2.8 ms in Firefox); its finest unit is a source layer, and a parse cursor
   would be the next cut. Ledger: one `style` sample per body over the summed
   slices, so `tile phase (style)` keeps its denominator.
+  *Then (WO-30):* the reason the funnel gate read 0 of 108 was the worker's
+  message loop — `handle_job` runs a job to completion inside `onmessage`, so
+  the queue behind a 3.9-5.0 s model job IS the wait, and no priority order
+  on that queue can preempt it. The batches ride a **tile lane** instead: one
+  more nested Worker instantiated on the rasterization worker's own memory
+  (`init({module, memory})`, the call wasm-bindgen-rayon's helpers make), with
+  a `MessagePort` to the page, running the `basemap/tiles` row serially on a
+  one-thread rayon pool of its own.
+
+  No second heap, and the figure is measured rather than argued. On this box
+  2026-09-04, against the release bundle, the rasterization worker's own `mem`
+  reading was **21,626,880 B** on its `hello` and **23,789,568 B** once the
+  lane had said hello on its port — **+2,162,688 B, 2.06 MiB** — and running a
+  job through the lane's message loop did not move it again. Firefox 154 and
+  Chromium 151 agreed to the byte. That is the lane's FIXED cost: what a real
+  batch's parse costs transiently is not in it, because the probe's job was an
+  empty request the codec refuses.
+
+  The gate now reads the lane's count (`offload::jobs_in_lane`), so it stages
+  whenever a lane is attached; with no lane — before its hello, after its loss — the sliced
+  inline path above is what runs. What stays on the frame thread per tile is
+  the reply's wire decode and the flatten (37 + 231 us on the Monaco core
+  tile, native release), against 4.7 ms of styling.
 
 ### 10.4 Nothing persisted, and why
 

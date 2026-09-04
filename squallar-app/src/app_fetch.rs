@@ -3791,6 +3791,13 @@ mod reinit_active_tests;
 #[cfg(test)]
 mod step_button_tests;
 
+/// The browser's tile offloader reads the tile lane's count and not the
+/// funnel's — the one line that decides whether a vector body leaves the
+/// frame thread at all.
+#[path = "app_fetch/tile_lane_tests.rs"]
+#[cfg(test)]
+mod tile_lane_tests;
+
 /// A pane restored with a playing loop boots before its first scan arrives,
 /// and the loop must defer and resume rather than be dropped.
 #[cfg(test)]
@@ -3799,7 +3806,9 @@ mod loop_restore_race_tests;
 
 /// The browser's basemap tile offloader: what `squallar_egui::tile_source`'s
 /// frame pump hands a pass's vector bodies to instead of tessellating them on
-/// the frame thread.
+/// the frame thread — the funnel's **tile lane**
+/// (`squallar_worker::offload::offload_to_lane`), a sink the worker's own
+/// job queue cannot occupy.
 ///
 /// **Installed rather than depended on.** `squallar-egui` must not name
 /// `squallar-worker` — the worker composes `squallar-basemap`'s codec row and
@@ -3813,19 +3822,15 @@ struct WorkerTileOffloader;
 
 #[cfg(target_arch = "wasm32")]
 impl squallar_egui::tile_source::TileOffloader for WorkerTileOffloader {
-    /// `None` whenever posting would not promptly run: with no worker
-    /// attached `offload_job` executes the job **inline on the calling
-    /// thread**, unbudgeted, and during the handshake window it *holds* the
-    /// job until one attaches. Both are worse for tile latency than the pump
-    /// decoding under `PUMP_TIME_BUDGET`, and the pump reads this as "do what
-    /// you did before".
+    /// The **tile lane's** count, not the funnel's: the lane is a thread on
+    /// the rasterization worker's memory with a message loop of its own, so
+    /// what the worker's queue holds — a 3.9-5.0 s model rasterization on a
+    /// busy scene — says nothing about when a batch posted here runs. `None`
+    /// until a lane has said hello, and again once it is lost: with no lane
+    /// there is nothing to post to, and the pump reads `None` as "style it
+    /// yourself, in slices".
     fn queued(&self) -> Option<usize> {
-        if !squallar_worker::offload::worker_attached()
-            || squallar_worker::offload::expecting_sink()
-        {
-            return None;
-        }
-        Some(squallar_worker::offload::jobs_in_worker())
+        squallar_worker::offload::lane_attached().then(squallar_worker::offload::jobs_in_lane)
     }
 
     fn post(
@@ -3833,15 +3838,13 @@ impl squallar_egui::tile_source::TileOffloader for WorkerTileOffloader {
         job: squallar_basemap::jobs::BasemapTilesJob,
         deliver: Box<dyn FnOnce(Option<squallar_basemap::jobs::BasemapTiles>) + Send>,
     ) -> bool {
-        squallar_worker::offload::offload_job(
+        squallar_worker::offload::offload_to_lane(
             "basemap-tiles",
-            squallar_worker::offload::Job::Described(
-                squallar_worker::offload::JobRequest::describe(
-                    job,
-                    // A batch of shapes has no raster geometry of its own:
-                    // extent units are the tile's, not the screen's.
-                    squallar_worker::offload::ceiling_only_geometry(0),
-                ),
+            squallar_worker::offload::JobRequest::describe(
+                job,
+                // A batch of shapes has no raster geometry of its own:
+                // extent units are the tile's, not the screen's.
+                squallar_worker::offload::ceiling_only_geometry(0),
             ),
             move |result| {
                 deliver(result.and_then(|out| out.take::<squallar_basemap::jobs::BasemapTiles>()))

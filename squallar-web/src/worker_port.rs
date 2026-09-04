@@ -178,6 +178,8 @@ fn lose(generation: u64, reason: &str) {
         return;
     }
     offload::abandon_worker(reason);
+    // The tile lane lives in that worker's memory and dies with it.
+    offload::abandon_lane(reason);
     // The requests this page lent that worker are owed `RELEASE`s it will never
     // send. Nothing is reading them any more — a replaced worker's messages are
     // dropped by generation before they reach a handler — so the sweep is the
@@ -266,7 +268,19 @@ fn handle_message(generation: u64, worker: &web_sys::Worker, data: &JsValue) {
             offload::set_worker(Box::new(Port {
                 worker: worker.clone(),
             }));
+            // The tile lane's port rides the same hello. A hello without one
+            // — a build before the lane, or a spawn that failed — leaves the
+            // tile pump on its own thread, which is what it does anyway
+            // until the lane says hello.
+            if let Some(port) = proto::field(data, proto::LANE)
+                .and_then(|v| v.dyn_into::<web_sys::MessagePort>().ok())
+            {
+                listen_to_lane(generation, port);
+            }
         }
+        // The worker's nested lane raised an error: fail the batches it owed
+        // and go back to styling on the page. The worker itself is fine.
+        Some(proto::LANE_LOST) => offload::abandon_lane("the tile lane raised an error"),
         Some(proto::FATAL) => {
             let error = proto::string_field(data, proto::ERROR).unwrap_or_default();
             log::warn!(
@@ -364,6 +378,144 @@ fn deliver(worker: &web_sys::Worker, data: &JsValue) {
 
     // `None` still delivers: the caller's slot is released either way.
     offload::deliver_encoded_reply(id as u64, reply);
+}
+
+// ── The tile lane ────────────────────────────────────────────────────────────
+//
+// A second channel beside the worker's, deliberately not the worker's: its
+// bytes are not in the `transport:` ledger above, whose denominator is the
+// funnel's jobs, and its replies are decoded by the same `deliver_encoded_reply`
+// through the row recorded at dispatch. What crosses it is small — a batch's
+// MVT bodies out (2.4 KB median), styled shapes back (~10 KB typical, 652 KB
+// at the measured tail) — and its running figure is the tile pump's own
+// `tile bodies: N offloaded` line, a count that cannot be evicted from the
+// console ring.
+
+/// Start listening on the lane's port. The lane is installed into the funnel
+/// only when it says hello: a port whose lane never came up installs nothing,
+/// and the pump keeps styling on this thread.
+fn listen_to_lane(generation: u64, port: web_sys::MessagePort) {
+    let handler_port = port.clone();
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            handle_lane_message(generation, &handler_port, &event.data());
+        });
+    // Setting `onmessage` starts the port.
+    port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget();
+}
+
+fn handle_lane_message(generation: u64, port: &web_sys::MessagePort, data: &JsValue) {
+    if GENERATION.with(Cell::get) != generation {
+        log::debug!("ignoring a message from a tile lane this page has already replaced");
+        return;
+    }
+    match proto::string_field(data, proto::KIND).as_deref() {
+        Some(proto::LANE_HELLO) => {
+            // One memory, two threads: the lane's heap reading IS the worker's.
+            note_worker_memory(data);
+            offload::set_lane(Box::new(LanePort { port: port.clone() }));
+            log::info!("tile lane attached; vector tile batches leave the frame thread");
+        }
+        Some(proto::DONE) => {
+            note_worker_memory(data);
+            deliver_from_lane(port, data);
+        }
+        // The lane has finished copying a request out of this page's memory.
+        Some(proto::RELEASE) => crate::shared_loan::release(proto::loan_field(data)),
+        Some(proto::FATAL) => {
+            let error = proto::string_field(data, proto::ERROR).unwrap_or_default();
+            log::warn!("tile lane failed to start ({error}); vector tiles stay on this thread");
+            offload::abandon_lane("the tile lane failed to start");
+        }
+        other => log::warn!("ignoring a tile lane message of kind {other:?}"),
+    }
+}
+
+/// Hand a lane's `done` to the batch that asked for it: the same trio, the
+/// same one copy into this page's memory, the same `RELEASE` before the
+/// delivery — on the lane's port, because the loan book is per thread and the
+/// lane's thread is the lender.
+fn deliver_from_lane(port: &web_sys::MessagePort, data: &JsValue) {
+    let Some(id) = proto::field(data, proto::ID).and_then(|v| v.as_f64()) else {
+        log::error!("the tile lane answered with no job id");
+        return;
+    };
+    let loan = proto::loan_field(data);
+    let reply = (|| {
+        let out = proto::field(data, proto::OUT).filter(|v| !v.is_null() && !v.is_undefined())?;
+        let kind = proto::field(data, proto::OUT_KIND)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as u8)?;
+        let head = out.dyn_into::<js_sys::Uint8Array>().ok()?.to_vec();
+        let tails = match proto::field(data, proto::TAILS).filter(|v| !v.is_null()) {
+            None => Vec::new(),
+            Some(v) => {
+                let array = v.dyn_into::<js_sys::Array>().ok()?;
+                let mut tails = Vec::with_capacity(array.length() as usize);
+                for tail in array.iter() {
+                    tails.push(tail.dyn_into::<js_sys::Uint8Array>().ok()?.to_vec());
+                }
+                tails
+            }
+        };
+        Some((kind, head, tails))
+    })();
+    if loan != crate::shared_loan::NO_LOAN {
+        let message = js_sys::Object::new();
+        proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::RELEASE));
+        proto::set_loan(&message, loan);
+        if let Err(e) = port.post_message(&message) {
+            log::warn!("could not release the tile lane's loan {loan}: {e:?}");
+        }
+    }
+    offload::deliver_encoded_reply(id as u64, reply);
+}
+
+/// The installed lane. Owns the page's end of the port.
+struct LanePort {
+    port: web_sys::MessagePort,
+}
+
+impl JobSink for LanePort {
+    /// The request wire `Port::send` speaks, on the lane's port: `to_bytes`,
+    /// lent as a view when the page can lend and copied-and-transferred when
+    /// it cannot. Not routed through `Port::send` because that is the funnel's
+    /// transport and its ledger; this channel keeps its own count.
+    fn send(&self, id: u64, request: JobRequest) -> Result<(), JobRequest> {
+        let message = js_sys::Object::new();
+        proto::set_field(&message, proto::KIND, &JsValue::from_str(proto::JOB));
+        proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
+        proto::set_loan(&message, crate::shared_loan::NO_LOAN);
+
+        let bytes = request.to_bytes();
+        let transfer = js_sys::Array::new();
+        let loan = match crate::shared_loan::lend(vec![bytes]) {
+            Ok((loan, views)) => {
+                proto::set_loan(&message, loan);
+                proto::set_field(&message, proto::REQUEST, &views.get(0));
+                loan
+            }
+            Err(mut bytes) => {
+                let bytes = bytes.pop().unwrap_or_default();
+                let payload = js_sys::Uint8Array::from(bytes.as_slice());
+                transfer.push(&payload.buffer());
+                proto::set_field(&message, proto::REQUEST, &payload);
+                crate::shared_loan::NO_LOAN
+            }
+        };
+        match self
+            .port
+            .post_message_with_transferable(&message, &transfer)
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log::warn!("could not post batch {id} to the tile lane: {e:?}");
+                crate::shared_loan::release(loan);
+                Err(request)
+            }
+        }
+    }
 }
 
 /// Tell the worker it may free the reply this page has now copied out.

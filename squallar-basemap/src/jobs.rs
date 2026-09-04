@@ -19,9 +19,13 @@
 //! frame thread become eight tiles wide on the worker's pool.
 //!
 //! That amortises the round trip; it does not remove head-of-line blocking,
-//! and nothing here can. What removes it is the dispatch gate in
-//! `squallar_egui::tile_source`, which posts only when the funnel is idle and
-//! otherwise decodes inline exactly as it does today.
+//! and nothing here can. What removes it is where the row RUNS: the browser
+//! posts these batches to the funnel's **tile lane**
+//! (`squallar_worker::offload::offload_to_lane`) — a nested Worker on the
+//! rasterization worker's memory with a message loop of its own, serial, so
+//! a batch never waits behind a model rasterization there and never contends
+//! with a radar render for the pool. With no lane the pump styles the body
+//! itself, in slices under its frame budget.
 //!
 //! # The style does not cross
 //!

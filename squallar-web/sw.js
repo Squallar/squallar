@@ -84,7 +84,7 @@ const META_KEY = new URL("__squallar_sw_meta__", ROOT).href;
 const PINS_KEY = new URL("__squallar_sw_pins__", ROOT).href;
 
 /*
- * The app shell, relative to ROOT. Ten entries, but the wasm module
+ * The app shell, relative to ROOT. Eleven entries, but the wasm module
  * (10,161,914 B) and its glue (117,911 B) are essentially all of it — index.html
  * and the icons together are under 260 KB.
  *
@@ -99,11 +99,17 @@ const PINS_KEY = new URL("__squallar_sw_pins__", ROOT).href;
  * radar frames on the main thread — correct, but a fifth of a second of frozen
  * UI per frame. It loads no bytes of its own beyond the `pkg/` pair already
  * here, which is what keeps this list one deploy generation wide.
+ *
+ * `tile-lane.js` is the bootstrap of the nested Worker the rasterization
+ * worker starts on its own memory for the basemap's vector tiles. Same
+ * argument, one step down: absent from the precache, an offline load styles
+ * every vector tile on the main thread. It too loads only the `pkg/` pair.
  */
 const SHELL_PATHS = [
   "",
   "manifest.webmanifest",
   "worker.js",
+  "tile-lane.js",
   "pkg/squallar_web.js",
   "pkg/squallar_web_bg.wasm",
   "icons/icon-192.png",

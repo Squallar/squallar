@@ -531,15 +531,7 @@ pub fn abandon_worker(reason: &str) {
     let Some((sink, _port)) = WORKER.with(|w| w.borrow_mut().take()) else {
         return;
     };
-    let orphaned: Vec<Pending> = {
-        let mut registry = pending();
-        let ids: Vec<u64> = registry
-            .iter()
-            .filter(|(_, job)| job.sink == sink)
-            .map(|(id, _)| *id)
-            .collect();
-        ids.iter().filter_map(|id| registry.remove(id)).collect()
-    };
+    let orphaned = take_jobs_of(sink);
     log::warn!(
         "rasterization worker abandoned ({reason}); failing {} in-flight job(s)",
         orphaned.len()
@@ -547,6 +539,20 @@ pub fn abandon_worker(reason: &str) {
     for job in orphaned {
         (job.deliver)(None);
     }
+}
+
+/// Every job filed under `sink`, removed from the registry and handed back so
+/// the caller can fail them outside the lock. Scoped to one installation: the
+/// worker's retirement must not fail the lane's jobs, nor the lane's the
+/// worker's.
+fn take_jobs_of(sink: u64) -> Vec<Pending> {
+    let mut registry = pending();
+    let ids: Vec<u64> = registry
+        .iter()
+        .filter(|(_, job)| job.sink == sink)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.iter().filter_map(|id| registry.remove(id)).collect()
 }
 
 /// Whether jobs are currently going to a worker. For diagnostics and tests.
@@ -1018,9 +1024,114 @@ pub fn jobs_in_worker() -> usize {
     pending().values().filter(|job| job.sink == sink).count()
 }
 
+// ── The tile lane ────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// A second [`JobSink`] beside [`WORKER`], for work that must not wait in
+    /// the worker's queue: the basemap's vector tile batches. On the browser
+    /// it is a `MessagePort` into a nested Worker that shares the
+    /// rasterization worker's memory but not its message loop, so a batch
+    /// posted here runs while a multi-second model rasterization holds that
+    /// loop. Filed under its own sink id, so the two installations retire
+    /// each other's jobs never. `squallar-web` installs it the way it installs
+    /// the worker; every native build and every test has none.
+    static LANE: RefCell<Option<(u64, Box<dyn JobSink>)>> = const { RefCell::new(None) };
+}
+
+/// Route [`offload_to_lane`] through `port` from now on. A lane already
+/// installed is abandoned first, for the reason [`set_worker`] abandons: a
+/// job whose sink is replaced under it would sit in the registry forever.
+pub fn set_lane(port: Box<dyn JobSink>) {
+    abandon_lane("replaced by a new lane");
+    LANE.with(|l| *l.borrow_mut() = installed(Some(port)));
+}
+
+/// Give up on the lane: fail every job **it** owes, delivering nothing, and
+/// leave the worker's jobs alone. A lane caller holds no render slot — what a
+/// `None` costs it is a re-stage, and the tile pump then styles the batch on
+/// the frame thread as it does with no lane at all.
+pub fn abandon_lane(reason: &str) {
+    let Some((sink, _port)) = LANE.with(|l| l.borrow_mut().take()) else {
+        return;
+    };
+    let orphaned = take_jobs_of(sink);
+    log::warn!(
+        "tile lane abandoned ({reason}); failing {} in-flight batch(es)",
+        orphaned.len()
+    );
+    for job in orphaned {
+        (job.deliver)(None);
+    }
+}
+
+/// Whether this thread has a tile lane to post to.
+pub fn lane_attached() -> bool {
+    LANE.with(|l| l.borrow().is_some())
+}
+
+/// How many jobs this thread's lane owes an answer for — the lane's own
+/// count, in which the worker's queue does not figure. The tile pump's
+/// dispatch gate reads this, so a busy worker no longer makes it decline.
+pub fn jobs_in_lane() -> usize {
+    let Some(sink) = LANE.with(|l| l.borrow().as_ref().map(|(id, _)| *id)) else {
+        return 0;
+    };
+    pending().values().filter(|job| job.sink == sink).count()
+}
+
+/// Hand `request` to the lane and answer the id its reply will pair with, or
+/// `None` when there is no lane or the lane refused — in which case
+/// **`deliver` is dropped unrun and the request is the caller's again**. That
+/// is the opposite of [`offload_job`]'s fallthrough, deliberately: a lane
+/// caller has a cheaper inline path of its own (the pump's sliced styling
+/// under its frame budget) and no slot to unwind, so running the job here
+/// would be the slow arm chosen for it. The reply comes back through
+/// [`deliver_encoded_reply`] like any other sink's.
+pub fn offload_to_lane(
+    name: &'static str,
+    request: JobRequest,
+    deliver: impl FnOnce(JobResult) + Send + 'static,
+) -> Option<u64> {
+    let row = row_for(&request.job);
+    let kind = row.label;
+    let deliver: Box<dyn FnOnce(JobResult) + Send> = Box::new(deliver);
+    LANE.with(|l| {
+        let borrowed = l.borrow();
+        let (sink_id, sink) = borrowed.as_ref()?;
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Registered before the send, as `dispatch` registers: a transport
+        // that answers before `send` returns must find its entry.
+        pending().insert(
+            id,
+            Pending {
+                kind,
+                started: web_time::Instant::now(),
+                sink: *sink_id,
+                row,
+                deliver,
+            },
+        );
+        match sink.send(id, request) {
+            Ok(()) => Some(id),
+            Err(_request) => {
+                log::warn!("{name}: the tile lane refused the job; handing it back undelivered");
+                // The entry goes with its `deliver`, unrun: nothing is owed
+                // for a job that never left.
+                pending().remove(&id);
+                None
+            }
+        }
+    })
+}
+
 /// The native transport. See the module's own doc for why it is a pool.
 #[cfg(not(target_arch = "wasm32"))]
 mod pool;
+
+/// The tile lane is a sink the worker's queue cannot occupy, and it retires
+/// only its own.
+#[cfg(test)]
+mod lane_tests;
 
 #[cfg(test)]
 mod tests;
