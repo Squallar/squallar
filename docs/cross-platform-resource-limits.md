@@ -1488,18 +1488,43 @@ every rung that lowers *that* axis at its stop.
 
 **The count is per `(pane, layer)`, and reading it per pane is a measured
 defect.** The Tier-2 `huge` legs of 2026-09-03 ran the whole ladder at rung 0
-and `oversample 150` with their page at 1011 of 1024 MiB, then trapped in
-`rust_oom`. One pane showing thirteen texture layers priced as one picture is
-365,741,620 B of host need, which fits the 805,306,368 B allowance with 440 MB
-to spare, so `fit` correctly answered "nothing to shed" to a question 500 MB
-short of the scene. Both the need term
-(`PaneNeed::overlay_pictures`) and the `overlay pictures:` line's `resident`
-field now come from the same record, `RenderDispatcher::last_overlay_dispatch`,
-keyed `(pane, LayerId)` — so the figure a reader sees and the figure the fit
-prices cannot disagree. `n` and `px` on that line stay **per pane**: they are
-the size a pane's picture is, which is what a surface check holds a bracket's
-uploaded bytes against, and `resident` is the count and weight of the pictures
-themselves. The two are never added and never the same question.
+and `oversample 150` with their page at 1011 of 1024 MiB, then trapped. One
+pane showing thirteen texture layers priced as one picture is 365,741,620 B of
+host need, which fits the 805,306,368 B allowance with 440 MB to spare, so
+`fit` correctly answered "nothing to shed" to a question 500 MB short of the
+scene.
+
+**But the count `fit` prices is the scene's DEMAND, not what is resident.**
+The first repair took the count off the dispatch record and was itself a race:
+the upload drain lands one band a frame, so the resident count passes through
+every value from one to the layer total on its way to steady state, and two
+Tier-2 passes on 2026-09-04 — same bundle, same box, same scene — read
+`steps 0 / oversample 150` and `steps 2 / oversample 100`. The user sees the
+oversampling, so a fit priced from a transient is visible as picture sharpness
+changing between runs. `PaneNeed::overlay_pictures` is therefore the count of
+**texture-mode layers the pane has enabled** (`App::loop_demand`, off the
+pane's own `overlay_textures` keys and its saved slot state, radar excluded) —
+saved UI state, which no upload moves. Pinned by
+`the_rung_is_the_same_however_many_pictures_are_resident`, whose tamper arm
+shows the racing source reddening it.
+
+The resident count keeps its place as an **observation**, on the telemetry
+line and nowhere else: `overlay pictures:` reports `n` and `px` **per pane**
+(the size a pane's picture is, which is what a surface check holds a bracket's
+uploaded bytes against) and `resident N of B B` over every `(pane, layer)` the
+dispatch record names. `n` and `resident` answer different questions, are
+never added, and one pane showing thirteen layers is `n=1` with `resident 13`.
+
+**Whether the page watermark ever acted is now on the always-on line.** Every
+trace of a page-heap action was evictable and was evicted: `budget pressure:`
+is one `log::warn!` per action, the browser console ring turns over in seconds
+under frame telemetry, and the rig reads its last 60 entries — 4.8 s of a 50 s
+leg on 2026-09-04. So a search of every capture channel came back empty on
+four passes whose pages sat at 993-1018 of 1024 MiB, and an evicted line and
+an arm that never fired are the same empty search. `budget state:` now ends
+`page heap acts N at M MiB`, re-said every telemetry period, so the last tick
+of any leg answers it. It rides after `balloon` because the rig's
+`budget_state_re` is unanchored at its end.
 
 **And a page-heap event lowers the presumption from the mark, not from the
 constant** (`refit_under_pressure`). The scene's host terms — tiles and
