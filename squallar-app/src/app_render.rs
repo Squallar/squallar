@@ -936,6 +936,10 @@ fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
 /// A period in which nothing presented prints the absence rather than a zero
 /// frame, on [`frame_segment_lines`]' terms inverted: a zero here would be a
 /// frame that cost nothing, which is a different claim from no frame at all.
+///
+/// The nine `ui_*` columns are that same frame's `ui` segment opened up — see
+/// [`ui_cut_columns`] for why they are on this line rather than left to
+/// `frame ui (*)`.
 fn frame_worst_line(
     worst: Option<crate::frame_ledger::WorstFrame>,
     since_boot: Option<crate::frame_ledger::WorstFrame>,
@@ -949,7 +953,8 @@ fn frame_worst_line(
         Some(b) => {
             let [pre, pump, ui, prepare, finish, post] = b.segments;
             format!(
-                "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, post={} us",
+                "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, \
+                 post={} us, {}",
                 if b.interact { "interact" } else { "idle" },
                 pre,
                 pump,
@@ -957,6 +962,7 @@ fn frame_worst_line(
                 prepare,
                 finish,
                 post,
+                ui_cut_columns(b.ui_cuts),
             )
         }
     };
@@ -969,7 +975,7 @@ fn frame_worst_line(
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us, {boot}",
+         ui={} us, prepare={} us, finish={} us, post={} us, {}, {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
         since_boot_us,
@@ -979,6 +985,41 @@ fn frame_worst_line(
         prepare,
         finish,
         post,
+        ui_cut_columns(w.ui_cuts),
+    )
+}
+
+/// One frame's nine `ui` cuts as the `ui_*=<n> us` columns `frame worst:`
+/// carries, in `UiHists`' order.
+///
+/// **Prefixed `ui_` and not left bare on purpose.** `poll` and `apply` are
+/// also `pump` cut names and `finish` also has a `draw`; a bare `stack=` on a
+/// line that already carries `ui=` would be read as a seventh segment beside
+/// the six rather than as a slice of the third.
+///
+/// **Never added to `frame ui (*)`, and not comparable to it either.** Those
+/// nine histograms record inside the ledger's `if interacted` arm; these nine
+/// are one frame's microseconds and that frame is usually an idle one, so it
+/// contributed to none of them. The nine here sum to this line's own `ui=`
+/// exactly — `the_worst_frames_ui_cuts_telescope_to_its_ui` holds it — which
+/// is what turns "the two families' maxima are in adjacent bins" into
+/// arithmetic on one named frame.
+fn ui_cut_columns(cuts: [u32; 9]) -> String {
+    let [
+        poll,
+        layout,
+        topbar,
+        statusbar,
+        stack,
+        dialog,
+        panes,
+        apply,
+        chrome,
+    ] = cuts;
+    format!(
+        "ui_poll={poll} us, ui_layout={layout} us, ui_topbar={topbar} us, \
+         ui_statusbar={statusbar} us, ui_stack={stack} us, ui_dialog={dialog} us, \
+         ui_panes={panes} us, ui_apply={apply} us, ui_chrome={chrome} us"
     )
 }
 

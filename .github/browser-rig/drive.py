@@ -3103,8 +3103,8 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // once at the end: a family the watcher never ingests can only ever be read as
 // a last-period fallback, which is what silently voided every windowed
 // worst-frame reading this instrument produced.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us/;
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us/;
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3400,21 +3400,40 @@ for (var i = 0; i < C.length; i++) {
                                    sum: parseInt(x[3], 10), p50: x[4],
                                    p90: x[5], p99: x[6], hist: x[7] });
   var wm = frame_worst_re.exec(m);
+  // The nine `ui_*` are THIS frame's own ui cuts, telescoping to its `ui`.
+  // They are never added to, and never ratio'd against, the `frame ui (*)`
+  // families: those record interact frames only, and the frame reported here
+  // is usually an idle one that contributed to none of them.
   if (wm) frame_worst_all.push({ t: C[i].t, service: parseInt(wm[1], 10), family: wm[2],
                           since_boot: parseInt(wm[3], 10),
                           pre: parseInt(wm[4], 10), pump: parseInt(wm[5], 10),
                           ui: parseInt(wm[6], 10), prepare: parseInt(wm[7], 10),
                           finish: parseInt(wm[8], 10), post: parseInt(wm[9], 10),
-                          boot_family: wm[10],
-                          boot_pre: parseInt(wm[11], 10), boot_pump: parseInt(wm[12], 10),
-                          boot_ui: parseInt(wm[13], 10), boot_prepare: parseInt(wm[14], 10),
-                          boot_finish: parseInt(wm[15], 10), boot_post: parseInt(wm[16], 10) });
+                          ui_poll: parseInt(wm[10], 10), ui_layout: parseInt(wm[11], 10),
+                          ui_topbar: parseInt(wm[12], 10), ui_statusbar: parseInt(wm[13], 10),
+                          ui_stack: parseInt(wm[14], 10), ui_dialog: parseInt(wm[15], 10),
+                          ui_panes: parseInt(wm[16], 10), ui_apply: parseInt(wm[17], 10),
+                          ui_chrome: parseInt(wm[18], 10),
+                          boot_family: wm[19],
+                          boot_pre: parseInt(wm[20], 10), boot_pump: parseInt(wm[21], 10),
+                          boot_ui: parseInt(wm[22], 10), boot_prepare: parseInt(wm[23], 10),
+                          boot_finish: parseInt(wm[24], 10), boot_post: parseInt(wm[25], 10),
+                          boot_ui_poll: parseInt(wm[26], 10), boot_ui_layout: parseInt(wm[27], 10),
+                          boot_ui_topbar: parseInt(wm[28], 10), boot_ui_statusbar: parseInt(wm[29], 10),
+                          boot_ui_stack: parseInt(wm[30], 10), boot_ui_dialog: parseInt(wm[31], 10),
+                          boot_ui_panes: parseInt(wm[32], 10), boot_ui_apply: parseInt(wm[33], 10),
+                          boot_ui_chrome: parseInt(wm[34], 10) });
   var wn = frame_worst_none_re.exec(m);
   if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
                                  since_boot: parseInt(wn[1], 10), boot_family: wn[2],
                                  boot_pre: parseInt(wn[3], 10), boot_pump: parseInt(wn[4], 10),
                                  boot_ui: parseInt(wn[5], 10), boot_prepare: parseInt(wn[6], 10),
-                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10) });
+                                 boot_finish: parseInt(wn[7], 10), boot_post: parseInt(wn[8], 10),
+                                 boot_ui_poll: parseInt(wn[9], 10), boot_ui_layout: parseInt(wn[10], 10),
+                                 boot_ui_topbar: parseInt(wn[11], 10), boot_ui_statusbar: parseInt(wn[12], 10),
+                                 boot_ui_stack: parseInt(wn[13], 10), boot_ui_dialog: parseInt(wn[14], 10),
+                                 boot_ui_panes: parseInt(wn[15], 10), boot_ui_apply: parseInt(wn[16], 10),
+                                 boot_ui_chrome: parseInt(wn[17], 10) });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -7730,11 +7749,32 @@ def run_smoke(args):
               % (tag, src, fw.get("service"), fw.get("family"),
                  fw.get("pre"), fw.get("pump"), fw.get("ui"),
                  fw.get("prepare"), fw.get("finish"), fw.get("post")))
+        # That frame's own `ui` segment, opened up. NOT a percentile and never
+        # added to -- or ratio'd against -- `frame ui (*)`: those record
+        # interact frames only and this frame is usually an idle one, so it
+        # contributed to none of them. The nine sum to the `ui=` above exactly,
+        # which is what makes an attribution here arithmetic on one frame
+        # rather than two cumulative maxima landing in adjacent bins.
+        print("[%s] SUMMARY frame worst ui cuts (one frame; sum == ui above): "
+              "poll=%s layout=%s topbar=%s statusbar=%s stack=%s dialog=%s "
+              "panes=%s apply=%s chrome=%s"
+              % (tag, fw.get("ui_poll"), fw.get("ui_layout"),
+                 fw.get("ui_topbar"), fw.get("ui_statusbar"),
+                 fw.get("ui_stack"), fw.get("ui_dialog"), fw.get("ui_panes"),
+                 fw.get("ui_apply"), fw.get("ui_chrome")))
         print("[%s] SUMMARY frame worst since boot (NOT a tail; may be boot): service=%s us "
               "family=%s | pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
               % (tag, fw.get("since_boot"), fw.get("boot_family"),
                  fw.get("boot_pre"), fw.get("boot_pump"), fw.get("boot_ui"),
                  fw.get("boot_prepare"), fw.get("boot_finish"), fw.get("boot_post")))
+        print("[%s] SUMMARY frame worst since boot ui cuts: poll=%s layout=%s "
+              "topbar=%s statusbar=%s stack=%s dialog=%s panes=%s apply=%s "
+              "chrome=%s"
+              % (tag, fw.get("boot_ui_poll"), fw.get("boot_ui_layout"),
+                 fw.get("boot_ui_topbar"), fw.get("boot_ui_statusbar"),
+                 fw.get("boot_ui_stack"), fw.get("boot_ui_dialog"),
+                 fw.get("boot_ui_panes"), fw.get("boot_ui_apply"),
+                 fw.get("boot_ui_chrome")))
     tb = result.get("transport_bytes")
     if tb:
         # Every field the pattern reads is printed. A figure parsed into the

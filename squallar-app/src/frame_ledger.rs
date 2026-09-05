@@ -625,6 +625,26 @@ pub(crate) struct WorstFrame {
     pub(crate) service: u32,
     /// `[pre, pump, ui, prepare, finish, post]`, this one frame's.
     pub(crate) segments: [u32; 6],
+    /// The nine `ui` cuts of THIS frame, in [`UiHists`]' order:
+    /// `[poll, layout, topbar, statusbar, stack, dialog, panes, apply,
+    /// chrome]`. They telescope to `segments[2]` exactly, on
+    /// [`ui_phase_micros`]' terms, so the worst frame's `ui` is decomposed by
+    /// arithmetic on ONE frame rather than by pairing two cumulative
+    /// distributions that share no frame.
+    ///
+    /// **Why it is here and not left to [`UiHists`].** Those nine record
+    /// inside `finalize`'s `if interacted` arm, so a frame that carried no
+    /// pointer event — every frame that PAYS for a click, and half the spikes
+    /// measured on scene D — contributes to none of them. Until this field
+    /// the only way to attribute a worst frame's `ui` to a cut was to observe
+    /// that two cumulative maxima landed in adjacent bins, which is an
+    /// inference across two aggregates and not a fact about one frame.
+    ///
+    /// Zeroed on a frame that left no `ui_phases` — an early return before
+    /// the pass, which is the same frame that leaves no acquire and is not a
+    /// sample of anything. **Zero new clock reads**: the stamps already exist
+    /// on every presented frame; only the subtraction moved out of the arm.
+    pub(crate) ui_cuts: [u32; 9],
     /// Whether this frame's raw input carried interaction. Reported rather
     /// than filtered on: a scene whose worst frame is always idle is saying
     /// something, and a family column is how it says it.
@@ -1045,15 +1065,30 @@ impl FrameLedger {
             acquire,
         );
 
+        // **Above the arm on purpose, and the only ARITHMETIC that is.** These
+        // nine ride on `WorstFrame`, whose denominator is every presented
+        // frame, so they have to be computed on the idle ones too -- the
+        // frames that pay for a click, where half of scene D's spikes live and
+        // where `UiHists` records nothing. The nine `self.ui.*.record` calls
+        // stay inside the arm below, so no histogram's denominator moves; only
+        // the subtraction left it. Zero new clock reads: `m.ui_phases` is
+        // already stamped on every presented frame.
+        let ui_cuts = m.ui_phases.as_ref().map_or([0u32; 9], |phases| {
+            ui_phase_micros(ui_start, phases, ui_end)
+        });
+
         // EVERY split below is interact-only, and that is a limit worth
         // stating rather than rediscovering. A frame the renderer did not call
-        // interacted -- boot among them -- contributes to `service_idle` and
-        // to the worst-frame latch, and to nothing else: no segment, no `ui`,
-        // `prepare`, `post`, `pump` or `dispatch` cut. So a boot frame's
-        // anatomy is visible ONLY on the `frame worst:` line, and a search for
-        // the expensive row behind one will find every family empty. Measured
-        // instance, 2026-09-04: a 13 ms `pump` on a Mac Firefox boot frame,
-        // against a 203 us interact mean, attributable to no cut in the tree.
+        // interacted -- boot among them -- contributes to `service_idle`, to
+        // the worst-frame latch and to `finish`, and to nothing else: no
+        // segment, no `prepare`, `post`, `pump` or `dispatch` cut, and no `ui`
+        // histogram. So a boot frame's anatomy is visible only on the
+        // `frame worst:` line -- which since `ui_cuts` landed carries that
+        // frame's own nine `ui` cuts, so `ui` is the one segment a search
+        // CAN open up behind such a frame; every other family is still empty.
+        // Measured instance, 2026-09-04: a 13 ms `pump` on a Mac Firefox boot
+        // frame, against a 203 us interact mean, attributable to no cut in the
+        // tree.
         if interacted {
             self.service_interact.record(service);
             let [pre, pump, ui, prepare, finish, post] = segments;
@@ -1104,7 +1139,15 @@ impl FrameLedger {
             // The same, for the `ui` segment recorded above. Independent of
             // the prepare block: a different segment, a different set of
             // stamps, the same denominator rule.
-            if let Some(phases) = m.ui_phases.as_ref() {
+            //
+            // The nine values are computed above the arm because
+            // `WorstFrame::ui_cuts` needs them on idle frames too; the RECORD
+            // calls stay here, and still only on a frame that actually left
+            // `ui_phases`, so this family's denominator is exactly what it was
+            // before that move. A frame with no phases must contribute no
+            // sample -- nine zeros would be nine false readings, not an
+            // absence.
+            if m.ui_phases.is_some() {
                 let [
                     poll,
                     layout,
@@ -1115,7 +1158,7 @@ impl FrameLedger {
                     panes,
                     apply,
                     chrome,
-                ] = ui_phase_micros(ui_start, phases, ui_end);
+                ] = ui_cuts;
                 self.ui.poll.record(poll);
                 self.ui.layout.record(layout);
                 self.ui.topbar.record(topbar);
@@ -1191,6 +1234,7 @@ impl FrameLedger {
             WorstFrame {
                 service,
                 segments,
+                ui_cuts,
                 interact: interacted,
             },
         ));
@@ -1198,6 +1242,7 @@ impl FrameLedger {
             self.worst_since_boot = Some(WorstFrame {
                 service,
                 segments,
+                ui_cuts,
                 interact: interacted,
             });
         }
@@ -1803,15 +1848,26 @@ mod tests {
         );
     }
 
-    /// A candidate frame whose six segments sum to `service`, so a test can
-    /// state a frame as one number and still have it telescope.
+    /// A candidate frame whose six segments sum to `service` and whose nine
+    /// `ui` cuts sum to `segments[2]`, so a test can state a frame as one
+    /// number and still have both decompositions telescope.
+    ///
+    /// The nine are spread rather than parked on one cut on purpose: a fixture
+    /// of `[0, 0, 0, 0, ui, 0, 0, 0, 0]` telescopes under a formatter that
+    /// printed `segments[2]` in the `ui_stack=` slot, so it could not tell the
+    /// two apart. `the_worst_frames_ui_cuts_telescope_to_its_ui` keeps that
+    /// degenerate shape as its own explicit green arm instead.
     fn frame(service: u32, interact: bool) -> WorstFrame {
         let sixth = service / 6;
         let mut segments = [sixth; 6];
         segments[5] = service - sixth * 5;
+        let ninth = segments[2] / 9;
+        let mut ui_cuts = [ninth; 9];
+        ui_cuts[8] = segments[2] - ninth * 8;
         WorstFrame {
             service,
             segments,
+            ui_cuts,
             interact,
         }
     }
@@ -1921,6 +1977,116 @@ mod tests {
             w.service,
             "the worst frame's segments do not sum to the service it was \
              latched on, so the line would decompose a different frame",
+        );
+    }
+
+    /// **The latched frame's nine `ui` cuts telescope to its own `ui`
+    /// segment**, so `frame worst`'s `ui_*` figures decompose the very frame
+    /// the line names rather than standing beside it.
+    ///
+    /// This is the property the whole field exists for. Before it, the only
+    /// way to say which `ui` cut owned a spike was to observe that
+    /// `frame ui (stack)`'s cumulative maximum and `frame segment (ui)`'s
+    /// cumulative maximum landed in adjacent bins — two aggregates that share
+    /// no frame, over a denominator that excludes every idle frame. The
+    /// assertion below is arithmetic on one frame instead.
+    ///
+    /// On `the_post_phases_telescope_to_post`'s terms, and with its two
+    /// assertions for its reason: the exact array catches a cut computed from
+    /// the wrong pair of stamps, which the sum alone cannot see.
+    #[test]
+    fn the_worst_frames_ui_cuts_telescope_to_its_ui() {
+        // One frame's stamps, stated as offsets from `ui_start`, and its `ui`
+        // segment taken from the SAME pair of instants the ledger takes it
+        // from — so the two figures being compared are one frame's, which is
+        // the whole claim.
+        let ui_start = Instant::now();
+        let phases = ui_phases_at(
+            ui_start,
+            [300, 1_900, 9_000, 12_000, 24_100, 24_600, 39_400, 39_450],
+        );
+        let ui_end = ui_start + std::time::Duration::from_micros(41_000);
+        let w = WorstFrame {
+            service: 60_000,
+            segments: [1_000, 2_000, micros(ui_start, ui_end), 8_000, 4_000, 4_000],
+            ui_cuts: ui_phase_micros(ui_start, &phases, ui_end),
+            interact: false,
+        };
+        assert_eq!(
+            w.ui_cuts,
+            [300, 1_600, 7_100, 3_000, 12_100, 500, 14_800, 50, 1_550],
+            "a cut moved: the nine no longer bracket the phases they are named \
+             for, so `frame worst`'s ui_* columns name the wrong spans",
+        );
+        assert_eq!(
+            w.ui_cuts.iter().sum::<u32>(),
+            w.segments[2],
+            "the worst frame's nine ui cuts do not sum to its own ui segment, \
+             so the line's ui_* figures decompose some other frame and the \
+             attribution they exist to make is an inference again",
+        );
+        assert_eq!(w.ui_cuts.iter().sum::<u32>(), 41_000);
+
+        // **The green arm, beside the red one.** A frame whose `ui` really is
+        // all in one cut — every other cut genuinely zero — is a healthy input
+        // that RESEMBLES the degenerate failure, and the gate must not fire on
+        // it. Over-firing here would block every real single-cut frame.
+        let single = WorstFrame {
+            ui_cuts: [0, 0, 0, 0, 41_000, 0, 0, 0, 0],
+            ..w
+        };
+        assert_eq!(
+            single.ui_cuts.iter().sum::<u32>(),
+            single.segments[2],
+            "a frame whose ui was genuinely spent in one cut fails the \
+             telescoping gate, so the gate over-fires on healthy input",
+        );
+    }
+
+    /// **The nine cuts are computed for EVERY presented frame, not only the
+    /// interact ones.** Held against `finalize`'s own source, on
+    /// [`the_worst_frame_latch_is_outside_the_interact_arm`]'s terms: the
+    /// binding must appear before the `if interacted {` that opens the arm.
+    ///
+    /// The degenerate this is red against is the natural one — leaving the
+    /// `ui_phase_micros` call where its nine `record` calls are and reading
+    /// zeros on every idle frame. That shape compiles, telescopes on the
+    /// frames it does fill, and reports nine zeros on exactly the frames this
+    /// field was added to describe: the ones that pay for a click.
+    #[test]
+    fn the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let bound = body
+            .find("let ui_cuts = ")
+            .expect("finalize no longer binds the worst frame's nine ui cuts");
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        assert!(
+            bound < interact_arm,
+            "the nine ui cuts are computed inside finalize's interact arm, so \
+             every frame that PAYS for a click -- all of which are filed idle, \
+             and where half of scene D's spikes live -- would carry nine zeros \
+             on the one line that reports it",
+        );
+        // **The position alone is not enough**, and this is the half that
+        // catches the degenerate a position check cannot see: a binding
+        // spelled `let ui_cuts = if interacted { … } else { [0; 9] };` sits
+        // before the arm, compiles, telescopes on every frame it fills, and
+        // reports nine zeros on exactly the frames the field was added for.
+        // So the statement itself may not read the flag.
+        let statement = body[bound..]
+            .split_once("\n\n")
+            .expect("the ui_cuts binding is no longer a statement of its own")
+            .0;
+        assert!(
+            !statement.contains("interacted"),
+            "the ui cuts binding reads the interact flag, so an idle frame \
+             would carry nine zeros however early the binding sits: \
+             {statement:?}",
         );
     }
 

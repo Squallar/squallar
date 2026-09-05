@@ -583,11 +583,13 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
     let worst = crate::frame_ledger::WorstFrame {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
+        ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
         interact: true,
     };
     let boot = crate::frame_ledger::WorstFrame {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
+        ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
         interact: false,
     };
     let payload = serde_json::to_string(&serde_json::json!({
@@ -637,12 +639,49 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[0]["ui"].as_u64(), Some(9_514));
     assert_eq!(got[0]["boot_family"].as_str(), Some("idle"));
     assert_eq!(got[0]["boot_prepare"].as_u64(), Some(21_000));
+    // **The nine ui cuts survive the scrape into the entry the artifact is
+    // written from.** Reached by name and by VALUE, not by "the key exists":
+    // the nine are consecutive `(\d+)` groups in a 34-group positional regex,
+    // so an off-by-one in the group numbers would leave every key present and
+    // every figure wrong -- which reads as data rather than as a null. The
+    // two ends and the middle are pinned, plus the telescoping the app's own
+    // gate holds, so a shifted window cannot pass.
+    assert_eq!(got[0]["ui_poll"].as_u64(), Some(11));
+    assert_eq!(got[0]["ui_stack"].as_u64(), Some(6_902));
+    assert_eq!(got[0]["ui_chrome"].as_u64(), Some(77));
+    assert_eq!(
+        (0..9)
+            .map(|i| {
+                let key = [
+                    "poll",
+                    "layout",
+                    "topbar",
+                    "statusbar",
+                    "stack",
+                    "dialog",
+                    "panes",
+                    "apply",
+                    "chrome",
+                ][i];
+                got[0][format!("ui_{key}")].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>(),
+        got[0]["ui"].as_u64().unwrap_or_default(),
+        "the scraped ui cuts do not sum to the scraped ui, so the rig read \
+         the nine out of the wrong capture groups",
+    );
+    assert_eq!(got[0]["boot_ui_poll"].as_u64(), Some(7));
+    assert_eq!(got[0]["boot_ui_stack"].as_u64(), Some(133));
+    assert_eq!(got[0]["boot_ui_chrome"].as_u64(), Some(31));
     // The absence spelling: a period in which nothing presented still carries
     // the since-boot maximum and its stamp.
     assert_eq!(got[1]["t"].as_u64(), Some(4201), "the wrong console stamp");
     assert!(got[1]["service"].is_null());
     assert_eq!(got[1]["since_boot"].as_u64(), Some(22_628));
     assert_eq!(got[1]["boot_prepare"].as_u64(), Some(21_000));
+    assert_eq!(got[1]["boot_ui_poll"].as_u64(), Some(7));
+    assert_eq!(got[1]["boot_ui_stack"].as_u64(), Some(133));
+    assert_eq!(got[1]["boot_ui_chrome"].as_u64(), Some(31));
 }
 
 /// **Each gate above reddens on a driver that deserves it, and passes on one

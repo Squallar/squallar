@@ -859,9 +859,14 @@ fn every_dispatch_site_asks_has_texture_not_texture_equality() {
 /// `var frame_[a-z]+_re` in `drive.py`) read ten families against five.
 #[test]
 fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
+    // Nine DISTINCT ui cuts, summing to this frame's own `ui` of 9514: a
+    // fixture with repeats could not tell a transposed pair of columns from a
+    // correct one, and the positional group order is exactly what this test
+    // exists to hold.
     let w = crate::frame_ledger::WorstFrame {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
+        ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
         interact: true,
     };
     // The since-boot maximum is a whole frame too: a boot-time compile spike
@@ -870,15 +875,24 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
     let boot = crate::frame_ledger::WorstFrame {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
+        ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
         interact: false,
     };
+    assert_eq!(
+        w.ui_cuts.iter().sum::<u32>(),
+        w.segments[2],
+        "the fixture's ui cuts do not telescope to its ui, so the pin below \
+         would pin a line describing no frame that could exist",
+    );
+    assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
     assert_eq!(
         super::frame_worst_line(Some(w), Some(boot)),
         rendered(
             &pattern("frame_worst_re"),
             &[
-                "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "idle",
-                "100", "90", "300", "21000", "800", "338",
+                "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "11",
+                "402", "1207", "96", "6902", "4", "812", "3", "77", "idle", "100", "90", "300",
+                "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
@@ -887,7 +901,10 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         super::frame_worst_line(None, Some(boot)),
         rendered(
             &pattern("frame_worst_none_re"),
-            &["22628", "idle", "100", "90", "300", "21000", "800", "338"],
+            &[
+                "22628", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
+                "133", "2", "61", "1", "31",
+            ],
         ),
         "the no-frame spelling and the rig's probe have drifted",
     );
@@ -1592,6 +1609,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
     let worst = crate::frame_ledger::WorstFrame {
         service: 6_728,
         segments: [61, 54, 4_402, 1_580, 611, 20],
+        ui_cuts: [12, 310, 903, 41, 2_800, 6, 288, 2, 40],
         interact: false,
     };
     assert_eq!(
@@ -1600,17 +1618,29 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         "the fixture's segments do not telescope to its service, so the pin \
          below would pin a line describing no frame that could exist",
     );
+    assert_eq!(
+        worst.ui_cuts.iter().sum::<u32>(),
+        worst.segments[2],
+        "the fixture's nine ui cuts do not telescope to its ui, so the pin \
+         below would pin a line whose ui_* columns decompose no frame",
+    );
     let boot = crate::frame_ledger::WorstFrame {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
+        ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
         interact: false,
     };
+    assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
     assert_eq!(
         super::frame_worst_line(Some(worst), Some(boot)),
         "frame worst: service=6728 us, family=idle, since_boot=9513 us, \
          pre=61 us, pump=54 us, ui=4402 us, prepare=1580 us, finish=611 us, \
-         post=20 us, boot: idle, pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, \
-         finish=4 us, post=3 us",
+         post=20 us, ui_poll=12 us, ui_layout=310 us, ui_topbar=903 us, \
+         ui_statusbar=41 us, ui_stack=2800 us, ui_dialog=6 us, ui_panes=288 us, \
+         ui_apply=2 us, ui_chrome=40 us, boot: idle, pre=1 us, pump=2 us, \
+         ui=3 us, prepare=9500 us, finish=4 us, post=3 us, ui_poll=0 us, \
+         ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, ui_stack=1 us, \
+         ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us",
     );
 }
 
@@ -1621,6 +1651,7 @@ fn the_worst_frame_line_names_the_interact_family_too() {
     let worst = crate::frame_ledger::WorstFrame {
         service: 600,
         segments: [100; 6],
+        ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
         interact: true,
     };
     assert!(
@@ -1638,6 +1669,7 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
     let boot = crate::frame_ledger::WorstFrame {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
+        ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
         interact: false,
     };
     let line = super::frame_worst_line(None, Some(boot));
@@ -1648,7 +1680,9 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
     assert_eq!(
         line,
         "frame worst: no frame presented this period, since_boot=9513 us, boot: idle, \
-         pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, finish=4 us, post=3 us",
+         pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, finish=4 us, post=3 us, \
+         ui_poll=0 us, ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, \
+         ui_stack=1 us, ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us",
         "an empty period must still carry the session maximum, or a console \
          ring that dropped the bad tick reads as a run with no bad frame",
     );
@@ -1667,6 +1701,7 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
     let worst = crate::frame_ledger::WorstFrame {
         service: 600,
         segments: [100; 6],
+        ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
         interact: true,
     };
     let worst_line = super::frame_worst_line(Some(worst), None);
