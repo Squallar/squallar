@@ -2755,6 +2755,8 @@ var by_kind = {};
 var transport = null;
 var uploads_all = [];
 var rasters_all = [];
+var cmdstream_all = [];
+var cmdstream_unparsed = null;
 var off_re = /([A-Za-z0-9_-]+) took (\d+) ms off the frame/;
 var rayon_re = /rayon: (\d+) threads/;
 // The LAST match wins, not the first: `worker_port::account` logs RUNNING
@@ -2781,6 +2783,15 @@ var rasters_re = /overlay rasters: (\d+) dispatched, (\d+) arrived, (\d+) pictur
 // `whole` is a routing subset of `blocking` (a whole delta moves through a
 // blocking write_texture on the frame's own queue); the GPU total is the
 // disjoint pair staged + blocking. Never add whole to anything.
+// `command stream:` is a COUNT line, not a timing family -- it deliberately
+// does NOT wear the `frame ` prefix that
+// `every_frame_line_family_the_app_writes_has_a_named_rig_probe` enumerates.
+// `last` is the most recent walk of the main pass; `per walk` divides the
+// running totals by `walks`. Scene D's frames are BIMODAL (the ground path
+// issues one callback per tile-mesh run, so some frames carry the basemap and
+// some carry none) -- never average the two, solve the mixture.
+var cmdstream_re = /command stream: last (\d+) primitives \((\d+) mesh, (\d+) callback, (\d+) skipped\), (\d+) draws, (\d+) calls; splits (\d+) clip, (\d+) texture, (\d+) callback, (\d+) mergeable; (\d+) resets, (\d+) scissors \((\d+) repeat\), (\d+) bind groups \((\d+) repeat\), (\d+) buffer binds; per walk (\d+) primitives, (\d+) calls over (\d+) walks/;
+var cmdstream_loose_re = /command stream: last \d+ primitives/;
 var uploads_re = /texture uploads: (\d+) deltas, (\d+) B to the GPU, (\d+) B whole, (\d+) bands, (\d+) B staged, (\d+) B blocking/;
 // A THIRD denominator, and it is added to neither of the two above. These
 // count archive tile BODIES DECODED, split by the archive header's declared
@@ -2938,6 +2949,22 @@ for (var i = 0; i < C.length; i++) {
                               picture_bytes: rasters.picture_bytes,
                               inked: rasters.inked, shown: rasters.shown });
   else if (rasters_loose_re.test(m)) rasters_unparsed = m;
+  var cm = cmdstream_re.exec(m);
+  if (cm) cmdstream_all.push({ t: C[i].t,
+                               primitives: parseInt(cm[1], 10), meshes: parseInt(cm[2], 10),
+                               callbacks: parseInt(cm[3], 10), skipped: parseInt(cm[4], 10),
+                               draws: parseInt(cm[5], 10), calls: parseInt(cm[6], 10),
+                               split_clip: parseInt(cm[7], 10), split_texture: parseInt(cm[8], 10),
+                               split_callback: parseInt(cm[9], 10), split_none: parseInt(cm[10], 10),
+                               resets: parseInt(cm[11], 10),
+                               scissor_sets: parseInt(cm[12], 10), scissor_repeats: parseInt(cm[13], 10),
+                               bind_group_sets: parseInt(cm[14], 10), bind_group_repeats: parseInt(cm[15], 10),
+                               buffer_binds: parseInt(cm[16], 10),
+                               per_walk_primitives: parseInt(cm[17], 10),
+                               per_walk_calls: parseInt(cm[18], 10), walks: parseInt(cm[19], 10) });
+  // Present but unparseable is NOT the same answer as absent: a line whose
+  // shape moved must say so rather than read as a binary too old to emit it.
+  else if (cmdstream_loose_re.test(m)) cmdstream_unparsed = m;
   var um = uploads_re.exec(m);
   if (um) {
     uploads = { deltas: parseInt(um[1], 10),
@@ -3023,6 +3050,7 @@ return { attached: attached, different: different, off_frame: off_frame,
          off_frame_by_kind: by_kind, rayon_threads: rayon,
          transport: transport, rasters: rasters, uploads: uploads,
          uploads_all: uploads_all, rasters_all: rasters_all,
+         cmdstream_all: cmdstream_all, cmdstream_unparsed: cmdstream_unparsed,
          basemap: basemap, ground: ground, floor: floor,
          tile_cache: tile_cache, tile_cache_all: tile_cache_all,
          tile_bodies: tile_bodies,
@@ -3593,6 +3621,7 @@ class RunningTotalsWatcher:
         self.basemap = {}
         self.uploads = {}
         self.rasters = {}
+        self.cmdstream = {}
 
     def poll(self):
         sig = self.session.execute(WORKER_SIGNAL_PROBE) or {}
@@ -3606,13 +3635,15 @@ class RunningTotalsWatcher:
             self.uploads[r.get("t")] = r
         for r in sig.get("rasters_all") or []:
             self.rasters[r.get("t")] = r
+        for r in sig.get("cmdstream_all") or []:
+            self.cmdstream[r.get("t")] = r
         return sig
 
     def readings(self, family, role=None):
         """Every reading of `family` (optionally of one `role`), oldest first."""
         source = {"tile_cache": self.tile_cache, "ground": self.ground,
                   "basemap": self.basemap, "uploads": self.uploads,
-                  "rasters": self.rasters}[family]
+                  "rasters": self.rasters, "cmdstream": self.cmdstream}[family]
         rs = [r for r in source.values() if role is None or r.get("role") == role]
         rs.sort(key=lambda r: r.get("t") or 0)
         return rs
