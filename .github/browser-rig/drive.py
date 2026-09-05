@@ -7136,6 +7136,14 @@ def run_smoke(args):
         result["overlay_raster_all"] = sorted(
             (r for r in getattr(totals_watch, "rasters", {}).values()
              if r.get("t") is not None), key=lambda r: r["t"])
+        # The command-stream census: collected by the watcher exactly like the
+        # family above, and until this line NEVER SERIALIZED -- an artifact key
+        # that is absent (not empty) was collected and dropped here. It is a
+        # COUNT of recorded commands, so a software arm is valid for it.
+        result["command_stream_all"] = sorted(
+            (r for r in getattr(totals_watch, "cmdstream", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
+        result["command_stream_unparsed"] = _sig.get("cmdstream_unparsed")
         gw = gesture_window_stats(frames_watch, args.quiet_window,
                                   args.window_skip_loops)
         if gw is not None:
