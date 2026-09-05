@@ -254,7 +254,7 @@ pub const MRMS_DOMAIN_LON: std::ops::RangeInclusive<f64> = -130.0..=-60.0;
 /// mosaic was 98,000,000 B to hold 49,000,000 B of information. The store is
 /// [`GridValues::Scaled`](crate::render::gridded::GridValues::Scaled) now and
 /// this figure follows it.
-pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * std::mem::size_of::<u16>();
+pub const CONUS_GRID_BYTES: usize = 7000 * 3500 * crate::render::gridded::ScaledU16::ELEMENT_BYTES;
 
 /// How many bytes of decoded MRMS grid may stay resident at once: **two grids
 /// on every arm** — never fewer than the layer has products, which the
@@ -336,9 +336,20 @@ const _: () = assert!(GRID_CACHE_BYTES >= MrmsProduct::all().len() * CONUS_GRID_
 const _: () = assert!(GRID_CACHE_BYTES >= CONUS_GRID_BYTES);
 // And a whole number of grids, which is what the doc above claims.
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(CONUS_GRID_BYTES));
-// **The width gate.** A store that silently went back to `f32` — or a budget
-// restated in the old width — fails the BUILD here rather than showing up as a
-// doubled census figure nobody was looking at.
+// **The width gate, which until this commit gated nothing.** It claimed a store
+// that went back to `f32` "fails the BUILD here"; it did not, and could not.
+// The constant was `7000 * 3500 * size_of::<u16>()` — a literal width, not the
+// store's — so its value did not depend on the store at all. Measured on this
+// tree with `ScaledCode` narrowed to a byte and this spelling left in place:
+// every other width pin in the crate fired and THIS ONE STAYED GREEN, holding
+// 49,000,000 for a 24,500,000 B grid. That is the same defect, in the same
+// shape, as `GLOBAL_GRID_BYTES` pricing four bytes a point after GMGSI narrowed
+// to one.
+//
+// Read through `ScaledU16::ELEMENT_BYTES` the gate is real, and the two terms
+// are pinned APART so a failure names which one moved: the store's element, or
+// the product of it and the shape.
+const _: () = assert!(crate::render::gridded::ScaledU16::ELEMENT_BYTES == 2);
 const _: () = assert!(CONUS_GRID_BYTES == 49_000_000);
 
 /// How many grids a single pane that cycles selections keeps warm — the
@@ -437,9 +448,12 @@ pub const FRAME_STAGING_BYTES: usize = CONUS_GRID_BYTES;
 // cache carries the same floor, and the same reason it is a **build** failure.
 const _: () = assert!(FRAME_STAGING_BYTES >= CONUS_GRID_BYTES);
 // The retained buffer is sized in points off this budget, so a budget that is
-// not a whole number of `f32` would silently round the staging grid down and
-// make every mosaic decode miss the pool.
-const _: () = assert!(FRAME_STAGING_BYTES.is_multiple_of(std::mem::size_of::<u16>()));
+// not a whole number of STORED CODES would silently round the staging grid down
+// and make every mosaic decode miss the pool. The reason said `f32` while the
+// check said `u16`; both now name the store's own element, which is the only
+// width that makes the sentence true.
+const _: () =
+    assert!(FRAME_STAGING_BYTES.is_multiple_of(crate::render::gridded::ScaledU16::ELEMENT_BYTES));
 
 /// **What one frame listing found**, carried back to `apply_frame_listing` as
 /// its scope.
