@@ -1075,19 +1075,20 @@ impl OverlayHandler for GlmHandler {
         vec![FetchTask {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
-                // Clone the cache out so we don't hold a std::sync::Mutex across await
-                let mut local_cache = cache.snapshot();
-                let result = crate::glm::fetch::fetch_glm_flashes(
+                // The snapshot/write-back pair lives with the cache
+                // (`glm::fetch::poll_glm_into_store`), which is where the
+                // reason for it — no `std::sync::Mutex` across an `await` —
+                // and its residency cost are both documented.
+                let result = crate::glm::fetch::poll_glm_into_store(
+                    &cache,
                     &client,
                     &sources,
                     &satellites,
                     &levels,
-                    &mut local_cache,
                     as_of,
                     depicted,
                 )
                 .await;
-                cache.replace(local_cache);
                 Box::new(GlmFetchResult(result)) as FetchPayload
             }),
         }]
@@ -1389,9 +1390,13 @@ impl OverlayHandler for GlmHandler {
     /// the memo parks (`overlay parked`), the rasters made from them (the
     /// overlay picture family) and the textures those became (the GPU's) —
     /// the same exclusions `MrmsHandler::resident_source_bytes` lists. Nor the
-    /// whole-cache clone a poll makes for the length of its future: that is a
-    /// local of the future rather than something the store is holding, and it
-    /// doubles this figure while a poll runs.
+    /// cache clone a poll makes for the length of its future: that is a local
+    /// of the future rather than something the store is holding. It used to
+    /// **double** this figure while a poll ran; since the granule rows moved
+    /// behind an `Arc` the clone is the granule map alone (a `String` key and
+    /// a table slot each, kilobytes at the cap) and does not scale with the
+    /// flash count — `tests/glm_poll_peak.rs` measures the peak at the
+    /// allocator.
     fn resident_source_bytes(&self) -> u64 {
         self.cache.retained_bytes() as u64
     }

@@ -18,7 +18,27 @@ use squallar_netcdf::cf;
 
 #[derive(Clone)]
 struct CachedGranule {
-    flashes: Vec<GlmFlash>,
+    /// **Behind an `Arc`, which is what makes [`GlmStore::snapshot`] a map of
+    /// handles rather than a second copy of the rows.**
+    ///
+    /// A poll may not hold a `std::sync::Mutex` across an `await`, so it works
+    /// on a clone of the whole `GlmCache` and writes it back — see
+    /// [`poll_glm_into_store`]. With the rows owned inline that clone was a
+    /// second `Vec<GlmFlash>` per granule, resident for the whole poll (list,
+    /// download **and** parse) rather than momentarily, so the peak was
+    /// **twice** [`GlmCache::retained_bytes`]: 6,681,600 B at the shipped
+    /// default posture and 24,000,000 B at [`MAX_RETAINED_FLASHES`]. Shared,
+    /// the clone is the `HashMap`'s table and one `String` key per granule —
+    /// kilobytes at the ~16 granules the cap holds, and it does not scale with
+    /// the flash count at all.
+    ///
+    /// **Sharing is sound because a granule's rows are immutable once built.**
+    /// `entries` is private to this module and every writer of it
+    /// ([`GlmCache::insert`], [`GlmCache::evict_before`],
+    /// [`GlmCache::evict_oldest_over`]) replaces or removes a **whole**
+    /// granule; nothing anywhere takes a `&mut Vec<GlmFlash>` out of one, so
+    /// no copy-on-write door is needed and none is offered.
+    flashes: std::sync::Arc<Vec<GlmFlash>>,
     newest: NaiveDateTime,
 }
 
@@ -29,7 +49,10 @@ impl CachedGranule {
             .map(|f| f.time)
             .max()
             .unwrap_or(granule_start);
-        CachedGranule { flashes, newest }
+        CachedGranule {
+            flashes: std::sync::Arc::new(flashes),
+            newest,
+        }
     }
 }
 
@@ -147,7 +170,7 @@ impl GlmCache {
     }
 
     pub fn all_flashes(&self) -> impl Iterator<Item = &GlmFlash> {
-        self.entries.values().flat_map(|g| &g.flashes)
+        self.entries.values().flat_map(|g| g.flashes.iter())
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
@@ -239,12 +262,22 @@ impl GlmStore {
     }
 
     /// A clone of the cache, for a poll that must not hold a `std::sync::Mutex`
-    /// across an `await`.
+    /// across an `await`. See [`poll_glm_into_store`] for what the poll then
+    /// does with it.
     ///
-    /// **This doubles the store for the length of a poll** — up to a second
-    /// 12,000,000 B — and it is the clone the fetch path has always made. It is
-    /// not in [`Self::retained_bytes`], which is a level of what the *store*
-    /// holds; the copy is a local of the poll's future and is priced nowhere.
+    /// **A map of handles, not a second copy of the rows.** Each granule's
+    /// `Vec<GlmFlash>` sits behind an `Arc` (see `CachedGranule`), so this
+    /// allocates the `HashMap`'s table and one `String` key per granule and
+    /// shares every row with the store. It used to clone the rows as well,
+    /// which put a second [`Self::retained_bytes`] on the heap for the whole
+    /// length of a poll — list, download and parse — and made the peak
+    /// 6,681,600 B at the shipped default posture and 24,000,000 B at
+    /// [`MAX_RETAINED_FLASHES`].
+    ///
+    /// What this costs is still not in [`Self::retained_bytes`], which is a
+    /// level of what the *store* holds; it is a local of the poll's future and
+    /// is priced nowhere. It no longer scales with the flash count, which is
+    /// what made it worth pricing.
     pub fn snapshot(&self) -> GlmCache {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -254,6 +287,46 @@ impl GlmStore {
     pub fn replace(&self, cache: GlmCache) {
         self.with_mut(|held| *held = cache);
     }
+}
+
+/// **One poll of the archive, against the shared store** — the
+/// snapshot/write-back pair, spelled in the module that owns the cache rather
+/// than inline in `GlmHandler::create_fetch_tasks`.
+///
+/// **What the copy is for, and what it is not for.** A `std::sync::MutexGuard`
+/// may not be held across an `await`, so the poll works on a clone and writes
+/// it back. That is the whole of it: the write-back is **unconditional**, so a
+/// round that errors at the listing still installs whatever the local copy
+/// reached — the old cache is *not* a rollback and nothing here treats it as
+/// one. What the shape does guarantee is that a future **dropped** before it
+/// completes leaves the store untouched, because [`GlmStore::replace`] is the
+/// last thing it does. Both properties are the ones the inline spelling had.
+///
+/// The rows are shared with the store for the length of the poll rather than
+/// copied (see `CachedGranule`), so the peak is one
+/// [`GlmCache::retained_bytes`] plus the granule map, not two of them.
+pub async fn poll_glm_into_store(
+    store: &GlmStore,
+    client: &reqwest::Client,
+    sources: &DataSources,
+    satellites: &[GlmSatellite],
+    levels: &[GlmDataLevel],
+    as_of: NaiveDateTime,
+    depicted: Residency,
+) -> Result<GlmFetchOutcome, FetchError> {
+    let mut local_cache = store.snapshot();
+    let result = fetch_glm_flashes(
+        client,
+        sources,
+        satellites,
+        levels,
+        &mut local_cache,
+        as_of,
+        depicted,
+    )
+    .await;
+    store.replace(local_cache);
+    result
 }
 
 fn cache_granules(

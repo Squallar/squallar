@@ -3152,3 +3152,165 @@ fn a_retained_row_costs_its_size_of_and_the_cap_is_that_times_the_ceiling() {
         "the ceiling `MAX_RETAINED_FLASHES` documents, in bytes",
     );
 }
+
+// ── The store round trip: what a poll leaves behind, row for row ────────────
+
+/// **A successful poll's cache contents, against the parser's own output.**
+///
+/// The poll works on a clone of the cache and writes it back
+/// ([`poll_glm_into_store`]), and that clone's granule rows are *shared* with
+/// the store rather than copied. Sharing is only sound while a granule's rows
+/// are immutable once built, so this pins the property that would break first
+/// if they ever were not: every row the store holds after a poll is exactly
+/// what [`parse_glm_netcdf`] produced from that granule's bytes, in that order,
+/// beside a granule the poll did not touch.
+///
+/// The oracle is the parser run directly on the same bytes, not a hand-copied
+/// float: what is under test is that the cache stores the parse **verbatim**,
+/// and a pinned literal would only say the parser has not moved.
+#[test]
+fn a_successful_poll_holds_each_granules_rows_exactly_as_the_parser_made_them() {
+    use crate::render::overlay_state::{FetchConfig, OverlayHandler, PaneRef};
+
+    let as_of = chrono::NaiveDate::from_ymd_opt(2020, 6, 15)
+        .unwrap()
+        .and_hms_opt(8, 0, 0)
+        .unwrap();
+    // Three granules inside the live pane's 300 s window, each with its own
+    // position so a granule swapped for another's rows is visible.
+    let downloaded: Vec<(NaiveDateTime, f32, f32)> = (0..3)
+        .map(|i| {
+            (
+                as_of - TimeDelta::seconds(60 + 20 * i),
+                35.0 + i as f32,
+                -97.0 - i as f32,
+            )
+        })
+        .collect();
+    let bucket: Vec<(String, Vec<u8>)> = downloaded
+        .iter()
+        .map(|&(start, lat, lon)| (granule_key(start), one_flash_granule(start, lat, lon)))
+        .collect();
+    let (sources, _seen) = s3_archive(bucket.clone());
+
+    // A granule already resident under a key the bucket does not list, so the
+    // poll neither refetches nor evicts it: the arm that proves a write-back
+    // carries the untouched granules through as well as the new ones.
+    let held_start = as_of - TimeDelta::seconds(200);
+    let held_key = granule_key(held_start);
+    let held_row = loop_flash_at(41.0, -101.0, held_start + TimeDelta::seconds(5));
+
+    let handler = sweep_handler();
+    handler
+        .cache
+        .with_mut(|cache| cache.insert(held_key.clone(), held_start, vec![held_row]));
+
+    let config = FetchConfig {
+        client: loopback_client(),
+        zone_cache_dir: None,
+        sources,
+        viewport: None,
+        as_of,
+        depicted_span_secs: None,
+        depicted_frames: Vec::new(),
+    };
+    let mut tasks = handler.create_fetch_tasks(&config, &PaneRef::bare(0));
+    assert_eq!(tasks.len(), 1, "GLM builds exactly one poll task");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(tasks.remove(0).future);
+
+    handler.cache.with_mut(|cache| {
+        let mut want: Vec<String> = bucket.iter().map(|(k, _)| k.clone()).collect();
+        want.push(held_key.clone());
+        want.sort();
+        assert_eq!(
+            cached_keys(cache),
+            want,
+            "the poll must hold the three it downloaded and the one it already \
+             had, and nothing else",
+        );
+
+        for (key, bytes) in &bucket {
+            let expected = parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+                .expect("the fixture parses")
+                .records;
+            assert!(
+                !expected.is_empty(),
+                "premise: {key} must parse to at least one row, or the \
+                 comparison below is of two empty lists",
+            );
+            let got = &cache.entries[key.as_str()].flashes;
+            assert_eq!(got.len(), expected.len(), "{key} row count");
+            for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.lat, b.lat, "{key} row {i} lat");
+                assert_eq!(a.lon, b.lon, "{key} row {i} lon");
+                assert_eq!(a.energy, b.energy, "{key} row {i} energy");
+                assert_eq!(a.area, b.area, "{key} row {i} area");
+                assert_eq!(a.time, b.time, "{key} row {i} time");
+                assert_eq!(a.satellite, b.satellite, "{key} row {i} satellite");
+                assert_eq!(a.level, b.level, "{key} row {i} level");
+            }
+        }
+
+        let kept = &cache.entries[held_key.as_str()].flashes;
+        assert_eq!(kept.len(), 1, "the resident granule kept its one row");
+        assert_eq!(kept[0].lat, 41.0);
+        assert_eq!(kept[0].lon, -101.0);
+        assert_eq!(kept[0].time, held_start + TimeDelta::seconds(5));
+
+        assert_eq!(
+            cache.retained_bytes(),
+            cache.flash_count() * super::FLASH_BYTES,
+            "the maintained level must agree with a walk after a real poll's \
+             write-back",
+        );
+    });
+}
+
+/// **The rows a granule holds are shared, not copied, when the cache is
+/// cloned** — the property the poll's whole peak figure rests on, asserted at
+/// the pointer rather than at a byte total.
+///
+/// `GlmStore::snapshot` is a `GlmCache::clone`, and the poll holds that clone
+/// for the length of its future. If a clone ever deep-copied the rows again,
+/// this goes red without needing an allocator: `tests/glm_poll_peak.rs`
+/// measures the consequence, this names the mechanism.
+#[test]
+fn cloning_the_cache_shares_the_granule_rows_rather_than_copying_them() {
+    let start = chrono::NaiveDate::from_ymd_opt(2020, 6, 15)
+        .unwrap()
+        .and_hms_opt(8, 0, 0)
+        .unwrap();
+    let store = GlmStore::default();
+    let key = granule_key(start);
+    store.with_mut(|cache| {
+        cache.insert(
+            key.clone(),
+            start,
+            (0..64)
+                .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i)))
+                .collect(),
+        );
+    });
+
+    let copy = store.snapshot();
+    // Compared at the ROW's address rather than through `Arc::ptr_eq`, so this
+    // still compiles against a cache that owns its rows inline and goes red
+    // there instead of failing to build — a tamper that cannot compile the
+    // test proves nothing about the test.
+    let shared = store.with_mut(|held| {
+        std::ptr::eq(
+            &held.entries[key.as_str()].flashes[0],
+            &copy.entries[key.as_str()].flashes[0],
+        )
+    });
+    assert!(
+        shared,
+        "a cache clone must share each granule's rows; a second `Vec` per \
+         granule is what put a whole second `retained_bytes` on the heap for \
+         the length of every poll",
+    );
+}
