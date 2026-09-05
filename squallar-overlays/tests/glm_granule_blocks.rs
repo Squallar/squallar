@@ -465,22 +465,15 @@ fn a_dispatch_after_a_poll_rebuilds_the_rows_and_the_counter_sees_it() {
     );
 }
 
-/// **What the memo keeps alive, which is not nothing.**
+/// Six polls, each dispatched, measured as the net of one window — so what
+/// the window leaves behind is what the layer now holds.
 ///
-/// The memoised value is a built row set, not a handle onto something the hit
-/// map already holds, so the layer's resident bytes grow by it: one live row
-/// set for the current generation, plus the one row set a rollover parks for
-/// a discard seam that has no production drainer yet. Both are `Arc`s over a
-/// single block of `FlashPaint`, and the rollover *replaces* the parked slot
-/// rather than pushing to it, so the parked half is one row set at steady
-/// state and not one per poll.
-///
-/// Measured as the net of a poll-and-dispatch window — everything allocated
-/// inside it, so what the window leaves behind is what the layer now holds.
-/// The claim under test is **flat, not small**: the fourth and fifth polls
-/// must leave no more behind than the second did.
-#[test]
-fn the_memo_keeps_a_bounded_number_of_row_sets_however_many_polls_land() {
+/// `drain` decides whether the app's per-frame drain runs inside the window.
+/// It is the production caller's own call — `OverlayRegistry::take_retired`
+/// is what `Gui::ui_phased` invokes at the end of every frame — and the batch
+/// is dropped inside the window as well, because the free is the thing being
+/// measured.
+fn six_polls_net(drain: bool) -> (i64, Vec<i64>) {
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(&known::LIGHTNING, true, &mut PaneMut::bare(0));
     let pane = PaneRef::bare(0);
@@ -491,15 +484,81 @@ fn the_memo_keeps_a_bounded_number_of_row_sets_however_many_polls_land() {
         let ((), _allocs, _frees, taken, handed_back) = blocks_during(|| {
             registry.apply_fetch_result(a_granule(FLASHES), &pane);
             drop(registry.prepare_job(&known::LIGHTNING, &a_ctx(7.0), &pane));
+            if drain {
+                drop(registry.take_retired());
+            }
         });
         let net = taken as i64 - handed_back as i64;
         cumulative += net;
         per_poll.push(net);
     }
+    (cumulative, per_poll)
+}
+
+/// **What the layer holds once the drain is wired, which is the live row set
+/// and nothing behind it.**
+///
+/// The memoised value is a built row set rather than a handle onto something
+/// the hit map already holds, so it is real residency: 40 bytes a flash for
+/// the current generation. What a rollover retires — the previous granule's
+/// slab and the previous row set — goes to the park slot, and the app's
+/// per-frame drain files it against the worker's discard pool, so at steady
+/// state it is resident for about a frame rather than for a poll interval.
+///
+/// The budget is therefore the 48-byte slab row plus ONE 40-byte paint row
+/// set. Measured against `the_park_is_bounded_even_when_nothing_drains_it`
+/// below, which is the same six polls with the drain switched off.
+#[test]
+fn a_drained_poll_leaves_the_live_row_set_and_nothing_behind_it() {
+    let (cumulative, per_poll) = six_polls_net(true);
 
     println!(
-        "resident after 6 polls, each dispatched: {cumulative} bytes over \
-         {FLASHES} flashes = {:.1} bytes per flash; per-poll net {per_poll:?}",
+        "resident after 6 drained polls, each dispatched: {cumulative} bytes \
+         over {FLASHES} flashes = {:.1} bytes per flash; per-poll net \
+         {per_poll:?}",
+        cumulative as f64 / FLASHES as f64,
+    );
+    let row = std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>() as i64;
+    for (i, net) in per_poll.iter().enumerate().skip(1) {
+        assert!(
+            *net < FLASHES as i64 * row / 2,
+            "poll {} left {net} bytes behind over {FLASHES} flashes; with the \
+             drain running every poll past the first must leave nothing, and \
+             half a row set ({} bytes) is a park the drain did not collect",
+            i + 1,
+            FLASHES as i64 * row / 2,
+        );
+    }
+    assert!(
+        cumulative < FLASHES as i64 * 100,
+        "the layer holds {cumulative} bytes over {FLASHES} flashes ({:.1} per \
+         flash) after six drained polls. The budget is the 48-byte slab row \
+         plus ONE 40-byte paint row set, which is 88 per flash; 128 is the \
+         figure with the memo's parked half still resident",
+        cumulative as f64 / FLASHES as f64,
+    );
+}
+
+/// **And what it holds if the drain never runs**, which is the bound that
+/// makes the park safe rather than a leak.
+///
+/// The park slot is SINGLE on both halves: a rollover *replaces* what is
+/// parked rather than pushing to it, freeing the older value inline — which
+/// is exactly what happened before the seam existed. So an undrained layer
+/// settles at one extra generation, not one per poll, and the claim under
+/// test is **flat, not small**: the fourth and fifth polls must leave no more
+/// behind than the third did.
+///
+/// This arm is what the drained figure above is a measurement *against*: same
+/// binary, same fixture, same window, one call different.
+#[test]
+fn the_park_is_bounded_even_when_nothing_drains_it() {
+    let (cumulative, per_poll) = six_polls_net(false);
+
+    println!(
+        "resident after 6 undrained polls, each dispatched: {cumulative} \
+         bytes over {FLASHES} flashes = {:.1} bytes per flash; per-poll net \
+         {per_poll:?}",
         cumulative as f64 / FLASHES as f64,
     );
     let row = std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>() as i64;
@@ -508,18 +567,17 @@ fn the_memo_keeps_a_bounded_number_of_row_sets_however_many_polls_land() {
             *net < FLASHES as i64 * row / 2,
             "poll {} left {net} bytes behind over {FLASHES} flashes; past the \
              first two the residency must be flat, and a poll that keeps half \
-             a row set ({} bytes) is the memo growing with the poll count \
-             rather than holding a bounded number of row sets",
+             a row set ({} bytes) is a park that grows with the poll count \
+             rather than holding one generation",
             i + 1,
             FLASHES as i64 * row / 2,
         );
     }
     assert!(
-        cumulative < FLASHES as i64 * 160,
-        "the layer holds {cumulative} bytes over {FLASHES} flashes ({:.1} per \
-         flash) after six polls. The budget is the 48-byte slab row plus at \
-         most two 40-byte paint row sets — the live one and the parked one — \
-         which is 128 per flash",
+        cumulative < FLASHES as i64 * 208,
+        "an undrained layer holds {cumulative} bytes over {FLASHES} flashes \
+         ({:.1} per flash). The bound is the live slab and row set plus ONE \
+         parked generation of each — 48 + 40 twice over, 176 per flash",
         cumulative as f64 / FLASHES as f64,
     );
 }

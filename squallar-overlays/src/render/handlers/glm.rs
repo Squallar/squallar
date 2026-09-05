@@ -420,7 +420,13 @@ impl FailureKind {
 impl GlmHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`: the
+            // two are set together, so a park always has a drain. A granule
+            // is one block of up to ~6 MB and freeing it can return pages to
+            // the system rather than move a pointer, so the SIZE is what
+            // makes it worth moving off the frame thread — the count
+            // argument, one `dealloc`, would say the opposite.
+            state: OverlayState::parked(),
             flash_memo: crate::render::signature_memo::BuiltMemo::new(
                 crate::render::footprint::glm_flash_rows,
             ),
@@ -971,6 +977,34 @@ impl OverlayHandler for GlmHandler {
                 self.state.record_failure(&e);
             }
         }
+    }
+
+    /// **No pane draws this layer, so its granule goes** — parked for the
+    /// discard seam, not freed here. See [`OverlayHandler::release_data`].
+    fn release_data(&mut self) -> bool {
+        if !self.state.release_data() {
+            return false;
+        }
+        // The rows were built from the slab that just went away, and nothing
+        // dispatches this layer any more, so no later `get_or_build` would
+        // ever see a new generation and retire them.
+        self.flash_memo.retire_live_rows();
+        true
+    }
+
+    /// The granule this layer's state parked and the paint rows its memo
+    /// retired, handed back for the app to free off the frame thread — see
+    /// [`OverlayHandler::take_retired`].
+    ///
+    /// Both halves matter here and they retire on different passes: the slab
+    /// retires at DELIVERY, where `install` replaces it, and the rows retire
+    /// at the next DISPATCH that sees the new generation. A drain on either
+    /// path alone would find the other empty every time.
+    fn take_retired(&self) -> Vec<Box<dyn Any + Send>> {
+        crate::render::overlay_state::retired_batch(
+            self.state.take_retired(),
+            self.flash_memo.take_retired(),
+        )
     }
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>, _pane: &PaneRef<'_>) {

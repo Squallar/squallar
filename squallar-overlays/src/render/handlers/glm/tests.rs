@@ -1942,6 +1942,151 @@ fn a_poll_rebuilds_the_flash_rows_once_and_parks_the_old_ones() {
     );
 }
 
+// ── The retirement seam ──────────────────────────────────────────────────
+
+/// One poll's payload, for a test that installs several in a row. `lat_base`
+/// only makes successive granules distinguishable.
+fn a_granule(n: usize, lat_base: f64) -> FetchPayload {
+    let base = item(GlmDataLevel::Flash, Some(1e-14), None).flash;
+    Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+        flashes: (0..n)
+            .map(|i| GlmFlash {
+                lat: lat_base + i as f64 * 0.01,
+                ..base
+            })
+            .collect(),
+        dead_feeds: Vec::new(),
+        queried: vec![GlmSatellite::GoesEast],
+        parse_failures: None,
+        transport_failures: None,
+        level_failures: Vec::new(),
+        evaluated_levels: vec![(GlmSatellite::GoesEast, GlmDataLevel::Flash)],
+        listing_failures: Vec::new(),
+        window_gaps: Vec::new(),
+        record_drops: Default::default(),
+    })))
+}
+
+/// A poll and the dispatch that follows it, the pair the seam is shaped
+/// around: the granule retires at the delivery, the rows at the dispatch.
+fn poll_and_dispatch(handler: &mut GlmHandler, n: usize, lat_base: f64) {
+    handler.apply_fetch_result(a_granule(n, lat_base), &PaneRef::across(&[]));
+    drop(handler.prepare_job(&memo_ctx(7.0, false, memo_clock()), &PaneRef::bare(0)));
+}
+
+/// **Both halves reach the drain, and they are the granule and the rows.**
+///
+/// `take_retired` returning *something* would be satisfied by either half
+/// alone, and the two retire on different passes — the slab where `install`
+/// replaces it, the rows at the next `get_or_build` that sees the new
+/// generation — so a seam wired to one pass only would pass a length check
+/// and move half the bytes. Hence the downcasts: what the app files must be
+/// the granule and the row set, and getting here at all is the proof that
+/// each is `Any + Send` and borrows nothing from the handler.
+#[test]
+fn a_poll_hands_the_drain_both_the_granule_and_the_rows() {
+    let mut handler = a_handler_holding(6);
+    drop(handler.prepare_job(&memo_ctx(7.0, false, memo_clock()), &PaneRef::bare(0)));
+    // The session's first install replaced an empty default, which owns
+    // nothing and is freed inline; drain whatever it left so the claim below
+    // is about a rollover.
+    drop(handler.take_retired());
+
+    poll_and_dispatch(&mut handler, 9, 40.0);
+    let retired = handler.take_retired();
+
+    assert_eq!(
+        retired.len(),
+        2,
+        "a rollover retires the previous granule AND the rows built from it; \
+         {} payload(s) reached the drain",
+        retired.len(),
+    );
+    assert!(
+        retired.iter().any(|value| value
+            .downcast_ref::<Arc<GlmSlab>>()
+            .is_some_and(|slab| slab.len() == 6)),
+        "the previous granule's slab must be one of the payloads",
+    );
+    assert!(
+        retired.iter().any(|value| value
+            .downcast_ref::<Arc<Vec<rasterize::FlashPaint>>>()
+            .is_some_and(|rows| rows.len() == 6)),
+        "the previous granule's built paint rows must be the other",
+    );
+    assert!(
+        handler.take_retired().is_empty(),
+        "a drained slot must stay drained: handing the same batch out twice \
+         is handing out a promise to free something already freed",
+    );
+}
+
+/// **Polls do not accumulate.** Every poll retires exactly one granule and
+/// one row set, the drain takes both, and the memo's own parked figure is
+/// back at zero before the next poll lands — so six polls hold what one does.
+#[test]
+fn draining_every_poll_leaves_the_park_slot_at_nothing() {
+    let mut handler = a_handler_holding(50);
+    drop(handler.prepare_job(&memo_ctx(7.0, false, memo_clock()), &PaneRef::bare(0)));
+    drop(handler.take_retired());
+
+    let mut moved = Vec::new();
+    for poll in 0..6 {
+        poll_and_dispatch(&mut handler, 50, 33.0 + poll as f64);
+        assert!(
+            handler.flash_memo.parked_bytes() > 0,
+            "poll {poll}: the rollover must have parked the previous rows, or \
+             the drain below is collecting nothing",
+        );
+        moved.push(handler.take_retired().len());
+        assert_eq!(
+            handler.flash_memo.parked_bytes(),
+            0,
+            "poll {poll}: the drain must empty the memo's slot, not read it",
+        );
+    }
+    assert_eq!(
+        moved,
+        vec![2; 6],
+        "every poll retires one granule and one row set and no poll retires a \
+         backlog; the drain moved {moved:?}",
+    );
+}
+
+/// **The layer switched off**, which is the other way its data retires: no
+/// pane draws it, so the granule goes — to the seam, not to a free here — and
+/// the live rows go with it, because nothing will dispatch this layer again
+/// to notice they are stale.
+#[test]
+fn releasing_the_layer_hands_the_granule_and_the_live_rows_to_the_seam() {
+    let mut handler = a_handler_holding(12);
+    drop(handler.prepare_job(&memo_ctx(7.0, false, memo_clock()), &PaneRef::bare(0)));
+    drop(handler.take_retired());
+
+    assert!(handler.release_data(), "there was a granule to release");
+    let retired = handler.take_retired();
+    assert_eq!(
+        retired.len(),
+        2,
+        "the released granule and the rows built from it both go to the seam",
+    );
+    assert!(
+        retired.iter().any(|value| value
+            .downcast_ref::<Arc<Vec<rasterize::FlashPaint>>>()
+            .is_some_and(|rows| rows.len() == 12)),
+        "the built rows must go too: nothing dispatches this layer any more, \
+         so no later build would ever retire them",
+    );
+    assert!(
+        handler.state.data.is_empty(),
+        "the layer must actually be empty afterwards",
+    );
+    assert!(
+        !handler.release_data(),
+        "a second release has nothing to give",
+    );
+}
+
 /// **Why the view half of the key is zero, derived rather than copied.**
 ///
 /// Every pane-selected term that can change which flashes exist — the

@@ -100,6 +100,116 @@ fn the_frames_drain_carries_out_a_replaced_generation() {
     );
 }
 
+// ── The lightning layer, whose two halves retire on different passes ─────
+
+const LIGHTNING: squallar_source::id::LayerId = squallar_source::id::known::LIGHTNING;
+
+/// One GLM poll's granule. Small: what is under test is which passes retire
+/// what, and the byte figures live in `glm_granule_blocks.rs`.
+fn a_granule(n: usize, lat_base: f64) -> OverlayFetchResult {
+    let time = chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+        .expect("a real date")
+        .and_hms_opt(12, 0, 0)
+        .expect("a real time");
+    let flashes: Vec<squallar_overlays::glm::GlmFlash> = (0..n)
+        .map(|i| squallar_overlays::glm::GlmFlash {
+            lat: lat_base + i as f64 * 0.01,
+            lon: -97.0 + i as f64 * 0.01,
+            energy: Some(1e-14),
+            area: None,
+            time,
+            satellite: squallar_overlays::glm::GlmSatellite::GoesEast,
+            level: squallar_overlays::glm::GlmDataLevel::Flash,
+        })
+        .collect();
+    OverlayFetchResult {
+        kind: LIGHTNING,
+        data: Box::new(squallar_overlays::glm::GlmFetchResult(Ok(
+            squallar_overlays::glm::GlmFetchOutcome {
+                flashes,
+                dead_feeds: Vec::new(),
+                queried: vec![squallar_overlays::glm::GlmSatellite::GoesEast],
+                parse_failures: None,
+                transport_failures: None,
+                level_failures: Vec::new(),
+                evaluated_levels: Vec::new(),
+                listing_failures: Vec::new(),
+                window_gaps: Vec::new(),
+                record_drops: squallar_overlays::glm::RecordDrops::default(),
+            },
+        ))),
+    }
+}
+
+/// **What the app does between frames**, spelled here because this crate's
+/// frame does not do it: `App::spawn_overlay_render` asks the layer for a job
+/// once per surviving overlay request, and that dispatch is the pass on which
+/// the previous generation's built rows retire.
+fn dispatch(h: &mut InputHarness) {
+    let ctx = squallar_overlays::render::overlay_state::RasterizeContext {
+        is_dark: false,
+        zoom: 7.0,
+        device_scale: 1.0,
+        now: chrono::Utc::now().naive_utc(),
+        as_of: chrono::Utc::now().naive_utc(),
+        frame: None,
+    };
+    drop(
+        h.gui_mut()
+            .overlays
+            .prepare_job(&LIGHTNING, &ctx, &PaneRef::bare(0)),
+    );
+}
+
+/// **The lightning layer's granule AND its built rows leave on the frame.**
+///
+/// The two retire on different passes — the slab where the poll's `install`
+/// replaces it, the rows on the next dispatch that sees the new generation —
+/// so this is the case a drain wired to either pass alone gets half right.
+/// The assertion is the count the frame moved, which is zero on a tree where
+/// this layer does not park.
+#[test]
+fn the_frames_drain_carries_out_a_lightning_granule_and_its_paint_rows() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&LIGHTNING);
+    h.warm_up();
+
+    h.gui_mut()
+        .overlays
+        .apply_fetch_result(a_granule(6, 33.0), &PaneRef::bare(0));
+    dispatch(&mut h);
+    h.frame();
+    // The first install replaced an empty default, which owns nothing and is
+    // freed inline, so what that frame carried is at most the built rows.
+    let opening = h.last_retired();
+    assert!(
+        opening <= 1,
+        "an opening poll retires no granule, moved {opening}",
+    );
+
+    h.gui_mut()
+        .overlays
+        .apply_fetch_result(a_granule(9, 40.0), &PaneRef::bare(0));
+    dispatch(&mut h);
+    h.frame();
+    assert_eq!(
+        h.last_retired(),
+        2,
+        "the replaced granule and the rows built from it must both reach the \
+         frame's drain; it moved {} payload(s)",
+        h.last_retired(),
+    );
+
+    // And polls do not accumulate: a frame after a drained one finds nothing,
+    // so the app is not handed the same batch twice.
+    h.frame();
+    assert_eq!(
+        h.last_retired(),
+        0,
+        "a drained slot must stay drained until something else retires",
+    );
+}
+
 /// The drain is on the **frame**, so it keeps running with no fetch traffic at
 /// all — and finds nothing, which is the honest answer and not a failure.
 #[test]
