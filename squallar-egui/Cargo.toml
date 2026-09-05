@@ -163,7 +163,7 @@ pmtiles = { workspace = true, features = ["http-async"] }
 # the browser's event loop and `reqwest` becomes `fetch()`, which also means the
 # browser's trust store rather than anything shipped in the artifact.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen-futures = "=0.4.77"
+wasm-bindgen-futures = "=0.4.78"
 
 [dev-dependencies]
 # `image` moved to `[dependencies]` when the terrain hillshade landed: the
