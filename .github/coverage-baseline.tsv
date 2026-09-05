@@ -7,8 +7,8 @@ nexrad-level3/src/model/radial.rs	86	85
 nexrad-level3/src/model/symbology.rs	5	5
 squallar-alloc/src/lib.rs	63	62
 squallar-app/src/app.rs	1591	1169
-squallar-app/src/app_chunks.rs	220	133
-squallar-app/src/app_fetch.rs	1942	1611
+squallar-app/src/app_chunks.rs	220	124
+squallar-app/src/app_fetch.rs	1942	1633
 squallar-app/src/app_render.rs	3905	3250
 squallar-app/src/app_state.rs	77	0
 squallar-app/src/budget_arms.rs	17	17
@@ -86,7 +86,7 @@ squallar-egui/src/terrain.rs	234	216
 squallar-egui/src/tile_mesh.rs	278	241
 squallar-egui/src/tile_mesh/ledger.rs	77	46
 squallar-egui/src/tile_mesh/stroke.rs	225	218
-squallar-egui/src/tile_source.rs	1541	1476
+squallar-egui/src/tile_source.rs	1541	1475
 squallar-egui/src/tile_source/byte_lru.rs	272	271
 squallar-egui/src/tile_source/cache_ledger.rs	178	138
 squallar-egui/src/tile_source/snap.rs	157	157
@@ -237,8 +237,8 @@ squallar-radar/src/azimuth.rs	191	191
 squallar-radar/src/beam.rs	33	33
 squallar-radar/src/catalogue.rs	174	160
 squallar-radar/src/chunk_feed.rs	271	257
-squallar-radar/src/chunk_notify.rs	402	370
-squallar-radar/src/chunks.rs	975	750
+squallar-radar/src/chunk_notify.rs	402	367
+squallar-radar/src/chunks.rs	975	743
 squallar-radar/src/current.rs	117	116
 squallar-radar/src/derive.rs	320	307
 squallar-radar/src/dpprep.rs	1022	956
@@ -264,7 +264,7 @@ squallar-radar/src/render/polar.rs	264	260
 squallar-radar/src/render_input.rs	663	633
 squallar-radar/src/sampler.rs	573	553
 squallar-radar/src/sampler/seam_fixture.rs	178	167
-squallar-radar/src/scan.rs	374	212
+squallar-radar/src/scan.rs	374	211
 squallar-radar/src/scan_size.rs	30	30
 squallar-radar/src/site_position.rs	81	81
 squallar-radar/src/sites.rs	801	799
