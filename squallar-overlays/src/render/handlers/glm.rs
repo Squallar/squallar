@@ -15,8 +15,8 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::Surface;
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayState,
-    PopupContent, PopupSection, RasterizeContext, RenderMode,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, HitItems, HitResolve, OverlayHandler,
+    OverlayItem, OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize;
 use squallar_source::id::{LayerId, known};
@@ -135,6 +135,54 @@ fn round_coverage(outcome: &GlmFetchOutcome) -> crate::fetch_policy::DataComplet
         unit: "satellite feeds",
         part_unit: "granules",
         reasons,
+    }
+}
+
+/// **One poll's flashes, in one heap block.**
+///
+/// Every other field of a `GlmFlash` is a scalar, so a granule is a flat run of
+/// rows and wants to be stored as one. It used to be stored as one
+/// `Arc<GlmFlashItem>` per flash, built at `apply_fetch_result` so that
+/// [`GlmHandler::hit_items`] could hand the list over as pointers. At the
+/// ~125,000 flashes a busy 20 s poll delivers, that is ~125,000 allocations
+/// every poll, and ~125,000 frees on the frame thread when the next poll's
+/// assignment drops the previous granule — to keep a list of which one click
+/// reads exactly one element.
+///
+/// The rows own themselves and the handle carries no lifetime, so this is a
+/// value the handler can hand back to be dropped somewhere other than the
+/// frame thread, and it is exactly what `OverlayState::install`'s assignment
+/// replaces.
+#[derive(Debug, Default)]
+pub(crate) struct GlmSlab {
+    pub flashes: Vec<GlmFlash>,
+}
+
+impl GlmSlab {
+    fn len(&self) -> usize {
+        self.flashes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.flashes.is_empty()
+    }
+}
+
+/// **A click's own item, and no others.** `index` is the row's position, which
+/// is the id the rasterizer recorded, so the item a cell names is one bounds
+/// check and one allocation rather than one of a pre-built 125,000.
+impl HitResolve for GlmSlab {
+    fn len(&self) -> usize {
+        self.flashes.len()
+    }
+
+    fn get(&self, index: usize) -> Option<Arc<dyn OverlayItem>> {
+        self.flashes.get(index).map(|flash| {
+            Arc::new(GlmFlashItem {
+                flash: *flash,
+                index,
+            }) as Arc<dyn OverlayItem>
+        })
     }
 }
 
@@ -296,7 +344,7 @@ impl GlmPaneState {
 }
 
 pub(crate) struct GlmHandler {
-    pub state: OverlayState<Vec<Arc<GlmFlashItem>>, Assembled>,
+    pub state: OverlayState<Arc<GlmSlab>, Assembled>,
     /// **The registry's own copy**, used only where no pane is supplied. The
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
@@ -407,12 +455,13 @@ impl GlmHandler {
             flashes: self
                 .state
                 .data
+                .flashes
                 .iter()
-                .map(|i| rasterize::FlashPaint {
-                    lat: i.flash.lat,
-                    lon: i.flash.lon,
-                    time: i.flash.time,
-                    energy: i.flash.energy,
+                .map(|f| rasterize::FlashPaint {
+                    lat: f.lat,
+                    lon: f.lon,
+                    time: f.time,
+                    energy: f.energy,
                 })
                 .collect(),
             zoom: ctx.zoom,
@@ -867,13 +916,15 @@ impl OverlayHandler for GlmHandler {
                 self.report_failures(FailureKind::Parse, outcome.parse_failures);
                 self.report_failures(FailureKind::Transport, outcome.transport_failures);
                 self.report_level_failures(&outcome.evaluated_levels, outcome.level_failures);
-                let items = outcome
-                    .flashes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, flash)| Arc::new(GlmFlashItem { flash, index: i }))
-                    .collect();
-                self.state.set_data_with_coverage(items, coverage);
+                // **The granule's own `Vec`, moved**: the parse already
+                // allocated it, so installing a poll asks the allocator for
+                // the one `Arc` around it and nothing else.
+                self.state.set_data_with_coverage(
+                    Arc::new(GlmSlab {
+                        flashes: outcome.flashes,
+                    }),
+                    coverage,
+                );
             }
             Err(e) => {
                 // A failed fetch says nothing about feed liveness, so leave the
@@ -908,21 +959,23 @@ impl OverlayHandler for GlmHandler {
             .find(|row| row.label == "overlay/glm")
     }
 
-    /// Index-aligned with [`Self::paint_input`]'s rows: both iterate
-    /// `state.data` in order, so `hit_items()[i]` **is** the item whose flash
+    /// Index-aligned with [`Self::paint_input`]'s rows: both index the same
+    /// slab in order, so `hit_items().get(i)` **is** the item whose flash
     /// travelled at row `i` — the invariant
     /// [`rasterize::HitMap::from_cells`] zips on.
-    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
+    ///
+    /// **A handle, not a list.** The other two hit-map layers materialise one
+    /// item per row; this one hands over the slab and lets a click build its
+    /// own, so a dispatch costs one refcount bump instead of 125,000 pointers
+    /// copied out of a list that was itself 125,000 allocations to build. See
+    /// [`GlmSlab`].
+    fn hit_items(&self) -> Option<HitItems> {
         if self.state.data.is_empty() {
             return None;
         }
-        Some(
-            self.state
-                .data
-                .iter()
-                .map(|i| i.clone() as Arc<dyn OverlayItem>)
-                .collect(),
-        )
+        Some(HitItems::Slab(
+            Arc::clone(&self.state.data) as Arc<dyn HitResolve>
+        ))
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig, pane: &PaneRef<'_>) -> Vec<FetchTask> {

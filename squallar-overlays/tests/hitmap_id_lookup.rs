@@ -28,7 +28,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use squallar_overlays::render::overlay_state::{OverlayItem, PopupContent};
+use squallar_overlays::render::overlay_state::{HitItems, OverlayItem, PopupContent};
 use squallar_overlays::render::rasterize::{HitCells, HitMap};
 use squallar_source::id::{LayerId, known};
 
@@ -149,7 +149,11 @@ impl OverlayItem for Numbered {
     }
 }
 
-fn numbered(n: u32) -> Vec<Arc<dyn OverlayItem>> {
+/// The materialised arm, [`HitItems::Rows`] — the shape every hit-map layer but
+/// GLM lightning answers, and the one the byte figure below is about. The slab
+/// arm holds one handle and builds nothing until a click asks, so it is not
+/// measured here and could not be: there is no per-item cost to count.
+fn numbered(n: u32) -> HitItems {
     (0..n)
         .map(|i| Arc::new(Numbered(i)) as Arc<dyn OverlayItem>)
         .collect()

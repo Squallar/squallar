@@ -23,6 +23,7 @@ pub use squallar_source::handler::{
     PopupActionKind, PopupContent, PopupSection, RasterizeContext, RenderMode, Signed, SourceEvent,
     SourceHandler as OverlayHandler, Surface, TaskFuture,
 };
+pub use squallar_source::hit::{HitItems, HitResolve};
 
 /// What opens a layer-stack status line that is reporting a fault rather than a
 /// count — see [`OverlayRegistry::status_line`].
@@ -393,7 +394,7 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.job_codec())
     }
 
-    pub fn hit_items(&self, id: &LayerId) -> Option<Vec<Arc<dyn OverlayItem>>> {
+    pub fn hit_items(&self, id: &LayerId) -> Option<HitItems> {
         self.handler(id).and_then(|h| h.hit_items())
     }
 

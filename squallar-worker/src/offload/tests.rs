@@ -3517,26 +3517,29 @@ fn a_shuffled_id_map_names_the_wrong_item_and_the_probes_can_tell() {
         .expect("report 0 has cells of its own");
     let (u, v) = uv_of_cell(&wire_cells, *idx);
 
+    let first = items.get(0).expect("three reports seeded");
+    let last = items.get(items.len() - 1).expect("three reports seeded");
     let straight = HitMap::from_cells(wire_cells.clone(), &items);
     let hit = straight.hit_test(u, v);
     assert_eq!(hit.len(), 1, "the probe sits on one marker");
     assert!(
-        hit[0].matches(items[0].as_ref()),
+        hit[0].matches(first.as_ref()),
         "zipped in dispatch order, report 0's marker names report 0",
     );
 
-    let reversed: Vec<_> = items.iter().rev().cloned().collect();
-    let shuffled = HitMap::from_cells(wire_cells, &reversed);
+    let mut reversed: Vec<_> = items.iter().collect();
+    reversed.reverse();
+    let shuffled = HitMap::from_cells(wire_cells, &reversed.into());
     let wrong = shuffled.hit_test(u, v);
     assert_eq!(wrong.len(), 1, "the shuffle moves identity, not coverage");
     assert!(
-        !wrong[0].matches(items[0].as_ref()),
+        !wrong[0].matches(first.as_ref()),
         "the reversed zip still answered the right item, so these probes \
          could never catch an order mismatch and every identity assertion \
          in this file is vacuous",
     );
     assert!(
-        wrong[0].matches(items[items.len() - 1].as_ref()),
+        wrong[0].matches(last.as_ref()),
         "the reversed zip must answer exactly the mirrored item — anything \
          else means the probe is not reading the id space these tests think \
          it is",

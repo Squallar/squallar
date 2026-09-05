@@ -8,7 +8,7 @@ use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Tr
 use std::sync::Arc;
 
 use crate::nws::alert::AlertCategory;
-use crate::render::overlay_state::OverlayItem;
+use crate::render::overlay_state::{HitItems, OverlayItem};
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::reports::StormReportKind;
 use crate::types::OverlayFeature;
@@ -103,23 +103,23 @@ pub struct HitMap {
     ///
     /// This was a `HashMap<u32, Arc<dyn OverlayItem>>` whose keys were exactly
     /// `0..items.len()` — a dense range hashed with SipHash to find a slot the
-    /// index already named. `Vec::get` answers the same question with a bounds
-    /// check, so the whole build hashes nothing.
+    /// index already named. A positional lookup answers the same question with
+    /// a bounds check, so the whole build hashes nothing.
     ///
-    /// The clone gets cheaper too, but not free and not for that reason:
-    /// hashbrown's `Clone` never rehashes, it walks the control bytes and
-    /// clones each entry. What goes is the walk and the buckets' slack; the `n`
-    /// atomic increments the `Arc`s cost stay exactly as they were.
-    items: Vec<Arc<dyn OverlayItem>>,
+    /// A [`HitItems::Rows`] clone is that vector of pointers and one refcount
+    /// bump each; a [`HitItems::Slab`] clone is one refcount bump, and its
+    /// items are built by the handful a click actually names.
+    items: HitItems,
 }
 
 impl HitMap {
-    /// `items[i]` **must** be the item whose row travelled at position `i` of
-    /// the described input, because a cell records positions and nothing else.
-    pub fn from_cells(cells: HitCells, items: &[Arc<dyn OverlayItem>]) -> Self {
+    /// `items.get(i)` **must** answer the item whose row travelled at position
+    /// `i` of the described input, because a cell records positions and
+    /// nothing else.
+    pub fn from_cells(cells: HitCells, items: &HitItems) -> Self {
         Self {
             cells,
-            items: items.to_vec(),
+            items: items.clone(),
         }
     }
 
@@ -127,7 +127,7 @@ impl HitMap {
         self.cells
             .ids_at(u, v)
             .iter()
-            .filter_map(|id| self.items.get(*id as usize).cloned())
+            .filter_map(|id| self.items.get(*id as usize))
             .collect()
     }
 }

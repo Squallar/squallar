@@ -710,7 +710,7 @@ pub trait SourceHandler: Send {
     /// The `Arc<dyn OverlayItem>`s a hit-map kind's clicks resolve to,
     /// **index-aligned with the rows `prepare_job` describes**: build both from
     /// one iteration of one list, or a hover names the wrong report.
-    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
+    fn hit_items(&self) -> Option<crate::hit::HitItems> {
         None
     }
 

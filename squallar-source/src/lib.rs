@@ -11,6 +11,7 @@ pub mod draw;
 pub mod feature;
 pub mod fetch_policy;
 pub mod handler;
+pub mod hit;
 pub mod id;
 pub mod job;
 pub mod liveness;

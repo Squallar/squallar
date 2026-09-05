@@ -1028,9 +1028,7 @@ impl super::App {
         label: &'static str,
         width: u32,
         height: u32,
-        id_map: Option<
-            Vec<std::sync::Arc<dyn squallar_overlays::render::overlay_state::OverlayItem>>,
-        >,
+        id_map: Option<squallar_overlays::render::overlay_state::HitItems>,
         mut response: OverlayRenderResponse,
         sender: Sender<OverlayRenderResponse>,
         window: Option<crate::WindowRef>,

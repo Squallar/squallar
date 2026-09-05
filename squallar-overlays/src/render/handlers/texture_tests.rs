@@ -962,7 +962,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
         let items = handler.hit_items().expect("seeded");
         if let Some(input) = job.downcast_ref::<rasterize::MetarInput>() {
             assert_eq!(items.len(), input.obs.len(), "one item per row");
-            for (i, (row, item)) in input.obs.iter().zip(&items).enumerate() {
+            for (i, (row, item)) in input.obs.iter().zip(items.iter()).enumerate() {
                 let item = item
                     .as_any()
                     .downcast_ref::<super::metar::MetarItem>()
@@ -977,7 +977,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
             }
         } else if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
             assert_eq!(items.len(), input.reports.len(), "one item per row");
-            for (i, (row, item)) in input.reports.iter().zip(&items).enumerate() {
+            for (i, (row, item)) in input.reports.iter().zip(items.iter()).enumerate() {
                 let item = item
                     .as_any()
                     .downcast_ref::<super::reports::StormReportItem>()
@@ -997,7 +997,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
             }
         } else if let Some(input) = job.downcast_ref::<rasterize::GlmStrikesInput>() {
             assert_eq!(items.len(), input.flashes.len(), "one item per row");
-            for (i, (row, item)) in input.flashes.iter().zip(&items).enumerate() {
+            for (i, (row, item)) in input.flashes.iter().zip(items.iter()).enumerate() {
                 let item = item
                     .as_any()
                     .downcast_ref::<super::glm::GlmFlashItem>()

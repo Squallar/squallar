@@ -1861,12 +1861,12 @@ fn a_loop_sweeping_two_hours_draws_each_frames_own_strikes_not_the_polls() {
         cache.insert(
             g_early.clone(),
             day.and_hms_opt(6, 10, 0).unwrap(),
-            vec![flash_early.clone()],
+            vec![flash_early],
         );
         cache.insert(
             g_late.clone(),
             day.and_hms_opt(7, 40, 0).unwrap(),
-            vec![flash_late.clone()],
+            vec![flash_late],
         );
     }
 

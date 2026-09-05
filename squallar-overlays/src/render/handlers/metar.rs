@@ -441,7 +441,7 @@ impl OverlayHandler for MetarHandler {
     /// The items stay here, page-side, and never ride the wire — which is why
     /// the six fields the picture does not need can be dropped from it. A
     /// hover is answered from these, not from anything the worker decoded.
-    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
+    fn hit_items(&self) -> Option<crate::render::overlay_state::HitItems> {
         if self.state.data.is_empty() {
             return None;
         }

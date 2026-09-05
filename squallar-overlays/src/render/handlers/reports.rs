@@ -376,7 +376,7 @@ impl OverlayHandler for StormReportsHandler {
     /// Index-aligned with [`Self::paint_input`]'s rows: `hit_items()[i]` **is**
     /// the item whose report travelled at row `i` — the invariant
     /// [`rasterize::HitMap::from_cells`] zips on.
-    fn hit_items(&self) -> Option<Vec<Arc<dyn OverlayItem>>> {
+    fn hit_items(&self) -> Option<crate::render::overlay_state::HitItems> {
         if self.state.data.is_empty() {
             return None;
         }

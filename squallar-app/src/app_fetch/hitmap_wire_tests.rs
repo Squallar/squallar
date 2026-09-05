@@ -43,7 +43,7 @@ impl squallar_worker::offload::JobSink for RefusingPort {
 }
 
 /// The id_map argument's shape, named once for the deliver-level cases below.
-type IdMap = Option<Vec<Arc<dyn squallar_overlays::render::overlay_state::OverlayItem>>>;
+type IdMap = Option<squallar_overlays::render::overlay_state::HitItems>;
 
 fn described_label(job: &squallar_source::job::DescribedJob) -> &'static str {
     use squallar_overlays::render::rasterize as rz;
@@ -387,7 +387,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
         .hit_test((1.0 + 0.5) / 16.0, (2.0 + 0.5) / 12.0);
     assert_eq!(hit.len(), 1);
     assert!(
-        hit[0].matches(items[1].as_ref()),
+        hit[0].matches(items.get(1).expect("two rows seeded").as_ref()),
         "the zipped map must answer the item the cells name",
     );
 

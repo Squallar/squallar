@@ -61,7 +61,9 @@ impl GlmDataLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+/// **A flat row**: every field is a scalar, so a granule's flashes are one run
+/// of them and are stored as one — see `render::handlers::glm::GlmSlab`.
+#[derive(Debug, Clone, Copy)]
 pub struct GlmFlash {
     pub lat: f64,
     pub lon: f64,
