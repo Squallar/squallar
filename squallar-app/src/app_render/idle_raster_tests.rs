@@ -68,7 +68,15 @@ const MAX_TEXTURE_SIDE: usize = 16384;
 /// Frames spent letting the pipeline fill: dispatch, rasterize, arrive,
 /// promote, several times over. Generous, because what is asserted is what
 /// happens *after* it.
-const WARMUP_FRAMES: usize = 60;
+/// The ceiling on the warm-up drive in
+/// [`an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture`],
+/// which drives until every layer holds a picture rather than for a fixed
+/// count. Sixty frames is what an idle box needs; a loaded CI runner needs more
+/// of them for the same work, because the loop sleeps for a job that runs on
+/// another thread. This is a stall guard, not a budget: it is far past any
+/// observed cost, so a pipeline that has genuinely stopped still fails the
+/// floor below instead of hanging the suite.
+const WARMUP_FRAMES_MAX: usize = 3_000;
 
 /// Frames the pane is then left alone for. Nothing moves the map, the clock's
 /// layers, the theme or the data across any of them.
@@ -263,7 +271,15 @@ fn an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture() {
 
     let mut time = 100.0_f64;
     let mut warmed: Vec<LayerId> = Vec::new();
-    for _ in 0..WARMUP_FRAMES {
+    // **Driven until the pipeline has finished, not for a fixed count.** The
+    // refused job runs on its own thread and this loop sleeps for it, so a
+    // frame budget is a wall-clock budget wearing a counter's clothes: it holds
+    // on an idle box and fails on a loaded CI runner, where the same three
+    // layers land in the same order and simply take more frames to do it. What
+    // the floors below need is that the pipeline *finished*, so that is what is
+    // waited for, with a bound two orders of magnitude past the observed cost
+    // so a genuine stall still fails rather than hanging.
+    for _ in 0..WARMUP_FRAMES_MAX {
         time += 1.0 / 60.0;
         for id in one_frame(&mut app, &ctx, time) {
             if !warmed.contains(&id) {
@@ -273,6 +289,9 @@ fn an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture() {
         // The refused job runs on its own thread; give it the frame's worth of
         // wall time it would have had in the app before the next drain.
         std::thread::sleep(std::time::Duration::from_millis(2));
+        if layers_on_the_glass(&app).len() == seeded_layers().len() {
+            break;
+        }
     }
 
     assert!(
