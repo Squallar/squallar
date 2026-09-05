@@ -4,8 +4,8 @@
 //! `crate::staging::tests` holds the pool's invariants at a toy width; what is
 //! checked here is what only the instance can be wrong about — the two doors a
 //! raster leaves the layer by reach the slot, and a granule of the shape NOAA
-//! is publishing today is pooled rather than refused. 15,000,000 `f32` is
-//! 60 MB, so these allocate for real.
+//! is publishing today is pooled rather than refused. 15,000,000 `u8` is
+//! 15 MB, so these allocate for real.
 //!
 //! **Why a second width is here at all.** The committed fixture is 5000 wide
 //! and so was every assertion in this file, so a slot keyed on `3000 * 5000`
@@ -22,14 +22,14 @@ use squallar_source::product::FieldId;
 /// 2025-06 and 2026-07 granules are 5000 wide; the product moved.
 const PUBLISHED_NX: usize = 4999;
 const PUBLISHED_NY: usize = 3000;
-/// 14,997,000 points, 59,988,000 B — 12,000 B under [`STAGING_POINTS`], and
-/// the whole reason the pool reused nothing.
+/// 14,997,000 points, 14,997,000 B — 3,000 B under [`STAGING_POINTS`], and the
+/// whole reason the pool reused nothing.
 const PUBLISHED_POINTS: usize = PUBLISHED_NY * PUBLISHED_NX;
 
 /// A raster of `ny` x `nx` whose buffer is capacity-exact — what the decode
 /// hands over.
 fn grid_of(ny: usize, nx: usize) -> ResidentGrid {
-    let mut values: Vec<f32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
     values
         .try_reserve_exact(ny * nx)
         .expect("a mosaic buffer fits on a test host");
@@ -38,9 +38,9 @@ fn grid_of(ny: usize, nx: usize) -> ResidentGrid {
 
 /// The same, around a buffer the caller already has — so a test can follow one
 /// block out of the slot, through a raster, and back in.
-fn grid_from(mut values: Vec<f32>, ny: usize, nx: usize) -> ResidentGrid {
+fn grid_from(mut values: Vec<u8>, ny: usize, nx: usize) -> ResidentGrid {
     values.clear();
-    values.resize(ny * nx, 82.0);
+    values.resize(ny * nx, 82);
     ResidentGrid {
         field: FieldId::from_static("GmgsiLongwaveIr"),
         ni: nx,
@@ -49,7 +49,10 @@ fn grid_from(mut values: Vec<f32>, ny: usize, nx: usize) -> ResidentGrid {
             lat_axis: vec![0.0; ny],
             lon_axis: vec![0.0; nx],
         },
-        values: GridValues::F32(values),
+        values: GridValues::Bytes(
+            crate::render::gridded::ByteCodes::new(values, Vec::new())
+                .expect("a raster with no absent points is a byte store"),
+        ),
     }
 }
 
@@ -64,17 +67,22 @@ fn mosaic_grid() -> ResidentGrid {
 fn the_nominal_shape_prices_the_budgets_and_does_not_key_the_slot() {
     assert_eq!(STAGING_POINTS, 3000 * 5000);
     assert_eq!(global().nominal_points(), STAGING_POINTS);
-    // The handler's `GLOBAL_GRID_BYTES` is derived from the same constant and
-    // pinned to this figure at compile time, so what one resident channel is
-    // priced at and what the frame cache's budget allows cannot drift apart.
+    // **What the slot now holds**: one byte a point, because a GMGSI value is
+    // a byte reading. This is the figure every byte the layer parks is spent
+    // against, and `retained_bytes` derives from it.
+    assert_eq!(STAGING_POINTS * size_of::<u8>(), 15_000_000);
+    // **What the handler still prices it at**, unchanged by the narrowing:
+    // `GLOBAL_GRID_BYTES` is `GRID_POINTS * size_of::<f32>()` and is spelled in
+    // `render::handlers::gmgsi`, whose budgets are not this module's to move.
+    // The two differing by 4x is the budget over-provisioning, never
+    // under-counting — `GridValues::resident_bytes` reports the real 15 MB, so
+    // the caches evict against what the heap is carrying and not against this.
     assert_eq!(STAGING_POINTS * size_of::<f32>(), 60_000_000);
-    // And the figure the budget over-provisions by, stated so a later reader
-    // does not have to re-derive whether it matters: 0.02 % of one grid.
+    // And the figure the nominal shape over-provisions by against the width
+    // the product publishes, stated so a later reader does not have to
+    // re-derive whether it matters: 0.02 % of one grid, at either width.
     assert_eq!(STAGING_POINTS - PUBLISHED_POINTS, 3000);
-    assert_eq!(
-        (STAGING_POINTS - PUBLISHED_POINTS) * size_of::<f32>(),
-        12_000,
-    );
+    assert_eq!((STAGING_POINTS - PUBLISHED_POINTS) * size_of::<u8>(), 3_000);
 }
 
 /// **The shipping defect, at the width the product publishes.**
@@ -118,8 +126,8 @@ fn a_granule_at_the_width_the_product_publishes_is_pooled() {
     );
     assert_eq!(
         POOL.retained_bytes(),
-        PUBLISHED_POINTS * size_of::<f32>(),
-        "which is 59,988,000 B and not the nominal 60,000,000",
+        PUBLISHED_POINTS * size_of::<u8>(),
+        "which is 14,997,000 B and not the nominal 15,000,000",
     );
 
     let second = POOL
@@ -238,7 +246,7 @@ fn a_raster_another_reference_still_holds_is_declined_not_reclaimed() {
         0,
         "premise: a sole reference is reclaimed"
     );
-    assert_eq!(SOLE.retained_bytes(), STAGING_POINTS * size_of::<f32>());
+    assert_eq!(SOLE.retained_bytes(), STAGING_POINTS * size_of::<u8>());
 
     static SHARED: StagingPool = StagingPool::new(STAGING_POINTS);
     let grid = Arc::new(mosaic_grid());
@@ -255,11 +263,11 @@ fn a_raster_another_reference_still_holds_is_declined_not_reclaimed() {
          instead of pretending it recycled",
     );
     assert_eq!(SHARED.retained_bytes(), 0);
-    let GridValues::F32(kept) = &still_reading.values else {
-        panic!("the fixture's raster is f32");
+    let GridValues::Bytes(kept) = &still_reading.values else {
+        panic!("the fixture's raster is a byte store");
     };
     assert_eq!(
-        kept.capacity(),
+        kept.codes().len(),
         STAGING_POINTS,
         "and the reference that kept it alive still has its buffer",
     );

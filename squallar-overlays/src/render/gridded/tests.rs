@@ -219,3 +219,88 @@ fn a_raster_of_an_unregistered_field_paints_nothing() {
         "a field this build does not register was painted anyway",
     );
 }
+
+// -- The byte store's own invariants ----------------------------------------
+
+/// **An absent set the store cannot honour is refused, never accepted and
+/// half-read.**
+///
+/// `ByteCodes::new` is the boundary a wire head crosses — `WireValues`
+/// rebuilds a store from bytes another build wrote — so the three ways the set
+/// can be wrong are checked here rather than assumed of the sender. An
+/// unsorted list is the dangerous one: `value` reads it with `binary_search`,
+/// so an out-of-order entry answers "present" for a missing point on some
+/// samples and not others, which paints a hole as a reading with nothing
+/// anywhere to say so.
+#[test]
+fn a_byte_store_refuses_an_absent_set_it_could_not_read_back() {
+    let codes = || (0u8..16).collect::<Vec<u8>>();
+    assert!(
+        ByteCodes::new(codes(), vec![]).is_some(),
+        "control: an empty absent set is the ordinary case",
+    );
+    assert!(
+        ByteCodes::new(codes(), vec![0, 5, 15]).is_some(),
+        "control: an ascending set inside the codes is honoured",
+    );
+    assert!(
+        ByteCodes::new(codes(), vec![5, 0]).is_none(),
+        "an unsorted set would be read with `binary_search` and answer wrongly",
+    );
+    assert!(
+        ByteCodes::new(codes(), vec![5, 5]).is_none(),
+        "a repeated index is not a set",
+    );
+    assert!(
+        ByteCodes::new(codes(), vec![16]).is_none(),
+        "an index past the codes names a point that is not in this grid",
+    );
+    assert!(
+        ByteCodes::new(
+            (0u8..=255).cycle().take(MAX_ABSENT_POINTS + 1).collect(),
+            (0..=MAX_ABSENT_POINTS as u32).collect(),
+        )
+        .is_none(),
+        "past the bound the store declines rather than making every sample \
+         walk a longer list",
+    );
+}
+
+/// **A byte store reads back as the bytes it holds, and prices itself as what
+/// it holds.**
+#[test]
+fn a_byte_store_widens_exactly_and_prices_both_of_its_blocks() {
+    let store = ByteCodes::new(vec![0, 1, 200, 255, 42], vec![2]).expect("a valid store");
+    let values = GridValues::Bytes(store);
+    assert_eq!(values.get(0).unwrap().to_bits(), 0.0f32.to_bits());
+    assert_eq!(values.get(1).unwrap(), 1.0);
+    assert!(
+        values.get(2).unwrap().is_nan(),
+        "the absent point is missing"
+    );
+    assert_eq!(values.get(3).unwrap(), 255.0);
+    assert_eq!(values.get(4).unwrap(), 42.0);
+    assert_eq!(values.get(5), None, "past the end there is nothing to read");
+
+    // The iterator is the same answer as `get`, index for index — it walks by
+    // index rather than by code precisely because the absent point's code is
+    // an ordinary one.
+    let walked: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+    let indexed: Vec<u32> = (0..values.len())
+        .map(|k| values.get(k).unwrap().to_bits())
+        .collect();
+    assert_eq!(walked, indexed);
+    assert_eq!(values.iter().len(), 5, "and it states its own length");
+
+    assert_eq!(values.bytes_per_sample(), 1);
+    assert_eq!(
+        values.resident_bytes(),
+        5 + size_of::<u32>(),
+        "five codes and one absent index, both blocks priced",
+    );
+    assert_eq!(
+        values.stored_bytes(),
+        &[0, 1, 200, 255, 42],
+        "and what the transport lends is the codes alone",
+    );
+}

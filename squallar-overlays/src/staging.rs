@@ -292,7 +292,7 @@ impl<T: Copy> StagingPool<T> {
     /// same thing — the grid-sized block the slot is holding while nothing is
     /// decoding handed back to the allocator — and neither has to know the
     /// other exists or to have run first. Two sources retain a grid apiece
-    /// (GMGSI ~60 MB, MRMS 49 MB), so this is ~109 MB resident whether or not
+    /// (GMGSI 15 MB, MRMS 49 MB), so this is ~64 MB resident whether or not
     /// anything is decoding.
     ///
     /// `false` means nothing was released: the slot was empty, or —

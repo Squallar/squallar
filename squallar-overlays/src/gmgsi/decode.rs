@@ -96,8 +96,10 @@ pub fn decode(bytes: Vec<u8>, channel: GmgsiChannel) -> Result<GmgsiGrid, String
 /// 60,000,000 B per decode, measured.
 ///
 /// Then the raster: `data` lands straight in the slot's buffer through
-/// [`read_unpacked_f32_into`](squallar_netcdf::Granule::read_unpacked_f32_into),
-/// so no fresh raster-sized block is taken past the first granule. What
+/// [`read_unpacked_f32_to`](squallar_netcdf::Granule::read_unpacked_f32_to) and
+/// [`Narrowing`], one value at a time and at the width the values are — so no
+/// fresh raster-sized block is taken past the first granule, and no wide array
+/// exists at any point to be narrowed from. What
 /// remains, per steady-state granule, is **one** transient 60,000,000 B
 /// block — the stored bytes `hdf5_pure` assembles for `data` before decoding
 /// them — because its public API in 0.44 reads a dataset whole or by
@@ -140,15 +142,24 @@ pub fn decode_in(
         .and_then(|s| parse_coverage_start(&s))
         .ok_or_else(|| "GMGSI granule has no readable `time_coverage_start`".to_string())?;
 
-    // Read straight into the raster form. A missing point is NaN, which
-    // `render::gridded::color_for` already paints as fully transparent through
-    // its non-finite guard; encoding it as any in-domain number would paint it
-    // as that number.
-    let mut values = pool.take(points)?;
+    // Read straight into the raster form, narrowing on the way past. A
+    // missing point is NaN, which `render::gridded::color_for` already paints
+    // as fully transparent through its non-finite guard; encoding it as any
+    // in-domain number would paint it as that number — and on the byte arm
+    // every in-domain number is a real reading, which is why the absent points
+    // are a list beside the codes and not a code.
+    let mut values = Narrowing::new(pool.take(points)?, points);
     if let Err(e) = read_whole(&granule, "data", nj, ni, &mut values) {
         // A refused granule must not cost the slot its buffer.
-        pool.give(values);
+        pool.give(values.into_codes());
         return Err(e);
+    }
+    let (values, spare) = values.into_values()?;
+    if let Some(spare) = spare {
+        // The byte buffer the wide arm no longer needs, back to the slot
+        // rather than dropped: a granule this build cannot narrow must not
+        // also cost the next granule its retained block.
+        pool.give(spare);
     }
 
     Ok(GmgsiGrid {
@@ -158,20 +169,193 @@ pub fn decode_in(
             ni,
             nj,
             coords: GridCoords::Separable { lat_axis, lon_axis },
-            // **`F32`, and that is a fact about the source, not a default.**
-            // GMGSI's brightness values are genuinely `float` on disk, so the
-            // narrow arm MRMS takes would be a real quantisation here rather
-            // than the repacking it is there. Narrowing this needs its own
-            // losslessness proof or an explicit quality ruling.
-            values: crate::render::gridded::GridValues::F32(values),
+            values,
         },
         bounds,
         valid_time,
     })
 }
 
+/// **The mosaic as it is stored, decided value by value while it arrives.**
+///
+/// GMGSI is `float` on disk and its values are not floats: every one is an
+/// integer on the unit lattice in `0..=255` — measured over 24 real granules
+/// (20 study, 4 holdout) on all four channels and three dates, `n_fill = 0`
+/// and bit-exact on every one, and the variable's own `long_name` is "0-255
+/// Brightness Temperature". So the `f32` array is a fourfold widening of a
+/// byte source, and this narrows it back.
+///
+/// **The claim is proved per granule, not assumed from the corpus.** Every
+/// value passes [`code_of`], which asks the only question that matters — does
+/// this bit pattern survive a round trip through a byte — and a granule
+/// carrying one value that does not, or more absent points than
+/// [`MAX_ABSENT_POINTS`], becomes [`GridValues::F32`] whole, from the value
+/// that failed onward, in the same single pass. **Nothing is ever quantised
+/// and nothing is ever re-read**: the widening walks the codes already taken,
+/// which cost 15,000,000 B rather than the 60,000,000 B a read-wide-then-narrow
+/// design would have had to allocate before it could ask the question.
+struct Narrowing {
+    /// The codes so far. After a widening it is the emptied buffer waiting to
+    /// go back to the staging pool, so the slot keeps its block either way.
+    codes: Vec<u8>,
+    /// Indices into `codes` the file marked missing, strictly ascending
+    /// because they are pushed in the order they arrive.
+    absent: Vec<u32>,
+    /// `Some` from the first value that is not a byte code, or from the absent
+    /// point past the bound.
+    wide: Option<Vec<f32>>,
+    /// The element count [`squallar_netcdf::UnpackedSink::reserve`] stated.
+    count: usize,
+    /// A reservation this could not make. `push` has no error channel, so the
+    /// failure is carried to the end of the read rather than aborting inside
+    /// the allocator — the reason every reserve in this tree is fallible.
+    failed: Option<String>,
+}
+
+/// One stored value as the byte that stands for it, or `None` for a value no
+/// byte stands for.
+///
+/// **The round trip decides, never the cast.** `v as u8` is total and
+/// saturating — NaN gives 0, -1.0 gives 0, 300.0 gives 255 — so the cast alone
+/// would call all three a code; comparing bit patterns after widening back is
+/// what makes this exact. `-0.0` is refused for the same reason and by the
+/// same line: it is numerically zero but not zero's bit pattern.
+#[inline]
+fn code_of(v: f32) -> Option<u8> {
+    let code = v as u8;
+    (f32::from(code).to_bits() == v.to_bits()).then_some(code)
+}
+
+impl Narrowing {
+    fn new(codes: Vec<u8>, count: usize) -> Self {
+        Self {
+            codes,
+            absent: Vec::new(),
+            wide: None,
+            count,
+            failed: None,
+        }
+    }
+
+    /// Values stored so far, whichever arm holds them.
+    fn len(&self) -> usize {
+        match &self.wide {
+            Some(values) => values.len(),
+            None => self.codes.len(),
+        }
+    }
+
+    /// Start again from empty.
+    ///
+    /// One of the three `clear`s a staged buffer passes through — the pool's
+    /// on `give` and on `take` are the other two — so "the decode starts from
+    /// empty" does not rest on any one of them having run.
+    fn clear(&mut self) {
+        self.codes.clear();
+        self.absent.clear();
+        self.wide = None;
+        self.failed = None;
+    }
+
+    /// Take the wide arm, carrying every code already stored into it.
+    ///
+    /// The absent points become `NaN` there, which is what they read as on the
+    /// byte arm too — one meaning, two representations.
+    fn widen(&mut self) {
+        let mut values: Vec<f32> = Vec::new();
+        if values.try_reserve_exact(self.count).is_err() {
+            self.failed = Some(format!(
+                "GMGSI `data`: cannot widen {} values to f32 in this build's memory",
+                self.count
+            ));
+            return;
+        }
+        let mut absent = self.absent.iter().copied().peekable();
+        for (k, &code) in self.codes.iter().enumerate() {
+            if absent.peek() == Some(&(k as u32)) {
+                absent.next();
+                values.push(f32::NAN);
+            } else {
+                values.push(f32::from(code));
+            }
+        }
+        self.codes.clear();
+        self.absent.clear();
+        self.wide = Some(values);
+    }
+
+    /// The store, plus the byte buffer the wide arm left over for the pool.
+    fn into_values(self) -> Result<(crate::render::gridded::GridValues, Option<Vec<u8>>), String> {
+        use crate::render::gridded::{ByteCodes, GridValues};
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        match self.wide {
+            Some(values) => Ok((GridValues::F32(values), Some(self.codes))),
+            None => {
+                let absent = self.absent.len();
+                let codes = ByteCodes::new(self.codes, self.absent).ok_or_else(|| {
+                    format!("GMGSI `data` produced {absent} absent points this store cannot carry")
+                })?;
+                Ok((GridValues::Bytes(codes), None))
+            }
+        }
+    }
+
+    /// The byte buffer, whatever arm this ended on — the refusal path's way of
+    /// returning the slot's block.
+    fn into_codes(self) -> Vec<u8> {
+        self.codes
+    }
+}
+
+impl squallar_netcdf::UnpackedSink for Narrowing {
+    fn reserve(&mut self, count: usize) -> Result<(), String> {
+        // The buffer is the staging slot's and is already exactly this long;
+        // the reserve is a no-op that stays fallible for the granule whose
+        // shape the slot was not holding.
+        self.count = count;
+        self.codes
+            .try_reserve(count)
+            .map_err(|_| format!("cannot hold {count} values"))
+    }
+
+    #[inline]
+    fn push(&mut self, value: f32) {
+        if let Some(values) = &mut self.wide {
+            values.push(value);
+            return;
+        }
+        if self.failed.is_some() {
+            return;
+        }
+        // A missing point carries a code like any other — there is none to
+        // spare, all 256 being real readings somewhere in the product — so
+        // what records it is its index.
+        if value.is_nan() {
+            if self.absent.len() == crate::render::gridded::MAX_ABSENT_POINTS {
+                self.widen();
+                self.push(value);
+                return;
+            }
+            self.absent.push(self.codes.len() as u32);
+            self.codes.push(0);
+            return;
+        }
+        match code_of(value) {
+            Some(code) => self.codes.push(code),
+            None => {
+                self.widen();
+                self.push(value);
+            }
+        }
+    }
+}
+
 /// Read a whole `nj x ni` variable into `into`, which is emptied first and
 /// holds exactly `nj * ni` values afterwards or the read is refused.
+///
+/// `into` decides the width it stores them at; see [`Narrowing`].
 ///
 /// The count is checked against the shape the caller already established
 /// rather than trusted: a variable that declares one shape and delivers
@@ -181,11 +365,11 @@ fn read_whole(
     name: &str,
     nj: usize,
     ni: usize,
-    into: &mut Vec<f32>,
+    into: &mut Narrowing,
 ) -> Result<(), String> {
     into.clear();
     let read = granule
-        .read_unpacked_f32_into(name, into)?
+        .read_unpacked_f32_to(name, into)?
         .ok_or_else(|| format!("GMGSI granule has no `{name}` variable"))?;
     if read != nj * ni || into.len() != nj * ni {
         return Err(format!(

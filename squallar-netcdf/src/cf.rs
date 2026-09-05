@@ -218,6 +218,47 @@ pub struct UnpackedF32 {
     pub units: Option<String>,
 }
 
+/// **Where a variable's unpacked values go, one at a time.**
+///
+/// [`UnpackedF32`] is the whole array in one block; this is the same values
+/// without the block. A consumer that stores its raster **narrower than
+/// `f32`** — GMGSI's mosaic is a byte-valued brightness count, so the `f32`
+/// array is a fourfold widening of it — would otherwise have to take the
+/// 60,000,000 B array and narrow it afterwards, which allocates exactly the
+/// block the narrowing exists to remove. Through this it never exists.
+///
+/// **The value handed over is the value [`unpack_f32`] would have stored**,
+/// bit for bit: one code path produces both, so a consumer of this cannot see
+/// a different CF rule from a consumer of that. Missing is `NaN`, for the
+/// reason [`UnpackedF32`] gives.
+///
+/// Nothing about a *narrower* width is decided here. This crate knows NetCDF4
+/// and CF and does not know what a satellite is; whether a value fits in a
+/// byte is the caller's question about its own product, asked value by value
+/// on the way past.
+pub trait UnpackedSink {
+    /// The element count, stated **before** the first value arrives, so a
+    /// destination can size itself in one go rather than growing into a
+    /// mosaic. Called exactly once per read, and an `Err` refuses the read.
+    fn reserve(&mut self, count: usize) -> Result<(), String>;
+
+    /// One unpacked value, in order.
+    fn push(&mut self, value: f32);
+}
+
+/// The plain destination: the array itself, appended to.
+impl UnpackedSink for Vec<f32> {
+    fn reserve(&mut self, count: usize) -> Result<(), String> {
+        self.try_reserve(count)
+            .map_err(|_| format!("cannot hold {count} values"))
+    }
+
+    #[inline]
+    fn push(&mut self, value: f32) {
+        Vec::push(self, value);
+    }
+}
+
 /// Steps 3 to 5 of the rules at the top of this module, resolved once for a
 /// variable and then applied per element.
 ///

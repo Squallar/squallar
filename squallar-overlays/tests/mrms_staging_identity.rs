@@ -68,9 +68,9 @@ fn poisoned_mosaic() -> Vec<u16> {
 fn codes(grid: &MrmsGrid) -> &[u16] {
     match &grid.grid.values {
         GridValues::Scaled(scaled) => &scaled.codes,
-        GridValues::F32(_) => panic!(
+        GridValues::F32(_) | GridValues::Bytes(_) => panic!(
             "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
-             fell to the f32 arm, so it can never be staged through the pool",
+             fell to another arm, so it can never be staged through the pool",
         ),
     }
 }

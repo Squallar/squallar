@@ -51,17 +51,124 @@ pub struct ResidentGrid {
 /// (`mrms::decode::tests::every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars`
 /// pins that bit for bit over both shipped products and all 24.5 M points).
 ///
-/// **The boundary of that precedent matters as much as the precedent.** GMGSI
-/// is genuinely `float` on disk, so narrowing *it* would be a real quantisation
-/// and needs its own losslessness proof or an explicit quality ruling. HRRR is
-/// the same. Neither takes [`Self::Scaled`], and the arm is chosen from the
-/// granule's declared width rather than from which source is asking.
+/// **GMGSI's width is a fact about its VALUES, not about its storage.** It is
+/// `float` on disk with no `scale_factor`, so there is no declared width to
+/// read an arm off — and every value of it is an integer on the unit lattice
+/// in `0..=255`, which its own `long_name` says in as many words ("0-255
+/// Brightness Temperature"). The `f32` array is therefore a fourfold widening
+/// of a byte source exactly as MRMS's was of a 16-bit one, and [`Self::Bytes`]
+/// stores it back. The claim is not made about the product: `gmgsi::decode`
+/// proves it **per granule**, value by value, on the way past, and a granule
+/// that fails is decoded wide. HRRR takes neither arm.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridValues {
     /// One `f32` a point — what a source whose values really are floats holds.
     F32(Vec<f32>),
     /// One 16-bit code a point, plus the affine it is read back through.
     Scaled(ScaledU16),
+    /// One byte a point, read back as the byte's own value.
+    Bytes(ByteCodes),
+}
+
+/// **A byte a point, and the points that carry no reading.**
+///
+/// No affine, deliberately. `value = f32::from(code)` is the whole rule, which
+/// is what makes the round trip exact by inspection rather than by argument:
+/// `f32::from` is lossless for every `u8`, so a value that entered as a code
+/// leaves as the same bit pattern. A source needing a scale over bytes extends
+/// this then, with its own proof; inventing the operands now would put a
+/// multiply on the sampling path for nobody.
+///
+/// **Missing is a side list, not a code.** GMGSI declares
+/// `_FillValue = -9999` and all 256 codes are used by real data somewhere in
+/// the corpus, so no code may be spent as a sentinel. The absent points ride
+/// beside the codes instead, as their own indices — sorted, bounded by
+/// [`MAX_ABSENT_POINTS`], and empty on every granule the product has actually
+/// published (24 real granules, four channels, three dates: `n_fill = 0` on
+/// every one; the committed fixture plants exactly one).
+///
+/// Why indices and not a bit per point. A bitmask is 1,875,000 B against a
+/// 15,000,000 B mosaic and covers any number of absent points, but it is a
+/// *per-point* fact and the window cut on the wire is strided, so every job
+/// would have to repack a window's worth of bits **on the frame thread** where
+/// `JobRequest::to_bytes` runs. A bounded index set rides the head instead —
+/// the shape [`ScaledU16::nan_codes`] already established — and costs the
+/// encoder at most [`MAX_ABSENT_POINTS`] comparisons, so the zero-copy
+/// resident lend survives untouched. What that buys is paid for on the other
+/// side: a granule with more absent points than the bound takes
+/// [`GridValues::F32`] whole, at four times the bytes, priced honestly by
+/// [`GridValues::resident_bytes`] and visible in the memory census as the 60 MB
+/// it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ByteCodes {
+    codes: Vec<u8>,
+    absent: Vec<u32>,
+}
+
+/// How many absent points the byte arm will carry before it declines.
+///
+/// A `binary_search` of this many `u32` sits on the sampling path, so it is
+/// bounded rather than trusted — the reasoning [`MAX_NAN_CODES`] gives, at a
+/// bound six comparisons deep instead of a walk. The observed populations are
+/// zero (every real granule) and one (the fixture's plant); a granule with a
+/// genuine outage gap has thousands and is not a granule whose missing points
+/// are a small reserved set, so it takes [`GridValues::F32`] rather than making
+/// every sample pay for it.
+pub const MAX_ABSENT_POINTS: usize = 64;
+
+impl ByteCodes {
+    /// The byte arm, or `None` when `absent` is not a set this can carry:
+    /// longer than [`MAX_ABSENT_POINTS`], not strictly ascending, or naming a
+    /// point past the codes.
+    ///
+    /// Strictly ascending is checked rather than sorted-for: it is what
+    /// [`Self::value`]'s `binary_search` needs, and an unsorted list read off a
+    /// wire would otherwise answer "present" for a point that is missing —
+    /// silently, on some samples and not others.
+    pub fn new(codes: Vec<u8>, absent: Vec<u32>) -> Option<Self> {
+        if absent.len() > MAX_ABSENT_POINTS {
+            return None;
+        }
+        if !absent.windows(2).all(|w| w[0] < w[1]) {
+            return None;
+        }
+        if absent.last().is_some_and(|&k| k as usize >= codes.len()) {
+            return None;
+        }
+        Some(Self { codes, absent })
+    }
+
+    /// The codes, unwidened — what the transport lends and the wire writes.
+    #[inline]
+    pub fn codes(&self) -> &[u8] {
+        &self.codes
+    }
+
+    /// The points this grid holds no reading for, as indices into
+    /// [`Self::codes`], strictly ascending.
+    #[inline]
+    pub fn absent(&self) -> &[u32] {
+        &self.absent
+    }
+
+    /// Give the codes back — the door the staging pool's `give` is behind.
+    pub fn into_codes(self) -> Vec<u8> {
+        self.codes
+    }
+
+    /// The value at a flat index, or `None` past the end.
+    ///
+    /// `f32::from` widens exactly; the whole cost of the narrow store at a
+    /// sample is that call plus a `binary_search` of an **empty** slice on
+    /// every granule the product publishes.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<f32> {
+        let code = *self.codes.get(index)?;
+        if self.absent.binary_search(&(index as u32)).is_ok() {
+            return Some(f32::NAN);
+        }
+        Some(f32::from(code))
+    }
 }
 
 /// **GRIB2 simple packing, kept packed.**
@@ -178,6 +285,7 @@ impl GridValues {
         match self {
             Self::F32(v) => v.len(),
             Self::Scaled(s) => s.codes.len(),
+            Self::Bytes(b) => b.codes.len(),
         }
     }
 
@@ -192,6 +300,7 @@ impl GridValues {
         match self {
             Self::F32(v) => v.get(index).copied(),
             Self::Scaled(s) => s.get(index),
+            Self::Bytes(b) => b.get(index),
         }
     }
 
@@ -202,6 +311,7 @@ impl GridValues {
         match self {
             Self::F32(_) => size_of::<f32>(),
             Self::Scaled(_) => size_of::<u16>(),
+            Self::Bytes(_) => size_of::<u8>(),
         }
     }
 
@@ -211,7 +321,16 @@ impl GridValues {
     /// cache hold twice the granules while believing it was at budget.
     #[inline]
     pub fn resident_bytes(&self) -> usize {
+        // **Every block, not only the samples.** The byte arm's absent set is
+        // a second allocation beside the codes, and a figure that priced the
+        // codes alone would let a cache hold more than it believes it does —
+        // the same misreading a store that narrowed while this did not would
+        // produce. It is at most `MAX_ABSENT_POINTS * 4` = 256 B.
         self.len() * self.bytes_per_sample()
+            + match self {
+                Self::Bytes(b) => size_of_val(b.absent.as_slice()),
+                Self::F32(_) | Self::Scaled(_) => 0,
+            }
     }
 
     /// Every value in order — for the passes that read a whole grid once and
@@ -234,6 +353,11 @@ impl GridValues {
                 scaled: s,
                 codes: s.codes.iter(),
             },
+            // By index, not by code: on this arm a value is a function of
+            // *where* it sits — an absent point carries a code like any other
+            // and is missing all the same — so a walk over the codes alone
+            // could not tell the two apart.
+            Self::Bytes(b) => GridValuesIter::Bytes { bytes: b, next: 0 },
         }
     }
 
@@ -255,6 +379,10 @@ impl GridValues {
             Self::Scaled(s) => {
                 crate::hrrr::summarize_values_iter(s.codes.iter().map(|&c| s.value(c)), paints)
             }
+            Self::Bytes(b) => crate::hrrr::summarize_values_iter(
+                (0..b.codes.len()).map(|k| b.get(k).unwrap_or(f32::NAN)),
+                paints,
+            ),
         }
     }
 
@@ -278,6 +406,11 @@ impl GridValues {
         match self {
             Self::F32(v) => bytemuck::cast_slice(v),
             Self::Scaled(s) => bytemuck::cast_slice(&s.codes),
+            // Already bytes. The absent set is **not** here and must not be:
+            // this is what the transport lends by range, and a set of grid
+            // indices is not a range of samples. It rides the head instead,
+            // cut to the window — see `jobs::WireValues`.
+            Self::Bytes(b) => &b.codes,
         }
     }
 
@@ -286,6 +419,7 @@ impl GridValues {
         match self {
             Self::F32(v) => ValuesRef::F32(v),
             Self::Scaled(s) => ValuesRef::Scaled(s),
+            Self::Bytes(b) => ValuesRef::Bytes(b),
         }
     }
 }
@@ -298,6 +432,7 @@ impl GridValues {
 pub enum ValuesRef<'a> {
     F32(&'a [f32]),
     Scaled(&'a ScaledU16),
+    Bytes(&'a ByteCodes),
 }
 
 impl<'a> ValuesRef<'a> {
@@ -306,6 +441,7 @@ impl<'a> ValuesRef<'a> {
         match self {
             Self::F32(v) => v.len(),
             Self::Scaled(s) => s.codes.len(),
+            Self::Bytes(b) => b.codes.len(),
         }
     }
 
@@ -319,6 +455,7 @@ impl<'a> ValuesRef<'a> {
         match self {
             Self::F32(v) => v.get(index).copied(),
             Self::Scaled(s) => s.get(index),
+            Self::Bytes(b) => b.get(index),
         }
     }
 
@@ -327,6 +464,7 @@ impl<'a> ValuesRef<'a> {
         match self {
             Self::F32(_) => size_of::<f32>(),
             Self::Scaled(_) => size_of::<u16>(),
+            Self::Bytes(_) => size_of::<u8>(),
         }
     }
 
@@ -338,6 +476,7 @@ impl<'a> ValuesRef<'a> {
         match self {
             Self::F32(v) => v.get(range).map(bytemuck::cast_slice),
             Self::Scaled(s) => s.codes.get(range).map(bytemuck::cast_slice),
+            Self::Bytes(b) => b.codes.get(range),
         }
     }
 }
@@ -578,6 +717,10 @@ pub enum GridValuesIter<'a> {
         scaled: &'a ScaledU16,
         codes: std::slice::Iter<'a, u16>,
     },
+    Bytes {
+        bytes: &'a ByteCodes,
+        next: usize,
+    },
 }
 
 impl Iterator for GridValuesIter<'_> {
@@ -588,6 +731,11 @@ impl Iterator for GridValuesIter<'_> {
         match self {
             Self::F32(values) => values.next().copied(),
             Self::Scaled { scaled, codes } => codes.next().map(|&code| scaled.value(code)),
+            Self::Bytes { bytes, next } => {
+                let value = bytes.get(*next)?;
+                *next += 1;
+                Some(value)
+            }
         }
     }
 
@@ -596,6 +744,10 @@ impl Iterator for GridValuesIter<'_> {
         match self {
             Self::F32(values) => values.size_hint(),
             Self::Scaled { codes, .. } => codes.size_hint(),
+            Self::Bytes { bytes, next } => {
+                let left = bytes.codes.len() - next.min(&bytes.codes.len());
+                (left, Some(left))
+            }
         }
     }
 }

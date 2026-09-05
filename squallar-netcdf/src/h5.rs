@@ -249,6 +249,23 @@ impl Granule {
         name: &str,
         out: &mut Vec<f32>,
     ) -> Result<Option<usize>, String> {
+        self.read_unpacked_f32_to(name, out)
+    }
+
+    /// [`read_unpacked_f32_into`](Self::read_unpacked_f32_into) into any
+    /// [`UnpackedSink`] rather than into a `Vec<f32>` — **the same read, with
+    /// no array in the middle**.
+    ///
+    /// One body, so the two cannot come to apply different CF rules: the
+    /// `Vec<f32>` form above is this one over the sink `Vec<f32>` implements.
+    /// A caller whose store is narrower than `f32` takes this and narrows on
+    /// the way past; see [`UnpackedSink`] for why the difference is a
+    /// 60,000,000 B block rather than a style.
+    pub fn read_unpacked_f32_to(
+        &self,
+        name: &str,
+        out: &mut impl cf::UnpackedSink,
+    ) -> Result<Option<usize>, String> {
         let Some(var) = self.describe(name, DatasetAccessProperties::new())? else {
             return Ok(None);
         };
@@ -295,9 +312,11 @@ impl Granule {
                 attrs: var.attrs,
             };
             let unpacked = cf::unpack_f32(&raw, name);
-            out.try_reserve(unpacked.values.len())
-                .map_err(|_| format!("Variable {name}: cannot hold {count} values"))?;
-            out.extend_from_slice(&unpacked.values);
+            out.reserve(unpacked.values.len())
+                .map_err(|e| format!("Variable {name}: {e}"))?;
+            for value in &unpacked.values {
+                out.push(*value);
+            }
             return Ok(Some(unpacked.values.len()));
         };
 
@@ -312,8 +331,8 @@ impl Granule {
                 bytes.len()
             ));
         }
-        out.try_reserve(count)
-            .map_err(|_| format!("Variable {name}: cannot hold {count} values"))?;
+        out.reserve(count)
+            .map_err(|e| format!("Variable {name}: {e}"))?;
         for word in bytes.chunks_exact(size_of::<f32>()) {
             let word: [u8; 4] = word.try_into().expect("chunks_exact yields four bytes");
             let stored = if little {

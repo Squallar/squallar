@@ -1926,6 +1926,60 @@ impl GriddedInput {
         }
     }
 
+    /// **The points inside `win` that carry no reading**, as indices into the
+    /// window the encoder is about to write — `win.area()`-space, row-major,
+    /// the same space the payload's values are in.
+    ///
+    /// Empty for every store but the byte one, which is the only one whose
+    /// missing points are a property of *where* a value sits rather than of
+    /// the code it carries: `ScaledU16` reserves codes, and an `f32` says NaN
+    /// in the value itself. See `gridded::ByteCodes`.
+    ///
+    /// **Bounded work on the frame thread.** `JobRequest::to_bytes` runs at the
+    /// dispatch site, so this is at most `MAX_ABSENT_POINTS` divisions and
+    /// comparisons — no walk over the window, and nothing proportional to the
+    /// grid. A per-point representation of the same fact could not be cut to a
+    /// strided window without one.
+    ///
+    /// The order survives the cut: the indices arrive ascending, and both
+    /// spaces are row-major over the same rows, so the mapping is monotone —
+    /// which is what `ByteCodes::new` demands at the far end.
+    pub fn absent_in_window(&self, win: &IndexWindow) -> Vec<u32> {
+        // Where this store's index space starts, and how wide its rows are.
+        // A resident grid is indexed from the grid's own origin; a window that
+        // has already been cut is indexed from its own.
+        let (absent, i0, j0, stride) = match self {
+            Self::Resident(grid) => match grid.values.view() {
+                ValuesRef::Bytes(b) => (b.absent(), 0, 0, grid.ni),
+                ValuesRef::F32(_) | ValuesRef::Scaled(_) => return Vec::new(),
+            },
+            Self::Window(window) => match window.values.view() {
+                ValuesRef::Bytes(b) => (
+                    b.absent(),
+                    window.win.i0,
+                    window.win.j0,
+                    window.win.i1.saturating_sub(window.win.i0),
+                ),
+                ValuesRef::F32(_) | ValuesRef::Scaled(_) => return Vec::new(),
+            },
+            Self::Whole(_) => return Vec::new(),
+        };
+        if absent.is_empty() || win.is_empty() || stride == 0 {
+            return Vec::new();
+        }
+        let row_w = win.i1 - win.i0;
+        absent
+            .iter()
+            .filter_map(|&k| {
+                let k = k as usize;
+                let j = j0 + k / stride;
+                let i = i0 + k % stride;
+                (i >= win.i0 && i < win.i1 && j >= win.j0 && j < win.j1)
+                    .then(|| ((j - win.j0) * row_w + (i - win.i0)) as u32)
+            })
+            .collect()
+    }
+
     /// One row of `win`'s values as **stored bytes**, in the storage's own
     /// width — the shape the wire carries and the transport lends.
     ///

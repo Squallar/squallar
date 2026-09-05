@@ -57,9 +57,9 @@ use squallar_overlays::render::gridded::GridValues;
 fn staged(values: GridValues) -> Vec<u16> {
     match values {
         GridValues::Scaled(scaled) => scaled.codes,
-        GridValues::F32(_) => panic!(
+        GridValues::F32(_) | GridValues::Bytes(_) => panic!(
             "premise: a shipped MRMS granule decodes to 16-bit codes; this one \
-             fell to the f32 arm and can never be staged through the pool",
+             fell to another arm and can never be staged through the pool",
         ),
     }
 }

@@ -285,14 +285,15 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
 fn codes_capacity(values: &crate::render::gridded::GridValues) -> usize {
     match values {
         crate::render::gridded::GridValues::Scaled(scaled) => scaled.codes.capacity(),
-        crate::render::gridded::GridValues::F32(_) => {
-            panic!("a mosaic grid is stored as codes, not as f32")
+        crate::render::gridded::GridValues::F32(_)
+        | crate::render::gridded::GridValues::Bytes(_) => {
+            panic!("a mosaic grid is stored as 16-bit codes, not as f32 or bytes")
         }
     }
 }
 
 /// **The same lever the generic pool carries, so a memory governor's handle set
-/// covers this 49 MB too and not only GMGSI's 60 MB.**
+/// covers this 49 MB too and not only GMGSI's 15 MB.**
 ///
 /// MRMS keeps its own pool — `handlers::mrms` names this concrete type and
 /// calls `recycle`/`recycle_shared` on it as inherent methods, which a generic

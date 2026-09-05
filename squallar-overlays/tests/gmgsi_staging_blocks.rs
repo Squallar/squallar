@@ -21,7 +21,7 @@
 //!
 //! Measured on the committed granule, debug build, this counter, 2026-09-04:
 //!
-//! | | blocks of 60,000,000 B per decode |
+//! | | grid-sized blocks per decode |
 //! |---|---|
 //! | before (`833bad45`) | **91** |
 //! | pool + one handle per coordinate variable | 5 |
@@ -52,9 +52,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use squallar_overlays::gmgsi::{GmgsiChannel, decode, staging};
 
-/// Blocks at or above this are counted — below the 60,000,000 B payload, on
-/// purpose; see the header.
-const LARGE: usize = 32 * 1024 * 1024;
+/// Blocks at or above this are counted.
+///
+/// **12 MiB, down from 32.** The raster is 15,000,000 B now that a GMGSI value
+/// is stored as the byte it is, so a 32 MiB bar would stop counting the very
+/// block this gate is about — the first control's difference would read zero,
+/// which the control itself says is the reading of a broken instrument. The
+/// bar sits between everything a decode touches that is not a whole grid (a
+/// `data` chunk is 1 x 793 x 1322 `f32` = 4,193,384 B, a 256-row coordinate
+/// window 5,120,000 B, the committed granule's own bytes 533,762 B) and the
+/// 15,000,000 B raster. The reader's assembled `data` bytes are 60,000,000 B
+/// and are over both bars, which is why `READER_BLOCKS` is unmoved.
+const LARGE: usize = 12 * 1024 * 1024;
 
 static LARGE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 /// Off outside the measured window, so the fixture copy and the warm-up are
@@ -186,8 +195,9 @@ fn granules_decode_through_one_retained_mosaic_block() {
     evict(decode_granule());
     assert_eq!(
         staging::global().retained_bytes(),
-        staging::STAGING_POINTS * size_of::<f32>(),
-        "premise: the warm-up's raster is parked in the slot",
+        staging::STAGING_POINTS * size_of::<u8>(),
+        "premise: the warm-up's raster is parked in the slot, at the byte a \
+         point the decode stores it as",
     );
     assert_eq!(
         decode::axis_cache().totals(),
@@ -249,14 +259,19 @@ fn granules_decode_through_one_retained_mosaic_block() {
         "with the slot bypassed one decode must cost exactly one more block \
          than a pooled one, and that block is the raster. Blocks seen: {seen:?}",
     );
-    let squallar_overlays::render::gridded::GridValues::F32(raster) = &grid.grid.values else {
-        panic!("a GMGSI raster is f32");
+    let squallar_overlays::render::gridded::GridValues::Bytes(raster) = &grid.grid.values else {
+        panic!("a GMGSI raster is a byte store");
     };
-    assert_eq!(
-        raster.capacity(),
-        staging::STAGING_POINTS,
-        "and the extra block is capacity-exact, so it is the raster and not \
-         a growth copy",
+    assert_eq!(raster.codes().len(), staging::STAGING_POINTS);
+    // **The block the allocator was actually asked for**, not the length the
+    // grid reports afterwards: a decode that grew into its buffer would report
+    // the same length off a block of some other size. `Vec::capacity` is not
+    // reachable through the store, and this is the better evidence anyway —
+    // the instrument saw the request.
+    assert!(
+        seen.contains(&(staging::STAGING_POINTS * size_of::<u8>())),
+        "and the extra block is capacity-exact at one byte a point, so it is \
+         the raster and not a growth copy. Blocks seen: {seen:?}",
     );
     drop(grid);
 
@@ -290,7 +305,9 @@ fn granules_decode_through_one_retained_mosaic_block() {
 
     // ── Non-triviality: the instrument can still count ────────────────────
     let (mosaic, counted, _) = counting(|| {
-        let mut mosaic: Vec<f32> = Vec::new();
+        // At the raster's own width, so what this proves the instrument can
+        // see is the block class the figures above are about.
+        let mut mosaic: Vec<u8> = Vec::new();
         mosaic
             .try_reserve_exact(staging::STAGING_POINTS)
             .expect("a mosaic buffer fits on a test host");

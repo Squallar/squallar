@@ -566,7 +566,17 @@ const SYN_NX: usize = 300;
 /// A GMGSI-shaped granule with 2-D `lat`/`lon`, small enough to build in a
 /// test. `coord` returns `(lat, lon)` for a grid point.
 fn synthetic_granule(coord: impl Fn(usize, usize, usize, usize) -> (f32, f32)) -> Vec<u8> {
+    synthetic_granule_with_data(coord, &vec![50f32; SYN_NY * SYN_NX])
+}
+
+/// [`synthetic_granule`] carrying `data` the caller chose — the door the
+/// granules the product has never published come through.
+fn synthetic_granule_with_data(
+    coord: impl Fn(usize, usize, usize, usize) -> (f32, f32),
+    data: &[f32],
+) -> Vec<u8> {
     let (ny, nx) = (SYN_NY, SYN_NX);
+    assert_eq!(data.len(), ny * nx, "the fixture's data must fill the grid");
     let mut lat = vec![0f32; ny * nx];
     let mut lon = vec![0f32; ny * nx];
     for j in 0..ny {
@@ -583,8 +593,7 @@ fn synthetic_granule(coord: impl Fn(usize, usize, usize, usize) -> (f32, f32)) -
     );
     {
         let b = w.create_dataset("data");
-        b.with_f32_data(&vec![50f32; ny * nx])
-            .with_shape(&[1, ny as u64, nx as u64]);
+        b.with_f32_data(data).with_shape(&[1, ny as u64, nx as u64]);
         b.set_attr("_FillValue", hdf5_pure::AttrValue::F64(-9999.0));
         b.set_attr("units", hdf5_pure::AttrValue::String("K".into()));
         b.set_attr(
@@ -760,11 +769,11 @@ fn a_granule_that_is_not_the_declared_shape_is_decoded_into_the_retained_buffer(
         1,
         "premise: the first granule of a process has nothing to be handed",
     );
-    let crate::render::gridded::GridValues::F32(raster) = &first.grid.values else {
-        panic!("a GMGSI raster is f32");
+    let crate::render::gridded::GridValues::Bytes(raster) = &first.grid.values else {
+        panic!("a GMGSI raster is a byte store");
     };
-    assert_eq!(raster.len(), SYN_NY * SYN_NX);
-    let address = raster.as_ptr() as usize;
+    assert_eq!(raster.codes().len(), SYN_NY * SYN_NX);
+    let address = raster.codes().as_ptr() as usize;
 
     // The eviction the frame cache performs on the next arrival.
     crate::gmgsi::staging::recycle(&pool, first.grid);
@@ -797,24 +806,316 @@ fn a_granule_that_is_not_the_declared_shape_is_decoded_into_the_retained_buffer(
         crate::gmgsi::staging::StagingHealth::Reusing,
         "and the pool must read as working",
     );
-    let crate::render::gridded::GridValues::F32(reused) = &second.grid.values else {
-        panic!("a GMGSI raster is f32");
+    let crate::render::gridded::GridValues::Bytes(reused) = &second.grid.values else {
+        panic!("a GMGSI raster is a byte store");
     };
     assert_eq!(
-        reused.as_ptr() as usize,
+        reused.codes().as_ptr() as usize,
         address,
         "and it must be the same block, not a fresh one of the same size: a \
          pool that reallocated would satisfy every count above and leave the \
          fragmentation it exists to remove exactly as it was",
     );
     assert_eq!(
-        reused.len(),
+        reused.codes().len(),
         SYN_NY * SYN_NX,
         "with the decode's own values in it and nothing inherited",
     );
     assert!(
-        reused.iter().all(|v| (*v - 50.0).abs() < 1e-5),
-        "the synthetic granule's `data` is 50.0 everywhere; a value that is \
-         not is content the decode did not write",
+        reused.codes().iter().all(|&c| c == 50),
+        "the synthetic granule's `data` is 50.0 everywhere, which is code 50; \
+         a code that is not is content the decode did not write",
     );
+}
+
+// -- The width the values are ----------------------------------------------
+
+/// **Every value of the committed granule is a byte, and the raster costs one
+/// byte a point.**
+///
+/// The losslessness proof, of the same shape MRMS's
+/// (`mrms::decode::tests::every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars`)
+/// takes and against the same standard: **every stored value maps to a code
+/// and back to the identical bit pattern**, over all 15,000,000 points, with
+/// the reference read independently through the very call the decoder used
+/// before this — `squallar_netcdf`'s own `read_unpacked_f32_into` — rather
+/// than against a figure recorded from this code's output.
+///
+/// `to_bits` and not `==`, because the planted `_FillValue` is a `NaN` and a
+/// `NaN` is not equal to itself: a value comparison would call the two grids
+/// identical at exactly the point where a narrowing bug would live.
+///
+/// **Red on the tree before this change**, at the last assertion:
+/// `resident_bytes` 60,000,000 against 15,000,004.
+#[test]
+fn every_value_of_the_granule_is_a_byte_and_the_raster_costs_one_byte_a_point() {
+    let g = grid();
+    let crate::render::gridded::GridValues::Bytes(store) = &g.grid.values else {
+        panic!(
+            "the committed granule must take the byte arm; it took {} bytes a \
+             sample over {} points, so the raster costs {} B",
+            g.grid.values.bytes_per_sample(),
+            g.grid.values.len(),
+            g.grid.values.resident_bytes(),
+        );
+    };
+
+    // The reference: the same variable, read wide, by the layer that has
+    // always read it.
+    let granule = squallar_netcdf::Granule::from_vec(GRANULE.to_vec()).expect("the fixture opens");
+    let mut wide: Vec<f32> = Vec::new();
+    let read = granule
+        .read_unpacked_f32_into("data", &mut wide)
+        .expect("`data` reads")
+        .expect("`data` is there");
+    assert_eq!(read, NY * NX, "premise: the reference is the whole raster");
+    assert_eq!(store.codes().len(), NY * NX);
+
+    let mut absent = 0usize;
+    for (k, reference) in wide.iter().enumerate() {
+        let read_back = store.get(k).expect("every point is in the store");
+        assert_eq!(
+            read_back.to_bits(),
+            reference.to_bits(),
+            "point {k} was stored as {reference} ({:#010x}) and reads back as \
+             {read_back} ({:#010x})",
+            reference.to_bits(),
+            read_back.to_bits(),
+        );
+        if reference.is_nan() {
+            absent += 1;
+        }
+    }
+    assert_eq!(
+        absent,
+        store.absent().len(),
+        "and every missing point is one the store knows is missing",
+    );
+    assert_eq!(absent, 1, "premise: the fixture's one planted _FillValue");
+
+    // **What the change is for.** 15,000,000 B of codes plus 4 B for the one
+    // absent point's index, against 60,000,000 B as `f32`: 3.9999989x.
+    assert_eq!(g.grid.values.resident_bytes(), 15_000_004);
+    assert_eq!(g.grid.values.bytes_per_sample(), 1);
+}
+
+/// **The narrowed raster paints exactly the picture the wide one painted.**
+///
+/// The claim `every_value_of_the_granule_is_a_byte_...` makes about bits, made
+/// about pixels: a colour lookup on a widened byte and on the original float
+/// must agree, and this rasterizes both grids through the shipped path and
+/// compares the RGBA byte for byte. Not against a recorded digest — against
+/// the wide grid built from the same granule's own values in the same run, so
+/// there is no pin to go stale and no reference this code produced.
+///
+/// The window covers the whole mosaic, so every code the granule carries — the
+/// fill included — reaches a pixel.
+#[test]
+fn the_narrowed_raster_paints_the_same_pixels_as_the_wide_one() {
+    use crate::render::rasterize::{GriddedInput, rasterize_gridded};
+
+    let g = grid();
+    let wide = crate::render::gridded::ResidentGrid {
+        field: g.grid.field.clone(),
+        ni: g.grid.ni,
+        nj: g.grid.nj,
+        coords: g.grid.coords.clone(),
+        // `to_f32` is the store's own widening, which is the thing under test
+        // only if it agrees with the file; `every_value_of_the_granule_...`
+        // is what pins it against the file.
+        values: crate::render::gridded::GridValues::F32(g.grid.values.to_f32()),
+    };
+    let bounds = g.bounds;
+    let (w, h) = (240, 160);
+
+    let narrow_px = rasterize_gridded(
+        &GriddedInput::Resident(std::sync::Arc::new(g.grid)),
+        &bounds,
+        w,
+        h,
+    );
+    let wide_px = rasterize_gridded(
+        &GriddedInput::Resident(std::sync::Arc::new(wide)),
+        &bounds,
+        w,
+        h,
+    );
+
+    assert_eq!(narrow_px.rgba.len(), (w * h * 4) as usize);
+    assert_eq!(narrow_px.rgba.len(), wide_px.rgba.len());
+    assert_eq!(
+        (narrow_px.blank, narrow_px.alpha),
+        (wide_px.blank, wide_px.alpha),
+        "the two rasters must agree about whether they drew and how opaquely",
+    );
+    assert!(
+        narrow_px.rgba.iter().any(|&b| b != 0),
+        "premise: the raster drew something, so an equal pair is not two blank \
+         textures agreeing",
+    );
+    let differing = narrow_px
+        .rgba
+        .iter()
+        .zip(wide_px.rgba.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "{differing} of {} subpixels differ between the byte store and the f32 \
+         store of the same granule",
+        narrow_px.rgba.len(),
+    );
+}
+
+/// **A granule carrying `_FillValue` keeps the byte arm**, with the missing
+/// points beside the codes rather than inside them.
+///
+/// The corpus has never produced one — `n_fill = 0` on all 24 real granules —
+/// which is not the same as "it cannot happen": the variable declares
+/// `_FillValue = -9999` precisely so the producer may emit it. So the fixture
+/// is built rather than found.
+///
+/// The reading at an absent point is `NaN` and paints nothing, and the codes
+/// on either side of it are untouched — a fill that shifted the raster by one
+/// point would be a globe misdrawn everywhere after it.
+#[test]
+fn a_granule_carrying_fill_values_keeps_the_byte_arm_and_paints_nothing_there() {
+    let separable = |j: usize, i: usize, ny: usize, _nx: usize| {
+        (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
+    };
+    let mut data: Vec<f32> = (0..SYN_NY * SYN_NX).map(|k| (k % 250) as f32).collect();
+    // Scattered, not a run: the absent set is a set of indices and a run would
+    // not tell a sorted list from an accidentally ordered one.
+    let planted = [7usize, 4001, 4002, 59_999];
+    for &k in &planted {
+        data[k] = -9999.0;
+    }
+
+    let g = decode(
+        synthetic_granule_with_data(separable, &data),
+        GmgsiChannel::LongwaveIr,
+    )
+    .expect("a granule with fills decodes");
+    let crate::render::gridded::GridValues::Bytes(store) = &g.grid.values else {
+        panic!("four absent points is inside the bound, so the byte arm holds");
+    };
+    assert_eq!(
+        store.absent(),
+        planted.iter().map(|&k| k as u32).collect::<Vec<_>>(),
+        "the absent points are the planted ones, in order",
+    );
+    assert_eq!(
+        g.grid.values.resident_bytes(),
+        SYN_NY * SYN_NX + planted.len() * size_of::<u32>(),
+        "one byte a point, plus four bytes an absent point",
+    );
+
+    let scale = crate::gmgsi::fields::scale(GmgsiChannel::LongwaveIr);
+    for &k in &planted {
+        assert!(
+            g.grid.values.get(k).unwrap().is_nan(),
+            "point {k} was written as _FillValue and must read back missing",
+        );
+        assert_eq!(
+            color_for(scale, g.grid.values.get(k).unwrap())[3],
+            0,
+            "and must paint nothing",
+        );
+    }
+    // Every other point is its own reading, so the fill displaced nothing.
+    for k in [0usize, 6, 8, 4000, 4003, 30_000, 59_998] {
+        assert_eq!(g.grid.values.get(k).unwrap(), (k % 250) as f32);
+    }
+}
+
+/// **More absent points than the store carries: the whole granule goes wide,
+/// exactly, rather than losing any of them.**
+///
+/// The other side of the trade `ByteCodes` states. A granule with a real
+/// coverage gap has thousands of missing points and is not one whose absences
+/// are a small reserved set; it takes four times the bytes and every value
+/// still reads back bit for bit, which is the only property that may not be
+/// traded.
+#[test]
+fn a_granule_with_more_fills_than_the_store_carries_is_decoded_wide_and_exactly() {
+    use crate::render::gridded::MAX_ABSENT_POINTS;
+    let separable = |j: usize, i: usize, ny: usize, _nx: usize| {
+        (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
+    };
+    let mut data: Vec<f32> = (0..SYN_NY * SYN_NX).map(|k| (k % 250) as f32).collect();
+    for k in 0..=MAX_ABSENT_POINTS {
+        data[k * 3] = -9999.0;
+    }
+
+    let g = decode(
+        synthetic_granule_with_data(separable, &data),
+        GmgsiChannel::LongwaveIr,
+    )
+    .expect("a granule with many fills decodes");
+    let crate::render::gridded::GridValues::F32(raster) = &g.grid.values else {
+        panic!("{} absent points is past the bound", MAX_ABSENT_POINTS + 1);
+    };
+    assert_eq!(raster.len(), SYN_NY * SYN_NX);
+    assert_eq!(
+        g.grid.values.resident_bytes(),
+        SYN_NY * SYN_NX * size_of::<f32>(),
+        "and it costs four bytes a point, which the census reports as it is",
+    );
+    for (k, v) in data.iter().enumerate() {
+        let expected = if *v == -9999.0 { f32::NAN } else { *v };
+        assert_eq!(
+            raster[k].to_bits(),
+            expected.to_bits(),
+            "point {k} of a wide granule must be its own value",
+        );
+    }
+}
+
+/// **A granule whose values are not byte-exact is decoded wide, bit for bit,
+/// from the value that first is not.**
+///
+/// The narrowing is not a bet that the product keeps publishing integers: it
+/// is a question asked of every value on the way past. A granule carrying a
+/// half-count, a negative, a value past 255 or a negative zero — none of which
+/// survives a round trip through a byte — takes `GridValues::F32` **whole**,
+/// including the byte-valued points before and after the one that failed.
+///
+/// `-0.0` is in the list deliberately. It is numerically zero and would pass
+/// any `fract() == 0 && 0..=255` test, and it is not zero's bit pattern, so a
+/// store that narrowed it would fail this suite's own `to_bits` standard.
+#[test]
+fn a_granule_whose_values_are_not_byte_exact_is_decoded_wide_and_bit_for_bit() {
+    let separable = |j: usize, i: usize, ny: usize, _nx: usize| {
+        (40.0 - 10.0 * j as f32 / ny as f32, -100.0 + 0.1 * i as f32)
+    };
+    for (name, offender) in [
+        ("a half count", 82.5f32),
+        ("a negative", -3.0),
+        ("past the byte", 300.0),
+        ("a negative zero", -0.0),
+    ] {
+        let mut data: Vec<f32> = (0..SYN_NY * SYN_NX).map(|k| (k % 250) as f32).collect();
+        // In the middle, so the arm has to carry the codes it already took.
+        data[SYN_NY * SYN_NX / 2] = offender;
+
+        let g = decode(
+            synthetic_granule_with_data(separable, &data),
+            GmgsiChannel::LongwaveIr,
+        )
+        .unwrap_or_else(|e| panic!("{name} must decode, not be refused: {e}"));
+        let crate::render::gridded::GridValues::F32(raster) = &g.grid.values else {
+            panic!("{name} ({offender}) is not a byte code, so the grid is wide");
+        };
+        assert_eq!(raster.len(), SYN_NY * SYN_NX);
+        let differing = raster
+            .iter()
+            .zip(data.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{name}: {differing} values of a wide granule differ from the file",
+        );
+    }
 }

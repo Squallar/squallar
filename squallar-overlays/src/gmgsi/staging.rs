@@ -5,9 +5,10 @@
 //! a granule leaves the layer by. The account of *why* — a wasm32 heap that
 //! only grows, dlmalloc that cannot coalesce across a live block, a 98 MB
 //! request failing with 192 MB free — is in [`crate::mrms::staging`], and it
-//! applies here unchanged: a GMGSI mosaic is 3000 x 5000 `f32` = 60,000,000 B,
-//! GMGSI is a loop layer that decodes one granule per frame, and until this
-//! module every granule built a fresh raster and freed the last one.
+//! applies here unchanged: a GMGSI mosaic is 3000 x 5000 points = 15,000,000 B
+//! at the byte a point its values are (60,000,000 B while it was held as
+//! `f32`), GMGSI is a loop layer that decodes one granule per frame, and until
+//! this module every granule built a fresh raster and freed the last one.
 //!
 //! Measured on the committed granule before the pool (debug build,
 //! `tests/gmgsi_staging_blocks.rs`'s own counter, 2026-09-04): **91 blocks of
@@ -37,7 +38,13 @@ use crate::render::gridded::{GridValues, ResidentGrid};
 pub const STAGING_POINTS: usize = super::GRID_POINTS;
 
 /// The pool over one GMGSI mosaic, by element.
-pub type StagingPool = crate::staging::StagingPool<f32>;
+///
+/// **`u8`, because a GMGSI value is a byte.** The slot holds the raster the
+/// decode fills and `render::gridded::GridValues::Bytes` keeps, so the block
+/// this module parks is 15,000,000 B where it was 60,000,000 B — the same one
+/// block, a quarter of it. `STAGING_POINTS` is a count of *points* and is
+/// unchanged by that; what changed is the width one point occupies.
+pub type StagingPool = crate::staging::StagingPool<u8>;
 
 pub use crate::staging::{StagingHealth, StagingTotals};
 
@@ -59,11 +66,14 @@ pub fn global() -> &'static StagingPool {
 /// over by value — so there is nothing to contend with.
 pub fn recycle(pool: &StagingPool, grid: ResidentGrid) {
     match grid.values {
-        GridValues::F32(values) => pool.give(values),
-        // GMGSI is `float` on disk and the decoder never packs it, so this arm
-        // is a grid that is not this pool's element at all; counted rather than
-        // silently dropped, for the same reason `give` reports a wrong capacity.
-        GridValues::Scaled(_) => pool.decline(),
+        GridValues::Bytes(codes) => pool.give(codes.into_codes()),
+        // A granule the decode could not narrow — one value that is not a byte
+        // code, or more absent points than the store carries — holds an `f32`
+        // raster that is not this pool's element at all, and a `Scaled` grid
+        // never comes from here. Counted rather than silently dropped, for the
+        // same reason `give` reports a wrong capacity: a slot that stops being
+        // refilled must say so rather than read like a slot nobody used.
+        GridValues::F32(_) | GridValues::Scaled(_) => pool.decline(),
     }
 }
 

@@ -773,15 +773,16 @@ impl JobSpec for GriddedJob {
         // silently stops covering it and the growth comes back.
         // **In the store's own width**, which is what the head has just
         // named. Both arms write exactly what is reserved here.
-        let repr = WireValues::of(input.values_ref());
+        let repr = WireValues::of(input, &win);
         out.reserve(win.area().saturating_mul(repr.bytes_per_sample()));
         match repr {
             WireValues::F32 => input.for_each_window_row(&win, |row| encode_f32s(out, row)),
             // **No expansion and no scratch.** This runs inside
             // `JobRequest::to_bytes` on the FRAME THREAD, so a per-row
             // widening buffer here would spend the footprint win on frame
-            // time. The codes are written exactly as stored.
-            WireValues::ScaledU16 { .. } => {
+            // time. The codes are written exactly as stored — one byte or two,
+            // whichever the store keeps.
+            WireValues::ScaledU16 { .. } | WireValues::Bytes { .. } => {
                 input.for_each_window_row_raw(&win, |row| out.extend_from_slice(row))
             }
         }
@@ -939,10 +940,18 @@ impl JobSpec for GriddedJob {
 /// **How a gridded job's values travel: the wire's own statement of the store's
 /// width.**
 ///
-/// A gridded grid is `f32` for a source whose values really are floats (HRRR,
-/// GMGSI) and 16-bit codes for one whose values are not (MRMS). Both ride this
-/// one row, so the head says which — and every length on the wire is derived
-/// from that tag rather than from a hardcoded four.
+/// A gridded grid is `f32` for a source whose values really are floats (HRRR),
+/// 16-bit codes for one packed that way (MRMS), and one byte a point for one
+/// whose values are byte readings (GMGSI). All three ride this one row, so the
+/// head says which — and every length on the wire is derived from that tag
+/// rather than from a hardcoded four.
+///
+/// **The byte arm carries its absent points, cut to the window.** They are the
+/// one fact about that store a payload of bare codes cannot state: no code is
+/// spare, so a missing point looks exactly like a reading. Carrying them here
+/// rather than as a bit per sample is what keeps the encoder's cost bounded by
+/// `MAX_ABSENT_POINTS` instead of by the window's area — see
+/// `GriddedInput::absent_in_window`, and `gridded::ByteCodes` for the trade.
 ///
 /// **`two_pow` and `dig_factor` travel as the precomputed operands**, never as
 /// `exp` and `dec`. The far end is a different build on a different target, and
@@ -964,22 +973,36 @@ enum WireValues {
         dig_factor: f32,
         nan_codes: Vec<u16>,
     },
+    Bytes {
+        /// Indices into the window's own values, ascending.
+        absent: Vec<u32>,
+    },
 }
 
 /// Values tag: one `f32` a point.
 const WIRE_VALUES_F32: u8 = 0;
 /// Values tag: one 16-bit code a point, plus the affine it reads back through.
 const WIRE_VALUES_SCALED_U16: u8 = 1;
+/// Values tag: one byte a point, plus the window's absent points.
+const WIRE_VALUES_BYTES: u8 = 2;
 
 impl WireValues {
-    fn of(view: crate::render::gridded::ValuesRef<'_>) -> Self {
-        match view {
+    /// **From the input and the window the head is naming**, never from the
+    /// store alone: the byte arm's absent points are indices, and an index
+    /// means nothing until it is said which cut it indexes. Both head writers
+    /// pass the window they wrote, so the tag and the payload cannot come to
+    /// describe different windows.
+    fn of(input: &GriddedInput, win: &crate::render::rasterize::IndexWindow) -> Self {
+        match input.values_ref() {
             crate::render::gridded::ValuesRef::F32(_) => Self::F32,
             crate::render::gridded::ValuesRef::Scaled(s) => Self::ScaledU16 {
                 ref_val: s.ref_val,
                 two_pow: s.two_pow,
                 dig_factor: s.dig_factor,
                 nan_codes: s.nan_codes.clone(),
+            },
+            crate::render::gridded::ValuesRef::Bytes(_) => Self::Bytes {
+                absent: input.absent_in_window(win),
             },
         }
     }
@@ -989,6 +1012,7 @@ impl WireValues {
         match self {
             Self::F32 => size_of::<f32>(),
             Self::ScaledU16 { .. } => size_of::<u16>(),
+            Self::Bytes { .. } => size_of::<u8>(),
         }
     }
 
@@ -1010,6 +1034,15 @@ impl WireValues {
                 out.push(nan_codes.len() as u8);
                 for code in nan_codes {
                     out.extend_from_slice(&code.to_le_bytes());
+                }
+            }
+            Self::Bytes { absent } => {
+                out.push(WIRE_VALUES_BYTES);
+                // A `u8` count, because the store refuses more than
+                // `MAX_ABSENT_POINTS` of them; see `gridded::ByteCodes`.
+                out.push(absent.len() as u8);
+                for index in absent {
+                    out.extend_from_slice(&index.to_le_bytes());
                 }
             }
         }
@@ -1040,6 +1073,19 @@ impl WireValues {
                     nan_codes,
                 })
             }
+            WIRE_VALUES_BYTES => {
+                let count = usize::from(r.u8()?);
+                // The store's own ceiling, restated as a wire refusal, exactly
+                // as the scaled arm restates its own.
+                if count > crate::render::gridded::MAX_ABSENT_POINTS {
+                    return None;
+                }
+                let mut absent = Vec::with_capacity(count);
+                for _ in 0..count {
+                    absent.push(r.u32()?);
+                }
+                Some(Self::Bytes { absent })
+            }
             _ => None,
         }
     }
@@ -1052,7 +1098,7 @@ impl WireValues {
     /// path exists for. The bytes are the same either way — the wire is
     /// little-endian by the assertion beside [`encode_f32s`].
     fn values_from(&self, bytes: &[u8]) -> Option<crate::render::gridded::GridValues> {
-        use crate::render::gridded::{GridValues, ScaledU16};
+        use crate::render::gridded::{ByteCodes, GridValues, ScaledU16};
         if !bytes.len().is_multiple_of(self.bytes_per_sample()) {
             return None;
         }
@@ -1073,6 +1119,14 @@ impl WireValues {
                 dig_factor: *dig_factor,
                 nan_codes: nan_codes.clone(),
             })),
+            // `ByteCodes::new` is the refusal: a head whose absent set is not
+            // ascending, or names a point past the payload, is a head this
+            // build cannot honour, and answering `None` here is what makes the
+            // pane keep its last texture instead of painting a point the
+            // sender called missing.
+            Self::Bytes { absent } => {
+                ByteCodes::new(bytes.to_vec(), absent.clone()).map(GridValues::Bytes)
+            }
         }
     }
 }
@@ -1102,8 +1156,9 @@ fn encode_gridded_head(
     }
     // **Last in the head, and read back first by every values reader.** Both
     // encoders write it, so neither can produce a payload whose width the head
-    // does not name.
-    WireValues::of(input.values_ref()).encode(out);
+    // does not name — nor, on the byte arm, an absent set cut to another
+    // window than the one just written.
+    WireValues::of(input, &win).encode(out);
     win
 }
 
@@ -2118,7 +2173,19 @@ mod tests {
         for edge in [i0, i1, j0, j1] {
             head.extend_from_slice(&(edge as u32).to_le_bytes());
         }
-        WireValues::of(GridValues::Scaled(scaled.clone()).view()).encode(&mut head);
+        // Through the same door the encoders use, so the tag under test is the
+        // tag a dispatch writes: the input it describes and the window it is
+        // cut to, not a bare view.
+        let sender =
+            GriddedInput::Resident(std::sync::Arc::new(crate::render::gridded::ResidentGrid {
+                field: field.clone(),
+                ni,
+                nj,
+                coords: coords.clone(),
+                values: GridValues::Scaled(scaled.clone()),
+            }));
+        let cut = crate::render::rasterize::IndexWindow { i0, i1, j0, j1 };
+        WireValues::of(&sender, &cut).encode(&mut head);
 
         // The band, lent exactly as `resident_payload` lends it: two bytes a
         // sample, not four.
@@ -2192,6 +2259,143 @@ mod tests {
             "the window spans no reserved code, so the loop above never \
              compared a `NaN` and a `nan_codes` list that failed to cross the \
              wire would read back as the finite −999.0 unnoticed",
+        );
+    }
+
+    /// **A byte grid crosses the whole wire at one byte a point, absent points
+    /// included, bit for bit.**
+    ///
+    /// The GMGSI half of what
+    /// [`a_narrow_grid_crosses_the_wire_at_its_own_width_bit_for_bit`] pins for
+    /// MRMS, and the half its store cannot pin: a byte grid's missing points
+    /// are **indices**, not codes, so they are cut to the window at the head
+    /// rather than read out of the payload. A cut that mapped them wrongly
+    /// would move a hole one point sideways — invisible in every length and
+    /// every count, and a fill painted as a reading.
+    ///
+    /// The planted absent point sits **inside** the cut window on purpose. One
+    /// outside it would leave the `NaN` half of the `to_bits` comparison
+    /// unreached, and an absent set that never crossed the wire would read back
+    /// as the code stored under it, which is a real brightness.
+    #[test]
+    fn a_byte_grid_crosses_the_wire_at_its_own_width_with_its_absent_points() {
+        use super::*;
+        use crate::hrrr::GridCoords;
+        use crate::render::gridded::{ByteCodes, GridValues};
+        use crate::render::rasterize::GriddedInput;
+
+        let (ni, nj) = (6usize, 5usize);
+        let (i0, i1, j0, j1) = (2usize, 5, 1, 4);
+        // Flat index 15 is (i = 3, j = 2) — inside the cut. Its code is a
+        // perfectly ordinary reading, which is the point: nothing about the
+        // payload says the point is missing.
+        let absent_at = 15u32;
+        let codes: Vec<u8> = (0..(ni * nj) as u8).collect();
+        let store = ByteCodes::new(codes.clone(), vec![absent_at]).expect("a valid byte store");
+
+        let coords = GridCoords::Regular {
+            lat0: 30.0,
+            lon0: -100.0,
+            dlat: 0.5,
+            dlon: 0.5,
+            ni,
+            nj,
+            scan_mode: 0,
+        };
+        let field = crate::render::gridded::paint_for_code("GmgsiLongwaveIr")
+            .expect("this build registers the GMGSI longwave field")
+            .id
+            .clone();
+
+        let sender =
+            GriddedInput::Resident(std::sync::Arc::new(crate::render::gridded::ResidentGrid {
+                field: field.clone(),
+                ni,
+                nj,
+                coords: coords.clone(),
+                values: GridValues::Bytes(store.clone()),
+            }));
+
+        let mut head = Vec::new();
+        encode_str(&mut head, field.as_str());
+        head.extend_from_slice(&(ni as u32).to_le_bytes());
+        head.extend_from_slice(&(nj as u32).to_le_bytes());
+        encode_grid_coords(&mut head, &coords);
+        for edge in [i0, i1, j0, j1] {
+            head.extend_from_slice(&(edge as u32).to_le_bytes());
+        }
+        let cut = crate::render::rasterize::IndexWindow { i0, i1, j0, j1 };
+        WireValues::of(&sender, &cut).encode(&mut head);
+
+        // The band, lent exactly as `resident_payload` lends it: one byte a
+        // sample, and the absent set is not in it.
+        let payload: &[u8] = &codes[j0 * ni..j1 * ni];
+        assert_eq!(
+            payload.len(),
+            (j1 - j0) * ni,
+            "the lent band must be one byte a sample, or the narrowing never \
+             reached the wire",
+        );
+
+        let geo = JobGeometry {
+            width: 8,
+            height: 8,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 30.0,
+                max_lat: 32.0,
+                min_lon: -100.0,
+                max_lon: -98.0,
+            },
+            side_ceiling_px: 0,
+        };
+        let mut r = Reader::new(&head);
+        let (input, _) = <GriddedJob as JobSpec>::decode_resident(&mut r, geo, payload)
+            .expect("a byte grid and the window naming part of it decode");
+
+        let GriddedInput::Window(window) = input else {
+            panic!("a lent grid decodes to the cut window");
+        };
+        assert!(
+            matches!(window.values, GridValues::Bytes(_)),
+            "the worker's own copy must stay narrow; widening at the boundary \
+             would give back three quarters of the win",
+        );
+
+        let page = GridValues::Bytes(store);
+        let row_w = i1 - i0;
+        for j in j0..j1 {
+            for i in i0..i1 {
+                let far = window
+                    .values
+                    .get((j - j0) * row_w + (i - i0))
+                    .expect("inside the cut");
+                let here = page.get(j * ni + i).expect("inside the grid");
+                assert_eq!(
+                    far.to_bits(),
+                    here.to_bits(),
+                    "point ({i}, {j}) read back as {far} where the page holds {here}",
+                );
+            }
+        }
+
+        // Non-vacuity, both halves: the window spans readings AND the absent
+        // point, so the loop above compared each.
+        let (mut readings, mut missing) = (0usize, 0usize);
+        for j in j0..j1 {
+            for i in i0..i1 {
+                match page.get(j * ni + i).expect("inside the grid") {
+                    v if v.is_finite() => readings += 1,
+                    _ => missing += 1,
+                }
+            }
+        }
+        assert!(readings > 0, "a window of nothing but holes proves nothing");
+        assert_eq!(
+            missing, 1,
+            "the window must span the one planted absent point, or an absent \
+             set that never crossed the wire would read back as code {} — a \
+             real brightness — unnoticed",
+            codes[absent_at as usize],
         );
     }
 

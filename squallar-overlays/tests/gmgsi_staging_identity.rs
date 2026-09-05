@@ -29,17 +29,49 @@ fn decode_granule() -> decode::GmgsiGrid {
         .expect("the committed granule decodes")
 }
 
-/// A byte no real reading can be, in every slot of a mosaic-sized buffer.
+/// **A code the granule does not carry**, in every slot of a mosaic-sized
+/// buffer.
+///
+/// `0xDEADBEEF` was available while the slot was `f32` and is not at this
+/// width: every one of the 256 byte patterns is a legal brightness reading, so
+/// no poison is out of domain by construction. What replaces it is the
+/// *checked* premise `mrms_staging_identity.rs` already uses at its own width
+/// — [`the_cold_mosaic_does_not_carry_the_poison_code`] runs inside the gate
+/// below, over all 15,000,000 points, before any poison is fed in. While it
+/// holds, "anything that reaches the grid without having been written by the
+/// decode reads back as poison" is true at **every** point.
+///
+/// 255 rather than a byte picked for looking wrong: the fixture's synthetic
+/// `data` carries 250 of the 256 codes and leaves 250..=255 unused, and the
+/// premise below is what says so. **A real granule uses all 256** — the
+/// measured corpus does — so a fixture swapped for one would fail that premise
+/// loudly rather than quietly poisoning with a legal reading.
+const POISON_CODE: u8 = 0xFF;
+
+/// A code the granule does not carry, in every slot of a mosaic-sized buffer.
 ///
 /// `give` clears the buffer rather than zeroing it, so these bytes stay in the
 /// block the next decode is handed. Anything that reaches the grid without
 /// having been written by the decode reads back as this.
-fn poisoned_mosaic() -> Vec<f32> {
-    let mut v: Vec<f32> = Vec::new();
+fn poisoned_mosaic() -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::new();
     v.try_reserve_exact(staging::STAGING_POINTS)
         .expect("a mosaic buffer fits on a test host");
-    v.resize(staging::STAGING_POINTS, f32::from_bits(0xDEAD_BEEF));
+    v.resize(staging::STAGING_POINTS, POISON_CODE);
     v
+}
+
+/// What makes [`POISON_CODE`] stand in for `0xDEADBEEF`: the granule does not
+/// carry it, so a surviving poisoned slot differs from the cold decode
+/// wherever it survives.
+fn the_cold_mosaic_does_not_carry_the_poison_code(g: &decode::GmgsiGrid) {
+    let poison = f32::from(POISON_CODE);
+    assert!(
+        !g.grid.values.iter().any(|v| v == poison),
+        "premise: the mosaic carries reading {poison} itself, so poison \
+         surviving at those points would read as the real granule; pick \
+         another code",
+    );
 }
 
 fn axes(g: &decode::GmgsiGrid) -> (&[f64], &[f64]) {
@@ -99,6 +131,7 @@ fn a_loop_of_decodes_through_the_retained_block_is_bit_identical() {
         "premise: the planted fill is in the raster, so a `to_bits` comparison \
          is doing work `==` could not",
     );
+    the_cold_mosaic_does_not_carry_the_poison_code(&cold);
 
     // A poisoned block, then the granule through it.
     staging::global().give(poisoned_mosaic());

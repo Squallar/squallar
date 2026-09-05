@@ -2,7 +2,7 @@
 //! allocator rather than by the pool's own counter.
 //!
 //! `retained_bytes()` falling to zero is what a lever that merely *forgot* the
-//! buffer would also print, and a forgotten 60 MB block is worse than a parked
+//! buffer would also print, and a forgotten 15 MB block is worse than a parked
 //! one: it is the same resident bytes with nothing left that can reclaim them.
 //! So the figure here is a real `GlobalAlloc::dealloc` at the mosaic size, in a
 //! window that contains one call to
@@ -13,9 +13,12 @@
 //! `gmgsi_staging_blocks.rs` gives: the instrument must be able to disagree with
 //! the fix, and the shipped slot is process-global, so one binary, one test.
 //!
-//! The bar is 32 MiB, below the 60,000,000 B payload and above everything else
-//! a decode touches (a 256-row coordinate window is 5 MB, a `data` chunk
-//! 4.2 MB, the granule 7.5 MB). Frees are counted through `dealloc` only: every
+//! The bar is 12 MiB, below the 15,000,000 B payload — a GMGSI value is stored
+//! as the byte it is — and above everything else a decode touches (a 256-row
+//! coordinate window is 5,120,000 B, a `data` chunk 4,193,384 B, the committed
+//! granule's own bytes 533,762 B). It was 32 MiB, which the narrowed raster
+//! passes under: a bar above the payload counts nothing and reports green.
+//! Frees are counted through `dealloc` only: every
 //! `Vec` drop takes that path, and a shrinking `realloc` is not something any
 //! buffer on this path performs.
 
@@ -25,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use squallar_overlays::gmgsi::{GmgsiChannel, decode, staging};
 
-const LARGE: usize = 32 * 1024 * 1024;
+const LARGE: usize = 12 * 1024 * 1024;
 
 static LARGE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static LARGE_FREES: AtomicUsize = AtomicUsize::new(0);
@@ -124,7 +127,7 @@ fn counting<T>(f: impl FnOnce() -> T) -> (T, usize, usize, Vec<usize>) {
 /// still reads 0 and the free count below reads 0 instead of 1.
 #[test]
 fn the_release_lever_returns_the_retained_mosaic_to_the_allocator() {
-    const MOSAIC_BYTES: usize = staging::STAGING_POINTS * size_of::<f32>();
+    const MOSAIC_BYTES: usize = staging::STAGING_POINTS * size_of::<u8>();
 
     // Warm the slot the way an arriving granule's eviction does.
     evict(decode_granule());
@@ -139,7 +142,7 @@ fn the_release_lever_returns_the_retained_mosaic_to_the_allocator() {
     assert_eq!(
         frees, 1,
         "releasing must hand exactly one block back to the allocator. A lever \
-         that only cleared the pool's own figure would leave the 60 MB \
+         that only cleared the pool's own figure would leave the 15 MB \
          resident with nothing left able to reclaim it, and `retained_bytes` \
          would read zero either way — which is why this gate counts `dealloc` \
          and not the counter. Freed: {freed:?}",
@@ -177,11 +180,11 @@ fn the_release_lever_returns_the_retained_mosaic_to_the_allocator() {
         "the decode after a release pays for its own block, exactly as the \
          first decode of a process does",
     );
-    let squallar_overlays::render::gridded::GridValues::F32(raster) = &grid.grid.values else {
-        panic!("a GMGSI raster is f32");
+    let squallar_overlays::render::gridded::GridValues::Bytes(raster) = &grid.grid.values else {
+        panic!("a GMGSI raster is a byte store");
     };
     assert_eq!(
-        raster.len(),
+        raster.codes().len(),
         staging::STAGING_POINTS,
         "and it is a whole granule, not a short one",
     );
@@ -203,7 +206,9 @@ fn the_release_lever_returns_the_retained_mosaic_to_the_allocator() {
 
     // ── Non-triviality: the instrument can see a free ─────────────────────
     let ((), _, control_frees, control) = counting(|| {
-        let mut mosaic: Vec<f32> = Vec::new();
+        // At the raster's own width, so what this proves the instrument can
+        // see is the block class the figure above is about.
+        let mut mosaic: Vec<u8> = Vec::new();
         mosaic
             .try_reserve_exact(staging::STAGING_POINTS)
             .expect("a mosaic buffer fits on a test host");

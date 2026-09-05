@@ -9,7 +9,7 @@
 //! GMGSI is the layer that makes it matter. 5000 columns x 3000 rows is
 //! 15,000,000 points, projected in full at every zoom, and the window is also
 //! what `render::jobs` cuts the values block to before it crosses the worker
-//! port — 60 MB of `f32` per raster.
+//! port — 15 MB per raster, one byte a point.
 
 use super::lambert_fixture::materialised;
 use super::*;

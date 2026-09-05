@@ -143,12 +143,20 @@ pub mod staging;
 ///
 /// **What it still means.** `GLOBAL_GRID_BYTES` (and through it
 /// `GRID_CACHE_BYTES` and `FRAME_STAGING_BYTES`) is `GRID_POINTS` times four,
-/// so this is the size one resident channel is priced at. A 4999-wide mosaic is
-/// 59,988,000 B against the 60,000,000 B priced here: **12,000 B per grid, over
-/// a budget of four of them**, so it over-provisions by 0.02 % and nothing is
-/// under-counted. Held at the round shape on purpose — a budget that follows a
-/// product's width from release to release buys nothing and moves four
-/// `const _` pins every time it does.
+/// so this is the size one resident channel is *priced* at. Two things
+/// over-provision that price and neither under-counts:
+///
+/// * the width. A resident mosaic is `GridValues::Bytes` — one byte a point,
+///   because a GMGSI value is a byte reading — so a 5000-wide channel costs
+///   15,000,000 B against the 60,000,000 B priced here. The caches evict
+///   against `GridValues::resident_bytes`, which reports what the heap is
+///   carrying, so the budgets simply hold more headroom than they name until
+///   `render::handlers::gmgsi` re-prices them;
+/// * the shape. A 4999-wide mosaic is 14,997,000 B against the 15,000,000 B
+///   this figure's point count implies: **3,000 B per grid**, 0.02 %. Held at
+///   the round shape on purpose — a budget that follows a product's width from
+///   release to release buys nothing and moves four `const _` pins every time
+///   it does.
 ///
 /// **What it no longer means.** It is not the staging pool's capacity. That is
 /// discovered at runtime from the granule being decoded; [`staging`] and

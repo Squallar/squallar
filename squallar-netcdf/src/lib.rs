@@ -37,12 +37,18 @@
 //! The `NaN` sentinel is not ambiguous: [`cf::unpack`] already marks a
 //! non-finite *unpacked* value missing, so no present value can be `NaN`. Pinned
 //! by [`cf::tests::a_non_finite_unpacked_value_is_missing_in_both_representations`].
+//!
+//! A third form is the same values with **no array at all**:
+//! [`cf::UnpackedSink`] takes them one at a time, for a consumer whose own
+//! store is narrower than `f32` and which would otherwise allocate the wide
+//! array only to narrow it. Same body, same CF rules — see
+//! [`h5::Granule::read_unpacked_f32_to`].
 
 pub mod cf;
 pub mod h5;
 
 pub use cf::{
-    CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedVar, VarType, attr_is_true,
-    parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,
+    CfAttr, RawValues, RawVar, TimeUnits, UnpackedF32, UnpackedSink, UnpackedVar, VarType,
+    attr_is_true, parse_cf_epoch, parse_time_units, reinterpret_unsigned, unpack, unpack_f32,
 };
 pub use h5::{Granule, StoredFingerprint, Variable};
