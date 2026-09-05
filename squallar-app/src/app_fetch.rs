@@ -1040,16 +1040,22 @@ impl super::App {
             if let Some(squallar_overlays::render::rasterize::RasterizeOutput {
                 rgba,
                 hit_cells,
+                blank,
                 ..
             }) = result
                 .and_then(|out| out.take::<squallar_overlays::render::rasterize::RasterizeOutput>())
             {
-                let sized = rgba.len() == expected;
+                // **The size the answer claims**, which a blank states and a
+                // painted one carries. A blank still has to name it: the check
+                // below is what separates a raster that painted nothing from a
+                // handler that answered the wrong size, and collapsing the two
+                // would turn a bug into a silent clear.
+                let answered = blank.map_or(rgba.len(), |len| len as usize);
+                let sized = answered == expected;
                 if !sized {
                     log::error!(
-                        "{label} answered {} bytes where {width}x{height} \
+                        "{label} answered {answered} bytes where {width}x{height} \
                          needs {expected}; treating it as a failed render",
-                        rgba.len(),
                     );
                 }
                 let hit_map = match (hit_cells, &id_map) {
@@ -1076,18 +1082,16 @@ impl super::App {
                 match hit_map {
                     Ok(hit_map) if sized => {
                         response.hit_map = hit_map;
-                        // **Asked here, off the frame thread**, for the reason
-                        // `OverlayPicture::Blank` gives: this is a pass over
-                        // the same buffer the premultiply already walks, and
-                        // the arrival that consumes the answer runs inside
-                        // `setup_egui_frame`.
-                        //
-                        // **And it is what decides whether a picture is built
-                        // at all.** A buffer with no ink in it would otherwise
-                        // become a full-size transparent `ColorImage` — 8.3 to
-                        // 8.9 MB on the measured browser legs — copied out of
-                        // `rgba`, handed to `Context::load_texture` and
-                        // uploaded, in order to draw nothing. The pane still
+                        // **Read, not decided.** Whether this raster painted
+                        // anything was settled once, in the run funnel's
+                        // output stage
+                        // (`RasterizeOutput::settle_blank`), which is where
+                        // the buffer already is and where the premultiply
+                        // already walks it. A blank arrives with no buffer at
+                        // all: it did not become a full-size transparent
+                        // `ColorImage` — 8.3 to 8.9 MB on the measured browser
+                        // legs, two targets never added — and on the web it
+                        // did not cross the worker wire either. The pane still
                         // has to be told, because the blank is what *replaces*
                         // the ink it was drawing when a layer's data goes
                         // away; `Blank` is that instruction at the price of
@@ -1102,24 +1106,26 @@ impl super::App {
                         // picture is one that failed or one still owed, and
                         // filing a blank as either would either hold the
                         // previous frame's ink on the glass or re-ask for the
-                        // same empty raster for ever. Loop frames are outside
-                        // the ledger's denominator, so this is the saving not
-                        // taken rather than a figure spoiled; see
+                        // same empty raster for ever. So a blank frame is
+                        // filled here rather than carried: `filled` writes the
+                        // same `Color32::TRANSPARENT` every byte of that
+                        // elided buffer would have decoded to, so the frame
+                        // gets a picture identical to the one it used to be
+                        // sent and the wire still carries none of it. Loop
+                        // frames are outside the ledger's denominator; see
                         // `file_overlay_loop_frame`.
-                        response.picture = Some(
-                            if squallar_egui::overlay_cache::ledger::has_ink(&rgba)
-                                || response.frame.is_some()
-                            {
+                        let size = [width as usize, height as usize];
+                        response.picture = Some(match blank {
+                            None => crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
+                                egui::ColorImage::from_rgba_premultiplied(size, &rgba),
+                            )),
+                            Some(_) if response.frame.is_some() => {
                                 crate::channels::OverlayPicture::Painted(std::sync::Arc::new(
-                                    egui::ColorImage::from_rgba_premultiplied(
-                                        [width as usize, height as usize],
-                                        &rgba,
-                                    ),
+                                    egui::ColorImage::filled(size, egui::Color32::TRANSPARENT),
                                 ))
-                            } else {
-                                crate::channels::OverlayPicture::Blank { width, height }
-                            },
-                        );
+                            }
+                            Some(_) => crate::channels::OverlayPicture::Blank { width, height },
+                        });
                     }
                     Ok(_) => {}
                     Err(what) => {

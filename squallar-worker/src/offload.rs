@@ -439,6 +439,15 @@ fn premultiply_raster(rgba: &mut [u8]) {
 /// cannot silently decline). It runs here because here is off the frame thread
 /// on both targets: 4.2–4.6 ms at the 2048 px browser ceiling against 16.7 ms.
 ///
+/// And every raster that leaves here has **given up any buffer that would
+/// change no pixel** (`JobOut::discard_blank_rasters`), which is the one place
+/// that question is asked. It has to be after the premultiply and it has to be
+/// before the reply is encoded: after, because a straight buffer may carry
+/// colour under a zero alpha; before, because the whole point is that a blank
+/// costs no picture-sized payload on the wire. Asking it anywhere else would
+/// mean two answers that can disagree — a picture uploaded against a pane told
+/// to clear.
+///
 /// "Pure" is a claim about what it *returns*, and it survives four buffer pools
 /// underneath (`POOLED_CELLS`, `POOLED_PLANES`, `POOLED_IMAGE`,
 /// `POOLED_VALUES`): none is handed out in any state but the one a fresh
@@ -454,6 +463,10 @@ pub fn execute(request: &JobRequest) -> JobResult {
     for raster in out.0.straight_rasters_mut() {
         premultiply_raster(raster);
     }
+    // The output stage's second half, on the same terms: after every kind, so
+    // a rasterizing row cannot be added that keeps a blank picture alive by
+    // forgetting to ask.
+    out.0.discard_blank_rasters();
     Some(out)
 }
 

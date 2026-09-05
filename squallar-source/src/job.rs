@@ -86,6 +86,23 @@ pub trait JobOut: std::fmt::Debug + Send + 'static {
     /// funnel to premultiply in place. Required, no default: every output type
     /// states its premultiply posture.
     fn straight_rasters_mut(&mut self) -> Vec<&mut [u8]>;
+
+    /// Give up any buffer this output can prove would change no pixel of the
+    /// frame it is drawn on, keeping whatever the reply needs to say so.
+    ///
+    /// Called by the run funnel once per reply, **after** the premultiply
+    /// above, so an implementation may assume premultiplied bytes — which is
+    /// the only alpha convention in which "no non-zero byte" and "paints
+    /// nothing" are the same statement.
+    ///
+    /// **Defaulted, where [`Self::straight_rasters_mut`] deliberately is
+    /// not.** Declining that one silently ships straight bytes as
+    /// premultiplied, which is a wrong picture; declining this one ships the
+    /// picture, which is what every output did before this existed. The safe
+    /// answer is the default, so a new output kind is not made to have an
+    /// opinion it has no way to hold — a radar loop frame has no state for
+    /// "draws nothing" and keeps its pixels on purpose.
+    fn discard_blank_rasters(&mut self) {}
 }
 
 #[derive(Debug)]

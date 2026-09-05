@@ -3565,21 +3565,29 @@ fn a_hit_cells_fixture() -> squallar_overlays::render::rasterize::HitCells {
 fn the_overlay_reply_round_trips_and_is_canonical() {
     let rgba: Vec<u8> = (0..32).collect();
     // `encode_overlay_out` writes into a sink since WO-M7d (the codec's head).
-    let encode = |cells: Option<&squallar_overlays::render::rasterize::HitCells>| {
+    let encode = |blank: Option<u32>,
+                  cells: Option<&squallar_overlays::render::rasterize::HitCells>| {
         let mut out = Vec::new();
-        encode_overlay_out(&rgba, cells, &mut out);
+        encode_overlay_out(&rgba, blank, cells, &mut out);
         out
     };
     for cells in [None, Some(a_hit_cells_fixture())] {
         assert_eq!(
-            decode_overlay_out(&encode(cells.as_ref())),
-            Some((rgba.clone(), cells.clone())),
+            decode_overlay_out(&encode(None, cells.as_ref())),
+            Some((rgba.clone(), None, cells.clone())),
             "the overlay reply did not survive its own codec",
+        );
+        // The blank form: no pixels on the wire, and the length the picture
+        // would have had comes back instead of them.
+        assert_eq!(
+            decode_overlay_out(&encode(Some(rgba.len() as u32), cells.as_ref())),
+            Some((Vec::new(), Some(rgba.len() as u32), cells.clone())),
+            "the blank overlay reply did not survive its own codec",
         );
     }
     assert_eq!(
-        encode(Some(&a_hit_cells_fixture())),
-        encode(Some(&a_hit_cells_fixture())),
+        encode(None, Some(&a_hit_cells_fixture())),
+        encode(None, Some(&a_hit_cells_fixture())),
         "two encodes of one reply disagree: the cell walk is not canonical",
     );
 }
@@ -3591,9 +3599,14 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
     // Sink-shaped construction since WO-M7d; the byte VALUES these rows pin
     // are the proof the flatten changed no stream.
     let mut bare = Vec::new();
-    encode_overlay_out(&rgba, None, &mut bare);
+    encode_overlay_out(&rgba, None, None, &mut bare);
     let mut with_cells = Vec::new();
-    encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()), &mut with_cells);
+    encode_overlay_out(&rgba, None, Some(&a_hit_cells_fixture()), &mut with_cells);
+    // The blank form, pinned as its own row: it is the one whose LENGTH is the
+    // saving, and a row that only pinned the painted forms would not see a
+    // blank that quietly started carrying pixels again.
+    let mut blank = Vec::new();
+    encode_overlay_out(&[], Some(rgba.len() as u32), None, &mut blank);
     let rows = vec![
         format!("bare | {} | {:#018x}", bare.len(), layout_digest(&bare)),
         format!(
@@ -3601,6 +3614,7 @@ fn the_overlay_reply_framing_is_the_one_this_protocol_ships() {
             with_cells.len(),
             layout_digest(&with_cells)
         ),
+        format!("blank | {} | {:#018x}", blank.len(), layout_digest(&blank)),
     ];
     assert_eq!(
         rows,
@@ -3707,23 +3721,131 @@ fn the_frame_reply_framing_is_the_one_this_registry_ships() {
     );
 }
 
+/// The alerts overlay job of [`an_overlay_alerts_job`] **with its data gone
+/// away**: the same dispatch over the same ground, with nothing left to draw.
+///
+/// This is the shape a blank really arrives in — a layer that was drawing and
+/// has stopped — rather than a hand-zeroed buffer, so the reply below is one
+/// the production rasterizer built.
+fn an_overlay_alerts_job_with_nothing_to_draw() -> JobRequest {
+    use squallar_overlays::render::rasterize::AlertsInput;
+    let JobRequest { geometry, job } = an_overlay_alerts_job();
+    let alerts = job
+        .downcast_ref::<AlertsInput>()
+        .expect("the fixture is an alerts job");
+    JobRequest {
+        geometry,
+        job: DescribedJob::new(AlertsInput {
+            alerts: Vec::new(),
+            enabled_categories: alerts.enabled_categories.clone(),
+            hidden_ids: alerts.hidden_ids.clone(),
+            device_scale: alerts.device_scale,
+        }),
+    }
+}
+
+/// **A raster with no ink in it puts no picture on the wire, and still says
+/// "clear".**
+///
+/// The whole funnel, not the codec alone: `execute_encoded` is what the worker
+/// runs on the bytes a page posts (`squallar_web::worker`), so the head this
+/// asserts on is the reply that really crosses. Before 2026-09-04 a blank
+/// alerts raster posted its 24,576 transparent bytes and the page rebuilt a
+/// full-size `ColorImage` out of them to draw nothing — 8.26 MB a picture on
+/// the measured Chromium legs and 8.92 MB on the Firefox ones, two targets
+/// never added, at between 10.8% and 19.1% of overlay pictures.
+///
+/// **Both directions, because the over-firing one is worse than the waste.**
+/// An inked raster that lost its pixels is a layer that stops drawing, and a
+/// blank that arrives as *nothing* is worse still: a failure is the answer the
+/// arrival ignores, so the pane would keep the ink of a layer whose data has
+/// gone away while every figure improved. So the painted control is asserted
+/// byte-identical through the wire, and the blank is asserted to arrive as a
+/// blank of the picture's own size.
+#[test]
+fn a_blank_overlay_reply_carries_no_picture_sized_payload() {
+    let painted_job = an_overlay_alerts_job();
+    let picture_bytes =
+        (painted_job.geometry.width as usize) * (painted_job.geometry.height as usize) * 4;
+
+    // The control, and the non-vacuity floor: this fixture paints, and its
+    // reply carries every byte of what it painted.
+    let direct = execute(&painted_job)
+        .and_then(|out| out.take::<RasterizeOutput>())
+        .expect("the alerts fixture rasterizes");
+    assert_eq!(
+        direct.blank, None,
+        "the output stage judged the painted alerts fixture BLANK. That is \
+         the over-firing direction and it is the worse one: every overlay on \
+         the map becomes a clear, and it reads as a broken rasterizer rather \
+         than a broken predicate",
+    );
+    assert!(
+        painted(&direct.rgba) > 0,
+        "the alerts fixture painted nothing, so every claim below is about \
+         the empty case twice",
+    );
+    let (_, painted_head, painted_tails) =
+        execute_encoded(&painted_job.to_bytes(), None).expect("the alerts job answers");
+    assert!(painted_tails.is_empty(), "the overlay rows write no tails");
+    assert!(
+        painted_head.len() > picture_bytes,
+        "an inked reply lost its picture: {} bytes on the wire for a \
+         {picture_bytes}-byte raster",
+        painted_head.len(),
+    );
+    let (via_wire, blank, _) =
+        decode_overlay_out(&painted_head).expect("the painted reply decodes");
+    assert_eq!(
+        (via_wire, blank),
+        (direct.rgba, None),
+        "the inked raster did not arrive byte-identical through its own wire \
+         form",
+    );
+
+    // The same dispatch with nothing left to draw.
+    let (_, blank_head, blank_tails) = execute_encoded(
+        &an_overlay_alerts_job_with_nothing_to_draw().to_bytes(),
+        None,
+    )
+    .expect("an alerts job with no alerts still answers");
+    assert!(blank_tails.is_empty(), "the overlay rows write no tails");
+    assert!(
+        blank_head.len() < 64,
+        "a raster with no ink in it put {} bytes on the wire, where the \
+         picture it declined to draw is {picture_bytes}. The pixels are back: \
+         the run funnel's output stage is not settling the raster, or the \
+         reply codec is writing them anyway",
+        blank_head.len(),
+    );
+    assert_eq!(
+        decode_overlay_out(&blank_head),
+        Some((Vec::new(), Some(picture_bytes as u32), None)),
+        "a blank reply must arrive AS a blank of the picture's own size. \
+         Arriving as nothing is a failed render, which the pane ignores — so \
+         the ink of a layer whose data has gone away stays on the glass while \
+         every byte figure improves",
+    );
+}
+
 /// The reply codec's malformed shapes, each with a paired positive control
 /// proving the mutation landed where this test believes it did.
 #[test]
 fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     let rgba: Vec<u8> = (0..16).collect();
     let mut encoded = Vec::new();
-    encode_overlay_out(&rgba, Some(&a_hit_cells_fixture()), &mut encoded);
+    encode_overlay_out(&rgba, None, Some(&a_hit_cells_fixture()), &mut encoded);
     let prefix = encoded.len() - rgba.len();
 
     // Control first: untouched bytes decode, so every refusal below is the
     // mutation's doing.
     assert!(decode_overlay_out(&encoded).is_some());
 
-    // Layout, stated once: tag(1) + width(4) + height(4) + count(4) = 13, then
-    // the sorted entries.
+    // Layout, stated once: cells tag(1) + width(4) + height(4) + count(4) = 13,
+    // then the sorted entries, then the pixels tag(1) — the last byte before
+    // the RGBA, and the byte that says whether there is any.
     assert_eq!(
-        prefix, 53,
+        prefix, 54,
         "the fixture's framed prefix moved; re-derive the offsets"
     );
 
@@ -3744,7 +3866,7 @@ fn a_malformed_overlay_reply_is_refused_rather_than_misread() {
     // The last entry's index: 8 is one past the 4×2 grid.
     let mut moved = encoded.clone();
     moved[41..45].copy_from_slice(&6u32.to_le_bytes());
-    let (_, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
+    let (_, _, cells) = decode_overlay_out(&moved).expect("index 6 is a legal cell");
     assert!(
         cells.expect("cells").cells.contains_key(&6),
         "bytes 41..45 are not the last entry's index; the refusal below \
@@ -4226,7 +4348,10 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
 
     // The payload round-trips through the sites row's own reply codec.
     let RasterizeOutput {
-        rgba, hit_cells, ..
+        rgba,
+        hit_cells,
+        blank,
+        ..
     } = output.take::<RasterizeOutput>().expect("an overlay raster");
     let sites_row = job_codecs()
         .find(|row| row.label == "overlay/coverage")
@@ -4238,12 +4363,13 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
             rgba: rgba.clone(),
             hit_cells: hit_cells.clone(),
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+            blank,
         })),
         &mut head,
         &mut tails,
     );
     let mut expected = Vec::new();
-    encode_overlay_out(&rgba, hit_cells.as_ref(), &mut expected);
+    encode_overlay_out(&rgba, blank, hit_cells.as_ref(), &mut expected);
     assert_eq!(head, expected);
     // Handing the (empty) tails straight back through is the emptiness check.
     let back = (sites_row.decode_out)(&head, tails)
@@ -4252,6 +4378,7 @@ fn an_overlay_reply_travels_as_its_own_out_kind() {
         .expect("the sites reply is a raster");
     assert_eq!(back.rgba, rgba);
     assert_eq!(back.hit_cells, hit_cells);
+    assert_eq!(back.blank, blank);
     // And the take is as narrow as its four siblings.
     assert!(
         execute(&a_job())

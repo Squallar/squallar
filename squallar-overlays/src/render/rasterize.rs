@@ -126,10 +126,49 @@ pub enum AlphaMode {
     Straight,
 }
 
+/// Whether any pixel of a **premultiplied** RGBA buffer would change the frame
+/// it is drawn on.
+///
+/// **Exact, not a sample.** Premultiplication is what makes it exact: a pixel
+/// that contributes nothing has zero in all four bytes, so "no non-zero byte"
+/// and "paints nothing" are the same statement. A sampled or strided version
+/// would miss a picture whose only ink is one polygon, which is the ordinary
+/// shape of an alerts raster.
+///
+/// **Short-circuits.** A picture with ink in its first row costs a handful of
+/// loads; only a picture with no ink at all pays the whole pass, and that is
+/// the reading this exists to take.
+///
+/// **It lives here, below the wire, because the wire needs it.** The answer is
+/// what decides whether a reply carries a picture-sized payload at all
+/// ([`RasterizeOutput::settle_blank`]), and the encoder is in this crate;
+/// `squallar_egui::overlay_cache::ledger` — which is where the reading was
+/// first taken and where its prose still lives — re-exports this one function
+/// rather than keeping a second spelling of it. Two predicates that can
+/// disagree about "is this blank" would be a picture uploaded against a pane
+/// told to clear.
+pub fn has_ink(rgba: &[u8]) -> bool {
+    rgba.iter().any(|&b| b != 0)
+}
+
 pub struct RasterizeOutput {
+    /// The picture's premultiplied bytes — **empty when `blank` is `Some`**.
     pub rgba: Vec<u8>,
     pub hit_cells: Option<HitCells>,
     pub alpha: AlphaMode,
+    /// `Some(len)` when this raster has been judged and had no ink in it:
+    /// `rgba` is then empty and `len` is the byte length the picture *would*
+    /// have had.
+    ///
+    /// **Written in exactly one place**, [`Self::settle_blank`], which the job
+    /// funnel's output stage calls once per reply after the premultiply. Every
+    /// other producer leaves it `None`, which says "the pixels are in `rgba`"
+    /// and is what an unjudged raster means; nothing downstream re-decides.
+    ///
+    /// The length rather than a bare flag, because it is the term the arrival
+    /// checks the answer's size by: a handler answering the wrong size is a
+    /// failed render, and a blank has to be separable from one.
+    pub blank: Option<u32>,
 }
 
 impl std::fmt::Debug for RasterizeOutput {
@@ -141,7 +180,30 @@ impl std::fmt::Debug for RasterizeOutput {
                 &self.hit_cells.as_ref().map(|cells| cells.cells.len()),
             )
             .field("alpha", &self.alpha)
+            .field("blank", &self.blank)
             .finish()
+    }
+}
+
+impl RasterizeOutput {
+    /// Give up a buffer that cannot change the frame it would be drawn on,
+    /// keeping the length it would have had.
+    ///
+    /// **Its precondition is premultiplied bytes**, which is why the funnel
+    /// calls it after the premultiply and not at the end of a rasterizer: a
+    /// straight buffer may carry non-zero colour under a zero alpha, and
+    /// [`has_ink`] would call that ink.
+    ///
+    /// Idempotent, and it never un-settles: a raster already judged blank is
+    /// left alone, and one with ink keeps every byte.
+    pub fn settle_blank(&mut self) {
+        if self.blank.is_some() || has_ink(&self.rgba) {
+            return;
+        }
+        if let Ok(len) = u32::try_from(self.rgba.len()) {
+            self.blank = Some(len);
+            self.rgba = Vec::new();
+        }
     }
 }
 
@@ -162,6 +224,10 @@ impl squallar_source::job::JobOut for RasterizeOutput {
                 vec![&mut self.rgba]
             }
         }
+    }
+
+    fn discard_blank_rasters(&mut self) {
+        self.settle_blank();
     }
 }
 
@@ -252,6 +318,7 @@ pub fn rasterize_spc_outlooks(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -268,6 +335,7 @@ pub fn rasterize_spc_outlooks(
         rgba: pixmap.take(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -306,6 +374,7 @@ pub fn rasterize_spc_discussions(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -338,6 +407,7 @@ pub fn rasterize_spc_discussions(
         rgba: pixmap.take(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -381,6 +451,7 @@ pub fn rasterize_nws_alerts(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -400,6 +471,7 @@ pub fn rasterize_nws_alerts(
         rgba: pixmap.take(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -476,6 +548,7 @@ pub fn rasterize_radar_coverage(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -547,6 +620,7 @@ pub fn rasterize_radar_coverage(
         rgba: pixmap.take(),
         hit_cells: None,
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -717,6 +791,7 @@ pub fn rasterize_metar_stations(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -778,6 +853,7 @@ pub fn rasterize_metar_stations(
         rgba: pixmap.take(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -942,6 +1018,7 @@ pub fn rasterize_storm_reports(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1058,6 +1135,7 @@ pub fn rasterize_storm_reports(
         rgba: pixmap.take(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -1170,6 +1248,7 @@ pub fn rasterize_glm_strikes(
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_cells: None,
             alpha: AlphaMode::Premultiplied,
+            blank: None,
         };
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -1238,6 +1317,7 @@ pub fn rasterize_glm_strikes(
         rgba: pixmap.take(),
         hit_cells: Some(hit_cells),
         alpha: AlphaMode::Premultiplied,
+        blank: None,
     }
 }
 
@@ -1883,6 +1963,7 @@ pub fn rasterize_gridded(
             rgba,
             hit_cells: None,
             alpha: AlphaMode::Straight,
+            blank: None,
         };
     }
 
@@ -1894,6 +1975,7 @@ pub fn rasterize_gridded(
             rgba,
             hit_cells: None,
             alpha: AlphaMode::Straight,
+            blank: None,
         };
     };
 
@@ -1909,6 +1991,7 @@ pub fn rasterize_gridded(
             rgba,
             hit_cells: None,
             alpha: AlphaMode::Straight,
+            blank: None,
         };
     }
     let win_w = win.i1 - win.i0;
@@ -2034,6 +2117,7 @@ pub fn rasterize_gridded(
         rgba,
         hit_cells: None,
         alpha: AlphaMode::Straight,
+        blank: None,
     }
 }
 

@@ -169,15 +169,18 @@ pub enum OverlayPicture {
     /// **The raster ran and every pixel of it was transparent**, carrying the
     /// size the picture would have been.
     ///
-    /// Decided by `squallar_egui::overlay_cache::ledger::has_ink` **inside the
-    /// offload closure that produced the pixels**, which is where the buffer
-    /// already is: premultiplication makes "no non-zero byte" and "would
-    /// change no pixel of the frame" the same statement, so the pane can be
-    /// told to clear without any of those pixels being copied, transferred or
-    /// uploaded. The arrival runs inside `setup_egui_frame`, and the question
-    /// costs a pass over a buffer that is 17.8 MiB on a 1080p pane and 71.2
-    /// MiB on a 4K one — the same reason the premultiply moved off this
-    /// thread; see `no_poller_unmultiplies_on_the_frame_thread`.
+    /// Decided by `has_ink` **in the run funnel's output stage**
+    /// (`squallar_overlays::render::rasterize::RasterizeOutput::settle_blank`,
+    /// called by `offload::execute` beside the premultiply), which is where
+    /// the buffer already is and the last point before the reply is encoded:
+    /// premultiplication makes "no non-zero byte" and "would change no pixel
+    /// of the frame" the same statement, so the pane can be told to clear
+    /// without any of those pixels being copied, put on the worker wire or
+    /// uploaded. `App::overlay_job_deliver` reads that answer and does not
+    /// take one of its own. The arrival runs inside `setup_egui_frame`, and
+    /// the question costs a pass over a buffer that is 17.8 MiB on a 1080p
+    /// pane and 71.2 MiB on a 4K one — the same reason the premultiply moved
+    /// off this thread; see `no_poller_unmultiplies_on_the_frame_thread`.
     ///
     /// **It is a clear, not a saving.** A layer whose data goes away
     /// rasterizes blank, and that blank is what replaces the ink the pane was

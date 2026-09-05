@@ -369,11 +369,14 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
             hit_cells: Some(cells(33, 1)),
             // The reply contract: pixels arrive premultiplied.
             alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+            blank: None,
         },
     );
     // An answer rather than a failure, which is the contrast every mismatch
-    // below draws. This fixture's buffer is deliberately all zeroes, so the
-    // answer is `Blank` — a hit map rides a reply whatever the pixels are.
+    // below draws. The fixture hands over an **unjudged** reply — `blank` is
+    // `None`, which is what every producer but the run funnel's output stage
+    // writes — so the answer is a picture whatever is in the buffer, and a hit
+    // map rides a reply either way.
     assert!(
         ok.picture.is_some(),
         "the well-shaped reply must deliver an answer rather than a failure",
@@ -410,6 +413,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                     )]),
                 }),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+                blank: None,
             },
         ),
         (
@@ -419,6 +423,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 2)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+                blank: None,
             },
         ),
         (
@@ -428,6 +433,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 rgba: rgba.clone(),
                 hit_cells: Some(cells(33, 0)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+                blank: None,
             },
         ),
         (
@@ -437,6 +443,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 rgba: rgba.clone(),
                 hit_cells: None,
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+                blank: None,
             },
         ),
         (
@@ -446,6 +453,7 @@ fn a_mismatched_hit_reply_is_a_failed_render_not_a_wrong_hit_map() {
                 rgba: vec![0u8; 16],
                 hit_cells: Some(cells(33, 1)),
                 alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+                blank: None,
             },
         ),
     ];

@@ -53,9 +53,12 @@
 //! # What a blank costs, since 2026-09-04
 //!
 //! `pictures - inked` is the count of arrivals that painted nothing, and each
-//! of them now costs **no picture at all**: `has_ink` decides on the offload
-//! thread, and where it answers `false` the transparent `ColorImage` is never
-//! built, never handed to `Context::load_texture` and never uploaded. What
+//! of them now costs **no picture at all**: `has_ink` decides in the run
+//! funnel's output stage, and where it answers `false` the buffer is given up
+//! there — so on the web it never crosses the worker wire (6 bytes of reply
+//! against the whole picture, pinned by `wire_identity::WIRE_REPLY_ROWS`), and
+//! on every target the transparent `ColorImage` is never built, never handed
+//! to `Context::load_texture` and never uploaded. What
 //! reaches the pane is a `Blank` carrying the size the picture would have had,
 //! and the pane clears on it exactly as it cleared on the transparent texture
 //! — `OverlayTextureCache::show_blank`. **A blank is a clear, not a skip**: it
@@ -180,7 +183,8 @@ pub struct Totals {
     /// is **every** overlay painting nothing, which every other figure on this
     /// line reports identically to a healthy run.
     ///
-    /// Decided by [`has_ink`] on the offload thread that produced the pixels,
+    /// Decided by [`has_ink`] in the run funnel's output stage, off the frame
+    /// thread on both targets,
     /// never on the frame thread: see `App::overlay_job_deliver`, and
     /// `no_poller_unmultiplies_on_the_frame_thread` for the rule. **That same
     /// answer is what decides whether a picture is built at all**, so
@@ -268,22 +272,21 @@ pub fn note_dropped() {
 }
 
 /// Whether any pixel of a premultiplied RGBA buffer would change the frame it
-/// is drawn on.
+/// is drawn on — **defined one crate down**, in
+/// [`squallar_overlays::render::rasterize`], and re-exported here.
 ///
-/// **Exact, not a sample.** Premultiplication is what makes it exact: a pixel
-/// that contributes nothing has zero in all four bytes, so "no non-zero byte"
-/// and "paints nothing" are the same statement. A sampled or strided version
-/// would miss a picture whose only ink is one polygon, which is the ordinary
-/// shape of an alerts raster.
+/// It moved there on 2026-09-04 and its prose stayed: this is the module that
+/// reports the reading, and the module note above is where the reading is
+/// explained. What moved is where the answer is *used*. The reply codec has to
+/// know whether a picture is worth putting on the wire at all, and the codec
+/// sits below this crate; a second spelling of the predicate down there could
+/// answer differently from this one, which is a picture uploaded against a
+/// pane that was told to clear.
 ///
-/// **Short-circuits.** A picture with ink in its first row costs a handful of
-/// loads; only a picture with no ink at all pays the whole pass, and that is
-/// the reading this exists to take. Called from the offload closure that
-/// produced the pixels — never from a poller; see
-/// `no_poller_unmultiplies_on_the_frame_thread`.
-pub fn has_ink(rgba: &[u8]) -> bool {
-    rgba.iter().any(|&b| b != 0)
-}
+/// Never called from a poller — see `no_poller_unmultiplies_on_the_frame_thread`.
+/// The one production caller is the run funnel's output stage, off the frame
+/// thread on both targets.
+pub use squallar_overlays::render::rasterize::has_ink;
 
 /// Record `bytes` of picture handed to egui, and whether [`has_ink`] found
 /// anything in it.

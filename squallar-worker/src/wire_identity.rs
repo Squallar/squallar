@@ -75,12 +75,24 @@ pub const WIRE_FRAMING_ROWS: &[&str] = &[
     "basemap/tiles | 199 | 0x5e52dbc4796f3a91",
 ];
 
-/// The 2 overlay-reply framing rows, exactly as
+/// The 3 overlay-reply framing rows, exactly as
 /// `offload::tests::the_overlay_reply_framing_is_the_one_this_protocol_ships`
 /// asserts them, folded into the token beside the request rows.
+///
+/// Re-pinned 2026-09-04 when a raster with no ink in it stopped putting its
+/// pixels on the wire. The reply gained a **pixels tag** — one byte, written
+/// after the cells block and immediately before the pixels — so the two
+/// painted rows each moved by one byte and both digests with them. The third
+/// row is the new form and the reason for the change: `blank` is a whole
+/// picture's answer in 6 bytes (cells tag, pixels tag, and the `u32` length
+/// the picture would have had), against the 17 the same 16-byte fixture costs
+/// painted. At the sizes measured on the Tier-2 legs that is 8.26 MB (Chromium)
+/// and 8.92 MB (Firefox) of pixels not sent, per blank reply — two targets,
+/// never added.
 pub const WIRE_REPLY_ROWS: &[&str] = &[
-    "bare | 17 | 0x770d1b313226dd5f",
-    "cells | 69 | 0x6637c90fa10e397a",
+    "bare | 18 | 0x93c5c4df6ea1a99a",
+    "cells | 70 | 0xc4b06c5559789a91",
+    "blank | 6 | 0xd78fbd7f8cf93a4d",
 ];
 
 /// The 6 frame-reply framing rows, exactly as

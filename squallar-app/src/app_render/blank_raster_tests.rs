@@ -25,9 +25,11 @@
 //!   on the next frame, which is the dispatch storm a cleared cache with no
 //!   memory of the clear would run.
 //!
-//! Every reply below is built by the production `App::overlay_job_deliver`
-//! over real rasterizer bytes, so what decides blank-versus-painted is
-//! `ledger::has_ink` on the offload thread and never the fixture.
+//! Every reply below goes through the production output stage
+//! (`JobOut::discard_blank_rasters`, which is `offload::execute`'s second
+//! half) and then the production `App::overlay_job_deliver`, over real
+//! rasterizer bytes — so what decides blank-versus-painted is `has_ink` off
+//! the frame thread and never the fixture.
 
 use crate::app::tests::drain_uploads;
 use squallar_egui::overlay_cache::ledger;
@@ -84,13 +86,19 @@ fn arrive(app: &mut crate::app::App, ctx: &egui::Context, generation: u64, rgba:
         frame: None,
     };
     let out = rgba.map(|rgba| {
-        squallar_source::job::DescribedOut(Box::new(
-            squallar_overlays::render::rasterize::RasterizeOutput {
-                rgba,
-                hit_cells: None,
-                alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
-            },
-        ))
+        use squallar_source::job::JobOut;
+        let mut raster = squallar_overlays::render::rasterize::RasterizeOutput {
+            rgba,
+            hit_cells: None,
+            alpha: squallar_overlays::render::rasterize::AlphaMode::Premultiplied,
+            // Unjudged going in, exactly as a rasterizer hands it over: the
+            // call below is the run funnel's own output stage, and it is what
+            // decides. A fixture that set this itself would assert its own
+            // input.
+            blank: None,
+        };
+        raster.discard_blank_rasters();
+        squallar_source::job::DescribedOut(Box::new(raster))
     });
     crate::app::App::overlay_job_deliver(
         "test-blank",
@@ -152,9 +160,9 @@ fn a_blank_raster_clears_a_pane_without_a_picture_sized_upload() {
         uploads.is_empty(),
         "a raster with no ink in it was uploaded anyway: {} texture(s), \
          {} pixels. Nothing on screen can change by it — that is what \
-         `has_ink` established on the offload thread — so every one of those \
-         bytes is a picture-sized allocation, transfer and upload spent to \
-         draw nothing",
+         `has_ink` established in the run funnel's output stage — so every \
+         one of those bytes is a picture-sized allocation, transfer and \
+         upload spent to draw nothing",
         uploads.len(),
         uploads.iter().map(|u| u.pixels.len()).sum::<usize>(),
     );
@@ -162,7 +170,7 @@ fn a_blank_raster_clears_a_pane_without_a_picture_sized_upload() {
         after.picture_bytes - before.picture_bytes,
         0,
         "the blank arrival was charged {} bytes of picture. The buffer is \
-         built where `has_ink` decides, so a non-zero figure here is the \
+         given up where `has_ink` decides, so a non-zero figure here is the \
          transparent `ColorImage` still being allocated",
         after.picture_bytes - before.picture_bytes,
     );

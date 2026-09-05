@@ -1161,7 +1161,7 @@ impl JobOutCodec for GriddedJob {
 // ── The shared reply pair ────────────────────────────────────────────────
 
 fn encode_raster_reply(v: RasterizeOutput, head: &mut Vec<u8>) {
-    encode_overlay_out(&v.rgba, v.hit_cells.as_ref(), head);
+    encode_overlay_out(&v.rgba, v.blank, v.hit_cells.as_ref(), head);
 }
 
 /// The reply adapter every row's [`JobOutCodec::decode_out`] shares.
@@ -1173,16 +1173,18 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
     if !tails.is_empty() {
         return None;
     }
-    let (rgba, hit_cells) = decode_overlay_out(head)?;
+    let (rgba, blank, hit_cells) = decode_overlay_out(head)?;
     Some(RasterizeOutput {
         rgba,
         hit_cells,
         alpha: AlphaMode::Premultiplied,
+        blank,
     })
 }
 
 /// The overlay reply's bytes: a hit-cells tag, the framed cells when the tag
-/// says so, and the raw RGBA as the rest.
+/// says so, a pixels tag, and then either the four bytes a blank costs or the
+/// raw RGBA as the rest.
 ///
 /// The cells are written **sorted by cell index** — a hash map's iteration
 /// order is a function of its hasher, its capacity and the order things went
@@ -1191,8 +1193,22 @@ fn decode_raster_reply(head: &[u8], tails: Vec<Vec<u8>>) -> Option<RasterizeOutp
 /// seeded per process by `RandomState` and it stays true now that
 /// [`HitCellMap`](crate::render::rasterize::HitCellMap) is unseeded: the sort is
 /// what makes the encoding canonical, not the hasher.
-/// The RGBA takes the rest.
-pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>, out: &mut Vec<u8>) {
+///
+/// **`blank` is transported, never re-decided.** `Some(len)` writes the pixels
+/// tag `0` and that length and no pixels at all — the whole of what a raster
+/// with no ink in it costs the wire, against `len` bytes before
+/// (8.26 MB a picture on the measured Chromium legs, 8.92 MB on the Firefox
+/// ones, two targets never added). `None` writes tag `1` and the RGBA takes
+/// the rest, exactly as it did. Which of the two a reply is was settled once,
+/// by [`RasterizeOutput::settle_blank`](crate::render::rasterize::RasterizeOutput::settle_blank)
+/// in the run funnel's output stage; asking again here could answer
+/// differently and put a picture on a pane that was told to clear.
+pub fn encode_overlay_out(
+    rgba: &[u8],
+    blank: Option<u32>,
+    hit_cells: Option<&HitCells>,
+    out: &mut Vec<u8>,
+) {
     out.reserve(rgba.len() + 64);
     match hit_cells {
         None => out.push(0),
@@ -1212,17 +1228,31 @@ pub fn encode_overlay_out(rgba: &[u8], hit_cells: Option<&HitCells>, out: &mut V
             }
         }
     }
-    out.extend_from_slice(rgba);
+    match blank {
+        None => {
+            out.push(1);
+            out.extend_from_slice(rgba);
+        }
+        Some(len) => {
+            out.push(0);
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+    }
 }
 
-/// The inverse of [`encode_overlay_out`]. `None` for a tag outside `{0, 1}`,
-/// a cell index at or past the grid the stated dimensions span, indices out
-/// of ascending order or repeated (the canonical form the encoder writes and
-/// the only one accepted, so one value has one byte string), an empty id
-/// list (the rasterizer never records one), or a buffer shorter than its own
-/// counts claim. The RGBA tail is handed back **unjudged**: only the
-/// dispatch knows the dimensions it must match.
-pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<HitCells>)> {
+/// The inverse of [`encode_overlay_out`], answering `(rgba, blank, cells)` on
+/// the same terms the encoder took them.
+///
+/// `None` for a hit-cells or pixels tag outside `{0, 1}`, a cell index at or
+/// past the grid the stated dimensions span, indices out of ascending order or
+/// repeated (the canonical form the encoder writes and the only one accepted,
+/// so one value has one byte string), an empty id list (the rasterizer never
+/// records one), a buffer shorter than its own counts claim, or **bytes after
+/// a blank's length** — a blank's payload is exactly those four bytes, so a
+/// tail there is a corrupt or foreign message rather than pixels this build
+/// should read. The RGBA tail is handed back **unjudged**: only the dispatch
+/// knows the dimensions it must match.
+pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<u32>, Option<HitCells>)> {
     let mut r = Reader::new(bytes);
     let hit_cells = match r.u8()? {
         0 => None,
@@ -1257,7 +1287,16 @@ pub fn decode_overlay_out(bytes: &[u8]) -> Option<(Vec<u8>, Option<HitCells>)> {
         }
         _ => return None,
     };
-    Some((r.rest().to_vec(), hit_cells))
+    match r.u8()? {
+        1 => Some((r.rest().to_vec(), None, hit_cells)),
+        0 => {
+            let len = r.u32()?;
+            r.rest()
+                .is_empty()
+                .then_some((Vec::new(), Some(len), hit_cells))
+        }
+        _ => None,
+    }
 }
 
 // ── The field codecs the rows share ──────────────────────────────────────
@@ -2847,6 +2886,11 @@ mod tests {
             rgba: rgba.clone(),
             hit_cells: hit_cells.clone(),
             alpha: AlphaMode::Premultiplied,
+            // Unjudged, which is what every producer but the output stage
+            // hands over: the codec transports that answer and does not take
+            // one of its own, so these bytes are the painted form whatever is
+            // in them.
+            blank: None,
         }));
         let mut head = Vec::new();
         let mut tails = Vec::new();
@@ -2856,6 +2900,11 @@ mod tests {
             .take::<RasterizeOutput>()
             .expect("the reply is a raster");
         assert_eq!(back.rgba, rgba, "the RGBA tail must survive unjudged");
+        assert_eq!(
+            back.blank, None,
+            "an unjudged reply came back as a blank; the codec has started \
+             deciding for itself what the output stage already decided",
+        );
         assert_eq!(back.hit_cells, hit_cells, "the cells must survive framed");
         assert_eq!(
             back.alpha,
@@ -2900,6 +2949,7 @@ mod tests {
         let mut a = Vec::new();
         encode_overlay_out(
             &rgba,
+            None,
             Some(&HitCells {
                 width: 8,
                 height: 4,
@@ -2910,6 +2960,7 @@ mod tests {
         let mut b = Vec::new();
         encode_overlay_out(
             &rgba,
+            None,
             Some(&HitCells {
                 width: 8,
                 height: 4,
