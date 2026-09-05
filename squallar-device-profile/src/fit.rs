@@ -23,21 +23,30 @@
 //! rung counter is remembered and nothing is persisted; the same scene against
 //! the same capacity fits to the same budgets on every start.
 //!
-//! The capacity has two live arms and `fit` does not know which it is on. On
+//! The capacity has three live arms and `fit` does not know which it is on. On
 //! the **measured** arm (`budget::DeviceProfile::capacity`, where the
 //! profile's readings amount to a measurement) the allowance is
 //! `NEED_FRACTION` of the card and no bracket constant binds the pool: a 3090
 //! holds what six two-hour loops cost and a 4 GiB card shortens them. On the
-//! **presumed** arm the bracket's constant is the capacity and the allowance,
-//! exactly as before a reader existed. [`fit_holds`] is the one invariant both
-//! arms promise, checked where the application adopts an answer.
+//! **derived** arm — a unified part with no reader, where the figure is
+//! arithmetic on the host's own RAM — the allowance is the same fraction of
+//! that share, and the bracket constants go on binding, because nothing
+//! measured anything. On the **presumed** arm the bracket's constant is the
+//! capacity and the allowance, exactly as before a reader existed.
+//! [`fit_holds`] is the one invariant every arm promises, checked where the
+//! application adopts an answer.
+//!
+//! Cutting across those arms is how many memories the capacity names. A
+//! `Pools::Split` capacity faces two independent tests, one per pool; a
+//! `Pools::Unified` one faces a single test of the whole need against the
+//! whole allowance, because there is a single memory to be over ([`over`]).
 
 use crate::budget::{
     BudgetLimits, Budgets, DeviceProfile, TileCacheBudget, resolve, step_down, step_down_for,
 };
 use crate::constants::LOOP_SCAN_RESERVE_BYTES;
 use crate::quality::{GroundPass, offscreen_bytes};
-use crate::scene::{Capacity, Need, PaneNeed, Scene};
+use crate::scene::{Capacity, Need, PaneNeed, Pools, Scene};
 use squallar_radar::types::RenderView;
 
 /// Bytes one resident voxel grid of a cell budget costs the device, `None` on
@@ -382,6 +391,46 @@ pub fn loop_pool_bytes(
 /// Which of a scene's two needs are over `cap`'s allowances at `budgets`:
 /// `(gpu, host)`. A capacity with no host figure has no host allowance, and
 /// nothing is ever over one.
+///
+/// # One pool asks one question
+///
+/// On a [`Pools::Unified`] capacity the two tests collapse into a test of the
+/// **whole** need against [`Capacity::joint_allowance`], and both flags carry
+/// its answer.
+///
+/// Two independent tests are only sound where the two needs are drawn from two
+/// memories. On a unified part they are drawn from one, and the split of
+/// [`NeedTerms::total`] is drawn along a line that stops meaning anything
+/// there: the overlay pictures, the tile working set and the decoded overlay
+/// grids are all charged to `host_bytes` and cost `gpu_bytes` nothing, which is
+/// right on a discrete card — a picture is host memory until it is uploaded —
+/// and wrong twice over on an APU, where the same picture becomes a texture the
+/// driver must place in memory shared with the compositor. On the Framework 13
+/// that froze, that was some 459 MB of pictures, a tile cache of up to 1 GiB
+/// and some 735 MB of decoded grids, every byte of it tested only against a
+/// host allowance and never charged to the GPU at all.
+///
+/// **The property this preserves is that every term is charged exactly once,
+/// against every byte of memory exactly once.** Charging the picture terms to
+/// both axes would refuse scenes that fit. Summing the need and summing the
+/// allowance does not: one memory, one need, one allowance.
+///
+/// **Stated exactly, because the direction matters.** Taken alone this test is
+/// *weaker* than the two it replaces — both halves under their own allowance
+/// implies the sum under the sum, so a joint refusal always implies an axis
+/// was over. What tightens the arm is the pool it is taken over: before
+/// [`Capacity::unified`] the GPU figure was half the machine's RAM and the
+/// host figure was that same RAM **again**, two readings of one memory, and
+/// the two tests together admitted a scene of up to 1.5 pools. The partition
+/// makes the two figures sum to the pool; the collapse then spends that pool's
+/// allowance wherever the scene needs it instead of fencing each axis inside a
+/// share that no hardware enforces. The pair is the fix, and either half alone
+/// is not (`on_one_pool_the_two_needs_face_one_allowance`).
+///
+/// Both flags carry the same answer because on one pool there is no axis that
+/// is *not* over — any rung the shed order can take frees bytes from the same
+/// memory, so [`fit`] is free to walk the whole ladder rather than the half a
+/// single flag would open.
 pub fn over(
     scene: &Scene,
     budgets: &Budgets,
@@ -389,11 +438,17 @@ pub fn over(
     grid_bytes: GridBytes,
 ) -> (bool, bool) {
     let need = need(scene, budgets, grid_bytes);
-    (
-        need.gpu_bytes > cap.allowance(),
-        cap.host_allowance()
-            .is_some_and(|allowance| need.host_bytes > allowance),
-    )
+    match cap.pools {
+        Pools::Unified => {
+            let over = need.gpu_bytes.saturating_add(need.host_bytes) > cap.joint_allowance();
+            (over, over)
+        }
+        Pools::Split => (
+            need.gpu_bytes > cap.allowance(),
+            cap.host_allowance()
+                .is_some_and(|allowance| need.host_bytes > allowance),
+        ),
+    }
 }
 
 /// The largest budgets whose need for `scene` fits `cap`'s allowances.
@@ -516,7 +571,15 @@ pub const TILE_ECONOMY_SHARES: [u64; 3] = [2, 2, 1];
 /// rung its class earned, and a 4 GiB card whose scene has taken most of it
 /// resolves toward the floor.
 ///
-/// The tile-sharpness rung rides along on both arms: `whole_zoom` is
+/// On the **derived** arm this is the class rung's figures too, and the
+/// reason is the presumed arm's: the economy split is what a capacity that was
+/// read buys, and a figure this crate computed from the host's RAM was not
+/// read. The shares are bracket-held either way, so this arm is not where the
+/// APU's memory ran away — it is here because a derived figure taking a
+/// measurement's privileges anywhere is the defect, and each consumer is
+/// decided rather than inherited.
+///
+/// The tile-sharpness rung rides along on every arm: `whole_zoom` is
 /// [`Budgets::tile_whole_zoom`] whatever the capacity's source, because it is
 /// the ladder's answer and not the economy's.
 pub fn tile_cache_budget(
@@ -526,8 +589,10 @@ pub fn tile_cache_budget(
     cap: &Capacity,
     grid_bytes: GridBytes,
 ) -> TileCacheBudget {
-    if cap.source == crate::scene::CapacitySource::Presumed {
-        return budgets.tile_cache();
+    use crate::scene::CapacitySource;
+    match cap.source {
+        CapacitySource::Presumed | CapacitySource::Derived => return budgets.tile_cache(),
+        CapacitySource::Measured | CapacitySource::Probed => {}
     }
     let economy = economy_allowance(scene, budgets, cap, grid_bytes);
     let parts: u64 = TILE_ECONOMY_SHARES.iter().sum();

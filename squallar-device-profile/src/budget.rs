@@ -2,7 +2,7 @@
 
 use crate::constants;
 use crate::quality::{DeviceClass, GradientShading, VolumeQuality};
-use crate::scene::{Capacity, CapacitySource};
+use crate::scene::Capacity;
 
 /// Which APIs exist. **Not** which machine this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -234,13 +234,63 @@ impl DeviceProfile {
         }
     }
 
-    /// What a unified-memory part is taken to hold: a reader's own figure
-    /// where one answered, else the host's RAM over the divisor.
+    /// **Whether this profile's GPU figure and its host figure name one
+    /// physical memory.** The two cells [`Self::gpu_capacity_bytes`] answers
+    /// with [`Self::unified_capacity`] and no others, so the topology and the
+    /// figure cannot come apart.
+    ///
+    /// An unclassed native adapter at the desktop-class line is in it because
+    /// that is the cell a 3090 over GL lands in as well as an APU whose driver
+    /// would not say — the partition under-states a discrete card's host
+    /// figure and over-states nothing, which is the direction to be wrong in.
+    pub fn unified_memory(&self) -> bool {
+        match (self.platform, self.class) {
+            (_, DeviceClass::Software | DeviceClass::Virtual) => false,
+            (Platform::Web, _) => false,
+            (Platform::Native, DeviceClass::Discrete) => false,
+            (Platform::Native, DeviceClass::Integrated) => true,
+            (Platform::Native, DeviceClass::Unknown) => self.reports_desktop_class(),
+        }
+    }
+
+    /// **The one memory a unified adapter's two figures both name**, or `None`
+    /// where nothing read it.
+    ///
+    /// **[`Self::host_pool_bytes`] first, and the order is the fix.** That is
+    /// the receding figure — what the OS says is available plus what this
+    /// process holds, re-read on every telemetry tick — where
+    /// [`Self::system_ram_bytes`] is `MemTotal` and never moves. Cutting the
+    /// partition from the total is what removed the sign from the loop: the
+    /// host half receded as the machine filled while the GPU half stood at
+    /// half of `MemTotal` for ever, nothing in this tree measures GPU
+    /// residency, and so on an integrated part `fit` could not demote a rung
+    /// however tight RAM got. Over the available reading both halves shrink
+    /// together and the ladder sheds.
+    ///
+    /// The total is the last resort, for a machine with no available reader at
+    /// all. There the GPU figure is a fixed fraction of a fixed number and
+    /// says so: nothing measured this GPU, and [`CapacitySource::Derived`] is
+    /// the label the capacity carries.
+    ///
+    /// [`CapacitySource::Derived`]: crate::scene::CapacitySource::Derived
+    fn unified_pool_bytes(&self) -> Option<u64> {
+        self.host_pool_bytes.or(self.system_ram_bytes)
+    }
+
+    /// What a unified-memory part is taken to hold: [`Capacity::unified`]'s
+    /// GPU share of the pool — a reader's own figure where one answered, else
+    /// the pool over [`constants::UNIFIED_MEMORY_GPU_DIVISOR`]. Spelled
+    /// through that constructor rather than beside it so this figure and the
+    /// host figure it leaves behind cannot be derived two different ways.
+    ///
+    /// A reader that answered with no RAM figure beside it keeps the whole of
+    /// what it said: there is no pool to take a share of, and no host figure
+    /// for it to be double counted against.
     fn unified_capacity(&self) -> Option<u64> {
-        self.vram_bytes.or_else(|| {
-            self.system_ram_bytes
-                .map(|ram| ram / constants::UNIFIED_MEMORY_GPU_DIVISOR)
-        })
+        match self.unified_pool_bytes() {
+            Some(pool) => Some(Capacity::unified(pool, self.vram_bytes).gpu_bytes),
+            None => self.vram_bytes,
+        }
     }
 
     /// **What the device can hold, as this profile knows it**: a measured
@@ -262,13 +312,35 @@ impl DeviceProfile {
     /// three quarters of a machine's *total* RAM is precisely the imaginary
     /// budget the available reader was written to replace, and a profile that
     /// knows only the total goes on saying nothing about the host.
+    ///
+    /// **A unified adapter is the exception to the decoupling, and has to be.**
+    /// There the two pools are one pool: what the GPU takes, the host cannot
+    /// also take. Reading each figure independently authorised both over the
+    /// same silicon — 32.32 GiB of GPU allowance beside 64.65 GiB of host
+    /// allowance on a Framework 13's 86.2 GiB — so that cell goes through
+    /// [`Capacity::unified`], which cuts one pool into two shares that sum to
+    /// it.
+    ///
+    /// The pool it cuts is [`Self::unified_pool_bytes`], the **available**
+    /// reading and not the machine's total, so the GPU share recedes with the
+    /// host share as the box fills and the ladder can shed on an integrated
+    /// part. Nothing holds the shares down afterwards and nothing needs to:
+    /// each is under a pool that is already what the OS would give.
     pub fn capacity(&self) -> Capacity {
+        if self.unified_memory()
+            && let Some(pool) = self.unified_pool_bytes()
+        {
+            return Capacity::unified(pool, self.vram_bytes);
+        }
         match self.gpu_capacity_bytes() {
-            Some(gpu_bytes) => Capacity {
-                gpu_bytes,
-                host_bytes: self.host_pool_bytes.or(self.system_ram_bytes),
-                source: CapacitySource::Measured,
-            },
+            // Two memories: a discrete card's own, and whatever the host
+            // reader said beside it. Also the one unified cell the partition
+            // cannot reach — a driver that answered on a host that would not
+            // say its RAM — where there is no pool to cut and no host figure
+            // to be spent twice.
+            Some(gpu_bytes) => {
+                Capacity::measured(gpu_bytes, self.host_pool_bytes.or(self.system_ram_bytes))
+            }
             None => {
                 let mut presumed = Capacity::presumed(&self.limits);
                 // **The pool, else the instance's own wall, outranks the

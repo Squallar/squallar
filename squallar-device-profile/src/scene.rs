@@ -11,7 +11,7 @@
 //! arithmetic.
 
 use crate::budget::{BudgetLimits, Promotion};
-use crate::constants::{ECONOMY_FRACTION, NEED_FRACTION};
+use crate::constants::{ECONOMY_FRACTION, NEED_FRACTION, UNIFIED_MEMORY_GPU_DIVISOR};
 use crate::quality::GroundPass;
 use squallar_radar::types::RenderView;
 
@@ -189,6 +189,13 @@ pub struct Need {
 }
 
 /// How a capacity figure was obtained, in descending order of trust.
+///
+/// **Provenance, not a rank to test with `>=`.** Every consumer matches every
+/// arm, so a new way of learning a figure makes the compiler name each place
+/// that has to decide what it buys. Two of them did read this as a boolean
+/// once — the loop pool's ceiling and the tile caches' — and a figure this
+/// crate had *computed* took what a driver reading buys, which is how an
+/// integrated part's budgets went unbounded on a machine with 86.2 GiB of RAM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CapacitySource {
     /// Read from the driver: a Vulkan device-local heap sum, DXGI's budget,
@@ -197,6 +204,16 @@ pub enum CapacitySource {
     /// Found by allocating until the API refused — a browser's per-tab
     /// allowance, which no API states.
     Probed,
+    /// **Computed here from a figure read about something else.** No API was
+    /// asked about the GPU: this is the host's own RAM over
+    /// [`crate::constants::UNIFIED_MEMORY_GPU_DIVISOR`], the share
+    /// [`Capacity::unified`] gives a unified adapter where no reader answered
+    /// for it. A guess with a machine's number in it is still a guess, and the
+    /// arithmetic that produced it can be wrong in either direction on any
+    /// given part — so it buys exactly what [`Self::Presumed`] buys at every
+    /// consumer, and differs from it only in carrying this machine's figure
+    /// rather than the bracket's constant.
+    Derived,
     /// Nothing answered, or nothing that could be believed, so the bracket's
     /// constant stands in — every browser, every native adapter without a
     /// reader, and every software or virtual adapter whatever it read
@@ -277,6 +294,28 @@ pub fn host_pool_bytes(available_bytes: u64, own_live_bytes: Option<u64>) -> u64
     available_bytes.saturating_add(own_live_bytes.unwrap_or(0))
 }
 
+/// **Whether a capacity's two figures are two memories or one.**
+///
+/// Carried in the type rather than re-derived from the source, because the two
+/// questions come apart: Metal's recommended working set is *read from a
+/// driver* — [`CapacitySource::Measured`], the same arm a discrete card's VRAM
+/// reading takes — and on Apple silicon it still names the same physical RAM
+/// the host figure does. Nothing about how a figure was learned says what
+/// memory it is a figure *of*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Pools {
+    /// Two memories. A discrete card's VRAM is not the host's RAM: a byte
+    /// spent on a texture is not a byte taken from the tile cache, so each
+    /// need is tested against its own allowance. Also every arm that knows
+    /// nothing — a presumption is a bracket constant beside a page heap, and
+    /// neither figure is a claim about silicon.
+    Split,
+    /// **One memory under two names.** Built only by [`Capacity::unified`],
+    /// which cuts one pool into two shares; every byte either figure names is
+    /// a byte the other cannot also have.
+    Unified,
+}
+
 /// What the device can hold. It only ever limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
@@ -287,6 +326,10 @@ pub struct Capacity {
     /// How [`Self::gpu_bytes`] was learned, which decides how much of it need
     /// may take — see [`Self::allowance`].
     pub source: CapacitySource,
+    /// Whether the two figures above are two memories or one, which decides
+    /// whether the scene faces two admission tests or one
+    /// ([`crate::fit::over`]).
+    pub pools: Pools,
 }
 
 impl Capacity {
@@ -301,6 +344,7 @@ impl Capacity {
             gpu_bytes: limits.app_texture_ceiling_bytes.at(Promotion::Floor) as u64,
             host_bytes: limits.presumed_host_bytes.map(|bytes| bytes as u64),
             source: CapacitySource::Presumed,
+            pools: Pools::Split,
         }
     }
 
@@ -312,6 +356,7 @@ impl Capacity {
             gpu_bytes,
             host_bytes,
             source: CapacitySource::Measured,
+            pools: Pools::Split,
         }
     }
 
@@ -323,7 +368,83 @@ impl Capacity {
             gpu_bytes,
             host_bytes: None,
             source: CapacitySource::Probed,
+            pools: Pools::Split,
         }
+    }
+
+    /// **A unified adapter: one physical memory under two names.**
+    ///
+    /// It takes ONE figure because there is one memory. On an integrated part
+    /// the bytes a texture takes are bytes the tile cache cannot also take:
+    /// the GPU figure and the host figure are the same silicon, and every
+    /// other constructor here hands out two figures that were read
+    /// independently and may therefore be spent twice. On a Framework 13 with
+    /// 86.2 GiB of RAM that is what happened — 32.32 GiB of GPU allowance and
+    /// 64.65 GiB of host allowance, both authorised over the one 86.2 GiB
+    /// pool, and the machine froze hard enough to need a power cycle.
+    ///
+    /// The fix is structural rather than a smaller constant. `gpu_bytes` is a
+    /// **share** of the pool — a reader's own figure where one answered
+    /// (Metal's recommended working set), else the pool over
+    /// [`UNIFIED_MEMORY_GPU_DIVISOR`], and never more than the pool itself —
+    /// and `host_bytes` is what the pool has **left after it**, a residual and
+    /// not a second reading. So
+    ///
+    /// ```text
+    /// gpu_bytes + host_bytes == pool_bytes
+    /// ```
+    ///
+    /// exactly, for every input, and since each allowance is a fraction under
+    /// one of its own share, the two allowances sum to at most the pool
+    /// whatever fraction anyone later picks
+    /// (`a_unified_adapters_two_allowances_never_sum_past_its_one_pool`).
+    /// There is no second reading here for a future reader to double count
+    /// with, which is the property a divisor could not have carried.
+    ///
+    /// **`pool_bytes` is the receding figure — what the OS says is available
+    /// plus what this process holds — and not the machine's total.** That is
+    /// the second half of the incident and the half that made it a freeze
+    /// rather than a shed. The host figure was already re-read from
+    /// `MemAvailable` on every telemetry tick, but the GPU figure was half of
+    /// `MemTotal`, which never moves, and nothing in this tree measures GPU
+    /// residency — so on an integrated part the one arm that could have
+    /// noticed the machine filling was structurally incapable of it, and `fit`
+    /// could not demote a rung however tight RAM got. Cut from the available
+    /// reading, **both halves shrink together by construction**: the GPU share
+    /// tracks availability with no new reader and no new term, and the ladder
+    /// sheds on the way down
+    /// (`a_falling_pool_takes_the_gpu_share_down_with_it`). A machine with no
+    /// available reader falls back to its total and says so in the source.
+    ///
+    /// The source follows the GPU share, which is the figure
+    /// [`Self::source`] documents: a driver answered, or this arithmetic did.
+    pub fn unified(pool_bytes: u64, measured_gpu_bytes: Option<u64>) -> Self {
+        let gpu_bytes = measured_gpu_bytes
+            .unwrap_or(pool_bytes / UNIFIED_MEMORY_GPU_DIVISOR)
+            .min(pool_bytes);
+        Self {
+            gpu_bytes,
+            host_bytes: Some(pool_bytes - gpu_bytes),
+            source: match measured_gpu_bytes {
+                Some(_) => CapacitySource::Measured,
+                None => CapacitySource::Derived,
+            },
+            pools: Pools::Unified,
+        }
+    }
+
+    /// **The one allowance a unified capacity's whole need is tested
+    /// against**: its two shares' allowances, summed. Since the shares
+    /// partition the pool, this is the pool's own fraction — one number for
+    /// one memory, and the figure [`crate::fit::over`] asks a unified scene
+    /// about instead of asking two questions of two pools that do not exist.
+    ///
+    /// Meaningless on a [`Pools::Split`] capacity and not to be read there: a
+    /// discrete card's VRAM and the host's RAM cannot be summed, which is why
+    /// this is only ever reached under a `Pools::Unified` arm.
+    pub fn joint_allowance(&self) -> u64 {
+        self.allowance()
+            .saturating_add(self.host_allowance().unwrap_or(0))
     }
 
     /// This capacity, held to what the session has learned: pressure lowers a
@@ -380,12 +501,31 @@ impl Capacity {
     ///
     /// A measured or probed figure is raw hardware and needs headroom for the
     /// driver, the compositor and the picture in flight: `NEED_FRACTION` of it.
-    /// A presumed figure is a bracket constant argued with its own headroom, and
-    /// today's sum proof already spends up to it, so the constant is the
+    /// **A derived figure takes the same fraction**: it is a share of the
+    /// machine's real RAM, so it is raw hardware in exactly the way a heap
+    /// reading is — a wall, not a budget argued with headroom already inside
+    /// it — and spending it whole is what put 32.32 GiB of textures and 64.65
+    /// GiB of host allowance over one 86.2 GiB pool.
+    ///
+    /// A presumed figure is a bracket constant argued with its own headroom,
+    /// and today's sum proof already spends up to it, so the constant is the
     /// allowance and the fraction is not applied twice.
+    ///
+    /// **The unconditional rule — the fraction on every arm, the presumed one
+    /// included, because a presumption is a wall too — is a written decision
+    /// and is deferred, not rejected.** It is not in this commit because every
+    /// browser is on the presumed arm, and the web build has a live complaint
+    /// that the smallest pan re-renders its tiles and redraws its alerts: the
+    /// margin that prevents that is the overlay oversampling rung, whose
+    /// bottom rung is no margin at all
+    /// (`crate::budget::overdraw_for_oversample`), and it is the first thing
+    /// the ladder sheds. Taking a quarter of the presumed allowance would push
+    /// that arm further down the very rung the complaint is about. It lands
+    /// when there is a measurement of what it costs the oversample rung on the
+    /// web, which is a separate lane's.
     pub fn allowance(&self) -> u64 {
         match self.source {
-            CapacitySource::Measured | CapacitySource::Probed => {
+            CapacitySource::Measured | CapacitySource::Probed | CapacitySource::Derived => {
                 self.gpu_bytes / NEED_FRACTION.1 * NEED_FRACTION.0
                     + (self.gpu_bytes % NEED_FRACTION.1) * NEED_FRACTION.0 / NEED_FRACTION.1
             }
@@ -401,16 +541,22 @@ impl Capacity {
     /// ceiling of `allowance / NEED_FRACTION`, and one byte less allows one
     /// byte too few (`a_capacity_for_an_allowance_is_the_smallest_that_covers_it`).
     /// Saturates rather than wraps at the top of `u64`.
+    ///
+    /// The arms are [`Self::allowance`]'s, inverted — they have to be the same
+    /// two sets or the round trip stops closing, so the derived arm moved here
+    /// with it.
     pub fn gpu_bytes_for_allowance(&self, allowance: u64) -> u64 {
         match self.source {
             // In `u128`: the product overflows a `u64` well before the
             // quotient does, so saturating the multiply would answer a third
             // of the truth for every figure above `u64::MAX / 4`.
-            CapacitySource::Measured | CapacitySource::Probed => u64::try_from(
-                (u128::from(allowance) * u128::from(NEED_FRACTION.1))
-                    .div_ceil(u128::from(NEED_FRACTION.0)),
-            )
-            .unwrap_or(u64::MAX),
+            CapacitySource::Measured | CapacitySource::Probed | CapacitySource::Derived => {
+                u64::try_from(
+                    (u128::from(allowance) * u128::from(NEED_FRACTION.1))
+                        .div_ceil(u128::from(NEED_FRACTION.0)),
+                )
+                .unwrap_or(u64::MAX)
+            }
             CapacitySource::Presumed => allowance,
         }
     }

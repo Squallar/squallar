@@ -1317,9 +1317,9 @@ fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
     );
     assert!(!fitted.tile_whole_zoom);
 
-    // A unified-memory part on a 64 GiB host: 32 GiB stands in for the GPU,
-    // one loop's pool is its need, and the offscreen stays at the Step the
-    // class earns — memory says nothing about fill rate.
+    // A unified-memory part on a 64 GiB host: the pool is cut in two, 32 GiB
+    // to each side, one loop's pool is its need, and the offscreen stays at
+    // the Step the class earns — memory says nothing about fill rate.
     let integrated = DeviceProfile {
         class: DeviceClass::Integrated,
         vram_bytes: None,
@@ -1327,8 +1327,14 @@ fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
         ..shipped_profile(BudgetLimits::DESKTOP)
     };
     let cap = integrated.capacity();
-    assert_eq!(cap.source, CapacitySource::Measured);
+    // Derived, not measured: no API was asked about this GPU. The figure and
+    // everything the fit does with it are the same as before that word
+    // existed — what changed is the ceiling `LoopPoolLimits::on` leaves in
+    // place and the host share, not the arithmetic here.
+    assert_eq!(cap.source, CapacitySource::Derived);
+    assert_eq!(cap.pools, crate::scene::Pools::Unified);
     assert_eq!(cap.gpu_bytes, 32 << 30);
+    assert_eq!(cap.host_bytes, Some(32 << 30));
     let one = scene_of(vec![plan_pane(HD, true, TWO_HOURS, None)]);
     let fitted = fit(&one, &integrated, &cap, stand_in_grid_bytes);
     assert_eq!(fitted, resolve(&integrated));
@@ -2021,4 +2027,375 @@ fn a_capacity_with_no_host_figure_never_sheds_for_the_host() {
         assert_eq!(fitted, resolve(&profile), "{}", limits.name);
         assert!(need(&scene, &fitted, stand_in_grid_bytes).host_bytes > 800_000_000);
     }
+}
+
+/// The Framework 13 that froze, in the terms the profile carries: an AMD
+/// Radeon 890M — integrated, and no Vulkan reader is believed for one — beside
+/// 86.2 GiB of RAM. The GPU reading is `None` because
+/// `squallar::capacity::trust_local_heaps` answers `false` for every device
+/// type but `DiscreteGpu`, so nothing on that machine ever asks the driver.
+const FRAMEWORK_13_RAM: u64 = 862 * (1 << 30) / 10;
+
+/// That machine's profile, with `available` as the caller names it.
+fn framework_13(available: Option<u64>) -> DeviceProfile {
+    DeviceProfile {
+        class: DeviceClass::Integrated,
+        vram_bytes: None,
+        system_ram_bytes: Some(FRAMEWORK_13_RAM),
+        host_pool_bytes: available,
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    }
+}
+
+/// **What each arm of [`CapacitySource`] buys, one row each.**
+///
+/// The enum is provenance and every consumer decides on it, so the table is
+/// what those decisions add up to at one figure. The fraction separates the
+/// arms that name real memory from the bracket constant that does not; the
+/// tile caches separate the arms a reader answered on from the arms nothing
+/// measured. The loop pool's ceiling is the third consumer and lives in
+/// `squallar-app` beside the pool it bounds
+/// (`loop_pool::tests::what_each_capacity_source_arm_buys_the_loop_pool`).
+#[test]
+fn what_each_capacity_source_arm_buys() {
+    const GPU: u64 = 24 << 30;
+    let limits = BudgetLimits::DESKTOP;
+    let profile = shipped_profile(limits);
+    let budgets = resolve(&profile);
+    let scene = scene_of(vec![plan_pane(HD, true, TWO_HOURS, PRECIP)]);
+
+    // source | allowance | the tile caches are the bracket's, not the economy's
+    let table = [
+        (CapacitySource::Measured, GPU / 4 * 3, false),
+        (CapacitySource::Probed, GPU / 4 * 3, false),
+        (CapacitySource::Derived, GPU / 4 * 3, true),
+        (CapacitySource::Presumed, GPU, true),
+    ];
+    for (source, allowance, bracket_tiles) in table {
+        let cap = Capacity {
+            gpu_bytes: GPU,
+            host_bytes: None,
+            source,
+            pools: Pools::Split,
+        };
+        assert_eq!(cap.allowance(), allowance, "{source:?}: allowance");
+        // The inverse closes on every arm, which is what keeps the two
+        // matches spelling the same two sets.
+        assert_eq!(
+            cap.gpu_bytes_for_allowance(cap.allowance()),
+            GPU,
+            "{source:?}: the round trip",
+        );
+        assert_eq!(
+            tile_cache_budget(&scene, &budgets, &limits, &cap, stand_in_grid_bytes)
+                == budgets.tile_cache(),
+            bracket_tiles,
+            "{source:?}: the tile caches",
+        );
+    }
+    // Not a table of one value wearing four labels: the two groups really do
+    // differ, on both columns.
+    assert_ne!(GPU / 4 * 3, GPU);
+    let economy_split = tile_cache_budget(
+        &scene,
+        &budgets,
+        &limits,
+        &Capacity::measured(GPU, None),
+        stand_in_grid_bytes,
+    );
+    assert_ne!(economy_split, budgets.tile_cache());
+    assert_eq!(
+        economy_split.styled_bytes, limits.tile_styled_bytes.ceiling as u64,
+        "a 24 GiB card with a one-pane scene resolves the styled ceiling",
+    );
+}
+
+/// **A unified adapter's two allowances never sum past its one pool.**
+///
+/// The property [`Capacity::unified`] exists for, held by construction rather
+/// than by a constant: the GPU figure is a share of the pool and the host
+/// figure is the rest of it, so the two sum to the pool exactly and their
+/// allowances to `NEED_FRACTION` of it — for a reader's figure anywhere in the
+/// pool as well as for the divisor's. Swept rather than spot-checked, because
+/// the claim is about every input and not about one machine.
+#[test]
+fn a_unified_adapters_two_allowances_never_sum_past_its_one_pool() {
+    let pools = [
+        1u64,
+        3,
+        4 << 30,
+        16 << 30,
+        FRAMEWORK_13_RAM,
+        64 << 30,
+        u64::MAX / 2,
+    ];
+    let mut derived_rows = 0usize;
+    let mut measured_rows = 0usize;
+    for pool in pools {
+        for measured in [
+            None,
+            Some(0),
+            Some(pool / 4),
+            Some(pool),
+            // A reader that answered more than the pool: held to it, never
+            // over it, so the residual can never go negative.
+            Some(pool.saturating_add(1)),
+            Some(u64::MAX),
+        ] {
+            let cap = Capacity::unified(pool, measured);
+            assert_eq!(
+                cap.pools,
+                Pools::Unified,
+                "pool {pool} measured {measured:?}"
+            );
+            let host = cap.host_bytes.expect("a unified capacity always has one");
+            assert_eq!(
+                cap.gpu_bytes + host,
+                pool,
+                "pool {pool} measured {measured:?}: the shares are not a partition",
+            );
+            let spent = cap.allowance() + cap.host_allowance().unwrap();
+            assert_eq!(spent, cap.joint_allowance());
+            assert!(
+                spent <= pool,
+                "pool {pool} measured {measured:?}: {spent} authorised over {pool}",
+            );
+            // Three quarters of the pool, to the rounding of two independent
+            // shares: never more, and never more than a byte per share less.
+            // Spelled as the code spells it — floor(3n/4) without overflowing
+            // — because `pool / 4 * 3` is a different, smaller number.
+            use crate::constants::NEED_FRACTION as FRAC;
+            let three_quarters = |n: u64| n / FRAC.1 * FRAC.0 + (n % FRAC.1) * FRAC.0 / FRAC.1;
+            assert!(
+                spent <= three_quarters(pool) && spent + 2 >= three_quarters(pool),
+                "pool {pool} measured {measured:?}: {spent} against {}",
+                three_quarters(pool),
+            );
+            match cap.source {
+                CapacitySource::Derived => derived_rows += 1,
+                CapacitySource::Measured => measured_rows += 1,
+                other => panic!("{other:?} from Capacity::unified"),
+            }
+        }
+    }
+    assert_eq!(derived_rows, pools.len(), "one derived row per pool");
+    assert_eq!(measured_rows, pools.len() * 5);
+}
+
+/// **On one pool the two needs face one allowance** — against the shape the
+/// incident had, which is the only honest comparison.
+///
+/// Taken alone the collapse is the weaker test: two halves each under their
+/// own allowance are always under the sum, so a joint refusal implies an axis
+/// was over. What the pair of changes buys is visible only against what was
+/// there before — a GPU figure of half the machine's RAM beside a host figure
+/// of that same RAM **again**, each tested on its own. Here is one scene and
+/// one machine, read both ways: the old shape admits it, the partitioned pool
+/// with one admission test refuses it, and a machine with room admits it on
+/// either shape, which is the other arm.
+#[test]
+fn on_one_pool_the_two_needs_face_one_allowance() {
+    let limits = BudgetLimits::DESKTOP;
+    let profile = shipped_profile(limits);
+    let budgets = resolve(&profile);
+    let scene = huge(13);
+    let need = need(&scene, &budgets, stand_in_grid_bytes);
+    let together = need.gpu_bytes + need.host_bytes;
+
+    // A machine whose RAM is four thirds of the scene's host half — so the
+    // host reading whole is exactly its allowance, and the pair is over it.
+    let pool = need.host_bytes * 4 / 3 + 4;
+    let as_the_incident_read_it = Capacity {
+        gpu_bytes: pool / 2,
+        host_bytes: Some(pool),
+        source: CapacitySource::Measured,
+        pools: Pools::Split,
+    };
+    // The two allowances over one machine, which is the defect in one line.
+    assert!(
+        as_the_incident_read_it.allowance() + as_the_incident_read_it.host_allowance().unwrap()
+            > pool,
+    );
+    assert_eq!(
+        over(
+            &scene,
+            &budgets,
+            &as_the_incident_read_it,
+            stand_in_grid_bytes
+        ),
+        (false, false),
+        "the shape that froze the machine admitted this scene",
+    );
+
+    let partitioned = Capacity::unified(pool, None);
+    assert_eq!(
+        partitioned.gpu_bytes + partitioned.host_bytes.unwrap(),
+        pool
+    );
+    assert!(together > partitioned.joint_allowance());
+    assert_eq!(
+        over(&scene, &budgets, &partitioned, stand_in_grid_bytes),
+        (true, true),
+        "one pool admitted a scene that does not fit it",
+    );
+
+    // The other arm, and it has to be here: a unified machine with room
+    // admits the same scene. The collapse refuses what does not fit, not
+    // everything.
+    let roomy = Capacity::unified(together * 4, None);
+    assert!(together < roomy.joint_allowance());
+    assert_eq!(
+        over(&scene, &budgets, &roomy, stand_in_grid_bytes),
+        (false, false),
+    );
+    assert_eq!(
+        over(
+            &scene,
+            &budgets,
+            &Capacity {
+                pools: Pools::Split,
+                ..roomy
+            },
+            stand_in_grid_bytes,
+        ),
+        (false, false),
+    );
+}
+
+/// **A falling pool takes the GPU share down with it** — the property whose
+/// absence made the Framework 13 a freeze rather than a shed.
+///
+/// The host figure was always the receding one, re-read from `MemAvailable`
+/// on the telemetry tick. The GPU figure was half of `MemTotal`, which never
+/// moves, and nothing in this tree measures GPU residency — so on an
+/// integrated part the ladder could not find a reason to demote however tight
+/// RAM got. Cut from the same available reading, both halves fall together.
+#[test]
+fn a_falling_pool_takes_the_gpu_share_down_with_it() {
+    let mut previous: Option<(u64, u64, u64)> = None;
+    for available in [80u64 << 30, 40 << 30, 16 << 30, 8 << 30, 2 << 30] {
+        let cap = framework_13(Some(available)).capacity();
+        assert_eq!(cap.source, CapacitySource::Derived);
+        assert_eq!(cap.pools, Pools::Unified);
+        assert_eq!(cap.gpu_bytes, available / 2, "{available}");
+        assert_eq!(cap.host_bytes, Some(available / 2), "{available}");
+        let row = (cap.gpu_bytes, cap.allowance(), cap.joint_allowance());
+        if let Some(before) = previous {
+            assert!(row.0 < before.0, "{available}: the GPU figure stood still");
+            assert!(
+                row.1 < before.1,
+                "{available}: the GPU allowance stood still"
+            );
+            assert!(
+                row.2 < before.2,
+                "{available}: the joint allowance stood still"
+            );
+        }
+        previous = Some(row);
+    }
+    // The total is the last resort and says so, and it is the figure that
+    // does not move: a machine with no available reader is exactly the one
+    // this arm was named for.
+    let unread = framework_13(None).capacity();
+    assert_eq!(unread.source, CapacitySource::Derived);
+    assert_eq!(unread.gpu_bytes, FRAMEWORK_13_RAM / 2);
+}
+
+/// **The Framework 13 sheds as its available memory falls.** The regression
+/// test for the incident: the same scene on the same machine, admitted at the
+/// class rung with 80 GiB available and walked down the ladder at 512 MiB.
+/// Before the partition was cut from the receding figure, every column of
+/// this test read the same at both ends.
+#[test]
+fn the_framework_13_sheds_as_its_available_memory_falls() {
+    let scene = huge(13);
+    let roomy = framework_13(Some(80 << 30));
+    let roomy_cap = roomy.capacity();
+    let fitted = fit(&scene, &roomy, &roomy_cap, stand_in_grid_bytes);
+    assert_eq!(
+        fitted,
+        resolve(&roomy),
+        "with 80 GiB available the scene fits at the class rung",
+    );
+    assert_eq!(
+        over(&scene, &fitted, &roomy_cap, stand_in_grid_bytes),
+        (false, false),
+    );
+
+    let tight = framework_13(Some(512 << 20));
+    let tight_cap = tight.capacity();
+    assert_eq!(
+        over(&scene, &resolve(&tight), &tight_cap, stand_in_grid_bytes),
+        (true, true),
+        "at 512 MiB available the class rung is over the one pool",
+    );
+    let shed = fit(&scene, &tight, &tight_cap, stand_in_grid_bytes);
+    assert!(
+        shed.steps_back > fitted.steps_back,
+        "the ladder did not move as the machine filled: {} rungs both times",
+        shed.steps_back,
+    );
+    // Over with every rung spent is the runtime's clamp-and-log, not a broken
+    // ladder: `fit_holds` still answers true.
+    assert!(fit_holds(
+        &scene,
+        &shed,
+        &tight.limits,
+        &tight_cap,
+        stand_in_grid_bytes
+    ));
+}
+
+/// **The control: a genuinely measured discrete card is unchanged, in every
+/// figure.** The regression that would cost the desktop user real capacity.
+/// Every number here is the 24 GiB card's from before the derived arm, the
+/// partition and the collapsed admission test existed — two memories, two
+/// allowances, two independent tests, and the economy split the reading buys.
+#[test]
+fn a_measured_discrete_card_is_unchanged_in_every_figure() {
+    const VRAM: u64 = 24 << 30;
+    const RAM: u64 = 64 << 30;
+    let limits = BudgetLimits::DESKTOP;
+    let profile = DeviceProfile {
+        class: DeviceClass::Discrete,
+        vram_bytes: Some(VRAM),
+        system_ram_bytes: Some(RAM),
+        ..shipped_profile(limits)
+    };
+    let cap = profile.capacity();
+    assert_eq!(cap, Capacity::measured(VRAM, Some(RAM)));
+    assert_eq!(cap.source, CapacitySource::Measured);
+    assert_eq!(cap.pools, Pools::Split, "a card's memory is its own");
+    assert_eq!(cap.gpu_bytes, VRAM);
+    assert_eq!(cap.host_bytes, Some(RAM));
+    assert_eq!(cap.allowance(), VRAM / 4 * 3);
+    assert_eq!(cap.host_allowance(), Some(RAM / 4 * 3));
+    assert_eq!(cap.gpu_bytes_for_allowance(cap.allowance()), VRAM);
+    // The two pools are tested apart, and neither figure was cut from the
+    // other: the host keeps the whole RAM reading.
+    let scene = huge(13);
+    let budgets = resolve(&profile);
+    assert_eq!(
+        over(&scene, &budgets, &cap, stand_in_grid_bytes),
+        (false, false),
+    );
+    assert_eq!(fit(&scene, &profile, &cap, stand_in_grid_bytes), budgets);
+    assert_eq!(cap.gpu_bytes + cap.host_bytes.unwrap(), VRAM + RAM);
+    // The economy split, which is what a reading buys. A card this size
+    // resolves every share's ceiling, which on a Discrete row is also the
+    // class rung — so the ceilings alone would not show the split is live.
+    // A 1 GiB reading of the same card is what shows it.
+    let tiles = tile_cache_budget(&scene, &budgets, &limits, &cap, stand_in_grid_bytes);
+    assert_eq!(tiles.styled_bytes, limits.tile_styled_bytes.ceiling as u64);
+    assert_eq!(tiles.parsed_bytes, limits.tile_parsed_bytes.ceiling as u64);
+    assert_eq!(
+        tiles.terrain_bytes,
+        limits.tile_terrain_bytes.ceiling as u64
+    );
+    let small = Capacity::measured(1 << 30, Some(RAM));
+    assert_ne!(
+        tile_cache_budget(&scene, &budgets, &limits, &small, stand_in_grid_bytes),
+        budgets.tile_cache(),
+        "the economy split is not in force on the measured arm",
+    );
 }

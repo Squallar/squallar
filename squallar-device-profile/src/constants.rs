@@ -581,15 +581,21 @@ pub const DESKTOP_TILE_TERRAIN_BYTES: [usize; 3] = [mib(64), mib(80), mib(128)];
 /// exactly its sum: nothing is slack there.
 pub const DESKTOP_TILE_HOST_CEILING_BYTES: [usize; 3] = [mib(448), mib(640), mib(1024)];
 
-/// The share of a **measured or probed** GPU capacity the scene's need may
-/// occupy, as `(numerator, denominator)`: three quarters. Metal's own
+/// The share of a **measured, probed or derived** GPU capacity the scene's
+/// need may occupy, as `(numerator, denominator)`: three quarters. Metal's own
 /// recommended working set is ~75 % of RAM on M-series, the one vendor figure
 /// for how much of a memory a renderer is meant to take; the rest is the
-/// driver, the compositor and the picture in flight. **Never applied to a
-/// presumed capacity**: the bracket's `APP_TEXTURE_BUDGET_BYTES` constant was
-/// argued with its own headroom and is what today's sum proof already spends up
-/// to, so on that arm the constant is the allowance
-/// ([`crate::scene::Capacity::allowance`]).
+/// driver, the compositor and the picture in flight. A derived figure is a
+/// share of that same real memory, so it takes the same fraction — spending it
+/// whole is what put an APU's two allowances over its one pool.
+///
+/// **Not applied to a presumed capacity**: the bracket's
+/// `APP_TEXTURE_BUDGET_BYTES` constant was argued with its own headroom and is
+/// what today's sum proof already spends up to, so on that arm the constant is
+/// the allowance ([`crate::scene::Capacity::allowance`]). The written decision
+/// to apply it there too — a presumption is a wall as well — is deferred
+/// pending a measurement of what it costs the web arm's oversample rung, which
+/// that function's own doc records.
 pub const NEED_FRACTION: (u64, u64) = (3, 4);
 
 /// **How much larger than its pane a whole-picture overlay raster is planned**,
@@ -634,6 +640,14 @@ pub const ECONOMY_FRACTION: (u64, u64) = (9, 10);
 /// own recommended working set is ~75 % of RAM on M-series, so a half is
 /// conservative, and Metal answers for every class and replaces this wherever
 /// it does ([`crate::budget::DeviceProfile::gpu_capacity_bytes`]).
+///
+/// **It divides the pool into two named shares, not just the GPU's.** The
+/// remainder is the host's ([`crate::scene::Capacity::unified`]), so the
+/// figure this names is one side of a partition and the two sides sum to the
+/// memory that carries both. Moving it moves where the line falls and can
+/// never let the two sides overlap — which is the property the number itself
+/// could not carry, and why the incident this comes from was not fixed by
+/// changing it.
 pub const UNIFIED_MEMORY_GPU_DIVISOR: u64 = 2;
 
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.

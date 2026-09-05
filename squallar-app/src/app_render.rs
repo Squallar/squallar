@@ -5086,9 +5086,14 @@ impl super::App {
                     capacity_bytes: host,
                     // The host has no probe: a probed session's host figure is
                     // the bracket's presumption, and a measured session's is
-                    // the RAM reading beside the VRAM one.
+                    // the RAM reading beside the VRAM one. A derived session's
+                    // is the other half of a partitioned pool
+                    // (`Capacity::unified`) — a residual, not a reading — so
+                    // it keeps the derived word rather than being folded into
+                    // either neighbour.
                     source: match cap.source {
                         CapacitySource::Measured => CapacitySource::Measured,
+                        CapacitySource::Derived => CapacitySource::Derived,
                         CapacitySource::Probed | CapacitySource::Presumed => {
                             CapacitySource::Presumed
                         }

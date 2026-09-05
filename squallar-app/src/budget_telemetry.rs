@@ -26,9 +26,10 @@
 //! figure. `cap` is the **capacity in force this session** — the measured
 //! figure where the readings amount to one, the bracket's presumption where
 //! they do not, held to what pressure has taught this session — and the
-//! integer after it is how it was learned: 0 presumed, 1 measured, 2 probed.
-//! `cap` is not `vram`: a unified-memory part's capacity is half its `ram`
-//! with `vram` unread, a rasteriser's is the presumption with `vram` read.
+//! integer after it is how it was learned: 0 presumed, 1 derived, 2 measured,
+//! 3 probed. `cap` is not `vram`: a unified-memory part's capacity is half the
+//! host pool with `vram` unread — **derived, not measured**, and it prints 1 —
+//! and a rasteriser's is the presumption with `vram` read.
 //! `probe` is where the browser's WebGPU probe stands ([`gpu_probe_code`]):
 //! carried here, on the level line, because the probe's own lines are said
 //! once and the browser console's bounded ring evicts them within seconds,
@@ -77,7 +78,7 @@ use squallar_device_profile::scene::{Capacity, CapacitySource};
 /// device's refusal, 5 found at the WebGPU probe's own bound (`capped` —
 /// the figure is a floor), 6 silent to the cap (a WebGL2 walk that reached
 /// its policy cap with nothing refused: unmeasured, and the presumption
-/// stands). A `cap N 2` beside 4 or 5 is the probe's figure in force;
+/// stands). A `cap N 3` beside 4 or 5 is the probe's figure in force;
 /// `cap 288 0` beside 3 or 6 is a WebGL2 page on its presumption.
 pub(crate) fn gpu_probe_code(report: GpuProbeReport) -> u8 {
     match report {
@@ -92,13 +93,18 @@ pub(crate) fn gpu_probe_code(report: GpuProbeReport) -> u8 {
 }
 
 /// The integer the line prints for how a capacity was learned: 0 presumed,
-/// 1 measured, 2 probed — in ascending order of trust, so a reader who sorts
-/// by it sorts by that.
+/// 1 derived, 2 measured, 3 probed — **in ascending order of trust, so a
+/// reader who sorts by it sorts by that**, which is why the derived arm took
+/// the rung between the bracket's constant and a reading rather than being
+/// appended past both. It carries this machine's own RAM figure, so it says
+/// more than a compiled constant; no API was asked about the GPU, so it says
+/// less than a reading. Nothing outside this crate parses the code.
 pub(crate) fn capacity_source_code(source: CapacitySource) -> u8 {
     match source {
         CapacitySource::Presumed => 0,
-        CapacitySource::Measured => 1,
-        CapacitySource::Probed => 2,
+        CapacitySource::Derived => 1,
+        CapacitySource::Measured => 2,
+        CapacitySource::Probed => 3,
     }
 }
 
@@ -106,6 +112,7 @@ pub(crate) fn capacity_source_code(source: CapacitySource) -> u8 {
 pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
     match source {
         CapacitySource::Presumed => "presumed",
+        CapacitySource::Derived => "derived",
         CapacitySource::Measured => "measured",
         CapacitySource::Probed => "probed",
     }
@@ -434,6 +441,7 @@ mod tests {
         gpu_bytes: 5 << 30,
         host_bytes: None,
         source: CapacitySource::Probed,
+        pools: squallar_device_profile::scene::Pools::Split,
     };
 
     /// The probe report for the distinct line: found at the probe's own
@@ -568,7 +576,7 @@ mod tests {
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
-             threads 32, form 2, linear 300/700 MiB, cap 5120 2, probe 5, \
+             threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              spare gpu none host none, live 250/600 MiB",
         );
@@ -626,7 +634,7 @@ mod tests {
                 LIVE,
             )
             .ends_with(
-                ", cap 24576 1, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
+                ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, spare gpu none host none, \
                  live 250/600 MiB"
             ),
@@ -651,10 +659,15 @@ mod tests {
                  live 250/600 MiB"
             ),
         );
+        // Ascending trust, every arm, and the order is the assertion: the
+        // derived arm took the rung above the bracket's constant and below a
+        // reading, so measured and probed each moved up one.
         assert_eq!(capacity_source_code(CapacitySource::Presumed), 0);
-        assert_eq!(capacity_source_code(CapacitySource::Measured), 1);
-        assert_eq!(capacity_source_code(CapacitySource::Probed), 2);
+        assert_eq!(capacity_source_code(CapacitySource::Derived), 1);
+        assert_eq!(capacity_source_code(CapacitySource::Measured), 2);
+        assert_eq!(capacity_source_code(CapacitySource::Probed), 3);
         assert_eq!(capacity_source_word(CapacitySource::Measured), "measured");
+        assert_eq!(capacity_source_word(CapacitySource::Derived), "derived");
     }
 
     /// The probe codes, in the order the doc names them, and the one fact that
@@ -744,7 +757,10 @@ mod tests {
     /// bracket word and the fifteen integers after it, the balloon last.
     const DISTINCT_GROUPS: [&str; 16] = [
         "desktop", "1", "3", "3072", "3840", "24576", "65536", "8192", "32", "2", "300", "700",
-        "5120", "2", "5", "7",
+        // The capacity-source group: probed, which is 3 now that the derived
+        // arm holds 1 and every arm above it moved up
+        // ([`capacity_source_code`]).
+        "5120", "3", "5", "7",
     ];
 
     /// **The rig reads the budget line the app actually writes.** An extra

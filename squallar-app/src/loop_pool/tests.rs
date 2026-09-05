@@ -562,6 +562,109 @@ fn a_lone_pane_over_six_hours_holds_every_listed_scan_up_to_the_list_cap() {
     );
 }
 
+/// **What each arm of `CapacitySource` buys the loop pool** — the app-side half
+/// of `squallar_device_profile::fit::tests::what_each_capacity_source_arm_buys`,
+/// and the consumer the incident ran through.
+///
+/// The bracket ceiling is the only bound in this crate that is ever removed,
+/// and `hold` is `clamp(floor, ceiling.max(floor))`, so an arm that reads
+/// `usize::MAX` here has no upper bound at all. A reading removes it, a
+/// presumption keeps it, and a **derived** figure keeps it — which is the
+/// correction. On a Framework 13 with 86.2 GiB of RAM the derived figure was
+/// wearing the measured arm's label, so a machine with no VRAM reader at all
+/// had an unbounded loop pool.
+#[test]
+fn what_each_capacity_source_arm_buys_the_loop_pool() {
+    use squallar_device_profile::scene::{Capacity, CapacitySource, Pools};
+
+    let limits = desktop_limits();
+    assert_eq!(limits.ceiling, DESKTOP_LOOP_POOL_CEILING_BYTES);
+    assert!(limits.floor < limits.ceiling, "or the table says nothing");
+
+    // source | the bracket's ceiling still binds
+    for (source, bounded) in [
+        (CapacitySource::Measured, false),
+        (CapacitySource::Probed, false),
+        (CapacitySource::Derived, true),
+        (CapacitySource::Presumed, true),
+    ] {
+        let cap = Capacity {
+            gpu_bytes: 43 << 30,
+            host_bytes: Some(43 << 30),
+            source,
+            pools: Pools::Unified,
+        };
+        let on = limits.on(&cap);
+        assert_eq!(
+            on.floor, limits.floor,
+            "{source:?}: the floor holds on every arm",
+        );
+        assert_eq!(on.ceiling == limits.ceiling, bounded, "{source:?}");
+        assert_eq!(
+            LoopPool::new(usize::MAX, on).bytes(),
+            if bounded {
+                DESKTOP_LOOP_POOL_CEILING_BYTES
+            } else {
+                usize::MAX
+            },
+            "{source:?}: what an unbounded ask resolves to",
+        );
+        // The floor still wins a pool below it, on every arm.
+        assert_eq!(LoopPool::new(0, on).bytes(), limits.floor, "{source:?}");
+    }
+}
+
+/// **The Framework 13's loop pool is bounded again.** End to end from the
+/// profile that machine really carries — an integrated adapter, no VRAM
+/// reader, 86.2 GiB of RAM — through the capacity, the fit and the pool: the
+/// pool it is handed is the bracket's 3072 MiB and not the 32 GiB of allowance
+/// its capacity names.
+#[test]
+fn the_framework_13s_loop_pool_is_held_to_the_bracket_ceiling() {
+    use crate::budget_arms::shipped_profile;
+    use squallar_device_profile::budget::{BudgetLimits, DeviceProfile, resolve};
+    use squallar_device_profile::fit::fit;
+    use squallar_device_profile::scene::CapacitySource;
+
+    const RAM: u64 = 862 * (1 << 30) / 10;
+    let profile = DeviceProfile {
+        class: DeviceClass::Integrated,
+        vram_bytes: None,
+        system_ram_bytes: Some(RAM),
+        host_pool_bytes: Some(80 << 30),
+        ..shipped_profile(BudgetLimits::DESKTOP)
+    };
+    let cap = profile.capacity();
+    assert_eq!(cap.source, CapacitySource::Derived);
+    // 40 GiB of GPU share, 30 GiB of allowance: the figure is unchanged, and
+    // what changed is that it no longer buys an unbounded pool.
+    assert_eq!(cap.gpu_bytes, 40 << 30);
+    assert_eq!(cap.allowance(), 30 << 30);
+
+    let scene = scene_of(6);
+    let budgets = fit(&scene, &profile, &cap, GRID_BYTES);
+    assert_eq!(
+        budgets,
+        resolve(&profile),
+        "the scene fits with room to spare"
+    );
+    let pool = LoopPool::for_scene(
+        &scene,
+        &budgets,
+        &cap,
+        LoopPoolLimits::from_budgets(&budgets),
+    );
+    assert_eq!(
+        pool.bytes(),
+        DESKTOP_LOOP_POOL_CEILING_BYTES,
+        "the derived arm keeps the bracket ceiling",
+    );
+    assert!(
+        (pool.bytes() as u64) < cap.allowance(),
+        "the ceiling is what binds, not the allowance",
+    );
+}
+
 /// **Six such panes share one budget by water-filling.** At 3072 MiB — 192 frames of
 /// 16 MiB — the six bases (150 frames) fit and the 42 spare frames go seven apiece:
 /// **32 each**, 6 x 32 x 16 MiB = 3072 MiB exactly. At the presumed arm's 2304 MiB of
@@ -1627,11 +1730,13 @@ mod budget_agreement {
     /// 9 frames each: 6 x (9 x 16 + 256) = 2400 MiB, an 864 MiB pool, 1536 MiB
     /// of room, and 8 x 259 s = thirty-four minutes of the two hours asked for.
     /// An integrated desktop GPU on a 64 GiB host is unified memory, 32 GiB
-    /// measured: its pool is still one loop's need, and its offscreen still the
-    /// Step the class earns, because memory says nothing about fill rate. The
-    /// same 3090 over GL is `Other` to wgpu; with the host's RAM read it too is
-    /// unified memory at the desktop-class line, and with nothing read it is
-    /// the presumption. A browser is the presumption whatever it reads.
+    /// **derived** — the host's own RAM over the divisor, since no API was
+    /// asked about the card: its pool is still one loop's need, and its
+    /// offscreen still the Step the class earns, because memory says nothing
+    /// about fill rate. The same 3090 over GL is `Other` to wgpu; with the
+    /// host's RAM read it too is unified memory at the desktop-class line, and
+    /// with nothing read it is the presumption. A browser is the presumption
+    /// whatever it reads.
     #[test]
     fn what_five_real_machines_get() {
         use squallar_device_profile::fit::fit;
@@ -1677,7 +1782,7 @@ mod budget_agreement {
         let w = BudgetLimits::WASM;
         const RTX_3090_MIB: u64 = 24822;
         let ram_64 = Some(64u64 << 30);
-        use CapacitySource::{Measured, Presumed};
+        use CapacitySource::{Derived, Measured, Presumed};
 
         // machine | rung | cells | offscreen | pool | room | raster | cap | source | frames
         assert_eq!(
@@ -1770,11 +1875,14 @@ mod budget_agreement {
                 24576 - 256,
                 8192,
                 32768,
-                Measured,
+                Derived,
                 36
             ),
             "the 3090 over GL with the host's 64 GiB read: an unclassed adapter at the \
-             desktop-class line is believed as unified memory, half the RAM",
+             desktop-class line is believed as unified memory, half the RAM — DERIVED \
+             and not measured, since no API was asked about this GPU; every other \
+             column is unchanged, which is what says the word moved and the arithmetic \
+             did not",
         );
         assert_eq!(
             row(d, DeviceClass::Integrated, 16384, 8192, None, ram_64, 1),
@@ -1786,12 +1894,12 @@ mod budget_agreement {
                 24576 - 256,
                 8192,
                 32768,
-                Measured,
+                Derived,
                 36
             ),
-            "a desktop integrated GPU on a 64 GiB host: 32 GiB of unified memory measured, \
-             the pool by need, and the offscreen at the Step — what holds it back is fill \
-             rate, which no memory figure speaks to",
+            "a desktop integrated GPU on a 64 GiB host: 32 GiB of unified memory DERIVED \
+             from the host's RAM and not measured, the pool by need, and the offscreen at \
+             the Step — what holds it back is fill rate, which no memory figure speaks to",
         );
         // **The raster column moved from 2048 to 4096 at WS1**, on the four-leg
         // adapter measurement recorded at

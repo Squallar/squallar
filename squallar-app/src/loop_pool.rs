@@ -75,13 +75,21 @@ impl LoopPoolLimits {
 
     /// These bounds on `cap`'s arm. The floor holds everywhere. The ceiling is
     /// a presumption — the most a bracket spends on loops when nothing has
-    /// measured the card — so it binds only a presumed capacity; against a
-    /// measured or probed one the bound is the room under the allowance,
-    /// which `loop_pool_bytes` has already applied, and no bracket constant
-    /// caps what a scene needs on a card that was seen to hold it.
+    /// measured the card — so it binds only a capacity nothing measured;
+    /// against a measured or probed one the bound is the room under the
+    /// allowance, which `loop_pool_bytes` has already applied, and no bracket
+    /// constant caps what a scene needs on a card that was seen to hold it.
+    ///
+    /// **A derived figure keeps the ceiling**, and that is the correction. It
+    /// is the only bound here that is ever removed, so removing it on the
+    /// strength of arithmetic this app did on the host's RAM — no API was
+    /// asked about the card — is what let an integrated part's loop pool run
+    /// to `usize::MAX` on a laptop with 86.2 GiB of RAM. What retires a static
+    /// VRAM ceiling is a card that was *seen* to hold more, and a division has
+    /// seen nothing.
     pub fn on(self, cap: &Capacity) -> Self {
         match cap.source {
-            CapacitySource::Presumed => self,
+            CapacitySource::Presumed | CapacitySource::Derived => self,
             CapacitySource::Measured | CapacitySource::Probed => Self {
                 floor: self.floor,
                 ceiling: usize::MAX,

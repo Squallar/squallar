@@ -91,7 +91,7 @@ fn a_probe_of(bytes: u64) -> ProbedCapacity {
 /// **The browser probe's figure reaches the fit, and only where it belongs.**
 /// A web profile the driver would not class — every browser — holds the
 /// 288 MiB presumption until the probe reports and prints `cap 288 0`; the
-/// fold then prints `cap 4032 2`, the capacity is `Capacity::probed`, and
+/// fold then prints `cap 4032 3`, the capacity is `Capacity::probed`, and
 /// the scene is re-fitted once. Six two-hour loops that the presumption had
 /// to shorten keep every frame under a 3024 MiB allowance; the page heap the
 /// probe does not speak for still cannot hold their decoded volumes, and
@@ -151,7 +151,7 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
         "three quarters of a probed figure"
     );
     assert!(
-        budget_line(&app).contains(", cap 4032 2, probe 4, balloon "),
+        budget_line(&app).contains(", cap 4032 3, probe 4, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -203,7 +203,7 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     app.adopt_probed_capacity(a_probe_of(8 << 30), wgpu::Backend::BrowserWebGpu);
     assert_eq!(app.gpu_probe.bytes(), Some(4032 << 20));
     assert!(
-        budget_line(&app).contains(", cap 4032 2, probe 4, balloon "),
+        budget_line(&app).contains(", cap 4032 3, probe 4, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -226,7 +226,7 @@ fn a_capped_probe_prints_five_beside_its_figure() {
         wgpu::Backend::BrowserWebGpu,
     );
     assert!(
-        budget_line(&app).contains(", cap 8192 2, probe 5, balloon "),
+        budget_line(&app).contains(", cap 8192 3, probe 5, balloon "),
         "{}",
         budget_line(&app)
     );
@@ -492,7 +492,7 @@ fn an_injected_gpu_capacity_reaches_the_profile_and_moves_no_budget() {
 /// **A measured capacity reaches the fit, and a presumed one does not pretend
 /// to.** The same headless application on the class a discrete card earns:
 /// with a 24 GiB reading its capacity is measured, the `budget state:` line
-/// says `cap 24576 1`, and six two-hour loops fit at the full 36-frame render
+/// says `cap 24576 2`, and six two-hour loops fit at the full 36-frame render
 /// budget — where the 3840 MiB presumption, which is what the same profile
 /// holds before the reading arrives, prints `cap 3840 0` and halves the
 /// history to 18. The default headless application, having met no adapter,
@@ -567,7 +567,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
 
     assert_eq!(app.capacity(), Capacity::measured(24 << 30, None));
     assert!(
-        line(&app).contains(", cap 24576 1, probe 0, balloon "),
+        line(&app).contains(", cap 24576 2, probe 0, balloon "),
         "{}",
         line(&app)
     );

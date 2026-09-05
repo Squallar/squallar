@@ -334,7 +334,15 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
     check_budgets(&resolve(profile), profile, from);
     check_fit_against(profile, &Capacity::presumed(&profile.limits), from);
     let measured = profile.capacity();
-    if measured.source == CapacitySource::Measured {
+    // A derived capacity carries a figure the same way a measured one does —
+    // it is this machine's RAM rather than the bracket's constant — so it is
+    // checked on the same arm. It cannot arise from this matrix, whose rows
+    // carry no available-RAM reading, but the predicate says what it means
+    // rather than what today's rows happen to produce.
+    if matches!(
+        measured.source,
+        CapacitySource::Measured | CapacitySource::Derived
+    ) {
         check_fit_against(profile, &measured, &format!("{from} / measured"));
     }
 }
@@ -911,7 +919,13 @@ fn the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where
                     );
                 }
             }
-            CapacitySource::Measured => {
+            // A derived capacity is on this arm for the same reason it is in
+            // `check_invariants`: it carries a reading's arithmetic, so it
+            // moves budgets where a presumption moves none. No row of this
+            // matrix produces one — every row's host pool is unread, so a
+            // unified part falls back to its total — and folding it in here
+            // keeps the row accounting true if that ever changes.
+            CapacitySource::Measured | CapacitySource::Derived => {
                 measured_rows += 1;
                 assert_eq!(profile.platform, Platform::Native, "{row}");
                 assert!(
@@ -1376,12 +1390,30 @@ fn a_reading_is_a_measurement_only_where_the_platform_and_class_make_it_one() {
         radeon_890m.gpu_capacity_bytes(),
         Some(RAM / crate::constants::UNIFIED_MEMORY_GPU_DIVISOR),
     );
+    // **The two figures partition the one pool.** No API was asked about this
+    // GPU, so the figure is derived and not measured; the host figure is what
+    // the GPU share leaves rather than the RAM reading over again, and the two
+    // sum to the pool exactly.
+    let apu = radeon_890m.capacity();
+    assert_eq!(apu.source, CapacitySource::Derived);
+    assert_eq!(apu.pools, crate::scene::Pools::Unified);
+    assert_eq!(apu.gpu_bytes, RAM / 2);
+    assert_eq!(apu.host_bytes, Some(RAM / 2));
+    assert_eq!(apu.gpu_bytes + apu.host_bytes.unwrap(), RAM);
     let m_series = cell(Native, Integrated, Some(48 << 30), Some(RAM), desktop_class);
     assert_eq!(
         m_series.gpu_capacity_bytes(),
         Some(48 << 30),
         "Metal's working set replaces the divisor wherever it answers",
     );
+    // Metal read the GPU, so the source stays measured — but the memory it
+    // read is the memory the host figure names, so the partition applies all
+    // the same and the host keeps only the 16 GiB the working set left.
+    let mac = m_series.capacity();
+    assert_eq!(mac.source, CapacitySource::Measured);
+    assert_eq!(mac.pools, crate::scene::Pools::Unified);
+    assert_eq!(mac.gpu_bytes, 48 << 30);
+    assert_eq!(mac.host_bytes, Some(16 << 30));
     assert_eq!(
         cell(Native, Integrated, None, None, guarantee).gpu_capacity_bytes(),
         None,
@@ -1424,11 +1456,23 @@ fn a_reading_is_a_measurement_only_where_the_platform_and_class_make_it_one() {
                         match got {
                             Some(gpu_bytes) => {
                                 measuring += 1;
+                                // Two memories ride side by side; one memory
+                                // is cut in two. The cell that reads as
+                                // unified with no RAM figure has no pool to
+                                // cut and no host figure to double count, so
+                                // it takes the side-by-side arm too.
+                                let expected = match (profile.unified_memory(), ram) {
+                                    (true, Some(pool)) => Capacity::unified(pool, vram),
+                                    _ => Capacity::measured(gpu_bytes, ram),
+                                };
                                 assert_eq!(
                                     profile.capacity(),
-                                    Capacity::measured(gpu_bytes, ram),
-                                    "{platform:?} / {class:?}",
+                                    expected,
+                                    "{platform:?} / {class:?} / vram {vram:?} / ram {ram:?}",
                                 );
+                                // Whatever the arm, the GPU figure is the one
+                                // `gpu_capacity_bytes` named.
+                                assert_eq!(profile.capacity().gpu_bytes, gpu_bytes);
                             }
                             None => assert_eq!(
                                 profile.capacity(),
