@@ -49,10 +49,28 @@ impl GridKey {
 
 /// What one resident grid really costs, in bytes.
 ///
-/// `values` is the whole figure in practice — 1,905,141 `f32` = **7,620,564
-/// bytes** on the CONUS grid — but the `Explicit` coordinate arm is counted
-/// too rather than assumed away: it is 30.5 MB at that size, four times the
-/// values, and it is what a non-Lambert HRRR-shaped source would arrive on.
+/// `values` is the whole figure in practice — 1,905,141 values at
+/// [`HrrrGridData::ELEMENT_BYTES`] = **7,620,564 bytes** on the CONUS grid —
+/// but the `Explicit` coordinate arm is counted too rather than assumed away:
+/// it is 30.5 MB at that size, four times the values, and it is what a
+/// non-Lambert HRRR-shaped source would arrive on.
+///
+/// **The values term is read off the store, not spelled here.** It was
+/// `grid.values.len() * size_of::<f32>()`, and a literal width beside a field
+/// that owns the real one is a figure that goes on compiling while the store
+/// under it moves — the way [`super::gmgsi::GLOBAL_GRID_BYTES`] went on
+/// pricing four bytes a point after its mosaic narrowed to one, with its own
+/// `== N` pin still green. `size_of_val` over the slice reads the field's own
+/// element, so this figure cannot disagree with the store; and — measured, not
+/// asserted — it stops compiling outright if `values` ever becomes a tagged
+/// [`GridValues`](crate::render::gridded::GridValues) rather than narrowing in
+/// place, which is the swap the old spelling accepted in silence.
+///
+/// **The coordinate terms are still literals**, and knowingly: `lats`,
+/// `lons` and the two axes are geodetic `f64`, where the width is a precision
+/// requirement rather than a storage choice, and narrowing one would redden
+/// `squallar-geo` long before it reached a byte figure. Same shape, different
+/// risk; stated rather than left to read as an oversight.
 fn grid_bytes(grid: &HrrrGridData) -> usize {
     let coords = match &grid.coords {
         crate::hrrr::GridCoords::Explicit { lats, lons } => {
@@ -67,7 +85,7 @@ fn grid_bytes(grid: &HrrrGridData) -> usize {
         // `size_of` below.
         crate::hrrr::GridCoords::Lambert(_) | crate::hrrr::GridCoords::Regular { .. } => 0,
     };
-    std::mem::size_of::<HrrrGridData>() + grid.values.len() * std::mem::size_of::<f32>() + coords
+    std::mem::size_of::<HrrrGridData>() + std::mem::size_of_val(grid.values.as_slice()) + coords
 }
 
 /// **How many bytes of decoded grid this target keeps resident**, across every
@@ -116,11 +134,28 @@ pub const MAX_PANES_DESKTOP: usize = 6;
 pub const MAX_PANES_MOBILE: usize = 4;
 
 /// What one CONUS grid costs, as [`grid_bytes`] counts it: 1799 × 1059 =
-/// 1,905,141 `f32`, on a `Lambert` coordinate arm that adds nothing. Measured
-/// 2026-08-21; the opening assertion of
-/// `the_byte_budget_holds_at_least_one_grid_per_pane` is what keeps it from
-/// drifting away from the function.
-pub const HRRR_CONUS_GRID_BYTES: usize = 1799 * 1059 * 4;
+/// 1,905,141 values at [`HrrrGridData::ELEMENT_BYTES`], on a `Lambert`
+/// coordinate arm that adds nothing. Measured 2026-08-21; the opening
+/// assertion of `the_byte_budget_holds_at_least_one_grid_per_pane` is what
+/// keeps it from drifting away from the function.
+///
+/// **The width is the store's, not a literal `4`.** It was, and that made this
+/// the denominator of every budget below without depending on the thing it
+/// prices: the shape moved with the product and the width moved with nothing.
+/// The test that holds this equal to [`grid_bytes`] could not tell, because
+/// both sides were the same literal — a mutual-consistency pin over two copies
+/// of one constant, which is exactly the arrangement that let
+/// [`super::gmgsi::GLOBAL_GRID_BYTES`] and `mrms::volume::CONUS_STACK_BYTES`
+/// each survive a change to their own store.
+pub const HRRR_CONUS_GRID_BYTES: usize = 1799 * 1059 * HrrrGridData::ELEMENT_BYTES;
+
+// **The two terms pinned APART**, so a build failure names which one moved
+// rather than only that a total did, and so no reader can retype one figure
+// green. Neither pin existed before: the constant was arithmetic over a
+// literal, so an `== N` over it would have been one literal checked against
+// another. The width pin is the one the old spelling could not have had.
+const _: () = assert!(HrrrGridData::ELEMENT_BYTES == 4);
+const _: () = assert!(HRRR_CONUS_GRID_BYTES == 7_620_564);
 
 /// **The floor, as a build failure.** A budget below one grid per pane is
 /// overrun *silently* — the pinned keys are never victims, so the cache holds

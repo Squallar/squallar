@@ -1728,12 +1728,26 @@ impl GridCoords {
     }
 }
 
+/// **The element [`HrrrGridData::values`] stores one of a point.**
+///
+/// HRRR's values really are float-wide, and unlike
+/// [`GridValues::Scaled`](crate::render::gridded::GridValues::Scaled) and
+/// [`GridValues::Bytes`](crate::render::gridded::GridValues::Bytes) — the two
+/// arms that store a source's own narrower code — this grid takes neither.
+///
+/// It is **named rather than spelled** so that the width has one declaration
+/// and every byte figure reaches it: [`HrrrGridData::ELEMENT_BYTES`] reads it,
+/// and `render::handlers::model`'s `grid_bytes` and `HRRR_CONUS_GRID_BYTES`
+/// read that. Two of those were separate literal `4`s with nothing making them
+/// agree.
+pub type HrrrValue = f32;
+
 /// `PartialEq` is derived for the described-overlay wire tests and carries the
 /// usual `NaN != NaN` caveat.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HrrrGridData {
     pub parameter: ModelParameter,
-    pub values: Vec<f32>,
+    pub values: Vec<HrrrValue>,
     pub coords: GridCoords,
     pub ni: usize,
     pub nj: usize,
@@ -1750,6 +1764,24 @@ pub struct HrrrGridData {
 }
 
 impl HrrrGridData {
+    /// **Bytes one stored value occupies**, off the field's own element.
+    ///
+    /// The multiplier every byte figure on a model grid is built from.
+    /// A literal `size_of::<f32>()` in any of its readers is the same defect
+    /// one turn later: it goes on pricing four bytes a point after the store it
+    /// describes has moved, and an `== N` pin over the product cannot see that,
+    /// because a literal width does not depend on the store.
+    ///
+    /// **Measured on this tree.** `values` swapped to
+    /// [`GridValues`](crate::render::gridded::GridValues) — the crate's own
+    /// narrow-capable store, and what a narrowing here would reach for — with
+    /// the old spelling left in place: **28 sites across the crate's readers
+    /// failed to compile, and the two byte figures were not among them**, nor
+    /// was any `const _`. The type system catches every reader of a narrowed
+    /// store and waves the pricing through. Under the spelling this const now
+    /// serves, the same swap fails at `grid_bytes` itself.
+    pub const ELEMENT_BYTES: usize = size_of::<HrrrValue>();
+
     pub fn valid_time(&self) -> chrono::NaiveDateTime {
         self.ref_time + chrono::Duration::hours(self.forecast_hour as i64)
     }
