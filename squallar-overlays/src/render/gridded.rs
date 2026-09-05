@@ -70,6 +70,63 @@ pub enum GridValues {
     Bytes(ByteCodes),
 }
 
+/// The element [`ScaledU16`] stores one of a point.
+pub type ScaledCode = u16;
+/// The element [`ByteCodes`] stores one of a point.
+pub type ByteCode = u8;
+
+/// **Which store an arm is** — the question [`SampleKind::bytes_per_sample`]
+/// prices, asked once so the answer is not spelled three times.
+///
+/// Three types name a storage arm: [`GridValues`] owns one, [`ValuesRef`]
+/// borrows one, and `render::jobs::WireValues` is the wire's statement of one.
+/// Each carried its **own copy of the widths**, and nothing held the copies
+/// equal.
+///
+/// **A disagreement here is a misread, not an over-charge.** A lend is cut in
+/// the store's width by `GriddedJob::resident_payload` and read back in the
+/// wire tag's width by `GriddedJob::decode_resident`, so two copies that stop
+/// agreeing describe one band at two strides. Measured on this tree with the
+/// borrowed copy's scaled arm alone moved to four: the crate compiled and all
+/// 992 tests passed, because no test drove those two arithmetics against each
+/// other. An interior band is then refused — and a **vertically centred** one,
+/// the shape where the lend's range clamp trims an over-long request to exactly
+/// the length the far end demands, is *accepted* with every sample read from
+/// the wrong rows: 224 of 224 wrong, nothing refused, nothing logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleKind {
+    F32,
+    ScaledU16,
+    Bytes,
+}
+
+impl SampleKind {
+    /// **Bytes one stored sample occupies** — the multiplier every byte figure
+    /// and every wire length in the tree is built from.
+    ///
+    /// Read off each arm's **own element** rather than spelled here: a literal
+    /// `size_of::<u16>()` would be the same defect one turn later, going on
+    /// reading two after the store it describes had moved. That is precisely
+    /// how `GLOBAL_GRID_BYTES` came to price four bytes a point for a store
+    /// that had narrowed to one while its own `== N` pin stayed green.
+    #[inline]
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::F32 => size_of::<f32>(),
+            Self::ScaledU16 => ScaledU16::ELEMENT_BYTES,
+            Self::Bytes => ByteCodes::ELEMENT_BYTES,
+        }
+    }
+}
+
+// The three widths, pinned APART, so a build failure names WHICH store moved
+// rather than only that some total did. A widening is allowed to land; what it
+// may not do is land silently, and this is the line that makes a human re-read
+// the budgets and the prose around it.
+const _: () = assert!(SampleKind::F32.bytes_per_sample() == 4);
+const _: () = assert!(SampleKind::ScaledU16.bytes_per_sample() == 2);
+const _: () = assert!(SampleKind::Bytes.bytes_per_sample() == 1);
+
 /// **A byte a point, and the points that carry no reading.**
 ///
 /// No affine, deliberately. `value = f32::from(code)` is the whole rule, which
@@ -101,7 +158,7 @@ pub enum GridValues {
 /// it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ByteCodes {
-    codes: Vec<u8>,
+    codes: Vec<ByteCode>,
     absent: Vec<u32>,
 }
 
@@ -117,6 +174,10 @@ pub struct ByteCodes {
 pub const MAX_ABSENT_POINTS: usize = 64;
 
 impl ByteCodes {
+    /// **Bytes one stored code occupies**, off the field's own element — the
+    /// width [`SampleKind::Bytes`] prices this arm at.
+    pub const ELEMENT_BYTES: usize = size_of::<ByteCode>();
+
     /// The byte arm, or `None` when `absent` is not a set this can carry:
     /// longer than [`MAX_ABSENT_POINTS`], not strictly ascending, or naming a
     /// point past the codes.
@@ -185,7 +246,7 @@ impl ByteCodes {
 /// agreeing in the last ULP.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScaledU16 {
-    pub codes: Vec<u16>,
+    pub codes: Vec<ScaledCode>,
     pub ref_val: f32,
     /// `2^exp` — section 5's binary scale, pre-raised.
     pub two_pow: f32,
@@ -213,6 +274,10 @@ pub struct ScaledU16 {
 pub const MAX_NAN_CODES: usize = 8;
 
 impl ScaledU16 {
+    /// **Bytes one stored code occupies**, off the field's own element — the
+    /// width [`SampleKind::ScaledU16`] prices this arm at.
+    pub const ELEMENT_BYTES: usize = size_of::<ScaledCode>();
+
     /// The narrow arm, or `None` when this packing does not belong in it.
     ///
     /// `nan_codes` is discovered here rather than supplied: the caller states
@@ -304,15 +369,25 @@ impl GridValues {
         }
     }
 
+    /// Which store this holds — the arm [`SampleKind`] prices.
+    #[inline]
+    pub fn kind(&self) -> SampleKind {
+        match self {
+            Self::F32(_) => SampleKind::F32,
+            Self::Scaled(_) => SampleKind::ScaledU16,
+            Self::Bytes(_) => SampleKind::Bytes,
+        }
+    }
+
     /// **Bytes one point occupies** — the multiplier every byte figure on this
     /// grid is built from, and the one the wire's length check derives from.
+    ///
+    /// Through [`SampleKind`], never restated here: this and the borrowed and
+    /// wire spellings must agree, and the only way two of them cannot disagree
+    /// is for there to be one of them.
     #[inline]
     pub fn bytes_per_sample(&self) -> usize {
-        match self {
-            Self::F32(_) => size_of::<f32>(),
-            Self::Scaled(_) => size_of::<u16>(),
-            Self::Bytes(_) => size_of::<u8>(),
-        }
+        self.kind().bytes_per_sample()
     }
 
     /// **What this grid costs resident.** Every byte budget in the tree is
@@ -459,13 +534,22 @@ impl<'a> ValuesRef<'a> {
         }
     }
 
+    /// Which store this borrows — the arm [`SampleKind`] prices.
+    #[inline]
+    pub fn kind(self) -> SampleKind {
+        match self {
+            Self::F32(_) => SampleKind::F32,
+            Self::Scaled(_) => SampleKind::ScaledU16,
+            Self::Bytes(_) => SampleKind::Bytes,
+        }
+    }
+
+    /// **Bytes one borrowed point occupies.** The width the lend's byte range
+    /// is cut in — see [`SampleKind`] for what a copy of this that stopped
+    /// agreeing with the wire's costs.
     #[inline]
     pub fn bytes_per_sample(self) -> usize {
-        match self {
-            Self::F32(_) => size_of::<f32>(),
-            Self::Scaled(_) => size_of::<u16>(),
-            Self::Bytes(_) => size_of::<u8>(),
-        }
+        self.kind().bytes_per_sample()
     }
 
     /// The stored bytes of `range`, in the storage's own width — what the

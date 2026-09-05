@@ -1009,13 +1009,27 @@ impl WireValues {
         }
     }
 
-    /// **The multiplier every length on this wire is built from.**
-    fn bytes_per_sample(&self) -> usize {
+    /// Which store this tag names — the arm
+    /// [`SampleKind`](crate::render::gridded::SampleKind) prices.
+    fn kind(&self) -> crate::render::gridded::SampleKind {
+        use crate::render::gridded::SampleKind;
         match self {
-            Self::F32 => size_of::<f32>(),
-            Self::ScaledU16 { .. } => size_of::<u16>(),
-            Self::Bytes { .. } => size_of::<u8>(),
+            Self::F32 => SampleKind::F32,
+            Self::ScaledU16 { .. } => SampleKind::ScaledU16,
+            Self::Bytes { .. } => SampleKind::Bytes,
         }
+    }
+
+    /// **The multiplier every length on this wire is built from.**
+    ///
+    /// The same table the STORE side reads, not a second copy of it. These two
+    /// are the write and read halves of one payload — `resident_payload` cuts
+    /// the lent range in the store's width and `decode_resident` checks and
+    /// cuts it in this one — so a copy here that stopped agreeing would not be
+    /// a wrong figure, it would be a band read at the wrong stride. See
+    /// [`SampleKind`](crate::render::gridded::SampleKind).
+    fn bytes_per_sample(&self) -> usize {
+        self.kind().bytes_per_sample()
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
@@ -1112,9 +1126,18 @@ impl WireValues {
                 dig_factor,
                 nan_codes,
             } => Some(GridValues::Scaled(ScaledU16 {
+                // The stride and the width it reads back are ONE fact, spelled
+                // once: a `chunks_exact(2)` beside a `u16::from_le_bytes` is
+                // two statements of the store's element that a widening moves
+                // separately. `chunks_exact` yields exactly `ELEMENT_BYTES`, so
+                // the conversion below is total by construction.
                 codes: bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .chunks_exact(ScaledU16::ELEMENT_BYTES)
+                    .map(|c| {
+                        crate::render::gridded::ScaledCode::from_le_bytes(
+                            c.try_into().expect("`chunks_exact` yields ELEMENT_BYTES"),
+                        )
+                    })
                     .collect(),
                 ref_val: *ref_val,
                 two_pow: *two_pow,
@@ -2262,6 +2285,118 @@ mod tests {
              compared a `NaN` and a `nan_codes` list that failed to cross the \
              wire would read back as the finite −999.0 unnoticed",
         );
+    }
+
+    /// **The band is read back at the width it was lent**, over the real pair
+    /// rather than a hand-built payload.
+    ///
+    /// `resident_payload` cuts the lent range in the **store's** width and
+    /// `decode_resident` checks its length and cuts its columns in the **wire
+    /// tag's** width. Every other resident test on this row builds the payload
+    /// by hand, so nothing drove those two arithmetics against each other and a
+    /// width table that stopped agreeing with the other was invisible: with
+    /// `ValuesRef::bytes_per_sample`'s scaled arm alone moved to four, this
+    /// crate compiled and all 992 tests passed. Both now read
+    /// [`SampleKind`](crate::render::gridded::SampleKind); this is the test
+    /// that fires if they are ever spelled apart again.
+    ///
+    /// **An interior band is the case that can fail.** A whole-grid window
+    /// lends `start = 0` and a length the range clamp trims back to exactly the
+    /// buffer, so the far end checks the right bytes whatever the lend believed
+    /// a sample was — the one window shape under which a disagreement cannot
+    /// show. The assertion below refuses to run on one.
+    #[test]
+    fn a_lent_band_is_read_back_at_the_width_it_was_lent() {
+        use crate::hrrr::GridCoords;
+        use crate::render::gridded::{GridValues, ResidentGrid, ScaledU16};
+        use squallar_source::job::EncodeCtx;
+
+        let (ni, nj) = (16usize, 16usize);
+        let scaled = ScaledU16 {
+            codes: (0..(ni * nj) as u16).collect(),
+            ref_val: 0.0,
+            two_pow: 1.0,
+            dig_factor: 1.0,
+            nan_codes: vec![],
+        };
+        let coords = GridCoords::Regular {
+            lat0: 30.0,
+            lon0: -100.0,
+            dlat: 0.5,
+            dlon: 0.5,
+            ni,
+            nj,
+            scan_mode: 0,
+        };
+        let field = crate::render::gridded::paint_for_code("vis")
+            .expect("this build registers the `vis` field")
+            .id
+            .clone();
+        let sender = GriddedInput::Resident(std::sync::Arc::new(ResidentGrid {
+            field: field.clone(),
+            ni,
+            nj,
+            coords: coords.clone(),
+            values: GridValues::Scaled(scaled.clone()),
+        }));
+
+        let geo = JobGeometry {
+            width: 64,
+            height: 64,
+            bounds: squallar_geo::GeoBounds {
+                min_lat: 32.0,
+                max_lat: 35.5,
+                min_lon: -98.0,
+                max_lon: -94.0,
+            },
+            side_ceiling_px: 0,
+        };
+        let ctx = EncodeCtx { geometry: geo };
+
+        let win = sender.window_for(
+            &ctx.geometry.bounds,
+            ctx.geometry.width,
+            ctx.geometry.height,
+        );
+        // Non-vacuity: a band starting at row zero is the shape that MASKS a
+        // width disagreement, so this test would prove nothing on one.
+        assert!(
+            win.j0 > 0 && win.j1 < nj,
+            "this test needs an INTERIOR band ({}..{} of {nj}); a whole-grid \
+             window cannot show a lend and a read disagreeing about a sample",
+            win.j0,
+            win.j1,
+        );
+
+        let payload = <GriddedJob as JobSpec>::resident_payload(&sender, &ctx)
+            .expect("a resident grid lends its band");
+        let mut head = Vec::new();
+        <GriddedJob as JobSpec>::encode_resident_head(&sender, &ctx, &mut head);
+
+        let mut r = Reader::new(&head);
+        let (input, _) = <GriddedJob as JobSpec>::decode_resident(&mut r, geo, payload.bytes())
+            .expect("the band the lend just cut is the band the head names");
+
+        let GriddedInput::Window(window) = input else {
+            panic!("a lent grid decodes to the cut window");
+        };
+        // Every value, against what the page holds at the same point.
+        let page = GridValues::Scaled(scaled);
+        let row_w = win.i1 - win.i0;
+        for j in win.j0..win.j1 {
+            for i in win.i0..win.i1 {
+                let far = window
+                    .values
+                    .get((j - win.j0) * row_w + (i - win.i0))
+                    .expect("inside the cut");
+                let here = page.get(j * ni + i).expect("inside the grid");
+                assert_eq!(
+                    far.to_bits(),
+                    here.to_bits(),
+                    "point ({i}, {j}) read back as {far} where the page holds {here}",
+                );
+            }
+        }
     }
 
     /// **A byte grid crosses the whole wire at one byte a point, absent points
