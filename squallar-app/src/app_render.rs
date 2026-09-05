@@ -1354,8 +1354,10 @@ impl super::App {
                     budget_state: self.budget_state_panel_line.as_deref(),
                     ..self.frame_ledger.diagnostics()
                 }),
-                // As the last loop walk composed it — see
-                // `Self::compose_budget_readout`.
+                // As the last telemetry tick composed it — see
+                // `Self::compose_budget_readout`. Borrowed, and the Gui
+                // copies it only when its generation moved, so re-stating it
+                // every frame costs a pointer here and a `u64` compare there.
                 budget_readout: Some(&self.budget_readout),
             });
     }
@@ -1985,6 +1987,13 @@ impl super::App {
         // reading serves both the line and the watermark below it.
         let linear = self.platform.linear_memory();
         self.page_heap_reading = linear.or(self.page_heap_reading);
+        // **The readout is composed here, by the one thing that reads it**,
+        // and after the heap reading above so its host spare is held to this
+        // tick's room rather than the last one's. This is the whole of its
+        // cadence: the frame path composes nothing
+        // ([`Self::compose_budget_readout`]). The scene comes back so the
+        // pane count below reads it instead of walking again.
+        let scene = self.refresh_budget_readout();
         say_telemetry(
             loud,
             self.budget_state_panel_line
@@ -2010,9 +2019,7 @@ impl super::App {
         say_telemetry(
             loud,
             &crate::budget_telemetry::overlay_pictures_line(
-                &self
-                    .render
-                    .overlay_picture_sizes(self.scene_of().panes.len()),
+                &self.render.overlay_picture_sizes(scene.panes.len()),
                 self.render.resident_overlay_pictures(),
                 self.budgets.overlay_oversample_percent,
             ),
@@ -4758,7 +4765,9 @@ impl super::App {
             demand,
             counts,
             scene,
-            overlay_grids,
+            // The readout's, and composed on the readout's cadence rather
+            // than this one — see `Self::compose_budget_readout`.
+            overlay_grids: _,
         } = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
@@ -4793,27 +4802,71 @@ impl super::App {
             .pictures_host
             .saturating_add(terms.picture_arrival_host);
         self.loop_pool = self.pool_for_scene(&scene);
-        let allocation = self
-            .loop_pool_state
+        self.loop_pool_state
             .observe(
                 self.loop_pool,
                 LoopFrameModel::from_budgets(&self.budgets),
                 demand,
             )
-            .clone();
-        self.compose_budget_readout(&scene, &terms, overlay_grids, &allocation);
-        allocation
+            .clone()
     }
 
-    /// **Compose the budget readout** from the scene this walk priced: per
+    /// **Rebuild the budget readout**, taking the walk it needs.
+    ///
+    /// The one caller is [`Self::report_frame_telemetry`], which is the
+    /// readout's only consumer — see [`Self::compose_budget_readout`] for why
+    /// the cadence is the consumer's and not the frame's. It takes one
+    /// `loop_demand` walk, which that tick was already taking for
+    /// `overlay_pictures_line`'s pane count, and hands the scene back so the
+    /// tick spends one walk where it spent one before.
+    ///
+    /// The allocation is the one in force ([`Self::loop_allocation`]), not a
+    /// fresh plan: planning is the frame path's, and a readout that re-planned
+    /// the pool to describe it would be an instrument with a side effect.
+    fn refresh_budget_readout(&mut self) -> Scene {
+        let LoopWalk {
+            scene,
+            overlay_grids,
+            ..
+        } = self.loop_demand();
+        let terms = squallar_device_profile::fit::need_terms(&scene, &self.budgets, GRID_BYTES);
+        let allocation = self.loop_allocation();
+        self.compose_budget_readout(&scene, &terms, overlay_grids, &allocation);
+        scene
+    }
+
+    /// **Compose the budget readout** from a scene a walk has priced: per
     /// pane, `fit::need_terms_for_pane` beside what the pane's stores hold;
     /// per pool, the capacity in force, its allowance, the scene's need and
-    /// what is spare. On the loop walk, which is the cadence `fit` already
-    /// runs at — no second pane walk, and the pane vector is reused so this
-    /// allocates nothing past the first walk (the walk itself allocates one
-    /// site key per looping pane for the scan reconciliation); the Gui copies
-    /// the readout only when it changed. A few multiplications a pane and one
-    /// lock of the volume store's handful of entries.
+    /// what is spare.
+    ///
+    /// # Cadence, and who sets it
+    ///
+    /// **Called from [`Self::refresh_budget_readout`], on the telemetry tick
+    /// — never on the frame path.** The one thing that reads this readout is
+    /// `budget_telemetry::budget_state_line`, inside
+    /// [`Self::report_frame_telemetry`], which runs at most once per
+    /// [`RASTER_TELEMETRY_PERIOD`] — 2 s. **That consumer sets the cadence.**
+    /// The in-frame overlay the seam was built for reads `Gui::budget_readout`
+    /// and paints the same levels; neither needs a figure retaken 120 times a
+    /// second to say what the line says every 2 s.
+    ///
+    /// **There is no scene-change trigger to hang this on, and that is why it
+    /// is a cadence.** Half of what it reads is not a function of the scene at
+    /// all: `VolumeStore::pane_texture_bytes` and the loop grants are levels
+    /// of bytes resident *now*, moving as volumes land and are evicted, and
+    /// `page_heap_reading` is re-sampled by this same tick. A gate on "the
+    /// scene moved" would hold a stale figure through exactly the window the
+    /// readout exists to describe, and `refit_to_scene` — the nearest thing
+    /// to such a trigger — has none either: it re-runs `fit` every frame and
+    /// merely *acts* less often.
+    ///
+    /// What it costs, on the tick and nowhere else: a few multiplications a
+    /// pane, one lock of the volume store's handful of entries per 3D pane,
+    /// two linear scans of the allocation per 2D pane, and the grid list
+    /// moved in. The pane vector is reused, so past the first composition it
+    /// allocates nothing. [`squallar_egui::shell_api::BudgetReadout::generation`]
+    /// rises by one, which is the whole of what the Gui compares.
     ///
     /// **Held bytes have two sources and one denominator each.** A 3D pane's
     /// grids are in the volume store, which knows its holders — shared where
@@ -4841,6 +4894,9 @@ impl super::App {
         let cap = self.capacity();
         let need = terms.total();
         let readout = &mut self.budget_readout;
+        // Bumped here and nowhere else, so the counter and the content cannot
+        // disagree: every consumer that caches a copy keys off this.
+        readout.generation = readout.generation.wrapping_add(1);
         readout.panes.clear();
         for (pane_idx, pane) in scene.panes.iter().enumerate() {
             let pane_terms =
@@ -7663,3 +7719,9 @@ mod pane_need_px_tests;
 #[path = "app_render/host_spare_tests.rs"]
 #[cfg(test)]
 mod host_spare_tests;
+
+/// The budget readout is composed on the telemetry tick that reads it, and
+/// never on the frame path — the count, not the figures.
+#[path = "app_render/budget_readout_cadence_tests.rs"]
+#[cfg(test)]
+mod budget_readout_cadence_tests;

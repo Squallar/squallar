@@ -20,7 +20,17 @@ pub struct Gui {
     /// Gui last saw it change ([`crate::shell_api::BudgetReadout`]). Held so
     /// the in-frame and per-layer readouts can paint it without pricing
     /// anything themselves; `None` until the first frame carrying one.
+    ///
+    /// The copy is taken on [`crate::shell_api::BudgetReadout::generation`]
+    /// alone — see [`Self::budget_readout_copies`] for what counts them.
     pub(super) budget_readout: Option<crate::shell_api::BudgetReadout>,
+    /// **How many copies of the readout this Gui has taken across the seam**,
+    /// since construction. An always-on counter, not a test seam: the whole
+    /// point of the generation is that this rises on the App's cadence and
+    /// not on the frame's, and a counter is the only thing that can say so.
+    /// One copy is two `Vec` allocations plus a `Cow` clone per gridded
+    /// layer; the compare that guards it is one `u64`.
+    pub(super) budget_readout_copies: u64,
     pub(super) time_dialog: TimeDialogState,
     pub(super) initial_zoom_set: bool,
     pub(super) map_tiles: MapTileState,
@@ -561,6 +571,7 @@ impl Gui {
         let mut gui = Self {
             liveness: Vec::new(),
             budget_readout: None,
+            budget_readout_copies: 0,
             time_dialog: TimeDialogState {
                 timestamp,
                 date_string: timestamp.format("%Y-%m-%d").to_string(),

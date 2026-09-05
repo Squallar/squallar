@@ -820,12 +820,21 @@ impl Gui {
         // Cloned, not borrowed: each entry is an id plus an `Arc`, so a frame
         // that publishes an unchanged status re-states the same allocation.
         self.liveness = inputs.liveness.to_vec();
-        // Copied only when it moved: the readout is a handful of integers
-        // per pane, re-stated every frame by an App that recomputes it on
-        // every loop walk, and most frames it is the same readout.
+        // **Copied only when it moved, and "moved" is one integer.** The App
+        // re-states the same borrowed readout every frame and rebuilds it on
+        // its consumer's cadence, so on all but one frame per rebuild this is
+        // a `u64` compare that fails. Comparing the readouts themselves would
+        // walk the pane vector, both pool records and the grid list's layer
+        // ids — a string compare each — to learn the same thing, and would
+        // clone on a byte figure that moved while nothing a consumer reads
+        // did. `None` still clears, as before.
         match inputs.budget_readout {
-            Some(readout) if self.budget_readout.as_ref() != Some(readout) => {
+            Some(readout)
+                if self.budget_readout.as_ref().map(|held| held.generation)
+                    != Some(readout.generation) =>
+            {
                 self.budget_readout = Some(readout.clone());
+                self.budget_readout_copies += 1;
             }
             Some(_) => {}
             None => self.budget_readout = None,
@@ -871,6 +880,13 @@ impl Gui {
     /// App has walked a scene.
     pub fn budget_readout(&self) -> Option<&crate::shell_api::BudgetReadout> {
         self.budget_readout.as_ref()
+    }
+
+    /// **How many times this Gui has copied a readout across the seam.** The
+    /// figure the per-frame claim rests on: it rises once per composition the
+    /// App publishes, never once per frame. See the field.
+    pub fn budget_readout_copies(&self) -> u64 {
+        self.budget_readout_copies
     }
 
     /// The distinct sites some pane is watching live — the unit the chunk feed

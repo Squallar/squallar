@@ -60,6 +60,12 @@
 //! Product telemetry, not a campaign instrument: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, and no figure it prints
 //! gates CI.
+//!
+//! **That tick is also what composes the readout this line prints.** The
+//! pane rows and the spare pair are levels, not running totals, so the one
+//! consumer sets the cadence and the frame path prices nothing for them —
+//! `App::refresh_budget_readout` is called from the same tick, immediately
+//! before this line, and `App::compose_budget_readout` says why.
 
 use crate::platform::{GpuProbeReport, LinearMemory};
 use squallar_device_profile::budget::{Budgets, DeviceProfile, FormFactor, Promotion};
@@ -130,10 +136,11 @@ pub(crate) fn capacity_source_word(source: CapacitySource) -> &'static str {
 ///
 /// **The spare pair, the live pair and the pane rows ride after `heap max`**,
 /// for the same reason: `readout` is the budget system's own readout
-/// (`squallar_egui::shell_api::BudgetReadout`), the two pools' spare and then
-/// one group per visible pane, appended where the rig's unanchored regex
-/// cannot see them. `none` for a spare the session has no pool figure for —
-/// spelled, because 0 is a real spare.
+/// (`squallar_egui::shell_api::BudgetReadout`), composed by this line's own
+/// tick just before the call (`App::refresh_budget_readout`) — the two pools'
+/// spare and then one group per visible pane, appended where the rig's
+/// unanchored regex cannot see them. `none` for a spare the session has no
+/// pool figure for — spelled, because 0 is a real spare.
 ///
 /// **`live <page>/<worker>` is the one host figure on the line that can
 /// fall**, and it rides LAST. What each instance's allocator has handed out

@@ -214,3 +214,157 @@ fn a_none_gps_clears_the_fix() {
         "the dot outlived the consent that allowed it"
     );
 }
+
+/// **The readout crosses the seam on the App's cadence, and the Gui asks one
+/// integer whether it moved.**
+///
+/// The App re-states the same borrowed readout on every frame and composes a
+/// new one only on the tick that reads it. What the Gui must not do is pay for
+/// that restatement: comparing the readouts structurally walks the pane
+/// vector, both pool records and the grid list's layer ids — a string compare
+/// each — on every frame, and copies whenever a byte figure moved, which
+/// during a gesture is nearly every frame. The generation is the whole of the
+/// question.
+///
+/// A test that asserted the *figures* arrive would have passed on the
+/// structural compare too; what is asserted here is the copy count.
+mod readout_cadence {
+    use super::*;
+    use crate::shell_api::{BudgetReadout, PaneBudget, PoolReadout};
+    use squallar_source::id::LayerId;
+
+    /// Two seconds of 120 Hz: the frames one composition has to survive.
+    const FRAMES: usize = 240;
+
+    /// A readout shaped like one the App composes — pane rows and a grid list,
+    /// so a copy is a real pair of allocations and a structural compare would
+    /// be a real walk. `need_bytes` distinguishes two readouts by content.
+    fn readout(generation: u64, panes: usize, need_bytes: u64) -> BudgetReadout {
+        BudgetReadout {
+            generation,
+            panes: vec![PaneBudget::default(); panes],
+            gpu: PoolReadout {
+                need_bytes,
+                ..PoolReadout::default()
+            },
+            overlay_grids: vec![
+                (LayerId::new("mrms-reflectivity"), 64 << 20),
+                (LayerId::new("gmgsi-longwave"), 32 << 20),
+            ],
+            ..BudgetReadout::default()
+        }
+    }
+
+    /// One frame's worth of inputs, everything but the readout held still —
+    /// the App's per-frame restatement.
+    fn apply(h: &mut InputHarness, budget_readout: Option<&BudgetReadout>) {
+        h.gui_mut().apply_frame_inputs(FrameInputs {
+            safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            supports_exit: true,
+            loop_frame_budget: 60,
+            concurrent_renders: 1,
+            tile_cache: crate::tile_source::default_tile_budget(),
+            overlay_overdraw: crate::overlay_cache::OVERDRAW_FRACTION,
+            location_settings_available: false,
+            location: (squallar_location::LocationPermission::Denied, false),
+            gps: None,
+            user_heading: None,
+            catalogue_pending: false,
+            liveness: &[],
+            floor_tile_zoom_bias: 0,
+            mirror_plan_stamp: 0,
+            frame_diagnostics: None,
+            budget_readout,
+        });
+    }
+
+    #[test]
+    fn the_seam_copies_once_per_composition_and_not_once_per_frame() {
+        let mut h = InputHarness::new();
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            0,
+            "precondition: nothing has crossed the seam yet",
+        );
+
+        let composed = readout(1, 2, 100);
+        for _ in 0..FRAMES {
+            apply(&mut h, Some(&composed));
+        }
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            1,
+            "{FRAMES} frames restating one composition took {} copies; the \
+             seam is comparing readouts again instead of generations",
+            h.gui().budget_readout_copies(),
+        );
+        assert_eq!(
+            h.gui().budget_readout(),
+            Some(&composed),
+            "the one copy has to be the real readout, or the count is vacuous",
+        );
+
+        // **And a gesture's worth of moving figures under one generation.**
+        // The App does not publish these — it composes once a tick, so
+        // between ticks the readout is byte-identical — but the seam's
+        // guarantee is that it would not pay for them if it did, which is
+        // what makes the compare O(1) rather than O(panes + layers). A
+        // structural compare copies on every one of these frames.
+        for frame in 0..FRAMES {
+            apply(&mut h, Some(&readout(1, 2, 100 + frame as u64)));
+        }
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            1,
+            "{FRAMES} frames of moving byte figures under one composition              took {} copies; the seam is walking the readout again",
+            h.gui().budget_readout_copies(),
+        );
+
+        // The App composed again: the generation moved, so the copy is taken.
+        let next = readout(2, 2, 200);
+        apply(&mut h, Some(&next));
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            2,
+            "a new composition did not cross, so the UI would paint the last \
+             one forever",
+        );
+        assert_eq!(
+            h.gui().budget_readout().map(|r| r.gpu.need_bytes),
+            Some(200),
+            "the copy carried the old figures",
+        );
+
+        // Clearing is not a copy, and still clears.
+        apply(&mut h, None);
+        assert!(
+            h.gui().budget_readout().is_none(),
+            "`None` no longer clears the held readout",
+        );
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            2,
+            "clearing counted as a copy",
+        );
+    }
+
+    /// **The generation is the whole question, and that is a contract the App
+    /// keeps.** Figures that moved under an unmoved generation are not copied
+    /// — which is sound only because `App::compose_budget_readout` bumps the
+    /// generation on every composition, with no arm that rebuilds without it.
+    /// `app_render/budget_readout_cadence_tests.rs` is what pins that half.
+    #[test]
+    fn an_unmoved_generation_is_not_re_copied_however_the_figures_moved() {
+        let mut h = InputHarness::new();
+        apply(&mut h, Some(&readout(7, 2, 100)));
+        assert_eq!(h.gui().budget_readout_copies(), 1);
+
+        apply(&mut h, Some(&readout(7, 5, 999)));
+        assert_eq!(
+            h.gui().budget_readout_copies(),
+            1,
+            "the seam copied on the figures, so the generation is not what it \
+             is asking and every gesture frame pays a clone",
+        );
+    }
+}

@@ -261,12 +261,15 @@ pub struct App {
     /// and before the first walk.
     host_headroom_bytes: u64,
     /// **The budget system's readout** — per pane, what the scene costs and
-    /// what the pane's stores hold; per pool, capacity, need and spare —
-    /// composed on every loop walk from the scene that walk already prices
-    /// ([`Self::observe_loop_demand`]) and handed to the Gui with the frame's
-    /// inputs (`squallar_egui::shell_api::BudgetReadout`). Its pane vector is
-    /// reused walk to walk, so past the first walk composing it allocates
-    /// nothing on the frame thread.
+    /// what the pane's stores hold; per pool, capacity, need and spare
+    /// (`squallar_egui::shell_api::BudgetReadout`). Re-stated to the Gui with
+    /// every frame's inputs, but **composed only on the telemetry tick**, by
+    /// the one thing that reads it ([`Self::refresh_budget_readout`], and
+    /// [`Self::compose_budget_readout`] for why its cadence is the
+    /// consumer's). The frame path composes nothing; its `generation` is what
+    /// the Gui compares, so a frame that publishes an unchanged readout costs
+    /// one `u64` on each side of the seam. The pane vector is reused
+    /// composition to composition.
     budget_readout: squallar_egui::shell_api::BudgetReadout,
     /// The page heap as the frame last sampled it ([`Self::sample_page_heap`]
     /// and the telemetry tick), kept so the readout's host spare is held to

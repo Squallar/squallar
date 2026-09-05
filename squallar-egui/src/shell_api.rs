@@ -11,12 +11,19 @@ use squallar_radar::types::ScanInfo;
 use squallar_source::id::LayerId;
 
 /// **What the scene costs and what the machine holds, as the App last priced
-/// them** — the budget system's readout, composed in `squallar-app` on the
-/// loop walk that already prices the scene (`App::observe_loop_demand`) and
+/// them** — the budget system's readout, composed in `squallar-app` and
 /// crossing here as one field of [`FrameInputs`]. The UI reads it and paints
 /// it; it prices nothing, because pricing is `fit::need` over a `Scene` the
 /// App alone can describe (the loop aliasing, the tile ledger, the planned
 /// picture sizes).
+///
+/// **Composed on its consumer's cadence, not the frame's.** The App builds
+/// it inside `App::report_frame_telemetry`, the 2 s tick that prints
+/// `budget state:` — every input it reads is a *level* (bytes resident now,
+/// the heap as last sampled), so there is no scene-change trigger that would
+/// make it fresh, and a level printed every two seconds does not need a
+/// figure taken 120 times a second to say it. The frame path composes
+/// nothing. See [`Self::generation`] for what a consumer compares.
 ///
 /// Two families of figure, never added: the **priced** terms
 /// (`fit::need_terms_for_pane` per pane, `fit::need_terms` for the whole)
@@ -27,6 +34,16 @@ use squallar_source::id::LayerId;
 /// pool's grants. Every byte figure is bytes; the telemetry line divides.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BudgetReadout {
+    /// **Which composition this is** — the App bumps it once per rebuild and
+    /// never otherwise, so a reader that holds a copy asks "has this moved?"
+    /// with one integer compare instead of walking the pane vector and the
+    /// grid list. `0` is the readout a fresh application carries before its
+    /// first composition; the first real one is `1`.
+    ///
+    /// It is part of `PartialEq` on purpose: two readouts with the same
+    /// figures composed at different times are not interchangeable to a
+    /// consumer that caches by generation.
+    pub generation: u64,
     /// One entry per visible pane, in pane order.
     pub panes: Vec<PaneBudget>,
     /// The whole scene's terms — the panes folded plus the scene-level
@@ -258,9 +275,10 @@ pub struct FrameInputs<'a> {
     pub frame_diagnostics: Option<FrameDiagnostics<'a>>,
     /// **The budget system's readout** — per-pane priced terms and held
     /// bytes, the two pools' capacity, need and spare — as the App's last
-    /// loop walk composed it ([`BudgetReadout`]). Borrowed for the frame;
-    /// the Gui takes a copy only when it changed. `None` from a caller that
-    /// prices no scene (the test harness).
+    /// telemetry tick composed it ([`BudgetReadout`]). Borrowed for the
+    /// frame; the Gui takes a copy only when [`BudgetReadout::generation`]
+    /// moved, which on every frame but that one is a single `u64` compare.
+    /// `None` from a caller that prices no scene (the test harness).
     pub budget_readout: Option<&'a BudgetReadout>,
 }
 
