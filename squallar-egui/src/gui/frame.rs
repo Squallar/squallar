@@ -341,18 +341,97 @@ impl Gui {
             self.set_radar_round_in_flight(false);
         }
 
+        // **Every distinct ask on screen, not the first pane's.** A layer's
+        // round is shaped by the pane it is built against, so a poll that named
+        // one pane refreshed one pane's selection and left every other pane
+        // drawing the answer it happened to arrive with — for the life of the
+        // session, with the layer's clock, health and status line all reading
+        // fresh. The radar arm above has fanned out over its own distinct asks
+        // (`seen_sites`) all along; this is the same shape for the layers whose
+        // ask is a selection rather than a site.
         let poll_ids: Vec<squallar_source::id::LayerId> =
             self.overlays.handlers().map(|h| h.id()).collect();
         for kind in poll_ids {
-            if self
+            if !self
                 .overlays
                 .auto_fetch_delay(&kind)
                 .is_some_and(|d| d.is_zero())
-                && let Some(pane_idx) = self.first_pane_with_overlay_enabled(&kind)
             {
-                actions.push(GuiAction::FetchOverlay { kind, pane_idx });
+                continue;
+            }
+            for pane_idx in self.panes_owed_a_round(&kind) {
+                actions.push(GuiAction::FetchOverlay {
+                    kind: kind.clone(),
+                    pane_idx,
+                });
             }
         }
+    }
+
+    /// **One pane index per distinct ask the panes drawing `kind` would make**,
+    /// in pane order — who a due round is started on behalf of.
+    ///
+    /// Asked **per frame**, and that is what covers the layer-link fan-out. A
+    /// pane's selection is propagated to its linked siblings wholesale, inside
+    /// the same frame as the click that provoked it, so a check made at the
+    /// click reads the state before the propagation and nothing asks again.
+    /// Asking here needs no hook inside `propagate_layer_state` — the same
+    /// reason [`Gui::release_data_of_layers_no_pane_draws`] is a per-frame
+    /// question rather than a per-click one.
+    ///
+    /// **Deduplicated on what a round actually asks for, and on nothing else.**
+    /// Every `create_fetch_tasks` that reads its pane at all reads exactly two
+    /// things: this layer's own per-pane state, through the handler's own view
+    /// of [`PaneRef::state`]; and the instant and window the pane depicts,
+    /// which `fetch_config_for_layer` narrows `FetchConfig::as_of` and the
+    /// depicted span by. None of them reads the pane's site, its index or its
+    /// sibling slots. So the key is those two members and no more — a wider key
+    /// turns two panes showing one product into two identical downloads, and a
+    /// narrower one collapses two panes scrubbed to different hours into a
+    /// single round, which is this very defect on the other axis.
+    fn panes_owed_a_round(&mut self, kind: &squallar_source::id::LayerId) -> Vec<usize> {
+        let wanting = self.panes_with_overlay_enabled(kind);
+        // The ordinary case, and it costs exactly what naming one pane cost:
+        // no hydrate, no serialize, no key.
+        if wanting.len() < 2 {
+            return wanting;
+        }
+        let Self {
+            overlays, panes, ..
+        } = self;
+        // **Only a layer whose picture is a function of the depicted instant
+        // carries a window in its key**, and this is `as_of_for_layer`'s own
+        // predicate verbatim — the one that decides whether the fetch context
+        // is narrowed to the pane's clock at all, and the same one the
+        // depicted span and frames are held back by. A `TimeAxis::Live` layer
+        // keeps the wall clock however far a pane is scrubbed, so two panes
+        // parked at different hours ask the national feed for the very same
+        // bytes; splitting them would buy a second identical download for a
+        // difference the request never carries.
+        let depicted_matters = overlays.handlers().any(|handler| {
+            handler.id() == *kind
+                && matches!(
+                    handler.time_axis(),
+                    squallar_source::time::TimeAxis::EventLifetime
+                        | squallar_source::time::TimeAxis::FrameSeries { .. }
+                )
+        });
+        let mut asks: Vec<RoundAsk> = Vec::with_capacity(wanting.len());
+        let mut owed: Vec<usize> = Vec::with_capacity(wanting.len());
+        for idx in wanting {
+            // An unhydrated pane carries no state at all and would answer for
+            // the layer's defaults — the precondition `App::with_layer_pane`
+            // states before it hands a handler a pane view, and the same one
+            // `Gui::across_panes` states before it builds the arrival union.
+            panes[idx].hydrate_layer_states(overlays, idx);
+            let ask = round_ask(&panes[idx], overlays, kind, depicted_matters);
+            if asks.contains(&ask) {
+                continue;
+            }
+            asks.push(ask);
+            owed.push(idx);
+        }
+        owed
     }
 
     /// Zoom to the radar on the first scan of a session and never again, so a later
@@ -728,4 +807,63 @@ impl Gui {
         };
         section.line = Some(line);
     }
+}
+
+/// **What one pane's round of a layer would ask for**, as far as anything
+/// outside the handler can see it — see [`Gui::panes_owed_a_round`] for why it
+/// is these two members and no others.
+type RoundAsk = (serde_json::Value, Option<DepictedWindow>);
+
+/// **The window a scrubbed pane depicts**: the instant, the width its listing
+/// was asked over, and the stops its clock can land on. `None` on a live pane,
+/// where all three of the app-side narrowings fall back to the wall clock and
+/// two live panes therefore ask the same thing — and `None` again for a layer
+/// whose time axis means those narrowings never fire, however far its panes
+/// are scrubbed apart.
+type DepictedWindow = (chrono::NaiveDateTime, u64, Vec<chrono::NaiveDateTime>);
+
+/// [`RoundAsk`] for one pane.
+///
+/// The selection is taken as **the handler's own serialization** of the pane's
+/// state, which is the description of a selection that already exists — the one
+/// the pane persists — rather than a second one invented here that could go on
+/// reading equal after a handler gained a field. `slot.config` is the same
+/// bytes only *after* `adopt_handler_state` has run: on a pane that has merely
+/// been hydrated it is still `null`, so keying on it would read two identical
+/// panes as two different asks.
+fn round_ask(
+    pane: &crate::pane::PaneState,
+    overlays: &squallar_overlays::render::overlay_state::OverlayRegistry,
+    kind: &squallar_source::id::LayerId,
+    depicted_matters: bool,
+) -> RoundAsk {
+    let selection = pane
+        .slot(kind)
+        .and_then(|slot| slot.state.as_deref())
+        .map_or(serde_json::Value::Null, |state| {
+            overlays.serialize_pane_state(kind, state as &dyn std::any::Any)
+        });
+    let depicted = pane
+        .time
+        .mode
+        .as_of()
+        .filter(|_| depicted_matters)
+        .map(|instant| {
+            let timeline = pane.transport_state();
+            // The width the listing was actually asked over while a loop is armed,
+            // and the Lookback slider when one is not — `depicted_stops`' own two
+            // arms, which is what the fetch's depicted span is derived from.
+            let span = if timeline.is_active() {
+                timeline.span_secs
+            } else {
+                pane.time.span_secs
+            };
+            let stops: Vec<chrono::NaiveDateTime> = timeline
+                .frames
+                .iter()
+                .map(|frame| frame.timestamp)
+                .collect();
+            (instant, span, stops)
+        });
+    (selection, depicted)
 }

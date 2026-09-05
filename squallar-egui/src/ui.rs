@@ -304,6 +304,24 @@ struct SectionAnchor {
 
 /// Queue an overlay fetch the **user** asked for, and clear the layer's retry
 /// ladder on the way past.
+///
+/// **The guard is per LAYER, and it has a split-shaped hole this is not the
+/// place to close.** Every caller names the one pane it edited, so four panes
+/// that a preset just enabled a layer on queue four asks and the guard collapses
+/// them to one download — the §5.9 rule
+/// `a_preset_apply_queues_one_fetch_per_kind` pins, and the right answer while
+/// those four asks are identical. What it also collapses is two asks that are
+/// NOT identical: `Gui::check_auto_polls` runs first in the frame, so a round it
+/// queued for one pane swallows the request of a user editing the pane beside
+/// it, and that pane draws the product it did not pick until the layer's next
+/// interval comes round — an hour, on the model layer.
+///
+/// Widening this to `(kind, pane_idx)` is measurably wrong: it turns the preset
+/// apply back into four downloads. The key that is right is the one
+/// `Gui::panes_owed_a_round` deduplicates on — what the round actually asks
+/// for — and reaching it needs the other pane's state at a call site that is
+/// holding its own pane `mem::take`n out of the vector. That is a change of
+/// this function's shape, not of its condition.
 pub(crate) fn push_user_overlay_fetch(
     overlays: &mut OverlayRegistry,
     actions: &mut Vec<GuiAction>,
@@ -1259,18 +1277,37 @@ impl Gui {
         self.insp_open && self.inspector_sel == InspectorSelection::AppSettings
     }
 
+    /// **Whether the pane at `idx` draws `kind`** — one definition, read three
+    /// ways below, so "does any pane still want this layer", "which pane is a
+    /// round attributed to" and "which panes each need one" cannot drift.
+    ///
+    /// A pane the layout does not show, and a pane with no ground to draw on,
+    /// answer `false`: `draws_ground` is `false` for a Volume pane with its
+    /// floor hidden and for a cross-section, and neither has a surface this
+    /// layer would land on.
+    fn pane_draws_overlay(&self, idx: usize, kind: &LayerId) -> bool {
+        idx < self.pane_layout.pane_count
+            && self
+                .panes
+                .get(idx)
+                .is_some_and(|p| p.draws_ground() && p.is_overlay_enabled(kind))
+    }
+
     pub fn any_pane_has_overlay_enabled(&self, kind: &LayerId) -> bool {
-        self.panes
-            .iter()
-            .take(self.pane_layout.pane_count)
-            .any(|p| p.draws_ground() && p.is_overlay_enabled(kind))
+        (0..self.pane_layout.pane_count).any(|idx| self.pane_draws_overlay(idx, kind))
     }
 
     pub fn first_pane_with_overlay_enabled(&self, kind: &LayerId) -> Option<usize> {
-        self.panes
-            .iter()
-            .take(self.pane_layout.pane_count)
-            .position(|p| p.draws_ground() && p.is_overlay_enabled(kind))
+        (0..self.pane_layout.pane_count).find(|&idx| self.pane_draws_overlay(idx, kind))
+    }
+
+    /// **Every pane on screen that draws `kind`**, in pane order — the plural
+    /// the poll gate fans out over, where the singular above named only the
+    /// first and left every other pane's selection unrefreshed.
+    pub fn panes_with_overlay_enabled(&self, kind: &LayerId) -> Vec<usize> {
+        (0..self.pane_layout.pane_count)
+            .filter(|&idx| self.pane_draws_overlay(idx, kind))
+            .collect()
     }
 
     pub fn active_pane(&self) -> &PaneState {
@@ -2557,6 +2594,10 @@ mod surfaced_control_tests;
 
 #[cfg(test)]
 mod overlay_retry_tests;
+
+/// Whose selection an automatic round refreshes, with a split open.
+#[cfg(test)]
+mod poll_fanout_tests;
 
 #[cfg(test)]
 mod overlay_texture_release_tests;
