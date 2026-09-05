@@ -9,21 +9,33 @@ description: Run squallar browser measurement legs on the Mac (jacobs-mac-mini).
 arm64. No VPN, no wake step, `BatchMode=yes` works.
 
 **The Mac's display is a ghost unless the KVM is on the Mac.** There is one
-physical panel — the 175 Hz monitor the Linux box drives as DP-0 (3440x1440 @
-174.96 Hz) — shared with the Mac over a KVM, so a headed leg on the Mac and a
-headed leg on Linux are mutually exclusive, and whichever box the KVM is not on
-has no real EDID. With the KVM on Linux, the Mac presents to a virtual
-1920x1080 @ 60.00 Hz display — `Vendor Apple`, `Online Yes`, `Main Display Yes`
-— a ghost it drives when nothing real is attached, read on both boxes at one
-instant on 2026-09-04. The 16.67 ms rAF cadence and the 19,028 us native cadence
-recorded below were taken on that ghost, not on the panel, and a `finish`
-segment on the ghost is not a compositor's vblank. A real-panel Mac leg needs the
-KVM switched to the Mac, which takes the user's screen — get their word first.
+physical panel — a 3440x1440 monitor whose native rate is 175 Hz, which the
+Linux box drives as DP-0 at 174.96 Hz — shared with the Mac over a KVM, so a
+headed leg on the Mac and a headed leg on Linux are mutually exclusive, and
+whichever box the KVM is not on has no real EDID. With the KVM on Linux, the Mac
+presents to a virtual 1920x1080 @ 60.00 Hz display — `Vendor Apple`, `Online
+Yes`, `Main Display Yes` — a ghost it drives when nothing real is attached, read
+on both boxes at one instant on 2026-09-04. With the KVM on the Mac (2026-09-04,
+23:29 to about 00:30), `system_profiler SPDisplaysDataType` shows the Mac driving
+that same panel at its native 3440x1440 @ 175 Hz — not 60. **So there is no
+"Mac 60 Hz arm" on this hardware; any figure so labelled was the ghost.** The
+only way to get 60 Hz out of the Mac on the real panel is to change the Mac's own
+display setting, and that is the user's device, not ours to change. The 16.67 ms
+rAF cadence and the 19,028 us native cadence recorded below were taken on the
+ghost, not on the panel, and a `finish` segment on the ghost is not a
+compositor's vblank. A real-panel Mac leg needs the KVM switched to the Mac,
+which takes the user's screen — get their word first.
+
 Before any headed or cadence leg, read the display state on the Mac itself
 (`system_profiler SPDisplaysDataType`, or the rAF cadence as the presentation
 evidence), and put `ghost 1080p60` or `panel 175 Hz via KVM` in every Mac
 cadence figure's denominator; a figure carrying neither cannot be placed against
-anything. Interleaved CPU-side comparisons on the ghost stay internally valid.
+anything. The denominator for the legs taken in that KVM window, and the
+template for any later real-panel Mac leg, is *Mac, real panel 3440x1440 @
+175 Hz via KVM, Metal, Firefox 155* — the first Mac arm with a real vblank at
+all, and the first leg on which the Mac's Metal capacity figure and a
+real-display presentation path exist together. Interleaved CPU-side comparisons
+on the ghost stay internally valid.
 
 **Browser legs run headed over a plain ssh session** — verified: rAF fires at
 16.67 ms on the 60 Hz ghost display, which is presentation, not boot. webdriver
@@ -52,8 +64,9 @@ GPU init inside the redraw path.
 
 **What is NOT established: nobody looked at the glass.** No screenshot was taken
 in any of those legs. The claim that survives is "reached and sustained its
-render loop at panel-adjacent cadence", not "a scene was seen to render". If you
-need the second thing, capture an image; do not infer it from this.
+render loop at a cadence adjacent to the ghost's 60 Hz", not "a scene was seen
+to render". If you need the second thing, capture an image; do not infer it from
+this.
 
 **The mechanism is unexplained and that is worth recording rather than
 papering over.** WindowServer access is gated on the `gui/$UID` bootstrap domain,
@@ -159,6 +172,38 @@ The pinned nightly is not optional: `.github/scripts/wasm-threads.sh` pins
 `nightly-2026-08-15` and installs the *target* and *components* itself, but it
 cannot install the *toolchain*.
 
+### Every Firefox leg dies at the driver step in ~8 s: the rig fetches a LINUX geckodriver
+
+`.github/browser-rig/ensure-geckodriver.sh` has no OS or architecture switch.
+It downloads `geckodriver-v0.37.1-linux64.tar.gz` unconditionally, extracts a
+Linux binary onto arm64 macOS, and then rejects it with `FATAL: extracted binary
+does not report geckodriver 0.37.1`; the leg runner adds `FATAL:
+ensure-geckodriver.sh failed`. Neither line names the platform or the fix, so it
+reads as a wrong-version driver on a box that has the right one. The mechanism
+is in `version_ok`: it runs `"$1" --version 2>/dev/null`, and a Linux ELF on
+macOS fails to execute — so the one message that would have named the platform
+goes to `/dev/null` and the empty output is reported as a version mismatch.
+Observed 2026-09-04 during the KVM window: about eight seconds per attempt,
+every Firefox leg.
+
+The Mac already has the pinned version at `~/ffmac-lane/bin/geckodriver`
+(0.37.1, read-only — see the table above). Two variables name it, both verified
+in the rig's own scripts:
+
+- `RIG_GECKODRIVER=~/ffmac-lane/bin/geckodriver` — read by `run_measure.sh`,
+  `run_tier2.sh` and `run_gpu_arm.sh`; when set, `ensure-geckodriver.sh` is
+  never invoked.
+- `GECKODRIVER_BIN=~/ffmac-lane/bin/geckodriver` — read by
+  `ensure-geckodriver.sh` itself; a binary there that reports 0.37.1 is reused
+  and nothing is downloaded. Use this one when a step calls the script directly
+  rather than through a leg runner.
+
+With either set the browser comes up in seconds.
+
+A red herring to skip while probing this: the rig is Python 3 standard library
+plus raw WebDriver over HTTP (`urllib`), and imports no selenium. "System Python
+lacks selenium" explains nothing about a failed leg, on this box or any other.
+
 ### A Firefox leg that dies in ~4 s with rc=0 is the UPDATER, not the rig
 
 `firefox exited rc=0 before Marionette came up`, a 0-byte `D.firefox.firefox.log`,
@@ -185,6 +230,19 @@ because it is still on the old image. Tell them; do not kill it. The rig's
 `-no-remote -profile <throwaway>` means it never touches their profile, and a
 running user Firefox is NOT what blocked the leg — check the bundle mtime first.
 
+### A runbook that dies silently on its first line lost an argument at a quoting boundary
+
+Observed 2026-09-04: an arm name passed through a variable into a detached shell
+did not survive the quoting boundary, so the runbook's first line ran with an
+empty argument and aborted. A detached shell reports nothing back to the
+terminal that launched it, so the abort was silent, and fifteen minutes passed
+before its log was read. The fix was spelling the argument literally in the
+detached command instead of expanding a variable across the boundary. Two habits
+follow: read the detached log within seconds of launching, not at the end of the
+leg — a runbook that has printed nothing by then is dead, not busy; and treat
+every quote-then-detach hop as a place where an expansion can arrive empty, so
+pass literals across it and check the value on the far side.
+
 ## Getting a tree over
 
 No clone, no git remote — **nothing AI-driven pushes**. Copy a tarball into a
@@ -204,7 +262,10 @@ Budget ~1.4 GiB for source + target + legs.
 ## Reading the results
 
 - Mac figures are a **third arm**. Never merge them with headed-Linux or with
-  headless Tier-2 — different GPU, compositor, refresh, and unified memory.
+  headless Tier-2 — different GPU, compositor and unified memory, and on the
+  ghost a different refresh too. Via the KVM the Mac drives the same panel at
+  the same 175 Hz as headed Linux, so refresh is the one term that drops out of
+  that pairing; the other three still keep the arms apart.
 - Measured GPU capacity is 5,461 MiB and the budget ladder shed no rung on any
   scene tried (`steps 0`). An 8 GiB M2 is **not** a constrained device for our
   budgets; if a scene behaves differently there, capacity is not why.
