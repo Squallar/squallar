@@ -158,6 +158,14 @@ struct StoredVolume {
 }
 
 impl StoredVolume {
+    /// Whether a pane the layout is showing — one below `visible_panes` —
+    /// holds this entry.
+    fn held_by_visible(&self, visible_panes: usize) -> bool {
+        self.panes
+            .iter()
+            .any(|&pane| pane_is_visible(pane, visible_panes))
+    }
+
     /// GPU texture bytes this entry's upload occupies, or 0 while there is
     /// nothing uploaded.
     fn texture_bytes(&self) -> usize {
@@ -184,6 +192,29 @@ pub struct VolumeLookup {
     /// This is not the target's own entry — it is a grid the pane was already
     /// holding, standing in while the build for `target` is in flight.
     pub stood_in: bool,
+}
+
+/// What one [`VolumeStore::enforce_budget_sparing`] pass did, and what it
+/// could not do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BudgetOutcome {
+    /// Resolved grids dropped, oldest first, none of them held by a visible
+    /// pane.
+    pub evicted: usize,
+    /// Bytes the store is still over its budget after every grid no visible
+    /// pane holds has gone — 0 when the budget was met. Non-zero means the
+    /// budget is below what the visible panes hold, and the store has kept
+    /// what they are showing rather than blank one of them; the figure is for
+    /// the caller to refuse on, upstream, and to show.
+    pub shortfall_bytes: usize,
+}
+
+/// The one reading of "visible" the store has: a pane index below the count
+/// the layout is showing. [`VolumeStore::hidden_holders`] names the panes
+/// that fail it; [`VolumeStore::enforce_budget_sparing`] spares the grids
+/// held by the panes that pass it.
+fn pane_is_visible(pane: usize, visible_panes: usize) -> bool {
+    pane < visible_panes
 }
 
 impl VolumeStore {
@@ -307,7 +338,7 @@ impl VolumeStore {
             .iter()
             .flat_map(|e| e.panes.iter().copied())
             .chain(inner.set_holders.iter().copied())
-            .filter(|&pane| pane >= visible_panes)
+            .filter(|&pane| !pane_is_visible(pane, visible_panes))
             .collect();
         hidden.sort_unstable();
         hidden.dedup();
@@ -324,29 +355,51 @@ impl VolumeStore {
     }
 
     /// Evict resolved grids, oldest first, until the store's GPU texture bytes
-    /// fit `budget`. Returns how many were evicted.
+    /// fit `budget`, with **no pane declared visible** — every resolved grid
+    /// is a candidate, including one a pane is showing. Returns how many were
+    /// evicted. This is [`Self::enforce_budget_sparing`] at `visible_panes =
+    /// 0`; a caller that knows its layout's visible count hands it to that
+    /// door instead, and reads the shortfall this one cannot report.
     pub fn enforce_budget(&self, budget: usize) -> usize {
+        self.enforce_budget_sparing(budget, 0).evicted
+    }
+
+    /// Evict resolved grids **no visible pane holds**, oldest first, until the
+    /// store's GPU texture bytes fit `budget`. A grid held by a pane below
+    /// `visible_panes` — the same denominator [`Self::hidden_holders`] takes —
+    /// is on screen and is never a victim: what is displayed is given up by
+    /// refusing it before it is built, never by blanking it after.
+    ///
+    /// When every remaining grid is held and the store is still over
+    /// `budget`, the pass stops and says so in
+    /// [`BudgetOutcome::shortfall_bytes`]: the budget is below what the
+    /// visible panes need, which is the caller's to refuse upstream and to
+    /// show, not the store's to swallow. Entries still building or refused
+    /// hold no texture and are never candidates, so a store over budget on
+    /// in-flight builds alone reports the same shortfall until they land and
+    /// the next pass reclaims.
+    pub fn enforce_budget_sparing(&self, budget: usize, visible_panes: usize) -> BudgetOutcome {
         let mut inner = self.lock();
-        let mut evicted = 0;
+        let mut outcome = BudgetOutcome::default();
         loop {
             let total: usize = inner.entries.iter().map(StoredVolume::texture_bytes).sum();
             if total <= budget {
-                return evicted;
+                return outcome;
             }
             let Some(oldest) = inner
                 .entries
                 .iter()
-                .filter(|e| matches!(e.entry, VolumeEntry::Ready(_)))
+                .filter(|e| {
+                    matches!(e.entry, VolumeEntry::Ready(_)) && !e.held_by_visible(visible_panes)
+                })
                 .map(|e| e.id)
                 .min()
             else {
-                // Over budget with nothing resolved to give back. Reported by
-                // returning what was actually evicted rather than looping: the
-                // in-flight builds land, and the next pass reclaims.
-                return evicted;
+                outcome.shortfall_bytes = total - budget;
+                return outcome;
             };
             inner.entries.retain(|e| e.id != oldest);
-            evicted += 1;
+            outcome.evicted += 1;
         }
     }
 

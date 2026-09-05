@@ -1265,9 +1265,10 @@ fn the_fade_bar_is_inclusive_and_bites_one_index_below_it() {
     assert!(palette_refusal_for(u16::from(MINIMUM_FADE_INDICES) - 1, "x").is_some());
 }
 
-/// **The byte-bounded eviction actually bounds.** A set holder is exempt from
-/// every shed in this file, so this is the only thing standing between a 3D
-/// loop and an unbounded store.
+/// **The byte-bounded eviction actually bounds, with no pane declared
+/// visible.** A set holder is exempt from every shed in this file, so this
+/// door and the sparing one below are what stand between a 3D loop and an
+/// unbounded store; this is the door that spares nothing.
 #[test]
 fn the_store_eviction_actually_bounds() {
     let store = VolumeStore::new();
@@ -1306,8 +1307,8 @@ fn the_store_eviction_actually_bounds() {
         one * 2,
     );
     // Oldest-first, by build order: the two the pane asked for first are the
-    // two that went. In production those are the pane's live grid and the
-    // oldest loop frame, which is exactly the intended order.
+    // two that went — pane 0's own, because no pane was declared visible.
+    // Whether pane 0 is on screen is the sparing door's question, below.
     assert!(
         store.lookup(&targets[0]).is_none() && store.lookup(&targets[1]).is_none(),
         "the two oldest entries survived a budget they caused to be exceeded, \
@@ -1318,6 +1319,232 @@ fn the_store_eviction_actually_bounds() {
         "the newest entry was evicted, so the eviction is not oldest-first and \
          a playing loop would lose the frame it had just built",
     );
+}
+
+/// **A grid a visible pane is showing is never a victim.** The held grid is
+/// the oldest in the store on purpose: an eviction that consults age alone
+/// takes it first, and this test goes red.
+#[test]
+fn a_grid_a_visible_pane_is_showing_is_never_a_victim() {
+    let store = VolumeStore::new();
+    let one = one_grid_texture_bytes();
+    assert!(one > 0, "precondition: a resident grid costs something");
+
+    // Pane 0 is the one pane the layout shows, and its grid is built first.
+    let shown = target(&known::REFLECTIVITY, 0);
+    store.begin_build(0, &shown);
+    assert!(store.complete(&shown, ready_grid()), "the build resolves");
+    let shown_id = store.lookup(&shown).expect("resolved").id;
+    // Panes 1..=3 are hidden, each holding one grid, built in that order.
+    let hidden: Vec<VolumeTarget> = (1..4).map(|m| target(&known::REFLECTIVITY, m)).collect();
+    for (pane, t) in (1..).zip(&hidden) {
+        store.begin_build(pane, t);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    assert_eq!(
+        store.texture_bytes(),
+        one * 4,
+        "precondition: four resident grids"
+    );
+
+    let outcome = store.enforce_budget_sparing(one * 2, 1);
+
+    assert_eq!(
+        outcome,
+        BudgetOutcome {
+            evicted: 2,
+            shortfall_bytes: 0,
+        },
+        "two hidden grids fit the budget, so two go and nothing is short",
+    );
+    assert!(
+        store.texture_bytes() <= one * 2,
+        "the store is still over its budget: {} bytes against {}",
+        store.texture_bytes(),
+        one * 2,
+    );
+    assert_eq!(
+        store.lookup(&shown).map(|l| l.id),
+        Some(shown_id),
+        "the grid the visible pane is showing was evicted — the oldest entry \
+         went regardless of who holds it, and pane 0 goes blank",
+    );
+    assert!(
+        store.lookup(&hidden[0]).is_none() && store.lookup(&hidden[1]).is_none(),
+        "the two oldest hidden grids survived, so the eviction is not \
+         oldest-first among the grids no visible pane holds",
+    );
+    assert!(
+        store.lookup(&hidden[2]).is_some(),
+        "the newest hidden grid went before an older one",
+    );
+}
+
+/// **When every grid is held, nothing goes and the shortfall is the whole
+/// overage.** The budget being below what the visible panes hold is a real
+/// condition, and the store's job is to say so — by the byte — not to blank a
+/// pane or to return quietly.
+#[test]
+fn when_every_grid_is_held_nothing_goes_and_the_shortfall_is_the_overage() {
+    let store = VolumeStore::new();
+    let one = one_grid_texture_bytes();
+    assert!(one > 0, "precondition: a resident grid costs something");
+
+    // One visible 3D loop holding a set of three.
+    let frames: Vec<VolumeTarget> = (0..3).map(|m| target(&known::REFLECTIVITY, m)).collect();
+    for t in &frames {
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    assert_eq!(
+        store.texture_bytes(),
+        one * 3,
+        "precondition: three resident grids"
+    );
+    let ids_before = store.live_ids();
+    assert_eq!(ids_before.len(), 3, "precondition: three live ids");
+
+    let budget = one / 2;
+    let outcome = store.enforce_budget_sparing(budget, 1);
+
+    assert_eq!(
+        outcome,
+        BudgetOutcome {
+            evicted: 0,
+            shortfall_bytes: one * 3 - budget,
+        },
+        "a held grid went, or the overage was not reported by the byte",
+    );
+    assert_eq!(
+        store.live_ids(),
+        ids_before,
+        "the held set is not the same three entries it was — something was \
+         evicted or rebuilt under a budget that could not be met",
+    );
+    for t in &frames {
+        assert!(
+            store.lookup(t).is_some(),
+            "a frame the visible loop holds is gone: {:?}",
+            t.volume.collected,
+        );
+    }
+    assert_eq!(
+        store.texture_bytes(),
+        one * 3,
+        "the store gave back bytes it had no unheld grid to give back from",
+    );
+}
+
+/// The shortfall is what is left over **after** every grid no visible pane
+/// holds has gone — the two doors compose, and the figure is the residual,
+/// not the whole overage.
+#[test]
+fn the_shortfall_is_what_remains_after_every_unheld_grid_went() {
+    let store = VolumeStore::new();
+    let one = one_grid_texture_bytes();
+    assert!(one > 0, "precondition: a resident grid costs something");
+
+    // Pane 0, visible, holds a set of two; pane 1, hidden, holds one grid.
+    let held: Vec<VolumeTarget> = (0..2).map(|m| target(&known::REFLECTIVITY, m)).collect();
+    for t in &held {
+        store.begin_build_held(0, t, Hold::Set);
+        assert!(store.complete(t, ready_grid()), "the build resolves");
+    }
+    let held_ids: Vec<u64> = held
+        .iter()
+        .map(|t| store.lookup(t).expect("resolved").id)
+        .collect();
+    let stranded = target(&known::REFLECTIVITY, 2);
+    store.begin_build(1, &stranded);
+    assert!(
+        store.complete(&stranded, ready_grid()),
+        "the build resolves"
+    );
+    assert_eq!(
+        store.texture_bytes(),
+        one * 3,
+        "precondition: three resident grids"
+    );
+
+    let outcome = store.enforce_budget_sparing(one, 1);
+
+    assert_eq!(
+        outcome,
+        BudgetOutcome {
+            evicted: 1,
+            shortfall_bytes: one,
+        },
+        "the hidden grid goes and the two held ones are one grid over the budget",
+    );
+    assert!(
+        store.lookup(&stranded).is_none(),
+        "the hidden pane's grid was spared, so the shortfall over-reports"
+    );
+    assert_eq!(
+        held.iter()
+            .map(|t| store.lookup(t).map(|l| l.id))
+            .collect::<Vec<_>>(),
+        held_ids.iter().copied().map(Some).collect::<Vec<_>>(),
+        "the visible loop's frames are not the same two entries they were",
+    );
+}
+
+/// **With no pane declared visible, the sparing door is the old one**: the
+/// same victims in the same order, so nothing changes for a caller that has
+/// no layout to declare.
+#[test]
+fn with_no_pane_declared_visible_the_sparing_door_is_the_old_one() {
+    let one = one_grid_texture_bytes();
+    assert!(one > 0, "precondition: a resident grid costs something");
+    let targets: Vec<VolumeTarget> = (0..4).map(|m| target(&known::REFLECTIVITY, m)).collect();
+    let fill = || {
+        let store = VolumeStore::new();
+        for t in &targets {
+            store.begin_build_held(0, t, Hold::Set);
+            assert!(store.complete(t, ready_grid()), "the build resolves");
+        }
+        assert_eq!(
+            store.texture_bytes(),
+            one * 4,
+            "precondition: four resident grids"
+        );
+        store
+    };
+
+    let old_door = fill();
+    let sparing_door = fill();
+    assert_eq!(
+        old_door.live_ids(),
+        sparing_door.live_ids(),
+        "precondition: the two stores are the same store",
+    );
+
+    let evicted = old_door.enforce_budget(one * 2);
+    let outcome = sparing_door.enforce_budget_sparing(one * 2, 0);
+
+    assert_eq!(evicted, 2, "the old door's count moved");
+    assert_eq!(
+        outcome,
+        BudgetOutcome {
+            evicted: 2,
+            shortfall_bytes: 0,
+        },
+        "with nothing spared there is nothing short, and the count is the old one",
+    );
+    assert_eq!(
+        sparing_door.live_ids(),
+        old_door.live_ids(),
+        "the two doors left different entries behind — the victims or their \
+         order moved for the caller that declares no layout",
+    );
+    for (i, t) in targets.iter().enumerate() {
+        assert_eq!(
+            sparing_door.lookup(t).is_some(),
+            i >= 2,
+            "the sparing door at zero visible panes is not oldest-first over \
+             everything: frame {i}",
+        );
+    }
 }
 
 /// A set holder keeps its whole set through the events that shed a single
