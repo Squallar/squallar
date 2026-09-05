@@ -20,12 +20,19 @@
 //!
 //! # The denominator, said once
 //!
-//! Every figure here is **bytes on ONE wasm instance's linear memory** — the
-//! page's, where the frame thread runs. The rasterization worker is a second
-//! instance with a second 1 GiB ceiling and its own heap; nothing on this
-//! census is the worker's, and the two are never summed. A family whose
-//! bytes live on the GPU (a `TextureHandle`'s pixels after upload) is not
-//! here either: this census is what the *allocator* is holding.
+//! Every figure summed here is **bytes on ONE wasm instance's linear
+//! memory** — the page's, where the frame thread runs. The rasterization
+//! worker is a second instance with a second 1 GiB ceiling and its own heap;
+//! nothing on this census is the worker's, and the two are never summed.
+//!
+//! **Two families are the GPU's and are carried outside the sum**: `tile
+//! meshes` and `gpu textures`. They are on the line because the reader at the
+//! trap wants them and there is nowhere else that is always on, and they are
+//! out of [`Census::resident_total`] because the residual this module exists
+//! to produce is against a `byteLength` reading of linear memory, which no
+//! device byte is on. The line prints them last, after the residual, and
+//! labels them. A caller that adds them to the total has broken the
+//! instrument.
 //!
 //! [`Census::residual`] against a real `byteLength` reading is the finding
 //! this module exists to produce. **It is not an error term.** It is every
@@ -76,9 +83,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// land. Sized against every figure at `u64::MAX` and the longest instance
 /// name, not against a plausible reading — and sized EXACTLY: the widest line
 /// is this many bytes, with no headroom, so a family added without re-deriving
-/// it is cut and the test says so. The arithmetic: twenty-two families (the
-/// GPU one included), the resident total and the linear reading are
-/// twenty-four `u64::MAX` figures at 20 digits apiece, the prose between them
+/// it is cut and the test says so. The arithmetic: twenty-three families (the
+/// two GPU ones included), the resident total and the linear reading are
+/// twenty-five `u64::MAX` figures at 20 digits apiece, the prose between them
 /// under `rasterization worker` makes up the rest — and the residual is the
 /// **`none` arm**: a reading of `u64::MAX - 1` against families that saturate
 /// prints `residual none (families price above it)`, 27 bytes wider than the
@@ -89,9 +96,11 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// space, twenty digits and `" B"`. The `deferred drops` family added 39 to
 /// the 768 before it; `overlay items` added 38 and `overlay parked` 39, so
 /// 807 + 77 = 884; `render pools` adds 37 and `renders in flight` adds 42,
-/// so 884 + 79 = 963 on the `residual 0 B` arm; the `none` arm's 27 make
-/// 990.
-pub const CENSUS_LINE_CAPACITY: usize = 990;
+/// so 884 + 79 = 963 on the `residual 0 B` arm; `gpu textures` is 12
+/// characters, so it adds `12 + 25 = 37`, and it lands in the GPU tail where
+/// the same 37 is spelled `", gpu textures "` (15) + twenty digits + `" B"`
+/// (2) — so 963 + 37 = 1000 on that arm; the `none` arm's 27 make 1027.
+pub const CENSUS_LINE_CAPACITY: usize = 1027;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -244,6 +253,26 @@ families! {
     TILE_MESH_BYTES, tile_mesh_bytes, set_tile_mesh_bytes,
         "Tile mesh buffers the renderer is holding. **GPU**, kept beside the \
          others for the reader; [`Census::resident_total`] leaves it out.";
+    GPU_TEXTURE_BYTES, gpu_texture_bytes, set_gpu_texture_bytes,
+        "Pixel bytes the DEVICE is holding in egui's texture population right \
+         now, at four bytes a texel of every live texture - the radar \
+         rasters, the overlay pictures, the loop frames, the raster-atlas \
+         pages and the glyph atlas, all of which stop being counted by every \
+         other family here the moment they upload. A LEVEL: it falls on a \
+         free and on a replace, which is what `squallar_gpu`'s `UploadTotals` \
+         structurally cannot do - those are cumulative flow, and one leg \
+         moved 21.7 GB of uploads against a device holding a few hundred MB. \
+         **GPU**, like the tile meshes above, and left out of \
+         [`Census::resident_total`] for the same reason. It does NOT name \
+         `squallar_volumetric`'s raymarch textures, which enter no egui \
+         population and which no family here measures; the host side of those \
+         is `volume store`. Maintained at the create, replace and free sites \
+         in `squallar_gpu::egui_renderer::texture_upload`, never walked. \
+         **A reading must name the BACKEND as well as the arm** - a Linux web \
+         leg is GL, a Mac one is WebGPU on Metal - because upload is backend \
+         behaviour. The LEVEL is not: it is hooked on egui's delta seam above \
+         wgpu, both upload routes charge through the same arithmetic, and \
+         neither backend is dark.";
     VOLUME_STORE_BYTES, volume_store_bytes, set_volume_store_bytes,
         "The 3D volume store's voxel grids on the HOST heap - each grid's \
          index plane, value plane and transfer table. The GPU textures built \
@@ -278,7 +307,9 @@ impl Census {
     /// knows, not a bug. The line names the instance for exactly that
     /// reason.
     ///
-    /// [`Census::tile_mesh_bytes`] is left out because it is the GPU's, and
+    /// [`Census::tile_mesh_bytes`] and [`Census::gpu_texture_bytes`] are left
+    /// out because they are the GPU's — a residual is `byteLength` less this
+    /// total, and no device byte is on a `byteLength` — and
     /// the radar families are summed as their own upper bound
     /// ([`Self::radar_total`]) rather than partitioned — see the module note
     /// on shared ownership. Saturating, because a sum of levels read at
@@ -403,12 +434,12 @@ pub fn write_line<W: core::fmt::Write>(
         },
         None => write!(out, "unread linear, residual unknown"),
     }?;
-    // Off the page total on purpose, and last so a reader cannot mistake it
+    // Off the page total on purpose, and last so a reader cannot mistake them
     // for part of the sum: these bytes are the GPU's.
     write!(
         out,
-        "; tile meshes {} B (GPU, not in the total)",
-        census.tile_mesh_bytes
+        "; tile meshes {} B, gpu textures {} B (GPU, not in the total)",
+        census.tile_mesh_bytes, census.gpu_texture_bytes,
     )
 }
 

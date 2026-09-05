@@ -36,6 +36,10 @@ use egui_wgpu::wgpu;
 
 use crate::staging_ring::{Ring, device_has_ring};
 
+mod resident;
+
+use resident::ResidentTextures;
+
 /// The most one band carries, and so the size of one ring slot.
 ///
 /// 8 MiB: what `write_texture` moves in 4.0 ms at the measured 2.1 GB/s through
@@ -230,6 +234,10 @@ pub struct TextureUploads {
     delivered: HashSet<egui::TextureId>,
     /// What this renderer has actually moved. See [`UploadTotals`].
     totals: UploadTotals,
+    /// What the device is holding right now. See [`ResidentTextures`] — a
+    /// level, maintained at the sites below that create, replace and free,
+    /// and the answer [`UploadTotals`] structurally cannot give.
+    resident: ResidentTextures,
     /// [`UploadTotals::progress`] at the last line [`Self::report`] logged, so
     /// a frame that moved nothing costs one `u64` compare and says nothing.
     reported: u64,
@@ -269,6 +277,7 @@ impl TextureUploads {
             pending: VecDeque::new(),
             delivered: HashSet::new(),
             totals: UploadTotals::default(),
+            resident: ResidentTextures::default(),
             reported: 0,
         }
     }
@@ -283,6 +292,7 @@ impl TextureUploads {
             pending: VecDeque::new(),
             delivered: HashSet::new(),
             totals: UploadTotals::default(),
+            resident: ResidentTextures::default(),
             reported: 0,
         }
     }
@@ -310,6 +320,7 @@ impl TextureUploads {
         }
         self.drain(device, queue, renderer);
         self.publish_pending_level();
+        self.publish_resident_level();
         !self.pending.is_empty()
     }
 
@@ -340,6 +351,15 @@ impl TextureUploads {
         if !mine && crosses_whole(id, self.capable, image.as_raw().len()) {
             renderer.update_texture(device, queue, id, delta);
             self.totals.count_whole_write(image.as_raw().len() as u64);
+            if delta.pos.is_none() {
+                // egui allocated a texture of exactly this image and dropped
+                // whatever it held under `id`. A delta WITH a `pos` is charged
+                // nothing on purpose: it writes into the texture already there
+                // and changes no resident byte — which is how a raster atlas
+                // page reads as one allocation of its full size rather than as
+                // the sum of the tiles written into it.
+                self.resident.egui_allocated(id, image.size);
+            }
             // Whole, on this frame's queue, before anything can draw it.
             self.delivered.insert(id);
             return;
@@ -355,16 +375,22 @@ impl TextureUploads {
             // The texture this replaces goes now. egui's bind group still holds
             // a view of it, so wgpu keeps it alive until the drain rebinds.
             self.owned.remove(&id);
+            self.resident.owned_dropped(id);
             allocate = Some(delta.options);
         } else if !mine {
             // A large *partial* into a texture egui allocated: take the texture
             // over, so the bind group needs no rebind.
             let Some(existing) = renderer.texture(&id).and_then(|held| held.texture.clone()) else {
                 // No texture under this id: hand it back and let
-                // `update_texture`'s own panic name the fault.
+                // `update_texture`'s own panic name the fault. Nothing is
+                // charged — a partial delta allocates no texture, and this arm
+                // does not return.
                 renderer.update_texture(device, queue, id, delta);
                 return;
             };
+            // The take-over: the texture is egui's and is already charged on
+            // egui's side. Filing an owned charge here would count one
+            // `wgpu::Texture` twice.
             self.owned.insert(id, existing);
         }
 
@@ -419,6 +445,7 @@ impl TextureUploads {
             id,
         );
         self.owned.insert(id, texture.clone());
+        self.resident.owned_allocated(id, size);
         texture
     }
 
@@ -440,6 +467,11 @@ impl TextureUploads {
             options,
         );
         renderer.update_texture(device, queue, id, &seed);
+        // egui really allocated one, and it outlives the take-over: the
+        // `update_egui_texture_from_wgpu_texture_with_sampler_options` in
+        // [`Self::allocate`] replaces the bind group and leaves egui's own
+        // `Texture.texture` exactly where it is until `free_texture` runs.
+        self.resident.egui_allocated(id, [1, 1]);
     }
 
     /// Move as many bands as the frame's budget allows.
@@ -633,6 +665,27 @@ impl TextureUploads {
         squallar_egui::heap_census::set_upload_pending_bytes(bytes);
     }
 
+    /// Publish what the DEVICE is holding in egui's texture population, for
+    /// `squallar_egui::heap_census`.
+    ///
+    /// # Denominator
+    ///
+    /// See the `resident` module: the pixel bytes of every `wgpu::Texture` alive under
+    /// an egui `TextureId`, at four bytes a texel, both sides of an id that
+    /// has two. **Not on the census's page total**, and the line says so:
+    /// these bytes are the device's, and the residual the census exists to
+    /// produce is against one wasm instance's linear memory.
+    ///
+    /// # What it costs
+    ///
+    /// One field read and one `Relaxed` store. The level is maintained at the
+    /// create, replace and free sites above; nothing walks the population, so
+    /// this may sit on the frame thread's own path the way
+    /// [`Self::publish_pending_level`] does.
+    fn publish_resident_level(&self) {
+        squallar_egui::heap_census::set_gpu_texture_bytes(self.resident.bytes());
+    }
+
     /// Forget everything egui retired this frame.
     pub fn free(&mut self, ids: &[egui::TextureId]) {
         for id in ids {
@@ -640,9 +693,15 @@ impl TextureUploads {
             // What keeps [`Self::delivered`] the size of the live texture set
             // rather than the size of the session.
             self.delivered.remove(id);
+            // `EguiRenderer::free_textures` calls `Renderer::free_texture` for
+            // the same ids in the same breath, so both sides of the charge go
+            // here. **This is the falling half of the level**; without it the
+            // figure is another running total.
+            self.resident.freed(*id);
         }
         self.pending.retain(|band| !ids.contains(&band.id));
         self.publish_pending_level();
+        self.publish_resident_level();
     }
 
     /// Whether every texel egui has handed over for `id` has reached the GPU.
@@ -655,6 +714,16 @@ impl TextureUploads {
     #[cfg(test)]
     pub fn pending_bands(&self) -> usize {
         self.pending.len()
+    }
+
+    /// File a resident charge for `id` the way [`Self::allocate`] does, with
+    /// no device to create a texture on — the host-test seam for the level.
+    /// Calls the same [`ResidentTextures::owned_allocated`] the real path
+    /// calls, so the seam and the drain share one arithmetic; what the test
+    /// then drives is the REAL [`Self::free`].
+    #[cfg(test)]
+    pub fn note_resident_for_test(&mut self, id: egui::TextureId, size: [usize; 2]) {
+        self.resident.owned_allocated(id, size);
     }
 
     /// Put `id` in the delivered set without a device to deliver it with.
@@ -684,6 +753,23 @@ impl TextureUploads {
     pub fn note_whole_delta_for_test(&mut self, bytes: u64) {
         self.totals.deltas += 1;
         self.totals.count_whole_write(bytes);
+    }
+
+    /// **What the device is holding in egui's texture population right now**,
+    /// in bytes. A level, not a running total: it falls on a free and on a
+    /// replace. See the `resident` module for the denominator and what it leaves
+    /// out.
+    pub fn resident_texture_bytes(&self) -> u64 {
+        self.resident.bytes()
+    }
+
+    /// The maintained level against a walk of the ledger's own maps — the
+    /// drift check a maintained total needs and a derived one does not.
+    /// Tests only; the walk is what [`Self::resident_texture_bytes`] exists to
+    /// avoid.
+    #[cfg(test)]
+    pub fn walked_resident_texture_bytes(&self) -> u64 {
+        self.resident.walked_bytes()
     }
 
     /// The texture this module allocated for `id`, if it owns one.

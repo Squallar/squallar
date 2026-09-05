@@ -407,3 +407,265 @@ fn a_ringless_byte_is_called_blocking_on_both_sides_of_the_band_straddle() {
 fn a_banded_write_texture_upload_lands_every_texel_where_it_belongs() {
     every_texel_lands(false);
 }
+
+/// An opaque image of `size`, for a resident figure that only cares how many
+/// texels there are.
+fn filled(size: [usize; 2]) -> egui::ColorImage {
+    egui::ColorImage::from_rgba_premultiplied(size, &vec![255u8; size[0] * size[1] * 4])
+}
+
+/// Run one egui pass and take every delta pending for `watch`.
+///
+/// **One `Context` for a whole test.** A `TextureHandle` holds an `Arc` of the
+/// `TextureManager` it was minted from, so a `set` or a `set_partial` reaches
+/// that context whichever one a later pass is opened on — and a second context
+/// would end its pass holding nothing, which reads as a green "no bytes moved"
+/// for a delta that really was filed.
+///
+/// `max_texture_side` is the adapter's, as `EguiRenderer::new` hands it to
+/// `egui_winit::State`: egui's own default is the WebGL2 floor of 2048 and it
+/// *panics* on a larger `load_texture`. It is carried on every pass because
+/// `Context::load_texture` reads the last input's, and a texture is minted
+/// between passes here.
+///
+/// Filtered to `watch` so nothing egui does on its own account — a font atlas,
+/// a stand-in — enters the figures the caller asserts on.
+fn take_deltas(
+    ctx: &egui::Context,
+    device: &wgpu::Device,
+    watch: egui::TextureId,
+) -> Vec<(egui::TextureId, egui::epaint::ImageDelta)> {
+    ctx.begin_pass(egui::RawInput {
+        max_texture_side: Some(device.limits().max_texture_dimension_2d as usize),
+        ..Default::default()
+    });
+    ctx.end_pass()
+        .textures_delta
+        .set
+        .into_iter()
+        .filter(|(at, _)| *at == watch)
+        .collect()
+}
+
+/// A context whose `max_texture_side` is this device's, ready to mint from.
+fn warm_context(device: &wgpu::Device) -> egui::Context {
+    let ctx = egui::Context::default();
+    let _ = take_deltas(&ctx, device, egui::TextureId::Managed(u64::MAX));
+    ctx
+}
+
+/// **The resident texture level rises on an upload and FALLS on a free**,
+/// driven through the real `apply` and `free` on a real device.
+///
+/// The falling half is the one that matters. `UploadTotals` is cumulative flow
+/// and only ever climbs — one Tier-2 leg moved 21.7 GB of uploads against a
+/// device holding a few hundred MB — so a "resident" figure that rose and never
+/// fell would be that counter under a new name. Three things here that a
+/// cumulative counter cannot do: a free gives bytes back, a replace costs the
+/// new size and not both, and a raster banded over many frames is charged once
+/// rather than once per band.
+#[test]
+#[ignore = "needs a real GPU adapter"]
+fn the_resident_texture_level_rises_on_upload_and_falls_on_free() {
+    let Some((device, queue, _)) = device(true) else {
+        eprintln!("no adapter; nothing to check");
+        return;
+    };
+    let mut renderer = egui_wgpu::Renderer::new(
+        &device,
+        wgpu::TextureFormat::Bgra8Unorm,
+        egui_wgpu::RendererOptions::default(),
+    );
+    let mut uploads = TextureUploads::new(&device);
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        0,
+        "a renderer that has been shown nothing is holding bytes",
+    );
+    let ctx = warm_context(&device);
+    const SMALL: usize = 64;
+
+    // A raster over the band budget: this module allocates it, and egui keeps
+    // the 1x1 stand-in `seed` put under the id.
+    let big = ctx.load_texture("big", source(), egui::TextureOptions::NEAREST);
+    let set = take_deltas(&ctx, &device, big.id());
+    assert_eq!(set.len(), 1, "the raster delta did not reach the renderer");
+    let frames = run_to_completion(&mut uploads, &device, &queue, &mut renderer, &set, None);
+    assert!(
+        frames > 1,
+        "a {SIDE}px raster finished in one frame, so the banded path — the one \
+         that must charge a raster once and not once per band — never ran",
+    );
+    let raster = (SIDE * SIDE * 4) as u64;
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        raster + 4,
+        "a {SIDE}px raster charged over {frames} frames of bands, plus the 1x1 \
+         stand-in egui still holds under its id",
+    );
+    let after_big = uploads.totals().bytes();
+    assert!(after_big >= raster, "the cumulative total lost the raster");
+
+    // A small texture goes whole through egui's own path and is charged there.
+    let small = ctx.load_texture(
+        "small",
+        filled([SMALL, SMALL]),
+        egui::TextureOptions::NEAREST,
+    );
+    let set = take_deltas(&ctx, &device, small.id());
+    assert_eq!(set.len(), 1, "the small delta did not reach the renderer");
+    uploads.apply(&device, &queue, &mut renderer, &set);
+    let small_bytes = (SMALL * SMALL * 4) as u64;
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        raster + 4 + small_bytes,
+        "the whole-delta route allocated a texture the level did not see",
+    );
+
+    // A second raster, then that same id replaced at a smaller size.
+    let mut second = ctx.load_texture(
+        "second",
+        filled([2048, 2048]),
+        egui::TextureOptions::NEAREST,
+    );
+    let set = take_deltas(&ctx, &device, second.id());
+    run_to_completion(&mut uploads, &device, &queue, &mut renderer, &set, None);
+    let wide = (2048 * 2048 * 4) as u64;
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        raster + wide + 8 + small_bytes,
+        "two rasters, two stand-ins and the small texture",
+    );
+
+    // The replace. The old texture is superseded at file time and the new one
+    // arrives when the drain allocates it, so the level must end at the NEW
+    // size and not at both.
+    second.set(filled([1024, 1024]), egui::TextureOptions::NEAREST);
+    let set = take_deltas(&ctx, &device, second.id());
+    assert_eq!(
+        set.len(),
+        1,
+        "the replacing delta did not reach the renderer"
+    );
+    assert!(set[0].1.pos.is_none(), "the replace was filed as a partial");
+    run_to_completion(&mut uploads, &device, &queue, &mut renderer, &set, None);
+    let narrow = (1024 * 1024 * 4) as u64;
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        raster + narrow + 8 + small_bytes,
+        "a replaced raster left its old {wide} B texture on the level, so the \
+         figure climbs with the session the way a running total does",
+    );
+
+    // And the fall. `EguiRenderer::free_textures` frees on both sides in one
+    // breath; this is the same pair.
+    for id in [big.id(), small.id(), second.id()] {
+        renderer.free_texture(&id);
+        uploads.free(&[id]);
+    }
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        0,
+        "every texture was retired and the device level did not come back to \
+         zero — the falling half is the whole difference between this figure \
+         and the cumulative upload total, which is {} B",
+        uploads.totals().bytes(),
+    );
+    assert!(
+        uploads.totals().bytes() > after_big,
+        "the cumulative total did not climb across the run, so the level's \
+         return to zero is not being compared against anything",
+    );
+}
+
+/// **A raster-atlas page is ONE resident charge of its full size, and the
+/// tiles written into it are free.**
+///
+/// `squallar_egui::raster_atlas` (landed `dfd5daab`) creates a page as one
+/// `load_texture` of a 1806x1806 transparent image — 7x7 slots at a 258 pitch
+/// inside the 2048 ceiling — and then writes each 256x256 hillshade tile into
+/// it as a `set_partial` of a 258x258 gutter-padded patch. The gutter grows a
+/// tile's *upload* bytes by 1.57 %, and the cumulative upload total is exactly
+/// the instrument that shows that climb for as long as the map scrolls. The
+/// resident level must not: the page is allocated once, every tile after it
+/// writes into a texture that already exists, and a level that charged the
+/// partials would read a scrolling basemap as a leak.
+#[test]
+#[ignore = "needs a real GPU adapter"]
+fn an_atlas_page_is_one_resident_charge_and_its_tiles_are_free() {
+    const PAGE: usize = 1806;
+    const SLOT: usize = 258;
+
+    let Some((device, queue, _)) = device(true) else {
+        eprintln!("no adapter; nothing to check");
+        return;
+    };
+    if (device.limits().max_texture_dimension_2d as usize) < PAGE {
+        eprintln!("this adapter cannot hold a {PAGE}px page; nothing to check");
+        return;
+    }
+    let mut renderer = egui_wgpu::Renderer::new(
+        &device,
+        wgpu::TextureFormat::Bgra8Unorm,
+        egui_wgpu::RendererOptions::default(),
+    );
+    let mut uploads = TextureUploads::new(&device);
+    let ctx = warm_context(&device);
+
+    // The page, exactly as `raster_atlas::place` creates it.
+    let mut page = ctx.load_texture(
+        "atlas-page",
+        egui::ColorImage::filled([PAGE, PAGE], egui::Color32::TRANSPARENT),
+        Default::default(),
+    );
+    let set = take_deltas(&ctx, &device, page.id());
+    assert_eq!(set.len(), 1, "the page delta did not reach the renderer");
+    run_to_completion(&mut uploads, &device, &queue, &mut renderer, &set, None);
+
+    let page_bytes = (PAGE * PAGE * 4) as u64;
+    assert_eq!(page_bytes, 13_046_544);
+    let after_page = uploads.resident_texture_bytes();
+    assert_eq!(
+        after_page,
+        page_bytes + 4,
+        "the page and its stand-in; a page must be one resident allocation of \
+         its full size from creation, not the sum of what is written into it",
+    );
+    let uploaded_after_page = uploads.totals().bytes();
+
+    // Every slot of the page filled, the way the atlas fills them.
+    let patch = filled([SLOT, SLOT]);
+    let slots = PAGE / SLOT;
+    assert_eq!(slots * slots, 49);
+    for row in 0..slots {
+        for col in 0..slots {
+            page.set_partial([col * SLOT, row * SLOT], patch.clone(), Default::default());
+            let set = take_deltas(&ctx, &device, page.id());
+            assert_eq!(set.len(), 1, "the partial did not reach the renderer");
+            assert!(
+                set[0].1.pos.is_some(),
+                "a tile reached the renderer as a FULL delta, which really \
+                 would allocate a texture",
+            );
+            run_to_completion(&mut uploads, &device, &queue, &mut renderer, &set, None);
+        }
+    }
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        after_page,
+        "49 tiles written into one page moved the resident level; a scrolling \
+         basemap would read as a leak",
+    );
+    // And the counter that DOES climb, so this is not a pair of zeros: the
+    // gutter's 1.57 % is on that figure and on no other.
+    let tiles = (slots * slots * SLOT * SLOT * 4) as u64;
+    assert!(
+        uploads.totals().bytes() >= uploaded_after_page + tiles,
+        "the cumulative upload total did not carry the {tiles} B of tile \
+         patches, so the resident level's flatness above proves nothing",
+    );
+
+    renderer.free_texture(&page.id());
+    uploads.free(&[page.id()]);
+    assert_eq!(uploads.resident_texture_bytes(), 0);
+}

@@ -29,17 +29,24 @@ fn distinct() -> Census {
         tile_mesh_bytes: 524_288,
         render_pool_bytes: 1_048_576,
         render_in_flight_bytes: 2_097_152,
+        gpu_texture_bytes: 4_194_304,
     }
 }
 
 /// The resident total is every family that lives on this heap and **not** the
-/// tile meshes, which are the GPU's. Powers of two make the omission
-/// unambiguous: a total that included them could only be this one bug.
+/// two GPU ones — the tile meshes and the resident textures. Powers of two
+/// make the omission unambiguous: a total that swept either in could only be
+/// that one bug, and the figure names which.
 #[test]
-fn the_resident_total_leaves_the_gpu_family_out() {
+fn the_resident_total_leaves_the_gpu_families_out() {
     let c = distinct();
-    let every_family = (1 << 22) - 1;
-    assert_eq!(c.resident_total(), every_family - 524_288);
+    let every_family = (1 << 23) - 1;
+    assert_eq!(
+        c.resident_total(),
+        every_family - 524_288 - 4_194_304,
+        "the resident total swept a GPU family in; it is a residual against a \
+         linear-memory `byteLength`, which no device byte is on",
+    );
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16);
 }
 
@@ -109,8 +116,9 @@ fn the_line_names_every_family_and_its_denominator() {
     assert!(said.starts_with("heap census (page): "), "{said}");
     assert!(said.contains("residual 900000000 B"), "{said}");
     assert!(
-        said.contains("tile meshes 524288 B (GPU, not in the total)"),
-        "the GPU family must be on the line and marked out of the sum: {said}"
+        said.contains("tile meshes 524288 B, gpu textures 4194304 B (GPU, not in the total)"),
+        "both GPU families must be on the line, after the residual and marked \
+         out of the sum: {said}"
     );
 }
 
@@ -148,6 +156,7 @@ fn the_widest_line_fits_the_hooks_buffer() {
         tile_parsed_bytes: u64::MAX,
         tile_cache_bytes: u64::MAX,
         tile_mesh_bytes: u64::MAX,
+        gpu_texture_bytes: u64::MAX,
         volume_store_bytes: u64::MAX,
         loan_outstanding_bytes: u64::MAX,
         job_in_flight_bytes: u64::MAX,

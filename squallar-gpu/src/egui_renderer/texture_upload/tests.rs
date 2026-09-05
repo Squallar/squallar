@@ -425,3 +425,144 @@ fn freeing_an_id_takes_it_back_out_of_the_delivered_set() {
         "a retired id stayed in the set, so the set grows with the session",
     );
 }
+
+/// **The resident level falls when egui retires a texture**, driven through
+/// the real [`TextureUploads::free`] — the path `EguiRenderer::free_textures`
+/// calls after every submit.
+///
+/// The falling half is the whole point. [`UploadTotals`] already answers "how
+/// much has crossed"; nothing before this answered "how much is held", and a
+/// figure that only rose would be the counter that already exists under a new
+/// name. The charge is filed through the seam that shares
+/// `ResidentTextures::owned_allocated` with the drain's `allocate`; what is
+/// under test here is the free, which needs no device.
+#[test]
+fn the_resident_level_falls_when_egui_retires_a_texture() {
+    let mut uploads = TextureUploads::without_device();
+    assert_eq!(uploads.resident_texture_bytes(), 0);
+
+    let a = egui::TextureId::Managed(1);
+    let b = egui::TextureId::Managed(2);
+    uploads.note_resident_for_test(a, [1806, 1806]);
+    uploads.note_resident_for_test(b, [256, 256]);
+    let held = uploads.resident_texture_bytes();
+    assert_eq!(held, 1806 * 1806 * 4 + 256 * 256 * 4);
+
+    uploads.free(&[b]);
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        1806 * 1806 * 4,
+        "`free` did not give the retired texture's bytes back, so the level is \
+         a running total wearing a level's name",
+    );
+    uploads.free(&[a]);
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        0,
+        "every texture was retired and the level did not return to zero",
+    );
+    assert_eq!(
+        uploads.resident_texture_bytes(),
+        uploads.walked_resident_texture_bytes(),
+        "the maintained total parted from the ledger's own maps at `free`",
+    );
+}
+
+/// **A raster-atlas page is one resident allocation of its full size**, and
+/// the tiles written into it are free.
+///
+/// `squallar_egui::raster_atlas` creates a page as one
+/// `Context::load_texture` of a 1806x1806 transparent image (7x7 slots at a
+/// 258 pitch inside `MAX_PAGE_SIDE`), then writes each 256x256 tile into it as
+/// a `set_partial` of a 258x258 gutter-padded patch. A resident figure that
+/// charged the partials would climb with every tile the map scrolls over and
+/// read as a leak; the cumulative upload total genuinely does climb that way
+/// and cannot say otherwise. Checked here as the ledger's arithmetic — a full
+/// delta charges, a partial does not — because that routing decision is
+/// `file`'s `delta.pos.is_none()` guard, and the same property on the real
+/// path is `an_atlas_page_is_one_resident_charge_and_its_tiles_are_free` in
+/// `tests/raster_upload_gpu.rs` — which is `#[ignore]`d because it needs a real
+/// adapter, so run it with
+/// `cargo test -p squallar-gpu --test raster_upload_gpu -- --ignored`.
+#[test]
+fn an_atlas_page_costs_its_page_and_not_the_sum_of_its_tiles() {
+    const PAGE: usize = 1806;
+    const SLOT: usize = 258;
+    const TILE: usize = 256;
+
+    let page_bytes = (PAGE * PAGE * 4) as u64;
+    assert_eq!(
+        page_bytes, 13_046_544,
+        "the page this family must see as one"
+    );
+
+    let mut uploads = TextureUploads::without_device();
+    let page = egui::TextureId::Managed(40);
+    uploads.note_resident_for_test(page, [PAGE, PAGE]);
+    assert_eq!(uploads.resident_texture_bytes(), page_bytes);
+
+    // The page's shape, so a page that stopped being one texture would show
+    // here: 7x7 slots of 258 inside the 2048 ceiling, 49 tiles to a page, and
+    // one tile's own patch is 1.57 % larger than the tile because of the
+    // gutter — an upload-bytes figure, and not a resident one, since every one
+    // of those patches is a `set_partial` into the page above.
+    assert_eq!(PAGE, (2048 / SLOT) * SLOT);
+    assert_eq!((PAGE / SLOT) * (PAGE / SLOT), 49);
+    assert_eq!(SLOT * SLOT * 4, 266_256);
+    assert!(
+        (SLOT * SLOT * 4) as f64 / (TILE * TILE * 4) as f64 - 1.0 < 0.02,
+        "the gutter grows a tile's upload bytes by more than 2 %",
+    );
+
+    // And what the atlas actually bought, which only a resident figure can
+    // say: 47 single-tile textures against one page.
+    let unshared = (47 * TILE * TILE * 4) as u64;
+    assert_eq!(unshared, 12_320_768);
+    assert!(
+        page_bytes > unshared,
+        "the atlas is a draw-call win and not a byte win at 47 tiles, and the \
+         resident family is the only instrument that can say so: one page is \
+         {page_bytes} B against {unshared} B of separate tile textures",
+    );
+}
+
+/// **The published census level is the renderer's own resident figure.**
+///
+/// One test, not several: the census is a set of process-wide statics and two
+/// publishers racing in one test binary would read each other's stores.
+#[test]
+fn the_census_carries_the_resident_texture_level() {
+    let mut uploads = TextureUploads::without_device();
+    let id = egui::TextureId::User(5);
+    uploads.note_resident_for_test(id, [512, 512]);
+    // `free` publishes, and it is the only publish this fixture can reach
+    // without a device.
+    uploads.free(&[egui::TextureId::User(6)]);
+    assert_eq!(
+        squallar_egui::heap_census::census().gpu_texture_bytes,
+        512 * 512 * 4,
+        "the renderer holds {} B and the census published something else",
+        uploads.resident_texture_bytes(),
+    );
+
+    uploads.free(&[id]);
+    assert_eq!(
+        squallar_egui::heap_census::census().gpu_texture_bytes,
+        0,
+        "the census level did not follow the free down",
+    );
+    // And the family is on the line, out of the page total, beside the meshes.
+    let census = squallar_egui::heap_census::Census {
+        gpu_texture_bytes: 777,
+        ..Default::default()
+    };
+    let line = squallar_egui::heap_census::line(&census, Some(1_000), "page");
+    assert!(
+        line.contains("gpu textures 777 B (GPU, not in the total)"),
+        "{line}",
+    );
+    assert!(
+        line.contains("resident total 0 B of 1000 B linear, residual 1000 B"),
+        "a GPU family entered the linear-memory residual: {line}",
+    );
+}
