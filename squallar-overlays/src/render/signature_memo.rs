@@ -80,10 +80,23 @@ const JOB_MEMO_ROWS: usize = 4;
 /// refcount increment and the worker, the wire encoder and this table all
 /// share one payload.
 ///
-/// **Rows retired by a rollover are parked, not dropped.** Freeing a
-/// thousand-row input is a thousand frees on the frame thread, and the app
-/// owns a discard seam for retired generations; [`Self::take_retired`] hands
-/// the parked rows to the drain at the end of every frame. Until it runs, the slot holds
+/// **Rows retired by a rollover are parked, not dropped.** What parking buys
+/// is that the free happens where the app chooses rather than on the frame
+/// thread, and that is worth having for two different reasons depending on
+/// the input's shape. An input with per-row drop glue — a row set of owned
+/// strings — costs one free per row, so a thousand rows is a thousand frees
+/// and the COUNT is the cost. An input that is one block with no drop glue —
+/// a slab-backed row set — costs exactly one `dealloc`, but of a block that
+/// may be megabytes, and a free that large can return pages to the system
+/// rather than merely update a pointer, so there the SIZE is the cost. **A
+/// single-block value is therefore not a poor candidate for parking**, which
+/// the count argument alone would wrongly imply.
+///
+/// [`Self::take_retired`] hands the parked rows to the drain at the end of
+/// every frame the UI runs. While anything is animating that bounds a
+/// parked value to about one frame; if the app is idle or backgrounded and
+/// repaints stop, it waits for whatever wakes the UI instead — small and
+/// bounded, but not a frame interval. Until the drain runs, the slot holds
 /// the rows of the most recent rollover only — an undrained older batch is
 /// dropped when the next one arrives. Evictions inside one generation park
 /// too, and the slot is capped at `JOB_MEMO_ROWS` there as well: past that
