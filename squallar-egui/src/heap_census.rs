@@ -147,9 +147,12 @@ families! {
         "Overlay pictures this frame's dispatch has resident - the batch \
          WO-36 capped, at `width * height * 4`.";
     OVERLAY_GRID_BYTES, overlay_grid_bytes, set_overlay_grid_bytes,
-        "Decoded gridded overlay SOURCE data the layer handlers are holding \
-         - MRMS mosaics, GMGSI granules, HRRR model grids and their retained \
-         staging blocks. Not the pictures rasterized from them.";
+        "Decoded overlay SOURCE data the layer handlers are holding BESIDE \
+         their state - MRMS mosaics, GMGSI granules, HRRR model grids, their \
+         retained staging blocks, and the GLM lightning layer's S3 granule \
+         cache. Not the pictures rasterized from them, and disjoint from \
+         `overlay items`: this family is what a handler holds in its own \
+         fields, that one is what an `OverlayState` installed.";
     OVERLAY_ITEM_BYTES, overlay_item_bytes, set_overlay_item_bytes,
         "Decoded overlay ITEM data the feature layers are holding - the \
          lightning flashes, station observations, alerts, storm reports, \

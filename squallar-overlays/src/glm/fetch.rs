@@ -36,7 +36,31 @@ impl CachedGranule {
 #[derive(Default, Clone)]
 pub struct GlmCache {
     entries: HashMap<String, CachedGranule>,
+    /// **Rows the map is holding, maintained beside it rather than folded out
+    /// of it** — the level [`Self::retained_bytes`] prices and the census
+    /// reads through [`GlmStore::retained_bytes`].
+    ///
+    /// Beside, for the reason [`crate::staging::StagingPool`]'s
+    /// `retained_points` is beside its slot: the reader is the frame thread's
+    /// telemetry tick, the map is behind a `Mutex` a poll holds while it
+    /// writes back, and a reader that missed the lock would have to answer a
+    /// false **zero** on a store of up to 12 MB. A missing family shows up in
+    /// the census residual; a false zero does not.
+    ///
+    /// Maintained at every site that adds or removes a granule and **nowhere
+    /// else it could be** — `entries` is private to this module, so the four
+    /// writers below are the whole set by the language's rule rather than by
+    /// anyone's recollection. [`Self::flash_count`] stays an independent walk
+    /// of the map so a test can disagree with this field; nothing shipped
+    /// compares them, and [`Self::evict_oldest_over`] deliberately enforces
+    /// the cap off the walk, so a drifted level cannot mis-evict.
+    retained_flashes: usize,
 }
+
+/// **Bytes one retained row costs**, read through `size_of` rather than
+/// spelled: `GlmFlash` owns nothing on the heap, so its `size_of` is the whole
+/// price of a row and a field added to it carries this figure with it.
+pub const FLASH_BYTES: usize = size_of::<GlmFlash>();
 
 /// Ceiling on flashes retained across a depicted span, enforced by
 /// [`GlmCache::evict_oldest_over`] and **only under a span posture** — a live
@@ -61,12 +85,39 @@ pub const MAX_RETAINED_FLASHES: usize = 250_000;
 
 impl GlmCache {
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
-        self.entries
-            .retain(|_key, granule| granule.newest >= cutoff);
+        let retained = &mut self.retained_flashes;
+        self.entries.retain(|_key, granule| {
+            let keep = granule.newest >= cutoff;
+            if !keep {
+                *retained = retained.saturating_sub(granule.flashes.len());
+            }
+            keep
+        });
     }
 
+    /// **A walk of the map**, and the independent second opinion
+    /// [`Self::retained_flashes`] is checked against. Deliberately not routed
+    /// through the maintained level: a cap enforced off the same field the
+    /// level is read from would agree with itself after a mutation site
+    /// forgot to update it.
     pub fn flash_count(&self) -> usize {
         self.entries.values().map(|g| g.flashes.len()).sum()
+    }
+
+    /// **Rows resident right now**, off the maintained level — no walk, no
+    /// allocation. See [`Self::retained_flashes`]' field docs for why it is
+    /// maintained rather than folded.
+    pub fn retained_flashes(&self) -> usize {
+        self.retained_flashes
+    }
+
+    /// **Bytes those rows cost**, which is the whole cost: a granule is one
+    /// `Vec<GlmFlash>` and `GlmFlash` owns nothing on the heap, so
+    /// `rows * FLASH_BYTES` prices the map's contents exactly. The `HashMap`'s
+    /// own table and its `String` keys are not in it — at the shipped cap
+    /// those are ~16 keys against 250,000 rows.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_flashes * FLASH_BYTES
     }
 
     /// Drop whole granules, oldest first, until at most `cap` flashes remain
@@ -90,6 +141,7 @@ impl GlmCache {
             }
             if let Some(granule) = self.entries.remove(&key) {
                 total -= granule.flashes.len();
+                self.retained_flashes = self.retained_flashes.saturating_sub(granule.flashes.len());
             }
         }
     }
@@ -102,9 +154,105 @@ impl GlmCache {
         self.entries.contains_key(key)
     }
 
+    /// **A re-inserted key replaces its granule**, so the level loses the rows
+    /// the old one held before it gains the new one's — an insert counted as a
+    /// pure addition would drift upward on every refetch of a key already
+    /// held.
     pub fn insert(&mut self, key: String, granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) {
-        self.entries
-            .insert(key, CachedGranule::new(granule_start, flashes));
+        let added = flashes.len();
+        if let Some(replaced) = self
+            .entries
+            .insert(key, CachedGranule::new(granule_start, flashes))
+        {
+            self.retained_flashes = self.retained_flashes.saturating_sub(replaced.flashes.len());
+        }
+        self.retained_flashes += added;
+    }
+}
+
+/// **The shared lightning cache, and the byte level a frame may read without
+/// waiting for it.**
+///
+/// The handler's store used to be a bare `Arc<Mutex<GlmCache>>`, which is a
+/// store held *beside* its `OverlayState` and therefore in no census family at
+/// all: [`crate::render::footprint`] prices what an `OverlayState` installed,
+/// and up to [`MAX_RETAINED_FLASHES`] rows — 12,000,000 B — were in neither
+/// that figure nor `overlay grids`. Dark bytes in the governor's residual are
+/// exactly what makes a whole-heap reading unattributable.
+///
+/// **Two fields rather than one, and that is the whole design.** The map is
+/// behind the `Mutex` a poll holds while it clones the cache out and writes it
+/// back; the level is an atomic beside it. A census on the frame thread's
+/// telemetry tick may not block, and the two lock-free alternatives are both
+/// worse than the atomic: `try_lock` answers a **false zero** on a 12 MB store
+/// whenever a poll is writing back, and a false zero is worse than a missing
+/// family — the missing one shows up in the residual. Same shape, same reason,
+/// as [`crate::staging::StagingPool`]'s `retained_points`.
+///
+/// **The level cannot go stale behind a mutation**, because [`Self::with_mut`]
+/// is the only door to a `&mut GlmCache` this type has and it republishes
+/// [`GlmCache::retained_bytes`] before it releases the lock. The `Mutex` is
+/// private, so that is the language's guarantee rather than a convention.
+pub struct GlmStore {
+    cache: std::sync::Mutex<GlmCache>,
+    /// Published copy of [`GlmCache::retained_bytes`], refreshed at the end of
+    /// every [`Self::with_mut`]. `Relaxed`, like every census level: a reader
+    /// wants a recent figure, none wants a synchronised one.
+    retained_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for GlmStore {
+    fn default() -> Self {
+        GlmStore {
+            cache: std::sync::Mutex::new(GlmCache::default()),
+            retained_bytes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl GlmStore {
+    /// **Bytes the cache is holding, without taking its lock** — the figure
+    /// `GlmHandler::resident_source_bytes` answers with.
+    ///
+    /// One relaxed load, so it is safe on the frame thread's telemetry tick and
+    /// on the allocation-error hook's path behind it. Never a walk, never a
+    /// lock, and never a zero it does not mean.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// **The only way to mutate the cache**, and therefore the only place the
+    /// published level can fall behind — which is why the republish is here
+    /// rather than at each caller.
+    ///
+    /// A poisoned lock is taken over rather than propagated, as every other
+    /// caller of this mutex already did: a panicked poll leaves a *stale*
+    /// cache, not an invalid one, and refusing to fetch again would be a worse
+    /// outcome than redrawing yesterday's flashes.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut GlmCache) -> R) -> R {
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let out = f(&mut guard);
+        self.retained_bytes
+            .store(guard.retained_bytes(), std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    /// A clone of the cache, for a poll that must not hold a `std::sync::Mutex`
+    /// across an `await`.
+    ///
+    /// **This doubles the store for the length of a poll** — up to a second
+    /// 12,000,000 B — and it is the clone the fetch path has always made. It is
+    /// not in [`Self::retained_bytes`], which is a level of what the *store*
+    /// holds; the copy is a local of the poll's future and is priced nowhere.
+    pub fn snapshot(&self) -> GlmCache {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Put a whole cache in place of the current one — the poll's write-back
+    /// and the level-change clear, both of which replace rather than edit.
+    pub fn replace(&self, cache: GlmCache) {
+        self.with_mut(|held| *held = cache);
     }
 }
 

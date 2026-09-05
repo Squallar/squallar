@@ -2143,3 +2143,140 @@ fn an_empty_slab_describes_no_job_and_builds_nothing() {
     );
     assert_eq!(handler.flash_memo.builds.get(), 0);
 }
+
+// ── The residency figure, read the way a frame reads it ──────────────────
+
+/// Seed `granules` granules of `per_granule` rows each, twenty minutes apart,
+/// through the store's own door — which is the only door there is.
+fn seed_cache(handler: &GlmHandler, granules: usize, per_granule: usize) -> usize {
+    let base = chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    handler.cache.with_mut(|cache| {
+        for granule in 0..granules {
+            let start = base + chrono::TimeDelta::minutes(granule as i64 * 20);
+            let flashes: Vec<GlmFlash> = (0..per_granule)
+                .map(|i| GlmFlash {
+                    lat: 35.0,
+                    lon: -97.0,
+                    energy: Some(1.0e-14),
+                    area: Some(1.0e8),
+                    time: start + chrono::TimeDelta::milliseconds(i as i64),
+                    satellite: GlmSatellite::GoesEast,
+                    level: GlmDataLevel::Flash,
+                })
+                .collect();
+            cache.insert(format!("granule_{granule}.nc"), start, flashes);
+        }
+    });
+    granules * per_granule
+}
+
+/// **The figure is right while the cache's own lock is held**, which is the
+/// one condition that tells the two candidate implementations apart.
+///
+/// The store is `Arc<Mutex<GlmCache>>` plus a level beside it. A census that
+/// answered by locking would have to `try_lock` — a frame's telemetry tick may
+/// not block — and a `try_lock` that misses answers **zero** on a store holding
+/// up to 12,000,000 B. A false zero is worse than a missing family: a missing
+/// family is visible in the census residual and a false zero is not.
+///
+/// So the read happens *inside* `with_mut`, with the lock held on this very
+/// thread. A `try_lock` implementation reports 0 here and a maintained level
+/// reports the real number; without this arm the two are indistinguishable.
+/// (`std::sync::Mutex` is not reentrant, so a blocking `lock()` implementation
+/// does not merely fail this test either.)
+///
+/// **Floor — delete `GlmHandler::resident_source_bytes`**: the trait's default
+/// `0` then reads against the seeded 240,000 B.
+#[test]
+fn the_resident_figure_is_the_real_number_while_the_cache_lock_is_held() {
+    let handler = GlmHandler::new();
+    let rows = seed_cache(&handler, 5, 1_000);
+    let expected = (rows * size_of::<GlmFlash>()) as u64;
+
+    assert_eq!(
+        handler.resident_source_bytes(),
+        expected,
+        "premise: with nothing holding the lock the figure is the seeded one",
+    );
+    assert!(
+        expected > 0,
+        "non-triviality: a zero expectation would be met by the trait default",
+    );
+
+    let read_under_lock = handler
+        .cache
+        .with_mut(|_held| handler.resident_source_bytes());
+    assert_eq!(
+        read_under_lock, expected,
+        "the residency figure read ZERO (or a wrong number) while the cache's \
+         lock was held — that is a lock-based implementation reporting a false \
+         zero on a {expected} B store, which is exactly what the level beside \
+         the map exists to prevent",
+    );
+}
+
+/// **A handler holding nothing answers zero, and it is a real zero.** The
+/// over-firing arm: a figure that were somehow always non-zero would pass the
+/// test above and be useless.
+#[test]
+fn a_handler_with_an_empty_cache_reports_no_resident_source_bytes() {
+    let handler = GlmHandler::new();
+    assert_eq!(handler.resident_source_bytes(), 0);
+    assert_eq!(
+        handler
+            .cache
+            .with_mut(|_held| handler.resident_source_bytes()),
+        0,
+        "and the same under the lock",
+    );
+}
+
+/// **The level follows the store through a clear**, which is the write-back
+/// door `GlmStore::replace` covers — a level-selection change empties the
+/// cache and the census must see the bytes go.
+#[test]
+fn clearing_the_cache_takes_its_bytes_out_of_the_resident_figure() {
+    let handler = GlmHandler::new();
+    let rows = seed_cache(&handler, 3, 500);
+    assert_eq!(
+        handler.resident_source_bytes(),
+        (rows * size_of::<GlmFlash>()) as u64,
+    );
+
+    handler.clear_cache();
+
+    assert_eq!(
+        handler.resident_source_bytes(),
+        0,
+        "a cleared cache still reported bytes, so the published level does not \
+         follow a whole-value replacement",
+    );
+}
+
+/// **What the registry publishes into the `overlay grids` census family
+/// includes this layer.** The handler answering correctly is worth nothing if
+/// the sum a frame reads never asks it.
+#[test]
+fn the_registry_sum_carries_the_lightning_cache() {
+    use crate::render::overlay_state::OverlayRegistry;
+
+    let handler = GlmHandler::new();
+    let seeded = seed_cache(&handler, 4, 2_000);
+
+    let registry = OverlayRegistry::with_handlers(vec![Box::new(handler)]);
+    assert_eq!(
+        registry.resident_source_bytes(),
+        (seeded * size_of::<GlmFlash>()) as u64,
+        "the registry's `overlay grids` sum does not carry the lightning \
+         cache's bytes",
+    );
+    assert_eq!(
+        OverlayRegistry::default().resident_source_bytes(),
+        0,
+        "and a build that has fetched nothing prices its source bytes at \
+         nothing, lightning included",
+    );
+}

@@ -183,6 +183,13 @@ impl ItemFootprint for SpcFireOutlook {
 /// and two discriminants — so the slab's whole cost is the one buffer its
 /// rows live in. At the ~125 000 flashes a busy 20 s poll delivers that is
 /// the largest single item figure in the census.
+///
+/// **Not the same bytes as the layer's S3 granule cache**, which
+/// `GlmHandler::resident_source_bytes` prices into `overlay grids` instead.
+/// The cache holds a `Vec<GlmFlash>` per granule across polls; this slab is
+/// the fresh `Vec` `flashes_in_window` **cloned** out of them for one poll and
+/// installed. Two allocations, two lifetimes, and each figure names one of
+/// them — which is the double count this file exists to make visible.
 impl ItemFootprint for crate::render::handlers::glm::GlmSlab {
     fn owned_bytes(&self) -> u64 {
         self.flashes.owned_bytes()

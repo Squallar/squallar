@@ -1856,8 +1856,7 @@ fn a_loop_sweeping_two_hours_draws_each_frames_own_strikes_not_the_polls() {
 
     let mut handler = crate::render::handlers::glm::GlmHandler::new();
     handler.defaults.enabled = true;
-    {
-        let mut cache = handler.cache.lock().unwrap_or_else(|e| e.into_inner());
+    handler.cache.with_mut(|cache| {
         cache.insert(
             g_early.clone(),
             day.and_hms_opt(6, 10, 0).unwrap(),
@@ -1868,7 +1867,7 @@ fn a_loop_sweeping_two_hours_draws_each_frames_own_strikes_not_the_polls() {
             day.and_hms_opt(7, 40, 0).unwrap(),
             vec![flash_late],
         );
-    }
+    });
 
     // The poll the loop's 20 s cadence lands while the playhead is on the
     // LAST frame — `fetch_config_for_layer` hands it that frame's instant.
@@ -2967,5 +2966,189 @@ fn the_layers_window_is_subtracted_once_between_the_stops_and_the_listing() {
         window > TimeDelta::zero() && window != GRANULE_SPAN,
         "fixture: a {SWEEP_WINDOW_SECS}s window makes the assertions above \
          indistinguishable from each other",
+    );
+}
+
+// ── The maintained retention level ───────────────────────────────────────
+//
+// [`GlmCache::retained_flashes`] is a level kept beside the map rather than
+// folded out of it, because the reader is the frame thread's telemetry tick
+// and the map is behind a lock a poll holds while it writes back. That shape
+// buys a figure that cannot read a false zero and costs the one failure mode a
+// folded figure does not have: a mutation site that forgets to update it. Both
+// tests below exist for that failure mode, so they compare the level against
+// [`GlmCache::flash_count`], which walks the map and is never routed through
+// the level.
+
+/// **Every writer of `entries`, once each, with the level checked after each
+/// one.**
+///
+/// The set is complete by the language's rule rather than by recollection:
+/// `entries` is a private field of [`GlmCache`], so nothing outside
+/// `crate::glm::fetch` and its descendants can name it, and the only writes in
+/// that module are the four exercised here — `insert` (fresh key and replaced
+/// key are separate arms), `evict_before`, `evict_oldest_over`, and the
+/// `Default` a clear rebuilds from. `git grep -n 'entries' src/glm/fetch.rs
+/// src/glm/fetch/tests.rs` is the enumeration; the only match outside the impl
+/// is `cached_keys`, which reads.
+///
+/// **Floor — drop the update at any one site**: delete the
+/// `self.retained_flashes` line from `insert`, from `evict_before` or from
+/// `evict_oldest_over` and the arm after it reads the level against the walk
+/// and disagrees.
+#[test]
+fn the_retention_level_agrees_with_a_walk_after_every_writer_of_the_map() {
+    let base = t0();
+    let mut cache = GlmCache::default();
+
+    let agree = |cache: &GlmCache, site: &str| {
+        assert_eq!(
+            cache.retained_flashes(),
+            cache.flash_count(),
+            "the maintained level drifted from a walk of the map at {site}",
+        );
+        assert_eq!(
+            cache.retained_bytes(),
+            cache.flash_count() * size_of::<GlmFlash>(),
+            "the byte figure is the walk's row count at `size_of::<GlmFlash>()` \
+             — `GlmFlash` owns nothing on the heap, so there is no second term",
+        );
+    };
+
+    agree(&cache, "Default");
+    assert_eq!(cache.retained_bytes(), 0, "an empty cache holds no rows");
+
+    // `insert`, fresh keys.
+    for granule in 0..4u32 {
+        let start = base + TimeDelta::minutes(granule as i64 * 30);
+        let flashes: Vec<GlmFlash> = (0..7 + granule as usize)
+            .map(|i| flash_at(start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        cache.insert(granule_key(start), start, flashes);
+        agree(&cache, "insert (fresh key)");
+    }
+    let after_inserts = cache.retained_flashes();
+    assert_eq!(
+        after_inserts,
+        7 + 8 + 9 + 10,
+        "premise: the four granules seeded above",
+    );
+
+    // `insert`, a key already held — the arm that must SUBTRACT before it
+    // adds. A refetch of a granule that shrank is the shape that drifts a
+    // level counted as a pure addition.
+    let replaced_start = base;
+    cache.insert(
+        granule_key(replaced_start),
+        replaced_start,
+        vec![flash_at(replaced_start)],
+    );
+    agree(&cache, "insert (replaced key)");
+    assert_eq!(
+        cache.retained_flashes(),
+        after_inserts - 7 + 1,
+        "a replaced granule's rows leave the level with it",
+    );
+
+    // `evict_before`, dropping the two oldest granules.
+    cache.evict_before(base + TimeDelta::minutes(45));
+    agree(&cache, "evict_before");
+    assert!(
+        cache.retained_flashes() < after_inserts - 7 + 1,
+        "non-triviality: the cutoff must actually evict something, or the \
+         arm above proves nothing",
+    );
+
+    // `evict_oldest_over`, at a cap between two granules' worth.
+    let before_cap = cache.retained_flashes();
+    cache.evict_oldest_over(before_cap - 1);
+    agree(&cache, "evict_oldest_over");
+    assert!(
+        cache.retained_flashes() < before_cap,
+        "non-triviality: the cap must actually evict something",
+    );
+
+    // The clear — a whole-value replacement, which is what `GlmStore::replace`
+    // performs for a level-selection change.
+    cache = GlmCache::default();
+    agree(&cache, "clear");
+    assert_eq!(cache.retained_bytes(), 0, "a cleared cache holds no rows");
+}
+
+/// **A whole poll, not a hand-driven sequence**: the level a real
+/// [`fetch_glm_flashes`] leaves behind is the walk's, over a round that both
+/// evicts by cutoff and enforces the retention cap.
+///
+/// The hand-driven test above can only exercise the sites it thought to call.
+/// This one runs the shipped path and asks the same question of whatever it
+/// happened to do.
+#[test]
+fn a_polls_retention_level_is_the_one_a_walk_of_its_cache_reports() {
+    const PER_GRANULE: usize = 80_000;
+    let day = chrono::NaiveDate::from_ymd_opt(2020, 6, 15).unwrap();
+    let as_of = day.and_hms_opt(8, 0, 0).unwrap();
+
+    let starts = [
+        day.and_hms_opt(6, 10, 0).unwrap(),
+        day.and_hms_opt(6, 40, 0).unwrap(),
+        day.and_hms_opt(7, 10, 0).unwrap(),
+        day.and_hms_opt(7, 40, 0).unwrap(),
+    ];
+    let keys: Vec<String> = starts.iter().copied().map(granule_key).collect();
+
+    let mut cache = GlmCache::default();
+    for (key, start) in keys.iter().zip(starts) {
+        let flashes: Vec<GlmFlash> = (0..PER_GRANULE)
+            .map(|i| loop_flash_at(35.0, -97.0, start + TimeDelta::milliseconds(i as i64)))
+            .collect();
+        cache.insert(key.clone(), start, flashes);
+    }
+    assert!(
+        cache.flash_count() > MAX_RETAINED_FLASHES,
+        "non-triviality floor: the seed must overflow the cap, or the poll's \
+         `evict_oldest_over` never runs and this test asks nothing of it",
+    );
+
+    let listing = http_response("200 OK", &listing_xml(&keys[0]));
+    let sources = s3_serving(vec![("east", listing.clone()), ("west", listing)]);
+    poll_spanned(&sources, &mut cache, as_of, Some(7200)).expect("both listings answered");
+
+    assert_eq!(
+        cache.retained_flashes(),
+        cache.flash_count(),
+        "the level a real poll left is not what a walk of its cache reports",
+    );
+    assert_eq!(
+        cache.retained_bytes(),
+        cache.flash_count() * size_of::<GlmFlash>(),
+    );
+    assert!(
+        cache.retained_flashes() <= MAX_RETAINED_FLASHES,
+        "premise: the poll enforced the cap",
+    );
+    assert!(
+        cache.retained_flashes() > 0,
+        "premise: the poll kept something, so a level that always read zero \
+         would fail here",
+    );
+}
+
+/// **The denominator the cap's byte figure is quoted with.** `GlmFlash` owns
+/// nothing on the heap, so a row's whole price is its `size_of`, and
+/// [`MAX_RETAINED_FLASHES`] rows are that many bytes. A field added to
+/// `GlmFlash` moves this and every figure derived from it, which is what this
+/// pin exists to say out loud.
+#[test]
+fn a_retained_row_costs_its_size_of_and_the_cap_is_that_times_the_ceiling() {
+    assert_eq!(
+        size_of::<GlmFlash>(),
+        48,
+        "the 48 bytes a row every GLM byte figure in this tree is quoted at",
+    );
+    assert_eq!(super::FLASH_BYTES, size_of::<GlmFlash>());
+    assert_eq!(
+        MAX_RETAINED_FLASHES * super::FLASH_BYTES,
+        12_000_000,
+        "the ceiling `MAX_RETAINED_FLASHES` documents, in bytes",
     );
 }

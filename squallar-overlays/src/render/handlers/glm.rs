@@ -5,7 +5,7 @@ use std::sync::Arc;
 use squallar_units::UserPreferences;
 
 use crate::fetch_policy::Assembled;
-use crate::glm::fetch::GlmCache;
+use crate::glm::fetch::GlmStore;
 use crate::glm::{
     DeadFeed, FetchFailures, GLM_MAX_TIME_WINDOW_SECS, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel,
     GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, LevelFailure, RecordDrops, WindowGap,
@@ -354,8 +354,11 @@ pub(crate) struct GlmHandler {
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
     pub defaults: GlmPaneState,
-    /// Cached S3 file data for incremental fetching.
-    pub cache: Arc<std::sync::Mutex<GlmCache>>,
+    /// **Cached S3 granules for incremental fetching, and the byte level a
+    /// frame reads off them.** See [`GlmStore`]: the map is behind a mutex a
+    /// poll holds, the level is an atomic beside it, and
+    /// [`GlmHandler::resident_source_bytes`] answers off the level.
+    pub cache: Arc<GlmStore>,
     /// Satellites whose last listing returned no objects at all.
     dead_feeds: Vec<DeadFeed>,
     /// Per-kind failure state — see [`GlmHandler::report_failures`].
@@ -431,7 +434,7 @@ impl GlmHandler {
                 crate::render::footprint::glm_flash_rows,
             ),
             defaults: GlmPaneState::new(false),
-            cache: Arc::new(std::sync::Mutex::new(GlmCache::default())),
+            cache: Arc::new(GlmStore::default()),
             dead_feeds: Vec::new(),
             parse: FailureState::default(),
             transport: FailureState::default(),
@@ -718,8 +721,7 @@ impl GlmHandler {
 
     /// Clear the file cache (needed when level selection changes).
     fn clear_cache(&self) {
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = GlmCache::default();
+        self.cache.replace(crate::glm::fetch::GlmCache::default());
     }
     /// **Every instant this pane's clock can stop on**, ascending and never
     /// empty — what [`Self::residency_for`] is asked about.
@@ -1074,10 +1076,7 @@ impl OverlayHandler for GlmHandler {
             kind: known::LIGHTNING,
             future: Box::pin(async move {
                 // Clone the cache out so we don't hold a std::sync::Mutex across await
-                let mut local_cache = {
-                    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.clone()
-                };
+                let mut local_cache = cache.snapshot();
                 let result = crate::glm::fetch::fetch_glm_flashes(
                     &client,
                     &sources,
@@ -1088,10 +1087,7 @@ impl OverlayHandler for GlmHandler {
                     depicted,
                 )
                 .await;
-                {
-                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                    *guard = local_cache;
-                }
+                cache.replace(local_cache);
                 Box::new(GlmFetchResult(result)) as FetchPayload
             }),
         }]
@@ -1372,6 +1368,32 @@ impl OverlayHandler for GlmHandler {
             "show_groups": state.show_groups,
             "show_flashes": state.show_flashes,
         })
+    }
+
+    /// **One block: the S3 granule cache held beside this handler's state**,
+    /// off [`GlmStore::retained_bytes`] — a relaxed load, no lock and no walk,
+    /// which is what lets the frame thread's telemetry tick ask.
+    ///
+    /// **Bytes this covers, and the ones it does not.** The `overlay items`
+    /// census family prices what an `OverlayState` *installed*
+    /// (`squallar_source::footprint::installed_item_bytes`, a level maintained
+    /// at install), which for this layer is the `Arc<GlmSlab>` built from
+    /// `flashes_in_window`'s freshly collected `Vec`. The cache holds the
+    /// per-granule `Vec<GlmFlash>` that `Vec` was **cloned out of** — a
+    /// different allocation with a different lifetime, kept across polls while
+    /// the slab is replaced by each one. So the two figures are disjoint by
+    /// allocation, not by convention, and the `overlay grids` family this one
+    /// joins is disjoint from `overlay items` already.
+    ///
+    /// **Not counted here**: the slab (`overlay items`), the built paint rows
+    /// the memo parks (`overlay parked`), the rasters made from them (the
+    /// overlay picture family) and the textures those became (the GPU's) —
+    /// the same exclusions `MrmsHandler::resident_source_bytes` lists. Nor the
+    /// whole-cache clone a poll makes for the length of its future: that is a
+    /// local of the future rather than something the store is holding, and it
+    /// doubles this figure while a poll runs.
+    fn resident_source_bytes(&self) -> u64 {
+        self.cache.retained_bytes() as u64
     }
 }
 
