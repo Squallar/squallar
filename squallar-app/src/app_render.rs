@@ -367,6 +367,33 @@ fn overlay_raster_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> Stri
     )
 }
 
+/// The `overlay reasons:` running-total line — [`overlay_raster_line`]'s
+/// `dispatched` figure split by the arm that asked for each raster.
+///
+/// **A second line and not more fields on the first**, for one reason that is
+/// not style: the Tier-2 rig matches `overlay rasters:` with a single anchored
+/// regex over the whole sentence (`drive.py`'s `rasters_re`), and
+/// `the_rig_reads_the_lines_the_app_actually_writes` pins the two together. A
+/// field inserted into that sentence turns the rig's overlay reading into
+/// `null`, which reads as "the path never ran" — the exact failure that test
+/// exists to prevent. This line is additive: the rig skips what it has no
+/// probe for.
+///
+/// Its denominator is the same `dispatched`, and the counts sum to it — see
+/// [`ledger::Totals::reasons_balance`]. It is **never added to
+/// `texture uploads:`**, which counts every egui texture the renderer was
+/// shown and has a different denominator entirely.
+///
+/// [`ledger::Totals::reasons_balance`]: squallar_egui::overlay_cache::ledger::Totals::reasons_balance
+fn overlay_reason_line(t: &squallar_egui::overlay_cache::ledger::Totals) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!("overlay reasons: {} dispatched", t.dispatched);
+    for reason in squallar_egui::overlay_cache::RerenderReason::ALL {
+        let _ = write!(line, ", {} {}", t.reason(reason), reason.name());
+    }
+    line
+}
+
 /// The `texture uploads:` running-total line. See [`overlay_raster_line`] for
 /// why this is a value.
 ///
@@ -1941,6 +1968,9 @@ impl super::App {
         let loud = self.raster_telemetry_loud;
         if let Some(t) = rasters {
             say_telemetry(loud, &overlay_raster_line(&t));
+            // Beside the line it splits, and off the same reading, so the two
+            // sentences can never be a frame apart.
+            say_telemetry(loud, &overlay_reason_line(&t));
         }
         if let Some(u) = uploads {
             say_telemetry(loud, &texture_upload_line(&u));
@@ -7899,6 +7929,12 @@ pub(super) fn pump_dispatch_overlay_loop_renders(
 #[path = "app_render/idle_raster_tests.rs"]
 #[cfg(test)]
 mod idle_raster_tests;
+
+/// **Why** a raster was spent, and that the reason tells a view-driven rebuild
+/// from a data-driven one — the figure that prices the oversampling margin.
+#[path = "app_render/rebuild_reason_tests.rs"]
+#[cfg(test)]
+mod rebuild_reason_tests;
 
 /// A 3D pane is priced at the size and ground pass the painter last fitted
 /// its offscreen from, not at the window's.

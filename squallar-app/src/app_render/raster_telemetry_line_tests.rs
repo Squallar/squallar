@@ -115,6 +115,10 @@ fn the_rig_reads_the_lines_the_app_actually_writes() {
         dropped: 77,
         superseded: 88,
         cancelled: 99,
+        // Not in this sentence at all — the reason split is its own line, so
+        // that the rig's anchored `rasters_re` keeps matching. See
+        // `app_render::overlay_reason_line`.
+        reasons: [0; squallar_egui::overlay_cache::RerenderReason::COUNT],
     };
     assert_eq!(
         super::overlay_raster_line(&rasters),

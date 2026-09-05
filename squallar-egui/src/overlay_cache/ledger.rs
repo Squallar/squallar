@@ -92,10 +92,16 @@
 //! of a picture is ink". [`Totals::inked`] has exactly one denominator,
 //! [`Totals::pictures`], and `inked <= pictures` always.
 
+use super::RerenderReason;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Overlay rasters asked for. See [`note_dispatched`].
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+/// [`DISPATCHED`] split by [`RerenderReason`], indexed by
+/// [`RerenderReason::index`]. Written by the same call that writes
+/// [`DISPATCHED`], so the two cannot drift — see [`Totals::reasons_balance`].
+static DISPATCH_REASONS: [AtomicU64; RerenderReason::COUNT] =
+    [const { AtomicU64::new(0) }; RerenderReason::COUNT];
 /// Rasterized responses received. See [`note_arrived`].
 static ARRIVED: AtomicU64 = AtomicU64::new(0);
 /// Responses thrown away before their pixels were handed over.
@@ -218,6 +224,15 @@ pub struct Totals {
     /// from it about an asynchronous pipeline does not hold. That mistake has
     /// been made on this counter once already.
     pub superseded: u64,
+    /// [`Self::dispatched`] split by the arm that asked for it, indexed by
+    /// [`RerenderReason::index`]. Read it through [`Self::reason`].
+    ///
+    /// **Its denominator is [`Self::dispatched`] and nothing else**, and
+    /// [`Self::reasons_balance`] is that identity rather than an expectation:
+    /// the same call writes both. An ask that `RendersInFlight::admits`
+    /// refused appears in neither — it spent no raster — so this is a
+    /// breakdown of rasters *spent*, never of rasters *wanted*.
+    pub reasons: [u64; RerenderReason::COUNT],
     /// Of [`Self::dispatched`], those withdrawn at the supersede seam (WO-8)
     /// before their answer was used: a newer dispatch replaced every
     /// destination the raster was for, so the job was cancelled at the
@@ -244,6 +259,51 @@ impl Totals {
         self.arrived == self.pictures + self.dropped
     }
 
+    /// Whether every dispatch is accounted for by exactly one reason. False
+    /// means a `record` reached the ledger without passing through
+    /// [`note_dispatched`], which is the only way the two can disagree.
+    pub fn reasons_balance(&self) -> bool {
+        self.reasons.iter().sum::<u64>() == self.dispatched
+    }
+
+    /// How many rasters `reason` asked for.
+    pub fn reason(&self, reason: RerenderReason) -> u64 {
+        self.reasons[reason.index()]
+    }
+
+    /// How many distinct reasons were observed at all.
+    ///
+    /// **The anti-vacuity conjunct for this breakdown.** A reason counter that
+    /// always answered the same variant satisfies every other check here —
+    /// `dispatched` is positive, the sum balances, each figure is readable —
+    /// and says nothing. A scene that really does move the view *and* deliver
+    /// data must read at least two.
+    pub fn distinct_reasons(&self) -> usize {
+        self.reasons.iter().filter(|n| **n > 0).count()
+    }
+
+    /// Rasters the **view moving** asked for — see
+    /// [`RerenderReason::is_view_driven`], which excludes a density or pane
+    /// resize on purpose.
+    pub fn view_driven(&self) -> u64 {
+        self.sum_where(RerenderReason::is_view_driven)
+    }
+
+    /// Rasters a **wider oversampling margin could have prevented** — see
+    /// [`RerenderReason::is_margin_avoidable`]. This is the figure that prices
+    /// the margin, and its denominator is [`Self::dispatched`].
+    pub fn margin_avoidable(&self) -> u64 {
+        self.sum_where(RerenderReason::is_margin_avoidable)
+    }
+
+    fn sum_where(&self, pred: fn(RerenderReason) -> bool) -> u64 {
+        RerenderReason::ALL
+            .iter()
+            .filter(|r| pred(**r))
+            .map(|r| self.reasons[r.index()])
+            .sum()
+    }
+
     /// Pictures that reached the screen, by either route.
     pub fn on_screen(&self) -> u64 {
         self.shown + self.promoted
@@ -256,9 +316,14 @@ impl Totals {
     }
 }
 
-/// Record that an overlay raster was asked for.
-pub fn note_dispatched() {
+/// Record that an overlay raster was asked for, and **why**.
+///
+/// Two relaxed `fetch_add`s and one `match` on a fieldless enum; nothing here
+/// allocates, formats or takes a clock, so it stays as free on the frame
+/// thread as the single counter it replaced.
+pub fn note_dispatched(reason: RerenderReason) {
     DISPATCHED.fetch_add(1, Relaxed);
+    DISPATCH_REASONS[reason.index()].fetch_add(1, Relaxed);
 }
 
 /// Record that a rasterized response arrived.
@@ -340,6 +405,7 @@ pub fn totals() -> Totals {
         promoted: PROMOTED.load(Relaxed),
         superseded: SUPERSEDED.load(Relaxed),
         cancelled: CANCELLED.load(Relaxed),
+        reasons: std::array::from_fn(|i| DISPATCH_REASONS[i].load(Relaxed)),
     }
 }
 
@@ -383,6 +449,9 @@ pub fn reset_for_test() {
         &CANCELLED,
         &REPORTED,
     ] {
+        counter.store(0, Relaxed);
+    }
+    for counter in &DISPATCH_REASONS {
         counter.store(0, Relaxed);
     }
 }

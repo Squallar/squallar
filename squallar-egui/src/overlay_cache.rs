@@ -437,6 +437,167 @@ pub fn plan_overlay_texture(
 /// for, pictures uploaded and bytes with them, and the ones thrown away.
 pub mod ledger;
 
+// ── Why a raster was asked for ───────────────────────────────────────────
+
+/// Why one whole-picture overlay raster was dispatched.
+///
+/// **The margin's justification is a rate, and until this existed nothing
+/// could measure it.** Overlay pictures are rasterized oversized — 2.25x the
+/// pane's area at [`OVERLAY_OVERSAMPLE_PERCENTS[0]`][percents] — so that a pan
+/// can move across the picture's expanded ground without asking for a new one.
+/// What that margin buys is exactly the [`Self::PanCoverage`] dispatches it
+/// prevents, and the only honest way to price it is to know what share of
+/// rasters that arm is responsible for. [`OverlayTextureCache::needs_rerender`]
+/// collapsed nine branches into a bare `bool`, so the share was not merely
+/// unmeasured — it was unknowable.
+///
+/// [percents]: squallar_device_profile::constants::OVERLAY_OVERSAMPLE_PERCENTS
+///
+/// # The denominator
+///
+/// One variant is counted per [`RendersInFlight::record`], which is the same
+/// mark [`ledger::Totals::dispatched`] counts and the same one
+/// [`RendersInFlight::admits`] bounds. So the breakdown's denominator **is**
+/// `dispatched`, exactly, and [`ledger::Totals::reasons_balance`] is that
+/// identity rather than a hope. An ask that `admits` refused is in neither
+/// figure: it spent no raster.
+///
+/// # What separates the two content arms
+///
+/// [`Self::ContentOneShot`] and [`Self::ContentSweeping`] are the same
+/// *branch* — the cache token no longer matches the picture's — split on
+/// `OverlayTextureCache::token_sweeping`, which this module already computed
+/// for the dispatch brake. A token that moved once and then held still is a
+/// one-shot; a token that moves again within [`SWEEP_QUIET_FRAMES`] frames is
+/// a clock sweeping its window. That is the loop-versus-data distinction, and
+/// it is a **frame-rate-relative** one rather than a semantic one: the first
+/// tick of a playing loop is charged to `ContentOneShot`, because at that
+/// instant nothing has yet distinguished it from a data arrival, and every
+/// tick after it is charged to `ContentSweeping`. A loop playing faster than
+/// one token move per `SWEEP_QUIET_FRAMES` frames reads as sweeping for as
+/// long as it plays.
+///
+/// **`ContentOneShot` is not "data arrived".** The cache token mixes the data
+/// generation with the theme, the pane's layer settings and the as-of stamp
+/// (`squallar_egui::overlay_cache_token`), so a theme flip, a filter change
+/// and a units change all land here too. The one variant that *is* an
+/// unambiguous data arrival is [`Self::ArrivalDoor`], which is only ever armed
+/// by the `SourceEvent::Data` drain.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RerenderReason {
+    /// The pane is drawing nothing for this layer yet — no texture, no hold
+    /// and no blank. The first picture after a `clear`, a pane opening, or a
+    /// layer being switched on.
+    FirstPicture,
+    /// The cache token moved once and then held still: data arrived, the
+    /// theme flipped, a filter or unit changed, or an as-of stepped a single
+    /// bucket. See the type note — this is not exclusively data.
+    ContentOneShot,
+    /// The cache token is moving on consecutive frames — a playing loop, a
+    /// scrub, or a live as-of clock sweeping its window.
+    ContentSweeping,
+    /// The picture is no longer the size this pane would ask for: a display
+    /// density change, a window moved to another monitor, a browser zoom, or
+    /// the pane itself being resized. **Not a view movement** — the zoom and
+    /// the ground are untouched and only the texel count moved.
+    PlanResized,
+    /// The zoom drifted [`ZOOM_REBUILD_BAND`] from the picture's own while a
+    /// gesture was still running. Off in every shipped build — see
+    /// [`MID_GESTURE_REBUILDS`] — and counted so that the policy's cost is
+    /// visible if it is ever turned back on.
+    ZoomBand,
+    /// A gesture settled at a different quantized zoom. The picture the
+    /// gesture was stretching is replaced by one rasterized at the zoom the
+    /// map came to rest at.
+    ZoomSettled,
+    /// **The viewport ran off the edge of the picture's expanded ground.**
+    /// This is the one arm the oversampling margin exists to prevent, and its
+    /// share is what prices the margin.
+    PanCoverage,
+    /// Dispatched by the arrival drain rather than by a frame — `SourceEvent::
+    /// Data` found a pane whose recorded token is stale. Unambiguously a data
+    /// arrival: this door does not consult [`OverlayTextureCache::
+    /// needs_rerender`] at all.
+    ArrivalDoor,
+    /// A raster was marked with nothing armed. **Zero in a healthy tree**, and
+    /// a nonzero reading is a hole in this wiring rather than a category of
+    /// rebuild: every production `record` is reached from one of the two
+    /// doors, and both arm. Counted rather than folded into a neighbour so
+    /// that the hole is visible instead of silently inflating whichever
+    /// variant it was merged with.
+    Unattributed,
+}
+
+impl RerenderReason {
+    /// Every variant, in the order [`Self::index`] assigns.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::FirstPicture,
+        Self::ContentOneShot,
+        Self::ContentSweeping,
+        Self::PlanResized,
+        Self::ZoomBand,
+        Self::ZoomSettled,
+        Self::PanCoverage,
+        Self::ArrivalDoor,
+        Self::Unattributed,
+    ];
+
+    /// How many variants there are — the width of the ledger's counter array.
+    pub const COUNT: usize = 9;
+
+    /// This variant's slot in [`Self::ALL`] and in the ledger's array.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::FirstPicture => 0,
+            Self::ContentOneShot => 1,
+            Self::ContentSweeping => 2,
+            Self::PlanResized => 3,
+            Self::ZoomBand => 4,
+            Self::ZoomSettled => 5,
+            Self::PanCoverage => 6,
+            Self::ArrivalDoor => 7,
+            Self::Unattributed => 8,
+        }
+    }
+
+    /// A short name for a log line. Stable — the Tier-2 rig reads these.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::FirstPicture => "first",
+            Self::ContentOneShot => "content",
+            Self::ContentSweeping => "sweep",
+            Self::PlanResized => "resize",
+            Self::ZoomBand => "zoom-band",
+            Self::ZoomSettled => "zoom-settled",
+            Self::PanCoverage => "pan",
+            Self::ArrivalDoor => "arrival",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    /// Whether the **view moving** is what asked for this raster, as against
+    /// content changing under a view that did not move.
+    ///
+    /// [`Self::PlanResized`] is deliberately **not** here: a density or pane
+    /// resize changes how many texels a point is worth and leaves the zoom and
+    /// the ground exactly where they were. Folding it in would inflate the
+    /// figure this lane exists to measure.
+    pub const fn is_view_driven(self) -> bool {
+        matches!(self, Self::ZoomBand | Self::ZoomSettled | Self::PanCoverage)
+    }
+
+    /// Whether a **larger oversampling margin could have prevented** this
+    /// raster.
+    ///
+    /// Only [`Self::PanCoverage`] can be: it is the arm that fires when the
+    /// viewport leaves the picture's expanded ground, and expanding that
+    /// ground is what the margin does. A settled zoom asks for a picture at a
+    /// different scale, which no amount of margin at the old scale answers.
+    pub const fn is_margin_avoidable(self) -> bool {
+        matches!(self, Self::PanCoverage)
+    }
+}
+
 // ── How many rasters may be crossing at once ─────────────────────────────
 
 /// Which of a layer's pictures a raster is on its way to, as an index the
@@ -566,6 +727,9 @@ pub struct RendersInFlight {
     /// `MAX_CONCURRENT_RENDERS`, which is 1, 3 or 6: scanning six tickets is
     /// cheaper than hashing one.
     out: Vec<RenderTicket>,
+    /// Why the next [`Self::record`] is about to spend a raster, put here by
+    /// whichever door decided it. See [`Self::arm`].
+    armed: Option<RerenderReason>,
 }
 
 impl RendersInFlight {
@@ -594,6 +758,44 @@ impl RendersInFlight {
         !self.holds(slot) && self.out.len() < limit
     }
 
+    /// Say why the raster this cache is about to dispatch is being spent.
+    ///
+    /// **Set as late as the decision allows, and consumed by the very next
+    /// [`Self::record`]**, which is what makes the attribution exact rather
+    /// than a guess about ordering. Both doors are same-frame ordered against
+    /// this latch and neither can read the other's arm:
+    ///
+    /// 1. `Ingest` — `App::arrived_overlay_asks` arms [`RerenderReason::
+    ///    ArrivalDoor`] on each cache it decided for, then
+    ///    `App::dispatch_overlay_renders` records them.
+    /// 2. The draw pass — `OverlayTextureCache::needs_rerender` arms the arm
+    ///    it fired on, or clears the latch where it answered `false`.
+    /// 3. `App::process_gui_actions`, on the actions *that same pass* emitted
+    ///    (`App::setup_egui_frame` returns them and the drain is the next
+    ///    statement), records them.
+    ///
+    /// So a latch can only survive a frame where the draw pass wanted a raster
+    /// and [`Self::admits`] refused it — and on the next frame the draw pass
+    /// re-arms from a freshly recomputed decision before anything records, or
+    /// the arrival door overwrites it with its own. What can never happen is a
+    /// `record` reading a reason from a *different* cache: the latch is per
+    /// destination set, which is per pane and layer.
+    pub fn arm(&mut self, reason: RerenderReason) {
+        self.armed = Some(reason);
+    }
+
+    /// Drop a latch nothing is going to spend — the frame decided this cache
+    /// is up to date after all.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
+    /// What is armed, if anything. For tests; production consumes it at
+    /// [`Self::record`].
+    pub fn armed(&self) -> Option<RerenderReason> {
+        self.armed
+    }
+
     /// Mark a raster as dispatched for `ticket.slot`.
     ///
     /// **Insert-or-replace, not push.** The dispatch paths mark
@@ -607,8 +809,13 @@ impl RendersInFlight {
         // Counted here and not at the dispatch that calls it, because this is
         // the mark itself: a dispatch that returned before marking has not
         // asked for a raster, and one that marked twice for a slot really did
-        // spend two. One relaxed `fetch_add`; see [`ledger`].
-        ledger::note_dispatched();
+        // spend two. Two relaxed `fetch_add`s; see [`ledger`].
+        //
+        // The reason is **taken**, not read: one arm pays for one raster, and
+        // a second `record` with nothing re-armed is [`RerenderReason::
+        // Unattributed`] rather than a repeat of the first one's cause. That
+        // is the reading that makes a hole in the wiring visible.
+        ledger::note_dispatched(self.armed.take().unwrap_or(RerenderReason::Unattributed));
         match self.out.iter_mut().find(|t| t.slot == ticket.slot) {
             Some(slot) => *slot = ticket,
             None => self.out.push(ticket),
@@ -646,6 +853,11 @@ impl RendersInFlight {
     /// Whatever is still flying reads as stale at [`Self::retire`].
     pub fn abandon_all(&mut self) {
         self.out.clear();
+        // The pane moved or the context died, so whatever a frame decided
+        // about this cache is about to be recomputed against a different one.
+        // Leaving the latch would charge the next raster to a scene that is
+        // gone.
+        self.armed = None;
     }
 }
 
@@ -991,6 +1203,11 @@ impl OverlayTextureCache {
     }
 
     /// [`Self::needs_rerender`] with the platform policy as a parameter.
+    ///
+    /// **Arming is done here rather than at either caller**, so that every
+    /// path which can answer `true` charges the raster it is about to cause,
+    /// and a `false` clears a latch an earlier frame left behind. See
+    /// [`RendersInFlight::arm`] for the ordering that makes the latch exact.
     fn needs_rerender_with_policy(
         &mut self,
         token: u64,
@@ -1000,6 +1217,45 @@ impl OverlayTextureCache {
         plan: &OverlayTexturePlan,
         mid_gesture_band: bool,
     ) -> bool {
+        match self.rerender_reason_with_policy(
+            token,
+            zoom,
+            drive,
+            viewport_bounds,
+            plan,
+            mid_gesture_band,
+        ) {
+            Some(reason) => {
+                self.renders.arm(reason);
+                true
+            }
+            None => {
+                self.renders.disarm();
+                false
+            }
+        }
+    }
+
+    /// **Why** a raster is owed for this frame's viewport, zoom and content,
+    /// or `None` where none is.
+    ///
+    /// This is the body [`Self::needs_rerender_with_policy`] wraps, and it
+    /// carries every one of that gate's rules unchanged — what it adds is that
+    /// each `true` now names the arm it came from. See [`RerenderReason`] for
+    /// why the naming is the point.
+    ///
+    /// **One call is one frame**, exactly as before: the settle countdown and
+    /// the sweep clock both advance here, so this must be called once per
+    /// frame per cache and never speculatively.
+    fn rerender_reason_with_policy(
+        &mut self,
+        token: u64,
+        zoom: f64,
+        drive: ZoomDrive,
+        viewport_bounds: &GeoBounds,
+        plan: &OverlayTexturePlan,
+        mid_gesture_band: bool,
+    ) -> Option<RerenderReason> {
         // Two things re-arm the countdown and they refuse different frames.
         // The drive is the gesture still running — a wheel action egui has not
         // called finished, fingers on the glass — and it covers the frames
@@ -1052,7 +1308,7 @@ impl OverlayTextureCache {
             .or_else(|| self.current.as_ref().map(OverlayTextureData::shape))
             .or(self.blank)
         else {
-            return true;
+            return Some(RerenderReason::FirstPicture);
         };
         // ── Content ─────────────────────────────────────────────────────────
         //
@@ -1121,10 +1377,25 @@ impl OverlayTextureCache {
             // rasters, discards 0 and promotes 300, and it does so under this
             // rule too. What is refused is the pane that has *demonstrated* a
             // discard during this sweep — see [`Self::sweep_discarded`].
+            // The two content exits keep their conditions exactly; what is
+            // added is the name. `token_sweeping` is the same flag the brake
+            // above is written on, so the loop-versus-one-shot split costs
+            // nothing to compute and cannot disagree with the brake it sits
+            // beside. The first exit is reachable only while sweeping, so it
+            // has one name.
             if self.token_sweeping && self.sweep_discarded {
-                return self.held.is_none();
+                return self
+                    .held
+                    .is_none()
+                    .then_some(RerenderReason::ContentSweeping);
             }
-            return !(self.hold_superseded && self.held.is_some());
+            return (!(self.hold_superseded && self.held.is_some())).then_some(
+                if self.token_sweeping {
+                    RerenderReason::ContentSweeping
+                } else {
+                    RerenderReason::ContentOneShot
+                },
+            );
         }
         // The texture is no longer the size this pane would ask for. Nothing
         // else here can notice that: a display-density change — a window moved
@@ -1133,14 +1404,14 @@ impl OverlayTextureCache {
         // how many texels a point is worth. Without this the pane would keep a
         // half-density texture for as long as it stayed put.
         if tex.width != plan.width || tex.height != plan.height {
-            return true;
+            return Some(RerenderReason::PlanResized);
         }
         let render_zoom = tex.render_zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
         if mid_gesture_band && (zoom - render_zoom).abs() >= ZOOM_REBUILD_BAND {
-            return true;
+            return Some(RerenderReason::ZoomBand);
         }
         if settled && tex.render_zoom != quantize_zoom(zoom) {
-            return true;
+            return Some(RerenderReason::ZoomSettled);
         }
 
         // ── Coverage ────────────────────────────────────────────────────────
@@ -1215,13 +1486,14 @@ impl OverlayTextureCache {
             // destination that has one out, so `held` is the half that was
             // still getting through.
             if self.held.is_some() {
-                return false;
+                return None;
             }
             // Deadbanded, for the reason the margin arm below is: a viewport
             // wobbling by less than one of the picture's own texels rasterises
             // the picture it already has, and at a coverage floor that is still
             // the whole of the margin on the axis a clamp ate.
-            return coverage_is_exhausted_visibly(&displayed, viewport_bounds);
+            return coverage_is_exhausted_visibly(&displayed, viewport_bounds)
+                .then_some(RerenderReason::PanCoverage);
         }
 
         // **What is on screen has run out of margin**, by at least a texel of
@@ -1239,7 +1511,7 @@ impl OverlayTextureCache {
         // three arms are ANDed, and a deadbanded `true` implies the undeadbanded
         // one, so nothing below can re-admit what this withheld.
         if !pan_exceeds_coverage_visibly(&displayed, viewport_bounds) {
-            return false;
+            return None;
         }
 
         // **And so has the newest picture**, or the hold already answers this:
@@ -1247,7 +1519,7 @@ impl OverlayTextureCache {
         // is what will *be* on screen once its last band lands. When nothing is
         // held these two are the same texture and this is one test asked twice.
         if !pan_exceeds_coverage(&tex.placed.geo, viewport_bounds) {
-            return false;
+            return None;
         }
 
         // **And this pane has not already thrown one away.** [`Self::hold`]
@@ -1266,7 +1538,11 @@ impl OverlayTextureCache {
         // arms between (plan size, zoom band, settle) stay unbraked: each
         // fires once per settled change rather than continuously, so none of
         // them can close the dispatch-and-discard loop this guards.
-        !(self.hold_superseded && self.held.is_some())
+        // **The one arm the oversampling margin exists to prevent.** Every
+        // other reason above is a picture that a wider margin would have been
+        // asked for anyway; this is the one it buys off. See
+        // [`RerenderReason::is_margin_avoidable`].
+        (!(self.hold_superseded && self.held.is_some())).then_some(RerenderReason::PanCoverage)
     }
 }
 

@@ -1573,6 +1573,16 @@ impl super::App {
                 recorded.data_generation,
                 fresh,
             );
+            // **Charge the raster this door is about to spend.** This path
+            // never consults `needs_rerender`, so nothing else can name its
+            // reason, and this is the one variant that is unambiguously a data
+            // arrival — see `RerenderReason::ArrivalDoor`. Armed here rather
+            // than at the dispatch because this is where the decision is made,
+            // and nothing draws between here and the `record` that consumes
+            // it: `dispatch_overlay_renders` is the next thing `Ingest` does.
+            pane.overlay_cache_mut(&id)
+                .renders
+                .arm(squallar_egui::overlay_cache::RerenderReason::ArrivalDoor);
             asks.push((
                 pane_idx,
                 id,
