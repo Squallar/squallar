@@ -1127,6 +1127,7 @@ mod tests {
     /// this test did against itself.
     #[test]
     fn a_layer_drains_once_however_many_tiles_it_draws() {
+        let _ledger = ledger_guard();
         squallar_radar::tls::init();
 
         let ctx = egui::Context::default();
@@ -1190,6 +1191,7 @@ mod tests {
     /// release gate's input — and equals what it drew before the snap.
     #[test]
     fn a_snapped_source_is_asked_for_the_whole_zoom_and_its_net_the_same_way() {
+        let _ledger = ledger_guard();
         use crate::tile_source::snap::TILE_SNAP_DWELL_PASSES;
         squallar_radar::tls::init();
 
@@ -1327,6 +1329,7 @@ mod tests {
     /// and the net evicts the glass it exists to back up).
     #[test]
     fn a_drawn_layer_asks_for_the_ancestor_net_and_no_more_than_its_bound() {
+        let _ledger = ledger_guard();
         squallar_radar::tls::init();
 
         let ctx = egui::Context::default();
@@ -1468,6 +1471,7 @@ mod tests {
     /// produced one.
     #[test]
     fn a_vector_tile_reaches_the_painter_placed_on_its_own_rect() {
+        let _ledger = ledger_guard();
         squallar_radar::tls::init();
 
         let ctx = egui::Context::default();
@@ -1577,6 +1581,7 @@ mod tests {
     /// would squeeze a whole ancestor into a quarter of its area.
     #[test]
     fn a_uv_window_places_against_the_whole_tile_and_clips_to_the_piece() {
+        let _ledger = ledger_guard();
         let piece = egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(64.0, 64.0));
         // The north-west quarter of the tile.
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 0.5));
@@ -1607,6 +1612,7 @@ mod tests {
     /// cannot bleed over its neighbour.
     #[test]
     fn the_vector_painter_is_clipped_to_the_tile() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(256.0, 256.0));
@@ -1683,6 +1689,7 @@ mod tests {
     /// text on top of legible text and still look plausible in a screenshot.
     #[test]
     fn overlapping_labels_collide_and_only_one_is_drawn() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
@@ -1732,6 +1739,7 @@ mod tests {
     /// gets wrong.
     #[test]
     fn a_place_carried_by_two_adjoining_tiles_is_drawn_once() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
@@ -1765,6 +1773,7 @@ mod tests {
     /// not a renderer that stopped drawing past the first tile.
     #[test]
     fn a_place_of_its_own_in_the_second_tile_still_draws() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
@@ -1790,6 +1799,7 @@ mod tests {
     /// half -- which is the other half of what the per-tile draw got wrong.
     #[test]
     fn a_label_is_clipped_to_the_pane_and_not_to_its_tile() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
@@ -1818,6 +1828,7 @@ mod tests {
     /// Upstream's 4.0 puts this at 2.0 points instead of 8.0.
     #[test]
     fn a_styled_line_width_arrives_on_screen_at_that_width() {
+        let _ledger = ledger_guard();
         let style = walkers::Style::from_json(
             r##"{"layers":[{"type":"line","source-layer":"transportation",
                  "paint":{"line-color":"#ff0000","line-width":8}}]}"##,
@@ -1897,6 +1908,7 @@ mod tests {
     /// the frame out from scratch positionally while re-using the glyphs.
     #[test]
     fn a_kept_galley_cache_paints_what_a_fresh_one_paints() {
+        let _ledger = ledger_guard();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
         let names = ["Washita River", "Oklahoma City", "Lake Thunderbird"];
         let offsets = [0.0_f32, 17.0, -23.0];
@@ -1971,6 +1983,7 @@ mod tests {
     /// `text-max-width` was parsed by nothing and every label drew as one run.
     #[test]
     fn a_long_name_wraps_to_its_styled_width() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
@@ -2021,6 +2034,7 @@ mod tests {
     /// silently inflate every collision box on the map.
     #[test]
     fn a_short_name_is_not_widened_by_its_wrap_limit() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2052,6 +2066,7 @@ mod tests {
     /// named at both ends.
     #[test]
     fn a_river_split_into_fragments_is_named_once_per_stretch() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 600.0));
 
@@ -2141,6 +2156,7 @@ mod tests {
     /// which is correct -- that would be a deliberate change, not a regression.
     #[test]
     fn a_label_is_one_draw_and_no_background_box() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
@@ -2180,6 +2196,7 @@ mod tests {
     /// not label that area at this zoom.
     #[test]
     fn a_name_too_long_to_set_in_two_rows_is_not_drawn() {
+        let _ledger = ledger_guard();
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
 
@@ -2232,6 +2249,7 @@ mod tests {
     /// Each of the three conditions must block **on its own**.
     #[test]
     fn each_condition_blocks_a_position_on_its_own() {
+        let _ledger = ledger_guard();
         let clear = egui::pos2(400.0, 300.0);
         assert!(
             PANE.contains(clear),
@@ -2303,6 +2321,7 @@ mod tests {
     /// freezes a 3D floor on whatever was on it.
     #[test]
     fn coverage_is_complete_only_when_every_cell_is_answered_exactly() {
+        let _ledger = ledger_guard();
         squallar_radar::tls::init();
 
         let ctx = egui::Context::default();
@@ -2393,13 +2412,40 @@ mod tests {
     // -----------------------------------------------------------------
     // The ground-mesh split.
     //
-    // Every test below reads process-global counters
-    // (`tile_mesh::ledger`), so they take one lock and reset inside it.
-    // Cargo runs tests in threads of one process; without this they would
-    // read each other's tiles.
+    // **Every test in this module takes `ledger_guard()`, first thing.**
+    //
+    // `tile_mesh::ledger`'s counters are process-global and are written by
+    // production `emit`, so a test does not have to *read* them to disturb
+    // one that does — painting a tile is enough. The lock used to be taken
+    // only by the tests that read totals, and the nineteen that merely paint
+    // ran beside them: a sibling's label was counted into a reader's figure
+    // and `a_declined_run_does_not_place_a_label_in_its_span_twice` saw
+    // `label_anchors_placed` of 2 where it required 1.
+    //
+    // **It was invisible on an idle box.** Serialized
+    // (`--test-threads=1`) all 31 pass; run as a filtered subset under load
+    // 15-19 twelve fail, and the same tests pass in a full-lib run on a quiet
+    // machine, which is why five runs on one box and three on another called
+    // it green while `cargo test --workspace` reddened. Scheduling decided
+    // the outcome, so this is a race, and a race is the regression.
     // -----------------------------------------------------------------
 
     static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The module's turn at the process-global ledger, with a poisoned lock
+    /// read as a live one.
+    ///
+    /// **Poison-tolerant on purpose.** These tests share
+    /// `tile_mesh::ledger`'s counters, so one failing test used to poison the
+    /// lock and every sibling then died on `PoisonError` instead of running:
+    /// one real assertion arrived buried under ten failures that said nothing
+    /// about themselves. A panicking test has already failed and reported;
+    /// it must not decide the outcome of the others.
+    fn ledger_guard() -> std::sync::MutexGuard<'static, ()> {
+        LEDGER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// A painter that hands back a payload for every span of runs it is asked
     /// about, and remembers what it was asked: the tile, the span as
@@ -2506,7 +2552,7 @@ mod tests {
     /// RED before the fix: `label_anchors_placed` reads 2.
     #[test]
     fn a_declined_run_does_not_place_a_label_in_its_span_twice() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let shapes = a_tile_with_a_label_inside_a_stroke_span();
         let flat = crate::tile_mesh::flatten(&shapes, FEATHERING);
@@ -2641,7 +2687,7 @@ mod tests {
     /// placed every frame, which is the `without` half below.
     #[test]
     fn ground_fills_stop_being_placed_on_the_cpu_while_labels_still_place() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let (_, without) = one_ground_pass(None);
         assert!(
@@ -2679,7 +2725,7 @@ mod tests {
     /// stroke that was styled over it.
     #[test]
     fn a_fill_run_becomes_a_callback_at_its_own_position() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
             std::sync::Arc::new(RecordingPainter::default());
@@ -2717,7 +2763,7 @@ mod tests {
     /// `a_stroke_run_becomes_a_callback_at_its_own_position`.
     #[test]
     fn each_ground_draw_carries_its_own_run_and_the_cpu_paths_placement() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let recorder = std::sync::Arc::new(RecordingPainter::default());
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
@@ -2754,7 +2800,7 @@ mod tests {
     /// no painter, so the zero is a move and not an absence.
     #[test]
     fn ground_strokes_stop_being_placed_on_the_cpu() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let (_, without) = one_ground_pass_at(None, FEATHERING, FEATHERING);
         assert!(
@@ -2793,7 +2839,7 @@ mod tests {
     /// what this pins.
     #[test]
     fn a_stroke_run_flattened_at_another_ppp_falls_back_to_the_cpu() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
             std::sync::Arc::new(RecordingPainter::default());
@@ -2836,7 +2882,7 @@ mod tests {
     /// before the background rectangle.
     #[test]
     fn a_stroke_run_becomes_a_callback_at_its_own_position() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
 
         let recorder = std::sync::Arc::new(RecordingPainter::default());
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
@@ -2889,7 +2935,7 @@ mod tests {
             }
         }
 
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
         let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
             std::sync::Arc::new(Refuses);
         let (shapes, totals) = one_ground_pass(Some(&painter));
@@ -3046,7 +3092,7 @@ mod tests {
     /// the count the whole thing exists for.
     #[test]
     fn the_background_rectangles_lead_the_walk_as_one_mesh() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
         let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
         let background = egui::Color32::from_rgb(0x10, 0x20, 0x30);
         for cell in &cells {
@@ -3142,7 +3188,7 @@ mod tests {
     /// nothing else stops it.
     #[test]
     fn a_stretched_ancestor_s_background_is_cut_to_its_piece() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
         let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
         let background = egui::Color32::from_rgb(0x10, 0x20, 0x30);
         let ancestor = egui::Color32::from_rgb(0x70, 0x10, 0x10);
@@ -3217,7 +3263,7 @@ mod tests {
     /// clipped walk, exactly as before.
     #[test]
     fn a_background_that_is_not_a_plain_first_fill_stays_inside_its_tile() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
         let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
         let extent = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT));
         let stroked = egui::Color32::from_rgb(0x10, 0x20, 0x30);
@@ -3301,7 +3347,7 @@ mod tests {
     /// the one a frame takes.
     #[test]
     fn a_hoisted_background_is_not_placed_again_by_its_tile() {
-        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let _ledger = ledger_guard();
         let shapes = a_styled_tile();
         let flat = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes, FEATHERING));
         assert!(
