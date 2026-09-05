@@ -147,7 +147,9 @@ impl StormReportsHandler {
         Self {
             state: OverlayState::new(),
             enabled: false,
-            rows_memo: crate::render::signature_memo::BuiltMemo::new(),
+            rows_memo: crate::render::signature_memo::BuiltMemo::new(
+                crate::render::footprint::reports_rows,
+            ),
         }
     }
 

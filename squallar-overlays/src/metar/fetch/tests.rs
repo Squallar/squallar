@@ -506,3 +506,29 @@ async fn live_networks_table_matches_iems_own_extents() {
         "networks table has drifted from IEM: missing {missing:?}, extra {extra:?}",
     );
 }
+
+/// **What one state network's observations cost the heap** — the item-data
+/// census family, priced on the captured `?network=OK_ASOS` body rather than
+/// on a model of one.
+///
+/// The denominator is this fixture: one state's ASOS network, trimmed to the
+/// stations the tests above use. A live viewport spanning several states
+/// holds several such rounds; the per-observation figure is what carries over
+/// and the count is what does not.
+#[test]
+fn the_captured_network_prices_its_observations() {
+    use squallar_source::footprint::ItemFootprint;
+
+    let obs = sample();
+    let count = obs.len();
+    assert!(count > 0, "the fixture must carry observations");
+    let bytes = obs.owned_bytes();
+    eprintln!(
+        "METAR: {count} observations from the captured OK_ASOS body, {bytes} B, {} B/ob",
+        bytes / count as u64,
+    );
+    assert!(
+        bytes > (count * size_of::<MetarOb>()) as u64,
+        "an observation's strings must be priced, not only its struct",
+    );
+}

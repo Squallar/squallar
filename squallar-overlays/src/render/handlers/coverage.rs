@@ -42,7 +42,9 @@ impl RadarCoverageHandler {
         Self {
             state: OverlayState::new(),
             enabled: false,
-            job_memo: crate::render::signature_memo::JobMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(
+                crate::render::footprint::coverage_job,
+            ),
         }
     }
 }

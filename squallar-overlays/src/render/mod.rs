@@ -1,5 +1,6 @@
 pub mod controls;
 pub mod draw;
+pub mod footprint;
 pub mod geo;
 pub mod gridded;
 // `pub` so the frontend's described-job dispatch tests can name the three

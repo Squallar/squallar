@@ -112,7 +112,9 @@ impl SpcDiscussionHandler {
             enabled: true,
             labels: Vec::new(),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
-            job_memo: crate::render::signature_memo::JobMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(
+                crate::render::footprint::discussions_job,
+            ),
             #[cfg(test)]
             sig_item_visits: std::cell::Cell::new(0),
         }

@@ -15,16 +15,18 @@ fn distinct() -> Census {
         render_cache_bytes: 32,
         overlay_picture_bytes: 64,
         overlay_grid_bytes: 128,
-        loop_frame_bytes: 256,
-        upload_pending_bytes: 512,
-        tile_body_bytes: 1024,
-        tile_parsed_bytes: 2048,
-        tile_cache_bytes: 4096,
-        loan_outstanding_bytes: 8192,
-        volume_store_bytes: 16384,
-        job_in_flight_bytes: 32768,
-        deferred_drop_bytes: 65536,
-        tile_mesh_bytes: 131072,
+        overlay_item_bytes: 256,
+        overlay_parked_bytes: 512,
+        loop_frame_bytes: 1024,
+        upload_pending_bytes: 2048,
+        tile_body_bytes: 4096,
+        tile_parsed_bytes: 8192,
+        tile_cache_bytes: 16384,
+        loan_outstanding_bytes: 32768,
+        volume_store_bytes: 65536,
+        job_in_flight_bytes: 131_072,
+        deferred_drop_bytes: 262_144,
+        tile_mesh_bytes: 524_288,
     }
 }
 
@@ -34,8 +36,8 @@ fn distinct() -> Census {
 #[test]
 fn the_resident_total_leaves_the_gpu_family_out() {
     let c = distinct();
-    let every_family = (1 << 18) - 1;
-    assert_eq!(c.resident_total(), every_family - 131072);
+    let every_family = (1 << 20) - 1;
+    assert_eq!(c.resident_total(), every_family - 524_288);
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16);
 }
 
@@ -86,22 +88,24 @@ fn the_line_names_every_family_and_its_denominator() {
         "render cache 32 B",
         "overlay pictures 64 B",
         "overlay grids 128 B",
-        "loop frames 256 B",
-        "upload pending 512 B",
-        "tile bodies 1024 B",
-        "tile parsed 2048 B",
-        "tile cache 4096 B",
-        "loans out 8192 B",
-        "volume store 16384 B",
-        "jobs in flight 32768 B",
-        "deferred drops 65536 B",
+        "overlay items 256 B",
+        "overlay parked 512 B",
+        "loop frames 1024 B",
+        "upload pending 2048 B",
+        "tile bodies 4096 B",
+        "tile parsed 8192 B",
+        "tile cache 16384 B",
+        "loans out 32768 B",
+        "volume store 65536 B",
+        "jobs in flight 131072 B",
+        "deferred drops 262144 B",
     ] {
         assert!(said.contains(field), "{field} missing from {said}");
     }
     assert!(said.starts_with("heap census (page): "), "{said}");
     assert!(said.contains("residual 900000000 B"), "{said}");
     assert!(
-        said.contains("tile meshes 131072 B (GPU, not in the total)"),
+        said.contains("tile meshes 524288 B (GPU, not in the total)"),
         "the GPU family must be on the line and marked out of the sum: {said}"
     );
 }
@@ -132,6 +136,8 @@ fn the_widest_line_fits_the_hooks_buffer() {
         render_cache_bytes: u64::MAX,
         overlay_picture_bytes: u64::MAX,
         overlay_grid_bytes: u64::MAX,
+        overlay_item_bytes: u64::MAX,
+        overlay_parked_bytes: u64::MAX,
         loop_frame_bytes: u64::MAX,
         upload_pending_bytes: u64::MAX,
         tile_body_bytes: u64::MAX,

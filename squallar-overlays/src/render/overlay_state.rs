@@ -29,6 +29,25 @@ pub use squallar_source::hit::{HitItems, HitResolve};
 /// count — see [`OverlayRegistry::status_line`].
 pub const STATUS_MARK: &str = "!";
 
+/// **Bytes of overlay ITEM data installed across every layer on this
+/// instance** — the `overlay items` heap-census family.
+///
+/// Not a fold: a level the install path maintains, so this is a load
+/// whatever the scene. Disjoint from
+/// [`OverlayRegistry::resident_source_bytes`], which is the gridded layers'
+/// own family and prices the same handlers' grids; the two may be read
+/// together and never overlap.
+pub fn installed_item_bytes() -> u64 {
+    squallar_source::footprint::installed_item_bytes()
+}
+
+/// **Bytes of retired item data and built paint inputs waiting on the discard
+/// seam** — the `overlay parked` heap-census family. A level, like its
+/// neighbour above.
+pub fn parked_item_bytes() -> u64 {
+    crate::render::signature_memo::parked_input_bytes()
+}
+
 // ── Overlay registry ─────────────────────────────────────────────────────
 
 pub struct OverlayRegistry {

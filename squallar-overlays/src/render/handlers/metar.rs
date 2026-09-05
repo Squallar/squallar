@@ -51,6 +51,18 @@ pub(crate) struct MetarItem {
     pub text: station_model::StationText,
 }
 
+/// **The observation and the four strings formatted from it.** Written here
+/// rather than beside every other layer's in `render::footprint` for one
+/// reason: this handler's module is private, so nothing outside it can name
+/// the type.
+impl squallar_source::footprint::ItemFootprint for MetarItem {
+    fn owned_bytes(&self) -> u64 {
+        self.ob
+            .owned_bytes()
+            .saturating_add(self.text.owned_bytes())
+    }
+}
+
 impl OverlayItem for MetarItem {
     fn layer_id(&self) -> LayerId {
         known::METAR
@@ -211,7 +223,9 @@ impl MetarHandler {
             state: OverlayState::new(),
             cached_points: Vec::new(),
             enabled: false,
-            obs_memo: crate::render::signature_memo::BuiltMemo::new(),
+            obs_memo: crate::render::signature_memo::BuiltMemo::new(
+                crate::render::footprint::metar_job,
+            ),
         }
     }
 

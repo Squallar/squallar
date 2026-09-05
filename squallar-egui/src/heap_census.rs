@@ -67,13 +67,17 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// land. Sized against every figure at `u64::MAX` and the longest instance
 /// name, not against a plausible reading — and sized EXACTLY: the widest line
 /// is this many bytes, with no headroom, so a family added without re-deriving
-/// it is cut and the test says so. The arithmetic: eighteen families (the GPU
-/// one included), the resident total and the linear reading are twenty
+/// it is cut and the test says so. The arithmetic: twenty families (the GPU
+/// one included), the resident total and the linear reading are twenty-two
 /// `u64::MAX` figures at 20 digits apiece, the residual is `0` when every
 /// family saturates, and the prose between them under `rasterization worker`
-/// makes up the rest; the `deferred drops` family added 39 (`, deferred drops `
-/// + 20 digits + ` B`) to the 768 before it.
-pub const CENSUS_LINE_CAPACITY: usize = 807;
+/// makes up the rest.
+///
+/// **One family costs `name.len() + 25`**: `", "` before it, the name, the
+/// space, twenty digits and `" B"`. The `deferred drops` family added 39 to
+/// the 768 before it; `overlay items` adds 38 and `overlay parked` adds 39,
+/// so 807 + 77 = 884.
+pub const CENSUS_LINE_CAPACITY: usize = 884;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
@@ -146,6 +150,19 @@ families! {
         "Decoded gridded overlay SOURCE data the layer handlers are holding \
          - MRMS mosaics, GMGSI granules, HRRR model grids and their retained \
          staging blocks. Not the pictures rasterized from them.";
+    OVERLAY_ITEM_BYTES, overlay_item_bytes, set_overlay_item_bytes,
+        "Decoded overlay ITEM data the feature layers are holding - the \
+         lightning flashes, station observations, alerts, storm reports, \
+         discussions and outlook polygons every `OverlayState` installed. \
+         Priced at install and DISJOINT from `overlay grids`, which the \
+         gridded layers answer instead.";
+    OVERLAY_PARKED_BYTES, overlay_parked_bytes, set_overlay_parked_bytes,
+        "Overlay item data and built paint inputs that have been RETIRED and \
+         are waiting on the discard seam - a replaced generation, and the \
+         memo rows a rollover or an eviction parked. Disjoint from the two \
+         above: what is parked is what the live figures no longer count, \
+         except where a parked row shares an `Arc` with a live one and prices \
+         only its pointers.";
     LOOP_FRAME_BYTES, loop_frame_bytes, set_loop_frame_bytes,
         "What the finished 2D loop frames hold on THIS heap. A radar or \
          section frame's pixels are the GPU's behind a `TextureHandle`; what \
@@ -212,6 +229,8 @@ impl Census {
             self.render_cache_bytes,
             self.overlay_picture_bytes,
             self.overlay_grid_bytes,
+            self.overlay_item_bytes,
+            self.overlay_parked_bytes,
             self.loop_frame_bytes,
             self.upload_pending_bytes,
             self.tile_body_bytes,
@@ -283,7 +302,8 @@ pub fn write_line<W: core::fmt::Write>(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
          derive memo {} B, loop frame scans {} B, render cache {} B, overlay pictures {} B, \
-         overlay grids {} B, loop frames {} B, upload pending {} B, tile bodies {} B, tile parsed {} B, \
+         overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
+         upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
          deferred drops {} B; resident total {} B of ",
         census.loop_scan_bytes,
@@ -294,6 +314,8 @@ pub fn write_line<W: core::fmt::Write>(
         census.render_cache_bytes,
         census.overlay_picture_bytes,
         census.overlay_grid_bytes,
+        census.overlay_item_bytes,
+        census.overlay_parked_bytes,
         census.loop_frame_bytes,
         census.upload_pending_bytes,
         census.tile_body_bytes,

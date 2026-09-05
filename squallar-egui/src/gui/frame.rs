@@ -47,6 +47,18 @@ impl Gui {
         // answering from a byte field or a walk of the one to four grid
         // entries its budget allows. No grid contents are touched.
         crate::heap_census::set_overlay_grid_bytes(self.overlays.resident_source_bytes());
+        // **The item half of the same question**, and two families rather
+        // than one because they answer different things: what a layer has
+        // INSTALLED, and what it has RETIRED and not yet handed to the
+        // discard seam. Both are levels the source layer maintains at the
+        // install and the park, so each of these is a load rather than a
+        // walk of a six-figure flash list.
+        crate::heap_census::set_overlay_item_bytes(
+            squallar_overlays::render::overlay_state::installed_item_bytes(),
+        );
+        crate::heap_census::set_overlay_parked_bytes(
+            squallar_overlays::render::overlay_state::parked_item_bytes(),
+        );
         // The tile mesh store publishes its own level into the mesh ledger
         // every sweep; the census carries the same figure so one line names
         // every family. GPU bytes, and the census keeps them out of its page

@@ -283,7 +283,9 @@ impl NwsAlertHandler {
             hidden_alerts: HashSet::new(),
             defaults: AlertPaneState::new(true),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
-            job_memo: crate::render::signature_memo::JobMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(
+                crate::render::footprint::alerts_job,
+            ),
             #[cfg(test)]
             sig_item_visits: std::cell::Cell::new(0),
         }

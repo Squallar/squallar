@@ -238,7 +238,9 @@ impl SpcFireOutlookHandler {
             round_answered_in_scope: false,
             round_stray_failures: Vec::new(),
             defaults: FirePaneState::new(false),
-            job_memo: crate::render::signature_memo::JobMemo::new(),
+            job_memo: crate::render::signature_memo::JobMemo::new(
+                crate::render::footprint::outlooks_job,
+            ),
         }
     }
 
@@ -792,6 +794,10 @@ impl OverlayHandler for SpcFireOutlookHandler {
             Ok(outlook) => {
                 log::info!("Received SPC fire outlook: {key:?}");
                 self.state.data.insert(key, outlook);
+                // This layer stamps its own map one product per payload
+                // rather than replacing it, so the bytes moved without an
+                // install and the heap level has to be told.
+                self.state.reprice();
                 self.per_product_error.remove(&key);
                 self.state.fetch_time = Some(web_time::Instant::now());
                 let counter = self.per_product_generation.entry(key).or_insert(0);

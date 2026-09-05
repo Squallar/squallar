@@ -2,6 +2,7 @@
 //! for the built job inputs `prepare_job` hands the dispatch.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use squallar_source::job::DescribedJob;
 
@@ -96,6 +97,14 @@ pub(crate) struct BuiltMemo<T> {
     /// The rows the last rollover or eviction retired, awaiting
     /// [`Self::take_retired`].
     retired: RefCell<Vec<T>>,
+    /// **What [`Self::retired`] is holding**, maintained as rows go in and
+    /// out rather than folded on read: the price of one input is a walk of
+    /// it, and the census reads this on the frame thread.
+    parked_bytes: Cell<u64>,
+    /// What one row of this memo owns on the heap. A `fn`, not a closure:
+    /// every memo's price is a plain function of the row, and refusing
+    /// captures keeps the memo the same size it was.
+    price: fn(&T) -> u64,
     /// How many times the build closure ran — the mechanism's count, for the
     /// gate that an unchanged key builds nothing.
     #[cfg(test)]
@@ -106,14 +115,34 @@ pub(crate) struct BuiltMemo<T> {
 pub(crate) type JobMemo = BuiltMemo<DescribedJob>;
 
 impl<T: Clone> BuiltMemo<T> {
-    pub fn new() -> Self {
+    /// `price` answers what freeing one row would give back — see
+    /// [`crate::render::footprint`], where every memo's is written. It is
+    /// **required**, not defaulted: a memo constructed without one would
+    /// publish a silent zero into a census family whose whole purpose is to
+    /// find what nobody is counting.
+    pub fn new(price: fn(&T) -> u64) -> Self {
         Self {
             generation: Cell::new(0),
             rows: RefCell::new(Vec::new()),
             retired: RefCell::new(Vec::new()),
+            parked_bytes: Cell::new(0),
+            price,
             #[cfg(test)]
             builds: Cell::new(0),
         }
+    }
+
+    /// Move [`Self::parked_bytes`] and the module level together, so the
+    /// per-memo figure and the census level cannot drift apart.
+    fn set_parked(&self, bytes: u64) {
+        move_parked(self.parked_bytes.get(), bytes);
+        self.parked_bytes.set(bytes);
+    }
+
+    /// What this memo's parked slot is holding right now.
+    #[cfg(test)]
+    pub fn parked_bytes(&self) -> u64 {
+        self.parked_bytes.get()
     }
 
     /// The value for `(generation, view_key)`, running `build` only on the
@@ -129,7 +158,12 @@ impl<T: Clone> BuiltMemo<T> {
         if self.generation.get() != generation {
             let stale = std::mem::take(&mut *self.rows.borrow_mut());
             if !stale.is_empty() {
-                *self.retired.borrow_mut() = stale.into_iter().map(|(_, value)| value).collect();
+                let batch: Vec<T> = stale.into_iter().map(|(_, value)| value).collect();
+                let bytes = batch
+                    .iter()
+                    .fold(0u64, |sum, row| sum.saturating_add((self.price)(row)));
+                *self.retired.borrow_mut() = batch;
+                self.set_parked(bytes);
             }
             self.generation.set(generation);
         }
@@ -142,15 +176,20 @@ impl<T: Clone> BuiltMemo<T> {
         let mut rows = self.rows.borrow_mut();
         if rows.len() >= JOB_MEMO_ROWS {
             let (_, evicted) = rows.remove(0);
+            let mut parked = self.parked_bytes.get();
             let mut retired = self.retired.borrow_mut();
             if retired.len() >= JOB_MEMO_ROWS {
                 // The slot is full and nothing has drained it. Free the
                 // oldest here, which is exactly what happened before this
                 // memo existed, rather than holding a parked input per
                 // eviction for the whole generation.
-                retired.remove(0);
+                let freed = retired.remove(0);
+                parked = parked.saturating_sub((self.price)(&freed));
             }
+            parked = parked.saturating_add((self.price)(&evicted));
             retired.push(evicted);
+            drop(retired);
+            self.set_parked(parked);
         }
         rows.push((view_key, value.clone()));
         Some(value)
@@ -172,7 +211,9 @@ impl<T: Clone> BuiltMemo<T> {
         )
     )]
     pub fn take_retired(&self) -> Vec<T> {
-        std::mem::take(&mut *self.retired.borrow_mut())
+        let batch = std::mem::take(&mut *self.retired.borrow_mut());
+        self.set_parked(0);
+        batch
     }
 
     /// How many inputs are held for the current generation.
@@ -180,6 +221,35 @@ impl<T: Clone> BuiltMemo<T> {
     pub fn held(&self) -> usize {
         self.rows.borrow().len()
     }
+}
+
+/// **A memo that goes away takes its parked slot with it.** Without this the
+/// level would climb across a process by one memo's parked batch per handler
+/// ever built, and read as resident memory nobody is holding.
+impl<T> Drop for BuiltMemo<T> {
+    fn drop(&mut self) {
+        move_parked(self.parked_bytes.get(), 0);
+    }
+}
+
+/// **Bytes the built-input memos have PARKED**, summed over every memo on
+/// this instance — rows a rollover or an eviction retired and nothing has
+/// drained yet.
+///
+/// A level, in `squallar_egui::heap_census`'s sense, and a **separate** one
+/// from the installed item data: a parked input is a built copy that the
+/// layer's own item list does not hold, except where the price says so (the
+/// alert rows share their geometry with the alert list and price only the
+/// pointers). So the two figures are disjoint and may be read together.
+static PARKED_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn move_parked(was: u64, now: u64) {
+    PARKED_INPUT_BYTES.fetch_add(now.wrapping_sub(was), Relaxed);
+}
+
+/// [`PARKED_INPUT_BYTES`] as a reading.
+pub(crate) fn parked_input_bytes() -> u64 {
+    PARKED_INPUT_BYTES.load(Relaxed)
 }
 
 /// Fold one more term into a memo key. Multiplicative with an odd constant
@@ -229,11 +299,24 @@ mod job_memo_tests {
         Some(DescribedJob::new(Input(v)))
     }
 
+    /// A stand-in for a real layer's price: one figure per row, so a parked
+    /// count and a parked byte figure move together and either can be
+    /// asserted.
+    const ROW_BYTES: u64 = 64;
+
+    fn price(_: &DescribedJob) -> u64 {
+        ROW_BYTES
+    }
+
+    fn memo() -> JobMemo {
+        JobMemo::new(price)
+    }
+
     /// The whole point: a second ask under the same key builds nothing and
     /// hands back **the same allocation**, not an equal one.
     #[test]
     fn an_unchanged_key_hands_back_the_same_allocation_and_builds_nothing() {
-        let memo = JobMemo::new();
+        let memo = memo();
         let first = memo.get_or_build(3, 7, || job(1)).unwrap();
         let second = memo.get_or_build(3, 7, || job(2)).unwrap();
         assert!(
@@ -247,7 +330,7 @@ mod job_memo_tests {
     /// generation are parked, not dropped.
     #[test]
     fn a_generation_move_parks_every_row_and_rebuilds() {
-        let memo = JobMemo::new();
+        let memo = memo();
         memo.get_or_build(1, 10, || job(1));
         memo.get_or_build(1, 11, || job(2));
         assert_eq!(memo.held(), 2);
@@ -268,7 +351,7 @@ mod job_memo_tests {
 
     #[test]
     fn a_view_key_move_within_a_generation_is_a_second_row() {
-        let memo = JobMemo::new();
+        let memo = memo();
         memo.get_or_build(1, 10, || job(1));
         memo.get_or_build(1, 11, || job(2));
         assert_eq!(memo.builds.get(), 2);
@@ -282,7 +365,7 @@ mod job_memo_tests {
     /// input per eviction for the whole generation.
     #[test]
     fn eviction_does_not_park_without_bound_inside_one_generation() {
-        let memo = JobMemo::new();
+        let memo = memo();
         // One generation, many distinct views — a zoom gesture's quanta.
         for key in 0..64u64 {
             memo.get_or_build(7, key, || job(key));
@@ -300,7 +383,7 @@ mod job_memo_tests {
     /// The table is bounded: past `JOB_MEMO_ROWS` views the oldest is parked.
     #[test]
     fn the_rows_are_capped_and_the_oldest_is_retired_first() {
-        let memo = JobMemo::new();
+        let memo = memo();
         for key in 0..=JOB_MEMO_ROWS as u64 {
             memo.get_or_build(1, key, || job(key));
         }
@@ -325,18 +408,57 @@ mod job_memo_tests {
     /// answer against a view that later has rows.
     #[test]
     fn a_none_is_not_remembered() {
-        let memo = JobMemo::new();
+        let memo = memo();
         assert!(memo.get_or_build(1, 0, || None).is_none());
         assert_eq!(memo.held(), 0);
         assert!(memo.get_or_build(1, 0, || job(1)).is_some());
         assert_eq!(memo.builds.get(), 2, "the second ask built");
     }
 
+    /// **The parked slot's byte figure is what a drain would give back**, and
+    /// it is the figure the census family reads. Asserted on both edges: it
+    /// rises when a rollover parks and falls to zero when the drain takes the
+    /// batch.
+    #[test]
+    fn the_parked_byte_figure_tracks_what_the_slot_holds() {
+        let memo = memo();
+        memo.get_or_build(1, 10, || job(1));
+        memo.get_or_build(1, 11, || job(2));
+        assert_eq!(memo.parked_bytes(), 0, "nothing has retired yet");
+
+        memo.get_or_build(2, 10, || job(3));
+        assert_eq!(
+            memo.parked_bytes(),
+            2 * ROW_BYTES,
+            "both rows of the old generation are parked and priced",
+        );
+        assert_eq!(memo.take_retired().len(), 2);
+        assert_eq!(memo.parked_bytes(), 0, "a drain empties the figure too");
+    }
+
+    /// The eviction path maintains the figure incrementally, and the bound on
+    /// the slot is a bound on the bytes as well as on the count.
+    #[test]
+    fn eviction_keeps_the_byte_figure_inside_the_same_bound() {
+        let memo = memo();
+        for key in 0..64u64 {
+            memo.get_or_build(7, key, || job(key));
+        }
+        assert!(
+            memo.parked_bytes() <= JOB_MEMO_ROWS as u64 * ROW_BYTES,
+            "the parked slot priced {} B after 64 views in one generation",
+            memo.parked_bytes(),
+        );
+        let count = memo.take_retired().len() as u64;
+        assert_eq!(memo.parked_bytes(), 0);
+        assert!(count <= JOB_MEMO_ROWS as u64);
+    }
+
     /// An undrained parked batch is replaced by the next rollover's, so the
     /// parked footprint is one generation's rows and never grows.
     #[test]
     fn an_undrained_batch_is_replaced_not_accumulated() {
-        let memo = JobMemo::new();
+        let memo = memo();
         memo.get_or_build(1, 0, || job(1));
         memo.get_or_build(2, 0, || job(2));
         memo.get_or_build(3, 0, || job(3));

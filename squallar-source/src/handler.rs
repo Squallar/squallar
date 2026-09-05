@@ -17,6 +17,7 @@ use crate::fetch_policy::{
     Assembled, DataCompleteness, FetchError, FetchFailure, FetchRetry, FetchRound, RoundShape,
     Whole,
 };
+use crate::footprint::ItemFootprint;
 use crate::id::LayerId;
 use crate::job::{DescribedJob, JobCodec};
 use crate::product::{FieldId, ProductSpec};
@@ -42,6 +43,11 @@ pub struct OverlayState<T, S: RoundShape> {
     pub fetching: bool,
     pub data_generation: u64,
     pub retry: FetchRetry,
+    /// **What [`Self::data`] owns on the heap**, priced where it was
+    /// installed and read back as a load — see [`crate::footprint`]. Private,
+    /// and moved only through the doors that can change it, so this figure
+    /// and the level it feeds cannot disagree.
+    data_bytes: u64,
     /// `fn() -> S` so the marker cannot make this state less `Send`/`Sync`.
     shape: PhantomData<fn() -> S>,
 }
@@ -54,8 +60,21 @@ impl<T: Default, S: RoundShape> Default for OverlayState<T, S> {
             fetching: false,
             data_generation: 0,
             retry: FetchRetry::new(),
+            data_bytes: 0,
             shape: PhantomData,
         }
+    }
+}
+
+/// **The level follows a state's whole life, not only its installs.**
+///
+/// A handler that goes away takes its data with it, and a level that counted
+/// only installs would climb across a process and read as resident memory
+/// nobody is holding. `data` is never moved out of an `OverlayState` anywhere
+/// in this workspace, so no caller loses a partial move to this impl.
+impl<T, S: RoundShape> Drop for OverlayState<T, S> {
+    fn drop(&mut self) {
+        crate::footprint::move_installed(self.data_bytes, 0);
     }
 }
 
@@ -65,7 +84,7 @@ impl<T: Default, S: RoundShape> OverlayState<T, S> {
     }
 }
 
-impl<T> OverlayState<T, Whole> {
+impl<T: ItemFootprint> OverlayState<T, Whole> {
     /// Bumps `data_generation`, ends the fetch, clears the retry ladder, and
     /// declares the answer **whole**.
     pub fn set_data(&mut self, data: T) {
@@ -73,7 +92,7 @@ impl<T> OverlayState<T, Whole> {
     }
 }
 
-impl<T> OverlayState<T, Assembled> {
+impl<T: ItemFootprint> OverlayState<T, Assembled> {
     /// The **only** way data reaches the map of a layer whose round can deliver
     /// less than it was asked for. The clock still stamps and the ladder still
     /// resets: a half-delivered round is a good answer missing pieces.
@@ -131,14 +150,38 @@ impl<T> OverlayState<T, Assembled> {
     }
 }
 
-impl<T, S: RoundShape> OverlayState<T, S> {
+impl<T: ItemFootprint, S: RoundShape> OverlayState<T, S> {
+    /// **The one write to [`Self::data`]**, and therefore the one place the
+    /// heap level it feeds moves.
+    ///
+    /// The pricing walk is O(items) and it runs here rather than on any frame
+    /// path: an install already builds the list it is handed, and the census
+    /// read is a load of what this stores.
     fn install(&mut self, data: T, coverage: DataCompleteness) {
+        let bytes = data.owned_bytes();
+        crate::footprint::move_installed(self.data_bytes, bytes);
+        self.data_bytes = bytes;
         self.data = data;
         self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
         self.fetching = false;
         self.retry.record_success();
         self.retry.record_coverage(coverage);
+    }
+
+    /// **Re-price [`Self::data`] after a write that did not go through
+    /// [`Self::install`].**
+    ///
+    /// [`Self::data`] is public, and two layers use that: the SPC outlook and
+    /// fire-weather handlers **stamp their own map** one product per payload
+    /// rather than replacing it wholesale (see [`Self::record_coverage`]), so
+    /// their bytes move without an install. A direct write that does not call
+    /// this leaves the level reading the previous generation's figure, which
+    /// is a wrong census line rather than a wrong picture.
+    pub fn reprice(&mut self) {
+        let bytes = self.data.owned_bytes();
+        crate::footprint::move_installed(self.data_bytes, bytes);
+        self.data_bytes = bytes;
     }
 
     /// This layer's own round, out of the payload the host handed back.
@@ -192,6 +235,12 @@ impl<T, S: RoundShape> OverlayState<T, S> {
         R: FetchRound<Shape = S>,
     {
         payload.downcast::<R>().ok().map(|round| *round)
+    }
+
+    /// **What [`Self::data`] owns on the heap**, as last priced. A load, not
+    /// a walk.
+    pub fn data_bytes(&self) -> u64 {
+        self.data_bytes
     }
 
     /// End a fetch that did not produce data, filing it against the ladder.

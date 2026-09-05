@@ -10,6 +10,7 @@ pub mod controls;
 pub mod draw;
 pub mod feature;
 pub mod fetch_policy;
+pub mod footprint;
 pub mod handler;
 pub mod hit;
 pub mod id;
