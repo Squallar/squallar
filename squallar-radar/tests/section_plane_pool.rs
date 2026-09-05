@@ -252,8 +252,37 @@ fn a_cut_never_inherits_a_pixel_from_the_one_before_it() {
         &blank_first,
         "the held blank cut drifted",
     );
+
+    // **The census arms.** `xsect::pooled_bytes` is what the heap census's
+    // `render pools` family reads for this slot, and it must be the slot's
+    // truth at each step: nothing while both sets of planes are out with a
+    // cut, exactly the dropped set's bytes once one is parked, unchanged when
+    // the second is declined by the full slot. The expectation is computed
+    // from the planes that moved — three planes at their lengths, which a
+    // first `fit` from empty reserves exactly — never from a constant.
+    assert_eq!(
+        squallar_radar::xsect::pooled_bytes(),
+        0,
+        "two cuts hold both sets of planes, yet the slot reports {} B parked",
+        squallar_radar::xsect::pooled_bytes()
+    );
+    let blank_bytes = held_blank.image().len()
+        + std::mem::size_of_val(held_blank.values())
+        + held_blank.status().len();
     drop(held_blank);
+    assert_eq!(
+        squallar_radar::xsect::pooled_bytes(),
+        blank_bytes,
+        "dropping a cut parked its planes, and the slot reports {} B rather than their \
+         {blank_bytes} B",
+        squallar_radar::xsect::pooled_bytes()
+    );
     drop(held_dense);
+    assert_eq!(
+        squallar_radar::xsect::pooled_bytes(),
+        blank_bytes,
+        "a set of planes the full slot declined moved the level"
+    );
     same(
         &planes(&render(&blank)),
         &blank_first,

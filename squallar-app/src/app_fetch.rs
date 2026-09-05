@@ -2298,6 +2298,9 @@ impl super::App {
             lon,
         } = params;
         let sender = self.channels.loop_render_sender.clone();
+        // The third producer of in-flight rasters, and on a looping scene the
+        // largest: priced at the same seam as the two dispatcher-owned ones.
+        let loop_reply = self.render.loop_reply_ticket();
         let window = self.window.clone();
 
         // The storm motion override is read from the dispatcher for the same
@@ -2401,6 +2404,9 @@ impl super::App {
                     Default::default(),
                 ),
             };
+            // Priced BEFORE the send, so `poll_loop_render_results` can never
+            // settle bytes that were not added. Zero on the failure arm.
+            loop_reply.price(crate::render_dispatch::loop_image_bytes(image.as_ref()));
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them.
             let _ = sender.send(crate::channels::LoopRenderResponse {

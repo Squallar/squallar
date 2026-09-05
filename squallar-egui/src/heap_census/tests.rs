@@ -27,6 +27,8 @@ fn distinct() -> Census {
         job_in_flight_bytes: 131_072,
         deferred_drop_bytes: 262_144,
         tile_mesh_bytes: 524_288,
+        render_pool_bytes: 1_048_576,
+        render_in_flight_bytes: 2_097_152,
     }
 }
 
@@ -36,7 +38,7 @@ fn distinct() -> Census {
 #[test]
 fn the_resident_total_leaves_the_gpu_family_out() {
     let c = distinct();
-    let every_family = (1 << 20) - 1;
+    let every_family = (1 << 22) - 1;
     assert_eq!(c.resident_total(), every_family - 524_288);
     assert_eq!(c.radar_total(), 1 + 2 + 4 + 8 + 16);
 }
@@ -99,6 +101,8 @@ fn the_line_names_every_family_and_its_denominator() {
         "volume store 65536 B",
         "jobs in flight 131072 B",
         "deferred drops 262144 B",
+        "render pools 1048576 B",
+        "renders in flight 2097152 B",
     ] {
         assert!(said.contains(field), "{field} missing from {said}");
     }
@@ -148,8 +152,23 @@ fn the_widest_line_fits_the_hooks_buffer() {
         loan_outstanding_bytes: u64::MAX,
         job_in_flight_bytes: u64::MAX,
         deferred_drop_bytes: u64::MAX,
+        render_pool_bytes: u64::MAX,
+        render_in_flight_bytes: u64::MAX,
     };
-    let said = line(&widest, Some(u64::MAX), "rasterization worker");
+    // All three residual arms, because the widest is not the obvious one: a
+    // reading of `u64::MAX` against saturated families prints `residual 0 B`,
+    // a reading one below it prints `residual none (families price above
+    // it)`, 27 bytes wider, and an unread heap prints no figure at all.
+    let arms = [
+        line(&widest, Some(u64::MAX), "rasterization worker"),
+        line(&widest, Some(u64::MAX - 1), "rasterization worker"),
+        line(&widest, None, "rasterization worker"),
+    ];
+    let said = arms.iter().max_by_key(|s| s.len()).expect("three arms");
+    assert!(
+        said.contains("residual none (families price above it)"),
+        "the widest arm is no longer the `none` one; re-derive the doc's arithmetic: {said}"
+    );
     assert!(
         said.len() <= CENSUS_LINE_CAPACITY,
         "the widest census line is {} bytes, past the hook's {CENSUS_LINE_CAPACITY}",

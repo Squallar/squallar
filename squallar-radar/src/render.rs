@@ -5,7 +5,7 @@ use crate::palette::get_color_for_value;
 use crate::types;
 use nexrad_model::data::{DataMoment, Radial, Scan};
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub mod polar;
 
@@ -248,6 +248,25 @@ struct RenderBuffers {
 /// The one cell buffer this process keeps between plan-view renders.
 static POOLED_CELLS: std::sync::Mutex<Option<Vec<AtomicU64>>> = std::sync::Mutex::new(None);
 
+/// Bytes [`POOLED_CELLS`] is holding: the parked buffer's **capacity** at
+/// eight bytes a cell while one is parked, zero while the slot is empty or a
+/// render has the buffer out.
+///
+/// Maintained beside the slot and never derived from it. It is written only
+/// with the slot's own lock in hand — [`park_slot`] stores the capacity where
+/// [`RenderBuffers::recycle`] parks, [`take_slot`] stores zero where
+/// [`RenderBuffers::checkout`] and [`trim_pools`] take — so the level and the
+/// slot are never seen to disagree, and [`pooled_bytes`] is a relaxed load
+/// that takes no lock at all. That matters because of how it is read:
+/// `squallar_egui::heap_census::census()` reads [`pooled_bytes`] directly,
+/// with no publish step, so the frame thread's telemetry tick and the
+/// allocation-error hook — both of which call `census()`, the hook after the
+/// allocator has already refused — see the slot as it is at that instant and
+/// neither may block nor allocate to do so. A walk under the lock would stall
+/// them behind a render's `take`; a `try_lock` miss would report a false zero
+/// for a buffer that was 413 MiB on the measured scene.
+static POOLED_CELL_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// How much larger than the demand behind it a carried buffer may be before
 /// the pool drops it instead of holding it.
 ///
@@ -356,6 +375,37 @@ static POOLED_IMAGE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(N
 /// See [`POOLED_IMAGE`], which documents both slots.
 static POOLED_VALUES: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
 
+/// Bytes [`POOLED_IMAGE`] is holding — the parked texture's capacity, zero
+/// while the slot is empty. The same discipline as [`POOLED_CELL_BYTES`]:
+/// stored only under the slot's lock, read without it.
+static POOLED_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes [`POOLED_VALUES`] is holding — the parked grid's capacity at four
+/// bytes a value. See [`POOLED_IMAGE_BYTES`].
+static POOLED_VALUE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Empty `slot`, recording in `level` that it now holds nothing.
+///
+/// Called with the slot's guard in hand — the `&mut Option` *is* the guard,
+/// dereferenced — so the store and the take are one critical section and no
+/// reader of `level` can see a parked buffer priced at zero or an empty slot
+/// priced at a buffer. Whichever arm the caller takes afterwards (reuse the
+/// buffer, drop a misfit, allocate fresh), the slot is empty from here.
+fn take_slot<T>(slot: &mut Option<T>, level: &AtomicUsize) -> Option<T> {
+    level.store(0, Ordering::Relaxed);
+    slot.take()
+}
+
+/// Park `buffer` in `slot` if the slot is free, recording its `bytes` in
+/// `level`; a full slot declines and drops the offer. The counterpart of
+/// [`take_slot`], with the same guard-in-hand contract.
+fn park_slot<T>(slot: &mut Option<T>, level: &AtomicUsize, buffer: T, bytes: usize) {
+    if slot.is_none() {
+        level.store(bytes, Ordering::Relaxed);
+        *slot = Some(buffer);
+    }
+}
+
 /// The texture slot, with a poisoned lock read as a live one.
 fn image_pool() -> std::sync::MutexGuard<'static, Option<Vec<u8>>> {
     POOLED_IMAGE
@@ -392,8 +442,7 @@ fn checkout_image(pixels: usize) -> Vec<u8> {
     // the `match` below. A guard produced inside a scrutinee temporary lives to
     // the end of the whole `match`, so `match image_pool().take() { .. }` would
     // hold the pool lock across the fallback allocation and the zero-fill.
-    let taken = image_pool()
-        .take()
+    let taken = take_slot(&mut image_pool(), &POOLED_IMAGE_BYTES)
         .filter(|image| within_slack(image.capacity(), pixels.max(demand::high()) * 4));
     match taken {
         Some(mut image) => {
@@ -410,8 +459,7 @@ fn checkout_image(pixels: usize) -> Vec<u8> {
 fn checkout_values(pixels: usize) -> Vec<f32> {
     // See [`checkout_image`] for why this is a `let` and not a receiver, and
     // for why the misfit is filtered out rather than dropped by a match arm.
-    let taken = values_pool()
-        .take()
+    let taken = take_slot(&mut values_pool(), &POOLED_VALUE_BYTES)
         .filter(|values| within_slack(values.capacity(), pixels.max(demand::high())));
     let mut values = taken.unwrap_or_default();
     values.clear();
@@ -436,10 +484,8 @@ pub fn recycle_image(image: Vec<u8>) {
     if image.capacity() == 0 || !within_slack(image.capacity(), demand::carry() * 4) {
         return;
     }
-    let mut pool = image_pool();
-    if pool.is_none() {
-        *pool = Some(image);
-    }
+    let bytes = image.capacity();
+    park_slot(&mut image_pool(), &POOLED_IMAGE_BYTES, image, bytes);
 }
 
 /// Offer a finished value grid back. See [`recycle_image`], which this mirrors
@@ -448,28 +494,49 @@ pub fn recycle_values(values: Vec<f32>) {
     if values.capacity() == 0 || !within_slack(values.capacity(), demand::carry()) {
         return;
     }
-    let mut pool = values_pool();
-    if pool.is_none() {
-        *pool = Some(values);
-    }
+    let bytes = values.capacity() * std::mem::size_of::<f32>();
+    park_slot(&mut values_pool(), &POOLED_VALUE_BYTES, values, bytes);
 }
 
 /// Bytes the three plan-view slots are holding right now: **capacity**, not
 /// length, and the cells' eight bytes a pixel beside the texture's four and the
-/// value grid's four.
+/// value grid's four. Zero for a slot whose buffer is out with a render.
 ///
-/// An always-on counter and not an instrument — nothing gates on it in the
-/// app — so that "how much is reserved" is a question the process can answer
-/// about itself rather than one only a browser profiler can.
+/// **Three relaxed loads and no lock.** Each slot's figure is maintained
+/// beside it by [`take_slot`] and [`park_slot`] under that slot's own lock
+/// (see [`POOLED_CELL_BYTES`]), so `squallar_egui::heap_census::census()`
+/// reads it — through [`parked_bytes`] — as the `render pools` family
+/// directly: the telemetry tick and the allocation-error hook both go through
+/// `census()`, and there is no publish step between a park and what they see.
+/// It reads what the slots hold, not what a walk would find, and the two are
+/// equal by construction: no path moves a buffer into or out of a slot
+/// without storing the level in the same critical section.
 pub fn pooled_bytes() -> usize {
-    let cells = RenderBuffers::pool()
-        .as_ref()
-        .map_or(0, |c| c.capacity() * std::mem::size_of::<AtomicU64>());
-    let image = image_pool().as_ref().map_or(0, Vec::capacity);
-    let values = values_pool()
-        .as_ref()
-        .map_or(0, |v| v.capacity() * std::mem::size_of::<f32>());
-    cells + image + values
+    POOLED_CELL_BYTES.load(Ordering::Relaxed)
+        + POOLED_IMAGE_BYTES.load(Ordering::Relaxed)
+        + POOLED_VALUE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Every render buffer this crate parks between renders, in bytes: the three
+/// plan-view slots of [`pooled_bytes`] and the section-plane slot of
+/// [`crate::xsect::pooled_bytes`]. Four relaxed loads; see each for the
+/// discipline that makes them lock-free.
+///
+/// On the measured scene the plan-view slots alone were 620 MiB — a 7362²
+/// cell buffer at eight bytes a pixel and its RGBA texture at four — and sat
+/// in no census family while the smaller staging pools beside them did. This
+/// is the figure `squallar_egui::heap_census::census()` reads as `render
+/// pools`, at the instant of the read; it holds nothing less.
+///
+/// **This instance's own, and never summed with another's.** These statics
+/// are per module instantiation, so on the web the page and the rasterization
+/// worker each have a set: this answers the buffers *this* instance's renders
+/// parked, and the worker — which is where the browser rasterizes — usually
+/// holds the larger. Each instance's census line carries its own figure and
+/// names itself, the way `live <page>/<worker>` already does; adding the two
+/// would price one heap's buffers against the other's ceiling.
+pub fn parked_bytes() -> usize {
+    pooled_bytes() + crate::xsect::pooled_bytes()
 }
 
 /// Drop every pooled buffer and forget the demand behind them, so the next
@@ -488,9 +555,9 @@ pub fn pooled_bytes() -> usize {
 /// browser's rasterization worker is message-driven with the job queue held by
 /// the event loop, so "no job pending" is not a fact it can observe.
 pub fn trim_pools() {
-    let cells = RenderBuffers::pool().take();
-    let image = image_pool().take();
-    let values = values_pool().take();
+    let cells = take_slot(&mut RenderBuffers::pool(), &POOLED_CELL_BYTES);
+    let image = take_slot(&mut image_pool(), &POOLED_IMAGE_BYTES);
+    let values = take_slot(&mut values_pool(), &POOLED_VALUE_BYTES);
     demand::forget();
     drop(cells);
     drop(image);
@@ -529,8 +596,7 @@ impl RenderBuffers {
         // scrutinee. A guard produced in a scrutinee lives to the end of the
         // match, so `match Self::pool().take()` would hold the pool lock across
         // the fallback allocation below.
-        let pooled = Self::pool()
-            .take()
+        let pooled = take_slot(&mut Self::pool(), &POOLED_CELL_BYTES)
             // Weighed against `capacity` and against the larger of this render
             // and the recent demand. `resize_with` never returns capacity, so a
             // buffer weighed by `len` reads as the size it was last resized to
@@ -563,17 +629,16 @@ impl RenderBuffers {
         if !within_slack(cells.capacity(), carry_ceiling_px) {
             return;
         }
-        let mut pool = Self::pool();
-        if pool.is_none() {
-            *pool = Some(cells);
-        }
+        let bytes = cells.capacity() * std::mem::size_of::<AtomicU64>();
+        park_slot(&mut Self::pool(), &POOLED_CELL_BYTES, cells, bytes);
     }
 
     /// The pool, with a poisoned lock read as a live one.
     ///
-    /// **What the lock covers is one `Option::take` in [`Self::checkout`] and
-    /// one `is_none` plus a move-assign in [`Self::recycle`], and nothing
-    /// else.**
+    /// **What the lock covers is one `Option::take` in [`Self::checkout`],
+    /// one `is_none` plus a move-assign in [`Self::recycle`], and one
+    /// `Option::take` in [`trim_pools`] — each with the one relaxed store that
+    /// keeps [`POOLED_CELL_BYTES`] in step — and nothing else.**
     fn pool() -> std::sync::MutexGuard<'static, Option<Vec<AtomicU64>>> {
         POOLED_CELLS
             .lock()

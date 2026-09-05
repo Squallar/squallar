@@ -54,6 +54,15 @@
 //! loads whatever the scene. That matters twice: it rides the frame thread's
 //! telemetry tick, and it is read from the **allocation-error hook**, which
 //! runs after the allocator has already refused and must not allocate.
+//!
+//! **A level that lives one frame is published where it moves, not on the
+//! tick.** The tick is 2 s apart and runs after the frame's own receipts, so
+//! a family whose bytes arrive and leave inside one frame — a render reply in
+//! its channel — would read zero at every tick and zero in the hook. Such a
+//! family is published by the code that moves the bytes (`renders in
+//! flight`, like `upload pending` and `loans out` before it), or, where the
+//! owner cannot see this module, read straight from the owner's own atomics
+//! by [`census`] (`render pools`).
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -67,24 +76,32 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// land. Sized against every figure at `u64::MAX` and the longest instance
 /// name, not against a plausible reading — and sized EXACTLY: the widest line
 /// is this many bytes, with no headroom, so a family added without re-deriving
-/// it is cut and the test says so. The arithmetic: twenty families (the GPU
-/// one included), the resident total and the linear reading are twenty-two
-/// `u64::MAX` figures at 20 digits apiece, the residual is `0` when every
-/// family saturates, and the prose between them under `rasterization worker`
-/// makes up the rest.
+/// it is cut and the test says so. The arithmetic: twenty-two families (the
+/// GPU one included), the resident total and the linear reading are
+/// twenty-four `u64::MAX` figures at 20 digits apiece, the prose between them
+/// under `rasterization worker` makes up the rest — and the residual is the
+/// **`none` arm**: a reading of `u64::MAX - 1` against families that saturate
+/// prints `residual none (families price above it)`, 27 bytes wider than the
+/// `residual 0 B` that a reading of `u64::MAX` gives. The test measures all
+/// three residual arms and takes the widest.
 ///
 /// **One family costs `name.len() + 25`**: `", "` before it, the name, the
 /// space, twenty digits and `" B"`. The `deferred drops` family added 39 to
-/// the 768 before it; `overlay items` adds 38 and `overlay parked` adds 39,
-/// so 807 + 77 = 884.
-pub const CENSUS_LINE_CAPACITY: usize = 884;
+/// the 768 before it; `overlay items` added 38 and `overlay parked` 39, so
+/// 807 + 77 = 884; `render pools` adds 37 and `renders in flight` adds 42,
+/// so 884 + 79 = 963 on the `residual 0 B` arm; the `none` arm's 27 make
+/// 990.
+pub const CENSUS_LINE_CAPACITY: usize = 990;
 
 /// One family's level. A `u64` of bytes, `Relaxed` throughout: every reader
 /// wants a recent figure, none wants a synchronised one, and a census torn
 /// across two families is a census of two adjacent instants — which is what
 /// it would be anyway.
 macro_rules! families {
-    ($($name:ident, $field:ident, $setter:ident, $doc:literal;)*) => {
+    (
+        $($name:ident, $field:ident, $setter:ident, $doc:literal;)*
+        @read $($rfield:ident = $read:expr, $rdoc:literal;)*
+    ) => {
         $(
             #[doc = $doc]
             static $name: AtomicU64 = AtomicU64::new(0);
@@ -104,17 +121,24 @@ macro_rules! families {
                 #[doc = $doc]
                 pub $field: u64,
             )*
+            $(
+                #[doc = $rdoc]
+                pub $rfield: u64,
+            )*
         }
 
-        /// Read every level.
+        /// Read every level. The `@read` families are read from the atomics
+        /// their owner maintains, at this instant, with no publish between.
         pub fn census() -> Census {
             Census {
                 $($field: $name.load(Relaxed),)*
+                $($rfield: $read,)*
             }
         }
 
-        /// Put every level back to zero. Tests only: nothing shipped resets a
-        /// level, because a level is not a running total.
+        /// Put every published level back to zero. Tests only: nothing
+        /// shipped resets a level, because a level is not a running total.
+        /// The `@read` families are their owners' to empty.
         #[cfg(test)]
         pub(crate) fn reset() {
             $($name.store(0, Relaxed);)*
@@ -143,6 +167,23 @@ families! {
     RENDER_CACHE_BYTES, render_cache_bytes, set_render_cache_bytes,
         "Finished radar rasters the render cache is holding, CPU-side: the \
          `Color32` pixel buffers and their resident hover fields.";
+    RENDER_IN_FLIGHT_BYTES, render_in_flight_bytes, set_render_in_flight_bytes,
+        "Finished plan-view rasters between the render thread and the frame \
+         thread: the `ColorImage` a render's reply built, priced at its \
+         `Color32` pixels, from the moment it is sent until the frame thread \
+         receives it. Disjoint from `render cache` and `upload pending`, \
+         which price the same image only after receipt installs it and the \
+         renderer bands it; at the tick this family was built for, that \
+         image was 206.8 MiB and both of those read it as nothing. \
+         Published at the seam - the reply closure as it sends, the receipt \
+         as it settles - because a reply lives one frame and a tick would \
+         read it as zero almost always. Covers all three producers: the pane \
+         renders, the adjacent-tilt speculation and the loop frames. \
+         A FLOOR, and under-counts in one direction only: a receipt clears a \
+         pane's whole cell, so a second reply queued behind the first, or a \
+         pane forgotten while a reply is still in the channel, stops being \
+         priced while its raster is still resident. It never prices an image \
+         that has gone.";
     OVERLAY_PICTURE_BYTES, overlay_picture_bytes, set_overlay_picture_bytes,
         "Overlay pictures this frame's dispatch has resident - the batch \
          WO-36 capped, at `width * height * 4`.";
@@ -207,6 +248,23 @@ families! {
         "The 3D volume store's voxel grids on the HOST heap - each grid's \
          index plane, value plane and transfer table. The GPU textures built \
          from them are the device's and are not this figure.";
+    @read
+    render_pool_bytes = squallar_radar::render::parked_bytes() as u64,
+        "Render buffers `squallar_radar` is PARKING between renders - the \
+         plan-view cell buffer, RGBA texture and value grid, and the section \
+         planes - each at its capacity while no render has it out, zero while \
+         one does. Disjoint from `render cache`: a parked buffer is what the \
+         next render draws into, not a finished raster anyone is showing. \
+         READ THROUGH, not published: `census()` reads radar's own maintained \
+         atomics (four relaxed loads, each stored under its slot's lock), so \
+         the tick and the allocation-error hook see the slots as they are at \
+         the instant of the read. Radar cannot see this module, and a publish \
+         from the 2 s tick would catch a buffer parked between two renders \
+         almost never. PER INSTANCE, like every family here: the page and the \
+         rasterization worker each instantiate this module and radar's slots \
+         alike, so each reports the buffers ITS OWN renders parked and the \
+         two are NEVER summed - the worker rasterizes, so its figure is \
+         usually the larger, and it appears on the worker's own census line.";
 }
 
 impl Census {
@@ -230,6 +288,8 @@ impl Census {
         [
             self.radar_total(),
             self.render_cache_bytes,
+            self.render_pool_bytes,
+            self.render_in_flight_bytes,
             self.overlay_picture_bytes,
             self.overlay_grid_bytes,
             self.overlay_item_bytes,
@@ -304,7 +364,8 @@ pub fn write_line<W: core::fmt::Write>(
     write!(
         out,
         "heap census ({instance}): loop scans {} B, loop l3 {} B, still scans {} B, \
-         derive memo {} B, loop frame scans {} B, render cache {} B, overlay pictures {} B, \
+         derive memo {} B, loop frame scans {} B, render cache {} B, render pools {} B, \
+         renders in flight {} B, overlay pictures {} B, \
          overlay grids {} B, overlay items {} B, overlay parked {} B, loop frames {} B, \
          upload pending {} B, tile bodies {} B, tile parsed {} B, \
          tile cache {} B, loans out {} B, volume store {} B, jobs in flight {} B, \
@@ -315,6 +376,8 @@ pub fn write_line<W: core::fmt::Write>(
         census.derive_memo_bytes,
         census.loop_frame_scan_bytes,
         census.render_cache_bytes,
+        census.render_pool_bytes,
+        census.render_in_flight_bytes,
         census.overlay_picture_bytes,
         census.overlay_grid_bytes,
         census.overlay_item_bytes,

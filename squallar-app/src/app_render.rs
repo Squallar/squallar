@@ -2186,6 +2186,10 @@ impl super::App {
         census::set_still_scan_bytes(self.volumes.resident_scan_bytes() as u64);
         census::set_derive_memo_bytes(squallar_radar::derive::memo_bytes() as u64);
         census::set_render_cache_bytes(self.render.render_cache.resident_bytes() as u64);
+        // `renders in flight` is published at its seams, where the bytes
+        // move; this is the tick's reconciliation of it. `render pools` needs
+        // no publisher here: `census()` reads radar's slot atomics directly.
+        self.render.publish_heap_census();
         census::set_overlay_picture_bytes(self.render.resident_overlay_pictures().1);
         census::set_loop_frame_bytes(self.loop_frames.resident_host_bytes());
         census::set_loop_frame_scan_bytes(self.loop_frames.pinned_volume_bytes());
@@ -4176,6 +4180,12 @@ impl super::App {
     /// Poll for completed loop frame render results and upload textures.
     fn poll_loop_render_results(&mut self, ctx: &egui::Context) {
         while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv() {
+            // Off the channel: this raster is no longer in flight, whatever
+            // this frame then does with it. Priced here, before anything can
+            // move the image out of `rr`, and per response rather than per
+            // pane — a loop pane has many frames in flight at once.
+            self.render
+                .settle_loop_reply(crate::render_dispatch::loop_image_bytes(rr.image.as_ref()));
             let origin_pane = rr.pane_idx;
             // Resolved before the pane is borrowed, and off the *response*
             // rather than off the pane — see `frame_gates`.

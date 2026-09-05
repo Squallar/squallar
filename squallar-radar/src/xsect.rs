@@ -34,6 +34,7 @@
 use crate::par::*;
 use crate::sampler::{Column, Sample, SampleStatus, VolumeSampler};
 use crate::types::RadarProduct;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The wasm32 section width, named outside the cascade so a host build can
 /// check it. See [`SECTION_WIDTH`].
@@ -503,6 +504,26 @@ fn render_with_sampler(
 /// inside each one.
 static POOLED_PLANES: std::sync::Mutex<Option<SectionPlanes>> = std::sync::Mutex::new(None);
 
+/// Bytes [`POOLED_PLANES`] is holding: the parked planes' capacities summed
+/// while a set is parked, zero while the slot is empty or a cut has them.
+///
+/// Maintained beside the slot and stored only with the slot's lock in hand —
+/// [`recycle`] stores the capacity as it parks, [`checkout`] stores zero as it
+/// takes — so [`pooled_bytes`] is one relaxed load that takes no lock. The
+/// discipline is `render`'s `POOLED_CELL_BYTES`, for the same reader:
+/// `squallar_egui::heap_census::census()`, which the telemetry tick and the
+/// allocation-error hook both call, reads this through
+/// `render::parked_bytes` with no publish step between a park and the read.
+static POOLED_PLANE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes the section-plane slot is holding right now — one relaxed load. On
+/// the page this is one section's three planes at nine bytes a pixel, since a
+/// [`CrossSection`] decoded off the wire parks its planes here when dropped
+/// exactly as one cut locally does.
+pub fn pooled_bytes() -> usize {
+    POOLED_PLANE_BYTES.load(Ordering::Relaxed)
+}
+
 /// The three parallel planes of one section — see [`CrossSection`], whose
 /// fields these become.
 struct SectionPlanes {
@@ -534,6 +555,14 @@ impl SectionPlanes {
         self.status
             .resize(pixels, SampleStatus::NoCoverage.wire_code());
     }
+
+    /// What the allocator is holding for these planes: every plane's
+    /// **capacity**, which is what a parked buffer costs whatever its length.
+    fn capacity_bytes(&self) -> usize {
+        self.image.capacity()
+            + self.values.capacity() * std::mem::size_of::<f32>()
+            + self.status.capacity()
+    }
 }
 
 /// A seeded, correctly-sized set of planes — the pool's if it has one.
@@ -542,7 +571,14 @@ fn checkout() -> SectionPlanes {
     // `pool().take().unwrap_or_else(..)`: in that shape the temporary guard
     // lives to the end of the statement and holds the pool lock across the
     // fallback allocation below.
-    let taken = pool().take();
+    //
+    // The level is stored inside the same block as the take, guard in hand, so
+    // no reader sees the slot empty and the level still priced.
+    let taken = {
+        let mut slot = pool();
+        POOLED_PLANE_BYTES.store(0, Ordering::Relaxed);
+        slot.take()
+    };
     let mut planes = taken.unwrap_or_else(SectionPlanes::empty);
     planes.fit();
     planes
@@ -552,6 +588,7 @@ fn checkout() -> SectionPlanes {
 fn recycle(planes: SectionPlanes) {
     let mut pool = pool();
     if pool.is_none() {
+        POOLED_PLANE_BYTES.store(planes.capacity_bytes(), Ordering::Relaxed);
         *pool = Some(planes);
     }
 }

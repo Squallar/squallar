@@ -57,22 +57,31 @@ pub struct PaneRenderState {
     /// One flag per render dispatched for this pane and not yet finished, held
     /// alongside the copy the render thread carries.
     results_wanted: Vec<Arc<AtomicBool>>,
-}
-
-impl Default for PaneRenderState {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Bytes of finished rasters this pane's renders have sent and the frame
+    /// thread has not yet received — one cell of
+    /// [`RenderDispatcher::in_flight_image_bytes`]. The reply closure adds to
+    /// it before it sends; [`Self::render_finished`] settles it, because that
+    /// is the call the receipt makes for every reply of this pane's, whether
+    /// it then installs, discards or abandons the raster. Shared with the
+    /// closure, hence the `Arc`.
+    reply_bytes: Arc<AtomicUsize>,
+    /// The dispatcher-wide in-flight total this cell settles into — see
+    /// [`RenderDispatcher::in_flight_total`]. Held here so the receipt's
+    /// `render_finished` can publish the census level at the seam.
+    in_flight_total: Arc<AtomicUsize>,
 }
 
 impl PaneRenderState {
-    pub fn new() -> Self {
+    /// A pane's state, settling its replies into `in_flight_total`.
+    pub fn new(in_flight_total: Arc<AtomicUsize>) -> Self {
         Self {
             render_in_flight: false,
             in_flight_plan_view: None,
             last_rendered: None,
             cached_render: None,
             results_wanted: Vec::new(),
+            reply_bytes: Arc::new(AtomicUsize::new(0)),
+            in_flight_total,
         }
     }
 
@@ -89,9 +98,14 @@ impl PaneRenderState {
     }
 
     /// Mark this pane's render finished — answered, discarded or abandoned.
+    ///
+    /// Whichever of the three it is, the raster the reply carried is no longer
+    /// in flight: received, it is the cache's and the renderer's to price;
+    /// discarded or abandoned, it is dropped with the reply.
     pub fn render_finished(&mut self) {
         self.render_in_flight = false;
         self.in_flight_plan_view = None;
+        settle_in_flight(&self.reply_bytes, &self.in_flight_total);
     }
 
     /// The flag a newly dispatched render reports through, live until this pane's
@@ -341,6 +355,24 @@ pub struct RenderDispatcher {
     pub(crate) plan_view_extractions: std::cell::Cell<u32>,
     /// Whether an adjacent-tilt pre-render is out.
     speculative_in_flight: bool,
+    /// **The loop-render replies' cell.** `App::spawn_loop_frame_render` is the
+    /// third producer of in-flight rasters and the largest population on a
+    /// looping scene — one `ColorImage` per frame per pane, in flight from the
+    /// closure's send to `poll_loop_render_results`. It is one cell rather
+    /// than one per pane because its receipt prices the raster it actually
+    /// took ([`Self::settle_loop_reply`]) instead of clearing a pane's slate.
+    loop_reply_bytes: Arc<AtomicUsize>,
+    /// The speculative arm's reply cell — `PaneRenderState::reply_bytes` for
+    /// the one render no pane owns. Settled by [`Self::speculative_finished`],
+    /// which the receipt calls for every speculative reply.
+    speculative_reply_bytes: Arc<AtomicUsize>,
+    /// **Bytes of finished rasters in flight, as one figure**: the sum every
+    /// reply cell has been added to and settled out of, kept so the seams can
+    /// publish the census level the moment it moves. Cloned into every pane
+    /// state and every reply closure. The cells are the truth; this is the
+    /// running total of them, re-derived from them once a tick by
+    /// [`Self::publish_heap_census`] — see there for what that reconciles.
+    in_flight_total: Arc<AtomicUsize>,
     /// **The last overlay raster asked for per `(pane, layer)`** — written by
     /// every dispatch, from either path, in `spawn_overlay_render`.
     ///
@@ -616,6 +648,111 @@ fn plan_view_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
+/// What a reply's raster costs on this heap while it is in flight — its
+/// `Color32` pixels: the pixel term of `RenderCache::entry_bytes`, and only
+/// that. The reply's hover field (`HoverSource`, about a fortieth of the
+/// pixels) rides unpriced until receipt installs it under `render cache`.
+/// Zero for a reply that drew nothing.
+fn in_flight_bytes(rendered: Option<&crate::channels::RenderedImage>) -> usize {
+    rendered.map_or(0, |r| {
+        r.image.pixels.len() * std::mem::size_of::<egui::Color32>()
+    })
+}
+
+/// **What a loop reply's raster costs on this heap**, priced the same way a
+/// plan-view reply is: its `Color32` pixels, and zero for a reply that drew
+/// nothing. Public because both ends of that seam live outside this module —
+/// the send in `app_fetch`'s `spawn_loop_frame_render`, the receipt in
+/// `app_render`'s `poll_loop_render_results` — and pricing them through one
+/// function is what stops the two ends from disagreeing.
+pub fn loop_image_bytes(image: Option<&egui::ColorImage>) -> usize {
+    image.map_or(0, |i| i.pixels.len() * std::mem::size_of::<egui::Color32>())
+}
+
+/// A loop reply closure's handle on the in-flight level — see
+/// [`RenderDispatcher::loop_reply_ticket`]. Holds cloned Arcs so it can
+/// outlive the borrow the dispatch was made under.
+pub struct LoopReplyTicket {
+    cell: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+}
+
+impl LoopReplyTicket {
+    /// Price this reply's raster **before it is sent**, so no receipt can
+    /// settle bytes that were never added.
+    pub fn price(&self, bytes: usize) {
+        price_in_flight(&self.cell, &self.total, bytes);
+    }
+}
+
+/// **The seam where a reply's raster enters the census**: add `bytes` to the
+/// pane's `cell` and to the dispatcher-wide `total`, and publish the total as
+/// the `renders in flight` level at once. Called by the reply closure before
+/// it sends — on an offload thread native, on the page thread on wasm — so
+/// the level is current when the allocation-error hook reads it, not two
+/// seconds later on a tick that a one-frame reply never survives to.
+///
+/// The cell first, the total second: a tick reconciliation that lands between
+/// the two re-derives the total from the cells and sees this reply already
+/// counted, so the total is never left below its cells for longer than the
+/// tick that fixes it. Nothing for a reply that drew nothing.
+fn price_in_flight(cell: &AtomicUsize, total: &AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    cell.fetch_add(bytes, Ordering::Relaxed);
+    let now = total.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    squallar_egui::heap_census::set_render_in_flight_bytes(now as u64);
+}
+
+/// **The seam where a reply's raster leaves the census**: settle `cell` —
+/// its raster is received, discarded or abandoned — out of `total`, and
+/// publish. Saturating, so a cell that a tick reconciliation already
+/// re-derived out of the total cannot wrap it. Nothing when the cell is
+/// empty, so a reply that drew nothing publishes nothing.
+///
+/// Two seams on two threads can each publish the total as it stood at their
+/// own operation, and the later store can be the staler figure; the window
+/// is the few instructions between an op and its store, and
+/// `RenderDispatcher::publish_heap_census` re-derives and republishes the
+/// level from the cells on the next tick. A stale figure is bounded by one
+/// tick, and it is never a zero standing in for a raster.
+fn settle_in_flight(cell: &AtomicUsize, total: &AtomicUsize) {
+    let bytes = cell.swap(0, Ordering::Relaxed);
+    take_from_total(total, bytes);
+}
+
+/// Take `bytes` off `total` and publish the level. Split out of
+/// [`settle_in_flight`] because a loop reply settles **its own** bytes rather
+/// than a whole pane cell: the receipt has the image and can price exactly
+/// the raster it took, where a pane's cell is settled wholesale.
+fn take_from_total(total: &AtomicUsize, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let now = subtract_saturating(total, bytes);
+    squallar_egui::heap_census::set_render_in_flight_bytes(now as u64);
+}
+
+/// Take `bytes` off `counter`, saturating at zero, answering what is left.
+///
+/// A compare-exchange loop for two reasons. `fetch_sub` would **wrap** a
+/// counter that a tick reconciliation has already re-derived below the amount
+/// being settled, turning a raster that has gone into a 16-exabyte level on
+/// the one line the allocation-error hook gets to print. `fetch_update` says
+/// this in one call and is deprecated on the wasm toolchain, which is a
+/// warning on a row the native gate never sees.
+fn subtract_saturating(counter: &AtomicUsize, bytes: usize) -> usize {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break next,
+            Err(seen) => current = seen,
+        }
+    }
+}
+
 /// [`plan_view_image`] for a raster already in egui's layout: the same size
 /// refusal, and the buffer moves into the image instead of being copied.
 fn plan_view_image_owned(pixels: Vec<egui::Color32>) -> Option<egui::ColorImage> {
@@ -650,8 +787,9 @@ impl RenderDispatcher {
         // The extract-results pair is dispatcher-local: it is not a ChannelHub
         // channel and never becomes one.
         let (extract_results_tx, extract_results_rx) = std::sync::mpsc::channel();
+        let in_flight_total = Arc::new(AtomicUsize::new(0));
         Self {
-            pane_render: vec![PaneRenderState::new()],
+            pane_render: vec![PaneRenderState::new(Arc::clone(&in_flight_total))],
             level3_data: HashMap::new(),
             env_heights: HashMap::new(),
             melting_layer: HashMap::new(),
@@ -677,6 +815,9 @@ impl RenderDispatcher {
             #[cfg(test)]
             plan_view_extractions: std::cell::Cell::new(0),
             speculative_in_flight: false,
+            speculative_reply_bytes: Arc::new(AtomicUsize::new(0)),
+            loop_reply_bytes: Arc::new(AtomicUsize::new(0)),
+            in_flight_total,
             last_overlay_dispatch: HashMap::new(),
             overlay_job_at: HashMap::new(),
             overlay_job_serves: HashMap::new(),
@@ -866,7 +1007,8 @@ impl RenderDispatcher {
     /// Ensure the pane_render vec has at least `count` entries.
     pub fn ensure_pane_count(&mut self, count: usize) {
         while self.pane_render.len() < count {
-            self.pane_render.push(PaneRenderState::new());
+            self.pane_render
+                .push(PaneRenderState::new(Arc::clone(&self.in_flight_total)));
         }
     }
 
@@ -1939,6 +2081,8 @@ impl RenderDispatcher {
         // Cleared if this pane's data changes while the render runs, which is where a
         // per-site reset stops a result.
         let wanted = self.pane_render[pane_idx].want_result();
+        let reply_bytes = Arc::clone(&self.pane_render[pane_idx].reply_bytes);
+        let in_flight_total = Arc::clone(&self.in_flight_total);
         squallar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             // An output of another kind is `None` here — "nothing to draw",
@@ -1948,8 +2092,18 @@ impl RenderDispatcher {
             let still_wanted = wanted.load(Ordering::Relaxed);
             drop(wanted);
             if still_wanted {
+                let rendered = frame.and_then(rendered_image_from);
+                // Priced and PUBLISHED before the send: a receipt that settles
+                // the cell can then never run ahead of the increment it is
+                // settling, which would leave a phantom raster on the census
+                // after its image had gone.
+                price_in_flight(
+                    &reply_bytes,
+                    &in_flight_total,
+                    in_flight_bytes(rendered.as_ref()),
+                );
                 let _ = sender.send(RenderResponse {
-                    rendered: frame.and_then(rendered_image_from),
+                    rendered,
                     product,
                     elevation,
                     generation,
@@ -2038,13 +2192,22 @@ impl RenderDispatcher {
         self.speculative_in_flight = true;
         let generation = self.render_generation;
         let speculative_for = Some(site.to_string());
+        let reply_bytes = Arc::clone(&self.speculative_reply_bytes);
+        let in_flight_total = Arc::clone(&self.in_flight_total);
         squallar_worker::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
             let frame = output.and_then(|out| out.take::<squallar_radar::frame::RenderedFrame>());
+            let rendered = frame.and_then(rendered_image_from);
+            // Before the send, for the reason `spawn_render` gives.
+            price_in_flight(
+                &reply_bytes,
+                &in_flight_total,
+                in_flight_bytes(rendered.as_ref()),
+            );
             // Sent unconditionally: the receiver is what clears the one-speculative
             // bool.
             let _ = sender.send(RenderResponse {
-                rendered: frame.and_then(rendered_image_from),
+                rendered,
                 product,
                 elevation,
                 generation,
@@ -2064,9 +2227,87 @@ impl RenderDispatcher {
     }
 
     /// The speculative render answered (with a raster or with nothing) —
-    /// speculation may dispatch again.
+    /// speculation may dispatch again, and its raster is no longer in flight.
     pub(crate) fn speculative_finished(&mut self) {
         self.speculative_in_flight = false;
+        settle_in_flight(&self.speculative_reply_bytes, &self.in_flight_total);
+    }
+
+    /// **The loop path's half of the send seam.** `spawn_loop_frame_render`
+    /// lives in `app_fetch` and its reply closure outlives this borrow, so it
+    /// takes this ticket rather than a `&self`: cloned Arcs of the loop cell
+    /// and the shared total, priced the moment the raster is built and before
+    /// it is sent, exactly as the two dispatcher-owned closures do.
+    pub fn loop_reply_ticket(&self) -> LoopReplyTicket {
+        LoopReplyTicket {
+            cell: Arc::clone(&self.loop_reply_bytes),
+            total: Arc::clone(&self.in_flight_total),
+        }
+    }
+
+    /// **The loop path's half of the receipt seam**: one reply's raster has
+    /// been taken off the channel, so its bytes leave the level.
+    ///
+    /// Priced per response and not per pane: a loop pane has many frames in
+    /// flight at once, so clearing a whole cell on one receipt would drop
+    /// every sibling reply still in the channel.
+    pub fn settle_loop_reply(&self, bytes: usize) {
+        subtract_saturating(&self.loop_reply_bytes, bytes);
+        take_from_total(&self.in_flight_total, bytes);
+    }
+
+    /// **Bytes of finished rasters in flight between the render threads and
+    /// this one**: every `ColorImage` a reply closure has built and sent that
+    /// the frame thread has not yet received.
+    ///
+    /// A fold over the panes' reply cells and the speculative arm's — each an
+    /// atomic the closure adds to as it sends and the receipt settles through
+    /// [`PaneRenderState::render_finished`] or [`Self::speculative_finished`].
+    /// No lock, no walk of a raster, and a fold bounded by the pane count.
+    /// This fold is the **truth** the published level is reconciled against
+    /// once a tick; the level the allocation-error hook reads is the census
+    /// static, which the two seams (`price_in_flight`, `settle_in_flight`)
+    /// publish the moment a raster is sent or settled — a reply lives one
+    /// frame, and a tick would read it as zero almost always.
+    ///
+    /// Exact for a reply received in order, which is every reply on wasm
+    /// (the closure runs on the page thread) and the common case native.
+    /// Where a pane has two replies queued, the first receipt settles the
+    /// cell for both and the second is uncounted for the frame it waits;
+    /// where a pane is forgotten with a reply queued, the bytes go with the
+    /// cell and the next tick re-derives the total without them. Both are
+    /// transient under-counts of a raster about to be dropped — never a
+    /// phantom that outlives its image.
+    pub fn in_flight_image_bytes(&self) -> u64 {
+        self.pane_render
+            .iter()
+            .map(|prs| prs.reply_bytes.load(Ordering::Relaxed) as u64)
+            .chain(std::iter::once(
+                self.speculative_reply_bytes.load(Ordering::Relaxed) as u64,
+            ))
+            .chain(std::iter::once(
+                self.loop_reply_bytes.load(Ordering::Relaxed) as u64,
+            ))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// **The tick's reconciliation of the `renders in flight` level.** The
+    /// level itself is published at the seams, where the bytes move; this
+    /// re-derives the running total from the cells ([`Self::in_flight_image_bytes`])
+    /// and republishes it, which corrects the two things a seam cannot: a
+    /// store that lost a race to another thread's later-but-staler store, and
+    /// a cell orphaned by a forgotten pane whose bytes the total still
+    /// carries. Called once a telemetry tick by the app's census publisher.
+    ///
+    /// `render pools` needs nothing here: `heap_census::census()` reads
+    /// radar's slot atomics directly.
+    pub fn publish_heap_census(&self) {
+        let fold = self.in_flight_image_bytes();
+        self.in_flight_total.store(
+            usize::try_from(fold).unwrap_or(usize::MAX),
+            Ordering::Relaxed,
+        );
+        squallar_egui::heap_census::set_render_in_flight_bytes(fold);
     }
 
     /// Whether some pane already has **this exact plan view** in flight.
@@ -2100,3 +2341,8 @@ mod raster_size_tests;
 
 #[cfg(test)]
 mod budget_order_tests;
+
+// Native-only, like the gated renders it is built on: `Job::Opaque` and the
+// offload pool's threads have no wasm arm.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod in_flight_census_tests;

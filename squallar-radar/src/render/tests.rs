@@ -3147,3 +3147,60 @@ fn consecutive_gates_tile_with_no_seam() {
         worst * 1000.0,
     );
 }
+
+/// `pooled_bytes` is a maintained level and not a walk under the slot locks.
+///
+/// With every slot's lock held on this thread, a read from another thread
+/// must both **return** and return **the level**. The two wrong shapes each
+/// fail one arm: a `lock` walk never answers and the wait times out; a
+/// `try_lock` walk answers zero for a slot that holds a buffer — on the
+/// measured scene, a false zero for 413 MiB. The readers this protects are
+/// the frame thread's telemetry tick and the allocation-error hook, neither
+/// of which may block behind a render's `take`.
+///
+/// The three guards are taken in the order `trim_pools` takes them; no path in
+/// this module holds two slot locks at once, so nothing can deadlock against
+/// this thread while it holds all three. Other tests in this binary that
+/// render will wait on the locks for the length of the test, which is one
+/// thread spawn.
+#[test]
+fn pooled_bytes_is_read_without_taking_a_slot_lock() {
+    let mut cells = RenderBuffers::pool();
+    let mut image = image_pool();
+    let mut values = values_pool();
+
+    // Known contents under the guards: whatever another test left is taken
+    // out (and its level zeroed), then one buffer of known capacity goes in
+    // each slot through the same seam the production doors use.
+    drop(take_slot(&mut cells, &POOLED_CELL_BYTES));
+    drop(take_slot(&mut image, &POOLED_IMAGE_BYTES));
+    drop(take_slot(&mut values, &POOLED_VALUE_BYTES));
+    let cell_buffer: Vec<AtomicU64> = (0..512).map(|_| AtomicU64::new(0)).collect();
+    let cell_bytes = cell_buffer.capacity() * std::mem::size_of::<AtomicU64>();
+    let image_buffer = vec![0u8; 4096];
+    let image_bytes = image_buffer.capacity();
+    let value_buffer = vec![0f32; 1024];
+    let value_bytes = value_buffer.capacity() * std::mem::size_of::<f32>();
+    park_slot(&mut cells, &POOLED_CELL_BYTES, cell_buffer, cell_bytes);
+    park_slot(&mut image, &POOLED_IMAGE_BYTES, image_buffer, image_bytes);
+    park_slot(&mut values, &POOLED_VALUE_BYTES, value_buffer, value_bytes);
+    let expected = cell_bytes + image_bytes + value_bytes;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(pooled_bytes());
+    });
+    let read = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("`pooled_bytes` blocked behind a slot lock it must never take");
+    assert_eq!(
+        read, expected,
+        "with every slot lock held, `pooled_bytes` read {read} B where the slots hold \
+         {expected} B; a `try_lock` miss is reporting an empty slot"
+    );
+
+    // Leave the slots as they were found by the next test: empty, at zero.
+    drop(take_slot(&mut cells, &POOLED_CELL_BYTES));
+    drop(take_slot(&mut image, &POOLED_IMAGE_BYTES));
+    drop(take_slot(&mut values, &POOLED_VALUE_BYTES));
+}
