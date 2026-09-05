@@ -252,16 +252,43 @@ pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 /// priced at the size it was measured at on arrival
 /// (`PaneNeed::loop_scans_resident_bytes`), never at this.
 ///
-/// A reservation, not a measurement. `squallar-radar`'s loop download cache
-/// (`loop_downloads.rs`, the doc on `scan_bytes_cached`) measured a decoded
-/// volume at 46.1–46.8 MiB median and **58.3 MiB maximum over 208 real
-/// archive volumes**; a sample maximum is not a ceiling, so the reserve is
-/// that maximum rounded up to the next power of two. It over-states a median
-/// volume by 39 % and under-states nothing measured, so it over-prices only
-/// what has not arrived — the direction a reservation must err. The ladder
-/// answers the term with the host rungs alone: the span is the user's and no
-/// host rung shortens it.
-pub const LOOP_SCAN_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+/// A reservation, not a measurement. The real decode path was measured under a
+/// counting global allocator over **208 real archive volumes** at a 48.88 MiB
+/// median and a **74.63 MiB maximum** (`squallar_app::volume_inventory`, which
+/// carries the corpus, the instrument and the correction below). 80 MiB covers
+/// that maximum with 5.37 MiB to spare and over-states a median volume by 64 %
+/// (80 ÷ 48.88 = 1.637), so it over-prices only what has not arrived — the
+/// direction a reservation must err. The ladder answers the term with the host
+/// rungs alone: the span is the user's and no host rung shortens it.
+///
+/// **This is a bootstrap, not a ceiling.** What stood here before — that the
+/// reserve "under-states nothing measured" — was a claim about a sample worn
+/// as a bound, and it stopped being true the moment the corpus was
+/// re-measured: 58.3 MiB, the figure 64 MiB had been rounded up from, turned
+/// out to be the **70.7th percentile** of those same 208 volumes rather than
+/// their maximum, exceeded by 61 of them. The lesson is not that the number
+/// was stale. It is that a maximum drawn from a non-random corpus was never a
+/// bound: this one sampled two hours of the day (06Z and 18Z) and lost one of
+/// four planned seasons to a silent fetch failure, so no re-measurement of it
+/// can promote this constant to a ceiling. Starting the count honestly is all
+/// this figure is for.
+///
+/// The reserve is due to become the **floor** under a per-site self-calibrating
+/// one — `max(bootstrap, that site's resident maximum)` — because a site that
+/// has already handed this process a volume larger than 80 MiB is evidence
+/// about that site which no corpus percentile outranks. Until that lands, this
+/// bootstrap is the whole reserve; afterwards it is still the whole reserve for
+/// the first frame at any site, which is the case that has no measurement yet.
+///
+/// **The power-of-two rounding is gone, deliberately.** 64 MiB was "58.3
+/// rounded up to the next power of two" — a convention with no reason under
+/// it, and the rounding is what hid how little headroom there really was.
+/// Carried forward onto the corrected maximum it would give 128 MiB, which
+/// over-prices an eleven-frame loop by 11 × (128 − 80) MiB = **528 MiB** of
+/// bytes nobody allocates, and the ladder pays that in shed rungs — picture
+/// quality a user can see — for a quantity that does not exist. The rule is
+/// now a clean figure just above the measured maximum.
+pub const LOOP_SCAN_RESERVE_BYTES: u64 = 80 * 1024 * 1024;
 
 /// How many cross-section loop frames may be *dispatched* in one frame.
 /// `RenderInput::extract_volume_parts` runs on the frame thread (~1.0 ms on a
@@ -788,11 +815,25 @@ const _: () = const {
     assert!(MIN_LOOP_SPEED_FPS <= DEFAULT_LOOP_SPEED_FPS);
     assert!(DEFAULT_LOOP_SPEED_FPS <= MAX_LOOP_SPEED_FPS);
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
-    // The scan reserve prices one decoded Level II volume per radar loop
-    // frame on the host: 64 MiB in bytes, and never under the 58.3 MiB
-    // sample maximum it was rounded up from.
-    assert!(LOOP_SCAN_RESERVE_BYTES == 67_108_864);
-    assert!(LOOP_SCAN_RESERVE_BYTES >= 61_131_981);
+    // The scan reserve prices one decoded Level II volume per radar loop frame
+    // on the host. Both arms say what they pin, so that neither can be retyped
+    // to match a constant that moved under it.
+    //
+    // The first pins the WIDTH. The value is **bytes**, spelled here as the
+    // decimal that `80 * 1024 * 1024` expands to, so a reserve re-entered as
+    // `80` — or as MiB anywhere on the path — under-prices a pending frame by
+    // 2^20 and reads as a scene that fits.
+    //
+    // The second pins WHAT IT PRICES: the 74.63 MiB maximum measured over 208
+    // real archive volumes (`squallar_app::volume_inventory`), 78,255,227 B,
+    // which the reserve covers with 5.37 MiB to spare. This arm exists to go
+    // red when a re-measurement moves that maximum — moving this literal to
+    // match a new maximum *without* moving the reserve is precisely the defect
+    // it is here to catch, and it is how the superseded 58.3 MiB figure
+    // (61,131,981 B) sat compiled in under a 64 MiB reserve that had quietly
+    // fallen 10.63 MiB below the real maximum.
+    assert!(LOOP_SCAN_RESERVE_BYTES == 83_886_080);
+    assert!(LOOP_SCAN_RESERVE_BYTES >= 78_255_227);
     // The plan-view side is **not** required to be a power of two; what every
     // path shares is a floor and a ceiling, which is what
     // `raster_side_from_rgba_len` checks a finished buffer against.

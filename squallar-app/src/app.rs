@@ -2278,8 +2278,8 @@ impl App {
                 parked.push((info.site.name, info.timestamp));
             }
         }
-        // place is this frame: an entry is a whole decoded volume, a measured 46 MiB
-        // median and 58.3 MiB worst case (`volume_inventory::MAX_RESIDENT_STILL_VOLUMES`)
+        // place is this frame: an entry is a whole decoded volume, a measured 48.9 MiB
+        // median and 74.6 MiB maximum (`volume_inventory::MAX_RESIDENT_STILL_VOLUMES`)
         // across thousands of per-radial buffers, and the walk that returns them is the
         // frame-thread cost `offload::discard` exists to move.
         let unshown = |site: &String| !shown.iter().any(|shown| *shown == site);

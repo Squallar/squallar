@@ -105,7 +105,7 @@ fn every_term_is_the_cost_function_it_reuses() {
         looping.loop_scans_host,
         frames as u64 * LOOP_SCAN_RESERVE_BYTES
     );
-    assert_eq!(looping.loop_scans_host, 28 * 64 * MIB);
+    assert_eq!(looping.loop_scans_host, 28 * 80 * MIB);
     assert_eq!(looping.total().host_bytes, looping.loop_scans_host);
     assert_eq!(plan.loop_scans_host, 0, "a still pane plays from no cache");
     // A pane asking for less than the budget's span gets less; one asking for
@@ -478,7 +478,7 @@ fn a_second_pane_on_a_shared_loop_prices_at_no_loop_cost() {
     let o = terms(&owner);
     let a = terms(&alias);
     assert_eq!(o.loops, 28 * 16 * MIB, "28 frames of two hours at 259 s");
-    assert_eq!(o.loop_scans_host, 28 * 64 * MIB);
+    assert_eq!(o.loop_scans_host, 28 * 80 * MIB);
     assert_eq!(a.loops, 0, "the alias holds the owner's frames");
     assert_eq!(a.loop_scans_host, 0, "and plays from the owner's volumes");
     assert_eq!(a.grids, 0);
@@ -1692,12 +1692,16 @@ fn a_shown_picture_is_priced_at_the_planners_own_arithmetic() {
 /// decoded volumes were priced at nothing, the same undercount as the
 /// pictures one paragraph up, of the same order. On the web bracket the
 /// leg's two-hour loop at 259 s is held to the 45-minute span, 1 + 2700 / 259
-/// = 11 frames, and at the 64 MiB reserve apiece that is 738,197,504 B —
-/// 91.7 % of the allowance on its own, before a tile or a picture. So the
+/// = 11 frames, and at the 80 MiB reserve apiece that is 922,746,880 B —
+/// **114.6 % of the allowance on its own**, before a tile or a picture, so on
+/// this bracket a loop that has fetched nothing yet is over the whole host
+/// allowance on its admission price alone. (At the superseded 58.3 MiB
+/// measurement the reserve was 64 MiB and this read 738,197,504 B, 91.7 %:
+/// under the allowance, which is the reading the correction removed.) So the
 /// host rungs go to their stops (1.25x, 1x, tiles snapped — three steps) and
-/// the scene is still 1,280,141,796 B over an 805,306,368 B allowance;
+/// the scene still costs 1,464,691,172 B against an 805,306,368 B allowance;
 /// `fit_holds`, because nothing is left to shed on that axis, and no GPU
-/// rung moves for it. The desktop bracket's 28 frames are 1,879,048,192 B
+/// rung moves for it. The desktop bracket's 28 frames are 2,348,810,240 B
 /// and the same three steps. Under ruling 13 no host rung shortens the loop;
 /// what makes this scene fit is the user's span or, later, a refusal at the
 /// door — not a rung.
@@ -1837,7 +1841,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     // **The leg itself, loop playing** — and its scans reconciled: the
     // eleven frames the web arm names had all arrived, so they are priced at
     // what they measured (46.5 MiB apiece, the fixture's modelled median),
-    // not at the 64 MiB reserve, and nothing is pending.
+    // not at the 80 MiB reserve, and nothing is pending.
     assert_eq!(loop_frames(&leg.panes[0], &top), 11, "1 + 2700 / 259");
     assert_eq!(leg.panes[0].loop_scans_resident_frames, 11);
     let playing = need_terms(&leg, &top, stand_in_grid_bytes);
@@ -1864,17 +1868,19 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     // **The same leg before its first volume arrived** is the admission
     // price: every named frame pending, at the reserve. The difference
     // between the two lines is what reconciliation is worth on this scene —
-    // 738,197,504 - 536,346,624 = 201,850,880 B, 27.3 % of the charge — and
+    // 922,746,880 - 536,346,624 = 386,400,256 B, 41.9 % of the charge — and
     // the reserve is only ever the larger of the two, which is the direction
-    // a bound must err.
+    // a bound must err. Reconciliation is worth more than it was, because the
+    // reserve it discharges is the corrected 80 MiB and the measured frames it
+    // discharges to did not move.
     let pending = need_terms(&huge_pending(13), &top, stand_in_grid_bytes);
     assert_eq!(pending.loop_scans_host, 11 * LOOP_SCAN_RESERVE_BYTES);
-    assert_eq!(pending.loop_scans_host, 738_197_504);
+    assert_eq!(pending.loop_scans_host, 922_746_880);
     assert_eq!(
         pending.loop_scans_host - playing.loop_scans_host,
-        201_850_880
+        386_400_256
     );
-    assert_eq!(pending.total().host_bytes, 1_604_572_980);
+    assert_eq!(pending.total().host_bytes, 1_789_122_356);
 
     let leg_fitted = fit(&leg, &wasm, &presumed, stand_in_grid_bytes);
     assert_eq!(
@@ -1922,8 +1928,8 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     );
 
     // **The desktop bracket names 28 frames and holds eleven of them**, so
-    // the term is the mixed case: 11 x 46.5 MiB measured + 17 x 64 MiB
-    // reserved = 536,346,624 + 1,140,850,688. The volumes are a host figure
+    // the term is the mixed case: 11 x 46.5 MiB measured + 17 x 80 MiB
+    // reserved = 536,346,624 + 1,426,063,360. The volumes are a host figure
     // the bracket does not change; what the bracket changes is how many
     // frames the loop names, and every frame it names past what has arrived
     // is charged the bound.
@@ -1934,7 +1940,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
         on_desktop.loop_scans_host,
         11 * HUGE_LEG_SCAN_BYTES + 17 * LOOP_SCAN_RESERVE_BYTES,
     );
-    assert_eq!(on_desktop.loop_scans_host, 1_677_197_312);
+    assert_eq!(on_desktop.loop_scans_host, 1_962_409_984);
     let leg_on_desktop = fit(&leg, &desktop, &measured, stand_in_grid_bytes);
     assert_eq!(leg_on_desktop.steps_back, 3);
     assert_eq!(leg_on_desktop.overlay_oversample_percent, 100);

@@ -20,10 +20,10 @@
 //! subsystem; it is not held here and this module deliberately knows nothing
 //! about it.
 //!
-//! Every entry is a whole decoded volume — a **measured** 46 MiB median and
-//! 58.3 MiB worst case (see [`MAX_RESIDENT_STILL_VOLUMES`]) across thousands
-//! of per-radial buffers — so eviction hands the values back **owned**, for
-//! the caller to pass to the deferred-drop path rather than free on the frame
+//! Every entry is a whole decoded volume — a **measured** 48.9 MiB median and
+//! 74.6 MiB maximum (see [`MAX_RESIDENT_STILL_VOLUMES`]) across thousands of
+//! per-radial buffers — so eviction hands the values back **owned**, for the
+//! caller to pass to the deferred-drop path rather than free on the frame
 //! thread.
 //!
 //! # Why residency is now a policy and not an accident
@@ -64,32 +64,105 @@ pub(crate) type Base = (Arc<Scan>, Arc<DeclaredNyquist>, NaiveDateTime);
 /// three days chosen for regime spread (2025-04-23 and 2025-06-11 convective,
 /// 2025-12-03 clear-air), VCPs 12/31/34/35/212/215, 1–21 sweeps, 360–11 160
 /// radials, all Level II moments the volume carries. The figure is live heap
-/// bytes held by the `DecodedScan` — `Scan` plus `DeclaredNyquist` — with the
-/// archive buffer already freed:
+/// bytes held by the `DecodedScan` — `Scan` plus `DeclaredNyquist`:
 ///
-/// | | arbitration (n=108) | holdout (n=100) |
-/// |---|---|---|
-/// | median | 46.8 MiB | 46.1 MiB |
-/// | max | 58.3 MiB | 55.3 MiB |
+/// | over all 208 | live heap held |
+/// |---|---|
+/// | median | 48.88 MiB |
+/// | max | 74.63 MiB |
 ///
-/// A single 1-sweep truncated volume read 3.1 MiB; every whole volume in
-/// either set landed between 31.7 and 58.3 MiB. **Take 58.3 MiB as one slot.**
+/// **Take 74.63 MiB as one slot.**
+///
+/// ## The anchors this replaces cannot be reproduced, and that is the point
+///
+/// Until 2026-09-04 this doc pinned 46.8 / 46.1 MiB medians and **58.3 MiB as
+/// a worst case**, from the same 208 volumes and the same decode path. Those
+/// six anchors are **superseded**: re-running the instrument that produced
+/// them will reproduce them exactly and they will still be wrong, because the
+/// defect was in the measurement window, not in the corpus or the code under
+/// it.
+///
+/// That instrument took its baseline **after the compressed archive buffer had
+/// been read**, and `decode_bytes` frees that buffer *inside* the window. So
+/// every volume's recorded price was reduced by the size of its own compressed
+/// archive — 0.34–17.96 MiB over this corpus. The prose said "with the archive
+/// buffer already freed"; the arithmetic had subtracted it.
+///
+/// The correction is a second baseline taken after the read. It **reproduces
+/// the old instrument** rather than merely disagreeing with it: the old
+/// arbitration max to within 0.04 MiB, the old holdout max to 0.05, the old
+/// minimum to 0.02, the old "31.7 MiB" floor landing exactly on the
+/// second-smallest whole volume, and the per-row identity
+/// `live − old_figure − archive_buffer = 0` closing on all 208 rows, over two
+/// runs that were byte-identical. A future reader who finds 58.3 quoted
+/// somewhere is looking at that subtraction, not at a second opinion.
+///
+/// **58.3 MiB was never a worst case.** 61 of the 208 volumes exceed it —
+/// 29.3 % — which makes it the **70.7th percentile presented as a maximum**.
+/// The corrected slot is 74.63 ÷ 58.3 = **1.28×** the one this file pinned,
+/// and every total derived from it below moved with it.
+///
+/// The corrected median is **not** the old median plus the median archive
+/// buffer, and no arithmetic here should be read as if it were: decoded size
+/// is quantised by scan structure into 75 distinct values across the 208,
+/// while the archive buffer is continuous, so the two distributions have
+/// different shapes and their medians are not related by subtraction. The
+/// maximum is the figure that *can* be reasoned about directly, because
+/// maxima compose along a single row: 74.63 − 58.34 (the old maximum
+/// unrounded) = 16.29 MiB, under the 17.96 MiB largest archive in the corpus,
+/// with no assumption at all.
+///
+/// The re-run reported a median, a maximum and that exceedance count. It did
+/// **not** restate a minimum, so the old 31.7 MiB floor and the 3.1 MiB
+/// single-sweep truncated reading are recorded above as *superseded*, not as
+/// replaced: this file currently pins no corrected lower bound, and one should
+/// not be inferred from the numbers that remain.
+///
+/// ## What is still excluded from 74.63 MiB
+///
+/// Both instruments count **requested** sizes, so neither carries the
+/// allocator's own per-block overhead: on the largest volume, at roughly
+/// 56 000 live blocks, a further ~0.4–0.9 MiB. Named as excluded rather than
+/// quietly absorbed — 74.63 is a floor on the real resident cost, not a
+/// ceiling on it.
+///
+/// ## Corpus caveats, which travel with any percentile quoted from this set
+///
+/// Only the 06Z and 18Z hours were fetched — two instants a day, not a diurnal
+/// population — and one of four planned seasonal dates silently failed to
+/// fetch, so that season is *missing*, not sampled. Neither touches the window
+/// defect; both bound how far "29.3 % exceed 58.3 MiB" generalises beyond
+/// these 208.
 ///
 /// **The floor is forced, not chosen.** Each of at most
 /// [`MAX_PANES_DESKTOP`] panes may be parked at its own moment, so six slots
 /// is the smallest cap that does not break the feature this key exists for:
-/// 6 × 58.3 MiB = **350 MiB** worst case, 6 × 46.4 MiB = 279 MiB typical.
-/// That is the same worst case the site-keyed store already had, since six
-/// panes on six sites held six volumes then too — re-keying moved *which*
-/// arrangements reach the bound, not the bound.
+/// 6 × 74.63 MiB = **448 MiB** worst case (was 6 × 58.3 = 350 MiB),
+/// 6 × 48.88 MiB = 293 MiB typical. That is the same worst case the
+/// site-keyed store already had, since six panes on six sites held six volumes
+/// then too — re-keying moved *which* arrangements reach the bound, not the
+/// bound.
 ///
 /// **The two spare slots are the priced part.** The archive drain
 /// (`poll_scan_results`) is the one installer that can land several volumes in
 /// a single frame, and an arrival for a site whose pane has since switched
 /// away is nobody's. Two slots of headroom buy that, at a measured
-/// 2 × 58.3 MiB = **117 MiB** worst case, and are what stop such an arrival
-/// displacing a volume a pane is showing before [`retain_still`] runs at the
-/// end of the same frame. Total: **466 MiB** worst case, 371 MiB typical.
+/// 2 × 74.63 MiB = **149 MiB** worst case (was 117 MiB), and are what stop
+/// such an arrival displacing a volume a pane is showing before
+/// [`retain_still`] runs at the end of the same frame. Total:
+/// 8 × 74.63 MiB = **597 MiB** worst case (was 466 MiB),
+/// 8 × 48.88 MiB = 391 MiB typical.
+///
+/// **The cap itself did not move**, and the correction gave no reason to move
+/// it: it counts volumes, and what was mispriced is what one volume costs. Six
+/// is still forced by [`MAX_PANES_DESKTOP`] and the two spare slots still buy
+/// the same one-frame burst. What changed is that the residency this cap
+/// admits is 131 MiB larger than this file used to claim.
+///
+/// Consumers outside this crate sized themselves against the superseded
+/// 58.3 MiB — a reserve rounded up from it is no longer above the sample
+/// maximum. Each has to re-derive from 74.63 in its own crate; none of them is
+/// corrected by this doc.
 ///
 /// [`retain_still`]: VolumeInventory::retain_still
 pub(crate) const MAX_RESIDENT_STILL_VOLUMES: usize = MAX_PANES_DESKTOP + 2;
@@ -407,7 +480,7 @@ pub(crate) enum VolumeDropPart {
 ///
 /// Handed to `offload::discard_each`, which files every item separately: on
 /// wasm each part is its own queue entry, so one drain turn frees one sweep
-/// rather than one 46.8 MiB median / 58.3 MiB worst-case volume (measured;
+/// rather than one 48.88 MiB median / 74.63 MiB maximum volume (measured;
 /// see [`MAX_RESIDENT_STILL_VOLUMES`]). The `Scan` shell left behind — site
 /// and coverage pattern, a few KiB — is dropped here, which is the price of
 /// upstream's model owning its sweeps.
