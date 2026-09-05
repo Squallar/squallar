@@ -26,15 +26,7 @@ use squallar_source::id::known;
 use squallar_radar::loop_downloads::LoopFrameData;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Set once `fit` has handed back an answer that does not hold
-/// ([`App::fit_scene`]); never cleared, because the arithmetic that broke does
-/// not heal within a process, and read where the pool is sized so the loops
-/// are held at the floor from then on. Process-global rather than a field:
-/// it is a defect flag, and a second `App` in the same process has the same
-/// arithmetic.
-static FIT_INVARIANT_BROKEN: AtomicBool = AtomicBool::new(false);
+use std::sync::atomic::Ordering;
 
 // **Why every loop read in this file is `time_state(&known::RADAR)`, spelled
 // out rather than hidden behind an accessor (WO-T3.7).**
@@ -5083,7 +5075,7 @@ impl super::App {
     /// allowance, or every rung at its stop — by construction on both arms,
     /// so a `false` here is a defect in the arithmetic, not a scene too large.
     /// A debug build stops on it. A release build logs it once at warn and
-    /// marks [`FIT_INVARIANT_BROKEN`], which holds the loop pool at its floor
+    /// marks [`Self::fit_invariant_broken`], which holds the loop pool at its floor
     /// from then on ([`Self::pool_for_scene`]) rather than sizing loops from
     /// budgets that were not fitted; the budgets themselves are still
     /// adopted, since the floor of the ladder is the safest answer there is.
@@ -5104,7 +5096,7 @@ impl super::App {
              left to shed",
             cap.allowance() / (1024 * 1024),
         );
-        if !holds && !FIT_INVARIANT_BROKEN.swap(true, Ordering::Relaxed) {
+        if !holds && !self.fit_invariant_broken.replace(true) {
             log::warn!(
                 "Budgets: fit handed back {needed} MiB of need against a {} MiB allowance \
                  with rungs left to shed, at rung {}; the loop pool is held at its floor \
@@ -5119,11 +5111,11 @@ impl super::App {
     /// **The pool the scene asks for** — what its loops need, capped by the
     /// room the rest leaves under this session's capacity, held inside the
     /// bracket's floor and, on the presumed arm, its ceiling — or the floor
-    /// alone once [`FIT_INVARIANT_BROKEN`] has been set.
+    /// alone once [`Self::fit_invariant_broken`] has been set.
     pub(super) fn pool_for_scene(&self, scene: &Scene) -> LoopPool {
         let cap = self.capacity();
         let limits = crate::loop_pool::LoopPoolLimits::from_budgets(&self.budgets);
-        if FIT_INVARIANT_BROKEN.load(Ordering::Relaxed) {
+        if self.fit_invariant_broken.get() {
             return LoopPool::new(0, limits);
         }
         LoopPool::for_scene(scene, &self.budgets, &cap, limits)

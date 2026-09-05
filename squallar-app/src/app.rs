@@ -227,6 +227,14 @@ pub struct App {
     loop_pool: crate::loop_pool::LoopPool,
     /// See [`Self::loop_pool`].
     loop_pool_state: crate::loop_pool::LoopPoolState,
+    /// Set once `fit` has handed back an answer that does not hold
+    /// ([`Self::fit_scene`]); never cleared, because the arithmetic that broke
+    /// does not heal within a session, and read where the pool is sized
+    /// ([`Self::pool_for_scene`]) so the loops are held at the floor from then
+    /// on. A debug build stops on the assertion beside the write, so only a
+    /// release build ever sets it. This instance's defect, not the process's:
+    /// a second `App` beside it starts clear.
+    fit_invariant_broken: std::cell::Cell<bool>,
     /// **This session's GPU capacity presumption**, lowered by pressure and
     /// never raised: `None` until an event, then the allowance in force at
     /// the event less one economy fraction. Discarded at exit — nothing is
@@ -804,6 +812,7 @@ impl App {
                 loop_pool,
                 crate::loop_pool::LoopFrameModel::from_budgets(&budgets),
             ),
+            fit_invariant_broken: std::cell::Cell::new(false),
             session_capacity: None,
             session_host_capacity: None,
             capacity_modulation: squallar_device_profile::scene::Modulation::NONE,

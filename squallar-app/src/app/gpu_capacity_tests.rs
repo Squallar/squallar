@@ -686,3 +686,53 @@ fn the_modulation_term_is_the_identity_by_default_and_only_ever_lowers() {
         assert!(lowered.allowance() < two_terms.allowance());
     }
 }
+
+/// The fit-invariant latch is this `App`'s, not the process's: set on one, it
+/// holds that one's pool at the floor while an `App` built beside it still
+/// sizes its pool from the scene, and an `App` built after the first is
+/// dropped starts clear. The write stands in for the release-only path in
+/// `fit_scene`, which a debug build cannot reach past its `debug_assert!`.
+#[test]
+fn the_fit_invariant_latch_belongs_to_one_app() {
+    let six = six_two_hour_loops();
+    let a = headless(TestBridge::desktop());
+    let b = headless(TestBridge::desktop());
+    let limits = crate::loop_pool::LoopPoolLimits::from_budgets(&a.budgets);
+    let floor = crate::loop_pool::LoopPool::new(0, limits);
+    let sized = crate::loop_pool::LoopPool::for_scene(&six, &a.budgets, &a.capacity(), limits);
+    assert_ne!(
+        floor, sized,
+        "the fixture cannot tell a held pool from a sized one"
+    );
+
+    // `fit` holds by construction: a fit on either app latches nothing.
+    let _ = a.fit_scene(&six);
+    let _ = b.fit_scene(&six);
+    assert!(!a.fit_invariant_broken.get());
+    assert!(!b.fit_invariant_broken.get());
+    assert_eq!(a.pool_for_scene(&six), sized);
+
+    a.fit_invariant_broken.set(true);
+    assert_eq!(
+        a.pool_for_scene(&six),
+        floor,
+        "a latched app sizes its pool above the floor"
+    );
+    assert!(
+        !b.fit_invariant_broken.get(),
+        "the latch reached a second app"
+    );
+    assert_eq!(
+        b.pool_for_scene(&six),
+        sized,
+        "a second app's pool followed the first's latch"
+    );
+
+    drop(a);
+    let c = headless(TestBridge::desktop());
+    assert!(
+        !c.fit_invariant_broken.get(),
+        "a fresh app inherited a dropped app's latch"
+    );
+    assert_eq!(c.pool_for_scene(&six), sized);
+}
