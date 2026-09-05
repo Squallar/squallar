@@ -33,92 +33,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # An EXPLICIT feature list on the desktop rows, never `--all-features`.
-          # These rows do two jobs with one command: they are the cross-target
-          # compile coverage, and the executable each one's `artifact:` delivers
-          # -- bare, or wrapped in the macOS rows' signed .app -- is the file a
-          # person downloads and runs. `--all-features` therefore put every
-          # feature in the workspace into a shipped executable, and cargo offers
-          # no way for a feature to opt out of it.
-          #
-          # It did exactly that. `--all-features` enabled the overlays crate's
-          # test-only `fake-source`, so every desktop download registered a layer
-          # called "Fake Source", drew it, and wrote its id into the user's
-          # config. Read out of the binary, not inferred: the same bin built both
-          # ways in one tree carried `FakeSourceHandler` 129 times, "Fake Source"
-          # once and `overlay/fake` 3 times under `--all-features`, and zero of
-          # each under the list below, with "Reflectivity" found 11 times in both
-          # as the control that the scan reads something. That layer and its
-          # feature were deleted on 2026-08-22, so this particular arm is gone --
-          # but the reason for the explicit list is not, and the next paragraph
-          # is why.
-          #
-          # It also overrode the workspace's deliberate
-          # `nexrad-data = { default-features = false }` and compiled that
-          # crate's AWS polling arm into the binary. Measured, so the claim is no
-          # larger than the fact: the resolved PACKAGE set is identical either
-          # way (470), and reqwest, rustls, tokio and rayon are in the graph
-          # regardless -- reqwest arrives through `walkers`. What
-          # `--all-features` added was feature surface on packages already
-          # present, not new dependencies.
-          #
-          # `squallar/jni-typecheck` is the one thing these rows want that the
-          # manifests do not already give them. It widens the
-          # `cfg(target_os = "android")` module gate so the JNI bodies
-          # type-check on the host, and forwards to
-          # squallar-location/jni-typecheck.
-          #
-          # The serial/IOKit half needs no flag and never did: squallar's own
-          # `[target.'cfg(not(any(android, ios)))'.dependencies]` block turns on
-          # squallar-nmea-serial/serial, squallar-egui/gps-serial and
-          # squallar-location/serial for exactly these targets. Measured --
-          # `cargo tree -p squallar --target aarch64-apple-darwin -i io-kit-sys`
-          # prints serialport with no feature flag at all, and prints nothing at
-          # all for aarch64-apple-ios. The comment this replaces credited
-          # `--all-features` for the IOKit link; measuring it is what showed the
-          # credit was misplaced.
-          #
-          # What the list gives up against `--all-features`, measured with
-          # `cargo metadata --filter-platform` while `fake-source` still existed:
-          # 18 resolved features -- the fake-source family (3, since deleted),
-          # nexrad-data's aws arm with bzip2-rs/rayon (9), and 6 transitive tokio
-          # features under them. The aws arm is the live half, and it is the
-          # reason this list stays: `--all-features` overrode the workspace's
-          # deliberate `default-features = false` on nexrad-data. clippy.yaml
-          # still
-          # runs `--all-features` on the host, so what is given up is
-          # cross-target compile coverage of those arms, not coverage.
-          #
-          # `squallar/src/release_artifact_features.rs` holds this as a test: it
-          # parses this matrix and, for every row carrying an `artifact:` key,
-          # asserts that the feature SET the row's command requests contains no
-          # test-only feature. `--all-features` fails it because it expands to
-          # every feature the member manifests declare -- the property, not the
-          # spelling.
-          #
-          # `--release` on every row whose artifact a person can run, and folded
-          # into the command that already provides the compile coverage rather
-          # than added as a second one. Not for wall clock -- that comes out even,
-          # measured: folding it in is 6:30 cold and 3:25 warm against 6:25 and
-          # 3:27 for a debug coverage pass plus a release `-p squallar`.
-          # One fat-LTO link is nearly serial, while the 21 here run in parallel.
-          # What folding buys is the other two axes: one profile instead of two
-          # means the dependency graph is compiled once, `target/` is 1.8 GB
-          # instead of 12 GB, and the uploaded file is 27.5 MB instead of 602 MB
-          # on four rows every run. The cost is CPU -- about 3.4x warm, since
-          # 21 test binaries nobody runs are linked under fat LTO.
-          # `--all-targets` is unchanged, so the crate coverage is the same set
-          # of crates as before; the feature coverage is the list above.
-          #
-          # Until this said `--release`, every desktop download was workspace
-          # code at `opt-level = 0` with debug assertions on.
-          # `[profile.dev.package."*"]` optimizes the dependencies, so the whole
-          # penalty landed on squallar's own crates -- which is where the
-          # rasterizer is. squallar-web/src/lib.rs prices unoptimized workspace
-          # code at 2349 ms per Level II frame against 160-190 ms.
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
-            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu
+            cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu
             artifact: target/x86_64-unknown-linux-gnu/release/squallar
           # The artifact is a signed .app in a zip, not the bare executable.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
@@ -131,18 +48,18 @@ jobs:
             target: aarch64-apple-darwin
             package: macos
             macos_arch: aarch64
-            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-darwin
+            cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-darwin && cargo build --release -p squallar --features squallar/jni-typecheck --target aarch64-apple-darwin
             artifact: packaging/macos/build/aarch64-apple-darwin/squallar.app.zip
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
-            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-apple-darwin
+            cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-apple-darwin && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-apple-darwin
             artifact: packaging/macos/build/x86_64-apple-darwin/squallar.app.zip
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
-            cmd: cargo build --release --workspace --all-targets --features squallar/jni-typecheck --target x86_64-pc-windows-gnullvm
+            cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-pc-windows-gnullvm && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-pc-windows-gnullvm
             artifact: target/x86_64-pc-windows-gnullvm/release/squallar.exe
 
           # A real link, not a `check`. `squallar --lib` as a staticlib
@@ -171,67 +88,6 @@ jobs:
             artifact: packaging/ios/build/linux/iphonesimulator/squallar.app
             cmd: make -C packaging/ios IN_CONTAINER=1 SIMULATOR=1
 
-          # `./gradlew assembleRelease`, not a bare `cargo ndk`. These were the
-          # only rows whose artifact nobody could act on: every other row ships
-          # something that runs, and these shipped a `.so`, which is not an app
-          # but an input to one. Turning it into an installable APK is
-          # android/app/build.gradle.kts's job and it was already written; CI
-          # simply never called it.
-          #
-          # This is still one compile of one triple, and the coverage the old
-          # `cargo ndk` line gave is unchanged, because Gradle *is* that line:
-          # `buildRustLibRelease` runs `cargo ndk -t <abi> -P <minSdk> build -p
-          # squallar --lib --release`. `ring`'s build script still gets
-          # the cross clang/sysroot cargo-ndk exports. What changes is that the
-          # two constants are read from the Gradle build instead of repeated
-          # here: the old comment warned that `-P 28` "must track minSdk there",
-          # and on these rows it no longer can, because Gradle reads minSdk
-          # rather than being told it.
-          #
-          # That does not retire the literal repo-wide, and it is worth saying
-          # where the other one lives instead of implying there is none.
-          # clippy.yaml's "Verify the autofixed tree still builds (Android
-          # arm64-v8a)" step calls `cargo ndk` directly -- it lints rather than
-          # packages, so routing it through Gradle would buy it an APK it has
-          # no use for -- and something still has to hand it the platform
-          # level. That step now greps `minSdk` out of the same
-          # build.gradle.kts, so the number has one definition and two readers
-          # rather than one definition and two copies.
-          #
-          # `-PabiFilter` is what keeps one row to one ABI. Without it each row
-          # builds both, so every .so is compiled twice per run and a break in
-          # either ABI reddens both rows instead of the one that owns it.
-          #
-          # `abi` repeats what `-PabiFilter` already says because a matrix entry
-          # cannot reference a sibling key. It is not loose duplication: the
-          # assertion step reads the ABI back out of the finished APK and
-          # compares it to this, so the two disagreeing is a red row.
-          #
-          # The artifact *name* is itself the first signing check. AGP emits
-          # `app-<abi>-release-unsigned.apk` when the release build type has no
-          # signingConfig and `app-<abi>-release.apk` when it has one, so with
-          # `if-no-files-found: error` below, a run whose signing step quietly
-          # did nothing fails on the missing path rather than uploading a file
-          # Android would refuse to install. The assertion step still runs
-          # apksigner over the result afterwards, because a filename is not a
-          # signature.
-          #
-          # Two things `assembleRelease` brings with it that this change does
-          # not act on, written down so the next person meets them as known
-          # rather than as a surprise:
-          #
-          #   - It runs `lintVitalRelease`, so these rows can now go red on an
-          #     Android lint finding -- scope the `cargo ndk` line never had,
-          #     since it only ever compiled Rust. Nothing here configures or
-          #     suppresses that. The first time it fires is the moment to
-          #     choose between fixing the finding and scoping the lint,
-          #     deliberately rather than by reflex.
-          #
-          #   - R8 writes `mapping.txt` and AGP writes
-          #     `native-debug-symbols.zip`, and both die with the container.
-          #     Uploading them beside the APK is what would make a crash from a
-          #     CI build symbolicable; it is left out only because it is a
-          #     change to the upload step rather than to the build.
           - name: android-arm64-v8a
             target: aarch64-linux-android
             package: android
