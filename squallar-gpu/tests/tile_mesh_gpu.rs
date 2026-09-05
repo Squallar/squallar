@@ -291,6 +291,11 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture
     out
 }
 
+/// The whole canvas, which is also the clip every root painter carries.
+fn canvas() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIDE as f32, SIDE as f32))
+}
+
 /// One frame: `shapes` painted into `piece()`'s clip, tessellated by egui,
 /// drawn by egui's renderer into a fresh target, read back.
 ///
@@ -303,15 +308,31 @@ fn frame(
     format: wgpu::TextureFormat,
     shapes: Vec<egui::Shape>,
 ) -> Vec<u8> {
+    frame_clipped(device, queue, renderer, format, vec![(piece(), shapes)]).0
+}
+
+/// [`frame`] over several groups of shapes, each painted under its own clip
+/// rect in the order given -- the shape of a ground walk over more than one
+/// tile -- returning the readback and what egui's tessellator made of the
+/// shapes, so a case can count primitives beside comparing pixels.
+fn frame_clipped(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut egui_wgpu::Renderer,
+    format: wgpu::TextureFormat,
+    groups: Vec<(egui::Rect, Vec<egui::Shape>)>,
+) -> (Vec<u8>, Vec<egui::ClippedPrimitive>) {
     let ctx = egui::Context::default();
-    let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SIDE as f32, SIDE as f32));
+    let canvas = canvas();
     ctx.begin_pass(egui::RawInput {
         screen_rect: Some(canvas),
         ..Default::default()
     });
-    ctx.layer_painter(egui::LayerId::background())
-        .with_clip_rect(piece())
-        .extend(shapes);
+    for (clip, shapes) in groups {
+        ctx.layer_painter(egui::LayerId::background())
+            .with_clip_rect(clip)
+            .extend(shapes);
+    }
     let output = ctx.end_pass();
     let tris = ctx.tessellate(output.shapes, 1.0);
 
@@ -353,7 +374,7 @@ fn frame(
     buffers.push(encoder.finish());
     queue.submit(buffers);
 
-    read_back(device, queue, &texture)
+    (read_back(device, queue, &texture), tris)
 }
 
 /// The CPU path's shape: the flattened fills placed by
@@ -950,5 +971,349 @@ fn a_tile_the_cache_let_go_of_stops_being_resident_and_its_bytes_come_back() {
     assert!(
         peak_tiles >= 1 && peak_bytes >= one_tile_bytes,
         "nothing was ever resident, so the eviction bound is vacuous"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The hoisted background rectangles.
+//
+// `draw_tile_layer` draws every vector tile's background rectangle ahead of
+// every tile's geometry, under the pane's clip, cut to its piece by
+// `tile_mesh::background_within` instead of clipped to it by the tile's own
+// painter -- so epaint tessellates the lot into one primitive where the clip
+// opened one per tile. Whether the cut is the clip, pixel for pixel, is the
+// question below; `background_within`'s docs carry the argument and this is
+// the picture that holds it.
+// ---------------------------------------------------------------------------
+
+/// The grid's north-west corner, **off the pixel grid on purpose, and
+/// differently on the two axes.** Every x edge lands on an exact half-pixel,
+/// where a hard edge and `round()` disagree: the rasterizer's top-left rule
+/// covers a pixel centre sitting on a left edge and not one on a right edge,
+/// while `round()` pushes both edges up. So the pixel-rounding
+/// `background_within` spells out is load-bearing on that axis, and gated
+/// here -- without it the case below reads three whole columns off, 600
+/// texels, one column per half-pixel x edge handed to the wrong side. Every y
+/// edge lands elsewhere between pixels, where a hard edge rounds itself to
+/// the nearest pixel centre and the two roundings have merely to agree.
+const GRID_ORIGIN: egui::Pos2 = egui::pos2(28.5, 27.6);
+
+/// A tile's side, in points and texels. Small enough that the 2x2 grid plus
+/// the stretched ancestor's overreach fit the canvas with margin.
+const GRID_SIDE: f32 = 100.0;
+
+/// One tile of the fixture grid.
+struct GridTile {
+    /// The rect the tile occupies on screen.
+    piece: egui::Rect,
+    /// The rect the whole tile is placed against: the piece, or twice it for
+    /// the stretched ancestor.
+    full: egui::Rect,
+    /// Its background colour. Opaque and distinct per tile, so a background
+    /// reaching over a neighbour is a visible change.
+    background: egui::Color32,
+    /// Its one fill quad's colour. Opaque, so a rectangle drawn over it
+    /// instead of under it is a visible change.
+    quad: egui::Color32,
+}
+
+/// A 2x2 grid: three tiles answered by themselves and, south-east, one
+/// answered by a **stretched ancestor** whose south-east quarter is the piece
+/// -- the whole tile placed against that window is 200 points across and
+/// covers all four pieces. That tile is the case the per-tile clip existed
+/// for, and the case the cut has to reproduce.
+fn grid_tiles() -> Vec<GridTile> {
+    let colours = [
+        (
+            egui::Color32::from_rgb(0x10, 0x20, 0x30),
+            egui::Color32::from_rgb(200, 30, 40),
+        ),
+        (
+            egui::Color32::from_rgb(0x30, 0x20, 0x10),
+            egui::Color32::from_rgb(20, 160, 60),
+        ),
+        (
+            egui::Color32::from_rgb(0x20, 0x30, 0x10),
+            egui::Color32::from_rgb(40, 60, 220),
+        ),
+        (
+            egui::Color32::from_rgb(0x70, 0x10, 0x10),
+            egui::Color32::from_rgb(230, 200, 20),
+        ),
+    ];
+    colours
+        .into_iter()
+        .enumerate()
+        .map(|(i, (background, quad))| {
+            let column = (i % 2) as f32;
+            let row = (i / 2) as f32;
+            let piece = egui::Rect::from_min_size(
+                GRID_ORIGIN + egui::vec2(column * GRID_SIDE, row * GRID_SIDE),
+                egui::vec2(GRID_SIDE, GRID_SIDE),
+            );
+            let full = if i == 3 {
+                egui::Rect::from_min_max(
+                    piece.max - egui::vec2(2.0 * GRID_SIDE, 2.0 * GRID_SIDE),
+                    piece.max,
+                )
+            } else {
+                piece
+            };
+            GridTile {
+                piece,
+                full,
+                background,
+                quad,
+            }
+        })
+        .collect()
+}
+
+/// Each tile's quad, flattened through the map's own flattener: the middle
+/// half of the extent, which on the stretched ancestor places partly outside
+/// its piece and so exercises the scissor on geometry in every arm.
+fn grid_meshes(tiles: &[GridTile]) -> Vec<std::sync::Arc<tile_mesh::TileMeshes>> {
+    tiles
+        .iter()
+        .map(|tile| {
+            let mut mesh = egui::epaint::Mesh::default();
+            mesh.add_rect_with_uv(
+                egui::Rect::from_min_max(
+                    egui::pos2(EXTENT * 0.25, EXTENT * 0.25),
+                    egui::pos2(EXTENT * 0.75, EXTENT * 0.75),
+                ),
+                egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+                tile.quad,
+            );
+            std::sync::Arc::new(tile_mesh::flatten_meshes(std::iter::once((0, &mesh))))
+        })
+        .collect()
+}
+
+/// The tile's background as the tile's own walk places it: the whole extent
+/// onto the whole tile.
+fn placed_background(tile: &GridTile) -> egui::epaint::RectShape {
+    egui::epaint::RectShape::filled(tile.full, 0.0, tile.background)
+}
+
+/// One callback drawing the tile's quad at the whole tile's placement, under
+/// the piece -- what `paint_vector_tile` emits for the tile's one run.
+fn grid_callback(
+    tile: &GridTile,
+    meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
+    pass_nr: u64,
+) -> egui::Shape {
+    egui::Shape::Callback(egui::epaint::PaintCallback {
+        rect: tile.piece,
+        callback: TileMeshBridge
+            .payload(tile_mesh::GroundDraw {
+                meshes,
+                first_run: 0,
+                run_count: 1,
+                place: tile_mesh::Placement::of(tile.full),
+                pass_nr,
+            })
+            .expect("the bridge always answers for a run it was given"),
+    })
+}
+
+/// The tiles' geometry, one clipped group per tile, in walk order.
+fn grid_geometry(
+    tiles: &[GridTile],
+    meshes: &[std::sync::Arc<tile_mesh::TileMeshes>],
+    pass_nr: u64,
+) -> Vec<(egui::Rect, Vec<egui::Shape>)> {
+    tiles
+        .iter()
+        .zip(meshes)
+        .map(|(tile, meshes)| (tile.piece, vec![grid_callback(tile, meshes, pass_nr)]))
+        .collect()
+}
+
+/// **The gate for the hoist.** Four tiles drawn four ways, and the readbacks
+/// compared byte for byte:
+///
+/// * **per tile, clipped** -- the arrangement the hoist replaces: each tile's
+///   background placed on the whole tile and clipped to the piece by the
+///   tile's own painter, then its geometry, tile after tile;
+/// * **hoisted** -- what `draw_tile_layer` emits now: every background cut to
+///   its piece by `tile_mesh::background_within` -- the hard mesh at the
+///   pixel-rounded intersection -- under the canvas's clip, ahead of every
+///   tile's geometry. Must match the first byte for byte, or the cut is not
+///   the clip. (A *feathered* rectangle here is not: its alpha-zero outer
+///   band still blends and dithers one pixel into each neighbour, 59 texels
+///   on this canvas, which is what the scissor used to discard.);
+/// * **hoisted, uncut** -- the same hoist without the intersection. The
+///   stretched ancestor's background then covers all four pieces, so this
+///   *must differ*: it is what shows the cut is load-bearing and the compare
+///   can see a background where it does not belong;
+/// * **hoisted, after the geometry** -- the backgrounds drawn last. Opaque
+///   backgrounds over opaque quads, so this too *must differ*: it shows the
+///   compare can see draw order, so the first agreement is evidence that the
+///   hoist preserved it rather than of an insensitive compare.
+///
+/// The primitive count is asserted beside the pixels: the four clipped
+/// backgrounds are four primitives and the four hoisted ones are one, which
+/// is the whole reason the hoist exists.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn the_hoisted_background_rectangles_put_the_same_bytes_on_screen_as_per_tile_clipping() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let tiles = grid_tiles();
+    let meshes = grid_meshes(&tiles);
+
+    // Non-triviality of the fixture itself: the ancestor's placed background
+    // really does reach over the other three pieces, so uncut it would paint
+    // them; and every tile edge is off the pixel grid.
+    // (To within an ulp of `f32` grid arithmetic: what matters is that the
+    // uncut rectangle paints the neighbours' interiors, not a shared edge.)
+    let ancestor = &tiles[3];
+    for other in &tiles[..3] {
+        assert!(
+            ancestor.full.expand(0.01).contains_rect(other.piece),
+            "fixture: the ancestor's whole tile {:?} does not cover {:?}",
+            ancestor.full,
+            other.piece
+        );
+    }
+    for tile in &tiles {
+        for edge in [tile.piece.min.x, tile.piece.max.x] {
+            assert!(
+                (edge.fract() - 0.5).abs() < 1e-4,
+                "fixture: the x edge {edge} is not on a half-pixel, so the tie the \
+                 rounding decides is untested"
+            );
+        }
+        for edge in [tile.piece.min.y, tile.piece.max.y] {
+            assert!(
+                (edge - edge.round()).abs() > 0.05 && (edge.fract() - 0.5).abs() > 0.05,
+                "fixture: the y edge {edge} sits on the pixel grid or on a half-pixel"
+            );
+        }
+    }
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+
+    // The arrangement the hoist replaces.
+    let per_tile: Vec<(egui::Rect, Vec<egui::Shape>)> = tiles
+        .iter()
+        .zip(&meshes)
+        .map(|(tile, meshes)| {
+            (
+                tile.piece,
+                vec![
+                    egui::Shape::Rect(placed_background(tile)),
+                    grid_callback(tile, meshes, 1),
+                ],
+            )
+        })
+        .collect();
+    let (clipped, clipped_prims) = frame_clipped(&device, &queue, &mut renderer, format, per_tile);
+
+    // What the walk emits now.
+    let hoisted_rects: Vec<egui::Shape> = tiles
+        .iter()
+        .map(|tile| {
+            tile_mesh::background_within(&placed_background(tile), tile.piece, 1.0)
+                .expect("every background overlaps its piece")
+        })
+        .collect();
+    let mut hoisted = vec![(canvas(), hoisted_rects.clone())];
+    hoisted.extend(grid_geometry(&tiles, &meshes, 2));
+    let (hoisted, hoisted_prims) = frame_clipped(&device, &queue, &mut renderer, format, hoisted);
+
+    // Control one: hoisted without the cut.
+    let mut uncut = vec![(
+        canvas(),
+        tiles
+            .iter()
+            .map(|tile| egui::Shape::Rect(placed_background(tile)))
+            .collect(),
+    )];
+    uncut.extend(grid_geometry(&tiles, &meshes, 3));
+    let (uncut, _) = frame_clipped(&device, &queue, &mut renderer, format, uncut);
+
+    // Control two: hoisted after the geometry instead of ahead of it.
+    let mut last = grid_geometry(&tiles, &meshes, 4);
+    last.push((canvas(), hoisted_rects));
+    let (rects_last, _) = frame_clipped(&device, &queue, &mut renderer, format, last);
+
+    let drew = painted(&clipped);
+    assert!(
+        drew >= (4.0 * GRID_SIDE * GRID_SIDE * 0.95) as usize,
+        "non-triviality: the clipped arrangement painted {drew} texels of the \
+         {} four opaque pieces cover",
+        (4.0 * GRID_SIDE * GRID_SIDE) as usize
+    );
+    assert_ne!(
+        uncut, clipped,
+        "the control is blind: the ancestor's background drawn uncut over its \
+         three neighbours produced the same picture as the clipped arrangement, \
+         so the cut is not load-bearing here and the agreement below proves nothing"
+    );
+    assert_ne!(
+        rects_last, clipped,
+        "the control is blind: drawing the backgrounds over the quads produced \
+         the same picture as drawing them under, so the compare cannot see draw order"
+    );
+
+    let differing: Vec<String> = clipped
+        .chunks_exact(4)
+        .zip(hoisted.chunks_exact(4))
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, (a, b))| {
+            format!(
+                "({}, {}): clipped {a:?} hoisted {b:?}",
+                i % SIDE as usize,
+                i / SIDE as usize
+            )
+        })
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{} of {} texels differ between the per-tile clipped backgrounds and the \
+         hoisted cut ones -- the cut is not the clip. The first of them:\n{}",
+        differing.len(),
+        SIDE * SIDE,
+        differing
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // The count the hoist exists for: four clipped backgrounds were four
+    // primitives; hoisted they are one mesh of four hard rectangles.
+    let meshes_in = |prims: &[egui::ClippedPrimitive]| {
+        prims
+            .iter()
+            .filter(|p| matches!(p.primitive, egui::epaint::Primitive::Mesh(_)))
+            .count()
+    };
+    assert_eq!(
+        (meshes_in(&clipped_prims), clipped_prims.len()),
+        (4, 8),
+        "the clipped arrangement is four background primitives and four callbacks"
+    );
+    assert_eq!(
+        (meshes_in(&hoisted_prims), hoisted_prims.len()),
+        (1, 5),
+        "the hoisted arrangement is one background primitive and four callbacks"
+    );
+    let egui::epaint::Primitive::Mesh(first) = &hoisted_prims[0].primitive else {
+        panic!("the hoisted backgrounds do not lead the primitive list")
+    };
+    assert_eq!(
+        first.vertices.len(),
+        4 * 4,
+        "the one background mesh holds {} vertices, not four hard rectangles' 16",
+        first.vertices.len()
     );
 }

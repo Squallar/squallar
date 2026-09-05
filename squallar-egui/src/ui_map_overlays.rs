@@ -1,5 +1,5 @@
 use crate::overlay_cache::{OverlayTextureData, draw_overlay_texture, geo_point_in_feature};
-use crate::tile_source::HttpsTiles;
+use crate::tile_source::{GroundPiece, HttpsTiles};
 use squallar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use squallar_overlays::types::OverlayLabel;
 use std::sync::Arc;
@@ -299,6 +299,15 @@ pub(super) fn draw_tile_layer(
     // arrived, never one the source cannot serve.
     let mut exact = true;
 
+    // Two walks over the span, not one. The first asks the source for every
+    // cell and paints nothing but the vector tiles' background rectangles --
+    // all of them, ahead of every tile's geometry, under the pane's clip
+    // rather than each tile's own, so epaint tessellates the lot into ONE
+    // primitive where the per-tile clip opened one per tile (45 on a
+    // 1920x1080 pane: the ground's largest remaining primitive source once
+    // its callbacks were batched). The second walk draws the tiles. Why the
+    // hoist changes no pixel is `hoisted_background`'s to say.
+    let mut answered: Vec<(egui::Rect, GroundPiece, Background)> = Vec::with_capacity(span.tiles());
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
             let tile_id = TileId {
@@ -307,49 +316,67 @@ pub(super) fn draw_tile_layer(
                 zoom: tile_zoom,
             };
 
-            let answered = tiles.ground_at(tile_id);
-            exact &= answered
-                .as_ref()
-                .is_some_and(|piece| piece.uv == FULL_TILE_UV);
-            if let Some(twuv) = answered {
-                // Affine, not geographic. This used to spell the tile's two corners as
-                // latitudes and longitudes and hand them to `geo_corner_rect`, which
-                // projected them straight back: `tile_to_lat` is `sinh`/`atan` and
-                // `Projector::project` is `tan`/`asinh`, exact inverses, four transcendental
-                // pairs per tile to arrive at a rect that is a linear function of
-                // `(x, y, zoom)`. `tests::the_affine_tile_rect_agrees_with_the_geographic_round_trip`
-                // holds the two answers together.
-                let rect = projector.tile_rect(tile_id);
+            let piece = tiles.ground_at(tile_id);
+            exact &= piece.as_ref().is_some_and(|piece| piece.uv == FULL_TILE_UV);
+            let Some(piece) = piece else {
+                continue;
+            };
 
-                match twuv.tile {
-                    // `window_of` and not `twuv.uv`: the tile may be a slot
-                    // of a shared texture, and the ancestor window is a
-                    // window of the TILE. It is the identity for a tile with
-                    // a texture to itself.
-                    Tile::Raster(ref raster) => {
-                        ui.painter().image(
-                            raster.id(),
-                            rect,
-                            raster.window_of(twuv.uv),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                    Tile::Vector(ref shapes) => {
-                        paint_vector_tile(
-                            ui.painter(),
-                            shapes,
-                            GroundMeshes {
-                                meshes: twuv.meshes.as_ref(),
-                                painter: ground,
-                                pass_nr,
-                                feathering,
-                            },
-                            rect,
-                            twuv.uv,
-                            &mut labels,
-                        );
+            // Affine, not geographic. This used to spell the tile's two corners as
+            // latitudes and longitudes and hand them to `geo_corner_rect`, which
+            // projected them straight back: `tile_to_lat` is `sinh`/`atan` and
+            // `Projector::project` is `tan`/`asinh`, exact inverses, four transcendental
+            // pairs per tile to arrive at a rect that is a linear function of
+            // `(x, y, zoom)`. `tests::the_affine_tile_rect_agrees_with_the_geographic_round_trip`
+            // holds the two answers together.
+            let rect = projector.tile_rect(tile_id);
+
+            let background = match &piece.tile {
+                Tile::Vector(shapes) => {
+                    match hoisted_background(shapes, rect, piece.uv, ui.pixels_per_point()) {
+                        Some(shape) => {
+                            ui.painter().add(shape);
+                            Background::Hoisted
+                        }
+                        None => Background::Inline,
                     }
                 }
+                // A raster tile has no background rectangle to take.
+                Tile::Raster(_) => Background::Inline,
+            };
+            answered.push((rect, piece, background));
+        }
+    }
+
+    for (rect, piece, background) in answered {
+        match piece.tile {
+            // `window_of` and not `piece.uv`: the tile may be a slot
+            // of a shared texture, and the ancestor window is a
+            // window of the TILE. It is the identity for a tile with
+            // a texture to itself.
+            Tile::Raster(ref raster) => {
+                ui.painter().image(
+                    raster.id(),
+                    rect,
+                    raster.window_of(piece.uv),
+                    egui::Color32::WHITE,
+                );
+            }
+            Tile::Vector(ref shapes) => {
+                paint_vector_tile(
+                    ui.painter(),
+                    shapes,
+                    GroundMeshes {
+                        meshes: piece.meshes.as_ref(),
+                        painter: ground,
+                        pass_nr,
+                        feathering,
+                    },
+                    rect,
+                    piece.uv,
+                    &mut labels,
+                    background,
+                );
             }
         }
     }
@@ -456,61 +483,6 @@ fn lay_out_label(
     }
 }
 
-/// Paint one decoded vector tile.
-///
-/// `shapes` are in MVT extent units over the whole tile and are shared by every
-/// pane that draws this tile, so nothing here mutates them:
-/// [`walkers::ShapeOrText::placed`] returns a placed copy of the one shape it
-/// is given.
-///
-/// **One copy of a shape is made, and only for the shapes the clip can show.**
-/// This used to be `mvt::transformed`, which materialised a whole second
-/// `Vec<ShapeOrText>` and then walked it in place — and the in-place walk hit
-/// `Arc::make_mut` on every tessellated fill, which copied again because the
-/// tile cache still held the original. Two deep copies of every shape in every
-/// visible tile, every frame. Measured on the committed Monaco fixture's z14
-/// tile, release build: 22.9 us to clone the cached `Tile` plus 135.2 us to
-/// transform it — 158.1 us per tile per frame, against a viewport that holds up
-/// to 84 tiles.
-///
-/// **The tessellated fills and the strokes do not take that copy at all where
-/// a renderer can draw them.** Both were flattened once when the tile arrived
-/// ([`crate::tile_mesh`]) and are drawn from a GPU buffer with the placement
-/// as a uniform, so a run becomes one paint callback rather than a copy of its
-/// geometry. Same fixture, same build: the two coalesced meshes were 12.63 us
-/// of the tile's 26.61 us of placement and the 708 stroked paths beside them
-/// were the other 13.51 us. A stroke's width is in screen points while its
-/// geometry is in extent units, which is what used to keep it here; the offset
-/// each vertex takes from its point is invariant under the placement, so it is
-/// pre-computed and added in the shader ([`crate::tile_mesh::stroke`]).
-/// `ground` being `None` (a floor strip, a raster tile, a build with no
-/// renderer installed) puts every run back on this path unchanged, and so does
-/// a tile flattened at a feathering this frame does not draw at.
-///
-/// **Nothing is culled here, and that was measured rather than assumed.** A
-/// per-shape bounding-rect test against the clip looks like the obvious
-/// companion to this, and it was tried: on the quarter-piece ancestor case it
-/// dropped 738 shapes to 75 and still ran *slower* (35.9 us against 32.1 us),
-/// because `mvt::render` folds a tile's fills into a couple of large meshes and
-/// a large mesh both dominates the bounds pass and always intersects. epaint's
-/// own `visual_bounding_rect` cull against the clip is what does this job, and
-/// it does it after the tessellator rather than before this loop.
-///
-/// The placement is against the whole tile
-/// ([`full_rect_of_clipped_tile`]) and the clip is against the piece, so an
-/// ancestor stretched over a gap draws only the part that belongs to the tile
-/// that was asked for.
-///
-/// **This is the ground phase: it paints geometry and defers every label.**
-/// Text is pushed onto `labels` for [`paint_labels`] to lay out once the whole
-/// grid has been walked, and is *not* painted through this function's clip —
-/// a name whose glyphs straddle a tile boundary has to draw whole.
-///
-/// A label is taken from the tile whose piece its **anchor** falls in, and from
-/// that tile only. Vector tiles carry a buffer, so the same place is present in
-/// its neighbours' data too; without the anchor test each copy would be drawn,
-/// and copies generalised at different zooms do not land close enough to be
-/// collided away.
 /// Place one shape on the CPU: count it, transform it, and file it as geometry
 /// or as a deferred label.
 ///
@@ -709,6 +681,127 @@ fn take_run_batch(
     }
 }
 
+/// The shape a vector tile's background rectangle is, when it is one:
+/// `mvt::render` pushes the style's `background` layer before anything it
+/// reads a feature for, so it is shape 0 of every styled tile.
+const BACKGROUND_SHAPE: usize = 0;
+
+/// Where a vector tile's background rectangle is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Background {
+    /// Inside the tile's own walk, placed and clipped like every other shape.
+    Inline,
+    /// Already drawn by the caller, ahead of every tile's geometry, from
+    /// [`hoisted_background`]; the tile's walk skips [`BACKGROUND_SHAPE`].
+    Hoisted,
+}
+
+impl Background {
+    /// Whether the caller has already drawn shape `index`.
+    fn already_drew(self, index: usize) -> bool {
+        self == Self::Hoisted && index == BACKGROUND_SHAPE
+    }
+}
+
+/// A vector tile's background rectangle, if the ground walk may draw it out of
+/// the tile -- see [`crate::tile_mesh::is_hoistable_background`] -- placed
+/// against the whole tile exactly as the tile's own walk would place it, then
+/// cut to `piece` as the hard mesh that paints what the clipped rectangle
+/// painted ([`crate::tile_mesh::background_within`]).
+///
+/// **Shape [`BACKGROUND_SHAPE`] and nothing else.** Hoisting a shape ahead of
+/// every tile's geometry preserves draw order only for a shape nothing in its
+/// own tile draws under, and within a tile that is the first shape alone.
+/// Across tiles it is what the cut buys: a rectangle cut to its piece paints
+/// no pixel of any other piece -- tiles partition the pane
+/// (`Projector::tile_rect` is affine in the tile index, so neighbours share an
+/// edge bit for bit), and every neighbour's geometry is scissored to *its*
+/// piece by the same `round()` this rectangle's edges take -- so it commutes
+/// with the geometry of every tile but its own, and its own is still drawn
+/// after it. A label is drawn after every tile, as it always was.
+///
+/// `None` leaves the shape to the tile's clipped walk: a tile whose first
+/// shape is not a plain fill, or a background that misses its piece.
+fn hoisted_background(
+    shapes: &[walkers::ShapeOrText],
+    piece: egui::Rect,
+    uv: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<egui::Shape> {
+    let first = shapes.get(BACKGROUND_SHAPE)?;
+    let walkers::ShapeOrText::Shape(egui::Shape::Rect(background)) = first else {
+        return None;
+    };
+    if !crate::tile_mesh::is_hoistable_background(background) {
+        return None;
+    }
+    // `placed`, not a hand-written transform: the same arithmetic `place_one`
+    // applies to every shape the tile's own walk draws.
+    let placement = walkers::mvt::placement(full_rect_of_clipped_tile(piece, uv));
+    let walkers::ShapeOrText::Shape(egui::Shape::Rect(placed)) = first.placed(placement) else {
+        return None;
+    };
+    crate::tile_mesh::background_within(&placed, piece, pixels_per_point)
+}
+
+/// Paint one decoded vector tile.
+///
+/// `shapes` are in MVT extent units over the whole tile and are shared by every
+/// pane that draws this tile, so nothing here mutates them:
+/// [`walkers::ShapeOrText::placed`] returns a placed copy of the one shape it
+/// is given.
+///
+/// **One copy of a shape is made, and only for the shapes the clip can show.**
+/// This used to be `mvt::transformed`, which materialised a whole second
+/// `Vec<ShapeOrText>` and then walked it in place — and the in-place walk hit
+/// `Arc::make_mut` on every tessellated fill, which copied again because the
+/// tile cache still held the original. Two deep copies of every shape in every
+/// visible tile, every frame. Measured on the committed Monaco fixture's z14
+/// tile, release build: 22.9 us to clone the cached `Tile` plus 135.2 us to
+/// transform it — 158.1 us per tile per frame, against a viewport that holds up
+/// to 84 tiles.
+///
+/// **The tessellated fills and the strokes do not take that copy at all where
+/// a renderer can draw them.** Both were flattened once when the tile arrived
+/// ([`crate::tile_mesh`]) and are drawn from a GPU buffer with the placement
+/// as a uniform, so a run becomes one paint callback rather than a copy of its
+/// geometry. Same fixture, same build: the two coalesced meshes were 12.63 us
+/// of the tile's 26.61 us of placement and the 708 stroked paths beside them
+/// were the other 13.51 us. A stroke's width is in screen points while its
+/// geometry is in extent units, which is what used to keep it here; the offset
+/// each vertex takes from its point is invariant under the placement, so it is
+/// pre-computed and added in the shader ([`crate::tile_mesh::stroke`]).
+/// `ground` being `None` (a floor strip, a raster tile, a build with no
+/// renderer installed) puts every run back on this path unchanged, and so does
+/// a tile flattened at a feathering this frame does not draw at.
+///
+/// **Nothing is culled here, and that was measured rather than assumed.** A
+/// per-shape bounding-rect test against the clip looks like the obvious
+/// companion to this, and it was tried: on the quarter-piece ancestor case it
+/// dropped 738 shapes to 75 and still ran *slower* (35.9 us against 32.1 us),
+/// because `mvt::render` folds a tile's fills into a couple of large meshes and
+/// a large mesh both dominates the bounds pass and always intersects. epaint's
+/// own `visual_bounding_rect` cull against the clip is what does this job, and
+/// it does it after the tessellator rather than before this loop.
+///
+/// The placement is against the whole tile
+/// ([`full_rect_of_clipped_tile`]) and the clip is against the piece, so an
+/// ancestor stretched over a gap draws only the part that belongs to the tile
+/// that was asked for. The one shape that does not take that clip is the
+/// background rectangle when `background` is [`Background::Hoisted`]: the
+/// caller has already drawn it, cut to the piece rather than clipped to it,
+/// ahead of every tile -- see [`hoisted_background`] -- and this walk skips it.
+///
+/// **This is the ground phase: it paints geometry and defers every label.**
+/// Text is pushed onto `labels` for [`paint_labels`] to lay out once the whole
+/// grid has been walked, and is *not* painted through this function's clip —
+/// a name whose glyphs straddle a tile boundary has to draw whole.
+///
+/// A label is taken from the tile whose piece its **anchor** falls in, and from
+/// that tile only. Vector tiles carry a buffer, so the same place is present in
+/// its neighbours' data too; without the anchor test each copy would be drawn,
+/// and copies generalised at different zooms do not land close enough to be
+/// collided away.
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
@@ -716,6 +809,7 @@ fn paint_vector_tile(
     rect: egui::Rect,
     uv: egui::Rect,
     labels: &mut Vec<walkers::Text>,
+    background: Background,
 ) {
     let painter = painter.with_clip_rect(rect);
 
@@ -761,6 +855,9 @@ fn paint_vector_tile(
                     );
                 }
                 crate::tile_mesh::PlanStep::Place(index) => {
+                    if background.already_drew(index as usize) {
+                        continue;
+                    }
                     if let Some(shape) = shapes.get(index as usize) {
                         place_one(shape, placement, rect, &mut counted, &mut placed, labels);
                     }
@@ -780,6 +877,9 @@ fn paint_vector_tile(
             if runs.covers(index)
                 && matches!(shape, walkers::ShapeOrText::Shape(egui::Shape::Path(_)))
             {
+                continue;
+            }
+            if background.already_drew(index) {
                 continue;
             }
             place_one(shape, placement, rect, &mut counted, &mut placed, labels);
@@ -1407,14 +1507,22 @@ mod tests {
         // NON-VACUITY, and the specific thing that would have passed before:
         // the old arm emitted exactly one `rect_filled` in MAGENTA. So "some
         // shape was emitted" is not the assertion -- the fill has to be the
-        // colour the tile carried, at the tile's own rect.
+        // colour the tile carried, at the tile's own rect. It arrives as the
+        // hoisted background (`tile_mesh::background_within`): a hard mesh on
+        // the tile's rect rounded to pixels.
+        let fill = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+        let expected = {
+            use egui::emath::GuiRounding as _;
+            rect.round_to_pixels(1.0)
+        };
         let painted_fill = shapes.iter().any(|clipped| {
             matches!(
                 &clipped.shape,
-                egui::Shape::Rect(r)
-                    if r.fill == egui::Color32::from_rgb(0x10, 0x20, 0x30)
-                        && (r.rect.min - rect.min).length() < 0.01
-                        && (r.rect.max - rect.max).length() < 0.01
+                egui::Shape::Mesh(m)
+                    if m.vertices.len() == 4
+                        && m.vertices.iter().all(|v| v.color == fill)
+                        && (m.calc_bounds().min - expected.min).length() < 0.01
+                        && (m.calc_bounds().max - expected.max).length() < 0.01
             )
         });
         assert!(
@@ -1515,6 +1623,7 @@ mod tests {
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 &mut Vec::new(),
+                Background::Inline,
             );
         });
 
@@ -1545,6 +1654,7 @@ mod tests {
                 *rect,
                 whole,
                 &mut labels,
+                Background::Inline,
             );
         }
         paint_labels(ui.painter(), labels, &mut walkers::GalleyCache::default());
@@ -2496,6 +2606,7 @@ mod tests {
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 &mut labels,
+                Background::Inline,
             );
             paint_labels(
                 ui.painter(),
@@ -2796,5 +2907,454 @@ mod tests {
             2,
             "a refused run was not placed exactly once"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The hoisted background rectangles.
+    //
+    // `draw_tile_layer` draws every vector tile's background ahead of every
+    // tile's geometry, under the pane's clip, so epaint makes one primitive
+    // of them where the per-tile clip made one each. Pixel parity with the
+    // clipped arrangement is the GPU suite's to hold
+    // (`squallar-gpu/tests/tile_mesh_gpu.rs`); what is pinned here is the
+    // arrangement itself: where the rectangles sit in the shape list, what
+    // clip they carry, and that the tessellator really merges them.
+    // -----------------------------------------------------------------
+
+    use egui::emath::GuiRounding as _;
+
+    /// The zoom every fixture below is drawn at: whole, so the tile side is
+    /// exactly 256 points and a 512-point pane spans more than one cell.
+    const HOIST_ZOOM: f64 = 6.0;
+
+    /// A styled tile in miniature whose ground the CPU path draws as real
+    /// geometry: the background rectangle first, then one opaque quad over
+    /// the whole extent.
+    fn a_tile_with_a_quad(background: egui::Color32) -> Tile {
+        let mut quad = egui::epaint::Mesh::default();
+        quad.add_rect_with_uv(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)),
+            egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+            egui::Color32::RED,
+        );
+        Tile::Vector(std::sync::Arc::new(vec![
+            ShapeOrText::Shape(egui::Shape::rect_filled(
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT)),
+                0.0,
+                background,
+            )),
+            ShapeOrText::Shape(egui::Shape::Mesh(quad.into())),
+        ]))
+    }
+
+    /// A 512-point pane at [`HOIST_ZOOM`] over `DeadSource`, and the cells its
+    /// span walks, in walk order (north to south, west to east).
+    fn a_pane_and_its_cells() -> (
+        egui::Context,
+        egui::Rect,
+        walkers::Projector,
+        HttpsTiles,
+        Vec<TileId>,
+    ) {
+        squallar_radar::tls::init();
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(512.0, 512.0));
+        let mut memory = walkers::MapMemory::default();
+        memory
+            .set_zoom(HOIST_ZOOM)
+            .expect("zoom 6 is in walkers' range");
+        let projector = walkers::Projector::new(canvas, &memory, walkers::lat_lon(35.33, -97.28));
+        let tiles = HttpsTiles::with_client(
+            DeadSource,
+            ctx.clone(),
+            reqwest::Client::builder()
+                .build()
+                .expect("the test client should build"),
+        );
+        let tile_zoom = HOIST_ZOOM.round() as u8;
+        let span = crate::tiles::tile_span(&projector, canvas, tile_zoom);
+        let mut cells = Vec::new();
+        for ty in span.north..=span.south {
+            for tx in span.west..=span.east {
+                cells.push(TileId {
+                    x: tx,
+                    y: ty,
+                    zoom: tile_zoom,
+                });
+            }
+        }
+        assert!(
+            cells.len() > 1,
+            "fixture: one cell cannot show a merge or a neighbour"
+        );
+        (ctx, canvas, projector, tiles, cells)
+    }
+
+    /// One ground pass over the pane, returning the shapes it emitted and the
+    /// clip the pane's own painter carried.
+    fn one_pane_pass(
+        ctx: &egui::Context,
+        canvas: egui::Rect,
+        projector: &walkers::Projector,
+        tiles: &mut HttpsTiles,
+    ) -> (Vec<egui::epaint::ClippedShape>, egui::Rect) {
+        let pane_clip = std::cell::Cell::new(egui::Rect::NOTHING);
+        let shapes = shapes_of_one_pass(ctx, canvas, |ui| {
+            pane_clip.set(ui.clip_rect());
+            draw_tile_layer(ui, projector, HOIST_ZOOM, tiles, 0, None);
+        });
+        (shapes, pane_clip.get())
+    }
+
+    /// An inline background: the `Shape::Rect` the tile's own walk places.
+    fn is_fill(clipped: &egui::epaint::ClippedShape, fill: egui::Color32) -> bool {
+        matches!(&clipped.shape, egui::Shape::Rect(r) if r.fill == fill && r.stroke.is_empty())
+    }
+
+    /// A solid four-vertex mesh in one colour: the hoisted form of a
+    /// background (`tile_mesh::background_within`) -- and also the fixture's
+    /// quads, which is why every colour below is distinct.
+    fn is_solid_quad(clipped: &egui::epaint::ClippedShape, colour: egui::Color32) -> bool {
+        matches!(
+            &clipped.shape,
+            egui::Shape::Mesh(m) if m.vertices.len() == 4 && m.vertices.iter().all(|v| v.color == colour)
+        )
+    }
+
+    fn bounds_of(clipped: &egui::epaint::ClippedShape) -> egui::Rect {
+        let egui::Shape::Mesh(m) = &clipped.shape else {
+            panic!("{:?} is not a mesh", clipped.shape)
+        };
+        m.calc_bounds()
+    }
+
+    fn within(a: egui::Rect, b: egui::Rect, tolerance: f32) -> bool {
+        (a.min - b.min).length() < tolerance && (a.max - b.max).length() < tolerance
+    }
+
+    /// **Every tile's background rectangle leads the walk, under the pane's
+    /// clip, and epaint makes one mesh of them.** Under the per-tile clip each
+    /// was its own primitive -- one per tile, per pane, per frame, and the
+    /// ground's largest remaining primitive source once its callbacks were
+    /// batched.
+    ///
+    /// Three things are pinned and each alone would pass a defect: that the
+    /// rectangles come first and carry the pane's clip (else they are still
+    /// one primitive each); that every tile's geometry still follows them
+    /// under its own clip (else the hoist changed what draws over what); and
+    /// that the tessellator really folds them into one primitive, which is
+    /// the count the whole thing exists for.
+    #[test]
+    fn the_background_rectangles_lead_the_walk_as_one_mesh() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
+        let background = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+        for cell in &cells {
+            tiles.put_for_test(*cell, a_tile_with_a_quad(background));
+        }
+
+        let (shapes, pane_clip) = one_pane_pass(&ctx, canvas, &projector, &mut tiles);
+        let n = cells.len();
+        assert!(
+            shapes.len() > n,
+            "the walk emitted {} shapes for {n} tiles",
+            shapes.len()
+        );
+
+        // The first `n` shapes are the `n` backgrounds, in walk order, each the
+        // hard mesh on its own tile's pixel-rounded rect, none under its
+        // tile's clip.
+        for (clipped, cell) in shapes[..n].iter().zip(&cells) {
+            assert!(
+                is_solid_quad(clipped, background),
+                "{:?} leads the walk where {cell:?}'s background should",
+                clipped.shape
+            );
+            let rect = projector.tile_rect(*cell).round_to_pixels(1.0);
+            assert!(
+                within(bounds_of(clipped), rect, 0.01),
+                "the background for {cell:?} sits at {:?}, not on its tile {rect:?}",
+                bounds_of(clipped)
+            );
+            assert_eq!(
+                clipped.clip_rect, pane_clip,
+                "the background for {cell:?} still carries a clip of its own"
+            );
+        }
+
+        // No tile placed its background a second time, in either form, and
+        // every tile's quad follows the backgrounds under that tile's own clip.
+        let later = shapes[n..]
+            .iter()
+            .filter(|clipped| is_fill(clipped, background) || is_solid_quad(clipped, background))
+            .count();
+        assert_eq!(
+            later, 0,
+            "{later} background rectangles were also placed inside their tiles"
+        );
+        let quads: Vec<&egui::epaint::ClippedShape> = shapes[n..]
+            .iter()
+            .filter(|clipped| is_solid_quad(clipped, egui::Color32::RED))
+            .collect();
+        assert_eq!(
+            quads.len(),
+            n,
+            "{} quads followed the backgrounds for {n} tiles",
+            quads.len()
+        );
+        for (quad, cell) in quads.iter().zip(&cells) {
+            assert_eq!(
+                quad.clip_rect,
+                projector.tile_rect(*cell).intersect(pane_clip),
+                "the quad for {cell:?} lost its tile's clip"
+            );
+        }
+
+        // The tessellator's own answer: one primitive for the lot, the quads
+        // still one each. A hard rectangle is four vertices.
+        let primitives = ctx.tessellate(shapes, 1.0);
+        assert_eq!(primitives[0].clip_rect, pane_clip);
+        let egui::epaint::Primitive::Mesh(first) = &primitives[0].primitive else {
+            panic!("the first primitive is a callback")
+        };
+        assert_eq!(
+            first.vertices.len(),
+            4 * n,
+            "the first primitive holds {} vertices, not the {} of {n} hard \
+             rectangles: the backgrounds did not merge",
+            first.vertices.len(),
+            4 * n
+        );
+        assert_eq!(
+            primitives.len(),
+            1 + n,
+            "{} primitives for {n} tiles; expected one mesh of backgrounds and \
+             one clipped quad per tile",
+            primitives.len()
+        );
+    }
+
+    /// **A stretched ancestor's background is cut to its piece, not clipped
+    /// to it -- and that cut is what the per-tile clip was for.** `HttpsTiles`
+    /// answers an unanswered cell with a shallower tile and the `uv` window of
+    /// it that covers the cell; placed against the whole ancestor, that tile's
+    /// background reaches over three sibling cells. Under the pane's clip
+    /// nothing else stops it.
+    #[test]
+    fn a_stretched_ancestor_s_background_is_cut_to_its_piece() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
+        let background = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+        let ancestor = egui::Color32::from_rgb(0x70, 0x10, 0x10);
+        let hole = cells[0];
+        for cell in &cells[1..] {
+            tiles.put_for_test(*cell, a_tile_with_a_quad(background));
+        }
+        tiles.put_for_test(
+            TileId {
+                x: hole.x / 2,
+                y: hole.y / 2,
+                zoom: hole.zoom - 1,
+            },
+            a_tile_with_a_quad(ancestor),
+        );
+
+        // Non-triviality: the hole IS answered through a window of the
+        // ancestor, and the whole ancestor placed against that window reaches
+        // past the piece -- else the cut is the identity and this proves
+        // nothing.
+        let piece = projector.tile_rect(hole);
+        let answered = tiles
+            .ground_at(hole)
+            .expect("the ancestor answers the hole");
+        assert_ne!(
+            answered.uv, FULL_TILE_UV,
+            "fixture: the hole was answered exactly"
+        );
+        let full = full_rect_of_clipped_tile(piece, answered.uv);
+        assert!(
+            full.width() > 1.5 * piece.width() && full.height() > 1.5 * piece.height(),
+            "fixture: the placed ancestor {full:?} does not reach past the piece {piece:?}"
+        );
+
+        let (shapes, pane_clip) = one_pane_pass(&ctx, canvas, &projector, &mut tiles);
+        let drawn: Vec<(usize, &egui::epaint::ClippedShape)> = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, clipped)| is_fill(clipped, ancestor) || is_solid_quad(clipped, ancestor))
+            .collect();
+        assert_eq!(
+            drawn.len(),
+            1,
+            "the ancestor's background was drawn {} times",
+            drawn.len()
+        );
+        let (at, clipped) = drawn[0];
+        assert!(
+            is_solid_quad(clipped, ancestor),
+            "the ancestor's background is still the clipped rectangle, not the cut mesh"
+        );
+        assert_eq!(
+            clipped.clip_rect, pane_clip,
+            "the ancestor's background kept a clip of its own"
+        );
+        let piece = piece.round_to_pixels(1.0);
+        assert!(
+            within(bounds_of(clipped), piece, 0.01),
+            "the ancestor's background covers {:?}; the piece it may cover is {piece:?}",
+            bounds_of(clipped)
+        );
+        assert_eq!(
+            at, 0,
+            "the hole is the walk's first cell, so its background leads; it sat at {at}"
+        );
+    }
+
+    /// **Only a plain fill drawn first is taken out of its tile.** A stroked
+    /// rectangle paints across its own edges, so cutting it to the piece is
+    /// not the clip; and a rectangle that is not the tile's first shape has
+    /// geometry under it that must stay under it. Both keep the tile's own
+    /// clipped walk, exactly as before.
+    #[test]
+    fn a_background_that_is_not_a_plain_first_fill_stays_inside_its_tile() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let (ctx, canvas, projector, mut tiles, cells) = a_pane_and_its_cells();
+        let extent = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(EXTENT, EXTENT));
+        let stroked = egui::Color32::from_rgb(0x10, 0x20, 0x30);
+        let second = egui::Color32::from_rgb(0x30, 0x20, 0x10);
+
+        // Cell 0: a stroked rectangle first.
+        tiles.put_for_test(
+            cells[0],
+            Tile::Vector(std::sync::Arc::new(vec![ShapeOrText::Shape(
+                egui::Shape::rect_stroke(
+                    extent,
+                    0.0,
+                    egui::Stroke::new(2.0, stroked),
+                    egui::StrokeKind::Inside,
+                ),
+            )])),
+        );
+        // Cell 1: a quad first, then a plain fill over it.
+        let mut quad = egui::epaint::Mesh::default();
+        quad.add_rect_with_uv(
+            extent,
+            egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+            egui::Color32::RED,
+        );
+        tiles.put_for_test(
+            cells[1],
+            Tile::Vector(std::sync::Arc::new(vec![
+                ShapeOrText::Shape(egui::Shape::Mesh(quad.into())),
+                ShapeOrText::Shape(egui::Shape::rect_filled(extent, 0.0, second)),
+            ])),
+        );
+
+        let (shapes, pane_clip) = one_pane_pass(&ctx, canvas, &projector, &mut tiles);
+
+        let strokes: Vec<&egui::epaint::ClippedShape> = shapes
+            .iter()
+            .filter(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.stroke.color == stroked))
+            .collect();
+        assert_eq!(
+            strokes.len(),
+            1,
+            "the stroked rectangle drew {} times",
+            strokes.len()
+        );
+        assert_eq!(
+            strokes[0].clip_rect,
+            projector.tile_rect(cells[0]).intersect(pane_clip),
+            "a stroked rectangle was taken out of its tile's clip"
+        );
+
+        let fills: Vec<(usize, &egui::epaint::ClippedShape)> = shapes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| is_fill(c, second))
+            .collect();
+        assert_eq!(
+            fills.len(),
+            1,
+            "the second shape's fill drew {} times",
+            fills.len()
+        );
+        assert_eq!(
+            fills[0].1.clip_rect,
+            projector.tile_rect(cells[1]).intersect(pane_clip),
+            "a rectangle with geometry under it was taken out of its tile's clip"
+        );
+        let quad_at = shapes
+            .iter()
+            .position(|c| is_solid_quad(c, egui::Color32::RED))
+            .expect("the quad drew");
+        assert!(
+            quad_at < fills[0].0,
+            "the fill at {} was drawn before the quad at {quad_at} that is under it",
+            fills[0].0
+        );
+    }
+
+    /// `Background::Hoisted` is the caller's word that shape 0 is drawn: the
+    /// tile's walk places everything else and that rectangle never -- on the
+    /// planned walk and on the un-planned fallback alike, since either can be
+    /// the one a frame takes.
+    #[test]
+    fn a_hoisted_background_is_not_placed_again_by_its_tile() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+        let shapes = a_styled_tile();
+        let flat = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes, FEATHERING));
+        assert!(
+            flat.plan().is_some(),
+            "fixture: the flattened tile carries a plan"
+        );
+        let ctx = egui::Context::default();
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
+
+        // (rectangles, meshes, paths, labels) one ground pass emits.
+        let counts = |ground: GroundMeshes<'_>, background: Background| {
+            let mut labels = Vec::new();
+            let emitted = shapes_of_one_pass(&ctx, canvas, |ui| {
+                paint_vector_tile(
+                    ui.painter(),
+                    &shapes,
+                    ground,
+                    rect,
+                    FULL_TILE_UV,
+                    &mut labels,
+                    background,
+                );
+            });
+            let count =
+                |pick: fn(&egui::Shape) -> bool| emitted.iter().filter(|c| pick(&c.shape)).count();
+            (
+                count(|s| matches!(s, egui::Shape::Rect(_))),
+                count(|s| matches!(s, egui::Shape::Mesh(_))),
+                count(|s| matches!(s, egui::Shape::Path(_))),
+                labels.len(),
+            )
+        };
+        // The planned walk: a plan, every run declined (no painter), so the
+        // fills and the stroke are placed on the CPU through the plan's steps.
+        let planned = GroundMeshes {
+            meshes: Some(&flat),
+            painter: None,
+            pass_nr: 1,
+            feathering: FEATHERING,
+        };
+        for (name, ground) in [("planned", planned), ("un-planned", GroundMeshes::CPU_ONLY)] {
+            assert_eq!(
+                counts(ground, Background::Inline),
+                (1, 2, 1, 1),
+                "{name}: the control, inline, does not draw the tile as itself"
+            );
+            assert_eq!(
+                counts(ground, Background::Hoisted),
+                (0, 2, 1, 1),
+                "{name}: hoisted, the tile drew its background a second time or \
+                 lost something else"
+            );
+        }
     }
 }

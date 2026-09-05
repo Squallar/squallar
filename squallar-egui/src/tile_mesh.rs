@@ -32,7 +32,10 @@
 //!
 //! * **Labels.** They need egui's font atlas and its glyph layout, they are
 //!   few, and they are laid out once per pane rather than once per tile.
-//! * **The background rectangle.** One shape per tile.
+//! * **The background rectangle.** One shape per tile — and one *primitive*
+//!   per pane rather than one per tile: the ground walk draws every tile's
+//!   ahead of every tile's geometry, cut to its piece instead of clipped to
+//!   it ([`background_within`]), so epaint merges them into one mesh.
 //! * **Any stroke [`stroke::is_open_stroke`] refuses** — a closed path, a
 //!   filled one, a `ColorMode::UV` one, or a path whose coordinates are not
 //!   integers in `i16`. None of those can come out of `mvt::render_line` over
@@ -51,6 +54,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use egui::emath::GuiRounding as _;
 use walkers::ShapeOrText;
 
 /// What the [`ledger`] counts, and the denominators it counts against.
@@ -705,6 +709,92 @@ impl Placement {
             translation: [transform.translation.x, transform.translation.y],
         }
     }
+}
+
+/// Whether `rect` is a background rectangle the ground walk may take out of
+/// its tile: drawn ahead of every tile's geometry, under the pane's clip, in
+/// one mesh with every other tile's, with the piece it belongs to folded into
+/// its geometry by [`background_within`] instead of held by a clip rect.
+///
+/// **A plain axis-aligned fill is the one rectangle for which "clip to the
+/// piece" and "cut to the piece" put the same bytes on screen.** Every field
+/// tested here is a way a rectangle paints outside its own edges, or paints
+/// them differently once they move: a stroke straddles them, a corner radius
+/// or a rotation bends them, a blur widens the feather past the pixel a
+/// scissor would have kept, a brush changes the texture the mesh is drawn with
+/// and so which mesh it can share. `mvt::render`'s background is
+/// `Shape::rect_filled(extent, 0, colour)`, which passes; this is the branch
+/// that keeps that a checked fact rather than a belief, and a style that ever
+/// put something else there keeps its background inside the tile, clipped, as
+/// before.
+pub fn is_hoistable_background(rect: &egui::epaint::RectShape) -> bool {
+    rect.stroke.is_empty()
+        && rect.corner_radius == egui::CornerRadius::ZERO
+        && rect.blur_width == 0.0
+        && rect.brush.is_none()
+        && rect.angle == 0.0
+}
+
+/// `placed` — a tile's background after placement, one
+/// [`is_hoistable_background`] said yes to — cut to `piece`, the rect the tile
+/// occupies on screen, as the mesh that paints exactly the pixels the tile's
+/// own clipped painter painted, ready to draw under the **pane's** clip.
+///
+/// # Why the cut is the clip
+///
+/// The tile's own painter clips to the piece and lets epaint tessellate the
+/// rectangle: rounded to whole pixels first (`round_rects_to_pixels`, on by
+/// default and never changed here), then feathered by half a pixel either
+/// side of every edge, opaque inside and transparent outside
+/// (`fill_closed_path`, at egui's default one-pixel feathering). On a
+/// pixel-rounded edge that feather resolves to nothing: the pixel centre half
+/// a pixel inside reads the fill exactly, the one half a pixel outside reads
+/// alpha zero exactly. So a feathered, pixel-rounded rectangle paints exactly
+/// the pixels of the *hard* rectangle at its rounded bounds — and the clip,
+/// rounded by the same `round()` (`egui_wgpu`'s `ScissorRect::new`; both are
+/// `round()`, neither `floor` nor `ceil`), keeps exactly the pixels of the
+/// hard rectangle at the rounded intersection.
+///
+/// This returns that hard rectangle: four vertices at the rounded
+/// intersection, two triangles, no feather. Inside, the fragments are the same
+/// pixel centres in the same colour, so the same dither. Outside there is
+/// nothing — where a feathered rectangle's alpha-zero outer band still passes
+/// through the blend and the dither, one pixel into every neighbouring piece,
+/// which is exactly what the tile's scissor used to discard; a feathered
+/// rectangle under the pane's clip is *not* byte-identical, and that was
+/// measured before this became a mesh (59 texels on a 256² canvas).
+///
+/// The rounding is spelled out although a rasterizer rounds a hard edge to
+/// the nearest pixel centre by itself: on an edge sitting exactly on a
+/// half-pixel the top-left rule and `round()` disagree, and the rounding is
+/// what makes this mesh take the scissor's side of that tie. Byte parity with
+/// the clipped arrangement is held on a real adapter by `squallar-gpu`'s
+/// `tile_mesh_gpu` suite
+/// (`the_hoisted_background_rectangles_put_the_same_bytes_on_screen_as_per_tile_clipping`
+/// — `#[ignore]`d like every case there that needs an adapter; run with
+/// `cargo test -p squallar-gpu --test tile_mesh_gpu -- --ignored`), with every
+/// x edge on a half-pixel, every y edge elsewhere between pixels, and a
+/// stretched ancestor whose placed rectangle reaches over three neighbouring
+/// pieces.
+///
+/// `None` when the two do not overlap, or the rounding leaves nothing; the
+/// tile's clipped walk then places the shape itself and draws nothing, which
+/// is the same picture.
+pub fn background_within(
+    placed: &egui::epaint::RectShape,
+    piece: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<egui::Shape> {
+    let within = placed
+        .rect
+        .intersect(piece)
+        .round_to_pixels(pixels_per_point);
+    if !within.is_positive() {
+        return None;
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.add_colored_rect(within, placed.fill);
+    Some(egui::Shape::Mesh(mesh.into()))
 }
 
 /// A consecutive span of one tile's runs, at one placement, on one frame.
