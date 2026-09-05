@@ -145,7 +145,9 @@ pub(crate) struct StormReportsHandler {
 impl StormReportsHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`:
+            // the two are set together, so a park always has a drain.
+            state: OverlayState::parked(),
             enabled: false,
             rows_memo: crate::render::signature_memo::BuiltMemo::new(
                 crate::render::footprint::reports_rows,
@@ -320,6 +322,16 @@ impl OverlayHandler for StormReportsHandler {
 
     fn clickable_items<'a>(&'a self, _pane: &PaneRef<'_>) -> Vec<ClickableItem<'a>> {
         Vec::new() // Clicks resolve through the rasterizer's `HitMap` instead.
+    }
+
+    /// The generation this layer's state parked and the inputs its memo
+    /// retired, handed back for the app to free off the frame thread — see
+    /// [`OverlayHandler::take_retired`].
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        crate::render::overlay_state::retired_batch(
+            self.state.take_retired(),
+            self.rows_memo.take_retired(),
+        )
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {

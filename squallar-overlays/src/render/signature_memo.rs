@@ -83,7 +83,7 @@ const JOB_MEMO_ROWS: usize = 4;
 /// **Rows retired by a rollover are parked, not dropped.** Freeing a
 /// thousand-row input is a thousand frees on the frame thread, and the app
 /// owns a discard seam for retired generations; [`Self::take_retired`] hands
-/// the parked rows to whoever drains it. Until something does, the slot holds
+/// the parked rows to the drain at the end of every frame. Until it runs, the slot holds
 /// the rows of the most recent rollover only — an undrained older batch is
 /// dropped when the next one arrives. Evictions inside one generation park
 /// too, and the slot is capped at `JOB_MEMO_ROWS` there as well: past that
@@ -199,17 +199,12 @@ impl<T: Clone> BuiltMemo<T> {
     /// for the app's discard seam, so their frees happen where it chooses.
     /// Empty when nothing has retired.
     ///
-    /// Unreached outside tests until the seam that returns a retired
-    /// generation to the app (`apply_fetch_result -> deliver_overlay_fetch ->
-    /// poll_overlay_fetch_results`) carries these rows too; the type it must
-    /// carry is this one's return.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "drained by the app's retired-generation seam, not yet wired"
-        )
-    )]
+    /// Drained once a frame by the handler's
+    /// [`SourceHandler::take_retired`](squallar_source::handler::SourceHandler::take_retired),
+    /// which the app files against the worker's discard pool. It must be a
+    /// PER-FRAME drain and not a per-arrival one: these rows retire on the
+    /// next `get_or_build` that sees a new generation, which is the dispatch
+    /// and not the delivery.
     pub fn take_retired(&self) -> Vec<T> {
         let batch = std::mem::take(&mut *self.retired.borrow_mut());
         self.set_parked(0);

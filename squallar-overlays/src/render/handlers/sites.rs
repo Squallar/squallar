@@ -44,7 +44,9 @@ pub(crate) struct RadarSitesHandler {
 impl RadarSitesHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`:
+            // the two are set together, so a park always has a drain.
+            state: OverlayState::parked(),
             enabled: false,
         }
     }
@@ -130,6 +132,12 @@ impl OverlayHandler for RadarSitesHandler {
     }
 
     /// The site table, installed by the frontend that owns it.
+    /// The generation this layer's state parked, handed back for the app to
+    /// free off the frame thread — see [`OverlayHandler::take_retired`].
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        self.state.take_retired().into_iter().collect()
+    }
+
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(rows) = self.state.downcast_round::<RadarSitesFetchResult>(result) else {
             log::error!("radar sites handler received unexpected fetch result type");

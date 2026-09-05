@@ -41,11 +41,31 @@ pub fn installed_item_bytes() -> u64 {
     squallar_source::footprint::installed_item_bytes()
 }
 
+/// **One layer's retired batch, boxed**: the generation its state parked and
+/// the rows its memo parked, in one list for the app to file.
+///
+/// Spelled once rather than in each handler so a layer that gains a second
+/// memo adds a chain rather than a shape.
+pub(crate) fn retired_batch<M: Send + 'static>(
+    parked: Option<Box<dyn std::any::Any + Send>>,
+    memo_rows: Vec<M>,
+) -> Vec<Box<dyn std::any::Any + Send>> {
+    parked
+        .into_iter()
+        .chain(
+            memo_rows
+                .into_iter()
+                .map(|row| Box::new(row) as Box<dyn std::any::Any + Send>),
+        )
+        .collect()
+}
+
 /// **Bytes of retired item data and built paint inputs waiting on the discard
 /// seam** — the `overlay parked` heap-census family. A level, like its
 /// neighbour above.
 pub fn parked_item_bytes() -> u64 {
-    crate::render::signature_memo::parked_input_bytes()
+    squallar_source::footprint::parked_item_bytes()
+        .saturating_add(crate::render::signature_memo::parked_input_bytes())
 }
 
 // ── Overlay registry ─────────────────────────────────────────────────────
@@ -647,6 +667,19 @@ impl OverlayRegistry {
 
     /// **Bytes of decoded SOURCE data every registered layer is holding on
     /// this instance's heap**, summed —
+    /// **Every layer's retired batch**, for the app's discard seam.
+    ///
+    /// Called once a frame, and it MUST be a per-frame path: a layer's state
+    /// retires at delivery and its memos retire at dispatch, so a drain
+    /// hanging off either one alone finds the other empty every time. See
+    /// [`OverlayHandler::take_retired`].
+    pub fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        self.handlers
+            .iter()
+            .flat_map(|handler| handler.take_retired())
+            .collect()
+    }
+
     /// [`OverlayHandler::resident_source_bytes`] over the handlers.
     ///
     /// The three gridded layers are the whole of it in practice: MRMS at

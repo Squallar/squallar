@@ -40,7 +40,9 @@ pub(crate) struct RadarCoverageHandler {
 impl RadarCoverageHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`:
+            // the two are set together, so a park always has a drain.
+            state: OverlayState::parked(),
             enabled: false,
             job_memo: crate::render::signature_memo::JobMemo::new(
                 crate::render::footprint::coverage_job,
@@ -150,6 +152,16 @@ impl OverlayHandler for RadarCoverageHandler {
     /// The same table `RadarSites` is handed, through the same door and by the
     /// same publisher — one arrival, two layers, so the two can never disagree
     /// about which stations exist.
+    /// The generation this layer's state parked and the inputs its memo
+    /// retired, handed back for the app to free off the frame thread — see
+    /// [`OverlayHandler::take_retired`].
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        crate::render::overlay_state::retired_batch(
+            self.state.take_retired(),
+            self.job_memo.take_retired(),
+        )
+    }
+
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
         let Some(rows) = self.state.downcast_round::<RadarSitesFetchResult>(result) else {
             log::error!("radar coverage handler received unexpected fetch result type");

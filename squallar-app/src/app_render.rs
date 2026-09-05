@@ -1292,14 +1292,38 @@ impl super::App {
             });
         // Last, so this frame is laid out over everything applied above.
         self.frame_ledger.mark_ui_start();
-        let (gui_action, ui_phases) = self.gui.ui_phased(&ctx);
+        let (gui_action, ui_phases, retired) = self.gui.ui_phased(&ctx);
         self.frame_ledger.mark_ui_end();
         // After `mark_ui_end`, because the stamps only cut anything when
         // paired with this frame's `ui_start`/`ui_end`. See
         // `frame_ledger::UiHists`.
         self.frame_ledger.record_ui_phases(ui_phases);
+        // **Carried out on the frame's existing return, not fetched by a new
+        // reach.** The overlay registry is the UI layer's, and the ceiling on
+        // this file's reaches into it may only fall
+        // (`gui_seam_ratchet_tests`), so the batch travels back with the
+        // actions rather than through a second call.
+        Self::discard_retired_overlay_data(retired);
 
         (size_in_pixels, gui_action)
+    }
+
+    /// **Free what the overlay layers retired this frame, away from here.**
+    ///
+    /// Each payload is one layer's replaced generation or one parked paint
+    /// input: a list whose free is one free per item, and the lightning
+    /// layer's is six figures of them. `discard_each` files them one at a
+    /// time, so a drain turn frees one layer's batch rather than every
+    /// layer's at once.
+    ///
+    /// Answers how many payloads went, so a test can say the seam moved
+    /// something rather than only that it ran.
+    pub(super) fn discard_retired_overlay_data(
+        retired: Vec<Box<dyn std::any::Any + Send>>,
+    ) -> usize {
+        let moved = retired.len();
+        squallar_worker::offload::discard_each("retired-overlay-data", retired);
+        moved
     }
 
     /// Compose this frame's [`squallar_egui::shell_api::FrameInputs`] from the
@@ -7409,6 +7433,12 @@ mod frame_build_order_tests;
 #[path = "app_render/frame_thread_conversion_tests.rs"]
 #[cfg(test)]
 mod frame_thread_conversion_tests;
+
+/// Where the frame's retired overlay payloads are actually freed.
+#[path = "app_render/retired_discard_tests.rs"]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod retired_discard_tests;
 
 /// What the overlay poller puts on the GPU, read back from egui's own texture
 /// delta rather than inferred.

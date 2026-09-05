@@ -107,6 +107,14 @@ pub(crate) struct InputHarness {
     max_texture_side: Option<usize>,
     /// The [`GuiAction`]s `Gui::ui` returned from the last frame.
     last_actions: Vec<crate::actions::GuiAction>,
+    /// **How many retired overlay payloads the last frame's drain moved.**
+    ///
+    /// The production caller hands these to the worker's discard pool; the
+    /// harness has no pool, so it counts them and lets them go. Counting
+    /// rather than ignoring is the point: "the drain ran" and "the drain
+    /// found anything" are different claims, and only this one can tell them
+    /// apart.
+    last_retired: usize,
     /// Every text run painted during the last frame, with its layout rect.
     last_texts: Vec<(egui::Rect, String)>,
     /// Every textured quad painted during the last frame — see [`PaintedImage`].
@@ -398,6 +406,7 @@ impl InputHarness {
             last_rect_fills: Vec::new(),
             max_texture_side: None,
             last_actions: Vec::new(),
+            last_retired: 0,
             last_texts: Vec::new(),
             last_images: Vec::new(),
             last_segments: Vec::new(),
@@ -1889,6 +1898,11 @@ impl InputHarness {
         &self.last_actions
     }
 
+    /// See [`Self::last_retired`].
+    pub(crate) fn last_retired(&self) -> usize {
+        self.last_retired
+    }
+
     /// Split the map into `count` panes, as the settings UI does.
     pub(crate) fn set_pane_count(&mut self, count: usize) {
         self.gui.set_pane_count_for_test(count);
@@ -2371,7 +2385,12 @@ impl InputHarness {
 
         // The real UI, panels, dialogs and map panes included. `render_panes`
         // resolves each pane's pointer state on the way through and records it.
-        self.last_actions = self.gui.ui(&ctx);
+        // `ui_phased`, not `ui`: the third return is the frame's retired
+        // batch, and the harness counts it so a test can assert the seam
+        // moved something.
+        let (actions, _phases, retired) = self.gui.ui_phased(&ctx);
+        self.last_actions = actions;
+        self.last_retired = retired.len();
 
         // The double-render guard, enforced on every frame any test runs:
         // each handler-control pass ends by saving the handlers' state over

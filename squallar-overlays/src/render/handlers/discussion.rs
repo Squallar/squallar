@@ -108,7 +108,9 @@ pub(crate) struct SpcDiscussionHandler {
 impl SpcDiscussionHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`:
+            // the two are set together, so a park always has a drain.
+            state: OverlayState::parked(),
             enabled: true,
             labels: Vec::new(),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
@@ -347,6 +349,16 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn map_labels(&self) -> &[OverlayLabel] {
         &self.labels
+    }
+
+    /// The generation this layer's state parked and the inputs its memo
+    /// retired, handed back for the app to free off the frame thread — see
+    /// [`OverlayHandler::take_retired`].
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        crate::render::overlay_state::retired_batch(
+            self.state.take_retired(),
+            self.job_memo.take_retired(),
+        )
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {

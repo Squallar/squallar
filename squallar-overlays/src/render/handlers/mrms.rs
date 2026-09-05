@@ -474,6 +474,10 @@ impl MrmsHandler {
     /// gives it [`staging::global`].
     fn with_staging(pool: &'static staging::StagingPool) -> Self {
         Self {
+            // Not parked: this layer's replaced grid goes back to its
+            // staging pool, which can only take it while the state is
+            // the buffer's last owner. A park slot would hold a second
+            // `Arc` and the pool would decline the block.
             state: OverlayState::new(),
             defaults: MrmsPaneState::new(false),
             cached_grids: MrmsGridCache::new(GRID_CACHE_BYTES, GRID_HISTORY_ENTRIES, pool),

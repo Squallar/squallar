@@ -2,6 +2,7 @@
 //! vocabulary its methods speak.
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -48,6 +49,39 @@ pub struct OverlayState<T, S: RoundShape> {
     /// and moved only through the doors that can change it, so this figure
     /// and the level it feeds cannot disagree.
     data_bytes: u64,
+    /// **The generation an install replaced, parked rather than freed.**
+    ///
+    /// ONE slot, and a rollover replaces it. An unbounded park would trade a
+    /// frame-thread free for a growing resident set, which is a worse defect
+    /// than the one this exists to fix; the cost of the single slot is that
+    /// an undrained park is freed inline when the next one arrives, which is
+    /// exactly what happened before the slot existed. The app drains it every
+    /// frame ([`SourceHandler::take_retired`]), so in production it is empty
+    /// by the next install.
+    ///
+    /// A `RefCell` because the drain takes `&self`: the trait method is
+    /// reached through a `&dyn SourceHandler` the registry hands out, and a
+    /// `&mut` door there would make the drain a second mutable walk of every
+    /// handler once a frame.
+    retired: RefCell<Option<Box<dyn Any + Send>>>,
+    /// What [`Self::retired`] is holding, so the level and the slot move
+    /// together.
+    retired_bytes: Cell<u64>,
+    /// **Whether a replaced generation goes to the park slot at all.**
+    ///
+    /// **Opt-IN, and the default is off**, because parking without draining
+    /// is a regression rather than a partial win: the slot would hold one
+    /// whole extra generation between polls, where the plain assignment held
+    /// none. So a layer parks exactly when its handler also implements
+    /// [`SourceHandler::take_retired`] — the two are set together, in the
+    /// same constructor call — and a layer that has not been wired to the
+    /// seam behaves byte for byte as it did before the seam existed.
+    ///
+    /// It is also the right answer for a layer that already has a BETTER
+    /// retirement than freeing: the three gridded layers hand their replaced
+    /// buffer back to a staging pool that RE-USES it, and that can only
+    /// happen while this state is the buffer's last owner.
+    parks: bool,
     /// `fn() -> S` so the marker cannot make this state less `Send`/`Sync`.
     shape: PhantomData<fn() -> S>,
 }
@@ -61,6 +95,9 @@ impl<T: Default, S: RoundShape> Default for OverlayState<T, S> {
             data_generation: 0,
             retry: FetchRetry::new(),
             data_bytes: 0,
+            retired: RefCell::new(None),
+            retired_bytes: Cell::new(0),
+            parks: false,
             shape: PhantomData,
         }
     }
@@ -75,6 +112,7 @@ impl<T: Default, S: RoundShape> Default for OverlayState<T, S> {
 impl<T, S: RoundShape> Drop for OverlayState<T, S> {
     fn drop(&mut self) {
         crate::footprint::move_installed(self.data_bytes, 0);
+        crate::footprint::move_parked(self.retired_bytes.get(), 0);
     }
 }
 
@@ -82,9 +120,24 @@ impl<T: Default, S: RoundShape> OverlayState<T, S> {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// **A state whose replaced generation is PARKED for the discard seam**
+    /// rather than freed inline — see [`Self::parks`].
+    ///
+    /// Only for a handler that also implements
+    /// [`SourceHandler::take_retired`]: a park nothing drains holds a whole
+    /// extra generation between polls, which is worse than the frame-thread
+    /// free it was meant to move.
+    pub fn parked() -> Self {
+        // Spelled out rather than `..Self::default()`: this type has a `Drop`,
+        // and struct-update syntax cannot move fields out of one.
+        let mut state = Self::default();
+        state.parks = true;
+        state
+    }
 }
 
-impl<T: ItemFootprint> OverlayState<T, Whole> {
+impl<T: ItemFootprint + Send + 'static> OverlayState<T, Whole> {
     /// Bumps `data_generation`, ends the fetch, clears the retry ladder, and
     /// declares the answer **whole**.
     pub fn set_data(&mut self, data: T) {
@@ -92,7 +145,7 @@ impl<T: ItemFootprint> OverlayState<T, Whole> {
     }
 }
 
-impl<T: ItemFootprint> OverlayState<T, Assembled> {
+impl<T: ItemFootprint + Send + 'static> OverlayState<T, Assembled> {
     /// The **only** way data reaches the map of a layer whose round can deliver
     /// less than it was asked for. The clock still stamps and the ladder still
     /// resets: a half-delivered round is a good answer missing pieces.
@@ -150,7 +203,7 @@ impl<T: ItemFootprint> OverlayState<T, Assembled> {
     }
 }
 
-impl<T: ItemFootprint, S: RoundShape> OverlayState<T, S> {
+impl<T: ItemFootprint + Send + 'static, S: RoundShape> OverlayState<T, S> {
     /// **The one write to [`Self::data`]**, and therefore the one place the
     /// heap level it feeds moves.
     ///
@@ -160,8 +213,9 @@ impl<T: ItemFootprint, S: RoundShape> OverlayState<T, S> {
     fn install(&mut self, data: T, coverage: DataCompleteness) {
         let bytes = data.owned_bytes();
         crate::footprint::move_installed(self.data_bytes, bytes);
+        let replaced = std::mem::replace(&mut self.data, data);
+        self.park(replaced, self.data_bytes);
         self.data_bytes = bytes;
-        self.data = data;
         self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
         self.fetching = false;
@@ -237,10 +291,43 @@ impl<T: ItemFootprint, S: RoundShape> OverlayState<T, S> {
         payload.downcast::<R>().ok().map(|round| *round)
     }
 
+    /// **Park a retired generation instead of freeing it here.**
+    ///
+    /// The free of a replaced generation is one free per item — a hundred
+    /// thousand of them on the lightning layer — and `install` runs on the
+    /// frame thread, where the arrival is drained. So the value moves to a
+    /// slot the app drains into the worker's discard pool.
+    ///
+    /// The slot is SINGLE. Replacing it frees whatever was there, which is
+    /// the pre-seam behaviour and is what bounds the parked footprint to one
+    /// generation whether or not anything drains.
+    fn park(&mut self, replaced: T, bytes: u64) {
+        // **A generation that owns nothing is freed here**, because freeing
+        // it costs nothing and parking it would cost a `Box` allocation and a
+        // drain turn. The first install of a session replaces a default, and
+        // this is what keeps that out of the seam.
+        if bytes == 0 || !self.parks {
+            return;
+        }
+        crate::footprint::move_parked(self.retired_bytes.get(), bytes);
+        self.retired_bytes.set(bytes);
+        // Assigned rather than `take`n first: the old box is dropped here, at
+        // the one moment the doc above says it can be.
+        *self.retired.borrow_mut() = Some(Box::new(replaced));
+    }
+
     /// **What [`Self::data`] owns on the heap**, as last priced. A load, not
     /// a walk.
     pub fn data_bytes(&self) -> u64 {
         self.data_bytes
+    }
+
+    /// **The parked generation, for the app's discard seam.** `None` when
+    /// nothing has been retired since the last drain.
+    pub fn take_retired(&self) -> Option<Box<dyn Any + Send>> {
+        crate::footprint::move_parked(self.retired_bytes.get(), 0);
+        self.retired_bytes.set(0);
+        self.retired.borrow_mut().take()
     }
 
     /// End a fetch that did not produce data, filing it against the ladder.
@@ -1114,6 +1201,32 @@ pub trait SourceHandler: Send {
     /// different opinions about whether this layer comes in frames.
     fn frames_mut(&mut self) -> Option<&mut dyn FrameSource> {
         None
+    }
+
+    /// **Everything this layer has retired and not yet let go of**, for the
+    /// app to free away from the frame thread.
+    ///
+    /// Two kinds of thing end up here, and they retire at different moments,
+    /// which is why the drain that calls this must be on a PER-FRAME path
+    /// rather than on the arrival path:
+    ///
+    /// - the generation an [`OverlayState::install`] replaced, retired at
+    ///   **delivery**; and
+    /// - the built paint inputs a memo parked, retired on the next
+    ///   `prepare_job` that sees a new generation — which is the **dispatch**,
+    ///   a different pass from the one that took the arrival.
+    ///
+    /// A drain sitting after fetch delivery would find the second kind empty
+    /// every time and look like a working seam that moves no frees.
+    ///
+    /// **Returns, never discards.** The UI layer does not depend on the
+    /// worker and cannot reach the pool; the app takes what this hands back
+    /// and files it (`squallar_worker::offload::discard_each`). The default
+    /// is empty — a layer that installs nothing has nothing to retire — and
+    /// a layer that overrides it hands over its state's park slot and its
+    /// memos' parked rows together.
+    fn take_retired(&self) -> Vec<Box<dyn Any + Send>> {
+        Vec::new()
     }
 
     /// **Bytes of decoded SOURCE data this handler is holding on the host

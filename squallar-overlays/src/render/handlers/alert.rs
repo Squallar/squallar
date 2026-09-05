@@ -279,7 +279,9 @@ pub(crate) struct NwsAlertHandler {
 impl NwsAlertHandler {
     pub fn new() -> Self {
         Self {
-            state: OverlayState::new(),
+            // Parked, because this handler implements `take_retired`:
+            // the two are set together, so a park always has a drain.
+            state: OverlayState::parked(),
             hidden_alerts: HashSet::new(),
             defaults: AlertPaneState::new(true),
             signature_memo: crate::render::signature_memo::SignatureMemo::new(),
@@ -720,6 +722,16 @@ impl OverlayHandler for NwsAlertHandler {
                 false
             }
         }
+    }
+
+    /// The generation this layer's state parked and the inputs its memo
+    /// retired, handed back for the app to free off the frame thread — see
+    /// [`OverlayHandler::take_retired`].
+    fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        crate::render::overlay_state::retired_batch(
+            self.state.take_retired(),
+            self.job_memo.take_retired(),
+        )
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload, _pane: &PaneRef<'_>) {
@@ -1372,6 +1384,47 @@ mod tests {
         assert!(
             !handler.job_memo.take_retired().is_empty(),
             "the poll parked the previous generation's inputs for the discard seam",
+        );
+    }
+
+    /// **The handler's own drain hands back BOTH halves**, which is why it has
+    /// to sit on a per-frame path.
+    ///
+    /// The state's generation retires at DELIVERY and the memo's inputs
+    /// retire at the next DISPATCH that sees the new generation. A drain
+    /// placed after delivery would find the second half empty every time, so
+    /// this asserts the count and not that the call happened.
+    #[test]
+    fn one_drain_carries_the_replaced_generation_and_the_parked_inputs() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        let ctx = live_ctx(at(19, 0));
+        let pane = PaneRef::bare(0);
+        // A dispatch, so the memo has a row of the current generation.
+        handler.prepare_job(&ctx, &pane);
+        assert!(
+            handler.take_retired().is_empty(),
+            "nothing has retired yet: one generation, one built input",
+        );
+
+        // Delivery retires the installed generation...
+        handler.apply_fetch_result(
+            whole(vec![alert("b", "Tornado Warning")]),
+            &PaneRef::across(&[]),
+        );
+        // ...and the dispatch that follows retires the built input.
+        handler.prepare_job(&ctx, &pane);
+
+        let batch = handler.take_retired();
+        assert_eq!(
+            batch.len(),
+            2,
+            "one drain must carry the replaced generation AND the parked \
+             input; it carried {}",
+            batch.len(),
+        );
+        assert!(
+            handler.take_retired().is_empty(),
+            "a drain empties both slots",
         );
     }
 

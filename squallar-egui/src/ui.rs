@@ -2464,6 +2464,10 @@ mod overlay_retry_tests;
 #[cfg(test)]
 mod overlay_texture_release_tests;
 
+/// What the frame's retirement drain actually moved.
+#[cfg(test)]
+mod retired_drain_tests;
+
 /// Which panes each scan-info event is addressed to.
 #[cfg(test)]
 mod scan_info_audience_tests;

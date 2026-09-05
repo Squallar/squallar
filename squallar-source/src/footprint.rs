@@ -206,6 +206,20 @@ pub fn installed_item_bytes() -> u64 {
     INSTALLED_ITEM_BYTES.load(Relaxed)
 }
 
+/// **Bytes of RETIRED overlay item data**, summed over every live
+/// `OverlayState`'s park slot — a generation an install replaced and the
+/// discard seam has not drained yet.
+///
+/// Disjoint from [`INSTALLED_ITEM_BYTES`]: a parked generation is one the
+/// installed figure no longer counts, because the install moved it out of
+/// `data` in the same breath.
+static PARKED_ITEM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// [`PARKED_ITEM_BYTES`] as a reading.
+pub fn parked_item_bytes() -> u64 {
+    PARKED_ITEM_BYTES.load(Relaxed)
+}
+
 /// Move a level from `was` to `now`. One `Relaxed` RMW of a difference the
 /// caller already has, so the two figures cannot drift the way an add here
 /// and a subtract elsewhere could.
@@ -215,6 +229,10 @@ pub(crate) fn move_level(level: &AtomicU64, was: u64, now: u64) {
 
 pub(crate) fn move_installed(was: u64, now: u64) {
     move_level(&INSTALLED_ITEM_BYTES, was, now);
+}
+
+pub(crate) fn move_parked(was: u64, now: u64) {
+    move_level(&PARKED_ITEM_BYTES, was, now);
 }
 
 // ── The substrate's own shapes ───────────────────────────────────────────

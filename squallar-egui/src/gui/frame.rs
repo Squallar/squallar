@@ -15,6 +15,17 @@ impl Gui {
         self.ui_phased(ctx).0
     }
 
+    /// **What the overlay layers retired this frame**, for a caller that
+    /// drives a frame without the app's discard seam.
+    ///
+    /// [`Gui::ui`] drops the batch, which frees it right here — the frame
+    /// thread — and that is exactly what the seam exists to avoid. It is
+    /// tolerable in the harnesses and tests that spelling is for, and the
+    /// production caller is [`Gui::ui_phased`]'s third return.
+    pub fn take_retired_overlay_data(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        self.overlays.take_retired()
+    }
+
     /// [`Gui::ui`], with the five instants at which it crossed its own phase
     /// boundaries.
     ///
@@ -23,7 +34,14 @@ impl Gui {
     /// function to disagree about, and no frame where the instrument is off.
     /// What the caller does with them is the caller's business; see
     /// [`crate::shell_api::UiPhaseStamps`] for why they are instants.
-    pub fn ui_phased(&mut self, ctx: &egui::Context) -> (Vec<GuiAction>, UiPhaseStamps) {
+    pub fn ui_phased(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> (
+        Vec<GuiAction>,
+        UiPhaseStamps,
+        Vec<Box<dyn std::any::Any + Send>>,
+    ) {
         let mut actions = Vec::new();
 
         if !self.settings_visible() {
@@ -171,6 +189,13 @@ impl Gui {
 
         self.apply_pending_pane_close(ctx, &mut actions);
 
+        // **Last, and per-frame.** A layer's state retires at delivery and
+        // its memos retire at dispatch — two different passes — so this is
+        // the only place that sees both. The batch is RETURNED rather than
+        // discarded here: this crate does not depend on the worker, and the
+        // app files it against the pool's free lane.
+        let retired = self.overlays.take_retired();
+
         (
             actions,
             UiPhaseStamps {
@@ -183,6 +208,7 @@ impl Gui {
                 panes,
                 applied,
             },
+            retired,
         )
     }
 
