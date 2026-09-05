@@ -1046,3 +1046,64 @@ fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
     assert_eq!(desktop.raster_side_for_adapter(32768), 8192);
     assert_eq!(desktop.raster_side_for_adapter(4096), 4096);
 }
+
+/// The desktop ceiling is the widest honest sweep's own need — a WSR-88D
+/// surveillance cut at `TEXELS_PER_SAMPLE` — rounded up to its texture
+/// doubling. **No pane size enters it, and none could:** a raster the side of
+/// the default window, or of the largest canvas the browser rig measures at,
+/// is under one texel per gate over ±460 km, so a pane-proportionate bound
+/// would drop gates the moment the user zoomed past the raster's own scale.
+/// The pane can always out-zoom the raster (walkers accepts zoom 26, where a
+/// pane shows some 500 000 px/km), so the only floor that keeps every gate on
+/// the glass at every reachable zoom is the data's.
+#[test]
+fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
+    use squallar_radar::types::{
+        TEXELS_PER_SAMPLE, data_limited_side_px, plan_view_extent_km, raster_side_px,
+    };
+    // 2.125 + 1832 × 0.25 km, the longest reach in this display.
+    const SURVEILLANCE_REACH_KM: f64 = 460.125;
+    const SUPER_RES_GATE_KM: f64 = 0.25;
+    let extent_km = plan_view_extent_km(SURVEILLANCE_REACH_KM);
+    let need = data_limited_side_px(extent_km, SUPER_RES_GATE_KM);
+    let texels_per_gate = |side: usize| side as f64 / (2.0 * extent_km) * SUPER_RES_GATE_KM;
+
+    // The ceiling clears the need, so at the ceiling the widest sweep draws
+    // every gate at the texels the data asks for …
+    let side = raster_side_px(extent_km, DESKTOP_RASTER_SIDE_CEILING, SUPER_RES_GATE_KM);
+    assert!(
+        texels_per_gate(side) >= TEXELS_PER_SAMPLE - 1e-9,
+        "under a {DESKTOP_RASTER_SIDE_CEILING} px ceiling a surveillance cut draws {side} px, \
+         {:.3} texels per 250 m gate against the {TEXELS_PER_SAMPLE} its data asks for",
+        texels_per_gate(side),
+    );
+    // … and it binds nothing: the render is the data's own size, so the bytes
+    // a desktop render costs are the sweep's, not the ceiling's.
+    assert_eq!(
+        side, need,
+        "the desktop ceiling is what sized a surveillance cut, not its gates"
+    );
+    // Within one doubling of the need: the data's number rounded to its
+    // texture doubling, and not the 16384 the adapter rule would admit.
+    assert_eq!(
+        DESKTOP_RASTER_SIDE_CEILING,
+        need.next_power_of_two(),
+        "the desktop ceiling is no longer the surveillance cut's {need} px need rounded to \
+         its doubling",
+    );
+
+    // Why no pane is the denominator: the default window's longer side and the
+    // largest canvas the browser rig measures at (`run_tier2.sh`'s `huge` leg,
+    // 2878 × 1651) both give a 250 m gate less than one texel over ±460 km.
+    for (pane_side, what) in [
+        (RENDER_WIDTH.max(RENDER_HEIGHT) as usize, "the default window"),
+        (2878, "the huge leg's canvas"),
+    ] {
+        assert!(
+            texels_per_gate(pane_side) < 1.0,
+            "{what} is {pane_side} px across, which is {:.3} texels per gate at the ring: a \
+             pane-sized raster would not drop gates, so the pane could be the bound",
+            texels_per_gate(pane_side),
+        );
+    }
+}

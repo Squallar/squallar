@@ -25,6 +25,12 @@ pub const LONG_RANGE_IMAGE_SIZE: usize = DESKTOP_LONG_RANGE_IMAGE_SIZE;
 /// cut): 4096 -> 8192 is 20.3 ms -> 118.1 ms and 464 -> 1070 MiB resident, the
 /// one step in the ladder that is not linear in pixels; and a 1832-gate
 /// surveillance cut needs only 7362 px at two texels per gate.
+///
+/// So it is that need rounded up to its texture doubling, and the render it
+/// admits is the sweep's own 7362 px: the ceiling binds nothing a real sweep
+/// asks for. No pane size enters it — a pane-sized raster is under one texel
+/// per gate at the ring, and the map can always out-zoom the raster
+/// (`the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes`).
 pub const DESKTOP_RASTER_SIDE_CEILING: usize = 8192;
 
 pub const MOBILE_RASTER_SIDE_CEILING: usize = MOBILE_LONG_RANGE_IMAGE_SIZE;
