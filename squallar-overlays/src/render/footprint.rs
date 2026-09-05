@@ -54,6 +54,9 @@ squallar_source::impl_pod_footprint!(
     // A flash row: two coordinates, two optional energies, an instant and two
     // discriminants, all inline.
     crate::glm::GlmFlash,
+    // And the paint row built from it: the four terms the rasterizer reads,
+    // all inline.
+    crate::render::rasterize::FlashPaint,
 );
 
 // ── The feature layers ───────────────────────────────────────────────────
@@ -325,6 +328,21 @@ pub(crate) fn metar_job(rows: &std::sync::Arc<Vec<MetarOb>>) -> u64 {
 
 pub(crate) fn reports_rows(rows: &std::sync::Arc<Vec<ReportPaint>>) -> u64 {
     reports_rows_bytes(rows)
+}
+
+/// **The lightning layer's built paint rows** — the memo's whole row set,
+/// which at the ~125 000 flashes a busy 20 s poll delivers is the largest
+/// single figure in the parked family.
+///
+/// `arc_body`, not the pointer price: the memo CREATED this body out of the
+/// slab, so nothing else in the census holds it. The slab those rows were
+/// taken off is the same layer's item data and a separate 48 bytes a flash —
+/// two disjoint figures over one granule, which is the whole reason the item
+/// and parked families are read apart.
+pub(crate) fn glm_flash_rows(
+    rows: &std::sync::Arc<Vec<crate::render::rasterize::FlashPaint>>,
+) -> u64 {
+    arc_body(rows)
 }
 
 /// The METAR job's own input, for the memo that holds whole jobs rather than

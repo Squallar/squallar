@@ -1723,3 +1723,278 @@ fn loop_hour(k: i64) -> chrono::NaiveDateTime {
         .expect("a real time")
         + chrono::Duration::hours(k)
 }
+
+// ── The built paint rows are memoised (WO: GLM paint memo) ────────────
+
+/// A handler holding one granule of `n` flashes, each at its own position so
+/// a row set that drifted would be visible in the values and not only in the
+/// pointer.
+fn a_handler_holding(n: usize) -> GlmHandler {
+    let mut handler = GlmHandler::new();
+    handler.defaults.enabled = true;
+    let base = item(GlmDataLevel::Flash, Some(1e-14), None).flash;
+    let flashes: Vec<GlmFlash> = (0..n)
+        .map(|i| GlmFlash {
+            lat: 33.0 + i as f64 * 0.01,
+            lon: -99.0 + i as f64 * 0.01,
+            ..base
+        })
+        .collect();
+    handler.apply_fetch_result(
+        Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+            flashes,
+            dead_feeds: Vec::new(),
+            queried: vec![GlmSatellite::GoesEast],
+            parse_failures: None,
+            transport_failures: None,
+            level_failures: Vec::new(),
+            evaluated_levels: vec![(GlmSatellite::GoesEast, GlmDataLevel::Flash)],
+            listing_failures: Vec::new(),
+            window_gaps: Vec::new(),
+            record_drops: Default::default(),
+        }))),
+        &PaneRef::across(&[]),
+    );
+    handler
+}
+
+fn memo_clock() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+}
+
+fn memo_ctx(
+    zoom: f64,
+    is_dark: bool,
+    as_of: chrono::NaiveDateTime,
+) -> crate::render::overlay_state::RasterizeContext {
+    crate::render::overlay_state::RasterizeContext {
+        is_dark,
+        zoom,
+        device_scale: 1.0,
+        now: memo_clock(),
+        as_of,
+        frame: None,
+    }
+}
+
+fn flashes_of(job: &DescribedJob) -> &Arc<Vec<rasterize::FlashPaint>> {
+    &job.downcast_ref::<rasterize::GlmStrikesInput>()
+        .expect("a GLM job")
+        .flashes
+}
+
+/// **The hit.** Two dispatches a zoom quantum apart describe two inputs — the
+/// zoom differs — that share ONE row allocation, and the per-flash copy ran
+/// once.
+///
+/// This is the direction a correctness-only test cannot see: a memo whose key
+/// moved every frame would satisfy every assertion about *what* the rows say
+/// while rebuilding all of them every dispatch.
+#[test]
+fn dispatches_at_two_zooms_share_one_built_flash_row_set() {
+    let handler = a_handler_holding(50);
+    let pane = PaneRef::bare(0);
+    let near = handler
+        .prepare_job(&memo_ctx(7.0, false, memo_clock()), &pane)
+        .unwrap();
+    let far = handler
+        .prepare_job(&memo_ctx(7.5, false, memo_clock()), &pane)
+        .unwrap();
+    assert_ne!(near, far, "the zoom is in the input and moved");
+    assert!(
+        Arc::ptr_eq(flashes_of(&near), flashes_of(&far)),
+        "the flash rows must be one shared allocation, not a second copy",
+    );
+    assert_eq!(flashes_of(&near).len(), 50);
+    assert_eq!(
+        handler.flash_memo.builds.get(),
+        1,
+        "fifty flashes were copied once, not once per dispatch",
+    );
+}
+
+/// **The clock is not in the key, and the hit is not stale.** `ctx.as_of`
+/// reaches the input as `now` and this layer quantises it at one second, so a
+/// key carrying it would miss on every dispatch of a scrubbed pane while the
+/// memo still read as a working one. The rows are shared across the scrub;
+/// the clock beside them is the dispatch's own.
+#[test]
+fn a_scrub_reuses_the_rows_and_still_carries_its_own_clock() {
+    let handler = a_handler_holding(20);
+    let pane = PaneRef::bare(0);
+    let live = handler
+        .prepare_job(&memo_ctx(7.0, false, memo_clock()), &pane)
+        .unwrap();
+    let scrubbed_at = memo_clock() - chrono::Duration::hours(1);
+    let scrubbed = handler
+        .prepare_job(&memo_ctx(7.0, false, scrubbed_at), &pane)
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(flashes_of(&live), flashes_of(&scrubbed)),
+        "a second of scrub must not re-copy every flash: the rows carry no \
+         clock term",
+    );
+    assert_eq!(
+        handler.flash_memo.builds.get(),
+        1,
+        "the depicted instant must not be a key term",
+    );
+    assert_eq!(
+        scrubbed
+            .downcast_ref::<rasterize::GlmStrikesInput>()
+            .unwrap()
+            .now,
+        scrubbed_at,
+        "the shared rows must not drag the previous dispatch's clock with \
+         them — the ages the rasterizer computes come from this field",
+    );
+    assert_eq!(
+        live.downcast_ref::<rasterize::GlmStrikesInput>()
+            .unwrap()
+            .now,
+        memo_clock(),
+    );
+}
+
+/// The theme is the other per-dispatch scalar that decides bytes, and it is
+/// beside the rows rather than in them.
+#[test]
+fn a_theme_flip_reuses_the_rows_and_still_carries_its_own_theme() {
+    let handler = a_handler_holding(20);
+    let pane = PaneRef::bare(0);
+    let light = handler
+        .prepare_job(&memo_ctx(7.0, false, memo_clock()), &pane)
+        .unwrap();
+    let dark = handler
+        .prepare_job(&memo_ctx(7.0, true, memo_clock()), &pane)
+        .unwrap();
+    assert!(Arc::ptr_eq(flashes_of(&light), flashes_of(&dark)));
+    assert!(
+        dark.downcast_ref::<rasterize::GlmStrikesInput>()
+            .unwrap()
+            .is_dark
+    );
+    assert!(
+        !light
+            .downcast_ref::<rasterize::GlmStrikesInput>()
+            .unwrap()
+            .is_dark
+    );
+    assert_eq!(handler.flash_memo.builds.get(), 1);
+}
+
+/// **The miss.** A poll moves the generation, the rows rebuild — once — with
+/// the new granule's values, and the old rows are parked rather than freed on
+/// the frame thread.
+#[test]
+fn a_poll_rebuilds_the_flash_rows_once_and_parks_the_old_ones() {
+    let mut handler = a_handler_holding(4);
+    let pane = PaneRef::bare(0);
+    let before = handler
+        .prepare_job(&memo_ctx(7.0, false, memo_clock()), &pane)
+        .unwrap();
+    assert_eq!(flashes_of(&before).len(), 4);
+
+    let base = item(GlmDataLevel::Flash, Some(1e-14), None).flash;
+    handler.apply_fetch_result(
+        Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+            flashes: (0..7)
+                .map(|i| GlmFlash {
+                    lat: 40.0 + i as f64 * 0.01,
+                    ..base
+                })
+                .collect(),
+            dead_feeds: Vec::new(),
+            queried: vec![GlmSatellite::GoesEast],
+            parse_failures: None,
+            transport_failures: None,
+            level_failures: Vec::new(),
+            evaluated_levels: vec![(GlmSatellite::GoesEast, GlmDataLevel::Flash)],
+            listing_failures: Vec::new(),
+            window_gaps: Vec::new(),
+            record_drops: Default::default(),
+        }))),
+        &PaneRef::across(&[]),
+    );
+
+    let after = handler
+        .prepare_job(&memo_ctx(7.0, false, memo_clock()), &pane)
+        .unwrap();
+    assert!(
+        !Arc::ptr_eq(flashes_of(&before), flashes_of(&after)),
+        "a poll must rebuild: holding the previous granule's rows would draw \
+         the previous granule",
+    );
+    assert_eq!(flashes_of(&after).len(), 7, "the new granule's rows");
+    assert_eq!(flashes_of(&after)[0].lat, 40.0);
+    assert_eq!(
+        handler.flash_memo.builds.get(),
+        2,
+        "one build per granule, not one per dispatch",
+    );
+    assert_eq!(
+        handler.flash_memo.take_retired().len(),
+        1,
+        "the retired generation's rows were handed back, not freed inline",
+    );
+}
+
+/// **Why the view half of the key is zero, derived rather than copied.**
+///
+/// Every pane-selected term that can change which flashes exist — the
+/// satellite, the hierarchy levels, the window the fetch asks for — bumps
+/// `data_generation` in `apply_control`, so it reaches the memo through the
+/// generation half and never needs a view fold. A change here that stopped
+/// bumping would serve one pane's satellite to another, so this pins the
+/// premise rather than the consequence.
+#[test]
+fn every_selection_the_rows_could_depend_on_moves_the_generation() {
+    for update in [
+        ControlUpdate {
+            id: "satellite",
+            value: ControlValue::String("west".to_string()),
+        },
+        ControlUpdate {
+            id: "time_window",
+            value: ControlValue::Float(9.0),
+        },
+        ControlUpdate {
+            id: "show_events",
+            value: ControlValue::Bool(true),
+        },
+        ControlUpdate {
+            id: "show_groups",
+            value: ControlValue::Bool(true),
+        },
+        ControlUpdate {
+            id: "show_flashes",
+            value: ControlValue::Bool(false),
+        },
+    ] {
+        let mut handler = a_handler_holding(3);
+        let before = handler.state.data_generation;
+        handler.apply_control(&update, &mut PaneMut::bare(0));
+        assert_ne!(
+            handler.state.data_generation, before,
+            "control {:?} left the generation still — the flash memo keys its \
+             view half on zero because every such control moves it",
+            update.id,
+        );
+    }
+}
+
+/// An empty slab describes no job and copies nothing, and does not park an
+/// empty answer against the generation that later has rows.
+#[test]
+fn an_empty_slab_describes_no_job_and_builds_nothing() {
+    let handler = GlmHandler::new();
+    assert!(
+        handler
+            .prepare_job(&memo_ctx(7.0, false, memo_clock()), &PaneRef::bare(0))
+            .is_none()
+    );
+    assert_eq!(handler.flash_memo.builds.get(), 0);
+}

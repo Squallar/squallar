@@ -658,7 +658,7 @@ impl JobSpec for GlmJob {
         // gates over an age-straddling fixture are what enforce it.
         encode_datetime(out, &glm.now);
         out.extend_from_slice(&(glm.flashes.len() as u32).to_le_bytes());
-        for flash in &glm.flashes {
+        for flash in glm.flashes.iter() {
             out.extend_from_slice(&flash.lat.to_le_bytes());
             out.extend_from_slice(&flash.lon.to_le_bytes());
             encode_datetime(out, &flash.time);
@@ -694,7 +694,9 @@ impl JobSpec for GlmJob {
         }
         Some((
             crate::render::rasterize::GlmStrikesInput {
-                flashes,
+                // One block for the whole run, matching the page side: the
+                // rows travel as a shared value there and are shared here too.
+                flashes: std::sync::Arc::new(flashes),
                 zoom,
                 is_dark,
                 time_window_secs,
@@ -2695,7 +2697,7 @@ mod tests {
     #[test]
     fn the_glm_row_round_trips_in_order() {
         let job = DescribedJob::new(GlmStrikesInput {
-            flashes: vec![
+            flashes: std::sync::Arc::new(vec![
                 FlashPaint {
                     lat: 34.5,
                     lon: -99.0,
@@ -2708,7 +2710,7 @@ mod tests {
                     time: ts(1_755_215_400, 0),
                     energy: None,
                 },
-            ],
+            ]),
             zoom: 5.0,
             is_dark: true,
             time_window_secs: 600.0,

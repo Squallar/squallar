@@ -345,6 +345,11 @@ impl GlmPaneState {
 
 pub(crate) struct GlmHandler {
     pub state: OverlayState<Arc<GlmSlab>, Assembled>,
+    /// **The paint rows of the current granule, built once per poll** and
+    /// handed to every dispatch since as a refcount clone — see
+    /// [`GlmHandler::paint_input`].
+    pub(crate) flash_memo:
+        crate::render::signature_memo::BuiltMemo<Arc<Vec<rasterize::FlashPaint>>>,
     /// **The registry's own copy**, used only where no pane is supplied. The
     /// config swap keeps it in step until WO-M10c deletes the swap; every
     /// answer prefers [`PaneRef::state`] when there is one.
@@ -416,6 +421,9 @@ impl GlmHandler {
     pub fn new() -> Self {
         Self {
             state: OverlayState::new(),
+            flash_memo: crate::render::signature_memo::BuiltMemo::new(
+                crate::render::footprint::glm_flash_rows,
+            ),
             defaults: GlmPaneState::new(false),
             cache: Arc::new(std::sync::Mutex::new(GlmCache::default())),
             dead_feeds: Vec::new(),
@@ -443,6 +451,30 @@ impl GlmHandler {
         }
     }
 
+    /// **The rows are built once per poll, not once per dispatch.**
+    ///
+    /// A `FlashPaint` is 40 bytes and this layer's granule is on the order of
+    /// 125,000 rows, so the `collect` below was a ~5 MB deep copy on the frame
+    /// thread on every overlay render — the single largest frame-thread cost
+    /// left in this layer once the per-flash `Arc`s went. The rows sit behind
+    /// one `Arc` the memo hands out; what is built per dispatch is the five
+    /// scalars around it.
+    ///
+    /// **The view key is zero, and that is a derived answer, not a copied
+    /// one.** Every term that reaches a row is read from `self.state.data`
+    /// alone: the map takes `lat`, `lon`, `time` and `energy` off every flash
+    /// of the slab, in slab order, with no filter — the time-window cull and
+    /// the age ramp are the *rasterizer's*, against `now` and
+    /// `time_window_secs`, which travel beside the rows and not inside them,
+    /// and `satellite` / `show_events` / `show_groups` / `show_flashes` decide
+    /// what is *fetched* and each bumps `data_generation` when it moves. So no
+    /// pane's selection can make one dispatch's rows differ from another's at
+    /// the same generation, and the `Arc` is safe to share across panes.
+    ///
+    /// **`ctx.now` and `ctx.as_of` are never in the key.** `as_of` reaches the
+    /// input as `now`, and this layer quantises it at one second — folding it
+    /// into a key would make every dispatch of a scrubbed pane a miss while
+    /// the memo still read as if it were working.
     fn paint_input(
         &self,
         ctx: &RasterizeContext,
@@ -451,19 +483,25 @@ impl GlmHandler {
         if self.state.data.is_empty() {
             return None;
         }
+        let flashes = self
+            .flash_memo
+            .get_or_build(self.state.data_generation, 0, || {
+                Some(Arc::new(
+                    self.state
+                        .data
+                        .flashes
+                        .iter()
+                        .map(|f| rasterize::FlashPaint {
+                            lat: f.lat,
+                            lon: f.lon,
+                            time: f.time,
+                            energy: f.energy,
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+            })?;
         Some(rasterize::GlmStrikesInput {
-            flashes: self
-                .state
-                .data
-                .flashes
-                .iter()
-                .map(|f| rasterize::FlashPaint {
-                    lat: f.lat,
-                    lon: f.lon,
-                    time: f.time,
-                    energy: f.energy,
-                })
-                .collect(),
+            flashes,
             zoom: ctx.zoom,
             is_dark: ctx.is_dark,
             time_window_secs: self.view(pane).time_window_secs,

@@ -590,13 +590,13 @@ pub(super) fn an_overlay_glm_job() -> JobRequest {
             side_ceiling_px: 0,
         },
         job: DescribedJob::new(GlmStrikesInput {
-            flashes: vec![
+            flashes: std::sync::Arc::new(vec![
                 at(60, 35.3, -97.3, Some(1e-15)),  // first third: white-ish
                 at(270, 36.2, -98.5, None),        // second third; unknown energy
                 at(480, 33.8, -96.7, Some(1e-13)), // last third: red-ish
                 at(570, 34.5, -98.2, Some(1e-14)), // inside, hugging the window edge
                 at(660, 35.8, -96.5, Some(1e-14)), // past the window: culled
-            ],
+            ]),
             zoom: 6.5,
             is_dark: true,
             time_window_secs: 600.0,

@@ -1225,7 +1225,14 @@ pub struct FlashPaint {
 /// A flash's position in `flashes` is its hit-map id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlmStrikesInput {
-    pub flashes: Vec<FlashPaint>,
+    /// **Shared, not copied per dispatch.** The rows are a function of the
+    /// resident granule alone — every other field of this struct is a scalar
+    /// the dispatch supplies — so the handler builds them once per poll and
+    /// hands out a refcount clone. At the ~125,000 flashes a busy 20 s poll
+    /// delivers, a `Vec` here was a 5 MB deep copy on the frame thread per
+    /// overlay render. The worker side decodes into a fresh `Arc`, which is
+    /// one block for the whole run.
+    pub flashes: Arc<Vec<FlashPaint>>,
     pub zoom: f64,
     pub is_dark: bool,
     /// Flashes older than this many seconds are dropped; younger ones fade

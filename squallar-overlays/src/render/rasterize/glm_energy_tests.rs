@@ -67,12 +67,12 @@ fn render_one(energy: Option<f32>) -> usize {
     };
     let out = rasterize_glm_strikes(
         &GlmStrikesInput {
-            flashes: vec![FlashPaint {
+            flashes: std::sync::Arc::new(vec![FlashPaint {
                 lat: flash.lat,
                 lon: flash.lon,
                 time: flash.time,
                 energy: flash.energy,
-            }],
+            }]),
             device_scale: 1.0,
             zoom: 8.0,
             is_dark: true,
@@ -131,12 +131,12 @@ fn render_at(lon: f64, min_lon: f64, max_lon: f64) -> usize {
     };
     let out = rasterize_glm_strikes(
         &GlmStrikesInput {
-            flashes: vec![FlashPaint {
+            flashes: std::sync::Arc::new(vec![FlashPaint {
                 lat: flash.lat,
                 lon: flash.lon,
                 time: flash.time,
                 energy: flash.energy,
-            }],
+            }]),
             device_scale: 1.0,
             zoom: 8.0,
             is_dark: true,

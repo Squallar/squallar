@@ -32,7 +32,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::LocalKey;
 
 use squallar_overlays::glm::{
     GlmDataLevel, GlmFetchOutcome, GlmFetchResult, GlmFlash, GlmSatellite, RecordDrops,
@@ -48,21 +48,36 @@ use squallar_source::id::known;
 /// gate does not depend on this.
 const FLASHES: usize = 20_000;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static FREES: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-static BYTES_FREED: AtomicUsize = AtomicUsize::new(0);
-
 thread_local! {
     /// Thread-local, not a global flag: libtest runs this binary's tests
     /// concurrently and a global one would count whatever another test happened
     /// to be allocating. `const`-initialised so reading it inside the allocator
     /// cannot itself allocate.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
+    /// **And so are the counters, for the same reason the flag is.** They were
+    /// global atomics that every window `store(0)`d before it ran: the flag
+    /// kept a concurrent test's *allocations* out of the total, but nothing
+    /// kept its **reset** out, so two measured windows overlapping zeroed each
+    /// other mid-count. Caught by a tamper whose second dispatch printed 144
+    /// bytes where it had just copied 20,000 rows — a figure that would have
+    /// read as a passing bar.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    static FREES: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
+    static BYTES_FREED: Cell<usize> = const { Cell::new(0) };
 }
 
 fn counting() -> bool {
     COUNTING.try_with(Cell::get).unwrap_or(false)
+}
+
+/// Add to one counter, tolerating a thread whose TLS is already torn down.
+fn bump(counter: &'static LocalKey<Cell<usize>>, by: usize) {
+    let _ = counter.try_with(|c| c.set(c.get().wrapping_add(by)));
+}
+
+fn read(counter: &'static LocalKey<Cell<usize>>) -> usize {
+    counter.try_with(Cell::get).unwrap_or(0)
 }
 
 struct SmallBlocks;
@@ -70,32 +85,32 @@ struct SmallBlocks;
 unsafe impl GlobalAlloc for SmallBlocks {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if counting() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            bump(&ALLOCS, 1);
+            bump(&BYTES, layout.size());
         }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if counting() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            bump(&ALLOCS, 1);
+            bump(&BYTES, layout.size());
         }
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if counting() {
-            FREES.fetch_add(1, Ordering::Relaxed);
-            BYTES_FREED.fetch_add(layout.size(), Ordering::Relaxed);
+            bump(&FREES, 1);
+            bump(&BYTES_FREED, layout.size());
         }
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if counting() {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(new_size, Ordering::Relaxed);
+            bump(&ALLOCS, 1);
+            bump(&BYTES, new_size);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -104,46 +119,35 @@ unsafe impl GlobalAlloc for SmallBlocks {
 #[global_allocator]
 static A: SmallBlocks = SmallBlocks;
 
-/// **One measured window at a time.**
-///
-/// The four counters are process-global statics and the harness runs these
-/// tests on several threads, so two windows open at once reset and add to
-/// each other's figures: a reading is then a mixture of two tests, and
-/// `a_resident_granule_is_the_rows_and_little_else` subtracts a `BYTES_FREED`
-/// its own window never took and panics on the overflow. The `COUNTING`
-/// thread-local decides WHICH thread's allocations are counted; it cannot
-/// keep two counting threads apart, because there is one set of counters.
-///
-/// Observed 2/5 parallel runs red where the same binary is 5/5 green under
-/// `--test-threads=1`. The window is what has to be exclusive, so this is
-/// where the lock is.
-static WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Blocks taken, blocks handed back, bytes taken, bytes handed back.
 ///
-/// All four readings are taken while the window's lock is still held: a
-/// figure read after the lock is released is a figure another test's window
-/// may already have reset.
+/// **The four counters are thread-local, and that is what makes one window
+/// independent of another.** They were process-global statics gated by a
+/// thread-local `COUNTING` flag: the flag decided WHICH thread's allocations
+/// were counted and could not keep two counting threads apart, so two windows
+/// open at once on the harness's several threads reset and added to each
+/// other's figures, and `a_resident_granule_is_the_rows_and_little_else`
+/// subtracted a `BYTES_FREED` its own window never took and panicked on the
+/// overflow. Per-thread counters answer that at the counter rather than by
+/// serialising the windows: a window can only ever see its own thread's
+/// figures, so there is nothing left for a lock to order.
+///
+/// All four readings are still taken before the caller gets control back,
+/// which is the second half of the same rule: a figure read after the window
+/// closes is a figure the next window on this thread may already have reset.
 fn blocks_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize, usize, usize) {
-    // A test that panicked inside its window poisons this; the lock is
-    // ordering, not data, so the next test takes it anyway rather than
-    // turning one failure into four.
-    let _window = WINDOW
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ALLOCS.store(0, Ordering::Relaxed);
-    FREES.store(0, Ordering::Relaxed);
-    BYTES.store(0, Ordering::Relaxed);
-    BYTES_FREED.store(0, Ordering::Relaxed);
+    for counter in [&ALLOCS, &FREES, &BYTES, &BYTES_FREED] {
+        counter.with(|c| c.set(0));
+    }
     COUNTING.with(|c| c.set(true));
     let out = f();
     COUNTING.with(|c| c.set(false));
     (
         out,
-        ALLOCS.load(Ordering::Relaxed),
-        FREES.load(Ordering::Relaxed),
-        BYTES.load(Ordering::Relaxed),
-        BYTES_FREED.load(Ordering::Relaxed),
+        read(&ALLOCS),
+        read(&FREES),
+        read(&BYTES),
+        read(&BYTES_FREED),
     )
 }
 
@@ -338,5 +342,184 @@ fn every_row_still_resolves_to_its_own_flash() {
     assert!(
         items.get(FLASHES).is_none(),
         "an index past the end must answer nothing rather than wrap or panic",
+    );
+}
+
+// ── The dispatch's paint rows ─────────────────────────────────────────
+
+/// The dispatch context two overlay renders of an unmoved map supply. Only
+/// `zoom` differs between the two below, because a real pair of dispatches
+/// under a wheel gesture differs by exactly that and the rows must not care.
+fn a_ctx(zoom: f64) -> squallar_overlays::render::overlay_state::RasterizeContext {
+    squallar_overlays::render::overlay_state::RasterizeContext {
+        is_dark: false,
+        zoom,
+        device_scale: 1.0,
+        now: now(),
+        as_of: now(),
+        frame: None,
+    }
+}
+
+fn flash_rows(
+    job: &squallar_source::job::DescribedJob,
+) -> &std::sync::Arc<Vec<squallar_overlays::render::rasterize::FlashPaint>> {
+    &job.downcast_ref::<squallar_overlays::render::rasterize::GlmStrikesInput>()
+        .expect("the dispatch described a GLM job")
+        .flashes
+}
+
+/// **The dispatch.** `prepare_job` used to turn every flash of the resident
+/// granule into its own `FlashPaint` row and `collect` them into a fresh
+/// `Vec`, on the frame thread, on every overlay render — 40 bytes a flash,
+/// ~5 MB at the ~125,000 a busy poll delivers, for rows that are a function
+/// of the granule alone.
+///
+/// A second dispatch whose picture has not moved must copy **nothing**: the
+/// rows are built once per granule and handed out as a refcount clone, and
+/// what is built per dispatch is the five scalars around them.
+#[test]
+fn a_second_dispatch_of_one_granule_copies_no_flashes() {
+    let registry = a_registry_holding_a_granule();
+    let pane = PaneRef::bare(0);
+
+    let (first, first_allocs, _, first_bytes, _freed) =
+        blocks_during(|| registry.prepare_job(&known::LIGHTNING, &a_ctx(7.0), &pane));
+    let first = first.expect("a granule is resident, so the layer describes a job");
+
+    let (second, allocs, _frees, bytes, _freed) =
+        blocks_during(|| registry.prepare_job(&known::LIGHTNING, &a_ctx(7.5), &pane));
+    let second = second.expect("the second dispatch describes a job too");
+
+    // Printed before any bar, for the reason this file's header gives: a bar
+    // tells a reader only which side of it the run landed on.
+    println!(
+        "prepare_job, first dispatch of a granule: {first_allocs} blocks, \
+         {first_bytes} bytes over {FLASHES} flashes = {:.1} bytes per flash",
+        first_bytes as f64 / FLASHES as f64,
+    );
+    println!(
+        "prepare_job, second dispatch, picture unmoved: {allocs} blocks, \
+         {bytes} bytes over {FLASHES} flashes = {:.2} bytes per flash",
+        bytes as f64 / FLASHES as f64,
+    );
+    assert_eq!(
+        flash_rows(&second).len(),
+        FLASHES,
+        "every row must still travel, or the counts above are of a shorter \
+         picture",
+    );
+    assert!(
+        bytes <= 1024,
+        "a second dispatch of the same granule asked the allocator for \
+         {bytes} bytes in {allocs} block(s), over {FLASHES} flashes. A row \
+         per flash is {} bytes ({} per flash), copied on the frame thread \
+         once per overlay render; the only block this dispatch needs is the \
+         `Arc` the described job itself is",
+        FLASHES * std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>(),
+        std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>(),
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(flash_rows(&first), flash_rows(&second)),
+        "the two dispatches must share ONE row allocation; an equal-but-\
+         separate `Vec` is the copy this test exists to catch",
+    );
+}
+
+/// **The other direction, and the instrument's own liveness.** The rows must
+/// rebuild when the granule moves — a memo that never missed would draw the
+/// previous poll's lightning forever — and the same counting window that
+/// reads ~0 above must be able to read the whole copy here, or its zero says
+/// nothing.
+#[test]
+fn a_dispatch_after_a_poll_rebuilds_the_rows_and_the_counter_sees_it() {
+    let mut registry = a_registry_holding_a_granule();
+    let pane = PaneRef::bare(0);
+    let before = registry
+        .prepare_job(&known::LIGHTNING, &a_ctx(7.0), &pane)
+        .expect("a granule is resident");
+
+    registry.apply_fetch_result(a_granule(FLASHES), &pane);
+
+    let (after, allocs, _frees, bytes, _freed) =
+        blocks_during(|| registry.prepare_job(&known::LIGHTNING, &a_ctx(7.0), &pane));
+    let after = after.expect("the new granule describes a job");
+
+    assert!(
+        !std::sync::Arc::ptr_eq(flash_rows(&before), flash_rows(&after)),
+        "a poll must rebuild the rows: sharing them with the retired granule \
+         would draw the retired granule",
+    );
+    println!(
+        "prepare_job, first dispatch after a poll: {allocs} blocks, {bytes} \
+         bytes over {FLASHES} flashes = {:.1} bytes per flash",
+        bytes as f64 / FLASHES as f64,
+    );
+    let row = std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>();
+    assert!(
+        bytes >= FLASHES * row,
+        "the rebuild after a poll asked for {bytes} bytes over {FLASHES} \
+         flashes; the rows alone are {} — a window that cannot see the copy \
+         here cannot be quoted for the ~0 the unmoved dispatch reads",
+        FLASHES * row,
+    );
+}
+
+/// **What the memo keeps alive, which is not nothing.**
+///
+/// The memoised value is a built row set, not a handle onto something the hit
+/// map already holds, so the layer's resident bytes grow by it: one live row
+/// set for the current generation, plus the one row set a rollover parks for
+/// a discard seam that has no production drainer yet. Both are `Arc`s over a
+/// single block of `FlashPaint`, and the rollover *replaces* the parked slot
+/// rather than pushing to it, so the parked half is one row set at steady
+/// state and not one per poll.
+///
+/// Measured as the net of a poll-and-dispatch window — everything allocated
+/// inside it, so what the window leaves behind is what the layer now holds.
+/// The claim under test is **flat, not small**: the fourth and fifth polls
+/// must leave no more behind than the second did.
+#[test]
+fn the_memo_keeps_a_bounded_number_of_row_sets_however_many_polls_land() {
+    let mut registry = OverlayRegistry::default();
+    registry.set_enabled(&known::LIGHTNING, true, &mut PaneMut::bare(0));
+    let pane = PaneRef::bare(0);
+
+    let mut cumulative: i64 = 0;
+    let mut per_poll: Vec<i64> = Vec::new();
+    for _ in 0..6 {
+        let ((), _allocs, _frees, taken, handed_back) = blocks_during(|| {
+            registry.apply_fetch_result(a_granule(FLASHES), &pane);
+            drop(registry.prepare_job(&known::LIGHTNING, &a_ctx(7.0), &pane));
+        });
+        let net = taken as i64 - handed_back as i64;
+        cumulative += net;
+        per_poll.push(net);
+    }
+
+    println!(
+        "resident after 6 polls, each dispatched: {cumulative} bytes over \
+         {FLASHES} flashes = {:.1} bytes per flash; per-poll net {per_poll:?}",
+        cumulative as f64 / FLASHES as f64,
+    );
+    let row = std::mem::size_of::<squallar_overlays::render::rasterize::FlashPaint>() as i64;
+    for (i, net) in per_poll.iter().enumerate().skip(2) {
+        assert!(
+            *net < FLASHES as i64 * row / 2,
+            "poll {} left {net} bytes behind over {FLASHES} flashes; past the \
+             first two the residency must be flat, and a poll that keeps half \
+             a row set ({} bytes) is the memo growing with the poll count \
+             rather than holding a bounded number of row sets",
+            i + 1,
+            FLASHES as i64 * row / 2,
+        );
+    }
+    assert!(
+        cumulative < FLASHES as i64 * 160,
+        "the layer holds {cumulative} bytes over {FLASHES} flashes ({:.1} per \
+         flash) after six polls. The budget is the 48-byte slab row plus at \
+         most two 40-byte paint row sets — the live one and the parked one — \
+         which is 128 per flash",
+        cumulative as f64 / FLASHES as f64,
     );
 }

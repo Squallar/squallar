@@ -653,12 +653,12 @@ fn the_degenerate_paths_declare_what_the_drawing_paths_do() {
     let now = chrono::Utc::now().naive_utc();
     let flash = glm_fixture();
     let glm_input = rasterize::GlmStrikesInput {
-        flashes: vec![rasterize::FlashPaint {
+        flashes: std::sync::Arc::new(vec![rasterize::FlashPaint {
             lat: flash.lat,
             lon: flash.lon,
             time: flash.time,
             energy: flash.energy,
-        }],
+        }]),
         device_scale: 1.0,
         zoom: 7.0,
         is_dark: false,

@@ -66,7 +66,7 @@ fn bounds() -> squallar_geo::GeoBounds {
 fn strike_cells(lat: f64, lon: f64) -> Vec<u32> {
     let out = rasterize_glm_strikes(
         &GlmStrikesInput {
-            flashes: vec![FlashPaint {
+            flashes: std::sync::Arc::new(vec![FlashPaint {
                 lat,
                 lon,
                 time: as_of(),
@@ -74,7 +74,7 @@ fn strike_cells(lat: f64, lon: f64) -> Vec<u32> {
                 // zoom 8 the base is 16 texels, the bolt 16 and the hit disc's
                 // radius 9.6.
                 energy: None,
-            }],
+            }]),
             zoom: 8.0,
             is_dark: true,
             time_window_secs: WINDOW_SECS,

@@ -38,7 +38,7 @@ fn flash(lon: f64, time: chrono::NaiveDateTime) -> FlashPaint {
 fn render(flashes: Vec<FlashPaint>) -> RasterizeOutput {
     rasterize_glm_strikes(
         &GlmStrikesInput {
-            flashes,
+            flashes: std::sync::Arc::new(flashes),
             zoom: 8.0,
             is_dark: true,
             time_window_secs: WINDOW_SECS,
