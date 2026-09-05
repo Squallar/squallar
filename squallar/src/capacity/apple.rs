@@ -12,22 +12,47 @@ pub fn system_ram_bytes() -> Option<u64> {
     (bytes > 0).then_some(bytes)
 }
 
-/// **Memory this process could take right now**, in bytes: the Mach host's
-/// free plus inactive pages, at the host's page size.
+/// **Memory this process could take right now**, in bytes:
+/// `(free - speculative) + inactive` pages, at the host's page size.
 ///
 /// `None` when `host_statistics64` refuses, when the page size reads zero, or
 /// when the sum is zero — a machine with no reclaimable page at all is a call
 /// that went wrong, and a pool of zero bytes is a wall every scene is over
 /// where an absent pool is the arm every budget already handles.
 ///
-/// **Why free + inactive, and nothing else.** Darwin's `free_count` alone is
-/// close to nothing on any machine that has been up: the kernel keeps almost
-/// no page free and moves what it no longer needs to the *inactive* queue,
-/// which is reclaimable on demand and is what Activity Monitor's own
-/// arithmetic treats as available. `active`, `wire` and `compressor` pages
-/// are memory in use, and `speculative` is read-ahead the kernel is still
-/// betting on; none of them are this process's to take. `purgeable_count` is
-/// a subset of the counts already summed here and adding it double-counts.
+/// **Why inactive is added.** Darwin's free pages alone are close to nothing
+/// on any machine that has been up: the kernel keeps almost no page free and
+/// moves what it no longer needs to the *inactive* queue, which is
+/// reclaimable on demand and is what Activity Monitor's own arithmetic treats
+/// as available. `active`, `wire` and `compressor` pages are memory in use.
+/// `purgeable_count` is a subset of the counts already summed here and adding
+/// it double-counts.
+///
+/// **Why speculative is subtracted, when nothing else is.** `free_count` is
+/// **inclusive of** `speculative_count` — the two are published side by side
+/// as though they were disjoint queues, and they are not. Darwin's own
+/// `vm_stat` takes one out of the other before printing "Pages free", and a
+/// reader that sums `free_count` raw counts every read-ahead page twice over.
+/// The raw counts that establish it are on
+/// [`super::darwin_pages::available_bytes_from`], which performs the
+/// arithmetic.
+///
+/// **What it was worth.** Three interleaved samples on jacobs-mac-mini (M2,
+/// macOS 26.4.1, 8 GiB unified, page size 16384) on 2026-09-04 put the
+/// unsubtracted reader **+52.1 % over `vm_stat`** on all three. On the first,
+/// **1.099 GB of a 3.21 GB reported pool was speculative pages: 34.2 % of the
+/// figure the budget was spending against, and 12.8 % of the whole machine.**
+///
+/// **This is the conservative end of a real trade, not a settled fact.**
+/// Speculative pages genuinely are reclaimable — the kernel drops them under
+/// pressure without writing anything back — so the larger figure is
+/// defensible on the merits and the counters cannot settle which one is
+/// "right". What settles it is direction: over-state the pool and the budget
+/// over-commits, under-state it and a rung of picture quality is lost. Those
+/// costs are not symmetric — one of those failures is recoverable and the
+/// other is not — so the uncertainty is resolved toward the recoverable one.
+/// That is the same rule, for the same reason, as
+/// `squallar_radar::scan_size::ALLOCATOR_BLOCK_OVERHEAD`.
 ///
 /// **No `mach_port_deallocate`.** `mach_host_self` returns a send right the
 /// task already holds — the host name port is a task special port, not a new
@@ -42,10 +67,15 @@ pub fn system_ram_bytes() -> Option<u64> {
 /// whose count-in/count-out argument names its own size, and that is the
 /// whole of the contract — the same shape as the Windows reader's.
 ///
-/// **UNEXECUTED.** Written and compile-checked from a Linux box on
-/// 2026-09-04; no Apple arm has run it. What a run has to confirm is the one
-/// thing a compiler cannot: that the sum tracks what the machine will
-/// actually hand out. The `vm_stat` command prints the same three counts.
+/// **Executed on 2026-09-04**, on the box above: `host_statistics64` returns
+/// `KERN_SUCCESS` at run time, so the deprecated port getter below does work;
+/// [`system_ram_bytes`] matches `sysctl hw.memsize` to the byte; and the
+/// scoped allow is load-bearing, since the same call without it warns. That
+/// run is what found the missing subtraction. **What is still unexecuted is
+/// the corrected arithmetic**: no Apple arm has run the reader since the
+/// subtraction landed, and what a Mac has to confirm is that it now tracks
+/// `vm_stat`'s free-plus-inactive to within sampling drift rather than
+/// standing 52 % over it.
 #[allow(
     unsafe_code,
     reason = "host_statistics64 writes through a raw pointer to a struct this function owns"
@@ -87,7 +117,10 @@ pub fn available_ram_bytes() -> Option<u64> {
     let (stats, page_bytes) = unsafe { (stats.assume_init(), libc::vm_page_size) };
     // `vm_statistics64` is `repr(packed(8))`: each field is copied out by
     // value rather than referenced, which is what a packed field allows.
-    let pages = u64::from(stats.free_count) + u64::from(stats.inactive_count);
-    let bytes = pages.checked_mul(page_bytes as u64)?;
-    (bytes > 0).then_some(bytes)
+    super::darwin_pages::available_bytes_from(
+        stats.free_count,
+        stats.speculative_count,
+        stats.inactive_count,
+        page_bytes as u64,
+    )
 }

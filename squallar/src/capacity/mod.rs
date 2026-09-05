@@ -25,6 +25,14 @@ mod apple;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use apple::{available_ram_bytes, system_ram_bytes};
 
+/// The Darwin reader's page arithmetic, split out and **mounted on every
+/// target** — the one module here a `cfg` does not select. `apple` compiles
+/// only on Apple and no CI row executes an Apple test binary, so a test beside
+/// the syscall would run on no arm; this half carries no platform type, so
+/// every arm's `cargo test` proves it. Re-exported because a `pub fn` inside a
+/// private module is dead code on the targets that never call it.
+pub mod darwin_pages;
+
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
