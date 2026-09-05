@@ -135,8 +135,8 @@ fn same_shape(a: &MrmsGrid, b: &MrmsGrid) -> bool {
 /// Two lesser corruptions are caught earlier and never get here, which is why
 /// they are recorded rather than asserted: a `give` that skipped its `clear`
 /// trips `take`'s own clear and, failing that, the decode's
-/// `values.len() != ni * nj` refusal; and a `take` relaxed from
-/// `points == STAGING_POINTS` to `capacity >= points` is caught by
+/// `values.len() != ni * nj` refusal; and a `take` relaxed from the retained
+/// buffer's own capacity to `capacity >= points` is caught by
 /// `staging::tests::a_grid_of_another_shape_is_never_given_the_mosaic_buffer`,
 /// since both shipped products are the same shape and cannot show it here.
 #[test]

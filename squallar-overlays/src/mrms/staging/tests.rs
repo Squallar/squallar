@@ -1,19 +1,281 @@
-//! The pool's own invariants, over buffers rather than over granules.
+//! The MRMS instance of the pool — its invariants over buffers rather than
+//! over granules, **at the CONUS shape and at a shape the CONUS constant does
+//! not describe**.
 //!
-//! The *decode* gates live in `tests/mrms_staging.rs`, where a counting global
-//! allocator watches the real shipped path. What is checked here is the half
-//! that decides whether a retained buffer can ever hand a grid the wrong bytes,
-//! and it is checked at the sizes a shipped mosaic uses — 24.5 M `u16` is
-//! 49 MB, so these allocate for real rather than at a toy width.
+//! The *decode* gates live in `tests/mrms_staging_blocks.rs`, where a counting
+//! global allocator watches the real shipped path. What is checked here is the
+//! half that decides whether a retained buffer can ever hand a grid the wrong
+//! bytes, and it is checked at the sizes a shipped mosaic uses — 24.5 M `u16`
+//! is 49 MB, so these allocate for real rather than at a toy width.
+//!
+//! **Why a second shape is here at all.** Every assertion in this file used to
+//! be at [`STAGING_POINTS`], which is also the committed fixture's shape and
+//! also the constant the slot was keyed on — three spellings of one number, so
+//! nothing here could tell a pool that reuses from a pool keyed on a figure the
+//! product has stopped publishing. That is exactly how GMGSI shipped a slot
+//! that reused nothing on every real granule with its whole suite green.
 
 use super::*;
 
+/// **The CONUS mosaic NOAA publishes**, and what this build is sized for:
+/// 7000 x 3500 = 24,500,000 points. Read off section 3 of one granule per day
+/// across 17 dates from 2020-10-14 to 2026-09-04 on both shipped products; it
+/// has never been anything else.
+const CONUS_POINTS: usize = 7000 * 3500;
+
+/// **A shape MRMS publishes that this build's constant does not describe** —
+/// the Caribbean domain's 3000 x 1500 = 4,500,000 points, read off
+/// `CARIB/MergedReflectivityQCComposite_00.50/20260904/` on 2026-09-04. Same
+/// product name, same packing (template 3.0, DRT 5.41, 16-bit, no bitmap), a
+/// fifth of the points.
+///
+/// It stands in for the event this module is now proof against and which CONUS
+/// has not had: NOAA moving the grid under a build. GMGSI had it on
+/// 2026-09-03.
+const OFF_NOMINAL_POINTS: usize = 3000 * 1500;
+
 /// A capacity-exact mosaic buffer, empty — in the pool's own width.
 fn mosaic_buffer() -> Vec<u16> {
+    buffer_of(STAGING_POINTS)
+}
+
+/// The same at any point count, so a test can drive a shape the constant does
+/// not name.
+fn buffer_of(points: usize) -> Vec<u16> {
     let mut v: Vec<u16> = Vec::new();
-    v.try_reserve_exact(STAGING_POINTS)
-        .expect("a mosaic buffer fits on a test host");
+    v.try_reserve_exact(points)
+        .expect("a staging buffer fits on a test host");
     v
+}
+
+/// **The nominal figure prices the budgets and does not key the slot.**
+#[test]
+fn the_nominal_shape_prices_the_budgets_and_does_not_key_the_slot() {
+    assert_eq!(STAGING_POINTS, CONUS_POINTS);
+    assert_eq!(StagingPool::new().nominal_points(), STAGING_POINTS);
+    assert_eq!(
+        STAGING_POINTS * size_of::<StagedCode>(),
+        crate::mrms::FRAME_STAGING_BYTES,
+        "one staged mosaic, which is what the frame budget is",
+    );
+    assert_ne!(
+        OFF_NOMINAL_POINTS, STAGING_POINTS,
+        "premise: the off-nominal shape below really is off-nominal",
+    );
+}
+
+/// **The defect GMGSI shipped, at a shape MRMS itself publishes.**
+///
+/// A pool keyed on [`STAGING_POINTS`] and handed a grid at any other shape
+/// reuses nothing and accepts nothing back: `take` compared the request against
+/// the constant and `give` compared the offered capacity against it, so every
+/// decode allocated a fresh block and every one was freed again — the exact
+/// churn this module exists to remove, with the module in place, at full speed,
+/// with no error anywhere.
+///
+/// Observed red before the fix, this test: `declined` **1** where 0 is
+/// expected, then `reused` **0** where 1 is, `retained_bytes` **0**, and
+/// `health` `Inert`.
+#[test]
+fn a_grid_at_a_shape_the_conus_constant_does_not_describe_is_pooled() {
+    let pool = StagingPool::new();
+    assert_eq!(pool.health(), StagingHealth::Cold);
+
+    let first = pool
+        .take(OFF_NOMINAL_POINTS)
+        .expect("a cold pool allocates");
+    let address = first.as_ptr() as usize;
+    assert_eq!(first.capacity(), OFF_NOMINAL_POINTS);
+    assert_eq!(
+        pool.totals().allocated,
+        1,
+        "premise: the first one is fresh"
+    );
+
+    // That very buffer back through `recycle`, the door an eviction uses, so
+    // what the next grid is handed can be compared block for block.
+    pool.recycle(grid_around(first));
+    assert_eq!(
+        pool.totals().declined,
+        0,
+        "a grid of the shape the product is publishing must not be refused by \
+         the slot because a constant in this build says 7000 x 3500",
+    );
+    assert_eq!(
+        pool.retained_points(),
+        OFF_NOMINAL_POINTS,
+        "and the slot must describe the block it is actually holding",
+    );
+    assert_eq!(
+        pool.retained_bytes(),
+        OFF_NOMINAL_POINTS * size_of::<StagedCode>(),
+        "which is 9,000,000 B and not the nominal 49,000,000",
+    );
+
+    let second = pool
+        .take(OFF_NOMINAL_POINTS)
+        .expect("the slot holds that shape");
+    assert_eq!(
+        pool.totals().reused,
+        1,
+        "the next grid of the same product must be handed that block",
+    );
+    assert_eq!(
+        pool.health(),
+        StagingHealth::Reusing,
+        "and the pool must read as working rather than as merely untouched",
+    );
+    assert_eq!(
+        second.as_ptr() as usize,
+        address,
+        "and it must be the FIRST one's block, not a fresh allocation of the \
+         same size: a pool that reallocated would satisfy every count above and \
+         leave the fragmentation it exists to remove exactly as it was",
+    );
+    assert!(second.is_empty(), "and arrive with nothing in it");
+    drop(second);
+
+    assert_eq!(
+        pool.nominal_points(),
+        STAGING_POINTS,
+        "with the budget figure untouched: it prices the caches, not the slot",
+    );
+}
+
+/// **A pool that reuses nothing reads as inert, not as cold** — the reading the
+/// shipping GMGSI defect had, and the one three raw counters could not give.
+///
+/// `reused: 0` is the reading of a healthy pool nobody has touched *and* of a
+/// permanently broken one; only the company it keeps separates them.
+#[test]
+fn a_pool_that_reuses_nothing_reads_as_inert_and_not_as_cold() {
+    let pool = StagingPool::new();
+    assert_eq!(
+        pool.health(),
+        StagingHealth::Cold,
+        "premise: nothing has asked this pool for anything",
+    );
+    assert_eq!(
+        pool.totals().reused,
+        0,
+        "and `reused` is 0 while it is cold"
+    );
+
+    // Two decodes that never get a block back — what a pool keyed on a stale
+    // constant does on every granule for the life of the process.
+    let a = pool.take(OFF_NOMINAL_POINTS).expect("allocates");
+    pool.give(buffer_of(OFF_NOMINAL_POINTS));
+    let b = pool.take(OFF_NOMINAL_POINTS + 1).expect("allocates");
+    assert_eq!(
+        pool.totals().reused,
+        0,
+        "premise: `reused` still reads 0, exactly as it did while cold",
+    );
+    assert_eq!(
+        pool.health(),
+        StagingHealth::Inert,
+        "and that is the difference a verdict makes: the same 0, now saying \
+         the pool is removing nothing rather than that nobody has used it",
+    );
+    drop((a, b));
+}
+
+/// **The product's shape moving mid-process costs one block, not the pool.**
+///
+/// The slot follows the granule: the buffer for a shape nobody is publishing
+/// any more is dropped, the arriving shape becomes the retained one, and the
+/// change is counted where an operator can read it. Holding the old block
+/// instead is what left GMGSI's shipped pool inert.
+#[test]
+fn a_shape_change_hands_the_slot_over_and_says_it_did() {
+    let pool = StagingPool::new();
+    pool.give(mosaic_buffer());
+    assert_eq!(
+        pool.retained_points(),
+        STAGING_POINTS,
+        "premise: one CONUS mosaic is parked",
+    );
+
+    let fresh = pool.take(OFF_NOMINAL_POINTS).expect("allocates its own");
+    assert_eq!(fresh.capacity(), OFF_NOMINAL_POINTS);
+    assert_eq!(
+        pool.resizes(),
+        1,
+        "the shape change is one counted event, not a silent decline",
+    );
+    assert_eq!(pool.retained_points(), 0, "and the old block is let go");
+    drop(fresh);
+
+    pool.give(buffer_of(OFF_NOMINAL_POINTS));
+    let staged = pool
+        .take(OFF_NOMINAL_POINTS)
+        .expect("the new shape is pooled");
+    assert_eq!(
+        pool.totals().reused,
+        1,
+        "so the cost of the change is one block, once, and not one per granule \
+         for the life of the process",
+    );
+    assert_eq!(pool.resizes(), 1, "and it is not counted again");
+    drop(staged);
+}
+
+/// **Two shapes alternating over one slot corrupt nothing.**
+///
+/// Not a shape any shipped path produces — one slot, one product family — but
+/// the case a "≥" rule or an inherited-content bug would show up in first.
+/// Every buffer handed out is capacity-exact for its own request, nothing is
+/// inherited, and the thrash reads as `resizes` rather than as silence.
+#[test]
+fn two_shapes_alternating_never_hand_a_grid_the_wrong_capacity() {
+    let pool = StagingPool::new();
+    let shapes = [OFF_NOMINAL_POINTS, 4096, OFF_NOMINAL_POINTS, 4096];
+    for (round, points) in shapes.into_iter().enumerate() {
+        let mut buffer = pool.take(points).expect("a buffer for this shape");
+        assert_eq!(
+            buffer.capacity(),
+            points,
+            "round {round}: a grid is handed a block of its OWN capacity, \
+             never merely one big enough — `resident_bytes` is `len * 2` and a \
+             grid holding a larger block would under-report its footprint to \
+             the byte budget that evicts it",
+        );
+        assert!(
+            buffer.is_empty(),
+            "round {round}: and with nothing in it, whatever it last held",
+        );
+        buffer.resize(points, round as u16 + 1);
+        pool.give(buffer);
+    }
+    assert_eq!(
+        pool.resizes(),
+        3,
+        "three of the four requests were a shape the slot was not holding",
+    );
+    assert_eq!(
+        pool.totals().reused,
+        0,
+        "so nothing was reused, which is the honest reading of a thrash and \
+         what a second slot — not a bigger one — would be the fix for",
+    );
+    assert_eq!(pool.health(), StagingHealth::Inert);
+}
+
+/// A one-reference [`MrmsGrid`](crate::mrms::MrmsGrid) around a caller's own
+/// buffer, so a test can follow one block out of the slot and back in.
+fn grid_around(values: Vec<u16>) -> crate::mrms::MrmsGrid {
+    let points = values.capacity();
+    let mut grid = mosaic_grid();
+    let arc = std::sync::Arc::get_mut(&mut grid.grid).expect("sole reference");
+    arc.values = crate::render::gridded::GridValues::Scaled(crate::render::gridded::ScaledU16 {
+        codes: values,
+        ref_val: -9990.0,
+        two_pow: 1.0,
+        dig_factor: 0.1,
+        nan_codes: vec![0, 9000],
+    });
+    debug_assert_eq!(codes_capacity(&arc.values), points);
+    grid
 }
 
 /// **The whole point, at the pool's own level**: hand a buffer back and the
@@ -63,7 +325,7 @@ fn a_returned_mosaic_buffer_is_the_next_mosaic_decodes_buffer() {
     );
 }
 
-/// **A grid that is not mosaic-shaped never touches the retained buffer.**
+/// **A grid that is not the slot's shape never touches the retained buffer.**
 ///
 /// The invariant that stops a pooled buffer from being a memory bug in the
 /// other direction: `MrmsGrid::resident_bytes` — the figure both byte budgets
@@ -72,6 +334,15 @@ fn a_returned_mosaic_buffer_is_the_next_mosaic_decodes_buffer() {
 /// cache would go on
 /// filling until the tab died. Matching capacity *exactly* rather than "≥" is
 /// what forbids it.
+///
+/// **Its second half is deliberately falsified and re-pinned rather than
+/// loosened.** It used to assert the mosaic buffer stayed parked and was handed
+/// to the next mosaic-sized request. That is precisely how a wrongly declared
+/// pool stays inert for the life of a process: a block for a shape nobody is
+/// asking for any more holds the slot, refuses every offer at the shape they
+/// *are* asking for, and reuses nothing. The arriving shape wins the slot now,
+/// and the safety half — the small grid never receives the big block — is
+/// unchanged and is the first assertion below.
 #[test]
 fn a_grid_of_another_shape_is_never_given_the_mosaic_buffer() {
     let pool = StagingPool::new();
@@ -90,35 +361,74 @@ fn a_grid_of_another_shape_is_never_given_the_mosaic_buffer() {
             reused: 0,
             declined: 0
         },
-        "and the mosaic buffer must still be in the slot, untouched",
+        "and it is a fresh block, not the mosaic's handed over",
     );
+    assert_eq!(
+        pool.resizes(),
+        1,
+        "the mosaic block is let go rather than parked for a shape nobody is \
+         asking for — counted, so a product that moved is one readable event",
+    );
+    assert_eq!(pool.retained_points(), 0, "and the slot is empty behind it");
 
-    let mosaic = pool.take(STAGING_POINTS).expect("the slot still holds one");
-    assert_eq!(pool.totals().reused, 1, "which the next mosaic then takes");
+    let mosaic = pool
+        .take(STAGING_POINTS)
+        .expect("so the next one allocates");
+    assert_eq!(mosaic.capacity(), STAGING_POINTS);
+    assert_eq!(
+        pool.totals().allocated,
+        2,
+        "which is the one-block cost of a shape change, paid once",
+    );
     drop((small, mosaic));
 }
 
-/// And the same rule on the way in: a buffer of any other capacity is refused
-/// rather than kept, so the slot can only ever hold something a mosaic decode
-/// is allowed to be handed.
+/// And on the way in: a buffer of another capacity is **retained** — it becomes
+/// the shape the slot holds — but is never handed to a grid of a different
+/// shape.
+///
+/// **Both halves, because the first was the GMGSI defect.** This asserted the
+/// offer was *refused*, which is the assertion that made every real 4999-wide
+/// GMGSI granule a refusal and the pool inert. Refusing is safe and useless;
+/// what has to stay true is the second half.
 #[test]
-fn a_buffer_of_another_capacity_is_refused_by_the_slot() {
+fn a_buffer_of_another_capacity_is_retained_but_never_handed_to_another_shape() {
     let pool = StagingPool::new();
-    let mut odd: Vec<u16> = Vec::new();
-    odd.try_reserve_exact(STAGING_POINTS - 1).expect("fits");
-    pool.give(odd);
+    pool.give(buffer_of(STAGING_POINTS - 1));
     assert_eq!(
         pool.totals(),
         StagingTotals {
             allocated: 0,
             reused: 0,
-            declined: 1
+            declined: 0
         },
+        "the offer is kept: a slot that refused it would allocate a block of \
+         that shape on every granule for the life of the process",
+    );
+    assert_eq!(
+        pool.retained_points(),
+        STAGING_POINTS - 1,
+        "and the slot says which shape it is holding",
     );
 
-    let fresh = pool.take(STAGING_POINTS).expect("so the slot was empty");
-    assert_eq!(pool.totals().allocated, 1, "and the next mosaic allocates");
+    let fresh = pool.take(STAGING_POINTS).expect("a mosaic-sized request");
+    assert_eq!(
+        fresh.capacity(),
+        STAGING_POINTS,
+        "a mosaic is never handed the one-short block: capacity is matched \
+         EXACTLY, and `len` is what every byte budget is spent against",
+    );
+    assert_eq!(pool.totals().allocated, 1, "so this one is fresh");
+    assert_eq!(pool.resizes(), 1);
     drop(fresh);
+
+    pool.give(buffer_of(STAGING_POINTS - 1));
+    let reused = pool
+        .take(STAGING_POINTS - 1)
+        .expect("and its own shape gets it back");
+    assert_eq!(reused.capacity(), STAGING_POINTS - 1);
+    assert_eq!(pool.totals().reused, 1);
+    drop(reused);
 }
 
 /// **One slot, not a free list.** The second buffer offered while the first is
@@ -270,14 +580,20 @@ fn the_retained_level_follows_the_slot_in_both_directions() {
     );
     drop(buffer);
 
-    let mut odd: Vec<u16> = Vec::new();
-    odd.try_reserve_exact(STAGING_POINTS - 1).expect("fits");
-    pool.give(odd);
+    pool.give(buffer_of(STAGING_POINTS - 1));
     assert_eq!(
         pool.retained_bytes(),
-        0,
-        "a refused offer is dropped, not kept, and must not raise the level",
+        (STAGING_POINTS - 1) * size_of::<StagedCode>(),
+        "and it follows the block the slot is ACTUALLY holding, not the \
+         nominal figure: this used to read 0 because a one-short buffer was \
+         refused, and a level that reported 0 over a parked 49 MB block would \
+         be the exact under-report the census exists to stop",
     );
+    assert!(
+        pool.release_retained(),
+        "premise: there was a block to find"
+    );
+    assert_eq!(pool.retained_bytes(), 0);
 }
 
 /// The narrow arm's own capacity — what the slot's exact-capacity rule is
@@ -295,10 +611,11 @@ fn codes_capacity(values: &crate::render::gridded::GridValues) -> usize {
 /// **The same lever the generic pool carries, so a memory governor's handle set
 /// covers this 49 MB too and not only GMGSI's 15 MB.**
 ///
-/// MRMS keeps its own pool — `handlers::mrms` names this concrete type and
-/// calls `recycle`/`recycle_shared` on it as inherent methods, which a generic
-/// pool cannot carry — so the lever is spelled twice rather than shared. Same
-/// name, same signature, same `try_lock` rule.
+/// It is now literally the same lever: MRMS keeps its own *name* — the handler
+/// calls `recycle`/`recycle_shared` on this concrete type as inherent methods,
+/// which a generic pool cannot carry — but the slot behind it is
+/// `crate::staging::StagingPool`, so this forwards rather than reimplementing.
+/// The test stays because what the handler calls is this name.
 #[test]
 fn releasing_the_retained_mosaic_empties_the_slot_and_the_pool_still_works() {
     let pool = StagingPool::new();

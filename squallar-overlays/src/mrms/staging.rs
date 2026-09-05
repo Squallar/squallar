@@ -43,18 +43,59 @@
 //! [`parse_grib2_raw`](super::decode::parse_grib2_raw) stays as the net that
 //! keeps the page alive; it is not the cure.
 //!
+//! ## The one capacity is discovered, never declared
+//!
+//! **A compile-time point count is a guess about a product, and a wrong guess
+//! is silent.** This slot was keyed on [`STAGING_POINTS`]: `take` reused only
+//! when the arriving grid had exactly that many points and `give` accepted a
+//! buffer back only at exactly that capacity. Both spellings are a claim that
+//! NOAA publishes a 7000 x 3500 CONUS mosaic, and **that claim is an
+//! observation, not a definition** — the module header has said so since the
+//! layer landed, in the words "measured against the live bucket".
+//!
+//! GMGSI is what an observation is worth. Its pool was keyed the same way on
+//! `3000 * 5000`, the product started publishing `[1, 3000, 4999]`, and from
+//! that granule on the pool reused nothing and accepted nothing back: every
+//! decode allocated a fresh 60 MB block and every one was freed again —
+//! precisely the churn the module exists to remove, with the module in place,
+//! at full speed, with no error anywhere. Its suites went on passing because
+//! the committed fixture was 5000 wide. A suite whose fixture is the constant
+//! cannot notice the constant has stopped describing the product.
+//!
+//! **The CONUS grid has not moved, and this is precaution rather than repair.**
+//! Read off `noaa-mrms-pds` on 2026-09-04, section 3 of one granule per day
+//! across 17 dates spanning the bucket's whole retention — 2020-10-14, the
+//! first day held, through today — on both shipped products: **every one is
+//! grid definition template 3.0, `ni` 7000, `nj` 3500, 24,500,000 points at
+//! 0.01 degrees**, DRT 5.41, 16-bit, no bitmap. Four other CONUS products
+//! (`MergedReflectivityQC_00.50`, `_19.00`, `MESH_00.50`, `EchoTop_18_00.50`)
+//! read the same today. Whether NOAA *guarantees* that shape is not something
+//! this tree can establish; what it can say is that nothing in six years of
+//! published CONUS granules has departed from it.
+//!
+//! So the retained buffer carries **its own** point count and the reuse key is
+//! that rather than a constant, exactly as [`crate::staging`] does for GMGSI: a
+//! grid of a shape the slot is not holding drops the retained buffer and
+//! becomes the shape the slot holds, counted by
+//! [`StagingPool::resizes`](crate::staging::StagingPool::resizes).
+//! [`STAGING_POINTS`] survives as the **nominal** figure — what
+//! [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) and
+//! [`GRID_CACHE_BYTES`](super::GRID_CACHE_BYTES) are sized for, and the
+//! reference a `retained_points` reading is compared against the next time a
+//! product moves.
+//!
 //! ## Nothing here may hand a grid the wrong bytes
 //!
 //! A retained buffer that outlives the product it was filled for is a
 //! data-corruption bug wearing a performance fix's clothes, so the invariants
-//! are narrow and checked rather than reasoned about:
+//! are narrow and checked rather than reasoned about. **What the shape key
+//! changed is *which* count "exactly" names, never that it is exact:**
 //!
 //! * **capacity is matched exactly, never merely "big enough".**
 //!   [`StagingPool::take`] answers the pooled buffer only when the grid it is
-//!   about to hold has exactly [`STAGING_POINTS`] points, and
-//!   [`StagingPool::give`] accepts one back only at exactly that capacity. A
-//!   "≥" rule would hand a 400-byte test grid a 49 MB block whose `len` no
-//!   longer describes its footprint, which is the figure both byte budgets are
+//!   about to hold has exactly the retained buffer's point count. A "≥" rule
+//!   would hand a 400-byte test grid a 49 MB block whose `len` no longer
+//!   describes its footprint, which is the figure both byte budgets are
 //!   spent against
 //!   ([`MrmsGrid::resident_bytes`](super::MrmsGrid::resident_bytes));
 //! * **content is never inherited.** Both ends clear — [`StagingPool::give`] on
@@ -65,67 +106,64 @@
 //!   and decodes both shipped
 //!   products through it; it is the check that fires if a `set_len` shortcut
 //!   ever lands (measured: half a mosaic of poison reaches the grid and the
-//!   summary moves).
+//!   summary moves);
+//! * **a grid another reference still holds is genuinely in use.**
+//!   [`StagingPool::recycle`] reclaims through `Arc::into_inner` and declines
+//!   rather than prising a buffer out from under a raster job still reading it;
+//! * **a pool that is not doing its job says so.** The three totals were always
+//!   here and nothing ever read them, which is how GMGSI's wholly inert pool
+//!   shipped and held: `reused: 0, declined: N` reads at a glance exactly like
+//!   a pool nobody has exercised yet.
+//!   [`StagingPool::health`](crate::staging::StagingPool::health) is that
+//!   reading as a verdict.
+//!
+//! ## Why the slot itself is [`crate::staging`]'s and the doors are not
+//!
+//! The pool logic is one implementation, not two: this type wraps
+//! [`crate::staging::StagingPool<StagedCode>`](crate::staging::StagingPool) and
+//! forwards, so the invariants above are checked in one place and a repair to
+//! either instance is a repair to both. What cannot move up is the two doors —
+//! [`StagingPool::recycle`] and [`StagingPool::recycle_shared`] take an
+//! [`MrmsGrid`](super::MrmsGrid), which is this layer's type, and
+//! `render::handlers::mrms` calls them as **inherent** methods on this concrete
+//! name. A free function like GMGSI's would be a change to that handler; a
+//! wrapper is not.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// How many values one staged mosaic holds —
-/// [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) in points.
+/// **The mosaic shape this build's byte budgets were sized for**, in points —
+/// [`FRAME_STAGING_BYTES`](super::FRAME_STAGING_BYTES) divided by the width of
+/// one staged value.
 ///
-/// Derived from the budget rather than restated, so a product whose grid
-/// changes shape moves both together or neither.
-///
-/// # What a wrong divisor costs, and what now prevents one
-///
-/// The divisor is no longer written here to be kept in step by hand. It is
-/// [`StagingPool::ELEMENT_BYTES`], whose `StagedCode` **is** the store's own
-/// element, so the instruction this heading used to carry — "if you change what
-/// [`StagingPool`] holds, change this divisor in the same edit" — is discharged
-/// by the spelling instead of asked of the reader. It said `size_of::<f32>()`
-/// while the slot was a `Vec<f32>`, which is the edit that has to stop being
-/// possible rather than be remembered.
-///
-/// **The cost, if one ever were wrong.** It sizes the slot at half a mosaic (or
-/// twice one), and [`StagingPool::give`] matches capacity **exactly**, never
-/// "big enough" — so every buffer offered back is refused, the slot stays empty
-/// for ever, and every decode allocates its own mosaic (49 MB at the narrow
-/// store; it was 98 MB at the wide one). That is precisely the defect this
-/// module exists to prevent, reintroduced through a constant nobody would think
-/// to look at, and the only symptom is the `declined` counter climbing where
-/// `reused` used to. On wasm32 it ends the way it ended before: a heap that only
-/// grows, fragmented past a contiguous mosaic-sized request, and a page that
-/// freezes with every screenshot and rAF check reporting it healthy.
-///
-/// **It would not, however, be silent, and this doc used to say it would.**
-/// Measured on this tree: the divisor alone moved back to `size_of::<f32>()`
-/// fails the build on the pin below — `assertion failed: STAGING_POINTS ==
-/// 24_500_000`. The pin was doing its job and the prose beside it overstated
-/// the exposure, which is its own defect — it reads as a reason to go carefully
-/// where the build already refuses. What the literal genuinely could not do is
-/// **re-derive**, which is what changed here.
-///
-/// The assertion below is the guard, because prose is not a gate: the slot
-/// holds one CONUS mosaic and that is a **point** count, so a divisor error
-/// moves it and fails the build.
+/// **Not the slot's capacity.** It was, and on GMGSI that exact spelling was
+/// the defect: a product whose grid moves by one column leaves a pool keyed on
+/// the constant reusing nothing and accepting nothing back, silently, for the
+/// life of the process. The slot takes its one capacity from the grid that
+/// hands a buffer back, whatever shape that is; this figure is what the pool
+/// reports as
+/// [`nominal_points`](crate::staging::StagingPool::nominal_points) — the
+/// reference a [`retained_points`](crate::staging::StagingPool::retained_points)
+/// reading is compared against.
 ///
 /// # The divisor names the slot rather than restating its type
 ///
-/// It is [`StagingPool::ELEMENT_BYTES`], whose `StagedCode` **is** the store's
+/// It is [`StagingPool::ELEMENT_BYTES`], whose [`StagedCode`] **is** the store's
 /// own element — [`recycle`](StagingPool::recycle) moves a decoded grid's
-/// `ScaledU16::codes` into [`StagingPool::give`], so the compiler holds the
-/// slot's element and the grid's equal and neither this nor the budget above it
-/// can name a width the store does not use.
+/// `ScaledU16::codes` into [`give`](StagingPool::give), so the compiler holds
+/// the slot's element and the grid's equal and neither this nor the budget
+/// above it can name a width the store does not use. A literal
+/// `size_of::<u16>()` would be the same defect one turn later: it goes on
+/// reading two after the slot it describes has moved.
 ///
-/// The literal it replaces was not dead — moving it alone to
-/// `size_of::<f32>()` fails this build on the pin below, which is exactly what
-/// it was put there to do. What it could not do is **re-derive**: the divisor
-/// and the `size_of::<u16>()` inside
-/// [`CONUS_GRID_BYTES`](super::CONUS_GRID_BYTES) were two spellings of one
-/// width that CANCELLED, so the pair read 24,500,000 whether or not either
-/// still named the store. Now the numerator follows the store and the divisor
-/// follows the slot, and a genuine widening carries both instead of
-/// red-gating on a constant that was never the thing that moved.
+/// The literal it replaced was not dead — moving it alone to `size_of::<f32>()`
+/// fails this build on the pin below, which is exactly what it was put there to
+/// do. What it could not do is **re-derive**: the divisor and the
+/// `size_of::<u16>()` inside [`CONUS_GRID_BYTES`](super::CONUS_GRID_BYTES) were
+/// two spellings of one width that CANCELLED, so the pair read 24,500,000
+/// whether or not either still named the store. Now the numerator follows the
+/// store and the divisor follows the slot.
+///
+/// The assertion below is the guard, because prose is not a gate: the budget
+/// holds one CONUS mosaic and that is a **point** count, so a divisor error
+/// moves it and fails the build.
 pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / StagingPool::ELEMENT_BYTES;
 
 // The two terms, pinned APART, so a build failure names which one moved rather
@@ -133,8 +171,19 @@ pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / StagingPool::ELEM
 // purpose: deriving it from `FRAME_STAGING_BYTES` again would be the same
 // division restated and could not disagree with itself.
 const _: () = assert!(StagingPool::ELEMENT_BYTES == 2);
-// One CONUS mosaic, in points — 7000 x 3500.
+// One CONUS mosaic, in points — 7000 x 3500, which is what every granule
+// `noaa-mrms-pds` has published since 2020-10-14 declares in section 3. A
+// *nominal* figure now: it prices the budgets and no longer keys the slot.
 const _: () = assert!(STAGING_POINTS == 24_500_000);
+
+/// **The element the slot holds** — the store's own, not a restatement of it.
+///
+/// [`StagingPool::recycle`] moves a decoded grid's `ScaledU16::codes` into
+/// [`StagingPool::give`], so this alias and the grid's element are held equal
+/// by the compiler rather than by two edits agreeing.
+pub type StagedCode = crate::render::gridded::ScaledCode;
+
+pub use crate::staging::{StagingHealth, StagingTotals};
 
 /// **One retained mosaic-sized buffer, and the running count of what it saved.**
 ///
@@ -144,187 +193,55 @@ const _: () = assert!(STAGING_POINTS == 24_500_000);
 /// one-at-a-time throttle is the handler's frame gate and stays there.
 ///
 /// **Injectable rather than only global** for the reason `MrmsGridCache`'s own
-/// budget is injected: a suite that can only observe the process-wide slot cannot tell
-/// "the pool worked" from "another test in this binary happened to leave a
-/// buffer in it", and a filtered run in this workspace is explicitly not
-/// self-contained. The shipped path uses [`global`].
-pub struct StagingPool {
-    /// `try_lock` only — see [`Self::take`].
-    slot: Mutex<Option<Vec<StagedCode>>>,
-    /// Mosaic-sized buffers this pool had to allocate. **The figure the
-    /// shipping defect is about**: it was one per granule and is now one per
-    /// process, per live block.
-    allocated: AtomicUsize,
-    /// Decodes that were handed a retained buffer instead.
-    reused: AtomicUsize,
-    /// Grids offered back whose buffer the slot could not take — the slot was
-    /// full, the capacity did not match, or another `Arc` was still holding
-    /// the grid. Reported rather than hidden: a pool that silently never
-    /// recycles reads exactly like one that does until the tab dies.
-    declined: AtomicUsize,
-    /// **Bytes the slot is holding right now** — a level, not a total: one
-    /// mosaic's worth while a buffer is parked here, zero while it is out
-    /// being decoded into.
-    ///
-    /// Maintained at the two transitions inside the slot's own critical
-    /// section rather than read off the slot, because the one caller that
-    /// needs it is a frame-thread census and the slot is `try_lock`-only: a
-    /// reader that missed the lock would have to report either a stale figure
-    /// or a false zero, and a false zero on a 49 MB block is the exact shape
-    /// of mistake the census exists to stop.
-    retained: AtomicUsize,
-}
-
-/// Running totals off [`StagingPool`], in the order
-/// `(allocated, reused, declined)`.
+/// budget is injected: a suite that can only observe the process-wide slot
+/// cannot tell "the pool worked" from "another test in this binary happened to
+/// leave a buffer in it", and a filtered run in this workspace is explicitly
+/// not self-contained. The shipped path uses [`global`].
 ///
-/// Always on, like `squallar_egui::overlay_cache::ledger` and `UploadTotals`:
-/// three relaxed counters cost nothing beside a 49 MB decode, and a figure that
-/// only exists under a `cfg` is a figure nobody reads when the tab dies in the
-/// field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagingTotals {
-    pub allocated: usize,
-    pub reused: usize,
-    pub declined: usize,
-}
-
-/// **The element the slot holds** — the store's own, not a restatement of it.
-///
-/// [`StagingPool::recycle`] moves a decoded grid's `ScaledU16::codes` into
-/// [`StagingPool::give`], so this alias and the grid's element are held equal
-/// by the compiler rather than by two edits agreeing.
-pub type StagedCode = crate::render::gridded::ScaledCode;
+/// A wrapper over [`crate::staging::StagingPool`] rather than a second copy of
+/// it — see this module's last heading for what that buys and what it cannot.
+pub struct StagingPool(crate::staging::StagingPool<StagedCode>);
 
 impl StagingPool {
     /// **Bytes one element of the slot occupies** — the width
     /// [`STAGING_POINTS`] divides the byte budget by, so that constant does not
     /// have to name a type.
-    ///
-    /// A literal `size_of::<u16>()` would be the same defect one turn later:
-    /// it goes on reading two after the slot it describes has moved.
-    pub const ELEMENT_BYTES: usize = size_of::<StagedCode>();
+    pub const ELEMENT_BYTES: usize = crate::staging::StagingPool::<StagedCode>::ELEMENT_BYTES;
 
+    /// A pool whose surrounding byte budgets were sized for [`STAGING_POINTS`]
+    /// values. Which buffer it retains is decided by the grid that hands one
+    /// back, not by that figure.
     pub const fn new() -> Self {
-        Self {
-            slot: Mutex::new(None),
-            allocated: AtomicUsize::new(0),
-            reused: AtomicUsize::new(0),
-            declined: AtomicUsize::new(0),
-            retained: AtomicUsize::new(0),
-        }
+        Self(crate::staging::StagingPool::new(STAGING_POINTS))
     }
 
     /// A buffer able to hold `points` values, retained from a previous granule
     /// when one is waiting and it is exactly the right size.
     ///
-    /// **`try_lock`, never `lock`.** The critical section is a pointer move and
-    /// the only contenders are a live fetch and a frame fetch, so contention is
-    /// vanishingly rare — and on wasm32 with atomics, blocking the main thread
-    /// is not something this path may ever do. A contended pool simply
-    /// allocates, which is the behaviour every decode had before this existed.
-    ///
-    /// The fresh arm keeps the `try_reserve_exact` the safety net landed:
-    /// `with_capacity` here calls `handle_alloc_error` on failure, and on a
-    /// `panic-strategy = "abort"` target that leaves winit's event loop
-    /// borrowed for the life of the page.
+    /// **A request at another shape empties the slot** rather than leaving a
+    /// block nobody can use parked in it; see [`crate::staging::StagingPool`],
+    /// which is where the `try_lock` rule and the fallible reserve live too.
     pub fn take(&self, points: usize) -> Result<Vec<StagedCode>, String> {
-        if points == STAGING_POINTS
-            && let Ok(mut slot) = self.slot.try_lock()
-            && let Some(mut buffer) = slot.take()
-        {
-            // The slot is empty from here whichever arm below runs, including
-            // the mismatch that drops the buffer.
-            self.retained.store(0, Ordering::Relaxed);
-            // Belt and braces: `give` already refuses any other capacity, and
-            // a buffer that somehow arrived at another one must not be handed
-            // out as if it were mosaic-sized. Falling out of this block drops
-            // it and allocates fresh below, exactly as a contended slot does.
-            if buffer.capacity() == STAGING_POINTS {
-                self.reused.fetch_add(1, Ordering::Relaxed);
-                // Both ends, deliberately. `give` clears on the way in, and a
-                // buffer is cleared again on the way out, so the "the decode
-                // starts from empty" invariant does not depend on any one
-                // caller having done the right thing. For a `u16` this is a
-                // store to `len` and nothing else.
-                buffer.clear();
-                return Ok(buffer);
-            }
-        }
-        let mut fresh: Vec<StagedCode> = Vec::new();
-        fresh.try_reserve_exact(points).map_err(|_| {
-            format!(
-                "MRMS: cannot hold a {} MB staging grid in this build's memory",
-                points.saturating_mul(size_of::<u16>()) / (1024 * 1024),
-            )
-        })?;
-        self.allocated.fetch_add(1, Ordering::Relaxed);
-        Ok(fresh)
+        self.0.take(points).map_err(|e| format!("MRMS: {e}"))
     }
 
     /// Offer a spent mosaic buffer back.
     ///
-    /// Refused — and counted as refused — unless the slot is empty and the
-    /// capacity is exactly [`STAGING_POINTS`]. A refused buffer is dropped
-    /// here, which is what every buffer did before this module existed.
-    pub fn give(&self, mut values: Vec<StagedCode>) {
-        if values.capacity() != STAGING_POINTS {
-            self.declined.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        // Before the lock: the slot must never hold a buffer whose length is
-        // anything but zero, whichever arm below runs.
-        values.clear();
-        let Ok(mut slot) = self.slot.try_lock() else {
-            self.declined.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        if slot.is_some() {
-            self.declined.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.retained
-            .store(values.capacity() * size_of::<u16>(), Ordering::Relaxed);
-        *slot = Some(values);
+    /// **The offered buffer's own capacity becomes the shape the slot holds.**
+    /// Refused — and counted as refused — when the slot is already full or the
+    /// buffer owns no allocation to retain. A refused buffer is dropped here,
+    /// which is what every buffer did before this module existed.
+    pub fn give(&self, values: Vec<StagedCode>) {
+        self.0.give(values);
     }
 
     /// **Drop the retained buffer**, answering whether there was one to drop.
     ///
-    /// The pool's one lever, and it is deliberately shaped for **two callers
-    /// with no knowledge of each other**: an idle policy in the layer that owns
-    /// the source, and a memory governor's tier-2 pressure step. Both want the
-    /// same thing — the grid-sized block the slot is holding while nothing is
-    /// decoding handed back to the allocator — and neither has to know the
-    /// other exists or to have run first. Two sources retain a grid apiece
-    /// (GMGSI 15 MB, MRMS 49 MB), so this is ~64 MB resident whether or not
-    /// anything is decoding.
-    ///
-    /// `false` means nothing was released: the slot was empty, or —
-    /// vanishingly rarely — a decode held the lock. **`try_lock`, never
-    /// `lock`**, for the reason [`Self::take`] gives: on wasm32 with atomics
-    /// this path may not block the main thread. A caller that must have the
-    /// block back calls again; it is not a failure to report.
-    ///
-    /// **This is one `free` of one block** — the same free every declined offer
-    /// already performs — so it is not work in the sense the frame thread cares
-    /// about. The cost is entirely on the other side: the next decode allocates
-    /// a grid again, which is the allocation this module exists to remove. That
-    /// is why a *clock* is a poor trigger and *pressure* is a good one — under
-    /// pressure the block is worth more free than parked, whereas a short idle
-    /// threshold re-introduces exactly one mosaic-sized allocate-and-free per
-    /// poll, on a heap that cannot coalesce, for a layer that is still on.
+    /// The pool's one lever, shaped for **two callers with no knowledge of each
+    /// other**: an idle policy in the layer that owns the source, and a memory
+    /// governor's tier-2 pressure step. See [`crate::staging::StagingPool`].
     pub fn release_retained(&self) -> bool {
-        let Ok(mut slot) = self.slot.try_lock() else {
-            return false;
-        };
-        match slot.take() {
-            Some(buffer) => {
-                self.retained.store(0, Ordering::Relaxed);
-                drop(buffer);
-                true
-            }
-            None => false,
-        }
+        self.0.release_retained()
     }
 
     /// Take a [`MrmsGrid`](super::MrmsGrid)'s values back into the pool, if
@@ -346,9 +263,7 @@ impl StagingPool {
                 values: crate::render::gridded::GridValues::Scaled(scaled),
                 ..
             }) => self.give(scaled.codes),
-            _ => {
-                self.declined.fetch_add(1, Ordering::Relaxed);
-            }
+            _ => self.0.decline(),
         }
     }
 
@@ -356,31 +271,51 @@ impl StagingPool {
     pub fn recycle_shared(&self, grid: std::sync::Arc<super::MrmsGrid>) {
         match std::sync::Arc::into_inner(grid) {
             Some(grid) => self.recycle(grid),
-            None => {
-                self.declined.fetch_add(1, Ordering::Relaxed);
-            }
+            None => self.0.decline(),
         }
     }
 
-    /// **What the slot is holding**, in bytes: one mosaic
-    /// ([`super::FRAME_STAGING_BYTES`]) while a buffer is parked, zero while
-    /// it is out with a decode.
+    /// **What the slot is holding**, in bytes: one grid at whatever shape the
+    /// last granule handed back, zero while it is out with a decode.
     ///
-    /// A level off the `retained` field, so this is one relaxed load and takes
-    /// no lock — safe to read on the frame thread and safe to read from an
-    /// allocation-error hook. It counts the retained buffer's **capacity**,
-    /// which is what the allocator is holding; the buffer is always empty
-    /// while it is in the slot, so its length would read zero and say nothing.
+    /// Derived from the retained buffer's own capacity, so a slot holding a
+    /// shape this build was not sized for reports what the allocator is
+    /// actually holding rather than the nominal figure. One relaxed load and a
+    /// multiply, taking no lock — safe to read on the frame thread and safe to
+    /// read from an allocation-error hook. It counts **capacity**: the buffer
+    /// is always empty while it is in the slot, so its length would read zero
+    /// and say nothing.
     pub fn retained_bytes(&self) -> usize {
-        self.retained.load(Ordering::Relaxed)
+        self.0.retained_bytes()
+    }
+
+    /// **The shape the slot is holding**, in points — zero while nothing is
+    /// parked. The count [`Self::take`] matches a request against.
+    pub fn retained_points(&self) -> usize {
+        self.0.retained_points()
+    }
+
+    /// **The shape this build's byte budgets were sized for**, in points —
+    /// [`STAGING_POINTS`], and not the reuse key. The two differing means the
+    /// product's grid has moved off what this build was sized for.
+    pub const fn nominal_points(&self) -> usize {
+        self.0.nominal_points()
     }
 
     pub fn totals(&self) -> StagingTotals {
-        StagingTotals {
-            allocated: self.allocated.load(Ordering::Relaxed),
-            reused: self.reused.load(Ordering::Relaxed),
-            declined: self.declined.load(Ordering::Relaxed),
-        }
+        self.0.totals()
+    }
+
+    /// **Decodes that arrived at a shape the slot was not holding.** Zero in
+    /// the steady state; one per product change by design.
+    pub fn resizes(&self) -> usize {
+        self.0.resizes()
+    }
+
+    /// **Whether this pool is removing allocations, in one value.** See
+    /// [`StagingHealth`] for why three counters were not enough on their own.
+    pub fn health(&self) -> StagingHealth {
+        self.0.health()
     }
 }
 

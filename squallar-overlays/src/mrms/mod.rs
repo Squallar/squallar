@@ -15,6 +15,17 @@
 //! | Cadence | ~2 min, **timestamps are not clock-aligned** (`000039`, `000242`, `000442`) |
 //! | Retention | back to 2020-10-14 |
 //!
+//! **The grid row is an OBSERVATION, not a definition, and nothing in this
+//! tree may treat it as one.** Re-measured 2026-09-04 off section 3 of one
+//! granule per day across 17 dates spanning the bucket's whole retention —
+//! 2020-10-14, the first day held, through 2026-09-04 — on both shipped
+//! products: every one is 7000 × 3500. Four other CONUS products read the same
+//! today. So the shape has never moved in six years of published granules, and
+//! that is still an observation: GMGSI's grid width moved on 2026-09-03 after
+//! years of not moving, and the pool keyed on the constant went inert on every
+//! granule with its whole suite green. [`staging`] is keyed on the shape a
+//! granule arrives at rather than on this row; the row prices the budgets.
+//!
 //! **`CONUS_5KM/` is dead** — it stops at ~2021-02-24. It is still in the
 //! bucket listing and reads like a cheaper CONUS; it is not, and
 //! [`squallar_source::origins::DataSources::mrms_day_prefix`] never addresses

@@ -854,3 +854,195 @@ fn every_mosaic_value_is_a_sixteen_bit_code_and_three_scalars() {
         );
     }
 }
+
+// ── The staging slot, at a shape this build's constant does not describe ─────
+
+/// **A real MRMS granule at a point count `STAGING_POINTS` does not name.**
+///
+/// `CARIB/MergedReflectivityQCComposite_00.50/20260904/MRMS_MergedReflectivityQCComposite_00.50_20260904-000059.grib2.gz`
+/// — the object that key names in `noaa-mrms-pds`, byte for byte, 29 776 B
+/// gzipped. The **same product** as [`COMPOSITE_GZ`] on the **same packing**
+/// (grid definition template 3.0, DRT 5.41, 16-bit, decimal scale 1, reference
+/// value −999.0, no bitmap) over a 3000 × 1500 domain instead of 7000 × 3500,
+/// and its longitudes (−89.995..−60.005) are inside
+/// [`MRMS_DOMAIN_LON`](crate::mrms::MRMS_DOMAIN_LON), so it reaches the end of
+/// the shipped decode rather than the domain refusal.
+///
+/// **It is not a domain this layer fetches, and it is not here as one.** It is
+/// here because the CONUS grid has never moved — one granule per day across 17
+/// dates from 2020-10-14 to 2026-09-04 on both shipped products is 7000 × 3500
+/// without exception — so there is no CONUS granule at another shape to commit,
+/// and a fixture invented at another width would prove the pool works on bytes
+/// nobody publishes. This one is published.
+const CARIB_GZ: &[u8] = include_bytes!(
+    "../../../testdata/MRMS_CARIB_MergedReflectivityQCComposite_00.50_20260904-000059.grib2.gz"
+);
+
+/// The Caribbean domain in points — 3000 × 1500.
+const CARIB_POINTS: usize = 3000 * 1500;
+
+/// **The whole shipped decode, twice, over a slot this build was not sized
+/// for.**
+///
+/// The layer-level twin of
+/// `staging::tests::a_grid_at_a_shape_the_conus_constant_does_not_describe_is_pooled`,
+/// through `parse_grib2_raw_in` and `StagingPool::recycle` rather than against
+/// the pool directly: this is the path a playing loop runs, and it is the path
+/// that on GMGSI allocated a fresh mosaic per granule for a day with every
+/// suite green.
+///
+/// Observed red before the fix: `declined` **1** against 0 expected — the
+/// decoded buffer was refused by the slot because its capacity was not
+/// `STAGING_POINTS` — and then `reused` **0** against 1, with `health`
+/// [`StagingHealth::Inert`].
+#[test]
+fn a_granule_at_a_shape_the_conus_constant_does_not_describe_reuses_the_slot() {
+    let bytes = gunzip(CARIB_GZ).expect("the committed granule is a gzip member");
+    let product = MrmsProduct::ReflectivityComposite;
+    // This test's own pool: the counters are process-global on the shipped
+    // path and a filtered run in this workspace is not self-contained.
+    let pool = crate::mrms::staging::StagingPool::new();
+
+    let first = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool)
+        .expect("a published MRMS granule decodes");
+    assert_eq!(
+        (first.ni, first.nj),
+        (3000, 1500),
+        "premise: this granule really is a shape the CONUS constant does not \
+         describe",
+    );
+    assert_ne!(
+        CARIB_POINTS,
+        crate::mrms::staging::STAGING_POINTS,
+        "premise: and so the slot cannot be keyed on that constant and reuse",
+    );
+    assert!(
+        matches!(first.values, GridValues::Scaled(_)),
+        "premise: it takes the narrow arm, which is the only arm that touches \
+         the pool — a granule that fell to the f32 arm would exercise the \
+         decline path under a test name that says it exercised the slot",
+    );
+    assert_eq!(first.values.len(), CARIB_POINTS);
+    assert_eq!(
+        first
+            .values
+            .to_f32()
+            .iter()
+            .filter(|v| v.is_finite())
+            .count(),
+        13_853,
+        "premise: it carries real readings, so what goes back into the slot is \
+         a decoded mosaic and not an empty one. Counted off section 7 \
+         independently (a 3000x1500 16-bit PNG, little-endian samples): \
+         3 582 323 points at code 0 (-999.0, no radar coverage) and 903 824 at \
+         code 9000 (-99.0), leaving 13 853 readings — 0.31 % of the domain, \
+         which is what a quiet Caribbean night looks like and is why this is a \
+         pinned figure rather than a floor with room to be vacuous under",
+    );
+    assert_eq!(
+        pool.totals().allocated,
+        1,
+        "premise: a cold pool allocated the first one",
+    );
+
+    let address = codes_address(&first.values);
+    pool.recycle(grid_around(first, product));
+    assert_eq!(
+        pool.totals().declined,
+        0,
+        "a decoded granule must not be refused by the slot because a constant \
+         in this build says 7000 x 3500. That refusal is silent, costs a fresh \
+         49 MB block on every granule for the life of the process, and is what \
+         GMGSI shipped",
+    );
+    assert_eq!(
+        pool.retained_bytes(),
+        CARIB_POINTS * size_of::<crate::mrms::staging::StagedCode>(),
+        "and the level follows the block the slot is actually holding",
+    );
+
+    let second =
+        parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("the second decode runs");
+    assert_eq!(
+        pool.totals(),
+        crate::mrms::staging::StagingTotals {
+            allocated: 1,
+            reused: 1,
+            declined: 0
+        },
+        "the second decode must come out of the slot",
+    );
+    assert_eq!(
+        pool.health(),
+        crate::mrms::staging::StagingHealth::Reusing,
+        "and the pool must read as working rather than as merely untouched",
+    );
+    assert_eq!(
+        codes_address(&second.values),
+        address,
+        "into the FIRST decode's block, by pointer: a pool that reallocated a \
+         buffer of the same size would satisfy every count above and leave the \
+         fragmentation it exists to remove exactly as it was",
+    );
+    assert_eq!(
+        second.values.len(),
+        CARIB_POINTS,
+        "with the whole mosaic in it — the buffer is cleared at both ends, so \
+         a decode into a pooled block pushes its own values or none",
+    );
+}
+
+/// **A CONUS granule is pooled too**, so the test above is a *difference* and
+/// not a claim that the slot only works off a shape this build was not sized
+/// for.
+#[test]
+fn the_conus_granule_this_build_is_sized_for_is_pooled_too() {
+    let bytes = gunzip(COMPOSITE_GZ).expect("gzip member");
+    let product = MrmsProduct::ReflectivityComposite;
+    let pool = crate::mrms::staging::StagingPool::new();
+
+    let first = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("decodes");
+    assert_eq!(first.values.len(), crate::mrms::staging::STAGING_POINTS);
+    let address = codes_address(&first.values);
+    pool.recycle(grid_around(first, product));
+    assert_eq!(
+        pool.retained_points(),
+        crate::mrms::staging::STAGING_POINTS,
+        "the nominal shape is retained like any other",
+    );
+
+    let second = parse_grib2_raw_in(&bytes, product.missing_codes(), &pool).expect("decodes");
+    assert_eq!(pool.totals().reused, 1);
+    assert_eq!(codes_address(&second.values), address);
+    assert_eq!(pool.resizes(), 0, "and nothing about it is a shape change");
+}
+
+/// The address of the block a decoded grid's codes are held in — what makes
+/// "the same buffer" a claim about the allocation and not about its size.
+fn codes_address(values: &GridValues) -> usize {
+    match values {
+        GridValues::Scaled(scaled) => scaled.codes.as_ptr() as usize,
+        GridValues::F32(_) | GridValues::Bytes(_) => {
+            panic!("a pooled MRMS grid is stored as 16-bit codes")
+        }
+    }
+}
+
+/// A one-reference [`MrmsGrid`] around a decoded [`RawGrid`] — what
+/// `parse_grib2` builds, minus the paint summary the pool has no use for.
+fn grid_around(raw: RawGrid, product: MrmsProduct) -> MrmsGrid {
+    MrmsGrid {
+        product,
+        grid: std::sync::Arc::new(ResidentGrid {
+            field: crate::mrms::fields::spec(product).id.clone(),
+            ni: raw.ni,
+            nj: raw.nj,
+            coords: raw.coords,
+            values: raw.values,
+        }),
+        bounds: raw.bounds,
+        valid: raw.valid,
+        visible_points: 0,
+        value_range: None,
+    }
+}

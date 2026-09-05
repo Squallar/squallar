@@ -11,8 +11,10 @@
 //!
 //! This module is that pool with the two facts MRMS had spelled as constants —
 //! the element type and the point count — made parameters, so a second source
-//! with a different grid does not copy the type and the tests with it. MRMS
-//! keeps its own for now; nothing here is a change to it.
+//! with a different grid does not copy the type and the tests with it. MRMS is
+//! now this pool too: [`crate::mrms::staging::StagingPool`] wraps it and
+//! forwards, keeping only the two doors that take an `MrmsGrid` — its handler
+//! calls those as inherent methods on that concrete name.
 //!
 //! ## The one capacity is discovered, never declared
 //!
