@@ -142,6 +142,12 @@ pub(crate) struct TestBridge {
     /// move the reading between ticks after the bridge is the app's; `None`,
     /// as every native bridge answers, until a test sets one.
     linear_memory: Rc<Cell<Option<LinearMemory>>>,
+    /// What `available_memory_bytes` answers. A gauge for the same reason as
+    /// [`Self::linear_memory`], and a stronger one: the real reading moves
+    /// with every other program on the machine, so a test that could not move
+    /// it between ticks could not tell a re-read from a value remembered at
+    /// construction. `None`, as every browser answers, until a test sets one.
+    available_memory: Rc<Cell<Option<u64>>>,
     /// What `gpu_probe_report` answers when asked about a WebGPU backend,
     /// standing in for the browser probe's outcome cell. `None` makes the
     /// double a native bridge, which reports `Absent`; `Some` makes it a web
@@ -178,6 +184,7 @@ impl TestBridge {
             back_claims: Rc::new(RefCell::new(Vec::new())),
             gpu_capacity: None,
             linear_memory: Rc::new(Cell::new(None)),
+            available_memory: Rc::new(Cell::new(None)),
             probed_gpu_capacity: None,
         }
     }
@@ -256,6 +263,20 @@ impl TestBridge {
     /// heap grows between them.
     pub(crate) fn linear_memory_gauge(&self) -> Rc<Cell<Option<LinearMemory>>> {
         Rc::clone(&self.linear_memory)
+    }
+
+    /// Answer `available_memory_bytes` with `bytes`, as a native bridge
+    /// answers from `/proc/meminfo`, `ullAvailPhys` or the Mach host.
+    pub(crate) fn with_available_memory(self, bytes: u64) -> Self {
+        self.available_memory.set(Some(bytes));
+        self
+    }
+
+    /// The gauge behind `available_memory_bytes`, taken before the bridge is
+    /// handed to `App`, so a test can move what the OS would give between
+    /// ticks the way another program on the machine moves it.
+    pub(crate) fn available_memory_gauge(&self) -> Rc<Cell<Option<u64>>> {
+        Rc::clone(&self.available_memory)
     }
 
     /// A handle on the blobs `kv` hands out, for seeding a config
@@ -359,6 +380,10 @@ impl TestBridge {
 impl PlatformBridge for TestBridge {
     fn linear_memory(&self) -> Option<LinearMemory> {
         self.linear_memory.get()
+    }
+
+    fn available_memory_bytes(&self) -> Option<u64> {
+        self.available_memory.get()
     }
 
     fn poll_theme(&mut self) -> Option<bool> {

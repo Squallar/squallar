@@ -131,6 +131,23 @@ pub struct DeviceProfile {
     /// like every other reading here it is spent by `fit`, through
     /// [`Self::capacity`].
     pub linear_memory_max_bytes: Option<u64>,
+    /// **The host pool this session may take a share of**, in bytes: what the
+    /// OS says is available plus what this process already holds
+    /// ([`crate::scene::host_pool_bytes`], which carries the arithmetic and
+    /// the reason the two terms are summed). `None` where no reader answered
+    /// — every browser, and any native build whose reader failed.
+    ///
+    /// **Outranks [`Self::system_ram_bytes`] as the host figure**, and that is
+    /// the whole point of it: the total is what the machine has, this is what
+    /// it would give. A percentage of the total is imaginary budget on a box
+    /// whose memory is already spoken for.
+    ///
+    /// A time-varying reading, unlike every other field here: it moves with
+    /// every other program on the machine, so it is re-read on the telemetry
+    /// tick rather than once at construction. Nothing in [`resolve`] reads it
+    /// — like every other reading here it is spent by `fit`, through
+    /// [`Self::capacity`].
+    pub host_pool_bytes: Option<u64>,
     /// See [`BudgetMemo`]. Wins outright when present.
     pub memo: Option<BudgetMemo>,
 }
@@ -227,27 +244,43 @@ impl DeviceProfile {
     }
 
     /// **What the device can hold, as this profile knows it**: a measured
-    /// capacity where [`Self::gpu_capacity_bytes`] answers, carrying the host's
-    /// RAM beside it, else the bracket's presumption
+    /// capacity where [`Self::gpu_capacity_bytes`] answers, carrying the
+    /// host's figure beside it, else the bracket's presumption
     /// ([`Capacity::presumed`]). The one function the application asks; the
     /// probed arm is a browser's to fill, and no profile produces it.
+    ///
+    /// **The two pools are decoupled.** The host figure used to ride on the
+    /// GPU arm — set only where a VRAM reader had answered — so a native
+    /// machine with no readable card carried no host capacity at all and
+    /// `fit`'s host arm was inert on it. [`Self::host_pool_bytes`] now stands
+    /// on both arms: which pool was read says nothing about the other. Each
+    /// arm keeps its own fallback beneath it, so a profile with no pool
+    /// reading answers exactly what it answered before one existed.
+    ///
+    /// **Total RAM is the measured arm's last resort and is not promoted onto
+    /// the presumed arm.** It is kept so no machine loses the figure it had;
+    /// three quarters of a machine's *total* RAM is precisely the imaginary
+    /// budget the available reader was written to replace, and a profile that
+    /// knows only the total goes on saying nothing about the host.
     pub fn capacity(&self) -> Capacity {
         match self.gpu_capacity_bytes() {
             Some(gpu_bytes) => Capacity {
                 gpu_bytes,
-                host_bytes: self.system_ram_bytes,
+                host_bytes: self.host_pool_bytes.or(self.system_ram_bytes),
                 source: CapacitySource::Measured,
             },
             None => {
                 let mut presumed = Capacity::presumed(&self.limits);
-                // **The instance's own wall outranks the bracket's.** The
-                // bracket states what the module was LINKED with; a browser
-                // page chooses its memory's maximum per device below that
-                // bound before the module is instantiated, and it is that
-                // figure the scene has to fit inside. A profile nobody told
-                // keeps the bracket's presumption, which is what every native
-                // arm and every pre-plumbing test does.
-                if let Some(bytes) = self.linear_memory_max_bytes {
+                // **The pool, else the instance's own wall, outranks the
+                // bracket's presumption.** The bracket states what the module
+                // was LINKED with; a browser page chooses its memory's
+                // maximum per device below that bound before the module is
+                // instantiated, and it is that figure the scene has to fit
+                // inside. The two never compete — no browser has a pool
+                // reader and no native build has a linear memory — and a
+                // profile nobody told keeps the bracket's presumption, which
+                // is every native arm and every pre-plumbing test.
+                if let Some(bytes) = self.host_pool_bytes.or(self.linear_memory_max_bytes) {
                     presumed.host_bytes = Some(bytes);
                 }
                 presumed
@@ -274,6 +307,7 @@ impl DeviceProfile {
             parallelism: None,
             form_factor: None,
             linear_memory_max_bytes: None,
+            host_pool_bytes: None,
             memo: None,
         }
     }

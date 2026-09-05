@@ -516,6 +516,7 @@ mod tests {
             parallelism: Some(32),
             form_factor: Some(FormFactor::Desktop),
             linear_memory_max_bytes: None,
+            host_pool_bytes: None,
             memo: Some(BudgetMemo {
                 loop_pool_bytes: None,
                 steps_back: 3,

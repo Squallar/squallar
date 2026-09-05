@@ -1,25 +1,34 @@
 //! What this machine can hold, read where an API exists.
 //!
-//! One RAM reader per OS and one GPU reader per backend, selected by which
-//! module is mounted: a `cfg` here picks a module and never forks a body.
-//! Every reader answers `None` rather than a guess when its API does not — a
-//! signal a platform cannot read is absent, and the device profile treats
-//! absent as the majority arm rather than as small.
+//! **Two RAM readers per OS, never one.** `system_ram_bytes` is what the
+//! machine has; `available_ram_bytes` is what it would give this process
+//! right now. The first is a hardware fact read once at construction; the
+//! second moves with every other program on the box and is read on the
+//! telemetry tick. A percentage of the total is imaginary budget on a machine
+//! whose memory is already spoken for, which is why the available figure
+//! exists — and it is not a pool by itself, because it already excludes this
+//! process (`squallar_device_profile::scene::host_pool_bytes`).
+//!
+//! One GPU reader per backend beside them, selected by which module is
+//! mounted: a `cfg` here picks a module and never forks a body. Every reader
+//! answers `None` rather than a guess when its API does not — a signal a
+//! platform cannot read is absent, and the device profile treats absent as the
+//! majority arm rather than as small.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use linux::system_ram_bytes;
+pub use linux::{available_ram_bytes, system_ram_bytes};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use apple::system_ram_bytes;
+pub use apple::{available_ram_bytes, system_ram_bytes};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::system_ram_bytes;
+pub use windows::{available_ram_bytes, system_ram_bytes};
 
 /// An OS this crate has no reader for. Unknown, not zero.
 #[cfg(not(any(
@@ -33,6 +42,10 @@ mod unknown {
     pub fn system_ram_bytes() -> Option<u64> {
         None
     }
+
+    pub fn available_ram_bytes() -> Option<u64> {
+        None
+    }
 }
 #[cfg(not(any(
     target_os = "linux",
@@ -41,7 +54,7 @@ mod unknown {
     target_os = "ios",
     target_os = "windows",
 )))]
-pub use unknown::system_ram_bytes;
+pub use unknown::{available_ram_bytes, system_ram_bytes};
 
 // ── GPU readers, one per backend ──
 

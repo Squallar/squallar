@@ -600,6 +600,28 @@ pub(super) fn capacity_with_probe(
     }
 }
 
+/// **The host pool this instance may take a share of**, or `None` where the
+/// platform has no available-memory reader — every browser, and any native
+/// build whose reader failed.
+///
+/// Two readings, summed, and the sum is the point: the OS's available figure
+/// already excludes this process, so a percentage of it alone recedes as the
+/// app grows, and the app's own live bytes are the term that restores the
+/// invariant (`squallar_device_profile::scene::host_pool_bytes` carries the
+/// arithmetic). `squallar_alloc::live_bytes` answers `None` in a process that
+/// never installed the counting allocator — every test binary here — which
+/// the sum reads as zero, under-stating the pool by what this process holds
+/// and never over-stating it.
+///
+/// A free function rather than a method so both callers spell it once: the
+/// seed in [`App::new`], before the first `fit`, and the re-read on the
+/// telemetry tick, which is what keeps it from being a high-water mark.
+pub(super) fn host_pool_reading(platform: &dyn PlatformBridge) -> Option<u64> {
+    platform.available_memory_bytes().map(|available| {
+        squallar_device_profile::scene::host_pool_bytes(available, squallar_alloc::live_bytes())
+    })
+}
+
 /// `gpu probe: 4032 MiB ok, failed at 8128 MiB, 7 steps, 812 ms, backend
 /// BrowserWebGpu` — the probe's report, once, when it lands. `failed at none`
 /// and a trailing `, capped` when the probe stopped at its own bound rather
@@ -675,6 +697,14 @@ impl App {
         // and `DeviceProfile::capacity` prefers it to the bracket's link-flag
         // presumption. `None` natively and on any bridge that never said.
         device_profile.linear_memory_max_bytes = signals.linear_memory_max_bytes;
+        // **The host pool, seeded before the first resolve and re-read on
+        // every telemetry tick.** Not a `HostSignals` field, because unlike
+        // every other signal there it is not a fact about the machine: it is
+        // what the machine would give this process at this instant, and it
+        // moves with every other program on the box. `None` on every browser
+        // — a page is told nothing about the machine, and its wall is the
+        // linear memory above.
+        device_profile.host_pool_bytes = host_pool_reading(platform.as_ref());
         // Nothing is learned across sessions: every launch resolves the class
         // rung and lets `fit` shed from there for the scene it finds, and what
         // pressure teaches lowers this session's capacity presumption only.
@@ -3030,6 +3060,11 @@ mod gui_seam_ratchet_tests;
 
 #[cfg(test)]
 mod gpu_capacity_tests;
+
+/// What the OS would give this process reaches the capacity in force, on the
+/// arm that had no host figure at all, and is re-read on every tick.
+#[cfg(test)]
+mod host_pool_tests;
 
 #[cfg(test)]
 mod tests;

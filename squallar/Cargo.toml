@@ -205,6 +205,19 @@ objc2 = { version = "=0.6.4", default-features = false }
 objc2-metal = { version = "=0.3.2", default-features = false, features = [
     "MTLDevice",
 ] }
+# `host_statistics64` and the Mach VM counts it fills, for
+# `available_ram_bytes` in `src/capacity/apple.rs`. The objc2 family above
+# cannot answer that question -- Foundation states what the machine HAS
+# (`physicalMemory`) and nothing about what is free of it, and the one
+# NSProcessInfo-adjacent figure that sounds close, `os_proc_available_memory`,
+# is this process's own footprint limit rather than the machine's. Zero new
+# compiled packages: `libc 0.2.189` is already in both Apple graphs off
+# Cargo.lock (tokio, mio and getrandom each reach it), which is the same test
+# every other entry in this block records. NOT `=`-pinned, unlike its
+# neighbours: libc is a leaf every unix crate in the graph shares, and an
+# exact pin here would be this manifest overriding a version resolution it has
+# no stake in the moment anything else asks for a newer 0.2.
+libc = "0.2.189"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`, and

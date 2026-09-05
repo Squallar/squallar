@@ -251,6 +251,14 @@ impl PlatformBridge for DesktopPlatform {
         crate::capacity::host_signals(FormFactor::Desktop)
     }
 
+    /// `MemAvailable`, `ullAvailPhys` or the Mach host's free plus inactive
+    /// pages, by which module `crate::capacity` mounted. `None` where the
+    /// reader failed, which leaves the host figure exactly where it was
+    /// before one existed.
+    fn available_memory_bytes(&self) -> Option<u64> {
+        crate::capacity::available_ram_bytes()
+    }
+
     /// Vulkan's device-local heaps or DXGI's local budget for a discrete card;
     /// `None` over GL and for a UMA part, whose heaps lie. See `crate::capacity`.
     fn gpu_capacity(
@@ -457,6 +465,13 @@ impl PlatformBridge for AndroidPlatform {
         crate::capacity::host_signals(FormFactor::Handheld)
     }
 
+    /// `MemAvailable`, the same reader as Linux. The arm this figure matters
+    /// most on: a 2 GB phone's total says nothing about what is free of it,
+    /// and it is the only host reading Android gives before `onLowMemory`.
+    fn available_memory_bytes(&self) -> Option<u64> {
+        crate::capacity::available_ram_bytes()
+    }
+
     /// The Vulkan reader, which believes a discrete card only — so a phone
     /// answers `None` and keeps its presumption. See `crate::capacity`.
     fn gpu_capacity(
@@ -642,6 +657,13 @@ impl PlatformBridge for IosPlatform {
     /// An iOS build is a handheld: a build fact, not a reading.
     fn host_signals(&self) -> HostSignals {
         crate::capacity::host_signals(FormFactor::Handheld)
+    }
+
+    /// The Mach host's free plus inactive pages — `crate::capacity::apple`,
+    /// the same reader as macOS. **Unexecuted on either Apple arm**; see that
+    /// module.
+    fn available_memory_bytes(&self) -> Option<u64> {
+        crate::capacity::available_ram_bytes()
     }
 
     /// Metal's working set, for every device class. See `crate::capacity`.

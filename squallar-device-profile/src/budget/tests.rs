@@ -2523,3 +2523,187 @@ fn a_page_that_said_what_its_heap_was_built_with_outranks_the_bracket() {
         "a measured capacity's host figure was overwritten by a wasm ceiling",
     );
 }
+
+/// **A percentage of "available" is self-referential, and the pool is the fix.**
+///
+/// Every OS's available figure already excludes the asking process. Model a
+/// machine whose available figure was `S` when this app held nothing, and let
+/// the app's own live bytes be `L`: the machine then reports `S − L`. The
+/// naive rule `own = pct × available` converges where `L = pct × (S − L)`,
+/// i.e. `L = S · pct/(1 + pct)` — at 40 % that is 28.6 % of `S`, not 40 % —
+/// and the ceiling recedes on every step of the way there, so a governor
+/// aiming at it can never arrive and can never tell that it has not.
+///
+/// The pool `available + own live` is `S` at every `L`, which is the fixed
+/// line the percentage is meant to name.
+#[test]
+fn a_percentage_of_available_alone_converges_to_a_smaller_share_than_it_names() {
+    use crate::scene::host_pool_bytes;
+
+    const START: u64 = 8 << 30;
+    /// 40 %, as the numerator/denominator pair a real setting would carry.
+    const PCT: (u64, u64) = (2, 5);
+    let take = |figure: u64| figure / PCT.1 * PCT.0;
+
+    // The naive rule, iterated until it stops moving rather than for a fixed
+    // count: a 2/5 contraction over 8 GiB is still 90 B from its fixed point
+    // after twenty rounds, and a test that stopped there would be asserting
+    // its own truncation error.
+    let mut naive_live = 0u64;
+    for round in 0..64 {
+        let next = take(START - naive_live);
+        if next == naive_live {
+            break;
+        }
+        naive_live = next;
+        assert!(round < 63, "the naive rule did not settle");
+    }
+    // pct/(1 + pct) = (2/5)/(7/5) = 2/7 of the starting figure.
+    assert_eq!(
+        naive_live,
+        START * 2 / 7,
+        "the naive rule did not settle at pct/(1 + pct)",
+    );
+    assert!(
+        naive_live < take(START),
+        "40 % of available settled at {naive_live} B where 40 % of the machine's own figure \
+         is {} B",
+        take(START),
+    );
+
+    // The pool, at every point on that same walk: the line does not move.
+    for live in [0, 1 << 20, 1 << 30, naive_live, START] {
+        assert_eq!(
+            host_pool_bytes(START - live, Some(live)),
+            START,
+            "the pool moved while this process held {live} B",
+        );
+    }
+}
+
+/// **The pool never recedes as this process grows**, which is the property
+/// that makes it safe to hand a governor: feeding a larger own-live figure
+/// can only raise it.
+///
+/// Both arms, because over-firing is the worse direction: the sum is monotone
+/// in the own figure, and an absent own figure — a process that never
+/// installed the counting allocator, which is every test binary here — reads
+/// as zero, under-stating the pool by what the process holds and never
+/// over-stating it.
+#[test]
+fn the_pool_never_recedes_as_this_process_grows() {
+    use crate::scene::host_pool_bytes;
+
+    const AVAILABLE: u64 = 4 << 30;
+    let mut last = host_pool_bytes(AVAILABLE, None);
+    assert_eq!(last, AVAILABLE, "an uncounted process is read as holding 0");
+    for live in [0, 1, 1 << 20, 1 << 30, 64 << 30] {
+        let pool = host_pool_bytes(AVAILABLE, Some(live));
+        assert!(
+            pool >= last,
+            "the pool fell from {last} B to {pool} B when own live bytes reached {live} B",
+        );
+        last = pool;
+    }
+    // A sum that would overflow saturates rather than wrapping to a tiny
+    // pool: wrapping is the one direction that turns a huge figure into a wall.
+    assert_eq!(host_pool_bytes(u64::MAX, Some(1)), u64::MAX);
+}
+
+/// **The host pool outranks total RAM, and it stands whether or not the GPU
+/// reader answered.**
+///
+/// Two defects in one call: `capacity()` used to set a host figure only on the
+/// arm where a VRAM reading existed, so a native machine with no readable card
+/// carried `host_bytes: None` and `fit`'s host arm was inert on it; and the
+/// figure it did set was *total* RAM, which is what the machine has rather
+/// than what it would give. The control arm — a profile with no pool reading —
+/// is every other fixture in this crate, and it keeps the old answer exactly.
+#[test]
+fn the_host_pool_outranks_total_ram_and_does_not_wait_for_the_gpu_reader() {
+    const TOTAL: u64 = 64 << 30;
+    const POOL: u64 = 9 << 30;
+
+    let mut measured = DeviceProfile::for_target();
+    measured.platform = Platform::Native;
+    measured.limits = BudgetLimits::DESKTOP;
+    measured.class = DeviceClass::Discrete;
+    measured.vram_bytes = Some(24 << 30);
+    measured.system_ram_bytes = Some(TOTAL);
+
+    // Control: no reader answered, so the measured arm carries the total it
+    // always did.
+    assert_eq!(measured.capacity().host_bytes, Some(TOTAL));
+    assert_eq!(measured.capacity().source, CapacitySource::Measured);
+
+    // With a pool reading the host figure is the pool, and nothing else moves.
+    let mut with_pool = measured;
+    with_pool.host_pool_bytes = Some(POOL);
+    assert_eq!(with_pool.capacity().host_bytes, Some(POOL));
+    assert_eq!(
+        with_pool.capacity().gpu_bytes,
+        measured.capacity().gpu_bytes
+    );
+    assert_eq!(with_pool.capacity().source, measured.capacity().source);
+
+    // The decoupling: the same machine with no readable card. Control first —
+    // a bracket presumption with no host figure at all, which is what every
+    // native arm carried before this reader existed.
+    let mut presumed = measured;
+    presumed.class = DeviceClass::Software;
+    assert_eq!(presumed.capacity().source, CapacitySource::Presumed);
+    assert_eq!(
+        presumed.capacity().host_bytes,
+        None,
+        "the desktop bracket declares no host presumption",
+    );
+    assert_eq!(
+        presumed.capacity().host_allowance(),
+        None,
+        "fit's host arm was inert on a native machine with no VRAM reading",
+    );
+
+    // And with the pool: a host figure, on the arm that never had one.
+    let mut presumed_with_pool = presumed;
+    presumed_with_pool.host_pool_bytes = Some(POOL);
+    assert_eq!(presumed_with_pool.capacity().host_bytes, Some(POOL));
+    assert_eq!(
+        presumed_with_pool.capacity().host_allowance(),
+        Some(POOL / 4 * 3),
+    );
+    assert_eq!(
+        presumed_with_pool.capacity().gpu_bytes,
+        presumed.capacity().gpu_bytes,
+        "a host reading moved the GPU pool",
+    );
+
+    // **Total RAM is not promoted onto the presumed arm.** It stays the
+    // measured arm's last resort: three quarters of a machine's total is the
+    // imaginary budget the available reader exists to replace, and a profile
+    // that knows only the total goes on saying nothing about the host.
+    assert_eq!(presumed.system_ram_bytes, Some(TOTAL));
+    assert_eq!(presumed.capacity().host_bytes, None);
+}
+
+/// **On web the pool never answers, so the page's own wall still governs.**
+///
+/// A browser is told nothing about the machine — no `MemAvailable`, no
+/// `ullAvailPhys` — so `host_pool_bytes` is `None` there by construction and
+/// the instance's linear-memory ceiling stays the host figure. This is the arm
+/// that must not move: the web host figure has been the page's chosen wall
+/// since the per-device ceiling landed, and nothing here re-opens it.
+#[test]
+fn a_web_profile_keeps_its_instances_wall_because_no_pool_reader_answers_there() {
+    let mut page = DeviceProfile::for_target();
+    page.platform = Platform::Web;
+    page.limits = BudgetLimits::WASM;
+    page.linear_memory_max_bytes = Some(512 << 20);
+    assert_eq!(page.host_pool_bytes, None, "a browser has no such reader");
+    assert_eq!(page.capacity().host_bytes, Some(512 << 20));
+    assert_eq!(
+        page.capacity().host_allowance(),
+        Some((512 << 20) / 4 * 3),
+        "the handheld page's allowance is three quarters of ITS wall, not of the 1 GiB the \
+         module was linked with",
+    );
+}

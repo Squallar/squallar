@@ -645,6 +645,25 @@ pub trait PlatformBridge {
         None
     }
 
+    /// **What the OS says is free for this process to take right now**, in
+    /// bytes, or `None` on a platform with no such reader — which is every
+    /// browser, where a page is told nothing about the machine and its wall
+    /// is [`HostSignals::linear_memory_max_bytes`] instead.
+    ///
+    /// Polled, not read once, and that is why it is a method here rather than
+    /// a field on [`HostSignals`]: the figure moves with every other program
+    /// on the machine, and a value taken at construction would be exactly the
+    /// high-water mark this reading exists to replace. Asked on the telemetry
+    /// tick, never on the frame thread — `/proc/meminfo` is a file read.
+    ///
+    /// **Not a pool on its own.** Every OS's answer already excludes this
+    /// process, so a percentage taken of it directly recedes as the app grows;
+    /// what a percentage is taken of is this figure plus the app's own live
+    /// bytes (`squallar_device_profile::scene::host_pool_bytes`).
+    fn available_memory_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// The GPU's capacity in bytes and how that figure was obtained, or
     /// `None` where no reader exists for this adapter.
     ///

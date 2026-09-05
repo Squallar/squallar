@@ -235,6 +235,48 @@ impl Modulation {
     };
 }
 
+/// **The host pool a percentage is taken of**: what the OS says is available
+/// plus what this process already holds.
+///
+/// # Why the sum, and not `available` alone
+///
+/// Every OS's "available" figure — Linux's `MemAvailable`, Darwin's free plus
+/// inactive pages, Windows' `ullAvailPhys` — is memory available to a process
+/// that holds none of it. **It already excludes this one.** So a rule spelled
+/// `own = pct × available` reads its own consumption back as a smaller
+/// machine, and the ceiling recedes as the app approaches it.
+///
+/// Write `S` for the figure available when the app held nothing, `L` for its
+/// own live bytes and `A = S − L` for what is available with `L` held. The
+/// naive rule settles where `L = pct × (S − L)`, i.e.
+/// `L = S · pct/(1 + pct)` — at 40 % that is **28.6 % of `S`**, not 40 %, and
+/// at 100 % it is 50 %. Worse than the wrong number: the ceiling *moves* while
+/// the app allocates, so a governor watching it can never reach it and never
+/// tell that it has not.
+///
+/// The pool restores the invariant. `available + own live = (S − L) + L = S`
+/// whatever `L` is, so `pct × pool` is a fixed line the app can walk up to and
+/// sit on, and `pct` means what its label says. It is also monotone in the own
+/// figure — a process that holds more never sees its pool shrink for holding
+/// it — which is the property that makes it safe to feed a governor
+/// (`the_pool_never_recedes_as_this_process_grows`).
+///
+/// `own_live_bytes` is `squallar_alloc::live_bytes()` where the counting
+/// allocator is installed and `None` where it is not; `None` is read as zero
+/// here, which under-states the pool by whatever this process holds. That is
+/// the safe direction — an under-stated pool refuses, it never over-promises
+/// — and it is the arm every process without the allocator takes.
+///
+/// **The pool is not RAM this app may take.** It is the figure a percentage
+/// is taken OF, and what may be taken is [`Capacity::host_allowance`] of that
+/// product. **There is no percentage yet** — nothing multiplies this figure
+/// today, and the pool reaches `Capacity::host_bytes` whole, so the only
+/// clamp on it is the three-quarters allowance every host figure has always
+/// had.
+pub fn host_pool_bytes(available_bytes: u64, own_live_bytes: Option<u64>) -> u64 {
+    available_bytes.saturating_add(own_live_bytes.unwrap_or(0))
+}
+
 /// What the device can hold. It only ever limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
@@ -415,6 +457,11 @@ pub(crate) mod fixtures {
             // for the wasm bracket is the bound the module was linked with.
             // A browser page that chose a smaller wall would carry it here.
             linear_memory_max_bytes: None,
+            // No available-RAM reader has answered, so the profile carries no
+            // pool and the host figure falls back the way it did before one
+            // existed — which is what makes every expectation in this crate a
+            // control on the reader rather than a re-typed value.
+            host_pool_bytes: None,
             memo: None,
         }
     }

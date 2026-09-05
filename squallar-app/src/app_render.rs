@@ -2087,6 +2087,14 @@ impl super::App {
         // reading serves both the line and the watermark below it.
         let linear = self.platform.linear_memory();
         self.page_heap_reading = linear.or(self.page_heap_reading);
+        // **The host pool, re-read rather than remembered.** What the OS will
+        // give this process moves with every other program on the machine, so
+        // a figure taken once at construction would be the high-water mark
+        // this reading exists to replace. Read here, on the tick, and never on
+        // the frame thread: on Linux and Android it is a `/proc/meminfo` read.
+        // A reader that stops answering leaves the field unread rather than
+        // stale, the way `adopt_gpu_capacity` does with the card's.
+        self.device_profile.host_pool_bytes = crate::app::host_pool_reading(self.platform.as_ref());
         // **The readout is composed here, by the one thing that reads it**,
         // and after the heap reading above so its host spare is held to this
         // tick's room rather than the last one's. This is the whole of its
