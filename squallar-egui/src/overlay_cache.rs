@@ -138,6 +138,44 @@ impl ZoomDrive {
 /// on each side of the viewport.
 pub const OVERDRAW_FRACTION: f32 = 0.25;
 
+/// **The least ground an overlay picture covers, as a multiple of the
+/// viewport** — and the reason [`plan_overlay_texture`] does not derive the
+/// ground and the texel count from the same number.
+///
+/// Until 2026-09-05 it did. One `scale` set both, so the ladder's overlay
+/// oversampling rung bought its bytes back by shrinking the *ground* as well
+/// as the resolution, and its bottom rung — 100 percent, `overdraw == 0.0`
+/// exactly — left the picture covering precisely the viewport it was
+/// rasterised for. [`pan_exceeds_coverage_beyond`] then reduces to four strict
+/// inequalities against that viewport offset by [`COVERAGE_DEADBAND_TEXELS`],
+/// so **the whole pan margin was one texel** and any drag a person could see
+/// re-rasterised every enabled texture layer at full size, for as long as the
+/// finger moved.
+///
+/// Counted on this module's own `gesture_dispatch_tests` rig — 6 layers, 150
+/// frames, a pan of **0.05 of a viewport**, one raster frame into a
+/// three-frame upload:
+///
+/// | margin per side | dispatched | superseded |
+/// |-----------------|-----------:|-----------:|
+/// | 0.25 (rung 150) |      **0** |          0 |
+/// | 0.0  (rung 100) |    **288** |    **144** |
+///
+/// 288 dispatches is 32% of the 900 layer-frames in that run, and it is the
+/// same figure the 2-viewport pan produces (294): **the count does not move
+/// with how far the pan went**, because the trigger is not distance, it is
+/// "the viewport is not exactly where the picture was rasterised for".
+///
+/// **What this constant costs is nothing.** The ground and the resolution are
+/// two numbers now, and only their product is bytes: a picture covering 1.25
+/// viewports at 0.8 texels per device pixel has exactly the texel count of one
+/// covering 1.0 viewports at 1.0, so `pane_px` and both sides are bit-identical
+/// at every rung and `squallar_device_profile::fit::picture_bytes` prices this
+/// plan exactly as it priced the old one. At the two upper rungs (150 and 125)
+/// the asked scale already exceeds this floor, the resolution is exactly 1.0
+/// and nothing whatever changes; only the bottom rung moves.
+const MIN_COVERAGE_SCALE: f32 = 1.25;
+
 /// When the accumulated pan exceeds this fraction of the overdraw margin,
 /// a fresh render is triggered so the texture stays ahead of the viewport.
 ///
@@ -345,6 +383,37 @@ pub fn plan_overlay_texture(
         .max(0.0);
 
     let scale = 1.0 + 2.0 * overdraw;
+
+    // ── Ground and resolution, which are two numbers ────────────────────────
+    //
+    // `scale` above is how much bigger than the viewport this picture is
+    // *allowed to be*, and until 2026-09-05 it was spent entirely on ground:
+    // the texture covered `scale` viewports at one texel per device pixel. It
+    // does not have to be. What costs bytes is the product, so the same texel
+    // count buys a picture covering [`MIN_COVERAGE_SCALE`] viewports at
+    // proportionally fewer texels per device pixel — and the ground is what
+    // the pan trigger is judged against. See [`MIN_COVERAGE_SCALE`] for the
+    // counted figures and for why the bytes are unchanged.
+    //
+    // The delivered scale, not the asked one, because the ceiling below can cut
+    // it: `affordable` has already held `overdraw` to what `max_side` allows,
+    // but once that floored at zero the arithmetic stopped targeting `max_side`
+    // at all and only the `min` below is holding the line. Computed off the
+    // untruncated sides so a picture that is under the ceiling — every arm this
+    // tree has measured, where `max_texture_dimension_2d` is 8192 or more —
+    // divides `scale` by itself exactly and keeps `pixels_per_point` bit-equal
+    // to the density it was handed.
+    let ceiling = |side: f32| {
+        if side > 0.0 {
+            max_side as f32 / side
+        } else {
+            f32::INFINITY
+        }
+    };
+    let delivered = scale.min(ceiling(screen_w)).min(ceiling(screen_h));
+    let coverage_scale = delivered.max(MIN_COVERAGE_SCALE);
+    let resolution = delivered / coverage_scale;
+
     // `min(max_side)` is load-bearing, not defensive. It is the *only* thing keeping
     // the primary WebGL2 case legal: once `max(0.0)` has floored the overdraw at
     // zero — a pane at least as wide as the whole limit — `scale` is 1.0 and the
@@ -353,8 +422,13 @@ pub fn plan_overlay_texture(
     OverlayTexturePlan {
         width: ((screen_w * scale) as u32).min(max_side),
         height: ((screen_h * scale) as u32).min(max_side),
-        overdraw,
-        pixels_per_point: density,
+        // The ground, which is no longer the same question as the size above.
+        overdraw: (coverage_scale - 1.0) / 2.0,
+        // The density the *texture* is at, which is what the rasterizer must
+        // draw its strokes and glyphs at — `app_fetch`'s `device_scale`. Below
+        // the display's own density exactly when the ground was widened past
+        // what the byte budget pays for at full resolution.
+        pixels_per_point: density * resolution,
         pane_px: [screen_w as u32, screen_h as u32],
     }
 }
@@ -1096,6 +1170,60 @@ impl OverlayTextureCache {
             .or(self.blank)
             .unwrap_or(tex);
 
+        // **While the view is still moving, the margin is not the trigger.**
+        //
+        // Every other arm of this gate is gated on the settle or on a policy
+        // that stands the gesture down — the zoom band arm by
+        // [`MID_GESTURE_REBUILDS`], the zoom arm by `settled` itself. This arm
+        // never was, and that asymmetry is the defect: with mid-gesture
+        // rebuilds off, the zoom axis went quiet during a gesture while the pan
+        // axis stayed wide open and fired on every frame it could get a
+        // dispatch admitted. Counted on `gesture_dispatch_tests`, a pan of 0.05
+        // of a viewport with the zoom bit-identical throughout — so no other arm
+        // can be what answered — spent **294 rasters across 6 layers and 150
+        // frames and threw away 144 of them**. A pan of 2 whole viewports on the
+        // same rig spent 294, and a ten-notch zoom-out spent 294. **The trigger
+        // was not distance; it was motion**, and three gestures crossing 0.05,
+        // 2.0 and 1023x of ground costing the identical figure is what says so.
+        //
+        // So mid-gesture the question becomes the one the viewer can actually
+        // answer: **is the pane about to draw nothing**, rather than is it
+        // short of the margin it keeps for later. The margin exists to have a
+        // replacement ready before the old picture runs out, and mid-gesture
+        // there is no "before": a raster asked for now answers a viewport the
+        // gesture has already left. The moment the gesture ends the full margin
+        // rule below applies again unchanged, and that is what keeps a settled
+        // pane's texture ahead of a sustained pan.
+        //
+        // **The drive and not the settle countdown**, which are different
+        // questions and this is the one worth asking. The countdown is
+        // hysteresis on top of the drive, and it is re-armed by any zoom this
+        // cache has not seen before — including the very first zoom a fresh
+        // cache is asked about, which is a cold start and not a gesture. What
+        // this arm is about is a person's hand still being on the map, and
+        // [`ZoomDrive`] is exactly that. The two frames they differ by fall on
+        // the settled side, where the full rule below applies and can spend at
+        // most one raster per layer, at the position the gesture ended.
+        if drive.is_live() {
+            // **And nothing goes out while a picture is already crossing to
+            // this destination.** A dispatch made while the view is still
+            // moving supersedes that hold by construction — the replacement is
+            // owed before the first one can land — which is the freeze
+            // [`RenderSlot`] describes, run by a finger instead of by a fling.
+            // The in-flight half of the same rule is already refused one layer
+            // up: [`RendersInFlight::admits`] declines a second raster for a
+            // destination that has one out, so `held` is the half that was
+            // still getting through.
+            if self.held.is_some() {
+                return false;
+            }
+            // Deadbanded, for the reason the margin arm below is: a viewport
+            // wobbling by less than one of the picture's own texels rasterises
+            // the picture it already has, and at a coverage floor that is still
+            // the whole of the margin on the axis a clamp ate.
+            return coverage_is_exhausted_visibly(&displayed, viewport_bounds);
+        }
+
         // **What is on screen has run out of margin**, by at least a texel of
         // itself. While it still has some, nothing is dispatched, whatever a
         // picture the viewer cannot see yet may have run out of. The two
@@ -1209,6 +1337,26 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
     pan_exceeds_coverage_beyond(texture_bounds, viewport_bounds, 0.0, 0.0)
 }
 
+/// Whether the viewport has ground in it this picture does not cover — **the
+/// pane is drawing nothing there**, which is the only thing about coverage a
+/// person can see while a gesture is running.
+///
+/// [`pan_exceeds_coverage`] with the whole band consumed rather than
+/// [`PAN_REBUILD_THRESHOLD`] of it, so it shares that function's handling of an
+/// edge already at the projection's limit — the case that spun for ever — and
+/// cannot drift from it. It is strictly weaker: anything this answers `true`
+/// for, `pan_exceeds_coverage` answers `true` for as well.
+fn coverage_is_exhausted_visibly(texture: &PictureShape, viewport_bounds: &GeoBounds) -> bool {
+    let (deadband_lat, deadband_lon) = coverage_deadband(texture, viewport_bounds);
+    pan_exceeds_coverage_at(
+        &texture.placed.geo,
+        viewport_bounds,
+        1.0,
+        deadband_lat,
+        deadband_lon,
+    )
+}
+
 /// [`pan_exceeds_coverage`] with the trigger moved `deadband_lat` / `deadband_lon`
 /// degrees later on every edge. A deadband wider than the margin puts the trigger
 /// *outside* the texture's own bounds, which is what makes it mean anything at
@@ -1216,6 +1364,26 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
 fn pan_exceeds_coverage_beyond(
     texture_bounds: &GeoBounds,
     viewport_bounds: &GeoBounds,
+    deadband_lat: f64,
+    deadband_lon: f64,
+) -> bool {
+    pan_exceeds_coverage_at(
+        texture_bounds,
+        viewport_bounds,
+        PAN_REBUILD_THRESHOLD,
+        deadband_lat,
+        deadband_lon,
+    )
+}
+
+/// [`pan_exceeds_coverage_beyond`] with the fraction of the band a pan must
+/// consume as a parameter, so [`coverage_is_exhausted_visibly`] can ask for the whole
+/// of it through the same projection-limit handling rather than a second
+/// spelling of these four inequalities.
+fn pan_exceeds_coverage_at(
+    texture_bounds: &GeoBounds,
+    viewport_bounds: &GeoBounds,
+    threshold: f32,
     deadband_lat: f64,
     deadband_lon: f64,
 ) -> bool {
@@ -1232,10 +1400,13 @@ fn pan_exceeds_coverage_beyond(
     let band_lat = (tex_lat_range - view_lat_range) / 2.0;
     let band_lon = (tex_lon_range - view_lon_range) / 2.0;
 
-    // Headroom left when the pan has consumed PAN_REBUILD_THRESHOLD of the band.
-    // Crossing into it is what triggers the rebuild, leaving the rest of the band
-    // to cover the viewport while the new texture rasterises.
-    let headroom = 1.0 - PAN_REBUILD_THRESHOLD as f64;
+    // Headroom left when the pan has consumed `threshold` of the band. Crossing
+    // into it is what triggers the rebuild, leaving the rest of the band to
+    // cover the viewport while the new texture rasterises. At
+    // `PAN_REBUILD_THRESHOLD` that is half the band; at 1.0 there is no headroom
+    // left at all and the question becomes whether the picture covers the
+    // viewport — see [`coverage_is_exhausted_visibly`].
+    let headroom = 1.0 - threshold as f64;
     let margin_lat = band_lat * headroom - deadband_lat;
     let margin_lon = band_lon * headroom - deadband_lon;
 
@@ -1417,3 +1588,9 @@ mod texture_budget_tests;
 /// arrival balance, and the two routes to the screen.
 #[cfg(test)]
 mod ledger_tests;
+
+/// What one gesture is allowed to cost: the rasters a pan and a zoom-out spend
+/// across a whole gesture, counted rather than timed, and the margin the
+/// planner keeps at every rung of the ladder.
+#[cfg(test)]
+mod gesture_dispatch_tests;

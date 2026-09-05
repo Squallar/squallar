@@ -125,7 +125,20 @@ fn a_full_size_browser_pane_stays_within_the_limit() {
         "the wide axis should have been sized to the limit, got {}",
         plan.width
     );
-    assert_eq!(plan.height, (h * (1.0 + 2.0 * plan.overdraw)) as u32);
+    // **Both axes are sized by the same delivered scale**: the clamp shortens
+    // the picture, it does not stretch it. Read off the binding axis rather
+    // than off `plan.overdraw`, which since 2026-09-05 is the *ground* the
+    // picture covers and no longer the scale it was sized at — see
+    // `MIN_COVERAGE_SCALE`. The one-texel allowance is the binding axis's own
+    // truncation being divided back out.
+    let delivered = f64::from(plan.width) / f64::from(w);
+    let expected = (f64::from(h) * delivered) as u32;
+    assert!(
+        plan.height.abs_diff(expected) <= 1,
+        "the short axis was sized at a different scale from the binding one: \
+         {} against {expected}",
+        plan.height,
+    );
     assert!(plan.overdraw > 0.0 && plan.overdraw < OVERDRAW_FRACTION);
 }
 
@@ -176,7 +189,21 @@ fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
         "fixture must overflow on both axes for both clamps to be reached"
     );
     let plan = plan_overlay_texture(rect, WEBGL2_LIMIT, NO_SCALING, OVERDRAW_FRACTION);
-    assert_eq!(plan.overdraw, 0.0, "nothing left to give up");
+    // **The texels are given up; the ground is not.** Until 2026-09-05 this
+    // read `plan.overdraw == 0.0`, because one number set both the size and the
+    // ground — and a picture covering exactly its own viewport re-rasterises on
+    // any pan at all. The clamp still bounds the size to the limit; what it now
+    // buys the margin with is resolution. See `MIN_COVERAGE_SCALE`.
+    assert_eq!(
+        plan.overdraw,
+        (MIN_COVERAGE_SCALE - 1.0) / 2.0,
+        "the coverage floor is what a clamped pane falls back to, not zero"
+    );
+    assert!(
+        plan.pixels_per_point < NO_SCALING,
+        "and it is paid for out of density: {}",
+        plan.pixels_per_point
+    );
     assert_eq!(plan.width, WEBGL2_LIMIT);
     assert_eq!(plan.height, WEBGL2_LIMIT);
 }
@@ -191,7 +218,11 @@ fn only_the_overflowing_axis_is_truncated() {
         NO_SCALING,
         OVERDRAW_FRACTION,
     );
-    assert_eq!(plan.overdraw, 0.0);
+    assert_eq!(
+        plan.overdraw,
+        (MIN_COVERAGE_SCALE - 1.0) / 2.0,
+        "the ground falls back to the coverage floor, not to nothing"
+    );
     assert_eq!(
         plan.width, WEBGL2_LIMIT,
         "the overflowing axis is cut to the limit"
@@ -225,8 +256,10 @@ fn a_pane_with_one_zero_axis_still_sizes_the_other() {
     );
     assert!(plan.overdraw.is_finite());
     assert_eq!(
-        plan.overdraw, 0.0,
-        "the 3000pt axis alone exhausts the limit"
+        plan.overdraw,
+        (MIN_COVERAGE_SCALE - 1.0) / 2.0,
+        "the 3000pt axis alone exhausts the limit, so the ground it covers is \
+         the coverage floor and the texels are what were given up"
     );
     assert_eq!(plan.width, 0);
     assert_eq!(plan.height, WEBGL2_LIMIT);
@@ -734,8 +767,11 @@ fn the_planners_margin_is_the_ladders_top_rung_and_each_rung_is_exact() {
     );
     let nan = plan_overlay_texture(canvas, 32768, NO_SCALING, f32::NAN);
     assert_eq!(
-        nan.overdraw, 0.0,
-        "a fraction that is not a number asks for nothing"
+        nan.overdraw,
+        (MIN_COVERAGE_SCALE - 1.0) / 2.0,
+        "a fraction that is not a number asks for no extra texels — and the \
+         picture still covers the coverage floor, because that is the ground \
+         and not the size. `nan.width` below is what the asked-for nothing buys"
     );
     assert_eq!(nan.width, 2878);
 }
