@@ -391,21 +391,52 @@ fn cpu_shape(meshes: &tile_mesh::TileMeshes) -> Vec<egui::Shape> {
     vec![egui::Shape::Mesh(mesh.into())]
 }
 
-/// The callback path's shapes: one paint callback per fill run, at the same
-/// placement, exactly as `paint_vector_tile` emits them.
+/// The callback path's shapes: **one** paint callback covering every run of
+/// the tile, at the one placement they share, exactly as `paint_vector_tile`
+/// emits them when nothing the ground phase draws sits between the runs.
+///
+/// The batch is what the parity comparison below is taken against, so "the
+/// runs of one callback draw the same pixels as the same runs drawn one
+/// callback each, and as the CPU path" is settled by the image rather than by
+/// an argument about draw order.
 fn callback_shapes(
     meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
     pass_nr: u64,
 ) -> Vec<egui::Shape> {
     let bridge = TileMeshBridge;
-    (0..meshes.runs().len())
+    vec![egui::Shape::Callback(egui::epaint::PaintCallback {
+        rect: piece(),
+        callback: bridge
+            .payload(tile_mesh::GroundDraw {
+                meshes,
+                first_run: 0,
+                run_count: meshes.runs().len(),
+                place: tile_mesh::Placement::of(piece()),
+                pass_nr,
+            })
+            .expect("the bridge always answers for a span it was given"),
+    })]
+}
+
+/// One paint callback per run, in the order given.
+///
+/// The arrangement the batch replaces — and, given a reversed order, the
+/// control that shows the byte compare can see a draw-order difference at all.
+fn callback_shapes_per_run(
+    meshes: &std::sync::Arc<tile_mesh::TileMeshes>,
+    order: impl Iterator<Item = usize>,
+    pass_nr: u64,
+) -> Vec<egui::Shape> {
+    let bridge = TileMeshBridge;
+    order
         .map(|run| {
             egui::Shape::Callback(egui::epaint::PaintCallback {
                 rect: piece(),
                 callback: bridge
                     .payload(tile_mesh::GroundDraw {
                         meshes,
-                        run,
+                        first_run: run,
+                        run_count: 1,
                         place: tile_mesh::Placement::of(piece()),
                         pass_nr,
                     })
@@ -413,6 +444,118 @@ fn callback_shapes(
             })
         })
         .collect()
+}
+
+/// Four **opaque** overlapping quads, each its own mesh, so the flatten makes
+/// four runs and each one hides part of the one before it.
+///
+/// Opaque and overlapping is the whole design: with translucent quads the
+/// blend is very nearly commutative and a reordered draw would produce a
+/// picture too close to the right one to separate, which would make the
+/// order-sensitivity control below vacuous. These are `a` over `b` with no
+/// alpha, so painting them in any other order is a visibly different image.
+fn layered_fills() -> Vec<egui::epaint::Mesh> {
+    [
+        egui::Color32::from_rgb(200, 30, 40),
+        egui::Color32::from_rgb(20, 160, 60),
+        egui::Color32::from_rgb(40, 60, 220),
+        egui::Color32::from_rgb(230, 200, 20),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, colour)| {
+        let at = i as f32 * 512.0;
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.add_rect_with_uv(
+            egui::Rect::from_min_size(egui::pos2(at, at), egui::vec2(2048.0, 2048.0)),
+            egui::Rect::from_min_max(egui::epaint::WHITE_UV, egui::epaint::WHITE_UV),
+            colour,
+        );
+        mesh
+    })
+    .collect()
+}
+
+/// **The batch draws its runs in the order the style asked for.**
+///
+/// `the_callback_path_puts_the_same_bytes_on_screen_as_cpu_placement` settles
+/// the shader against the CPU on a tile of **one** run, so it says nothing
+/// about a callback that draws several. (It is `#[ignore]`d like everything
+/// here; run the file with `cargo test -p squallar-gpu --test tile_mesh_gpu --
+/// --ignored`.) This is that case: four opaque overlapping fill runs, drawn
+/// three ways, and the three readbacks compared.
+///
+/// * **one batched callback** — what `paint_vector_tile` emits today;
+/// * **one callback per run** — what it emitted before, byte-identical or the
+///   batch has changed what covers what;
+/// * **one callback per run, reversed** — the interleaved control. It must
+///   *differ*, or these quads do not overlap enough for the compare to see an
+///   order at all and the two agreements above would prove nothing.
+///
+/// The CPU arm is the fourth reading and the anchor: `cpu_shape` walks the
+/// flat index buffer in order, so it is the order the runs were flattened in
+/// by construction rather than by a second statement of it here.
+#[test]
+#[ignore = "needs a real wgpu adapter"]
+fn a_batched_callback_draws_its_runs_in_run_order() {
+    let _serialised = gpu_lock();
+    let Some((device, queue)) = device() else {
+        eprintln!("SKIPPED: no wgpu adapter");
+        return;
+    };
+    let layers = layered_fills();
+    let meshes = std::sync::Arc::new(tile_mesh::flatten_meshes(
+        layers.iter().enumerate().map(|(i, m)| (i as u32, m)),
+    ));
+    assert_eq!(
+        meshes.runs().len(),
+        4,
+        "the fixture is four runs, or the batch under test is not a batch"
+    );
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let mut renderer = renderer_for(&device, format);
+    let cpu = frame(&device, &queue, &mut renderer, format, cpu_shape(&meshes));
+    let batched = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        callback_shapes(&meshes, 1),
+    );
+    let per_run = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        callback_shapes_per_run(&meshes, 0..4, 2),
+    );
+    let reversed = frame(
+        &device,
+        &queue,
+        &mut renderer,
+        format,
+        callback_shapes_per_run(&meshes, (0..4).rev(), 3),
+    );
+
+    assert!(
+        painted(&cpu) > 1000,
+        "non-triviality: the control drew {} texels, so a match below would          be a compare of two empty pictures",
+        painted(&cpu),
+    );
+    assert!(
+        reversed != cpu,
+        "the control is blind: drawing the four runs back to front produced          the same {} painted texels as drawing them front to back, so these          quads do not overlap and the agreements below prove no ordering",
+        painted(&cpu),
+    );
+    assert!(
+        batched == cpu,
+        "one callback over four runs did not draw what placing the same four          runs on the CPU draws: the batch has changed what covers what"
+    );
+    assert!(
+        per_run == cpu,
+        "four callbacks of one run each did not match the CPU path either, so          the disagreement is not the batching"
+    );
 }
 
 fn renderer_for(device: &wgpu::Device, format: wgpu::TextureFormat) -> egui_wgpu::Renderer {

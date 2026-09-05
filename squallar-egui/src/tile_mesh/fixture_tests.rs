@@ -287,28 +287,131 @@ fn the_plan_reproduces_the_unplanned_walks_decisions_exactly() {
     let plan = flat.plan().expect("flatten builds a plan");
 
     let covered = covered_by_a_stroke_run(&shapes, &flat);
-    let mut expected: Vec<PlanStep> = Vec::new();
+    let mut expected: Vec<Decision> = Vec::new();
     let mut next_run = 0usize;
     for (index, shape) in shapes.iter().enumerate() {
         if next_run < flat.runs().len() && flat.runs()[next_run].shape_index as usize == index {
-            expected.push(PlanStep::Run(next_run as u32));
+            expected.push(Decision::Run(next_run as u32));
             next_run += 1;
             continue;
         }
         if covered[index] && matches!(shape, ShapeOrText::Shape(egui::Shape::Path(_))) {
             continue;
         }
-        expected.push(PlanStep::Place(index as u32));
+        expected.push(Decision::Place(index as u32));
     }
 
-    assert_eq!(plan.steps(), expected.as_slice());
+    assert_eq!(decisions(plan), expected);
 
     // Non-triviality: the two lists agreeing proves nothing if neither holds
     // the interesting cases. This fixture must exercise both kinds and must
     // actually drop shapes, or the gate is comparing two empty walks.
-    assert!(expected.iter().any(|s| matches!(s, PlanStep::Run(_))));
-    assert!(expected.iter().any(|s| matches!(s, PlanStep::Place(_))));
+    assert!(expected.iter().any(|s| matches!(s, Decision::Run(_))));
+    assert!(expected.iter().any(|s| matches!(s, Decision::Place(_))));
     assert!(expected.len() < shapes.len());
+}
+
+/// **Every run of a real tile is one paint callback.**
+///
+/// The cut this batching exists for, as a count on real styled geometry
+/// rather than an argument. A callback forces a primitive boundary
+/// unconditionally, so one per run was one primitive, one draw and the state
+/// churn around it per run; the ground was the largest source of primitives
+/// on a terrain-off frame, which is the **default** configuration
+/// (`Terrain::default_enabled()` is false).
+///
+/// Swept over every zoom of both committed themes at two pixel densities —
+/// 60 styled tiles, 184 runs — and **every one of the 60 is a single batch**.
+/// The reason is structural rather than lucky: `mvt::render` emits the
+/// background rectangle, then the fills and strokes, then the labels, and a
+/// label cannot break a batch because the ground phase defers it. What would
+/// break one is a shape that draws landing between two runs, so this asserts
+/// the batch count and not merely that batching happened.
+#[test]
+fn every_run_of_a_styled_tile_is_one_paint_callback() {
+    let Some(parsed) = monaco_parsed() else {
+        return;
+    };
+
+    let mut tiles = 0usize;
+    let mut runs = 0usize;
+    for dark in [true, false] {
+        let style = crate::basemap_style::committed(dark);
+        for zoom in 0..=TILE.0 {
+            for pixels_per_point in [1.0f32, 2.0] {
+                let shapes = walkers::mvt::styled(&parsed, &style, zoom);
+                let flat = flatten(&shapes, feathering_at(pixels_per_point));
+                if flat.runs().is_empty() {
+                    continue;
+                }
+                let plan = flat.plan().expect("flatten builds a plan");
+
+                let batches: Vec<(u32, u32)> = plan
+                    .steps()
+                    .iter()
+                    .filter_map(|step| match *step {
+                        PlanStep::Runs { first, count } => Some((first, count)),
+                        PlanStep::Place(_) => None,
+                    })
+                    .collect();
+
+                assert_eq!(
+                    batches.len(),
+                    1,
+                    "z{zoom} dark={dark} ppp={pixels_per_point}: {} runs went \
+                     out as {} callbacks, not one -- something that draws is \
+                     landing between two runs",
+                    flat.runs().len(),
+                    batches.len(),
+                );
+                assert_eq!(
+                    batches[0],
+                    (0, flat.runs().len() as u32),
+                    "z{zoom} dark={dark} ppp={pixels_per_point}: the one batch \
+                     does not cover every run of the tile from run 0",
+                );
+
+                tiles += 1;
+                runs += flat.runs().len();
+            }
+        }
+    }
+
+    // Non-triviality: the assertions above are vacuous over an empty sweep,
+    // and a one-run tile would satisfy them without any batching happening.
+    assert!(tiles >= 50, "the sweep styled only {tiles} tiles");
+    assert!(
+        runs > tiles,
+        "{runs} runs over {tiles} tiles -- no tile had more than one run, so \
+         nothing here was actually batched"
+    );
+}
+
+/// One decision of the ground walk, with the batching undone.
+///
+/// A plan that issues `n` consecutive runs as one [`PlanStep::Runs`] and a
+/// walk that issues them one at a time take the **same decisions in the same
+/// order**; they differ only in how many callbacks carry them. This is the
+/// form the two are compared in, so the identity gate above keeps asking
+/// about the decisions rather than about the encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Run(u32),
+    Place(u32),
+}
+
+/// `plan`'s steps with every batch expanded back into its runs, in order.
+fn decisions(plan: &TilePlan) -> Vec<Decision> {
+    let mut out = Vec::new();
+    for step in plan.steps() {
+        match *step {
+            PlanStep::Runs { first, count } => {
+                out.extend((first..first + count).map(Decision::Run));
+            }
+            PlanStep::Place(index) => out.push(Decision::Place(index)),
+        }
+    }
+    out
 }
 
 /// Every label survives the plan. The count gate rewards dropping work, and

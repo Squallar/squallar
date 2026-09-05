@@ -132,11 +132,21 @@ pub enum RunKind {
 /// without revisiting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanStep {
-    /// Issue `runs[i]`. If the renderer declines it — no store, or a
-    /// feathering this frame does not draw at — every shape in its span is
-    /// placed on the CPU instead, which is exactly what the un-planned walk
-    /// did when `take_at` returned `None`.
-    Run(u32),
+    /// Issue `runs[first..first + count]` as **one** paint callback.
+    ///
+    /// Runs are coalesced here rather than at the frame, and only when
+    /// nothing the ground phase draws sits between them, so the batch draws
+    /// its runs in the order the style asked for and in the place the first
+    /// of them held. See [`build_plan`] for why that is every run of a tile
+    /// in practice.
+    ///
+    /// A run the renderer declines — no store, or a feathering this frame
+    /// does not draw at — breaks the batch at exactly that run: the runs
+    /// before it go out as one callback, its own span is placed on the CPU,
+    /// and the runs after it open a fresh batch. That keeps the declined
+    /// geometry at its own place among the shapes, which is what the
+    /// un-planned walk did when `take_at` returned `None`.
+    Runs { first: u32, count: u32 },
     /// Place `shapes[i]` on the CPU.
     Place(u32),
 }
@@ -389,7 +399,9 @@ pub fn flatten(shapes: &[ShapeOrText], feathering: f32) -> TileMeshes {
 /// **It reproduces the un-planned walk's decisions exactly, in its order.**
 /// Every branch below is one the frame loop used to take per shape:
 ///
-/// * a run's opening index becomes [`PlanStep::Run`] — the `take_at` arm;
+/// * a run's opening index becomes a [`PlanStep::Runs`] batch — the `take_at`
+///   arm — extending the batch the step before it opened, if that step was
+///   one;
 /// * a **path** inside a run's span is dropped — the `covers` arm, which is
 ///   spelled for `Shape::Path` and nothing else;
 /// * everything remaining becomes [`PlanStep::Place`] — labels, the background
@@ -413,11 +425,22 @@ fn build_plan(shapes: &[ShapeOrText], runs: &[MeshRun]) -> TilePlan {
         }
     }
 
-    let mut steps = Vec::new();
+    let mut steps: Vec<PlanStep> = Vec::new();
     let mut next_run = 0usize;
     for (index, shape) in shapes.iter().enumerate() {
         if next_run < runs.len() && runs[next_run].shape_index as usize == index {
-            steps.push(PlanStep::Run(next_run as u32));
+            // Extend the batch the previous step opened, or open one. The
+            // test is `steps.last()`, so anything the ground phase places
+            // between two runs ends the batch by simply being the last step;
+            // a `Text` cannot, because it is deferred to the label phase and
+            // pushes nothing into the primitive list.
+            match steps.last_mut() {
+                Some(PlanStep::Runs { count, .. }) => *count += 1,
+                _ => steps.push(PlanStep::Runs {
+                    first: next_run as u32,
+                    count: 1,
+                }),
+            }
             next_run += 1;
             continue;
         }
@@ -684,13 +707,21 @@ impl Placement {
     }
 }
 
-/// One run of one tile, at one placement, on one frame.
+/// A consecutive span of one tile's runs, at one placement, on one frame.
+///
+/// **A span rather than a run** because every run of a tile shares this
+/// placement, this clip and these buffers, so one callback can draw all of
+/// them: a callback forces a primitive boundary unconditionally, and the
+/// boundary is what the frame tail is paid for. See [`PlanStep::Runs`].
 pub struct GroundDraw<'a> {
     /// Cloned by the renderer to keep the flattened buffers alive for the
     /// upload, and downgraded to the weak handle its residency is swept by.
     pub meshes: &'a Arc<TileMeshes>,
-    /// Index into [`TileMeshes::runs`].
-    pub run: usize,
+    /// Index into [`TileMeshes::runs`] of the first run to draw.
+    pub first_run: usize,
+    /// How many consecutive runs from [`Self::first_run`] this draw covers,
+    /// in that order.
+    pub run_count: usize,
     pub place: Placement,
     /// egui's cumulative pass number, so the renderer can tell one frame's
     /// draws from the next without a clock or a callback of its own.
@@ -705,8 +736,8 @@ pub struct GroundDraw<'a> {
 ///
 /// [`GuiEvent::TileMeshPainter`]: crate::shell_api::GuiEvent::TileMeshPainter
 pub trait TileMeshPainter: Send + Sync {
-    /// This frame's payload for one run, or `None` when the renderer cannot
-    /// draw it and the caller must place the shape itself.
+    /// This frame's payload for one span of runs, or `None` when the renderer
+    /// cannot draw them and the caller must place the shapes itself.
     fn payload(&self, draw: GroundDraw<'_>) -> Option<Arc<dyn Any + Send + Sync>>;
 }
 

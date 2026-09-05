@@ -546,6 +546,169 @@ fn place_one(
     }
 }
 
+/// Place every shape a declined run would have drawn, each at its own place
+/// among the shapes.
+///
+/// **A `Text` in the span is skipped, and that is the whole of the subtlety.**
+/// A label whose anchor falls inside a stroke run's span is not drawn by the
+/// run, so `tile_mesh::build_plan` already emits its own `PlanStep::Place` for
+/// it; placing it here as well would push the same label into `labels` twice
+/// and lay it out twice. Nothing else can be in a span — a fill run is one
+/// mesh, and any shape that draws closes a stroke run at flatten time
+/// (`tile_mesh::flatten`) — so skipping `Text` leaves exactly the geometry the
+/// run was going to draw.
+fn place_run_on_cpu(
+    run: crate::tile_mesh::MeshRun,
+    shapes: &[walkers::ShapeOrText],
+    placement: egui::emath::TSTransform,
+    rect: egui::Rect,
+    counted: &mut Counted,
+    placed: &mut Vec<egui::Shape>,
+    labels: &mut Vec<walkers::Text>,
+) {
+    for at in run.shape_index..run.shape_index + run.shape_span {
+        let Some(shape) = shapes.get(at as usize) else {
+            continue;
+        };
+        if matches!(shape, walkers::ShapeOrText::Text(_)) {
+            continue;
+        }
+        place_one(shape, placement, rect, counted, placed, labels);
+    }
+}
+
+/// Whether this install can draw `run` from the GPU on this frame.
+///
+/// The feathering test is the `pixels_per_point` guard; see
+/// [`RunCursor::take_at`], which states why bit equality is the right
+/// comparison. It is a property of the **tile**, not of the run, so a
+/// mismatch declines every stroke run of the tile and no fill run of it.
+fn run_is_drawable(
+    run: crate::tile_mesh::MeshRun,
+    meshes: &crate::tile_mesh::TileMeshes,
+    ground: &GroundMeshes<'_>,
+) -> bool {
+    ground.painter.is_some()
+        && !(run.kind == crate::tile_mesh::RunKind::Stroke
+            && meshes.feathering() != ground.feathering)
+}
+
+/// One paint callback for `runs[first..first + count]`, drawn in that order.
+fn issue_run_batch(
+    meshes: &std::sync::Arc<crate::tile_mesh::TileMeshes>,
+    ground: &GroundMeshes<'_>,
+    first: usize,
+    count: usize,
+    placement: egui::emath::TSTransform,
+    piece: egui::Rect,
+) -> Option<egui::Shape> {
+    let painter = ground.painter?;
+    let payload = painter.payload(crate::tile_mesh::GroundDraw {
+        meshes,
+        first_run: first,
+        run_count: count,
+        place: crate::tile_mesh::Placement {
+            scale: placement.scaling,
+            translation: [placement.translation.x, placement.translation.y],
+        },
+        pass_nr: ground.pass_nr,
+    })?;
+    Some(egui::Shape::Callback(egui::epaint::PaintCallback {
+        // The **piece**, which is what egui turns into a viewport and refuses
+        // when it is degenerate. The draw replaces that viewport with the
+        // whole screen, because the geometry is placed in screen points by the
+        // uniform exactly as the CPU path places it; the clip that makes a
+        // stretched ancestor draw only the quarter that belongs to this tile
+        // is egui's scissor, taken from the clip rect the painter carries.
+        //
+        // Every run of the batch shares this rect, because they are all runs
+        // of the same tile at the same placement -- which is what lets them
+        // share one callback at all.
+        rect: piece,
+        callback: payload,
+    }))
+}
+
+/// Issue `runs[first..first + count]` as **as few paint callbacks as their
+/// drawability allows**, placing on the CPU every run the renderer declines.
+///
+/// A callback forces a primitive boundary unconditionally, so one callback per
+/// run was one primitive, one draw and one state reset per run. Every run of a
+/// tile shares the tile's placement, clip rect and buffers, so a contiguous
+/// drawable span of them is one callback and the frame records one boundary
+/// for the tile instead of one per run.
+///
+/// **Order is preserved by construction, not by argument.** The batch draws
+/// its runs in index order, which is `shape_index` order
+/// (`Flattening::finish` sorts them and `runs_are_in_shape_order` holds it to
+/// that), so what covers what inside a batch is what covered what before it.
+/// Between batches, order is preserved because a batch is only ever a
+/// contiguous span of `PlanStep::Runs`, which `build_plan` opens afresh the
+/// moment anything the ground phase *places* comes between two runs; a `Text`
+/// does not, because it is deferred to the label phase and pushes nothing
+/// into the primitive list. A declined run splits the span at exactly itself,
+/// so its own geometry still draws between the runs before and after it.
+#[allow(clippy::too_many_arguments)]
+fn take_run_batch(
+    first: usize,
+    count: usize,
+    meshes: &std::sync::Arc<crate::tile_mesh::TileMeshes>,
+    ground: &GroundMeshes<'_>,
+    placement: egui::emath::TSTransform,
+    rect: egui::Rect,
+    shapes: &[walkers::ShapeOrText],
+    counted: &mut Counted,
+    placed: &mut Vec<egui::Shape>,
+    labels: &mut Vec<walkers::Text>,
+) {
+    let end = first.saturating_add(count).min(meshes.runs().len());
+    let mut at = first.min(end);
+    while at < end {
+        let mut reach = at;
+        while reach < end && run_is_drawable(meshes.runs()[reach], meshes, ground) {
+            reach += 1;
+        }
+        if reach > at {
+            if let Some(callback) = issue_run_batch(meshes, ground, at, reach - at, placement, rect)
+            {
+                for run in &meshes.runs()[at..reach] {
+                    match run.kind {
+                        crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
+                        crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
+                    }
+                }
+                placed.push(callback);
+            } else {
+                // The renderer refused the span outright. Every run in it goes
+                // back on the CPU, in order, exactly as a per-run decline does.
+                for index in at..reach {
+                    place_run_on_cpu(
+                        meshes.runs()[index],
+                        shapes,
+                        placement,
+                        rect,
+                        counted,
+                        placed,
+                        labels,
+                    );
+                }
+            }
+            at = reach;
+            continue;
+        }
+        place_run_on_cpu(
+            meshes.runs()[at],
+            shapes,
+            placement,
+            rect,
+            counted,
+            placed,
+            labels,
+        );
+        at += 1;
+    }
+}
+
 fn paint_vector_tile(
     painter: &egui::Painter,
     shapes: &[walkers::ShapeOrText],
@@ -583,36 +746,19 @@ fn paint_vector_tile(
     if let Some((meshes, plan)) = planned {
         for step in plan.steps() {
             match *step {
-                crate::tile_mesh::PlanStep::Run(index) => {
-                    let Some(run) = meshes.runs().get(index as usize).copied() else {
-                        continue;
-                    };
-                    match runs.take_at(run.shape_index as usize, &ground, placement, rect) {
-                        Some((callback, kind)) => {
-                            match kind {
-                                crate::tile_mesh::RunKind::Fill => counted.mesh_draws += 1,
-                                crate::tile_mesh::RunKind::Stroke => counted.stroke_draws += 1,
-                            }
-                            placed.push(callback);
-                        }
-                        // Declined -- no store, or a feathering this frame does
-                        // not draw at. The span goes back on the CPU exactly as
-                        // it did when `take_at` returned `None` mid-walk.
-                        None => {
-                            for at in run.shape_index..run.shape_index + run.shape_span {
-                                if let Some(shape) = shapes.get(at as usize) {
-                                    place_one(
-                                        shape,
-                                        placement,
-                                        rect,
-                                        &mut counted,
-                                        &mut placed,
-                                        labels,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                crate::tile_mesh::PlanStep::Runs { first, count } => {
+                    take_run_batch(
+                        first as usize,
+                        count as usize,
+                        meshes,
+                        &ground,
+                        placement,
+                        rect,
+                        shapes,
+                        &mut counted,
+                        &mut placed,
+                        labels,
+                    );
                 }
                 crate::tile_mesh::PlanStep::Place(index) => {
                     if let Some(shape) = shapes.get(index as usize) {
@@ -721,7 +867,7 @@ impl RunCursor {
         piece: egui::Rect,
     ) -> Option<(egui::Shape, crate::tile_mesh::RunKind)> {
         let meshes = ground.meshes?;
-        let painter = ground.painter?;
+        ground.painter?;
         let run = *meshes.runs().get(self.next)?;
         if run.shape_index as usize != index {
             return None;
@@ -735,34 +881,12 @@ impl RunCursor {
         // (`HttpsTiles::set_feathering`) lands. Bit equality is the right
         // test: both sides come from `tile_mesh::feathering_of`, so equal
         // inputs give equal bits and there is no tolerance to pick.
-        if run.kind == crate::tile_mesh::RunKind::Stroke && meshes.feathering() != ground.feathering
-        {
+        if !run_is_drawable(run, meshes, ground) {
             return None;
         }
-        let payload = painter.payload(crate::tile_mesh::GroundDraw {
-            meshes,
-            run: self.next - 1,
-            place: crate::tile_mesh::Placement {
-                scale: placement.scaling,
-                translation: [placement.translation.x, placement.translation.y],
-            },
-            pass_nr: ground.pass_nr,
-        })?;
+        let shape = issue_run_batch(meshes, ground, self.next - 1, 1, placement, piece)?;
         self.covered_to = index + run.shape_span as usize;
-        Some((
-            egui::Shape::Callback(egui::epaint::PaintCallback {
-                // The **piece**, which is what egui turns into a viewport and
-                // refuses when it is degenerate. The draw replaces that viewport
-                // with the whole screen, because the geometry is placed in screen
-                // points by the uniform exactly as the CPU path places it; the
-                // clip that makes a stretched ancestor draw only the quarter that
-                // belongs to this tile is egui's scissor, taken from the clip
-                // rect the painter above carries.
-                rect: piece,
-                callback: payload,
-            }),
-            run.kind,
-        ))
+        Some((shape, run.kind))
     }
 
     /// Whether an already-issued run has drawn the shape at `index`.
@@ -2167,12 +2291,17 @@ mod tests {
 
     static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// A painter that hands back a payload for every run it is asked about,
-    /// and remembers what it was asked.
+    /// A painter that hands back a payload for every span of runs it is asked
+    /// about, and remembers what it was asked: the tile, the span as
+    /// `(first_run, run_count)`, and the placement.
     #[derive(Default)]
     struct RecordingPainter {
-        asked: std::sync::Mutex<Vec<(u64, usize, crate::tile_mesh::Placement)>>,
+        asked: std::sync::Mutex<Vec<Asked>>,
     }
+
+    /// One thing [`RecordingPainter`] was asked for: the tile's id, the span
+    /// as `(first_run, run_count)`, and the placement.
+    type Asked = (u64, (usize, usize), crate::tile_mesh::Placement);
 
     impl crate::tile_mesh::TileMeshPainter for RecordingPainter {
         fn payload(
@@ -2182,7 +2311,11 @@ mod tests {
             self.asked
                 .lock()
                 .expect("the recorder is not poisoned")
-                .push((draw.meshes.id(), draw.run, draw.place));
+                .push((
+                    draw.meshes.id(),
+                    (draw.first_run, draw.run_count),
+                    draw.place,
+                ));
             Some(std::sync::Arc::new(()))
         }
     }
@@ -2222,6 +2355,90 @@ mod tests {
         ]
     }
 
+    /// A tile whose label's anchor falls **between two paths of one stroke
+    /// run**, so the run's span covers the label.
+    ///
+    /// `flatten` lets a `Text` sit inside a span deliberately — it neither
+    /// opens nor closes a run, because the ground phase defers every label —
+    /// which is exactly the arrangement that makes a declined run's CPU
+    /// fallback able to place the label a second time.
+    fn a_tile_with_a_label_inside_a_stroke_span() -> Vec<ShapeOrText> {
+        let line = |from: f32, to: f32| {
+            ShapeOrText::Shape(egui::Shape::line(
+                vec![egui::pos2(from, from), egui::pos2(to, to)],
+                egui::Stroke::new(2.0, egui::Color32::GREEN),
+            ))
+        };
+        vec![
+            line(0.0, EXTENT / 2.0),
+            ShapeOrText::Text(Text::new(
+                egui::pos2(EXTENT / 2.0, EXTENT / 2.0),
+                "Monaco".to_owned(),
+                12.0,
+                egui::Color32::WHITE,
+                0.0,
+            )),
+            line(EXTENT / 2.0, EXTENT),
+        ]
+    }
+
+    /// **A declined run does not place the label inside its span a second
+    /// time.**
+    ///
+    /// The plan emits a `Place` step for a `Text` inside a run's span, because
+    /// the run does not draw it. When the renderer declines the run, its span
+    /// goes back on the CPU — and if that fallback placed the whole span it
+    /// would place that same label again, from the two paths' own step. The
+    /// label would then be laid out twice, collide with itself, and draw
+    /// doubled on every frame a display change left the tile flattened at the
+    /// wrong feathering.
+    ///
+    /// RED before the fix: `label_anchors_placed` reads 2.
+    #[test]
+    fn a_declined_run_does_not_place_a_label_in_its_span_twice() {
+        let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
+
+        let shapes = a_tile_with_a_label_inside_a_stroke_span();
+        let flat = crate::tile_mesh::flatten(&shapes, FEATHERING);
+        // Non-triviality: the fixture is only the case under test if the two
+        // paths really are one run whose span reaches over the label.
+        assert_eq!(flat.runs().len(), 1, "the fixture is one stroke run");
+        assert_eq!(
+            (flat.runs()[0].shape_index, flat.runs()[0].shape_span),
+            (0, 3),
+            "the run's span does not cover the label, so nothing here is the \
+             double-place case"
+        );
+
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
+            std::sync::Arc::new(RecordingPainter::default());
+
+        // The control: flattened and drawn at the same feathering, the run is
+        // drawn from the GPU and the label places once.
+        let (_, drawn) = one_ground_pass_of(shapes.clone(), Some(&painter), FEATHERING, FEATHERING);
+        assert_eq!(drawn.stroke_draws, 1, "the control did not draw the run");
+        assert_eq!(drawn.label_anchors_placed, 1);
+
+        // The case: a display change leaves the tile flattened at another
+        // feathering, so the run is declined and its span falls back.
+        let (_, declined) =
+            one_ground_pass_of(shapes, Some(&painter), FEATHERING, FEATHERING / 2.0);
+        assert_eq!(
+            declined.stroke_draws, 0,
+            "the run was drawn after all, so the fallback under test did not run"
+        );
+        assert!(
+            declined.path_points_placed > 0,
+            "the declined run placed no path points, so its span did not fall \
+             back to the CPU at all"
+        );
+        assert_eq!(
+            declined.label_anchors_placed, 1,
+            "the declined run placed the label inside its span a second time; \
+             it is drawn twice, over itself"
+        );
+    }
+
     /// Feathering off, which puts every stroke on the CPU path — what the
     /// fill-only cases below were written against and still assert.
     const NO_FEATHERING: f32 = 0.0;
@@ -2246,10 +2463,22 @@ mod tests {
         Vec<egui::epaint::ClippedShape>,
         crate::tile_mesh::ledger::Totals,
     ) {
+        one_ground_pass_of(a_styled_tile(), painter, flattened_at, drawn_at)
+    }
+
+    /// [`one_ground_pass_at`] over a caller's shape list.
+    fn one_ground_pass_of(
+        shapes: Vec<ShapeOrText>,
+        painter: Option<&std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter>>,
+        flattened_at: f32,
+        drawn_at: f32,
+    ) -> (
+        Vec<egui::epaint::ClippedShape>,
+        crate::tile_mesh::ledger::Totals,
+    ) {
         let ctx = egui::Context::default();
         let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
-        let shapes = a_styled_tile();
         let meshes = std::sync::Arc::new(crate::tile_mesh::flatten(&shapes, flattened_at));
 
         crate::tile_mesh::ledger::reset();
@@ -2366,8 +2595,15 @@ mod tests {
     }
 
     /// Every callback carries the placement the CPU path would have placed
-    /// by, and the run index it was asked for — the two things that decide
-    /// which geometry lands where.
+    /// by, and the runs it was asked for — the two things that decide which
+    /// geometry lands where.
+    ///
+    /// The two fill runs here are **not** batched together, and that is the
+    /// point of taking this reading at [`NO_FEATHERING`]: the stroke between
+    /// them is refused by the flatten and placed on the CPU, so a drawing
+    /// shape sits between the runs and `build_plan` opens a second batch. The
+    /// batched reading is
+    /// `a_stroke_run_becomes_a_callback_at_its_own_position`.
     #[test]
     fn each_ground_draw_carries_its_own_run_and_the_cpu_paths_placement() {
         let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
@@ -2378,8 +2614,12 @@ mod tests {
 
         let asked = recorder.asked.lock().expect("not poisoned").clone();
         assert_eq!(asked.len(), 2);
-        assert_eq!(asked[0].1, 0, "the first run was not asked for as run 0");
-        assert_eq!(asked[1].1, 1);
+        assert_eq!(
+            asked[0].1,
+            (0, 1),
+            "the first run was not asked for as run 0 alone"
+        );
+        assert_eq!(asked[1].1, (1, 1));
         assert_eq!(asked[0].0, asked[1].0, "the two runs are one tile's");
 
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(256.0, 256.0));
@@ -2473,16 +2713,23 @@ mod tests {
         );
     }
 
-    /// **A stroke run draws where the style put it.** The callback replaces
-    /// the span *in place*, so a road still draws over the fill it was styled
-    /// above and under the one styled above it.
+    /// **A stroke run draws where the style put it, and the batch keeps it
+    /// there.** The fixture's fill, stroke, fill are three consecutive runs
+    /// with nothing the ground phase draws between them, so they are one
+    /// callback — and the order the road draws in is now carried by the run
+    /// span inside that callback rather than by three primitives' positions.
+    ///
+    /// Both halves are asserted, because either alone would pass a defect:
+    /// the shape sequence alone would not notice a batch that drew its runs
+    /// in the wrong order, and the span alone would not notice a batch pushed
+    /// before the background rectangle.
     #[test]
     fn a_stroke_run_becomes_a_callback_at_its_own_position() {
         let _guard = LEDGER.lock().expect("the ledger lock is not poisoned");
 
-        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> =
-            std::sync::Arc::new(RecordingPainter::default());
-        let (with, _) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING);
+        let recorder = std::sync::Arc::new(RecordingPainter::default());
+        let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+        let (with, totals) = one_ground_pass_at(Some(&painter), FEATHERING, FEATHERING);
 
         let kinds: Vec<&'static str> = with
             .iter()
@@ -2496,9 +2743,23 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec!["rect", "callback", "callback", "callback", "text"],
-            "the fixture's fill, stroke, fill order did not survive: the \
-             stroke must be the middle callback, not before or after both"
+            vec!["rect", "callback", "text"],
+            "the tile's three runs are not one callback sitting where the \
+             first of them sat, after the background rectangle"
+        );
+
+        // Non-triviality: one callback is only a win if it still draws all
+        // three runs. Two fills and one stroke went to the GPU.
+        assert_eq!((totals.mesh_draws, totals.stroke_draws), (2, 1));
+
+        let asked = recorder.asked.lock().expect("not poisoned").clone();
+        assert_eq!(asked.len(), 1, "the three runs were not one ask");
+        assert_eq!(
+            asked[0].1,
+            (0, 3),
+            "the batch does not cover runs 0, 1 and 2 in that order, so the \
+             fixture's fill, stroke, fill order did not survive: the stroke \
+             must be the middle draw, not before or after both"
         );
     }
 
