@@ -259,11 +259,23 @@ pub const MISSING_CODES: [f32; 2] = [-999.0, -99.0];
 /// the allocation did not**: a budget that understates a 3.2 GB buffer by 2×
 /// is worse than no budget, because it reads as headroom. The doc above states
 /// a count and the value must keep honouring it.
-pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * 7000 * 3500 * std::mem::size_of::<f32>();
+pub const CONUS_STACK_BYTES: usize = LEVEL_COUNT * 7000 * 3500 * MrmsVolume::ELEMENT_BYTES;
 
-// The stack's own width, restated as a build failure: `resident_bytes` counts
-// `values.len() * size_of::<f32>()`, and this constant is what that figure is
-// checked against.
+// **The stack's own width — off the stack's own element, not a literal.** It
+// was `size_of::<f32>()`, restated a second time inside `resident_bytes`, with
+// nothing making the two agree; the pin below could not see either, because a
+// literal width does not depend on the store. Measured on this tree with
+// `MrmsVolume::values` narrowed to `Vec<u16>` and the old spelling left in
+// place: this assertion **did not fire**, holding 3,234,000,000 for a
+// 1,617,000,000 B buffer.
+//
+// The distinction the doc above draws survives it: this derives from the
+// STACK's element and still not from `CONUS_GRID_BYTES`, which is the grid's
+// narrow one. What changed is that both spellings of the stack's width are now
+// the same one.
+//
+// The two terms are pinned APART so a failure names which moved.
+const _: () = assert!(MrmsVolume::ELEMENT_BYTES == 4);
 const _: () = assert!(CONUS_STACK_BYTES == 3_234_000_000);
 
 /// How many level GETs are in flight at once.
@@ -409,7 +421,7 @@ pub struct MrmsVolume {
     /// arrive in and the order a level-of-detail scheme drops levels in; a
     /// column-major reshuffle would be 3.2 GB of gather for a layout nothing has
     /// yet chosen.
-    pub values: Vec<f32>,
+    pub values: Vec<StackValue>,
     /// Gzipped bytes downloaded for this timestep, **per level** — the shape of
     /// the download and not just its total, because the levels are nowhere near
     /// equal and which ones a residency scheme could drop is exactly the
@@ -435,7 +447,24 @@ impl std::fmt::Debug for MrmsVolume {
     }
 }
 
+/// **The element [`MrmsVolume::values`] stores one of a cell.**
+///
+/// The stack really is float-wide and deliberately so — it widens each level at
+/// `push` and keeps one flat buffer, because nothing draws it and a second
+/// narrow store would be carried for no reader. Named rather than spelled so
+/// the budget and the residency figure read one width instead of two.
+pub type StackValue = f32;
+
 impl MrmsVolume {
+    /// **Bytes one stacked value occupies**, off the field's own element.
+    ///
+    /// A literal `size_of::<f32>()` in either of its two readers was the same
+    /// defect one turn later: it goes on pricing four bytes a cell after the
+    /// buffer it describes has moved, and [`CONUS_STACK_BYTES`]'s own `== N`
+    /// pin cannot see that because a literal width does not depend on the
+    /// store.
+    pub const ELEMENT_BYTES: usize = size_of::<StackValue>();
+
     /// Gzipped bytes for the whole timestep — **all 33 levels**, which is the
     /// only denominator a per-timestep download budget may be stated against.
     pub fn compressed_bytes(&self) -> usize {
@@ -459,8 +488,13 @@ impl MrmsVolume {
     }
 
     /// Bytes of stacked values held.
+    ///
+    /// Through [`Self::ELEMENT_BYTES`], which is also what
+    /// [`CONUS_STACK_BYTES`] is built from: the budget and the figure it
+    /// bounds were two `size_of::<f32>()`s that had to agree with nothing
+    /// making them.
     pub fn resident_bytes(&self) -> usize {
-        self.values.len() * std::mem::size_of::<f32>()
+        self.values.len() * Self::ELEMENT_BYTES
     }
 
     /// One level's grid.
