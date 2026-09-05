@@ -272,7 +272,63 @@ Three tampers, each applied to the tree and reverted:
 The third is why the scene gives every cell its own clip rect. On the first
 draft the whole picture tessellated to **one** primitive, and that tamper passed.
 
+### Changed — `src/renderer.rs`, what `Renderer::render` records
+
+Two edits inside the primitive walk, plus `Clone, Copy, PartialEq, Eq` on the
+private `ScissorRect` so one of them can compare. Nothing about which pixels are
+drawn changes; both remove render-pass calls whose effect was already in force.
+
+* **The state reset is deferred to the next primitive that draws with it.**
+  Upstream re-establishes egui's viewport, pipeline and uniform bind group at
+  the top of every iteration following a painted callback — including an
+  iteration that is itself a callback, and one whose clip rect is about to be
+  skipped. Neither can use any of the three. egui's pipeline is undrawable
+  until the mesh arm binds the vertex buffer, the index buffer and a texture
+  bind group; and the viewport is overwritten, unread, by the courtesy viewport
+  the callback arm sets sixty lines further down. The `if needs_reset` block
+  moves into the `Primitive::Mesh` arm.
+* **A scissor the pass already holds is not recorded again.** `render` now
+  remembers the rect it last set. A painted callback clears that memory, in the
+  same statement that raises `needs_reset`, because a callback owns the pass
+  while it paints and may set a scissor of its own.
+
+**Why the second one is not already free, when the first is next to two calls
+that are.** `wgpu-core` drops a `set_bind_group` or a `set_pipeline` whose
+argument already holds (`StateChange::set_and_check_redundant`, `render.rs`) —
+so a redundant *bind group* costs an FFI hop and stops. It has no such check for
+`set_scissor_rect`, `set_index_buffer` or `set_vertex_buffer` at either the
+recording or the execution layer: each is pushed onto the pass's
+`Vec<ArcRenderCommand>` and replayed into the HAL encoder unconditionally. On
+the GL backend that becomes a `glScissor` executed on the frame thread at
+`queue.submit`, which is where 93% of the frame tail is.
+
+### Measured, scene D, 2026-09-04
+
+One 1920×1080 pane, KTLX, all overlays, the `ui-sweep` gesture script, run
+through `.github/browser-rig/run_measure_native.sh` on **Xvfb :99** — a display
+with no active mode, which makes every *timing* on that leg invalid and says
+nothing about a *count*. Backend read out of the app's own log: **Vulkan, NVIDIA
+GeForce RTX 3090 (DiscreteGpu)**, hardware, no fallback.
+
+Scene D's frames are bimodal, and the two are not averaged here. A frame
+carrying the basemap issues one egui callback per tile-mesh run; a frame without
+it issues none. Solving the running mean against the two, both the primitive
+count and the call count give the same mixture, 26% basemap frames:
+
+| per frame | basemap frame | frame without |
+| --- | --- | --- |
+| primitives | 279 (109 mesh, **170 callback**) | 73 (73 mesh, 0 callback) |
+| recorded calls, before | 1399 | 369 |
+| — of which reset triples | 513 (171 resets) | 3 |
+| — of which repeated scissors | 228 | 67 |
+
+`squallar-gpu`'s `command_stream` census is the instrument, and it counts what
+this walk records rather than what it costs: a count is deterministic where this
+arm's 340 µs noise floor makes a timing of one frame's tail unmeasurable.
+
 ## Removing this directory
+
+
 
 Delete `vendor/egui-wgpu/`, the `[patch.crates-io]` entry, the workspace
 `members` entry and the `[profile.dev.package.egui-wgpu]` override, then delete
@@ -282,3 +338,9 @@ Delete `vendor/egui-wgpu/`, the `[patch.crates-io]` entry, the workspace
 `frame prep geometry:` line (and the matching capture groups in
 `.github/browser-rig/drive.py`). Every frame's geometry goes back through the
 BAR window.
+
+Also delete `squallar-gpu/src/egui_renderer/command_stream.rs`, its `pub mod`
+line, the census call in `EguiRenderer::draw`, the two accessors and
+`squallar-app`'s `frame command stream:` line: the census models *this* walk,
+and against upstream's it would report resets and scissors that are recorded
+again.

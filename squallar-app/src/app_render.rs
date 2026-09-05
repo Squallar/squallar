@@ -1126,6 +1126,73 @@ fn prep_geometry_line(
     )
 }
 
+/// The `command stream:` line — what the main pass's walk of the primitive
+/// list recorded into the encoder.
+///
+/// **Not a `frame <name>` line, deliberately.** That prefix is this app's
+/// namespace for the timing families the rig buckets and
+/// `every_frame_line_family_the_app_writes_has_a_named_rig_probe` enumerates;
+/// every one of them is a clock. This is a count, and it sits with the other
+/// always-on counter lines — `overlay rasters:`, `texture uploads:`,
+/// `ground tiles:` — which name themselves.
+///
+/// **Two readings on this one line and they are never added.** The `last`
+/// group is the most recent walk alone — what "a scene-D frame records N
+/// commands" means. The `per walk` group is the running totals divided by
+/// their own walk count, which is every main pass drawn since boot and so
+/// spans every layout the session has been in. A window is a subtraction of
+/// two `total` readings, not a reading of the mean.
+///
+/// Denominator: **every [`squallar_gpu::egui_renderer::EguiRenderer::draw`]**
+/// — the frame's main pass alone. The pane-mirror pass walks the same
+/// primitives a second time and is *not* counted here, unlike
+/// `frame prep geometry:`'s stagings, which are.
+///
+/// **Counts, not clocks, and that is the point.** The frame tail is 93%
+/// `queue.submit`, which on the GL backend replays this recorded stream as
+/// real GL calls on the frame thread. A count of it is deterministic where a
+/// timing of it is not: the same scene records the same number under any
+/// load, so a reduction is provable on a box this campaign's 340 us noise
+/// floor makes untimeable.
+///
+/// **The GL multiplier is not in `calls`.** `wgpu-core` drops the bind-group
+/// repeats; `wgpu-hal`'s GL backend turns each draw's vertex bind into one
+/// command where `VERTEX_BUFFER_LAYOUT` holds and into one per vertex
+/// attribute — three, for egui's vertex — where it does not, which is every
+/// WebGL2 leg. A `calls` figure quoted without its backend is two different
+/// numbers.
+fn command_stream_line(
+    last: &squallar_gpu::egui_renderer::command_stream::CommandStream,
+    total: &squallar_gpu::egui_renderer::command_stream::CommandStream,
+) -> String {
+    let per = |n: u64| n.checked_div(total.walks).unwrap_or(0);
+    format!(
+        "command stream: last {} primitives ({} mesh, {} callback, {} skipped), \
+         {} draws, {} calls; splits {} clip, {} texture, {} callback, {} mergeable; \
+         {} resets, {} scissors ({} repeat), {} bind groups ({} repeat), {} buffer binds; \
+         per walk {} primitives, {} calls over {} walks",
+        last.primitives,
+        last.meshes,
+        last.callbacks,
+        last.skipped,
+        last.draws,
+        last.calls,
+        last.split_clip,
+        last.split_texture,
+        last.split_callback,
+        last.split_none,
+        last.resets,
+        last.scissor_sets,
+        last.scissor_repeats,
+        last.bind_group_sets,
+        last.bind_group_repeats,
+        last.buffer_binds,
+        per(total.primitives),
+        per(total.calls),
+        total.walks,
+    )
+}
+
 /// The `gpu passes:` line — what each bracketed pass family costs the GPU.
 ///
 /// Three denominators share this line and are never added: each family's
@@ -1973,6 +2040,15 @@ impl super::App {
                 &prep_geometry_line(
                     &state.egui_renderer.staged_geometry(),
                     &state.egui_renderer.geometry_staging_totals(),
+                ),
+            );
+            // The command stream the pass tail replays. A count, beside the
+            // clocks above and never added to them.
+            say_telemetry(
+                loud,
+                &command_stream_line(
+                    &state.egui_renderer.command_stream_last(),
+                    &state.egui_renderer.command_stream(),
                 ),
             );
             // The GPU pass family: real figures where a probe is installed,

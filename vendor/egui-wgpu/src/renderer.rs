@@ -575,9 +575,45 @@ impl Renderer {
         let pixels_per_point = screen_descriptor.pixels_per_point;
         let size_in_pixels = screen_descriptor.size_in_pixels;
 
-        // Whether or not we need to reset the render pass because a paint callback has just
-        // run.
+        // **Local change** (see `VENDORED.md`): deferred, and no longer paid by
+        // a primitive that cannot use it.
+        //
+        // Upstream re-establishes egui's viewport, pipeline and uniform bind
+        // group at the top of every iteration that follows a paint callback —
+        // *including* an iteration that is itself a callback, and one whose
+        // clip rect is about to be skipped. Neither can use any of the three:
+        // egui's pipeline is undrawable until the `Primitive::Mesh` arm below
+        // binds the vertex buffer, the index buffer and a texture bind group,
+        // and the viewport set here is overwritten unread by the courtesy
+        // viewport the callback arm sets a few lines further down. So the
+        // triple is deferred to the next primitive that actually draws with
+        // it.
+        //
+        // Measured, scene D, one 1920x1080 pane, all overlays, native Vulkan:
+        // the ground path issues one callback per tile-mesh run, so a frame
+        // carrying the basemap held 170 callbacks and 171 resets — 513 of its
+        // 1399 recorded calls, 510 of them dead. On the GL backend each
+        // `set_pipeline` is a `glUseProgram` plus a re-dirtied texture and
+        // vertex-attribute state that the frame thread replays at
+        // `queue.submit`.
         let mut needs_reset = true;
+
+        // **Local change** (see `VENDORED.md`): the scissor the pass is known
+        // to hold, so an unchanged one is not recorded again.
+        //
+        // Nothing in either `wgpu` layer checks a scissor for redundancy — a
+        // `set_bind_group` and a `set_pipeline` are dropped when the argument
+        // already holds (`wgpu-core`'s `StateChange::set_and_check_redundant`)
+        // and a scissor never is — so every repeat upstream issues reaches the
+        // HAL and, on GL, becomes a `glScissor` on the frame thread. Under one
+        // clip rect a run of primitives sets the same rect once per primitive:
+        // 228 of the 280 scissor sets on the scene-D frame above, and 67 of
+        // the 74 on a frame without the basemap.
+        //
+        // `None` is *unknown*, not *unset*: a painted callback owns the pass
+        // for the length of its `paint` and may set a scissor of its own, so
+        // the knowledge is dropped there exactly as `needs_reset` is raised.
+        let mut scissor: Option<ScissorRect> = None;
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
@@ -587,20 +623,6 @@ impl Renderer {
             primitive,
         } in paint_jobs
         {
-            if needs_reset {
-                render_pass.set_viewport(
-                    0.0,
-                    0.0,
-                    size_in_pixels[0] as f32,
-                    size_in_pixels[1] as f32,
-                    0.0,
-                    1.0,
-                );
-                render_pass.set_pipeline(&self.pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                needs_reset = false;
-            }
-
             {
                 let rect = ScissorRect::new(clip_rect, pixels_per_point, size_in_pixels);
 
@@ -618,11 +640,28 @@ impl Renderer {
                     continue;
                 }
 
-                render_pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                if scissor != Some(rect) {
+                    render_pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                    scissor = Some(rect);
+                }
             }
 
             match primitive {
                 Primitive::Mesh(mesh) => {
+                    if needs_reset {
+                        render_pass.set_viewport(
+                            0.0,
+                            0.0,
+                            size_in_pixels[0] as f32,
+                            size_in_pixels[1] as f32,
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        needs_reset = false;
+                    }
+
                     let index_buffer_slice = index_buffer_slices
                         .next()
                         .expect("You must call .update_buffers() before .render()");
@@ -667,6 +706,11 @@ impl Renderer {
                         profiling::scope!("callback");
 
                         needs_reset = true;
+                        // The callback owns the pass while it paints and may
+                        // set a scissor of its own; what this walk last set is
+                        // no longer known to hold. **Local change**, see the
+                        // declaration above.
+                        scissor = None;
 
                         // We're setting a default viewport for the render pass as a
                         // courtesy for the user, so that they don't have to think about
@@ -1253,11 +1297,32 @@ fn create_index_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
 }
 
 /// A Rect in physical pixel space, used for setting clipping rectangles.
+// `Clone, Copy, PartialEq, Eq` are a **local change** (see `VENDORED.md`):
+// `render` remembers the scissor it last set so it does not record the same
+// one again, and remembering it means comparing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ScissorRect {
     x: u32,
     y: u32,
     width: u32,
     height: u32,
+}
+
+/// The rounding [`Renderer::render`] puts a clip rect through before it
+/// becomes a scissor, as `[x, y, width, height]` in physical pixels.
+///
+/// **Local addition** (see `VENDORED.md`). `render` decides from exactly this
+/// whether a primitive is drawn at all — a zero-width or zero-height result is
+/// skipped — and `squallar-gpu`'s command-stream census has to take the same
+/// decision on the same slice. Exported rather than restated so the two cannot
+/// round differently and disagree about which primitives were drawn.
+pub fn scissor_rect_in_pixels(
+    clip_rect: &epaint::Rect,
+    pixels_per_point: f32,
+    target_size: [u32; 2],
+) -> [u32; 4] {
+    let r = ScissorRect::new(clip_rect, pixels_per_point, target_size);
+    [r.x, r.y, r.width, r.height]
 }
 
 impl ScissorRect {

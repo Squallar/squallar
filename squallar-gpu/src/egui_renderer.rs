@@ -20,6 +20,8 @@ pub struct EguiRenderer {
     /// Which route this renderer's geometry took. The write side is inside
     /// `egui_wgpu::Renderer`; this is the read side of the same counters.
     geometry_staging: geometry_staging::GeometryStagingLedger,
+    /// What the main pass's walk of the primitive list recorded.
+    command_stream: command_stream::CommandStreamLedger,
     /// Whether this frame's raw input carried interaction. Written by
     /// [`Self::begin_frame`]; see [`Self::frame_had_interaction`].
     frame_interacted: bool,
@@ -70,6 +72,9 @@ pub mod texture_upload;
 /// How a frame's vertices and indices get there without the frame paying for
 /// them either.
 pub mod geometry_staging;
+
+/// What one frame's primitive list records into the command encoder.
+pub mod command_stream;
 
 /// What the mirror pass is asked to copy, and where to put it. The 3D view's
 /// map floor is the pane's own map render, drawn into an off-screen strip below
@@ -358,6 +363,7 @@ impl EguiRenderer {
             uploads: texture_upload::TextureUploads::new(device),
             pass_costs: pass_costs::PassCostLedger::default(),
             geometry_staging: geometry_ledger,
+            command_stream: command_stream::CommandStreamLedger::default(),
             frame_interacted: false,
             probe: None,
         }
@@ -690,6 +696,14 @@ impl EguiRenderer {
         view: &TextureView,
         frame: &PreparedFrame,
     ) {
+        // Ahead of `render`, over the slice `render` is about to walk. One
+        // walk of a few hundred elements and no clock read; see
+        // [`command_stream`] for why the count and not a timing is the figure.
+        self.command_stream.note(command_stream::census(
+            &frame.tris,
+            frame.screen_descriptor.pixels_per_point,
+            frame.screen_descriptor.size_in_pixels,
+        ));
         let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
@@ -745,6 +759,19 @@ impl EguiRenderer {
     /// why a zero here is readable.
     pub fn geometry_staging_totals(&self) -> geometry_staging::GeometryStagingTotals {
         self.geometry_staging.totals()
+    }
+
+    /// What the last main-pass walk of the primitive list recorded, and the
+    /// running totals over every walk. See [`command_stream::CommandStream`]
+    /// for the denominator — **every [`Self::draw`]**, which is the frame's
+    /// main pass alone: the mirror pass has its own walk and is not in it.
+    pub fn command_stream(&self) -> command_stream::CommandStream {
+        self.command_stream.totals()
+    }
+
+    /// The most recent walk on its own, all zero before the first [`Self::draw`].
+    pub fn command_stream_last(&self) -> command_stream::CommandStream {
+        self.command_stream.last()
     }
 
     /// What ending passes has cost this renderer's frame thread, asked
