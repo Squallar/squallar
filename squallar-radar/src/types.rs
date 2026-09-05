@@ -87,9 +87,19 @@ pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize, sample_km: f64) ->
 
 /// Texels per sample the raster is allowed to spend, at most.
 ///
-/// Two, which is Nyquist: below it adjacent gates share a texel and detail the
-/// radar measured is lost, above it the picture is sampling its own
+/// Two, which is Nyquist: above it the picture is sampling its own
 /// interpolation rather than any new measurement.
+///
+/// **What the second texel buys, measured** (`tests/raster_gate_survival.rs`,
+/// a 1832-gate surveillance cut on eight probe radials): along range, one
+/// texel per gate is the floor — at 1.11 texels a gate (4096 px over ±460 km)
+/// every gate past 34 km still owns a texel, and gates only start vanishing
+/// along a radial at 1.00 (46 of them, out to the ring). What two texels buy
+/// is not gates but the near-site crowding radius, inside which 0.5° radials
+/// share texels whatever the side — furthest lost gate 18.9 km at 2.0 texels,
+/// 25.4 km at 1.5, 34.1 km at 1.11 — and a texel half the size when the pane
+/// zooms past the raster's own scale. The base side's 0.56 texels a gate
+/// loses one gate in five past 103 km.
 pub const TEXELS_PER_SAMPLE: f64 = 2.0;
 
 /// The largest side worth painting `extent_km` of a field sampled every
