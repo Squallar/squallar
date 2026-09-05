@@ -76,35 +76,64 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Derived from the budget rather than restated, so a product whose grid
 /// changes shape moves both together or neither.
 ///
-/// # The divisor is the slot's own element width, and getting it wrong is silent
+/// # What a wrong divisor costs, and what now prevents one
 ///
-/// **If you change what [`StagingPool`] holds, change this divisor in the same
-/// edit.** It is `size_of::<u16>()` because the slot is a `Vec<u16>`; it said
-/// `size_of::<f32>()` while the slot was a `Vec<f32>`. The two must name the
-/// same type, and nothing about the spelling makes that obvious — which is why
-/// this heading exists.
+/// The divisor is no longer written here to be kept in step by hand. It is
+/// [`StagingPool::ELEMENT_BYTES`], whose `StagedCode` **is** the store's own
+/// element, so the instruction this heading used to carry — "if you change what
+/// [`StagingPool`] holds, change this divisor in the same edit" — is discharged
+/// by the spelling instead of asked of the reader. It said `size_of::<f32>()`
+/// while the slot was a `Vec<f32>`, which is the edit that has to stop being
+/// possible rather than be remembered.
 ///
-/// A mismatched divisor does **not** fail loudly. It sizes the slot at half a
-/// mosaic (or twice one), and [`StagingPool::give`] matches capacity
-/// **exactly**, never "big enough" — so every buffer offered back is refused,
-/// the slot stays empty for ever, and every decode allocates its own mosaic
-/// (49 MB at the narrow store; it was 98 MB at the wide one).
-/// That is precisely the defect this module exists to prevent, reintroduced
-/// through a constant nobody would think to look at, and the only symptom is
-/// the `declined` counter climbing where `reused` used to. On wasm32 it ends
-/// the way it ended before: a heap that only grows, fragmented past a
-/// contiguous mosaic-sized request, and a page that freezes with every
-/// screenshot and rAF check reporting it healthy.
+/// **The cost, if one ever were wrong.** It sizes the slot at half a mosaic (or
+/// twice one), and [`StagingPool::give`] matches capacity **exactly**, never
+/// "big enough" — so every buffer offered back is refused, the slot stays empty
+/// for ever, and every decode allocates its own mosaic (49 MB at the narrow
+/// store; it was 98 MB at the wide one). That is precisely the defect this
+/// module exists to prevent, reintroduced through a constant nobody would think
+/// to look at, and the only symptom is the `declined` counter climbing where
+/// `reused` used to. On wasm32 it ends the way it ended before: a heap that only
+/// grows, fragmented past a contiguous mosaic-sized request, and a page that
+/// freezes with every screenshot and rAF check reporting it healthy.
+///
+/// **It would not, however, be silent, and this doc used to say it would.**
+/// Measured on this tree: the divisor alone moved back to `size_of::<f32>()`
+/// fails the build on the pin below — `assertion failed: STAGING_POINTS ==
+/// 24_500_000`. The pin was doing its job and the prose beside it overstated
+/// the exposure, which is its own defect — it reads as a reason to go carefully
+/// where the build already refuses. What the literal genuinely could not do is
+/// **re-derive**, which is what changed here.
 ///
 /// The assertion below is the guard, because prose is not a gate: the slot
 /// holds one CONUS mosaic and that is a **point** count, so a divisor error
 /// moves it and fails the build.
-pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / size_of::<u16>();
+///
+/// # The divisor names the slot rather than restating its type
+///
+/// It is [`StagingPool::ELEMENT_BYTES`], whose `StagedCode` **is** the store's
+/// own element — [`recycle`](StagingPool::recycle) moves a decoded grid's
+/// `ScaledU16::codes` into [`StagingPool::give`], so the compiler holds the
+/// slot's element and the grid's equal and neither this nor the budget above it
+/// can name a width the store does not use.
+///
+/// The literal it replaces was not dead — moving it alone to
+/// `size_of::<f32>()` fails this build on the pin below, which is exactly what
+/// it was put there to do. What it could not do is **re-derive**: the divisor
+/// and the `size_of::<u16>()` inside
+/// [`CONUS_GRID_BYTES`](super::CONUS_GRID_BYTES) were two spellings of one
+/// width that CANCELLED, so the pair read 24,500,000 whether or not either
+/// still named the store. Now the numerator follows the store and the divisor
+/// follows the slot, and a genuine widening carries both instead of
+/// red-gating on a constant that was never the thing that moved.
+pub const STAGING_POINTS: usize = super::FRAME_STAGING_BYTES / StagingPool::ELEMENT_BYTES;
 
-// One CONUS mosaic, in points — 7000 x 3500. Stated as a literal on purpose:
-// deriving it from `FRAME_STAGING_BYTES` again would be the same division
-// restated and could not disagree with itself. This is what catches a divisor
-// that stopped naming the slot's element type.
+// The two terms, pinned APART, so a build failure names which one moved rather
+// than only that the quotient did. The point count is stated as a literal on
+// purpose: deriving it from `FRAME_STAGING_BYTES` again would be the same
+// division restated and could not disagree with itself.
+const _: () = assert!(StagingPool::ELEMENT_BYTES == 2);
+// One CONUS mosaic, in points — 7000 x 3500.
 const _: () = assert!(STAGING_POINTS == 24_500_000);
 
 /// **One retained mosaic-sized buffer, and the running count of what it saved.**
@@ -121,7 +150,7 @@ const _: () = assert!(STAGING_POINTS == 24_500_000);
 /// self-contained. The shipped path uses [`global`].
 pub struct StagingPool {
     /// `try_lock` only — see [`Self::take`].
-    slot: Mutex<Option<Vec<u16>>>,
+    slot: Mutex<Option<Vec<StagedCode>>>,
     /// Mosaic-sized buffers this pool had to allocate. **The figure the
     /// shipping defect is about**: it was one per granule and is now one per
     /// process, per live block.
@@ -160,7 +189,22 @@ pub struct StagingTotals {
     pub declined: usize,
 }
 
+/// **The element the slot holds** — the store's own, not a restatement of it.
+///
+/// [`StagingPool::recycle`] moves a decoded grid's `ScaledU16::codes` into
+/// [`StagingPool::give`], so this alias and the grid's element are held equal
+/// by the compiler rather than by two edits agreeing.
+pub type StagedCode = crate::render::gridded::ScaledCode;
+
 impl StagingPool {
+    /// **Bytes one element of the slot occupies** — the width
+    /// [`STAGING_POINTS`] divides the byte budget by, so that constant does not
+    /// have to name a type.
+    ///
+    /// A literal `size_of::<u16>()` would be the same defect one turn later:
+    /// it goes on reading two after the slot it describes has moved.
+    pub const ELEMENT_BYTES: usize = size_of::<StagedCode>();
+
     pub const fn new() -> Self {
         Self {
             slot: Mutex::new(None),
@@ -184,7 +228,7 @@ impl StagingPool {
     /// `with_capacity` here calls `handle_alloc_error` on failure, and on a
     /// `panic-strategy = "abort"` target that leaves winit's event loop
     /// borrowed for the life of the page.
-    pub fn take(&self, points: usize) -> Result<Vec<u16>, String> {
+    pub fn take(&self, points: usize) -> Result<Vec<StagedCode>, String> {
         if points == STAGING_POINTS
             && let Ok(mut slot) = self.slot.try_lock()
             && let Some(mut buffer) = slot.take()
@@ -207,7 +251,7 @@ impl StagingPool {
                 return Ok(buffer);
             }
         }
-        let mut fresh: Vec<u16> = Vec::new();
+        let mut fresh: Vec<StagedCode> = Vec::new();
         fresh.try_reserve_exact(points).map_err(|_| {
             format!(
                 "MRMS: cannot hold a {} MB staging grid in this build's memory",
@@ -223,7 +267,7 @@ impl StagingPool {
     /// Refused — and counted as refused — unless the slot is empty and the
     /// capacity is exactly [`STAGING_POINTS`]. A refused buffer is dropped
     /// here, which is what every buffer did before this module existed.
-    pub fn give(&self, mut values: Vec<u16>) {
+    pub fn give(&self, mut values: Vec<StagedCode>) {
         if values.capacity() != STAGING_POINTS {
             self.declined.fetch_add(1, Ordering::Relaxed);
             return;
