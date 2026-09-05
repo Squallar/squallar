@@ -94,7 +94,10 @@ fn tick_sequence(app: &mut crate::app::App, n: usize) -> Vec<Option<chrono::Naiv
 /// The picture is an `Overlay` texture because playback reads
 /// `frame.image.is_some()` and nothing else — what a radar frame's image *is*
 /// belongs to the render path, not to the tick.
-fn textured_frames(ctx: &egui::Context, stamps: &[chrono::NaiveDateTime]) -> Vec<LoopFrame> {
+pub(super) fn textured_frames(
+    ctx: &egui::Context,
+    stamps: &[chrono::NaiveDateTime],
+) -> Vec<LoopFrame> {
     stamps
         .iter()
         .map(|&timestamp| LoopFrame {

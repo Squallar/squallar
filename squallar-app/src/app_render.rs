@@ -2066,7 +2066,7 @@ impl super::App {
         say_telemetry(loud, &frame_cadence_line(ledger.cadence()));
         say_telemetry(
             loud,
-            &crate::loop_telemetry::loop_state_line(&self.loop_state()),
+            &crate::loop_telemetry::loop_state_line(&self.loop_state(), &self.loop_skips),
         );
         // The browser probe's figure, if it has landed since the last tick,
         // folded before the line below is composed so the tick it arrives on
@@ -4477,7 +4477,11 @@ impl super::App {
     fn advance_loop_playback(&mut self) {
         let now = web_time::Instant::now();
 
-        for pane in self.gui.panes_mut() {
+        // **Indexed, so a skipped tick can be attributed.** `enumerate` over
+        // the walk this function already makes — the pane index is the key
+        // `SkippedTicks` files under, and no reach into the `Gui` is added to
+        // get it (`gui_seam_ratchet_tests`).
+        for (pane_idx, pane) in self.gui.panes_mut().iter_mut().enumerate() {
             // The pane's own posture, which every pane carries the same copy
             // of — see `Gui::set_loop_speed_fps`.
             let interval = loop_interval(pane.time.speed_fps);
@@ -4508,10 +4512,26 @@ impl super::App {
                 // clock, and every other layer on the pane rides the same one.
                 let num_frames = ls.frames.len();
                 let from = ls.frame_at(mode);
-                let landed = (1..=num_frames)
-                    .map(|offset| (from + offset) % num_frames)
-                    .find(|&candidate| ls.frames[candidate].image.is_some())
-                    .map(|candidate| ls.frames[candidate].timestamp);
+                // **The OFFSET it landed at, not just the stamp**, because
+                // that is the whole question: offset 1 is the frame this tick
+                // was due to show, anything further is a frame set the loop
+                // played over, and `None` is a tick that found no picture at
+                // all. A single-frame loop lands on offset 1 — itself — and
+                // is not a skip.
+                let landed_at = (1..=num_frames)
+                    .find(|&offset| ls.frames[(from + offset) % num_frames].image.is_some());
+                let landed =
+                    landed_at.map(|offset| ls.frames[(from + offset) % num_frames].timestamp);
+                // **A tick that wanted a frame and did not get one**, counted
+                // where it happens because it is invisible everywhere else:
+                // the clock is stamped unconditionally two lines down whether
+                // or not the due frame was there, so playback neither slows
+                // nor logs, and `resident`/`listed` read healthy on the ticks
+                // either side. See `crate::loop_telemetry::SkippedTicks` —
+                // ticks, never frames.
+                if landed_at != Some(1) {
+                    self.loop_skips.note(pane_idx);
+                }
                 // The slot is known to exist — an absent one reads back the
                 // pane's `Inactive` orphan and was dropped above — so this
                 // cannot be the write that materialises an empty timeline.
@@ -7579,6 +7599,12 @@ mod loop_frame_sharing_tests;
 #[path = "app_render/loop_playback_transport_tests.rs"]
 #[cfg(test)]
 mod loop_playback_transport_tests;
+
+/// The one EVENT count on the loop line: a playback tick that wanted a frame
+/// and did not get one, both arms, and the frame set it must never touch.
+#[path = "app_render/loop_skipped_tick_tests.rs"]
+#[cfg(test)]
+mod loop_skipped_tick_tests;
 
 /// What the satellite layer puts on the glass under another layer's transport.
 #[path = "app_render/satellite_loop_draw_tests.rs"]

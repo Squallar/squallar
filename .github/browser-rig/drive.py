@@ -3119,6 +3119,17 @@ var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|
 // a third denominator: two slots on two panes drawing one picture are two
 // `resident` and one `shared`, never added to or taken from `resident`.
 var loop_state_re = /loop state: (\d+) panes, (\d+) layers animating, (\d+) frames listed, (\d+) resident, (\d+) in flight, (\d+) failed; allowed plan=(\d+) section=(\d+) volume=(\d+) overlay=(\d+), cap (\d+), held (\d+); share (\d+) B, pool (\d+) B, floor (\d+) B, ceiling (\d+) B; advance (\d+) us; shared (\d+)/;
+// The skipped-tick count off the TAIL of the same `loop state:` line, under
+// a probe of its own because `loop_state_re` stops at `shared` and the tail
+// carries a variable-arity per-pane group before this figure.
+//
+// **The one RUNNING TOTAL the loop line carries**, unlike every field above,
+// which is a level: it counts playback ticks that wanted a frame and did not
+// get one, since launch, so two readings bracket an interval. It is the only
+// way a thinned loop shows up at all -- the tick stamps its clock whether or
+// not the due frame was there, so `resident` reads healthy either side of a
+// skip and playback never slows.
+var loop_skipped_re = /ticks skipped (\d+)/;
 // The `budget state:` line: the bracket and rung the budgets were resolved
 // at, and every host signal the device profile carries beside them. A LEVEL,
 // every group MANDATORY: the app prints every field on every tick, with 0
@@ -3331,7 +3342,14 @@ for (var i = 0; i < C.length; i++) {
                    floor_bytes: parseInt(x[15], 10),
                    ceiling_bytes: parseInt(x[16], 10),
                    advance_us: parseInt(x[17], 10),
-                   shared: parseInt(x[18], 10) };
+                   shared: parseInt(x[18], 10),
+                   // A RUNNING TOTAL riding a line of levels -- see
+                   // `loop_skipped_re`. `null` for a bundle from before the
+                   // counter, never 0, because "no skips" and "the build
+                   // could not have told you" are different readings.
+                   ticks_skipped: null };
+    var sk = loop_skipped_re.exec(m);
+    if (sk) loop_state.ticks_skipped = parseInt(sk[1], 10);
     loop_state_all.push(loop_state);
   }
   x = budget_state_re.exec(m);

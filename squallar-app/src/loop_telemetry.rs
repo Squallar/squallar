@@ -44,6 +44,16 @@
 //! itself consumes it, and an integer because the rig's probe reads these
 //! sentences with `(\d+)` groups.
 //!
+//! **The one EVENT count on the line is `ticks skipped`**, and it is here
+//! because every figure above it is a level. `resident` against `listed` is
+//! the documented gap detector, and a level cannot see this particular gap:
+//! the playback tick scans forward for the first frame holding a picture and
+//! stamps its clock on whatever it finds, so a loop whose frames are arriving
+//! slower than it plays them runs at full wall-clock speed over half its
+//! frames and reads `resident` healthy on every tick either side of the skip.
+//! [`SkippedTicks`] counts those ticks as they happen — see its own note for
+//! the denominator, which is ticks and never frames.
+//!
 //! **Product telemetry, not a campaign instrument**: it rides
 //! `report_frame_telemetry`'s existing 2 s tick, walks panes only on the tick
 //! that is due, and no figure it prints ever gates CI.
@@ -120,6 +130,71 @@ impl LoopState {
     }
 }
 
+/// **Playback ticks that wanted a frame and did not get one**, since launch,
+/// attributed to the pane whose transport ticked.
+///
+/// `App::advance_loop_playback` moves a playing pane's clock by scanning
+/// forward from the frame it is on for the first frame holding a picture, and
+/// stamps `last_advance` unconditionally — there is no branch that waits. So a
+/// tick whose next frame has no picture yet does not slow down and does not
+/// log: it lands on a later frame, or on nothing at all, and the loop plays a
+/// thinned set at full speed. That is decimation, which the frame-density
+/// ruling forbids, and before this counter existed **nothing in the process
+/// counted it**.
+///
+/// **The denominator is TICKS, not frames.** One tick that skipped nine
+/// frames counts 1, the same as one that skipped one. The question this
+/// answers is "how often did playback not show the frame it was due to show",
+/// and a frame count would answer a different one — and would be dominated by
+/// the empty-timeline case, where every tick skips the whole list. It is
+/// never added to `listed`, `resident` or `shared`, which count slots and
+/// pictures on one tick rather than events over a run.
+///
+/// **A RUNNING TOTAL, unlike every other figure on the line**, which is a
+/// level. It only rises, so two readings bracket an interval and the rig's
+/// last reading in a window is the count since launch rather than the count
+/// in that window.
+///
+/// **Attributed by pane index, not by site.** The tick walks each pane's
+/// *transport* layer, which is whatever the ∞ toggle armed — radar on one
+/// pane, satellite on the next — so a site is the wrong key and would be the
+/// empty string for every non-radar transport. The pane is what has one
+/// transport and one clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkippedTicks {
+    /// Skipped ticks per pane index, grown on demand. A `Vec` and not a map
+    /// because pane indices are small, dense and few, and the line walks it
+    /// in index order.
+    by_pane: Vec<u64>,
+}
+
+impl SkippedTicks {
+    /// Record that `pane`'s tick did not land on the frame it asked for.
+    pub(crate) fn note(&mut self, pane: usize) {
+        if self.by_pane.len() <= pane {
+            self.by_pane.resize(pane + 1, 0);
+        }
+        self.by_pane[pane] = self.by_pane[pane].saturating_add(1);
+    }
+
+    /// Every pane that has ever skipped, and how often — index order, and
+    /// panes that never skipped are not in it.
+    pub(crate) fn attributed(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.by_pane
+            .iter()
+            .enumerate()
+            .filter(|&(_, n)| *n > 0)
+            .map(|(idx, n)| (idx, *n))
+    }
+
+    /// Skipped ticks over every pane. The figure the line's tail carries.
+    pub(crate) fn total(&self) -> u64 {
+        self.by_pane
+            .iter()
+            .fold(0u64, |sum, n| sum.saturating_add(*n))
+    }
+}
+
 /// The `loop state:` line.
 ///
 /// **A free function returning a `String`, for the reason every other
@@ -130,12 +205,35 @@ impl LoopState {
 /// `the_rig_reads_the_loop_line_the_app_actually_writes` is what stops that,
 /// and it can only exist because this is a value rather than an argument to
 /// `log::info!`.
-pub(crate) fn loop_state_line(s: &LoopState) -> String {
+///
+/// **`skips` rides the TAIL, past every column `loop_state_re` reads.** That
+/// regex is unanchored and ends at `shared`, so appending here cannot shift a
+/// group it captures and cannot turn an existing reading into `null`. The
+/// per-pane attribution is variable-arity and so could never be a `(\d+)`
+/// column; the scalar the rig reads comes **after** it, under its own
+/// `loop_skipped_re` probe, so a run with four panes skipping and a run with
+/// none put that figure behind the same label.
+pub(crate) fn loop_state_line(s: &LoopState, skips: &SkippedTicks) -> String {
+    // `none` rather than an empty run of pairs, so the sentence never has two
+    // separators with nothing between them and the healthy case is a positive
+    // statement rather than an absence a reader has to notice.
+    let attributed: String = {
+        let mut panes = skips.attributed().peekable();
+        if panes.peek().is_none() {
+            "none".to_string()
+        } else {
+            panes
+                .map(|(idx, n)| format!("{idx}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    };
     format!(
         "loop state: {} panes, {} layers animating, {} frames listed, \
          {} resident, {} in flight, {} failed; allowed plan={} section={} \
          volume={} overlay={}, cap {}, held {}; share {} B, pool {} B, \
-         floor {} B, ceiling {} B; advance {} us; shared {}",
+         floor {} B, ceiling {} B; advance {} us; shared {}; \
+         skipped by pane {attributed}; ticks skipped {}",
         s.panes,
         s.layers,
         s.listed,
@@ -154,6 +252,7 @@ pub(crate) fn loop_state_line(s: &LoopState) -> String {
         s.ceiling_bytes,
         s.advance_us,
         s.shared,
+        skips.total(),
     )
 }
 

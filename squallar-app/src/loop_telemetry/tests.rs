@@ -5,7 +5,7 @@
 //! a literal here AND against `drive.py`'s own pattern. A copy of a literal is
 //! a second place for it to be wrong.
 
-use super::{LoopState, loop_state_line};
+use super::{LoopState, SkippedTicks, loop_state_line};
 
 /// The rig driver and the measurement launcher, read at compile time so a
 /// moved or deleted file is a build failure rather than a skipped test.
@@ -86,18 +86,47 @@ fn distinct() -> LoopState {
     }
 }
 
+/// A skip reading with two panes at different counts, so the tail's
+/// attribution cannot read correctly with the pair transposed and the total
+/// cannot be a copy of either half. Pane 1 and pane 3, never 0 and 1, so an
+/// index printed as a count (or the reverse) is visible.
+fn distinct_skips() -> SkippedTicks {
+    let mut skips = SkippedTicks::default();
+    for _ in 0..4 {
+        skips.note(1);
+    }
+    for _ in 0..2 {
+        skips.note(3);
+    }
+    skips
+}
+
 /// The literal pin. Every figure appears once and in the order the sentence
 /// documents; the byte figures are bytes, never MiB, because the row printer
 /// is the only thing that should be dividing.
 #[test]
 fn the_loop_state_line_reads_exactly_as_pinned() {
     assert_eq!(
-        loop_state_line(&distinct()),
+        loop_state_line(&distinct(), &distinct_skips()),
         "loop state: 2 panes, 5 layers animating, 61 frames listed, \
          47 resident, 6 in flight, 3 failed; allowed plan=14 section=28 \
          volume=4 overlay=9, cap 36, held 60; share 29360128 B, \
          pool 58720256 B, floor 60817408 B, ceiling 3221225472 B; \
-         advance 100000 us; shared 7",
+         advance 100000 us; shared 7; skipped by pane 1=4 3=2; \
+         ticks skipped 6",
+    );
+}
+
+/// **The healthy case is a positive statement, not an absence.** A run where
+/// nothing skipped prints `none` and a zero rather than an empty run of
+/// pairs, so a reader never has to tell "no skips" apart from "the tail was
+/// truncated" — and the rig's `(\d+)` still has a digit to capture.
+#[test]
+fn a_run_that_skipped_nothing_still_says_so() {
+    let line = loop_state_line(&distinct(), &SkippedTicks::default());
+    assert!(
+        line.ends_with("; skipped by pane none; ticks skipped 0"),
+        "a clean run must still name the counter: {line}",
     );
 }
 
@@ -105,34 +134,64 @@ fn the_loop_state_line_reads_exactly_as_pinned() {
 /// the seam: an extra space here is not a compile error and turns the rig's
 /// whole loop reading into `null`, which reads as "nothing was looping" —
 /// exactly the silent under-fill the line exists to expose.
+///
+/// A PREFIX rather than the whole sentence, and the assertion is no weaker
+/// for it: `loop_state_re` is unanchored and stops at `shared`, so what it
+/// reads *is* this prefix, and the tail past it is pinned exactly by the
+/// `strip_prefix` remainder below and by its own probe in
+/// [`the_rig_reads_the_skipped_tick_count_the_app_actually_writes`]. Every
+/// character of the line is still held by one of the three.
 #[test]
 fn the_rig_reads_the_loop_line_the_app_actually_writes() {
+    let line = loop_state_line(&distinct(), &distinct_skips());
+    let fixed = rendered(
+        &pattern("loop_state_re"),
+        &[
+            "2",
+            "5",
+            "61",
+            "47",
+            "6",
+            "3",
+            "14",
+            "28",
+            "4",
+            "9",
+            "36",
+            "60",
+            "29360128",
+            "58720256",
+            "60817408",
+            "3221225472",
+            "100000",
+            "7",
+        ],
+    );
+    let tail = line.strip_prefix(&fixed).unwrap_or_else(|| {
+        panic!(
+            "the `loop state:` line and the rig's probe have drifted; the rig \
+             reads {fixed:?} and the app writes {line:?}"
+        )
+    });
     assert_eq!(
-        loop_state_line(&distinct()),
-        rendered(
-            &pattern("loop_state_re"),
-            &[
-                "2",
-                "5",
-                "61",
-                "47",
-                "6",
-                "3",
-                "14",
-                "28",
-                "4",
-                "9",
-                "36",
-                "60",
-                "29360128",
-                "58720256",
-                "60817408",
-                "3221225472",
-                "100000",
-                "7",
-            ],
-        ),
-        "the `loop state:` line and the rig's probe have drifted",
+        tail, "; skipped by pane 1=4 3=2; ticks skipped 6",
+        "the tail past the rig's fixed columns is not what it is pinned to",
+    );
+}
+
+/// **The rig reads the skipped-tick count the app actually writes.** The
+/// counter's own end of the seam: it sits past `loop_state_re`'s last group,
+/// behind a variable-arity per-pane group, so it needs a probe that finds it
+/// by label rather than by column — and that probe has to agree with the
+/// sentence exactly as the other one does.
+#[test]
+fn the_rig_reads_the_skipped_tick_count_the_app_actually_writes() {
+    let line = loop_state_line(&distinct(), &distinct_skips());
+    let probe = rendered(&pattern("loop_skipped_re"), &["6"]);
+    assert!(
+        line.ends_with(&probe),
+        "the skipped-tick probe reads {probe:?}, which is not how the line \
+         ends: {line:?}",
     );
 }
 
@@ -164,14 +223,14 @@ fn a_loop_line_that_drifted_by_one_space_is_not_accepted() {
             "7",
         ],
     );
-    assert_eq!(loop_state_line(&distinct()), good);
+    let line = loop_state_line(&distinct(), &distinct_skips());
+    assert!(line.starts_with(&good));
     let drifted = good.replacen(" resident", "  resident", 1);
     assert_ne!(drifted, good, "the perturbation perturbed nothing");
-    assert_ne!(
-        loop_state_line(&distinct()),
-        drifted,
-        "a line with one extra space compared equal to the real one, so the \
-         seam test above cannot fail",
+    assert!(
+        !line.starts_with(&drifted),
+        "a line with one extra space still matched as a prefix, so the seam \
+         test above cannot fail",
     );
 }
 

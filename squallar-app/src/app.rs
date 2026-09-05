@@ -319,6 +319,16 @@ pub struct App {
     /// parked here for `report_frame_telemetry` to pick up. A LEVEL, not a
     /// total: it is overwritten every frame.
     loop_counts: crate::loop_telemetry::LoopState,
+    /// **Playback ticks that wanted a frame and did not get one**, per pane,
+    /// since launch — see [`crate::loop_telemetry::SkippedTicks`].
+    ///
+    /// A RUNNING TOTAL, and that is why it is a field of its own rather than
+    /// three more fields of [`Self::loop_counts`]: that one is overwritten
+    /// wholesale by every pool observation, which would erase an event count
+    /// on the frame after the event. Written by `App::advance_loop_playback`
+    /// and read by `App::loop_state`, the same shape as the allocation and the
+    /// budgets it sits beside there.
+    pub(crate) loop_skips: crate::loop_telemetry::SkippedTicks,
     /// The site-keyed decoded volumes: what each pane's static render draws, and
     /// each site's merge base. One owner, asked by name rather than indexed —
     /// see [`crate::volume_inventory`].
@@ -826,6 +836,7 @@ impl App {
             pending_fit: None,
             tile_cache_budget: budgets.tile_cache(),
             loop_counts: crate::loop_telemetry::LoopState::default(),
+            loop_skips: crate::loop_telemetry::SkippedTicks::default(),
             volumes: crate::volume_inventory::VolumeInventory::default(),
             input,
             channels,
