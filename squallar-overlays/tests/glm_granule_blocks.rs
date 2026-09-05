@@ -104,8 +104,33 @@ unsafe impl GlobalAlloc for SmallBlocks {
 #[global_allocator]
 static A: SmallBlocks = SmallBlocks;
 
-/// Blocks taken, blocks handed back, bytes taken.
-fn blocks_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize, usize) {
+/// **One measured window at a time.**
+///
+/// The four counters are process-global statics and the harness runs these
+/// tests on several threads, so two windows open at once reset and add to
+/// each other's figures: a reading is then a mixture of two tests, and
+/// `a_resident_granule_is_the_rows_and_little_else` subtracts a `BYTES_FREED`
+/// its own window never took and panics on the overflow. The `COUNTING`
+/// thread-local decides WHICH thread's allocations are counted; it cannot
+/// keep two counting threads apart, because there is one set of counters.
+///
+/// Observed 2/5 parallel runs red where the same binary is 5/5 green under
+/// `--test-threads=1`. The window is what has to be exclusive, so this is
+/// where the lock is.
+static WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Blocks taken, blocks handed back, bytes taken, bytes handed back.
+///
+/// All four readings are taken while the window's lock is still held: a
+/// figure read after the lock is released is a figure another test's window
+/// may already have reset.
+fn blocks_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize, usize, usize) {
+    // A test that panicked inside its window poisons this; the lock is
+    // ordering, not data, so the next test takes it anyway rather than
+    // turning one failure into four.
+    let _window = WINDOW
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ALLOCS.store(0, Ordering::Relaxed);
     FREES.store(0, Ordering::Relaxed);
     BYTES.store(0, Ordering::Relaxed);
@@ -118,6 +143,7 @@ fn blocks_during<T>(f: impl FnOnce() -> T) -> (T, usize, usize, usize) {
         ALLOCS.load(Ordering::Relaxed),
         FREES.load(Ordering::Relaxed),
         BYTES.load(Ordering::Relaxed),
+        BYTES_FREED.load(Ordering::Relaxed),
     )
 }
 
@@ -178,7 +204,7 @@ fn installing_a_granule_over_another_is_a_constant_number_of_blocks() {
     let mut registry = a_registry_holding_a_granule();
     let next = a_granule(FLASHES);
 
-    let ((), allocs, frees, bytes) = blocks_during(|| {
+    let ((), allocs, frees, bytes, _freed) = blocks_during(|| {
         registry.apply_fetch_result(next, &PaneRef::bare(0));
     });
 
@@ -218,7 +244,7 @@ fn installing_a_granule_over_another_is_a_constant_number_of_blocks() {
 fn capturing_the_hit_items_of_a_granule_is_a_constant_number_of_blocks() {
     let registry = a_registry_holding_a_granule();
 
-    let (items, allocs, _frees, bytes) =
+    let (items, allocs, _frees, bytes, _freed) =
         blocks_during(|| registry.hit_items(&known::LIGHTNING).expect("seeded"));
 
     assert_eq!(
@@ -250,10 +276,10 @@ fn a_resident_granule_is_the_rows_and_little_else() {
     let mut registry = OverlayRegistry::default();
     registry.set_enabled(&known::LIGHTNING, true, &mut PaneMut::bare(0));
 
-    let ((), _allocs, _frees, taken) = blocks_during(|| {
+    let ((), _allocs, _frees, taken, handed_back) = blocks_during(|| {
         registry.apply_fetch_result(a_granule(FLASHES), &PaneRef::bare(0));
     });
-    let net = taken - BYTES_FREED.load(Ordering::Relaxed);
+    let net = taken.saturating_sub(handed_back);
 
     assert_eq!(
         registry.item_count(&known::LIGHTNING, &PaneRef::bare(0)),
