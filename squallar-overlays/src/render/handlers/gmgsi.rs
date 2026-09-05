@@ -9,7 +9,7 @@
 //! * **the cache holds the raster alone.** [`crate::gmgsi::decode::GmgsiGrid`]
 //!   carries its [`ResidentGrid`] by value, so the arrival is destructured once
 //!   and the raster moved into an `Arc` — after that a described job costs a
-//!   refcount and the 60 MB never moves again.
+//!   refcount and the 15 MB never moves again.
 //!
 //! **No codec row and no wire label.** `prepare_job` describes a
 //! [`rasterize::GriddedInput::Resident`], the field-identified carry the gridded
@@ -29,7 +29,8 @@
 //!
 //! # Grids are a staging area; the loop holds textures
 //!
-//! One mosaic is 3000 x 5000 `f32` = 60 MB, and [`GRID_CACHE_BYTES`] may hold
+//! One mosaic is 3000 x 5000 counts at one byte a point = 15 MB, and
+//! [`GRID_CACHE_BYTES`] may hold
 //! all four channels on every arm; how many of them a pane keeps warm after
 //! switching away is [`GRID_HISTORY_ENTRIES`]'s, and that is none on wasm. A
 //! thirteen-frame loop is therefore **not** thirteen granules: a loop frame is
@@ -41,7 +42,7 @@
 //! the raster, so the cache may drop it the instant after), be drawn. That is
 //! why [`FRAME_STAGING_BYTES`] is one grid on every arm and why the frame
 //! fetches are **serialised** through [`GmgsiHandler::frame_gate`]: thirteen
-//! concurrent decodes would put 780 MB in flight before any cache saw them,
+//! concurrent decodes would put 195 MB in flight before any cache saw them,
 //! and no eviction policy can undo that.
 //!
 //! When a granule is evicted before its job is described — possible only if a
@@ -71,13 +72,31 @@ use squallar_source::id::{LayerId, known};
 use squallar_source::job::{DescribedJob, JobCodec};
 use squallar_source::time::{FrameListing, FrameSource, FrameStamp, TimeAxis};
 
-/// One mosaic's values, in bytes: 3000 x 5000 `f32` = **60 MB**.
+/// One mosaic's values, in bytes: 15,000,000 points at **one byte a point** =
+/// **15,000,000 B** (14.31 MiB).
 ///
-/// Derived from the product's own shape ([`crate::gmgsi::GRID_POINTS`]) rather
-/// than stated as a round number of megabytes, so "one resident channel" stays
-/// one resident channel if the grid ever changes shape — and so the staging
-/// pool's slot, sized off the same constant, changes with it.
-pub const GLOBAL_GRID_BYTES: usize = crate::gmgsi::GRID_POINTS * std::mem::size_of::<f32>();
+/// **Both terms are read; neither is typed here.** The shape is the product's
+/// own ([`crate::gmgsi::GRID_POINTS`]) and the width is the store's own
+/// ([`crate::staging::StagingPool::ELEMENT_BYTES`], through this layer's
+/// [`staging::StagingPool`] alias) — `size_of` of the element the staging slot
+/// holds, which is the element the cached raster carries because
+/// [`staging::recycle`] moves that raster's `Vec` straight into the pool. So
+/// "one resident channel" stays one resident channel across a change to either
+/// term, and the slot sized off the same figures changes with it.
+///
+/// **It was `GRID_POINTS * size_of::<f32>()`, and that is what this constant is
+/// now a warning about.** When the store narrowed to a byte the literal did not
+/// move: the constant went on reading 60,000,000 for a 15,000,000 B grid, its
+/// `== 60_000_000` pin went on passing, and both figures derived from it
+/// silently changed meaning — [`FRAME_STAGING_BYTES`] became four staged
+/// granules where it documents one, and [`GRID_CACHE_BYTES`], which is what
+/// [`super::source_grid_budget_bytes`] prices this layer at, charged the budget
+/// model 240,000,000 B against a cache that can hold 60,000,000: 180 MB of
+/// phantom, on a web host allowance of 805 MB, shedding rungs of picture
+/// quality for bytes that do not exist. A budget spelled over a literal width
+/// is a budget whose pin cannot fail.
+pub const GLOBAL_GRID_BYTES: usize =
+    crate::gmgsi::GRID_POINTS * staging::StagingPool::ELEMENT_BYTES;
 
 /// How many bytes of decoded GMGSI raster may stay resident at once: **all four
 /// channels, on every arm**.
@@ -93,7 +112,7 @@ pub const GLOBAL_GRID_BYTES: usize = crate::gmgsi::GRID_POINTS * std::mem::size_
 /// of them is ever a victim. The arms that sat below that — one channel on
 /// wasm, two on mobile — did not make a browser tab hold less: below the key
 /// space `insert` runs out of unpinned victims and takes its `break` arm, so
-/// four panes on four channels held 240 MB under a constant that said 60.
+/// four panes on four channels held 60 MB under a constant that said 15.
 /// Stating the key space moved nothing at that peak. Whether a pane that has
 /// switched channels keeps the ones it left resident is not this ceiling's
 /// decision but [`GRID_HISTORY_ENTRIES`]'s. The `const _` below keeps every
@@ -135,7 +154,15 @@ const _: () = assert!(GRID_CACHE_BYTES >= GmgsiChannel::all().len() * GLOBAL_GRI
 // budget under one grid overruns exactly as one under the key space does.)
 const _: () = assert!(GRID_CACHE_BYTES >= GLOBAL_GRID_BYTES);
 const _: () = assert!(GRID_CACHE_BYTES.is_multiple_of(GLOBAL_GRID_BYTES));
-const _: () = assert!(GLOBAL_GRID_BYTES == 60_000_000);
+// **The two terms pinned apart**, so a build failure names which one moved and
+// no reader can retype one figure green. The width pin is the one the old
+// spelling could not have had: `GLOBAL_GRID_BYTES` was arithmetic over a
+// literal `size_of::<f32>()`, so it did not move when the store did and a `==`
+// pin on it passed straight through a fourfold change. 15,000,000 appears twice
+// and means two things — points, and (only because the width is one) bytes.
+const _: () = assert!(crate::gmgsi::GRID_POINTS == 15_000_000);
+const _: () = assert!(staging::StagingPool::ELEMENT_BYTES == 1);
+const _: () = assert!(GLOBAL_GRID_BYTES == 15_000_000);
 
 /// How many grids a single pane that cycles selections keeps warm — the
 /// **unpinned history** the cache may retain beyond the pinned set: **none on
@@ -143,8 +170,8 @@ const _: () = assert!(GLOBAL_GRID_BYTES == 60_000_000);
 ///
 /// [`GRID_CACHE_BYTES`] is the ceiling and it is held at the key space, so on
 /// its own it lets one pane that has cycled through every channel keep every
-/// channel resident — 240 MB of GMGSI in a browser tab behind a pane that is
-/// showing 60. Those grids are the second tier of the memory model: switching
+/// channel resident — 60 MB of GMGSI in a browser tab behind a pane that is
+/// showing 15. Those grids are the second tier of the memory model: switching
 /// back is faster with them, nothing is lost without them, and how many to keep
 /// is a governor's decision to lower and restore, not a constant's. This is
 /// that governor's lever — `GmgsiGridCache::set_history` — at its opening
@@ -202,15 +229,16 @@ const _: () = {
 /// Not a per-arm cascade, because the figure is not a guess about the device —
 /// it is what the pipeline needs. A loop frame's storage is its **texture**
 /// (11.06 MB for a 1280x960-point pane at 1x, held by the pane, priced by
-/// `overlay_frame_bytes`); the granule is a 60 MB staging buffer a frame
+/// `overlay_frame_bytes`); the granule is a 15 MB staging buffer a frame
 /// passes through on its way to one. A described job takes its own refcount on
 /// the raster, so the slot is free again the moment `prepare_job` has run, and
 /// [`GmgsiHandler::frame_gate`] admits one fetch at a time so nothing else can
 /// ask for the slot in the meantime.
 ///
-/// **Thirteen resident granules would be 780 MB** against a 96 MiB wasm model
-/// pool and a 56 MiB wasm loop pool — 14x and 15x over. A grid-holding loop is
-/// not a smaller version of this design, it is an infeasible one.
+/// **Thirteen resident granules would be 195,000,000 B** (185.97 MiB) against
+/// a 96 MiB wasm model pool and a 56 MiB wasm loop pool — 1.94x and 3.32x over.
+/// A grid-holding loop is not a smaller version of this design, it is an
+/// infeasible one.
 pub const FRAME_STAGING_BYTES: usize = GLOBAL_GRID_BYTES;
 
 // The pipeline advances one granule at a time, so a staging area under one
@@ -224,7 +252,7 @@ const _: () = assert!(FRAME_STAGING_BYTES >= GLOBAL_GRID_BYTES);
 /// pass and states in as many words that it has **no throttle** — radar's
 /// concurrency lives in its download manager, which this layer does not use.
 /// Thirteen unthrottled GMGSI fetches would hold thirteen 7.5 MB bodies and
-/// thirteen 60 MB decoded rasters at once, inside the futures, before any
+/// thirteen 15 MB decoded rasters at once, inside the futures, before any
 /// cache could evict anything.
 ///
 /// Serialising costs almost no wall time: the bytes are the bottleneck either
@@ -260,7 +288,7 @@ struct GmgsiFrameCache {
     entries: HashMap<FrameKey, GmgsiGranule>,
     recency: RefCell<Vec<FrameKey>>,
     /// Injected for the same reason [`GmgsiGridCache::budget`] is: the shipped
-    /// budget is one 60 MB mosaic and no test can afford to overflow it.
+    /// budget is one 15 MB mosaic and no test can afford to overflow it.
     budget: usize,
     /// **Where an evicted granule's buffer goes** — [`staging::global`] on
     /// every shipped path.
@@ -302,7 +330,7 @@ impl GmgsiFrameCache {
 
     /// **Nothing is pinned.** A staged granule that is evicted before its job
     /// is described costs one frame its picture until the next listing; a
-    /// staged granule that is *kept* past the budget costs 60 MB on an arm
+    /// staged granule that is *kept* past the budget costs 15 MB on an arm
     /// that has already said it cannot spare it. The live cache makes the
     /// opposite trade because a pane with no live granule has nothing that
     /// will re-ask.
@@ -310,7 +338,7 @@ impl GmgsiFrameCache {
     /// **Every granule that leaves here is offered to [`staging`].** This is
     /// the hot eviction of the whole layer — one per arriving loop frame — and
     /// it is where the retained mosaic buffer comes from: dropping the victim
-    /// instead is what made every granule take a fresh 60 MB block off a heap
+    /// instead is what made every granule take a fresh 15 MB block off a heap
     /// that only grows.
     fn insert(&mut self, key: FrameKey, granule: GmgsiGranule) {
         if let Some(replaced) = self.entries.insert(key, granule) {
@@ -365,7 +393,7 @@ impl GmgsiFrameCache {
 /// One decoded channel, as the layer holds it.
 ///
 /// The raster is behind an `Arc` and everything else is a scalar: describing a
-/// job must cost a refcount, never a 60 MB copy. `crate::gmgsi::decode` hands
+/// job must cost a refcount, never a 15 MB copy. `crate::gmgsi::decode` hands
 /// its `ResidentGrid` over by value, so the `Arc` is made once, here, out of a
 /// move.
 struct GmgsiGranule {
@@ -396,7 +424,7 @@ struct GmgsiGridCache {
     recency: RefCell<Vec<GmgsiChannel>>,
     /// **Injected, not read from the constant.** The shipped handler passes
     /// [`GRID_CACHE_BYTES`]; a test passes a budget it can actually overflow.
-    /// A cache whose only budget was 60 MB x 4 could not have its eviction
+    /// A cache whose only budget was 15 MB x 4 could not have its eviction
     /// policy exercised at all, and an untested eviction policy is how a cache
     /// settles at one entry and every other pane stops drawing.
     budget: usize,
@@ -631,7 +659,7 @@ impl GmgsiHandler {
     /// [`FRAME_STAGING_BYTES`].
     ///
     /// The same reason [`GmgsiGridCache::budget`] is injected: the shipped
-    /// figure is one 60 MB mosaic, no test can build one, and an eviction
+    /// figure is one 15 MB mosaic, no test can build one, and an eviction
     /// policy that is never overflowed is a policy nothing has checked.
     #[cfg(test)]
     fn with_frame_budget(bytes: usize) -> Self {
@@ -824,7 +852,7 @@ impl FrameSource for GmgsiHandler {
     /// throttle. The throttle is inside the task: it takes the gate before it
     /// touches the network, so the whole render set may be dispatched at once
     /// (which it is — `dispatch_loop_frame_fetches` has no throttle of its
-    /// own) while only one 60 MB decode exists at a time.
+    /// own) while only one 15 MB decode exists at a time.
     fn fetch_frame(
         &self,
         ctx: &FetchConfig,
@@ -1268,7 +1296,7 @@ impl OverlayHandler for GmgsiHandler {
 
     /// The [`Resident`](rasterize::GriddedInput::Resident) carry: an `Arc` clone
     /// of the resident raster, so describing the job costs a refcount and the
-    /// 60 MB never moves. The values memcpy happens only in the web encoder,
+    /// 15 MB never moves. The values memcpy happens only in the web encoder,
     /// which knows the texture's bounds and writes the window's rows alone.
     ///
     /// **A named frame is drawn from that frame's own granule.** `ctx.frame` is
@@ -1465,16 +1493,21 @@ impl OverlayHandler for GmgsiHandler {
         })
     }
 
-    /// **Two blocks, and one 60 MB blend is the unit of both**: the live
-    /// cache's decoded channels and the staged loop granules. This layer
-    /// retains no staging buffer between decodes — MRMS's pool is the MRMS
-    /// handler's, and nothing here is offered to it.
+    /// **Two blocks, and one 15 MB blend is the unit of both**: the live
+    /// cache's decoded channels and the staged loop granules.
+    ///
+    /// **A third block is missing from this figure and that is a gap, not a
+    /// choice.** [`staging::global`] parks one mosaic-sized buffer between
+    /// decodes and reports it through `StagingPool::retained_bytes`;
+    /// `MrmsHandler::resident_source_bytes` adds its pool's and this does not,
+    /// so GMGSI under-reports its own resident bytes by one grid whenever the
+    /// slot is parked.
     ///
     /// **What is excluded.** The pane's own carry (`state.data`) is the same
     /// `Arc` the live cache's granule holds, so it is added only when the
     /// cache has already dropped that granule while the carry kept the raster
     /// alive. The `f64` coordinate axes are not counted: a separable grid's
-    /// axes are 64 KB against a 60 MB raster, and the budget this figure is
+    /// axes are 64 KB against a 15 MB raster, and the budget this figure is
     /// read beside prices values only. Not counted at all: the rasters made
     /// from these grids, which are the overlay picture family's, and the
     /// textures those became, which are the GPU's.

@@ -160,6 +160,24 @@ pub enum StagingHealth {
 }
 
 impl<T: Copy> StagingPool<T> {
+    /// **Bytes one element of this pool occupies** — the width the byte budgets
+    /// around the pool are derived from, so none of them has to name a type.
+    ///
+    /// `T` is the element the *store* holds and not a restatement of it: a
+    /// source's `recycle` moves its decoded `Vec` into [`Self::give`], so the
+    /// compiler holds the pool's element and the grid's equal, and a budget
+    /// read through this cannot disagree with either.
+    ///
+    /// **Why a budget must not spell the width itself.** GMGSI's
+    /// `GLOBAL_GRID_BYTES` was `GRID_POINTS * size_of::<f32>()`. When the store
+    /// narrowed the literal did not move, so the constant went on reading four
+    /// bytes a point, its `== 60_000_000` pin went on passing, and both figures
+    /// derived from it silently came to mean four grids where they document
+    /// one. Read through here instead and a width change carries the budget
+    /// with it — and the budget's own `== N` pin fires, which is the point at
+    /// which a human re-reads the prose around it.
+    pub const ELEMENT_BYTES: usize = size_of::<T>();
+
     /// A pool whose surrounding byte budgets were sized for `points` elements.
     ///
     /// `points` is the *nominal* shape — see [`Self::nominal_points`]. The
@@ -245,7 +263,7 @@ impl<T: Copy> StagingPool<T> {
         fresh.try_reserve_exact(points).map_err(|_| {
             format!(
                 "cannot hold a {} MB staging grid in this build's memory",
-                points.saturating_mul(size_of::<T>()) / (1024 * 1024),
+                points.saturating_mul(Self::ELEMENT_BYTES) / (1024 * 1024),
             )
         })?;
         self.allocated.fetch_add(1, Ordering::Relaxed);
@@ -340,7 +358,7 @@ impl<T: Copy> StagingPool<T> {
     /// which is what the allocator is holding; the buffer is always empty
     /// while it is in the slot, so its length would read zero and say nothing.
     pub fn retained_bytes(&self) -> usize {
-        self.retained_points().saturating_mul(size_of::<T>())
+        self.retained_points().saturating_mul(Self::ELEMENT_BYTES)
     }
 
     pub fn totals(&self) -> StagingTotals {

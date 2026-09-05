@@ -207,11 +207,11 @@ fn a_refetch_of_a_resident_channel_replaces_its_own_key() {
 /// The `>=` half of this is already a `const _: () = assert!(..)` in the
 /// handler, so repeating it here would be an assertion clippy can see is
 /// constant and a reader cannot see is redundant. What is left is the figure
-/// itself: 3000 x 5000 x 4 bytes, which is the number every budget arm is a
-/// multiple of.
+/// itself: 3000 x 5000 points at one byte apiece, which is the number every
+/// budget arm is a multiple of.
 #[test]
-fn one_global_mosaic_is_sixty_megabytes() {
-    assert_eq!(GLOBAL_GRID_BYTES, 60_000_000);
+fn one_global_mosaic_is_fifteen_million_bytes() {
+    assert_eq!(GLOBAL_GRID_BYTES, 15_000_000);
     assert_eq!(
         GRID_CACHE_BYTES % GLOBAL_GRID_BYTES,
         0,
@@ -946,9 +946,9 @@ fn a_named_frame_is_rasterized_from_that_frames_granule_and_not_the_panes() {
 /// holds more than the staging budget buys — one mosaic.
 ///
 /// The byte arithmetic, with its denominator: **one mosaic is
-/// `3000 * 5000 * 4` = 60,000,000 B (57.22 MiB)**, so thirteen resident would
-/// be 780,000,000 B — against a 96 MiB wasm model pool and a 56 MiB wasm loop
-/// pool, 14x and 15x over. The loop's own storage is thirteen *textures* at
+/// `3000 * 5000 * 1` = 15,000,000 B (14.31 MiB)**, so thirteen resident would
+/// be 195,000,000 B (185.97 MiB) — against a 96 MiB wasm model pool and a
+/// 56 MiB wasm loop pool, 1.94x and 3.32x over. The loop's own storage is thirteen *textures* at
 /// 11.06 MB for a 1280x960-point pane, which is a different budget in a
 /// different crate.
 ///
@@ -979,7 +979,7 @@ fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
             h.frame_grids.len(),
             1,
             "after {} granules the layer holds {}. One mosaic is \
-             3000 x 5000 x 4 = {GLOBAL_GRID_BYTES} B, so {} resident is {} B, \
+             3000 x 5000 x 1 = {GLOBAL_GRID_BYTES} B, so {} resident is {} B, \
              against a 96 MiB model pool and a 56 MiB loop pool on wasm. A \
              loop holds textures, not grids.",
             k + 1,
@@ -1004,7 +1004,7 @@ fn the_layer_stages_one_granule_however_many_frames_the_loop_holds() {
     );
     assert_eq!(
         13 * GLOBAL_GRID_BYTES,
-        780_000_000,
+        195_000_000,
         "thirteen resident granules, spelled out"
     );
 }
