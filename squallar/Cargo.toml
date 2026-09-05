@@ -217,7 +217,7 @@ objc2-metal = { version = "=0.3.2", default-features = false, features = [
 # neighbours: libc is a leaf every unix crate in the graph shares, and an
 # exact pin here would be this manifest overriding a version resolution it has
 # no stake in the moment anything else asks for a newer 0.2.
-libc = "0.2.189"
+libc = "=0.2.189"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # `GlobalMemoryStatusEx`, for `src/capacity/windows.rs`, and
