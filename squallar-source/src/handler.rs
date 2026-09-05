@@ -316,6 +316,35 @@ impl<T: ItemFootprint + Send + 'static, S: RoundShape> OverlayState<T, S> {
         *self.retired.borrow_mut() = Some(Box::new(replaced));
     }
 
+    /// **Let go of the installed data**, parking it for the discard seam.
+    ///
+    /// What a layer no pane draws any more calls. Answers whether anything
+    /// was actually released, so a caller asking every frame does not bump a
+    /// generation — and invalidate every cache keyed on it — on a layer that
+    /// is already empty.
+    ///
+    /// The generation moves because what this layer would draw has changed,
+    /// and the poll clock is CLEARED: a layer switched back on must re-ask
+    /// the origin rather than wait out an interval against data that is gone.
+    /// Both halves of the way back are then covered — `set_enabled` asks
+    /// [`Self::enable_should_refetch`], which answers `true` on no data, and
+    /// `auto_fetch_delay` reads a cleared clock as due now.
+    pub fn release_data(&mut self) -> bool
+    where
+        T: Default,
+    {
+        if self.data_bytes == 0 {
+            return false;
+        }
+        crate::footprint::move_installed(self.data_bytes, 0);
+        let replaced = std::mem::take(&mut self.data);
+        self.park(replaced, self.data_bytes);
+        self.data_bytes = 0;
+        self.fetch_time = None;
+        self.data_generation = self.data_generation.wrapping_add(1);
+        true
+    }
+
     /// **What [`Self::data`] owns on the heap**, as last priced. A load, not
     /// a walk.
     pub fn data_bytes(&self) -> u64 {
@@ -1227,6 +1256,38 @@ pub trait SourceHandler: Send {
     /// memos' parked rows together.
     fn take_retired(&self) -> Vec<Box<dyn Any + Send>> {
         Vec::new()
+    }
+
+    /// **Let go of this layer's source data, because no pane draws it.**
+    ///
+    /// Switching a layer off already released its per-pane TEXTURES
+    /// (`PaneState::release_disabled_overlay_textures`) and already gated its
+    /// polling off. What nothing released was the fetched data itself, and
+    /// with the polling gated off no newer generation ever arrived to replace
+    /// it — so a layer the user switched off in the first minute kept its
+    /// last round resident for the life of the process.
+    ///
+    /// An implementor parks its data on [`Self::take_retired`]'s slot rather
+    /// than freeing it inline, and clears whatever it derived from that data
+    /// — the point list a per-frame pass walks, the map labels — because
+    /// those index the list that just went away.
+    ///
+    /// Answers whether anything was released. Called once a frame for every
+    /// layer no pane draws, so an implementor that is already empty must
+    /// answer `false` and change nothing: bumping a generation every frame
+    /// would invalidate every cache keyed on it.
+    ///
+    /// **The way back must re-populate the layer.** `OverlayState::release_data`
+    /// clears the poll clock as well as the data, so both routes back are
+    /// covered: the toggle asks `enable_should_refetch`, and a layer that
+    /// becomes visible again some other way reads as due now.
+    ///
+    /// The default does nothing, which is the right answer for a layer whose
+    /// data is not a fetched round — the site table the frontend installs,
+    /// the user's location, the colour scale — and for one whose replaced
+    /// data already has a better retirement than being dropped.
+    fn release_data(&mut self) -> bool {
+        false
     }
 
     /// **Bytes of decoded SOURCE data this handler is holding on the host

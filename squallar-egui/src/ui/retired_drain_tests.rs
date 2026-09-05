@@ -109,3 +109,149 @@ fn a_quiet_frame_drains_nothing_and_says_so() {
     h.frame();
     assert_eq!(h.last_retired(), 0);
 }
+
+// ── The layer-off drop, and the split that hid it ────────────────────────
+
+use crate::Gui;
+use squallar_source::id::LayerId;
+
+const ALERTS: LayerId = squallar_source::id::known::NWS_ALERTS;
+
+/// The production per-pane write — the same call a stack row's eye makes.
+fn set_pane_layer(gui: &mut Gui, idx: usize, on: bool) {
+    let mut pane = std::mem::take(gui.pane_mut(idx).expect("the pane exists"));
+    Gui::write_pane_overlay(&mut gui.overlays, idx, &mut pane, &ALERTS, on);
+    *gui.pane_mut(idx).expect("the pane exists") = pane;
+}
+
+fn layer_holds_data(h: &mut InputHarness) -> bool {
+    h.gui_mut().overlays.has_data(&ALERTS, &PaneRef::bare(0))
+}
+
+/// **The over-firing direction, which is the dangerous one.**
+///
+/// A layer another pane genuinely still draws must keep its data. Dropping it
+/// there blanks a live pane, which is far worse than the memory it saves — so
+/// this is asserted before the drop is, and over several frames, because the
+/// sweep runs on every one of them and only has to be wrong once.
+///
+/// The sibling is UNLINKED, which is what makes it a real second opinion: a
+/// linked one adopts the off-switch inside the same frame (see the test
+/// below), so it would not be holding the layer on for long enough to
+/// disagree.
+#[test]
+fn a_layer_another_pane_still_draws_keeps_its_data() {
+    let mut h = InputHarness::new();
+    h.set_pane_count(2);
+    h.gui_mut().enable_overlay_for_test(&ALERTS);
+    h.gui_mut().pane_mut(1).expect("a second pane").layer_link = false;
+    h.warm_up();
+    ingest(&mut h, &["urn:one", "urn:two"]);
+    h.frame();
+    assert!(layer_holds_data(&mut h), "premise: the round landed");
+    assert!(
+        h.gui_mut()
+            .pane(1)
+            .expect("a second pane")
+            .is_overlay_enabled(&ALERTS),
+        "premise: the sibling draws the layer",
+    );
+
+    set_pane_layer(h.gui_mut(), 0, false);
+    for frame in 0..5 {
+        h.frame();
+        assert!(
+            h.gui_mut()
+                .pane(1)
+                .expect("a second pane")
+                .is_overlay_enabled(&ALERTS),
+            "frame {frame}: the unlinked sibling must keep its own switch",
+        );
+        assert!(
+            layer_holds_data(&mut h),
+            "frame {frame}: a pane still draws this layer and its data was \
+             dropped; that blanks a live layer",
+        );
+    }
+}
+
+/// **The drop lands once the layer-link fan-out has reached the sibling —
+/// which happens inside the same frame as the click, with nothing asking
+/// again.**
+///
+/// This is the trap the whole placement is for. At the moment of the click
+/// the predicate answers "a sibling still draws it" and a click-time check
+/// correctly declines; the off-switch is then copied onto that sibling
+/// wholesale by the frame's own fan-out, and there is no second click to
+/// re-ask on. Asking at the END of every frame is what closes it, and both
+/// halves are asserted here: the answer before the frame, and the data after
+/// it.
+#[test]
+fn the_drop_lands_after_the_layer_link_fan_out_reaches_the_sibling() {
+    let mut h = InputHarness::new();
+    h.set_pane_count(2);
+    h.gui_mut().enable_overlay_for_test(&ALERTS);
+    h.warm_up();
+    ingest(&mut h, &["urn:one", "urn:two"]);
+    h.frame();
+    assert!(layer_holds_data(&mut h));
+
+    set_pane_layer(h.gui_mut(), 0, false);
+    assert!(
+        h.gui_mut().any_pane_has_overlay_enabled(&ALERTS),
+        "at the click the linked sibling still draws it, so a check made HERE \
+         would decline — this is the state the old hole was in",
+    );
+
+    h.frame();
+    assert!(
+        !h.gui_mut().any_pane_has_overlay_enabled(&ALERTS),
+        "the fan-out reached the sibling during the frame",
+    );
+    assert!(
+        !layer_holds_data(&mut h),
+        "no pane draws this layer any more and its round is still resident",
+    );
+    assert!(
+        h.last_retired() >= 1,
+        "the released round must reach the discard seam, not be freed here",
+    );
+}
+
+/// **Switching it back on re-populates it**, which is what makes the drop
+/// affordable: interaction is realtime, data may lag.
+#[test]
+fn switching_the_layer_back_on_asks_for_the_round_again() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&ALERTS);
+    h.warm_up();
+    ingest(&mut h, &["urn:one"]);
+    h.frame();
+
+    set_pane_layer(h.gui_mut(), 0, false);
+    h.frame();
+    assert!(!layer_holds_data(&mut h), "premise: the round was dropped");
+
+    // The poll clock went with the data, so the layer reads as due rather
+    // than waiting out an interval against a round that is gone.
+    assert!(
+        h.gui_mut()
+            .overlays
+            .auto_fetch_delay(&ALERTS)
+            .is_none_or(|d| d.is_zero()),
+        "a layer whose data was dropped must be due for a round, not parked \
+         behind the interval its last one stamped",
+    );
+
+    // And the way back through the toggle asks for a round of its own.
+    set_pane_layer(h.gui_mut(), 0, true);
+    h.frames_for(3, 0.05);
+    assert!(
+        h.gui_mut().overlays.is_fetching(&ALERTS)
+            || h.last_actions()
+                .iter()
+                .any(|a| matches!(a, crate::actions::GuiAction::FetchOverlay { kind, .. } if *kind == ALERTS)),
+        "switching the layer back on must ask the origin again, or it stays \
+         silently empty",
+    );
+}

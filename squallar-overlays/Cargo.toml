@@ -65,6 +65,12 @@ serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
 
 [dev-dependencies]
+# **The counting global allocator**, installed by `tests/overlay_item_release.rs`
+# alone so that test can watch live bytes fall when a released overlay round is
+# freed. A leaf with no first-party dependencies, so it adds nothing to either
+# layer crate's closure; shipped code in this crate never names it.
+squallar-alloc = { workspace = true }
+
 # Test fixtures only: `glm::tests` and `gmgsi::decode::tests` write HDF5 files
 # with `FileBuilder` to feed the decoders. Shipped code in this crate reaches
 # HDF5 exclusively through `squallar-netcdf`, which owns the pin and the

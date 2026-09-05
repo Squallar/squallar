@@ -189,6 +189,9 @@ impl Gui {
 
         self.apply_pending_pane_close(ctx, &mut actions);
 
+        // **Before the drain, so what it lets go of leaves on this frame.**
+        self.release_data_of_layers_no_pane_draws();
+
         // **Last, and per-frame.** A layer's state retires at delivery and
         // its memos retire at dispatch — two different passes — so this is
         // the only place that sees both. The batch is RETURNED rather than
@@ -210,6 +213,57 @@ impl Gui {
             },
             retired,
         )
+    }
+
+    /// **Let go of the source data of every layer no pane draws.**
+    ///
+    /// Asked once a frame, at the END of one, and both of those are the
+    /// point.
+    ///
+    /// A **per-frame** question rather than a per-click one, because the
+    /// answer changes after the click that provoked it. The ordinary
+    /// sequence with a split open is: the user hides a layer on the active
+    /// pane; a click-time check correctly declines, because a linked sibling
+    /// still draws it; and the off-switch is then propagated to that sibling
+    /// wholesale by `propagate_layer_state`, with nothing asking again. The
+    /// texture release already carries a line inside that fan-out for exactly
+    /// this reason. Asking every frame needs no such line and covers every
+    /// other route a pane can stop drawing a layer — a pane closed, a slot
+    /// curated out, a config loaded.
+    ///
+    /// At the **end** of the frame, because that is where every `mem::take`n
+    /// pane is back in the vector: a mid-frame walk would read a pane that is
+    /// currently out as drawing nothing, and drop the data it is drawing
+    /// with.
+    ///
+    /// [`Gui::any_pane_has_overlay_enabled`] is the predicate, and it is the
+    /// same one the poll gate hangs off (`some_pane_could_use`) — one
+    /// definition of "does any pane still show this", not a second that can
+    /// drift from it.
+    ///
+    /// **A layer with a 3D half is excluded**, and this is the over-firing
+    /// guard rather than an optimisation. That predicate asks
+    /// `PaneState::draws_ground`, which is `false` for a Volume pane with its
+    /// floor hidden and for a cross-section — so a pane rendering a gridded
+    /// layer in 3D reads as not drawing it, and a drop would blank a live
+    /// layer. None of the layers that implement `release_data` has a 3D half
+    /// today; the guard is what keeps that true if one gains it.
+    pub(crate) fn release_data_of_layers_no_pane_draws(&mut self) {
+        if self.pane_layout.pane_count == 0 {
+            return;
+        }
+        let idle: Vec<squallar_source::id::LayerId> = self
+            .overlays
+            .handlers()
+            .filter(|handler| handler.volume().is_none())
+            .map(|handler| handler.id())
+            .filter(|id| !self.any_pane_has_overlay_enabled(id))
+            .collect();
+        for id in idle {
+            if let Some(handler) = self.overlays.get_handler_mut(&id) {
+                handler.release_data();
+            }
+        }
     }
 
     /// **Last thing in the frame, and both halves of that matter.**

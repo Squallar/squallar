@@ -727,6 +727,19 @@ impl OverlayHandler for NwsAlertHandler {
     /// The generation this layer's state parked and the inputs its memo
     /// retired, handed back for the app to free off the frame thread — see
     /// [`OverlayHandler::take_retired`].
+    /// **No pane draws this layer, so its round goes** — parked for the
+    /// discard seam, not freed here. See [`OverlayHandler::release_data`].
+    fn release_data(&mut self) -> bool {
+        if !self.state.release_data() {
+            return false;
+        }
+        // The built inputs were made from the data that just went away, and
+        // nothing dispatches this layer any more, so no later `get_or_build`
+        // would retire them.
+        self.job_memo.retire_live_rows();
+        true
+    }
+
     fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
         crate::render::overlay_state::retired_batch(
             self.state.take_retired(),
@@ -1425,6 +1438,75 @@ mod tests {
         assert!(
             handler.take_retired().is_empty(),
             "a drain empties both slots",
+        );
+    }
+
+    /// **A layer no pane draws lets go of its round** — and the bytes are the
+    /// assertion, not a flag.
+    ///
+    /// `data_bytes` is the census family's own figure for this state, so a
+    /// release that only emptied a list the handler still pointed at could
+    /// not pass this.
+    #[test]
+    fn releasing_a_layer_no_pane_draws_returns_its_bytes_and_its_inputs() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        handler.prepare_job(&live_ctx(at(19, 0)), &PaneRef::bare(0));
+        let held = handler.state.data_bytes();
+        assert!(held > 0, "the fixture must hold real bytes");
+        let generation = handler.state.data_generation;
+
+        assert!(handler.release_data(), "there was something to release");
+        assert_eq!(handler.state.data_bytes(), 0, "the bytes are gone");
+        assert!(
+            !handler.has_data(&PaneRef::bare(0)),
+            "and the layer says it has nothing to draw",
+        );
+        assert_ne!(
+            handler.state.data_generation, generation,
+            "what this layer would draw changed, so the generation must move",
+        );
+        assert!(
+            handler.state.fetch_time.is_none(),
+            "the poll clock must be cleared or the way back waits out an \
+             interval against data that is gone",
+        );
+        assert!(
+            handler.state.enable_should_refetch(false),
+            "switching the layer back on must re-ask the origin",
+        );
+
+        // Both the round and the input the dispatch built from it come out.
+        assert_eq!(
+            handler.take_retired().len(),
+            2,
+            "the released round and the built input must both reach the seam",
+        );
+    }
+
+    /// **Asked every frame, and it must cost nothing when there is nothing to
+    /// do.** A release that bumped the generation on an already-empty layer
+    /// would invalidate every cache keyed on it, once a frame, for as long as
+    /// the layer stayed off.
+    #[test]
+    fn releasing_an_already_empty_layer_changes_nothing() {
+        let mut handler = handler_with(vec![alert("a", "Tornado Warning")]);
+        assert!(handler.release_data());
+        let generation = handler.state.data_generation;
+        let _ = handler.take_retired();
+
+        for _ in 0..5 {
+            assert!(
+                !handler.release_data(),
+                "an empty layer has nothing to release and must say so",
+            );
+        }
+        assert_eq!(
+            handler.state.data_generation, generation,
+            "a no-op release must not move the generation",
+        );
+        assert!(
+            handler.take_retired().is_empty(),
+            "and it must not park anything",
         );
     }
 

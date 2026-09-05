@@ -195,6 +195,27 @@ impl<T: Clone> BuiltMemo<T> {
         Some(value)
     }
 
+    /// **Park every live row**, for a layer that has just let go of the data
+    /// they were built from.
+    ///
+    /// Same shape as a rollover: the batch replaces whatever was parked, so
+    /// the slot still holds one generation's rows at most. Without this a
+    /// switched-off layer would keep its built inputs for the life of the
+    /// process — nothing dispatches it any more, so no `get_or_build` would
+    /// ever see the new generation and retire them.
+    pub fn retire_live_rows(&self) {
+        let live = std::mem::take(&mut *self.rows.borrow_mut());
+        if live.is_empty() {
+            return;
+        }
+        let batch: Vec<T> = live.into_iter().map(|(_, value)| value).collect();
+        let bytes = batch
+            .iter()
+            .fold(0u64, |sum, row| sum.saturating_add((self.price)(row)));
+        *self.retired.borrow_mut() = batch;
+        self.set_parked(bytes);
+    }
+
     /// The inputs a rollover or an eviction retired since the last drain —
     /// for the app's discard seam, so their frees happen where it chooses.
     /// Empty when nothing has retired.

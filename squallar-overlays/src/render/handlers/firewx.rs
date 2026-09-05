@@ -784,6 +784,19 @@ impl OverlayHandler for SpcFireOutlookHandler {
     /// The generation this layer's state parked and the inputs its memo
     /// retired, handed back for the app to free off the frame thread — see
     /// [`OverlayHandler::take_retired`].
+    /// **No pane draws this layer, so its round goes** — parked for the
+    /// discard seam, not freed here. See [`OverlayHandler::release_data`].
+    fn release_data(&mut self) -> bool {
+        if !self.state.release_data() {
+            return false;
+        }
+        // The built inputs were made from the data that just went away, and
+        // nothing dispatches this layer any more, so no later `get_or_build`
+        // would retire them.
+        self.job_memo.retire_live_rows();
+        true
+    }
+
     fn take_retired(&self) -> Vec<Box<dyn std::any::Any + Send>> {
         crate::render::overlay_state::retired_batch(
             self.state.take_retired(),
