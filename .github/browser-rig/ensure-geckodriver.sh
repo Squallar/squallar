@@ -23,7 +23,7 @@ BIN="${GECKODRIVER_BIN:-$HOME/.cache/squallar-ci/geckodriver-$GECKODRIVER_VERSIO
 
 version_ok() {
   [ -x "$1" ] &&
-    "$1" --version 2>/dev/null | head -n 1 |
+    "$1" --version 2>&1 | head -n 1 |
     grep -q "geckodriver $GECKODRIVER_VERSION"
 }
 
@@ -36,6 +36,15 @@ fi
 DIR="$(dirname -- "$BIN")"
 mkdir -p "$DIR" || { echo "FATAL: cannot create $DIR" >&2; exit 1; }
 
+# The tarball below is linux64 and nothing else. On any other OS a downloaded
+# binary is an exec-format error, which used to be reported as a VERSION
+# mismatch because the check above threw stderr away -- a wrong architecture
+# impersonating a wrong version. Name the platform and both ways round it.
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "ensure-geckodriver: this script downloads a linux64 geckodriver and cannot run on $(uname -s)/$(uname -m)." >&2
+    echo "ensure-geckodriver: point GECKODRIVER_BIN at a native geckodriver $GECKODRIVER_VERSION, or set RIG_GECKODRIVER so the runner skips this script." >&2
+    exit 1
+fi
 URL="https://github.com/mozilla/geckodriver/releases/download/v$GECKODRIVER_VERSION/geckodriver-v$GECKODRIVER_VERSION-linux64.tar.gz"
 TARBALL="$DIR/geckodriver-v$GECKODRIVER_VERSION-linux64.tar.gz"
 

@@ -274,3 +274,23 @@ Budget ~1.4 GiB for source + target + legs.
   window was on the ghost or on the panel via KVM before quoting it as the Mac's
   own drift.
 - Firefox governs over Chrome, on whichever box.
+
+### The rig's browser is named `chromium`, not `chrome`
+
+`RIG_BROWSERS=chrome` fails every leg with `unknown browser: chrome` in the
+runner log and a `NO RESULT` row after it, `driver rc=0`. Nothing about the
+driver or the launch flags is wrong; the name is. Observed 2026-09-04: two
+Chrome legs on the real panel produced no row for this reason, and the cause
+was in the log both times, above the row. Read the refusal before the row.
+
+### Both Mac browsers run WebGPU on hardware; every Linux web figure is GL
+
+Measured on the real panel 2026-09-04: Firefox 155 and Chromium 152 on the M2
+both select `BrowserWebGpu` with `webgpu_adapter.class = hardware`,
+`is_fallback = false` (Chromium: `arch = metal-3`, ANGLE Metal Renderer). On
+the NVIDIA Linux box both browsers get GL because WebGPU is blocklisted there.
+So the backend differs by **platform and GPU vendor, never by browser** — put
+the backend beside the arm in every Mac figure, and expect upload and residency
+shape to differ from Linux for backend reasons before GPU or OS ones. Under
+WebGPU the frame tail is the `ui` segment, not `finish`: submit reads 11–18 us
+mean here against 604–677 on Linux GL.
