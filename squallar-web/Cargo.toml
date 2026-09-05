@@ -98,7 +98,7 @@ egui-wgpu = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated
 # bindings do not line up; these move when that stack moves.
-wasm-bindgen = "=0.2.127"
+wasm-bindgen = "=0.2.128"
 # The pool behind `squallar_radar::par` on this target (WS3b). `no-bundler` is
 # the `--target web` arm: the bundler arm's `workerHelpers.js` expects a
 # bundler to rewrite `new Worker(new URL(...))`, and nothing rewrites anything
@@ -118,13 +118,13 @@ wasm-bindgen-rayon = { version = "=1.3.0", default-features = false, features = 
 # installs a global pool for -- two rayons would mean two global pools and the
 # one that got built would not be the one being used.
 rayon = "=1.12.0"
-wasm-bindgen-futures = "=0.4.77"
-js-sys = "=0.3.104"
+wasm-bindgen-futures = "=0.4.78"
+js-sys = "=0.3.105"
 console_error_panic_hook = "=0.1.7"
 console_log = "=1.1.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.104"
+version = "=0.3.105"
 # web-sys gates every interface behind its own feature. Listing them explicitly
 # rather than taking a blanket set keeps the generated glue to what is used.
 features = [
@@ -190,7 +190,7 @@ serde_json = { workspace = true }
 # the train that satisfies the `=0.2.127` pin above, and the workflow's
 # `cargo tree -i wasm-bindgen` gate is what keeps that single-versioned.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "=0.3.77"
+wasm-bindgen-test = "=0.3.78"
 # For the first-egui-frame test; same pinned copy the app links.
 egui = { workspace = true }
 # For the JobRequest transfer test: the described envelope is constructed the
@@ -203,7 +203,7 @@ squallar-source = { workspace = true }
 squallar-geo = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies.web-sys]
-version = "=0.3.104"
+version = "=0.3.105"
 # Additive on top of the [dependencies] list (web-sys features unify across
 # the graph): only what the Tier-1 tests need beyond the app itself -- a real
 # `MessageChannel` transfer.
