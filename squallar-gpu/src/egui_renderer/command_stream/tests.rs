@@ -65,11 +65,12 @@ fn callback(at: Rect) -> Primitive {
 /// **One mesh records the six calls `render` makes for one mesh.**
 ///
 /// The arithmetic on paper: the reset triple, the primitive's own scissor, its
-/// texture bind group, its index and vertex binds, its draw, and the walk's
-/// closing scissor. 3 + 1 + 1 + 2 + 1 + 1 = 9 calls for a one-mesh frame, of
-/// which the closing scissor is unconditional overhead. Pinned as a value, not
-/// a direction: a change that records a tenth call for one mesh is a change
-/// the frame tail pays for on every primitive of every frame.
+/// texture bind group, the index and vertex binds the reset makes, its draw,
+/// and the walk's closing scissor. 3 + 1 + 1 + 2 + 1 + 1 = 9 calls for a
+/// one-mesh frame, of which the closing scissor is unconditional overhead.
+/// Pinned as a value, not a direction: a change that records a tenth call for
+/// one mesh is a change the frame tail pays for on every primitive of every
+/// frame.
 #[test]
 fn one_mesh_records_nine_calls() {
     let c = census(
@@ -157,6 +158,83 @@ fn a_mesh_behind_a_callback_still_pays_the_reset() {
         c.resets, 2,
         "the walk opens with one and the mesh behind the callback pays the \
          second; anything less draws egui geometry through a foreign pipeline"
+    );
+}
+
+/// **A run of meshes binds the buffers once, not once each.**
+///
+/// The cut this field now measures. Upstream `render` issued a
+/// `set_index_buffer` and a `set_vertex_buffer` per drawn mesh — the same two
+/// buffers, sliced at each mesh's own offset — and neither `wgpu` layer drops
+/// either, so on ES 3.0 every pair was replayed as thirteen GL calls: 396 of
+/// a non-basemap frame's 750 (apitrace, 2026-09-04, llvmpipe). The vendored
+/// walk binds both whole at the reset and draws by `first_index`, so five
+/// meshes under one reset record **two** binds where they recorded ten.
+///
+/// The first assertion is the control: it says the five really were drawn as
+/// five draws, so a two here is not a walk that drew one mesh.
+#[test]
+fn a_run_of_meshes_binds_the_buffers_once_at_the_reset() {
+    let clip = rect(0.0, 0.0, 400.0, 400.0);
+    let list: Vec<_> = (0..5)
+        .map(|_| clipped(clip, mesh(TextureId::default(), 1)))
+        .collect();
+    let c = census(&list, PPP, SURFACE);
+
+    assert_eq!(
+        (c.meshes, c.draws, c.resets),
+        (5, 5, 1),
+        "the control failed: five meshes under one clip rect and no callback \
+         should be five draws under one reset"
+    );
+    assert_eq!(
+        c.buffer_binds, 2,
+        "five meshes drawn under one reset recorded {} buffer binds; the walk \
+         binds the index and vertex buffers once at the reset (2) and draws by \
+         `first_index`, so anything else is a per-mesh rebind — twelve GL calls \
+         a mesh on WebGL2",
+        c.buffer_binds
+    );
+    // 3 (reset) + 1 (scissor) + 5 (bind groups) + 2 (buffers) + 5 (draws) + 1
+    // (closing scissor) = 17, against 25 with the per-mesh pair.
+    assert_eq!(c.calls, 17, "the walk's length moved for a five-mesh frame");
+}
+
+/// **A mesh behind a painted callback binds them again — with the reset it
+/// already pays, and only then.**
+///
+/// A callback owns the pass while it paints and may bind an index or vertex
+/// buffer of its own (the tile-mesh callbacks do), so the next mesh cannot
+/// assume egui's are still bound. The rebind rides inside the reset that
+/// mesh pays anyway: two resets, four binds, for mesh–callback–mesh. A mesh
+/// that follows a mesh pays neither.
+#[test]
+fn a_mesh_behind_a_callback_rebinds_the_buffers_inside_its_reset() {
+    let clip = rect(0.0, 0.0, 400.0, 400.0);
+    let c = census(
+        &[
+            clipped(clip, mesh(TextureId::default(), 1)),
+            clipped(clip, mesh(TextureId::default(), 1)),
+            clipped(clip, callback(clip)),
+            clipped(clip, mesh(TextureId::default(), 1)),
+            clipped(clip, mesh(TextureId::default(), 1)),
+        ],
+        PPP,
+        SURFACE,
+    );
+    assert_eq!(
+        (c.draws, c.callback_viewports, c.resets),
+        (4, 1, 2),
+        "the control failed: four meshes around one painted callback should \
+         be four draws under two resets"
+    );
+    assert_eq!(
+        c.buffer_binds,
+        2 * c.resets,
+        "{} buffer binds over {} resets: the buffers are bound exactly once per \
+         reset — a callback may have rebound them, a mesh cannot have",
+        c.buffer_binds,
+        c.resets
     );
 }
 
@@ -450,5 +528,33 @@ fn the_vendored_walks_three_rules_are_the_ones_the_census_models() {
         "a painted callback no longer clears the remembered scissor; `census` \
          assumes it does, and both would then skip a scissor the callback \
          changed underneath them"
+    );
+
+    // 4. The index and vertex buffers are bound inside the reset and nowhere
+    //    else in the mesh arm, so `buffer_binds` is two per reset.
+    let (reset_block, after_reset) = mesh_arm
+        .split_once("needs_reset = false;")
+        .expect("`render`'s mesh arm no longer closes its reset with `needs_reset = false;`");
+    assert!(
+        reset_block.contains("render_pass.set_index_buffer(")
+            && reset_block.contains("render_pass.set_vertex_buffer("),
+        "the reset no longer binds the index and vertex buffers; `census` \
+         charges two buffer binds per reset and would now over-count them"
+    );
+    let mesh_arm_after_reset = after_reset
+        .split_once("Primitive::Callback(callback) => {")
+        .map_or(after_reset, |(before, _)| before);
+    assert!(
+        !mesh_arm_after_reset.contains("set_index_buffer(")
+            && !mesh_arm_after_reset.contains("set_vertex_buffer("),
+        "the mesh arm binds a buffer per draw again; `census` counts two \
+         binds per reset and would now under-count by two per drawn mesh — \
+         twelve GL calls a mesh on WebGL2"
+    );
+    assert!(
+        mesh_arm_after_reset.contains("first_index..first_index + mesh.indices.len() as u32"),
+        "the draw no longer addresses its mesh by `first_index` into the \
+         buffers the reset bound; whatever it does instead, the census does \
+         not model it"
     );
 }

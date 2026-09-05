@@ -28,9 +28,18 @@
 //! `prepare_draw` turns it into one `SetVertexBuffer` where
 //! `PrivateCapabilities::VERTEX_BUFFER_LAYOUT` holds (desktop GL 4.3 / ES 3.1
 //! and up) and into **one `SetVertexAttribute` per vertex attribute** where it
-//! does not. egui's vertex has three, and **WebGL2 is ES 3.0**, so a web leg
-//! records three commands per draw where a native GL leg records one. Never
-//! quote a command total without saying which.
+//! does not — each of which is a `glBindBuffer`, a
+//! `glEnableVertexAttribArray`, a `glVertexAttribPointer` and a
+//! `glVertexAttribDivisor` on the frame thread. egui's vertex has three, and
+//! **WebGL2 is ES 3.0**, so a web leg pays twelve GL calls per recorded
+//! `set_vertex_buffer` where a native GL leg pays one. Never quote a command
+//! total without saying which.
+//!
+//! That multiplier is why the vendored walk binds the buffers once per
+//! *reset* and not once per *draw* ([`CommandStream::buffer_binds`]): an
+//! apitrace of the ES 3.0 profile (2026-09-04, llvmpipe, counts only) put the
+//! per-draw rebinds at 396 of a non-basemap frame's 750 GL calls, every one
+//! of them rebinding the same buffer at a new offset.
 
 use egui::epaint::Primitive;
 use egui::{ClippedPrimitive, Rect};
@@ -76,7 +85,9 @@ pub struct CommandStream {
     /// `set_viewport` + `set_pipeline` + `set_bind_group(0)` triples: one
     /// before the first mesh drawn after the walk opens or a callback paints.
     /// A callback never pays one, because egui's pipeline is undrawable until
-    /// a mesh binds the buffers and the texture that go with it.
+    /// a mesh binds the buffers and the texture that go with it. The two
+    /// [`Self::buffer_binds`] a reset also records are counted there, not in
+    /// the triple.
     pub resets: u64,
     /// `set_scissor_rect` calls recorded: one per drawn primitive whose rect
     /// differs from the one the walk knows the pass holds, plus the
@@ -91,9 +102,15 @@ pub struct CommandStream {
     /// Of those, ones whose texture was already bound. Dropped by `wgpu-core`
     /// before the encoder sees them.
     pub bind_group_repeats: u64,
-    /// `set_index_buffer` + `set_vertex_buffer` calls: two per drawn mesh,
-    /// always, because egui slices one buffer per mesh rather than binding it
-    /// once and offsetting the draw.
+    /// `set_index_buffer` + `set_vertex_buffer` calls: **two per reset**, not
+    /// two per drawn mesh. The walk binds the pass's whole index and vertex
+    /// buffers where it re-establishes egui's pipeline, and every mesh then
+    /// draws by `first_index` into them — its indices were rebased by its
+    /// vertex base as they were staged, so no draw needs the vertex buffer
+    /// bound at a new offset. Upstream bound both per mesh, and on ES 3.0
+    /// each of those was twelve GL calls (see the module docs). A mesh that
+    /// follows a painted callback pays the pair again, inside the reset it
+    /// already pays, because the callback may have bound buffers of its own.
     pub buffer_binds: u64,
     /// `draw_indexed` calls.
     pub draws: u64,
@@ -189,6 +206,10 @@ pub fn census(
                     // A reset re-establishes egui's own pipeline and uniform
                     // bind group, so whatever a callback left bound is gone.
                     bound_texture = None;
+                    // And binds the pass's index and vertex buffers, once:
+                    // every mesh until the next callback draws by
+                    // `first_index` into them.
+                    c.buffer_binds += 2;
                     needs_reset = false;
                 }
                 c.bind_group_sets += 1;
@@ -196,7 +217,6 @@ pub fn census(
                     c.bind_group_repeats += 1;
                 }
                 bound_texture = Some(mesh.texture_id);
-                c.buffer_binds += 2;
                 c.draws += 1;
                 c.draw_indices += mesh.indices.len() as u64;
             }

@@ -173,6 +173,11 @@ struct UniformBuffer {
 /// starts on a `COPY_BUFFER_ALIGNMENT` boundary. Getting that region into the
 /// two buffers before this frame's own submission runs is the stager's job.
 ///
+/// The index bytes are not the meshes' indices verbatim: each mesh's are
+/// **rebased by its vertex base** — see [`index_writes`] — so that they index
+/// the pass's one vertex buffer directly and [`Renderer::render`] can bind it
+/// once. A stager copies bytes; it neither knows nor needs the layout.
+///
 /// Returning `false` means the stager had nothing to hand out, and
 /// `update_buffers` takes the queue's mapping instead. **Nothing may have been
 /// written in that case**: `fill` must not have been called.
@@ -226,6 +231,40 @@ fn fill_slices(slices: &mut Vec<Range<usize>>, sizes: impl Iterator<Item = usize
         slices.push(offset..offset + size);
         offset += size;
     }
+}
+
+/// Every mesh, with where its indices go and the vertex base to rebase them
+/// by: the start of its own vertex slice, in vertices. **Local change** (see
+/// `VENDORED.md`). Both staging routes write indices through this one walk, so
+/// the rebase has one definition — and it is what lets [`Renderer::render`]
+/// bind the vertex buffer once per reset and draw every mesh by `first_index`
+/// rather than rebinding the same buffer at each mesh's offset.
+fn index_writes<'a>(
+    paint_jobs: &'a [epaint::ClippedPrimitive],
+    index_slices: &'a [Range<usize>],
+    vertex_slices: &'a [Range<usize>],
+) -> impl Iterator<Item = (&'a epaint::Mesh, Range<usize>, u32)> + 'a {
+    meshes(paint_jobs)
+        .zip(index_slices)
+        .zip(vertex_slices)
+        .map(|((mesh, index), vertex)| {
+            let vertex_base = vertex.start / std::mem::size_of::<Vertex>();
+            (mesh, index.clone(), vertex_base as u32)
+        })
+}
+
+/// Write `indices`, each rebased by `vertex_base`, into `dst`. **Local
+/// change** (see `VENDORED.md`). Element-wise and write-only: a mapped region
+/// may be write-combining memory, so nothing here reads it back, and it is
+/// not assumed to be four-byte aligned. `dst` is exactly `indices.len()`
+/// words long, which `write_iter` checks.
+fn write_rebased_indices(dst: wgpu::WriteOnly<'_, [u8]>, indices: &[u32], vertex_base: u32) {
+    let (words, _) = dst.into_chunks::<4>();
+    words.write_iter(
+        indices
+            .iter()
+            .map(|index| (index + vertex_base).to_ne_bytes()),
+    );
 }
 
 struct SlicedBuffer {
@@ -564,6 +603,12 @@ impl Renderer {
     ///
     /// # Panic
     /// Always ensure that [`Renderer::update_buffers`] has been called otherwise calling [`Renderer::render`] will panic!
+    ///
+    /// **Local change** (see `VENDORED.md`): the index and vertex buffers are
+    /// bound once, where egui's pipeline is (re-)established, and each mesh
+    /// is drawn by `first_index` into them; its indices were rebased by its
+    /// vertex base as they were staged ([`index_writes`]). Upstream rebound
+    /// both buffers at every mesh's own offset.
     pub fn render(
         &self,
         render_pass: &mut wgpu::RenderPass<'static>,
@@ -615,8 +660,10 @@ impl Renderer {
         // the knowledge is dropped there exactly as `needs_reset` is raised.
         let mut scissor: Option<ScissorRect> = None;
 
+        // Only the index slices are walked here: a mesh's vertex base is
+        // already in its indices, so `render` never needs to know where its
+        // vertices are. **Local change**, see the doc comment.
         let mut index_buffer_slices = self.index_buffer.slices.iter();
-        let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
 
         for epaint::ClippedPrimitive {
             clip_rect,
@@ -629,11 +676,8 @@ impl Renderer {
                 if rect.width == 0 || rect.height == 0 {
                     // Skip rendering zero-sized clip areas.
                     if let Primitive::Mesh(_) = primitive {
-                        // If this is a mesh, we need to advance the index and vertex buffer iterators:
+                        // If this is a mesh, we need to advance the index buffer iterator:
                         index_buffer_slices
-                            .next()
-                            .expect("You must call .update_buffers() before .render()");
-                        vertex_buffer_slices
                             .next()
                             .expect("You must call .update_buffers() before .render()");
                     }
@@ -659,31 +703,43 @@ impl Renderer {
                         );
                         render_pass.set_pipeline(&self.pipeline);
                         render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        // **Local change** (see `VENDORED.md`): both buffers,
+                        // whole, once per reset. Every mesh until the next
+                        // painted callback draws by `first_index` into them.
+                        // Neither `wgpu` layer drops a redundant buffer bind,
+                        // and on ES 3.0 (WebGL2) — which has no
+                        // `VERTEX_BUFFER_LAYOUT` — each `set_vertex_buffer`
+                        // is replayed as four GL calls per vertex attribute,
+                        // twelve for egui's vertex: measured by apitrace at
+                        // 396 of a non-basemap frame's 750 GL calls when they
+                        // were issued per mesh, every one rebinding the same
+                        // buffer at a new offset.
+                        render_pass.set_index_buffer(
+                            self.index_buffer.buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.set_vertex_buffer(0, self.vertex_buffer.buffer.slice(..));
                         needs_reset = false;
                     }
 
                     let index_buffer_slice = index_buffer_slices
                         .next()
                         .expect("You must call .update_buffers() before .render()");
-                    let vertex_buffer_slice = vertex_buffer_slices
-                        .next()
-                        .expect("You must call .update_buffers() before .render()");
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
                         render_pass.set_bind_group(1, bind_group, &[]);
-                        render_pass.set_index_buffer(
-                            self.index_buffer.buffer.slice(
-                                index_buffer_slice.start as u64..index_buffer_slice.end as u64,
-                            ),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        render_pass.set_vertex_buffer(
+                        // Into the buffers bound at the reset above, by index
+                        // offset alone. `base_vertex` stays 0 — WebGL2 has no
+                        // base-vertex draw (`DownlevelFlags::BASE_VERTEX` is
+                        // ES 3.2) — because the rebase already happened in the
+                        // bytes. **Local change**, see the doc comment.
+                        let first_index =
+                            (index_buffer_slice.start / std::mem::size_of::<u32>()) as u32;
+                        render_pass.draw_indexed(
+                            first_index..first_index + mesh.indices.len() as u32,
                             0,
-                            self.vertex_buffer.buffer.slice(
-                                vertex_buffer_slice.start as u64..vertex_buffer_slice.end as u64,
-                            ),
+                            0..1,
                         );
-                        render_pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
                     } else {
                         log::warn!("Missing texture: {:?}", mesh.texture_id);
                     }
@@ -1150,10 +1206,10 @@ impl Renderer {
                 (&index_buffer.buffer, required_index_buffer_size),
                 (&vertex_buffer.buffer, required_vertex_buffer_size),
                 &mut |region| {
-                    for (mesh, slice) in meshes(paint_jobs).zip(&index_buffer.slices) {
-                        region
-                            .slice(slice.clone())
-                            .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
+                    for (mesh, slice, vertex_base) in
+                        index_writes(paint_jobs, &index_buffer.slices, &vertex_buffer.slices)
+                    {
+                        write_rebased_indices(region.slice(slice), &mesh.indices, vertex_base);
                     }
                     // The vertex half starts where the index half ended; see
                     // `GeometryStager`, which is where that layout is stated.
@@ -1186,10 +1242,14 @@ impl Renderer {
                     );
                 };
 
-                for (mesh, slice) in meshes(paint_jobs).zip(&index_buffer.slices) {
-                    index_buffer_staging
-                        .slice(slice.clone())
-                        .copy_from_slice(bytemuck::cast_slice(&mesh.indices));
+                for (mesh, slice, vertex_base) in
+                    index_writes(paint_jobs, &index_buffer.slices, &vertex_buffer.slices)
+                {
+                    write_rebased_indices(
+                        index_buffer_staging.slice(slice),
+                        &mesh.indices,
+                        vertex_base,
+                    );
                 }
             }
             if vertex_count > 0 {

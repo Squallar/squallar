@@ -234,7 +234,8 @@ take:
    runs — including its two `profiling::scope!`s and both of its panic
    messages verbatim.
 
-`Renderer::render` is untouched, and so is everything else in the file.
+`Renderer::render` was untouched by this change; the two sections below are
+what later changed in it.
 
 ## The pin
 
@@ -325,6 +326,112 @@ count and the call count give the same mixture, 26% basemap frames:
 `squallar-gpu`'s `command_stream` census is the instrument, and it counts what
 this walk records rather than what it costs: a count is deterministic where this
 arm's 340 µs noise floor makes a timing of one frame's tail unmeasurable.
+
+### Changed — `src/renderer.rs`, the buffers are bound once per reset
+
+Upstream's mesh arm issued a `set_index_buffer` and a `set_vertex_buffer` for
+**every** drawn mesh — the same two buffers, sliced at that mesh's own offset —
+and then `draw_indexed(0..n, 0, 0..1)`. Neither `wgpu` layer drops a buffer
+bind whose argument already holds (see the section above), so every pair
+reached the HAL. On desktop GL 4.3+ a `set_vertex_buffer` is one
+`glBindVertexBuffer`; on **ES 3.0, which is WebGL2**, there is no
+`VERTEX_BUFFER_LAYOUT`, the offset lives in `glVertexAttribPointer`, and the
+following draw's `prepare_draw` replays one `SetVertexAttribute` per vertex
+attribute — three for egui's vertex, each a `glBindBuffer`,
+`glEnableVertexAttribArray`, `glVertexAttrib{I}Pointer` and
+`glVertexAttribDivisor` — plus the index bind's own `glBindBuffer`. Thirteen GL
+calls a mesh, on the frame thread, at `queue.submit`.
+
+Measured before the change by apitrace (2026-09-04, native app forced to the
+ES 3.0 profile with `MESA_GLES_VERSION_OVERRIDE=3.0 WGPU_GLES_MINOR_VERSION=0`,
+llvmpipe, counts only): the per-mesh rebinds were **396 of a non-basemap
+frame's 750 GL calls (52.8%)** and 1 100 904 of the leg's 3 253 517 (33.8%).
+Every one rebound the buffer that was already bound, at a new offset.
+
+Three edits, all inside `renderer.rs`:
+
+* **`update_buffers` rebases each mesh's indices by its vertex base** — the
+  start of its vertex slice, in vertices — as it writes them, on both routes
+  (`index_writes` is the one walk both call; `write_rebased_indices` does the
+  element-wise, write-only store). The vertex bytes are untouched. A
+  `GeometryStager` still receives the same region of the same size; only the
+  index words in it changed value.
+* **`render` binds both buffers, whole, inside the `needs_reset` block** —
+  once when the walk opens and once after every painted callback, which may
+  have bound buffers of its own — and draws each mesh as
+  `draw_indexed(first_index..first_index + n, 0, 0..1)` with `first_index` the
+  mesh's index-slice start in words. `base_vertex` stays zero: WebGL2 has no
+  base-vertex draw (`DownlevelFlags::BASE_VERTEX` needs ES 3.2), which is why
+  the rebase is in the bytes rather than in the draw.
+* `render` no longer walks the vertex slice list at all; the skip arm advances
+  only the index iterator.
+
+**The index type is `u32` and stays `u32`** (`wgpu::IndexFormat::Uint32`,
+upstream's choice). A rebased index is bounded by the pass's total vertex
+count, which the heaviest frame measured put at 928 000 — three orders of
+magnitude under `u32::MAX` and fourteen over `u16::MAX`, so there was never a
+narrower type to protect. The vertex and index buffers are each **one
+allocation for the whole pass**: `update_buffers` grows them before staging and
+`render` reads the same two handles, so "once per reset" is exactly that — the
+staging ring is a *source* the copy engine reads from, and no mesh's bytes are
+ever drawn out of a different destination buffer within one pass. There is no
+wrap to count.
+
+Pinned by `squallar-gpu/tests/egui_bind_once_gpu.rs`: 288 meshes with
+distinct non-zero vertex bases, drawn by `first_index` out of buffers bound
+once, read back byte-identical to the same shapes tessellated as **one** mesh
+(base zero, `first_index` zero — the draw upstream made, with the rebase done
+by `epaint`'s own `Mesh::append`). Its sensitivity control stages the same
+picture with one mesh's indices rebased one mesh too far, through the
+`GeometryStager` seam, and asserts the readback **differs**. It needs no
+adapter feature and runs on a software rasteriser. The census's
+`the_vendored_walks_three_rules_are_the_ones_the_census_models` grew a fourth
+rule: both binds inside the reset block, none after it in the mesh arm, and a
+`first_index` draw.
+
+#### Measured, scene D, 2026-09-05
+
+One 1920×1080 pane, KTLX, all overlays, the `ui-sweep` gesture script, on this
+lane's own Xvfb display (counts only — every *timing* on such a leg is invalid
+and none is quoted). Backend read out of the app's own log on both legs:
+**Vulkan, NVIDIA GeForce RTX 3090 (DiscreteGpu)**, hardware. Two legs, each 62
+telemetry ticks over 6 gesture loops; each tick's `command stream: last` group
+is one frame's walk, bucketed by whether that frame carried the basemap
+(callbacks > 0) and never averaged across the two kinds. Modes over ticks.
+
+The `before` leg ran the pre-change binary that was in the shared checkout. The
+`same frames` column is what the pre-change census would have recorded for the
+**after** leg's own frames — it charged two binds per drawn mesh, by
+construction — so that column and the last are the like-for-like pair; the
+first is the observation that the formula is what the old binary really did.
+
+| per frame | before, observed | same frames, per-mesh formula | after, observed |
+| --- | --- | --- | --- |
+| basemap frame: n (ticks) | 18 | 19 | 19 |
+| basemap frame: draws / resets | 56 / 46 | 59 / 46 | 59 / 46 |
+| basemap frame: **buffer binds** | **112** | **118** | **92** |
+| frame without: n (ticks) | 44 | 43 | 43 |
+| frame without: draws / resets | 32 / 1 | 35 / 1 | 35 / 1 |
+| frame without: **buffer binds** | **64** | **70** | **2** |
+
+Every one of the 62 before ticks read exactly `2 × draws`; every one of the 62
+after ticks read exactly `2 × resets`. On a frame without the basemap the pair
+is gone — 2 binds whatever the mesh count, 70 → 2. On a frame carrying the
+basemap the floor is its 46 resets: a callback owns the pass while it paints,
+so the first mesh after each one must rebind, and the callback/mesh
+interleaving — not the bind — is what is left to cut there (118 → 92). The two
+legs' *callback* counts differ (170 against 45 per basemap frame) because the
+before binary is from an earlier tree whose commit was not recorded —
+`058bd921` (one paint callback per tile rather than per tile-mesh run) is the
+change of that size, and is not this one; the reset count, which is what the
+after figure is a function of, is 46 in both.
+
+What that is worth on the GL backend is not in these counts, which are
+`wgpu-core` commands: on ES 3.0 each removed pair was thirteen GL calls at
+`queue.submit`, so the frame without the basemap sheds 68 × 13 = 884 GL calls
+a frame against the 750 the apitrace leg counted for the whole of such a frame
+under a different layout. The apitrace re-capture that would turn that
+arithmetic into an observation was not taken.
 
 ## Removing this directory
 

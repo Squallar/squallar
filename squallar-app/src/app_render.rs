@@ -1148,11 +1148,14 @@ fn prep_geometry_line(
 /// floor makes untimeable.
 ///
 /// **The GL multiplier is not in `calls`.** `wgpu-core` drops the bind-group
-/// repeats; `wgpu-hal`'s GL backend turns each draw's vertex bind into one
-/// command where `VERTEX_BUFFER_LAYOUT` holds and into one per vertex
-/// attribute — three, for egui's vertex — where it does not, which is every
-/// WebGL2 leg. A `calls` figure quoted without its backend is two different
-/// numbers.
+/// repeats; `wgpu-hal`'s GL backend turns each vertex bind into one command
+/// where `VERTEX_BUFFER_LAYOUT` holds and into one per vertex attribute —
+/// three, for egui's vertex, each four GL calls — where it does not, which is
+/// every WebGL2 leg. A `calls` figure quoted without its backend is two
+/// different numbers. `buffer binds` is the field that multiplier lands on:
+/// two per *reset* since the buffers were bound once per reset rather than
+/// once per mesh, so on a frame with no callbacks it reads 2, whatever the
+/// mesh count, and `2 x draws` is what the same frame recorded before.
 fn command_stream_line(
     last: &squallar_gpu::egui_renderer::command_stream::CommandStream,
     total: &squallar_gpu::egui_renderer::command_stream::CommandStream,
