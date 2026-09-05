@@ -1000,3 +1000,147 @@ fn the_mercator_y_from_a_sine_is_the_one_from_an_angle() {
     assert!(squallar_geo::mercator_y_from_sin_lat(1.0).is_infinite());
     assert!(squallar_geo::mercator_y_from_sin_lat(-1.0).is_infinite());
 }
+
+/// The side comes back with the word for **which** bound produced it, because
+/// the number alone cannot be read: 4096 px reached by a sweep that wanted no
+/// more is a render with nothing wrong with it, and 4096 px reached by a
+/// device that could hold no more is detail the radar measured and the glass
+/// never showed.
+#[test]
+fn a_raster_side_names_the_bound_that_produced_it() {
+    // 2.125 + 1832 x 0.25 km, the longest reach in this display, at the
+    // 250 m gate a super-resolution surveillance cut carries.
+    const SURVEILLANCE_KM: f64 = 460.125;
+    const GATE_KM: f64 = 0.25;
+    // Above anything either term asks for, so the data's own answer is what
+    // comes back rather than a device's.
+    const UNBOUNDED: usize = 1 << 20;
+
+    let need = data_limited_side_px(SURVEILLANCE_KM, GATE_KM);
+    for (ceiling, want_px, want_bound, why) in [
+        (UNBOUNDED, need, SideBound::Data, "nothing bounds the sweep"),
+        (4096, 4096, SideBound::Capacity, "the device is the smaller"),
+        (
+            8192,
+            need,
+            SideBound::Data,
+            "the shipped desktop ceiling clears it",
+        ),
+        // A tie keeps the incumbent: the data reached this answer and the
+        // ceiling only agreed with it, so nothing was lost to the machine.
+        (
+            need,
+            need,
+            SideBound::Data,
+            "ceiling exactly equal to the need",
+        ),
+        (
+            need - 1,
+            need - 1,
+            SideBound::Capacity,
+            "one px under the need",
+        ),
+    ] {
+        let side = raster_side(SURVEILLANCE_KM, ceiling, GATE_KM);
+        assert_eq!(
+            (side.side_px, side.bound),
+            (want_px, want_bound),
+            "+/-{SURVEILLANCE_KM} km under a {ceiling} px ceiling ({why})",
+        );
+    }
+
+    // The same two answers below the reference extent, where the side is the
+    // base texture rather than a Nyquist figure — that is still the picture's
+    // own need and not the machine's.
+    let short = raster_side(BASE_EXTENT_KM, UNBOUNDED, GATE_KM);
+    assert_eq!((short.side_px, short.bound), (IMAGE_SIZE, SideBound::Data));
+    let squeezed = raster_side(BASE_EXTENT_KM, 1024, GATE_KM);
+    assert_eq!(
+        (squeezed.side_px, squeezed.bound),
+        (1024, SideBound::Capacity),
+    );
+
+    // One word each, all different, so a readout can print it verbatim.
+    let words = [SideBound::Data, SideBound::Capacity, SideBound::Setting].map(SideBound::word);
+    assert_eq!(words, ["data", "capacity", "setting"]);
+    for word in words {
+        assert!(!word.contains(' '), "{word:?} is not a single word");
+    }
+    assert_eq!(format!("{}", SideBound::Capacity), "capacity");
+
+    // The `usize` spelling is the same computation with the word dropped, so
+    // the two cannot drift apart.
+    for extent in [50.0, BASE_EXTENT_KM, 300.11, SURVEILLANCE_KM] {
+        for ceiling in [512, 2048, 4096, 8192, UNBOUNDED] {
+            assert_eq!(
+                raster_side_px(extent, ceiling, GATE_KM),
+                raster_side(extent, ceiling, GATE_KM).side_px,
+                "+/-{extent} km under a {ceiling} px ceiling",
+            );
+        }
+    }
+}
+
+/// A bound is a **ceiling only**. It can lower a side and it can never raise
+/// one, so no caller downstream can read one of these as the size to
+/// allocate — and the capacity owner's own clamp composes onto it without
+/// re-deriving the data's figure.
+#[test]
+fn a_further_bound_clamps_below_and_can_never_raise_a_side() {
+    const GATE_KM: f64 = 0.25;
+    const SURVEILLANCE_KM: f64 = 460.125;
+    let start = raster_side(SURVEILLANCE_KM, 8192, GATE_KM);
+    assert_eq!(start.bound, SideBound::Data);
+
+    // Above, and at, the side: neither field moves. A bound cannot claim a
+    // result it did not win.
+    for limit in [start.side_px, start.side_px + 1, usize::MAX] {
+        assert_eq!(
+            start.held_to(limit, SideBound::Capacity),
+            start,
+            "a {limit} px limit over a {} px side",
+            start.side_px,
+        );
+    }
+
+    // Below it: the side falls to the limit and the word follows the clamp.
+    let capped = start.held_to(2048, SideBound::Capacity);
+    assert_eq!((capped.side_px, capped.bound), (2048, SideBound::Capacity));
+    let by_setting = start.held_to(1024, SideBound::Setting);
+    assert_eq!(
+        (by_setting.side_px, by_setting.bound),
+        (1024, SideBound::Setting)
+    );
+
+    // Composed, in any order, the answer is the smallest of the three and the
+    // word is whichever one is smallest. This is the whole contract the
+    // capacity owner needs: hand it a number, never re-derive ours.
+    for (capacity, setting, want_px, want_bound) in [
+        (4096_usize, 6000_usize, 4096, SideBound::Capacity),
+        (6000, 4096, 4096, SideBound::Setting),
+        (9000, 9000, start.side_px, SideBound::Data),
+        (1, 2, 1, SideBound::Capacity),
+    ] {
+        let got = start
+            .held_to(capacity, SideBound::Capacity)
+            .held_to(setting, SideBound::Setting);
+        assert_eq!(
+            (got.side_px, got.bound),
+            (want_px, want_bound),
+            "a {capacity} px capacity then a {setting} px setting over {} px",
+            start.side_px,
+        );
+        assert!(
+            got.side_px <= start.side_px,
+            "clamping raised {} px to {} px",
+            start.side_px,
+            got.side_px,
+        );
+    }
+
+    // And the ceiling a render is dispatched with is never what it draws when
+    // the sweep asks for less: the bytes are the sweep's, not the ceiling's.
+    let modest = raster_side(BASE_EXTENT_KM, 8192, GATE_KM);
+    assert_eq!(modest.side_px, IMAGE_SIZE);
+    assert!(modest.side_px < 8192);
+}

@@ -839,6 +839,20 @@ impl RenderDispatcher {
 
     /// The ceiling a **static** render dispatched now may take — the number
     /// that becomes the request envelope's `side_ceiling_px`.
+    ///
+    /// **A ceiling, never the size to allocate.** Nothing downstream builds a
+    /// buffer from this: `squallar_radar::types::raster_side` starts at the
+    /// data's own need and holds it *down* to whatever arrives here, so a
+    /// sweep asking for less is drawn at less and the render names which of
+    /// the two bound it.
+    ///
+    /// **Further ceilings belong on this expression, as another `.min(..)`.**
+    /// A scene-level capacity and a user's own setting are both clamps below,
+    /// and neither has to re-derive the data's figure to apply: the smallest
+    /// wins, and the render's readout follows. Only a clamp whose word is not
+    /// `capacity` — a user setting — has to reach past this and clamp the
+    /// [`squallar_radar::types::RasterSide`] itself, so that the readout says
+    /// `setting` rather than blaming the machine.
     fn static_side_ceiling_px(&self) -> usize {
         self.raster_side_ceiling_px
     }

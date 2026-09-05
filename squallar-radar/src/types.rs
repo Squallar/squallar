@@ -75,14 +75,112 @@ pub fn plan_view_extent_km(data_reach_km: f64) -> f64 {
     data_reach_km.min(MAX_EXTENT_KM)
 }
 
-/// How many pixels across to paint a plan view of `extent_km`, given the
-/// largest side this caller can accept.
-pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize, sample_km: f64) -> usize {
-    if extent_km > BASE_EXTENT_KM {
-        side_ceiling_px.min(data_limited_side_px(extent_km, sample_km))
-    } else {
-        IMAGE_SIZE.min(side_ceiling_px)
+/// Which bound decided a raster's side.
+///
+/// **A readout that prints an effective side beside the side that was asked
+/// for is unreadable without this word.** A user held to 4096 px by their own
+/// sweep has nothing to fix — more texels would resample their own
+/// interpolation — and a user held to 4096 px by their machine has a
+/// different problem entirely. The number is the same in both cases, so the
+/// word travels with it rather than being re-derived by whoever displays it.
+///
+/// One arm binds today. [`Capacity`](Self::Capacity) also covers a
+/// scene-level ceiling a caller applies through [`RasterSide::held_to`], and
+/// [`Setting`](Self::Setting) is here so a user's own clamp is nameable at the
+/// point it is applied rather than guessed at from the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideBound {
+    /// **The picture's own need**: [`data_limited_side_px`] past
+    /// [`BASE_EXTENT_KM`], [`IMAGE_SIZE`] at or below it. Nothing outside the
+    /// data held this render, so the bytes it costs are the sweep's own.
+    Data,
+    /// **The machine's**: the adapter's `max_texture_dimension_2d` bracketed
+    /// by this build's measured ceiling, or a scene-level capacity a caller
+    /// held the side to. The sweep asked for more than this device was given
+    /// room to draw, and detail the radar measured is not on the glass.
+    Capacity,
+    /// **The user's own choice.** No setting reaches this yet; the arm exists
+    /// so the clamp that adds one names itself here instead of arriving as an
+    /// unattributed [`Capacity`](Self::Capacity).
+    Setting,
+}
+
+impl SideBound {
+    /// The single word a readout prints beside the side.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Capacity => "capacity",
+            Self::Setting => "setting",
+        }
     }
+}
+
+impl std::fmt::Display for SideBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// A raster's side in pixels together with [the bound](SideBound) that decided
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RasterSide {
+    /// Pixels across; the raster is square, so this is both axes.
+    pub side_px: usize,
+    /// Which bound produced [`side_px`](Self::side_px).
+    pub bound: SideBound,
+}
+
+impl RasterSide {
+    /// Hold the side to `limit_px`, naming `bound` if that is what binds.
+    ///
+    /// **A ceiling and only a ceiling.** A `limit_px` at or above the side
+    /// leaves both fields untouched: it cannot raise a side, it is never "the
+    /// size to allocate", and it cannot claim a bound it did not win. A tie
+    /// keeps the incumbent, so the word names the bound that *reached* the
+    /// answer rather than the last caller to agree with it.
+    ///
+    /// This is how a further ceiling composes. A capacity or a setting clamps
+    /// what comes out of [`raster_side`] instead of re-deriving the data's
+    /// need, and the readout's word follows that clamp on its own.
+    #[must_use]
+    pub fn held_to(self, limit_px: usize, bound: SideBound) -> Self {
+        if limit_px < self.side_px {
+            Self {
+                side_px: limit_px,
+                bound,
+            }
+        } else {
+            self
+        }
+    }
+}
+
+/// How many pixels across to paint a plan view of `extent_km`, given the
+/// largest side this caller can accept — **and which of the two decided it.**
+///
+/// The data's own need is computed first and the caller's ceiling is then
+/// applied to it as a [`RasterSide::held_to`], so the ceiling is a ceiling in
+/// the *shape* and not only in the arithmetic: it can never raise the side,
+/// and anything further composes by clamping the value that comes back.
+pub fn raster_side(extent_km: f64, side_ceiling_px: usize, sample_km: f64) -> RasterSide {
+    let need = if extent_km > BASE_EXTENT_KM {
+        data_limited_side_px(extent_km, sample_km)
+    } else {
+        IMAGE_SIZE
+    };
+    RasterSide {
+        side_px: need,
+        bound: SideBound::Data,
+    }
+    .held_to(side_ceiling_px, SideBound::Capacity)
+}
+
+/// [`raster_side`]'s pixels alone, for callers with nothing to say about which
+/// bound won.
+pub fn raster_side_px(extent_km: f64, side_ceiling_px: usize, sample_km: f64) -> usize {
+    raster_side(extent_km, side_ceiling_px, sample_km).side_px
 }
 
 /// Texels per sample the raster is allowed to spend, at most.

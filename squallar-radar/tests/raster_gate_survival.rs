@@ -245,7 +245,11 @@ fn over_one_texel_per_gate_every_gate_outside_the_crowding_radius_owns_a_texel()
     assert_eq!(base.side, types::IMAGE_SIZE);
     let base_crowding = crowding_gate(base.side as f64 / (2.0 * base.extent_km));
     let past_crowding = PROBES.len() * (GATES - base_crowding);
-    let base_far = base.lost.iter().filter(|(_, g)| *g >= base_crowding).count();
+    let base_far = base
+        .lost
+        .iter()
+        .filter(|(_, g)| *g >= base_crowding)
+        .count();
     assert!(
         base_far * 10 > past_crowding,
         "the base side of {} px lost only {base_far} of the {past_crowding} gates past the \

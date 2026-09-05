@@ -1059,7 +1059,8 @@ fn the_raster_ceiling_follows_the_device_and_never_falls_below_what_shipped() {
 #[test]
 fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
     use squallar_radar::types::{
-        TEXELS_PER_SAMPLE, data_limited_side_px, plan_view_extent_km, raster_side_px,
+        SideBound, TEXELS_PER_SAMPLE, data_limited_side_px, plan_view_extent_km, raster_side,
+        raster_side_px,
     };
     // 2.125 + 1832 × 0.25 km, the longest reach in this display.
     const SURVEILLANCE_REACH_KM: f64 = 460.125;
@@ -1083,6 +1084,21 @@ fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
         side, need,
         "the desktop ceiling is what sized a surveillance cut, not its gates"
     );
+    // And a readout can say which bound won without re-deriving either figure:
+    // at the shipped ceiling the word is the data's, and at the rung below it
+    // the machine's.
+    assert_eq!(
+        raster_side(extent_km, DESKTOP_RASTER_SIDE_CEILING, SUPER_RES_GATE_KM).bound,
+        SideBound::Data,
+        "a surveillance cut under the {DESKTOP_RASTER_SIDE_CEILING} px ceiling is bound by \
+         its own gates, and the render has to be able to say so",
+    );
+    assert_eq!(
+        raster_side(extent_km, DESKTOP_LONG_RANGE_IMAGE_SIZE, SUPER_RES_GATE_KM).bound,
+        SideBound::Capacity,
+        "a {DESKTOP_LONG_RANGE_IMAGE_SIZE} px device holds the same cut under its own need, \
+         and the render has to name the device rather than the data",
+    );
     // Within one doubling of the need: the data's number rounded to its
     // texture doubling, and not the 16384 the adapter rule would admit.
     assert_eq!(
@@ -1096,7 +1112,10 @@ fn the_desktop_raster_ceiling_is_the_widest_sweeps_own_need_and_no_panes() {
     // largest canvas the browser rig measures at (`run_tier2.sh`'s `huge` leg,
     // 2878 × 1651) both give a 250 m gate less than one texel over ±460 km.
     for (pane_side, what) in [
-        (RENDER_WIDTH.max(RENDER_HEIGHT) as usize, "the default window"),
+        (
+            RENDER_WIDTH.max(RENDER_HEIGHT) as usize,
+            "the default window",
+        ),
         (2878, "the huge leg's canvas"),
     ] {
         assert!(

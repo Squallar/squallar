@@ -1226,10 +1226,12 @@ struct FieldRadial {
 /// for the four per-tilt paths is a ground range: they have already folded
 /// [`sweep_ground_factor`] into both the reach and every gate.
 ///
-/// `side_ceiling_px` is the largest side the caller will accept; the extent,
-/// that ceiling and `sample_km` together give the raster's own side through
-/// [`types::raster_side_px`], which is the second half of the geometry and the
-/// only half this crate cannot decide alone.
+/// `side_ceiling_px` is the largest side the caller will accept — **a ceiling
+/// and never a size**; the extent, that ceiling and `sample_km` together give
+/// the raster's own side through [`types::raster_side`], which is the second
+/// half of the geometry and the only half this crate cannot decide alone. What
+/// comes back also names which of the two bound the result, and the completion
+/// line prints that word beside both figures.
 ///
 /// `sample_km` is how far apart this field's samples are along a radial, in the
 /// same ground coordinate `reach_km` is in — so the four per-tilt paths fold
@@ -1249,7 +1251,11 @@ fn render_with_projection(
         shape,
     } = field;
     let extent_km = types::plan_view_extent_km(reach_km);
-    let side_px = types::raster_side_px(extent_km, side_ceiling_px, sample_km);
+    // The bound is carried, not re-derived: the readout below names which of
+    // the caller's ceiling and the data's own need produced `side_px`, and a
+    // further clamp names itself the same way (`types::RasterSide::held_to`).
+    let side = types::raster_side(extent_km, side_ceiling_px, sample_km);
+    let side_px = side.side_px;
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon, extent_km);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds, extent_km, side_px);
     let bufs = RenderBuffers::new(product, side_px, shape);
@@ -1259,11 +1265,13 @@ fn render_with_projection(
     let output = bufs.into_output(extent_km);
     log::info!(
         "{} rendering complete: data reaches {:.1}km, projected at ±{:.1}km \
-         onto {side_px}² px ({:.2} px/km)",
+         onto {side_px}² px ({:.2} px/km) against a {side_ceiling_px} px request, \
+         bound by {}",
         label,
         reach_km,
         output.max_range_km,
         proj.px_per_km,
+        side.bound,
     );
     output
 }
