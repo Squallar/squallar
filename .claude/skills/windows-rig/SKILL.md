@@ -64,6 +64,12 @@ The correct reading is 32,945,209,344 B = 31,419 MiB, against WMI's truncated
 box reads 33,750,515,712 B, also un-truncated; `nvidia-smi` reports 34,190,917,632 B
 total, so the DXGI budget is 96.4 % of the card and the Vulkan heap sum 98.7 %.
 
+**Do not reach for `wmic` to re-read that WMI figure — Microsoft removed it.** On
+build 26200.6718 it is not a missing number, it is a missing command, and in a
+transcript that reads exactly like a probe that found nothing. The replacement
+over the same CIM data is `Get-CimInstance Win32_OperatingSystem`. Substitute it
+wherever a brief still names `wmic`.
+
 Five cases were run on the box to establish this, same session, same binary:
 stock `PATH` and the VS `VCPackages` entry alone both fall back to FXC and create
 DX12; only the full `vcvars64` environment kills it, with
@@ -106,8 +112,14 @@ win.rustup.rs/x86_64  ->  rustup-init.exe -y --no-modify-path --profile minimal
 RUSTUP_HOME / CARGO_HOME  ->  your own directory
 ```
 
-It pulls a current stable, then materialises the repo's pinned **1.97.1** MSVC
-toolchain. `cargo build --release -p squallar` takes ~4m50s.
+It pulls a current stable — **1.98.1** as of 2026-09-04, *not* the repo's pin —
+and then materialises the pinned **1.97.1** MSVC toolchain beside it. Two
+toolchains land; the pinned one is what builds.
+
+`cargo build --release -p squallar` takes ~4m50s, and **that figure is the whole
+app**. Most work here does not need it: a capacity probe pulls a 15-crate graph
+and builds in **5.31 s**. Budget the app build only when you actually need the
+app.
 
 ## Cleanup is a requirement, not a courtesy
 
