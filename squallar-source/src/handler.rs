@@ -78,9 +78,10 @@ pub struct OverlayState<T, S: RoundShape> {
     /// seam behaves byte for byte as it did before the seam existed.
     ///
     /// It is also the right answer for a layer that already has a BETTER
-    /// retirement than freeing: the three gridded layers hand their replaced
-    /// buffer back to a staging pool that RE-USES it, and that can only
-    /// happen while this state is the buffer's last owner.
+    /// retirement than freeing: MRMS and GMGSI hand their replaced buffer back
+    /// to a staging pool that RE-USES it, and that can only happen while this
+    /// state is the buffer's last owner. (HRRR is gridded too and has no pool;
+    /// it takes the same `false` for the plain reason above.)
     parks: bool,
     /// `fn() -> S` so the marker cannot make this state less `Send`/`Sync`.
     shape: PhantomData<fn() -> S>,
@@ -1300,7 +1301,9 @@ pub trait SourceHandler: Send {
     /// whose data is a few hundred parsed features answers the default `0`
     /// rather than pricing itself into a figure the caller is reading in
     /// megabytes; what this exists to find is the three gridded layers whose
-    /// single granule is 60 to 98 MB.
+    /// single granule is 7.6 to 49 MB — HRRR, GMGSI at 15,000,000 B and MRMS
+    /// at 49,000,000 B, both of the latter at the byte widths their stores
+    /// narrowed to.
     ///
     /// **Cheap, and read on the frame thread's telemetry tick**: an
     /// implementation reads a maintained total or walks a cache whose entry
@@ -1309,6 +1312,13 @@ pub trait SourceHandler: Send {
     ///
     /// A report, never a requirement: nothing here says what the layer would
     /// need, only what it is holding right now.
+    ///
+    /// **Including what a pool has parked for the layer.** A staging buffer
+    /// retained between decodes is resident whether or not anything is
+    /// decoding, so its bytes are the handler's; omitting them under-reports
+    /// the layer by a whole grid, and an under-reporting census sheds nothing.
+    /// `squallar-overlays/tests/handler_residency_counts_staging.rs` is the
+    /// check that a handler holding a pool reads its `retained_bytes()`.
     fn resident_source_bytes(&self) -> u64 {
         0
     }

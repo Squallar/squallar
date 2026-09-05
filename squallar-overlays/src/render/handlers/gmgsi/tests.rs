@@ -2107,3 +2107,88 @@ fn a_replaced_live_mosaic_is_offered_to_the_staging_pool() {
     assert_eq!(POOL.retained_bytes(), MOSAIC_BYTES);
     assert_eq!(POOL.totals().declined, 0);
 }
+
+/// **The parked staging buffer is inside this layer's residency figure** — the
+/// one `overlay grids` publishes and the memory governor sheds against.
+///
+/// Asserted as a **relation**, not as a figure. A fixture whose slot is empty
+/// reports the same number with the pool term and without it, so an absolute
+/// assertion is green on the very defect this test exists to fail:
+/// `resident_source_bytes` omitted the pool from the day this layer gained one,
+/// and every suite in this file went on passing. Parking a buffer and requiring
+/// the reported bytes to rise by exactly what the pool says it is holding — and
+/// to fall back when the release lever takes it — cannot be satisfied without
+/// the term.
+///
+/// Against a pool of this test's own, not [`staging::global`]: the shipped slot
+/// is process-wide, so a mosaic another test in this binary left parked would
+/// be inside the figure asserted here and the failure would name the wrong
+/// module.
+///
+/// **Floor — `no_pool_term`:** delete
+/// `+ self.frame_grids.staging.retained_bytes()` from
+/// `GmgsiHandler::resident_source_bytes`; the rise below reads 0 where
+/// 15,000,000 is required.
+#[test]
+fn the_parked_staging_mosaic_is_in_this_layers_resident_bytes() {
+    use crate::render::overlay_state::OverlayRegistry;
+
+    static POOL: staging::StagingPool = staging::StagingPool::new(staging::STAGING_POINTS);
+    let channel = GmgsiChannel::LongwaveIr;
+    let mut h = GmgsiHandler::with_frame_budget_and_staging(MOSAIC_BYTES, &POOL);
+    h.defaults.enabled = true;
+    h.defaults.selected_channel = channel;
+    h.apply_fetch_result(
+        Box::new(GmgsiFetchResult(Ok(sized(channel, 100)))),
+        &PaneRef::across(&[]),
+    );
+
+    let empty_slot = h.resident_source_bytes();
+    assert!(
+        empty_slot > 0,
+        "premise: the layer is holding a decoded channel, so the pool term \
+         below is being added to the stores rather than standing in for them",
+    );
+    assert_eq!(POOL.retained_bytes(), 0, "premise: nothing is parked yet");
+
+    // Park one the way an evicted granule's buffer parks — through the pool's
+    // own doors, at the capacity the slot retains.
+    POOL.give(
+        POOL.take(staging::STAGING_POINTS)
+            .expect("a mosaic buffer fits on a test host"),
+    );
+    assert_eq!(
+        POOL.retained_bytes(),
+        MOSAIC_BYTES,
+        "premise: one mosaic is parked in the slot",
+    );
+
+    assert_eq!(
+        h.resident_source_bytes(),
+        empty_slot + MOSAIC_BYTES as u64,
+        "the block the slot holds is resident whether or not anything is \
+         decoding, so it belongs in the figure the governor reads. Leaving it \
+         out under-reports this layer by a whole mosaic, and an under-reporting \
+         census is the direction that sheds nothing",
+    );
+
+    // The registry's sum is the door `overlay grids` is actually read through.
+    let registry = OverlayRegistry::with_handlers(vec![Box::new(h)]);
+    assert_eq!(
+        registry.resident_source_bytes(),
+        empty_slot + MOSAIC_BYTES as u64,
+        "and it reaches the census through the registry, not only off the \
+         handler",
+    );
+
+    assert!(
+        POOL.release_retained(),
+        "premise: the parked mosaic is there to release",
+    );
+    assert_eq!(
+        registry.resident_source_bytes(),
+        empty_slot,
+        "and the figure falls back when the block goes, so the term tracks the \
+         slot rather than being a constant added once",
+    );
+}

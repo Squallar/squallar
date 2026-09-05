@@ -1493,15 +1493,16 @@ impl OverlayHandler for GmgsiHandler {
         })
     }
 
-    /// **Two blocks, and one 15 MB blend is the unit of both**: the live
-    /// cache's decoded channels and the staged loop granules.
+    /// **Three blocks, and one 15 MB blend is the unit of all of them**: the
+    /// live cache's decoded channels, the staged loop granules, and the buffer
+    /// [`staging`] is retaining between decodes.
     ///
-    /// **A third block is missing from this figure and that is a gap, not a
-    /// choice.** [`staging::global`] parks one mosaic-sized buffer between
-    /// decodes and reports it through `StagingPool::retained_bytes`;
-    /// `MrmsHandler::resident_source_bytes` adds its pool's and this does not,
-    /// so GMGSI under-reports its own resident bytes by one grid whenever the
-    /// slot is parked.
+    /// The pool is counted once even though both caches were handed it — they
+    /// are handed the *same* pool, [`staging::global`] on every shipped path,
+    /// and one slot recycled by two callers is still one block. It is read off
+    /// the frame cache's reference rather than the live cache's for no reason
+    /// beyond having to pick one; a suite that injects a pool into only one of
+    /// them is reading the one it injected.
     ///
     /// **What is excluded.** The pane's own carry (`state.data`) is the same
     /// `Arc` the live cache's granule holds, so it is added only when the
@@ -1516,7 +1517,10 @@ impl OverlayHandler for GmgsiHandler {
             Some(grid) if !self.cached_grids.holds(grid) => grid.values.resident_bytes(),
             _ => 0,
         };
-        (self.cached_grids.resident_bytes() + self.frame_grids.resident_bytes() + carried) as u64
+        (self.cached_grids.resident_bytes()
+            + self.frame_grids.resident_bytes()
+            + self.frame_grids.staging.retained_bytes()
+            + carried) as u64
     }
 }
 

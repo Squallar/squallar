@@ -711,10 +711,10 @@ pub(crate) struct ModelDataHandler {
 impl ModelDataHandler {
     pub fn new() -> Self {
         Self {
-            // Not parked: this layer's replaced grid goes back to its
-            // staging pool, which can only take it while the state is
-            // the buffer's last owner. A park slot would hold a second
-            // `Arc` and the pool would decline the block.
+            // Not parked: no `take_retired` drain and no staging pool waiting
+            // for the replaced grid, so a park slot would hold one whole extra
+            // grid between polls and free it inline on the next arrival — the
+            // reason `OverlayState::parks` is opt-in.
             state: OverlayState::new(),
             defaults: ModelPaneState::new(false),
             cached_grids: ModelGridCache::new(),
