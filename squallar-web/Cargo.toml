@@ -95,6 +95,12 @@ winit = { workspace = true }
 # target's graph through squallar-app, so the line adds no compiled package;
 # the feature set stays squallar-gpu's, the one chooser for the whole graph.
 egui-wgpu = { workspace = true }
+# `degrade::ProbeWindow`, the window the WebGL2 capacity probe
+# (`gpu_probe::webgl2_run`) opens on the 3D view's device-lost latch so a
+# context loss the probe caused is not counted against the view. Already in
+# this target's graph through squallar-app, so the line adds no compiled
+# package.
+squallar-volumetric = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated
 # bindings do not line up; these move when that stack moves.
@@ -161,6 +167,15 @@ features = [
     # without allocating (`src/alloc_failure.rs`). Enabled transitively by
     # `console_log` today; declared here for the reason `MediaQueryList` is.
     "console",
+    # The WebGL2 capacity probe (`src/gpu_probe/webgl2_run.rs`): a second
+    # context on a second canvas, its textures, the framebuffer they are
+    # cleared through and the fence behind the clear. Raw web-sys rather than
+    # wgpu because the gles backend has no error scope to read a refusal
+    # from (`src/gpu_probe/webgl2.rs`).
+    "WebGl2RenderingContext",
+    "WebGlTexture",
+    "WebGlFramebuffer",
+    "WebGlSync",
 ]
 
 # For `tests/pwa_assets.rs`. Target-gated because a plain `[dev-dependencies]`

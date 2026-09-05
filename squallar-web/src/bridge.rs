@@ -9,13 +9,25 @@ use winit::platform::web::WindowAttributesExtWebSys;
 
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";
 
-/// Where the WebGPU probe stands, as the bridge has driven it.
+/// Which instrument a page's probe is, by the backend the application draws
+/// with ([`gpu_probe_applies_to`] says which backends have one at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Instrument {
+    /// `crate::gpu_probe::run`: a throwaway WebGPU device inside error scopes,
+    /// walked to the 8 GiB ceiling.
+    WebGpu,
+    /// `crate::gpu_probe::webgl2_run`: raw WebGL2 on a second canvas, walked
+    /// to a policy cap.
+    WebGl2,
+}
+
+/// Where the browser probe stands, as the bridge has driven it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GpuProbe {
     /// Nobody has asked yet.
     NotStarted,
-    /// Started; the outcome cell is empty until it lands.
-    Running,
+    /// Started; the instrument's outcome cell is empty until it lands.
+    Running(Instrument),
     /// Reported, or skipped: this is the bridge's last word, re-said on
     /// every later ask so the level line can carry it.
     Settled(GpuProbeReport),
@@ -145,13 +157,7 @@ impl PlatformBridge for WebPlatform {
             parallelism: navigator_number("hardwareConcurrency")
                 .filter(|n| *n >= 1.0)
                 .map(|n| n as usize),
-            form_factor: crate::form_factor::classify(
-                media_matches("(pointer: coarse)"),
-                media_matches("(any-pointer: fine)"),
-                navigator_number("maxTouchPoints")
-                    .filter(|n| *n >= 0.0)
-                    .map(|n| n as u32),
-            ),
+            form_factor: form_factor(),
         }
     }
 
@@ -170,38 +176,69 @@ impl PlatformBridge for WebPlatform {
         })
     }
 
-    /// The WebGPU probe, driven from the app's asks. The first ask starts it
-    /// when the app's own backend is WebGPU and logs a skip once for anything
-    /// else — a WebGL2 page would have the probe measure an API that is not
-    /// the one drawing (`crate::gpu_probe`). Later asks read the outcome
-    /// cell; once it has landed the same report is re-said on every ask, so
-    /// the app's level line can carry it after the once-only lines are gone
-    /// from the console ring. A probe that held nothing settles as `Empty`.
+    /// The browser probe, driven from the app's asks. The first ask starts
+    /// the instrument the app's own backend calls for — the WebGPU probe on
+    /// `BrowserWebGpu`, the raw-WebGL2 probe on `Gl`, walked to the policy
+    /// cap for this page's form factor — and logs a skip once for any other
+    /// backend (`crate::gpu_probe`, both arms). Later asks read that
+    /// instrument's outcome cell; once it has landed the same report is
+    /// re-said on every ask, so the app's level line can carry it after the
+    /// once-only lines are gone from the console ring. A probe that reached
+    /// no figure settles as `Empty`, and the presumption stands.
     fn gpu_probe_report(&mut self, backend: wgpu::Backend) -> GpuProbeReport {
         match self.gpu_probe {
             GpuProbe::NotStarted => {
-                if gpu_probe_applies_to(backend) {
-                    crate::gpu_probe::run::start();
-                    self.gpu_probe = GpuProbe::Running;
-                    GpuProbeReport::Pending
-                } else {
+                if !gpu_probe_applies_to(backend) {
                     log::info!("gpu probe: skipped (backend {backend:?})");
                     self.gpu_probe = GpuProbe::Settled(GpuProbeReport::Skipped);
-                    GpuProbeReport::Skipped
+                    return GpuProbeReport::Skipped;
                 }
+                let instrument = if backend == wgpu::Backend::BrowserWebGpu {
+                    Instrument::WebGpu
+                } else {
+                    Instrument::WebGl2
+                };
+                match instrument {
+                    Instrument::WebGpu => crate::gpu_probe::run::start(),
+                    Instrument::WebGl2 => {
+                        let cap = crate::gpu_probe::webgl2::policy_cap_for(form_factor());
+                        log::info!(
+                            "gpu probe (webgl2): walking to a {} MiB policy cap",
+                            cap / (1024 * 1024)
+                        );
+                        crate::gpu_probe::webgl2_run::start(cap);
+                    }
+                }
+                self.gpu_probe = GpuProbe::Running(instrument);
+                GpuProbeReport::Pending
             }
-            GpuProbe::Running => {
+            GpuProbe::Running(Instrument::WebGpu) => {
                 let Some(outcome) = crate::gpu_probe::run::outcome() else {
                     return GpuProbeReport::Pending;
                 };
+                // A capped WebGPU walk is a floor: every step was confirmed
+                // held inside an error scope, so the figure stands.
                 let report = match crate::gpu_probe::capacity_from(&outcome) {
-                    Some(bytes) => GpuProbeReport::Found(ProbedCapacity {
-                        bytes,
-                        failed_at: outcome.failed_at,
-                        steps: outcome.steps,
-                        elapsed_ms: outcome.elapsed_ms,
-                        capped: outcome.capped,
-                    }),
+                    Some(bytes) => found(&outcome, bytes),
+                    None => GpuProbeReport::Empty,
+                };
+                self.gpu_probe = GpuProbe::Settled(report);
+                report
+            }
+            GpuProbe::Running(Instrument::WebGl2) => {
+                use crate::gpu_probe::webgl2::{Ending, capacity_from};
+
+                let Some(outcome) = crate::gpu_probe::webgl2_run::outcome() else {
+                    return GpuProbeReport::Pending;
+                };
+                log::info!("{}", webgl2_probe_line(&outcome));
+                // `Probed` means the GPU refused. A walk that reached its cap
+                // in silence is unmeasured, and says up to what.
+                let report = match capacity_from(&outcome) {
+                    Some(bytes) => found(&outcome.probe, bytes),
+                    None if outcome.ending == Ending::SilentToCap => GpuProbeReport::SilentToCap {
+                        cap_bytes: outcome.policy_cap_bytes,
+                    },
                     None => GpuProbeReport::Empty,
                 };
                 self.gpu_probe = GpuProbe::Settled(report);
@@ -225,6 +262,83 @@ impl PlatformBridge for WebPlatform {
             // The canvas is already in the document; appending adds a second one.
             .with_append(false)
     }
+}
+
+/// A found figure, with the arithmetic that reached it.
+fn found(outcome: &crate::gpu_probe::ProbeOutcome, bytes: u64) -> GpuProbeReport {
+    GpuProbeReport::Found(ProbedCapacity {
+        bytes,
+        failed_at: outcome.failed_at,
+        steps: outcome.steps,
+        elapsed_ms: outcome.elapsed_ms,
+        capped: outcome.capped,
+    })
+}
+
+/// `gpu probe (webgl2): 448 MiB ok, failed at 960 MiB, 4 steps, 812 ms, out
+/// of memory, renderer 'NVIDIA ...'` — the WebGL2 probe's once-only line,
+/// with what ended the walk in words: `out of memory`; `context lost once`
+/// (the figure was reached by exhaustion); `no limit found up to 1024 MiB;
+/// unmeasured, the presumption stands`; `silent short of the 1024 MiB cap;
+/// unmeasured, the presumption stands`; `faulted (GL error 0x501)`; `no
+/// WebGL2 context`; `software renderer, not walked; unmeasured`. Then the
+/// renderer string the context reported, so the line says which device
+/// answered, and a trailing clause counting the page's own context losses
+/// that fell inside the probe's window when there were any. Integers only,
+/// ASCII only apart from the renderer's own text, and nothing a rig row may
+/// read: the level line carries `probe <code>` for that.
+fn webgl2_probe_line(outcome: &crate::gpu_probe::webgl2::Webgl2Outcome) -> String {
+    use crate::gpu_probe::webgl2::{Ending, Fault};
+
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    let cap = mib(outcome.policy_cap_bytes);
+    let failed_at = match outcome.probe.failed_at {
+        Some(bytes) => format!("{} MiB", mib(bytes)),
+        None => "none".to_string(),
+    };
+    let ended = match outcome.ending {
+        Ending::Refused => "out of memory".to_string(),
+        Ending::ContextLost => "context lost once".to_string(),
+        Ending::SilentToCap => {
+            format!("no limit found up to {cap} MiB; unmeasured, the presumption stands")
+        }
+        Ending::Silent => {
+            format!("silent short of the {cap} MiB cap; unmeasured, the presumption stands")
+        }
+        Ending::Faulted(Fault::GlError(code)) => format!("faulted (GL error {code:#x})"),
+        Ending::Faulted(Fault::NullHandle) => "faulted (null texture handle)".to_string(),
+        Ending::NoContext => "no WebGL2 context".to_string(),
+        Ending::SoftwareRenderer => "software renderer, not walked; unmeasured".to_string(),
+    };
+    let renderer = match &outcome.renderer {
+        Some(name) => format!("renderer '{name}'"),
+        None => "renderer unknown".to_string(),
+    };
+    let own_losses = squallar_volumetric::degrade::losses_in_probe_window();
+    let own = if own_losses > 0 {
+        format!("; the page's own context was lost {own_losses} times inside the probe's window")
+    } else {
+        String::new()
+    };
+    format!(
+        "gpu probe (webgl2): {} MiB ok, failed at {failed_at}, {} steps, {} ms, {ended}, {renderer}{own}",
+        mib(outcome.probe.last_ok_bytes),
+        outcome.probe.steps,
+        outcome.probe.elapsed_ms,
+    )
+}
+
+/// The page's form factor from pointer media and touch points
+/// (`crate::form_factor::classify`), read where it is asked for: the host
+/// signals at boot, and the WebGL2 probe's policy cap.
+fn form_factor() -> Option<squallar_device_profile::budget::FormFactor> {
+    crate::form_factor::classify(
+        media_matches("(pointer: coarse)"),
+        media_matches("(any-pointer: fine)"),
+        navigator_number("maxTouchPoints")
+            .filter(|n| *n >= 0.0)
+            .map(|n| n as u32),
+    )
 }
 
 /// One numeric property off `navigator`, read through `Reflect` because the

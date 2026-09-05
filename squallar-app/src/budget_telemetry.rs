@@ -71,12 +71,14 @@ use crate::platform::{GpuProbeReport, LinearMemory};
 use squallar_device_profile::budget::{Budgets, DeviceProfile, FormFactor, Promotion};
 use squallar_device_profile::scene::{Capacity, CapacitySource};
 
-/// The integer the line prints for where the WebGPU probe stands: 0 absent
-/// (every native bridge, or not asked yet), 1 skipped (a WebGL2 page),
-/// 2 pending, 3 empty (ran, held nothing), 4 found at the device's refusal,
-/// 5 found at the probe's own bound (`capped` — the figure is a floor). A
-/// `cap N 2` beside 4 or 5 is the probe's figure in force; `cap 288 0`
-/// beside 1 is a WebGL2 page on its presumption, never a probe that failed.
+/// The integer the line prints for where the browser probe stands: 0 absent
+/// (every native bridge, or not asked yet), 1 skipped (a backend no probe
+/// covers), 2 pending, 3 empty (ran, reached no figure), 4 found at the
+/// device's refusal, 5 found at the WebGPU probe's own bound (`capped` —
+/// the figure is a floor), 6 silent to the cap (a WebGL2 walk that reached
+/// its policy cap with nothing refused: unmeasured, and the presumption
+/// stands). A `cap N 2` beside 4 or 5 is the probe's figure in force;
+/// `cap 288 0` beside 3 or 6 is a WebGL2 page on its presumption.
 pub(crate) fn gpu_probe_code(report: GpuProbeReport) -> u8 {
     match report {
         GpuProbeReport::Absent => 0,
@@ -85,6 +87,7 @@ pub(crate) fn gpu_probe_code(report: GpuProbeReport) -> u8 {
         GpuProbeReport::Empty => 3,
         GpuProbeReport::Found(probe) if probe.capped => 5,
         GpuProbeReport::Found(_) => 4,
+        GpuProbeReport::SilentToCap { .. } => 6,
     }
 }
 
@@ -673,14 +676,22 @@ mod tests {
         assert_eq!(gpu_probe_code(GpuProbeReport::Empty), 3);
         assert_eq!(gpu_probe_code(found(false)), 4);
         assert_eq!(gpu_probe_code(found(true)), 5);
+        let silent = GpuProbeReport::SilentToCap { cap_bytes: 1 << 30 };
+        assert_eq!(gpu_probe_code(silent), 6);
         assert_eq!(GpuProbeReport::default(), GpuProbeReport::Absent);
         assert_eq!(found(false).bytes(), Some(4032 << 20));
         assert_eq!(GpuProbeReport::Empty.bytes(), None);
+        assert_eq!(
+            silent.bytes(),
+            None,
+            "a silent walk is not a figure, whatever cap it reached"
+        );
         assert!(!GpuProbeReport::Pending.is_settled());
         for settled in [
             GpuProbeReport::Absent,
             GpuProbeReport::Skipped,
             GpuProbeReport::Empty,
+            silent,
             found(true),
         ] {
             assert!(settled.is_settled(), "{settled:?}");

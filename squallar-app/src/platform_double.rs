@@ -629,14 +629,18 @@ mod tests {
     }
 
     /// The double guards the probe on the backend as the web bridge does, so
-    /// an app test that asks about a WebGL2 page gets the same `Skipped`; with
+    /// an app test that asks about either browser backend gets the injected
+    /// figure and one that asks about a native backend gets `Skipped`; with
     /// nothing injected it is a native bridge and says `Absent`.
     #[test]
-    fn the_double_answers_a_probe_only_for_a_webgpu_backend() {
+    fn the_double_answers_a_probe_only_for_a_browser_backend() {
         let mut bridge = TestBridge::web().with_probed_capacity(4032 << 20);
-        assert_eq!(
-            bridge.gpu_probe_report(wgpu::Backend::Gl),
-            GpuProbeReport::Skipped
+        assert!(
+            matches!(
+                bridge.gpu_probe_report(wgpu::Backend::Gl),
+                GpuProbeReport::Found(probe) if probe.bytes == 4032 << 20
+            ),
+            "a WebGL2 page has a probe of its own now, and the double answers for it"
         );
         assert_eq!(
             bridge.gpu_probe_report(wgpu::Backend::Vulkan),

@@ -120,11 +120,12 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
     );
 
     // What the tick does with a live WebGPU adapter, minus the adapter: the
-    // bridge's answer for that backend, through the fold.
+    // bridge's answer for that backend, through the fold. A native backend
+    // asked of the same double has no probe and no figure to fold.
     assert_eq!(
-        app.platform.gpu_probe_report(wgpu::Backend::Gl),
+        app.platform.gpu_probe_report(wgpu::Backend::Vulkan),
         GpuProbeReport::Skipped,
-        "asked about a WebGL2 page, the bridge has no figure to fold",
+        "asked about a native backend, the bridge has no figure to fold",
     );
     let GpuProbeReport::Found(reading) =
         app.platform.gpu_probe_report(wgpu::Backend::BrowserWebGpu)

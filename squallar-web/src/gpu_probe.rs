@@ -14,14 +14,20 @@
 //! the host. The half that does touch one is [`run`], compiled for wasm32
 //! alone, and it drives this state machine step by step.
 //!
-//! Why WebGL2 gets no probe is `docs/cross-platform-resource-limits.md` §8.4:
-//! there is no clean failure to catch there. The probe therefore runs only when
-//! the application's own backend is WebGPU (`squallar_app::platform::
-//! gpu_probe_applies_to`); on a WebGL2 page it would measure an API that is
-//! not the one drawing.
+//! WebGL2 pages — every Firefox leg today — take the same ladder through a
+//! second instrument, [`webgl2`]: raw `web-sys` calls on a second canvas,
+//! because the wgpu path has no error scope and no lost-device callback on
+//! that backend and would report silence as a figure. Its ladder is capped
+//! by policy where this one runs to 8 GiB; the module says why. Which
+//! instrument a page gets is decided by the application's own backend
+//! (`squallar_app::platform::gpu_probe_applies_to`), so the figure always
+//! describes the API that is drawing.
 
 #[cfg(target_arch = "wasm32")]
 pub mod run;
+pub mod webgl2;
+#[cfg(target_arch = "wasm32")]
+pub mod webgl2_run;
 
 /// The first allocation, in bytes: 64 MiB, one 4096 x 4096 RGBA8 texture.
 pub const START_BYTES: u64 = 64 << 20;
@@ -211,6 +217,18 @@ impl Probe {
         self.capped = true;
         self.done = true;
         None
+    }
+
+    /// Stop the probe at a bound of the caller's — a step abandoned before
+    /// it could be judged, a fault that is not a refusal. Reported as
+    /// `capped`, exactly as the probe's own bounds are: nothing refused.
+    pub fn cap(&mut self) {
+        self.stop_capped();
+    }
+
+    /// The total held without refusal so far.
+    pub fn held_bytes(&self) -> u64 {
+        self.total_ok
     }
 
     /// What the device did with the allocation [`Self::next`] handed out, and

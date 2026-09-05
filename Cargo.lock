@@ -4968,6 +4968,7 @@ dependencies = [
  "squallar-overlays",
  "squallar-radar",
  "squallar-source",
+ "squallar-volumetric",
  "squallar-worker",
  "wasm-bindgen",
  "wasm-bindgen-futures",

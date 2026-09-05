@@ -967,7 +967,7 @@ So capacity is read **beside** wgpu, not through it. Sources in order of trust
 | native `Integrated` (non-Apple) | `system_ram / UNIFIED_MEMORY_GPU_DIVISOR (2)` — Vulkan heaps lie both ways on UMA | RAM | **Measured (RAM)** |
 | macOS / iOS | Metal `recommendedMaxWorkingSetSize` — every class; the fix for "`Integrated` is a lie on Apple Silicon" | `NSProcessInfo.physicalMemory` | **Measured** |
 | **web, WebGPU** (Chromium today; Firefox once shipped on Linux/Android) | **Probed** — §8.3 | 1 GiB link constant × 2 instances — §8.5 | **Probed** |
-| **web, WebGL2** (every Firefox leg today) | **Presumed** — §8.4: the bracket's constant, refined by the adapter's 2D/3D caps and form factor | 1 GiB × 2 | **Presumed** |
+| **web, WebGL2** (every Firefox leg today) | **Probed** where the raw-WebGL2 probe is refused — a clean `OUT_OF_MEMORY` (§8.4, 2026-09-04); **Presumed** otherwise — the bracket's constant, and a silent walk to the policy cap says up to what no limit was found | 1 GiB × 2 | **Probed / Presumed** |
 | Software / Virtual adapter, any reading | `None` — the lie-guard | — | **Presumed** |
 
 `Capacity { gpu_bytes: Option<u64>, host_bytes: Option<u64>, source:
@@ -1044,13 +1044,14 @@ profile ignores it (`a_probe_on_a_native_profile_is_ignored`); a web adapter
 classed software or virtual keeps its presumption, as the lie-guard already
 rules for its readings.
 
-**When it is skipped.** Whenever the app's own backend is not `BrowserWebGpu`
-(`gpu_probe_applies_to`, pinned by `a_probe_on_a_webgl2_page_never_runs`). wgpu
-binds one browser API when the instance is built (`ARCHITECTURE.md` §4), and
-on a WebGL2 page the probe would measure an API that is not the one drawing;
-WebGL2 itself has no clean failure to probe (§8.4). The web bridge logs
-`gpu probe: skipped (backend Gl)` once — every Firefox/Linux leg today — and
-the presumption stands.
+**When it is skipped.** Whenever the app's own backend is neither
+`BrowserWebGpu` nor `Gl` (`gpu_probe_applies_to`, pinned by
+`exactly_the_two_browser_backends_have_a_probe`). wgpu binds one browser API
+when the instance is built (`ARCHITECTURE.md` §4), and each API gets the
+instrument that measures it: this probe on WebGPU, the raw-WebGL2 probe of
+§8.4 on a WebGL2 page — every Firefox/Linux leg today. The web bridge logs
+`gpu probe: skipped (backend ...)` once for anything else, and the
+presumption stands.
 
 **What it prints, and which line carries what.** Two kinds of line, for two
 readers. **Once-only, for humans**: `gpu probe: 4032 MiB ok, failed at
@@ -1096,12 +1097,61 @@ never pushed because wgpu 29.0.4's backend maps a popped `GPUInternalError`
 to a panic. A lost device answers every later call as if it succeeded, so
 the loss flag outranks a silent scope.
 
-### 8.4 Why WebGL2 has no safe probe, and what "presumed" means
+### 8.4 The WebGL2 probe, its policy cap, and what "presumed" means
 
-*(plan D1)* On WebGL2 **no clean failure exists**: drivers oversubscribe
-silently, or the GPU-process reset loses every context in the tab, or the tab is
-killed. There is nothing to catch. So every WebGL2 browser — every Firefox leg
-today — runs on the **presumed** arm: the bracket's `APP_TEXTURE_BUDGET_BYTES`
+**Superseded in part, 2026-09-04 (ruling 17).** WebGL2 pages now get a probe
+of their own — `squallar-web/src/gpu_probe/webgl2.rs`, its wasm-only
+`webgl2_run` — because Firefox governs and, on Linux, exposes no WebGPU: measured
+2026-09-04, Firefox 154 on Linux has no `navigator.gpu` under any forced
+preference on either arm, so the app binds `Gl` there, the WebGPU probe of
+§8.3 never runs, and Firefox sat on a compiled 288 MiB presumption. The scope
+is exactly that: Firefox 155 on macOS exposes WebGPU and the app takes it
+(`BrowserWebGpu`, hardware adapter, no fallback), so there §8.3's probe
+applies and this one is never selected. Selection is by the backend the app's
+adapter answered with, never by browser name. The instrument is **raw `web-sys` WebGL2 on a
+second, unattached canvas**: `texStorage2D` per texture, a clear so the
+storage is written rather than reserved, a fence behind the clear (polled
+between `setTimeout(0)` yields, not `finish()`, so the page keeps its frames),
+then `getError()` and `isContextLost()`. Not wgpu: wgpu-hal 29.0.4's gles
+backend issues `texStorage2D/3D` with no `glGetError` behind it and maps
+`OutOfMemory` only onto name generation, so an out-of-memory scope on
+`Backend::Gl` pops empty forever — a probe built on it would walk to 8 GiB
+and call the result a figure.
+
+**The ladder is conservative here where §8.3's is not.** The paragraph below
+still holds: exhaustion on WebGL2 is a clean `OUT_OF_MEMORY` *or* a lost
+context, and a browser that loses one context to exhaustion may lose every
+context in the tab, the app's own included — which on this tree is a dead
+canvas nobody restores (wgpu-hal's web surface never reports a lost context
+and nothing listens for `webglcontextlost`). So the walk stops at a **policy
+cap**: 1 GiB on a desktop form factor, the 288 MiB wasm presumption on a
+handheld or an unclassified page — chosen bounds, validated only by the
+hardware leg, sized so that holding them resident is no more than the app
+itself is prepared to hold. The cap bounds what the probe *asks for*, never
+what it *reports*. **`Probed` means the GPU refused**: `OUT_OF_MEMORY` below
+the cap is the answer, and the figure is the total held before it. A walk to
+the cap with nothing refused is **no figure** — silence is absence of
+evidence, not evidence of capacity; a driver that hands back host memory
+stays silent past any real limit — and the presumption stands, unmeasured,
+with the cap on record (`GpuProbeReport::SilentToCap`, code `6` on the level
+line) so the readout can say "no limit found up to 1 GiB". A software
+renderer — SwiftShader, llvmpipe, WARP, read off `UNMASKED_RENDERER_WEBGL`
+or `RENDERER` — is released unwalked, since its figure would describe no
+machine a user has; the renderer string is on the once-only line either
+way. A lost context is recorded as what ended the walk, never sought;
+silence short of the cap — the time budget, a shape no texture takes, a
+fence that never signalled — is no figure either (code `3`). A found figure
+rides the same `GpuProbeReport` as §8.3's and `capacity_with_probe` treats
+it as `Probed`. The probe opens a bounded window on the 3D view's
+device-lost latch (`squallar_volumetric::degrade::ProbeWindow`) so a loss it
+caused is not counted against the view — a contract whose effect today is
+nil, since no WebGL loss reaches that latch; the latch's own doc says so.
+
+**What was true before, and still describes the arm the probe falls back
+to.** *(plan D1)* On WebGL2 **no clean failure is guaranteed**: drivers
+oversubscribe silently, or the GPU-process reset loses every context in the
+tab, or the tab is killed. Where the probe reaches no figure, every WebGL2
+browser runs on the **presumed** arm: the bracket's `APP_TEXTURE_BUDGET_BYTES`
 constant *is* the presumed GPU capacity (288 / 1024 / 3840 MiB — that is what
 those three numbers always were), refined by the adapter's reported 2D/3D caps
 and by form factor *(plan D2, D3)*.
