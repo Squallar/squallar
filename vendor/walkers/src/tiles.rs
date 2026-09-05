@@ -114,9 +114,119 @@ pub trait Tiles {
     fn tile_size(&self) -> u32;
 }
 
+/// A raster tile's pixels on the GPU: the texture that holds them, and where
+/// in it they are.
+///
+/// **A raster tile does not have to own a texture of its own.** A slippy map
+/// draws a viewport of them one after another, and a texture change is what
+/// opens a new `ClippedPrimitive` — so a texture each makes a viewport of 47
+/// tiles 47 primitives, 47 draws and 47 bind groups where one shared texture
+/// makes it one of each. This type is what lets a source put its tiles in a
+/// shared texture without every consumer having to know: `window` is the
+/// fraction of `texture` the tile occupies, and everything that draws a tile
+/// asks [`Self::window_of`] for the texture coordinates rather than assuming
+/// the tile is the whole texture.
+///
+/// `lease` is opaque here on purpose. Whoever placed the tile in a shared
+/// texture decides what reserves the space and what releases it; this type's
+/// only obligation is to hold that value for as long as any clone of the tile
+/// lives, which is what keeps the space from being handed to another tile
+/// while this one is still on the glass.
+#[derive(Clone)]
+pub struct RasterTile {
+    texture: TextureHandle,
+    /// `None` for a tile with a texture to itself, which is the whole of it
+    /// and needs nothing recorded. Behind an `Arc` so that cloning a tile —
+    /// which every consumer does once per visible grid cell per frame — is a
+    /// refcount bump, and so that this value stays two words wide: it is
+    /// carried by every cache entry the tile source holds, and the entry's
+    /// own node is priced against a fixed marker.
+    shared: Option<std::sync::Arc<SharedPixels>>,
+}
+
+/// Where a shared texture's tile is, and what holds its space there.
+struct SharedPixels {
+    /// The window of the texture this tile occupies.
+    window: Rect,
+    /// The tile's own side in texels. The texture's is the shared one and
+    /// says nothing about this tile.
+    size: [usize; 2],
+    /// Held for as long as any clone of the tile lives; see [`RasterTile`].
+    #[expect(dead_code, reason = "held for its Drop, never read")]
+    lease: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl RasterTile {
+    /// A tile with a texture to itself: the whole of it, and no lease.
+    pub fn own(texture: TextureHandle) -> Self {
+        Self {
+            texture,
+            shared: None,
+        }
+    }
+
+    /// A tile occupying `window` of a texture it shares with others.
+    ///
+    /// `size` is the tile's own side in texels — what the window is a
+    /// fraction of, and what a consumer pricing the tile is charged; the
+    /// texture's own size is the shared one and says nothing about this tile.
+    /// `lease` is held for as long as any clone of this value lives.
+    pub fn shared(
+        texture: TextureHandle,
+        window: Rect,
+        size: [usize; 2],
+        lease: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            texture,
+            shared: Some(std::sync::Arc::new(SharedPixels {
+                window,
+                size,
+                lease,
+            })),
+        }
+    }
+
+    /// The texture to bind.
+    pub fn id(&self) -> egui::TextureId {
+        self.texture.id()
+    }
+
+    /// The tile's own size in texels, which is **not** the texture's when the
+    /// texture is shared.
+    pub fn size(&self) -> [usize; 2] {
+        match &self.shared {
+            Some(shared) => shared.size,
+            None => self.texture.size(),
+        }
+    }
+
+    /// Whether these pixels are a window onto a texture shared with other
+    /// tiles.
+    pub fn is_shared(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    /// Texture coordinates for `uv`, which is a window of **the tile**.
+    ///
+    /// The identity for a tile that owns its texture, so a consumer that
+    /// always asks is correct either way and there is no second spelling to
+    /// forget.
+    pub fn window_of(&self, uv: Rect) -> Rect {
+        let Some(shared) = &self.shared else {
+            return uv;
+        };
+        let size = shared.window.size();
+        Rect::from_min_max(
+            shared.window.min + egui::vec2(uv.min.x * size.x, uv.min.y * size.y),
+            shared.window.min + egui::vec2(uv.max.x * size.x, uv.max.y * size.y),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub enum Tile {
-    Raster(TextureHandle),
+    Raster(RasterTile),
     /// **Shared, not owned.** `Tiles::at` hands a caller a [`TilePiece`] by
     /// value once per visible grid cell per frame, and a `TextureHandle` is a
     /// refcount so the raster arm costs nothing to hand over. Before the `Arc`
@@ -171,16 +281,24 @@ impl Tile {
 
     /// Load the texture from egui's [`ColorImage`].
     fn from_color_image(color_image: ColorImage, ctx: &Context) -> Self {
-        Self::Raster(ctx.load_texture("image", color_image, Default::default()))
+        Self::Raster(RasterTile::own(ctx.load_texture(
+            "image",
+            color_image,
+            Default::default(),
+        )))
     }
 
     /// Draw the tile on the given `rect`. The `uv` parameter defines which part of the tile
     /// should be drawn on the `rect`.
     fn draw(&self, painter: &egui::Painter, rect: Rect, uv: Rect, transparency: f32) {
         match self {
-            Tile::Raster(texture_handle) => {
-                let mut mesh = Mesh::with_texture(texture_handle.id());
-                mesh.add_rect_with_uv(rect, uv, Color32::WHITE.gamma_multiply(transparency));
+            Tile::Raster(raster) => {
+                let mut mesh = Mesh::with_texture(raster.id());
+                mesh.add_rect_with_uv(
+                    rect,
+                    raster.window_of(uv),
+                    Color32::WHITE.gamma_multiply(transparency),
+                );
                 painter.add(egui::Shape::mesh(mesh));
             }
             #[cfg(feature = "mvt")]

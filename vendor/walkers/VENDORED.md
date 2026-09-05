@@ -2067,6 +2067,55 @@ untouched by this commit.
 `a_pixels_per_point_change_drops_the_table` and
 `the_table_is_dropped_once_it_outgrows_its_ceiling`.
 
+### Changed — source, twenty-sixth commit: a raster tile does not have to own a texture
+
+`src/tiles.rs` gains `RasterTile` and `Tile::Raster` carries one instead of a
+bare `TextureHandle`; `src/lib.rs` exports it, and `src/map.rs`'s test source
+constructs one. `Tile::from_color_image` is unchanged in behaviour — it builds
+`RasterTile::own`, which is a texture to itself and windows onto the whole of
+it.
+
+**Why.** A `ClippedPrimitive` opens on a change of clip rect, a change of
+texture, or a callback, and the length of the primitive list is the length of
+the frame tail: on the web GL backend `queue.submit` replays every recorded
+command as a real GL call on the frame thread, and that is 93% of it. A raster
+tile layer draws its viewport one `Painter::image` per cell under **one** clip
+rect, so nothing but the texture separates the cells. Measured on this
+workspace's native rig, scene D, 1920x1080, one pane, terrain shading on
+(2026-09-05): the hillshade put **47 tiles on the glass as 47 primitives, 47
+draws, 47 bind groups and 94 buffer binds**, every draw six indices. That is 47
+of the 73 primitives of a frame with no basemap pass in it, and 47 of the 120
+draws of one with.
+
+`RasterTile` is what lets a source put its tiles in a shared texture without
+every consumer knowing: `window_of` maps a window of the **tile** onto texture
+coordinates and is the identity for a tile that owns its texture, so
+`Tile::draw` and this workspace's own `ui_map_overlays::draw_tile_layer` are
+correct either way and there is no second spelling to forget. The `lease` is
+`Arc<dyn Any + Send + Sync>` on purpose: whoever placed the tile decides what
+reserves and releases the space, and this crate's only obligation is to hold
+the value while any clone of the tile lives.
+
+**Two words wide, and that is a constraint rather than a preference.** The
+window, the tile's own size and the lease sit behind one `Arc<SharedPixels>`
+that a tile with a texture to itself does not allocate at all, so `RasterTile`
+is a `TextureHandle` and a pointer. Spelled inline it is 72 bytes, which grew
+`squallar-egui`'s tile-cache node from 101 bytes to 149 and reddened that
+crate's `a_marker_is_charged_at_least_its_node` — a cache entry is priced
+against a fixed marker of 128 bytes, and a `Tile` is in every entry. The `Arc`
+also makes the clone a refcount bump, which matters because a consumer clones
+a tile once per visible grid cell per frame; that is the same reason
+`Tile::Vector` is `Arc`-shared.
+
+**The policy is not here.** No atlas, no page, no slot: those live in
+`squallar-egui/src/raster_atlas.rs`, which is what the hillshade decode calls.
+This directory gained a carrier and nothing else, which is what keeps the delta
+re-appliable.
+
+After, on the same rig and scene: the 47 tiles are **one primitive, one draw,
+one bind group, two buffer binds** — one 270-index mesh for the 45 tiles that
+frame — and no `terrain-hillshade` texture is allocated at all.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

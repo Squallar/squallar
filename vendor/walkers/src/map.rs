@@ -414,7 +414,7 @@ mod tests {
         fn at(&mut self, tile_id: TileId) -> Option<TilePiece> {
             self.asked.borrow_mut().push(tile_id);
             Some(TilePiece::new(
-                Tile::Raster(self.texture.clone()),
+                Tile::Raster(crate::RasterTile::own(self.texture.clone())),
                 Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
             ))
         }

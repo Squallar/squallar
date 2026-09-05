@@ -322,9 +322,17 @@ pub(super) fn draw_tile_layer(
                 let rect = projector.tile_rect(tile_id);
 
                 match twuv.tile {
-                    Tile::Raster(ref tex) => {
-                        ui.painter()
-                            .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
+                    // `window_of` and not `twuv.uv`: the tile may be a slot
+                    // of a shared texture, and the ancestor window is a
+                    // window of the TILE. It is the identity for a tile with
+                    // a texture to itself.
+                    Tile::Raster(ref raster) => {
+                        ui.painter().image(
+                            raster.id(),
+                            rect,
+                            raster.window_of(twuv.uv),
+                            egui::Color32::WHITE,
+                        );
                     }
                     Tile::Vector(ref shapes) => {
                         paint_vector_tile(

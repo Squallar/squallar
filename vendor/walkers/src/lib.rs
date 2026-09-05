@@ -51,7 +51,7 @@ pub use style::Style;
 pub use style::{Color, Filter, Float, Layer, Layout, Paint, Value, json};
 #[cfg(feature = "mvt")]
 pub use text::{AtlasStamp, GalleyCache, OccupiedAreas, Text};
-pub use tiles::{Tile, TileId, TilePiece, Tiles, interpolate_from_lower_zoom};
+pub use tiles::{RasterTile, Tile, TileId, TilePiece, Tiles, interpolate_from_lower_zoom};
 pub use zoom::InvalidZoom;
 
 // TODO: In future, I'd like to expose full drawing API instead of this.

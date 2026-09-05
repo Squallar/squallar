@@ -52,6 +52,9 @@ pub(crate) mod point_painter;
 /// The radar layer's own glue: what the presentation holds for radar that no
 /// other layer has.
 pub mod radar_layer;
+/// Raster tiles of one size share one texture, so a viewport of them is one
+/// draw instead of one draw each.
+pub(crate) mod raster_atlas;
 pub mod shell_api;
 /// A radar site's marker: sized in points, on glass, every frame.
 pub(crate) mod site_marker;

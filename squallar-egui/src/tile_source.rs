@@ -458,8 +458,12 @@ impl CachedTile {
     /// figure measures on the fixture.
     fn priced(tile: &Tile, meshes: Option<&Arc<crate::tile_mesh::TileMeshes>>) -> u64 {
         match tile {
-            Tile::Raster(texture) => {
-                let [width, height] = texture.size();
+            // The tile's own size, which is **not** its texture's when the
+            // texture is shared: an atlas page holds tens of tiles, and
+            // pricing each of them at the page would charge the cache the
+            // page over and over.
+            Tile::Raster(raster) => {
+                let [width, height] = raster.size();
                 (width * height * 4) as u64
             }
             Tile::Vector(shapes) => {
@@ -924,10 +928,15 @@ pub(crate) fn decode_archive_tile(
         }
         ArchiveTileKind::Hillshade => {
             let remapped = crate::terrain::decode_hillshade_tile(bytes)?;
-            Ok(Tile::Raster(ctx.load_texture(
+            // **Through the atlas, not straight to a texture.** The hillshade
+            // is a whole tile layer drawn one `Painter::image` per cell under
+            // one clip rect, so a texture each is a primitive, a draw and a
+            // bind group each; see [`crate::raster_atlas`] for the measured
+            // figure and for what it falls back to.
+            Ok(Tile::Raster(crate::raster_atlas::place(
+                ctx,
                 "terrain-hillshade",
                 remapped,
-                Default::default(),
             )))
         }
         ArchiveTileKind::TerrainRgb => Err(

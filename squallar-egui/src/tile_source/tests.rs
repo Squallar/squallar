@@ -388,11 +388,11 @@ fn settle_repaints(ctx: &Context) {
     panic!("egui kept requesting repaints on its own; the flag cannot be used as a signal");
 }
 
-/// The pixels egui actually holds for `texture`.
-fn uploaded_pixels(ctx: &Context, texture: &egui::TextureHandle) -> egui::ColorImage {
+/// The pixels egui actually holds for the texture `id` names.
+fn uploaded_pixels(ctx: &Context, texture: egui::TextureId) -> egui::ColorImage {
     let delta = ctx.tex_manager().write().take_delta();
     for (id, image_delta) in delta.set {
-        if id == texture.id() {
+        if id == texture {
             let egui::epaint::ImageData::Color(image) = image_delta.image;
             return (*image).clone();
         }
@@ -829,7 +829,7 @@ fn a_fetched_tile_reaches_an_egui_texture_with_the_pixels_that_were_served() {
         "the texture is not the size of the image that was served"
     );
 
-    let image = uploaded_pixels(&ctx, &texture);
+    let image = uploaded_pixels(&ctx, texture.id());
     assert_eq!(image.size, [FIXTURE_SIDE as usize; 2]);
 
     for y in 0..FIXTURE_SIDE {
@@ -2228,7 +2228,13 @@ fn the_resident_level_prices_a_raster_at_its_texture_and_releases_it_on_eviction
         [FIXTURE_SIDE as usize, FIXTURE_SIDE as usize],
         egui::Color32::WHITE,
     );
-    let raster = || Tile::Raster(ctx.load_texture("t", image.clone(), Default::default()));
+    let raster = || {
+        Tile::Raster(walkers::RasterTile::own(ctx.load_texture(
+            "t",
+            image.clone(),
+            Default::default(),
+        )))
+    };
 
     cache.ask(id(0), 0);
     assert_eq!(
