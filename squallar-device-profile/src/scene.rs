@@ -479,11 +479,11 @@ pub(crate) mod fixtures {
     /// **The loop had been playing the whole leg, so its named frames are
     /// decoded**: [`HUGE_LEG_SCANS_HELD`] of them at [`HUGE_LEG_SCAN_BYTES`]
     /// apiece — a **modelled** steady state, since the leg's own volumes were
-    /// never priced one by one: the size is the middle of the 46.1–46.8 MiB
-    /// median band of the same 208-volume measurement the reserve was rounded
-    /// up from. The same scene before its first volume arrives — every frame
-    /// pending, at the reserve — is [`huge_pending`], and the two together
-    /// are the same leg at its two prices.
+    /// never priced one by one: the size is the median of the same
+    /// 208-volume measurement the reserve was rounded up from. The same scene
+    /// before its first volume arrives — every frame pending, at the reserve —
+    /// is [`huge_pending`], and the two together are the same leg at its two
+    /// prices.
     pub(crate) fn huge(pictures: usize) -> Scene {
         const MEASURED_STYLED_ENTRY_BYTES: usize = 1_462_708;
         Scene {
@@ -505,9 +505,19 @@ pub(crate) mod fixtures {
     }
 
     /// One decoded volume of the `huge` leg's loop as [`huge`] models it:
-    /// 46.5 MiB, the middle of the measured median band. A stand-in for the
-    /// leg's own volumes, which were never priced one by one.
-    pub(crate) const HUGE_LEG_SCAN_BYTES: u64 = 48_758_784;
+    /// **48.88 MiB, the measured median** of 208 real archive volumes decoded
+    /// under a counting global allocator. A stand-in for the leg's own
+    /// volumes, which were never priced one by one.
+    ///
+    /// It used to read 46.5 MiB, the middle of a 46.1–46.8 MiB band, and that
+    /// band was wrong: the instrument that produced it took its baseline
+    /// **after** the compressed archive buffer had been read, and that buffer
+    /// is freed inside the measurement window, so every volume was discounted
+    /// by its own compressed size (0.34–17.96 MiB, median 5.56). A modelled
+    /// resident volume that reads low makes a scene look like it fits when it
+    /// does not, which is the error direction that costs the process rather
+    /// than a rung.
+    pub(crate) const HUGE_LEG_SCAN_BYTES: u64 = 51_254_395;
 
     /// The frames the `huge` leg's loop holds decoded once it has settled:
     /// **eleven**, every frame the leg's own arm names — 1 + 2700 / 259, the

@@ -146,9 +146,16 @@ pub struct LoopDownloadManager {
     /// volume: each volume is priced ONCE where it is filed, and the price is
     /// kept beside it so eviction is a subtraction. The cache is bounded by
     /// **frame count and nothing else** — one decoded volume per named loop
-    /// frame — and a volume was measured at 46.1-46.8 MiB median, 58.3 MiB
-    /// max over 208 real archive volumes, so on a 1 GiB wasm page heap this
-    /// is a figure that decides whether a scene fits.
+    /// frame — and a volume was measured at **48.88 MiB median live heap,
+    /// 74.63 MiB max** over 208 real archive volumes, so on a 1 GiB wasm page
+    /// heap this is a figure that decides whether a scene fits.
+    ///
+    /// Those are the corrected figures. The 46.1–46.8 MiB median / 58.3 MiB
+    /// max this doc used to quote came from an instrument whose measurement
+    /// window took its baseline **after** the compressed archive buffer had
+    /// been read, and that buffer is freed inside the window — so every
+    /// volume was discounted by its own compressed size (0.34–17.96 MiB,
+    /// median 5.56). Under-stated, in the direction that costs the process.
     scan_bytes_cached: usize,
     /// The price of each cached volume, so [`Self::retain_scans`] subtracts
     /// what it removes instead of re-walking it. Keyed exactly as
@@ -332,9 +339,9 @@ impl LoopDownloadManager {
     }
 
     /// **Host bytes the loop's decoded volumes are holding**, by
-    /// [`crate::scan_size::scan_bytes`] — a floor, since the allocator's own
-    /// overhead is not reachable from a slice. O(1): the total is maintained
-    /// at the two places the cache changes.
+    /// [`crate::scan_size::scan_bytes`] — the vectors at capacity and one
+    /// allocator block per allocation, no longer a floor. O(1): the total is
+    /// maintained at the two places the cache changes.
     ///
     /// It is what emptying this cache would free **if nothing else held the
     /// same volumes**, and something else usually does: the still inventory

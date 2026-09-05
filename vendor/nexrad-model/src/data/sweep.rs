@@ -113,6 +113,19 @@ impl Sweep {
         &self.radials
     }
 
+    /// How many `Radial` slots this sweep's radial vector has room for.
+    ///
+    /// LOCAL CHANGE (squallar, see VENDORED.md): [`radials`](Self::radials)
+    /// hands out a `&[Radial]`, and a slice cannot report the spare capacity
+    /// the `Vec` behind it holds past its length. The decoder grows these
+    /// vectors radial by radial, so the spare is not incidental — it is
+    /// measured at ~42 % of the length across 208 real archive volumes, and
+    /// the allocator is holding every byte of it. Reads a field; allocates
+    /// nothing.
+    pub fn radials_capacity(&self) -> usize {
+        self.radials.capacity()
+    }
+
     /// The time range of this sweep as `(earliest, latest)` collection times.
     ///
     /// Returns `None` if the sweep has no radials or no valid timestamps.

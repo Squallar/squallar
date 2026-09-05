@@ -262,8 +262,10 @@ fn a_loops_volumes_are_priced_at_their_measured_size_and_the_reserve_for_the_res
     // Nothing arrived: the whole base at the reserve.
     assert_eq!(scans(&base), 28 * LOOP_SCAN_RESERVE_BYTES);
 
-    // Eleven arrived at 46.5 MiB apiece: those eleven at their price, the
-    // other seventeen at the reserve.
+    // Eleven arrived: those eleven at their price, the other seventeen at the
+    // reserve. The 48,758,784 B below is an arbitrary resident size, not a
+    // corpus figure — every property this test pins holds for any volume under
+    // the reserve, which is why the `tiny` case further down uses 1,000 B.
     let settling = PaneNeed {
         loop_scans_resident_frames: 11,
         loop_scans_resident_bytes: 11 * 48_758_784,
@@ -1840,19 +1842,19 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
 
     // **The leg itself, loop playing** — and its scans reconciled: the
     // eleven frames the web arm names had all arrived, so they are priced at
-    // what they measured (46.5 MiB apiece, the fixture's modelled median),
+    // what they measured (48.88 MiB apiece, the fixture's modelled median),
     // not at the 80 MiB reserve, and nothing is pending.
     assert_eq!(loop_frames(&leg.panes[0], &top), 11, "1 + 2700 / 259");
     assert_eq!(leg.panes[0].loop_scans_resident_frames, 11);
     let playing = need_terms(&leg, &top, stand_in_grid_bytes);
     assert_eq!(playing.loop_scans_host, 11 * HUGE_LEG_SCAN_BYTES);
-    assert_eq!(playing.loop_scans_host, 536_346_624);
+    assert_eq!(playing.loop_scans_host, 563_798_345);
     assert_eq!(
         playing.total().host_bytes,
-        866_375_476 + 536_346_624,
+        866_375_476 + 563_798_345,
         "the still shape's bytes plus the volumes"
     );
-    assert_eq!(playing.total().host_bytes, 1_402_722_100);
+    assert_eq!(playing.total().host_bytes, 1_430_173_821);
     assert_eq!(
         playing.total().host_bytes - playing.loop_scans_host,
         at_top.total().host_bytes,
@@ -1868,17 +1870,26 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     // **The same leg before its first volume arrived** is the admission
     // price: every named frame pending, at the reserve. The difference
     // between the two lines is what reconciliation is worth on this scene —
-    // 922,746,880 - 536,346,624 = 386,400,256 B, 41.9 % of the charge — and
+    // 922,746,880 - 563,798,345 = 358,948,535 B, 38.9 % of the charge — and
     // the reserve is only ever the larger of the two, which is the direction
-    // a bound must err. Reconciliation is worth more than it was, because the
-    // reserve it discharges is the corrected 80 MiB and the measured frames it
-    // discharges to did not move.
+    // a bound must err.
+    //
+    // **Both sides of that subtraction moved, and neither figure published
+    // while they moved separately survived.** The reserve rose 64 -> 80 MiB
+    // when the corpus maximum was corrected; the measured frames rose
+    // 46.5 -> 48.88 MiB when `scan_bytes` stopped charging vector length for
+    // vector capacity. Holding either side at its old value gives an answer
+    // that looks reasonable and is wrong — 41.9 % with the frames held, 23.6 %
+    // with the reserve held — so the figure is re-derived from the merged pair
+    // rather than from either lane's arithmetic. Reconciliation is worth more
+    // than it was, but by less than the reserve's rise alone implies, because
+    // what it discharges to rose too.
     let pending = need_terms(&huge_pending(13), &top, stand_in_grid_bytes);
     assert_eq!(pending.loop_scans_host, 11 * LOOP_SCAN_RESERVE_BYTES);
     assert_eq!(pending.loop_scans_host, 922_746_880);
     assert_eq!(
         pending.loop_scans_host - playing.loop_scans_host,
-        386_400_256
+        358_948_535
     );
     assert_eq!(pending.total().host_bytes, 1_789_122_356);
 
@@ -1891,11 +1902,11 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert!(leg_fitted.tile_whole_zoom);
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        541_944_292 + 536_346_624
+        541_944_292 + 563_798_345
     );
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        1_078_290_916
+        1_105_742_637
     );
     assert_eq!(
         over(&leg, &leg_fitted, &presumed, stand_in_grid_bytes),
@@ -1928,8 +1939,8 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     );
 
     // **The desktop bracket names 28 frames and holds eleven of them**, so
-    // the term is the mixed case: 11 x 46.5 MiB measured + 17 x 80 MiB
-    // reserved = 536,346,624 + 1,426,063,360. The volumes are a host figure
+    // the term is the mixed case: 11 x 48.88 MiB measured + 17 x 80 MiB
+    // reserved = 563,798,345 + 1,426,063,360. The volumes are a host figure
     // the bracket does not change; what the bracket changes is how many
     // frames the loop names, and every frame it names past what has arrived
     // is charged the bound.
@@ -1940,7 +1951,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
         on_desktop.loop_scans_host,
         11 * HUGE_LEG_SCAN_BYTES + 17 * LOOP_SCAN_RESERVE_BYTES,
     );
-    assert_eq!(on_desktop.loop_scans_host, 1_962_409_984);
+    assert_eq!(on_desktop.loop_scans_host, 1_989_861_705);
     let leg_on_desktop = fit(&leg, &desktop, &measured, stand_in_grid_bytes);
     assert_eq!(leg_on_desktop.steps_back, 3);
     assert_eq!(leg_on_desktop.overlay_oversample_percent, 100);
@@ -1987,7 +1998,7 @@ fn the_huge_legs_pictures_fit_after_one_oversampling_step_and_its_loop_fits_at_n
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes
             - presumed.host_allowance().unwrap(),
-        272_984_548,
+        300_436_269,
         "what the Level II leg is over by at every host rung",
     );
 }

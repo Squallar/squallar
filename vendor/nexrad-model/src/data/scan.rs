@@ -65,6 +65,17 @@ impl Scan {
         &self.sweeps
     }
 
+    /// How many `Sweep` slots this scan's sweep vector has room for.
+    ///
+    /// LOCAL CHANGE (squallar, see VENDORED.md): [`sweeps`](Self::sweeps)
+    /// hands out a `&[Sweep]`, and a slice cannot report the spare capacity
+    /// the `Vec` behind it holds past its length. A caller pricing what a
+    /// decoded volume costs the allocator needs the capacity, because that is
+    /// what the allocator is holding. Reads a field; allocates nothing.
+    pub fn sweeps_capacity(&self) -> usize {
+        self.sweeps.capacity()
+    }
+
     /// Consume this scan, yielding its sweeps owned.
     ///
     /// LOCAL CHANGE (squallar, see VENDORED.md): the only owned decomposition

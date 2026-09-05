@@ -186,9 +186,9 @@ static DERIVE_MEMO: LazyLock<Mutex<DeriveMemo>> = LazyLock::new(|| {
 static DERIVE_MEMO_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// Bytes the derivation memo is holding, by [`crate::scan_size::scan_bytes`]
-/// — a floor, and an upper bound on what emptying it would free: a derived
-/// volume the still inventory or a loop cache also names is counted by each
-/// of them. At most [`DERIVE_MEMO_CAPACITY`] whole synthetic scans.
+/// — an upper bound on what emptying it would free: a derived volume the
+/// still inventory or a loop cache also names is counted by each of them. At
+/// most [`DERIVE_MEMO_CAPACITY`] whole synthetic scans.
 pub fn memo_bytes() -> usize {
     DERIVE_MEMO_BYTES.load(Relaxed)
 }

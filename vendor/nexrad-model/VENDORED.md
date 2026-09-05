@@ -39,9 +39,10 @@ The published nexrad-model seals a `Scan`'s sweeps behind `&[Sweep]` borrows:
 `Scan::new` takes `Vec<Sweep>` by value, and no method gives them back owned.
 
 That seal is what made a decoded volume's teardown indivisible. A decoded
-volume is a measured 46.8 MiB median / 58.3 MiB worst case across thousands of
-per-radial buffers (`squallar-app/src/volume_inventory.rs` carries the full
-measurement), and on wasm every discarded volume is freed *on the page thread*
+volume is a measured 48.88 MiB median / 74.63 MiB maximum of live heap across
+thousands of per-radial buffers, over 208 real archive volumes decoded under a
+counting global allocator, and on wasm every discarded volume is freed *on the
+page thread*
 by `squallar_worker::offload::drain_deferred_drops`, whose budget paces turns
 but cannot split a payload: the drain's real spend per frame is its budget plus
 one whole payload. With the volume indivisible, that overshoot is the whole
@@ -84,6 +85,7 @@ the added method must leave untouched.
 
 | Path | What |
 | --- | --- |
-| `src/data/scan.rs` | One method, `Scan::into_sweeps(self) -> Vec<Sweep>` — the only owned decomposition of a scan, marked `LOCAL CHANGE` at the definition. It moves the field `Scan::new` took; no representation changes. |
+| `src/data/scan.rs` | Two methods. `Scan::into_sweeps(self) -> Vec<Sweep>` — the only owned decomposition of a scan. It moves the field `Scan::new` took; no representation changes. `Scan::sweeps_capacity(&self) -> usize` — reads `Vec::capacity` on the same field, because `sweeps()` hands out a slice and a slice cannot report spare capacity. Both marked `LOCAL CHANGE` at their definitions. |
+| `src/data/sweep.rs` | One method, `Sweep::radials_capacity(&self) -> usize` — `Vec::capacity` on the radial vector, for the same reason and marked the same way. Reading it is what lets `squallar_radar::scan_size::scan_bytes` charge what the allocator holds rather than what the slice's length implies; the spare is ~42 % of the length in real decoded volumes. |
 | `Cargo.toml` | The `[lints]` tables every vendored crate here carries, so the clippy fix-bot cannot rewrite upstream source — see the comment above them and vendor/nexrad-decode/Cargo.toml for the mechanism. Also the two `[[test]]` blocks and five dev-dependencies of the deleted tests, removed. |
 | `LICENSE`, `VENDORED.md` | This file and the license notice. |
