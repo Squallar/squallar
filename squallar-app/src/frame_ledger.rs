@@ -19,6 +19,11 @@
 //! [`WorstFrame`]'s latch and its session maximum, and like the `finish` nine
 //! they are offered EVERY presented frame.
 //!
+//! **The unnecessary-frame verdict adds no clock read and no bin search**, and
+//! that is the pin: [`crate::frame_need`] rides on this call and costs one
+//! relaxed `swap` of a `u32` register plus between three and six `u64`
+//! increments per presented frame. The three counts above are unchanged by it.
+//!
 //! **A dispatching frame pays more, and only a dispatching frame.** The
 //! `dispatch` split ([`DispatchHists`]) adds two clock reads per
 //! `dispatch_overlay_renders` call, eight more per request that survives its
@@ -704,6 +709,11 @@ pub(crate) struct FrameLedger {
     worst_since_boot: Option<WorstFrame>,
     /// The last presented frame's start, cadence's left stamp.
     last_presented_start: Option<Instant>,
+    /// **Whether this frame should have been drawn at all** — the one family
+    /// here that is not about what a frame cost. Its denominator is every
+    /// presented frame, [`WorstFrame`]'s and not the segments'; see
+    /// [`crate::frame_need`].
+    need: crate::frame_need::NeedLedger,
 }
 
 /// Whole microseconds from `a` to `b`, saturating into the histogram's `u32`.
@@ -1049,6 +1059,16 @@ impl FrameLedger {
             return;
         };
 
+        // **The first thing past the last early return, on purpose.** This is
+        // the point at which the frame is known to have presented, and the
+        // cause register must be cleared exactly once per presented frame:
+        // clear it earlier and a frame that early-returned would throw away
+        // causes nothing has drawn yet, so the frame that finally draws them
+        // would be reported as unnecessary. One relaxed `swap` and a handful
+        // of integer increments; no clock read, which is why the counts this
+        // module's doc pins are unchanged.
+        self.need.record(squallar_egui::frame_need::take());
+
         let acquire = micros(acquire_start, acquire_end);
         let segments = [
             micros(start, setup),
@@ -1299,6 +1319,18 @@ impl FrameLedger {
 
     pub(crate) fn cadence(&self) -> &Hist {
         &self.cadence
+    }
+
+    /// File what `handle_redraw`'s tail claimed, for the frame after this one.
+    /// See [`crate::frame_need::NeedLedger::record_wake_claim`].
+    pub(crate) fn record_wake_claim(&mut self, claim: crate::frame_need::WakeClaim) {
+        self.need.record_wake_claim(claim);
+    }
+
+    /// The unnecessary-frame verdict's running totals. See
+    /// [`crate::frame_need`].
+    pub(crate) fn need(&self) -> crate::frame_need::Reading {
+        self.need.reading()
     }
 
     /// The worst presented frame since the last call, and clear the latch.

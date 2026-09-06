@@ -411,7 +411,8 @@ impl super::Gui {
         // keeps rendering the page the flags just closed — remembered in
         // `sheet_last_page`, dead to input — until the slide is off screen.
         let open = self.top_sheet_page();
-        let open_factor = ctx.animate_bool_with_time(
+        let open_factor = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("sheet_open"),
             open.is_some(),
             super::fade::anim_time(),
@@ -783,7 +784,8 @@ impl super::Gui {
     ) {
         let live = self.layer_error(&crate::radar_layer::POLL_LAYER);
         let present = carries && live.is_some();
-        let factor = ctx.animate_bool_with_time(
+        let factor = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("error_toast_open"),
             present,
             super::fade::anim_time(),

@@ -512,8 +512,16 @@ pub fn note_shown() {
 }
 
 /// Record a held picture that reached the screen.
+///
+/// **Also an arrival door for the unnecessary-frame verdict**, and one that
+/// the channel drains cannot cover: a picture's last band arrives on frame N
+/// and the band-complete sweep puts it on the glass at the head of frame N+1,
+/// so the frame that actually shows it takes no message of its own. Without
+/// this, the frame a picture appears on would be scored unnecessary. See
+/// [`crate::frame_need`].
 pub fn note_promoted() {
     sink().promoted.fetch_add(1, Relaxed);
+    crate::frame_need::note(crate::frame_need::NeedCause::Arrival);
 }
 
 /// Record an upload thrown away mid-flight by a newer picture.

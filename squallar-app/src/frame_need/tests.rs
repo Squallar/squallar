@@ -1,0 +1,512 @@
+//! What the unnecessary-frame verdict has to get right, and the two ways it
+//! can be wrong.
+//!
+//! **Under-reporting** is a frame that needed nothing being called necessary —
+//! the failure a circular denominator produces, and the one the positive
+//! control below exists to catch. **Over-reporting** is a frame that genuinely
+//! needed drawing being called unnecessary, which is the worse of the two: it
+//! is what makes an instrument unbelievable, and an unbelievable instrument is
+//! ignored. Both directions are held here.
+
+use super::{NeedLedger, WakeClaim};
+use crate::app::{RepaintAction, repaint_action};
+use squallar_egui::frame_need::{NeedCause, note, take};
+
+/// A ledger with the process register cleared under it, so a fixture's frames
+/// are judged on causes the fixture itself raised.
+///
+/// The register is per-thread in a test build (see
+/// `squallar_egui::frame_need::sink`), and libtest gives each test its own
+/// thread, so this clears only this test's own.
+fn fresh() -> NeedLedger {
+    let _ = take();
+    NeedLedger::default()
+}
+
+/// **The instance-2 defect, built.**
+///
+/// The viewport clamp of `0e2161f4` stored the centre geographically and
+/// re-read it through a projection, which costs about `1e-10` points. A map
+/// resting against a bound was therefore out of bounds on **every** frame,
+/// moved a ten-billionth of a point, and asked for a repaint forever. Nothing
+/// in the tree could see it: no raster was dispatched, no command was
+/// recorded, and every frame the ledger timed was a frame that ran.
+///
+/// This is that shape with the arithmetic real — a round trip that does not
+/// round trip, compared with no deadband.
+struct SelfNudgingMap {
+    centre: f64,
+    bound: f64,
+    /// How many frames this map decided it had moved. The control's own
+    /// non-vacuity: a fixture that stopped nudging would make every assertion
+    /// below pass for the wrong reason.
+    nudges: u32,
+}
+
+impl SelfNudgingMap {
+    fn new() -> Self {
+        Self {
+            centre: 49.999_999_999_9,
+            bound: 50.0,
+            nudges: 0,
+        }
+    }
+
+    /// One frame of the defect: re-read the centre through a projection, find
+    /// it out of bounds by a ten-billionth, clamp, and ask for a repaint.
+    /// Returns what the app's tail would have claimed.
+    fn frame(&mut self) -> RepaintAction {
+        // The round trip that does not round trip. Deliberately arithmetic
+        // rather than a stubbed constant: the defect is that the error is
+        // real and smaller than anything a reader would think to guard.
+        let reprojected = ((self.centre * 1e7).round() / 1e7) + 1e-10;
+        assert_ne!(
+            reprojected, self.centre,
+            "the fixture's projection round-trips exactly, so it cannot \
+             reproduce the defect it is named for",
+        );
+        if reprojected > self.bound - 1e-9 {
+            // No deadband: any excursion at all is a clamp, and a clamp is a
+            // repaint. `Duration::ZERO` is what egui reports after a
+            // `request_repaint()` inside the pass.
+            self.centre = self.bound - 1e-10;
+            self.nudges += 1;
+            return repaint_action(std::time::Duration::ZERO);
+        }
+        repaint_action(std::time::Duration::MAX)
+    }
+}
+
+/// **The positive control, and the instrument does not land without it.**
+///
+/// A map that re-triggers itself every frame with nothing changing must read
+/// at or near 100 % unnecessary. It is also the non-circularity gate: this
+/// fixture *requests* every repaint it wastes, so a denominator built from the
+/// repaint ask — "egui wanted a frame, therefore the frame was needed" —
+/// scores it 100 % **necessary** and this test goes red. That is the whole
+/// design decision, held by a test rather than by a paragraph.
+#[test]
+fn a_map_that_nudges_itself_reads_wholly_unnecessary() {
+    const FRAMES: u32 = 240;
+    let mut ledger = fresh();
+    let mut map = SelfNudgingMap::new();
+
+    for _ in 0..FRAMES {
+        // The frame's tail: the map nudged itself and egui was asked for an
+        // immediate repaint, so nothing above it claimed and the charge falls
+        // to `EguiNow`.
+        let action = map.frame();
+        assert_eq!(
+            action,
+            RepaintAction::Now,
+            "the fixture stopped asking for repaints, so it is no longer the \
+             defect this control is about",
+        );
+        ledger.record_wake_claim(WakeClaim::EguiNow);
+        // No cause is raised: a clamp is not an input, not an arrival, not an
+        // animation and not a surface change. The register is read through
+        // the production spelling.
+        ledger.record(take());
+    }
+
+    let r = ledger.reading();
+    assert_eq!(
+        map.nudges, FRAMES,
+        "the fixture stopped nudging itself part way, so the reading below is \
+         about a quiet map and not about the defect",
+    );
+    assert!(r.ran(), "no frame was judged at all");
+    assert_eq!(r.drawn, u64::from(FRAMES));
+    assert_eq!(
+        r.needed, 0,
+        "a frame with nothing changing was called necessary — the denominator \
+         is agreeing with the defect it exists to find",
+    );
+    // Asserted against the extent of the run rather than against a threshold:
+    // every frame this fixture drew was one it should not have drawn, so the
+    // figure is the frame count and nothing else.
+    assert_eq!(r.unnecessary(), u64::from(FRAMES));
+    // Every frame but the first is charged to the immediate repaint that
+    // bought it. The first is charged to `External` and correctly so: no tail
+    // had yet run when it was judged, so nothing in this application had asked
+    // for it — which is what a boot frame is. Stated as `FRAMES - 1` rather
+    // than smoothed into a tolerance, because the one exception is a fact
+    // about the claim carry and not noise.
+    assert_eq!(
+        (r.charge(WakeClaim::EguiNow), r.charge(WakeClaim::External),),
+        (u64::from(FRAMES) - 1, 1),
+        "the waste was not charged to the immediate repaint that bought it, \
+         so a reader is pointed at the wrong code",
+    );
+    assert!(r.charges_balance());
+    assert!(r.causes_cover_the_needed());
+}
+
+/// **The over-firing gate, one cause at a time.**
+///
+/// A frame that genuinely needed drawing must never be counted unnecessary.
+/// Over-reporting is the worse direction here — it is what makes an instrument
+/// ignored — so each cause is checked on its own rather than in a soup where
+/// one working cause would carry the other three.
+#[test]
+fn a_frame_that_raised_any_cause_is_never_counted_unnecessary() {
+    for cause in NeedCause::ALL {
+        let mut ledger = fresh();
+        // A claim stands, exactly as it would in a live app with a render
+        // out: if the verdict ever consulted it, this frame would be charged.
+        ledger.record_wake_claim(WakeClaim::Render);
+        ledger.record(take());
+        // ^ the first frame, before any tail — charged to `External`.
+        note(cause);
+        ledger.record(take());
+
+        let r = ledger.reading();
+        assert_eq!(r.drawn, 2);
+        assert_eq!(
+            r.needed,
+            1,
+            "a frame that raised `{}` was not counted as needing to be drawn",
+            cause.name(),
+        );
+        assert_eq!(
+            r.cause(cause),
+            1,
+            "the `{}` cause was raised and the reading does not show it",
+            cause.name(),
+        );
+        assert_eq!(
+            r.unnecessary(),
+            1,
+            "the frame that raised `{}` was counted unnecessary; only the \
+             boot frame before it should be",
+            cause.name(),
+        );
+        assert_eq!(r.charge(WakeClaim::External), 1);
+        assert_eq!(r.charge(WakeClaim::Render), 0);
+    }
+}
+
+/// **A frame that raised several causes is one necessary frame, not several.**
+///
+/// The cause buckets overlap by design, so the only thing keeping `needed` a
+/// frame count rather than a cause count is that the verdict is taken once.
+#[test]
+fn several_causes_on_one_frame_are_one_necessary_frame() {
+    let mut ledger = fresh();
+    note(NeedCause::Input);
+    note(NeedCause::Arrival);
+    note(NeedCause::Animation);
+    ledger.record(take());
+
+    let r = ledger.reading();
+    assert_eq!(r.drawn, 1);
+    assert_eq!(r.needed, 1, "one frame was counted as three");
+    assert_eq!(r.unnecessary(), 0);
+    assert_eq!(
+        r.causes.iter().sum::<u64>(),
+        3,
+        "the three causes did not each record the frame they were raised on",
+    );
+    assert!(
+        r.causes_cover_the_needed(),
+        "the cause buckets no longer cover the frames called necessary",
+    );
+}
+
+/// **A frame is charged to the claim that bought it, not the one it leaves.**
+///
+/// `handle_redraw`'s tail runs *before* the verdict, so the naive wiring
+/// charges every frame to the claim it just made for the next one. That is
+/// wrong in exactly the case that matters: the frame that finally receives an
+/// answer clears the claim, and the poll frames before it would then be
+/// charged to whatever came after them.
+#[test]
+fn a_frame_is_charged_to_the_claim_that_bought_it() {
+    let mut ledger = fresh();
+
+    // Frame 1: nobody had claimed anything yet.
+    ledger.record_wake_claim(WakeClaim::Render);
+    ledger.record(take());
+    // Frame 2: bought by frame 1's render-in-flight claim; its own tail now
+    // claims something else entirely.
+    ledger.record_wake_claim(WakeClaim::Gesture);
+    ledger.record(take());
+    // Frame 3: bought by frame 2's gesture claim.
+    ledger.record_wake_claim(WakeClaim::EguiNow);
+    ledger.record(take());
+
+    let r = ledger.reading();
+    assert_eq!(r.drawn, 3);
+    assert_eq!(r.unnecessary(), 3);
+    assert_eq!(
+        (
+            r.charge(WakeClaim::External),
+            r.charge(WakeClaim::Render),
+            r.charge(WakeClaim::Gesture),
+            r.charge(WakeClaim::EguiNow),
+        ),
+        (1, 1, 1, 0),
+        "the charges are off by a frame: each one is being filed against the \
+         claim its own tail made rather than against the claim that woke it",
+    );
+    assert!(r.charges_balance());
+}
+
+/// **A cause raised on a frame that never presented reaches the frame that
+/// does.**
+///
+/// `handle_redraw` early-returns on a minimized window, a zero-area window and
+/// a lost surface, and an arrival that landed on one of those has still not
+/// been drawn. Clearing the register per redraw entry rather than per verdict
+/// would throw it away and report the frame that finally draws it as waste.
+#[test]
+fn a_cause_survives_a_frame_that_drew_nothing() {
+    let mut ledger = fresh();
+    note(NeedCause::Arrival);
+    // A `handle_redraw` that returned before presenting takes no verdict, so
+    // it neither counts a frame nor clears the register.
+    note(NeedCause::Input);
+    ledger.record(take());
+
+    let r = ledger.reading();
+    assert_eq!(r.drawn, 1, "an unpresented frame was counted as drawn");
+    assert_eq!(r.needed, 1);
+    assert_eq!(
+        (r.cause(NeedCause::Arrival), r.cause(NeedCause::Input)),
+        (1, 1)
+    );
+}
+
+/// **And the register is cleared past the last early return, not before it.**
+///
+/// The test above holds the ledger's half; this holds the caller's, and the
+/// two are different mistakes. `FrameLedger::finalize` opens with three
+/// guards — a frame that never reached the pass, a skipped or lost surface,
+/// and a missing acquire — and every one of them returns without drawing. A
+/// `take` above any of them counts an unpresented frame as drawn **and**
+/// throws away causes nothing has shown, so the frame that finally shows them
+/// reads as waste. That is the `publish at the seam` shape: a level sampled on
+/// the wrong tick is a false zero for everything living inside it.
+///
+/// Held on the source text because the property is a position, and there is no
+/// way to observe a position from inside a call that has already returned.
+#[test]
+fn the_cause_register_is_read_past_every_early_return_in_finalize() {
+    const LEDGER: &str = include_str!("../frame_ledger.rs");
+    let body = LEDGER
+        .split_once("fn finalize(")
+        .map(|(_, rest)| rest)
+        .expect("finalize is no longer a method on FrameLedger");
+    let at = |needle: &str| {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is gone from finalize"))
+    };
+    let take_at = at(concat!("frame_need::", "take()"));
+    for guard in [
+        // The frame never reached the pass.
+        "// The frame early-returned before the pass; not a sample.",
+        // The pass ended without a real present.
+        "if m.skipped {",
+        // No acquire and no present: nothing was shown.
+        "(m.acquire, m.present_return)",
+    ] {
+        assert!(
+            at(guard) < take_at,
+            "the cause register is read before `{guard}`, so a frame that drew \
+             nothing clears causes the next frame has still not shown — and \
+             that frame is then reported as waste",
+        );
+    }
+}
+
+/// **The three groups on the line are three denominators**, and the two
+/// identities that make them readable hold over a mixed run.
+#[test]
+fn the_line_s_three_groups_keep_their_own_identities() {
+    let mut ledger = fresh();
+    let script: [Option<NeedCause>; 8] = [
+        None,
+        Some(NeedCause::Input),
+        None,
+        Some(NeedCause::Arrival),
+        Some(NeedCause::Arrival),
+        None,
+        Some(NeedCause::Animation),
+        None,
+    ];
+    for (frame, cause) in script.iter().enumerate() {
+        ledger.record_wake_claim(if frame % 2 == 0 {
+            WakeClaim::Render
+        } else {
+            WakeClaim::EguiNow
+        });
+        if let Some(cause) = cause {
+            note(*cause);
+        }
+        ledger.record(take());
+    }
+
+    let r = ledger.reading();
+    assert_eq!((r.drawn, r.needed, r.unnecessary()), (8, 4, 4));
+    assert_eq!(
+        r.needed + r.unnecessary(),
+        r.drawn,
+        "`needed` and `unnecessary` no longer partition `drawn`",
+    );
+    assert!(
+        r.charges_balance(),
+        "the charges do not sum to the unnecessary frames, so a frame reached \
+         the verdict with no claim chosen",
+    );
+    assert!(r.causes_cover_the_needed());
+    assert_eq!(
+        (
+            r.cause(NeedCause::Input),
+            r.cause(NeedCause::Arrival),
+            r.cause(NeedCause::Animation),
+            r.cause(NeedCause::Surface),
+        ),
+        (1, 2, 1, 0),
+    );
+}
+
+/// **Every claim has its own slot and its own name.** A duplicated index would
+/// make one claim silently absorb another's count, and a duplicated name would
+/// do it on the rig's side of the line.
+#[test]
+fn every_wake_claim_has_its_own_slot_and_name() {
+    let mut indices: Vec<usize> = WakeClaim::ALL.iter().map(|c| c.index()).collect();
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (0..WakeClaim::COUNT).collect::<Vec<_>>(),
+        "the claims do not occupy the slots the charge array has",
+    );
+    let mut names: Vec<&str> = WakeClaim::ALL.iter().map(|c| c.name()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), WakeClaim::COUNT, "two claims share a name");
+}
+
+/// **The arrival cause has no bypass.**
+///
+/// Every channel drain on the frame thread must take its messages through
+/// `ArrivalRecv::try_recv_arrival`, or a whole class of arrivals is invisible
+/// and every frame that draws one is scored unnecessary. This is the
+/// non-vacuity floor under the arrival figure: without it the cause could be
+/// wired to one receiver of eighteen and every test above would still pass.
+#[test]
+fn every_frame_thread_drain_takes_its_messages_through_the_counted_spelling() {
+    // Split so this file never contains the uncounted spelling contiguously,
+    // on `arch_ratchets`' needle-hygiene terms.
+    let plain = concat!("_receiver.try_", "recv()");
+    let counted = concat!("_receiver.try_", "recv_arrival()");
+    let mut offences = Vec::new();
+    let mut counted_sites = 0usize;
+    for path in scanned_app_sources() {
+        let src = std::fs::read_to_string(&path).expect("source must be readable");
+        counted_sites += src.matches(counted).count();
+        if src.contains(plain) {
+            offences.push(path.display().to_string());
+        }
+    }
+    assert!(
+        offences.is_empty(),
+        "these frame-thread drains take messages without raising the arrival \
+         cause, so a frame that draws what they delivered reads as waste: \
+         {offences:?}",
+    );
+    // The floor: the pump's own inventory names the receivers a frame drains,
+    // and the counted spelling has to reach at least that many of them.
+    let drained = pump_drain_inventory();
+    assert!(
+        drained >= 15,
+        "the pump inventory reads {drained} drained receivers — the walk that \
+         counts them is broken, not the tree",
+    );
+    assert!(
+        counted_sites >= drained,
+        "{counted_sites} counted drains against {drained} receivers the frame \
+         pump declares it drains: the arrival cause is wired to a subset",
+    );
+}
+
+/// How many `ChannelHub` receiver fields the frame pump's own inventory says a
+/// frame drains — the `drains:` lists in `frame_pump.rs`, which an
+/// exhaustiveness test there already holds against the hub.
+fn pump_drain_inventory() -> usize {
+    let src = include_str!("../frame_pump.rs");
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = src[from..].find("_receiver\"") {
+        count += 1;
+        from += rel + 1;
+    }
+    count
+}
+
+/// This crate's sources, test files skipped by name — `ui_glyphs`' walk, and
+/// the same reason: a test's own prose is not production code.
+fn scanned_app_sources() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut files = Vec::new();
+    while let Some(dir) = roots.pop() {
+        for entry in std::fs::read_dir(&dir).expect("source dir must be readable") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                roots.push(path);
+            } else if name.ends_with(".rs") && !name.contains("test") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(
+        files.len() > 20,
+        "the scan found only {} sources — the walk is broken, not the tree",
+        files.len(),
+    );
+    files
+}
+
+/// **The animation cause has no bypass either.**
+///
+/// egui's own widget animations are the one picture-mover neither an input nor
+/// an arrival can see, and `squallar_egui::frame_need::animate_bool` is the
+/// only spelling that raises the cause. A call written straight against
+/// `Context` would animate a drawer while this instrument called every frame
+/// of it waste — the over-report that makes an instrument ignored.
+#[test]
+fn the_animation_cause_has_no_bypass_in_the_ui_layer() {
+    let needle = concat!("animate_bool_with", "_time(");
+    let ui_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../squallar-egui/src");
+    let mut roots = vec![ui_src];
+    let mut sites = Vec::new();
+    while let Some(dir) = roots.pop() {
+        for entry in std::fs::read_dir(&dir).expect("source dir must be readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                roots.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let src = std::fs::read_to_string(&path).expect("source must be readable");
+                let calls = src.matches(needle).count();
+                if calls > 0 {
+                    sites.push((path.display().to_string(), calls));
+                }
+            }
+        }
+    }
+    let calls: usize = sites.iter().map(|(_, n)| n).sum();
+    assert_eq!(
+        calls, 1,
+        "egui's animation is called from {calls} places; exactly one — the \
+         wrapper in `squallar_egui::frame_need` — may call it, or an \
+         animating picture reads as waste: {sites:?}",
+    );
+    assert!(
+        sites[0].0.ends_with("frame_need.rs"),
+        "the one call to egui's animation is no longer the wrapper that \
+         raises the cause: {}",
+        sites[0].0,
+    );
+}

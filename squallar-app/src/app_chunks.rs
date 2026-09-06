@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::channels::{ChunkResponse, FetchRequester};
+use crate::channels::{ArrivalRecv as _, ChunkResponse, FetchRequester};
 use squallar_radar::chunk_feed::Retirement;
 use squallar_radar::chunk_notify::{ChunkAvailable, Feed, Notified};
 
@@ -167,7 +167,7 @@ impl super::App {
 
     /// Drain finished rounds and apply them.
     pub(super) fn poll_chunk_results(&mut self) {
-        while let Ok(resp) = self.channels.chunk_receiver.try_recv() {
+        while let Ok(resp) = self.channels.chunk_receiver.try_recv_arrival() {
             let ChunkResponse {
                 generation,
                 site,

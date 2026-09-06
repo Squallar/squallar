@@ -10,6 +10,40 @@ use squallar_source::id::LayerId;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
+/// `Receiver::try_recv`, with the unnecessary-frame verdict's **arrival**
+/// cause raised on every message that actually comes back.
+///
+/// **The one spelling every frame-thread drain in this crate uses**, held by
+/// `every_frame_thread_drain_takes_its_messages_through_the_counted_spelling`.
+/// A
+/// newtype around the receiver would have carried the same guarantee without
+/// a rule, and was not taken: the `ChannelHub` field types are a counted
+/// architectural surface (`arch_ratchets` row 6), and re-spelling seventeen of
+/// them to hide an instrument inside is exactly the move that file forbids by
+/// name. An extension trait leaves the field types, and the ratchet, exactly
+/// where they were.
+///
+/// The cause is raised on the **take**, not on the send: a message that
+/// crossed a channel while the app was minimized has still not been drawn, and
+/// the frame that finally draws it is the one that needed drawing. See
+/// [`squallar_egui::frame_need`] for why nothing in this path may consult a
+/// repaint request.
+pub(crate) trait ArrivalRecv<T> {
+    /// Take one message, raising [`squallar_egui::frame_need::NeedCause::Arrival`]
+    /// if there was one.
+    fn try_recv_arrival(&self) -> Result<T, std::sync::mpsc::TryRecvError>;
+}
+
+impl<T> ArrivalRecv<T> for Receiver<T> {
+    fn try_recv_arrival(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
+        let taken = self.try_recv();
+        if taken.is_ok() {
+            squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Arrival);
+        }
+        taken
+    }
+}
+
 pub struct ScanData {
     pub scan: Scan,
     /// What the volume's cuts declared their Nyquist velocities to be.

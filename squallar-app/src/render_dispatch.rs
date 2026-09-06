@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::channels::ArrivalRecv as _;
 use squallar_radar::level3::Level3Product;
 use squallar_radar::srm::StormMotionSample;
 use squallar_radar::types::{RadarProduct, RenderView};
@@ -1864,7 +1865,7 @@ impl RenderDispatcher {
     /// Drain the extract-results channel into the cache — the body of the
     /// `poll_extract_results` FRAME_PUMP row.
     pub(crate) fn poll_extract_results(&mut self) {
-        while let Ok((key, input)) = self.extract_results_rx.try_recv() {
+        while let Ok((key, input)) = self.extract_results_rx.try_recv_arrival() {
             self.populate_extract(key, input);
         }
     }

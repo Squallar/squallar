@@ -208,12 +208,14 @@ impl super::Gui {
         // `ui_fade::anim_time`.
         let stack_open = self.layers_panel_visible();
         let insp_open = self.insp_open;
-        let stack_slide = ctx.animate_bool_with_time(
+        let stack_slide = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("stack_slide"),
             stack_open,
             super::fade::anim_time(),
         );
-        let insp_slide = ctx.animate_bool_with_time(
+        let insp_slide = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("inspector_slide"),
             insp_open,
             super::fade::anim_time(),

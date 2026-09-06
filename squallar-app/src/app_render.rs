@@ -1,4 +1,5 @@
 use super::frame_pump::PumpPhase;
+use crate::channels::ArrivalRecv as _;
 use crate::loop_pool::{
     GRID_BYTES, LoopAllocation, LoopDemand, LoopFrameModel, LoopKey, LoopKind, LoopNeed, LoopPool,
     loop_ceiling_frames,
@@ -1127,6 +1128,49 @@ fn tile_disposition_line(d: &squallar_egui::tile_source::take_ledger::Dispositio
     )
 }
 
+/// The `frame need:` line — **frames drawn against frames that needed
+/// drawing**, and what the ones that did not are charged to.
+///
+/// Denominator: **every presented frame**, interact and idle alike — the
+/// population `frame_ledger::WorstFrame` latches over, and deliberately not
+/// the interact-only one every `frame segment` family uses. Running totals, so
+/// a window is a subtraction.
+///
+/// # Three groups, three denominators, none of them added
+///
+/// * `drawn`, `needed` and `unnecessary`: `needed + unnecessary == drawn`
+///   exactly, so any two of the three give the third.
+/// * `caused …`: frames each cause was raised on. **These overlap** — a frame
+///   that took an arrival while the user dragged is in two — so they sum to at
+///   least `needed` and never to it. Never subtract one from another.
+/// * `charged …`: `unnecessary` split by the claim that kept the application
+///   awake, exactly one per frame, so these sum to `unnecessary` and that
+///   identity is `Reading::charges_balance`.
+///
+/// **Emitted unconditionally**, on `tile_disposition_line`'s terms: a count
+/// has nothing to diff against and no reason to go quiet, so `0 drawn` is a
+/// reading — "no frame has presented yet" — rather than a silence a reader
+/// cannot tell from a line nobody collected.
+fn frame_need_line(r: &crate::frame_need::Reading) -> String {
+    use crate::frame_need::WakeClaim;
+    use squallar_egui::frame_need::NeedCause;
+
+    let mut out = format!(
+        "frame need: {} drawn, {} needed, {} unnecessary; caused",
+        r.drawn,
+        r.needed,
+        r.unnecessary(),
+    );
+    for cause in NeedCause::ALL {
+        out.push_str(&format!(" {}={}", cause.name(), r.cause(cause)));
+    }
+    out.push_str("; charged");
+    for claim in WakeClaim::ALL {
+        out.push_str(&format!(" {}={}", claim.name(), r.charge(claim)));
+    }
+    out
+}
+
 /// The `frame prep costs:` running-total line.
 ///
 /// Denominator: every egui pass this renderer ended, presented or not — see
@@ -1519,7 +1563,7 @@ impl super::App {
     /// Poll for completed background render results and upload textures.
     fn poll_render_results(&mut self, ctx: &egui::Context) {
         let mut uploads = PlanViewUploads::default();
-        while let Ok(rr) = self.channels.render_receiver.try_recv() {
+        while let Ok(rr) = self.channels.render_receiver.try_recv_arrival() {
             // A speculative result before any pane bookkeeping:
             if let Some(site) = rr.speculative_for {
                 self.render.speculative_finished();
@@ -2079,6 +2123,11 @@ impl super::App {
             loud,
             &frame_worst_line(worst, ledger.worst_frame_since_boot()),
         );
+        // The one family here that is not about what a frame cost: whether it
+        // should have been drawn at all. Its denominator is every presented
+        // frame — `frame worst`'s, not the segments' — and none of its three
+        // groups is ever added to another. See `frame_need_line`.
+        say_telemetry(loud, &frame_need_line(&ledger.need()));
         // What one tile take cost, per family. Read unconditionally rather
         // than through an `_if_moved` arm, for the same reason the frame
         // families are: this runs at the end of a frame and the window a
@@ -2395,7 +2444,7 @@ impl super::App {
 
     /// Take the launch's one catalogue refresh and write it to the cache.
     fn poll_site_catalogue(&mut self) {
-        while let Ok(response) = self.channels.site_catalogue_receiver.try_recv() {
+        while let Ok(response) = self.channels.site_catalogue_receiver.try_recv_arrival() {
             // A failed fetch is silent by design — offline is not an error
             // state here, it is a launch that runs on the cache. `catalogue`
             // has already logged the reason at `debug`.
@@ -2488,7 +2537,7 @@ impl super::App {
 
     /// Poll for completed Level III fetch results and update scan info.
     fn poll_level3_results(&mut self) {
-        while let Ok(sounding) = self.channels.sounding_receiver.try_recv() {
+        while let Ok(sounding) = self.channels.sounding_receiver.try_recv_arrival() {
             if self
                 .render
                 .is_fetch_stale(&sounding.site, sounding.generation)
@@ -2518,7 +2567,7 @@ impl super::App {
                 );
             }
         }
-        while let Ok(ml) = self.channels.melting_layer_receiver.try_recv() {
+        while let Ok(ml) = self.channels.melting_layer_receiver.try_recv_arrival() {
             if self.render.is_fetch_stale(&ml.site, ml.generation) {
                 continue;
             }
@@ -2545,7 +2594,7 @@ impl super::App {
                 );
             }
         }
-        while let Ok(sm) = self.channels.storm_motion_receiver.try_recv() {
+        while let Ok(sm) = self.channels.storm_motion_receiver.try_recv_arrival() {
             if self.render.is_fetch_stale(&sm.site, sm.generation) {
                 continue;
             }
@@ -2571,7 +2620,7 @@ impl super::App {
                 );
             }
         }
-        while let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
+        while let Ok(l3_resp) = self.channels.level3_receiver.try_recv_arrival() {
             if self
                 .render
                 .is_fetch_stale(&l3_resp.site, l3_resp.generation)
@@ -2681,7 +2730,7 @@ impl super::App {
         use squallar_egui::overlay_cache::OverlayTextureData;
 
         let mut arrived = 0usize;
-        while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv() {
+        while let Ok(mut resp) = self.channels.overlay_render_receiver.try_recv_arrival() {
             arrived += 1;
             let id = resp.overlay_kind.clone();
 
@@ -3339,7 +3388,7 @@ impl super::App {
 
     /// Take delivery of finished cross-sections and upload their rasters.
     fn poll_section_results(&mut self, ctx: &egui::Context) {
-        while let Ok(sr) = self.channels.section_receiver.try_recv() {
+        while let Ok(sr) = self.channels.section_receiver.try_recv_arrival() {
             if let Some(state) = self.render.pane_render.get_mut(sr.pane_idx) {
                 state.render_finished();
             }
@@ -4036,7 +4085,7 @@ impl super::App {
     /// pairing that was waiting on it.
     fn poll_loop_l3_list_results(&mut self) {
         let mut listed = false;
-        while let Ok(resp) = self.channels.loop_l3_list_receiver.try_recv() {
+        while let Ok(resp) = self.channels.loop_l3_list_receiver.try_recv_arrival() {
             // Cached under the site and code it was *listed* for, never under
             // whatever the requesting pane has since become — the keys belong to
             // the listing, and every pane looping that site shares them.
@@ -4060,7 +4109,7 @@ impl super::App {
     /// retired once instead of being re-paired every pass.
     fn poll_loop_l3_fetch_results(&mut self) {
         let mut completed_count = 0usize;
-        while let Ok(resp) = self.channels.loop_l3_fetch_receiver.try_recv() {
+        while let Ok(resp) = self.channels.loop_l3_fetch_receiver.try_recv_arrival() {
             self.loop_mgr
                 .cache_l3_product(&resp.site, &resp.code, resp.timestamp, resp.product);
             completed_count += 1;
@@ -4168,7 +4217,7 @@ impl super::App {
     /// in the global scan cache and dispatch next pending downloads.
     fn poll_loop_scan_download_results(&mut self) {
         let mut completed_count = 0usize;
-        while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
+        while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv_arrival() {
             apply_completed_download(&mut self.loop_mgr, resp);
             completed_count += 1;
         }
@@ -4271,7 +4320,7 @@ impl super::App {
 
     /// Poll for completed loop frame render results and upload textures.
     fn poll_loop_render_results(&mut self, ctx: &egui::Context) {
-        while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv() {
+        while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv_arrival() {
             // Off the channel: this raster is no longer in flight, whatever
             // this frame then does with it. Priced here, before anything can
             // move the image out of `rr`, and per response rather than per
@@ -4604,6 +4653,16 @@ impl super::App {
             if !ls.is_active() || !ls.is_playing() || ls.frames.is_empty() {
                 continue;
             }
+            // **A playing transport is an animation running**, which is the
+            // unnecessary-frame verdict's third cause. Raised on every frame
+            // the transport is playing, not only on the ticks it advances on
+            // — the definition the verdict is built to is "an animation is
+            // running", and the tighter reading ("the picture moved") would
+            // score a 4 fps loop on a 175 Hz display 97 % unnecessary. That
+            // may well be the more useful number, and it is not this one: an
+            // over-report is what makes an instrument ignored, so the safe
+            // side is taken and the gap is stated. See `crate::frame_need`.
+            squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Animation);
 
             let should_advance = ls
                 .last_advance
@@ -6626,7 +6685,7 @@ impl super::App {
 
     /// Poll for finished cross-section loop cuts and upload their rasters.
     fn poll_loop_section_results(&mut self, ctx: &egui::Context) {
-        while let Ok(mut sr) = self.channels.loop_section_receiver.try_recv() {
+        while let Ok(mut sr) = self.channels.loop_section_receiver.try_recv_arrival() {
             let origin_pane = sr.pane_idx;
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;

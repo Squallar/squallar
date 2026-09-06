@@ -28,6 +28,11 @@ pub mod basemap_style;
 pub(crate) mod field_facts;
 /// The 3D floor path's always-on counters: strips painted, mirrors rendered.
 pub mod floor_ledger;
+/// **Why the frame being built had to exist at all** — the always-on cause
+/// register behind `squallar-app`'s unnecessary-frame verdict. Raised at the
+/// sites where a change actually happens, never from the repaint ask that
+/// follows one.
+pub mod frame_need;
 /// The scripted-input player: deterministic gesture scripts injected into the
 /// renderer's raw input, and the click registry the UiSweep script drives real
 /// widgets through. Dormant unless armed by the `gesture_script` config key or

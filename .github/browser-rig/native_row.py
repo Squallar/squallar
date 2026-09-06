@@ -185,6 +185,7 @@ PROBE_NAMES = (
     "budget_state_re",
     "tile_cache_re",
     "tile_bodies_re",
+    "frame_need_re",
     "gesture_begin_re",
     "gesture_loop_re",
 )
@@ -561,6 +562,7 @@ def scrape(lines, probes):
         "unparsed": [],
         "tile_cache": [],
         "tile_bodies": [],
+        "frame_need": [],
         "overlay_pictures": [],
         "segments": [],
         # `{key: [Reading]}` for every per-family line present, keyed the
@@ -604,6 +606,7 @@ def scrape(lines, probes):
             ("ground", "ground_re"),
             ("floor", "floor_re"),
             ("tile_bodies", "tile_bodies_re"),
+            ("frame_need", "frame_need_re"),
             ("loop_state", "loop_state_re"),
         ):
             m = probes[probe].search(line)
@@ -2346,6 +2349,42 @@ def build_row(args, scraped, probes):
     tile_bodies = (None if tb is None
                    else {"offloaded": tb[0], "inline": tb[1]})
 
+    # **Frames drawn against frames that needed drawing**, over the same
+    # bracket -- the one family on this row that is not about what a frame
+    # cost. Its denominator is EVERY PRESENTED FRAME (interact and idle
+    # alike), which is `frame worst`'s population and NOT the interact-only
+    # one every `segment:*` family carries, so `drawn` is never ratio'd
+    # against a segment family's `n`.
+    #
+    # Three groups, three denominators, never added across: `needed +
+    # unnecessary == drawn`; the four `caused` counts OVERLAP and sum to at
+    # least `needed`; the ten `charged` counts are one per unnecessary frame
+    # and sum to `unnecessary`. Both identities are asserted below rather than
+    # assumed -- a windowed difference of two running totals is where a
+    # miscount would first show, and a row that printed it silently would be
+    # the instrument's own failure printed as a finding.
+    #
+    # None when the log has no `frame need:` line, which on this line means a
+    # binary older than it: the app emits it unconditionally, so a leg that
+    # drew nothing says `0 drawn` rather than going quiet.
+    fnd = diff_totals(scraped["frame_need"], start_idx, end_idx)
+    if fnd is None:
+        frame_need = None
+    else:
+        frame_need = {
+            "drawn": fnd[0], "needed": fnd[1], "unnecessary": fnd[2],
+            "caused": dict(zip(("input", "arrival", "animation", "surface"),
+                               fnd[3:7])),
+            "charged": dict(zip(("render", "loop", "hold", "restore", "chunk",
+                                 "drops", "gesture", "egui", "timed",
+                                 "external"), fnd[7:17])),
+            # The two conservation laws, computed over the WINDOW. False is a
+            # reader or an app defect, never a property of the scene, so the
+            # row prints the flag beside the figures instead of hiding it.
+            "partitions": fnd[1] + fnd[2] == fnd[0],
+            "charges_balance": sum(fnd[7:17]) == fnd[2],
+        }
+
     # Basemap state, on `run_measure.sh`'s own two-counter terms.
     bt = diff_totals(scraped["basemap"], start_idx, end_idx)
     g = diff_totals(scraped["ground"], start_idx, end_idx)
@@ -2428,6 +2467,7 @@ def build_row(args, scraped, probes):
         "surface": surf,
         "loop_state": (scraped["loop_state"][-1][1] if scraped["loop_state"] else None),
         "tile_bodies": tile_bodies,
+        "frame_need": frame_need,
         # `(line, bracket, [fifteen ints])`, or None when the log has no
         # `budget state:` line -- a binary older than the line, kept apart
         # from a live binary reporting zeroes.
@@ -2663,6 +2703,51 @@ def print_row(row):
     # never ran. Never added to those families: they are microseconds, this is
     # bodies. Absent when the log has no line, which means a binary older than
     # it and never a leg that decoded nothing.
+    # Frames drawn against frames that NEEDED drawing, over the bracket. The
+    # only family on this row measuring work that should not have happened;
+    # every other one measures work done and reads a healthy zero on a frame
+    # that should never have been drawn. Denominator: every PRESENTED frame,
+    # never a segment family's interact-only `n`.
+    fn_ = row.get("frame_need")
+    if fn_ is None:
+        print(
+            "ROW   frame need: n/a (no `frame need:` line in this log -- a "
+            "binary older than the line. The app emits it unconditionally, so "
+            "this is never a run in which no frame was drawn)"
+        )
+    else:
+        drawn = fn_["drawn"]
+        print(
+            "ROW   frame need: %s drawn, %s needed, %s unnecessary (%s) "
+            "[over the bracket; denominator every PRESENTED frame]"
+            % (drawn, fn_["needed"], fn_["unnecessary"],
+               "n/a" if not drawn
+               else "%.1f%%" % (100.0 * fn_["unnecessary"] / drawn))
+        )
+        c = fn_["caused"]
+        print(
+            "ROW   frame need caused (OVERLAPPING, never added to each "
+            "other): input=%s arrival=%s animation=%s surface=%s"
+            % (c["input"], c["arrival"], c["animation"], c["surface"])
+        )
+        g = fn_["charged"]
+        print(
+            "ROW   frame need charged (one per unnecessary frame): render=%s "
+            "loop=%s hold=%s restore=%s chunk=%s drops=%s gesture=%s egui=%s "
+            "timed=%s external=%s"
+            % (g["render"], g["loop"], g["hold"], g["restore"], g["chunk"],
+               g["drops"], g["gesture"], g["egui"], g["timed"], g["external"])
+        )
+        if not (fn_["partitions"] and fn_["charges_balance"]):
+            # The instrument disagreeing with itself over this window. Printed
+            # as an instrument failure in those words, because a reader who
+            # met these figures without it would take them for a finding.
+            print(
+                "ROW   frame need: BROKEN over this window (partitions=%s "
+                "charges_balance=%s) -- the figures above are the "
+                "instrument's own failure, not a reading of the scene"
+                % (fn_["partitions"], fn_["charges_balance"])
+            )
     tb = row.get("tile_bodies")
     if tb is None:
         print(
@@ -5253,6 +5338,131 @@ class TileBodiesTests(unittest.TestCase):
         self.assertIn("ROW   tile bodies: n/a", text)
         self.assertIn("binary older than the line", text)
         self.assertNotIn("ROW   tile bodies: 0 offloaded", text)
+
+
+class FrameNeedTests(unittest.TestCase):
+    """The one family here that measures work that should NOT have happened.
+
+    Every other figure on a row measures work done, and all of them read a
+    healthy zero on a frame that should never have been drawn -- a
+    permanently repainting map, a map repainting on a value that did not
+    change, an app that never goes idle. Two such defects landed in one night
+    in September 2026 and neither was visible to any instrument in the tree.
+    """
+
+    LINE = ("[..] INFO frame need: %d drawn, %d needed, %d unnecessary; "
+            "caused input=%d arrival=%d animation=%d surface=%d; "
+            "charged render=%d loop=%d hold=%d restore=%d chunk=%d drops=%d "
+            "gesture=%d egui=%d timed=%d external=%d")
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.load = os.path.join(self._tmp.name, "load")
+        with open(self.load, "w", encoding="utf-8") as fh:
+            for i in range(6):
+                fh.write("%d\t1.0\n" % (1_000_000 + 5 * i))
+        self.probes = compile_probes()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _at(self, n):
+        """A reading at `n` frames, all of them unnecessary and charged to the
+        immediate-repaint arm -- the self-nudging map's shape."""
+        return self.LINE % (n, 0, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n, 0, 0)
+
+    def test_the_probe_is_drive_pys_own(self):
+        """Read out of drive.py at run time, never restated here, so the two
+        halves of the rig cannot come to read different lines."""
+        self.assertIn("frame need: (", drive_pattern("frame_need_re"))
+        self.assertIn("charged render=", drive_pattern("frame_need_re"))
+
+    def test_the_line_scrapes_with_every_group_mandatory(self):
+        m = self.probes["frame_need_re"].search(self._at(240))
+        self.assertIsNotNone(m)
+        g = [int(x) for x in m.groups()]
+        self.assertEqual(len(g), 17)
+        self.assertEqual(g[0], 240)
+        # A field dropped anywhere stops the match dead, which is what keeps a
+        # partial reading from arriving as a full one.
+        self.assertIsNone(self.probes["frame_need_re"].search(
+            "[..] INFO frame need: 240 drawn, 0 needed, 240 unnecessary"))
+
+    def _row(self, lines):
+        row = build_row(_leg_args(self.load, 1), scrape(lines, self.probes), self.probes)
+        return row, _capture(lambda: print_row(row))
+
+    def test_the_row_windows_the_running_total_and_names_the_charge(self):
+        """A running total, differenced across the bracket. The self-nudging
+        map reads 100% unnecessary over the window and every one of those
+        frames is charged to the immediate repaint that bought it."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        seen = 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                out.append(self._at(100 * seen))
+        row, text = self._row(out)
+        fn_ = row["frame_need"]
+        self.assertIsNotNone(fn_)
+        self.assertGreater(fn_["drawn"], 0)
+        self.assertEqual(fn_["needed"], 0)
+        self.assertEqual(fn_["unnecessary"], fn_["drawn"])
+        self.assertEqual(fn_["charged"]["egui"], fn_["drawn"])
+        self.assertTrue(fn_["partitions"])
+        self.assertTrue(fn_["charges_balance"])
+        self.assertIn("ROW   frame need: ", text)
+        self.assertIn("100.0%", text)
+        self.assertIn("ROW   frame need charged", text)
+        self.assertNotIn("BROKEN over this window", text)
+
+    def test_a_window_whose_identities_fail_is_printed_as_an_instrument_failure(self):
+        """A reader who met these figures without the warning would take them
+        for a finding about the scene."""
+        lines = _leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE)
+        out = []
+        seen = 0
+        for line in lines:
+            out.append(line)
+            if "gesture script pan-zoom-2d loop complete" in line:
+                seen += 1
+                # `needed + unnecessary != drawn`, and nothing charged.
+                out.append(self.LINE % (100 * seen, 0, 0, 0, 0, 0, 0,
+                                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        _row, text = self._row(out)
+        self.assertIn("BROKEN over this window", text)
+        self.assertIn("not a reading of the scene", text)
+
+    def test_a_binary_older_than_the_line_says_so_rather_than_zero(self):
+        """None, and the row says which. The app emits this line
+        unconditionally, so an absent line is never a run that drew no
+        frames -- and `0 drawn` for it would read as a perfectly idle app."""
+        row, text = self._row(_leg_log(ONE_PANE_PICTURE_BYTES, OVERLAY_PICTURES_ONE))
+        self.assertIsNone(row["frame_need"])
+        self.assertIn("ROW   frame need: n/a", text)
+        self.assertIn("binary older than the line", text)
+        self.assertNotIn("ROW   frame need: 0 drawn", text)
+
+    def test_drive_py_lists_the_family_in_the_artifact_key_tuple(self):
+        """A family the probe collects and the artifact's explicit key list
+        does not name is ABSENT from the artifact rather than empty in it,
+        which a reader takes for a bundle too old to carry the line. That has
+        already cost this campaign a probe once."""
+        text = _read(DRIVE_PY)
+        self.assertIn('"frame_need")}', text,
+                      "drive.py collects `frame need:` and does not list it in "
+                      "the `frame_lines` key tuple, so it never reaches the "
+                      "artifact")
+        self.assertIn('result["frame_need_all"] = sorted(', text,
+                      "drive.py does not serialize the per-tick series, so no "
+                      "window can be taken over the verdict")
+        self.assertIn("SUMMARY frame need charged", text,
+                      "drive.py parses the charge breakdown into the artifact "
+                      "and never prints it, so it is invisible to whoever "
+                      "runs the leg and reads stdout")
 
 
 class OffFrameEvictionTests(unittest.TestCase):

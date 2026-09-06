@@ -3108,6 +3108,38 @@ var frame_worst_none_re = /frame worst: no frame presented this period, since_bo
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// **THE ONE LINE HERE THAT IS NOT ABOUT WHAT A FRAME COST.** Every family
+// above measures work DONE; this one measures work that should not have
+// happened -- frames drawn against frames that needed drawing, plus what the
+// ones that did not are charged to. Written by
+// `squallar_app::app_render::frame_need_line` from the always-on cause
+// register in `squallar_egui::frame_need`.
+//
+// Running totals, so the LAST match wins for a headline reading and any two
+// readings bracket a window. Emitted UNCONDITIONALLY, on `tile bodies:`'
+// terms: `0 drawn` is a reading ("no frame has presented yet"), never a
+// silence a reader cannot tell from a line nobody collected.
+//
+// THREE GROUPS, THREE DENOMINATORS, NEVER ADDED ACROSS:
+//   * `drawn` / `needed` / `unnecessary`: needed + unnecessary == drawn
+//     exactly. Its denominator is EVERY PRESENTED FRAME -- `frame worst`'s
+//     population, interact and idle alike -- and NOT the interact-only one
+//     every `frame segment (*)` family carries. So `drawn` is larger than
+//     `segment:*`'s n and the two are never ratio'd.
+//   * `caused …`: frames each cause was raised on. These OVERLAP -- a frame
+//     that took an arrival while the user dragged is in two -- so they sum to
+//     at least `needed` and never to it. Never subtract one from another.
+//   * `charged …`: `unnecessary` split by the claim that kept the app awake,
+//     exactly one per frame, so these sum to `unnecessary`. A sum that stops
+//     matching is a frame reaching the verdict with no claim chosen.
+//
+// WHY THE DENOMINATOR IS NOT THE REPAINT REQUEST: a map that nudges itself
+// genuinely requests every frame it wastes, so "egui asked" scores the defect
+// 100% NECESSARY. The causes are raised where a change actually happens -- an
+// event on the raw input, a message taken off a channel, a tile body handled,
+// an animation factor between its endpoints, a surface rebuilt -- and none is
+// reachable from a repaint ask. The ask is used only for `charged`.
+var frame_need_re = /frame need: (\d+) drawn, (\d+) needed, (\d+) unnecessary; caused input=(\d+) arrival=(\d+) animation=(\d+) surface=(\d+); charged render=(\d+) loop=(\d+) hold=(\d+) restore=(\d+) chunk=(\d+) drops=(\d+) gesture=(\d+) egui=(\d+) timed=(\d+) external=(\d+)/;
 // Scene E's denominators. `listed` is frame SLOTS across every animating
 // layer of every pane; `resident`, `in flight` and `failed` are DISJOINT
 // SUBSETS of it and are never added to it -- a slot may be none of the three.
@@ -3264,6 +3296,7 @@ var cadence = null, gpu_unavailable = false, loop_state = null;
 var loop_state_all = [];
 var budget_state = null, budget_state_all = [];
 var interact_all = [], idle_all = [], cadence_all = [];
+var frame_need = null, frame_need_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
 var frame_pump_all = [];
@@ -3322,6 +3355,30 @@ for (var i = 0; i < C.length; i++) {
     cadence = { t: t, n: parseInt(x[1], 10), p50: x[2], p99: x[3],
                 hist: x[4] };
     cadence_all.push(cadence);
+  }
+  x = frame_need_re.exec(m);
+  if (x) {
+    // Running totals; every reading kept so a window is a subtraction, on
+    // `interact_all`'s terms. `unnecessary` is carried rather than derived
+    // even though `drawn - needed` gives it: the app computes it, and a rig
+    // that recomputed it could not notice the two disagreeing.
+    frame_need = { t: t, drawn: parseInt(x[1], 10), needed: parseInt(x[2], 10),
+                   unnecessary: parseInt(x[3], 10),
+                   caused: { input: parseInt(x[4], 10),
+                             arrival: parseInt(x[5], 10),
+                             animation: parseInt(x[6], 10),
+                             surface: parseInt(x[7], 10) },
+                   charged: { render: parseInt(x[8], 10),
+                              loop: parseInt(x[9], 10),
+                              hold: parseInt(x[10], 10),
+                              restore: parseInt(x[11], 10),
+                              chunk: parseInt(x[12], 10),
+                              drops: parseInt(x[13], 10),
+                              gesture: parseInt(x[14], 10),
+                              egui: parseInt(x[15], 10),
+                              timed: parseInt(x[16], 10),
+                              external: parseInt(x[17], 10) } };
+    frame_need_all.push(frame_need);
   }
   x = loop_state_re.exec(m);
   if (x) {
@@ -3468,6 +3525,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          budget_state: budget_state, budget_state_all: budget_state_all,
          interact_all: interact_all, idle_all: idle_all,
          cadence_all: cadence_all,
+         frame_need: frame_need, frame_need_all: frame_need_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          frame_ui_all: frame_ui_all,
@@ -3580,6 +3638,11 @@ class FrameLineWatcher:
         # One entry per telemetry tick: the period's worst frame, with the
         # since-boot maximum's anatomy beside it. Windowed by max service.
         self.worst = []
+        # Every `frame need:` reading seen, keyed by (page stamp, drawn) for
+        # `interact`'s reason: running totals, and the reading that brackets
+        # the START of a window can have been evicted from the console ring by
+        # the time the window ends.
+        self.need = {}
         self.loops = {}
         self.last = {}
 
@@ -3605,6 +3668,8 @@ class FrameLineWatcher:
                 self.named.setdefault(family, {})[(r.get("t"), r.get("n"))] = r
         for r in sig.get("frame_worst_all") or []:
             self.worst.append(r)
+        for r in sig.get("frame_need_all") or []:
+            self.need[(r.get("t"), r.get("drawn"))] = r
         for r in sig.get("gesture_begins") or []:
             self.begins[(r.get("t"), r.get("script"))] = r
         for r in sig.get("gesture_loops") or []:
@@ -7152,7 +7217,15 @@ def run_smoke(args):
         result["frame_lines"] = {
             k: fl_last.get(k) for k in ("interact", "idle", "segments",
                                         "prep", "gpu", "gpu_unavailable",
-                                        "cadence", "loop_state")}
+                                        "cadence", "loop_state",
+                                        # Frames drawn against frames that
+                                        # needed drawing. LISTED HERE OR
+                                        # ABSENT: a family the probe collects
+                                        # and this tuple does not name is
+                                        # missing from the artifact rather
+                                        # than empty in it, which reads as a
+                                        # bundle too old to have the line.
+                                        "frame_need")}
         # Recorded beside `loop_state`, and None -- never 0 -- when no
         # `budget state:` line matched: an older bundle, not a zero reading.
         result["frame_lines"]["budget_state"] = fl_last.get("budget_state")
@@ -7164,6 +7237,13 @@ def run_smoke(args):
         result["frame_worst_all"] = sorted(
             {r["t"]: r for r in getattr(frames_watch, "worst", [])
              if r.get("t") is not None}.values(), key=lambda r: r["t"])
+        # The unnecessary-frame verdict per tick, from the WATCHER for
+        # `frame_worst_all`'s reason: the end-of-run snapshot's console ring
+        # may have evicted the tick that carried the reading a window opens
+        # on. Running totals, so any two entries bracket a window.
+        result["frame_need_all"] = sorted(
+            (r for r in getattr(frames_watch, "need", {}).values()
+             if r.get("t") is not None), key=lambda r: r["t"])
         # The running upload totals per tick, on the SAME 2 s tick as the
         # worst-frame line, so the two difference to one period each: the
         # upload volume of the period whose worst frame that tick reports.
@@ -7775,6 +7855,43 @@ def run_smoke(args):
                  fw.get("boot_ui_stack"), fw.get("boot_ui_dialog"),
                  fw.get("boot_ui_panes"), fw.get("boot_ui_apply"),
                  fw.get("boot_ui_chrome")))
+    fn_ = (result.get("frame_lines") or {}).get("frame_need")
+    if fn_ is not None:
+        # EVERY field the pattern reads is printed, on `transport_bytes`'
+        # rule below: a figure parsed into the artifact and left out of the
+        # summary is INVISIBLE to whoever runs the leg and reads stdout.
+        #
+        # Cumulative from boot, so boot's own necessary frames are in it and
+        # the headline share is a whole-run figure, not a windowed one; the
+        # per-tick series in `frame_need_all` is what a window subtracts.
+        # The three groups have three denominators and are never added across
+        # -- see the probe's comment.
+        caused = fn_.get("caused") or {}
+        charged = fn_.get("charged") or {}
+        drawn = fn_.get("drawn") or 0
+        print("[%s] SUMMARY frame need: %s drawn, %s needed, %s unnecessary "
+              "(%s%% of frames drawn) [denominator: every PRESENTED frame, "
+              "interact and idle -- never `frame segment (*)`'s n]"
+              % (tag, drawn, fn_.get("needed"), fn_.get("unnecessary"),
+                 "n/a" if not drawn
+                 else round(100.0 * (fn_.get("unnecessary") or 0) / drawn, 1)))
+        print("[%s] SUMMARY frame need caused (OVERLAPPING, never added): "
+              "input=%s arrival=%s animation=%s surface=%s"
+              % (tag, caused.get("input"), caused.get("arrival"),
+                 caused.get("animation"), caused.get("surface")))
+        print("[%s] SUMMARY frame need charged (one per unnecessary frame, "
+              "sums to `unnecessary`): render=%s loop=%s hold=%s restore=%s "
+              "chunk=%s drops=%s gesture=%s egui=%s timed=%s external=%s"
+              % (tag, charged.get("render"), charged.get("loop"),
+                 charged.get("hold"), charged.get("restore"),
+                 charged.get("chunk"), charged.get("drops"),
+                 charged.get("gesture"), charged.get("egui"),
+                 charged.get("timed"), charged.get("external")))
+    else:
+        print("[%s] SUMMARY frame need: n/a (no `frame need:` line in this "
+              "log -- a bundle older than the line, or frame telemetry not "
+              "seeded. The app emits it unconditionally, so this is never a "
+              "run in which no frame was drawn)" % tag)
     tb = result.get("transport_bytes")
     if tb:
         # Every field the pattern reads is printed. A figure parsed into the

@@ -1289,7 +1289,8 @@ impl super::Gui {
             full_opacity: full,
         };
 
-        let reveal = ctx.animate_bool_with_time(
+        let reveal = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new(("pill_reveal", idx)),
             full,
             super::fade::anim_time(),

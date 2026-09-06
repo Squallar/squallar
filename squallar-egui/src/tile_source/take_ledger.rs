@@ -156,8 +156,16 @@ static TAKES: [AtomicHist; FAMILIES.len()] = [
 ];
 
 /// Record one take of `kind` that cost `micros`. The whole hot-path API.
+///
+/// **Also the basemap's arrival door for the unnecessary-frame verdict.** A
+/// take is one completion moved off a tile source's channel and handled to
+/// completion on the frame thread, which is precisely "a piece of the picture
+/// arrived this frame" — and it is the only such door the tile path has, since
+/// nothing in it crosses one of the app's `ChannelHub` receivers. Without it
+/// every frame that drew a newly decoded tile would be scored unnecessary.
 pub fn note_take(kind: TakeKind, micros: u32) {
     TAKES[kind.index()].record(micros);
+    crate::frame_need::note(crate::frame_need::NeedCause::Arrival);
 }
 
 /// One family's reading: its histogram, which carries its own `n`, its exact

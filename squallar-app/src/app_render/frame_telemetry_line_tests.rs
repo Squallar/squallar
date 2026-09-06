@@ -925,6 +925,11 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         ("cadence", &["cadence_re"]),
         ("dispatch", &["frame_dispatch_re"]),
         ("finish", &["frame_finish_re"]),
+        // The verdict family — frames drawn against frames that needed
+        // drawing. One probe, and its groups are all mandatory: an unlisted
+        // family is invisible to every leg, which is what this table exists
+        // to stop.
+        ("need", &["frame_need_re"]),
         ("post", &["frame_post_re"]),
         ("prep", &["prep_costs_re", "prep_geometry_re"]),
         ("prepare", &["frame_prepare_re"]),
@@ -1522,6 +1527,58 @@ fn the_tile_bodies_line_reads_exactly_as_pinned() {
             inline: 0,
         }),
         "tile bodies: 0 offloaded, 0 decoded on the frame thread",
+    );
+}
+
+/// The `frame need:` sentence, pinned at both ends — **the one line here that
+/// is not about what a frame cost**.
+///
+/// Its three groups are three denominators and are never added across, which
+/// is why they are pinned as one sentence rather than three: a reader who saw
+/// `caused` and `charged` on separate lines would have no reason not to sum
+/// them, and they answer different questions over different populations.
+///
+/// Emitted unconditionally, on `tile_disposition_line`'s terms: `0 drawn` is a
+/// reading — no frame has presented — and not a silence a reader cannot tell
+/// from a line nobody collected.
+#[test]
+fn the_frame_need_line_reads_exactly_as_pinned() {
+    use crate::frame_need::Reading;
+
+    let r = Reading {
+        drawn: 12_345,
+        needed: 12_000,
+        causes: [900, 11_000, 400, 3],
+        charged: [10, 0, 2, 0, 1, 0, 0, 300, 30, 2],
+    };
+    // The verdict is arithmetic on the two counts, never a third counter that
+    // could drift from them.
+    assert_eq!(r.unnecessary(), 345);
+    assert!(r.charges_balance());
+    assert!(r.causes_cover_the_needed());
+
+    let expected = "frame need: 12345 drawn, 12000 needed, 345 unnecessary; \
+                    caused input=900 arrival=11000 animation=400 surface=3; \
+                    charged render=10 loop=0 hold=2 restore=0 chunk=1 drops=0 \
+                    gesture=0 egui=300 timed=30 external=2";
+    assert_eq!(super::frame_need_line(&r), expected);
+    assert_eq!(
+        super::frame_need_line(&r),
+        rendered(
+            &pattern("frame_need_re"),
+            &[
+                "12345", "12000", "345", "900", "11000", "400", "3", "10", "0", "2", "0", "1", "0",
+                "0", "300", "30", "2",
+            ],
+        ),
+        "the `frame need:` line and the rig's probe have drifted",
+    );
+    // The all-zero reading is a SENTENCE, for the reason `tile bodies:`' is.
+    assert_eq!(
+        super::frame_need_line(&Reading::default()),
+        "frame need: 0 drawn, 0 needed, 0 unnecessary; caused input=0 \
+         arrival=0 animation=0 surface=0; charged render=0 loop=0 hold=0 \
+         restore=0 chunk=0 drops=0 gesture=0 egui=0 timed=0 external=0",
     );
 }
 

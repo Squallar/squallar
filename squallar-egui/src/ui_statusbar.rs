@@ -41,12 +41,14 @@ impl super::Gui {
             }
             return;
         };
-        let expanded_factor = ctx.animate_bool_with_time(
+        let expanded_factor = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("statusbar_expanded"),
             !self.statusbar_collapsed,
             super::fade::anim_time(),
         );
-        let restore_factor = ctx.animate_bool_with_time(
+        let restore_factor = crate::frame_need::animate_bool(
+            ctx,
             egui::Id::new("statusbar_restore"),
             expanded_factor <= 0.0,
             super::fade::anim_time(),

@@ -49,8 +49,12 @@ impl super::Gui {
                 self.ui_faded = false;
             }
         }
-        self.fade_factor =
-            ctx.animate_bool_with_time(egui::Id::new("ui_fade"), !self.ui_faded, anim_time());
+        self.fade_factor = crate::frame_need::animate_bool(
+            ctx,
+            egui::Id::new("ui_fade"),
+            !self.ui_faded,
+            anim_time(),
+        );
     }
 
     /// Resolve the pane loop's fade verdict — called from
@@ -72,8 +76,12 @@ impl super::Gui {
             flipped = true;
         }
         if flipped {
-            self.fade_factor =
-                ctx.animate_bool_with_time(egui::Id::new("ui_fade"), !self.ui_faded, anim_time());
+            self.fade_factor = crate::frame_need::animate_bool(
+                ctx,
+                egui::Id::new("ui_fade"),
+                !self.ui_faded,
+                anim_time(),
+            );
         }
     }
 
@@ -114,7 +122,7 @@ impl super::Gui {
         if pressed_in_bar {
             self.ui_faded = false;
             self.fade_factor =
-                ctx.animate_bool_with_time(egui::Id::new("ui_fade"), true, anim_time());
+                crate::frame_need::animate_bool(ctx, egui::Id::new("ui_fade"), true, anim_time());
         }
     }
 

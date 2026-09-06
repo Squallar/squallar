@@ -12,7 +12,8 @@ use winit::window::{Window, WindowId};
 
 use crate::WindowRef;
 use crate::app_state;
-use crate::channels::ChannelHub;
+use crate::channels::{ArrivalRecv as _, ChannelHub};
+use crate::frame_need::WakeClaim;
 use crate::input::InputHandler;
 use crate::platform::{
     GpuCapacitySource, GpuProbeReport, PlatformBridge, ProbedCapacity, RedrawWaker,
@@ -969,6 +970,10 @@ impl App {
         {
             log::info!("Window resized to {}x{}", width, height);
             state.resize_surface(width, height);
+            // The surface the next frame draws into is not the one the last
+            // frame drew into, so that frame needs drawing whatever else is
+            // quiet. See `crate::frame_need`.
+            squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Surface);
         }
     }
 
@@ -1036,19 +1041,35 @@ impl App {
         self.push_back_claim();
         let post_back = web_time::Instant::now();
 
-        if self.render.any_render_in_flight()
-            || self.gui.any_loop_active()
-            || self.gui.any_raster_held()
-            // A restore that deferred itself has to be brought back by
-            // something; nothing else in this list speaks for it.
-            || self.restore_pending
-            || self.chunk_feeds.any_in_flight()
-            || self.chunk_notify.handshake_pending()
-            || squallar_worker::offload::has_deferred_drops()
-            // An armed gesture player is a hand that never lifts: its next
-            // frame's events exist only if a next frame comes.
-            || self.gesture_player.is_some()
-        {
+        // **The same eight questions in the same order, with the same
+        // short-circuit** — `or_else` is lazy exactly as `||` was, so a frame
+        // with a render in flight still stops at the first one and this tail
+        // costs what it did. What is new is that the answer is NAMED rather
+        // than collapsed into a bool: the claim standing here is what buys the
+        // NEXT frame, and it is the only thing that can say who bought a frame
+        // that turned out to need nothing (`crate::frame_need::WakeClaim`).
+        let wake_claim = if self.render.any_render_in_flight() {
+            Some(WakeClaim::Render)
+        } else if self.gui.any_loop_active() {
+            Some(WakeClaim::Loop)
+        } else if self.gui.any_raster_held() {
+            Some(WakeClaim::Hold)
+        // A restore that deferred itself has to be brought back by
+        // something; nothing else in this list speaks for it.
+        } else if self.restore_pending {
+            Some(WakeClaim::Restore)
+        } else if self.chunk_feeds.any_in_flight() || self.chunk_notify.handshake_pending() {
+            Some(WakeClaim::Chunk)
+        } else if squallar_worker::offload::has_deferred_drops() {
+            Some(WakeClaim::Drops)
+        // An armed gesture player is a hand that never lifts: its next
+        // frame's events exist only if a next frame comes.
+        } else if self.gesture_player.is_some() {
+            Some(WakeClaim::Gesture)
+        } else {
+            None
+        };
+        if wake_claim.is_some() {
             notify_redraw(&self.window);
         }
         let post_wake = web_time::Instant::now();
@@ -1058,18 +1079,35 @@ impl App {
             .map(|delay| web_time::Instant::now() + delay);
         let post_poll = web_time::Instant::now();
 
-        match repaint_action(repaint_delay) {
+        let repaint_claim = match repaint_action(repaint_delay) {
             RepaintAction::Now => {
                 self.egui_repaint_at = None;
                 notify_redraw(&self.window);
+                Some(WakeClaim::EguiNow)
             }
             RepaintAction::After(delay) => {
                 self.egui_repaint_at = Some(web_time::Instant::now() + delay);
+                Some(WakeClaim::Timed)
             }
             RepaintAction::Idle => {
                 self.egui_repaint_at = None;
+                None
             }
-        }
+        };
+        // **The app's own claim outranks egui's**, and the order is the
+        // convention `WakeClaim` documents: a standing claim above is this
+        // application saying it wants another frame for work it has out, and
+        // egui's ask is a second, redundant post when one already stands. A
+        // frame nobody claimed at all is `External` — the platform delivered
+        // it and no code of ours asked. The auto-poll deadline set two lines
+        // up is folded into `Timed` rather than given a slot: both are a frame
+        // arriving on a clock.
+        self.frame_ledger.record_wake_claim(
+            wake_claim
+                .or(repaint_claim)
+                .or_else(|| self.auto_poll_at.map(|_| WakeClaim::Timed))
+                .unwrap_or(WakeClaim::External),
+        );
         // One level below the `dispatch` cut the stamps above bracket — the
         // same span, opened up. Filed before the stamps so a reader meets the
         // decomposition beside the thing it decomposes.
@@ -1101,6 +1139,9 @@ impl App {
         }
         self.cached_dark_theme = Some(dark);
         self.gui.bump_all_radar_sites_gen();
+        // Every glyph, ramp and site label is re-rasterized against the new
+        // theme, so the frame that adopts it is not one that could be skipped.
+        squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Surface);
         true
     }
 
@@ -1179,6 +1220,9 @@ impl App {
                 self.render
                     .set_raster_side_ceiling_px(state.raster_side_ceiling_px);
                 self.state = Some(state);
+                // A renderer exists where none did: the first frame it draws is
+                // by definition a frame the surface needs. See `crate::frame_need`.
+                squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Surface);
                 // Armed here, run from inside the frame. See the field.
                 self.restore_pending = true;
                 self.install_volume_bridge();
@@ -1196,6 +1240,9 @@ impl App {
                     self.render
                         .set_raster_side_ceiling_px(state.raster_side_ceiling_px);
                     self.state = Some(state);
+                    // A renderer exists where none did: the first frame it draws is
+                    // by definition a frame the surface needs. See `crate::frame_need`.
+                    squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Surface);
                     // Armed here, run from inside the frame. See the field.
                     self.restore_pending = true;
                     self.install_volume_bridge();
@@ -1773,7 +1820,7 @@ impl App {
     fn poll_voxel_results(&mut self) {
         use squallar_volumetric::bridge::VolumeEntry;
 
-        while let Ok(vr) = self.channels.voxel_receiver.try_recv() {
+        while let Ok(vr) = self.channels.voxel_receiver.try_recv_arrival() {
             let ready_grid = vr.grid.map(|grid| std::sync::Arc::new(*grid));
             let entry = match &ready_grid {
                 Some(grid) => VolumeEntry::Ready(std::sync::Arc::clone(grid)),
@@ -2043,7 +2090,7 @@ impl App {
 
     /// Drain the archive scan channel and apply every queued volume.
     fn poll_scan_results(&mut self) {
-        while let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
+        while let Ok(scan_resp) = self.channels.scan_receiver.try_recv_arrival() {
             if self
                 .render
                 .is_scan_stale(&scan_resp.site, scan_resp.requester, scan_resp.generation)
@@ -2198,7 +2245,7 @@ impl App {
         let mut answered: Vec<(squallar_source::id::LayerId, chrono::NaiveDateTime)> = Vec::new();
         // Bound once for the whole drain, not per arrival.
         let gui = &mut self.gui;
-        while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv() {
+        while let Ok(event) = self.channels.overlay_fetch_receiver.try_recv_arrival() {
             // Not "the pane the fetch was for": the arrival carries a layer
             // id and no pane, and what the handler needs of it is the whole
             // layer's — every pane's selection, unioned. `Gui` owns the panes

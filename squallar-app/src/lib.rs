@@ -28,6 +28,10 @@ pub mod budget_memo;
 pub(crate) mod budget_telemetry;
 pub mod channels;
 pub(crate) mod frame_ledger;
+/// **Frames drawn against frames that needed drawing**, and what the ones
+/// that did not are charged to — the one instrument here that measures work
+/// that should not have happened rather than work done.
+pub(crate) mod frame_need;
 pub mod input;
 pub mod location_hint;
 pub(crate) mod loop_frame_store;

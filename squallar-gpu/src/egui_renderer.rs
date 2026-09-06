@@ -468,6 +468,18 @@ impl EguiRenderer {
         // After the rewrites, so an event they re-spell is judged in the form
         // egui will fold in.
         self.frame_interacted = input_carries_interaction(&raw_input.events);
+        // **The unnecessary-frame verdict's INPUT cause**, and deliberately a
+        // wider question than the line above: `frame_had_interaction` is the
+        // frame ledger's interact/idle split and names five pointer-shaped
+        // variants, while this asks whether the user did anything at all. A
+        // keystroke does not move the map, which is why it is out of that
+        // split — and it is unarguably a reason to draw a frame, which is why
+        // it is in this one. Read off the event vector egui is about to be
+        // handed, before any of it is interpreted: no repaint request is
+        // consulted, which is the whole of why the verdict is not circular.
+        if !raw_input.events.is_empty() {
+            squallar_egui::frame_need::note(squallar_egui::frame_need::NeedCause::Input);
+        }
         self.state.egui_ctx().begin_pass(raw_input);
     }
 
