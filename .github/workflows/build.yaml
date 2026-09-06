@@ -13,6 +13,14 @@ on:
 permissions:
   contents: read
 
+# ONE pin, read by both places that fetch the signer: the macOS matrix rows
+# below and the `macos-universal` job. Two copies of a digest is how one of
+# them comes to be bumped alone, and the point of pinning a tool we hand our
+# signing key to is that it cannot drift.
+env:
+  RCODESIGN_VERSION: 0.29.0
+  RCODESIGN_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
   # Never cancel on main: bots push several times an hour, and a cancelled run
@@ -38,6 +46,12 @@ jobs:
             cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-unknown-linux-gnu
             artifact: target/x86_64-unknown-linux-gnu/release/squallar
           # The artifact is a signed .app in a zip, not the bare executable.
+          # `-NOT-NOTARIZED` in the file name is not a warning about these two
+          # rows going wrong: nothing notarizes a per-arch bundle, by design --
+          # `macos-universal` sends the one submission, for the one download.
+          # The name is written by packaging/macos/Makefile from what actually
+          # happened, so it says the true thing here rather than a special case
+          # saying nothing.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
           # execute an unsigned Mach-O at all, so the old `macos-aarch64`
           # artifact was never runnable; `upload-artifact` drops the executable
@@ -49,13 +63,15 @@ jobs:
             package: macos
             macos_arch: aarch64
             cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target aarch64-apple-darwin && cargo build --release -p squallar --features squallar/jni-typecheck --target aarch64-apple-darwin
-            artifact: packaging/macos/build/aarch64-apple-darwin/squallar.app.zip
+            artifact: packaging/macos/build/aarch64-apple-darwin/squallar-NOT-NOTARIZED.app.zip
+            macos_bin: target/aarch64-apple-darwin/release/squallar
           - name: macos-x86_64
             target: x86_64-apple-darwin
             package: macos
             macos_arch: x86_64
             cmd: cargo check --workspace --all-targets --features squallar/jni-typecheck --target x86_64-apple-darwin && cargo build --release -p squallar --features squallar/jni-typecheck --target x86_64-apple-darwin
-            artifact: packaging/macos/build/x86_64-apple-darwin/squallar.app.zip
+            artifact: packaging/macos/build/x86_64-apple-darwin/squallar-NOT-NOTARIZED.app.zip
+            macos_bin: target/x86_64-apple-darwin/release/squallar
           # gnullvm, not MSVC: MSVC is the one family the image does not carry.
           - name: windows-x86_64
             target: x86_64-pc-windows-gnullvm
@@ -617,12 +633,11 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends curl zip
-          v=0.29.0
+          v="$RCODESIGN_VERSION"
           base=apple-codesign-$v-x86_64-unknown-linux-musl
           curl -fsSL -o /tmp/rcodesign.tar.gz \
             "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
-          echo "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002  /tmp/rcodesign.tar.gz" \
-            | sha256sum -c -
+          echo "$RCODESIGN_SHA256  /tmp/rcodesign.tar.gz" | sha256sum -c -
           tar -xzf /tmp/rcodesign.tar.gz -C /tmp
           install -m 0755 "/tmp/$base/rcodesign" /usr/local/bin/rcodesign
           rcodesign --version
@@ -634,10 +649,18 @@ jobs:
       # the row's own `--release`, or the bundle carries a binary the row did
       # not intend to ship.
       #
-      # ── The secret this needs, which has to be created by hand ──
+      # ── The secrets this needs, all created by hand ──
       #
       # `MACOS_SIGNING_P12`          base64 of a .p12 signing certificate
       # `MACOS_SIGNING_P12_PASSWORD` its password
+      #
+      # Three more exist for notarization -- `MACOS_NOTARY_ISSUER_ID`,
+      # `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_KEY_P8` -- and they are NOT read
+      # here. This step signs; the `macos-universal` job below is what submits
+      # to Apple, because it is the job that has both architectures and so is
+      # the only one that can send a single submission. What each of the five
+      # is, and what a person has to do at developer.apple.com to obtain them,
+      # is written out at the top of packaging/macos/Makefile.
       #
       # Generate them once, on any machine with rcodesign:
       #
@@ -670,6 +693,11 @@ jobs:
       # designated requirement is the code hash, so it re-prompts on each
       # rebuild. The Makefile says so in the log; it is a labelled fallback,
       # not a silent one.
+      #
+      # Either way the bundle now carries the hardened runtime, and the Makefile
+      # fails the build if the signature it just wrote does not — on every arm,
+      # so the check has teeth on a fork pull request and does not wait for a
+      # paid Apple account to start working.
       - name: Package squallar.app
         if: matrix.package == 'macos'
         env:
@@ -688,6 +716,20 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
+      # The two halves the `macos-universal` job fuses, and deliberately the
+      # UNSIGNED ones: fusing two already-signed Mach-Os would carry two stale
+      # signatures into the fat file for the next `sign` to write over. The
+      # per-arch `.app.zip` above stays -- it is what proves each row's own
+      # packaging works, and it is the fallback if somebody needs one arch --
+      # but it is not what a person should be asked to choose between.
+      - name: Upload the unsigned macOS binary
+        if: matrix.macos_bin
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-bin-${{ matrix.macos_arch }}
+          path: ${{ matrix.macos_bin }}
+          if-no-files-found: error
+
       # Uploaded on every run so a pull request proves the artifact assembles.
       # `deploy-cloudfront` publishes this one; nothing is rebuilt there.
       - name: Upload web dist
@@ -698,22 +740,219 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  # The one macOS download a person should be offered: a single .app that runs
+  # on both architectures, signed once and notarized once.
+  #
+  # Why a job and not a matrix row. Nothing can fuse the two halves until both
+  # rows have finished, and they run in parallel; a single row building both
+  # triples would put the sum of two workspace builds on the critical path.
+  # What that costs is exactly this: one extra job, one artifact hop, and one
+  # more line in `build-success`. What it buys is one file instead of a choice,
+  # and ONE notarization submission per run instead of two -- a submission is
+  # an upload plus a wait, and Apple issues a ticket per submission.
+  #
+  # NOT in the rust-cross container, and `BIN_ARM64=`/`BIN_X86_64=` are why:
+  # nothing here compiles. `make`, `curl`, `tar` and `zip` are on the runner
+  # image already, so this job skips a 15 GB image pull to run four tools. The
+  # price is that `otool` is absent, so the Makefile's deployment-target guard
+  # prints that it skipped -- the two per-arch rows ran it on these same
+  # binaries minutes earlier, inside the image that has it.
+  macos-universal:
+    name: macos-universal
+    runs-on: ubuntu-24.04
+    needs: [build]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # This job asserts what it assumes rather than discovering it three steps
+      # later as a bare "command not found" out of a Makefile recipe.
+      - name: Assert the runner has the tools this job does not install
+        run: |
+          for t in make curl tar zip; do
+            command -v "$t" >/dev/null \
+              || { echo "::error::$t is not on the ubuntu-24.04 runner image; this job assumed it was."; exit 1; }
+          done
+
+      # Same tool, same pin, same reasoning as the matrix rows -- installed
+      # under RUNNER_TEMP rather than /usr/local/bin because this job is not
+      # root and has no reason to become it.
+      - name: Install the signer
+        run: |
+          v="$RCODESIGN_VERSION"
+          base=apple-codesign-$v-x86_64-unknown-linux-musl
+          curl -fsSL -o "$RUNNER_TEMP/rcodesign.tar.gz" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
+          echo "$RCODESIGN_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$RUNNER_TEMP/$base/rcodesign" "$RUNNER_TEMP/bin/rcodesign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Download the arm64 half
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-bin-aarch64
+          path: halves/aarch64
+      - name: Download the x86_64 half
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-bin-x86_64
+          path: halves/x86_64
+
+      # A rehearsal of the notarization credential path that needs no Apple
+      # account, so it runs on every event including a fork pull request.
+      #
+      # `encode-app-store-connect-api-key` is the piece most likely to be got
+      # wrong -- three values off three different pages, combined into one file
+      # -- and it is the only part of the notary path that can be exercised
+      # with no server on the other end. The key here is a throwaway P-256 one
+      # minted by the signer itself: an App Store Connect key is an ECDSA
+      # private key in PKCS#8 PEM, which is what
+      # `generate-self-signed-certificate --algorithm ecdsa --pem-filename`
+      # writes beside its certificate.
+      #
+      # It does not prove Apple would accept a real key -- nothing here can.
+      # It proves the command line packaging/macos/Makefile runs accepts a key
+      # of that shape and writes the three fields the notary client reads, so a
+      # typo in that line is a red pull request rather than a red release.
+      - name: Rehearse the notarization credential path
+        run: |
+          d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+          rcodesign generate-self-signed-certificate --algorithm ecdsa \
+            --person-name notary-rehearsal --validity-days 1 --pem-filename "$d/k" >/dev/null
+          rcodesign encode-app-store-connect-api-key -o "$d/key.json" \
+            00000000-0000-0000-0000-000000000000 REHEARSAL0 "$d/k.key" >/dev/null
+          for f in issuer_id key_id private_key; do
+            grep -q "\"$f\"" "$d/key.json" \
+              || { echo "::error::encode-app-store-connect-api-key produced no $f; the notary key this pipeline builds would be rejected before it is sent."; exit 1; }
+          done
+          echo "ok: issuer_id, key_id and private_key"
+
+      # The notary secrets are handed over ONLY on a push to main, and that is
+      # a throughput decision rather than a security one: a submission is an
+      # upload plus a wait of a few minutes, and this repository sees several
+      # pushes an hour. A same-repo pull request would otherwise notarize every
+      # commit and ship none of them. Everything else about the pipeline -- the
+      # fuse, the signature, the hardened-runtime guard, the credential
+      # rehearsal -- runs on every event, so what main sees first is the round
+      # trip to Apple and nothing else.
+      #
+      # Move this condition to a tag if the submission volume ever matters.
+      - name: Package, sign, notarize and staple the universal .app
+        id: package
+        env:
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_ISSUER_ID || '' }}
+          MACOS_NOTARY_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_KEY_ID || '' }}
+          MACOS_NOTARY_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_KEY_P8 || '' }}
+        run: |
+          make -C packaging/macos ARCH=universal ARCHIVE=1 \
+            BIN_ARM64=halves/aarch64/squallar \
+            BIN_X86_64=halves/x86_64/squallar
+
+          # Read the outcome off the disk rather than off the condition that
+          # was supposed to produce it. The Makefile writes exactly one of the
+          # two names and a one-word reason, so this step reports what was
+          # built -- including a notary failure the make step deliberately did
+          # not die on.
+          out=packaging/macos/build/universal-apple-darwin
+          reason=$(cat "$out/NOTARIZATION" 2>/dev/null || echo unknown)
+          if [ -f "$out/squallar.app.zip" ]; then
+            printf 'artifact=macos-universal\nzip=%s/squallar.app.zip\nnotarized=yes\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+          elif [ -f "$out/squallar-NOT-NOTARIZED.app.zip" ]; then
+            printf 'artifact=macos-universal-NOT-NOTARIZED\nzip=%s/squallar-NOT-NOTARIZED.app.zip\nnotarized=no\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+          else
+            # Fatal, and ours: the packaging step reported success and left no
+            # zip under either name.
+            echo "::error::packaging produced no zip under either name in $out"
+            ls -la "$out" || true
+            exit 1
+          fi
+
+      # The annotation and the run summary, because the Makefile's log is
+      # thirty steps deep in a fold and the question a person has -- can I hand
+      # this to somebody -- has to be answerable from the run page. `reason`
+      # separates "nobody has configured this yet" from "Apple was asked and
+      # did not say yes", which are the same artifact and completely different
+      # situations.
+      - name: Say plainly whether this artifact is notarized
+        env:
+          NOTARIZED: ${{ steps.package.outputs.notarized }}
+          REASON: ${{ steps.package.outputs.reason }}
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+        run: |
+          case "$NOTARIZED:$REASON" in
+            yes:stapled)
+              echo "::notice::$ARTIFACT carries a stapled notarization ticket. Unzip and open; no Gatekeeper prompt, no network needed."
+              printf '### macOS: notarized\n\n`%s` went through Apple and the ticket is stapled inside the .app.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            no:failed)
+              # The submission was attempted with real credentials and did not
+              # come back with a ticket. Loud, and deliberately not fatal: see
+              # the note in packaging/macos/Makefile.
+              echo "::error::$ARTIFACT is NOT NOTARIZED: the submission to Apple was attempted and did not complete. The build was not failed for it -- a notary outage, an expired credential or a rate limit is not evidence about this commit -- but this artifact must not be published to anyone. Read the make step's log for the submission id and Apple's reason."
+              printf '### macOS: NOT NOTARIZED (submission failed)\n\n`%s` is signed with the Developer ID identity and carries the hardened runtime, but Apple did not return a ticket, so **another Mac will refuse to open it**. The build was not failed for this on purpose: the cause is outside this repository. Do not publish this artifact.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::notice::$ARTIFACT is NOT NOTARIZED (reason: $REASON). Nothing was submitted to Apple on this event. Expected for a pull request, and for a repository whose MACOS_NOTARY_* secrets are not set yet."
+              printf '### macOS: not notarized (%s)\n\nNothing was submitted to Apple on this event, so `%s` will be refused by any Mac but the one that built it.\n' "$REASON" "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      # The artifact's NAME carries the same distinction the file name does. A
+      # run that failed to notarize must not publish something a person can
+      # mistake for the shippable build a week later, when the log has rolled
+      # off and only the artifact list is left.
+      - name: Upload the universal build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+
   # The one required status check. `needs` on a matrix job aggregates every row,
   # and with `fail-fast: false` it is `success` only if all of them were --
-  # `failure`, `cancelled` and `skipped` all fall through to the error.
+  # `failure`, `cancelled` and `skipped` all fall through to the error. The
+  # packaging job is named separately for the same reason: it is `skipped` when
+  # a macOS row is red, and a skipped job that nobody checks is a shipped
+  # artifact that was never built.
+  #
+  # `macos-universal` is in here, and an Apple notary outage still does not
+  # redden it. Those two facts are compatible because the job draws the line
+  # inside itself: the fuse, the signature, the hardened-runtime count and the
+  # ticket-actually-stapled check are fatal, because each is a statement about
+  # OUR code and a regression in one is a defect. The submission to Apple is
+  # not, because a failure there is an outage, an expired credential or a rate
+  # limit -- none of it evidence about the commit that happened to be pushed
+  # when it occurred, and none of it fixed by anyone reading that commit.
+  #
+  # That matters beyond this job: `deploy-cloudfront` needs this check, so a
+  # fatal notary failure would hold the website for a reason that has no
+  # relationship to the website. What a failed submission produces instead is
+  # an artifact named `macos-universal-NOT-NOTARIZED`, an `::error::`
+  # annotation and a run-summary section -- loud enough that the degraded path
+  # cannot quietly become the normal one, which is the actual risk of not
+  # failing.
   build-success:
     name: Build success check
     if: always()
     runs-on: ubuntu-24.04
-    needs: [build]
+    needs: [build, macos-universal]
     steps:
       - name: Fail unless every build row succeeded
         shell: bash
         env:
           RESULT: ${{ needs.build.result }}
+          UNIVERSAL: ${{ needs['macos-universal'].result }}
         run: |
-          echo "build matrix: $RESULT"
+          echo "build matrix:    $RESULT"
+          echo "macos-universal: $UNIVERSAL"
           test "$RESULT" = success || { echo "::error::the build matrix concluded '$RESULT'."; exit 1; }
+          test "$UNIVERSAL" = success || { echo "::error::the macos-universal job concluded '$UNIVERSAL'."; exit 1; }
 
   # The production web deploy: S3 behind CloudFront at https://squallar.app/.
   #
