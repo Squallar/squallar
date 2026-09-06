@@ -152,3 +152,10 @@ wasm-bindgen-futures = "=0.4.78"
 # dependency is invisible to this crate's tests, so the hooks ride a feature —
 # enabled here, on the dev-dependency only, never on the normal edge above.
 squallar-radar = { workspace = true, features = ["test-support"] }
+# One overlay-raster ledger per thread for this crate's test binary, so a
+# sibling test's dispatches cannot land in the figures a reader brackets. Same
+# shape as the line above and for the same reason: the switch is a feature
+# because `#[cfg(test)]` does not reach a dependency, and it rides the
+# dev-dependency edge alone so `cargo build` keeps the process-global counters
+# the shipped telemetry line reports.
+squallar-egui = { workspace = true, features = ["test-support"] }

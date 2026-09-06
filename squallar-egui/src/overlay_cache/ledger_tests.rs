@@ -1,16 +1,18 @@
 //! What a reading of the raster ledger is allowed to mean.
 //!
-//! **These are about the arithmetic, not about the statics.** The counters are
-//! process-global, so a unit-test binary shares them across every test it runs
-//! and an assertion on their absolute values would be an assertion about the
-//! order the harness happened to pick. What is checked here is the part that
-//! has no such dependence: given a reading, which conclusions it licenses. The
-//! claim that the *real* path moves the real counters is
-//! `every_arrival_is_either_a_picture_or_a_drop`, in `squallar-app`, and the
-//! per-browser figures come off the Tier-2 rig, which is a fresh process per
-//! leg.
+//! **All but the last of these are about the arithmetic, not about the
+//! counters.** What they check is the part with no dependence on any run:
+//! given a reading, which conclusions it licenses. The claim that the *real*
+//! path moves the real counters is `every_arrival_is_either_a_picture_or_a_drop`,
+//! in `squallar-app`, and the per-browser figures come off the Tier-2 rig,
+//! which is a fresh process per leg.
+//!
+//! The last one is about the counters themselves: that one test's writes stay
+//! out of another's figures, which is what a test build's per-thread sink buys
+//! and what a reading of absolute values in a concurrent binary rests on.
 
 use super::ledger::{Totals, has_ink};
+use super::{RerenderReason, ledger};
 
 /// **A picture that paints nothing is not a picture that painted.**
 ///
@@ -170,4 +172,62 @@ fn a_picture_reaches_the_screen_by_either_route() {
     assert_eq!(first_picture.on_screen(), 4);
     assert_eq!(after_a_hold.on_screen(), 4);
     assert_eq!(Totals::default().on_screen(), 0);
+}
+
+/// **A sibling thread's writes cannot reach this thread's figures**, which is
+/// a property of the build rather than of anyone remembering a lock.
+///
+/// What it pins, observed 2026-09-06 under `cargo test --workspace` and never
+/// under a filtered run:
+/// `rebuild_reason_tests::the_dispatch_reason_separates_a_pan_from_a_data_arrival`
+/// read one `PanCoverage` dispatch across a phase in which its map never
+/// moved, because a sibling test dispatched inside its bracket. The bracket
+/// was taken under a crate-wide lock — but fifteen files wrote these counters
+/// and only eight read them, and it was the readers that took it. See
+/// `ledger::sink`.
+///
+/// **Both directions, because only one of them is about isolation.** The
+/// sibling reads its own figures back, so a build in which its writes went
+/// nowhere at all cannot pass this by counting nothing; and the same call made
+/// on this thread still has to move this thread's own count.
+#[test]
+fn a_sibling_threads_writes_stay_out_of_this_threads_figures() {
+    const SIBLING_DISPATCHES: u64 = 64;
+
+    ledger::reset_for_test();
+    let before = ledger::totals();
+
+    let sibling = std::thread::spawn(|| {
+        ledger::reset_for_test();
+        for _ in 0..SIBLING_DISPATCHES {
+            ledger::note_dispatched(RerenderReason::PanCoverage);
+            ledger::note_arrived();
+        }
+        ledger::totals()
+    })
+    .join()
+    .expect("the sibling thread ran to completion");
+
+    assert_eq!(
+        sibling.dispatched, SIBLING_DISPATCHES,
+        "the sibling's own dispatches did not reach the sibling's own figures, \
+         so what is asserted below is isolation from a thread that counted \
+         nothing",
+    );
+    assert_eq!(
+        ledger::totals(),
+        before,
+        "{SIBLING_DISPATCHES} dispatches on another thread moved this thread's \
+         figures, so the counters are shared again and every bracketed reading \
+         in the workspace is its neighbours' spending as much as its own",
+    );
+
+    ledger::note_dispatched(RerenderReason::PanCoverage);
+    assert_eq!(
+        ledger::totals().dispatched,
+        before.dispatched + 1,
+        "a dispatch on this thread did not move this thread's own count, so \
+         the equality above says 'nothing counts anywhere' rather than \
+         'a sibling cannot reach me'",
+    );
 }

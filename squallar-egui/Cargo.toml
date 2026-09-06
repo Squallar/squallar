@@ -4,6 +4,18 @@ version.workspace = true
 edition.workspace = true
 
 [features]
+# One set of the overlay-raster counters per thread, for a dependent crate's
+# test binary. `squallar_egui::overlay_cache::ledger` is a process-global
+# `static` in production, and a test binary runs its tests concurrently in one
+# process — so the counters a reader brackets are the counters every sibling
+# writes, through production dispatch and paint rather than through anything a
+# test author can see. Measured 2026-09-06: fifteen files in `squallar-app/src`
+# wrote them, eight read them. With this on, a write cannot leave the thread
+# that made it. `#[cfg(test)]` is crate-local and invisible downstream, which
+# is why this is a feature; `squallar-app` turns it on through its
+# dev-dependency, never through the normal edge. See `ledger::sink`.
+test-support = []
+
 # Serial-port GPS controls in the settings pane.
 #
 # The port dropdown calls squallar_nmea_serial::detect_gps_ports, which is itself

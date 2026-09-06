@@ -131,7 +131,6 @@ fn on_screen(app: &mut crate::app::App) -> Option<egui::TextureId> {
 /// grew by its full size.
 #[test]
 fn a_blank_raster_clears_a_pane_without_a_picture_sized_upload() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     let _ = drain_uploads(&ctx);
@@ -212,7 +211,6 @@ fn a_blank_raster_clears_a_pane_without_a_picture_sized_upload() {
 /// removed.
 #[test]
 fn an_inked_raster_is_still_built_uploaded_and_drawn() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     let _ = drain_uploads(&ctx);
@@ -255,7 +253,6 @@ fn an_inked_raster_is_still_built_uploaded_and_drawn() {
 /// variant rather than an absence: a failure must leave the glass alone.
 #[test]
 fn a_failed_render_leaves_the_ink_it_could_not_replace() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
     let _ = drain_uploads(&ctx);
@@ -298,7 +295,6 @@ fn a_failed_render_leaves_the_ink_it_could_not_replace() {
 /// the layers that cost the least to draw.
 #[test]
 fn a_pane_that_took_a_blank_does_not_ask_for_it_again() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = crate::app::tests::n_pane_app(1, "KTLX");
 

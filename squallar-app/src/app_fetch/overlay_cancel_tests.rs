@@ -10,13 +10,14 @@
 //! file owns the app-side halves: which dispatch withdraws which job, what a
 //! grouped dispatch may not withdraw, and what the ledger counts.
 //!
-//! **The `cancelled` counter is process-global**, so the delta assertions
-//! below are only about their own test's dispatches while *no other test in
-//! the binary* is superseding concurrently. That is arranged by
-//! [`crate::app::fetch::overlay_ledger_lock`], held for each test's whole
-//! body. It used to be a file-private mutex here, which excluded the two
-//! tests already inside the bracket and none of the 47 withdrawals coming
-//! from elsewhere in the binary — the lock's own doc carries that census.
+//! **In a test build the `cancelled` counter is one set per thread**, so the
+//! delta assertions below can only ever see their own test's withdrawals —
+//! `squallar_egui::overlay_cache::ledger::sink` carries the mechanism and the
+//! premise it rests on. Before that it was a process-global `static` behind a
+//! crate-wide lock that only *readers* took, which protects nothing when the
+//! writers are production dispatch and paint; and before that a file-private
+//! mutex, which excluded the two tests already inside the bracket and none of
+//! the 47 withdrawals coming from elsewhere in the binary.
 
 use squallar_egui::overlay_cache::OverlayTexturePlan;
 use squallar_geo::GeoBounds;
@@ -99,7 +100,6 @@ fn a_render_request(generation: u64) -> super::OverlayRenderRequest {
 /// and was discarded only at retire.
 #[test]
 fn a_superseding_dispatch_withdraws_the_job_it_replaced() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let taken = Arc::new(Mutex::new(Vec::new()));
     let _guard = squallar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),
@@ -172,7 +172,6 @@ fn a_superseding_dispatch_withdraws_the_job_it_replaced() {
 /// supersede of the last destination withdraws it.
 #[test]
 fn a_grouped_job_survives_until_its_last_destination_supersedes() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let taken = Arc::new(Mutex::new(Vec::new()));
     let _guard = squallar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),
@@ -216,7 +215,6 @@ fn a_grouped_job_survives_until_its_last_destination_supersedes() {
 /// left behind by finished ones.
 #[test]
 fn a_new_dispatch_after_a_delivered_answer_withdraws_nothing() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let taken = Arc::new(Mutex::new(Vec::new()));
     let _guard = squallar_worker::offload::install_test_worker(Box::new(RecordingPort {
         taken: Arc::clone(&taken),

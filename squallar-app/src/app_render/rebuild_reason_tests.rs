@@ -33,11 +33,16 @@
 //! own drag handler — and never by writing the pane's centre, so what the pan
 //! phase exercises is the door a user's finger goes through.
 //!
-//! The ledger is process-global, so every test here holds
-//! `crate::app::fetch::overlay_ledger_lock` for its whole body — the same lock
-//! `blank_raster_tests` and `overlay_cancel_tests` take, and for the same
-//! reason: this binary runs its tests in parallel and a delta over a `static`
-//! would otherwise be another test's rasters as much as this one's.
+//! In a test build the ledger is one set of counters per thread, so each
+//! phase below reads this test's own dispatches and no sibling's — see
+//! `squallar_egui::overlay_cache::ledger::sink` for the mechanism and the
+//! premise it rests on, and
+//! `the_isolation_these_readings_depend_on_is_on_in_this_binary` for the
+//! proof that the switch reached this binary. What that replaced was a
+//! crate-wide lock only readers took, and it is how one of this file's fifteen
+//! data-phase dispatches came back charged to the coverage arm across a phase
+//! that never moved the map: a sibling holding no lock dispatched inside the
+//! bracket.
 
 use squallar_egui::overlay_cache::{RerenderReason, ledger};
 use squallar_overlays::render::overlay_state::{OverlayFetchResult, SourceEvent};
@@ -329,7 +334,6 @@ fn data_driven(t: &ledger::Totals) -> u64 {
 /// passes one direction and fails the other.
 #[test]
 fn the_dispatch_reason_separates_a_pan_from_a_data_arrival() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     let ctx = egui::Context::default();
@@ -475,7 +479,6 @@ fn the_dispatch_reason_separates_a_pan_from_a_data_arrival() {
 #[test]
 #[ignore = "instrument: prints the reason breakdown, asserts nothing about it"]
 fn the_reason_breakdown_over_a_pan_and_load_scene() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     let ctx = egui::Context::default();
@@ -567,7 +570,6 @@ fn the_reason_breakdown_over_a_pan_and_load_scene() {
 #[test]
 #[ignore = "instrument: prices the oversampling margin at each rung"]
 fn what_the_oversample_margin_buys_at_each_rung() {
-    let _ledger = crate::app::fetch::overlay_ledger_lock();
     squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
 
     println!(
@@ -614,5 +616,57 @@ fn what_the_oversample_margin_buys_at_each_rung() {
         "denominator: {PAN_STEPS} drags of {PAN_STEP_PX} px on a {}x{} pane, \
          3 texture layers; `resident MB` is one picture per layer.",
         SCREEN.x as u32, SCREEN.y as u32
+    );
+}
+
+/// **The isolation every reading in this file depends on is switched on in
+/// *this* binary.**
+///
+/// `squallar-egui`'s `a_sibling_threads_writes_stay_out_of_this_threads_figures`
+/// proves the mechanism where the counters live. This one proves it reached
+/// here, which is a separate fact: the counters are one set per thread in that
+/// crate's own test build through `cfg(test)`, and in this one only through
+/// the `test-support` feature on this crate's dev-dependency edge. Drop that
+/// feature and every figure below silently goes back to being its neighbours'
+/// dispatches as much as its own — with nothing else in the workspace to say
+/// so.
+#[test]
+fn the_isolation_these_readings_depend_on_is_on_in_this_binary() {
+    const SIBLING_DISPATCHES: u64 = 64;
+
+    ledger::reset_for_test();
+    let before = ledger::totals();
+
+    let sibling = std::thread::spawn(|| {
+        ledger::reset_for_test();
+        for _ in 0..SIBLING_DISPATCHES {
+            ledger::note_dispatched(RerenderReason::PanCoverage);
+        }
+        ledger::totals()
+    })
+    .join()
+    .expect("the sibling thread ran to completion");
+
+    assert_eq!(
+        sibling.dispatched, SIBLING_DISPATCHES,
+        "the sibling's own dispatches did not reach its own figures, so what \
+         is asserted below is isolation from a thread that counted nothing",
+    );
+    assert_eq!(
+        ledger::totals(),
+        before,
+        "{SIBLING_DISPATCHES} dispatches on another thread moved this \
+         thread's figures, so this binary is back on one shared set of \
+         counters and the pan/data discrimination above reads its siblings' \
+         rasters as its own",
+    );
+
+    ledger::note_dispatched(RerenderReason::PanCoverage);
+    assert_eq!(
+        ledger::totals().dispatched,
+        before.dispatched + 1,
+        "a dispatch on this thread did not move this thread's own count, so \
+         the equality above says 'nothing counts anywhere' rather than \
+         'a sibling cannot reach me'",
     );
 }

@@ -95,31 +95,160 @@
 use super::RerenderReason;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Overlay rasters asked for. See [`note_dispatched`].
-static DISPATCHED: AtomicU64 = AtomicU64::new(0);
-/// [`DISPATCHED`] split by [`RerenderReason`], indexed by
-/// [`RerenderReason::index`]. Written by the same call that writes
-/// [`DISPATCHED`], so the two cannot drift — see [`Totals::reasons_balance`].
-static DISPATCH_REASONS: [AtomicU64; RerenderReason::COUNT] =
-    [const { AtomicU64::new(0) }; RerenderReason::COUNT];
-/// Rasterized responses received. See [`note_arrived`].
-static ARRIVED: AtomicU64 = AtomicU64::new(0);
-/// Responses thrown away before their pixels were handed over.
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-/// Pictures handed to egui.
-static PICTURES: AtomicU64 = AtomicU64::new(0);
-/// Bytes of those pictures.
-static PICTURE_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Of those pictures, the ones that had any ink in them. See [`has_ink`].
-static INKED: AtomicU64 = AtomicU64::new(0);
-/// Pictures put straight on screen.
-static SHOWN: AtomicU64 = AtomicU64::new(0);
-/// Pictures that reached the screen after their last band landed.
-static PROMOTED: AtomicU64 = AtomicU64::new(0);
-/// Uploads discarded mid-flight by a newer picture for the same destination.
-static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
-/// Dispatches withdrawn at the supersede seam before their answer was used.
-static CANCELLED: AtomicU64 = AtomicU64::new(0);
+/// Every counter on this line, in one object.
+///
+/// **Fields rather than loose statics so that there can be more than one set
+/// of them**, which is the whole of the isolation described on `sink`.
+/// Production keeps exactly one, in a `static` of this type, so each `note_*`
+/// below is the same single relaxed `fetch_add` on the same address as the
+/// loose static it replaced.
+struct Counters {
+    /// Overlay rasters asked for. See [`note_dispatched`].
+    dispatched: AtomicU64,
+    /// [`Self::dispatched`] split by [`RerenderReason`], indexed by
+    /// [`RerenderReason::index`]. Written by the same call that writes
+    /// [`Self::dispatched`], so the two cannot drift — see
+    /// [`Totals::reasons_balance`].
+    reasons: [AtomicU64; RerenderReason::COUNT],
+    /// Rasterized responses received. See [`note_arrived`].
+    arrived: AtomicU64,
+    /// Responses thrown away before their pixels were handed over.
+    dropped: AtomicU64,
+    /// Pictures handed to egui.
+    pictures: AtomicU64,
+    /// Bytes of those pictures.
+    picture_bytes: AtomicU64,
+    /// Of those pictures, the ones that had any ink in them. See [`has_ink`].
+    inked: AtomicU64,
+    /// Pictures put straight on screen.
+    shown: AtomicU64,
+    /// Pictures that reached the screen after their last band landed.
+    promoted: AtomicU64,
+    /// Uploads discarded mid-flight by a newer picture for the same
+    /// destination.
+    superseded: AtomicU64,
+    /// Dispatches withdrawn at the supersede seam before their answer was
+    /// used.
+    cancelled: AtomicU64,
+    /// The last [`Totals::progress`] a caller was handed by
+    /// [`totals_if_moved`].
+    reported: AtomicU64,
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            dispatched: AtomicU64::new(0),
+            reasons: [const { AtomicU64::new(0) }; RerenderReason::COUNT],
+            arrived: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            pictures: AtomicU64::new(0),
+            picture_bytes: AtomicU64::new(0),
+            inked: AtomicU64::new(0),
+            shown: AtomicU64::new(0),
+            promoted: AtomicU64::new(0),
+            superseded: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            reported: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The counters this thread writes to and reads from.
+///
+/// # Production: one set, shared, exactly as before
+///
+/// A single `static`, so every figure on the line is the process's — which is
+/// what the reported sentence means. Nothing about the increments changed.
+///
+/// # A test build: one set per thread, and why
+///
+/// `cfg(test)`, and the `test-support` feature `squallar-app` turns on through
+/// its dev-dependency (the same edge it reaches `squallar-radar`'s
+/// state-forcing hooks on), replace that one shared set with a **per-thread**
+/// one.
+///
+/// A test binary runs its tests concurrently in one process, so a counter
+/// every test shares is a counter every test writes. Counted on this tree on
+/// 2026-09-06, per test file in `squallar-app/src`, as *sites that took the
+/// crate-wide lock this replaced* : *sites that dispatch or paint*:
+/// `gmgsi_loop_tests` 0:26, `satellite_loop_draw_tests` 0:23,
+/// `loop_overlay_render_tests` 0:19, `frame_build_order_tests` 0:11,
+/// `app_render/tests.rs` 0:10, `frame_thread_conversion_tests` 0:9,
+/// `raster_hold_tests` 0:6, and nine more — fifteen files writing these
+/// counters under no lock at all, against eight reading them under one.
+/// **A lock only readers take protects nothing**: production dispatch and
+/// paint are what write, so a sibling merely painting landed in a reader's
+/// figure. It surfaced as
+/// `rebuild_reason_tests::the_dispatch_reason_separates_a_pan_from_a_data_arrival`
+/// charging one of its fifteen dispatches to the coverage arm across a phase
+/// in which its map never moved — under `cargo test --workspace`, never under
+/// the filtered run.
+///
+/// Per-thread counters end that by deleting the object the two tests shared:
+/// there is no path from one thread's `note_*` to another thread's figures.
+/// libtest gives each test its own thread, so a reader is isolated whether or
+/// not its author knew to arrange anything — which is why the crate-wide
+/// `overlay_ledger_lock` this replaced is **deleted** rather than kept beside
+/// it. Keeping it would teach the next author that the lock is the mechanism.
+///
+/// # The premise, written down because the design rests on it
+///
+/// Thread-locality is reader-locality **only because every write below happens
+/// on the frame thread**, which in these fixtures is the test's own thread.
+/// All eleven call sites, workspace-wide on 2026-09-06:
+///
+/// * `squallar-egui/src/overlay_cache.rs:834` — [`note_dispatched`], in
+///   `RendersInFlight::record`, whose one production caller is
+///   `App::spawn_overlay_render` (`squallar-app/src/app_fetch.rs:1216`),
+///   reached from `App::dispatch_overlay_renders` (`app.rs:1977`, under
+///   `process_gui_actions`) and `App::dispatch_overlay_loop_renders`
+///   (`app_render.rs:5856`).
+/// * `squallar-app/src/app_fetch.rs:1391` — [`note_cancelled`], in that same
+///   `App::spawn_overlay_render`, at the supersede seam.
+/// * `squallar-app/src/app_render.rs` 2705, 2736, 2744, 2768, 2778, 2818,
+///   2835, 2843 — the eight arrival counters, all in
+///   `App::poll_overlay_render_results`, whose caller
+///   `pump_poll_overlay_render_results` (`app_render.rs:8036`) is an Apply row
+///   run from `setup_egui_frame`.
+/// * `squallar-egui/src/pane.rs:3354` — [`note_promoted`], in
+///   `PaneState::promote_held_overlays`, reached from
+///   `Gui::promote_held_rasters` (`squallar-egui/src/ui.rs:2383`), called by
+///   `App::promote_uploaded_rasters` (`app_render.rs:1876`) and
+///   `App::deliver_held_rasters` (`app_render.rs:2393`).
+///
+/// **If a future `note_*` call is added on a worker, a rayon thread or a
+/// task, a test build silently stops counting it.** The reader's figure comes
+/// back short with nothing at the call site to say why, so that is the one
+/// thing to check when a counter is added here. Nothing in this module can
+/// detect it.
+///
+/// # What this weakens
+///
+/// An assertion of the shape "and no more dispatches happened" can only ever
+/// observe **this thread's** writes, so it can no longer catch a production
+/// path that dispatches from another thread. Under the premise above there is
+/// no such path — which is exactly why the premise is stated rather than
+/// assumed.
+#[cfg(not(any(test, feature = "test-support")))]
+fn sink() -> &'static Counters {
+    static SHARED: Counters = Counters::new();
+    &SHARED
+}
+
+/// One set of counters per thread — the production arm above carries the whole
+/// account of why.
+#[cfg(any(test, feature = "test-support"))]
+fn sink() -> &'static Counters {
+    thread_local! {
+        /// Leaked rather than borrowed, so that this arm hands back the same
+        /// `&'static Counters` the production arm does and every `note_*`
+        /// body below stays one spelling. One `Counters` per thread that
+        /// touches this ledger at all; the process exit frees them.
+        static OWN: &'static Counters = Box::leak(Box::new(Counters::new()));
+    }
+    OWN.with(|counters| *counters)
+}
 
 /// A reading of the counters below, taken together.
 ///
@@ -331,18 +460,19 @@ impl Totals {
 /// allocates, formats or takes a clock, so it stays as free on the frame
 /// thread as the single counter it replaced.
 pub fn note_dispatched(reason: RerenderReason) {
-    DISPATCHED.fetch_add(1, Relaxed);
-    DISPATCH_REASONS[reason.index()].fetch_add(1, Relaxed);
+    let sink = sink();
+    sink.dispatched.fetch_add(1, Relaxed);
+    sink.reasons[reason.index()].fetch_add(1, Relaxed);
 }
 
 /// Record that a rasterized response arrived.
 pub fn note_arrived() {
-    ARRIVED.fetch_add(1, Relaxed);
+    sink().arrived.fetch_add(1, Relaxed);
 }
 
 /// Record that an arrival was thrown away before its pixels were handed over.
 pub fn note_dropped() {
-    DROPPED.fetch_add(1, Relaxed);
+    sink().dropped.fetch_add(1, Relaxed);
 }
 
 /// Whether any pixel of a premultiplied RGBA buffer would change the frame it
@@ -368,31 +498,32 @@ pub use squallar_overlays::render::rasterize::has_ink;
 /// **`bytes` is zero for a blank arrival**, which is not the same event as a
 /// drop: the arrival reached a pane and cleared it. See the module note.
 pub fn note_picture(bytes: u64, inked: bool) {
-    PICTURES.fetch_add(1, Relaxed);
-    PICTURE_BYTES.fetch_add(bytes, Relaxed);
+    let sink = sink();
+    sink.pictures.fetch_add(1, Relaxed);
+    sink.picture_bytes.fetch_add(bytes, Relaxed);
     if inked {
-        INKED.fetch_add(1, Relaxed);
+        sink.inked.fetch_add(1, Relaxed);
     }
 }
 
 /// Record a picture put straight on screen.
 pub fn note_shown() {
-    SHOWN.fetch_add(1, Relaxed);
+    sink().shown.fetch_add(1, Relaxed);
 }
 
 /// Record a held picture that reached the screen.
 pub fn note_promoted() {
-    PROMOTED.fetch_add(1, Relaxed);
+    sink().promoted.fetch_add(1, Relaxed);
 }
 
 /// Record an upload thrown away mid-flight by a newer picture.
 pub fn note_superseded() {
-    SUPERSEDED.fetch_add(1, Relaxed);
+    sink().superseded.fetch_add(1, Relaxed);
 }
 
 /// Record a dispatch withdrawn before its answer was used.
 pub fn note_cancelled() {
-    CANCELLED.fetch_add(1, Relaxed);
+    sink().cancelled.fetch_add(1, Relaxed);
 }
 
 /// Read every counter.
@@ -403,23 +534,21 @@ pub fn note_cancelled() {
 /// reader that has to lock to be exactly right would be paying for a
 /// consistency the numbers do not need.
 pub fn totals() -> Totals {
+    let sink = sink();
     Totals {
-        dispatched: DISPATCHED.load(Relaxed),
-        arrived: ARRIVED.load(Relaxed),
-        dropped: DROPPED.load(Relaxed),
-        pictures: PICTURES.load(Relaxed),
-        picture_bytes: PICTURE_BYTES.load(Relaxed),
-        inked: INKED.load(Relaxed),
-        shown: SHOWN.load(Relaxed),
-        promoted: PROMOTED.load(Relaxed),
-        superseded: SUPERSEDED.load(Relaxed),
-        cancelled: CANCELLED.load(Relaxed),
-        reasons: std::array::from_fn(|i| DISPATCH_REASONS[i].load(Relaxed)),
+        dispatched: sink.dispatched.load(Relaxed),
+        arrived: sink.arrived.load(Relaxed),
+        dropped: sink.dropped.load(Relaxed),
+        pictures: sink.pictures.load(Relaxed),
+        picture_bytes: sink.picture_bytes.load(Relaxed),
+        inked: sink.inked.load(Relaxed),
+        shown: sink.shown.load(Relaxed),
+        promoted: sink.promoted.load(Relaxed),
+        superseded: sink.superseded.load(Relaxed),
+        cancelled: sink.cancelled.load(Relaxed),
+        reasons: std::array::from_fn(|i| sink.reasons[i].load(Relaxed)),
     }
 }
-
-/// The last [`Totals::progress`] a caller was handed by [`totals_if_moved`].
-static REPORTED: AtomicU64 = AtomicU64::new(0);
 
 /// [`totals`], but only when something has happened since the last time this
 /// was asked — so a caller can write the line on a frame where the pipeline
@@ -430,37 +559,42 @@ static REPORTED: AtomicU64 = AtomicU64::new(0);
 pub fn totals_if_moved() -> Option<Totals> {
     let totals = totals();
     let progress = totals.progress();
-    if REPORTED.swap(progress, Relaxed) == progress {
+    if sink().reported.swap(progress, Relaxed) == progress {
         return None;
     }
     Some(totals)
 }
 
-/// Put every counter back to zero.
+/// Put this thread's counters back to zero.
 ///
-/// **For tests only, and the reason this is not `#[cfg(test)]`**: the
-/// counters are `static`, so a test binary shares them across every test in
-/// the process and a suite that read them raw would depend on the order the
-/// harness happened to run in. Tests that assert on a delta take one of these
-/// and a lock; see `overlay_cache::ledger_tests`.
+/// **For tests only, and the reason this is not `#[cfg(test)]`**: the counters
+/// live one crate below most of the tests that drive them, and a `cfg(test)`
+/// is crate-local.
+///
+/// In a test build there is one set of counters per thread — see `sink` — so
+/// this zeroes the calling test's own and no other's. It is still needed:
+/// under `--test-threads=1` libtest runs every test on the main thread, so one
+/// set of counters spans the whole run and a test asserting an absolute figure
+/// has to start it from zero.
 #[doc(hidden)]
 pub fn reset_for_test() {
+    let sink = sink();
     for counter in [
-        &DISPATCHED,
-        &ARRIVED,
-        &DROPPED,
-        &PICTURES,
-        &PICTURE_BYTES,
-        &INKED,
-        &SHOWN,
-        &PROMOTED,
-        &SUPERSEDED,
-        &CANCELLED,
-        &REPORTED,
+        &sink.dispatched,
+        &sink.arrived,
+        &sink.dropped,
+        &sink.pictures,
+        &sink.picture_bytes,
+        &sink.inked,
+        &sink.shown,
+        &sink.promoted,
+        &sink.superseded,
+        &sink.cancelled,
+        &sink.reported,
     ] {
         counter.store(0, Relaxed);
     }
-    for counter in &DISPATCH_REASONS {
+    for counter in &sink.reasons {
         counter.store(0, Relaxed);
     }
 }
