@@ -875,7 +875,33 @@ pub struct Budgets {
     /// Frames a loop may keep *textured* — what [`Self::loop_span_secs`] costs
     /// at the fastest radar measured, so the ceiling on the per-site figure
     /// rather than the figure itself.
+    ///
+    /// **A class figure, not a governor's lever.** No rung of [`LADDER`]
+    /// touches it: ruling 15 forbids a governor path lowering a granted
+    /// loop's frame count. What binds a loop at run time is
+    /// [`Self::loop_frames_reachable`].
     pub loop_render_budget: usize,
+    /// **The frames of one loop this session's capacity can actually hold** —
+    /// derived from what was measured, not compiled.
+    ///
+    /// `crate::fit::reachable_loop_frames` computes it: the spare each pool
+    /// has once the rest of the scene is paid for, divided by what one frame
+    /// costs on that pool — the loop frame's texture on the GPU, one decoded
+    /// volume (`crate::constants::LOOP_SCAN_RESERVE_BYTES`) on the host —
+    /// and the lower of the two, shared out over the scene's looping panes.
+    ///
+    /// [`resolve`] sets it to [`Self::loop_render_budget`], the class rung's
+    /// own figure, because nothing has been measured at that point; and
+    /// `fit` leaves it there on the presumed and derived arms for the reason
+    /// `crate::fit::tile_cache_budget` states — a figure this crate computed
+    /// rather than read does not get a measurement's privileges.
+    ///
+    /// It is a **ceiling on the ask, applied once, at admission**, and never
+    /// a rung: [`Self::frames_for_span_of`] holds the request to it and
+    /// [`Self::frames_requested_for_span_of`] states the request beside it,
+    /// so a span this machine cannot reach is a figure the user is shown and
+    /// not a quiet cut.
+    pub loop_frames_reachable: usize,
     /// The loop pool's floor. A pair rather than one resolved figure because
     /// the pool is held inside it: what the loops need, capped by the room the
     /// rest of the scene leaves under the capacity (`crate::fit::loop_pool_bytes`),
@@ -1035,11 +1061,47 @@ impl Budgets {
         self.frames_for_span_of(self.loop_span_secs, cadence_secs)
     }
 
+    /// **What `span_secs` of lookback ASKS for at `cadence_secs`** — the
+    /// request, and nothing of this crate's shortens it.
+    ///
+    /// **Ruling 13**: *"lookback up to the user's span setting is TIER 1 …
+    /// the governor may not shorten it"*. Until 2026-09-06 this arithmetic
+    /// opened `span_secs.min(self.loop_span_secs)`, so a user asking for six
+    /// hours on a bracket budgeted two was silently answered with two — a
+    /// compiled constant deciding a tier-1 setting. The span is now the
+    /// user's, whole; what a machine cannot reach is said out loud by
+    /// [`Self::frames_for_span_of`] beside this figure.
+    ///
+    /// A loop with no cadence yet has nothing to convert, so it asks for
+    /// what is reachable and is therefore never reported as clamped: nothing
+    /// has said what more exists.
+    ///
+    /// **The body lives on [`crate::admit::LoopFrames`]**, with
+    /// [`Self::frames_for_span_of`]'s, for that delegation's own reason: an
+    /// admission door has to be able to ask both questions for a span the
+    /// user is dragging toward without the whole `Budgets` crossing the Gui
+    /// seam, and a door counting a span's frames differently from the model
+    /// would refuse or admit a scene the model does not.
+    pub fn frames_requested_for_span_of(
+        &self,
+        span_secs: usize,
+        cadence_secs: Option<u32>,
+    ) -> usize {
+        crate::admit::LoopFrames::of(self).requested(span_secs, cadence_secs)
+    }
+
     /// Frames of `cadence_secs` apiece it takes to cover `span_secs` of a
-    /// pane's own lookback, held to [`Self::loop_span_secs`] and to the render
-    /// budget — the same clamp as [`Self::frames_for_span`], with the pane's
-    /// span in place of the budget's. A loop with no cadence yet buys the whole
-    /// render budget, as it always has.
+    /// pane's own lookback: [`Self::frames_requested_for_span_of`] held to
+    /// what this session's capacity can reach
+    /// ([`Self::loop_frames_reachable`]).
+    ///
+    /// **The one clamp left on a loop's length, and it is an admission
+    /// decision rather than a rung.** It is applied once, before a grant
+    /// exists, and the pair — this and the request — is what the readout
+    /// shows, so a span that cannot be reached is visible. No governor path
+    /// may lower the answer afterwards
+    /// (`crate::fit::no_governor_path_lowers_a_granted_loops_frames_or_span`).
+    ///
     /// **The body lives on [`crate::admit::LoopFrames`]**, which carries the
     /// two figures alone so an admission door can ask the same question for a
     /// span the user is dragging toward without the whole `Budgets` crossing
@@ -1073,9 +1135,18 @@ impl Budgets {
 
 /// The budgets this device gets.
 pub fn resolve(profile: &DeviceProfile) -> Budgets {
-    let limits = &profile.limits;
-    let promotion = profile.promotion();
-    let mut budgets = Budgets {
+    let mut budgets = at_class_rung(&profile.limits, profile.promotion());
+    demote(&mut budgets, &profile.limits, profile.steps_back());
+    budgets
+}
+
+/// **The class rung itself**: every bracket read at `promotion`, no rung of
+/// the ladder taken. [`resolve`] is this plus the profile's own
+/// `steps_back`, and `crate::fit::tile_cache_budget` prices its economy
+/// against it so that a machine which shed rungs does not thereby earn its
+/// caches more room.
+pub fn at_class_rung(limits: &BudgetLimits, promotion: Promotion) -> Budgets {
+    Budgets {
         name: limits.name,
         promotion,
         steps_back: 0,
@@ -1088,6 +1159,9 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
         loop_frames_held: limits.loop_frames_held.at(promotion),
         loop_span_secs: limits.loop_span_secs.at(promotion),
         loop_render_budget: limits.loop_render_budget.at(promotion),
+        // Nothing is measured here: `resolve` sees a profile and no capacity.
+        // `crate::fit::fit` replaces it wherever a capacity was read.
+        loop_frames_reachable: limits.loop_render_budget.at(promotion),
         loop_pool_floor_bytes: limits.loop_pool_bytes.floor,
         loop_pool_ceiling_bytes: limits
             .loop_pool_bytes
@@ -1112,9 +1186,7 @@ pub fn resolve(profile: &DeviceProfile) -> Budgets {
         tile_parsed_bytes: limits.tile_parsed_bytes.at(promotion),
         tile_terrain_bytes: limits.tile_terrain_bytes.at(promotion),
         tile_host_ceiling_bytes: limits.tile_host_ceiling_bytes.at(promotion),
-    };
-    demote(&mut budgets, limits, profile.steps_back());
-    budgets
+    }
 }
 
 /// One rung's knob: mutate, and say whether anything actually moved.
@@ -1169,46 +1241,22 @@ pub struct Rung {
 /// 1. **3D lighting**: the gradient shading, seven fetches a step against one.
 /// 2. **3D offscreen resolution**, one coarsening a step (`Native`, `Half`,
 ///    `Quarter`), and the offscreen and app ceilings to their floors with it.
-/// 3. **Loop history, 2D before 3D**: the render budget halves toward
-///    `MIN_LOOP_FRAMES_PER_PANE`, one halving a step, so a scene that is a
-///    little over sheds a little history rather than a rung of detail. A
-///    shorter loop is the least destructive thing in the application — nothing
-///    on screen gets worse, there is just less of it.
-///
-///    **THIS RUNG IS A STANDING VIOLATION OF RULING 15, and the ruling is why
-///    it stays `GPU` rather than being widened.** Ruling 15 — *"frame DENSITY
-///    is tier 1 too: refuse, never decimate. A loop plays at the listing's
-///    cadence or it is refused at admission with text"* — states the negative
-///    property as **"no governor path lowers a granted loop's frame count or
-///    span"**, and halving `loop_render_budget` is exactly a governor path
-///    lowering a granted frame count. WO-I owns removing it. It is recorded
-///    here rather than in a commit message because the next reader to find a
-///    host term sized from the frame count will make the same proposal:
-///
-///    On 2026-09-06 this rung was widened to `Lowers::BOTH` and measured,
-///    because the decoded Level II volume behind a loop frame
-///    (`fit::NeedTerms::loop_scans_host`) is a **host** term sized from the
-///    same frame count, and with no cadence yet
-///    [`Budgets::frames_for_span_of`] answers `loop_render_budget` outright —
-///    so on the web bracket a loop that has fetched nothing charges
-///    `14 x LOOP_SCAN_RESERVE_BYTES` = 1,174,405,120 B, **1.46x the whole host
-///    allowance**, and no host rung could touch it. Widening it made
-///    `scene_table`'s "one looping pane" go from 184,549,376 B over at the
-///    stops to fitting with 150,994,944 B to spare, and `huge_pending(13)`
-///    from 726,493,668 B over to 212,614,764 B over. **It was declined**: the
-///    scene is meant to be *refused at admission*, with text naming the span
-///    and the pool, not quietly given fewer frames. `every_host_rung_at_its_stop`
-///    reporting "nothing left to shed" on such a scene is therefore the
-///    **correct** answer, not the gap it looks like — there is nothing left to
-///    shed because shedding frames is forbidden — and what makes the refusal
-///    possible is that `need` prices the term correctly and `over` already
-///    answers "host over" with the rung untouched.
-/// 4. **Overlay oversampling**, one entry of
+/// 3. **Overlay oversampling**, one entry of
 ///    [`constants::OVERLAY_OVERSAMPLE_PERCENTS`] a step (1.5x, 1.25x, 1x per
-///    side). After the history because a shorter loop is *less of the same
-///    picture* where a thinner margin is a blank strip at the leading edge of
-///    a fast pan until the next raster lands — brief, and only while panning,
-///    but a picture defect where the history's loss is not one. Before the
+///    side). **The first rung a picture pays for**, and it was the fourth
+///    until 2026-09-06: a loop-history rung stood above it and halved
+///    `loop_render_budget` toward `MIN_LOOP_FRAMES_PER_PANE`, one halving a
+///    step, so a scene a little over shed history rather than detail. Ruling
+///    15 — *"frame DENSITY is tier 1 too: refuse, never decimate"*, with the
+///    negative property *"no governor path lowers a granted loop's frame
+///    count or span"* — removed it as a pressure lever, and
+///    `fit::no_governor_path_lowers_a_granted_loops_frames_or_span` is what
+///    keeps it removed. **The product consequence is stated rather than
+///    discovered**: a GPU-over looping scene now goes from resolution
+///    straight to oversampling, and the first rung a user calls "worse"
+///    arrives one step sooner. A thinner margin is a blank strip at the
+///    leading edge of a fast pan until the next raster lands — brief, and
+///    only while panning. Before the
 ///    tiles because a softened basemap is on every frame for as long as the
 ///    rung holds and this costs nothing while the map stands still; and
 ///    because it is the largest lever per step in the table — a whole-picture
@@ -1216,14 +1264,14 @@ pub struct Rung {
 ///    thirteen of them at the user's canvas are 556 MB of a 1 GiB page heap.
 ///    Lowers **both** axes: the picture is a GPU texture as well as a page
 ///    buffer, even though only the host side is priced today.
-/// 5. **Tile sharpness**: fewer, larger tiles cover the same glass. Above the
+/// 4. **Tile sharpness**: fewer, larger tiles cover the same glass. Above the
 ///    grid because a softer basemap is a softer picture and a coarser grid is
 ///    a wrong-looking one. Host bytes (the styled working set) — and taken
 ///    for the GPU axis too, as it has been since it landed: the terrain
 ///    rasters it shrinks are textures omitted from the GPU sum by name.
-/// 6. **3D grid cells**, and the volume texture budget with them: the first
+/// 5. **3D grid cells**, and the volume texture budget with them: the first
 ///    rung a user calls "worse".
-/// 7. **Raster side**, to the long-range floor: the most visible, so last.
+/// 6. **Raster side**, to the long-range floor: the most visible, so last.
 ///    Lowers **both** axes, and did not always: a plan-view render's texture
 ///    is a GPU term (`fit::NeedTerms::static_rasters`) and the raster, its
 ///    value grid and the claim buffer that painted them are a host one
@@ -1231,7 +1279,7 @@ pub struct Rung {
 ///    While the host half was priced at zero this read `GPU`, which made
 ///    `fit::every_host_rung_at_its_stop` answer "nothing left to shed" with
 ///    the largest host lever in the table untouched.
-const LADDER: [Rung; 7] = [
+const LADDER: [Rung; 6] = [
     Rung {
         step: |b, _| {
             let cheaper = b.quality_ceiling.shading.cheaper_of(GradientShading::Off);
@@ -1252,15 +1300,6 @@ const LADDER: [Rung; 7] = [
             b.offscreen_bytes = floor;
             // The bound the offscreen's promotion moved comes back with it.
             b.app_texture_ceiling_bytes = limits.app_texture_ceiling_bytes.floor;
-            moved
-        },
-        lowers: Lowers::GPU,
-    },
-    Rung {
-        step: |b, _| {
-            let halved = (b.loop_render_budget / 2).max(constants::MIN_LOOP_FRAMES_PER_PANE);
-            let moved = halved < b.loop_render_budget;
-            b.loop_render_budget = halved;
             moved
         },
         lowers: Lowers::GPU,

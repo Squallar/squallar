@@ -2424,6 +2424,7 @@ impl super::App {
                     linear,
                     self.loop_pool.bytes(),
                     self.loop_pool_state.allocation().balloon_bytes(),
+                    self.loop_pool_state.allocation().over_pool_bytes(),
                     &self.capacity(),
                     self.gpu_probe,
                     self.linear_memory_watch,
@@ -5560,10 +5561,12 @@ impl super::App {
             panes,
             new_pane,
             layer_grids,
-            frames: LoopFrames {
-                budget_span_secs: budgets.loop_span_secs,
-                render_budget: budgets.loop_render_budget,
-            },
+            // **Read off the budgets rather than spelled**, since ruling 13
+            // took the compiled span ceiling out of this pair and ruling 15
+            // put the capacity's reachable count in its place: a door that
+            // constructed the two fields itself would be a second place for
+            // them to drift from `Budgets`.
+            frames: LoopFrames::of(&budgets),
             // The user's own two settings, so a refusal can name the control
             // that produced the wall rather than the wall alone.
             requested_percent: (self.memory_percents.gpu, self.memory_percents.host),
@@ -5669,10 +5672,24 @@ impl super::App {
                     }
                 }
             };
+            // **Effective beside requested** (ruling 13): what this pane's
+            // own lookback asks for at its cadence, and what this session's
+            // capacity reaches. Equal wherever the span is reachable; the
+            // pair is what makes a clamp visible where it is not.
+            let (loop_frames_requested, loop_frames_effective) = if pane.looping {
+                (
+                    squallar_device_profile::fit::loop_frames_requested(pane, &self.budgets),
+                    squallar_device_profile::fit::loop_frames(pane, &self.budgets),
+                )
+            } else {
+                (0, 0)
+            };
             readout.panes.push(PaneBudget {
                 terms: pane_terms,
                 shared_bytes,
                 own_bytes,
+                loop_frames_requested,
+                loop_frames_effective,
             });
         }
         readout.terms = *terms;

@@ -452,7 +452,10 @@ pub struct LoopGrant {
     /// The most frames the loop can hold, from the need.
     pub max: usize,
     /// **Frames this loop may hold**: the base plus its share of the
-    /// balloon, or less than the base when the pool could not pay every base.
+    /// balloon, and **never less than the base** — ruling 15, since
+    /// 2026-09-06. A pool that cannot pay every base leaves them all standing
+    /// and reports [`LoopAllocation::over_pool_bytes`]; it does not take
+    /// frames back. See [`LoopPool::plan`].
     pub frames: usize,
     /// The bytes charged whatever the frame count — a 3D loop's live grid.
     fixed_bytes: usize,
@@ -616,6 +619,19 @@ impl LoopAllocation {
     pub fn pool_bytes(&self) -> usize {
         self.pool_bytes
     }
+
+    /// **Bytes this plan is over its pool by, 0 when it fits** — the figure
+    /// ruling 15 leaves behind in place of the frames the old downward arm
+    /// used to take back.
+    ///
+    /// Non-zero only where every loop is at its base and the bases together
+    /// do not fit, which is a scene `fit` had nothing left to shed for. It is
+    /// what an admission door reads to refuse the scene with text naming the
+    /// span and the pool, and what the loop telemetry reports until that door
+    /// lands: the state is priced and visible rather than quietly thinned.
+    pub fn over_pool_bytes(&self) -> usize {
+        self.bytes().saturating_sub(self.pool_bytes)
+    }
 }
 
 /// The application's whole loop allowance, in bytes.
@@ -674,13 +690,36 @@ impl LoopPool {
     /// get, and a longer window holds proportionally more frames. When the
     /// bases together do **not** fit — the ladder had nothing left to shed,
     /// or the presumed arm's ceiling binds — the same rule runs downward: one
-    /// frame at a time from whichever loop's frames stand for the fewest
-    /// seconds, none below the floor, until the plan fits or nothing can
-    /// shrink. That replaces the equal-bytes split, which gave a section loop
+    /// That replaces the equal-bytes split, which gave a section loop
     /// twice a plan-view loop's history for the same lookback and held six
-    /// panes to the density one pane earned.
+    /// panes to the density one pane earned. When the bases together do
+    /// **not** fit, nothing is taken back — see below.
     ///
     /// Deterministic: the same pool, model and demand plan the same grants.
+    ///
+    /// # There is no downward arm, and that is ruling 15
+    ///
+    /// Until 2026-09-06 the bases not fitting ran the same rule **downward**
+    /// — one frame at a time from whichever loop's frames stood for the
+    /// fewest seconds, none below `MIN_LOOP_FRAMES_PER_PANE`, until the plan
+    /// fitted or nothing could shrink. That is a governor path lowering a
+    /// granted loop's frame count, which ruling 15 forbids: *"frame DENSITY
+    /// is tier 1 too: refuse, never decimate. A loop plays at the listing's
+    /// cadence or it is refused at admission with text."*
+    ///
+    /// **What happens instead, today: the plan is over the pool and says
+    /// so.** Every loop holds its base, [`LoopAllocation::bytes`] exceeds
+    /// [`LoopAllocation::pool_bytes`], and
+    /// [`LoopAllocation::over_pool_bytes`] is the figure an admission door
+    /// reads and a refusal names. The door is a sibling lane's and is not
+    /// built here; until it lands the scene is **priced over and reported**,
+    /// which is the honest state and not a silent one — `fit` already prices
+    /// the same frames, `fit::over` already answers, and the loop telemetry
+    /// carries the overage.
+    ///
+    /// The bases can only fail to fit where `fit` had nothing left to shed
+    /// or the presumed arm's ceiling binds — both of which are scenes the
+    /// ruling says to refuse rather than to thin.
     pub fn plan(&self, model: LoopFrameModel, demand: &LoopDemand) -> LoopAllocation {
         let mut grants: Vec<LoopGrant> = demand
             .needs
@@ -725,23 +764,9 @@ impl LoopPool {
                 };
                 grants[i].frames += 1;
             }
-        } else {
-            // Down: the finest shrinkable loop gives the next frame back.
-            while charged(&grants) > self.bytes {
-                let next = grants
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, g)| g.frames > MIN_LOOP_FRAMES_PER_PANE)
-                    .fold(None::<usize>, |best, (i, g)| match best {
-                        Some(b) if !grants[b].coarser_than(g) => Some(b),
-                        _ => Some(i),
-                    });
-                let Some(i) = next else {
-                    break;
-                };
-                grants[i].frames -= 1;
-            }
         }
+        // No downward arm: a plan whose bases do not fit stays at its bases
+        // and reports the overage. See this function's own doc.
 
         // The per-kind ceilings: the most any loop of the kind holds, or the
         // single-loop answer where none does — the whole pool as one share,

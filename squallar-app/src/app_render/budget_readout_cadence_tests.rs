@@ -109,6 +109,7 @@ fn a_tick_inside_the_period_composes_nothing_and_the_line_reads_what_it_composed
         None,
         app.loop_pool.bytes(),
         app.loop_pool_state.allocation().balloon_bytes(),
+        app.loop_pool_state.allocation().over_pool_bytes(),
         &app.capacity(),
         app.gpu_probe,
         crate::pressure::LinearMemoryWatch::default(),

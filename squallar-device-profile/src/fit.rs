@@ -300,6 +300,25 @@ impl NeedTerms {
             .saturating_add(self.mirror)
             .saturating_add(self.buildings)
     }
+
+    /// **Every host term but the decoded volumes behind the loop frames** —
+    /// what a loop's scans have to fit beside, the host counterpart of
+    /// [`Self::gpu_without_loops`].
+    ///
+    /// [`Self::still_scans_host`] stays in: a pane parked at a still holds
+    /// its volume whatever the looping panes do, and it is exactly
+    /// complementary to [`Self::loop_scans_host`], so leaving it out would
+    /// hand the loops room another pane has already taken.
+    pub fn host_without_loop_scans(&self) -> u64 {
+        self.tiles_host
+            .saturating_add(self.pictures_host)
+            .saturating_add(self.upload_pending_host)
+            .saturating_add(self.picture_arrival_host)
+            .saturating_add(self.loop_pictures_host)
+            .saturating_add(self.overlay_grids_host)
+            .saturating_add(self.still_scans_host)
+            .saturating_add(self.render_peak_host)
+    }
 }
 
 /// **One pane's share of a scene's cost**, term by term — what
@@ -542,11 +561,113 @@ pub fn picture_bytes(px: [u32; 2], oversample_percent: u16) -> u64 {
     side(px[0]).saturating_mul(side(px[1])).saturating_mul(4)
 }
 
-/// Frames one looping pane wants: its own lookback converted at its cadence and
-/// held to the budget's span and render budget — `Budgets::frames_for_span`'s
-/// arithmetic with the pane's span in place of the budget's.
+/// Frames one looping pane wants: its own lookback converted at its cadence
+/// and held to what this session's capacity can reach —
+/// `Budgets::frames_for_span_of` with the pane's own span, which nothing
+/// shortens (ruling 13).
 pub fn loop_frames(pane: &PaneNeed, budgets: &Budgets) -> usize {
     budgets.frames_for_span_of(pane.loop_span_secs, pane.cadence_secs)
+}
+
+/// **What one looping pane ASKED for**, before the reachable ceiling:
+/// `Budgets::frames_requested_for_span_of` at the pane's own span. Equal to
+/// [`loop_frames`] wherever the machine can reach the span, and above it
+/// wherever it cannot — the pair the readout shows so a clamp is visible
+/// rather than silent.
+pub fn loop_frames_requested(pane: &PaneNeed, budgets: &Budgets) -> usize {
+    budgets.frames_requested_for_span_of(pane.loop_span_secs, pane.cadence_secs)
+}
+
+/// **How many frames of one loop this capacity can actually hold** — the
+/// figure `Budgets::loop_frames_reachable` carries, and the reason
+/// `MAX_LOOP_RENDER_BUDGET` stopped being what bounds a loop at run time.
+///
+/// The spare each pool has once everything in `scene` that is not a loop
+/// frame is paid for, divided by what one frame costs on that pool:
+///
+/// * **GPU** — `allowance - gpu_without_loops`, over the loop frame's
+///   texture (`Budgets::loop_frame_bytes`, the plan-view worst case).
+/// * **Host** — `host_allowance - host_without_loop_scans`, over
+///   [`LOOP_SCAN_RESERVE_BYTES`], the decoded volume behind one radar frame.
+/// * **One pool** — a `Pools::Unified` part has one memory, so the spare is
+///   the joint allowance less both, and a frame costs the sum of the two.
+///
+/// The lower of whichever apply. **Computed from the class rung's need, once,
+/// before [`fit`] walks the ladder** — not re-derived per rung. A count that
+/// grew as rungs freed bytes would let the loop eat every rung the ladder
+/// took, which is a governor lowering picture quality on a loop's behalf; the
+/// class rung's need is the largest, so this is the conservative reading.
+///
+/// **It is not divided by the scene's looping panes, and that is ruling 15.**
+/// Dividing would make a loop's own base fall because another pane exists,
+/// which is the decimation the ruling forbids — on the probed web bracket it
+/// answered *two frames* for each of six loops, admitting a scene that should
+/// have been refused. The question this asks is what the machine can hold for
+/// **one** loop; a scene of several that do not fit together is over, and
+/// [`over`] says so.
+///
+/// **Presumed and derived capacities keep the class rung's own figure**, for
+/// [`tile_cache_budget`]'s reason: the derivation is a measurement's
+/// privilege, and a bracket constant argued with its own headroom is not a
+/// reading of anything. Never below [`crate::constants::MIN_LOOP_FRAMES_PER_PANE`]
+/// — a loop that cannot hold two cannot animate, and that is a refusal to
+/// make at admission, not a count to round down to one.
+pub fn reachable_loop_frames(
+    scene: &Scene,
+    budgets: &Budgets,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> usize {
+    use crate::scene::CapacitySource;
+    match cap.source {
+        CapacitySource::Presumed | CapacitySource::Derived => return budgets.loop_render_budget,
+        CapacitySource::Measured | CapacitySource::Probed => {}
+    }
+    let terms = need_terms(scene, budgets, grid_bytes);
+    let per_loop = |spare: u64, frame: u64| -> u64 {
+        match frame {
+            0 => u64::MAX,
+            frame => spare / frame,
+        }
+    };
+    let gpu_frame = budgets.loop_frame_bytes() as u64;
+    let reachable = match cap.pools {
+        Pools::Unified => per_loop(
+            cap.joint_allowance().saturating_sub(
+                terms
+                    .gpu_without_loops()
+                    .saturating_add(terms.host_without_loop_scans()),
+            ),
+            gpu_frame.saturating_add(LOOP_SCAN_RESERVE_BYTES),
+        ),
+        Pools::Split => {
+            let gpu = per_loop(
+                cap.allowance().saturating_sub(terms.gpu_without_loops()),
+                gpu_frame,
+            );
+            match cap.host_allowance() {
+                Some(host) => gpu.min(per_loop(
+                    host.saturating_sub(terms.host_without_loop_scans()),
+                    LOOP_SCAN_RESERVE_BYTES,
+                )),
+                None => gpu,
+            }
+        }
+    };
+    usize::try_from(reachable)
+        .unwrap_or(usize::MAX)
+        // **A ceiling that only ever lowers, and the direction is the whole
+        // point.** Above the class figure this would make `need` grow with
+        // the capacity — a bigger card asking for more, so that halving a
+        // pool could RAISE a tile cache and `fit` stop being monotone
+        // (`scene::percent_tests`'s
+        // `the_percentage_is_inert_on_no_capacity_arm_and_never_raises_a_budget`
+        // catches exactly that). What a bigger card buys is density, and the
+        // pool's balloon already spends it: `loop_pool_bytes` caps at
+        // `loop_ceiling`, the whole window at its cadence, and
+        // `LoopPool::plan`'s Up arm hands the room out frame by frame.
+        .min(budgets.loop_render_budget)
+        .max(crate::constants::MIN_LOOP_FRAMES_PER_PANE)
 }
 
 /// What the loops need, in bytes: every looping pane's frames at its frame's
@@ -675,16 +796,40 @@ pub fn over(
     }
 }
 
+/// **The class rung, admitted against this capacity** — [`resolve`] plus the
+/// one thing a capacity can say that a profile cannot: how many frames of one
+/// loop it reaches ([`reachable_loop_frames`]).
+///
+/// The rung [`fit`] starts its walk from, and the rung a caller replaying
+/// that walk has to start from too: `resolve` alone is the class rung of a
+/// machine nobody measured, and comparing a fitted budget against it reads a
+/// measurement as a rung the ladder took.
+pub fn admit(
+    scene: &Scene,
+    profile: &DeviceProfile,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> Budgets {
+    let mut budgets = resolve(profile);
+    // Admission, before the ladder: what this capacity can reach is an input
+    // to the walk, never an output of it. See `reachable_loop_frames`.
+    budgets.loop_frames_reachable = reachable_loop_frames(scene, &budgets, cap, grid_bytes);
+    budgets
+}
+
 /// The largest budgets whose need for `scene` fits `cap`'s allowances.
 ///
 /// Starts from `resolve(profile)` — the rung the class earns, so a scene that
 /// fits changes nothing — and while a need is over its allowance takes the
 /// next rung of the shed order `budget::demote` walks **that lowers an axis
-/// which is over**: 3D lighting, 3D offscreen resolution, loop span (halving
-/// toward the two-frame floor), overlay oversampling, tile sharpness, 3D
-/// grid, raster side. A page heap over its allowance never costs the loop
-/// its history, and a card over its allowance never costs a picture its
-/// margin for a byte the GPU model does not price. Stops when the scene
+/// which is over**: 3D lighting, 3D offscreen resolution, overlay
+/// oversampling, tile sharpness, 3D grid, raster side. **No rung touches the
+/// loop**, by ruling 15 — a scene whose loops do not fit is refused at
+/// admission, not decimated — so a GPU-over looping scene goes from
+/// resolution straight to oversampling and the first rung a user calls
+/// "worse" arrives one step sooner than it did before 2026-09-06. A card
+/// over its allowance never costs a picture its margin for a byte the GPU
+/// model does not price. Stops when the scene
 /// fits, or when every rung that could answer is at its stop — then the
 /// floor budgets come back and the runtime clamps and logs. `steps_back`
 /// counts the rungs taken.
@@ -695,7 +840,7 @@ pub fn fit(
     grid_bytes: GridBytes,
 ) -> Budgets {
     let limits = &profile.limits;
-    let mut budgets = resolve(profile);
+    let mut budgets = admit(scene, profile, cap, grid_bytes);
     loop {
         let (gpu_over, host_over) = over(scene, &budgets, cap, grid_bytes);
         if !gpu_over && !host_over {
@@ -728,6 +873,21 @@ pub fn every_rung_at_its_stop(budgets: &Budgets, limits: &BudgetLimits) -> bool 
 /// (its panes, its loops, its grids) priced at that configuration.
 pub fn floor_need(scene: &Scene, profile: &DeviceProfile, grid_bytes: GridBytes) -> Need {
     let mut floor = resolve(profile);
+    while step_down(&mut floor, &profile.limits) {}
+    need(scene, &floor, grid_bytes)
+}
+
+/// [`floor_need`] against a capacity, so the loops are priced at the same
+/// reachable count [`fit`] admitted them at. The bare [`floor_need`] prices
+/// them at the class rung's figure, which is what every caller with no
+/// capacity to hand can say.
+pub fn floor_need_for(
+    scene: &Scene,
+    profile: &DeviceProfile,
+    cap: &Capacity,
+    grid_bytes: GridBytes,
+) -> Need {
+    let mut floor = admit(scene, profile, cap, grid_bytes);
     while step_down(&mut floor, &profile.limits) {}
     need(scene, &floor, grid_bytes)
 }
@@ -818,7 +978,27 @@ pub fn tile_cache_budget(
         CapacitySource::Presumed | CapacitySource::Derived => return budgets.tile_cache(),
         CapacitySource::Measured | CapacitySource::Probed => {}
     }
-    let economy = economy_allowance(scene, budgets, cap, grid_bytes);
+    // **Priced at the CLASS RUNG's need, not at the shed one**, and the
+    // direction is the whole reason: `economy_allowance` is a fraction of the
+    // pool less what the scene needs, so a scene that has shed rungs needs
+    // less and would earn its caches MORE — a machine under pressure
+    // rewarding its economy. Worse, it makes the figure non-monotone in the
+    // pool: measured 2026-09-06 on the probed desktop arm with six looping
+    // panes, halving the pool took the scene from fitting at the class rung
+    // to walking to the ladder's floor, which shed 1152 MiB of raster
+    // ceiling — more than the 0.45x the halving took off the economy — and
+    // the styled cache came out LARGER at half the pool than at the whole of
+    // it (`scene::percent_tests`'s
+    // `the_percentage_is_inert_on_no_capacity_arm_and_never_raises_a_budget`).
+    // The class rung's need does not fall when the ladder walks, so the
+    // economy falls with the pool and nothing else.
+    let unshed = Budgets {
+        // The one field admission wrote and no rung moves: keep it, or the
+        // loops would be priced at a length this capacity never admitted.
+        loop_frames_reachable: budgets.loop_frames_reachable,
+        ..crate::budget::at_class_rung(limits, budgets.promotion)
+    };
+    let economy = economy_allowance(scene, &unshed, cap, grid_bytes);
     let parts: u64 = TILE_ECONOMY_SHARES.iter().sum();
     let share = |n: u64, bracket: crate::budget::Bracket| {
         let raw = usize::try_from(economy / parts * n).unwrap_or(usize::MAX);

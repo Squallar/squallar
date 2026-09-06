@@ -126,8 +126,15 @@ fn bare(pane: usize, kind: LoopKind, model: &LoopFrameModel) -> LoopNeed {
 
 /// A radar plan-view loop on `pane` over a **six-hour lookback at a 300 s cadence** on
 /// the desktop bracket — the shape every pinned figure below is stated for. The lookback
-/// lists 73 scans; the base is 25 (two hours, the rung's span, at 300 s, as
-/// `Budgets::frames_for_span_of` answers it); the ceiling is `min(73, MAX_LOOP_FRAMES)`.
+/// lists 73 scans; the base is 36 and the ceiling is `min(73, MAX_LOOP_FRAMES)`.
+///
+/// **The base was 25 until 2026-09-06 (ruling 13)**: two hours at 300 s, the *bracket's*
+/// span rather than the pane's, because `Budgets::frames_for_span_of` opened
+/// `span_secs.min(self.loop_span_secs)`. The user's six hours are no longer cut to the
+/// bracket's two; the request is the whole 73 frames and what answers is the reachable
+/// ceiling, which on an unmeasured desktop profile is the class figure of 36.
+const SIX_HOUR_BASE: usize = DESKTOP_MAX_LOOP_RENDER_BUDGET;
+
 fn six_hours(pane: usize) -> LoopNeed {
     let span_secs = 6 * 60 * 60;
     LoopNeed {
@@ -136,14 +143,25 @@ fn six_hours(pane: usize) -> LoopNeed {
         span_secs,
         cadence_secs: Some(300),
         frame_bytes: desktop().plan_view,
-        base_frames: 25,
+        base_frames: SIX_HOUR_BASE,
         max_frames: loop_ceiling_frames(
             Some(73),
             span_secs,
             Some(300),
-            25,
+            SIX_HOUR_BASE,
             DESKTOP_MAX_LOOP_FRAMES,
         ),
+    }
+}
+
+/// A loop with room to grow, on every arm: its base is the two-frame floor and its
+/// listing holds the class's list cap, so **the whole grant is balloon** — which is what
+/// a crowd may take back, where ruling 15 says the base is what it may not.
+fn growable(pane: usize, kind: LoopKind, model: &LoopFrameModel) -> LoopNeed {
+    LoopNeed {
+        base_frames: MIN_LOOP_FRAMES_PER_PANE,
+        max_frames: model.list_cap,
+        ..bare(pane, kind, model)
     }
 }
 
@@ -158,6 +176,18 @@ fn demand_of(needs: impl IntoIterator<Item = LoopNeed>) -> LoopDemand {
 /// `n` of `six_hours`, on panes `0..n`.
 fn six_hours_on(n: usize) -> LoopDemand {
     demand_of((0..n).map(six_hours))
+}
+
+/// **The bound the pool has under ruling 15.** A plan charges no more than
+/// the pool, *or* every loop stands at its base and there is nothing the
+/// planner is allowed to take back — `LoopPool::plan`'s downward arm was
+/// removed on 2026-09-06 because taking a frame back is a governor lowering a
+/// granted loop's frame count. The overage is then
+/// `LoopAllocation::over_pool_bytes`, which is what an admission door refuses
+/// on. This replaces the old escape hatch, "or some loop is at the two-frame
+/// floor", which was the shape the downward arm left behind.
+fn within_pool_or_at_its_bases(allocation: &LoopAllocation, pool: &LoopPool) -> bool {
+    allocation.bytes() <= pool.bytes() || allocation.grants().iter().all(|g| g.frames <= g.base)
 }
 
 fn frames_of(allocation: &LoopAllocation, pane: usize) -> usize {
@@ -195,8 +225,10 @@ fn reachable_demands(max_panes: usize, model: &LoopFrameModel) -> Vec<LoopDemand
 /// The claim the whole change exists to make, and the one nothing could have made before:
 /// `MAX_PANES × LOOP_TEXTURE_BUDGET_BYTES` was 3.0 GiB on desktop and 1.0 GiB on a phone,
 /// and no test put those two halves side by side because they lived in different crates.
-/// Every grant together charges no more than the pool — except where the two-frame floor
-/// had to win, which is stated rather than absorbed.
+/// Every grant together charges no more than the pool — except where every loop is
+/// already at its base, which ruling 15 leaves standing and
+/// `LoopAllocation::over_pool_bytes` names. Until 2026-09-06 the exception was "except
+/// where the two-frame floor had to win", which was the downward arm's own floor.
 #[test]
 fn the_pool_actually_bounds_the_sum() {
     for arm in arms() {
@@ -204,18 +236,20 @@ fn the_pool_actually_bounds_the_sum() {
             let pool = LoopPool::new(bytes, arm.limits);
             for demand in reachable_demands(arm.max_panes, &arm.model) {
                 let allocation = pool.plan(arm.model, &demand);
-                let at_floor = allocation
-                    .grants()
-                    .iter()
-                    .any(|g| g.frames == MIN_LOOP_FRAMES_PER_PANE);
                 assert!(
-                    allocation.bytes() <= pool.bytes() || at_floor,
-                    "{}: {} loops at a {} MiB pool charge {} MiB with no loop at the \
-                     minimum — the pool does not bound the sum",
+                    within_pool_or_at_its_bases(&allocation, &pool),
+                    "{}: {} loops at a {} MiB pool charge {} MiB with a loop above \
+                     its base — the pool does not bound the sum",
                     arm.name,
                     demand.shares(),
                     pool.bytes() / MIB,
                     allocation.bytes() / MIB,
+                );
+                assert_eq!(
+                    allocation.over_pool_bytes() > 0,
+                    allocation.bytes() > pool.bytes(),
+                    "{}: the overage does not name what the plan is over by",
+                    arm.name,
                 );
                 // The 3D kind's bound is the reserve the store is held to, and it is
                 // part of the same sum.
@@ -242,13 +276,21 @@ fn the_pool_actually_bounds_the_sum() {
 }
 
 /// The behaviour the pool was asked for, stated as the property rather than as the formula.
+///
+/// **What a pane arriving takes is the BALLOON, and it stops at the base** — ruling 15,
+/// since 2026-09-06. This test used to run on `bare` loops, whose base is the whole
+/// render budget, and assert that a crowd cut them: that was the downward arm, and it is
+/// gone. It runs on `growable` loops now, where there is a balloon to take, and the
+/// assertion that a crowd never reaches the base is the ruling's negative property on
+/// this path.
 #[test]
 fn a_loop_shortens_when_a_pane_arrives_and_recovers_when_it_goes() {
     for arm in arms() {
         let pool = LoopPool::new(arm.limits.floor, arm.limits);
+        let base = growable(0, LoopKind::PlanView, &arm.model).base_frames;
         let frames = |loops: usize| {
             let demand =
-                demand_of((0..loops).map(|pane| bare(pane, LoopKind::PlanView, &arm.model)));
+                demand_of((0..loops).map(|pane| growable(pane, LoopKind::PlanView, &arm.model)));
             frames_of(&pool.plan(arm.model, &demand), 0)
         };
         let alone = frames(1);
@@ -261,10 +303,10 @@ fn a_loop_shortens_when_a_pane_arrives_and_recovers_when_it_goes() {
             arm.max_panes - 1,
         );
         assert!(
-            crowded >= MIN_LOOP_FRAMES_PER_PANE,
-            "{}: a full screen cuts a loop to {crowded} frames, under the \
-             {MIN_LOOP_FRAMES_PER_PANE}-frame minimum — this is the cliff, not \
-             the degradation",
+            crowded >= base,
+            "{}: a full screen cut a loop to {crowded} frames, under the {base} \
+             frames its span asked for — no governor path lowers a granted \
+             loop's frame count",
             arm.name,
         );
         for loops in 1..arm.max_panes {
@@ -324,15 +366,22 @@ fn the_3d_set_is_not_double_counted_across_two_panes() {
             one_set.volume_reserve_bytes()
         );
 
-        // Two panes on two volumes really are two sets, and really do divide.
+        // Two panes on two volumes really are two sets, and really do divide —
+        // stated on `growable` loops, because ruling 15 means a `bare` loop's
+        // base is the whole render budget and a second pane may not take a
+        // frame of it. What a second pane divides is the balloon.
+        let one_growable = pool.plan(
+            arm.model,
+            &demand_of([growable(0, LoopKind::Volume, &arm.model)]),
+        );
         let distinct = demand_of([
-            bare(0, LoopKind::Volume, &arm.model),
-            bare(1, LoopKind::Volume, &arm.model),
+            growable(0, LoopKind::Volume, &arm.model),
+            growable(1, LoopKind::Volume, &arm.model),
         ]);
         assert_eq!(distinct.count(LoopKind::Volume), 2, "{}", arm.name);
         let two_sets = pool.plan(arm.model, &distinct);
         assert!(
-            frames_of(&two_sets, 0) < frames_of(&one_set, 0),
+            frames_of(&two_sets, 0) < frames_of(&one_growable, 0),
             "{}: two distinct 3D loops were not divided",
             arm.name,
         );
@@ -352,28 +401,55 @@ fn the_3d_set_is_not_double_counted_across_two_panes() {
     }
 }
 
-/// A single 3D loop at the floor holds exactly the count this target ships: the floor
-/// less one live grid, in grids.
+/// **The floor pool pays exactly the 3D count this target ships** — the floor less one
+/// live grid, in grids — and a 3D loop whose base is above that keeps its base and says
+/// how far over it is.
+///
+/// Until 2026-09-06 the two were the same statement, because `LoopPool::plan`'s downward
+/// arm cut a bare 3D loop's base of `MAX_LOOP_RENDER_BUDGET` grids down to what the floor
+/// paid. Ruling 15 removed that arm, so the shipped count is now what the POOL pays — the
+/// figure `SHIPPED_VOLUME_LOOP_FRAMES` and `the_loop_budget_is_what_the_constants_derive`
+/// carry — while the grant stands at its base.
+///
+/// **The product consequence, stated:** a 3D loop with no cadence yet asks for more grids
+/// than the floor pool pays on every bracket (14 against 11 on wasm32, 18 against 17 on
+/// mobile, 36 against 14 on desktop), and `VolumeStore::enforce_budget` is handed
+/// `volume_reserve_bytes` — so the store holds the base rather than the floor until the
+/// admission door refuses the scene instead.
 #[test]
 fn the_pool_reproduces_the_shipped_3d_frame_count() {
     for arm in arms() {
         let pool = LoopPool::new(arm.limits.floor, arm.limits);
+        // What the pool pays for one 3D loop, which is what an unseen loop reads.
+        let empty = pool.plan(arm.model, &LoopDemand::default());
+        assert_eq!(
+            empty.frames_for_kind(LoopKind::Volume),
+            arm.volume_loop_frames,
+            "{}: the pool pays a single 3D loop {} grids where this target ships {}",
+            arm.name,
+            empty.frames_for_kind(LoopKind::Volume),
+            arm.volume_loop_frames,
+        );
         let allocation = pool.plan(
             arm.model,
             &demand_of([bare(0, LoopKind::Volume, &arm.model)]),
         );
         assert_eq!(
             frames_of(&allocation, 0),
-            arm.volume_loop_frames,
-            "{}: the pool gives a single 3D loop {} grids where this target ships {}",
+            arm.model.render_budget,
+            "{}: a granted 3D loop was cut to the pool",
             arm.name,
-            frames_of(&allocation, 0),
-            arm.volume_loop_frames,
         );
         assert_eq!(
-            allocation.volume_frames, arm.volume_loop_frames,
+            allocation.volume_frames, arm.model.render_budget,
             "{}",
             arm.name
+        );
+        assert!(
+            allocation.over_pool_bytes() > 0,
+            "{}: the floor pays this loop's base after all, so the overage \
+             would not be reported for it",
+            arm.name,
         );
     }
 }
@@ -404,15 +480,13 @@ fn a_full_3d_loop_leaves_room_for_a_live_grid_at_every_pool_size() {
                     arm.name,
                     bytes / MIB,
                 );
-                // And the charge is inside the pool, except where the two-frame floor won.
+                // And the charge is inside the pool, except where every loop is
+                // already at its base — see `within_pool_or_at_its_bases`.
                 assert!(
                     allocation.volume_reserve_bytes() <= pool.bytes()
-                        || allocation
-                            .grants()
-                            .iter()
-                            .any(|g| g.frames == MIN_LOOP_FRAMES_PER_PANE),
-                    "{}: {sets} 3D loop(s) reserve {} MiB of a {} MiB pool with none at \
-                     the minimum",
+                        || within_pool_or_at_its_bases(&allocation, &pool),
+                    "{}: {sets} 3D loop(s) reserve {} MiB of a {} MiB pool with a loop \
+                     above its base",
                     arm.name,
                     allocation.volume_reserve_bytes() / MIB,
                     bytes / MIB,
@@ -428,9 +502,13 @@ fn a_full_3d_loop_leaves_room_for_a_live_grid_at_every_pool_size() {
 
 /// **Two loops of unequal cost and one lookback reach the same temporal resolution from
 /// the same surplus** — not the same bytes. A plan-view frame is 16 MiB and a section
-/// frame 8 MiB; over a 6 h lookback at 300 s both have a base of 25, and a 1200 MiB pool
-/// pays both bases (600 MiB) and balloons both to **50 frames** (50 x 24 MiB = 1200 MiB
+/// frame 8 MiB; over a 6 h lookback at 300 s both have a base of 36, and a 1200 MiB pool
+/// pays both bases (864 MiB) and balloons both to **50 frames** (50 x 24 MiB = 1200 MiB
 /// exactly). The equal-bytes split this replaces gave the section loop twice the frames.
+///
+/// The frame count did not move when the bases went from 25 to 36 (ruling 13): the pool
+/// is what decides where two equal-span loops land, and the bases only decide how much of
+/// that is balloon.
 #[test]
 fn two_loops_of_unequal_cost_get_equal_temporal_resolution_from_the_same_surplus() {
     let model = desktop();
@@ -457,7 +535,7 @@ fn two_loops_of_unequal_cost_get_equal_temporal_resolution_from_the_same_surplus
     );
     assert_eq!(
         allocation.balloon_bytes(),
-        25 * model.plan_view + 25 * model.section
+        (50 - SIX_HOUR_BASE) * model.plan_view + (50 - SIX_HOUR_BASE) * model.section
     );
     assert!(
         frames_of(&allocation, 1) != 2 * frames_of(&allocation, 0),
@@ -488,9 +566,12 @@ fn every_base_is_paid_before_the_first_balloon_frame() {
         ceiling: usize::MAX,
     };
 
-    let bases = (25 + 13) * model.plan_view;
+    let bases = (SIX_HOUR_BASE + 13) * model.plan_view;
     let exact = LoopPool::new(bases, limits).plan(model, &demand);
-    assert_eq!((frames_of(&exact, 0), frames_of(&exact, 1)), (25, 13));
+    assert_eq!(
+        (frames_of(&exact, 0), frames_of(&exact, 1)),
+        (SIX_HOUR_BASE, 13)
+    );
     assert_eq!(
         exact.balloon_bytes(),
         0,
@@ -500,22 +581,22 @@ fn every_base_is_paid_before_the_first_balloon_frame() {
     let one_more = LoopPool::new(bases + model.plan_view, limits).plan(model, &demand);
     assert_eq!(
         (frames_of(&one_more, 0), frames_of(&one_more, 1)),
-        (26, 13),
+        (SIX_HOUR_BASE + 1, 13),
         "the one surplus frame went to the loop whose frames stand for the most seconds \
-         (21600 / 25 = 864 s against 3600 / 13 = 277 s)",
+         (21600 / 36 = 600 s against 3600 / 13 = 277 s)",
     );
     assert_eq!(one_more.balloon_bytes(), model.plan_view);
 
     let ten_more = LoopPool::new(bases + 10 * model.plan_view, limits).plan(model, &demand);
     assert_eq!(
         (frames_of(&ten_more, 0), frames_of(&ten_more, 1)),
-        (35, 13),
+        (SIX_HOUR_BASE + 10, 13),
         "the short loop already holds every scan it listed and takes none of the surplus",
     );
 }
 
 /// **A lone plan-view pane at a six-hour lookback holds every scan it listed, up to the
-/// list cap.** 73 scans at 300 s; the base is 25 (the rung's two-hour span); on the
+/// list cap.** 73 scans at 300 s; the base is 36 (what the profile reaches); on the
 /// measured arm with 17 GiB of room the pool's ceiling is retired and the loop holds
 /// **60** — `MAX_LOOP_FRAMES` binds, not the pool: 73 exist and 60 is the most any loop
 /// lists. On the presumed desktop arm the 3072 MiB ceiling pays min(60, 3072 / 16 = 192)
@@ -548,8 +629,8 @@ fn a_lone_pane_over_six_hours_holds_every_listed_scan_up_to_the_list_cap() {
     assert_eq!(frames_of(&allocation, 0), 60);
     assert_eq!(
         allocation.balloon_bytes(),
-        35 * model.plan_view,
-        "60 - 25 frames of balloon"
+        (60 - SIX_HOUR_BASE) * model.plan_view,
+        "60 - 36 frames of balloon"
     );
 
     let presumed = Capacity::presumed(&BudgetLimits::DESKTOP);
@@ -665,44 +746,76 @@ fn the_framework_13s_loop_pool_is_held_to_the_bracket_ceiling() {
     );
 }
 
-/// **Six such panes share one budget by water-filling.** At 3072 MiB — 192 frames of
-/// 16 MiB — the six bases (150 frames) fit and the 42 spare frames go seven apiece:
-/// **32 each**, 6 x 32 x 16 MiB = 3072 MiB exactly. At the presumed arm's 2304 MiB of
-/// room (3840 less six 256 MiB static renders) the bases do not fit, and every pane
-/// shrinks to the same resolution: **24 each**, 144 frames.
+/// **Six such panes share one budget by water-filling.** At 3840 MiB — 240 frames of
+/// 16 MiB — the six bases (216 frames) fit and the 24 spare frames go four apiece:
+/// **40 each**, 6 x 40 x 16 MiB = 3840 MiB exactly.
+///
+/// **Below the bases nothing is taken back.** At the presumed arm's 2304 MiB of room
+/// (3840 less six 256 MiB static renders) the bases do not fit; until 2026-09-06 every
+/// pane shrank to the same resolution, 24 each, and ruling 15 removed that arm. Every
+/// pane now holds its base of 36 and the plan is over its pool by 1152 MiB, which is the
+/// figure an admission door refuses on.
+///
+/// The two pool figures moved with the bases: 3072 MiB no longer seats six of them, so
+/// the water-filling half is stated at 3840 MiB. What is pinned is the rule — the spare
+/// goes round evenly, by time — and not the arithmetic's inputs.
 #[test]
 fn six_panes_over_six_hours_share_the_pool_by_water_filling() {
     let model = desktop();
     let demand = six_hours_on(6);
 
-    let full = LoopPool::new(3072 * MIB, desktop_limits()).plan(model, &demand);
+    // Stated limits, not `desktop_limits()`: the bracket's 3072 MiB ceiling no
+    // longer seats six 36-frame bases, and this test is about how a pool is
+    // shared rather than about which pool a bracket gives.
+    let unbounded = LoopPoolLimits {
+        floor: 0,
+        ceiling: usize::MAX,
+    };
+    let full = LoopPool::new(3840 * MIB, unbounded).plan(model, &demand);
     for pane in 0..6 {
-        assert_eq!(frames_of(&full, pane), 32, "pane {pane} at 3072 MiB");
+        assert_eq!(frames_of(&full, pane), 40, "pane {pane} at 3840 MiB");
     }
-    assert_eq!(full.bytes(), 3072 * MIB);
-    assert_eq!(full.balloon_bytes(), 6 * 7 * model.plan_view);
+    assert_eq!(full.bytes(), 3840 * MIB);
+    assert_eq!(full.balloon_bytes(), 6 * 4 * model.plan_view);
+    assert_eq!(full.over_pool_bytes(), 0);
 
-    let room = LoopPool::new(2304 * MIB, desktop_limits()).plan(model, &demand);
+    let room = LoopPool::new(2304 * MIB, unbounded).plan(model, &demand);
     for pane in 0..6 {
-        assert_eq!(frames_of(&room, pane), 24, "pane {pane} at 2304 MiB");
+        assert_eq!(
+            frames_of(&room, pane),
+            SIX_HOUR_BASE,
+            "pane {pane} at 2304 MiB was cut below its base",
+        );
     }
-    assert_eq!(room.bytes(), 2304 * MIB);
+    assert_eq!(room.bytes(), 6 * SIX_HOUR_BASE * model.plan_view);
     assert_eq!(
         room.balloon_bytes(),
         0,
         "below the bases there is no balloon"
     );
+    assert_eq!(
+        room.over_pool_bytes(),
+        (3456 - 2304) * MIB,
+        "and the overage is what the door refuses on",
+    );
 }
 
-/// **A pane joining deflates balloons before any base is cut.** 800 MiB is 50 frames:
-/// alone, a pane holds 25 of base and 25 of balloon; a second takes the whole balloon back
-/// and both hold exactly their base; a third cannot be paid at base, and all three shrink
-/// to within a frame of one another, none below two.
+/// **A pane joining deflates balloons, and stops at the bases.** 1152 MiB is 72 frames:
+/// alone, a pane holds 36 of base and grows to its listing's 60; a second takes the whole
+/// balloon back and both hold exactly their base; a third cannot be paid at base, and
+/// **nothing is taken from any of them** — all three keep their 36 and the plan is over
+/// its pool by 576 MiB.
+///
+/// The third arm is what ruling 15 changed. It used to read "all three shrink to within a
+/// frame of one another, none below two", which was `LoopPool::plan`'s downward arm doing
+/// exactly what the ruling forbids. The pool figure moved from 800 MiB to 1152 MiB with
+/// the bases (25 -> 36, ruling 13), so that two of them still fit it exactly and the
+/// narrative of the three arms is unchanged.
 #[test]
 fn a_pane_joining_deflates_balloons_before_any_base_is_cut() {
     let model = desktop();
     let pool = LoopPool::new(
-        800 * MIB,
+        1152 * MIB,
         LoopPoolLimits {
             floor: 0,
             ceiling: usize::MAX,
@@ -710,15 +823,19 @@ fn a_pane_joining_deflates_balloons_before_any_base_is_cut() {
     );
 
     let alone = pool.plan(model, &six_hours_on(1));
-    assert_eq!(frames_of(&alone, 0), 50);
-    assert_eq!(alone.balloon_bytes(), 25 * model.plan_view);
+    assert_eq!(frames_of(&alone, 0), 60, "its listing's whole 60 frames");
+    assert_eq!(
+        alone.balloon_bytes(),
+        (60 - SIX_HOUR_BASE) * model.plan_view
+    );
 
     let two = pool.plan(model, &six_hours_on(2));
     assert_eq!(
         (frames_of(&two, 0), frames_of(&two, 1)),
-        (25, 25),
+        (SIX_HOUR_BASE, SIX_HOUR_BASE),
         "both at base"
     );
+    assert_eq!(two.bytes(), pool.bytes(), "and the pool is spent exactly");
     assert_eq!(
         two.balloon_bytes(),
         0,
@@ -727,28 +844,30 @@ fn a_pane_joining_deflates_balloons_before_any_base_is_cut() {
 
     let three = pool.plan(model, &six_hours_on(3));
     let frames: Vec<usize> = (0..3).map(|pane| frames_of(&three, pane)).collect();
-    assert_eq!(
-        frames.iter().sum::<usize>(),
-        50,
-        "the pool is spent: {frames:?}"
-    );
     assert!(
-        frames.iter().all(|f| *f < 25),
-        "every base was cut: {frames:?}"
-    );
-    assert!(frames.iter().all(|f| *f >= MIN_LOOP_FRAMES_PER_PANE));
-    assert!(
-        frames.iter().max().unwrap() - frames.iter().min().unwrap() <= 1,
-        "the cut was not to one resolution: {frames:?}",
+        frames.iter().all(|f| *f == SIX_HOUR_BASE),
+        "a base was cut: {frames:?}",
     );
     assert_eq!(three.balloon_bytes(), 0);
+    assert_eq!(
+        three.over_pool_bytes(),
+        3 * SIX_HOUR_BASE * model.plan_view - pool.bytes(),
+        "the third base is what the plan is over by, and it is reported \
+         rather than taken",
+    );
+    assert_eq!(three.over_pool_bytes(), 576 * MIB);
 }
 
-/// When the bases do not fit, every loop shrinks to the same resolution and none below
-/// two — and a pool too small for two frames apiece is exceeded, in the open, rather than
-/// cutting a loop to a still picture.
+/// **When the bases do not fit, nothing is taken back.** Ruling 15 —
+/// *"frame DENSITY is tier 1 too: refuse, never decimate"* — removed
+/// `LoopPool::plan`'s downward arm on 2026-09-06. This test was renamed with
+/// it — it was named for every loop shrinking to one resolution, none below
+/// two, and pinned that arm's answers (3 and 3 out of a six-frame pool, 2 and
+/// 2 out of a two-frame one). Every loop now stands at its base whatever the pool, the charge
+/// exceeds it in the open, and `LoopAllocation::over_pool_bytes` is the figure an
+/// admission door refuses on.
 #[test]
-fn when_the_bases_do_not_fit_every_loop_shrinks_to_one_resolution_none_below_two() {
+fn when_the_bases_do_not_fit_nothing_is_taken_back_and_the_overage_is_stated() {
     let model = desktop();
     let limits = LoopPoolLimits {
         floor: 0,
@@ -765,25 +884,23 @@ fn when_the_bases_do_not_fit_every_loop_shrinks_to_one_resolution_none_below_two
     };
     let demand = demand_of([loop_of(0), loop_of(1)]);
 
-    let six_frames = LoopPool::new(6 * model.plan_view, limits).plan(model, &demand);
-    assert_eq!(
-        (frames_of(&six_frames, 0), frames_of(&six_frames, 1)),
-        (3, 3)
-    );
-    assert_eq!(six_frames.bytes(), 6 * model.plan_view);
-
-    let two_frames = LoopPool::new(2 * model.plan_view, limits).plan(model, &demand);
-    assert_eq!(
-        (frames_of(&two_frames, 0), frames_of(&two_frames, 1)),
-        (2, 2),
-        "the floor wins over the byte bound",
-    );
-    assert!(
-        two_frames.bytes() > two_frames.pool_bytes(),
-        "and the excess is stated: {} B charged against a {} B pool",
-        two_frames.bytes(),
-        two_frames.pool_bytes(),
-    );
+    for pool_frames in [6usize, 2] {
+        let pool = LoopPool::new(pool_frames * model.plan_view, limits);
+        let planned = pool.plan(model, &demand);
+        assert_eq!(
+            (frames_of(&planned, 0), frames_of(&planned, 1)),
+            (20, 20),
+            "a {pool_frames}-frame pool cut a granted loop's frames",
+        );
+        assert_eq!(planned.bytes(), 40 * model.plan_view);
+        assert_eq!(
+            planned.over_pool_bytes(),
+            (40 - pool_frames) * model.plan_view,
+            "and the excess is stated: {} B charged against a {} B pool",
+            planned.bytes(),
+            planned.pool_bytes(),
+        );
+    }
 }
 
 /// **A listing caps inflation.** Ten scans listed is ten frames, however much room there
@@ -816,7 +933,13 @@ fn max_frames_from_the_listing_caps_inflation() {
 #[test]
 fn the_same_inputs_plan_the_same_grants() {
     let model = desktop();
-    let pool = LoopPool::new(1000 * MIB, desktop_limits());
+    // 1000 MiB until 2026-09-06; raised so this determinism check still runs
+    // on a plan that FITS, which is where the tie-break it is checking lives.
+    // The three bases are 36 plan-view frames (576 MiB, ruling 13), 36 section
+    // frames (288 MiB) and a bare 3D loop's whole render budget of 36 grids
+    // with a live grid beside them (1354 MiB); a plan over its pool is
+    // deterministic too, and trivially so, since every loop is at its base.
+    let pool = LoopPool::new(2560 * MIB, desktop_limits());
     let demand = demand_of([
         six_hours(0),
         LoopNeed {
@@ -978,7 +1101,7 @@ fn the_scene_decides_where_between_the_bounds_the_pool_sits() {
 }
 
 /// **The pool follows the loops' ceiling, not their base, when the room allows.** A pane
-/// whose listing has said 300 s over a six-hour lookback has a base of 25 frames (400 MiB)
+/// whose listing has said 300 s over a six-hour lookback has a base of 36 frames (576 MiB)
 /// and a ceiling of 60 (960 MiB): on a measured 3090 the pool is the 960 MiB the balloon
 /// can grow into, and six such panes on the presumed arm are held to the 2304 MiB of room
 /// — the same room six two-hour loops with no cadence get, because the room does not
@@ -1010,9 +1133,15 @@ fn the_pool_follows_the_ceiling_not_the_base_when_the_room_allows() {
     };
     let b = resolve(&rtx_3090);
     assert_eq!(
+        b.frames_requested_for_span_of(6 * 60 * 60, Some(300)),
+        73,
+        "the request: the user's whole six hours at 300 s"
+    );
+    assert_eq!(
         b.frames_for_span_of(6 * 60 * 60, Some(300)),
-        25,
-        "the base: two hours at 300 s"
+        SIX_HOUR_BASE,
+        "the base: what this profile reaches — 25, the bracket's two hours, \
+         until ruling 13 stopped shortening the user's span"
     );
     let limits = LoopPoolLimits::from_budgets(&b);
     let measured = rtx_3090.capacity();
@@ -1160,12 +1289,25 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
         );
     }
 
-    // Held for the dwell, it is taken — and it is shorter, not blank.
+    // Held for the dwell, it is taken — and **the first pane's loop is
+    // untouched**. Both loops are `bare`, so both stand at the whole render
+    // budget as their base, and two bases do not fit the desktop floor's 36
+    // frames. Until 2026-09-06 the downward arm cut them to 18 apiece; ruling
+    // 15 leaves them standing and the plan reports the overage instead.
     for _ in 0..LOOP_POOL_DWELL_FRAMES {
         state.observe(pool, model, two.clone());
     }
     let shared = state.allocation();
-    assert!(frames_of(shared, 0) < frames_of(&settled, 0));
+    assert_eq!(
+        frames_of(shared, 0),
+        frames_of(&settled, 0),
+        "a pane arriving lowered a granted loop's frame count",
+    );
+    assert_eq!(
+        shared.over_pool_bytes(),
+        frames_of(&settled, 0) * model.plan_view,
+        "and the second base is what the plan is over its pool by",
+    );
     assert!(frames_of(shared, 0) >= MIN_LOOP_FRAMES_PER_PANE);
     assert!(
         shared.frames_for_pane(1).is_some(),
@@ -1175,9 +1317,15 @@ fn a_pane_that_flickers_inside_the_dwell_changes_nothing() {
 
 /// A shrink is taken after the dwell; a growth also has to clear the dead band — measured
 /// on the loops' **frames**, the thing a re-plan changes on screen. At 3072 MiB six
-/// six-hour panes hold 32 each; five would hold 38 or 39 (1.19x, inside the band) and are
-/// refused; four would hold 48 (1.5x) and are taken; and back to six is a shrink, taken with
-/// no band at all.
+/// six-hour panes hold their base of 36 each — 216 frames against the 192 the pool pays,
+/// so the plan is over it and ruling 15 leaves every base standing; five hold 39
+/// (1.083x, inside the band) and are refused; four hold 48 (1.33x) and are taken; and back
+/// to six is a shrink, taken with no band at all.
+///
+/// The three counts moved with the bases (25 -> 36, ruling 13) and with the removal of
+/// `LoopPool::plan`'s downward arm (ruling 15): 32 / 39 / 48 in place of 32 / 39 / 48
+/// read from a pool that used to cut the bases. What is pinned is the band, not the
+/// counts.
 #[test]
 fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
     let model = desktop();
@@ -1192,18 +1340,22 @@ fn a_growth_has_to_clear_the_dead_band_but_a_shrink_does_not() {
 
     let mut state = LoopPoolState::new(pool, model);
     let six = settle(&mut state, &six_hours_on(6));
-    assert_eq!(frames_of(&six, 0), 32);
+    assert_eq!(frames_of(&six, 0), SIX_HOUR_BASE);
+    assert!(
+        six.over_pool_bytes() > 0,
+        "six bases fit the pool after all, so this arm is not the over case",
+    );
 
-    // Five of six: 39 / 32 = 1.22x, inside the band.
+    // Five of six: 39 / 36 = 1.083x, inside the band.
     let five = settle(&mut state, &six_hours_on(5));
-    assert_eq!(five, six, "a 1.22x growth was taken");
+    assert_eq!(five, six, "a 1.083x growth was taken");
     for _ in 0..LOOP_POOL_DWELL_FRAMES * 4 {
         assert_eq!(state.observe(pool, model, six_hours_on(5)), &six);
     }
 
-    // Four of six: 48 / 32 = 1.5x, past the band.
+    // Four of six: 48 / 36 = 1.33x, past the band.
     let four = settle(&mut state, &six_hours_on(4));
-    assert_eq!(frames_of(&four, 0), 48, "a 1.5x growth was refused");
+    assert_eq!(frames_of(&four, 0), 48, "a 1.33x growth was refused");
 
     // And a shrink straight back to six is taken with no band at all, because the pool is a
     // bound.
@@ -1227,7 +1379,7 @@ fn a_loop_that_starts_gets_a_grant_after_the_dwell_whatever_the_band_says() {
     for _ in 0..LOOP_POOL_DWELL_FRAMES {
         state.observe(pool, model, six_hours_on(6));
     }
-    assert_eq!(state.allocation().frames_for_pane(5), Some(32));
+    assert_eq!(state.allocation().frames_for_pane(5), Some(SIX_HOUR_BASE));
 }
 
 /// `LoopDemand` keeps one need per pane, replaces rather than duplicates, aliases a pane
@@ -1279,6 +1431,28 @@ fn an_empty_demand_is_the_single_loop_answer() {
         assert_eq!(empty.share_bytes, pool.bytes(), "{}", arm.name);
         for kind in [LoopKind::PlanView, LoopKind::CrossSection, LoopKind::Volume] {
             let one = pool.plan(arm.model, &demand_of([bare(0, kind, &arm.model)]));
+            // **Where the pool cannot pay one loop's base, the two answers
+            // part, and ruling 15 is why.** The kind ceiling an unseen loop
+            // reads is what the pool can pay (`pool / price`); a loop that
+            // HAS a grant keeps its base whatever the pool. The wasm32
+            // bracket's 56 MiB floor pays eleven 4.598 MiB grids and a 3D
+            // loop's base is fourteen, so that arm takes the second branch.
+            // Nothing is lowered here: a pane with no grant has nothing
+            // granted to lower.
+            if one.over_pool_bytes() > 0 {
+                assert_eq!(
+                    frames_of(&one, 0),
+                    arm.model.render_budget,
+                    "{}: {kind:?}: a granted loop was cut to the pool",
+                    arm.name,
+                );
+                assert!(
+                    empty.frames_for_kind(kind) < frames_of(&one, 0),
+                    "{}: {kind:?}: the unseen-loop ceiling is not the pool's answer",
+                    arm.name,
+                );
+                continue;
+            }
             assert_eq!(
                 empty.frames_for_kind(kind),
                 frames_of(&one, 0),
@@ -1388,8 +1562,6 @@ mod budget_agreement {
         use crate::loop_pool::{
             LoopDemand, LoopFrameModel, LoopKey, LoopKind, LoopNeed, LoopPool, LoopPoolLimits,
         };
-        use squallar_device_profile::constants::MIN_LOOP_FRAMES_PER_PANE;
-
         for arm in arms() {
             let model = LoopFrameModel {
                 plan_view: arm.loop_frame_bytes(),
@@ -1441,18 +1613,21 @@ mod budget_agreement {
                                 .filter(|g| g.kind != LoopKind::Volume)
                                 .map(|g| g.bytes())
                                 .sum();
-                            let at_floor = allocation
-                                .grants()
-                                .iter()
-                                .any(|g| g.frames == MIN_LOOP_FRAMES_PER_PANE);
+                            // **The escape hatch is now "every loop is at its
+                            // base"**, not "some loop is at the two-frame
+                            // floor": ruling 15 removed `LoopPool::plan`'s
+                            // downward arm, so a plan that cannot be paid
+                            // stands at its bases and reports the overage
+                            // rather than walking down to the floor.
+                            let at_bases = allocation.grants().iter().all(|g| g.frames <= g.base);
                             assert!(
                                 raster + store
                                     <= arm.loop_pool_ceiling_bytes + arm.volume_loop_bytes()
-                                    || at_floor,
+                                    || at_bases,
                                 "{}: {plan_view_loops}/{section_loops}/{volume_sets} loops at \
                                  a {} MiB pool cache {} MiB of raster frames beside a {} MiB \
                                  store bound — over the `pool ceiling + volume-store floor` \
-                                 the app ceiling charges, with no loop at the minimum",
+                                 the app ceiling charges, with a loop above its base",
                                 arm.name,
                                 pool.bytes() / (1024 * 1024),
                                 raster / (1024 * 1024),
@@ -1775,7 +1950,7 @@ mod budget_agreement {
                 b.raster_side_for_adapter(two_d),
                 cap.gpu_bytes / (1024 * 1024),
                 cap.source,
-                b.loop_render_budget,
+                b.loop_frames_reachable,
             )
         };
         let d = BudgetLimits::DESKTOP;
@@ -1784,7 +1959,12 @@ mod budget_agreement {
         let ram_64 = Some(64u64 << 30);
         use CapacitySource::{Derived, Measured, Presumed};
 
-        // machine | rung | cells | offscreen | pool | room | raster | cap | source | frames
+        // **The last column is `loop_frames_reachable`, not `loop_render_budget`.**
+        // Moved 2026-09-06: ruling 15 took the loop-history rung out of the ladder, so
+        // the class figure is the same 36 on every desktop row and says nothing about
+        // the machine. What varies per machine — and what item 2 of WO-I derives rather
+        // than compiles — is how many frames of one loop the capacity actually reaches.
+        // machine | rung | cells | offscreen | pool | room | raster | cap | source | reach
         assert_eq!(
             row(d, DeviceClass::Discrete, 32768, 16384, None, None, 1),
             (
@@ -1838,16 +2018,19 @@ mod budget_agreement {
                 Promotion::Ceiling,
                 8_388_608,
                 20,
-                864,
-                1536,
-                8192,
+                2688,
+                2688,
+                4096,
                 4096,
                 Measured,
-                9
+                36
             ),
-            "a 4 GiB discrete card: the same six panes hold nine frames each, thirty-four \
-             minutes at the precipitation cadence; the offscreen is at its floor because \
-             the two resolution rungs were walked on the way to the loop history",
+            "a 4 GiB discrete card reaches every frame the class offers — 3072 MiB less \
+             the 384 MiB its six static rasters take at the ladder's floor is 168 frames \
+             of 16 MiB, well past 36 — so the six panes keep the whole two-hour window \
+             and the walk pays with the picture: the raster ceiling halves to 4096 px. \
+             Nine frames until 2026-09-06, when ruling 15 took the loop-history rung out \
+             of the ladder and the count stopped being a ladder position",
         );
         assert_eq!(
             row(d, DeviceClass::Unknown, 32768, 16384, None, None, 1),

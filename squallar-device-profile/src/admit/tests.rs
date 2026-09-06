@@ -356,6 +356,14 @@ fn a_preset_is_summed_before_it_is_asked() {
 /// must agree on every row a slider can produce. A door that counted a span's
 /// frames differently from the model would price a span change against frames
 /// the loop never holds.
+///
+/// **Both halves of the pair, and both of the rulings that shaped them.** The
+/// door was landed on 2026-09-06 beside WO-I, which took the compiled span
+/// ceiling out of this arithmetic (ruling 13) and put the capacity's reachable
+/// count in its place (ruling 15). The two lanes met here, so this checks the
+/// request as well as the effective count, and checks that a lowered
+/// `reachable` crosses the seam — a door reading the class figure while the
+/// model read the measured one would admit a loop the machine cannot hold.
 #[test]
 fn the_frame_converter_is_the_budgets_own_arithmetic() {
     for limits in BudgetLimits::SHIPPED {
@@ -370,8 +378,54 @@ fn the_frame_converter_is_the_budgets_own_arithmetic() {
                     "{}: {span}s at {cadence:?}",
                     limits.name,
                 );
+                assert_eq!(
+                    frames.requested(span, cadence),
+                    budgets.frames_requested_for_span_of(span, cadence),
+                    "{}: the REQUEST disagrees at {span}s at {cadence:?}",
+                    limits.name,
+                );
             }
         }
+
+        // **Non-vacuity, and it is ruling 13's own row.** A span past this
+        // bracket's own `loop_span_secs` used to be cut to it; if either side
+        // still cut it, the two would agree on a figure neither the user nor
+        // the model asked for. The whole 24 h at 259 s is 334 frames, above
+        // every bracket's render budget, so what answers is the ceiling and
+        // the request is what proves nothing shortened the span.
+        let day = 24 * 60 * 60;
+        assert_eq!(
+            frames.requested(day, Some(259)),
+            1 + day / 259,
+            "{}: a day of lookback was shortened before it was converted",
+            limits.name,
+        );
+        assert!(
+            frames.requested(day, Some(259)) > frames.frames(day, Some(259)),
+            "{}: nothing is clamped on this row, so it witnesses nothing",
+            limits.name,
+        );
+
+        // **A lowered reachable count crosses the seam.** `LoopFrames::of`
+        // reads it off the budgets, so a capacity measured too small for the
+        // class figure holds the door's answer down with the model's.
+        let measured = Budgets {
+            loop_frames_reachable: MIN_LOOP_FRAMES_PER_PANE,
+            ..budgets
+        };
+        assert_eq!(
+            LoopFrames::of(&measured).frames(2 * 60 * 60, Some(259)),
+            MIN_LOOP_FRAMES_PER_PANE,
+            "{}: the door counted the class figure where the model counted \
+             what the capacity reaches",
+            limits.name,
+        );
+        assert_eq!(
+            LoopFrames::of(&measured).frames(2 * 60 * 60, Some(259)),
+            measured.frames_for_span_of(2 * 60 * 60, Some(259)),
+            "{}",
+            limits.name,
+        );
     }
 }
 

@@ -272,6 +272,8 @@ fn the_budget_line_carries_the_admission_counters() {
         None,
         0,
         0,
+        // Nothing over its pool: this line is about the door counters.
+        0,
         &squallar_device_profile::scene::Capacity::presumed(
             &squallar_device_profile::budget::BudgetLimits::DESKTOP,
         ),

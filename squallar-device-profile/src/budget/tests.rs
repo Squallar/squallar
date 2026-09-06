@@ -32,6 +32,9 @@ fn the_resolver_reproduces_every_shipped_constant() {
             loop_frames_held: WASM_MAX_LOOP_FRAMES,
             loop_span_secs: WASM_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
+            // `resolve` has no capacity to derive one from, so the
+            // reachable count is the class rung's own figure.
+            loop_frames_reachable: WASM_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: WASM_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: WASM_LOOP_POOL_CEILING_BYTES,
             grid_cells: WASM_VOLUME_GRID_CELLS,
@@ -64,6 +67,9 @@ fn the_resolver_reproduces_every_shipped_constant() {
             loop_frames_held: MOBILE_MAX_LOOP_FRAMES,
             loop_span_secs: MOBILE_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
+            // `resolve` has no capacity to derive one from, so the
+            // reachable count is the class rung's own figure.
+            loop_frames_reachable: MOBILE_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: MOBILE_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: MOBILE_LOOP_POOL_CEILING_BYTES,
             grid_cells: MOBILE_VOLUME_GRID_CELLS,
@@ -96,6 +102,9 @@ fn the_resolver_reproduces_every_shipped_constant() {
             loop_frames_held: DESKTOP_MAX_LOOP_FRAMES,
             loop_span_secs: DESKTOP_LOOP_SPAN_BUDGET_SECS,
             loop_render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
+            // `resolve` has no capacity to derive one from, so the
+            // reachable count is the class rung's own figure.
+            loop_frames_reachable: DESKTOP_MAX_LOOP_RENDER_BUDGET,
             loop_pool_floor_bytes: DESKTOP_LOOP_POOL_FLOOR_BYTES,
             loop_pool_ceiling_bytes: DESKTOP_LOOP_POOL_CEILING_BYTES,
             grid_cells: DESKTOP_VOLUME_GRID_CELLS,
@@ -357,9 +366,14 @@ fn check_invariants(profile: &DeviceProfile, from: &str) {
 /// them on both arms.
 fn check_fit_against(profile: &DeviceProfile, cap: &Capacity, from: &str) {
     let limits = &profile.limits;
-    let b = resolve(profile);
     let allowance = cap.allowance();
     for (scene_name, scene) in scene_table() {
+        // **The class rung as this capacity admits it**, not `resolve`'s.
+        // `crate::fit::admit` is `resolve` plus how many frames of one loop
+        // the capacity reaches, which a profile cannot say; comparing a
+        // fitted budget against `resolve` alone would read that measurement
+        // as a rung the ladder took.
+        let b = crate::fit::admit(&scene, profile, cap, stand_in_grid_bytes);
         let fitted = fit(&scene, profile, cap, stand_in_grid_bytes);
         check_budgets(
             &fitted,
@@ -737,17 +751,32 @@ fn check_budgets(b: &Budgets, profile: &DeviceProfile, from: &str) {
         "{from} / {}: a very slow radar degrades a loop below the floor",
         b.name,
     );
+    // **The clamp is the REACHABLE count, not the compiled render budget.**
+    // Moved 2026-09-06 with the loop-history rung: `loop_render_budget` is
+    // the class figure and `loop_frames_reachable` is what this capacity was
+    // measured to hold, and on the presumed and derived arms — where nothing
+    // was read — they are the same number, so this is a widening and not a
+    // re-pointing.
     assert_eq!(
         b.frames_for_span(Some(1)),
-        b.loop_render_budget,
-        "{from} / {}: a very fast radar buys more than the render budget",
+        b.loop_frames_reachable,
+        "{from} / {}: a very fast radar buys more than this capacity reaches",
         b.name,
     );
     assert_eq!(
         b.frames_for_span(None),
-        b.loop_render_budget,
-        "{from} / {}: a loop with no cadence yet does not get the full budget",
+        b.loop_frames_reachable,
+        "{from} / {}: a loop with no cadence yet does not get what is reachable",
         b.name,
+    );
+    assert!(
+        b.loop_frames_reachable >= crate::constants::MIN_LOOP_FRAMES_PER_PANE
+            && b.loop_frames_reachable <= b.loop_render_budget,
+        "{from} / {}: {} reachable frames is outside [{}, {}] — a loop can          never hold more than its listing is sampled down to",
+        b.name,
+        b.loop_frames_reachable,
+        crate::constants::MIN_LOOP_FRAMES_PER_PANE,
+        b.loop_render_budget,
     );
     assert!(b.concurrent_renders > 0);
     assert!(b.render_cache_entries > 0);
@@ -948,7 +977,11 @@ fn the_signals_move_nothing_on_the_presumed_arm_and_only_the_pool_and_room_where
                     for (arm, fitted, arm_cap) in
                         [("measured", with, &cap), ("presumed", without, &bare)]
                     {
-                        let mut walked = resolved;
+                        // From the ADMITTED class rung: `crate::fit::admit`
+                        // is what `fit` starts its own walk from, and the
+                        // reachable frame count it carries is a reading of
+                        // the capacity rather than a rung anything took.
+                        let mut walked = crate::fit::admit(&scene, profile, arm_cap, g);
                         for _ in resolved.steps_back..fitted.steps_back {
                             let (gpu_over, host_over) = over(&scene, &walked, arm_cap, g);
                             assert!(
@@ -1755,21 +1788,6 @@ fn the_terrain_rasters_are_omitted_from_the_gpu_sum_by_name() {
     );
 }
 
-/// Halvings from `frames` down to `MIN_LOOP_FRAMES_PER_PANE`, the way the
-/// loop-history rung takes them: `max(n / 2, floor)` a step, until it stops
-/// moving. 36 -> 18 -> 9 -> 4 -> 2 is four on the desktop bracket, 18 -> 9 -> 4
-/// -> 2 three on mobile, 14 -> 7 -> 3 -> 2 three on wasm32.
-fn halvings_to_the_floor(frames: usize) -> u32 {
-    let floor = crate::constants::MIN_LOOP_FRAMES_PER_PANE;
-    let mut n = frames;
-    let mut steps = 0;
-    while (n / 2).max(floor) < n {
-        n = (n / 2).max(floor);
-        steps += 1;
-    }
-    steps
-}
-
 /// Steps the resolution rung takes from `top` to its stop, the way the rung
 /// takes them: one coarsening a step while there is a coarser rung or the
 /// offscreen sits above its floor. Two from `Native` (the desktop class rung),
@@ -1800,9 +1818,7 @@ fn resolution_steps_to_the_floor(top: &Budgets, limits: &BudgetLimits) -> u32 {
 /// grid at its floor and the raster at the long-range floor.
 #[test]
 fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
-    use crate::constants::{
-        DESKTOP_MAX_LOOP_RENDER_BUDGET, MIN_LOOP_FRAMES_PER_PANE, OVERLAY_OVERSAMPLE_PERCENTS,
-    };
+    use crate::constants::{DESKTOP_MAX_LOOP_RENDER_BUDGET, OVERLAY_OVERSAMPLE_PERCENTS};
     use crate::quality::{GradientShading, ResolutionRung};
 
     let stepped = |steps: u32| {
@@ -1849,48 +1865,34 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
     let shed_3d = 1 + resolution_steps_to_the_floor(&top, &BudgetLimits::DESKTOP);
     assert_eq!(shed_3d, 3, "lighting, then Native -> Half -> Quarter");
 
-    // Rung 3: the loop's history, one halving a step, 2D before 3D.
+    // **Rung 3 is the overlay margin, and it was the fourth step until
+    // 2026-09-06.** The loop-history rung stood here and halved the render
+    // budget 36 -> 18 -> 9 -> 4 -> 2, four steps, before the margin thinned.
+    // Ruling 15 removed it as a pressure lever — *"frame DENSITY is tier 1
+    // too: refuse, never decimate"* — so the walk now goes from resolution
+    // straight to the margin, and the loop is untouched at every step of
+    // this ladder.
     let four = stepped(shed_3d + 1);
     assert_eq!(
-        four.loop_render_budget,
-        DESKTOP_MAX_LOOP_RENDER_BUDGET / 2,
-        "the fourth step is the first halving of the loop history — 36 to 18 \
-         frames — and not the grid",
+        four.overlay_oversample_percent, OVERLAY_OVERSAMPLE_PERCENTS[1],
+        "the fourth step is the first thinning of the overlay margin — 150 to \
+         125 percent — and not the loop's history or the grid",
+    );
+    assert_eq!(
+        four.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "a rung lowered a granted loop's frame count",
     );
     assert_eq!(four.grid_cells, top.grid_cells);
     assert_eq!(four.raster_side_ceiling_px, top.raster_side_ceiling_px);
     assert!(!four.tile_whole_zoom);
 
-    let halvings = halvings_to_the_floor(DESKTOP_MAX_LOOP_RENDER_BUDGET);
-    assert_eq!(halvings, 4, "36 -> 18 -> 9 -> 4 -> 2");
-    let history_floor = stepped(shed_3d + halvings);
-    assert_eq!(history_floor.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
-    assert!(
-        !history_floor.tile_whole_zoom,
-        "the tiles snapped before the loop history reached its floor",
-    );
-    assert_eq!(
-        history_floor.overlay_oversample_percent, OVERLAY_OVERSAMPLE_PERCENTS[0],
-        "the overlay margin thinned before the loop history reached its floor",
-    );
-    assert_eq!(history_floor.grid_cells, top.grid_cells);
-
-    // Rung 4: overlay oversampling, one entry of the table a step — 1.5x
-    // to 1.25x to 1x per side — after the history (less of the same picture
-    // before a thinner margin under pan) and before the tiles (a softened
-    // basemap is on every frame; a thinner margin costs nothing at rest).
-    let thinner = stepped(shed_3d + halvings + 1);
-    assert_eq!(
-        thinner.overlay_oversample_percent,
-        OVERLAY_OVERSAMPLE_PERCENTS[1]
-    );
-    assert_eq!(thinner.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+    let thinner = four;
+    let no_margin = stepped(shed_3d + 2);
     assert!(
         !thinner.tile_whole_zoom,
         "the tiles snapped before the margin was gone"
     );
     assert_eq!(thinner.grid_cells, top.grid_cells);
-    let no_margin = stepped(shed_3d + halvings + 2);
     assert_eq!(
         no_margin.overlay_oversample_percent,
         OVERLAY_OVERSAMPLE_PERCENTS[2]
@@ -1903,20 +1905,23 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
     let oversampling = OVERLAY_OVERSAMPLE_PERCENTS.len() as u32 - 1;
     assert_eq!(oversampling, 2, "1.5x -> 1.25x -> 1x");
 
-    // Rung 5: tile sharpness, after the margin and before the grid.
-    let snapped = stepped(shed_3d + halvings + oversampling + 1);
+    // Rung 4: tile sharpness, after the margin and before the grid.
+    let snapped = stepped(shed_3d + oversampling + 1);
     assert!(snapped.tile_whole_zoom);
     assert_eq!(snapped.grid_cells, top.grid_cells);
     assert_eq!(snapped.raster_side_ceiling_px, top.raster_side_ceiling_px);
 
-    // Rungs 6 and 7, and past them: the grid at its floor, the picture last.
-    let deep = stepped(shed_3d + halvings + oversampling + 8);
+    // Rungs 5 and 6, and past them: the grid at its floor, the picture last.
+    let deep = stepped(shed_3d + oversampling + 8);
     assert_eq!(deep.grid_cells, BudgetLimits::DESKTOP.grid_cells.floor);
     assert_eq!(
         deep.raster_side_ceiling_px,
         BudgetLimits::DESKTOP.long_range_image_side_px.floor,
     );
-    assert_eq!(deep.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+    assert_eq!(
+        deep.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "the ladder walked to its floor and still lowered no loop's frames",
+    );
     assert_eq!(deep.overlay_oversample_percent, 100);
     assert!(deep.tile_whole_zoom);
 }
@@ -1924,17 +1929,18 @@ fn the_ladder_surrenders_lighting_before_resolution_and_the_picture_last() {
 /// **A machine that keeps failing lands on the configuration this build already
 /// shipped it, and stops.**
 ///
-/// Re-argued when the loop-history and tile-sharpness rungs were inserted
-/// before the grid: the grid now reaches its floor, and the ladder its fixed
-/// point, later than the 3 and 4 steps the four-rung ladder pinned — later by
-/// exactly the halvings the bracket's render budget takes to reach the
-/// two-frame floor plus the one tile step, with a rung that has nowhere to go
-/// on a bracket costing no step at all. The count is derived from the
-/// bracket's own constants below and named per bracket beside it, so a moved
-/// constant is read here rather than inferred.
+/// Re-argued twice. First when the loop-history and tile-sharpness rungs were
+/// inserted before the grid, which pushed the grid's floor and the ladder's
+/// fixed point past the 3 and 4 steps the four-rung ladder pinned. Then on
+/// 2026-09-06, when ruling 15 removed the loop-history rung again: the ladder
+/// is shorter by exactly the halvings that bracket's render budget used to
+/// take to reach the two-frame floor — four on desktop, three on mobile and
+/// wasm32 — and the loop's frame count is no longer at any stop, because no
+/// rung can move it. The count is derived from the bracket's own constants
+/// below and named per bracket beside it, so a moved constant is read here
+/// rather than inferred.
 #[test]
 fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
-    use crate::constants::MIN_LOOP_FRAMES_PER_PANE;
     use crate::quality::GradientShading;
 
     for limits in BudgetLimits::SHIPPED {
@@ -1956,42 +1962,34 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
         let top = resolve(&discrete(0));
         let shading = u32::from(top.quality_ceiling.shading == GradientShading::On);
         let resolution = resolution_steps_to_the_floor(&top, &limits);
-        let halvings = halvings_to_the_floor(top.loop_render_budget);
         let oversampling = crate::constants::OVERLAY_OVERSAMPLE_PERCENTS.len() as u32 - 1;
         let tiles = 1;
         let grid = u32::from(top.grid_cells != limits.grid_cells.floor);
         let raster = u32::from(top.raster_side_ceiling_px > limits.long_range_image_side_px.floor);
-        let grid_at_floor_from = shading + resolution + halvings + oversampling + tiles + grid;
+        let grid_at_floor_from = shading + resolution + oversampling + tiles + grid;
         let stop = grid_at_floor_from + raster;
-        // Steps per rung — shading, resolution, history, oversampling, tiles,
-        // grid, raster — as the bracket's constants were read to give them,
-        // so a moved constant fails on the rung that moved. The oversampling
-        // rung is two steps on every bracket (1.5x -> 1.25x -> 1x): the
-        // table is one constant, not a bracket, because a picture's margin
-        // is the same three fractions of the same pane on every device.
-        let expected_rungs: [u32; 7] = match limits.name {
-            // On, Native -> Half -> Quarter, 36 -> 2 in four, two of margin,
-            // snap, a pinned grid, 8192 -> 4096: eleven steps.
-            "desktop" => [1, 2, 4, 2, 1, 0, 1],
-            // Already Off, Half -> Quarter, 18 -> 2 in three, two of margin,
-            // snap, pinned, pinned: seven steps.
-            "mobile" => [0, 1, 3, 2, 1, 0, 0],
-            // Already Off, Half -> Quarter, 14 -> 2 in three, two of margin,
-            // snap, the promoted grid and the promoted raster both back to
-            // their floors: nine.
-            "wasm32" => [0, 1, 3, 2, 1, 1, 1],
+        // Steps per rung — shading, resolution, oversampling, tiles, grid,
+        // raster — as the bracket's constants were read to give them, so a
+        // moved constant fails on the rung that moved. The oversampling rung
+        // is two steps on every bracket (1.5x -> 1.25x -> 1x): the table is
+        // one constant, not a bracket, because a picture's margin is the same
+        // three fractions of the same pane on every device.
+        let expected_rungs: [u32; 6] = match limits.name {
+            // On, Native -> Half -> Quarter, two of margin, snap, a pinned
+            // grid, 8192 -> 4096: seven steps, four fewer than the eleven
+            // this pinned while the loop's history was a rung.
+            "desktop" => [1, 2, 2, 1, 0, 1],
+            // Already Off, Half -> Quarter, two of margin, snap, pinned,
+            // pinned: four steps, three fewer.
+            "mobile" => [0, 1, 2, 1, 0, 0],
+            // Already Off, Half -> Quarter, two of margin, snap, the promoted
+            // grid and the promoted raster both back to their floors: six,
+            // three fewer.
+            "wasm32" => [0, 1, 2, 1, 1, 1],
             other => panic!("an unnamed bracket: {other}"),
         };
         assert_eq!(
-            [
-                shading,
-                resolution,
-                halvings,
-                oversampling,
-                tiles,
-                grid,
-                raster
-            ],
+            [shading, resolution, oversampling, tiles, grid, raster],
             expected_rungs,
             "{}: the ladder's rungs take these steps here, not the steps its \
              constants were read to give — a rung moved or a bracket changed",
@@ -2021,8 +2019,16 @@ fn no_number_of_back_offs_takes_a_machine_below_its_bracket_floor() {
                     b.app_texture_ceiling_bytes,
                     unreadable.app_texture_ceiling_bytes,
                 );
-                // And the three rungs the silent device never had: at their stops.
-                assert_eq!(b.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+                // And the two rungs the silent device never had: at their
+                // stops. The loop's history is not among them any more —
+                // ruling 15 — so the frame count is checked for having NOT
+                // moved instead.
+                assert_eq!(
+                    b.loop_render_budget, unreadable.loop_render_budget,
+                    "{}: the ladder walked to its stop and lowered a granted \
+                     loop's frame count on the way",
+                    b.name,
+                );
                 assert_eq!(b.overlay_oversample_percent, 100);
                 assert!(b.tile_whole_zoom);
                 // The fixed point: one more step moves nothing.

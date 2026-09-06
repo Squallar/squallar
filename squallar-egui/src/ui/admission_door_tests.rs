@@ -43,8 +43,10 @@ fn costs(spare_bytes: u64, per_layer: u64, panes: usize) -> AdmissionCosts {
         new_pane: Increment::host(per_layer),
         layer_grids: Vec::new(),
         frames: LoopFrames {
-            budget_span_secs: 60 * 60,
             render_budget: 30,
+            // What the capacity reaches; at or above the render budget it is
+            // inert, which is the fixture's own arm.
+            reachable: 30,
         },
         requested_percent: (100, 100),
     }

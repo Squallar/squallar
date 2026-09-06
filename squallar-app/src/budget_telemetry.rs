@@ -39,6 +39,19 @@
 //! every loop, 0 when every loop holds its base or less; it is a subset of
 //! `pool` and is never added to it.
 //!
+//! **`loop over` and `loop clamped` are the two figures ruling 15 and ruling
+//! 13 leave behind, and neither is a subset of anything above.** `loop over`
+//! is what the loop plan charges ABOVE `pool` — non-zero only where every
+//! loop stands at its base and the bases together do not fit, which is a
+//! scene the ladder had nothing left to shed for and an admission door is to
+//! refuse. It is not `balloon`'s opposite: `balloon` is bytes held above the
+//! bases and this is bytes asked for beyond the pool, and a plan has exactly
+//! one of them. `loop clamped` counts the visible panes whose loop was held
+//! below what its span asked for
+//! (`squallar_egui::shell_api::PaneBudget::loop_span_clamped`) — the
+//! effective-beside-requested pair, counted rather than listed, since the
+//! per-pane figures ride the readout the settings screen paints.
+//!
 //! **After everything the rig reads**, in this order: `spare gpu <n> MiB host
 //! <n> MiB`, what each pool has left for one more pane or layer, `none` where
 //! the pool itself is unknown; then `admission asked <n> admitted <n> would
@@ -207,6 +220,7 @@ pub(crate) fn budget_state_line(
     linear: Option<LinearMemory>,
     pool_bytes: usize,
     balloon_bytes: usize,
+    over_pool_bytes: usize,
     cap: &Capacity,
     probe: GpuProbeReport,
     page_heap: crate::pressure::LinearMemoryWatch,
@@ -233,7 +247,7 @@ pub(crate) fn budget_state_line(
          vram {} MiB, ram {} MiB, declared {} MiB, threads {}, form {form}, \
          linear {}/{} MiB, cap {} {}, probe {}, balloon {} MiB, \
          page heap acts {} at {} MiB, heap max {}/{} MiB, \
-         host steps {} promotions {} churn {}",
+         host steps {} promotions {} churn {}, loop over {} MiB, loop clamped {}",
         budgets.name,
         budgets.steps_back,
         mib(pool_bytes as u64),
@@ -255,6 +269,12 @@ pub(crate) fn budget_state_line(
         host_recovery.level(),
         host_recovery.promotions(),
         host_recovery.churn(),
+        mib(over_pool_bytes as u64),
+        readout
+            .panes
+            .iter()
+            .filter(|pane| pane.loop_span_clamped())
+            .count(),
     );
     // **Fixed-width fields first, the variable-arity group last.** See the
     // note on this function: everything BEHIND a variable group is what a
@@ -471,6 +491,12 @@ mod tests {
     /// position carries.
     const BALLOON: usize = 7 << 20;
 
+    /// What the loop plan is over its pool by on the distinct line: 5 MiB,
+    /// a figure no other position carries. Non-zero on purpose — the field
+    /// exists to say a scene was admitted over its pool, and a pinned line
+    /// that read 0 there would not tell a printed zero from a missing field.
+    const OVER: usize = 5 << 20;
+
     /// The capacity in force for the distinct line: a probed 5 GiB, which no
     /// profile produces and no other position carries, so the `cap` figure
     /// and its source code are each distinct from every neighbour. The
@@ -518,6 +544,7 @@ mod tests {
                     },
                     shared_bytes: 0,
                     own_bytes: 272 << 20,
+                    ..PaneBudget::default()
                 },
                 PaneBudget {
                     terms: PaneTerms {
@@ -527,6 +554,7 @@ mod tests {
                     },
                     shared_bytes: 16 << 20,
                     own_bytes: 17 << 20,
+                    ..PaneBudget::default()
                 },
             ],
             gpu: PoolReadout {
@@ -610,6 +638,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -622,7 +651,7 @@ mod tests {
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, \
+             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
         );
@@ -634,6 +663,7 @@ mod tests {
                 linear,
                 576 << 20,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -653,6 +683,7 @@ mod tests {
                 linear,
                 POOL,
                 0,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -663,7 +694,7 @@ mod tests {
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -678,6 +709,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &profile.capacity(),
                 GpuProbeReport::Absent,
                 WATCH,
@@ -688,7 +720,7 @@ mod tests {
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -701,6 +733,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &lowered,
                 GpuProbeReport::Skipped,
                 WATCH,
@@ -711,7 +744,7 @@ mod tests {
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
-                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
+                 heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
                  spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
@@ -787,6 +820,7 @@ mod tests {
             None,
             POOL,
             0,
+            OVER,
             &cap,
             GpuProbeReport::Absent,
             WATCH,
@@ -802,17 +836,25 @@ mod tests {
             tail,
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
-             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, \
+             heap max 0/0 MiB, host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            19,
-            "nineteen comma-separated groups with no pane rows, eighteen separators: a \
-             field was dropped or gained. It was seventeen until the recovery \
-             governor's `host steps N promotions N churn N` landed, which is ONE \
-             group of three space-separated figures and so moves this by one",
+            21,
+            "twenty-two comma-separated groups with no pane rows, twenty-one \
+             separators: a field was dropped or gained. It was seventeen until \
+             the recovery governor's `host steps N promotions N churn N` landed, \
+             which is ONE group of three space-separated figures and so moved \
+             this by one; eighteen until the admission doors' \
+             `admission asked N admitted N would refuse N refused N`, one group \
+             of four; and twenty until ruling 15's `loop over N MiB` and \
+             ruling 13's `loop clamped N` landed as two more. **Re-derived by \
+             counting the line this build actually writes**, not by adding one \
+             lane's figure to another's: the doors and the loop fields landed \
+             from two lanes on one day and each was pinned against a line \
+             without the other's field on it",
         );
     }
 
@@ -851,6 +893,7 @@ mod tests {
             linear,
             POOL,
             BALLOON,
+            OVER,
             &CAP,
             PROBE,
             WATCH,
@@ -868,7 +911,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, spare gpu none host none, \
+             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
              admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
@@ -894,6 +937,7 @@ mod tests {
             linear,
             POOL,
             BALLOON,
+            OVER,
             &CAP,
             PROBE,
             WATCH,
@@ -909,7 +953,7 @@ mod tests {
         assert_eq!(
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
-             host steps 0 promotions 0 churn 0, \
+             host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, \
              spare gpu 3568 MiB host 601 MiB, admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
@@ -935,6 +979,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -971,6 +1016,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -998,6 +1044,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -1017,6 +1064,7 @@ mod tests {
                 linear,
                 POOL,
                 BALLOON,
+                OVER,
                 &CAP,
                 PROBE,
                 WATCH,
@@ -1058,6 +1106,7 @@ mod tests {
             None,
             POOL,
             BALLOON,
+            OVER,
             &CAP,
             PROBE,
             WATCH,
@@ -1069,7 +1118,7 @@ mod tests {
         assert!(
             never.ends_with(
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, spare gpu none host none, \
+                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1094,6 +1143,7 @@ mod tests {
             None,
             POOL,
             BALLOON,
+            OVER,
             &CAP,
             PROBE,
             watch,
@@ -1105,7 +1155,7 @@ mod tests {
         assert!(
             acted.ends_with(
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
-                 host steps 0 promotions 0 churn 0, spare gpu none host none, \
+                 host steps 0 promotions 0 churn 0, loop over 5 MiB, loop clamped 0, spare gpu none host none, \
                  admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
@@ -1163,6 +1213,7 @@ mod tests {
             None,
             POOL,
             BALLOON,
+            OVER,
             &CAP,
             PROBE,
             WATCH,

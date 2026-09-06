@@ -290,7 +290,12 @@ fn a_pane_scrubbing_away_cannot_evict_the_frame_another_pane_shows() {
         span_secs: 3600,
         cadence_secs: None,
         frame_bytes: model.plan_view,
-        base_frames: 12,
+        // **The base is what the pool pays**, and the list is longer than it.
+        // This read `base_frames: 12` against a four-frame pool until
+        // 2026-09-06 and relied on `LoopPool::plan`'s downward arm cutting it
+        // to four; ruling 15 removed that arm, so the four frames this test
+        // needs are asked for as the base and the balloon has nowhere to grow.
+        base_frames: 4,
         max_frames: 12,
     });
     demand.alias(1, 0);

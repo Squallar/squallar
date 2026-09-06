@@ -1419,8 +1419,10 @@ fn a_lost_surface_refits_a_scene_the_lowered_presumption_no_longer_holds() {
     app.on_pressure(crate::pressure::Pressure::SurfaceLost);
 
     assert_eq!(
-        app.budgets.steps_back, 4,
-        "lighting, resolution twice, one halving of the loop history",
+        app.budgets.steps_back, 7,
+        "lighting, resolution twice, the overlay margin twice, the tiles, the \
+         raster ceiling — four until 2026-09-06, when ruling 15 took the loop \
+         history out of the ladder and the walk had to reach the picture",
     );
     assert_eq!(app.budgets.quality_ceiling.shading, GradientShading::Off);
     assert_eq!(
@@ -1428,23 +1430,24 @@ fn a_lost_surface_refits_a_scene_the_lowered_presumption_no_longer_holds() {
         ResolutionRung::Quarter
     );
     assert_eq!(
-        app.budgets.loop_render_budget,
-        before.loop_render_budget / 2,
-        "the loop history is the first rung that lowers a 2D scene's need",
+        app.budgets.loop_render_budget, before.loop_render_budget,
+        "no governor path lowers a granted loop's frame count",
     );
-    assert_eq!(app.budgets.grid_cells, before.grid_cells);
     assert_eq!(
         app.budgets.raster_side_ceiling_px,
-        before.raster_side_ceiling_px
+        squallar_device_profile::budget::BudgetLimits::for_target()
+            .long_range_image_side_px
+            .floor,
+        "the raster ceiling is the rung that pays for a 2D scene now",
     );
-    assert!(!app.budgets.tile_whole_zoom);
+    assert!(app.budgets.tile_whole_zoom);
     let after = need(&app.scene_of(), &app.budgets, GRID_BYTES).gpu_bytes;
-    assert_eq!(after, (4 * 18 * 16 + 6 * 256) * MIB);
+    assert_eq!(after, (4 * 36 * 16 + 6 * 64) * MIB);
     assert!(after <= app.capacity().allowance());
     assert_eq!(
         app.loop_pool.bytes() as u64,
-        4 * 18 * 16 * MIB,
-        "the pool did not follow the loops down: min(4 x 288, 3456 - 1536)",
+        4 * 36 * 16 * MIB,
+        "the loops kept their frames: min(4 x 576, 3456 - 384)",
     );
 }
 
@@ -1537,20 +1540,31 @@ fn a_reopen_fits_the_same_scene_to_the_same_budgets() {
 /// the class rung; each event lowers the presumption by a tenth — 3456, 3110,
 /// 2799, 2519, 2267, 2041, 1837, 1653 MiB — and the re-fit follows it down the
 /// ladder: 18 frames, then 9, 4 and 2, the tiles snapped, the raster to 4096,
-/// at which point 6 x (2 x 16 + 64) = 576 MiB fits every presumption twelve
-/// events reach and the rung stays at the ladder's length — nine on this
-/// bracket: lighting, resolution twice, four halvings, the snap, a pinned grid
-/// that costs no step, the raster. The rung never comes back up under pressure,
-/// and the presumption is exactly twelve tenths off, in integer steps.
+/// **One looping pane, not six, since 2026-09-06.** Ruling 15 makes a loop's
+/// frame count irreducible, so six two-hour loops need
+/// 6 x (36 x 16 + 64) = 3840 MiB at the ladder's own floor — the whole desktop
+/// presumption — and `refit_under_pressure`'s floor (`floor_need`, which
+/// exists so a presumption never drops below a wall the scene was never going
+/// to fit under) then pins the presumption where it started. That is the
+/// correct answer for that scene and it leaves nothing for this test to watch:
+/// what it is about is the decay's shape, so it runs on one loop, whose floor
+/// need of 960 MiB sits under everything twelve events reach.
+///
+/// at which point the ladder has nothing left and the rung stays at its
+/// length — **seven** on this bracket: lighting, resolution twice, two of the
+/// overlay margin, the snap, a pinned grid that costs no step, the raster.
+/// Eleven until 2026-09-06, when ruling 15 took the loop history's four
+/// halvings out of it. The rung never comes back up under pressure, and the
+/// presumption is exactly twelve tenths off, in integer steps.
 #[test]
 fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
-    use squallar_device_profile::constants::{ECONOMY_FRACTION, MIN_LOOP_FRAMES_PER_PANE};
+    use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_device_profile::fit::every_rung_at_its_stop;
     use squallar_kv::KvStore;
 
     let platform = TestBridge::desktop();
     let store = platform.store();
-    let mut app = app_with_looping_panes(platform, 6, 6);
+    let mut app = app_with_looping_panes(platform, 6, 1);
     let presumed = app.capacity().allowance();
 
     let mut rungs = Vec::new();
@@ -1564,15 +1578,16 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
         "twelve lost surfaces resolved to rung {settled}, which is either no \
          ladder at all or a failure counter wearing one as a hat",
     );
-    // Re-argued when the overlay-oversampling rung landed between the
-    // history and the snap: a lost surface is the GPU axis, and the rung
+    // Re-argued twice: when the overlay-oversampling rung landed between the
+    // history and the snap, and on 2026-09-06 when ruling 15 removed the
+    // history itself. A lost surface is the GPU axis, and the margin rung
     // lowers both axes — the picture is a GPU texture — so a GPU walk takes
-    // its two steps (1.5x to 1.25x to 1x) after the history's four halvings
+    // its two steps (1.5x to 1.25x to 1x) straight after the resolution rungs
     // and before the tiles snap, exactly where the counted ladder has them.
     assert_eq!(
-        settled, 11,
-        "lighting, resolution twice, four halvings of the history, two of the overlay \
-         margin, the snap, a pinned grid that costs no step, the raster: {rungs:?}",
+        settled, 7,
+        "lighting, resolution twice, two of the overlay margin, the snap, a pinned \
+         grid that costs no step, the raster: {rungs:?}",
     );
     assert_eq!(app.budgets.overlay_oversample_percent, 100);
     assert!(
@@ -1596,7 +1611,11 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
         app.budgets.raster_side_ceiling_px,
         shipped.long_range_image_side_px.floor,
     );
-    assert_eq!(app.budgets.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+    assert_eq!(
+        app.budgets.loop_render_budget,
+        squallar_device_profile::budget::resolve(&app.device_profile).loop_render_budget,
+        "twelve pressure events lowered a granted loop's frame count",
+    );
     assert!(app.budgets.tile_whole_zoom);
     let mut expected = presumed;
     for _ in 0..12 {
@@ -1612,7 +1631,11 @@ fn a_session_that_keeps_failing_settles_at_the_floor_and_never_writes() {
 /// lowering buys no rung and only makes the readout lie about a wall the
 /// scene was never going to fit under.
 ///
-/// Thirty events on six two-hour loops: the presumption settles at the figure
+/// **One looping pane, not six, since 2026-09-06** — see
+/// `a_session_that_keeps_failing_settles_at_the_floor_and_never_writes` for
+/// why six no longer leaves the presumption anywhere to go.
+///
+/// Thirty events on one two-hour loop: the presumption settles at the figure
 /// whose allowance covers the floor rung's need, stays there for the last
 /// events, and the rung is at every rung's stop. Without the floor the same
 /// thirty events land at `0.9^30` of the presumption — 4.2 % of 3840 MiB,
@@ -1623,7 +1646,7 @@ fn thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below() {
     use squallar_device_profile::constants::ECONOMY_FRACTION;
     use squallar_device_profile::fit::{every_rung_at_its_stop, floor_need};
 
-    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 6);
+    let mut app = app_with_looping_panes(TestBridge::desktop(), 6, 1);
     let scene = app.scene_of();
     let floor = app
         .capacity()
@@ -1670,10 +1693,19 @@ fn thirty_events_leave_the_presumption_at_the_floor_rungs_need_and_not_below() {
 
 /// **An out-of-memory error, however many times the device raised it in one
 /// frame, is one event on that frame — one lowering of the presumption, one
-/// re-fit — and writes nothing.** Six two-hour loops never fitted the 3840 MiB
-/// presumption, so the re-fit against 3456 MiB sheds to 18 frames at step 4;
-/// two events would have reached 3110 MiB and step 5. The next frame, with
-/// nothing new noted, holds.
+/// re-fit — and writes nothing.** Four two-hour loops on six panes cost the
+/// 3840 MiB presumption exactly, so the re-fit against 3456 MiB walks the
+/// whole ladder to step 7; two events would have reached 3110 MiB. The next
+/// frame, with nothing new noted, holds.
+///
+/// **Four loops, not six, since 2026-09-06**: ruling 15 makes the frame count
+/// irreducible, and six of them need the whole presumption even at the
+/// ladder's floor, so `refit_under_pressure`'s floor pins the presumption and
+/// one event becomes indistinguishable from two.
+///
+/// Step 4 and a `loop_render_budget` of 18 until 2026-09-06: ruling 15 took
+/// the loop history out of the ladder, so what the walk reaches for instead is
+/// the picture, and it reaches the end of the ladder to do it.
 ///
 /// The counter is process-global; this is the only test in this binary that
 /// notes into it or takes from it, and the frame path that takes it never
@@ -1684,17 +1716,21 @@ fn an_out_of_memory_error_refits_once_per_frame_and_writes_nothing() {
 
     let platform = TestBridge::desktop();
     let store = platform.store();
-    let mut app = app_with_looping_panes(platform, 6, 6);
+    let mut app = app_with_looping_panes(platform, 6, 4);
     assert_eq!(app.budgets.steps_back, 0);
 
     squallar_gpu::pressure::note_out_of_memory();
     squallar_gpu::pressure::note_out_of_memory();
     app.absorb_gpu_pressure();
     assert_eq!(
-        app.budgets.steps_back, 4,
+        app.budgets.steps_back, 7,
         "two errors on one frame are one event, not two",
     );
-    assert_eq!(app.budgets.loop_render_budget, 18);
+    assert_eq!(
+        app.budgets.loop_render_budget,
+        squallar_device_profile::budget::resolve(&app.device_profile).loop_render_budget,
+        "a pressure re-fit lowered a granted loop's frame count",
+    );
     assert_eq!(
         app.session_capacity,
         Some(3456 * MIB),
@@ -1704,7 +1740,7 @@ fn an_out_of_memory_error_refits_once_per_frame_and_writes_nothing() {
     // The next frame, with nothing new noted: the presumption and the budgets
     // hold.
     app.absorb_gpu_pressure();
-    assert_eq!(app.budgets.steps_back, 4);
+    assert_eq!(app.budgets.steps_back, 7);
     assert_eq!(app.session_capacity, Some(3456 * MIB));
 
     assert_eq!(store.load(crate::budget_memo::BUDGET_MEMO_KEY), None);

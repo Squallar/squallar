@@ -199,8 +199,10 @@ fn the_balloon_figure_is_the_allocations_and_zero_means_none() {
     let some = planned([six_hours(0, Some(300))]);
     assert_eq!(
         some.balloon_bytes(),
-        35 * LoopFrameModel::from_budgets(&test_budgets()).plan_view,
-        "60 granted over a base of 25, at 16 MiB a frame",
+        24 * LoopFrameModel::from_budgets(&test_budgets()).plan_view,
+        "60 granted over a base of 36, at 16 MiB a frame — 35 over a base of \
+         25 until ruling 13 stopped cutting the pane's six-hour lookback to \
+         the bracket's two",
     );
     assert_eq!(
         test_loop_allocation().balloon_bytes(),

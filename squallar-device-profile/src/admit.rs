@@ -290,33 +290,72 @@ pub fn verdict(spare: Spare, want: Increment) -> Verdict {
 /// the way the model does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoopFrames {
-    /// The budget's own span ceiling, in seconds — a pane's lookback is held
-    /// to it.
-    pub budget_span_secs: usize,
-    /// The render budget: frames a pane may hold at once.
+    /// The render budget: the CLASS figure for frames a pane may hold at
+    /// once, which no rung of `budget::LADDER` moves (ruling 15).
     pub render_budget: usize,
+    /// **What this session's capacity was measured to reach for one loop** —
+    /// `budget::Budgets::loop_frames_reachable`, derived by
+    /// `crate::fit::reachable_loop_frames` rather than compiled.
+    ///
+    /// It only ever lowers [`Self::render_budget`], and on the presumed and
+    /// derived arms the two are the same number.
+    pub reachable: usize,
 }
 
 impl LoopFrames {
     /// The two figures a [`Budgets`] carries.
     pub const fn of(budgets: &Budgets) -> Self {
         Self {
-            budget_span_secs: budgets.loop_span_secs,
             render_budget: budgets.loop_render_budget,
+            reachable: budgets.loop_frames_reachable,
         }
     }
 
-    /// Frames of `cadence_secs` apiece it takes to cover `span_secs`, held to
-    /// the budget's own span and to the render budget. A loop with no cadence
-    /// yet buys the whole render budget, as it always has.
-    pub fn frames(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
+    /// **The ceiling on any one loop's frames**: the class figure and what
+    /// this capacity was measured to reach, whichever is lower, never under
+    /// the two-frame floor.
+    ///
+    /// The `min` is here and not only at the producer so that the pair cannot
+    /// come apart in a hand-built [`Budgets`] or `LoopFrames`: a fixture that
+    /// lowers [`Self::render_budget`] alone still lowers the answer, which is
+    /// what every such fixture written before the reachable count existed
+    /// means by it.
+    fn ceiling(&self) -> usize {
+        self.render_budget
+            .min(self.reachable)
+            .max(MIN_LOOP_FRAMES_PER_PANE)
+    }
+
+    /// **What `span_secs` of lookback ASKS for at `cadence_secs`** — the
+    /// request, which nothing here shortens.
+    ///
+    /// **Ruling 13**: *"lookback up to the user's span setting is TIER 1 …
+    /// the governor may not shorten it"*. This opened
+    /// `span_secs.min(self.budget_span_secs)` until 2026-09-06, so a user
+    /// asking for six hours on a bracket budgeted two was answered with two
+    /// and told nothing — and a door asking this question would have refused
+    /// or admitted on a span the user never asked for. The field it read is
+    /// gone with the clamp.
+    ///
+    /// A loop with no cadence yet has nothing to convert, so it asks for what
+    /// is reachable and is never reported as clamped: nothing has said what
+    /// more exists.
+    pub fn requested(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
         let Some(cadence) = cadence_secs.filter(|secs| *secs > 0) else {
-            return self.render_budget;
+            return self.ceiling();
         };
-        (1 + span_secs.min(self.budget_span_secs) / cadence as usize).clamp(
-            MIN_LOOP_FRAMES_PER_PANE,
-            self.render_budget.max(MIN_LOOP_FRAMES_PER_PANE),
-        )
+        (1 + span_secs / cadence as usize).max(MIN_LOOP_FRAMES_PER_PANE)
+    }
+
+    /// Frames of `cadence_secs` apiece it takes to cover `span_secs`:
+    /// [`Self::requested`] held to what this capacity reaches.
+    ///
+    /// **The one clamp left on a loop's length, and it is an admission
+    /// decision rather than a rung** (ruling 15). The pair — this and the
+    /// request — is what makes a span the machine cannot reach visible
+    /// instead of silently cut.
+    pub fn frames(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
+        self.requested(span_secs, cadence_secs).min(self.ceiling())
     }
 }
 

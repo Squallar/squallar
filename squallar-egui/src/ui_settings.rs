@@ -418,10 +418,17 @@ impl super::Gui {
                         // tile caches move off the economy allowance rather
                         // than off the ladder at all. A caption naming an
                         // order would be wrong on some machine.
+                        // **Not the loop's length.** It said "and the
+                        // loop's length step down too" until 2026-09-06;
+                        // ruling 15 made a loop's frame count tier 1, so no
+                        // rung of the ladder touches it and a caption saying
+                        // otherwise would be describing a lever that no
+                        // longer exists. What a loop cannot reach is said
+                        // below, per pane, in frames.
                         "The most of each memory this app will take. Lowering \
                          one leaves it less room to work in: the map tile \
-                         caches shrink, and past that the picture quality, \
-                         the 3D detail and the loop's length step down too.",
+                         caches shrink, and past that the picture quality \
+                         and the 3D detail step down too.",
                     )
                     .small()
                     .weak(),
@@ -455,6 +462,13 @@ impl super::Gui {
                 );
                 if before != self.memory_percents {
                     actions.push(GuiAction::SetMemoryPercents(self.memory_percents));
+                }
+                if let Some(line) = self
+                    .budget_readout
+                    .as_ref()
+                    .and_then(|readout| loop_span_caption(&readout.panes))
+                {
+                    ui.label(egui::RichText::new(line).small().weak());
                 }
                 true
             }
@@ -680,6 +694,34 @@ fn memory_share_caption(pool: Option<crate::shell_api::PoolReadout>, requested: 
         "{requested} % asked for, {effective} % in force ({held}): {} MiB.",
         pool.capacity_bytes / (1024 * 1024),
     )
+}
+
+/// **What a pane's loop asked for and what it got**, when the two differ —
+/// `None` when every looping pane reaches its whole span, which is the
+/// ordinary case and wants no line at all.
+///
+/// Ruling 13 makes a loop's lookback tier 1: no governor shortens it, and a
+/// span this machine cannot reach is *"refused at admission, visibly"*. The
+/// door that refuses it is not built yet; this is the visibility half, and it
+/// is here rather than beside the pane because what it names is a property of
+/// the memory the sliders above hand out.
+///
+/// One line for the whole scene, naming the worst pane, because a per-pane
+/// list under a settings slider is a table nobody reads and the figure a user
+/// acts on is the largest cut.
+fn loop_span_caption(panes: &[crate::shell_api::PaneBudget]) -> Option<String> {
+    let worst = panes
+        .iter()
+        .enumerate()
+        .filter(|(_, pane)| pane.loop_span_clamped())
+        .max_by_key(|(_, pane)| pane.loop_frames_requested - pane.loop_frames_effective)?;
+    let (idx, pane) = worst;
+    Some(format!(
+        "Pane {} asked for {} loop frames and this machine holds {}.",
+        idx + 1,
+        pane.loop_frames_requested,
+        pane.loop_frames_effective,
+    ))
 }
 
 /// Generic combo box for a unit preference enum.

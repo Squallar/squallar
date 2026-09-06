@@ -137,12 +137,28 @@ fn every_term_is_the_cost_function_it_reuses() {
         looping.loop_scans_host + looping.render_peak_host,
     );
     assert_eq!(plan.loop_scans_host, 0, "a still pane plays from no cache");
-    // A pane asking for less than the budget's span gets less; one asking for
-    // more is held to the budget's; no cadence yet buys the whole render budget.
+    // A pane asking for less than the budget's span gets less; one asking
+    // for more is held to **what the capacity reaches**, not to the bracket's
+    // compiled minutes; no cadence yet buys the whole render budget.
     assert_eq!(b.frames_for_span_of(30 * 60, PRECIP), 1 + 1800 / 259);
+    // **Moved 2026-09-06, ruling 13.** This read `b.frames_for_span(PRECIP)`
+    // — the pane's twenty-four hours cut to the bracket's two, 28 frames —
+    // because `frames_for_span_of` opened `span_secs.min(self.loop_span_secs)`.
+    // The user's span setting is tier 1 and no constant of this crate's
+    // shortens it: the request is 1 + 86400 / 259 = 334 frames and what
+    // answers is the reachable ceiling, which on this unmeasured profile is
+    // the class figure.
+    assert_eq!(
+        b.frames_requested_for_span_of(24 * 60 * 60, PRECIP),
+        1 + 86400 / 259
+    );
     assert_eq!(
         b.frames_for_span_of(24 * 60 * 60, PRECIP),
-        b.frames_for_span(PRECIP)
+        b.loop_render_budget
+    );
+    assert!(
+        b.frames_for_span_of(24 * 60 * 60, PRECIP) > b.frames_for_span(PRECIP),
+        "the bracket's own span is no longer a ceiling on the user's",
     );
     assert_eq!(b.frames_for_span_of(TWO_HOURS, None), b.loop_render_budget);
 
@@ -917,13 +933,28 @@ fn a_modulation_names_nothing_or_lowers_and_never_raises() {
     }
 }
 
-/// **`fit` sheds down the ladder only as far as the scene needs.** Six two-hour
-/// loops on the desktop bracket cost 6 x (36 x 16 MiB + 256 MiB) = 4992 MiB
-/// against a 3840 MiB presumption; the first three steps are 3D rungs that take
-/// nothing from a 2D scene but are the ladder's first rungs — lighting, then
-/// resolution twice, Native to Half to Quarter, one coarsening a step — and the
-/// fourth, the loop history at 36 to 18 frames, is what makes it fit:
-/// 6 x (18 x 16 + 256) = 3264 MiB. Nothing further moves.
+/// **`fit` sheds down the ladder only as far as the scene needs — and this
+/// scene is now a refusal rather than a shed.**
+///
+/// Six two-hour loops on the desktop bracket cost
+/// 6 x (36 x 16 MiB + 256 MiB) = 4992 MiB against a 3840 MiB presumption.
+/// Until 2026-09-06 the fourth step, the loop history at 36 to 18 frames,
+/// made it fit at 3264 MiB and the walk stopped there. Ruling 15 removed
+/// that rung — *"frame DENSITY is tier 1 too: refuse, never decimate"* — so
+/// the walk now takes every rung it has (lighting, resolution twice, the
+/// overlay margin twice, the tiles, the raster ceiling: seven), lands on the
+/// ladder's floor, where 6 x (36 x 16 + 64) MiB = 3840 MiB fits the
+/// presumption **exactly** — every rung spent on a scene that used to cost
+/// one. A pane more, or a card a byte smaller, and there is nothing left to
+/// shed and the scene is refused at admission rather than quietly given half
+/// its history.
+///
+/// **The product consequence, stated rather than discovered.** The rungs
+/// this scene now takes are ones it never used to: the overlay margin goes
+/// to 100 %, the tiles snap to the whole zoom and the raster ceiling falls
+/// to 4096 px. A GPU-over looping scene goes from resolution straight to
+/// oversampling, and the first rung a user calls "worse" arrives one step
+/// sooner.
 #[test]
 fn fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs() {
     let profile = DeviceProfile {
@@ -941,32 +972,50 @@ fn fit_sheds_down_the_ladder_only_as_far_as_the_scene_needs() {
 
     let fitted = fit(&six, &profile, &cap, stand_in_grid_bytes);
     assert_eq!(
-        fitted.steps_back, 4,
-        "lighting, resolution twice, one halving of the history"
+        fitted.steps_back, 7,
+        "lighting, resolution twice, the margin twice, the tiles, the raster \
+         ceiling — every rung the ladder has, because none of them is the \
+         loop's history any more",
     );
     assert_eq!(fitted.quality_ceiling.shading, GradientShading::Off);
     assert_eq!(fitted.quality_ceiling.resolution, ResolutionRung::Quarter);
     assert_eq!(
-        fitted.loop_render_budget,
-        DESKTOP_MAX_LOOP_RENDER_BUDGET / 2
+        fitted.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "no governor path lowers a granted loop's frame count",
     );
     assert!(
-        !fitted.tile_whole_zoom,
-        "the tiles were not asked to give anything"
+        fitted.tile_whole_zoom,
+        "the tiles are asked now: the history is not there to pay first",
     );
     assert_eq!(
-        fitted.overlay_oversample_percent, OVERLAY_OVERSAMPLE_PERCENTS[0],
-        "a card over its allowance thinned the overlay margin before the history \
-         had paid, or for a byte the GPU model does not price",
+        fitted.overlay_oversample_percent, 100,
+        "and the margin is gone, one step sooner than it used to be",
     );
-    assert_eq!(fitted.grid_cells, top.grid_cells);
-    assert_eq!(fitted.raster_side_ceiling_px, top.raster_side_ceiling_px);
+    assert_eq!(fitted.grid_cells, BudgetLimits::DESKTOP.grid_cells.floor);
+    assert_eq!(
+        fitted.raster_side_ceiling_px,
+        BudgetLimits::DESKTOP.long_range_image_side_px.floor
+    );
     let after = need(&six, &fitted, stand_in_grid_bytes);
-    assert_eq!(after.gpu_bytes, 6 * (18 * 16 + 256) * MIB);
-    assert!(after.gpu_bytes <= cap.allowance());
+    assert_eq!(after.gpu_bytes, 6 * (36 * 16 + 64) * MIB);
+    assert_eq!(
+        after.gpu_bytes,
+        cap.allowance(),
+        "at the ladder's floor the scene fits the 3840 MiB presumption \
+         exactly — 6 x (36 x 16 + 64) MiB — with every rung spent and \
+         nothing left over",
+    );
+    assert!(every_rung_at_its_stop(&fitted, &BudgetLimits::DESKTOP));
+    assert!(fit_holds(
+        &six,
+        &fitted,
+        &BudgetLimits::DESKTOP,
+        &cap,
+        stand_in_grid_bytes
+    ));
 
-    // The three 3D steps lowered nothing for this scene: the first rung that
-    // paid was the loop history, which is the doc's "2D loops shed first".
+    // The three 3D steps lower nothing for this scene: the first rung that
+    // pays is the raster ceiling, and it pays 6 x 192 MiB.
     let mut three = top;
     demote(&mut three, &BudgetLimits::DESKTOP, 3);
     assert_eq!(need(&six, &three, stand_in_grid_bytes), before);
@@ -1000,13 +1049,29 @@ fn fit_returns_the_floor_when_no_rung_can_pay() {
         assert_eq!(
             Budgets {
                 steps_back: fitted.steps_back,
+                // **The reachable frame count is admission's, not a rung's.**
+                // A one-byte capacity reaches the two-frame floor and
+                // `resolve` cannot know that: it sees a profile and no
+                // capacity. Carried like `steps_back`, and checked on its own
+                // line below.
+                loop_frames_reachable: fitted.loop_frames_reachable,
                 ..floor
             },
             fitted,
             "{}: the floor `fit` gives up at is not the ladder's floor",
             limits.name,
         );
-        assert_eq!(fitted.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE);
+        assert_eq!(
+            fitted.loop_render_budget,
+            resolve(&profile).loop_render_budget,
+            "{}: a rung lowered a granted loop's frame count",
+            limits.name,
+        );
+        assert_eq!(
+            fitted.loop_frames_reachable, MIN_LOOP_FRAMES_PER_PANE,
+            "{}: one byte of capacity reaches the two-frame floor and no more",
+            limits.name,
+        );
         assert!(
             !every_rung_at_its_stop(&resolve(&profile), &limits),
             "{}",
@@ -1148,7 +1213,17 @@ fn the_loop_pool_is_what_the_loops_need_capped_by_the_room() {
     );
     assert_eq!(pool(&six, &top), 2304 * MIB, "min(3456, 2304)");
     let fitted = fit(&six, &profile, &cap, stand_in_grid_bytes);
-    assert_eq!(pool(&six, &fitted), 1728 * MIB, "min(6 x 18 x 16, 2304)");
+    // **Moved 2026-09-06, ruling 15.** This read 1728 MiB — `min(6 x 18 x 16,
+    // 2304)` — because the ladder had halved the six loops to eighteen frames
+    // to make the scene fit. No rung touches the frame count now, so the
+    // loops still want all 36; what the walk shed instead is the raster
+    // ceiling, which frees 6 x 192 MiB of room, and the ceiling rather than
+    // the room is what binds.
+    assert_eq!(
+        pool(&six, &fitted),
+        3456 * MIB,
+        "min(6 x 36 x 16, 3840 - 6 x 64)"
+    );
 
     // Nothing looping asks for nothing; the application's limits then hold the
     // pool at its floor.
@@ -1180,15 +1255,21 @@ fn the_loop_pool_is_what_the_loops_need_capped_by_the_room() {
 
 /// **The pool is the room, capped at the loops' ceiling — not their base.** A
 /// pane whose listing has said 300 s over a six-hour lookback has a base of
-/// 25 frames (two hours at 300 s, the rung's span: what `fit` charges) and a
-/// ceiling of 60 (`MAX_LOOP_FRAMES`; the lookback at that cadence is 73). The
-/// pool is sized to the ceiling so the application's planner has room to
-/// balloon into: 960 MiB for one such pane under the presumption, and six of
-/// them are held to the 2304 MiB of room — the same room six two-hour loops
-/// with no cadence get, because the room does not depend on what the loops
-/// ask. `fit` asks whether the scene fits and charges the base; the pool asks
-/// how much room is left. Where no cadence is known, the ceiling is the base
-/// and nothing here moves.
+/// 36 frames and a ceiling of 60 (`MAX_LOOP_FRAMES`; the lookback at that
+/// cadence is 73). The pool is sized to the ceiling so the application's
+/// planner has room to balloon into: 960 MiB for one such pane under the
+/// presumption. `fit` asks whether the scene fits and charges the base; the
+/// pool asks how much room is left. Where no cadence is known, the ceiling is
+/// the base and nothing here moves.
+///
+/// **The base moved from 25 to 36 on 2026-09-06, ruling 13.** It used to be
+/// two hours at 300 s — the *bracket's* span, not the pane's — because
+/// `Budgets::frames_for_span_of` opened `span_secs.min(self.loop_span_secs)`.
+/// A user who set a six-hour lookback on the desktop bracket was answered
+/// with two hours of it and told nothing. The request is now the user's whole
+/// six hours (73 frames) and what answers is the reachable ceiling, which on
+/// this unmeasured profile is the class figure of 36 — three hours at 300 s,
+/// and a clamp the readout names rather than a cut nothing recorded.
 #[test]
 fn the_pool_is_the_room_capped_at_the_loops_ceiling_not_their_base() {
     let top = desktop();
@@ -1196,14 +1277,23 @@ fn the_pool_is_the_room_capped_at_the_loops_ceiling_not_their_base() {
     const SIX_HOURS: usize = 6 * 60 * 60;
     let pane = plan_pane(HD, true, SIX_HOURS, Some(300));
 
-    assert_eq!(loop_frames(&pane, &top), 25, "the base: two hours at 300 s");
+    assert_eq!(
+        loop_frames_requested(&pane, &top),
+        73,
+        "the request: the user's whole six hours at 300 s"
+    );
+    assert_eq!(
+        loop_frames(&pane, &top),
+        36,
+        "the base: what this capacity reaches, three hours at 300 s"
+    );
     assert_eq!(
         loop_frames_ceiling(&pane, &top),
         60,
         "the ceiling: min(1 + 21600 / 300 = 73, MAX_LOOP_FRAMES = 60)"
     );
     let one = scene_of(vec![pane]);
-    assert_eq!(loop_need(&one, &top, stand_in_grid_bytes), 25 * 16 * MIB);
+    assert_eq!(loop_need(&one, &top, stand_in_grid_bytes), 36 * 16 * MIB);
     assert_eq!(loop_ceiling(&one, &top, stand_in_grid_bytes), 60 * 16 * MIB);
     assert_eq!(
         loop_pool_bytes(&one, &top, &cap, stand_in_grid_bytes),
@@ -1311,9 +1401,18 @@ fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
         &Capacity::presumed(&BudgetLimits::DESKTOP),
         stand_in_grid_bytes,
     );
+    // **Moved 2026-09-06, ruling 15.** This read
+    // `DESKTOP_MAX_LOOP_RENDER_BUDGET / 2` — the presumed arm halved the
+    // loop's history to fit and the measured arm did not, which was the
+    // difference a measurement made. No rung halves it now; what the
+    // presumed arm sheds instead is the picture.
     assert_eq!(
-        presumed.loop_render_budget,
-        DESKTOP_MAX_LOOP_RENDER_BUDGET / 2
+        presumed.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "no governor path lowers a granted loop's frame count",
+    );
+    assert_eq!(
+        presumed.overlay_oversample_percent, 100,
+        "the presumption pays with the picture's margin instead",
     );
     assert_eq!(
         Budgets {
@@ -1321,7 +1420,11 @@ fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
             quality_ceiling: top.quality_ceiling,
             offscreen_bytes: top.offscreen_bytes,
             app_texture_ceiling_bytes: top.app_texture_ceiling_bytes,
-            loop_render_budget: top.loop_render_budget,
+            overlay_oversample_percent: top.overlay_oversample_percent,
+            tile_whole_zoom: top.tile_whole_zoom,
+            raster_side_ceiling_px: top.raster_side_ceiling_px,
+            grid_cells: top.grid_cells,
+            volume_texture_bytes: top.volume_texture_bytes,
             ..presumed
         },
         top,
@@ -1332,38 +1435,60 @@ fn a_measured_capacity_is_the_allowance_the_scene_is_fitted_to() {
     let cap = four_gib.capacity();
     assert_eq!(cap.allowance(), 3072 * MIB);
     let fitted = fit(&six, &four_gib, &cap, stand_in_grid_bytes);
+    // **Until 2026-09-06 this card's answer was five ladder steps — lighting,
+    // resolution twice, two halvings of the history — and a
+    // `loop_render_budget` of 9.** Ruling 15 took the halvings away, so the
+    // frame count is the class figure whatever this card holds and the walk
+    // pays with the picture instead. 3072 MiB less the 1536 MiB the six
+    // panes' static rasters take is 96 frames of 16 MiB, which is over the
+    // class figure, so this card reaches every frame the class offers.
     assert_eq!(
-        fitted.steps_back, 5,
-        "lighting, resolution twice, two halvings of the history"
+        fitted.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "no governor path lowers a granted loop's frame count",
     );
-    assert_eq!(fitted.loop_render_budget, 9);
     assert_eq!(
-        need(&six, &fitted, stand_in_grid_bytes).gpu_bytes,
-        2400 * MIB
-    );
-    let mut one_less = resolve(&four_gib);
-    demote(&mut one_less, &BudgetLimits::DESKTOP, 4);
-    assert_eq!(
-        need(&six, &one_less, stand_in_grid_bytes).gpu_bytes,
-        3264 * MIB
-    );
-    assert!(need(&six, &one_less, stand_in_grid_bytes).gpu_bytes > cap.allowance());
-    assert_eq!(
-        loop_pool_bytes(&six, &fitted, &cap, stand_in_grid_bytes),
-        6 * 9 * 16 * MIB,
-        "min(864, 3072 - 1536)",
+        fitted.loop_frames_reachable, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "4 GiB reaches every frame the class offers",
     );
     assert_eq!(
         fitted.frames_for_span_of(TWO_HOURS, PRECIP),
-        9,
-        "the pane asked for 28 frames of two hours and holds nine: 2072 s",
+        28,
+        "so the pane's two hours at 259 s are answered whole",
     );
-    assert_eq!(fitted.grid_cells, one_less.grid_cells);
+
+    // **A card small enough to bite, which is item 2's other half.** A probed
+    // 1 GiB capacity allows 768 MiB; the six panes' static rasters take
+    // 384 MiB of it at the ladder's floor, and what is left buys 24 frames of
+    // 16 MiB — under the class figure, so the request is CLAMPED and the pair
+    // says so. This is the figure that used to be a compiled constant.
+    let one_gib = discrete(1024);
+    let small = one_gib.capacity();
+    let fitted = fit(&six, &one_gib, &small, stand_in_grid_bytes);
+    assert_eq!(small.allowance(), 768 * MIB);
     assert_eq!(
-        fitted.raster_side_ceiling_px,
-        one_less.raster_side_ceiling_px
+        fitted.loop_render_budget, DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "no governor path lowers a granted loop's frame count",
     );
-    assert!(!fitted.tile_whole_zoom);
+    assert!(
+        fitted.loop_frames_reachable < DESKTOP_MAX_LOOP_RENDER_BUDGET,
+        "a 1 GiB card reaches the whole class figure, so nothing is clamped \
+         here and this arm proves nothing: {}",
+        fitted.loop_frames_reachable,
+    );
+    assert_eq!(
+        fitted.frames_requested_for_span_of(TWO_HOURS, PRECIP),
+        28,
+        "the ask: two hours at 259 s",
+    );
+    assert_eq!(
+        fitted.frames_for_span_of(TWO_HOURS, PRECIP),
+        fitted.loop_frames_reachable,
+        "and what this card reaches, which is what the readout names beside it",
+    );
+    assert!(
+        fitted.tile_whole_zoom,
+        "a 1 GiB card leaves this scene room to spare after all",
+    );
 
     // A unified-memory part on a 64 GiB host: the pool is cut in two, 32 GiB
     // to each side, one loop's pool is its need, and the offscreen stays at
@@ -1453,13 +1578,19 @@ fn the_economy_allowance_is_what_is_left_under_nine_tenths_of_the_capacity() {
         ..shipped_profile(BudgetLimits::DESKTOP)
     };
     let fitted = fit(&six, &profile, &presumed, stand_in_grid_bytes);
+    // **Moved 2026-09-06, ruling 15.** The need read 3264 MiB while the
+    // ladder could halve the six loops to eighteen frames. It cannot, so the
+    // loops still cost 6 x 36 x 16 MiB and what the walk sheds instead is the
+    // raster ceiling: 6 x (36 x 16 + 64) = 3840 MiB, the whole presumption,
+    // and nothing is left under the nine-tenths line.
     assert_eq!(
         need(&six, &fitted, stand_in_grid_bytes).gpu_bytes,
-        3264 * MIB
+        3840 * MIB
     );
     assert_eq!(
         economy_allowance(&six, &fitted, &presumed, stand_in_grid_bytes),
-        (3456 - 3264) * MIB,
+        0,
+        "a scene at the whole allowance leaves no economy",
     );
     // Four two-hour loops beside two still panes cost the whole 3840 MiB
     // allowance and fit it exactly; they are past the nine-tenths line, so
@@ -1919,14 +2050,33 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     ));
 
     // **The leg itself, loop playing** — and its scans reconciled: the
-    // eleven frames the web arm names had all arrived, so they are priced at
-    // what they measured (48.88 MiB apiece, the fixture's modelled median),
-    // not at the 80 MiB reserve, and nothing is pending.
-    assert_eq!(loop_frames(&leg.panes[0], &top), 11, "1 + 2700 / 259");
+    // eleven frames that had arrived are priced at what they measured
+    // (48.88 MiB apiece, the fixture's modelled median) and the rest at the
+    // 80 MiB reserve.
+    //
+    // **The web arm names fourteen frames now, and it named eleven before
+    // 2026-09-06 (ruling 13).** The pane's lookback is two hours and the web
+    // bracket budgets forty-five minutes, and `frames_for_span_of` used to
+    // open `span_secs.min(self.loop_span_secs)`: the user's two hours were
+    // cut to the bracket's 2700 s and 1 + 2700 / 259 = 11 frames, with
+    // nothing said. The request is now the user's whole two hours —
+    // 1 + 7200 / 259 = 28 frames — and what answers is the reachable
+    // ceiling, which on this unmeasured bracket is the class figure of 14.
+    // Three of those fourteen have not arrived, so they are charged the
+    // reserve.
+    assert_eq!(
+        top.frames_requested_for_span_of(TWO_HOURS, PRECIP),
+        28,
+        "1 + 7200 / 259: the user's own lookback, unshortened"
+    );
+    assert_eq!(loop_frames(&leg.panes[0], &top), 14, "what the web reaches");
     assert_eq!(leg.panes[0].loop_scans_resident_frames, 11);
     let playing = need_terms(&leg, &top, stand_in_grid_bytes);
-    assert_eq!(playing.loop_scans_host, 11 * HUGE_LEG_SCAN_BYTES);
-    assert_eq!(playing.loop_scans_host, 563_798_345);
+    assert_eq!(
+        playing.loop_scans_host,
+        11 * HUGE_LEG_SCAN_BYTES + 3 * LOOP_SCAN_RESERVE_BYTES,
+    );
+    assert_eq!(playing.loop_scans_host, 815_456_585);
     assert_eq!(
         playing.still_scans_host, 0,
         "a pane running a radar loop pays for its volumes through the loop",
@@ -1936,20 +2086,27 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
         at_top.total().host_bytes - at_top.still_scans_host + playing.loop_scans_host,
         "on the host the loop swaps the parked still for its own volumes",
     );
-    assert_eq!(playing.total().host_bytes, 2_039_636_029);
+    assert_eq!(playing.total().host_bytes, 2_291_294_269);
     assert_eq!(
         playing.total().gpu_bytes,
         at_top.total().gpu_bytes + playing.loops,
-        "on the GPU it adds its frames: 11 textures at the web loop side",
+        "on the GPU it adds its frames: 14 textures at the web loop side",
     );
-    assert_eq!(playing.loops, 11 * 4 * MIB);
+    assert_eq!(playing.loops, 14 * 4 * MIB);
 
     // **The same leg before its first volume arrived** is the admission
     // price: every named frame pending, at the reserve. The difference
     // between the two lines is what reconciliation is worth on this scene —
-    // 922,746,880 - 563,798,345 = 358,948,535 B, 38.9 % of the charge — and
-    // the reserve is only ever the larger of the two, which is the direction
-    // a bound must err.
+    // 1,174,405,120 - 815,456,585 = 358,948,535 B, 30.6 % of the charge —
+    // and the reserve is only ever the larger of the two, which is the
+    // direction a bound must err.
+    //
+    // **The difference itself did not move when the frame count went from
+    // eleven to fourteen** (ruling 13, above), and that is the arithmetic
+    // saying the right thing rather than a coincidence: reconciliation is
+    // worth `resident x (reserve - measured)`, and the three frames the
+    // wider span added are pending on both lines. What fell is the share:
+    // 38.9 % of a smaller charge, 30.6 % of this one.
     //
     // **Both sides of that subtraction moved, and neither figure published
     // while they moved separately survived.** The reserve rose 64 -> 80 MiB
@@ -1962,13 +2119,17 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     // than it was, but by less than the reserve's rise alone implies, because
     // what it discharges to rose too.
     let pending = need_terms(&huge_pending(13), &top, stand_in_grid_bytes);
-    assert_eq!(pending.loop_scans_host, 11 * LOOP_SCAN_RESERVE_BYTES);
-    assert_eq!(pending.loop_scans_host, 922_746_880);
+    assert_eq!(pending.loop_scans_host, 14 * LOOP_SCAN_RESERVE_BYTES);
+    assert_eq!(pending.loop_scans_host, 1_174_405_120);
+    assert_eq!(
+        pending.loop_scans_host - playing.loop_scans_host,
+        11 * (LOOP_SCAN_RESERVE_BYTES - HUGE_LEG_SCAN_BYTES),
+    );
     assert_eq!(
         pending.loop_scans_host - playing.loop_scans_host,
         358_948_535
     );
-    assert_eq!(pending.total().host_bytes, 2_398_584_564);
+    assert_eq!(pending.total().host_bytes, 2_650_242_804);
 
     let leg_fitted = fit(&leg, &wasm, &presumed, stand_in_grid_bytes);
     assert_eq!(leg_fitted.overlay_oversample_percent, 100);
@@ -1984,13 +2145,14 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     );
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes,
-        1_413_947_317
+        1_665_605_557
     );
     assert_eq!(
         over(&leg, &leg_fitted, &presumed, stand_in_grid_bytes),
         (false, true),
         "still over: eleven volumes that have arrived cost what they measured \
-         whatever the rung",
+         whatever the rung, and the three the wider span named cost the \
+         reserve at every rung too",
     );
     assert!(every_host_rung_at_its_stop(&leg_fitted, &wasm.limits));
     assert!(fit_holds(
@@ -2106,8 +2268,11 @@ fn the_huge_leg_fits_at_no_host_rung_and_the_one_picture_undercount_fitted() {
     assert_eq!(
         need(&leg, &leg_fitted, stand_in_grid_bytes).host_bytes
             - presumed.host_allowance().unwrap(),
-        608_640_949,
-        "what the Level II leg is over by at every host rung",
+        860_299_189,
+        "what the Level II leg is over by at every host rung — 608,640,949 B \
+         until ruling 13 stopped cutting the pane's two-hour lookback to the \
+         bracket's forty-five minutes, which is three more frames at the \
+         reserve",
     );
 }
 
@@ -2879,22 +3044,141 @@ fn a_loop_with_no_cadence_prices_its_whole_render_budget_and_no_rung_moves_it() 
         stand_in_grid_bytes
     ));
 
-    // **Walked to its stop, the host axis never reaches the frame count and
-    // the GPU axis does.** The second half is the standing ruling-15
-    // violation `budget`'s `LADDER` records — a GPU-over scene still
-    // decimates its loop — and this arm is here so WO-I's removal has a
-    // witness rather than a silent green.
+    // **Walked to its stop, NEITHER axis reaches the frame count.** This arm
+    // was written on 2026-09-06 as a witness with the second half inverted —
+    // the GPU walk then ended at `MIN_LOOP_FRAMES_PER_PANE`, the standing
+    // ruling-15 violation `budget`'s `LADDER` recorded — so that removing the
+    // rung had something to turn green rather than a silent pass. The rung is
+    // gone and both halves now say the same thing.
     let mut host_probe = top;
     while step_down_for(&mut host_probe, &wasm.limits, false, true) {}
     assert_eq!(
         host_probe.loop_render_budget, top.loop_render_budget,
-        "a host walk taken to its stop still lowered a granted frame count",
+        "a host walk taken to its stop lowered a granted frame count",
     );
     let mut gpu_probe = top;
     while step_down_for(&mut gpu_probe, &wasm.limits, true, false) {}
     assert_eq!(
-        gpu_probe.loop_render_budget, MIN_LOOP_FRAMES_PER_PANE,
-        "the shipped ladder still decimates a loop on the GPU axis: WO-I owns \
-         removing the rung",
+        gpu_probe.loop_render_budget, top.loop_render_budget,
+        "a GPU walk taken to its stop lowered a granted frame count",
     );
+}
+
+/// **The negative property, on every governor path this crate has.**
+///
+/// Ruling 15's *"no governor path lowers a granted loop's frame count or
+/// span"*, checked by driving each path to its stop rather than by reading
+/// the ladder's table:
+///
+/// * **The ladder** — `step_down`, and `step_down_for` on each axis alone,
+///   walked until nothing moves, on every shipped bracket and from every
+///   promotion.
+/// * **`fit`** — the whole walk, against capacities from one byte to a
+///   3090's, on scenes that fit and scenes that cannot.
+/// * **`refit_under_pressure` and `refit_to_scene`** — the application's two
+///   re-fit paths, which are `fit` against a lowered capacity and `fit`
+///   against a changed scene; the lowered capacity is modelled here by
+///   `Capacity::probed` at each of a sequence of falling figures, which is
+///   exactly what `App::refit_under_pressure` hands `fit`.
+///
+/// The span half is checked with the frame count: `frames_for_span_of` is
+/// the only place a span becomes frames, and `loop_span_secs` is not a knob
+/// of any rung, so a frame count that never falls is a span that never
+/// shortens. `LoopPool::plan`'s half of the property lives beside the pool,
+/// in `squallar-app`.
+#[test]
+fn no_governor_path_lowers_a_granted_loops_frames_or_span() {
+    let scenes = [
+        ("empty", Scene::empty()),
+        (
+            "one loop",
+            scene_of(vec![plan_pane(HD, true, TWO_HOURS, PRECIP)]),
+        ),
+        (
+            "one loop, no cadence",
+            scene_of(vec![plan_pane(HD, true, TWO_HOURS, None)]),
+        ),
+        (
+            "six loops",
+            scene_of(vec![plan_pane(HD, true, TWO_HOURS, PRECIP); 6]),
+        ),
+        (
+            "six loops, a day of lookback",
+            scene_of(vec![plan_pane(HD, true, 24 * 60 * 60, PRECIP); 6]),
+        ),
+    ];
+    for limits in BudgetLimits::SHIPPED {
+        for class in [DeviceClass::Discrete, DeviceClass::Integrated] {
+            let profile = DeviceProfile {
+                class,
+                ..shipped_profile(limits)
+            };
+            let top = resolve(&profile);
+
+            // The ladder, on each axis and on both.
+            for (gpu, host) in [(true, true), (true, false), (false, true)] {
+                let mut probe = top;
+                let mut steps = 0;
+                while step_down_for(&mut probe, &limits, gpu, host) {
+                    steps += 1;
+                    assert!(steps < 64, "{}: the ladder did not stop", limits.name);
+                    assert_eq!(
+                        probe.loop_render_budget, top.loop_render_budget,
+                        "{} / gpu {gpu} host {host}: step {steps} lowered a \
+                         granted loop's frame count",
+                        limits.name,
+                    );
+                    assert_eq!(
+                        probe.loop_span_secs, top.loop_span_secs,
+                        "{} / gpu {gpu} host {host}: step {steps} shortened a \
+                         granted loop's span",
+                        limits.name,
+                    );
+                }
+            }
+
+            // `fit`, and the two re-fit paths, which are `fit` against a
+            // capacity or a scene that moved. A falling sequence of probed
+            // figures is what `App::refit_under_pressure` hands it.
+            for (scene_name, scene) in &scenes {
+                let mut previous: Option<usize> = None;
+                for gpu in [24822u64 << 20, 4096 << 20, 1024 << 20, 256 << 20, 1] {
+                    let cap = Capacity::probed(gpu);
+                    let admitted = admit(scene, &profile, &cap, stand_in_grid_bytes);
+                    let fitted = fit(scene, &profile, &cap, stand_in_grid_bytes);
+                    assert_eq!(
+                        fitted.loop_render_budget, top.loop_render_budget,
+                        "{} / {scene_name} / {gpu} B: the ladder lowered a \
+                         granted loop's frame count",
+                        limits.name,
+                    );
+                    assert_eq!(
+                        fitted.loop_span_secs, top.loop_span_secs,
+                        "{} / {scene_name} / {gpu} B: the ladder shortened a \
+                         granted loop's span",
+                        limits.name,
+                    );
+                    // **The one figure a falling capacity may lower is the
+                    // one admission set, and it is lowered before the walk
+                    // and never during it.** The pair is what the readout
+                    // shows; the ladder is what may not move it.
+                    assert_eq!(
+                        fitted.loop_frames_reachable, admitted.loop_frames_reachable,
+                        "{} / {scene_name} / {gpu} B: a rung moved the \
+                         reachable count",
+                        limits.name,
+                    );
+                    if let Some(before) = previous {
+                        assert!(
+                            fitted.loop_frames_reachable <= before,
+                            "{} / {scene_name}: a smaller capacity reached MORE \
+                             frames",
+                            limits.name,
+                        );
+                    }
+                    previous = Some(fitted.loop_frames_reachable);
+                }
+            }
+        }
+    }
 }

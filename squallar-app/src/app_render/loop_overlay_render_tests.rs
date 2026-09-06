@@ -1123,12 +1123,16 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
          second such pane would too",
     );
 
-    // The byte consequence, on the pool's own arithmetic: a second such pane
-    // takes frames from what the first may hold. The need is the pane's real
-    // one — three listed frames, so three is the most it can hold — and the
-    // pool is five frames' worth with the bracket's floor lifted, so that two
-    // panes cannot both hold their three: the bracket floor pays six with room
-    // to spare, which would show no division at all.
+    // The byte consequence, on the pool's own arithmetic. **A second such pane
+    // does NOT take frames from what the first may hold** — ruling 15, since
+    // 2026-09-06, when `LoopPool::plan`'s downward arm went: this asserted
+    // `shared < alone` and was the arm doing exactly what the ruling forbids.
+    // What happens instead is that both keep their base and the plan says how
+    // far over its pool it is, which is what an admission door refuses on.
+    // The need is the pane's real one — three listed frames, so three is the
+    // most it can hold — and the pool is five frames' worth with the bracket's
+    // floor lifted, so that two panes cannot both hold their three: the
+    // bracket floor pays six with room to spare, which would show nothing.
     let budgets = app.budgets;
     let model = LoopFrameModel::from_budgets(&budgets);
     let need = demand.needs()[0];
@@ -1148,14 +1152,20 @@ fn a_radar_off_pane_looping_a_model_layer_is_a_share_of_the_pool() {
     let mut second = demand.needs()[0];
     second.key = crate::loop_pool::LoopKey { pane: 1 };
     two.push(second);
-    let shared = pool
-        .plan(model, &two)
+    let planned = pool.plan(model, &two);
+    let shared = planned
         .frames_for_pane(0)
         .expect("pane 0 still asks for a loop");
-    assert!(
-        shared < alone,
-        "two panes looping a model field must divide the pool between them: \
-         {alone} frames alone, {shared} beside another",
+    assert_eq!(
+        shared, alone,
+        "a second pane looping a model field lowered the first's granted \
+         frames: {alone} frames alone, {shared} beside another",
+    );
+    assert_eq!(
+        planned.over_pool_bytes(),
+        need.frame_bytes,
+        "and the sixth frame the two bases ask for is what the plan is over \
+         its five-frame pool by",
     );
 }
 

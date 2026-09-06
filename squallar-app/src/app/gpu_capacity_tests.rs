@@ -24,6 +24,7 @@ fn budget_line(app: &App) -> String {
         None,
         app.loop_pool.bytes(),
         app.loop_pool_state.allocation().balloon_bytes(),
+        app.loop_pool_state.allocation().over_pool_bytes(),
         &app.capacity(),
         app.gpu_probe,
         crate::pressure::LinearMemoryWatch::default(),
@@ -175,9 +176,20 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
         probed.loop_render_budget, class_rung.loop_render_budget,
         "six two-hour loops fit a 3024 MiB allowance with every frame",
     );
+    // **The presumption pays with the picture, not with the loop**, since
+    // ruling 15 (2026-09-06): this read `presumed.loop_render_budget <
+    // class_rung.loop_render_budget` while the ladder still halved the
+    // history, and the 288 MiB presumption was the scene that made it do so.
+    // No rung reaches the frame count now, so what says the presumption bit
+    // is the margin and the tiles.
+    assert_eq!(
+        presumed.loop_render_budget, class_rung.loop_render_budget,
+        "the 288 MiB presumption lowered a granted loop's frame count: {presumed:?}",
+    );
     assert!(
-        presumed.loop_render_budget < class_rung.loop_render_budget,
-        "the 288 MiB presumption had halved the history: {presumed:?}",
+        presumed.steps_back > probed.steps_back
+            && presumed.overlay_oversample_percent < class_rung.overlay_oversample_percent,
+        "the 288 MiB presumption cost the scene nothing at all: {presumed:?}",
     );
     assert_eq!(probed.steps_back, 3, "the three host rungs, no GPU rung");
     assert_eq!(
@@ -185,6 +197,12 @@ fn a_probed_capacity_reaches_the_fit_on_a_web_profile_and_prints_cap_2() {
             steps_back: 0,
             tile_whole_zoom: false,
             overlay_oversample_percent: 150,
+            // **Admission, not a rung.** `loop_frames_reachable` is what the
+            // probed capacity was measured to hold for one loop, which
+            // `resolve` cannot know; `crate::fit::admit` writes it before the
+            // ladder walks and no rung moves it. It is checked on its own
+            // line below.
+            loop_frames_reachable: class_rung.loop_frames_reachable,
             ..probed
         },
         class_rung,
@@ -508,6 +526,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             None,
             app.loop_pool.bytes(),
             app.loop_pool_state.allocation().balloon_bytes(),
+            app.loop_pool_state.allocation().over_pool_bytes(),
             &app.capacity(),
             app.gpu_probe,
             crate::pressure::LinearMemoryWatch::default(),
@@ -565,7 +584,15 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
         line(&app),
     );
     let presumed = fit(&six, &app.device_profile, &app.capacity(), GRID_BYTES);
-    assert_eq!(presumed.loop_render_budget, 18);
+    // 18 until 2026-09-06, when ruling 15 took the loop-history rung out of
+    // the ladder. The presumption still bites — it walks the whole ladder —
+    // but what it spends is the picture, never the loop's frames.
+    assert_eq!(
+        presumed.loop_render_budget,
+        resolve(&app.device_profile).loop_render_budget,
+        "the presumption lowered a granted loop's frame count",
+    );
+    assert_eq!(presumed.steps_back, 7, "and it walks every rung to do it");
 
     app.adopt_gpu_capacity(Some(reading));
 
@@ -579,6 +606,10 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
     assert_eq!(
         measured.loop_render_budget, 36,
         "six two-hour loops fit an 18 GiB allowance with every frame",
+    );
+    assert_eq!(
+        measured.loop_frames_reachable, 36,
+        "and 18 GiB reaches every one of them",
     );
     assert_eq!(measured, resolve(&app.device_profile));
     assert_eq!(

@@ -78,6 +78,27 @@ pub struct PaneBudget {
     /// panes whose windows overlap) is counted on `loop state:`'s `shared`
     /// and not folded in here — a different denominator.
     pub own_bytes: u64,
+    /// **Frames this pane's loop ASKED for**: its own lookback at its
+    /// cadence, which nothing of the budget model's shortens (ruling 13).
+    /// `0` for a pane that is not looping.
+    pub loop_frames_requested: usize,
+    /// **Frames it gets**: [`Self::loop_frames_requested`] held to what this
+    /// session's capacity was measured to reach
+    /// (`squallar_device_profile::budget::Budgets::loop_frames_reachable`).
+    ///
+    /// Below the request only where the machine cannot reach the span, and
+    /// then the pair is what makes the clamp **visible** — ruling 13's *"a
+    /// looping pane or layer that does not fit at full span is refused at
+    /// admission, visibly"*. The admission door itself is not built here; a
+    /// readout that names the two figures is what stands in for it.
+    pub loop_frames_effective: usize,
+}
+
+impl PaneBudget {
+    /// Whether this pane's loop was held below what its span asked for.
+    pub fn loop_span_clamped(&self) -> bool {
+        self.loop_frames_effective < self.loop_frames_requested
+    }
 }
 
 /// One pool — GPU or host — as the session sees it.

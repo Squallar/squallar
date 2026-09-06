@@ -16,6 +16,12 @@ use crate::scene::fixtures::{scene_table, shipped_profile, stand_in_grid_bytes};
 
 /// Half of both pools, which is the working percentage in every table below.
 const HALF: PoolPercents = PoolPercents { gpu: 50, host: 50 };
+/// The lowest share the control offers — [`PoolPercents::FLOOR`] on both
+/// pools, the bottom of the slider a user can actually reach.
+const LOWEST: PoolPercents = PoolPercents {
+    gpu: PoolPercents::FLOOR,
+    host: PoolPercents::FLOOR,
+};
 
 /// The bracket every arm below is built against — the desktop limits, so the
 /// presumed arm carries a real constant rather than a mobile stand-in.
@@ -349,45 +355,74 @@ fn the_ram_percentage_moves_the_host_allowance_with_no_gpu_reader() {
 fn the_percentage_is_inert_on_no_capacity_arm_and_never_raises_a_budget() {
     let limits = BudgetLimits::DESKTOP;
     let profile = desktop_profile();
-    let budget_for = |cap: &Capacity, scene: &Scene| -> (Budgets, crate::budget::TileCacheBudget) {
-        let budgets = fit::fit(scene, &profile, cap, stand_in_grid_bytes);
-        let tiles = fit::tile_cache_budget(scene, &budgets, &limits, cap, stand_in_grid_bytes);
-        (budgets, tiles)
-    };
+    let budget_for =
+        |cap: &Capacity, scene: &Scene| -> (Budgets, crate::budget::TileCacheBudget, u64) {
+            let budgets = fit::fit(scene, &profile, cap, stand_in_grid_bytes);
+            let tiles = fit::tile_cache_budget(scene, &budgets, &limits, cap, stand_in_grid_bytes);
+            // **The loop pool is counted here too, and it is the quantity the
+            // presumed arm moves.** Until 2026-09-06 the loop-history rung was
+            // the ladder's finest step and the one a halved presumed pool
+            // reliably took, so a moved `Budgets` was evidence enough. Ruling 15
+            // removed it, and the ladder that is left is coarse: on the presumed
+            // desktop bracket every scene in `scene_table` either fits at both
+            // percentages or bottoms out at the same floor at both. What the
+            // setting still buys there is the pool the loops are planned from —
+            // the balloon `LoopPool::plan` spends — so it joins the counted
+            // quantities rather than the arm being declared inert.
+            let pool = fit::loop_pool_bytes(scene, &budgets, cap, stand_in_grid_bytes);
+            (budgets, tiles, pool)
+        };
 
     for (arm, cap) in capacity_table() {
         let mut tiles_moved = 0usize;
         let mut budgets_moved = 0usize;
+        let mut pool_moved = 0usize;
         for (scene_name, scene) in scene_table() {
-            let (full_budgets, full) = budget_for(&cap.scaled_to(PoolPercents::FULL), &scene);
-            let (base_budgets, base) = budget_for(&cap, &scene);
+            let (full_budgets, full, full_pool) =
+                budget_for(&cap.scaled_to(PoolPercents::FULL), &scene);
+            let (base_budgets, base, base_pool) = budget_for(&cap, &scene);
             assert_eq!(
-                (full_budgets, full),
-                (base_budgets, base),
+                (full_budgets, full, full_pool),
+                (base_budgets, base, base_pool),
                 "{arm} / {scene_name}: 100 % moved the budgets — every existing \
                  user's session changes shape on upgrade",
             );
 
-            let (half_budgets, half) = budget_for(&cap.scaled_to(HALF), &scene);
-            assert!(
-                half.styled_bytes <= base.styled_bytes
-                    && half.parsed_bytes <= base.parsed_bytes
-                    && half.terrain_bytes <= base.terrain_bytes,
-                "{arm} / {scene_name}: halving the pools RAISED a tile cache, \
-                 {half:?} against {base:?}",
-            );
-            if half.styled_bytes < base.styled_bytes {
-                tiles_moved += 1;
-            }
-            if half_budgets != base_budgets {
-                budgets_moved += 1;
+            // **A sweep, not one percentage.** Halving alone stopped
+            // discriminating on the derived unified arm when ruling 15 took
+            // the loop-history rung out of the ladder: measured 2026-09-06,
+            // that arm's eleven scenes each either fit at both 100 % and
+            // 50 % or stood at the ladder's floor at both, and their loop
+            // pools were capped by the loops' own ceiling rather than by the
+            // room, so nothing moved at 50 % and the arm read inert. Lower
+            // percentages still reach it. Every one of them is held to the
+            // same monotonicity, so this is a wider net and not a weaker one.
+            for percent in [HALF, PoolPercents { gpu: 25, host: 25 }, LOWEST] {
+                let (low_budgets, low, low_pool) = budget_for(&cap.scaled_to(percent), &scene);
+                assert!(
+                    low.styled_bytes <= base.styled_bytes
+                        && low.parsed_bytes <= base.parsed_bytes
+                        && low.terrain_bytes <= base.terrain_bytes,
+                    "{arm} / {scene_name}: {} % of the pools RAISED a tile \
+                     cache, {low:?} against {base:?}",
+                    percent.gpu,
+                );
+                if low.styled_bytes < base.styled_bytes {
+                    tiles_moved += 1;
+                }
+                if low_budgets != base_budgets {
+                    budgets_moved += 1;
+                }
+                if low_pool != base_pool {
+                    pool_moved += 1;
+                }
             }
         }
         assert!(
-            tiles_moved + budgets_moved > 0,
-            "{arm}: halving both pools moved neither a tile cache nor a fitted \
-             budget on any of the {} scenes, so this arm would pass against a \
-             `scaled_to` that returned `self`",
+            tiles_moved + budgets_moved + pool_moved > 0,
+            "{arm}: halving both pools moved neither a tile cache, a fitted \
+             budget nor the loop pool on any of the {} scenes, so this arm \
+             would pass against a `scaled_to` that returned `self`",
             scene_table().len(),
         );
     }
