@@ -72,16 +72,59 @@ enum MoveClock {
     No,
 }
 
+/// **The actions whose whole job is to leave this process.**
+///
+/// Read by `App::handle_gui_action` under the offline switch. The four are the
+/// ones a frame emits on its own with nobody touching anything:
+/// `Gui::check_auto_polls` pushes `FetchRadarScan` on the very first frame —
+/// deliberately not behind the auto-poll setting, because a session with no
+/// volume yet has nothing to show — then `CheckForNewScans` per live site on
+/// the archive cadence, and `FetchOverlay` for every enabled polling layer,
+/// whose `auto_fetch_delay` is zero until it has fetched once.
+///
+/// `SwitchRadarSite` is not here on purpose: it also downloads, but only
+/// because a person moved a pane, and its handler does the move as well as the
+/// fetch. Its download is declined at the executor door with everything else.
+pub(super) fn reaches_the_network(action: &GuiAction) -> bool {
+    matches!(
+        action,
+        GuiAction::FetchRadarScan(_)
+            | GuiAction::CheckForNewScans(_)
+            | GuiAction::FetchOverlay { .. }
+            | GuiAction::RefreshOverlay { .. }
+    )
+}
+
 impl super::App {
     /// Spawn a detached future on whatever executor this target provides.
+    ///
+    /// **The door every detached task shares, and the offline switch's
+    /// counter** — counted here, declined upstream.
+    ///
+    /// It is deliberately not a gate. Dropping the future would be the widest
+    /// possible switch and it over-fires: `gmgsi_loop_tests`,
+    /// `satellite_loop_draw_tests` and `mrms_loop_tests` drive the *real*
+    /// frame dispatch on purpose, against `tests::unreachable_http_client`, and
+    /// what they assert is that the failure comes back on the arrival path. A
+    /// task that never runs delivers nothing at all, which is a different
+    /// state and reddened all five of them. So the switch is read where the
+    /// step is *decided* — see [`crate::app::offline`] — and this counts what
+    /// got past those decisions.
+    ///
+    /// That makes the count an over-approximation: it is detached tasks, not
+    /// proven sockets. Over-approximating is the safe direction for a gate that
+    /// asserts zero, and it is what makes `offline_tests` a ratchet — a network
+    /// path added later that nobody thought to gate still lands here.
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+        crate::app::offline::record(crate::app::offline::Origin::DetachedTask);
         self.tokio_runtime.spawn(future);
     }
 
     /// See the native variant above.
     #[cfg(target_arch = "wasm32")]
     pub(super) fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+        crate::app::offline::record(crate::app::offline::Origin::DetachedTask);
         wasm_bindgen_futures::spawn_local(future);
     }
 
@@ -393,7 +436,14 @@ impl super::App {
     }
 
     /// Refresh the cached network site catalogue, once per launch, detached.
+    ///
+    /// **`App::new` calls this**, so it is the one request no test could have
+    /// prevented after the fact — an S3 bucket listing and a GET to
+    /// `api.weather.gov`, from the constructor, before a frame exists.
     pub(super) fn spawn_site_catalogue_refresh(&self) {
+        if self.offline_for_tests {
+            return;
+        }
         let sender = self.channels.site_catalogue_sender.clone();
         let window = self.window.clone();
         self.spawn_detached(async move {
@@ -416,6 +466,14 @@ impl super::App {
         requester: FetchRequester,
     ) {
         let generation = self.render.next_scan_generation(&site, requester);
+        if self.offline_for_tests {
+            // After every synchronous effect above and before the download:
+            // no sound test can depend on an S3 answer, because an S3 answer
+            // arrives when the network says so — the generation bump, the
+            // spinner and the in-flight marks are what tests read, and they
+            // have already happened.
+            return;
+        }
         let window = self.window.clone();
         let sender = self.channels.scan_sender.clone();
         self.spawn_detached(async move {
@@ -469,6 +527,14 @@ impl super::App {
 
     /// Spawn Level III product fetches for all supported Level III products.
     pub(super) fn spawn_level3_fetches(&self, site: &str) {
+        if self.offline_for_tests {
+            // Fired on every scan delivery, and this crate's suites deliver
+            // scans by the hundred. Neither half rides `App::http_client` —
+            // the sounding builds its own client and the objects take
+            // `archive::shared_client()` — so the unreachable client cannot
+            // reach them and the switch has to.
+            return;
+        }
         let generation = self
             .render
             .fetch_generations
@@ -678,6 +744,14 @@ impl super::App {
         action: GuiAction,
         event_loop: Option<&ActiveEventLoop>,
     ) {
+        if self.offline_for_tests && reaches_the_network(&action) {
+            // Ahead of the handler, not inside it: `fetch_overlay` marks the
+            // layer fetching before it spawns anything, and a mark set for an
+            // answer that can never arrive is a spinner that never stops. The
+            // frame re-emits the action next frame and it is declined again,
+            // which is the resting state a test wants.
+            return;
+        }
         match action {
             GuiAction::FetchRadarScan(_)
             | GuiAction::CheckForNewScans(_)
@@ -2132,6 +2206,14 @@ impl super::App {
 
         let requester = FetchRequester::Pane(pane_idx);
         let generation = self.render.next_scan_generation(&site, requester);
+        if self.offline_for_tests {
+            // After every synchronous effect above and before the download:
+            // no sound test can depend on an S3 answer, because an S3 answer
+            // arrives when the network says so — the generation bump, the
+            // spinner and the in-flight marks are what tests read, and they
+            // have already happened.
+            return;
+        }
 
         let window = self.window.clone();
         let sender = self.channels.scan_sender.clone();
@@ -2317,6 +2399,14 @@ impl super::App {
         code: String,
         days: Vec<chrono::NaiveDate>,
     ) {
+        if self.offline_for_tests {
+            // After every synchronous effect above and before the download:
+            // no sound test can depend on an S3 answer, because an S3 answer
+            // arrives when the network says so — the generation bump, the
+            // spinner and the in-flight marks are what tests read, and they
+            // have already happened.
+            return;
+        }
         self.spawn_async_task(self.channels.loop_l3_list_sender.clone(), async move {
             let sources = squallar_radar::sources::DataSources::production();
             let keys = squallar_radar::level3::list_days(&sources, &site, &code, &days).await;
@@ -2345,6 +2435,14 @@ impl super::App {
         keys: std::sync::Arc<Vec<String>>,
         pick: squallar_radar::level3::VolumePick,
     ) {
+        if self.offline_for_tests {
+            // After every synchronous effect above and before the download:
+            // no sound test can depend on an S3 answer, because an S3 answer
+            // arrives when the network says so — the generation bump, the
+            // spinner and the in-flight marks are what tests read, and they
+            // have already happened.
+            return;
+        }
         self.spawn_async_task(self.channels.loop_l3_fetch_sender.clone(), async move {
             let sources = squallar_radar::sources::DataSources::production();
             let candidates =

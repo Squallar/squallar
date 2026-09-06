@@ -43,6 +43,11 @@ mod chunks;
 #[path = "frame_pump.rs"]
 mod frame_pump;
 
+/// The one switch that keeps a test's `App` off the network, and the always-
+/// zero counter that gates it.
+#[path = "app_offline.rs"]
+pub(crate) mod offline;
+
 /// Whether this build is the browser build.
 const WEB: bool = cfg!(target_arch = "wasm32");
 
@@ -533,6 +538,15 @@ pub struct App {
     egui_repaint_at: Option<web_time::Instant>,
     /// When an auto-poll timer next needs a frame, or `None` while none of them do.
     auto_poll_at: Option<web_time::Instant>,
+    /// **Never originate a network request from this `App`.**
+    ///
+    /// `cfg!(test)` in [`Self::new`] and nothing else — there is no setter,
+    /// no feature and no environment read, so a shipped build carries the
+    /// field as a constant `false` and every site that reads it is the branch
+    /// it already was. What it removes, where it is read, and the 42
+    /// `connect()` calls one unit test made without it are in
+    /// [`crate::app::offline`].
+    offline_for_tests: bool,
     /// Whether the current site was guessed from the timezone rather than chosen.
     site_is_provisional: bool,
     /// Whether the live table has never had a network catalogue in it, and is still waiting
@@ -957,6 +971,7 @@ impl App {
             },
             egui_repaint_at: None,
             auto_poll_at: None,
+            offline_for_tests: cfg!(test),
             site_is_provisional,
             catalogue_pending,
             site_hint_pending,
@@ -999,6 +1014,21 @@ impl App {
             site_catalogue,
         };
 
+        if app.offline_for_tests {
+            // The tile half of the same posture, and the older half: a live
+            // basemap source is an IO thread whose arrivals change what a test
+            // frame paints. Here rather than in the test constructors so it is
+            // true of every `App` this build makes, including one a suite
+            // added later builds its own way.
+            app.gui.go_offline_for_tests();
+            // And the half no decline can cover: a suite that drives a real
+            // dispatch on purpose needs the task to *run* and fail, not to be
+            // dropped. This is where it fails.
+            app.http_client = offline::unreachable_http_client();
+        }
+        // Declined by `spawn_detached` under the switch, like every other
+        // detached task — but it is the one request `App::new` itself makes,
+        // so nothing a test does afterwards could have stopped it.
         app.spawn_site_catalogue_refresh();
 
         app.platform.set_redraw_waker(app.redraw_waker.clone());
@@ -1007,6 +1037,27 @@ impl App {
             .set_wake(std::sync::Arc::new(move || location_wake.wake()));
         app.push_frame_inputs();
         app
+    }
+
+    /// **Decline and count in one answer**, for a step that does not reach the
+    /// executor.
+    ///
+    /// One caller today: the chunk-notification sync, whose websockets are
+    /// opened on `ChunkNotifier`'s own thread. Every other declined site reads
+    /// [`Self::offline_for_tests`] directly, because its counting is already
+    /// done downstream by `App::spawn_detached` and asking here as well would
+    /// count one step twice.
+    ///
+    /// `false` only under the switch; a shipped build answers `true`
+    /// unconditionally and the count compiles away. Ask it *at* the step — a
+    /// site that asks early and acts later has a window where the switch is on
+    /// and the socket opens anyway.
+    pub(crate) fn may_reach_the_network(&self, origin: offline::Origin) -> bool {
+        if self.offline_for_tests {
+            return false;
+        }
+        offline::record(origin);
+        true
     }
 
     /// A handle an entry point can give its own sensor threads.
@@ -3390,6 +3441,10 @@ mod texture_ceiling_tests;
 /// arm that had no host figure at all, and is re-read on every tick.
 #[cfg(test)]
 mod host_pool_tests;
+
+/// Nothing a test builds reaches the network, and the count that says so.
+#[cfg(test)]
+mod offline_tests;
 
 #[cfg(test)]
 mod tests;

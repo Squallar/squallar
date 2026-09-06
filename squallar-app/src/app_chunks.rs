@@ -54,6 +54,15 @@ impl super::App {
             self.chunk_feeds.ensure(&site);
             let selection = self.cut_selection_for(&site);
             self.chunk_feeds.set_selection(&site, selection);
+            if self.offline_for_tests {
+                // **Ahead of `take_for_round`, not at the executor door.** The
+                // poller travels into the task and comes back on the channel,
+                // so a task dropped after the take is a feed that never gets
+                // its poller back and reads in-flight for the life of the
+                // process. Everything above this line is bookkeeping the
+                // status bar reads, so it still runs.
+                continue;
+            }
             let Some(mut poller) = self.chunk_feeds.take_for_round(&site) else {
                 continue;
             };
@@ -87,9 +96,17 @@ impl super::App {
     /// anything they said into an early round. A notification never carries data
     /// — it marks the site due and the ordinary poller does the rest.
     fn drive_chunk_notifications(&mut self, live: &[String]) {
-        if !squallar_egui::radar_layer::chunk_notifications_enabled(&self.gui) {
+        // The switch is asked second so that a build with notifications off
+        // counts nothing: it never reaches the endpoint either way, and a step
+        // that was not going to be taken is not one this instrument should
+        // report as taken.
+        if !squallar_egui::radar_layer::chunk_notifications_enabled(&self.gui)
+            || !self.may_reach_the_network(crate::app::offline::Origin::NotifierSocket)
+        {
             // Drop every socket rather than ignoring them, so the setting off
-            // actually stops the connections.
+            // actually stops the connections. `ChunkNotifier::sync_sites` opens
+            // its websockets on its own thread and never touches the executor,
+            // so this is the only gate that reaches them.
             self.chunk_notify.sync_sites(&[], &[], "", || {});
             return;
         }
@@ -142,6 +159,11 @@ impl super::App {
     /// Fetch one notified chunk, borrowing the site's poller for the round, so a
     /// burst of notifications for one volume cannot start concurrent fetches.
     fn fetch_notified_chunk(&mut self, id: squallar_radar::chunks::ChunkId) {
+        if self.offline_for_tests {
+            // Ahead of `take_now`, for the reason the round is: the poller
+            // goes into the task and comes back on the channel.
+            return;
+        }
         let site = id.site().to_string();
         self.chunk_feeds.ensure(&site);
         let Some(mut poller) = self.chunk_feeds.take_now(&site) else {

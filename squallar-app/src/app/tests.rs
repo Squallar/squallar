@@ -842,13 +842,11 @@ fn a_platform_that_asks_to_quit_on_back_still_does() {
 pub(super) fn headless(mut platform: TestBridge) -> App {
     crate::test_sites::install();
     let location = squallar_location::LocationFacade::new(Box::new(platform.location_provider()));
-    let mut app = App::new(Box::new(platform), location);
-    // No frame under a test builds a live tile source: a built source is an
-    // IO thread fetching the production archive, whose tiles change what a
-    // frame paints and uploads if enough wall-clock time passes while the
-    // test runs. See `MapTileState::go_offline_for_tests`.
-    app.gui.go_offline_for_tests();
-    app
+    // Nothing here has to ask for the offline posture: `App::new` sets it from
+    // `cfg!(test)`, which covers the tile sources this used to switch off by
+    // hand and the fifteen network paths it never reached. See
+    // `crate::app::offline`.
+    App::new(Box::new(platform), location)
 }
 
 /// Android learns where config lives only *after* `App::new` — `android_main`
@@ -903,20 +901,15 @@ fn the_instrument_keys_are_honoured_when_the_store_arrives_after_construction() 
 /// An HTTP client no dispatch below can complete through, for the fixtures that
 /// drive a render path whose *failure* branch is the one under test.
 ///
-/// What makes it unreachable is the address the caller points it at — `127.0.0.1:1`
-/// refuses — and the millisecond timeouts are the backstop for a machine that answers
-/// on it. The browser's `ClientBuilder` carries neither knob, because a `fetch` is
-/// governed by the page and not by the client, so the `cfg` selects the builder value
-/// and the single body below builds whichever one it was handed.
+/// **Redundant since the offline switch**, which installs the same client on
+/// every `App` this build makes — kept because the four suites that call it say
+/// something true about themselves by calling it. The claim that used to sit
+/// here, that the callers point it at `127.0.0.1:1`, was false: they leave
+/// `DataSources::production()` alone and the requests went to S3. See
+/// [`crate::app::offline::unreachable_http_client`] for what makes it a
+/// refusal now, and for the 1,988 connections the old spelling made.
 pub(super) fn unreachable_http_client() -> reqwest::Client {
-    let builder = reqwest::Client::builder();
-    #[cfg(not(target_arch = "wasm32"))]
-    let builder = builder
-        .timeout(std::time::Duration::from_millis(1))
-        .connect_timeout(std::time::Duration::from_millis(1));
-    builder
-        .build()
-        .expect("a client with no connection to make")
+    crate::app::offline::unreachable_http_client()
 }
 
 /// A loop speed no default produces, so finding it can only mean the stored config was

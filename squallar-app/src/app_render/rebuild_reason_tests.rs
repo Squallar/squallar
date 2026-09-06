@@ -278,42 +278,13 @@ fn one_frame(app: &mut crate::app::App, ctx: &egui::Context, time: f64, events: 
     });
     let actions = app.gui.ui(ctx);
     let _ = ctx.end_pass();
-    let actions = actions
-        .into_iter()
-        .filter(|action| !reaches_the_network(action))
-        .collect();
+    // The network-reaching actions this frame emits are declined by the app
+    // itself now — see `crate::app::offline`, which is where this scene's
+    // local filter went and what the measurement below belongs to.
     app.process_gui_actions(actions);
     // The refused job runs on a thread of its own; give it the wall clock it
     // needs to land on the channel the next frame drains.
     std::thread::sleep(std::time::Duration::from_millis(2));
-}
-
-/// The actions a frame emits that would leave this process: the radar round
-/// and the overlay auto-fetch.
-///
-/// **The scene declines them, because their answers arrive on the network's
-/// clock.** `Gui::go_offline_for_tests` keeps the tiles from opening a socket
-/// and nothing keeps the radar round from opening one: the first frame asks
-/// for the pane's site and `App::spawn_fetch` downloads the latest KTLX volume
-/// from the NEXRAD archive — measured under `strace -e connect` on
-/// 2026-09-06: five S3 addresses, in a unit test. When that download lands,
-/// `Gui::apply(ScanInfoForSite)` claims the session's initial zoom and the
-/// pane goes from 4 to 7 — and it lands wherever the network puts it. Traced
-/// over ten isolated runs the claim fell **inside the data phase six times**
-/// (reading `2 zoom-settled` there each time, 0 otherwise) and after the test
-/// ended four times; under load the same download can fall in the pan phase,
-/// or land on the frame where it costs `pan` instead. The direction-2 note
-/// used to read that zoom move as "the data phase's own arrivals moving the
-/// zoom, which is the instrument working" — it was a NEXRAD download.
-fn reaches_the_network(action: &squallar_egui::actions::GuiAction) -> bool {
-    use squallar_egui::actions::GuiAction;
-    matches!(
-        action,
-        GuiAction::FetchRadarScan(_)
-            | GuiAction::CheckForNewScans(_)
-            | GuiAction::FetchOverlay { .. }
-            | GuiAction::RefreshOverlay { .. }
-    )
 }
 
 /// `n` quiet frames — no input at all, which is what makes the settle
