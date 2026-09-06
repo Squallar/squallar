@@ -1227,29 +1227,29 @@ jobs:
   # annotation and a run-summary section -- loud enough that the degraded path
   # cannot quietly become the normal one, which is the actual risk of not
   # failing.
+  # `needs: [build]` and nothing else -- NOT `macos-universal`, NOT
+  # `ios-testflight`. Both of those talk to Apple on Apple's clock: the notary
+  # poll waits up to NOTARY_TIMEOUT (900 s) and the App Store upload polls
+  # App Store Connect. A job in this list gates `deploy-cloudfront` by
+  # *duration* as well as by result, so an earlier design that made the Apple
+  # submissions non-fatal still held the website behind a 15-minute wait -- it
+  # fixed failure coupling and left latency coupling untouched. The user's
+  # ruling (2026-09-06): the web deploy never depends on those jobs. They still
+  # run, still go red on their own when the packaging or signing is broken,
+  # and still name their artifacts honestly; they just gate nothing here.
   build-success:
     name: Build success check
     if: always()
     runs-on: ubuntu-24.04
-    needs: [build, macos-universal, ios-testflight]
+    needs: [build]
     steps:
       - name: Fail unless every build row succeeded
         shell: bash
         env:
           RESULT: ${{ needs.build.result }}
-          UNIVERSAL: ${{ needs['macos-universal'].result }}
-          TESTFLIGHT: ${{ needs['ios-testflight'].result }}
         run: |
-          echo "build matrix:    $RESULT"
-          echo "macos-universal: $UNIVERSAL"
-          echo "ios-testflight:  $TESTFLIGHT"
+          echo "build matrix: $RESULT"
           test "$RESULT" = success || { echo "::error::the build matrix concluded '$RESULT'."; exit 1; }
-          test "$UNIVERSAL" = success || { echo "::error::the macos-universal job concluded '$UNIVERSAL'."; exit 1; }
-          # Green here means the credential rehearsal passed and the artifact
-          # was named honestly -- both statements about this repository. A
-          # refusal by Apple leaves this job green and says so loudly instead;
-          # the reasoning is the same one spelled out for macos-universal above.
-          test "$TESTFLIGHT" = success || { echo "::error::the ios-testflight job concluded '$TESTFLIGHT'."; exit 1; }
 
   # The production web deploy: S3 behind CloudFront at https://squallar.app/.
   #
