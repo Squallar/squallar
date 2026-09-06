@@ -9,9 +9,11 @@
 //! over-firing is the worse direction: a door that turns away scenes the
 //! machine can hold is a door a user switches off, and then nothing is gated.
 //!
-//! **WO-G is advisory**, so what moves is the verdict and the ledger's own
-//! counts, never the scene. `refused` is asserted at zero throughout: that is
-//! the whole claim of this land.
+//! Every refusal is asserted on **three** things, because any two of them can
+//! be true while the door is still broken: the ledger counted it, the scene
+//! did **not** move, and a notice went up. The third is the one a user feels -
+//! a refusal nobody can see is a worse defect than the allocation it
+//! prevents.
 
 use crate::admission::{AdmissionCosts, LayerGrid, PaneAdmission};
 use crate::input_harness::InputHarness;
@@ -44,6 +46,7 @@ fn costs(spare_bytes: u64, per_layer: u64, panes: usize) -> AdmissionCosts {
             budget_span_secs: 60 * 60,
             render_budget: 30,
         },
+        requested_percent: (100, 100),
     }
 }
 
@@ -56,10 +59,11 @@ fn a_layer() -> LayerId {
 // ── The layer door ────────────────────────────────────────────────────────
 
 /// **`write_pane_overlay`, both arms.** The same eye-click against a pool
-/// with room and against one without. The layer goes on either way — WO-G
-/// refuses nothing — and the verdict is what differs.
+/// with room and against one without: admitted, the layer goes on; refused,
+/// the pane keeps the enabled set it had and a notice says what would have to
+/// move.
 #[test]
-fn the_layer_door_reads_both_arms_and_turns_nothing_away() {
+fn the_layer_door_refuses_on_a_full_pool_and_admits_on_a_roomy_one() {
     for (spare, want_refusal) in [(1024 * MIB, false), (0, true)] {
         let mut h = InputHarness::new();
         let id = a_layer();
@@ -83,22 +87,26 @@ fn the_layer_door_reads_both_arms_and_turns_nothing_away() {
         gui.panes[0] = pane;
         let moved = h.gui().admission().counts().since(before);
 
-        assert!(
+        assert_eq!(
             h.gui().pane(0).is_some_and(|p| p.is_overlay_enabled(&id)),
-            "WO-G refuses nothing: the layer is on whatever the verdict",
+            !want_refusal,
+            "the layer must be on where it was admitted and off where it was \
+             refused; the door moved {moved:?}",
         );
-        assert_eq!(moved.refused, 0, "WO-G turns nothing away");
+        assert_eq!(
+            moved.refused > 0,
+            want_refusal,
+            "64 MiB of picture against {spare} of spare: the door moved \
+             {moved:?}",
+        );
         if want_refusal {
             assert!(
-                moved.would_refuse > 0,
-                "64 MiB of picture against no spare must register a \
-                 would-refuse; the door moved {moved:?}",
-            );
-        } else {
-            assert_eq!(
-                moved.would_refuse, 0,
-                "64 MiB of picture against 1 GiB of spare must not register a \
-                 would-refuse; the door moved {moved:?}",
+                h.gui()
+                    .admission()
+                    .notice(web_time::Instant::now())
+                    .is_some(),
+                "a refusal the user cannot see is worse than the allocation \
+                 it prevents",
             );
         }
     }
@@ -173,7 +181,7 @@ fn a_resident_grid_is_not_charged_at_the_door() {
         let moved = h.gui().admission().counts().since(before);
 
         assert_eq!(
-            moved.would_refuse > 0,
+            moved.refused > 0,
             want_refusal,
             "grid resident = {resident}: the door moved {moved:?}",
         );
@@ -190,17 +198,21 @@ fn the_pane_door_reads_both_arms() {
         let mut h = InputHarness::new();
         h.set_admission(costs(spare, 128 * MIB, 4));
         let before = h.gui().admission().counts();
-        assert!(h.gui_mut().set_pane_count(2));
+        let grew = h.gui_mut().set_pane_count(2);
         let moved = h.gui().admission().counts().since(before);
 
         assert_eq!(
-            h.gui().pane_count(),
-            2,
-            "WO-G refuses nothing: the pane opened whatever the verdict",
+            grew, !want_refusal,
+            "the door's answer is what `grown_pane` and the topbar read; \
+             spare {spare}, the door moved {moved:?}",
         );
-        assert_eq!(moved.refused, 0);
         assert_eq!(
-            moved.would_refuse > 0,
+            h.gui().pane_count(),
+            if want_refusal { 1 } else { 2 },
+            "a refused split must leave the layout exactly where it was",
+        );
+        assert_eq!(
+            moved.refused > 0,
             want_refusal,
             "spare {spare}: the door moved {moved:?}",
         );
@@ -213,9 +225,18 @@ fn the_pane_door_reads_both_arms() {
 #[test]
 fn the_pane_door_charges_only_for_growth() {
     let mut h = InputHarness::new();
-    h.set_admission(costs(0, 128 * MIB, 4));
+    // Room for the first growth, so what the rows below measure is the
+    // charge and not the refusal.
+    h.set_admission(costs(u64::MAX, 128 * MIB, 4));
     assert!(h.gui_mut().set_pane_count(3));
 
+    // And now nothing spare at all: a count that does not grow must still be
+    // free, or every frame that re-states the layout would be refused.
+    h.set_admission({
+        let mut tight = costs(0, 128 * MIB, 4);
+        tight.generation = 2;
+        tight
+    });
     let before = h.gui().admission().counts();
     assert!(h.gui_mut().set_pane_count(3));
     assert!(h.gui_mut().set_pane_count(2));
@@ -293,12 +314,12 @@ fn a_preset_reads_both_arms_as_one_verdict() {
 
         assert_eq!(
             h.gui().pane_count(),
-            4,
-            "WO-G applies the preset either way"
+            if want_refusal { 1 } else { 4 },
+            "a preset is whole or not at all: a refused one must leave the \
+             layout untouched, not grown and unpopulated",
         );
-        assert_eq!(moved.refused, 0);
         assert_eq!(
-            moved.would_refuse > 0,
+            moved.refused > 0,
             want_refusal,
             "spare {spare}: the preset door moved {moved:?}",
         );
@@ -344,19 +365,27 @@ fn the_span_door_charges_the_frames_a_wider_window_adds() {
         }];
         h.set_admission(table);
 
+        // Not the default 3600 s, or a refusal that changed nothing would be
+        // indistinguishable from one that held.
+        const WANTED: u64 = 45 * 60;
         let before = h.gui().admission().counts();
-        h.gui_mut().set_loop_span_secs(60 * 60);
+        h.gui_mut().set_loop_span_secs(WANTED);
         let moved = h.gui().admission().counts().since(before);
         assert!(
             moved.asked > 0,
             "a wider window over a looping pane must ask; the door moved \
              {moved:?}",
         );
-        assert_eq!(moved.refused, 0);
         assert_eq!(
-            moved.would_refuse > 0,
+            moved.refused > 0,
             want_refusal,
             "spare {spare}: the span door moved {moved:?}",
+        );
+        assert_eq!(
+            h.gui().loop_lookback_secs == WANTED,
+            !want_refusal,
+            "a refused slider must leave the window where it was, so the \
+             number on screen is the one in force",
         );
     }
 }
@@ -455,5 +484,49 @@ fn a_six_pane_config_survives_a_restore_under_a_capacity_with_nothing_left() {
         round_two.pane_count(),
         6,
         "the autosave after a constrained restore narrowed the config",
+    );
+}
+
+// ── The notice reaches the glass ──────────────────────────────────────────
+
+/// **A refusal is painted, and it names the setting.** The ledger holding a
+/// sentence is not the same as a user seeing it: this drives a real frame and
+/// reads the text back off the paint list.
+#[test]
+fn a_refusal_is_painted_on_the_pane_and_names_the_setting() {
+    let mut h = InputHarness::new();
+    let id = a_layer();
+    h.gui_mut().set_overlay_on_pane_for_test(0, &id, false);
+    let mut table = costs(0, 64 * MIB, 1);
+    table.requested_percent = (55, 65);
+    h.set_admission(table);
+
+    let mut pane = std::mem::take(&mut h.gui_mut().panes[0]);
+    pane.set_overlay_enabled(id.clone(), false);
+    let gui = h.gui_mut();
+    super::Gui::write_pane_overlay(
+        &mut gui.overlays,
+        &mut gui.admission,
+        0,
+        &mut pane,
+        &id,
+        true,
+    );
+    gui.panes[0] = pane;
+    assert!(
+        h.gui()
+            .admission()
+            .notice(web_time::Instant::now())
+            .is_some(),
+        "precondition: the door refused and left a notice",
+    );
+
+    h.frame();
+    let painted = h.painted_text_strings();
+    assert!(
+        painted.iter().any(|line| line.contains("System memory")),
+        "the refusal must reach the GLASS, naming the setting that produced \
+         it - a notice only the ledger holds is a silent refusal. Painted \
+         text was: {painted:?}",
     );
 }

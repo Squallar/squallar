@@ -318,6 +318,16 @@ pub struct App {
     /// twice. Named rather than discovered: the bound is one tick, and
     /// closing it means one owner for the table, which is a seam change.
     admission: squallar_egui::admission::AdmissionLedger,
+    /// **Bytes the volume store is over its budget by with every grid left
+    /// held by a visible pane** - `VolumeStore::enforce_budget_sparing`'s
+    /// shortfall, taken on the frame that could not shed them.
+    ///
+    /// Subtracted from the GPU spare the admission doors are compared
+    /// against. It is the one term in the table that is a **measurement**
+    /// rather than a price: the model says what the scene should cost, and
+    /// this says what the store is holding anyway because everything left is
+    /// on the glass.
+    volume_shortfall_bytes: u64,
     /// The page heap as the frame last sampled it ([`Self::sample_page_heap`]
     /// and the telemetry tick), kept so the readout's host spare is held to
     /// the heap's own room without a second `byteLength` read. `None` on a
@@ -877,6 +887,7 @@ impl App {
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
             admission_costs: squallar_egui::admission::AdmissionCosts::default(),
             admission: squallar_egui::admission::AdmissionLedger::default(),
+            volume_shortfall_bytes: 0,
             page_heap_reading: None,
             worker_memory_watch: crate::pressure::LinearMemoryWatch::default(),
             gpu_probe: GpuProbeReport::Absent,

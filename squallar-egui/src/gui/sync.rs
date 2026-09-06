@@ -148,7 +148,16 @@ impl Gui {
     /// charging here as well would price one gesture twice.
     pub(crate) fn set_loop_span_secs(&mut self, secs: u64) {
         let want = self.loop_span_increment(secs);
-        let _ = self.admission.ask(crate::admission::Act::LoopSpan, want);
+        if !self
+            .admission
+            .enforce(crate::admission::Act::LoopSpan, want)
+        {
+            // The window stays where it was on every pane and on the setting,
+            // so the slider reads the number that is actually in force. A
+            // narrower window is never refused - it frees frames - so this can
+            // only hold the user where they already were.
+            return;
+        }
         self.loop_lookback_secs = secs;
         for pane in &mut self.panes {
             pane.time.span_secs = secs;
@@ -260,7 +269,16 @@ impl Gui {
             return;
         }
         let want = self.adopt_layers_increment();
-        let _ = self.admission.ask(crate::admission::Act::AdoptLayers, want);
+        if !self
+            .admission
+            .enforce(crate::admission::Act::AdoptLayers, want)
+        {
+            // The group keeps the arrangement it had. Whole or not at all: a
+            // fan-out stopped halfway would leave a linked group holding two
+            // different layer stacks, which is the one thing linking promises
+            // cannot happen.
+            return;
+        }
         let src = &self.panes[self.active_pane];
         let group = src.group;
         let active_site = src.site().to_string();

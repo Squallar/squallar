@@ -848,6 +848,10 @@ impl Gui {
         if let Some(costs) = inputs.admission {
             self.admission.adopt(costs);
         }
+        // A refusal the App's own door raised, so the pane paints one notice
+        // whichever side of the seam turned the act away.
+        self.admission
+            .adopt_remote_notice(inputs.admission_notice, web_time::Instant::now());
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
         // Before the pane loop, when every slot is full: the live sources
         // and the parked ones are held to the device's allowance from here.
@@ -1191,7 +1195,12 @@ impl Gui {
                 .pane(pane_idx)
                 .show_layer
                 .plus(admission.layer_grid(kind));
-            let _ = admission.ask(crate::admission::Act::ShowLayer, want);
+            if !admission.enforce(crate::admission::Act::ShowLayer, want) {
+                // Nothing is written: the pane keeps the enabled set it had,
+                // so the eye stays where the user found it and the notice
+                // says what would have to move.
+                return;
+            }
         }
         pane.hydrate_layer_states(overlays, pane_idx);
         // The pane's own state is where "on" lives — for every handler, since
@@ -1465,9 +1474,16 @@ impl Gui {
         let added = count.saturating_sub(self.pane_layout.pane_count);
         if added > 0 {
             let want = self.admission.costs().new_pane.times(added as u64);
-            let _ = self
+            if !self
                 .admission
-                .ask(crate::admission::Act::Panes { added }, want);
+                .enforce(crate::admission::Act::Panes { added }, want)
+            {
+                // The layout is left exactly where it was, and the caller
+                // reads `false` the way it already reads a width class that
+                // cannot hold the count - `grown_pane` gives up, the topbar
+                // button does nothing, and the notice says why.
+                return false;
+            }
         }
         let active_site = self.panes[self.active_pane].site().to_string();
         let active_scan_info = self.panes[self.active_pane].scan_info.clone();

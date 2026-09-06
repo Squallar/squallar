@@ -1866,13 +1866,38 @@ impl super::Gui {
         let Some(content) = store.load(UI_CONFIG_KEY) else {
             return false;
         };
-        let mut value = match serde_json::from_str::<serde_json::Value>(&content) {
+        let value = match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("Failed to parse config: {}", e);
                 return false;
             }
         };
+        // **RESTORE IS NEVER A REFUSAL.** Every door this function passes
+        // through - `set_loop_span_secs`, `initialize_pane_enabled`, and the
+        // layer writes under them - is exempt for the whole load, and the
+        // reason is that a refused restore does not stay refused: autosave
+        // writes the narrowed scene back within seconds, and the user loses
+        // panes and layers they never touched, with no way back to the
+        // arrangement they saved.
+        //
+        // The scene a restore brings back is made survivable by what happens
+        // *after* it, not by refusing to bring it back: the governor sheds
+        // rungs around it on the next loop walk, and `App::handle_enable_loop`
+        // - which the restore reaches through `looping_panes` and
+        // `hydrate_parked_panes`, and which is where the killer scene's loops
+        // actually arm - IS a door. A loop a restore asks for is refusable
+        // there even though the pane carrying it is not, and the pane keeps
+        // its wish, so the config still round-trips and the loop arms on a
+        // session with room for it.
+        self.admission.begin_exempt();
+        let restored = self.load_ui_config_within_exemption(value);
+        self.admission.end_exempt();
+        restored
+    }
+
+    /// [`Self::load_ui_config`]'s body, run with every door exempt. See there.
+    fn load_ui_config_within_exemption(&mut self, mut value: serde_json::Value) -> bool {
         migrate::migrate_to_current(&mut value);
         sanitize_config_tree(&mut value);
         let config = match UiConfig::deserialize(&value) {

@@ -315,6 +315,19 @@ pub struct FrameInputs<'a> {
     /// priced a scene has nothing to refuse against, and refusing on an
     /// absent figure is how an admission system turns into a wall.
     pub admission: Option<&'a crate::admission::AdmissionCosts>,
+    /// **A refusal raised on the App's side of the seam**, for the pane to
+    /// paint.
+    ///
+    /// The loop door lives in `squallar-app` and keeps its own ledger, so its
+    /// refusals cannot reach the glass the way the UI doors' do. They cross
+    /// here instead, as the sentence itself - the Gui raises it locally when
+    /// the text **changes**, so a notice already up is not re-stamped every
+    /// frame and does age out.
+    ///
+    /// **A refusal nobody can see is a worse defect than the allocation it
+    /// prevents**, which is why this is a field on the frame's inputs rather
+    /// than a log line.
+    pub admission_notice: Option<&'a str>,
 }
 
 /// Event-shaped pushes applied at the call site's existing control-flow

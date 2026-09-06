@@ -129,6 +129,7 @@ fn walk_at(run: Walk<'_>) -> Walked {
     ui.set_opacity(run.base);
 
     let mut ctx = PaneRenderCtx {
+        admission_notice: None,
         pane_idx: 0,
         pane: &mut pane,
         overlays: &mut overlays,

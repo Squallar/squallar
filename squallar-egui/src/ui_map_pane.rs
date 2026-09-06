@@ -364,6 +364,16 @@ pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMe
 
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
+    /// **A refusal to paint over the imagery**, as the admission ledger last
+    /// raised one - see [`crate::admission`]. `None` on every frame no door
+    /// turned an act away, which is nearly all of them.
+    ///
+    /// It takes the top-of-pane plate ahead of the other three notices, and
+    /// that precedence is the point: the other three describe what the
+    /// application is *doing* and will resolve on their own, while this one
+    /// answers a thing the user just did and got nothing for. **A silent
+    /// refusal is a worse defect than the allocation it prevents.**
+    pub admission_notice: Option<&'a str>,
     pub pane_idx: usize,
     pub pane: &'a mut PaneState,
     pub overlays: &'a mut OverlayRegistry,
@@ -807,10 +817,27 @@ pub(super) fn render_pane_map_content(
             ctx.paint_order.push((id.clone(), painted_layer));
         }
 
+        // **A refusal, first of the four plates.** The three below say what
+        // the application is doing and resolve on their own; this one answers
+        // an act the user just made and got nothing for, and it names the
+        // setting that would let them have it. It yields the slot to nothing.
+        if let Some(text) = ctx.admission_notice
+            && ctx.surfaces.paints(Surface::Glass)
+        {
+            let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
+            draw_top_notice(
+                &notice_painter,
+                ctx.pane_rect,
+                crate::ui::pills::pill_row_clearance(ui.ctx(), ctx.pane_idx),
+                text.to_string(),
+            );
+        }
+
         // The deferred stale-image notice, submitted after every kind so
         // nothing in `draw_order` can paint over it. Glass: a floor strip does
         // not draw it — `Gui::draw_volume_glass` does instead.
         if let Some((on_screen, elevation)) = &pending_notice
+            && ctx.admission_notice.is_none()
             && ctx.surfaces.paints(Surface::Glass)
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
@@ -828,6 +855,7 @@ pub(super) fn render_pane_map_content(
         // The other half of the same plate — mutually exclusive with the
         // notice above, so they cannot stack.
         if let Some(source) = melting_layer_caveat
+            && ctx.admission_notice.is_none()
             && ctx.surfaces.paints(Surface::Glass)
         {
             let notice_painter = ui.painter().with_clip_rect(ctx.pane_rect);
@@ -847,6 +875,7 @@ pub(super) fn render_pane_map_content(
         // cannot stack.
         if pending_notice.is_none()
             && melting_layer_caveat.is_none()
+            && ctx.admission_notice.is_none()
             && ctx.surfaces.paints(Surface::Glass)
             && let Some(loading) = ctx.pane.loop_loading(web_time::Instant::now())
         {
@@ -1488,6 +1517,7 @@ fn handle_radar_site_interactions(
     // Destructuring borrows the fields disjointly, so `pane` and `actions` stay
     // mutable while `excluded_rects` is read.
     let PaneRenderCtx {
+        admission_notice: _,
         pane,
         actions,
         pane_idx,

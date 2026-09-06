@@ -72,6 +72,15 @@ impl super::Gui {
 
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
+        // **The refusal plate's text, taken once for the frame.** Cloned
+        // rather than borrowed because the pane loop below holds `&mut self`
+        // throughout; it is `None` on every frame no door refused, which is
+        // nearly all of them, and lives at most `NOTICE_LIFETIME`.
+        let admission_notice = self
+            .admission
+            .notice(web_time::Instant::now())
+            .map(|notice| notice.text.clone());
+
         let pane_count = self.visible_pane_count();
         // The base slot follows the BasemapTiles layer exactly as the terrain
         // slot follows Terrain: built only while a visible pane draws it,
@@ -314,6 +323,7 @@ impl super::Gui {
                                         }
 
                                         let mut render_ctx = pane_render::PaneRenderCtx {
+                                            admission_notice: admission_notice.as_deref(),
                                             pane_idx,
                                             pane: &mut pane,
                                             overlays: &mut self.overlays,
@@ -1815,6 +1825,12 @@ impl super::Gui {
                     .insert(pane_idx, map_pane_geo_from(projector, strip));
 
                 let mut render_ctx = pane_render::PaneRenderCtx {
+                    // A floor strip is ground only and never paints the
+                    // glass, so the refusal plate cannot draw here whatever is
+                    // passed. `None` rather than a second read of the ledger:
+                    // this is the strip's own draw and the glass above it
+                    // carries the notice.
+                    admission_notice: None,
                     pane_idx,
                     pane,
                     overlays: &mut self.overlays,

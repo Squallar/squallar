@@ -42,6 +42,7 @@ fn costs(spare_bytes: u64, per_layer: u64, panes: usize) -> AdmissionCosts {
             budget_span_secs: 60 * 60,
             render_budget: 30,
         },
+        requested_percent: (100, 100),
     }
 }
 
@@ -257,4 +258,138 @@ fn a_notice_ages_out() {
         ledger.notice(now + NOTICE_LIFETIME * 2).is_none(),
         "and gone after it",
     );
+}
+
+// ── Refusing, and being seen to ───────────────────────────────────────────
+
+/// **A refusal names the setting that produced it**, by the label the
+/// Settings screen actually shows. A notice the reader cannot act on is a
+/// defect in the code, not a caption to word better - and the two memory
+/// shares are exactly what the reader can move.
+#[test]
+fn a_refusal_names_the_memory_share_it_hit() {
+    let mut ledger = AdmissionLedger::default();
+    let mut table = costs(0, 10 * MIB, 1);
+    table.requested_percent = (45, 60);
+    ledger.adopt(&table);
+
+    assert!(!ledger.enforce(Act::ShowLayer, Increment::host(10 * MIB)));
+    let notice = ledger
+        .notice(web_time::Instant::now())
+        .expect("a refusal must leave a notice");
+    assert!(
+        notice.text.contains("System memory"),
+        "a host refusal must name the host share: {}",
+        notice.text,
+    );
+    assert!(
+        notice.text.contains("60 %"),
+        "and the value it is set to now: {}",
+        notice.text,
+    );
+    assert!(
+        notice.text.contains("Settings > Memory"),
+        "and where to find it: {}",
+        notice.text,
+    );
+    assert!(
+        notice.text.contains("this layer"),
+        "and what was refused: {}",
+        notice.text,
+    );
+}
+
+/// The GPU arm names the other share, and a unified pool names both - on one
+/// memory either control moves the same wall.
+#[test]
+fn each_pool_names_the_share_that_binds_it() {
+    let mut gpu = AdmissionLedger::default();
+    let mut table = costs(0, 0, 1);
+    table.requested_percent = (30, 70);
+    gpu.adopt(&table);
+    assert!(!gpu.enforce(
+        Act::Panes { added: 1 },
+        Increment {
+            gpu_bytes: 8 * MIB,
+            host_bytes: 0
+        }
+    ));
+    let text = gpu
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        text.contains("GPU memory") && text.contains("30 %"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("System memory"),
+        "a GPU refusal on a split pool must not send the user to the host \
+         slider: {text}",
+    );
+
+    let mut joint = AdmissionLedger::default();
+    let mut unified = costs(0, 0, 1);
+    unified.requested_percent = (30, 70);
+    unified.spare.joint_bytes = Some(0);
+    joint.adopt(&unified);
+    assert!(!joint.enforce(
+        Act::Panes { added: 1 },
+        Increment {
+            gpu_bytes: 8 * MIB,
+            host_bytes: 0
+        }
+    ));
+    let text = joint
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        text.contains("GPU memory") && text.contains("System memory"),
+        "one memory: either share moves the wall, so the notice names both: \
+         {text}",
+    );
+}
+
+/// **An exemption refuses nothing and leaves no notice.** Restore is never a
+/// refusal, and a plate saying otherwise would be a lie on the glass.
+#[test]
+fn an_exemption_refuses_nothing_and_raises_no_notice() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+    ledger.begin_exempt();
+    assert!(ledger.enforce(Act::ShowLayer, Increment::host(u64::MAX)));
+    ledger.end_exempt();
+    assert!(ledger.notice(web_time::Instant::now()).is_none());
+    assert_eq!(ledger.counts().refused, 0);
+
+    // Control: the same act outside the exemption refuses and does raise one.
+    assert!(!ledger.enforce(Act::ShowLayer, Increment::host(u64::MAX)));
+    assert!(ledger.notice(web_time::Instant::now()).is_some());
+}
+
+/// A refusal raised on the App's side crosses as its sentence, and is not
+/// re-stamped by a frame that restates it - a notice re-raised every frame
+/// would never age out.
+#[test]
+fn a_remote_notice_is_raised_once_and_ages_out() {
+    let mut ledger = AdmissionLedger::default();
+    let now = web_time::Instant::now();
+    ledger.adopt_remote_notice(Some("no room for this loop"), now);
+    let raised = ledger
+        .notice(now)
+        .expect("the remote notice is up")
+        .raised_at;
+    ledger.adopt_remote_notice(Some("no room for this loop"), now + NOTICE_LIFETIME / 2);
+    assert_eq!(
+        ledger
+            .notice(now + NOTICE_LIFETIME / 2)
+            .expect("still up")
+            .raised_at,
+        raised,
+        "restating one sentence must not restamp it",
+    );
+    assert!(ledger.notice(now + NOTICE_LIFETIME * 2).is_none());
 }

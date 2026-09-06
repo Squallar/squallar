@@ -500,6 +500,7 @@ impl InputHarness {
             frame_diagnostics: None,
             budget_readout: None,
             admission: self.facts.admission.as_ref(),
+            admission_notice: None,
         });
     }
 

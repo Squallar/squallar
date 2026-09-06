@@ -1437,12 +1437,42 @@ impl super::App {
             .loop_allocation()
             .volume_reserve_bytes()
             .max(self.budgets.volume_loop_bytes());
-        let evicted = self.volume_store.enforce_budget(volume_budget);
-        if evicted > 0 {
+        // **The sparing door, and WO-H is the consumer its shortfall never
+        // had.** `enforce_budget` is `enforce_budget_sparing` at
+        // `visible_panes = 0`, which evicts a grid a pane on screen is
+        // drawing from - and then answers `evicted`, throwing away the one
+        // figure that says the store could NOT get under its budget. Spared,
+        // it stops short and reports the bytes it is still over by, and those
+        // bytes are subtracted from the GPU spare the admission doors are
+        // compared against: a store holding more than the budget allows,
+        // because every grid left is on the glass, is exactly a machine with
+        // less room for one more pane than the model thinks.
+        //
+        // The visible count comes off `pane_render`, which
+        // `Self::ensure_pane_count` holds in step with the layout at the top
+        // of this frame - not through a second reach into the Gui, whose
+        // ceiling is permanent.
+        let visible_panes = self.render.pane_render.len();
+        let outcome = self
+            .volume_store
+            .enforce_budget_sparing(volume_budget, visible_panes);
+        if outcome.evicted > 0 {
             log::info!(
-                "3D volume view: evicted {evicted} resident grid(s) to fit the {} MiB budget",
+                "3D volume view: evicted {} resident grid(s) to fit the {} MiB budget",
+                outcome.evicted,
                 volume_budget / (1024 * 1024),
             );
+        }
+        if outcome.shortfall_bytes as u64 != self.volume_shortfall_bytes {
+            if outcome.shortfall_bytes > 0 {
+                log::warn!(
+                    "3D volume view: {} MiB over the {} MiB budget with every grid held by \
+                     a visible pane; admission is held to the smaller pool",
+                    outcome.shortfall_bytes / (1024 * 1024),
+                    volume_budget / (1024 * 1024),
+                );
+            }
+            self.volume_shortfall_bytes = outcome.shortfall_bytes as u64;
         }
         self.update_loop_readiness();
 
@@ -1561,6 +1591,12 @@ impl super::App {
                 // re-stated every frame; the ledger copies it only when its
                 // generation moved - see `Self::compose_admission_costs`.
                 admission: Some(&self.admission_costs),
+                // The loop door's refusals, which are raised on this side of
+                // the seam and have no other way to the glass.
+                admission_notice: self
+                    .admission
+                    .notice(web_time::Instant::now())
+                    .map(|notice| notice.text.as_str()),
             });
     }
 
@@ -5338,7 +5374,14 @@ impl super::App {
             headroom_bytes: self.host_headroom_bytes,
         };
         let spare = Spare {
-            gpu_bytes: Some(cap.allowance().saturating_sub(need.gpu_bytes)),
+            // Less what the volume store could not shed: those bytes are held
+            // by grids visible panes are drawing from, so they are resident
+            // and outside the model's own accounting of them.
+            gpu_bytes: Some(
+                cap.allowance()
+                    .saturating_sub(need.gpu_bytes)
+                    .saturating_sub(self.volume_shortfall_bytes),
+            ),
             host_bytes: cap.host_allowance().map(|allowance| {
                 host_spare_bytes(allowance.saturating_sub(need.host_bytes), allowance, heap)
             }),
@@ -5363,6 +5406,9 @@ impl super::App {
                 budget_span_secs: budgets.loop_span_secs,
                 render_budget: budgets.loop_render_budget,
             },
+            // The user's own two settings, so a refusal can name the control
+            // that produced the wall rather than the wall alone.
+            requested_percent: (self.memory_percents.gpu, self.memory_percents.host),
         };
         self.admission.adopt(&self.admission_costs);
     }

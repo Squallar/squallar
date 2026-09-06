@@ -274,9 +274,21 @@ impl Gui {
                 }
             }
         }
-        let _ = self
+        if !self
             .admission
-            .ask(crate::admission::Act::DefaultLayers, want);
+            .enforce(crate::admission::Act::DefaultLayers, want)
+        {
+            // Whole or not at all: a pane holding some of the layers it ships
+            // with and not others is a curation the user never made. The
+            // hydrate below still runs for the slots that are already there.
+            let Self {
+                panes, overlays, ..
+            } = self;
+            for (idx, pane) in panes.iter_mut().enumerate() {
+                pane.hydrate_layer_states(overlays, idx);
+            }
+            return;
+        }
         // Weight order, so each insertion lands among slots that are already
         // in it — the same walk `reconcile_draw_order` made.
         wanted.sort_by_key(|&(_, weight, _)| weight);

@@ -60,14 +60,39 @@
 //! when a fresher table arrives. What a door is compared against is the
 //! published spare less everything admitted since it was published.
 //!
-//! # WO-G is advisory
+//! # Refusing, and being seen to
 //!
-//! Every verdict is computed, counted and logged. **Nothing is refused.** The
-//! counters ride [`totals`], which the App prints on `budget state:`, so what
-//! the enforcing land would have turned away is measurable on the rig before
-//! it turns anything away.
+//! [`AdmissionLedger::ask`] computes a verdict and records it;
+//! [`AdmissionLedger::enforce`] acts on one. **A silent refusal is a worse
+//! defect than the allocation it prevents**: the user asked for a layer, the
+//! layer did not appear, and nothing on the glass says why or what to change.
+//! So every refusal raises an [`AdmissionNotice`] that names the setting
+//! behind the wall - the two memory shares the user owns, by the labels the
+//! Settings screen gives them - and the pane paints it.
+//!
+//! # Restore is never a refusal
+//!
+//! `Gui::load_ui_config` runs inside [`AdmissionLedger::begin_exempt`], and
+//! that is not an oversight to be closed later. A restore the doors narrowed
+//! would be **persisted by the next autosave within seconds**: the user would
+//! open the app, silently lose panes they never touched, and have no way back
+//! to the arrangement they saved. The scene a restore brings back is made
+//! survivable by the governor shedding around it, not by refusing to bring it
+//! back.
+//!
+//! **The killer scene arrives entirely through that exempt path** -
+//! `load_ui_config` writes each pane's `loop_arm_pending`, `looping_panes`
+//! collects them and `hydrate_parked_panes` drains them into
+//! `App::handle_enable_loop` - so restoring into a scene that traps is
+//! reachable and self-reinstating. `handle_enable_loop` is on the path
+//! **after** the restore, and it is a door: a loop armed by a restore is
+//! refusable there even though the pane that carries it is not. The pane's
+//! own wish survives the refusal, so the config still round-trips and the loop
+//! arms on a session with room for it.
 
-use squallar_device_profile::admit::{Increment, LoopFrames, Spare, Verdict, verdict};
+use squallar_device_profile::admit::{
+    Increment, LoopFrames, Pool, Refusal, Spare, Verdict, verdict,
+};
 use squallar_source::id::LayerId;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -107,6 +132,14 @@ pub struct AdmissionCosts {
     /// can count the units it is adding without re-spelling the model's
     /// arithmetic.
     pub frames: LoopFrames,
+    /// **The two memory shares the user owns**, `(gpu, host)`, as percentages
+    /// - `squallar_device_profile::scene::PoolPercents` verbatim.
+    ///
+    /// Carried so a refusal can name the setting that produced it. A wall the
+    /// reader cannot act on is a defect in the notice, not a caption to word
+    /// better, and "not enough memory" is exactly that wall: these two
+    /// numbers are what the user can move.
+    pub requested_percent: (u8, u8),
 }
 
 /// One gridded overlay layer's admission cost.
@@ -391,6 +424,66 @@ impl AdmissionLedger {
         self.counts
     }
 
+    /// **Ask, and act on the answer** - the enforcing door.
+    ///
+    /// [`Self::ask`]'s verdict, with two things added: a refusal is counted as
+    /// a refusal rather than as a would-refuse, and it raises the notice the
+    /// pane paints. Returns whether the caller may proceed, so a door reads
+    /// `if !admission.enforce(..) { return; }`.
+    ///
+    /// Everything [`Self::ask`] admits, this admits: a free act, an act inside
+    /// an open batch or exemption, and anything asked before the App has
+    /// priced a scene. **An application that has priced nothing refuses
+    /// nothing** - refusing on an absent figure is how an admission system
+    /// turns into a wall at startup, which is the moment the config restore is
+    /// putting the user's panes back.
+    pub fn enforce(&mut self, act: Act, want: Increment) -> bool {
+        match self.ask(act, want) {
+            Verdict::Admit => true,
+            Verdict::Refuse(refusal) => {
+                REFUSED.fetch_add(1, Relaxed);
+                self.counts.refused = self.counts.refused.saturating_add(1);
+                let text = refusal_text(act, refusal, self.costs.requested_percent);
+                self.raise_notice(text, web_time::Instant::now());
+                false
+            }
+        }
+    }
+
+    /// **Open an exemption**: every door reached until [`Self::end_exempt`]
+    /// admits whatever it is asked.
+    ///
+    /// Spelled apart from [`Self::begin_batch`] though it moves the same
+    /// counter, because the **reason** is different and the reason is what a
+    /// reader at the call site needs. A batch is "this act was already priced
+    /// whole". An exemption is "**restore is never a refusal**": a restore the
+    /// doors narrowed is persisted by the next autosave, and the user loses
+    /// panes without having acted.
+    pub fn begin_exempt(&mut self) {
+        self.batch = self.batch.saturating_add(1);
+    }
+
+    /// Close an exemption. See [`Self::begin_exempt`].
+    pub fn end_exempt(&mut self) {
+        self.batch = self.batch.saturating_sub(1);
+    }
+
+    /// **Take a refusal raised on the App's side of the seam.**
+    ///
+    /// The loop door lives in `squallar-app` and keeps its own ledger, so its
+    /// refusals are raised there and cross on the frame's inputs. Raised here
+    /// only when the text **changed**, so a notice already up is not
+    /// re-stamped every frame and does age out.
+    pub fn adopt_remote_notice(&mut self, text: Option<&str>, now: web_time::Instant) {
+        let Some(text) = text else {
+            return;
+        };
+        if self.notice.as_ref().is_some_and(|held| held.text == text) {
+            return;
+        }
+        self.raise_notice(text.to_string(), now);
+    }
+
     /// The last refusal's notice, once it is fresh enough to paint.
     pub fn notice(&self, now: web_time::Instant) -> Option<&AdmissionNotice> {
         self.notice
@@ -404,6 +497,45 @@ impl AdmissionLedger {
             text,
             raised_at: now,
         });
+    }
+}
+
+/// **What a refusal says, and it names the setting that produced it.**
+///
+/// Three things, in the order a reader needs them: which memory ran out, how
+/// much short the act was, and **which control to move**. The last is the
+/// point - the two memory shares are the user's own setting, they are what
+/// the wall is made of, and a notice that stopped at "not enough memory"
+/// would be a warning about something the reader cannot fix.
+///
+/// The setting is named by the label the Settings screen actually shows
+/// (`ui_settings`'s `"GPU memory"` and `"System memory"`, under the `Memory`
+/// heading), so the sentence and the screen cannot drift into two names for
+/// one control.
+///
+/// A unified pool names both, because on one memory either share moves the
+/// same wall.
+fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8)) -> String {
+    let short = refusal.short_bytes().div_ceil(1000 * 1000);
+    let (gpu, host) = percents;
+    match refusal.pool {
+        Pool::Gpu => format!(
+            "Not enough GPU memory for {} - {short} MB short. Raise \"GPU \
+             memory\" in Settings > Memory (now {gpu} %).",
+            act.noun(),
+        ),
+        Pool::Host => format!(
+            "Not enough system memory for {} - {short} MB short. Raise \
+             \"System memory\" in Settings > Memory (now {host} %).",
+            act.noun(),
+        ),
+        Pool::Joint => format!(
+            "Not enough memory for {} - {short} MB short. This machine shares \
+             one pool between the display and the system: raise \"GPU \
+             memory\" (now {gpu} %) or \"System memory\" (now {host} %) in \
+             Settings > Memory.",
+            act.noun(),
+        ),
     }
 }
 

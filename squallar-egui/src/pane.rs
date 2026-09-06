@@ -2774,7 +2774,12 @@ impl PaneState {
                 .pane(pane_idx)
                 .show_layer
                 .plus(admission.layer_grid(id));
-            let _ = admission.ask(crate::admission::Act::ShowLayer, want);
+            // Refused, the slot is not minted and the caller reads `false` the
+            // way it already reads a layer the pane holds - the stack is left
+            // exactly as the user curated it.
+            if !admission.enforce(crate::admission::Act::ShowLayer, want) {
+                return false;
+            }
         }
         let weight = handler.draw_order_weight();
         let weights: HashMap<LayerId, u32> = registry

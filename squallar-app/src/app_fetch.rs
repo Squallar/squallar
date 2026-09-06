@@ -1676,10 +1676,27 @@ impl super::App {
         // in it: `App::loop_demand` answered whether this pane's prospective
         // identity is one another pane owns, and the increment was taken over
         // a scene that says so.
+        //
+        // **This is the door on the restore path.** `load_ui_config` is
+        // exempt - a refused restore is written back by autosave and the user
+        // loses panes without acting - but the loops a restore asks for arm
+        // *here*, one redraw later, through `looping_panes` and
+        // `hydrate_parked_panes`. That is the whole of how the scene that
+        // trapped the rig's tab reinstates itself, and it is refusable.
+        //
+        // A refusal returns before the pane's parked wish is consumed, so the
+        // wish survives: the config still round-trips with the loop in it and
+        // the loop arms on a session with room for it. It does not retry in
+        // this one - `hydrate_parked_panes` took the App's queue by
+        // `mem::take` and nothing here puts the entry back - so a refusal is
+        // one refusal, not a spin.
         let want = self.admission.pane(pane_idx).arm_loop;
-        let _ = self
+        if !self
             .admission
-            .ask(squallar_egui::admission::Act::ArmLoop, want);
+            .enforce(squallar_egui::admission::Act::ArmLoop, want)
+        {
+            return;
+        }
         // One clock reading for both halves of the range, so a forward-reaching
         // rail's past and future cannot be anchored a tick apart.
         let now = chrono::Utc::now().naive_utc();

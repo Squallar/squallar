@@ -771,10 +771,15 @@ impl super::Gui {
     /// exactly the ones already priced.
     fn apply_preset(&mut self, preset: &PresetConfig, actions: &mut Vec<GuiAction>) {
         let count = preset.pane_count.clamp(1, self.layout.width.max_panes());
-        let _ = self.admission.ask(
+        if !self.admission.enforce(
             crate::admission::Act::Preset,
             self.preset_increment(preset, count),
-        );
+        ) {
+            // Whole or not at all. A preset applied halfway is a scene the
+            // user never asked for and cannot name, and it would be the next
+            // autosave's contents.
+            return;
+        }
         self.admission.begin_batch();
         self.apply_preset_within_batch(preset, count, actions);
         self.admission.end_batch();
