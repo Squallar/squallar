@@ -58,6 +58,7 @@ fn six_two_hour_loops() -> Scene {
                 loop_scans_resident_bytes: 0,
                 loop_scans_resident_frames: 0,
                 loop_scans_needed: true,
+                loop_scan_reserve_bytes: 0,
             };
             6
         ],
@@ -556,6 +557,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
                 loop_scans_resident_bytes: 0,
                 loop_scans_resident_frames: 0,
                 loop_scans_needed: true,
+                loop_scan_reserve_bytes: 0,
             };
             6
         ],

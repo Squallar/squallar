@@ -518,7 +518,7 @@ fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
             };
             terms.loop_scans_host = pane
                 .loop_scans_resident_bytes
-                .saturating_add(pending.saturating_mul(LOOP_SCAN_RESERVE_BYTES));
+                .saturating_add(pending.saturating_mul(scan_reserve(pane)));
         }
     }
     // **A 2D pane that is not running a radar loop is parked at a still**,
@@ -532,7 +532,7 @@ fn pane_terms(pane: &PaneNeed, budgets: &Budgets, grid: u64) -> PaneTerms {
         && !pane.loop_scans_shared
         && matches!(pane.view, RenderView::PlanView | RenderView::CrossSection)
     {
-        terms.still_scans_host = LOOP_SCAN_RESERVE_BYTES;
+        terms.still_scans_host = scan_reserve(pane);
     }
     if pane.looping && pane.overlay_frame_bytes > 0 {
         // One dispatch pass's whole burst of this pane's loop-frame rasters,
@@ -680,6 +680,23 @@ pub fn reachable_loop_frames(
         // `LoopPool::plan`'s Up arm hands the room out frame by frame.
         .min(budgets.loop_render_budget)
         .max(crate::constants::MIN_LOOP_FRAMES_PER_PANE)
+}
+
+/// **What one of `pane`'s not-yet-arrived volumes is reserved at.**
+///
+/// [`crate::scene::PaneNeed::loop_scan_reserve_bytes`] where the application
+/// has calibrated one against the site's own history, and
+/// [`LOOP_SCAN_RESERVE_BYTES`] — the corpus bootstrap — where it has not. The
+/// sentinel is `0`, so every construction site written before the per-site
+/// reserve existed prices exactly as it did.
+///
+/// **Never below the bootstrap.** A site whose volumes have all been small
+/// has shown that its volumes *can* be small, not that they cannot be large,
+/// and the bootstrap is a 208-volume maximum rather than a guess. Letting
+/// evidence lower this would turn one quiet afternoon at a site into a
+/// reserve the next storm's volumes walk straight through.
+fn scan_reserve(pane: &PaneNeed) -> u64 {
+    pane.loop_scan_reserve_bytes.max(LOOP_SCAN_RESERVE_BYTES)
 }
 
 /// What the loops need, in bytes: every looping pane's frames at its frame's

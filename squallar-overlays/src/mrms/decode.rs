@@ -510,6 +510,19 @@ pub fn parse_grib2_raw_in(
             .map(|nan_codes| (two_pow, dig_factor, nan_codes))
         });
 
+    // **Reserve the decode's high-water mark, at the header, before a value
+    // exists.** Section 3 gave `ni × nj` above; section 5 has not yet said how
+    // wide the values will be, and the widest arm this function can take is
+    // `f32`. Reserving the widest is the whole point — a reserve that assumed
+    // the narrow arm would under-declare exactly the decodes that are large
+    // enough to matter.
+    //
+    // Guarded, because every arm below leaves by `?` on bad data: the guard
+    // releases the declaration on those paths and records no overshoot, since
+    // a decode that never happened did not overshoot anything.
+    let reserved =
+        squallar_source::reserve::global().take(points.saturating_mul(size_of::<f32>()) as u64);
+
     let too_big = |width: usize| {
         format!(
             "MRMS: cannot hold a {ni}×{nj} grid ({} MB of values) in this \
@@ -560,6 +573,12 @@ pub fn parse_grib2_raw_in(
             GridValues::F32(floats)
         }
     };
+
+    // The truth, now that the arm is known: the narrow arm holds `u16`
+    // codes and the two wide arms hold `f32`. Settled before the length
+    // checks below so that a grid whose count disagrees still retires its
+    // reserve rather than leaving it to the pass boundary.
+    reserved.settle(values.resident_bytes() as u64);
 
     if values.is_empty() {
         return Err("MRMS: no grid points decoded".into());

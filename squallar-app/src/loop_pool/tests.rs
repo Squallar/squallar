@@ -998,6 +998,7 @@ fn looping_pane() -> squallar_device_profile::scene::PaneNeed {
         loop_scans_resident_bytes: 0,
         loop_scans_resident_frames: 0,
         loop_scans_needed: true,
+        loop_scan_reserve_bytes: 0,
     }
 }
 
@@ -1737,6 +1738,7 @@ mod budget_agreement {
                     loop_scans_resident_bytes: 0,
                     loop_scans_resident_frames: 0,
                     loop_scans_needed: true,
+                    loop_scan_reserve_bytes: 0,
                 }],
                 tile_sources: Vec::new(),
                 mirror_px: [0, 0],

@@ -157,6 +157,37 @@ pub struct LoopDownloadManager {
     /// volume was discounted by its own compressed size (0.34–17.96 MiB,
     /// median 5.56). Under-stated, in the direction that costs the process.
     scan_bytes_cached: usize,
+    /// **The largest volume this session has actually decoded from each
+    /// site**, in the bytes `crate::scan_size::scan_bytes` prices them at.
+    ///
+    /// The measured half of [`Self::site_scan_reserve_bytes`]. Keyed by site
+    /// and not by (site, stamp) on purpose: what it answers is "how big do
+    /// this radar's volumes get", which is a property of the site's VCP and
+    /// its weather, and a per-stamp figure would only ever describe a volume
+    /// that has already arrived and so needs no reserve.
+    ///
+    /// It never falls. An eviction frees the bytes but does not unlearn the
+    /// fact that this site produced them, and a reserve that forgot its own
+    /// evidence would re-under-reserve the next time the same weather came
+    /// back.
+    site_scan_peak: std::collections::HashMap<String, usize>,
+    /// The reserve's bootstrap, handed in by the application because the
+    /// figure is the budget crate's (`LOOP_SCAN_RESERVE_BYTES`) and that
+    /// crate depends on this one, not the other way about. Zero until set,
+    /// which makes the reserve the site's own peak alone — the honest answer
+    /// for a caller that has not said what its bootstrap is.
+    scan_reserve_bootstrap: usize,
+    /// **Volumes that arrived larger than the reserve in force for their
+    /// site**, and by how much in total.
+    ///
+    /// The field's own report that the reserve is wrong. The figure this
+    /// bootstraps from was called a maximum for months and turned out to be
+    /// a 70.7th percentile, exceeded by 61 of 208 volumes — discovered by
+    /// assembling a third corpus, which is a thing nobody does twice. These
+    /// two counters are what make the next such discovery arrive from the
+    /// field instead.
+    scan_over_arrivals: u64,
+    scan_over_arrival_bytes: u64,
     /// The price of each cached volume, so [`Self::retain_scans`] subtracts
     /// what it removes instead of re-walking it. Keyed exactly as
     /// [`scan_cache`](Self::scan_cache) is addressed, and every mutation of
@@ -235,6 +266,10 @@ impl LoopDownloadManager {
             l3_in_flight: HashSet::new(),
             in_flight_count: 0,
             scan_bytes_cached: 0,
+            site_scan_peak: std::collections::HashMap::new(),
+            scan_reserve_bootstrap: 0,
+            scan_over_arrivals: 0,
+            scan_over_arrival_bytes: 0,
             scan_prices: HashMap::new(),
             l3_bytes_cached: 0,
         }
@@ -325,6 +360,26 @@ impl LoopDownloadManager {
     /// [`Self::cached_scan_bytes`], which is asked for every telemetry tick.
     pub fn cache_scan(&mut self, site: &str, ts: chrono::NaiveDateTime, volume: CachedVolume) {
         let price = crate::scan_size::scan_bytes(&volume.0);
+        // **Reconcile the reserve against the truth, here, at the one moment
+        // the size is known.** Read the reserve that was in force *before*
+        // this arrival taught the site anything, so a volume is scored
+        // against the figure that was actually used to admit it — calibrating
+        // first and then comparing would make every arrival its own reserve
+        // and the counter could never fire.
+        let reserved = self.site_scan_reserve_bytes(site);
+        if price > reserved {
+            self.scan_over_arrivals = self.scan_over_arrivals.saturating_add(1);
+            self.scan_over_arrival_bytes = self
+                .scan_over_arrival_bytes
+                .saturating_add((price - reserved) as u64);
+            log::debug!(
+                "{site}: a volume arrived at {} MiB against a {} MiB reserve",
+                price / (1024 * 1024),
+                reserved / (1024 * 1024),
+            );
+        }
+        let peak = self.site_scan_peak.entry(site.to_string()).or_insert(0);
+        *peak = (*peak).max(price);
         // A re-file under a key already held replaces the volume, so its old
         // price leaves with it; `insert` returning the old price is what says
         // whether there was one.
@@ -363,6 +418,48 @@ impl LoopDownloadManager {
     /// site name.
     pub fn cached_scan_price(&self, site: &str, ts: &chrono::NaiveDateTime) -> Option<usize> {
         self.scan_prices.get(&(site.to_string(), *ts)).copied()
+    }
+
+    /// **Tell this cache what a volume is presumed to cost** before anything
+    /// has been measured — the budget crate's `LOOP_SCAN_RESERVE_BYTES`.
+    ///
+    /// Handed in rather than named here because the constant lives in the
+    /// crate that depends on this one. Setting it is what turns
+    /// [`Self::site_scan_reserve_bytes`] from "the largest volume seen" into
+    /// the floor-and-evidence figure it is meant to be.
+    pub fn set_scan_reserve_bootstrap(&mut self, bytes: usize) {
+        self.scan_reserve_bootstrap = bytes;
+    }
+
+    /// **What one not-yet-arrived volume from `site` should be reserved at**:
+    /// `max(bootstrap, that site's resident maximum)`.
+    ///
+    /// The bootstrap is a corpus percentile — a statement about radars in
+    /// general. The site's own peak is a statement about *this* radar, made
+    /// by this process, and **a site that has already handed this process a
+    /// volume larger than the bootstrap is evidence no corpus percentile
+    /// outranks**. So the two compose as a maximum and not as a replacement:
+    /// the bootstrap is the whole reserve for the first frame at any site,
+    /// which is exactly the case that has no measurement yet, and the
+    /// evidence takes over the moment there is some.
+    ///
+    /// **It only ever rises**, and that is deliberate. A reserve that fell
+    /// back toward the bootstrap when a big volume was evicted would let the
+    /// same site under-reserve repeatedly, which is the failure this replaces
+    /// rather than a different one.
+    pub fn site_scan_reserve_bytes(&self, site: &str) -> usize {
+        self.scan_reserve_bootstrap
+            .max(self.site_scan_peak.get(site).copied().unwrap_or(0))
+    }
+
+    /// **Volumes that arrived larger than the reserve in force for them**,
+    /// and the bytes by which they overshot.
+    ///
+    /// Always on, and reported whether or not anything gates on it: a reserve
+    /// is a claim about the world, and this is the only figure that can
+    /// falsify it from the field.
+    pub fn scan_over_arrivals(&self) -> (u64, u64) {
+        (self.scan_over_arrivals, self.scan_over_arrival_bytes)
     }
 
     /// **What a loop already holds decoded, at its measured size**: of the
@@ -1718,6 +1815,125 @@ mod tests {
         assert!(
             !site_needs_decoded_source("KTLX", &[]),
             "a site with no loop running claimed its volumes anyway",
+        );
+    }
+    /// **The bootstrap is a floor, not the whole answer.** Before any volume
+    /// has arrived from a site there is nothing to know about it, so the
+    /// reserve is the corpus figure the application handed down.
+    #[test]
+    fn a_site_with_no_history_reserves_the_bootstrap() {
+        let mut mgr = LoopDownloadManager::new();
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KTLX"),
+            0,
+            "with no bootstrap set the reserve can only be the site's own peak",
+        );
+        mgr.set_scan_reserve_bootstrap(80 * 1024 * 1024);
+        assert_eq!(mgr.site_scan_reserve_bytes("KTLX"), 80 * 1024 * 1024);
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KOUN"),
+            80 * 1024 * 1024,
+            "a site nobody has fetched from is not special",
+        );
+    }
+
+    /// **A site that has handed this process a volume larger than the
+    /// bootstrap is evidence no corpus percentile outranks.** The reserve
+    /// rises to it, and only for that site.
+    #[test]
+    fn a_site_reserve_rises_to_the_largest_volume_that_site_produced() {
+        let mut mgr = LoopDownloadManager::new();
+        // A bootstrap below the fixture's own size, so the arrival is the
+        // larger of the two and the calibration has something to do.
+        mgr.set_scan_reserve_bootstrap(1);
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let measured = mgr.cached_scan_price("KTLX", &ts(0)).expect("priced");
+
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KTLX"),
+            measured,
+            "the reserve did not learn from the volume that arrived",
+        );
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KOUN"),
+            1,
+            "one site's evidence moved another site's reserve",
+        );
+    }
+
+    /// The reserve never falls: an eviction frees the bytes but does not
+    /// unlearn that the site produced them. A reserve that forgot its own
+    /// evidence would under-reserve the next time the same weather came back.
+    #[test]
+    fn a_site_reserve_does_not_fall_when_the_volume_is_evicted() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_scan_reserve_bootstrap(1);
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let learned = mgr.site_scan_reserve_bytes("KTLX");
+        assert!(learned > 1);
+
+        let dropped = mgr.retain_scans(|_, _| false);
+        assert_eq!(dropped.len(), 1, "the fixture was not evicted");
+        assert_eq!(
+            mgr.cached_scan_bytes(),
+            0,
+            "the fixture did not actually leave the cache",
+        );
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KTLX"),
+            learned,
+            "the reserve unlearned its own evidence on eviction",
+        );
+    }
+
+    /// **The field's own report that a reserve is wrong.** A volume larger
+    /// than the reserve in force is counted with its shortfall — the figure
+    /// this bootstraps from was called a maximum and was in fact a 70.7th
+    /// percentile, found by assembling a third corpus, which is a thing
+    /// nobody does twice.
+    #[test]
+    fn a_volume_over_its_reserve_is_counted_with_its_shortfall() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_scan_reserve_bootstrap(1);
+        assert_eq!(mgr.scan_over_arrivals(), (0, 0));
+
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        let measured = mgr.cached_scan_price("KTLX", &ts(0)).expect("priced");
+        let (count, bytes) = mgr.scan_over_arrivals();
+        assert_eq!(
+            count, 1,
+            "the arrival over a 1-byte reserve was not counted"
+        );
+        assert_eq!(bytes, (measured - 1) as u64);
+
+        // The next volume of the same size is no longer a surprise: the site
+        // has calibrated, so an arrival AT the reserve is not over it. A
+        // counter that fired here would report every reserve wrong forever,
+        // including the volume the reserve was sized from.
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        assert_eq!(
+            mgr.scan_over_arrivals(),
+            (1, (measured - 1) as u64),
+            "an arrival at exactly the calibrated reserve was counted as over",
+        );
+    }
+
+    /// The healthy arm: with the shipped bootstrap above the fixture's size,
+    /// nothing is ever counted. A counter that fires on ordinary work cannot
+    /// be read as evidence of anything.
+    #[test]
+    fn a_volume_under_its_reserve_is_counted_nowhere() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_scan_reserve_bootstrap(80 * 1024 * 1024);
+        mgr.cache_scan("KTLX", ts(0), priced_volume());
+        mgr.cache_scan("KTLX", ts(1), priced_volume());
+        mgr.cache_scan("KOUN", ts(0), priced_volume());
+
+        assert_eq!(mgr.scan_over_arrivals(), (0, 0));
+        assert_eq!(
+            mgr.site_scan_reserve_bytes("KTLX"),
+            80 * 1024 * 1024,
+            "evidence smaller than the bootstrap lowered the reserve",
         );
     }
 }

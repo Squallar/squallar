@@ -18,6 +18,7 @@ pub mod job;
 pub mod liveness;
 pub mod origins;
 pub mod product;
+pub mod reserve;
 pub mod time;
 pub mod tls;
 pub mod volume;

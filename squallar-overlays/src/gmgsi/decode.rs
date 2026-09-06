@@ -134,6 +134,21 @@ pub fn decode_in(
         .checked_mul(nj)
         .ok_or_else(|| format!("GMGSI `data` at {nj} x {ni} overflows this platform"))?;
 
+    // **Reserve the decode's high-water mark, at the header.** The netCDF
+    // header has given `shape("data")` and not one chunk has been inflated.
+    //
+    // The figure is `points × 5`, and the 5 is the mechanism rather than a
+    // margin: `Narrowing` holds the values as one byte a point and widens to
+    // `f32` only when a value will not fit a code, and **during that widen
+    // both vectors are live** — the byte codes it is reading from and the
+    // four-byte floats it is writing to. Reserving the widened arm alone
+    // (`× 4`) would under-declare by the buffer being read out of, on exactly
+    // the granules that take the expensive path.
+    //
+    // Guarded: the axis reads, the whole-variable read and the narrowing's own
+    // fallible widen all leave by `?`.
+    let reserved = squallar_source::reserve::global().take(points.saturating_mul(5) as u64);
+
     let lat_axis = axes.axis(&granule, "lat", nj, ni, Axis::Row)?;
     let lon_axis = axes.axis(&granule, "lon", nj, ni, Axis::Column)?;
     let bounds = bounds_of(&lat_axis, &lon_axis);
@@ -155,6 +170,8 @@ pub fn decode_in(
         return Err(e);
     }
     let (values, spare) = values.into_values()?;
+    // The truth: what the grid actually came out as, whichever arm it took.
+    reserved.settle(values.resident_bytes() as u64);
     if let Some(spare) = spare {
         // The byte buffer the wide arm no longer needs, back to the slot
         // rather than dropped: a granule this build cannot narrow must not

@@ -543,6 +543,7 @@ fn a_loops_volumes_are_priced_at_their_measured_size_and_the_reserve_for_the_res
     // volume and not a function of the frame count.
     let level3 = PaneNeed {
         loop_scans_needed: false,
+        loop_scan_reserve_bytes: 0,
         loop_scans_resident_frames: 0,
         loop_scans_resident_bytes: 50_320_343,
         ..base
@@ -571,6 +572,7 @@ fn a_loops_volumes_are_priced_at_their_measured_size_and_the_reserve_for_the_res
     assert_eq!(
         scans(&PaneNeed {
             loop_scans_needed: true,
+            loop_scan_reserve_bytes: 0,
             ..bare_level3
         }),
         28 * LOOP_SCAN_RESERVE_BYTES,
@@ -3152,6 +3154,7 @@ fn a_loop_with_no_cadence_prices_its_whole_render_budget_and_no_rung_moves_it() 
     let presumed = Capacity::presumed(&BudgetLimits::WASM);
     let scene = scene_of(vec![PaneNeed {
         loop_scans_needed: true,
+        loop_scan_reserve_bytes: 0,
         ..plan_pane([0, 0], true, TWO_HOURS, None)
     }]);
     let at_top = need_terms(&scene, &top, stand_in_grid_bytes);
@@ -3335,4 +3338,66 @@ fn no_governor_path_lowers_a_granted_loops_frames_or_span() {
             }
         }
     }
+}
+
+/// **A pane's own per-site reserve is what its unfetched frames are priced
+/// at**, and the sentinel still prices at the class bootstrap.
+///
+/// Both arms, and the second is the one that protects everybody: every
+/// construction site that predates this reserve writes `0` and means "the
+/// class figure", so the sentinel arm must price byte-for-byte what this
+/// crate priced before the field existed.
+///
+/// A decoded radar volume is the one scene term whose size is not knowable in
+/// advance — no `Content-Length` is read and S3's `Size` sits in a listing
+/// document nothing parses — so what is checked here is that the *reserve*
+/// reaches the arithmetic, not that any measurement does.
+#[test]
+fn a_panes_own_scan_reserve_prices_the_frames_it_has_not_fetched() {
+    let b = desktop();
+    let priced = |pane: PaneNeed| need_terms(&scene_of(vec![pane]), &b, stand_in_grid_bytes);
+
+    let base = plan_pane(HD, true, TWO_HOURS, PRECIP);
+    let frames = loop_frames(&base, &b) as u64;
+    assert!(frames > 0, "the fixture loop asks for no frames");
+
+    // The sentinel: silence means the class bootstrap, exactly as before.
+    let at_sentinel = priced(PaneNeed {
+        loop_scan_reserve_bytes: 0,
+        ..base
+    });
+    assert_eq!(
+        at_sentinel.loop_scans_host,
+        frames * LOOP_SCAN_RESERVE_BYTES,
+        "the sentinel stopped pricing at the class bootstrap",
+    );
+
+    // A site this session has seen produce larger volumes prices its
+    // unfetched frames at what that site actually produces.
+    let calibrated = LOOP_SCAN_RESERVE_BYTES + 12 * 1024 * 1024;
+    let at_site = priced(PaneNeed {
+        loop_scan_reserve_bytes: calibrated,
+        ..base
+    });
+    assert_eq!(
+        at_site.loop_scans_host,
+        frames * calibrated,
+        "the pane's own reserve did not reach the price of its frames",
+    );
+    assert!(
+        at_site.loop_scans_host > at_sentinel.loop_scans_host,
+        "calibrating upward did not raise the price",
+    );
+
+    // **Evidence never lowers it.** A site whose volumes have all been small
+    // has shown that its volumes can be small, not that they cannot be large,
+    // and the bootstrap is a 208-volume maximum rather than a guess.
+    let at_tiny = priced(PaneNeed {
+        loop_scan_reserve_bytes: 1,
+        ..base
+    });
+    assert_eq!(
+        at_tiny.loop_scans_host, at_sentinel.loop_scans_host,
+        "a small per-site figure priced below the class bootstrap",
+    );
 }

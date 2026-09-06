@@ -952,7 +952,19 @@ impl App {
             tokio_runtime,
             #[cfg(target_arch = "wasm32")]
             pending_state: None,
-            loop_mgr: LoopDownloadManager::new(),
+            loop_mgr: {
+                // The reserve's bootstrap is the budget crate's figure and is
+                // handed down, because that crate depends on radar and not the
+                // other way about. Without it the per-site reserve is the
+                // site's own peak alone, which is zero until a volume arrives
+                // — so this is what makes the *first* frame at any site cost
+                // the corpus maximum rather than nothing.
+                let mut mgr = LoopDownloadManager::new();
+                mgr.set_scan_reserve_bootstrap(
+                    squallar_device_profile::constants::LOOP_SCAN_RESERVE_BYTES as usize,
+                );
+                mgr
+            },
             loop_listings_arrived: Vec::new(),
             loop_refill: Default::default(),
             chunk_feeds: squallar_radar::chunk_feed::ChunkFeedManager::new(),

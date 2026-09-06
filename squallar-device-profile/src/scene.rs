@@ -191,6 +191,24 @@ pub struct PaneNeed {
     /// Level II loop on the site, or a loop that has not dispatched yet, the
     /// safe direction — prices every named frame.
     pub loop_scans_needed: bool,
+    /// **What one of this pane's not-yet-arrived volumes is reserved at**, or
+    /// `0` to use the class bootstrap.
+    ///
+    /// A decoded radar volume is the one term of the scene whose size is not
+    /// knowable in advance: no `Content-Length` is read on the download path,
+    /// and S3's `Size` sits in a listing document nothing parses. So it is
+    /// reserved rather than measured, and the figure is
+    /// `squallar_radar::loop_downloads::LoopDownloadManager::site_scan_reserve_bytes`
+    /// — the bootstrap raised to the largest volume this session has actually
+    /// seen from that site.
+    ///
+    /// **Zero means the bootstrap**, so a caller that says nothing gets
+    /// exactly the arithmetic this crate did before the field existed, field
+    /// for field. That is not laziness about `Option`: every construction
+    /// site that predates this reserve means "the class figure" by its
+    /// silence, and a sentinel they already write is a smaller change than an
+    /// `Option` they must all learn to spell.
+    pub loop_scan_reserve_bytes: u64,
 }
 
 /// One map tile source's working set.
@@ -905,6 +923,7 @@ pub(crate) mod fixtures {
             loop_scans_resident_bytes: 0,
             loop_scans_resident_frames: 0,
             loop_scans_needed: true,
+            loop_scan_reserve_bytes: 0,
         }
     }
 
@@ -1023,6 +1042,7 @@ pub(crate) mod fixtures {
             loop_scans_resident_bytes: 0,
             loop_scans_resident_frames: 0,
             loop_scans_needed: true,
+            loop_scan_reserve_bytes: 0,
         }
     }
 

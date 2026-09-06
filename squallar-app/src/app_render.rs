@@ -5131,6 +5131,7 @@ impl super::App {
                 loop_scans_resident_bytes: 0,
                 loop_scans_resident_frames: 0,
                 loop_scans_needed: true,
+                loop_scan_reserve_bytes: 0,
             };
             if !ls.is_active() {
                 // **A pane looping something other than radar is a share
@@ -5285,6 +5286,14 @@ impl super::App {
             );
             pane.loop_scans_resident_bytes = (named_bytes + parked_bytes) as u64;
             pane.loop_scans_resident_frames = named_frames;
+            // **What a frame still to come is reserved at, for this site.**
+            // The frames above cost what they were measured at; the ones the
+            // loop has not fetched yet cost a reserve, and the reserve is the
+            // corpus bootstrap raised by whatever this site has already been
+            // seen to produce. A site that has handed this process a 92 MiB
+            // volume is evidence about that site which no percentile of other
+            // radars outranks.
+            pane.loop_scan_reserve_bytes = self.loop_mgr.site_scan_reserve_bytes(site) as u64;
         }
         // **Ruling 8 for a loop that is not running yet.** Resolved against
         // the same two lists the running loops were: a pane whose identity
