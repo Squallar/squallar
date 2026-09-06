@@ -265,6 +265,7 @@ fn layers_on_the_glass(app: &crate::app::App) -> Vec<LayerId> {
 /// settled `needs_rerender` would mean the opposite of what it says.
 #[test]
 fn an_idle_pane_asks_for_no_further_rasters_once_its_layers_hold_a_picture() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let _guard = squallar_worker::offload::install_test_worker(Box::new(RefusingPort));
     let ctx = egui::Context::default();
     let mut app = a_pane_with_three_texture_layers();

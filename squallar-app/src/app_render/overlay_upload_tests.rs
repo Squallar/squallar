@@ -86,6 +86,7 @@ fn placed(app: &mut crate::app::App, pane_idx: usize) -> egui::TextureId {
 
 #[test]
 fn the_uploaded_pixels_are_the_rasterizers_own() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
     let _ = drain_uploads(&ctx);
@@ -109,6 +110,7 @@ fn the_uploaded_pixels_are_the_rasterizers_own() {
 
 #[test]
 fn the_placed_overlay_is_described_by_its_own_picture() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
     deliver(&mut app, &ctx, vec![0]);
@@ -125,6 +127,7 @@ fn the_placed_overlay_is_described_by_its_own_picture() {
 
 #[test]
 fn four_panes_share_one_overlay_texture() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(4);
     let _ = drain_uploads(&ctx);
@@ -196,6 +199,7 @@ fn deliver_unmarked(app: &mut crate::app::App, ctx: &egui::Context, pane_indices
 /// Tier-2 browser leg is a fresh process.
 #[test]
 fn every_arrival_is_either_a_picture_or_a_drop() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     use squallar_egui::overlay_cache::ledger;
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);

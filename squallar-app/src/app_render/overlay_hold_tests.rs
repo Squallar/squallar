@@ -95,6 +95,7 @@ fn holding(app: &crate::app::App, idx: usize) -> bool {
 
 #[test]
 fn the_first_overlay_arrives_and_the_second_waits() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
 
@@ -126,6 +127,7 @@ fn the_first_overlay_arrives_and_the_second_waits() {
 
 #[test]
 fn a_held_overlay_keeps_the_frame_loop_awake() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
 
@@ -148,6 +150,7 @@ fn a_held_overlay_keeps_the_frame_loop_awake() {
 
 #[test]
 fn a_newer_overlay_result_supersedes_the_one_still_arriving() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
 
@@ -171,6 +174,7 @@ fn a_newer_overlay_result_supersedes_the_one_still_arriving() {
 
 #[test]
 fn an_overlay_swap_does_not_restamp_the_panes_data_time() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
     let sweep_time = chrono::NaiveDate::from_ymd_opt(2026, 8, 13)
@@ -193,6 +197,7 @@ fn an_overlay_swap_does_not_restamp_the_panes_data_time() {
 
 #[test]
 fn a_renderer_rebuild_releases_held_overlays() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(1);
 
@@ -213,6 +218,7 @@ fn a_renderer_rebuild_releases_held_overlays() {
 
 #[test]
 fn panes_sharing_an_overlay_result_swap_on_one_answer() {
+    let _ledger = crate::app::fetch::overlay_ledger_lock();
     let ctx = egui::Context::default();
     let mut app = n_pane_app(4);
 
