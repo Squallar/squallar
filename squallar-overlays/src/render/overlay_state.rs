@@ -345,6 +345,11 @@ impl OverlayRegistry {
         self.handler(id).and_then(|h| h.legend(pane))
     }
 
+    /// [`OverlayHandler::carries_legend`] for `id`.
+    pub fn carries_legend(&self, id: &LayerId) -> bool {
+        self.handler(id).is_some_and(|h| h.carries_legend())
+    }
+
     /// [`OverlayHandler::theme_sensitive`] for `id`.
     pub fn theme_sensitive(&self, id: &LayerId) -> bool {
         self.handler(id).is_some_and(|h| h.theme_sensitive())

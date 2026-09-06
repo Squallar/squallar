@@ -7,6 +7,9 @@ use squallar_source::id::{LayerId, known};
 use super::shell::SurfaceSlot;
 use super::{InspectorSelection, PaneState, map};
 
+/// The heading over the Color Scale layer's per-bar switches.
+pub(crate) const COLOR_BARS_HEADING: &str = "Bars";
+
 /// Width of the inspector, in both its floating and slide-over forms — one value
 /// for the same one-id reason as [`super::ui_stack::STACK_WIDTH`].
 pub(super) const INSPECTOR_WIDTH: f32 = 300.0;
@@ -325,7 +328,39 @@ impl super::Gui {
             ui.add_space(6.0);
         }
 
+        if *kind == known::COLOR_SCALE {
+            self.render_color_bar_switches(ui, pane);
+        }
+
         self.render_overlay_controls_one(ui, pane, kind, actions);
+    }
+
+    /// The Color Scale layer's body: one switch per bar the pane can show —
+    /// radar's, then each layer that carries a legend, in draw order. The
+    /// layer's own toggle is the whole HUD; these are its bars one at a time,
+    /// so a pane with three fields stacked can keep the one bar it reads.
+    /// Every bar a pane *could* show is listed, on or off, data or none —
+    /// `carries_legend` rather than `legend` — so a switch is where the user
+    /// left it rather than vanishing with the layer it belongs to.
+    fn render_color_bar_switches(&self, ui: &mut egui::Ui, pane: &mut PaneState) {
+        ui.label(egui::RichText::new(COLOR_BARS_HEADING).strong());
+        let radar = format!(
+            "Radar - {}",
+            crate::field_facts::facts(&pane.selected_product()).name
+        );
+        let mut bars: Vec<(LayerId, String)> = vec![(known::RADAR, radar)];
+        bars.extend(
+            pane.draw_order()
+                .filter(|id| self.overlays.carries_legend(id))
+                .map(|id| (id.clone(), self.overlays.display_name(id).to_owned())),
+        );
+        for (id, label) in bars {
+            let mut shown = pane.color_bar_shown(&id);
+            if ui.checkbox(&mut shown, label).changed() {
+                pane.set_color_bar_shown(&id, shown);
+            }
+        }
+        ui.add_space(6.0);
     }
 
     /// The Pane-properties body: what the pane is, what it shows, and how it runs

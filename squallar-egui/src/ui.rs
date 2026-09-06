@@ -27,7 +27,7 @@ pub(crate) use ui_stack::{ADD_LAYER_LABEL, StackProbe, StackRowProbe};
 #[path = "ui_inspector.rs"]
 mod ui_inspector;
 #[cfg(test)]
-pub(crate) use ui_inspector::InspectorProbe;
+pub(crate) use ui_inspector::{COLOR_BARS_HEADING, InspectorProbe};
 #[path = "ui_config.rs"]
 pub(crate) mod config;
 #[path = "ui_map_overlays.rs"]

@@ -7,7 +7,7 @@ use squallar_source::handler::{PaneMut, PaneRef};
 use squallar_source::id::{LayerId, known};
 use squallar_source::product::FieldId;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use walkers::MapMemory;
 
@@ -1020,6 +1020,12 @@ pub struct PaneState {
     pub hover_value: Option<String>,
     /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
     pub overlay_hover_value: Option<String>,
+    /// **The colour bars this pane keeps off the glass**, by the layer whose
+    /// bar it is — radar's under [`known::RADAR`]. The Color Scale layer's own
+    /// options: that layer's toggle is the whole HUD, and these are its bars
+    /// one at a time. Persisted; empty by default, so every bar draws until it
+    /// is switched off. Read through [`Self::color_bar_shown`].
+    pub hidden_color_bars: BTreeSet<LayerId>,
     pub last_hover_pos: Option<egui::Pos2>,
     pub map_memory: MapMemory,
     /// Per-overlay-type texture caches (background-rendered), keyed by
@@ -1749,6 +1755,7 @@ impl PaneState {
             layer_link: true,
             hover_value: None,
             overlay_hover_value: None,
+            hidden_color_bars: BTreeSet::new(),
             last_hover_pos: None,
             map_memory,
             // Lazily filled by `overlay_cache_mut`; an absent entry answers
@@ -2745,6 +2752,24 @@ impl PaneState {
 
     pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
         self.slot(id).is_some_and(|slot| slot.enabled)
+    }
+
+    /// Whether the colour bar belonging to `id`'s layer draws on this pane —
+    /// radar's asked as [`known::RADAR`]. Only meaningful with the Color Scale
+    /// layer on; the painter and the gutter both gate on that first, and on
+    /// the bar's own layer being enabled, before asking this.
+    pub fn color_bar_shown(&self, id: &LayerId) -> bool {
+        !self.hidden_color_bars.contains(id)
+    }
+
+    /// Switch `id`'s colour bar on or off for this pane. See
+    /// [`Self::color_bar_shown`].
+    pub fn set_color_bar_shown(&mut self, id: &LayerId, shown: bool) {
+        if shown {
+            self.hidden_color_bars.remove(id);
+        } else {
+            self.hidden_color_bars.insert(id.clone());
+        }
     }
 
     /// **Which of this pane's layers a 3D view asks for a grid, or why none of

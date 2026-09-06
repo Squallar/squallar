@@ -181,6 +181,15 @@ struct PaneConfig {
     /// forbids.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     coverage_ring: bool,
+    /// **The colour bars this pane keeps off**, by layer id — the Color Scale
+    /// layer's per-bar switches
+    /// ([`PaneState::hidden_color_bars`](crate::pane::PaneState::hidden_color_bars)).
+    /// Additive on `removed_layers`' terms: `#[serde(default)]`, **no
+    /// `CONFIG_VERSION` bump and no `migrate.rs` step**, and
+    /// `skip_serializing_if` so a pane that hides nothing writes byte-for-byte
+    /// what it wrote before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden_color_bars: Vec<String>,
     /// **This pane's layer stack, bottom to top** — the v3 shape. One entry
     /// per layer, each carrying its own id, enabled flag and saved config;
     /// the list's order IS the draw order. Replaces v2's three parallel
@@ -988,6 +997,7 @@ struct UiConfig {
     /// The config format this file speaks — see [`migrate`]. Absent reads as
     /// version 1 (every file written before the field existed), through the
     /// field-level default rather than [`migrate::CONFIG_VERSION`], because
+            hidden_color_bars: Vec::new(),
     /// "what an old file means" is a fact about history and must not move
     /// when the current version does. A version greater than this build's is
     /// not an error: the tolerant load proceeds, preservation carries what
@@ -1592,6 +1602,11 @@ impl super::Gui {
         let config = UiConfig {
             config_version: migrate::CONFIG_VERSION,
             pane_count: self.pane_layout.pane_count,
+                    hidden_color_bars: pane
+                        .hidden_color_bars
+                        .iter()
+                        .map(|id| id.as_str().to_owned())
+                        .collect(),
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
@@ -1943,6 +1958,7 @@ impl super::Gui {
             pane.group = pc.group.and_then(crate::pane::GroupId::from_index);
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
+            pane.hidden_color_bars = pc.hidden_color_bars.iter().map(LayerId::new).collect();
             pane.layer_link = pc.layer_link && config.sync_layers;
             pane.set_transport_layer(pc.transport.clone());
             pane.set_content(restore_content(i, pc, count));

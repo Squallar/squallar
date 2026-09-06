@@ -1480,6 +1480,10 @@ impl OverlayHandler for ModelDataHandler {
         if text.is_empty() { None } else { Some(text) }
     }
 
+    fn carries_legend(&self) -> bool {
+        true
+    }
+
     /// The signature is the selected parameter and nothing else, since the bar is
     /// a pure function of it — deliberately **not** `data_generation`, which every
     /// HRRR fetch bumps. `+ 1` keeps the first parameter's signature off `0`.

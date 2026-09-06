@@ -1705,12 +1705,7 @@ pub(super) fn color_scale_gutter(
     if !pane.is_overlay_enabled(&known::COLOR_SCALE) {
         return 0.0;
     }
-    let product = pane.selected_product();
-    let legend = crate::field_facts::facts(&product).scale;
-    if legend.thresholds.len() < 2 {
-        return 0.0;
-    }
-    // And the "pane too small" bail both painters take, restated from the same
+    // The "pane too small" bail both painters take, restated from the same
     // expressions so a pane that draws no bar reserves no room for one.
     let bar_length = if horizontal {
         pane_rect.width() - SCALE_MARGIN * 2.0
@@ -1721,20 +1716,29 @@ pub(super) fn color_scale_gutter(
         return 0.0;
     }
 
-    // The radar bar stands on the margin; each stacked overlay bar stands one
-    // bar-and-gap further in. Every one is measured, not the innermost alone.
+    // Slots from the pane edge inward: radar's bar stands on the margin when
+    // it draws, and each overlay bar stands one bar-and-gap further in. A bar
+    // switched off (`PaneState::color_bar_shown`) frees its slot rather than
+    // leaving a gap, exactly as the painters place them. Every one is
+    // measured, not the innermost alone.
+    let product = pane.selected_product();
+    let radar_shown = radar_bar_drawn(pane);
+    let mut reach = 0.0_f32;
+    let mut slots = 0usize;
+    if radar_shown {
+        let ticks = memoized_ticks(measure.ctx(), pane, prefs);
+        reach = legend_block_reach(
+            measure,
+            horizontal,
+            0.0,
+            &ticks,
+            crate::field_facts::unit_label(&product, prefs),
+        );
+        slots = 1;
+    }
     let view = pane.view(pane_idx);
-    let ticks = memoized_ticks(measure.ctx(), pane, prefs);
-    let mut reach = legend_block_reach(
-        measure,
-        horizontal,
-        0.0,
-        &ticks,
-        crate::field_facts::unit_label(&product, prefs),
-    );
-    let mut offset = 0.0;
     for id in pane.draw_order() {
-        if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) {
+        if *id == known::COLOR_SCALE || !pane.is_overlay_enabled(id) || !pane.color_bar_shown(id) {
             continue;
         }
         let Some(overlay) = overlays.legend(id, &view.layer(id)) else {
@@ -1743,7 +1747,8 @@ pub(super) fn color_scale_gutter(
         if overlay.items.thresholds.len() < 2 {
             continue;
         }
-        offset += SCALE_BAR_WIDTH + SCALE_STACK_GAP;
+        let offset = slots as f32 * (SCALE_BAR_WIDTH + SCALE_STACK_GAP);
+        slots += 1;
         let ticks = memoized_overlay_ticks(measure.ctx(), id, &overlay);
         reach = reach.max(legend_block_reach(
             measure,
@@ -1753,15 +1758,34 @@ pub(super) fn color_scale_gutter(
             overlay.items.unit_label,
         ));
     }
+    if slots == 0 {
+        return 0.0;
+    }
     let mut gutter = SCALE_MARGIN + reach;
 
     // The legend's second line is hung off the pane's own edge rather than off
     // a bar, so it is a floor under the whole gutter. Read through
-    // `legend_second_line`, the same function the painter draws from.
-    if !horizontal && let Some(line) = legend_second_line(pane, prefs) {
+    // `legend_second_line`, the same function the painter draws from — and
+    // only under the radar bar it annotates.
+    if radar_shown
+        && !horizontal
+        && let Some(line) = legend_second_line(pane, prefs)
+    {
         gutter = gutter.max(FOLD_TITLE_INSET + laid_out_width(measure, &line, SCALE_FONT_SIZE));
     }
     gutter
+}
+
+/// Whether the radar product's own bar draws on `pane`: its switch is on and
+/// the product has a scale to draw. The radar painter's first two bails, so
+/// the gutter and the overlay bars' slots agree with what it paints.
+fn radar_bar_drawn(pane: &PaneState) -> bool {
+    pane.color_bar_shown(&known::RADAR)
+        && crate::field_facts::facts(&pane.selected_product())
+            .scale
+            .thresholds
+            .len()
+            >= 2
 }
 
 /// How wide `text` lays out at `size`, logical pixels.
@@ -2183,6 +2207,11 @@ pub(super) fn render_color_scale(
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
+    // Switched off in the Color Scale layer's options: the overlay bars take
+    // its slot. `radar_bar_drawn` is this bail and the next one together.
+    if !pane.color_bar_shown(&known::RADAR) {
+        return;
+    }
     let product = pane.selected_product();
     let legend = crate::field_facts::facts(&product).scale;
     if legend.thresholds.len() < 2 {
@@ -2544,12 +2573,14 @@ fn render_overlay_color_scales(
     overlays: &OverlayRegistry,
 ) {
     let view = pane.view(pane_idx);
-    // Offset each overlay legend to the left of (vertical) or above
-    // (horizontal) the radar scale.
-    let mut bar_offset = 0;
+    // Slots from the pane edge inward — radar's first when it draws, each
+    // overlay bar one bar-and-gap further in, and a bar switched off in the
+    // Color Scale layer's options frees its slot. The same placement
+    // `color_scale_gutter` measures.
+    let mut slot = usize::from(radar_bar_drawn(pane));
 
     for id in pane.draw_order() {
-        if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE {
+        if !pane.is_overlay_enabled(id) || *id == known::COLOR_SCALE || !pane.color_bar_shown(id) {
             continue;
         }
         let Some(legend) = overlays.legend(id, &view.layer(id)) else {
@@ -2559,8 +2590,8 @@ fn render_overlay_color_scales(
             continue;
         }
 
-        bar_offset += 1;
-        let offset_px = bar_offset as f32 * (SCALE_BAR_WIDTH + 40.0);
+        let offset_px = slot as f32 * (SCALE_BAR_WIDTH + SCALE_STACK_GAP);
+        slot += 1;
 
         let bar_length = if horizontal {
             pane_rect.width() - SCALE_MARGIN * 2.0

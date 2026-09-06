@@ -16346,3 +16346,84 @@ fn the_expanded_transport_stays_inside_a_phone_screen() {
         );
     }
 }
+
+/// **Each colour bar has its own switch in the Color Scale layer's options.**
+///
+/// Radar's bar off: no bar quad paints in the pane, and the switch reads back
+/// off through a saved-and-reloaded config. The layer's own toggle is the
+/// whole HUD; this is one bar of it, so a pane stacking MRMS over radar can
+/// keep the one bar it reads.
+#[test]
+fn a_colour_bar_switched_off_in_the_layer_options_stops_painting_and_persists() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(1);
+    h.frame();
+    let panel = h.map_panel_rect();
+    let bar_quads = |h: &InputHarness| -> usize {
+        h.painted_images_in(panel)
+            .into_iter()
+            .map(|image| image.rect)
+            .filter(|r| {
+                (r.width() - 20.0).abs() < 0.5 && r.height() > 100.0
+                    || (r.height() - 20.0).abs() < 0.5 && r.width() > 100.0
+            })
+            .count()
+    };
+    assert_eq!(
+        bar_quads(&h),
+        1,
+        "precondition: the pane paints radar's bar and no other",
+    );
+
+    // The switch, where the user finds it: the Color Scale layer's body.
+    h.open_layer_in_inspector(&known::COLOR_SCALE);
+    h.frames_for(2, 1.0 / 60.0);
+    let screen = h.screen_rect();
+    assert!(
+        h.text_painted_in(screen, crate::ui::COLOR_BARS_HEADING),
+        "the Color Scale layer's body draws no bar switches",
+    );
+    let radar_switch = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text.starts_with("Radar - "))
+        .expect("a switch for radar's own bar, named by its product")
+        .0;
+    h.mouse_click(radar_switch.center());
+    h.frames_for(2, 1.0 / 60.0);
+    assert!(
+        !h.gui()
+            .pane(0)
+            .expect("pane 0")
+            .color_bar_shown(&known::RADAR),
+        "clicking the radar switch did not turn its bar off",
+    );
+    assert_eq!(
+        bar_quads(&h),
+        0,
+        "radar's bar still paints with its switch off",
+    );
+
+    // Through the config: the switch persists, and a pane hiding nothing
+    // writes no key at all.
+    let store = squallar_kv::MemoryKvStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut reopened = crate::Gui::new();
+    assert!(reopened.load_ui_config(&store));
+    assert!(
+        !reopened
+            .pane(0)
+            .expect("pane 0")
+            .color_bar_shown(&known::RADAR),
+        "the switch did not survive a reopen",
+    );
+    let mut untouched = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    untouched.set_pane_count(1);
+    untouched.frame();
+    let json = untouched.gui().ui_config_json().expect("serializable");
+    assert!(
+        !json.contains("hidden_color_bars"),
+        "a pane hiding no bar wrote the key anyway, so every existing config \
+         changes on its next save",
+    );
+}

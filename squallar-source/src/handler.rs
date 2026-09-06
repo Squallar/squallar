@@ -927,6 +927,16 @@ pub trait SourceHandler: Send {
         None
     }
 
+    /// Whether this layer ever answers [`Self::legend`] with a bar.
+    ///
+    /// Asked without a pane, so the Color Scale layer's options can list every
+    /// bar a pane *could* show — off, or on with no data yet — rather than
+    /// only the ones drawing this frame, which is what `legend` answers. A
+    /// handler that overrides `legend` overrides this too.
+    fn carries_legend(&self) -> bool {
+        false
+    }
+
     /// The renderable fields this layer offers, as data.
     ///
     /// A layer with one picture and nothing to choose between returns the empty

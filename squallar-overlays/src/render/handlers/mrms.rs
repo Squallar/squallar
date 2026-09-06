@@ -1072,6 +1072,10 @@ impl OverlayHandler for MrmsHandler {
         if text.is_empty() { None } else { Some(text) }
     }
 
+    fn carries_legend(&self) -> bool {
+        true
+    }
+
     /// The bar is a pure function of the selected product, so the signature is
     /// the product and nothing else — deliberately **not** `data_generation`,
     /// which every two-minute poll bumps. `+ 1` keeps the first product off `0`.

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// **Deliberately DERIVED `Debug`**: `{:?}` prints `LayerId("Radar")`, not
 /// `Radar`, so a leftover `format!("{:?}")` keying site produces a visibly
 /// wrong persistence key. Key by [`LayerId::as_str`], never by `{:?}`.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(transparent)]
 pub struct LayerId(Cow<'static, str>);
 
