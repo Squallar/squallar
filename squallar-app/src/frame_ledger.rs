@@ -569,17 +569,20 @@ pub(crate) struct SegmentHists {
     /// promote and the three pump phases.
     pub(crate) pump: Hist,
     /// The `Gui::ui` call itself: layout and the paint list. Opened up by
-    /// [`UiHists`], whose six cuts telescope to exactly this.
+    /// [`UiHists`], whose nine cuts telescope to this within [`micros`]'
+    /// truncation.
     pub(crate) ui: Hist,
     /// `Gui::ui` return to the acquire: mirror planning, tessellation, the
     /// texture-delta uploads and egui's buffer staging. Opened up by
-    /// [`PrepareHists`], whose six cuts telescope to exactly this.
+    /// [`PrepareHists`], whose six cuts telescope to this within [`micros`]'
+    /// truncation.
     pub(crate) prepare: Hist,
     /// Acquire return to `present_frame` return: draw, submit, present.
     pub(crate) finish: Hist,
     /// `present_frame` return to `finalize`: action processing and the
     /// repaint scheduling tail of `handle_redraw`. Opened up by
-    /// [`PostHists`], whose six cuts telescope to exactly this.
+    /// [`PostHists`], whose seven cuts telescope to this within [`micros`]'
+    /// truncation.
     pub(crate) post: Hist,
 }
 
@@ -632,10 +635,13 @@ pub(crate) struct WorstFrame {
     pub(crate) segments: [u32; 6],
     /// The nine `ui` cuts of THIS frame, in [`UiHists`]' order:
     /// `[poll, layout, topbar, statusbar, stack, dialog, panes, apply,
-    /// chrome]`. They telescope to `segments[2]` exactly, on
-    /// [`ui_phase_micros`]' terms, so the worst frame's `ui` is decomposed by
-    /// arithmetic on ONE frame rather than by pairing two cumulative
-    /// distributions that share no frame.
+    /// chrome]`. They telescope to `segments[2]` **to within the eight
+    /// microseconds nine truncating [`micros`] calls can lose, and never over
+    /// it** — 1–6 µs short on the 588 real frames measured, mean 3.39, exact
+    /// on none — so the worst frame's `ui` is decomposed by arithmetic on ONE
+    /// frame rather than by pairing two cumulative distributions that share no
+    /// frame. `the_worst_frames_ui_cuts_telescope_to_its_ui` derives that
+    /// bound off the cut count and holds it.
     ///
     /// **Why it is here and not left to [`UiHists`].** Those nine record
     /// inside `finalize`'s `if interacted` arm, so a frame that carried no
@@ -717,6 +723,29 @@ pub(crate) struct FrameLedger {
 }
 
 /// Whole microseconds from `a` to `b`, saturating into the histogram's `u32`.
+///
+/// # Truncating down, and every split in this file pays for it
+///
+/// A segment is ONE call of this; the `n` cuts that decompose it are `n` more.
+/// Each cut throws away its own fraction of a microsecond while the parent
+/// throws away only the fraction of the sum, so
+///
+/// ```text
+/// parent - sum(cuts) == floor(sum of the cuts' fractional parts),  in 0 ..= n-1
+/// ```
+///
+/// A split therefore **telescopes to its parent to within `n - 1` µs and can
+/// never exceed it** — not "exactly", however contiguous its stamps are.
+/// Measured on the nine `ui` cuts of 588 real frames: 1–6 µs short of the
+/// frame's own `ui`, mean 3.39 µs, and exact on **none** of them.
+///
+/// Per frame that is dust. Per WINDOW it is up to `n - 1` µs times the frame
+/// count, which is why a family's share is read as its own `sum` over its
+/// parent's `sum` rather than as a difference against it.
+/// `the_worst_frames_ui_cuts_telescope_to_its_ui` derives the bound above and
+/// holds it against instants a clock actually produced; [`DispatchHists`] is
+/// the one split that already stated it, because its residual is where its own
+/// truncation lands.
 fn micros(a: Instant, b: Instant) -> u32 {
     b.duration_since(a).as_micros().min(u128::from(u32::MAX)) as u32
 }
@@ -809,8 +838,9 @@ fn latch_worst(standing: Option<WorstFrame>, candidate: WorstFrame) -> WorstFram
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
 /// pair at the ends are `prepare`'s own boundaries, so the six sum to
-/// `micros(ui_end, acquire_start)` exactly. A free function so the telescoping
-/// is testable without a frame.
+/// `micros(ui_end, acquire_start)` to within the five microseconds six
+/// truncating [`micros`] calls can lose — see that function. A free function
+/// so the telescoping is testable without a frame.
 fn prepare_phase_micros(
     ui_end: Instant,
     phases: &squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps,
@@ -836,9 +866,11 @@ fn prepare_phase_micros(
 /// dialog that is not open was counted against the map surfaces.
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
-/// pair at the ends are `ui`'s own boundaries, so the six sum to
-/// `micros(ui_start, ui_end)` exactly. A free function so the telescoping is
-/// testable without a frame.
+/// pair at the ends are `ui`'s own boundaries, so the **nine** sum to
+/// `micros(ui_start, ui_end)` to within the eight microseconds nine
+/// truncating [`micros`] calls can lose — measured 1–6 on real frames, mean
+/// 3.39, exact on none of 588. A free function so the telescoping is testable
+/// without a frame.
 fn ui_phase_micros(
     ui_start: Instant,
     phases: &squallar_egui::shell_api::UiPhaseStamps,
@@ -863,8 +895,9 @@ fn ui_phase_micros(
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
 /// pair at the ends are `pump`'s own boundaries, so the eight sum to
-/// `micros(setup, ui_start)` exactly. A free function so the telescoping is
-/// testable without a frame.
+/// `micros(setup, ui_start)` to within the seven microseconds eight
+/// truncating [`micros`] calls can lose — see that function. A free function
+/// so the telescoping is testable without a frame.
 fn pump_phase_micros(setup: Instant, phases: &PumpPhaseStamps, ui_start: Instant) -> [u32; 8] {
     [
         micros(setup, phases.began),
@@ -890,8 +923,9 @@ fn pump_phase_micros(setup: Instant, phases: &PumpPhaseStamps, ui_start: Instant
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
 /// pair at the ends are `post`'s own boundaries, so the seven sum to
-/// `micros(present_return, closed)` exactly. A free function so the
-/// telescoping is testable without a frame.
+/// `micros(present_return, closed)` to within the six microseconds seven
+/// truncating [`micros`] calls can lose — see that function. A free function
+/// so the telescoping is testable without a frame.
 fn post_phase_micros(
     present_return: Instant,
     phases: &PostPhaseStamps,
@@ -914,8 +948,9 @@ fn post_phase_micros(
 ///
 /// Contiguous by construction: each cut ends where the next begins, and the
 /// pair at the ends are `finish`'s own boundaries, so the eight sum to
-/// `micros(acquire_end, present_return)` exactly. A free function so the
-/// telescoping is testable without a frame.
+/// `micros(acquire_end, present_return)` to within the seven microseconds
+/// eight truncating [`micros`] calls can lose — see that function. A free
+/// function so the telescoping is testable without a frame.
 fn finish_phase_micros(
     acquire_end: Instant,
     phases: &FinishPhaseStamps,
@@ -2012,6 +2047,48 @@ mod tests {
         );
     }
 
+    /// The gap a decomposition of truncated cuts leaves against its own
+    /// truncated parent, and the bound the number of cuts puts on it.
+    ///
+    /// Every cut is a [`micros`] call and so is the parent, and `micros`
+    /// **truncates down** to whole microseconds. Write each cut's true length
+    /// as `floor + frac`: the cuts throw away `sum(frac)` between them, and
+    /// the parent throws away `frac(sum(frac))`, so what is left over is
+    ///
+    /// ```text
+    /// parent - sum(cuts) == floor(sum of the cuts' fractional parts)
+    /// ```
+    ///
+    /// Each `frac` is in `[0, 1)`, so `n` of them sum to strictly less than
+    /// `n` and the gap is in `0 ..= n - 1`: never negative — the cuts can
+    /// never claim more than the parent — and never `n`. **The bound is a
+    /// contradiction off the number of cuts, not a tolerance chosen to fit an
+    /// observation**: a tenth cut would raise it by exactly one, and a split
+    /// that widened without widening this bound would be caught by it.
+    fn assert_telescopes_within_truncation(cuts: &[u32], parent: u32, what: &str) -> u32 {
+        let sum = cuts.iter().fold(0u32, |sum, &cut| sum.saturating_add(cut));
+        assert!(
+            sum <= parent,
+            "{what}: the cuts sum to {sum} us against a parent of {parent} us, \
+             so the decomposition claims time the span it decomposes did not \
+             have. Truncation can only make cuts SMALLER than their parent; a \
+             sum above it is an overlap or a cut taken from the wrong pair of \
+             stamps: {cuts:?}",
+        );
+        let gap = parent - sum;
+        assert!(
+            gap < cuts.len() as u32,
+            "{what}: the {} cuts fall {gap} us short of their {parent} us \
+             parent, and {} truncating micros() calls can lose at most {} us \
+             between them. A gap at or above the cut count is a cut that is \
+             missing, zeroed or measuring the wrong span: {cuts:?}",
+            cuts.len(),
+            cuts.len(),
+            cuts.len() - 1,
+        );
+        gap
+    }
+
     /// **The latched frame's nine `ui` cuts telescope to its own `ui`
     /// segment**, so `frame worst`'s `ui_*` figures decompose the very frame
     /// the line names rather than standing beside it.
@@ -2021,17 +2098,35 @@ mod tests {
     /// `frame ui (stack)`'s cumulative maximum and `frame segment (ui)`'s
     /// cumulative maximum landed in adjacent bins — two aggregates that share
     /// no frame, over a denominator that excludes every idle frame. The
-    /// assertion below is arithmetic on one frame instead.
+    /// assertions below are arithmetic on one frame instead.
     ///
-    /// On `the_post_phases_telescope_to_post`'s terms, and with its two
-    /// assertions for its reason: the exact array catches a cut computed from
-    /// the wrong pair of stamps, which the sum alone cannot see.
+    /// # Telescoping is not equality, and the fixture used to hide that
+    ///
+    /// [`ui_phase_micros`] makes **nine independent truncating `micros`
+    /// calls** where the parent makes one, so on a real frame the nine sum to
+    /// **1–6 µs short** of the `ui` the same frame reports — mean 3.39 µs,
+    /// and exact on **0 of 588** frames measured. The gate that stood here
+    /// asserted exact equality and passed anyway, because its hand-built
+    /// fixture placed every stamp at a whole-microsecond offset and so had no
+    /// fractions to lose. **A test that builds its input by hand never
+    /// exercises the constructor**: with the fixture below rounding to
+    /// nearest instead of truncating down — a real defect in the sub-
+    /// microsecond behaviour of `ui_phase_micros` — all 981 tests of this
+    /// crate's lib suite stayed green.
+    ///
+    /// So the claim is stated where each half of it is true: **exact** on
+    /// whole-microsecond stamps, **within [`assert_telescopes_within_truncation`]'s
+    /// derived bound** on stamps a clock actually produces, and **never over
+    /// the parent** on either.
     #[test]
     fn the_worst_frames_ui_cuts_telescope_to_its_ui() {
+        // ── Arm 1: whole-microsecond stamps, where the exactness IS true ──
+        //
         // One frame's stamps, stated as offsets from `ui_start`, and its `ui`
         // segment taken from the SAME pair of instants the ledger takes it
         // from — so the two figures being compared are one frame's, which is
-        // the whole claim.
+        // the whole claim. The exact array is what catches a cut computed
+        // from the wrong pair of stamps, which no sum can see.
         let ui_start = Instant::now();
         let phases = ui_phases_at(
             ui_start,
@@ -2045,19 +2140,108 @@ mod tests {
             interact: false,
         };
         assert_eq!(
+            assert_telescopes_within_truncation(&w.ui_cuts, w.segments[2], "whole-us stamps"),
+            0,
+            "nine stamps with nothing below a microsecond on them still lost \
+             time, so the nine are not contiguous cuts of one span",
+        );
+        assert_eq!(
             w.ui_cuts,
             [300, 1_600, 7_100, 3_000, 12_100, 500, 14_800, 50, 1_550],
             "a cut moved: the nine no longer bracket the phases they are named \
              for, so `frame worst`'s ui_* columns name the wrong spans",
         );
-        assert_eq!(
-            w.ui_cuts.iter().sum::<u32>(),
-            w.segments[2],
-            "the worst frame's nine ui cuts do not sum to its own ui segment, \
-             so the line's ui_* figures decompose some other frame and the \
-             attribution they exist to make is an inference again",
-        );
         assert_eq!(w.ui_cuts.iter().sum::<u32>(), 41_000);
+
+        // ── Arm 2: the same nine spans with half a microsecond of dust on
+        // each, which is what a clock hands the constructor ──
+        //
+        // Deterministic, and chosen so the loss is provably NOT zero: nine
+        // fractions of 0.5 sum to 4.5, so the nine cuts fall exactly 4 us
+        // short of a parent that is itself truncated. That 4 is inside the
+        // 1–6 measured in the field and is what the old fixture could not
+        // produce.
+        let dusty_start = Instant::now();
+        let mut at = 0u64;
+        let mut ns = [0u64; 8];
+        for (slot, len) in [
+            300_500u64, 1_600_500, 7_100_500, 3_000_500, 12_100_500, 500_500, 14_800_500, 50_500,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            at += len;
+            ns[slot] = at;
+        }
+        let dusty = UiPhaseStamps {
+            polled: dusty_start + std::time::Duration::from_nanos(ns[0]),
+            laid_out: dusty_start + std::time::Duration::from_nanos(ns[1]),
+            topbar: dusty_start + std::time::Duration::from_nanos(ns[2]),
+            statusbar: dusty_start + std::time::Duration::from_nanos(ns[3]),
+            shell: dusty_start + std::time::Duration::from_nanos(ns[4]),
+            dialog: dusty_start + std::time::Duration::from_nanos(ns[5]),
+            panes: dusty_start + std::time::Duration::from_nanos(ns[6]),
+            applied: dusty_start + std::time::Duration::from_nanos(ns[7]),
+        };
+        let dusty_end = dusty_start + std::time::Duration::from_nanos(at + 1_549_500);
+        let dusty_cuts = ui_phase_micros(dusty_start, &dusty, dusty_end);
+        let dusty_gap = assert_telescopes_within_truncation(
+            &dusty_cuts,
+            micros(dusty_start, dusty_end),
+            "sub-microsecond stamps",
+        );
+        assert_eq!(
+            dusty_gap, 4,
+            "nine cuts each half a microsecond long in their fraction did not \
+             lose the 4 us that truncating nine of them must lose, so this arm \
+             is not exercising the truncation it exists for: {dusty_cuts:?}",
+        );
+        assert_eq!(
+            dusty_cuts,
+            [300, 1_600, 7_100, 3_000, 12_100, 500, 14_800, 50, 1_549],
+            "the same nine spans as arm 1, each truncated: a cut that did not \
+             lose its own fraction is not the arithmetic the field sees",
+        );
+
+        // ── Arm 3: instants a clock actually produced, no offsets at all ──
+        //
+        // The stamps are nine bare `Instant::now()` reads in the order the
+        // struct declares them, which is the order `Gui::ui` takes them in and
+        // the only input shape the field ever hands this function. Their
+        // spacing is whatever the machine gives — tens to hundreds of
+        // nanoseconds — so the fractions are arbitrary rather than chosen.
+        //
+        // **The bound is asserted; a non-zero gap is not.** On a fast box
+        // every cut can truncate to zero and the gap with it, and a test that
+        // demanded truncation from a real clock would be asserting the clock
+        // rather than the property. Arm 2 carries the non-vacuity; this arm
+        // carries the input.
+        let mut samples = 0;
+        for _ in 0..256 {
+            let live_start = Instant::now();
+            let live = UiPhaseStamps {
+                polled: Instant::now(),
+                laid_out: Instant::now(),
+                topbar: Instant::now(),
+                statusbar: Instant::now(),
+                shell: Instant::now(),
+                dialog: Instant::now(),
+                panes: Instant::now(),
+                applied: Instant::now(),
+            };
+            let live_end = Instant::now();
+            assert_telescopes_within_truncation(
+                &ui_phase_micros(live_start, &live, live_end),
+                micros(live_start, live_end),
+                "instants from the clock",
+            );
+            samples += 1;
+        }
+        assert_eq!(
+            samples, 256,
+            "the real-clock arm did not take the samples it claims to have \
+             taken, so its greenness is an absence and not a reading",
+        );
 
         // **The green arm, beside the red one.** A frame whose `ui` really is
         // all in one cut — every other cut genuinely zero — is a healthy input
@@ -2068,23 +2252,16 @@ mod tests {
             ..w
         };
         assert_eq!(
-            single.ui_cuts.iter().sum::<u32>(),
-            single.segments[2],
+            assert_telescopes_within_truncation(
+                &single.ui_cuts,
+                single.segments[2],
+                "a genuinely single-cut frame",
+            ),
+            0,
             "a frame whose ui was genuinely spent in one cut fails the \
              telescoping gate, so the gate over-fires on healthy input",
         );
     }
-
-    /// **The nine cuts are computed for EVERY presented frame, not only the
-    /// interact ones.** Held against `finalize`'s own source, on
-    /// [`the_worst_frame_latch_is_outside_the_interact_arm`]'s terms: the
-    /// binding must appear before the `if interacted {` that opens the arm.
-    ///
-    /// The degenerate this is red against is the natural one — leaving the
-    /// `ui_phase_micros` call where its nine `record` calls are and reading
-    /// zeros on every idle frame. That shape compiles, telescopes on the
-    /// frames it does fill, and reports nine zeros on exactly the frames this
-    /// field was added to describe: the ones that pay for a click.
     #[test]
     fn the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm() {
         let body = include_str!("frame_ledger.rs")

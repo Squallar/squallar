@@ -731,6 +731,19 @@ fn frame_segments_line(
 ///
 /// The `frame segments` line is deliberately left exactly as it was: it is
 /// pinned by three things that move together, and this is additive.
+///
+/// # `sum` telescopes to a parent's `sum`, but not to the microsecond
+///
+/// Every figure here is whole microseconds truncated DOWN
+/// (`frame_ledger::micros`), and a family of `n` cuts truncates `n` times
+/// where its parent truncates once. So a cut family's `sum` runs up to
+/// `n - 1` µs per frame **under** its parent's `sum` and never over it —
+/// measured on the nine `ui` cuts of 588 real frames at 1–6 µs a frame,
+/// mean 3.39. Read a share as this family's `sum` over its parent's `sum`
+/// and the error is parts per thousand; read the residual as "time the cuts
+/// do not name" and remember that up to `n - 1` µs of every frame in the
+/// window is arithmetic rather than a finding. `frame_ledger::micros`
+/// derives the bound.
 fn named_hist_line(prefix: &str, name: &str, h: &squallar_device_profile::hist::Hist) -> String {
     format!(
         "{prefix} ({name}): n={}, sum={} us, p50={} us, p90={} us, p99={} us, hist={}",
@@ -748,7 +761,7 @@ fn named_hist_line(prefix: &str, name: &str, h: &squallar_device_profile::hist::
 ///
 /// Denominator: interact frames only, the same as `frame segments`, and the
 /// six are **contiguous cuts of one frame's service**, so their sum telescopes
-/// to it. The acquire is not among them and is not a service segment; it stays
+/// to it, to within [`named_hist_line`]'s truncation. The acquire is not among them and is not a service segment; it stays
 /// on the `frame segments` line where it already is.
 ///
 /// All six are emitted every tick, `n=0` included — the same choice
@@ -770,7 +783,8 @@ fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
 ///
 /// Denominator: **exactly `frame segment (prepare)`'s** — presented interact
 /// frames — and the six are contiguous cuts of that one span, so their sums
-/// telescope to its sum. That equality is what makes this a decomposition
+/// telescope to its sum, to within the truncation
+/// [`named_hist_line`] describes. That is what makes this a decomposition
 /// rather than a seventh segment: `frame prepare (*)` is never added to
 /// `frame segment (prepare)`, it *is* it.
 ///
@@ -797,10 +811,11 @@ fn frame_prepare_lines(p: &crate::frame_ledger::PrepareHists) -> [String; 6] {
 /// The nine `frame ui (<name>):` lines — the `ui` segment, opened up.
 ///
 /// Denominator: **exactly `frame segment (ui)`'s** — presented interact
-/// frames — and the six are contiguous cuts of that one span, so their sums
-/// telescope to its sum. That equality is what makes this a decomposition
-/// rather than a seventh segment: `frame ui (*)` is never added to
-/// `frame segment (ui)`, it *is* it.
+/// frames — and the **nine** are contiguous cuts of that one span, so their
+/// sums telescope to its sum, to within the truncation [`named_hist_line`]
+/// describes. That is what makes this a decomposition rather than a seventh
+/// segment: `frame ui (*)` is never added to `frame segment (ui)`, it *is*
+/// it.
 ///
 /// A sibling of [`frame_prepare_lines`] and independent of it: that one cuts
 /// `prepare`, this one cuts `ui`, and the two share only the formatter. Both
@@ -851,9 +866,10 @@ fn frame_pump_lines(p: &crate::frame_ledger::PumpHists) -> [String; 8] {
 ///
 /// Denominator: **exactly `frame segment (post)`'s** — presented interact
 /// frames — and the seven are contiguous cuts of that one span, so their sums
-/// telescope to its sum. That equality is what makes this a decomposition
-/// rather than a seventh segment: `frame post (*)` is never added to
-/// `frame segment (post)`, it *is* it.
+/// telescope to its sum, to within the truncation [`named_hist_line`]
+/// describes. That is what makes this a decomposition rather than a seventh
+/// segment: `frame post (*)` is never added to `frame segment (post)`, it
+/// *is* it.
 ///
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
 /// Five of the seven are structurally near-empty on every arm measured, and
@@ -886,8 +902,9 @@ fn frame_post_lines(p: &crate::frame_ledger::PostHists) -> [String; 7] {
 /// and are not a decomposition of it: they decompose the same span over a
 /// strictly larger frame set, and `n` here is larger than `n` there by the
 /// idle frames. `frame finish (whole)` is the parent on this family's own
-/// terms — the eight telescope to it exactly — so every share this family
-/// supports is computed without borrowing another family's count.
+/// terms — the eight telescope to it within [`named_hist_line`]'s
+/// truncation — so every share this family supports is computed without
+/// borrowing another family's count.
 ///
 /// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms.
 fn frame_finish_lines(f: &crate::frame_ledger::FinishHists) -> [String; 9] {
@@ -946,7 +963,10 @@ fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
 /// Denominator: **every presented frame of the last telemetry period**, both
 /// families, which is not any other frame line's denominator here. The six
 /// segment figures are that single frame's microseconds and they sum to its
-/// service exactly, because they are the same six the ledger telescoped to it.
+/// service, because they are the same six the ledger telescoped to it — to
+/// within the five microseconds six truncating `frame_ledger::micros` calls
+/// can lose, which is that function's own arithmetic and not a gap in this
+/// line.
 ///
 /// **Never added to `frame segments` or to `frame segment (*)`.** Those are
 /// percentiles over interact frames; this is one frame, and it is usually not
@@ -1028,10 +1048,18 @@ fn frame_worst_line(
 /// **Never added to `frame ui (*)`, and not comparable to it either.** Those
 /// nine histograms record inside the ledger's `if interacted` arm; these nine
 /// are one frame's microseconds and that frame is usually an idle one, so it
-/// contributed to none of them. The nine here sum to this line's own `ui=`
-/// exactly — `the_worst_frames_ui_cuts_telescope_to_its_ui` holds it — which
-/// is what turns "the two families' maxima are in adjacent bins" into
-/// arithmetic on one named frame.
+/// contributed to none of them.
+///
+/// The nine here sum to this line's own `ui=` **to within 8 µs and never over
+/// it**, not exactly: each is its own truncating `frame_ledger::micros` call
+/// where `ui=` is one, so the nine lose their fractions and the parent loses
+/// only the fraction of the sum. Measured on 588 real frames: 1–6 µs short,
+/// mean 3.39, exact on none of them. The bound is nine cuts minus one and is
+/// derived, not fitted — `the_worst_frames_ui_cuts_telescope_to_its_ui` holds
+/// it against instants a clock produced. That is still what turns "the two
+/// families' maxima are in adjacent bins" into arithmetic on one named
+/// frame; a residual of a few microseconds here is that arithmetic, not an
+/// unnamed cost.
 fn ui_cut_columns(cuts: [u32; 9]) -> String {
     let [
         poll,
