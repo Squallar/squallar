@@ -87,9 +87,9 @@ fn goes_whole(capable: bool, bytes: usize) -> bool {
 /// (1 MiB at 32 rows on an 8192-wide atlas, 256 MiB at the full square), so
 /// once the height crossed the band cap the banded route took it, and the
 /// place names broke on every doubling — at the zooms whose new label sizes
-/// forced one. One blocking write per doubling is the honest cost; the
-/// doublings are rare, and the tile labels quantise their sizes to keep them
-/// so.
+/// forced one. One blocking write per doubling is the honest cost, and the
+/// doublings are rare once no text size is a continuous function of zoom —
+/// see `station_model::font_size_for_zoom`, which was the one that was.
 fn crosses_whole(id: egui::TextureId, capable: bool, bytes: usize) -> bool {
     id == egui::TextureId::default() || goes_whole(capable, bytes)
 }

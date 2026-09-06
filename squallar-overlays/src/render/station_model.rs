@@ -135,24 +135,21 @@ pub fn draw_metar_station(
     }
 
     // ── Tier 3 ────────────────────────────────────────────────────────
+    // The multiples are rounded on their own: a quarter point times 0.85 is
+    // not a quarter point.
+    let small = quarter_points(font_size * 0.85);
     if let Some(code) = &text.pressure_code {
         painter.text(
             PRESSURE_OFFSET,
             code,
             text_color,
-            font_size * 0.85,
+            small,
             TextAnchor::BottomLeft,
         );
     }
 
     if let Some(vis) = &text.visibility {
-        painter.text(
-            VIS_OFFSET,
-            vis,
-            text_color,
-            font_size * 0.85,
-            TextAnchor::CenterRight,
-        );
+        painter.text(VIS_OFFSET, vis, text_color, small, TextAnchor::CenterRight);
     }
 
     if let Some(ref wx) = ob.wx_string {
@@ -163,7 +160,7 @@ pub fn draw_metar_station(
         ID_OFFSET,
         &ob.station_id,
         text_color,
-        font_size * 0.75,
+        quarter_points(font_size * 0.75),
         TextAnchor::TopLeft,
     );
 }
@@ -220,7 +217,23 @@ fn circle_radius_for_zoom(zoom: f32) -> f32 {
 }
 
 fn font_size_for_zoom(zoom: f32) -> f32 {
-    (zoom * 1.0 + 2.0).clamp(9.0, 14.0)
+    quarter_points((zoom * 1.0 + 2.0).clamp(9.0, 14.0))
+}
+
+/// `size` to the nearest quarter of a point.
+///
+/// **Every size the model hands the painter goes through this**, the base and
+/// its two multiples alike. Between zooms 7 and 12 the size is a continuous
+/// function of zoom, and the zoom under a pinch is a fresh float every
+/// frame, so each frame laid every number on the glass out at three sizes
+/// nobody had seen before — and each size is its own set of glyphs in egui's
+/// font atlas. Measured headless, 1300 stations under a five-level pinch at
+/// 60 fps on a 4096-wide atlas: 16 MiB and two whole-atlas uploads over the
+/// renderer's 4 MiB ringless band cap, against 1 MiB and none at quarter
+/// points. A quarter of a point is under the eye's threshold at every size
+/// in the model's range.
+fn quarter_points(size: f32) -> f32 {
+    (size * 4.0).round() / 4.0
 }
 
 fn flight_category_color(fc: Option<FlightCategory>) -> [u8; 4] {
@@ -676,6 +689,57 @@ mod tests {
 
     /// **The precomputed text is exactly what the inline `format!`s produced.**
     ///
+    /// **Every text size the model draws is a quarter-point step, and a
+    /// pinch through the whole continuous range meets a few dozen of them,
+    /// not thousands.** A painter that records sizes, driven across zooms
+    /// 6 to 14 at a thousandth of a level, is the same sweep a gesture makes.
+    #[test]
+    fn the_models_text_sizes_step_by_a_quarter_point_across_a_pinch() {
+        struct SizePainter(Vec<u32>);
+        impl PointPainter for SizePainter {
+            fn circle_filled(&mut self, _o: [f32; 2], _r: f32, _c: [u8; 4]) {}
+            fn circle_stroke(&mut self, _o: [f32; 2], _r: f32, _c: [u8; 4], _w: f32) {}
+            fn text(&mut self, _o: [f32; 2], _t: &str, _c: [u8; 4], s: f32, _a: TextAnchor) {
+                assert_eq!(
+                    (s * 4.0).fract(),
+                    0.0,
+                    "a text size of {s} is not a quarter-point step"
+                );
+                self.0.push(s.to_bits());
+            }
+            fn line(&mut self, _f: [f32; 2], _t: [f32; 2], _c: [u8; 4], _w: f32) {}
+            fn filled_polygon(&mut self, _p: &[[f32; 2]], _c: [u8; 4]) {}
+        }
+        let mut ob = ob(None);
+        ob.mslp_hpa = Some(1013.2);
+        let text = StationText::of(&ob);
+        let mut painter = SizePainter(Vec::new());
+        for step in 0..=8000 {
+            let ctx = DrawPointContext {
+                zoom: 6.0 + step as f32 / 1000.0,
+                is_dark: true,
+            };
+            draw_metar_station(&ob, &text, &mut painter, &ctx);
+        }
+        let mut distinct = painter.0.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 3,
+            "non-vacuity: the sweep met only {} sizes, so the range is not \
+             continuous and nothing here is being quantised",
+            distinct.len(),
+        );
+        // Base 9..=14 in quarter steps is 21 values; its 0.85 and 0.75
+        // multiples, rounded, at most 21 each.
+        assert!(
+            distinct.len() <= 63,
+            "a pinch from zoom 6 to 14 met {} distinct text sizes; each is a \
+             set of glyphs in the font atlas, and the atlas doubled under it",
+            distinct.len(),
+        );
+    }
+
     /// The formatting moved from the draw (per station, per frame) to
     /// `StationText::of` (per observation, once). That is a refactor of
     /// user-visible strings, so the old spellings are pinned here as LITERALS
