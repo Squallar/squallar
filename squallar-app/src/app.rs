@@ -1019,17 +1019,27 @@ impl App {
 
     fn handle_redraw(&mut self) {
         self.frame_ledger.mark_frame_start();
+        // The six stamps below cut the `pre` segment into the seven things
+        // this head does; `frame_ledger::PreHists` says what each one holds
+        // and why the split exists. Taken here rather than handed back by a
+        // callee because this head is not one call — `PostPhaseStamps`' own
+        // arrangement, at the other end of the frame.
         self.input.clear_frame_state();
         self.poll_platform_state();
+        let pre_polled = web_time::Instant::now();
         self.poll_data_channels();
+        let pre_ingested = web_time::Instant::now();
         self.evict_unshown_scans();
+        let pre_evicted = web_time::Instant::now();
         squallar_worker::offload::drain_deferred_drops(
             squallar_device_profile::constants::DEFERRED_DROP_BUDGET_PER_FRAME,
         );
+        let pre_dropped = web_time::Instant::now();
         // Ahead of the minimized and zero-area early returns below: a window that is
         // minimized or still sizing is exactly one whose session might be about to end, and
         // skipping the save there is how the last change gets lost.
         self.autosave_config(false);
+        let pre_saved = web_time::Instant::now();
 
         if let Some(window) = self.window.as_ref()
             && let Some(min) = window.is_minimized()
@@ -1050,12 +1060,28 @@ impl App {
                 return;
             }
         }
+        // After both window queries and before the renderer check: the `gate`
+        // cut is the two platform questions that can abandon the frame, and
+        // `ensure` is everything from here to the `setup` mark.
+        let pre_gated = web_time::Instant::now();
 
         self.ensure_rendering_state();
         if self.state.is_none() || self.window.is_none() {
             return;
         }
 
+        // Filed here, on the last line before the segment's right boundary is
+        // stamped: a frame that took one of the three early exits above draws
+        // nothing and `finalize` discards it, so it files no phases either.
+        self.frame_ledger
+            .record_pre_phases(crate::frame_ledger::PrePhaseStamps {
+                polled: pre_polled,
+                ingested: pre_ingested,
+                evicted: pre_evicted,
+                dropped: pre_dropped,
+                saved: pre_saved,
+                gated: pre_gated,
+            });
         let (screen_descriptor, gui_actions) = self.setup_egui_frame();
         let repaint_delay = self.present_frame(screen_descriptor);
         // The end of the present path: whatever the device's error sink noted

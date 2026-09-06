@@ -786,6 +786,60 @@ fn the_rig_reads_the_ui_lines_the_app_actually_writes() {
     );
 }
 
+/// The rig's `frame pre` probe reads what the app writes.
+///
+/// `pre` was the last segment in the file with no split, and the only one a
+/// reader could not open: mean 325.6 µs, p99 1,682 µs and 10,357 µs on one
+/// latched frame on scene D. A family the app writes and the rig has no regex
+/// for is ABSENT from the artifact rather than empty, which is what kept
+/// `frame ui (…)` — the largest segment of an interact frame — invisible for
+/// weeks.
+#[test]
+fn the_rig_reads_the_pre_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    assert_eq!(
+        super::named_hist_line("frame pre", "ingest", &h),
+        rendered(
+            &pattern("frame_pre_re"),
+            &["ingest", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame pre (…)` line and the rig's probe have drifted",
+    );
+    // **`frame pre` and `frame prepare` are two families, not one.** Their
+    // names share a prefix, so a probe anchored on `frame pre` alone would
+    // swallow every `frame prepare (…)` line and file six cuts of the wrong
+    // segment under `pre:`. Held on the fixed heads of the two patterns
+    // against the two sentences, which is the whole of what separates them —
+    // no regex engine needed, and none is a dependency here.
+    let head = |name: &str| {
+        pattern(name)
+            .split_once(r"\(")
+            .expect("a family probe opens with `<prefix> \\(`")
+            .0
+            .to_string()
+    };
+    let (pre_head, prepare_head) = (head("frame_pre_re"), head("frame_prepare_re"));
+    assert_eq!(
+        (pre_head.as_str(), prepare_head.as_str()),
+        ("frame pre ", "frame prepare ")
+    );
+    let prepare_line = super::named_hist_line("frame prepare", "plan", &h);
+    let pre_line = super::named_hist_line("frame pre", "platform", &h);
+    assert!(
+        !prepare_line.contains(&format!("{pre_head}(")),
+        "the `frame pre` probe's head occurs inside a `frame prepare` line, \
+         so the two families would be scraped into one: {prepare_line:?}",
+    );
+    assert!(
+        !pre_line.contains(&format!("{prepare_head}(")),
+        "the `frame prepare` probe's head occurs inside a `frame pre` line: \
+         {pre_line:?}",
+    );
+}
+
 /// **Every cut family the app writes is one the rig both scrapes and windows.**
 ///
 /// The per-family gates above each pin one name, so a family added with no
@@ -795,6 +849,7 @@ fn the_rig_reads_the_ui_lines_the_app_actually_writes() {
 #[test]
 fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
     for (family, key) in [
+        ("frame pre", "pre"),
         ("frame prepare", "prepare"),
         ("frame ui", "ui"),
         ("frame post", "post"),
@@ -867,6 +922,10 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
         ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
+        // Seven DISTINCT pre cuts summing to this frame's own `pre` of 64,
+        // for the ui nine's reason: a repeat could not tell a transposed pair
+        // of columns from a correct one.
+        pre_cuts: [3, 21, 9, 14, 2, 7, 8],
         interact: true,
     };
     // The since-boot maximum is a whole frame too: a boot-time compile spike
@@ -876,6 +935,7 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
+        pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         interact: false,
     };
     assert_eq!(
@@ -886,13 +946,21 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
     );
     assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
     assert_eq!(
+        w.pre_cuts.iter().sum::<u32>(),
+        w.segments[0],
+        "the fixture's pre cuts do not telescope to its pre, so the pin below \
+         would pin a line describing no frame that could exist",
+    );
+    assert_eq!(boot.pre_cuts.iter().sum::<u32>(), boot.segments[0]);
+    assert_eq!(
         super::frame_worst_line(Some(w), Some(boot)),
         rendered(
             &pattern("frame_worst_re"),
             &[
                 "13455", "interact", "22628", "64", "55", "9514", "2829", "700", "293", "11",
-                "402", "1207", "96", "6902", "4", "812", "3", "77", "idle", "100", "90", "300",
-                "21000", "800", "338", "7", "19", "41", "5", "133", "2", "61", "1", "31",
+                "402", "1207", "96", "6902", "4", "812", "3", "77", "3", "21", "9", "14", "2", "7",
+                "8", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
+                "133", "2", "61", "1", "31", "4", "31", "12", "20", "6", "9", "18",
             ],
         ),
         "the `frame worst:` line and the rig's probe have drifted",
@@ -903,7 +971,7 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
             &pattern("frame_worst_none_re"),
             &[
                 "22628", "idle", "100", "90", "300", "21000", "800", "338", "7", "19", "41", "5",
-                "133", "2", "61", "1", "31",
+                "133", "2", "61", "1", "31", "4", "31", "12", "20", "6", "9", "18",
             ],
         ),
         "the no-frame spelling and the rig's probe have drifted",
@@ -925,6 +993,12 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         ("cadence", &["cadence_re"]),
         ("dispatch", &["frame_dispatch_re"]),
         ("finish", &["frame_finish_re"]),
+        // The last segment to get a split, and a top-three tail owner while
+        // it had none. `frame pre` and `frame prepare` are DIFFERENT families
+        // whose names share a prefix; the enumeration below reads to the
+        // first non-lowercase character, so the two are separate rows here
+        // and separate regexes in drive.py.
+        ("pre", &["frame_pre_re"]),
         // The verdict family — frames drawn against frames that needed
         // drawing. One probe, and its groups are all mandatory: an unlisted
         // family is invisible to every leg, which is what this table exists
@@ -1667,6 +1741,7 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         service: 6_728,
         segments: [61, 54, 4_402, 1_580, 611, 20],
         ui_cuts: [12, 310, 903, 41, 2_800, 6, 288, 2, 40],
+        pre_cuts: [2, 18, 11, 21, 1, 4, 4],
         interact: false,
     };
     assert_eq!(
@@ -1681,23 +1756,35 @@ fn the_worst_frame_line_reads_exactly_as_pinned() {
         "the fixture's nine ui cuts do not telescope to its ui, so the pin \
          below would pin a line whose ui_* columns decompose no frame",
     );
+    assert_eq!(
+        worst.pre_cuts.iter().sum::<u32>(),
+        worst.segments[0],
+        "the fixture's seven pre cuts do not telescope to its pre, so the pin \
+         below would pin a line whose pre_* columns decompose no frame",
+    );
     let boot = crate::frame_ledger::WorstFrame {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
+        pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         interact: false,
     };
     assert_eq!(boot.ui_cuts.iter().sum::<u32>(), boot.segments[2]);
+    assert_eq!(boot.pre_cuts.iter().sum::<u32>(), boot.segments[0]);
     assert_eq!(
         super::frame_worst_line(Some(worst), Some(boot)),
         "frame worst: service=6728 us, family=idle, since_boot=9513 us, \
          pre=61 us, pump=54 us, ui=4402 us, prepare=1580 us, finish=611 us, \
          post=20 us, ui_poll=12 us, ui_layout=310 us, ui_topbar=903 us, \
          ui_statusbar=41 us, ui_stack=2800 us, ui_dialog=6 us, ui_panes=288 us, \
-         ui_apply=2 us, ui_chrome=40 us, boot: idle, pre=1 us, pump=2 us, \
+         ui_apply=2 us, ui_chrome=40 us, pre_platform=2 us, pre_ingest=18 us, \
+         pre_evict=11 us, pre_drops=21 us, pre_autosave=1 us, pre_gate=4 us, \
+         pre_ensure=4 us, boot: idle, pre=1 us, pump=2 us, \
          ui=3 us, prepare=9500 us, finish=4 us, post=3 us, ui_poll=0 us, \
          ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, ui_stack=1 us, \
-         ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us",
+         ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
+         pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
+         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
     );
 }
 
@@ -1709,6 +1796,7 @@ fn the_worst_frame_line_names_the_interact_family_too() {
         service: 600,
         segments: [100; 6],
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
+        pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         interact: true,
     };
     assert!(
@@ -1727,6 +1815,7 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
         service: 9_513,
         segments: [1, 2, 3, 9_500, 4, 3],
         ui_cuts: [0, 1, 0, 0, 1, 0, 1, 0, 0],
+        pre_cuts: [0, 1, 0, 0, 0, 0, 0],
         interact: false,
     };
     let line = super::frame_worst_line(None, Some(boot));
@@ -1739,7 +1828,9 @@ fn the_worst_frame_line_says_absence_rather_than_a_zero_frame() {
         "frame worst: no frame presented this period, since_boot=9513 us, boot: idle, \
          pre=1 us, pump=2 us, ui=3 us, prepare=9500 us, finish=4 us, post=3 us, \
          ui_poll=0 us, ui_layout=1 us, ui_topbar=0 us, ui_statusbar=0 us, \
-         ui_stack=1 us, ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us",
+         ui_stack=1 us, ui_dialog=0 us, ui_panes=1 us, ui_apply=0 us, ui_chrome=0 us, \
+         pre_platform=0 us, pre_ingest=1 us, pre_evict=0 us, pre_drops=0 us, \
+         pre_autosave=0 us, pre_gate=0 us, pre_ensure=0 us",
         "an empty period must still carry the session maximum, or a console \
          ring that dropped the bad tick reads as a run with no bad frame",
     );
@@ -1759,6 +1850,7 @@ fn the_worst_frame_line_is_not_mistakable_for_a_segment_line() {
         service: 600,
         segments: [100; 6],
         ui_cuts: [1, 2, 3, 4, 80, 5, 3, 1, 1],
+        pre_cuts: [10, 30, 20, 25, 5, 4, 6],
         interact: true,
     };
     let worst_line = super::frame_worst_line(Some(worst), None);

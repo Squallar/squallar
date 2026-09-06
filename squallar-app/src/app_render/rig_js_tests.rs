@@ -584,12 +584,14 @@ fn the_worst_frame_scrape_reads_back_the_line_the_app_formats() {
         service: 13_455,
         segments: [64, 55, 9_514, 2_829, 700, 293],
         ui_cuts: [11, 402, 1_207, 96, 6_902, 4, 812, 3, 77],
+        pre_cuts: [3, 21, 9, 14, 2, 7, 8],
         interact: true,
     };
     let boot = crate::frame_ledger::WorstFrame {
         service: 22_628,
         segments: [100, 90, 300, 21_000, 800, 338],
         ui_cuts: [7, 19, 41, 5, 133, 2, 61, 1, 31],
+        pre_cuts: [4, 31, 12, 20, 6, 9, 18],
         interact: false,
     };
     let payload = serde_json::to_string(&serde_json::json!({
@@ -670,9 +672,31 @@ console.log(JSON.stringify({{ threw: threw,
         "the scraped ui cuts do not sum to the scraped ui, so the rig read \
          the nine out of the wrong capture groups",
     );
+    // **The seven pre cuts survive the same scrape**, on the nine's terms
+    // exactly: they sit AFTER the nine in the positional regex, so a group
+    // miscount in the ui block would land here as plausible integers rather
+    // than as an absence.
+    assert_eq!(got[0]["pre_platform"].as_u64(), Some(3));
+    assert_eq!(got[0]["pre_drops"].as_u64(), Some(14));
+    assert_eq!(got[0]["pre_ensure"].as_u64(), Some(8));
+    assert_eq!(
+        (0..7)
+            .map(|i| {
+                let key = [
+                    "platform", "ingest", "evict", "drops", "autosave", "gate", "ensure",
+                ][i];
+                got[0][format!("pre_{key}")].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>(),
+        got[0]["pre"].as_u64().unwrap_or_default(),
+        "the scraped pre cuts do not sum to the scraped pre, so the rig read \
+         the seven out of the wrong capture groups",
+    );
     assert_eq!(got[0]["boot_ui_poll"].as_u64(), Some(7));
     assert_eq!(got[0]["boot_ui_stack"].as_u64(), Some(133));
     assert_eq!(got[0]["boot_ui_chrome"].as_u64(), Some(31));
+    assert_eq!(got[0]["boot_pre_platform"].as_u64(), Some(4));
+    assert_eq!(got[0]["boot_pre_ensure"].as_u64(), Some(18));
     // The absence spelling: a period in which nothing presented still carries
     // the since-boot maximum and its stamp.
     assert_eq!(got[1]["t"].as_u64(), Some(4201), "the wrong console stamp");
@@ -682,6 +706,8 @@ console.log(JSON.stringify({{ threw: threw,
     assert_eq!(got[1]["boot_ui_poll"].as_u64(), Some(7));
     assert_eq!(got[1]["boot_ui_stack"].as_u64(), Some(133));
     assert_eq!(got[1]["boot_ui_chrome"].as_u64(), Some(31));
+    assert_eq!(got[1]["boot_pre_platform"].as_u64(), Some(4));
+    assert_eq!(got[1]["boot_pre_ensure"].as_u64(), Some(18));
 }
 
 /// **Each gate above reddens on a driver that deserves it, and passes on one

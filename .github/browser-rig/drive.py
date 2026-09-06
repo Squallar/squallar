@@ -92,6 +92,7 @@ Typical use (see run_smoke.sh for the orchestrated version):
 import argparse
 import base64
 import errno
+import inspect
 import json
 import os
 import re
@@ -101,6 +102,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -3103,8 +3105,8 @@ var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) 
 // once at the end: a family the watcher never ingests can only ever be read as
 // a last-period fallback, which is what silently voided every windowed
 // worst-frame reading this instrument produced.
-var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us/;
-var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us/;
+var frame_worst_re = /frame worst: service=(\d+) us, family=([a-z0-9-]+), since_boot=(\d+) us, pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us/;
+var frame_worst_none_re = /frame worst: no frame presented this period, since_boot=(\d+) us, boot: ([a-z0-9-]+), pre=(\d+) us, pump=(\d+) us, ui=(\d+) us, prepare=(\d+) us, finish=(\d+) us, post=(\d+) us, ui_poll=(\d+) us, ui_layout=(\d+) us, ui_topbar=(\d+) us, ui_statusbar=(\d+) us, ui_stack=(\d+) us, ui_dialog=(\d+) us, ui_panes=(\d+) us, ui_apply=(\d+) us, ui_chrome=(\d+) us, pre_platform=(\d+) us, pre_ingest=(\d+) us, pre_evict=(\d+) us, pre_drops=(\d+) us, pre_autosave=(\d+) us, pre_gate=(\d+) us, pre_ensure=(\d+) us/;
 var prep_geometry_re = /frame prep geometry: (\d+) stagings, (\d+) vertices, (\d+) indices, (\d+) B staged, (\d+) through the ring, (\d+) declined/;
 var gpu_passes_re = /gpu passes: raymarch n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; ground n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; mirror n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; main n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us; (\d+) frames/;
 var cadence_re = /frame cadence: n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -3235,6 +3237,25 @@ var frame_prepare_re = /frame prepare \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p
 // on 79% of interact frames and 8 ms at p99 over the same 475 frames. A
 // percentile of a distribution that shape says an occasional event happened;
 // it cannot say WHICH of the six things the tail does was the event.
+// `frame segment (pre)` opened up, on `frame post`'s terms exactly: SEVEN
+// contiguous cuts of that ONE span, same denominator (presented interact
+// frames), so their sums telescope to its sum. A DECOMPOSITION, never a
+// seventh segment -- adding `frame pre (*)` to `frame segment (pre)`
+// double-counts the whole of it.
+//
+// `frame pre (ingest)` is NOT `frame pump (apply)`. This one is the `Ingest`
+// pump walk in `handle_redraw`'s head, before the renderer-state checks; that
+// one is the `Apply` walk inside `setup_egui_frame`. Different walks under
+// different parents; the family keys are `pre:ingest` and `pump:apply` and
+// they are never added.
+//
+// Why this family exists: `pre` was the LAST segment with no split, and a
+// top-three tail owner while it had none -- scene D, hardware Vulkan on an
+// RTX 3090, n=1120 interact frames per leg over three legs: mean 325.6 us,
+// p99 1,682 us, and 10,357 us on ONE latched frame, 88-92% of that whole
+// frame. Read the answer off `sum`, never off a percentile: Hist is four
+// bins per octave.
+var frame_pre_re = /frame pre \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_ui_re = /frame ui \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var frame_post_re = /frame post \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 // `frame finish (*)` decomposes the frame tail. **Its denominator is not
@@ -3299,6 +3320,7 @@ var interact_all = [], idle_all = [], cadence_all = [];
 var frame_need = null, frame_need_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
+var frame_pre_all = [];
 var frame_pump_all = [];
 var frame_ui_all = [];
 var frame_finish_all = [];
@@ -3436,6 +3458,10 @@ for (var i = 0; i < C.length; i++) {
   if (x) frame_prepare_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                                   sum: parseInt(x[3], 10), p50: x[4],
                                   p90: x[5], p99: x[6], hist: x[7] });
+  x = frame_pre_re.exec(m);
+  if (x) frame_pre_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
+                              sum: parseInt(x[3], 10), p50: x[4],
+                              p90: x[5], p99: x[6], hist: x[7] });
   x = frame_ui_re.exec(m);
   if (x) frame_ui_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                              sum: parseInt(x[3], 10), p50: x[4],
@@ -3471,15 +3497,30 @@ for (var i = 0; i < C.length; i++) {
                           ui_stack: parseInt(wm[14], 10), ui_dialog: parseInt(wm[15], 10),
                           ui_panes: parseInt(wm[16], 10), ui_apply: parseInt(wm[17], 10),
                           ui_chrome: parseInt(wm[18], 10),
-                          boot_family: wm[19],
-                          boot_pre: parseInt(wm[20], 10), boot_pump: parseInt(wm[21], 10),
-                          boot_ui: parseInt(wm[22], 10), boot_prepare: parseInt(wm[23], 10),
-                          boot_finish: parseInt(wm[24], 10), boot_post: parseInt(wm[25], 10),
-                          boot_ui_poll: parseInt(wm[26], 10), boot_ui_layout: parseInt(wm[27], 10),
-                          boot_ui_topbar: parseInt(wm[28], 10), boot_ui_statusbar: parseInt(wm[29], 10),
-                          boot_ui_stack: parseInt(wm[30], 10), boot_ui_dialog: parseInt(wm[31], 10),
-                          boot_ui_panes: parseInt(wm[32], 10), boot_ui_apply: parseInt(wm[33], 10),
-                          boot_ui_chrome: parseInt(wm[34], 10) });
+                          // The seven `pre` cuts of the same frame, telescoping to its
+                          // `pre` for the ui nine's reason: `pre` is the segment that
+                          // read 10,357 us on one latched frame, and half the expensive
+                          // frames are idle ones no `pre:` histogram ever sees.
+                          pre_platform: parseInt(wm[19], 10), pre_ingest: parseInt(wm[20], 10),
+                          pre_evict: parseInt(wm[21], 10), pre_drops: parseInt(wm[22], 10),
+                          pre_autosave: parseInt(wm[23], 10), pre_gate: parseInt(wm[24], 10),
+                          pre_ensure: parseInt(wm[25], 10),
+                          boot_family: wm[26],
+                          boot_pre: parseInt(wm[27], 10), boot_pump: parseInt(wm[28], 10),
+                          boot_ui: parseInt(wm[29], 10), boot_prepare: parseInt(wm[30], 10),
+                          boot_finish: parseInt(wm[31], 10), boot_post: parseInt(wm[32], 10),
+                          boot_ui_poll: parseInt(wm[33], 10), boot_ui_layout: parseInt(wm[34], 10),
+                          boot_ui_topbar: parseInt(wm[35], 10), boot_ui_statusbar: parseInt(wm[36], 10),
+                          boot_ui_stack: parseInt(wm[37], 10), boot_ui_dialog: parseInt(wm[38], 10),
+                          boot_ui_panes: parseInt(wm[39], 10), boot_ui_apply: parseInt(wm[40], 10),
+                          boot_ui_chrome: parseInt(wm[41], 10),
+                          boot_pre_platform: parseInt(wm[42], 10),
+                          boot_pre_ingest: parseInt(wm[43], 10),
+                          boot_pre_evict: parseInt(wm[44], 10),
+                          boot_pre_drops: parseInt(wm[45], 10),
+                          boot_pre_autosave: parseInt(wm[46], 10),
+                          boot_pre_gate: parseInt(wm[47], 10),
+                          boot_pre_ensure: parseInt(wm[48], 10) });
   var wn = frame_worst_none_re.exec(m);
   if (wn) frame_worst_all.push({ t: C[i].t, service: null, family: null,
                                  since_boot: parseInt(wn[1], 10), boot_family: wn[2],
@@ -3490,7 +3531,14 @@ for (var i = 0; i < C.length; i++) {
                                  boot_ui_topbar: parseInt(wn[11], 10), boot_ui_statusbar: parseInt(wn[12], 10),
                                  boot_ui_stack: parseInt(wn[13], 10), boot_ui_dialog: parseInt(wn[14], 10),
                                  boot_ui_panes: parseInt(wn[15], 10), boot_ui_apply: parseInt(wn[16], 10),
-                                 boot_ui_chrome: parseInt(wn[17], 10) });
+                                 boot_ui_chrome: parseInt(wn[17], 10),
+                                 boot_pre_platform: parseInt(wn[18], 10),
+                                 boot_pre_ingest: parseInt(wn[19], 10),
+                                 boot_pre_evict: parseInt(wn[20], 10),
+                                 boot_pre_drops: parseInt(wn[21], 10),
+                                 boot_pre_autosave: parseInt(wn[22], 10),
+                                 boot_pre_gate: parseInt(wn[23], 10),
+                                 boot_pre_ensure: parseInt(wn[24], 10) });
   x = tile_take_re.exec(m);
   if (x) tile_take_all.push({ t: t, name: x[1], n: parseInt(x[2], 10),
                               sum: parseInt(x[3], 10), p50: x[4],
@@ -3528,6 +3576,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_need: frame_need, frame_need_all: frame_need_all,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
+         frame_pre_all: frame_pre_all,
          frame_ui_all: frame_ui_all,
          frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
@@ -3656,6 +3705,7 @@ class FrameLineWatcher:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
                             ("frame_prepare_all", "prepare"),
+                            ("frame_pre_all", "pre"),
                             ("frame_ui_all", "ui"),
                             ("frame_pump_all", "pump"),
                             ("frame_post_all", "post"),
@@ -4079,7 +4129,8 @@ def _window_stats(watcher, t0, t1, out):
 # arm never produced still has no key, so an absent arm stays an ABSENCE and
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
-                          "ui:", "pump:", "finish:", "take:", "phase:")
+                          "pre:", "ui:", "pump:", "finish:", "take:",
+                          "phase:")
 
 
 def watcher_named_in(gw):
@@ -6460,6 +6511,8 @@ def selftest():
     failures += selftest_export_window()
     if selftest_worst_frame_window():
         failures.append("worst-frame window selector (see [self-test] lines)")
+    if selftest_named_family_reaches_the_artifact():
+        failures.append("named family -> written artifact (see [self-test] lines)")
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -7832,16 +7885,36 @@ def run_smoke(args):
         # That frame's own `ui` segment, opened up. NOT a percentile and never
         # added to -- or ratio'd against -- `frame ui (*)`: those record
         # interact frames only and this frame is usually an idle one, so it
-        # contributed to none of them. The nine sum to the `ui=` above exactly,
-        # which is what makes an attribution here arithmetic on one frame
-        # rather than two cumulative maxima landing in adjacent bins.
-        print("[%s] SUMMARY frame worst ui cuts (one frame; sum == ui above): "
+        # contributed to none of them.
+        #
+        # The nine sum to the `ui=` above to within 8 us and never over it,
+        # NOT exactly: each is its own truncating micros() call where `ui=` is
+        # one, so the nine lose their fractions and the parent loses only the
+        # fraction of the sum. Measured 1-6 us short on 588 real frames, mean
+        # 3.39, exact on none. That is still what makes an attribution here
+        # arithmetic on one frame rather than two cumulative maxima landing in
+        # adjacent bins; a few us of residual is the arithmetic, not a finding.
+        print("[%s] SUMMARY frame worst ui cuts (one frame; sum == ui above "
+              "to within 8 us of truncation): "
               "poll=%s layout=%s topbar=%s statusbar=%s stack=%s dialog=%s "
               "panes=%s apply=%s chrome=%s"
               % (tag, fw.get("ui_poll"), fw.get("ui_layout"),
                  fw.get("ui_topbar"), fw.get("ui_statusbar"),
                  fw.get("ui_stack"), fw.get("ui_dialog"), fw.get("ui_panes"),
                  fw.get("ui_apply"), fw.get("ui_chrome")))
+        # The same frame's `pre` segment, opened up, on the nine cuts' terms
+        # exactly -- and printed for the same rule: a figure parsed into the
+        # artifact and left out of the summary is INVISIBLE to whoever runs
+        # the leg. `pre` is the segment that read 10,357 us on one latched
+        # frame (88-92% of it), and `pre:*` records interact frames only.
+        print("[%s] SUMMARY frame worst pre cuts (one frame; sum == pre above "
+              "to within 6 us of truncation): "
+              "platform=%s ingest=%s evict=%s drops=%s autosave=%s gate=%s "
+              "ensure=%s"
+              % (tag, fw.get("pre_platform"), fw.get("pre_ingest"),
+                 fw.get("pre_evict"), fw.get("pre_drops"),
+                 fw.get("pre_autosave"), fw.get("pre_gate"),
+                 fw.get("pre_ensure")))
         print("[%s] SUMMARY frame worst since boot (NOT a tail; may be boot): service=%s us "
               "family=%s | pre=%s pump=%s ui=%s prepare=%s finish=%s post=%s"
               % (tag, fw.get("since_boot"), fw.get("boot_family"),
@@ -7855,6 +7928,12 @@ def run_smoke(args):
                  fw.get("boot_ui_stack"), fw.get("boot_ui_dialog"),
                  fw.get("boot_ui_panes"), fw.get("boot_ui_apply"),
                  fw.get("boot_ui_chrome")))
+        print("[%s] SUMMARY frame worst since boot pre cuts: platform=%s "
+              "ingest=%s evict=%s drops=%s autosave=%s gate=%s ensure=%s"
+              % (tag, fw.get("boot_pre_platform"), fw.get("boot_pre_ingest"),
+                 fw.get("boot_pre_evict"), fw.get("boot_pre_drops"),
+                 fw.get("boot_pre_autosave"), fw.get("boot_pre_gate"),
+                 fw.get("boot_pre_ensure")))
     fn_ = (result.get("frame_lines") or {}).get("frame_need")
     if fn_ is not None:
         # EVERY field the pattern reads is printed, on `transport_bytes`'
@@ -8211,6 +8290,110 @@ class _FixtureWatcher:
 
     def readings(self, family):
         return []
+
+
+class _StubSession:
+    """A `session` whose `execute` hands back one canned probe return, so the
+    REAL `FrameLineWatcher` can be polled without a browser."""
+
+    def __init__(self, sig):
+        self.sig = sig
+
+    def execute(self, _script):
+        return self.sig
+
+
+def selftest_named_family_reaches_the_artifact():
+    """**A family the app writes must reach a WRITTEN artifact, not just a
+    regex.** Returns the number of failed pins.
+
+    Three seams, none of which the other selftests cover, and every one of
+    which has silently swallowed a family before: the probe's return key must
+    be renamed into `watcher.named` by the explicit list in
+    `FrameLineWatcher.poll`; the windowed dict must carry the family, which
+    is `WINDOW_FAMILY_PREFIXES`' job; and the whole result must survive
+    `json.dump` and come back off disk. A family collected and left out of the
+    rename list or the prefix tuple is ABSENT from the artifact rather than
+    empty -- `prepare:` was missing from the day the prepare split landed, and
+    an absence reads as "the arm did not produce it".
+
+    Written for the `pre` split and deliberately not about `pre` alone: the
+    fixture drives whatever `FrameLineWatcher.poll` claims to rename, so the
+    NEXT family is covered by the same pins.
+    """
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    # The rename list, read out of the function under test rather than
+    # restated: a pin that listed the families itself could not notice one
+    # going missing from the code.
+    src = inspect.getsource(FrameLineWatcher.poll)
+    renamed = re.findall(r'\("(frame_\w+_all|tile_\w+_all)", "([a-z]+)"\)', src)
+    pin("the rename list in FrameLineWatcher.poll is readable at all",
+        len(renamed) >= 8)
+    pin("`pre` is one of the families the watcher renames",
+        ("frame_pre_all", "pre") in renamed)
+
+    def hist_with(n_at_slot):
+        counts = [0] * HIST_SLOTS
+        counts[n_at_slot] = 1
+        return ",".join(str(c) for c in counts)
+
+    # Two readings per family so a window is a real subtraction, and the
+    # markers that bracket it.
+    def reading(t, name, n, total):
+        return {"t": t, "name": name, "n": n, "sum": total, "p50": "63",
+                "p90": "63", "p99": "63", "hist": hist_with(3 if n else 0)}
+
+    sig = {"gesture_begins": [{"t": 1_000, "script": "selftest"}],
+           "gesture_loops": [{"t": 5_000, "script": "selftest", "frames": 60}]}
+    for key, family in renamed:
+        cut = "%s-cut" % family
+        sig[key] = [reading(1_000, cut, 0, 0), reading(6_000, cut, 1, 41)]
+
+    watcher = FrameLineWatcher(_StubSession(sig))
+    watcher.poll()
+    seen = watcher.named_families()
+    pin("the watcher ingested a family for every rename-list entry",
+        len(seen) == len(renamed))
+    pin("`pre:pre-cut` is one of them", "pre:pre-cut" in seen)
+
+    gw = gesture_window_stats(watcher)
+    pin("the fixture produced a gesture window at all", gw is not None)
+    windowed = watcher_named_in(gw or {})
+    missing = [f for f in seen if f not in windowed]
+    pin("every ingested family is windowed by WINDOW_FAMILY_PREFIXES%s"
+        % (" (missing: %s)" % ", ".join(missing) if missing else ""),
+        not missing)
+
+    # The written artifact, off disk, not the dict in memory: the last seam
+    # is `json.dump`, and a key that cannot serialize is a key that is not
+    # there when anyone reads the file.
+    path = os.path.join(tempfile.gettempdir(),
+                        "squallar-rig-selftest-artifact-%d.json" % os.getpid())
+    try:
+        with open(path, "w") as fh:
+            json.dump({"gesture_window": gw}, fh, indent=2, default=str)
+        with open(path) as fh:
+            back = json.load(fh)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    written = (back.get("gesture_window") or {})
+    pin("the written artifact carries `pre:pre-cut`", "pre:pre-cut" in written)
+    pin("and it carries its windowed sum, not an empty family",
+        (written.get("pre:pre-cut") or {}).get("mean_us") == 41)
+    absent = [f for f in seen if f not in written]
+    pin("no family reached the artifact as an ABSENCE%s"
+        % (" (absent: %s)" % ", ".join(absent) if absent else ""), not absent)
+    return failed
 
 
 def selftest_worst_frame_window(window_stats=None):

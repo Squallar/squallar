@@ -4,20 +4,39 @@
 //! instants per frame; `finalize` folds them into fixed-shape histograms
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
-//! feature gate, and the per-frame cost is twenty-six clock reads, about
-//! thirty-seven integer bin searches and two `u32` comparisons — the ledger's
-//! own eight stamps, the one the egui pass takes on entry, the five
-//! `Gui::ui` takes on its way through, the five `handle_redraw` takes
-//! across its tail and the **seven** `present_frame` takes across the frame's
-//! own tail. Six of the bin searches are the `prepare` split
-//! ([`PrepareHists`]), six more the `ui` split ([`UiHists`]), **seven**
-//! more the `post` split ([`PostHists`]) and **nine** more the `finish` split
-//! ([`FinishHists`]). Each of the first three records only on the frames its
-//! own segment does; the `finish` nine record on EVERY presented frame, which
-//! is the one denominator difference in this file and is the reason that
-//! split exists — see [`FinishHists`]. The two comparisons are
-//! [`WorstFrame`]'s latch and its session maximum, and like the `finish` nine
-//! they are offered EVERY presented frame.
+//! feature gate, and the per-frame cost is **forty-seven clock reads,
+//! fifty-five integer bin searches** and two `u32` comparisons.
+//!
+//! The clock reads, counted where they are taken: the ledger's own **eight**
+//! stamps (its six `mark_*`/`finalize` reads plus the pair the acquire
+//! closure hands back), the **six** `handle_redraw` takes across its head,
+//! the **seven** `setup_egui_frame` takes across `pump`, the **eight**
+//! `Gui::ui` takes on its way through (six in `ui_phased`, two inside
+//! `render_shell_phased`), the **five** the egui pass takes, the **six**
+//! `handle_redraw`'s tail takes (five in the tail, one inside
+//! `process_gui_actions`) and the **seven** `present_frame` takes after the
+//! acquire returns.
+//!
+//! The bin searches, on a presented interact frame: nine outside the splits
+//! (one service, six segments, one acquire, one cadence) and forty-six in
+//! them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
+//! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **six** the
+//! `prepare` split ([`PrepareHists`]), **seven** the `post` split
+//! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). All but
+//! the last record only on the frames their own segment does; the `finish`
+//! nine record on EVERY presented frame, which is the one denominator
+//! difference in this file and is the reason that split exists — see
+//! [`FinishHists`]. The two comparisons are [`WorstFrame`]'s latch and its
+//! session maximum, and like the `finish` nine they are offered EVERY
+//! presented frame.
+//!
+//! **Both figures were stale before the `pre` split, and by more than the
+//! split adds.** They read twenty-six and "about thirty-seven" while the `ui`
+//! split had grown from six cuts to nine, the `post` split from six to seven,
+//! and the eight `pump` stamps had never been counted at all. The `pre` split
+//! itself is six of the forty-seven and seven of the fifty-five; the other
+//! fifteen and eleven were drift. Recount here rather than adjust, or the
+//! next reader inherits the same arithmetic.
 //!
 //! **The unnecessary-frame verdict adds no clock read and no bin search**, and
 //! that is the pin: [`crate::frame_need`] rides on this call and costs one
@@ -69,6 +88,11 @@ const SERVICE_FROM_WHOLE_FRAME: bool = false;
 struct Marks {
     /// `handle_redraw` entry.
     start: Option<Instant>,
+    /// Where `handle_redraw`'s head crossed its own phase boundaries, taken
+    /// by that call on its way through. `None` on a frame that returned
+    /// through one of the head's three early exits — minimized, zero-area or
+    /// no renderer — which is the same frame that leaves no `setup`.
+    pre_phases: Option<PrePhaseStamps>,
     /// `setup_egui_frame` entry.
     setup: Option<Instant>,
     /// Immediately before `Gui::ui`.
@@ -108,6 +132,101 @@ struct Marks {
     dispatch: Option<DispatchCuts>,
     /// The pass ended without a real present (a skipped or lost surface).
     skipped: bool,
+}
+
+/// Where `handle_redraw`'s head crossed the six boundaries between the seven
+/// things it does before `setup_egui_frame`. Taken by `handle_redraw` itself
+/// — like [`PostPhaseStamps`] and [`PumpPhaseStamps`], and unlike the
+/// `prepare` and `ui` splits, this segment has no single callee to carry them
+/// back.
+///
+/// All six are stamped before the call that opens `pump`, so a frame that
+/// takes one of the head's early exits leaves them behind unfiled: `finalize`
+/// discards that frame anyway, and the stamps it did pay for are three or
+/// four clock reads on a path that draws nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct PrePhaseStamps {
+    /// After `clear_frame_state` and `poll_platform_state`: the theme poll,
+    /// the location permission step (which asks the platform for its KV
+    /// store), the fix poll and the heading poll.
+    pub(crate) polled: Instant,
+    /// `poll_data_channels`' return — the `Ingest` pump walk.
+    pub(crate) ingested: Instant,
+    /// `evict_unshown_scans`' return.
+    pub(crate) evicted: Instant,
+    /// `drain_deferred_drops`' return.
+    pub(crate) dropped: Instant,
+    /// `autosave_config`'s return.
+    pub(crate) saved: Instant,
+    /// After the minimized and zero-area window queries — the two platform
+    /// questions whose answers can abandon the frame.
+    pub(crate) gated: Instant,
+}
+
+/// Where the `pre` segment's time went, cut at the seams `handle_redraw`'s
+/// head has.
+///
+/// # Denominator
+///
+/// **Exactly [`SegmentHists::pre`]'s** — presented interact frames — and that
+/// equality is the whole design. The seven are contiguous cuts of the one
+/// span, so they telescope to it (`the_pre_phases_telescope_to_pre`) to
+/// within [`micros`]' truncation, which makes the residual arithmetic rather
+/// than inference.
+///
+/// **Never added to `frame segment (pre)`.** These are not a seventh segment
+/// beside it; they *are* it, opened up — [`PostHists`]' own relationship to
+/// `frame segment (post)`. The reporting prefix is `frame pre`.
+///
+/// `frame pre (drops)` and `frame post (*)` are different spans under
+/// different parents and are never added; so are `frame pre (ingest)` and
+/// `frame pump (apply)`, which are two different pump walks.
+///
+/// # What this split was cut to answer
+///
+/// `pre` was the last segment with no split, and a top-three tail owner
+/// while it had none. Measured on scene D, hardware Vulkan on an RTX 3090,
+/// n=1120 interact frames per leg over three legs: **mean 325.6 µs, p99
+/// 1,682 µs, and 10,357 µs on one latched frame — 88–92 % of that whole
+/// frame.** Every other segment could be opened up and this one could not,
+/// so nothing in the tree could say which of the seven things below the
+/// 10 ms was.
+#[derive(Default)]
+pub(crate) struct PreHists {
+    /// `InputHandler::clear_frame_state` (two bool writes, folded in rather
+    /// than given a name it could not fill) and `poll_platform_state`: the
+    /// theme poll, the location step, the fix poll and the heading poll.
+    /// Reaches the platform, and on a browser that is a JS crossing per ask.
+    pub(crate) platform: Hist,
+    /// `poll_data_channels` — the `Ingest` pump walk, where every arrival
+    /// channel is drained and its payload applied. **The data path onto the
+    /// frame thread**, and the cut that scales with what arrived.
+    pub(crate) ingest: Hist,
+    /// `evict_unshown_scans`: the pane walk, `retain_still` and the
+    /// `discard_each` that queues what it evicted. Scales with pane count and
+    /// with how many volumes fell out of retention.
+    pub(crate) evict: Hist,
+    /// `drain_deferred_drops`: the budgeted free of what eviction and
+    /// supersession queued. Bounded by `DEFERRED_DROP_BUDGET_PER_FRAME` by
+    /// design, so a figure meaningfully over that budget is the budget
+    /// failing on its own boundary rather than a busy frame.
+    pub(crate) drops: Hist,
+    /// `autosave_config(false)`: one clock read and an interval compare on
+    /// almost every frame, and on the one frame per period that fires, the
+    /// whole UI config serialized to JSON and handed to the KV store. Its own
+    /// cut because that shape — cheap on all but one frame — is exactly the
+    /// shape a percentile over `pre` cannot attribute.
+    pub(crate) autosave: Hist,
+    /// The minimized query and the zero-area `inner_size` query: two window
+    /// calls, and on the frames either answers yes the frame is abandoned
+    /// rather than drawn. Named because they are platform calls on the frame
+    /// thread, and a windowing system is free to make them expensive.
+    pub(crate) gate: Hist,
+    /// `ensure_rendering_state` and the renderer/window test after it:
+    /// nothing on a steady-state frame, and the whole device and surface
+    /// bring-up on the first. The tail of the head, named rather than folded
+    /// so that a `pre` residual cannot hide in an unnamed remainder.
+    pub(crate) ensure: Hist,
 }
 
 /// Where `setup_egui_frame` crossed the seven boundaries between the eight
@@ -563,7 +682,9 @@ pub(crate) struct DispatchHists {
 #[derive(Default)]
 pub(crate) struct SegmentHists {
     /// `handle_redraw` entry to `setup_egui_frame` entry — the pollers,
-    /// eviction, deferred drops and the autosave check.
+    /// eviction, deferred drops and the autosave check. Opened up by
+    /// [`PreHists`], whose seven cuts telescope to this within [`micros`]'
+    /// truncation.
     pub(crate) pre: Hist,
     /// `setup_egui_frame` entry to `Gui::ui` — theme, restore, the raster
     /// promote and the three pump phases.
@@ -656,6 +777,25 @@ pub(crate) struct WorstFrame {
     /// sample of anything. **Zero new clock reads**: the stamps already exist
     /// on every presented frame; only the subtraction moved out of the arm.
     pub(crate) ui_cuts: [u32; 9],
+    /// The seven `pre` cuts of THIS frame, in [`PreHists`]' order:
+    /// `[platform, ingest, evict, drops, autosave, gate, ensure]`. They
+    /// telescope to `segments[0]` within [`micros`]' truncation — at most six
+    /// microseconds for seven cuts — so the worst frame's `pre` is decomposed
+    /// by arithmetic on ONE frame.
+    ///
+    /// **Here for [`WorstFrame::ui_cuts`]' reason exactly.** [`PreHists`]
+    /// records inside `finalize`'s `if interacted` arm, and the frame this
+    /// split was cut for is a latched one: `pre` read 10,357 µs on it, 88–92 %
+    /// of the whole frame. Half the expensive frames on scene D carry no
+    /// pointer event and are filed idle, so the interact-only histograms
+    /// cannot open the very frames the `max` verdict is about.
+    ///
+    /// Zeroed on a frame that left no `pre_phases` — one of the head's three
+    /// early exits, which is the same frame that leaves no acquire and is not
+    /// a sample of anything. **Zero new clock reads**: the six stamps are
+    /// already taken on every frame that reaches the pass; only the
+    /// subtraction moved out of the arm.
+    pub(crate) pre_cuts: [u32; 7],
     /// Whether this frame's raw input carried interaction. Reported rather
     /// than filtered on: a scene whose worst frame is always idle is saying
     /// something, and a family column is how it says it.
@@ -672,6 +812,8 @@ pub(crate) struct FrameLedger {
     service_idle: Hist,
     /// See [`SegmentHists`] — interact frames only.
     segments: SegmentHists,
+    /// See [`PreHists`] — `segments.pre`, opened up, same frames.
+    pre: PreHists,
     /// See [`PrepareHists`] — `segments.prepare`, opened up, same frames.
     prepare: PrepareHists,
     /// See [`UiHists`] — `segments.ui`, opened up, same frames.
@@ -830,6 +972,27 @@ fn latch_worst(standing: Option<WorstFrame>, candidate: WorstFrame) -> WorstFram
         Some(worst) if worst.service >= candidate.service => worst,
         _ => candidate,
     }
+}
+
+/// The seven contiguous cuts of the `pre` segment, in call order:
+/// `[platform, ingest, evict, drops, autosave, gate, ensure]` — see
+/// [`PreHists`], whose fields these are.
+///
+/// Contiguous by construction: each cut ends where the next begins, and the
+/// pair at the ends are `pre`'s own boundaries, so the seven sum to
+/// `micros(start, setup)` to within the six microseconds seven truncating
+/// [`micros`] calls can lose — see that function. A free function so the
+/// telescoping is testable without a frame.
+fn pre_phase_micros(start: Instant, phases: &PrePhaseStamps, setup: Instant) -> [u32; 7] {
+    [
+        micros(start, phases.polled),
+        micros(phases.polled, phases.ingested),
+        micros(phases.ingested, phases.evicted),
+        micros(phases.evicted, phases.dropped),
+        micros(phases.dropped, phases.saved),
+        micros(phases.saved, phases.gated),
+        micros(phases.gated, setup),
+    ]
 }
 
 /// The six contiguous cuts of the `prepare` segment, in pass order:
@@ -995,6 +1158,13 @@ impl FrameLedger {
         self.cur.acquire = Some((start, end));
     }
 
+    /// The phase stamps `handle_redraw`'s head took on its way through.
+    /// Recorded unconditionally, immediately before the call that opens
+    /// `pump`; `finalize` decides whether this frame is a sample.
+    pub(crate) fn record_pre_phases(&mut self, stamps: PrePhaseStamps) {
+        self.cur.pre_phases = Some(stamps);
+    }
+
     /// The phase stamps the egui pass took on its way through, carried off the
     /// `PreparedFrame` it returned. Recorded unconditionally; `finalize`
     /// decides whether this frame is a sample.
@@ -1132,6 +1302,16 @@ impl FrameLedger {
             ui_phase_micros(ui_start, phases, ui_end)
         });
 
+        // The same, and for the same reason: `pre` is the segment that read
+        // 10,357 us on ONE latched frame, and a latched frame is as often
+        // idle as not. Above the arm, and the statement may not read
+        // `interacted` -- see
+        // `the_worst_frames_pre_cuts_are_computed_outside_the_interact_arm`.
+        let pre_cuts = m
+            .pre_phases
+            .as_ref()
+            .map_or([0u32; 7], |phases| pre_phase_micros(start, phases, setup));
+
         // EVERY split below is interact-only, and that is a limit worth
         // stating rather than rediscovering. A frame the renderer did not call
         // interacted -- boot among them -- contributes to `service_idle`, to
@@ -1154,6 +1334,25 @@ impl FrameLedger {
             self.segments.finish.record(finish);
             self.segments.post.record(post);
             self.acquire.record(acquire);
+            // Inside the interact arm, and only here: these seven are cuts of
+            // the `pre` recorded above, and the left boundary is the very
+            // `start` stamp `pre` measures from. The seven values are
+            // computed above the arm because `WorstFrame::pre_cuts` needs
+            // them on idle frames too; the RECORD calls stay here, and still
+            // only on a frame that actually left `pre_phases`, so this
+            // family's denominator is `segments.pre`'s exactly. A frame with
+            // no phases must contribute no sample -- seven zeros would be
+            // seven false readings, not an absence.
+            if m.pre_phases.is_some() {
+                let [platform, ingest, evict, drops, autosave, gate, ensure] = pre_cuts;
+                self.pre.platform.record(platform);
+                self.pre.ingest.record(ingest);
+                self.pre.evict.record(evict);
+                self.pre.drops.record(drops);
+                self.pre.autosave.record(autosave);
+                self.pre.gate.record(gate);
+                self.pre.ensure.record(ensure);
+            }
             // Inside the interact arm, and only here: these six are cuts of
             // the `prepare` recorded two lines up, and a sample recorded on a
             // frame that segment did not take would break the one property
@@ -1290,6 +1489,7 @@ impl FrameLedger {
                 service,
                 segments,
                 ui_cuts,
+                pre_cuts,
                 interact: interacted,
             },
         ));
@@ -1298,6 +1498,7 @@ impl FrameLedger {
                 service,
                 segments,
                 ui_cuts,
+                pre_cuts,
                 interact: interacted,
             });
         }
@@ -1318,6 +1519,11 @@ impl FrameLedger {
 
     pub(crate) fn segments(&self) -> &SegmentHists {
         &self.segments
+    }
+
+    /// See [`PreHists`] — `segments.pre`, opened up.
+    pub(crate) fn pre_phases(&self) -> &PreHists {
+        &self.pre
     }
 
     pub(crate) fn prepare_phases(&self) -> &PrepareHists {
@@ -1413,9 +1619,10 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchCuts, FinishPhaseStamps, Instant, PostPhaseStamps, PumpPhaseStamps, WorstFrame,
-        dispatch_cut_micros, finish_phase_micros, latch_worst, micros, post_phase_micros,
-        prepare_phase_micros, pump_phase_micros, service_micros, ui_phase_micros,
+        DispatchCuts, FinishPhaseStamps, Instant, PostPhaseStamps, PrePhaseStamps, PumpPhaseStamps,
+        WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
+        post_phase_micros, pre_phase_micros, prepare_phase_micros, pump_phase_micros,
+        service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -1605,6 +1812,197 @@ mod tests {
         assert!(
             cuts.iter().all(|&c| c > 0),
             "a cut is zero on stamps chosen to make all nine non-zero, so it \
+             cannot be reading the span it is named for: {cuts:?}",
+        );
+    }
+
+    /// A `handle_redraw` head whose boundaries land at the given microsecond
+    /// offsets from the `start` stamp, so a test can state its stamps as
+    /// arithmetic. The `pre` sibling of `pump_phases_at`.
+    fn pre_phases_at(start: Instant, offsets: [u64; 6]) -> PrePhaseStamps {
+        let at = |us: u64| start + std::time::Duration::from_micros(us);
+        PrePhaseStamps {
+            polled: at(offsets[0]),
+            ingested: at(offsets[1]),
+            evicted: at(offsets[2]),
+            dropped: at(offsets[3]),
+            saved: at(offsets[4]),
+            gated: at(offsets[5]),
+        }
+    }
+
+    /// **The seven cuts are a decomposition of `pre`, not a sample of it.**
+    ///
+    /// The sum telescopes to `micros(start, setup)` — the very span
+    /// [`super::SegmentHists::pre`] records — so "what is in pre" is answered
+    /// by subtraction rather than by inference. `pre` was the LAST segment
+    /// with no split and a top-three tail owner while it had none: scene D,
+    /// hardware Vulkan, n=1120 interact frames per leg over three legs, mean
+    /// 325.6 us, p99 1,682 us, and 10,357 us on one latched frame — 88–92 %
+    /// of that whole frame, attributable to nothing.
+    ///
+    /// **Truncation-aware from the first line it was written on.** Seven cuts
+    /// are seven truncating [`micros`] calls where the parent is one, so the
+    /// claim is exact only when every stamp lands on a whole microsecond, and
+    /// is `assert_telescopes_within_truncation`'s derived bound otherwise —
+    /// see that helper and `the_worst_frames_ui_cuts_telescope_to_its_ui`,
+    /// whose gate asserted an exactness that was false on 588 of 588 real
+    /// frames because its fixture could not produce a fraction.
+    #[test]
+    fn the_pre_phases_telescope_to_pre() {
+        // ── Arm 1: whole-microsecond stamps, where the exactness IS true ──
+        let start = Instant::now();
+        let phases = pre_phases_at(start, [4, 94, 124, 184, 186, 195]);
+        let setup = start + std::time::Duration::from_micros(207);
+
+        let cuts = pre_phase_micros(start, &phases, setup);
+        assert_eq!(
+            assert_telescopes_within_truncation(&cuts, micros(start, setup), "whole-us stamps"),
+            0,
+            "six stamps with nothing below a microsecond on them still lost \
+             time, so the seven are not contiguous cuts of one span",
+        );
+        assert_eq!(
+            cuts,
+            [4, 90, 30, 60, 2, 9, 12],
+            "a cut moved: the seven no longer bracket the phases they are \
+             named for",
+        );
+        assert_eq!(cuts.iter().sum::<u32>(), 207);
+
+        // ── Arm 2: the same seven spans with half a microsecond of dust on
+        // each, which is what a clock hands the constructor ──
+        //
+        // Seven fractions of 0.5 sum to 3.5, so the seven cuts fall exactly
+        // 3 us short of a parent that is itself truncated. Deterministic, and
+        // the arm that makes the bound below non-vacuous.
+        let dusty_start = Instant::now();
+        let mut at = 0u64;
+        let mut ns = [0u64; 6];
+        for (slot, len) in [4_500u64, 90_500, 30_500, 60_500, 2_500, 9_500]
+            .into_iter()
+            .enumerate()
+        {
+            at += len;
+            ns[slot] = at;
+        }
+        let dusty = PrePhaseStamps {
+            polled: dusty_start + std::time::Duration::from_nanos(ns[0]),
+            ingested: dusty_start + std::time::Duration::from_nanos(ns[1]),
+            evicted: dusty_start + std::time::Duration::from_nanos(ns[2]),
+            dropped: dusty_start + std::time::Duration::from_nanos(ns[3]),
+            saved: dusty_start + std::time::Duration::from_nanos(ns[4]),
+            gated: dusty_start + std::time::Duration::from_nanos(ns[5]),
+        };
+        let dusty_setup = dusty_start + std::time::Duration::from_nanos(at + 12_500);
+        let dusty_cuts = pre_phase_micros(dusty_start, &dusty, dusty_setup);
+        assert_eq!(
+            assert_telescopes_within_truncation(
+                &dusty_cuts,
+                micros(dusty_start, dusty_setup),
+                "sub-microsecond stamps",
+            ),
+            3,
+            "seven cuts each half a microsecond long in their fraction did \
+             not lose the 3 us that truncating seven of them must lose, so \
+             this arm is not exercising the truncation it exists for: \
+             {dusty_cuts:?}",
+        );
+        assert_eq!(
+            dusty_cuts,
+            [4, 90, 30, 60, 2, 9, 12],
+            "the same seven spans as arm 1, each truncated",
+        );
+
+        // ── Arm 3: instants a clock actually produced ──
+        //
+        // Six bare `Instant::now()` reads in the order `handle_redraw` takes
+        // them, bracketed by the two the ledger takes. The bound is asserted
+        // and a non-zero gap deliberately is not — see
+        // `the_worst_frames_ui_cuts_telescope_to_its_ui`'s third arm for why
+        // demanding truncation from a live clock would be asserting the
+        // clock.
+        let mut samples = 0;
+        for _ in 0..256 {
+            let live_start = Instant::now();
+            let live = PrePhaseStamps {
+                polled: Instant::now(),
+                ingested: Instant::now(),
+                evicted: Instant::now(),
+                dropped: Instant::now(),
+                saved: Instant::now(),
+                gated: Instant::now(),
+            };
+            let live_setup = Instant::now();
+            assert_telescopes_within_truncation(
+                &pre_phase_micros(live_start, &live, live_setup),
+                micros(live_start, live_setup),
+                "instants from the clock",
+            );
+            samples += 1;
+        }
+        assert_eq!(
+            samples, 256,
+            "the real-clock arm did not take the samples it claims to have \
+             taken, so its greenness is an absence and not a reading",
+        );
+    }
+
+    /// **The non-vacuity floor under the `pre` split: a cut may not trivially
+    /// cover the segment.**
+    ///
+    /// Telescoping alone is satisfied by a degenerate split — one cut holding
+    /// the whole span and six zeros telescopes perfectly and decomposes
+    /// nothing. So the floor is stated on the boundaries: **every one of the
+    /// six stamps must be able to move the answer**, which is only true if
+    /// each is read by two different cuts. Held by perturbation, on
+    /// `every_ui_stamp_is_load_bearing_in_two_cuts`' terms.
+    #[test]
+    fn every_pre_stamp_is_load_bearing_in_two_cuts() {
+        let start = Instant::now();
+        // Its own fixture, not the telescoping test's: every cut here is
+        // wider than the 100 us nudge, so a stamp that fails to move a cut
+        // fails this test rather than underflowing it.
+        let base_offsets = [500u64, 2_500, 9_000, 14_000, 15_200, 16_100];
+        let setup = start + std::time::Duration::from_micros(20_100);
+        let base = pre_phase_micros(start, &pre_phases_at(start, base_offsets), setup);
+
+        for stamp in 0..6 {
+            let mut moved = base_offsets;
+            moved[stamp] -= 100;
+            let cuts = pre_phase_micros(start, &pre_phases_at(start, moved), setup);
+            let changed: Vec<usize> = (0..7).filter(|&i| cuts[i] != base[i]).collect();
+            assert_eq!(
+                changed,
+                vec![stamp, stamp + 1],
+                "moving stamp {stamp} did not move exactly the two cuts it \
+                 bounds, so one of them is not reading it and the split is \
+                 narrower than its seven names claim",
+            );
+            assert_eq!(
+                (cuts[stamp], cuts[stamp + 1]),
+                (base[stamp] - 100, base[stamp + 1] + 100),
+                "the two cuts around stamp {stamp} did not trade the 100 us \
+                 exactly, so the boundary between them is not the stamp",
+            );
+            assert_eq!(cuts.iter().sum::<u32>(), 20_100);
+        }
+    }
+
+    /// **The floor's other half: no `pre` cut may be structurally empty.**
+    ///
+    /// A split whose seven names covered `pre` but where six were pinned at
+    /// zero would pass the telescoping test and report a single opaque number
+    /// under seven headings — which is the instrument this replaces, renamed.
+    #[test]
+    fn no_pre_cut_is_structurally_pinned_to_zero() {
+        let start = Instant::now();
+        let phases = pre_phases_at(start, [4, 94, 124, 184, 186, 195]);
+        let setup = start + std::time::Duration::from_micros(207);
+        let cuts = pre_phase_micros(start, &phases, setup);
+        assert!(
+            cuts.iter().all(|&c| c > 0),
+            "a cut is zero on stamps chosen to make all seven non-zero, so it \
              cannot be reading the span it is named for: {cuts:?}",
         );
     }
@@ -1931,10 +2329,14 @@ mod tests {
         let ninth = segments[2] / 9;
         let mut ui_cuts = [ninth; 9];
         ui_cuts[8] = segments[2] - ninth * 8;
+        let seventh = segments[0] / 7;
+        let mut pre_cuts = [seventh; 7];
+        pre_cuts[6] = segments[0] - seventh * 6;
         WorstFrame {
             service,
             segments,
             ui_cuts,
+            pre_cuts,
             interact,
         }
     }
@@ -2137,6 +2539,7 @@ mod tests {
             service: 60_000,
             segments: [1_000, 2_000, micros(ui_start, ui_end), 8_000, 4_000, 4_000],
             ui_cuts: ui_phase_micros(ui_start, &phases, ui_end),
+            pre_cuts: [100, 300, 200, 250, 50, 50, 50],
             interact: false,
         };
         assert_eq!(
@@ -2262,6 +2665,158 @@ mod tests {
              telescoping gate, so the gate over-fires on healthy input",
         );
     }
+
+    /// **The latched frame's seven `pre` cuts telescope to its own `pre`
+    /// segment**, so `frame worst`'s `pre_*` figures decompose the very frame
+    /// the line names rather than standing beside it.
+    ///
+    /// The property the field exists for, and it is not the same property
+    /// `frame pre (*)` has: those seven histograms record inside `finalize`'s
+    /// `if interacted` arm, and the frame this split was cut for is a latched
+    /// one — `pre` read **10,357 µs on it, 88–92 % of the whole frame**.
+    /// Half of scene D's expensive frames carry no pointer event and are filed
+    /// idle, so an interact-only histogram cannot open the very frames the
+    /// `max` verdict is about.
+    ///
+    /// Written on `the_worst_frames_ui_cuts_telescope_to_its_ui`'s corrected
+    /// pattern from the start: exact where the stamps are whole microseconds,
+    /// within the derived bound where they are not, never over the parent on
+    /// either, and a green arm beside the red ones.
+    #[test]
+    fn the_worst_frames_pre_cuts_telescope_to_its_pre() {
+        let start = Instant::now();
+        let phases = pre_phases_at(start, [4, 94, 124, 184, 186, 195]);
+        let setup = start + std::time::Duration::from_micros(207);
+        let w = WorstFrame {
+            service: 11_248,
+            segments: [micros(start, setup), 2_000, 4_000, 3_000, 1_000, 1_041],
+            ui_cuts: [0, 0, 0, 0, 4_000, 0, 0, 0, 0],
+            pre_cuts: pre_phase_micros(start, &phases, setup),
+            interact: false,
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(&w.pre_cuts, w.segments[0], "whole-us stamps"),
+            0,
+            "the worst frame's seven pre cuts do not sum to its own pre \
+             segment, so the line's pre_* figures decompose some other frame \
+             and the attribution they exist to make is an inference again",
+        );
+        assert_eq!(
+            w.pre_cuts,
+            [4, 90, 30, 60, 2, 9, 12],
+            "a cut moved: the seven no longer bracket the phases they are \
+             named for, so `frame worst`'s pre_* columns name the wrong spans",
+        );
+
+        // The same frame with sub-microsecond stamps, which is the only shape
+        // the field produces: the seven fall inside the derived bound and
+        // never over the parent.
+        let dusty_start = Instant::now();
+        let dusty = PrePhaseStamps {
+            polled: dusty_start + std::time::Duration::from_nanos(4_500),
+            ingested: dusty_start + std::time::Duration::from_nanos(95_000),
+            evicted: dusty_start + std::time::Duration::from_nanos(125_500),
+            dropped: dusty_start + std::time::Duration::from_nanos(186_000),
+            saved: dusty_start + std::time::Duration::from_nanos(188_500),
+            gated: dusty_start + std::time::Duration::from_nanos(198_000),
+        };
+        let dusty_setup = dusty_start + std::time::Duration::from_nanos(210_500);
+        let dusty_frame = WorstFrame {
+            segments: [
+                micros(dusty_start, dusty_setup),
+                2_000,
+                4_000,
+                3_000,
+                1_000,
+                1_041,
+            ],
+            pre_cuts: pre_phase_micros(dusty_start, &dusty, dusty_setup),
+            ..w
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(
+                &dusty_frame.pre_cuts,
+                dusty_frame.segments[0],
+                "sub-microsecond stamps",
+            ),
+            3,
+            "the seven cuts of a frame whose stamps carry fractions did not \
+             lose the 3 us seven truncating micros() calls must lose, so this \
+             arm is not exercising the truncation it exists for",
+        );
+
+        // **The green arm, beside the red one.** A frame whose `pre` really
+        // is all in one cut — an autosave that fired, every other cut
+        // genuinely zero — is a healthy input that RESEMBLES the degenerate
+        // failure, and the gate must not fire on it.
+        let single = WorstFrame {
+            segments: [8_400, 2_000, 4_000, 3_000, 1_000, 1_041],
+            pre_cuts: [0, 0, 0, 0, 8_400, 0, 0],
+            ..w
+        };
+        assert_eq!(
+            assert_telescopes_within_truncation(
+                &single.pre_cuts,
+                single.segments[0],
+                "a genuinely single-cut frame",
+            ),
+            0,
+            "a frame whose pre was genuinely spent in one cut fails the \
+             telescoping gate, so the gate over-fires on healthy input",
+        );
+    }
+
+    /// **The seven cuts are computed for EVERY presented frame, not only the
+    /// interact ones.** Held against `finalize`'s own source, on
+    /// [`the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm`]'s
+    /// terms: the binding must appear before the `if interacted {` that opens
+    /// the arm, and the statement itself may not read the flag.
+    ///
+    /// The degenerate this is red against is the natural one — leaving the
+    /// `pre_phase_micros` call where its seven `record` calls are. That shape
+    /// compiles, telescopes on the frames it does fill, and reports seven
+    /// zeros on exactly the frames the field was added to describe: the
+    /// latched ones, where `pre` was measured at 88–92 % of a whole frame.
+    #[test]
+    fn the_worst_frames_pre_cuts_are_computed_outside_the_interact_arm() {
+        let body = include_str!("frame_ledger.rs")
+            .split_once("pub(crate) fn finalize(")
+            .expect("finalize is no longer a method here")
+            .1;
+        let bound = body
+            .find("let pre_cuts = ")
+            .expect("finalize no longer binds the worst frame's seven pre cuts");
+        let interact_arm = body
+            .find("if interacted {")
+            .expect("finalize no longer splits on the interact flag");
+        assert!(
+            bound < interact_arm,
+            "the seven pre cuts are computed inside finalize's interact arm, \
+             so every frame that PAYS for a click -- all of which are filed \
+             idle -- would carry seven zeros on the one line that reports it",
+        );
+        let statement = body[bound..]
+            .split_once("\n\n")
+            .expect("the pre_cuts binding is no longer a statement of its own")
+            .0;
+        assert!(
+            !statement.contains("interacted"),
+            "the pre cuts binding reads the interact flag, so an idle frame \
+             would carry seven zeros however early the binding sits: \
+             {statement:?}",
+        );
+    }
+
+    /// **The nine cuts are computed for EVERY presented frame, not only the
+    /// interact ones.** Held against `finalize`'s own source, on
+    /// [`the_worst_frame_latch_is_outside_the_interact_arm`]'s terms: the
+    /// binding must appear before the `if interacted {` that opens the arm.
+    ///
+    /// The degenerate this is red against is the natural one — leaving the
+    /// `ui_phase_micros` call where its nine `record` calls are and reading
+    /// zeros on every idle frame. That shape compiles, telescopes on the
+    /// frames it does fill, and reports nine zeros on exactly the frames this
+    /// field was added to describe: the ones that pay for a click.
     #[test]
     fn the_worst_frames_ui_cuts_are_computed_outside_the_interact_arm() {
         let body = include_str!("frame_ledger.rs")

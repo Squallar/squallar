@@ -779,6 +779,41 @@ fn frame_segment_lines(s: &crate::frame_ledger::SegmentHists) -> [String; 6] {
     ]
 }
 
+/// The seven `frame pre (<name>):` lines — the `pre` segment, opened up.
+///
+/// Denominator: **exactly `frame segment (pre)`'s** — presented interact
+/// frames — and the seven are contiguous cuts of that one span, so their sums
+/// telescope to its sum, to within the truncation [`named_hist_line`]
+/// describes. That is what makes this a decomposition rather than a seventh
+/// segment: `frame pre (*)` is never added to `frame segment (pre)`, it *is*
+/// it.
+///
+/// `frame pre (ingest)` is **not** `frame pump (apply)`: this one is the
+/// `Ingest` pump walk in `handle_redraw`'s head, that one is the `Apply` walk
+/// inside `setup_egui_frame`. Different walks under different parents; the
+/// family keys are `pre:ingest` and `pump:apply` and they are never added.
+///
+/// Why this family exists: `pre` was the last segment in the file with no
+/// split, and a top-three tail owner while it had none — mean 325.6 µs, p99
+/// 1,682 µs and 10,357 µs on one latched frame on scene D, hardware Vulkan,
+/// n=1120 interact frames per leg over three legs. Read the answer off `sum`,
+/// never off a percentile: `Hist` is four bins per octave.
+///
+/// Emitted every tick, `n=0` included, on [`frame_segment_lines`]' terms: a
+/// `gate` cut of zero on a desktop that is never minimized is a figure, not
+/// an absence.
+fn frame_pre_lines(p: &crate::frame_ledger::PreHists) -> [String; 7] {
+    [
+        named_hist_line("frame pre", "platform", &p.platform),
+        named_hist_line("frame pre", "ingest", &p.ingest),
+        named_hist_line("frame pre", "evict", &p.evict),
+        named_hist_line("frame pre", "drops", &p.drops),
+        named_hist_line("frame pre", "autosave", &p.autosave),
+        named_hist_line("frame pre", "gate", &p.gate),
+        named_hist_line("frame pre", "ensure", &p.ensure),
+    ]
+}
+
 /// The six `frame prepare (<name>):` lines — the `prepare` segment, opened up.
 ///
 /// Denominator: **exactly `frame segment (prepare)`'s** — presented interact
@@ -987,7 +1022,8 @@ fn frame_dispatch_lines(d: &crate::frame_ledger::DispatchHists) -> [String; 7] {
 ///
 /// The nine `ui_*` columns are that same frame's `ui` segment opened up — see
 /// [`ui_cut_columns`] for why they are on this line rather than left to
-/// `frame ui (*)`.
+/// `frame ui (*)`; the seven `pre_*` columns are the same for `pre`, and see
+/// [`pre_cut_columns`] for why that segment earned them.
 fn frame_worst_line(
     worst: Option<crate::frame_ledger::WorstFrame>,
     since_boot: Option<crate::frame_ledger::WorstFrame>,
@@ -1002,7 +1038,7 @@ fn frame_worst_line(
             let [pre, pump, ui, prepare, finish, post] = b.segments;
             format!(
                 "boot: {}, pre={} us, pump={} us, ui={} us, prepare={} us, finish={} us, \
-                 post={} us, {}",
+                 post={} us, {}, {}",
                 if b.interact { "interact" } else { "idle" },
                 pre,
                 pump,
@@ -1011,6 +1047,7 @@ fn frame_worst_line(
                 finish,
                 post,
                 ui_cut_columns(b.ui_cuts),
+                pre_cut_columns(b.pre_cuts),
             )
         }
     };
@@ -1023,7 +1060,7 @@ fn frame_worst_line(
     let [pre, pump, ui, prepare, finish, post] = w.segments;
     format!(
         "frame worst: service={} us, family={}, since_boot={} us, pre={} us, pump={} us, \
-         ui={} us, prepare={} us, finish={} us, post={} us, {}, {boot}",
+         ui={} us, prepare={} us, finish={} us, post={} us, {}, {}, {boot}",
         w.service,
         if w.interact { "interact" } else { "idle" },
         since_boot_us,
@@ -1034,6 +1071,34 @@ fn frame_worst_line(
         finish,
         post,
         ui_cut_columns(w.ui_cuts),
+        pre_cut_columns(w.pre_cuts),
+    )
+}
+
+/// One frame's seven `pre` cuts as the `pre_*=<n> us` columns `frame worst:`
+/// carries, in `PreHists`' order.
+///
+/// **Prefixed `pre_` for [`ui_cut_columns`]' reason**: `apply` and `dispatch`
+/// are cut names elsewhere on this line's family, and a bare `gate=` beside a
+/// `pre=` would read as a seventh segment rather than as a slice of the
+/// first.
+///
+/// **Never added to `frame pre (*)`, and not comparable to it either.** Those
+/// seven histograms record inside the ledger's `if interacted` arm; these
+/// seven are one frame's microseconds and that frame is as often an idle one,
+/// which is the whole reason they are on this line — `pre` read 10,357 µs on
+/// one latched frame, 88–92 % of it, and an interact-only histogram cannot
+/// open a frame it never saw.
+///
+/// They sum to this line's own `pre=` **to within 6 µs and never over it**,
+/// on `ui_cut_columns`' terms: seven truncating `frame_ledger::micros` calls
+/// against a parent that makes one.
+fn pre_cut_columns(cuts: [u32; 7]) -> String {
+    let [platform, ingest, evict, drops, autosave, gate, ensure] = cuts;
+    format!(
+        "pre_platform={platform} us, pre_ingest={ingest} us, pre_evict={evict} us, \
+         pre_drops={drops} us, pre_autosave={autosave} us, pre_gate={gate} us, \
+         pre_ensure={ensure} us"
     )
 }
 
@@ -2145,6 +2210,13 @@ impl super::App {
         // denominator, with the bins that make a gesture window a subtraction
         // rather than a percentile of the whole run.
         for line in frame_segment_lines(ledger.segments()) {
+            say_telemetry(loud, &line);
+        }
+        // The `pre` segment above, opened up at the seams `handle_redraw`'s
+        // head has. Same denominator, seven contiguous cuts of that one span
+        // — a decomposition of the line above, never a seventh segment beside
+        // it.
+        for line in frame_pre_lines(ledger.pre_phases()) {
             say_telemetry(loud, &line);
         }
         // The `prepare` segment above, opened up at the seams the code has.
