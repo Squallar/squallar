@@ -45,6 +45,9 @@ pub(in crate::ui) struct FrameProbes {
     /// The committed region boxes the last frame painted over map panes: map
     /// pane, 3D pane, and the painted rect.
     pub last_region_boxes: Vec<(usize, usize, egui::Rect)>,
+    /// The downloaded-area outline the last frame painted over map panes —
+    /// the manage screen's "Show on map" — as (map pane, rect).
+    pub last_download_area_boxes: Vec<(usize, egui::Rect)>,
     /// The Volume Alpha corner buttons the last frame drew, per pane.
     pub last_alpha_buttons: Vec<(usize, egui::Rect)>,
     /// Each map pane's dispatched kinds in paint order, with the layer each
@@ -112,6 +115,7 @@ impl Default for FrameProbes {
             last_pane_borders: Vec::new(),
             last_section_tracks: Vec::new(),
             last_region_boxes: Vec::new(),
+            last_download_area_boxes: Vec::new(),
             last_alpha_buttons: Vec::new(),
             last_paint_order: Vec::new(),
             last_status_bar: StatusBarProbe::default(),

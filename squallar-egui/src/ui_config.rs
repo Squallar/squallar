@@ -739,6 +739,12 @@ struct DownloadAreaConfig {
     /// checkbox writes the same file this build's predecessor wrote.
     #[serde(skip_serializing_if = "Option::is_none")]
     terrain: Option<bool>,
+    /// The downloaded area whose box the map outlines, by id — the manage
+    /// screen's "Show on map", kept across a reopen like every other switch.
+    /// Absent, and `None`, for none; `skip_serializing_if` so a file that
+    /// never asked writes what it wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shown: Option<String>,
 }
 
 impl DownloadAreaConfig {
@@ -748,6 +754,7 @@ impl DownloadAreaConfig {
         picked: Option<crate::ui_download_area::PickedBox>,
         detail: crate::ui_download_area::DetailLevel,
         terrain: Option<bool>,
+        shown: Option<String>,
     ) -> Self {
         Self {
             armed,
@@ -756,6 +763,7 @@ impl DownloadAreaConfig {
             half_width_km: picked.map(|picked| picked.half_width_km),
             detail: detail.token().to_owned(),
             terrain,
+            shown,
         }
     }
 
@@ -797,6 +805,12 @@ impl super::Gui {
             .find(|area| area.spec.area_id == area_id)
     }
 
+    /// The area whose box the map outlines, if the manage screen asked for
+    /// one — see `ui_offline_areas`' "Show on map".
+    pub fn shown_downloaded_area(&self) -> Option<&str> {
+        self.shown_downloaded_area.as_deref()
+    }
+
     /// **Publish a finished area.** The last act of a download, and the one
     /// that makes the area exist to the rest of the app — the same discipline
     /// as `squallar::kv::write_blob`'s rename, kept in the manifest so one
@@ -830,6 +844,11 @@ impl super::Gui {
         let before = self.downloaded_areas.len();
         self.downloaded_areas
             .retain(|area| area.spec.area_id != area_id);
+        // An outline of a record that is gone would name ground the device no
+        // longer holds.
+        if self.shown_downloaded_area.as_deref() == Some(area_id) {
+            self.shown_downloaded_area = None;
+        }
         self.downloaded_areas.len() != before
     }
 }
@@ -978,6 +997,7 @@ impl Default for PaneConfig {
             layer_link: true,
             transport: default_transport(),
             coverage_ring: default_true(),
+            hidden_color_bars: Vec::new(),
             layer_slots: SlotList::default(),
             removed_layers: SlotList::default(),
             zoom: None,
@@ -997,7 +1017,6 @@ struct UiConfig {
     /// The config format this file speaks — see [`migrate`]. Absent reads as
     /// version 1 (every file written before the field existed), through the
     /// field-level default rather than [`migrate::CONFIG_VERSION`], because
-            hidden_color_bars: Vec::new(),
     /// "what an old file means" is a fact about history and must not move
     /// when the current version does. A version greater than this build's is
     /// not an error: the tolerant load proceeds, preservation carries what
@@ -1583,6 +1602,11 @@ impl super::Gui {
                     layer_link: pane.layer_link,
                     transport: pane.transport_layer().clone(),
                     coverage_ring: pane.selected_site().is_some(),
+                    hidden_color_bars: pane
+                        .hidden_color_bars
+                        .iter()
+                        .map(|id| id.as_str().to_owned())
+                        .collect(),
                     layer_slots: pane_slot_list(pane, global_live_chunks),
                     removed_layers: pane_removed_list(pane),
                     unknown: pane.config_baggage.fields.clone(),
@@ -1602,11 +1626,6 @@ impl super::Gui {
         let config = UiConfig {
             config_version: migrate::CONFIG_VERSION,
             pane_count: self.pane_layout.pane_count,
-                    hidden_color_bars: pane
-                        .hidden_color_bars
-                        .iter()
-                        .map(|id| id.as_str().to_owned())
-                        .collect(),
             active_pane: self.active_pane,
             viewport_sync: true,
             sync_layers: true,
@@ -1664,6 +1683,7 @@ impl super::Gui {
                 self.download_pick,
                 self.download_detail,
                 self.download_terrain,
+                self.shown_downloaded_area.clone(),
             ),
             split_orientation: self.split_orientation,
             row_ratios: {
@@ -1841,6 +1861,13 @@ impl super::Gui {
         self.download_pick = config.download_area.box_picked();
         self.download_detail = config.download_area.detail();
         self.download_terrain = config.download_area.terrain;
+        // Only an area the list still holds: a stale or hand-edited id names
+        // nothing to outline, and is dropped rather than restored badly.
+        self.shown_downloaded_area = config.download_area.shown.clone().filter(|id| {
+            self.downloaded_areas
+                .iter()
+                .any(|area| area.spec.area_id == *id)
+        });
         self.presets = config.presets;
 
         self.volume_alpha = crate::volume_alpha::AlphaCurves::default();
@@ -1931,6 +1958,7 @@ impl super::Gui {
             // deliberately side-effect-free (see `PaneState::site`), which is
             // exactly why this is written here at the call site that means it.
             pane.selected_site = pc.coverage_ring.then(|| pane.site().to_string());
+            pane.hidden_color_bars = pc.hidden_color_bars.iter().map(LayerId::new).collect();
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
             pane.viewing_live = pc.viewing_live;
             // A request for the app to act on, not a state to assume: arming a
@@ -1958,7 +1986,6 @@ impl super::Gui {
             pane.group = pc.group.and_then(crate::pane::GroupId::from_index);
             pane.time_link = pc.time_link && config.sync_layers;
             pane.viewport_link = pc.viewport_link && config.viewport_sync;
-            pane.hidden_color_bars = pc.hidden_color_bars.iter().map(LayerId::new).collect();
             pane.layer_link = pc.layer_link && config.sync_layers;
             pane.set_transport_layer(pc.transport.clone());
             pane.set_content(restore_content(i, pc, count));

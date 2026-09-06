@@ -1221,3 +1221,125 @@ fn a_basemap_only_area_draws_no_terrain_fact() {
         "another area's terrain segments were counted into this one",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Show on map
+// ---------------------------------------------------------------------------
+
+/// **"Show on map" outlines the area's own bbox on every map pane, and the
+/// choice survives a reopen.** The outline is drawn from the record, so the
+/// box on the glass is the box that was cut; the button flips to "Hide from
+/// map" while it is up, and a second press takes it down.
+#[test]
+fn show_on_map_outlines_the_areas_bbox_and_survives_a_reopen() {
+    let dir = TempDir::new("outline");
+    dir.place_segments("ok-central", 7);
+    let mut h = harness_over(&dir);
+    h.gui_mut()
+        .record_downloaded_area(area("ok-central", 7, 12, &live_generation()));
+    open_areas_screen(&mut h);
+    settle_statuses(&mut h, &["ok-central"]);
+    h.frame_after(1.0 / 60.0);
+    assert!(
+        h.gui().download_area_boxes_for_test().is_empty(),
+        "precondition: nothing outlined before the press",
+    );
+
+    let show = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == SHOW_ON_MAP_LABEL)
+        .expect("a Show on map button under the area")
+        .0;
+    h.mouse_click(show.center());
+    h.frames_for(3, 1.0 / 60.0);
+
+    assert_eq!(
+        h.gui().shown_downloaded_area(),
+        Some("ok-central"),
+        "the press did not select the area for outlining",
+    );
+    let boxes = h.gui().download_area_boxes_for_test().to_vec();
+    assert!(
+        !boxes.is_empty(),
+        "the map painted no outline for the shown area",
+    );
+    for (_, rect) in &boxes {
+        assert!(
+            rect.is_finite() && rect.width() > 0.0 && rect.height() > 0.0,
+            "the outline {rect:?} is not a box",
+        );
+    }
+    assert!(
+        row_says(&h, HIDE_FROM_MAP_LABEL) && !row_says(&h, SHOW_ON_MAP_LABEL),
+        "with the outline up the button must read {HIDE_FROM_MAP_LABEL:?}: {:?}",
+        row_text(&h),
+    );
+
+    // Reopen: the outline is a switch like every other, and comes back.
+    let store = squallar_kv::MemoryKvStore::default();
+    h.gui_mut().save_ui_config(&store);
+    let mut reopened = crate::Gui::new();
+    assert!(reopened.load_ui_config(&store));
+    assert_eq!(
+        reopened.shown_downloaded_area(),
+        Some("ok-central"),
+        "the outlined area did not survive a reopen",
+    );
+
+    // And a second press takes it down.
+    let hide = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == HIDE_FROM_MAP_LABEL)
+        .expect("a Hide from map button under the outlined area")
+        .0;
+    h.mouse_click(hide.center());
+    h.frames_for(3, 1.0 / 60.0);
+    assert_eq!(
+        h.gui().shown_downloaded_area(),
+        None,
+        "the second press did not hide"
+    );
+    assert!(
+        h.gui().download_area_boxes_for_test().is_empty(),
+        "the outline stayed on the map after Hide from map",
+    );
+}
+
+/// A deleted area takes its outline with it: the record is what the box is
+/// drawn from, and an outline of ground the device no longer holds would be
+/// a claim about nothing.
+#[test]
+fn deleting_the_outlined_area_takes_the_outline_down() {
+    let dir = TempDir::new("outline-delete");
+    dir.place_segments("ok-central", 7);
+    let mut h = harness_over(&dir);
+    h.gui_mut()
+        .record_downloaded_area(area("ok-central", 7, 12, &live_generation()));
+    open_areas_screen(&mut h);
+    settle_statuses(&mut h, &["ok-central"]);
+    h.frame_after(1.0 / 60.0);
+
+    let show = h
+        .painted_text_rects()
+        .into_iter()
+        .find(|(_, text)| text == SHOW_ON_MAP_LABEL)
+        .expect("a Show on map button")
+        .0;
+    h.mouse_click(show.center());
+    h.frames_for(3, 1.0 / 60.0);
+    assert_eq!(h.gui().shown_downloaded_area(), Some("ok-central"));
+
+    assert!(
+        h.gui_mut().forget_downloaded_area("ok-central"),
+        "precondition: the record was there to forget",
+    );
+    h.frames_for(2, 1.0 / 60.0);
+    assert_eq!(
+        h.gui().shown_downloaded_area(),
+        None,
+        "the outline outlived the record it was drawn from",
+    );
+    assert!(h.gui().download_area_boxes_for_test().is_empty());
+}

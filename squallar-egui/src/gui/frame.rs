@@ -103,6 +103,7 @@ impl Gui {
             self.probes.last_pane_borders.clear();
             self.probes.last_section_tracks.clear();
             self.probes.last_region_boxes.clear();
+            self.probes.last_download_area_boxes.clear();
             self.probes.last_alpha_buttons.clear();
             self.probes.last_paint_order.clear();
             self.probes.last_pane_options.clear();

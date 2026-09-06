@@ -1803,6 +1803,11 @@ impl Gui {
     }
 
     #[cfg(test)]
+    pub(crate) fn download_area_boxes_for_test(&self) -> &[(usize, egui::Rect)] {
+        &self.probes.last_download_area_boxes
+    }
+
+    #[cfg(test)]
     pub(crate) fn paint_order_for_test(&self, idx: usize) -> Vec<(LayerId, egui::LayerId)> {
         self.probes
             .last_paint_order

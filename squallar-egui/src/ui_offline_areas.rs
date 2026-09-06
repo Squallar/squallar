@@ -64,6 +64,10 @@ pub(crate) const AREAS_SCOPE_NOTE: &str = "A downloaded area holds the base map 
     and the static reference layers for that rectangle, so they draw without a \
     connection. Radar, alerts and forecasts are always fetched live.";
 
+/// The row button that outlines the area on the map, and its other state.
+pub(crate) const SHOW_ON_MAP_LABEL: &str = "Show on map";
+pub(crate) const HIDE_FROM_MAP_LABEL: &str = "Hide from map";
+
 /// What a row draws in the size slot while the store has not answered for it.
 pub(crate) const CHECKING_NOTE: &str = "Checking storage...";
 
@@ -85,6 +89,12 @@ enum AreaCommand {
         /// whatever the map panel's checkbox happens to say now.
         terrain: bool,
     },
+    /// Outline this area's box on the map, so the ground it names can be
+    /// checked against the map. One at a time: the outline is a question
+    /// about one area, and two boxes over one town answer nothing.
+    ShowOnMap(String),
+    /// Take the outline down.
+    HideFromMap,
 }
 
 impl super::Gui {
@@ -121,6 +131,8 @@ impl super::Gui {
                 .area_maintenance
                 .as_ref()
                 .and_then(|maintenance| maintenance.fact(&area.spec.area_id));
+            let outlined =
+                self.shown_downloaded_area.as_deref() == Some(area.spec.area_id.as_str());
             let asked = render_area(
                 ui,
                 area,
@@ -128,6 +140,7 @@ impl super::Gui {
                 &live_generation,
                 store_reachable,
                 archive_max_zoom,
+                outlined,
             );
             // First press wins. Only one button can be clicked in a frame, so
             // this decides nothing in practice - it just refuses to let a
@@ -141,6 +154,8 @@ impl super::Gui {
             Some(AreaCommand::Download { spec, terrain }) => {
                 self.start_area_download(spec, terrain, ui.ctx());
             }
+            Some(AreaCommand::ShowOnMap(area_id)) => self.shown_downloaded_area = Some(area_id),
+            Some(AreaCommand::HideFromMap) => self.shown_downloaded_area = None,
             None => {}
         }
     }
@@ -290,6 +305,8 @@ fn render_area(
     // The live archive's own detail ceiling, once a header read has reported
     // one - what a stored depth is named against, rather than a constant.
     archive_max_zoom: Option<u8>,
+    // Whether the map is outlining this area now, which decides the button.
+    outlined: bool,
 ) -> Option<AreaCommand> {
     let mut command = None;
     // The name and the figure on one line, in the panel's own left-to-right
@@ -315,8 +332,10 @@ fn render_area(
     // before it needs a newer cut.
     let incomplete = fact.is_some_and(|fact| !fact.status.is_complete());
     let updatable = note.is_some_and(|note| note.update_available);
-    ui.add_enabled_ui(store_reachable, |ui| {
-        ui.horizontal(|ui| {
+    ui.horizontal(|ui| {
+        // The store's buttons need the store; the outline needs only the
+        // record, so it stays live when the store is not reachable.
+        ui.add_enabled_ui(store_reachable, |ui| {
             let terrain = area.terrain.is_some();
             if incomplete && ui.button("Resume").clicked() {
                 command = Some(AreaCommand::Download {
@@ -330,6 +349,24 @@ fn render_area(
                     terrain,
                 });
             }
+        });
+        let label = if outlined {
+            HIDE_FROM_MAP_LABEL
+        } else {
+            SHOW_ON_MAP_LABEL
+        };
+        if ui
+            .button(label)
+            .on_hover_text("Outline this area's box on the map, to check the ground it covers")
+            .clicked()
+        {
+            command = Some(if outlined {
+                AreaCommand::HideFromMap
+            } else {
+                AreaCommand::ShowOnMap(area.spec.area_id.clone())
+            });
+        }
+        ui.add_enabled_ui(store_reachable, |ui| {
             if ui.button("Delete").clicked() {
                 command = Some(AreaCommand::Delete(area.spec.area_id.clone()));
             }

@@ -1356,24 +1356,33 @@ impl super::Gui {
             }
         }
 
-        self.draw_download_box(ui, projector, pane_idx);
+        let outlined = self.draw_download_box(ui, projector, pane_idx);
 
         #[cfg(test)]
-        self.probes.last_region_boxes.extend(painted);
+        {
+            self.probes.last_region_boxes.extend(painted);
+            self.probes
+                .last_download_area_boxes
+                .extend(outlined.map(|rect| (pane_idx, rect)));
+        }
+        #[cfg(not(test))]
+        let _ = outlined;
     }
 
-    /// The offline-download box: the one being dragged on this pane, and the
-    /// committed one, each with the chip that describes it.
+    /// The offline-download boxes: the one being dragged on this pane, the
+    /// committed one, and the downloaded area the manage screen asked to see,
+    /// each with the chip that describes it. Answers the outlined area's rect.
     ///
-    /// The committed box draws on **every** map pane rather than only the one
-    /// it was picked on: a downloaded area is a fact about the device rather
-    /// than about a window, so a second map over the same ground shows it too.
+    /// The committed box and the outline draw on **every** map pane rather
+    /// than only the one it was picked on: a downloaded area is a fact about
+    /// the device rather than about a window, so a second map over the same
+    /// ground shows it too.
     fn draw_download_box(
         &self,
         ui: &egui::Ui,
         projector: &walkers::Projector,
         pane_idx: crate::pane::PaneId,
-    ) {
+    ) -> Option<egui::Rect> {
         let painter = ui.painter();
         let color = crate::ui_download_area::DOWNLOAD_ARM_COLOR;
 
@@ -1402,6 +1411,24 @@ impl super::Gui {
                 color,
             );
         }
+
+        // The area the manage screen asked to see: its record's own bbox as an
+        // outline, with the id as its chip so two areas over one town read
+        // apart. The record is the download's own request, so the box drawn
+        // is the box that was cut.
+        let area = self
+            .shown_downloaded_area
+            .as_deref()
+            .and_then(|id| self.downloaded_area(id))?;
+        let spec = &area.spec;
+        let rect = crate::overlay_cache::geo_corner_rect(
+            projector,
+            (spec.north, spec.west),
+            (spec.south, spec.east),
+        );
+        paint_region_box(painter, rect, color, false);
+        paint_region_hint(painter, rect, &spec.area_id, color);
+        Some(rect)
     }
 
     /// The committed download box's chip: its width, its detail level, and the

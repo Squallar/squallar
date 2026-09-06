@@ -166,6 +166,10 @@ pub struct Gui {
     /// left; absence loads as `None`, which reopens tracking the switch — and
     /// the switch itself persists, so the checkbox is 1:1 either way.
     pub(super) download_terrain: Option<bool>,
+    /// The downloaded area whose box the map outlines, by id — the manage
+    /// screen's "Show on map", so a listed area can be checked against the
+    /// ground it names. App-wide like the list itself, and persisted.
+    pub(super) shown_downloaded_area: Option<String>,
     /// The exact size figure for the picked box, measured off the frame
     /// thread. Derived, never persisted — it is the archive's answer, not the
     /// user's choice.
@@ -619,6 +623,7 @@ impl Gui {
             download_pick: None,
             download_detail: crate::ui_download_area::DetailLevel::default(),
             download_terrain: None,
+            shown_downloaded_area: None,
             download_size: crate::ui_download_area::AreaSizeProbe::new(),
             download_quota: None,
             section_edit_drag: None,
