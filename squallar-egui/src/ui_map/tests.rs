@@ -145,6 +145,143 @@ fn a_section_track_is_drawn_in_the_turn_the_pane_is_looking_at() {
     }
 }
 
+/// **A section that crosses the antimeridian *itself* is drawn as short as the
+/// ground it covers.**
+///
+/// `squallar_geo::great_circle_point` answers through `atan2`, so its samples
+/// change sign at the seam: two neighbours a tenth of a degree apart on the
+/// ground are 359.9° apart as numbers, and the segment between them is drawn
+/// across the world. The track is the body's hit geometry as well as its paint,
+/// so that segment also grabs the section from anywhere near its latitude.
+///
+/// Every claim is a contradiction rather than a threshold, and each is measured
+/// against the extent of the thing it describes rather than a number: the drawn
+/// track spans the section's own longitude span, no step of a 33-sample track
+/// is longer than the whole track, the walk never doubles back, and the length
+/// walked is the end-to-end extent. None can fire on a track that is drawn
+/// where its ground is.
+///
+/// The tolerance is `f32` arithmetic's own: the projected `x` is an `f32`, and
+/// 33 of them differenced at a magnitude up to ~600 leave a few thousandths of
+/// a degree. The defect it stands against is three hundred and fifty-odd.
+#[test]
+fn a_section_crossing_the_seam_is_drawn_no_longer_than_the_ground_it_covers() {
+    let across = crate::pane::SectionLine::new(
+        squallar_geo::GeoPoint {
+            lat: 20.0,
+            lon: 179.0,
+        },
+        squallar_geo::GeoPoint {
+            lat: 20.6,
+            lon: -177.0,
+        },
+    )
+    .expect("a line straddling the antimeridian");
+
+    // The precondition the middle claim below rests on: once the walk has made
+    // the samples continuous this line's midpoint lies *outside* ±180, while
+    // the raw `atan2` midpoint lies inside it. A shift taken from the raw one
+    // is therefore a whole turn wrong, and the claim is about something.
+    let (_, raw_mid) = squallar_geo::great_circle_point(
+        (across.a().lat, across.a().lon),
+        (across.b().lat, across.b().lon),
+        0.5,
+    );
+    let walked_mid = squallar_geo::fold_lon_near(raw_mid, across.a().lon);
+    assert!(
+        (-180.0..=180.0).contains(&raw_mid) && !(-180.0..=180.0).contains(&walked_mid),
+        "fixture: the midpoint reads {raw_mid} raw and {walked_mid} walked, so \
+         the two spellings of the shift agree and nothing below is about them",
+    );
+
+    // The healthy arm, and it *resembles* the defect: a section 140° of
+    // longitude wide draws a track far wider than any streak the seam
+    // produces, and every claim below must stay green on it. A gate that
+    // refuses a legitimately wide track blocks the measurement it exists for.
+    let wide = crate::pane::SectionLine::new(
+        squallar_geo::GeoPoint {
+            lat: 5.0,
+            lon: -70.0,
+        },
+        squallar_geo::GeoPoint {
+            lat: 5.0,
+            lon: 70.0,
+        },
+    )
+    .expect("a wide line nowhere near the seam");
+
+    for line in [across, wide] {
+        check_track_covers_its_own_ground(line);
+    }
+}
+
+/// The body of [`a_section_crossing_the_seam_is_drawn_no_longer_than_the_ground_it_covers`],
+/// run over one line from panes in every turn.
+fn check_track_covers_its_own_ground(line: crate::pane::SectionLine) {
+    // The section's own longitude span, taken the short way round — the ground
+    // the drawn track has to cover, in the units it is about to be drawn in.
+    let span_deg =
+        (squallar_geo::fold_lon_near(line.b().lon, line.a().lon) - line.a().lon).abs() as f32;
+    assert!(
+        span_deg < 180.0 && span_deg > 0.0,
+        "fixture: the ends are {span_deg} deg apart, which is not a span this \
+         walk can be about",
+    );
+
+    // One point per degree of longitude, so every length below reads in
+    // degrees and is comparable to the span above.
+    let project = |p: squallar_geo::GeoPoint| egui::pos2(p.lon as f32, -p.lat as f32);
+    let tolerance = SECTION_TRACK_SAMPLES as f32 * f32::EPSILON * 600.0;
+
+    for turn in [-539.0, -180.0, 0.0, 178.0, 180.0, 182.0, 541.0] {
+        let track = great_circle_track(line, turn, project);
+        assert_eq!(track.len(), SECTION_TRACK_SAMPLES + 1);
+
+        let run = track[SECTION_TRACK_SAMPLES].x - track[0].x;
+        let extent = run.abs();
+        assert!(
+            (extent - span_deg).abs() <= tolerance,
+            "a pane at {turn} drew {extent} deg of track for a section whose \
+             ends are {span_deg} deg of longitude apart",
+        );
+
+        let mut walked = 0.0_f32;
+        let mut longest = 0.0_f32;
+        for pair in track.windows(2) {
+            let step = pair[1].x - pair[0].x;
+            assert!(
+                step * run >= 0.0,
+                "a pane at {turn} drew a step of {step} deg against a track \
+                 running {run} deg: the track doubles back on itself",
+            );
+            walked += step.abs();
+            longest = longest.max(step.abs());
+        }
+        assert!(
+            longest <= extent,
+            "a pane at {turn} drew one of {} segments {longest} deg wide on a \
+             track {extent} deg wide",
+            SECTION_TRACK_SAMPLES,
+        );
+        assert!(
+            (walked - extent).abs() <= tolerance,
+            "a pane at {turn} walked {walked} deg to cover {extent} deg of \
+             ground",
+        );
+
+        // And the track is placed in the pane's own turn, which is what
+        // `fold_lon_near` means: the shift has to be taken from the middle the
+        // walk produced, not from the raw `atan2` one a turn away from it.
+        let middle = f64::from(track[SECTION_TRACK_SAMPLES / 2].x);
+        assert!(
+            (middle - turn).abs() <= 180.0 + f64::from(tolerance),
+            "a pane at {turn} drew the middle of its own section at {middle}, \
+             {} deg away - past half a turn the far spelling was taken",
+            (middle - turn).abs(),
+        );
+    }
+}
+
 #[test]
 fn an_empty_track_paints_nothing() {
     let ctx = egui::Context::default();

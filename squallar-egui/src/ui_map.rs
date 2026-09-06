@@ -3328,9 +3328,24 @@ const SECTION_TRACK_SAMPLES: usize = 32;
 /// the track inside out, and folding each sample against the pane separately
 /// would break a track longer than half a turn in the middle.
 ///
-/// It does **not** straighten a track that crosses the seam itself:
-/// [`squallar_geo::great_circle_point`] answers through `atan2` and its samples
-/// change sign there, which is its own defect and its own change.
+/// # The samples are made continuous before either of those happens
+///
+/// [`squallar_geo::great_circle_point`] answers through `atan2`, so a track
+/// that crosses the antimeridian **itself** changes sign in the middle: two
+/// neighbouring samples a tenth of a degree apart on the ground are written
+/// 359.9 deg apart as numbers, and the segment between them is drawn across
+/// the whole world. That is one polyline, so it is not only paint — this
+/// track is also the body's hit geometry in [`crate::ui_section_edit::SectionGrabZone`],
+/// and a segment spanning the world grabs the section from anywhere near its
+/// latitude.
+///
+/// So each sample is carried to the turn its **predecessor** is written in
+/// before anything is projected. That is a fold along the curve, not against a
+/// frame: the track is a connected line and its own previous point is the only
+/// thing that says which turn the next one belongs in. It cannot turn a track
+/// inside out the way a per-sample fold against the pane would, and it leaves
+/// a track that does not cross the seam bit-for-bit where it was — the shift
+/// `fold_lon_near` applies is a whole turn or nothing.
 fn great_circle_track(
     line: crate::pane::SectionLine,
     turn_lon: f64,
@@ -3338,12 +3353,25 @@ fn great_circle_track(
 ) -> Vec<egui::Pos2> {
     let a = (line.a().lat, line.a().lon);
     let b = (line.b().lat, line.b().lon);
-    let (_, mid_lon) = squallar_geo::great_circle_point(a, b, 0.5);
+    let mut samples: Vec<(f64, f64)> = Vec::with_capacity(SECTION_TRACK_SAMPLES + 1);
+    for i in 0..=SECTION_TRACK_SAMPLES {
+        let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
+        let (lat, lon) = squallar_geo::great_circle_point(a, b, t);
+        let lon = match samples.last() {
+            Some(&(_, previous)) => squallar_geo::fold_lon_near(lon, previous),
+            None => lon,
+        };
+        samples.push((lat, lon));
+    }
+    // The middle sample is `great_circle_point(a, b, 0.5)` — `SECTION_TRACK_SAMPLES`
+    // is even, so `t` there is exactly 0.5 — read after the walk so that the
+    // shift is taken from the track as it will be drawn rather than from a
+    // sample the walk has since carried a turn.
+    let mid_lon = samples[SECTION_TRACK_SAMPLES / 2].1;
     let shift = squallar_geo::fold_lon_near(mid_lon, turn_lon) - mid_lon;
-    (0..=SECTION_TRACK_SAMPLES)
-        .map(|i| {
-            let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
-            let (lat, lon) = squallar_geo::great_circle_point(a, b, t);
+    samples
+        .into_iter()
+        .map(|(lat, lon)| {
             project(squallar_geo::GeoPoint {
                 lat,
                 lon: lon + shift,
