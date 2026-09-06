@@ -2431,6 +2431,96 @@ label, and a control that copies the same names the same number of times. On
 this tree the first two read 0 and the control reads the fixture's label count;
 on the tree before this commit all three read that count.
 
+### Changed — source, thirty-first commit: label collision is a neighbourhood search
+
+**The defect.** `OccupiedAreas` held every claim in one flat `Vec` and answered
+`try_occupy` by scanning all of it. Answering the `i`-th claim therefore ran
+`i - 1` `OrientedRect::intersects` calls, so a consumer laying out `n` labels
+against one `OccupiedAreas` ran **`n(n-1)/2`** of them. That is quadratic in a
+number the consumer does not control: how many names the tiles on the glass
+happen to carry.
+
+Upstream's own comment on `intersects` — "checking bbox first gives huge
+performance boost" — is about the cost of *one* test. The count was never
+addressed.
+
+**The measurement.** `squallar`'s release binary under its rig's scene D (one
+1920x1080 pane, KTLX, all 18 layers, the `ui-sweep` gesture script, NVIDIA RTX
+3090 / Vulkan on Xvfb), `perf --call-graph fp` over 100 s, 53,993 samples:
+`OccupiedAreas::try_occupy` was **the largest single symbol of walkers' or that
+app's own code on the frame thread** — 0.34 % of all on-CPU samples, and
+`perf annotate` put ~78 % of them inside the scan loop itself (the three
+instructions at `+0xd6`..`+0x106`). The app's always-on ledger counted 343 label
+anchors placed per frame on that leg, and 282 on an earlier one over the same
+scene with a colder tile cache. `n(n-1)/2` at `n = 282` is 39,621 tests a frame,
+and the arithmetic fits the sample count: ~30 µs of frame-thread CPU per drawn
+frame at roughly a nanosecond a test.
+
+**The change: a bucketed broad phase.** Each accepted claim is filed in every
+bucket its bounding box touches (`BUCKET_POINTS`, 64 points a side), and a query
+tests only the claims sharing a bucket with it. Three properties make that a
+search change and not a behaviour change:
+
+- Two `OrientedRect`s can only intersect if their bounding boxes overlap, and
+  two overlapping boxes always share at least one bucket, because each is filed
+  in *every* bucket it touches. So no claim that would have been hit is missed.
+- Every candidate a bucket produces is still put through the same
+  `OrientedRect::intersects`, so nothing is accepted that the scan refused.
+- A claim whose box spans more than `MAX_BUCKETS_PER_AREA` buckets, or whose
+  coordinates are not finite, is filed in none and goes on `unbucketed`, which
+  every query tests in full. A *query* with no bucket span is asked against
+  every claim, which is what the scan did for every query.
+
+The accept/reject sequence is therefore identical for any input, which is what
+the consumer's gate asserts rather than assumes.
+
+**The bucket table hashes cheaply, and that is load-bearing.** A pane of 282
+labels makes on the order of two thousand bucket lookups and insertions a
+frame. `RandomState`'s SipHash costs more per key than the quadratic scan cost
+per test, so with the default hasher the change would have paid for itself and
+no more; `BucketHasher` is a multiply-xorshift over a packed `i64` bucket key.
+The keys are screen positions divided by `BUCKET_POINTS` — nothing a caller
+chooses — so there is nothing to expose by hashing them cheaply.
+
+**What a consumer gains.** `BUCKET_POINTS` is `pub`, so a consumer can compute
+from its own claims alone which of them can be candidates for which query — two
+claims are candidates exactly when their boxes touch a common bucket — and so
+state a bound on the search's cost without restating the search.
+
+**The instrument.** `walkers::intersect_tests()` is a new always-on counter,
+one `Relaxed` `fetch_add` inside `OrientedRect::intersects` itself. It is
+product telemetry in the shape of the consumer's `tile_mesh::ledger`: no feature
+gate, and blind to how the claims are stored, so it counts a flat scan and a
+bucketed search alike. That blindness is the point — it is what lets the before
+and after figures be read off the same instrument.
+
+It is the hottest always-on counter in this crate, one atomic per test rather
+than one per pane, and that is priced rather than waved through: **after this
+commit the count it runs is the count it reports**, ~255 a frame on the leg
+above, where the scan it replaces would have made it ~26,000. A counter inside
+`try_occupy` would be cheaper and would be counting its own loop, which is the
+one thing that would stop the two figures being comparable.
+
+**The gate**, in the consumer rather than here, because that is where the
+per-frame path is: `squallar-egui/tests/label_collision_is_bucketed.rs`. Over a
+fixture of 282 label-shaped claims on a 1920x1080 pane — 282 because that is
+the lower of the two legs' per-frame anchor counts, so the fixture understates
+rather than flatters — measured with that counter:
+
+| | intersection tests |
+| --- | --- |
+| before this commit (flat scan) | **25,892** |
+| after (bucketed) | **255** |
+| what the fixture's own geometry allows | 314 |
+| control: every pair by hand | 39,621 = `n(n-1)/2` |
+
+Both figures are measured, on the two trees, by the same counter; the bound is
+computed from the fixture's anchors against `BUCKET_POINTS`, not written down.
+The correctness conjunct is a separate arm and shares no code with the count:
+the accept/reject answer for all 282 claims, in order, must equal a full scan's,
+and the fixture is asserted to place some and refuse some (180 of 282) so that
+agreement means something.
+
 ### A correction to the paragraph above, from the third commit
 
 The sentence "the other 23 arrive the day `mvt` is enabled" was **wrong by one

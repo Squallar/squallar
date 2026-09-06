@@ -200,10 +200,32 @@ impl OrientedRect {
         self.corners[0]
     }
 
+    /// Whether these two claims overlap.
+    ///
+    /// **Every call is counted**, in [`INTERSECT_TESTS`]. The count is the
+    /// figure any collision-broad-phase change is judged by: the test itself
+    /// is a bounding-box compare plus a separating-axis test over eight
+    /// corners, and how often it runs is a property of the *search*, not of
+    /// the geometry. See [`OccupiedAreas`].
     pub fn intersects(&self, other: &OrientedRect) -> bool {
+        INTERSECT_TESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Checking bbox first gives huge performance boost.
         self.bbox.intersects(other.bbox) && !separated(&self.corners, &other.corners)
     }
+}
+
+/// Every [`OrientedRect::intersects`] this process has run.
+///
+/// Product telemetry rather than a campaign instrument: always on, no feature
+/// gate, one `Relaxed` `fetch_add` per test. It exists because the label
+/// collision phase is a *search* whose cost is the number of tests it makes,
+/// and a search's cost is invisible to every timing an ordinary run takes --
+/// the per-test work never changed, only how many times it was asked for.
+static INTERSECT_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`OrientedRect::intersects`] calls since the process started.
+pub fn intersect_tests() -> u64 {
+    INTERSECT_TESTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The separating-axis test: two convex polygons are disjoint exactly when some
@@ -247,23 +269,241 @@ fn project(rect: &[Pos2; 4], axis: Vec2) -> (f32, f32) {
     (min, max)
 }
 
-// Tracks areas occupied by texts to avoid overlapping them.
+/// The side of one broad-phase bucket, in points.
+///
+/// **Published because it is what makes the search's cost derivable.** A
+/// caller that knows this can compute, from its own claims alone, exactly
+/// which of them can be candidates for which query -- two claims are
+/// candidates for each other precisely when their bounding boxes touch a
+/// common bucket -- and so state a bound on the number of
+/// [`OrientedRect::intersects`] calls a run may make without restating the
+/// search. `squallar-egui/tests/label_collision_is_bucketed.rs` is that
+/// caller.
+///
+/// A label is the thing this holds: a wrapped place name at a basemap text
+/// size measures on the order of 100 x 30 points, and a station name about
+/// 40 x 14. 64 puts the ordinary label in one or two buckets on each axis --
+/// small enough that a query looks at its own neighbourhood rather than the
+/// pane, large enough that inserting one claim is a handful of bucket writes
+/// rather than a walk over a fine grid.
+pub const BUCKET_POINTS: f32 = 64.0;
+
+/// The most buckets one claim may be filed in before it is filed in none.
+///
+/// A claim wider than this is not a label; it is a rectangle produced by a
+/// degenerate projector or an enormous galley, and spreading it over thousands
+/// of buckets would cost more than testing it against every query. Such a
+/// claim goes on [`OccupiedAreas::unbucketed`] instead, which every query
+/// tests in full -- so the answer is the same and only the search changes.
+const MAX_BUCKETS_PER_AREA: i64 = 256;
+
+/// The buckets a bounding box touches, or `None` when it touches too many to
+/// be worth filing (see [`MAX_BUCKETS_PER_AREA`]) or is not finite.
+///
+/// Inclusive on both ends: a box is in every bucket any part of it reaches.
+fn bucket_span(bbox: Rect) -> Option<(i32, i32, i32, i32)> {
+    let floor = |v: f32| {
+        let cell = (v / BUCKET_POINTS).floor();
+        (cell.is_finite() && cell >= i32::MIN as f32 && cell <= i32::MAX as f32)
+            .then_some(cell as i32)
+    };
+    let x0 = floor(bbox.min.x)?;
+    let y0 = floor(bbox.min.y)?;
+    let x1 = floor(bbox.max.x)?;
+    let y1 = floor(bbox.max.y)?;
+    // `Rect::from_points` orders the corners, so this holds for any box built
+    // from an `OrientedRect`; a caller-composed inverted box is refused rather
+    // than silently filed in nothing.
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    let buckets = (i64::from(x1) - i64::from(x0) + 1) * (i64::from(y1) - i64::from(y0) + 1);
+    (buckets <= MAX_BUCKETS_PER_AREA).then_some((x0, y0, x1, y1))
+}
+
+/// Tracks areas occupied by texts to avoid overlapping them.
+///
+/// **The rule is unchanged and the search is not.** First claim to ask for a
+/// piece of screen keeps it; a later claim that touches it is refused. What
+/// changed is how the claims already made are found: they are filed by the
+/// buckets their bounding boxes touch ([`BUCKET_POINTS`]), and a query tests
+/// only the claims sharing a bucket with it.
+///
+/// **That is exact, not approximate.** Two [`OrientedRect`]s can only
+/// intersect if their bounding boxes overlap, and two overlapping boxes always
+/// share at least one bucket -- each is filed in *every* bucket it touches --
+/// so no claim that would have been hit can be missed. Every candidate the
+/// buckets produce is then put through the same [`OrientedRect::intersects`]
+/// as before, so nothing is accepted that the full scan would have refused.
+/// The accept/reject sequence is identical for any input.
+///
+/// **Why it was worth doing.** The scan it replaces was linear in the claims
+/// already made, so a pane laying out `n` labels ran `n(n-1)/2` intersection
+/// tests. Measured on the native rig's scene D (one 1920x1080 pane, KTLX,
+/// every layer on, the `ui-sweep` script, RTX 3090 / Vulkan on Xvfb), the
+/// ground phase placed 282-343 label anchors per frame across two legs, and
+/// `try_occupy` was the largest single symbol of this crate's or the app's own
+/// code on the frame thread -- 0.34% of all on-CPU samples on the leg that
+/// counted 343, ~78% of them inside the scan loop itself.
 pub struct OccupiedAreas {
     areas: Vec<OrientedRect>,
+    /// Head of each bucket's chain: an index into [`Self::filed`], or
+    /// [`END`].
+    heads: BucketMap,
+    /// The chains themselves, `(claim, next link)`.
+    ///
+    /// **One arena rather than a `Vec` per bucket**, because a fresh
+    /// `OccupiedAreas` is built for every pane on every frame: a map of
+    /// per-bucket vectors would have allocated once per occupied bucket per
+    /// frame — around two hundred on a 1920x1080 pane of labels — to save a
+    /// scan that costs less than that.
+    filed: Vec<(u32, u32)>,
+    /// Claims with no usable bucket span, tested by every query.
+    unbucketed: Vec<u32>,
+    /// Per-claim stamp of the query that last considered it, so a claim filed
+    /// in several of the query's buckets is tested once rather than once per
+    /// shared bucket.
+    seen: Vec<u64>,
+    /// The query counter [`Self::seen`] is stamped with. Never reset, so a
+    /// stamp can never collide with a live one.
+    query: u64,
+    /// Candidate claims for the query in flight. A field rather than a local
+    /// so the allocation is made once per pane rather than once per label.
+    candidates: Vec<u32>,
+}
+
+/// The end of a bucket's chain.
+const END: u32 = u32::MAX;
+
+/// One bucket's key, packed so the table hashes eight bytes once rather than
+/// two fields twice.
+fn bucket_key(cx: i32, cy: i32) -> i64 {
+    (i64::from(cx) << 32) | i64::from(cy as u32)
+}
+
+/// A multiply-xorshift hash over the packed bucket key.
+///
+/// **Not a taste preference; the cut does not pay for itself without it.** A
+/// pane of 282 labels makes on the order of two thousand bucket lookups and
+/// insertions a frame, and SipHash — what `RandomState` gives a `HashMap` by
+/// default — costs more per key than the whole quadratic scan this replaces
+/// cost per test. The keys here are integers a caller cannot choose (they are
+/// screen positions divided by [`BUCKET_POINTS`]), so nothing is exposed by
+/// hashing them cheaply.
+#[derive(Default)]
+struct BucketHasher(u64);
+
+impl std::hash::Hasher for BucketHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        // The 64-bit golden-ratio constant, then a xorshift so the low bits a
+        // table indexes by carry the high bits' entropy.
+        let mixed = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 31);
+    }
+
+    /// Never reached: [`bucket_key`] is the only thing hashed here, and
+    /// `i64`'s `Hash` calls [`Self::write_i64`]. Spelled as a fold rather than
+    /// `unreachable!` so a future key type is slow rather than a panic.
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_i64(i64::from(byte));
+        }
+    }
+}
+
+type BucketMap = std::collections::HashMap<i64, u32, std::hash::BuildHasherDefault<BucketHasher>>;
+
+impl Default for OccupiedAreas {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OccupiedAreas {
     pub fn new() -> Self {
-        Self { areas: Vec::new() }
+        Self {
+            areas: Vec::new(),
+            heads: BucketMap::default(),
+            filed: Vec::new(),
+            unbucketed: Vec::new(),
+            seen: Vec::new(),
+            query: 0,
+            candidates: Vec::new(),
+        }
     }
 
     pub fn try_occupy(&mut self, rect: OrientedRect) -> bool {
-        if !self.areas.iter().any(|existing| existing.intersects(&rect)) {
-            self.areas.push(rect);
-            true
-        } else {
-            false
+        // Taken out by name so the gather below can read `self.heads` and
+        // `self.filed` while it writes the stamps. Both go back before this
+        // returns.
+        let mut candidates = std::mem::take(&mut self.candidates);
+        let mut seen = std::mem::take(&mut self.seen);
+        candidates.clear();
+
+        self.query += 1;
+        let query = self.query;
+
+        match bucket_span(rect.bbox) {
+            Some((x0, y0, x1, y1)) => {
+                for cy in y0..=y1 {
+                    for cx in x0..=x1 {
+                        let mut link = self.heads.get(&bucket_key(cx, cy)).copied().unwrap_or(END);
+                        while link != END {
+                            let (at, next) = self.filed[link as usize];
+                            if seen[at as usize] != query {
+                                seen[at as usize] = query;
+                                candidates.push(at);
+                            }
+                            link = next;
+                        }
+                    }
+                }
+                for &at in &self.unbucketed {
+                    if seen[at as usize] != query {
+                        seen[at as usize] = query;
+                        candidates.push(at);
+                    }
+                }
+            }
+            // A query with no bucket span is asked against everything, which
+            // is what the scan this replaces did for every query.
+            None => candidates.extend(0..self.areas.len() as u32),
         }
+
+        let free = !candidates
+            .iter()
+            .any(|&at| self.areas[at as usize].intersects(&rect));
+
+        self.candidates = candidates;
+        self.seen = seen;
+
+        if free {
+            self.file(rect);
+        }
+        free
+    }
+
+    /// File an accepted claim in every bucket its bounding box touches.
+    fn file(&mut self, rect: OrientedRect) {
+        let at = self.areas.len() as u32;
+        match bucket_span(rect.bbox) {
+            Some((x0, y0, x1, y1)) => {
+                for cy in y0..=y1 {
+                    for cx in x0..=x1 {
+                        let link = self.filed.len() as u32;
+                        let head = self.heads.insert(bucket_key(cx, cy), link).unwrap_or(END);
+                        self.filed.push((at, head));
+                    }
+                }
+            }
+            None => self.unbucketed.push(at),
+        }
+        self.areas.push(rect);
+        self.seen.push(0);
     }
 }
 
