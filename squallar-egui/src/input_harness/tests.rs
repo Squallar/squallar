@@ -16232,3 +16232,68 @@ fn a_swept_clock_spends_one_raster_per_picture_not_one_per_bucket() {
          the token is still moving for buckets rather than for pictures",
     );
 }
+
+/// **The colour bar drops to the map's bottom edge when the chrome fades.**
+///
+/// `Gui::color_scale_floor` dodges the transport by its remembered `Area`
+/// rect, and egui keeps that rect after the area stops being shown — which
+/// the map-tap fade does. So on the phone the bar stayed lifted over the
+/// strip the transport and the bottom bar had left, and the reported defect
+/// was a colour bar floating above empty map with the UI hidden. The floor
+/// reads the remembered rect only while the chrome is up.
+#[test]
+fn the_colour_scale_drops_into_the_space_the_faded_chrome_leaves() {
+    let mut h = InputHarness::with_screen(egui::vec2(402.0, 874.0));
+    h.set_pane_count(1);
+    h.warm_up();
+    let panel = h.map_panel_rect();
+
+    // The bar by its painted geometry, as the floor gate finds it.
+    let find_bar = |h: &InputHarness| -> egui::Rect {
+        h.painted_images_in(panel)
+            .into_iter()
+            .map(|image| image.rect)
+            .find(|r| (r.height() - 20.0).abs() < 0.5 && r.width() > 100.0)
+            .expect("non-vacuity: the portrait pane painted no horizontal colour-scale bar")
+    };
+    let lifted = find_bar(&h);
+    let transport = h.timeline().rect;
+    assert!(
+        transport.is_finite() && lifted.bottom() <= transport.top() + 0.5,
+        "precondition: with the chrome up the bar ({lifted:?}) must stand clear \
+         of the transport ({transport:?}) — the gate this test extends",
+    );
+
+    // The bare-map tap, as test 60b makes it on the phone.
+    let spot = h.pane_rects()[0].center();
+    for _ in 0..3 {
+        if h.faded() {
+            break;
+        }
+        h.mouse_click(spot);
+        h.warm_up();
+    }
+    assert!(h.faded(), "precondition: the bare-map tap faded the chrome");
+    assert!(
+        !h.timeline().rect.is_finite() && !h.bottom_bar().rect.is_finite(),
+        "precondition: faded, neither the transport nor the bottom bar drew",
+    );
+
+    let dropped = find_bar(&h);
+    assert!(
+        dropped.bottom() > lifted.bottom() + 20.0,
+        "the bar did not move down when the chrome faded: {lifted:?} before, \
+         {dropped:?} after — the floor is still dodging the transport's \
+         remembered rect",
+    );
+    // The margin the bar keeps from the pane edge is the painter's
+    // `SCALE_MARGIN`; nothing else may stand between them once the chrome is
+    // gone.
+    assert!(
+        (panel.bottom() - dropped.bottom() - 16.0).abs() < 1.0,
+        "faded, the bar must stand on the map's own bottom margin: bar bottom \
+         {} against panel bottom {}",
+        dropped.bottom(),
+        panel.bottom(),
+    );
+}

@@ -714,9 +714,17 @@ impl super::Gui {
         } else {
             "timeline"
         });
+        // And only while the chrome is up: egui keeps an `Area`'s last rect
+        // after it stops being shown, and the fade stops showing it, so a
+        // faded transport would keep the scale dodging a bar that is not on
+        // the glass — the phone's colour bar stayed lifted over an empty strip
+        // after the map-tap fade. The status bar clears its own rect.
+        let timeline_rect = self
+            .chrome_fade()
+            .and_then(|_| ui.ctx().memory(|memory| memory.area_rect(timeline)));
         self.statusbar_rect
             .into_iter()
-            .chain(ui.ctx().memory(|memory| memory.area_rect(timeline)))
+            .chain(timeline_rect)
             // `Rect::NOTHING` is inverted, so a surface that did not draw
             // fails this test rather than needing a case of its own.
             .filter(|bar| bar.max.x > scale_left && bar.min.x < pane_rect.right())
