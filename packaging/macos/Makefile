@@ -82,8 +82,13 @@ SHELL := bash
 .ONESHELL:
 ROOT := $(realpath $(CURDIR)/../..)
 
-# Digest-pinned to the same image the CI matrix uses.
-IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:433d3e61c46c6dea2e0bb0bc450fe34415d9769f6d801ab1f2e2ebbdbcf50c28
+# Digest-pinned to the same image the CI matrix uses. Engines honour the
+# DIGEST and ignore the tag, so a tag that reads 1.97.1 beside a digest built
+# from 1.94.1 is a local build on a toolchain CI does not have: this pin was
+# sha256:433d3e61 until 2026-09-06, which carried RUST_VERSION=1.94.1 while
+# rust-toolchain.toml and .github/workflows/build.yaml both said 1.97.1.
+# Change it together with the workflow's, or not at all.
+IMAGE ?= ghcr.io/usa-reddragon/rust-cross:1.97.1@sha256:68d608cfe4232a8a9b42ce41ea26412eaadc8f53218fed7e52e43974b388a302
 # Named volume for the crate cache, so a rebuild does not re-download the index.
 CARGO_VOL ?= squallar-xcross-cargo
 # arm64 by default: it is what every Mac sold since 2020 is, and the one arch
