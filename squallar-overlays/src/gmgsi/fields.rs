@@ -43,9 +43,10 @@ pub const GROUP: &str = "GMGSI channels";
 pub const MIN_COUNT: f32 = 0.0;
 pub const MAX_COUNT: f32 = 255.0;
 
-/// What the colour bar and the hover tooltip print after the number. One
-/// spelling, read by [`Quantity::Unitless`] below and by the handler, so the
-/// legend and the tooltip cannot disagree about what the values are.
+/// What the hover tooltip prints after the number. One spelling, read by
+/// [`Quantity::Unitless`] below and by the handler, so the two cannot disagree
+/// about what the values are. There is no colour bar to print it: the counts
+/// are the image, not a field, and the handler answers no legend.
 pub const UNIT_LABEL: &str = "count";
 
 /// Ascending greyscale over the full count domain.

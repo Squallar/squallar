@@ -5,7 +5,8 @@
 //! differences from MRMS are the ones the source forced:
 //!
 //! * **the key is a channel, not a product code.** Four channels, each its own
-//!   granule and its own colour bar, selected by one dropdown;
+//!   granule and its own count ramp, selected by one dropdown — and no colour
+//!   bar for any of them, see the handler's `legend` note;
 //! * **the cache holds the raster alone.** [`crate::gmgsi::decode::GmgsiGrid`]
 //!   carries its [`ResidentGrid`] by value, so the arrival is destructured once
 //!   and the raster moved into an `Arc` — after that a described job costs a
@@ -62,8 +63,8 @@ use crate::render::controls::{
 };
 use crate::render::gridded::ResidentGrid;
 use crate::render::overlay_state::{
-    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayLegend, OverlayState, PaneMut,
-    PaneRef, RasterizeContext, RenderMode, Signed, Surface,
+    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayState, PaneMut, PaneRef,
+    RasterizeContext, RenderMode, Surface,
 };
 use crate::render::rasterize;
 use squallar_geo::GeoBounds;
@@ -1273,26 +1274,11 @@ impl OverlayHandler for GmgsiHandler {
         ))
     }
 
-    /// The bar is a pure function of the selected channel, so the signature is
-    /// the channel and nothing else — deliberately **not** `data_generation`,
-    /// which every poll bumps. `+ 1` keeps the first channel off `0`.
-    fn legend(&self, pane: &PaneRef<'_>) -> Option<Signed<OverlayLegend>> {
-        let view = self.view(pane);
-        if !view.enabled {
-            return None;
-        }
-        let spec = crate::gmgsi::fields::spec(view.selected_channel);
-        Some(Signed {
-            signature: view.selected_channel as u64 + 1,
-            items: OverlayLegend {
-                thresholds: spec.scale.thresholds.clone(),
-                is_gradient: spec.scale.is_gradient,
-                min_value: spec.scale.min_value,
-                max_value: spec.scale.max_value,
-                unit_label: crate::gmgsi::fields::UNIT_LABEL,
-            },
-        })
-    }
+    // No `legend` — the trait's `None`. A satellite image is a picture, not
+    // a field with a scale: its values are sensor counts, 0 to 255, dark to
+    // bright, and a bar labelled in counts tells the reader nothing the image
+    // does not already show. The hover tooltip still prints the count under
+    // the pointer, which is the one place a number is asked for.
 
     /// The [`Resident`](rasterize::GriddedInput::Resident) carry: an `Arc` clone
     /// of the resident raster, so describing the job costs a refcount and the
