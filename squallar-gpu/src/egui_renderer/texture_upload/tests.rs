@@ -180,6 +180,44 @@ fn a_web_picture_bands_on_a_ringless_device_instead_of_blocking_whole() {
     assert_eq!(TextureUploads::without_device().bands_per_frame(), 1);
 }
 
+/// The font atlas crosses whole at every size on every device class, and
+/// nothing else past the cap does.
+///
+/// The texel coordinates every galley holds are into the *whole* atlas, so a
+/// band-by-band arrival is frames of labels drawn from an allocation whose
+/// rows have not landed; the overlay pictures have no such reader and keep
+/// banding.
+#[test]
+fn the_font_atlas_crosses_whole_however_large_it_has_grown() {
+    let atlas = egui::TextureId::default();
+    let picture = egui::TextureId::Managed(7);
+    // The atlas at its full 8192 square: 256 MiB, thirty-two ring bands.
+    let full_square = 8192 * 8192 * 4;
+    for capable in [false, true] {
+        let device = if capable {
+            "a ring device"
+        } else {
+            "a ringless device"
+        };
+        assert!(
+            crosses_whole(atlas, capable, full_square),
+            "on {device} the font atlas at {full_square} B was filed as bands, \
+             so every label whose glyphs sit past the first band draws from \
+             rows that have not landed",
+        );
+        assert!(
+            !crosses_whole(picture, capable, full_square),
+            "on {device} a picture of {full_square} B crossed whole: the atlas \
+             exemption leaked onto the rasters this module exists to band",
+        );
+        assert!(
+            crosses_whole(picture, capable, band_cap(capable)),
+            "on {device} a picture at the cap must still go whole, exactly as \
+             `goes_whole` says",
+        );
+    }
+}
+
 /// A raster the app loaded `NEAREST` is bound `NEAREST`.
 #[test]
 fn the_sampler_says_what_the_texture_options_said() {

@@ -76,6 +76,24 @@ fn goes_whole(capable: bool, bytes: usize) -> bool {
     bytes <= band_cap(capable)
 }
 
+/// [`goes_whole`], with the one texture that crosses whole at any size.
+///
+/// **The font atlas is never banded.** Every galley on the glass holds its
+/// glyphs' positions in that texture as texel coordinates, so a texture that
+/// is only partly uploaded draws every label whose rows have not landed yet
+/// from whatever the fresh allocation holds — and it stays that way for as
+/// long as the bands take, and for as long as no frame is asked for after
+/// that. egui hands the atlas over whole on every doubling of its height
+/// (1 MiB at 32 rows on an 8192-wide atlas, 256 MiB at the full square), so
+/// once the height crossed the band cap the banded route took it, and the
+/// place names broke on every doubling — at the zooms whose new label sizes
+/// forced one. One blocking write per doubling is the honest cost; the
+/// doublings are rare, and the tile labels quantise their sizes to keep them
+/// so.
+fn crosses_whole(id: egui::TextureId, capable: bool, bytes: usize) -> bool {
+    id == egui::TextureId::default() || goes_whole(capable, bytes)
+}
+
 /// Consecutive frames the ring may decline a band before it is pushed across by
 /// `write_texture` regardless.
 ///
@@ -118,7 +136,8 @@ pub struct UploadTotals {
     /// what makes a zero byte count readable.
     pub deltas: u64,
     /// Bytes handed whole to `Renderer::update_texture` — every delta at or
-    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own. **A
+    /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own, and
+    /// the font atlas at any size (see [`crosses_whole`]). **A
     /// routing figure and a subset of [`Self::blocking_bytes`], never added to
     /// it**: `update_texture` is `write_texture` on the frame's own queue, so
     /// these bytes are blocking too, whatever the device.
@@ -312,12 +331,13 @@ impl TextureUploads {
         // until then the renderer holds only the 1×1 stand-in.
         let mine = self.owned.contains_key(&id) || self.pending.iter().any(|band| band.id == id);
 
-        // Small and not already ours: the font atlas and every overlay under
-        // this device's whole-delta limit go through `update_texture`
-        // untouched. On a ringless device the limit is the blocking band, so
-        // a web-picture-sized raster spreads over frames instead of spending
+        // Not already ours, and either small or the font atlas: every overlay
+        // under this device's whole-delta limit goes through `update_texture`
+        // untouched, and the atlas does at any size — see `crosses_whole`. On
+        // a ringless device the limit is the blocking band, so a
+        // web-picture-sized raster spreads over frames instead of spending
         // one frame whole.
-        if !mine && goes_whole(self.capable, image.as_raw().len()) {
+        if !mine && crosses_whole(id, self.capable, image.as_raw().len()) {
             renderer.update_texture(device, queue, id, delta);
             self.totals.count_whole_write(image.as_raw().len() as u64);
             // Whole, on this frame's queue, before anything can draw it.

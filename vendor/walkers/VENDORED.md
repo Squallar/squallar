@@ -2229,6 +2229,21 @@ far side, the "no duplicate continents" half of the requirement stops being free
 and becomes the wrap's own problem to state — because a wrapped world can show
 the same continent twice without the viewport ever exceeding the world's width.
 
+### Changed — source, seventeenth commit: label sizes step by a quarter point
+
+`mvt::symbol_text_size` rounds the evaluated `text-size` to the nearest
+quarter of a point. The style's sizes are `interpolate`d over a fractional
+zoom, so under a pinch or a wheel every name was laid out at a fresh size on
+every frame, and each size is its own set of glyphs in egui's font atlas. A
+few seconds of zooming doubled the atlas's height several times over; each
+doubling is a whole-texture upload (256 MiB at the full 8192 square), and
+the renderer's banded upload path drew half-landed labels for the frames it
+took. The upload side is fixed in `squallar-gpu` (the atlas is never banded);
+this keeps the doublings rare. A quarter of a point is under the eye's
+threshold at every size the styles use.
+
+`mvt::tests` pins unchanged: the golden fixture's sizes are whole numbers.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is

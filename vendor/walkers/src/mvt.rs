@@ -944,7 +944,14 @@ fn symbol_text_size(context: &Context, layout: &Layout) -> f32 {
             let size = text_size.evaluate(context);
 
             if size > 3.0 {
-                Some(size)
+                // **Quarter-point steps.** `text-size` is interpolated over a
+                // fractional zoom, so a pinch or a wheel lays every name out
+                // at a new size on every frame, and each size is its own set
+                // of glyphs in egui's font atlas: a few seconds of zooming
+                // doubled the atlas's height several times over, each
+                // doubling a whole-texture upload of up to 256 MiB. The eye
+                // cannot see a quarter of a point; the atlas can.
+                Some((size * 4.0).round() / 4.0)
             } else {
                 warn!(
                     "{} evaluated into {size}, which is too small for text size.",
