@@ -29,10 +29,18 @@ struct Locals {
     /// 1 if dithering is enabled, 0 otherwise. Must be what
     /// `RendererOptions::dithering` gave egui's renderer.
     dithering: u32,
-    /// Paint-time layer opacity, 0-1, applied to the premultiplied colour
-    /// exactly as `Color32::gamma_multiply` is applied to the CPU-placed
-    /// shapes beside these fills: every channel, in gamma space, at the
-    /// vertex. Reuses the old pad lane so the block stays 32 bytes.
+    /// Paint-time layer opacity, 0-1, applied to the premultiplied colour the
+    /// way `Color32::gamma_multiply` is applied to the CPU-placed shapes
+    /// beside these fills: every channel, in gamma space, at the vertex.
+    ///
+    /// **The same operation, not the same bytes.** `gamma_multiply` rounds
+    /// each channel back to a `u8`; this multiplies a float and hands the
+    /// float on. The two agree exactly wherever the product lands on an
+    /// integer -- an even channel at 0.5, say -- and differ by at most one
+    /// least significant bit everywhere else. `tests/tile_mesh_gpu.rs` gates
+    /// the pair on a fixture chosen to land on integers for that reason.
+    ///
+    /// Reuses the old pad lane so the block stays 32 bytes.
     opacity: f32,
     _pad: f32,
 };

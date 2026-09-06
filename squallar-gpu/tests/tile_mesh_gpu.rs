@@ -654,21 +654,26 @@ fn a_batched_callback_draws_its_runs_in_run_order() {
 
     assert!(
         painted(&cpu) > 1000,
-        "non-triviality: the control drew {} texels, so a match below would          be a compare of two empty pictures",
+        "non-triviality: the control drew {} texels, so a match below would \
+         be a compare of two empty pictures",
         painted(&cpu),
     );
     assert!(
         reversed != cpu,
-        "the control is blind: drawing the four runs back to front produced          the same {} painted texels as drawing them front to back, so these          quads do not overlap and the agreements below prove no ordering",
+        "the control is blind: drawing the four runs back to front produced \
+         the same {} painted texels as drawing them front to back, so these \
+         quads do not overlap and the agreements below prove no ordering",
         painted(&cpu),
     );
     assert!(
         batched == cpu,
-        "one callback over four runs did not draw what placing the same four          runs on the CPU draws: the batch has changed what covers what"
+        "one callback over four runs did not draw what placing the same four \
+         runs on the CPU draws: the batch has changed what covers what"
     );
     assert!(
         per_run == cpu,
-        "four callbacks of one run each did not match the CPU path either, so          the disagreement is not the batching"
+        "four callbacks of one run each did not match the CPU path either, so \
+         the disagreement is not the batching"
     );
 }
 
@@ -839,11 +844,13 @@ fn a_callback_at_half_opacity_puts_the_same_bytes_on_screen_as_the_painters_tint
         let drew = painted(&full);
         assert!(
             drew > (SIDE * SIDE / 4) as usize,
-            "{format:?}: the CPU path painted only {drew} texels, so a match              would be two nearly-empty pictures agreeing"
+            "{format:?}: the CPU path painted only {drew} texels, so a match \
+             would be two nearly-empty pictures agreeing"
         );
         assert_ne!(
             full, reference,
-            "{format:?}: a painter at 0.5 drew the same bytes as one at 1.0,              so this suite cannot see a tint and every compare below is vacuous"
+            "{format:?}: a painter at 0.5 drew the same bytes as one at 1.0, \
+             so this suite cannot see a tint and every compare below is vacuous"
         );
         assert_eq!(
             painted(&reference),
@@ -865,13 +872,16 @@ fn a_callback_at_half_opacity_puts_the_same_bytes_on_screen_as_the_painters_tint
         assert_eq!(
             differing(&reference, &by_hand),
             0,
-            "{format:?}: the painter's tint of a mesh is not `gamma_multiply`              on every vertex, so the shader is mirroring the wrong operation"
+            "{format:?}: the painter's tint of a mesh is not `gamma_multiply` \
+             on every vertex, so the shader is mirroring the wrong operation"
         );
         let off = differing(&reference, &gpu);
         assert_eq!(
             off,
             0,
-            "{format:?}: {off} of {} texels differ between the callback at              opacity 0.5 and the painter's own tint of the same mesh -- the              uniform is not reaching both vertex stages, or not every channel",
+            "{format:?}: {off} of {} texels differ between the callback at \
+             opacity 0.5 and the painter's own tint of the same mesh -- the \
+             uniform is not reaching both vertex stages, or not every channel",
             SIDE * SIDE
         );
     }
@@ -1091,7 +1101,8 @@ fn a_frame_of_many_ground_draws_writes_the_ring_once() {
     );
     assert_eq!(
         gpu, cpu,
-        "the batched placements do not draw the picture of the same draws placed          on the CPU"
+        "the batched placements do not draw the picture of the same draws \
+         placed on the CPU"
     );
 
     let store = renderer

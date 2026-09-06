@@ -2212,3 +2212,67 @@ fn two_panes_hold_different_opacities_for_one_layer_and_both_survive_a_reopen() 
         );
     }
 }
+
+/// **The save fixpoint with explicit opacities in the file, byte for byte.**
+///
+/// [`a_current_config_reaches_its_save_fixpoint_in_one_round_trip`] is the
+/// same rule over a fixture that predates the slider, so every slot in it
+/// writes no `opacity` key at all and the round trip says nothing about the
+/// one path that could oscillate: an `f32` written as JSON, parsed back as an
+/// `f32`, and written again. That path is compared **as bytes** here rather
+/// than as parsed values, because that is how the autosave compares it
+/// (`App::autosave_ui_config` diffs the serialized strings), so a file that
+/// re-serialized to an equal number spelled differently would be rewritten on
+/// every check for the life of the session.
+///
+/// Two values, deliberately: `0.375` is a sum of powers of two and survives
+/// every widening as itself, and `0.37` is not -- it writes as the `f64`
+/// widening of the nearest `f32`, which is the long decimal a naive reader
+/// would call drift.
+#[test]
+fn a_config_carrying_explicit_opacities_reaches_its_save_fixpoint_byte_for_byte() {
+    let store = store_with(include_str!("fixtures/current_full.json"));
+    let mut gui = Gui::new();
+    assert!(gui.load_ui_config(&store));
+
+    let order = gui.pane(0).expect("pane 0").draw_order_vec();
+    assert!(
+        order.len() >= 2,
+        "fixture: pane 0 holds {} layers, so there is nowhere to put two \
+         different values",
+        order.len(),
+    );
+    let (exact, inexact) = (order[0].clone(), order[1].clone());
+    let pane = gui.pane_mut(0).expect("pane 0");
+    pane.set_layer_opacity(&exact, 0.375);
+    pane.set_layer_opacity(&inexact, 0.37);
+    // The write-back every toggle and control edit ends with.
+    gui.readopt_panes_for_test();
+
+    let save1 = gui.ui_config_json().expect("a loaded Gui serializes");
+    assert!(
+        save1.contains("\"opacity\""),
+        "non-vacuity: no opacity key reached the file, so this is the \
+         pre-feature fixpoint again under a new name",
+    );
+
+    let mut gui2 = Gui::new();
+    assert!(gui2.load_ui_config(&store_with(&save1)));
+    assert_eq!(
+        (
+            gui2.pane(0).expect("pane 0").layer_opacity(&exact),
+            gui2.pane(0).expect("pane 0").layer_opacity(&inexact),
+        ),
+        (Some(0.375_f32), Some(0.37_f32)),
+        "the reload dropped or moved a value, so the fixpoint below could be \
+         reached by two saves that both wrote nothing",
+    );
+    let save2 = gui2.ui_config_json().expect("a reloaded Gui serializes");
+
+    assert_eq!(
+        save1, save2,
+        "save-load-save moved the file with an opacity in it: the autosave \
+         compares serialized strings, so this rewrites the config on every \
+         check for the life of the session",
+    );
+}

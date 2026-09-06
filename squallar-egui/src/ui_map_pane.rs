@@ -1100,14 +1100,43 @@ pub fn overlay_cache_token(
 /// [`overlay_cache_token`] and for the same reason: a slider showing one
 /// number while the painter multiplies by another is a disagreement nothing
 /// else can catch.
+///
+/// **The value is validated here, at the one definition.** Both user paths are
+/// guarded twice already — [`PaneState::set_layer_opacity`] refuses non-finite
+/// and clamps, and the config reader and writer guard the file — but the
+/// default path is an open trait method
+/// ([`squallar_source::handler::SourceHandler::default_opacity`]) whose "0..=1"
+/// is prose, and a handler out of tree answers it. Unvalidated, its three
+/// consumers disagree rather than fail: `ui.set_opacity` **ignores** a
+/// non-finite factor outright (egui `Painter::set_opacity`), so a NaN paints
+/// the layer at full strength with nothing saying so, while the slider shows
+/// `NaN%` and the strip key hashes a payload that an arithmetic NaN is not
+/// obliged to reproduce — a key that moves on a frame where nothing changed
+/// repaints the 3D pane forever. A `2.0` is silently clamped by the painter,
+/// shown as `200%` by the slider, and hashed as `2.0` by the key: three
+/// numbers for one picture.
+///
+/// So: not finite is `1.0` — the layer's own documented default, and the
+/// value that paints what the layer looked like before anyone had a slider —
+/// and everything else is clamped. `-0.0` is normalized to `0.0` last,
+/// because the two are `==` and paint the same picture but hash differently,
+/// and [`ground_content_key`] hashes this by bits.
 pub(crate) fn resolved_layer_opacity(
     overlays: &OverlayRegistry,
     pane_idx: usize,
     pane: &PaneState,
     id: &LayerId,
 ) -> f32 {
-    pane.layer_opacity(id)
-        .unwrap_or_else(|| overlays.default_opacity(id, &pane.layer_ref(pane_idx, id)))
+    let resolved = pane
+        .layer_opacity(id)
+        .unwrap_or_else(|| overlays.default_opacity(id, &pane.layer_ref(pane_idx, id)));
+    if !resolved.is_finite() {
+        return 1.0;
+    }
+    let clamped = resolved.clamp(0.0, 1.0);
+    // `-0.0 == 0.0`, so this arm catches the negative zero the clamp lets
+    // through and hands back the one with the sign bit clear.
+    if clamped == 0.0 { 0.0 } else { clamped }
 }
 
 /// **The as-of half of the cache token, and it is `0` on a live pane.**
@@ -4101,3 +4130,7 @@ mod floor_strip_shading_tests;
 #[path = "ui_map_pane/layer_opacity_walk_tests.rs"]
 #[cfg(test)]
 mod layer_opacity_walk_tests;
+
+#[path = "ui_map_pane/resolved_opacity_tests.rs"]
+#[cfg(test)]
+mod resolved_opacity_tests;

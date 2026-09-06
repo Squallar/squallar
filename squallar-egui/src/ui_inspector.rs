@@ -305,6 +305,18 @@ impl super::Gui {
 
     /// The layer body: the layer's opacity, then the handler's own controls
     /// through the one host they have.
+    ///
+    /// **Hydration first, before anything in the body reads a handler's
+    /// answer.** The call used to sit inside `render_overlay_controls_one`,
+    /// at the bottom of this fn, which left every reader above it — the
+    /// opacity row, radar's status line, the colour-bar switches — asking
+    /// handlers about a pane whose slots still had `state: None` on the first
+    /// frame a body opened. That is harmless only while every answer is a
+    /// constant: a `default_opacity` that reads the pane's own product
+    /// (radar's does) would show the wrong percent for one frame and settle
+    /// on the next, which reads as a slider that moves on its own. This fn is
+    /// `render_overlay_controls_one`'s only host, so the call **moves** here
+    /// rather than being made twice a frame.
     fn render_layer_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -312,6 +324,8 @@ impl super::Gui {
         kind: &LayerId,
         actions: &mut Vec<GuiAction>,
     ) {
+        pane.hydrate_layer_states(&self.overlays, self.active_pane);
+
         self.render_layer_opacity(ui, pane, kind);
 
         if *kind == known::RADAR {

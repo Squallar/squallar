@@ -923,3 +923,72 @@ fn re_adding_a_removed_layer_restores_its_opacity() {
         "the re-add reset {subject:?}'s opacity instead of restoring it",
     );
 }
+
+/// **The inspector never leaves a layer body open on a pane that holds no
+/// slot for it.**
+///
+/// The selection is one per app; the layer stack is one per pane. With layer
+/// links off the two can disagree, and the two snaps that existed did not
+/// cover the disagreement: `render_stack_and_inspector` snapped a pane that
+/// draws no map layers *at all*, and `remove_layer_from_pane` snapped a
+/// removal from the pane being edited. Neither of them is the **pane
+/// changing** under a standing selection, which is what this walk does.
+///
+/// Left open, the body is a body about a slot that does not exist. Every
+/// control in it reads the layer's default and every edit is dropped in
+/// silence -- the opacity slider is the cleanest instance: it would show the
+/// default, and a drag would call `PaneState::set_layer_opacity`, which
+/// declines because it never mints a slot, and the slider would spring back
+/// with nothing on screen saying why.
+#[test]
+fn activating_a_pane_that_curated_the_selected_layer_out_snaps_the_inspector() {
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    h.set_pane_count(2);
+    // Off, so the removal below stays pane 1's and pane 0 keeps its row.
+    h.set_layer_links(false);
+
+    // Curate the layer out of pane 1 only.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
+    h.open_layers();
+    let row = h.stack_row(&REMOVABLE).expect("pane 1 holds it");
+    h.mouse_click(row.remove.center());
+    h.warm_up();
+    assert!(
+        h.gui().pane(1).expect("pane 1").slot(&REMOVABLE).is_none(),
+        "precondition: the removal did not take {REMOVABLE:?} out of pane 1",
+    );
+
+    // Select it on pane 0, which still holds it.
+    h.mouse_click(h.pane_rects()[0].center());
+    h.warm_up();
+    assert_eq!(h.active_pane_index(), 0, "precondition: pane 0 is active");
+    assert!(
+        h.gui().pane(0).expect("pane 0").slot(&REMOVABLE).is_some(),
+        "precondition: the unlinked removal took the layer out of pane 0 too, \
+         so there is no disagreement here to walk into",
+    );
+    h.open_layer_in_inspector(&REMOVABLE);
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::Layer(REMOVABLE)),
+        "precondition: the layer body did not open on pane 0",
+    );
+
+    // ...and then work on the pane that does not hold it.
+    h.mouse_click(h.pane_rects()[1].center());
+    h.warm_up();
+    assert_eq!(h.active_pane_index(), 1, "the click activated pane 1");
+    assert!(
+        h.gui().pane(1).expect("pane 1").draws_map_layers(),
+        "premise: pane 1 draws no layers at all, so the older snap covers \
+         this and it is not the case under test",
+    );
+    assert_eq!(
+        h.inspector().mode,
+        Some(crate::ui::InspectorSelection::PaneProps),
+        "the inspector is still showing {REMOVABLE:?}'s body on a pane that \
+         holds no slot for it: every control in it edits nothing",
+    );
+}

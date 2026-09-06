@@ -661,6 +661,21 @@ fn take_run_batch(
     placed: &mut Vec<egui::Shape>,
     labels: &mut Vec<walkers::Text>,
 ) {
+    // **A layer at zero opacity places nothing, on either path.** egui's
+    // `Painter::add` turns every shape a painter at 0.0 is handed into
+    // `Shape::Noop` -- the `Shape::Callback` this batch would return
+    // included, which is why the uniform never gets the chance to draw at 0.0
+    // either. Placing them anyway minted a `GroundDraw` payload and counted a
+    // mesh or stroke draw per run in `tile_mesh::ledger`, so a basemap at 0%
+    // reported ground draws that never reached a GPU: an always-on instrument
+    // over-reporting, in the one case where the truthful figure is zero.
+    //
+    // Nothing else leaves through here: the shapes are the Noops, and the
+    // label phase is fed by `paint_vector_tile`'s own text walk rather than
+    // by this fn, which skips `ShapeOrText::Text` outright.
+    if ground.opacity == 0.0 {
+        return;
+    }
     let end = first.saturating_add(count).min(meshes.runs().len());
     let mut at = first.min(end);
     while at < end {
@@ -2901,6 +2916,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **A layer at zero opacity counts no ground draw, because it makes
+    /// none.**
+    ///
+    /// egui's `Painter::add` turns every shape a painter at 0.0 is handed
+    /// into `Shape::Noop`, and a `Shape::Callback` is no exception -- so a
+    /// basemap the user has dragged to 0% draws nothing whichever path its
+    /// runs take. What it used to do anyway was mint the `GroundDraw` payload
+    /// and count a mesh or stroke draw per run, which put draws that never
+    /// reached a GPU into an always-on counter (`tile_mesh::ledger`), in the
+    /// one case where the honest figure is zero.
+    ///
+    /// Both halves, because skipping the GPU path by declining the runs would
+    /// have been *worse* than leaving it alone: the decline route places
+    /// every declined run on the CPU instead, so the vertices and points
+    /// would have moved into the ledger's other counters rather than out of
+    /// it.
+    #[test]
+    fn a_ground_at_zero_opacity_counts_no_draw_on_either_path() {
+        let _ledger = ledger_guard();
+
+        let pass = |opacity: f32| {
+            let recorder = std::sync::Arc::new(RecordingPainter::default());
+            let painter: std::sync::Arc<dyn crate::tile_mesh::TileMeshPainter> = recorder.clone();
+            let (_, totals) = one_ground_pass_dimmed(
+                a_styled_tile(),
+                Some(&painter),
+                FEATHERING,
+                FEATHERING,
+                opacity,
+            );
+            let asked = recorder.asked.lock().expect("not poisoned").len();
+            (totals, asked)
+        };
+
+        // The control: at full strength this tile's runs really do go to the
+        // GPU and really are counted, so the zeroes below are the guard's
+        // doing and not an empty fixture.
+        let (full, full_asked) = pass(1.0);
+        assert_eq!(
+            (full.mesh_draws, full.stroke_draws),
+            (2, 1),
+            "control: an opaque tile counted no ground draw, so this fixture \
+             has no path for a transparent one to skip",
+        );
+        assert!(full_asked > 0, "control: the renderer was never asked");
+
+        let (clear, clear_asked) = pass(0.0);
+        assert_eq!(
+            (clear.mesh_draws, clear.stroke_draws),
+            (0, 0),
+            "a layer at 0% opacity counted {} mesh and {} stroke draws that \
+             egui turned into `Noop` before any of them reached a GPU",
+            clear.mesh_draws,
+            clear.stroke_draws,
+        );
+        assert_eq!(
+            clear_asked, 0,
+            "the renderer was asked for {clear_asked} ground-draw payloads \
+             for a layer at 0% opacity, and egui discards every one of them",
+        );
+        assert_eq!(
+            (clear.mesh_vertices_placed, clear.path_points_placed),
+            (full.mesh_vertices_placed, full.path_points_placed),
+            "the skipped runs went to the CPU instead of nowhere: the \
+             ledger's placed counters moved rather than its draw counters \
+             going away, which is more work for the same invisible tile",
+        );
+        assert_eq!(
+            clear.label_anchors_placed, full.label_anchors_placed,
+            "the guard took the tile's labels with it: they are placed by the \
+             text walk, not by the run batch, and a layer at 0% still defers \
+             them for the label phase to drop",
+        );
     }
 
     /// One layer pass over a tile with runs, with the ground draws recorded:

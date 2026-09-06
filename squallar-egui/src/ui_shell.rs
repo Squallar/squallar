@@ -156,9 +156,32 @@ impl super::Gui {
         // selected on it describes something on screen. Before the take, off
         // the live pane — and at every width: the sheet pass below the
         // breakpoint relies on this having run.
-        if matches!(self.inspector_sel, InspectorSelection::Layer(_))
-            && !self.panes[self.active_pane].draws_map_layers()
-        {
+        //
+        // **And a layer the active pane does not hold has no body either.**
+        // The selection is per-app while the layer stack is per-pane, so with
+        // layer links off a layer curated out of one pane can still be the
+        // selection when that pane becomes active — the two existing snaps
+        // cover a pane with no rows at all (above) and a removal from the
+        // pane being edited (`Gui::remove_layer_from_pane`), and neither of
+        // them is the pane *changing*. Left open, that body is a body about a
+        // slot that does not exist: the opacity slider shows the layer's
+        // default, the drag calls `PaneState::set_layer_opacity`, and the
+        // setter declines because it never mints a slot — so the slider snaps
+        // back with nothing on screen saying why.
+        //
+        // Snapped, not disabled, and for the same reason as above: pane
+        // properties is what the inspector can still truthfully say about
+        // this pane. The catalogue is where a layer this pane does not hold
+        // is added back, and the stack row it would be selected from is the
+        // thing that is missing.
+        let selection_has_nothing_to_describe = match &self.inspector_sel {
+            InspectorSelection::Layer(kind) => {
+                let pane = &self.panes[self.active_pane];
+                !pane.draws_map_layers() || pane.slot(kind).is_none()
+            }
+            _ => false,
+        };
+        if selection_has_nothing_to_describe {
             self.inspector_sel = InspectorSelection::PaneProps;
         }
 

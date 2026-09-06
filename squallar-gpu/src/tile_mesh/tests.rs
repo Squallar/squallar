@@ -175,7 +175,9 @@ fn both_vertex_entry_points_apply_the_opacity_to_the_unpacked_colour() {
             .unwrap_or_else(|| panic!("the shader has no `{entry}`"));
         assert!(
             body.contains("out.color = unpack_color(a_color) * r_locals.opacity;"),
-            "`{entry}` no longer multiplies the unpacked colour by              `r_locals.opacity`; a layer's opacity would dim every CPU-placed              shape and leave this entry point's geometry at full strength"
+            "`{entry}` no longer multiplies the unpacked colour by \
+             `r_locals.opacity`; a layer's opacity would dim every CPU-placed \
+             shape and leave this entry point's geometry at full strength"
         );
     }
 }

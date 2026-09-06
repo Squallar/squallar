@@ -7,11 +7,13 @@
 //! the layer the walk draws after it, in the same frame, paints `WHITE`. (The
 //! restore itself, what the `Ui` is handed back at, is pinned at the seam in
 //! `ui_map_pane/layer_opacity_walk_tests.rs`: on the glass, the next arm's
-//! own `set_opacity` hides a missing restore.) The no-op arm: a
-//! stack whose every slot is explicitly at 1.0 paints what an untouched stack
-//! paints, quad for quad, text for text, segment for segment. And the cache:
-//! an opacity change asks for no raster, because the value is not in
-//! `overlay_cache_token` and never may be -- a slider drag re-rasters nothing.
+//! own `set_opacity` hides a missing restore.) The no-op arm: a stack whose
+//! every slot explicitly holds its own resolved default paints what the same
+//! stack paints at those defaults implicitly, quad for quad, text for text,
+//! segment for segment -- with a layer moved off its default in the same test
+//! as the counterfactual. And the cache: an opacity change asks for no
+//! raster, because the value is not in `overlay_cache_token` and never may be
+//! -- a slider drag re-rasters nothing.
 
 use super::loop_overlay_draw_tests::{LAYER, raster};
 use super::tests::{alert_over, ingest_alerts, land_requested_rasters, rasterizes_requested};
@@ -64,12 +66,19 @@ fn quads(h: &InputHarness) -> Vec<PaintedImage> {
 /// **The tint, and that it is the layer's own.** The layer drawn first at
 /// half opacity paints its quad at `WHITE.gamma_multiply(0.5)`; the layer
 /// drawn after it, at its default, paints `WHITE`. The second half pins that
-/// each arm's factor is `base * its own layer` with `base` read once before
-/// the loop: a walk that read the `Ui`'s opacity per arm would compound one
-/// layer's dim into every layer above it. It does not see a missing restore,
-/// measured: with the restore line removed this test stays green, because
-/// the next arm's `set_opacity` overwrites the leak before anything reaches
-/// the glass. The restore is `layer_opacity_walk_tests`' to pin.
+/// **no layer's factor compounds into the next**: each arm's factor is
+/// `base * its own layer`, with `base` the opacity the walk was handed.
+///
+/// The counterfactual is the *pair* coming apart, not the per-arm read on its
+/// own: a walk that read `ui.opacity()` inside each arm and still restored
+/// after it is this same walk, because the restore puts `base` back before
+/// the next read. What compounds is a per-arm read with **no** restore --
+/// then each arm multiplies the last arm's leftover. Which is also why this
+/// test cannot stand in for the restore itself: measured, with the restore
+/// line removed and `base` still read once before the loop, this test stays
+/// green, because the next arm's own `set_opacity` overwrites the leak before
+/// anything reaches the glass. The restore is `layer_opacity_walk_tests`' to
+/// pin.
 #[test]
 fn a_layer_at_half_opacity_tints_its_quad_and_the_next_layer_paints_at_full() {
     let mut h = InputHarness::new();
@@ -104,15 +113,25 @@ fn a_layer_at_half_opacity_tints_its_quad_and_the_next_layer_paints_at_full() {
     );
 }
 
-/// **The no-op arm.** A stack whose every slot is explicitly at 1.0 paints
-/// what an untouched stack paints. Compared within one harness, against a
-/// steady-state control: two quiet frames of the untouched stack must agree
-/// first, or a difference after the change could be the frame's and not
-/// opacity's.
+/// **The no-op arm: an explicit value equal to the layer's own default paints
+/// what the default paints.** Written against each slot's *resolved* default
+/// rather than against 1.0, because 1.0 is not the default — it is only
+/// today's default, for today's handlers, and a stack every slot of which is
+/// explicitly at some *other* number is a stack this test would have said
+/// nothing about while claiming to. The two paths into the resolver, the
+/// pane's `Some(value)` and the handler's answer, must agree on the glass for
+/// the same number.
+///
+/// Compared within one harness, against a steady-state control: two quiet
+/// frames of the untouched stack must agree first, or a difference after the
+/// change could be the frame's and not opacity's. And against a genuine
+/// counterfactual: one layer moved **off** its default in the same test must
+/// change the picture, or the equality above would hold for a walk that
+/// ignored opacity altogether.
 #[test]
-fn every_slot_explicitly_at_full_opacity_paints_what_an_untouched_stack_paints() {
+fn every_slot_explicitly_at_its_own_default_paints_what_an_untouched_stack_paints() {
     let mut h = InputHarness::new();
-    two_rasters(&mut h);
+    let ((first, _), _) = two_rasters(&mut h);
     let snapshot = |h: &InputHarness| {
         let rect = h.pane_rects()[0];
         (
@@ -139,12 +158,29 @@ fn every_slot_explicitly_at_full_opacity_paints_what_an_untouched_stack_paints()
         "non-vacuity: no textured quad was painted inside pane 0"
     );
 
+    // Read every slot's resolved default first: the setter below turns each
+    // one into an explicit value, and the ones read after it would be reading
+    // back what this loop wrote.
     let ids = h.gui().panes()[0].draw_order_vec();
-    for id in &ids {
-        h.gui_mut().panes_mut()[0].set_layer_opacity(id, 1.0);
+    let defaults: Vec<(LayerId, f32)> = ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                crate::ui::map::pane_render::resolved_layer_opacity(
+                    &h.gui().overlays,
+                    0,
+                    &h.gui().panes()[0],
+                    id,
+                ),
+            )
+        })
+        .collect();
+    for (id, default) in &defaults {
+        h.gui_mut().panes_mut()[0].set_layer_opacity(id, *default);
         assert_eq!(
             h.gui().panes()[0].layer_opacity(id),
-            Some(1.0),
+            Some(*default),
             "fixture: {id:?} took no explicit value",
         );
     }
@@ -152,8 +188,31 @@ fn every_slot_explicitly_at_full_opacity_paints_what_an_untouched_stack_paints()
     let c = snapshot(&h);
     assert_eq!(
         c, b,
-        "a stack whose every slot is explicitly 1.0 painted something the \
-         untouched stack did not",
+        "a stack whose every slot explicitly holds its own default painted \
+         something the same stack painted at that default implicitly",
+    );
+
+    // The counterfactual, in the same test and on the same fixture: a layer
+    // moved OFF its default must paint differently. Without it the equality
+    // above is satisfied by a walk that never reads the value at all.
+    let default_of_first = defaults
+        .iter()
+        .find(|(id, _)| id == &first)
+        .map(|(_, value)| *value)
+        .unwrap_or_else(|| panic!("{first:?} is not in pane 0's draw order"));
+    let moved = if default_of_first > 0.5 { 0.2 } else { 0.9 };
+    assert!(
+        (moved - default_of_first).abs() > 0.1,
+        "fixture: {first:?}'s default {default_of_first} is too close to \
+         {moved} for the change below to be visible",
+    );
+    h.gui_mut().panes_mut()[0].set_layer_opacity(&first, moved);
+    h.frame_after(FRAME_DT);
+    assert_ne!(
+        snapshot(&h),
+        c,
+        "{first:?} moved from {default_of_first} to {moved} and the frame \
+         painted the same picture: the walk is not reading the value",
     );
 }
 

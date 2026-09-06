@@ -17,6 +17,13 @@ pub(crate) enum RoundOutcome<'a> {
 impl Gui {
     /// Render **one** handler's controls — the only place handler [`ControlItem`]s
     /// render, hosted by the inspector's layer body.
+    ///
+    /// **The host hydrates.** `Gui::render_layer_body` calls
+    /// `PaneState::hydrate_layer_states` before the first thing in the body
+    /// that asks a handler anything, which is the opacity row above these
+    /// controls, not these controls. It is idempotent, so a second host would
+    /// simply call it too; what it may never do is leave it to this fn, which
+    /// runs last.
     pub(super) fn render_overlay_controls_one(
         &mut self,
         ui: &mut egui::Ui,
@@ -28,8 +35,6 @@ impl Gui {
         {
             self.probes.control_render_passes += 1;
         }
-
-        pane.hydrate_layer_states(&self.overlays, self.active_pane);
 
         let mut updates: Vec<(LayerId, ControlUpdate)> = Vec::new();
         let mut probe = ControlProbe::default();

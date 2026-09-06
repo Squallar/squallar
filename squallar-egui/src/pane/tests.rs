@@ -2359,3 +2359,58 @@ fn a_resample_without_a_listing_can_only_thin() {
     assert_eq!(ls.frames.len(), 5);
     assert_eq!(ls.sampled, Some(true));
 }
+
+/// **A reorder keeps each slot's opacity with its id**, driven through the
+/// call a drag of a stack row actually makes.
+///
+/// `PaneState::set_draw_order` is the caller that matters: it does not
+/// permute the slots it is given, it *rebuilds* the vector by looking each id
+/// up and minting a fresh `LayerSlot` for any it cannot find. A fresh slot
+/// carries no opacity, so the failure this is about -- the opacities staying
+/// put while the ids move -- is a failure of that lookup, and driving
+/// `LayerStack::take_slots`/`set_slots` underneath it walks straight past the
+/// only code that could produce it.
+#[test]
+fn a_reorder_keeps_each_slots_opacity_with_its_id() {
+    let mut pane = PaneState::new();
+    for id in [known::METAR, known::CITY_LABELS] {
+        pane.set_overlay_enabled(id, true);
+    }
+    pane.set_layer_opacity(&known::METAR, 0.25);
+    pane.set_layer_opacity(&known::CITY_LABELS, 0.75);
+    assert_eq!(
+        (
+            pane.layer_opacity(&known::METAR),
+            pane.layer_opacity(&known::CITY_LABELS)
+        ),
+        (Some(0.25), Some(0.75)),
+        "fixture: the pane did not take both values",
+    );
+
+    let before = pane.draw_order_vec();
+    let reversed: Vec<LayerId> = before.iter().rev().cloned().collect();
+    pane.set_draw_order(&reversed);
+
+    assert_eq!(
+        pane.draw_order_vec(),
+        reversed,
+        "precondition: the order did not move, so nothing below is about a \
+         reorder",
+    );
+    assert_ne!(
+        reversed, before,
+        "precondition: the stack is symmetric under reversal",
+    );
+    assert_eq!(
+        pane.layer_opacity(&known::METAR),
+        Some(0.25),
+        "the reorder left METAR's opacity behind with the position it used to \
+         hold",
+    );
+    assert_eq!(
+        pane.layer_opacity(&known::CITY_LABELS),
+        Some(0.75),
+        "the reorder left CITY_LABELS's opacity behind with the position it \
+         used to hold",
+    );
+}
