@@ -970,14 +970,25 @@ jobs:
           # not die on.
           out=packaging/macos/build/universal-apple-darwin
           reason=$(cat "$out/NOTARIZATION" 2>/dev/null || echo unknown)
+          # The submission id is written beside the reason (empty when nothing
+          # was submitted). It is the one token every follow-up needs --
+          # notary-wait, notary-log -- so it goes into the summary, never only
+          # into a fold.
+          submission=$(cat "$out/NOTARY_SUBMISSION_ID" 2>/dev/null || true)
+          printf 'out=%s\n' "$out" >> "$GITHUB_OUTPUT"
           if [ -f "$out/squallar.app.zip" ]; then
-            printf 'artifact=macos-universal\nzip=%s/squallar.app.zip\nnotarized=yes\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+            printf 'artifact=macos-universal\nzip=%s/squallar.app.zip\nnotarized=yes\nreason=%s\nsubmission=%s\n' "$out" "$reason" "$submission" >> "$GITHUB_OUTPUT"
+          elif [ -f "$out/squallar-PENDING-NOTARIZATION.app.zip" ]; then
+            # Apple has the bytes and no ticket is stapled. The name asserts
+            # exactly that: signed, submitted, not yet stapled.
+            # finish-notarization.yaml completes it with no rebuild.
+            printf 'artifact=macos-universal-PENDING-NOTARIZATION\nzip=%s/squallar-PENDING-NOTARIZATION.app.zip\nnotarized=no\nreason=%s\nsubmission=%s\n' "$out" "$reason" "$submission" >> "$GITHUB_OUTPUT"
           elif [ -f "$out/squallar-NOT-NOTARIZED.app.zip" ]; then
-            printf 'artifact=macos-universal-NOT-NOTARIZED\nzip=%s/squallar-NOT-NOTARIZED.app.zip\nnotarized=no\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+            printf 'artifact=macos-universal-NOT-NOTARIZED\nzip=%s/squallar-NOT-NOTARIZED.app.zip\nnotarized=no\nreason=%s\nsubmission=%s\n' "$out" "$reason" "$submission" >> "$GITHUB_OUTPUT"
           else
             # Fatal, and ours: the packaging step reported success and left no
-            # zip under either name.
-            echo "::error::packaging produced no zip under either name in $out"
+            # zip under any of the three names.
+            echo "::error::packaging produced no zip under any name in $out"
             ls -la "$out" || true
             exit 1
           fi
@@ -993,18 +1004,40 @@ jobs:
           NOTARIZED: ${{ steps.package.outputs.notarized }}
           REASON: ${{ steps.package.outputs.reason }}
           ARTIFACT: ${{ steps.package.outputs.artifact }}
+          SUBMISSION: ${{ steps.package.outputs.submission }}
         run: |
+          # Three ways a finished make step ends without a stapled ticket, and
+          # they are three different next steps, so they are three arms and
+          # never one: `pending` here means Apple ACCEPTED and the ticket could
+          # not be fetched in-run -- the wait itself is unconditional -- and
+          # finish-notarization.yaml staples it with no rebuild; `rejected` is
+          # a verdict, re-running changes nothing, and the make step has
+          # already printed Apple's reasons; `error` is the credentials, the
+          # upload or the network, and the make step's Error: line says which.
+          # All three are loud and none is fatal: see the note in
+          # packaging/macos/Makefile. A make step that never finished is the
+          # "cut off" step further down, not this one.
           case "$NOTARIZED:$REASON" in
             yes:stapled)
-              echo "::notice::$ARTIFACT carries a stapled notarization ticket. Unzip and open; no Gatekeeper prompt, no network needed."
-              printf '### macOS: notarized\n\n`%s` went through Apple and the ticket is stapled inside the .app.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::$ARTIFACT carries a stapled notarization ticket (submission $SUBMISSION). Unzip and open; no Gatekeeper prompt, no network needed."
+              printf '### macOS: notarized\n\n`%s` went through Apple (submission `%s`) and the ticket is stapled inside the .app.\n' "$ARTIFACT" "$SUBMISSION" >> "$GITHUB_STEP_SUMMARY"
               ;;
-            no:failed)
-              # The submission was attempted with real credentials and did not
-              # come back with a ticket. Loud, and deliberately not fatal: see
-              # the note in packaging/macos/Makefile.
-              echo "::error::$ARTIFACT is NOT NOTARIZED: the submission to Apple was attempted and did not complete. The build was not failed for it -- a notary outage, an expired credential or a rate limit is not evidence about this commit -- but this artifact must not be published to anyone. Read the make step's log for the submission id and Apple's reason."
-              printf '### macOS: NOT NOTARIZED (submission failed)\n\n`%s` is signed with the Developer ID identity and carries the hardened runtime, but Apple did not return a ticket, so **another Mac will refuse to open it**. The build was not failed for this on purpose: the cause is outside this repository. Do not publish this artifact.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+            no:pending)
+              echo "::warning::$ARTIFACT is PENDING NOTARIZATION: Apple ACCEPTED submission $SUBMISSION, and the ticket could not be stapled in-run (the make step says why). The ticket exists; the bundle is notarized without any rebuild or resubmission by: gh workflow run finish-notarization -f run_id=${{ github.run_id }}"
+              printf '### macOS: PENDING NOTARIZATION (accepted, not yet stapled)\n\nApple **accepted** submission `%s`; the ticket could not be fetched and stapled in this run (the "Package, sign, notarize and staple" step says why). `%s` is signed and is the bytes Apple examined; the ticket exists, and stapling alone finishes it, with no rebuild, no resubmission and no secrets:\n\n    gh workflow run finish-notarization -f run_id=%s\n\nThat run publishes the stapled bundle as `macos-universal`. Until then this artifact has no ticket and another Mac will refuse to open it. By hand instead: unzip it, `rcodesign staple squallar.app`, re-zip.\n' "$SUBMISSION" "$ARTIFACT" "${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            no:rejected)
+              echo "::error::$ARTIFACT is NOT NOTARIZED: Apple REJECTED submission $SUBMISSION. Re-running will not change it; read the issues above -- the make step prints the notary log verbatim and one issue per line. This artifact must not be published."
+              printf '### macOS: NOT NOTARIZED (Apple rejected it)\n\nApple returned a verdict of Invalid on submission `%s`. **Re-running will not change it; read the issues above** -- the "Package, sign, notarize and staple" step prints the notary log verbatim and one issue per line (severity, message, path). `%s` is signed with the Developer ID identity and carries the hardened runtime, but has no ticket, so **another Mac will refuse to open it**. The build was not failed for this on purpose. Do not publish this artifact.\n' "$SUBMISSION" "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            no:error)
+              if [ -n "$SUBMISSION" ]; then
+                queued="Submission \`$SUBMISSION\` was created before the failure; \`rcodesign notary-log $SUBMISSION --api-key-file <key.json>\` prints what Apple has for it."
+              else
+                queued="No submission was created, so nothing is queued at Apple."
+              fi
+              echo "::error::$ARTIFACT is NOT NOTARIZED: the submission to Apple did not reach a verdict this recipe knows -- the upload failed, the credentials were refused, or Apple returned an unknown state. The make step has the Error: line (a 401 is the credentials; a 5xx or a connection error is Apple or the network)${SUBMISSION:+; submission $SUBMISSION was created first}. The build was not failed for it -- the cause is outside this repository -- but this artifact must not be published."
+              printf '### macOS: NOT NOTARIZED (no verdict)\n\nNeither accepted nor rejected: the "Package, sign, notarize and staple" step has the Error: line. A 401 is the credentials (the three `APPSTORE_CONNECT_*` secrets do not agree, or the key was revoked); a 5xx or a connection error is Apple or the network; an upload that did not complete is a submission Apple will never process. %s `%s` has no ticket, so **another Mac will refuse to open it**. The build was not failed for this on purpose: the cause is outside this repository. Do not publish this artifact.\n' "$queued" "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
               ;;
             no:withheld)
               echo "::notice::$ARTIFACT is NOT NOTARIZED: the App Store Connect key is handed over only on a push to main, and this is a ${{ github.event_name }} on ${{ github.ref }}. The secrets may well be configured; nothing was submitted to Apple on this event."
@@ -1028,11 +1061,55 @@ jobs:
       # run that failed to notarize must not publish something a person can
       # mistake for the shippable build a week later, when the log has rolled
       # off and only the artifact list is left.
+      #
+      # The two one-line files ride beside the zip -- the outcome word and the
+      # submission id -- so a PENDING artifact carries the id that
+      # finish-notarization.yaml names when the ticket is still not there, and
+      # every artifact says which submission it came from.
       - name: Upload the universal build
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.artifact }}
-          path: ${{ steps.package.outputs.zip }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.out }}/NOTARIZATION
+            ${{ steps.package.outputs.out }}/NOTARY_SUBMISSION_ID
+          if-no-files-found: error
+
+      # The recovery record, for the one way an accepted submission can still
+      # end unstapled now that the wait is unconditional: this job cut off
+      # while waiting -- GitHub's 360-minute job bound, which is GitHub's and
+      # not ours, or a lost runner (in which case nothing here runs either,
+      # and `rcodesign notary-list` is how a person finds the id). The
+      # Makefile writes the PENDING zip and the id the moment the upload to
+      # Apple completes, before it starts waiting, so a cut-off job still
+      # leaves the bytes Apple is examining and the id to finish them.
+      # `always()` is what lets this run after a cancellation.
+      - name: Publish the pending bundle if this job was cut off
+        id: pending
+        if: always() && steps.package.outcome != 'success'
+        run: |
+          out=packaging/macos/build/universal-apple-darwin
+          if [ -f "$out/squallar-PENDING-NOTARIZATION.app.zip" ] \
+              && [ ! -f "$out/squallar.app.zip" ] && [ ! -f "$out/squallar-NOT-NOTARIZED.app.zip" ]; then
+            id=$(cat "$out/NOTARY_SUBMISSION_ID" 2>/dev/null || true)
+            printf 'publish=yes\nout=%s\n' "$out" >> "$GITHUB_OUTPUT"
+            echo "::warning::macos-universal-PENDING-NOTARIZATION: this job did not finish the notarize stage -- cut off while waiting on Apple (the job bound or a lost runner), or failed after the upload -- not Apple being slow and not a verdict. Submission $id is queued; the signed bundle is published under the pending name and is finished with no rebuild by: gh workflow run finish-notarization -f run_id=${{ github.run_id }}"
+            printf '### macOS: PENDING NOTARIZATION (job cut off)\n\nThis job did not finish the notarize stage: it was cut off while waiting on Apple (the 360-minute job bound, or a lost runner), or failed after the upload. **Not Apple being slow, not a verdict.** Submission `%s` is queued on the Apple side, and the signed bundle Apple is examining is published as `macos-universal-PENDING-NOTARIZATION`. Once Apple accepts, stapling alone finishes it, with no rebuild, no resubmission and no secrets:\n\n    gh workflow run finish-notarization -f run_id=%s\n\nThat run publishes the stapled bundle as `macos-universal`; if the ticket is not there yet it says so and is re-run later.\n' "$id" "${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+            echo "no pending bundle on disk (the make step did not get as far as the upload to Apple, or it finished); nothing to publish here."
+          fi
+
+      - name: Upload the pending bundle
+        if: always() && steps.pending.outputs.publish == 'yes'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-universal-PENDING-NOTARIZATION
+          path: |
+            ${{ steps.pending.outputs.out }}/squallar-PENDING-NOTARIZATION.app.zip
+            ${{ steps.pending.outputs.out }}/NOTARIZATION
+            ${{ steps.pending.outputs.out }}/NOTARY_SUBMISSION_ID
           if-no-files-found: error
 
   # TestFlight, from Linux, with no Mac anywhere in the pipeline.

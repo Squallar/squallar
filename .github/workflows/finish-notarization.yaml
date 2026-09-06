@@ -1,0 +1,107 @@
+# Finish a notarization the build run could not staple itself.
+#
+# `macos-universal` in build.yaml uploads the signed bundle to Apple, waits
+# for the verdict unconditionally, and staples in-run; that is the normal
+# path, and it publishes `macos-universal`. Two things leave a
+# `macos-universal-PENDING-NOTARIZATION` artifact instead: the job was cut
+# off while waiting (GitHub's own 360-minute job bound, or a lost runner),
+# or Apple accepted and the ticket could not be fetched in-run. In both the
+# SAME signed bundle Apple examined is in that artifact with its submission
+# id, and the run summary prints the dispatch line for this workflow. This
+# job downloads it, staples it and publishes it as `macos-universal`: no
+# rebuild, no resubmission and no secrets. `rcodesign staple` derives the
+# ticket's record name from the main executable's code-directory digest and
+# looks it up at Apple's public ticket service (apple-codesign 0.29.0
+# src/stapling.rs staple_bundle -> lookup_ticket_for_executable_bundle;
+# src/ticket_lookup.rs lookup_notarization_tickets is a bare POST with no
+# credential), so the only input is the bundle Apple examined.
+#
+# Dispatch only. A scheduled poller would run whether or not anything is
+# pending, for a state that arises only when a job was cut off; if
+# hands-free completion is ever wanted, a `schedule:` trigger that lists
+# recent runs for a PENDING artifact is the opt-in, and it is deliberately
+# unwritten.
+#
+# The one way this job is red on purpose: the ticket does not exist yet.
+# That is "re-run later", and the log names the submission to check.
+name: finish-notarization
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "id of the build run whose macos-universal job published a PENDING-NOTARIZATION artifact"
+        required: true
+        type: string
+      artifact:
+        description: "the artifact to finish (a NOT-NOTARIZED one from before the pending name existed also works, if Apple accepted it)"
+        required: false
+        default: macos-universal-PENDING-NOTARIZATION
+        type: string
+
+permissions:
+  contents: read
+  # Reading another run's artifact.
+  actions: read
+
+env:
+  # The same pin as build.yaml, for the reason given there. Two copies of a
+  # digest is one more than ideal; move both together or not at all.
+  SIGNTOOL_VERSION: 0.29.0
+  SIGNTOOL_SHA256: dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002
+
+jobs:
+  finish-notarization:
+    name: finish-notarization
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the runner image still has what this job assumes
+        run: |
+          for t in curl tar zip unzip; do
+            command -v "$t" >/dev/null \
+              || { echo "::error::$t is not on the ubuntu-24.04 runner image; this job assumed it was."; exit 1; }
+          done
+
+      # Same tool, same pin, same reasoning as build.yaml -- installed under
+      # RUNNER_TEMP rather than /usr/local/bin because this job is not root
+      # and has no reason to become it.
+      - name: Install the signer
+        run: |
+          v="$SIGNTOOL_VERSION"
+          base=apple-codesign-$v-x86_64-unknown-linux-musl
+          curl -fsSL -o "$RUNNER_TEMP/rcodesign.tar.gz" \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
+          echo "$SIGNTOOL_SHA256  $RUNNER_TEMP/rcodesign.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/rcodesign.tar.gz" -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$RUNNER_TEMP/$base/rcodesign" "$RUNNER_TEMP/bin/rcodesign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Download the pending bundle from the source run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.artifact }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: pending
+
+      # Red only when the ticket is not there yet (re-run later; the log
+      # names the submission) or when the bundle gained nothing. Either way
+      # nothing is uploaded, so `macos-universal` on this run means stapled.
+      - name: Staple the ticket and re-zip under the stapled name
+        env:
+          SOURCE_RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT: ${{ inputs.artifact }}
+        run: .github/scripts/finish-notarization.sh pending finished
+
+      - name: Upload the stapled build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-universal
+          path: |
+            finished/squallar.app.zip
+            finished/NOTARIZATION
+            finished/NOTARY_SUBMISSION_ID
+          if-no-files-found: error

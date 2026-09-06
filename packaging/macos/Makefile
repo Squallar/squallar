@@ -104,7 +104,7 @@
 #
 # Order is forced, and cannot be rearranged:
 #
-#   sign (--for-notarization) -> notary-submit -> staple -> zip
+#   sign (--for-notarization) -> notary-submit -> wait -> staple -> zip
 #
 # `rcodesign staple` refuses a .zip outright ("do not know how to staple") and
 # refuses a bare Mach-O ("cannot staple Mach-O binaries") -- both measured with
@@ -112,8 +112,8 @@
 # afterwards, around the stapled bundle. A .dmg can also carry a ticket, but
 # building one needs Apple's hdiutil, i.e. a Mac, so it is not available to
 # this Linux-only pipeline. The upload does not need a zip made here either:
-# `notary-submit` given a bundle path zips it itself for the upload and staples
-# the directory afterwards.
+# `notary-submit` given a bundle path zips it itself for the upload; the
+# recipe then waits for Apple's verdict and `rcodesign staple`s the directory.
 #
 # Stapling is what makes the ticket work OFFLINE. A notarized-but-unstapled app
 # still passes Gatekeeper on a machine that can reach Apple, and fails on one
@@ -123,8 +123,11 @@
 #
 # `squallar.app.zip` is written only when a ticket was stapled. Every other
 # outcome -- no notary credentials, an ad-hoc signature, Apple unreachable,
-# Apple saying no -- writes `squallar-NOT-NOTARIZED.app.zip` instead, and a
-# one-word reason lands in `NOTARIZATION` beside it. The reason for making the
+# Apple saying no -- writes `squallar-NOT-NOTARIZED.app.zip` instead (Apple
+# has the bytes and no ticket is stapled yet is
+# `squallar-PENDING-NOTARIZATION.app.zip`, a different claim; see the zip
+# step), and a one-word reason lands in `NOTARIZATION` beside it. The reason
+# for making the
 # degraded build LOUD rather than making it fail is set out in full at the
 # notarize stage further down: a notary outage is not evidence about this
 # repository's code and must not stop everything that gates on a green board,
@@ -265,12 +268,24 @@ TARGET_DIR ?= target-macos
 # `cargo install apple-codesign` or from
 # https://github.com/indygreg/apple-platform-rs/releases.
 RCODESIGN ?= rcodesign
-# How long to wait on Apple's notary service before giving up. Apple's own
-# figure is 'usually under 15 minutes'; the rcodesign default is 600s. A
-# time-out here is not a rejection -- the submission stays queued and
-# `rcodesign notary-wait <id>` resumes it -- so this is a bound on how long
-# one CI row may sit still, not a bound on notarization.
-NOTARY_TIMEOUT ?= 900
+# The wait for Apple's verdict is unconditional: the notarize stage polls
+# until Apple returns a terminal state, and the wait is the price of an
+# automatically stapled artifact. Apple offers no callback, so a runner
+# asking is the only way to learn the ticket exists. The only outer bound is
+# GitHub's own job timeout (360 minutes by default, left there): that is
+# GitHub's bound, not ours, and it exists so a runaway is not literally
+# infinite. The three below shape the asking, not its length.
+#
+# One `rcodesign notary-wait` call is bounded by --max-wait-seconds and ends
+# on the first transient error, so the recipe calls it again until a verdict
+# arrives; this is the length of one call.
+NOTARY_WAIT_CALL ?= 600
+# Pause before asking again after a poll that failed for a reason other than
+# its own limit (the network, a 5xx), and between staple attempts.
+NOTARY_RETRY_SLEEP ?= 30
+# A fresh ticket can take a minute to reach Apple's public ticket service;
+# staple attempts before publishing the bundle as PENDING-NOTARIZATION.
+NOTARY_STAPLE_TRIES ?= 10
 
 .PHONY: build clean
 build:
@@ -776,6 +791,7 @@ build:
 	# and stapling nothing. That is not Apple being unavailable, it is a claim
 	# that disagrees with the bundle on disk.
 	NOTARY_STATUS=skipped
+	SUBMISSION_ID=
 	if [ -n "$$NOTARY_READY" ] && [ "$$IDENTITY" = devid ]; then
 	  KEYP8="$$SCRATCH/AuthKey.p8"
 	  # Both shapes accepted on purpose. The .p8 is PEM text and survives a
@@ -783,8 +799,13 @@ build:
 	  # thing to paste wrong, and base64 is what the p12 secret next door
 	  # already uses. Whichever arrives, the log says which was recognised, so
 	  # a mangled secret is a named failure rather than a puzzling one.
+	  # The quotes on the pattern are load-bearing. Under .ONESHELL, make strips
+	  # every leading `-`, `@` and `+` from each recipe line before the shell
+	  # sees it (GNU make 5.3.1; measured on 4.4.1: `-----BEGIN*)` reaches bash
+	  # as `BEGIN*)`), so the bare spelling never matched a PEM key and every
+	  # PEM-text secret died in the base64 arm as "neither PEM nor base64".
 	  case "$${APPSTORE_CONNECT_KEY_P8}" in
-	    -----BEGIN*)
+	    "-----BEGIN"*)
 	      echo "==> notary key: PEM text"
 	      printf '%s\n' "$${APPSTORE_CONNECT_KEY_P8}" > "$$KEYP8" ;;
 	    *)
@@ -813,14 +834,16 @@ build:
 	  # vacuously, and it prints the path, so the next person reading this
 	  # learns where the ticket actually went.
 	  find "$$APP" -type f | sort > "$$SCRATCH/before.txt"
-	  echo "==> submitting to Apple's notary service (up to $(NOTARY_TIMEOUT)s)"
-	  if $(RCODESIGN) notary-submit --api-key-file "$$KEYJSON" \
-	      --staple --max-wait-seconds $(NOTARY_TIMEOUT) "$$APP"; then
+	  # What "stapled" is allowed to mean. `staple` writes the ticket INTO the
+	  # bundle directory; rather than assert a path this file would then have
+	  # to keep in step with rcodesign, take the file list before and after and
+	  # require that something appeared. It cannot pass vacuously, and it
+	  # prints the path. Fatal when nothing appeared, and the one thing on this
+	  # path that is: Apple saying yes and the bundle gaining nothing is a
+	  # disagreement between a claim and the disk, not an outage.
+	  record_staple() {
 	    find "$$APP" -type f | sort > "$$SCRATCH/after.txt"
 	    STAPLED="$$(comm -13 "$$SCRATCH/before.txt" "$$SCRATCH/after.txt")"
-	    # Fatal, and the one thing on this path that is. Apple saying yes and
-	    # the bundle gaining nothing is a disagreement between a claim and the
-	    # disk, not an outage.
 	    [ -n "$$STAPLED" ] || {
 	      echo "ERROR: notarization reported success but nothing was added to the"
 	      echo "       bundle, so no ticket was stapled. The zip would ship a bundle"
@@ -830,21 +853,160 @@ build:
 	    NOTARY_STATUS=stapled
 	    echo "    notarized and stapled:"
 	    printf '%s\n' "$$STAPLED" | sed 's/^/      /'
+	  }
+	  # ---- 1. upload ----
+	  # `notary-submit` WITHOUT --wait: it creates the submission, uploads the
+	  # bundle to Apple's S3 and exits 0 the moment the upload completes
+	  # (apple-codesign 0.29.0 src/notarization.rs upload_s3_and_maybe_wait
+	  # returns UploadId when no wait limit is given). The wait is the recipe's
+	  # own loop below, because rcodesign's wait is bounded by
+	  # --max-wait-seconds and ends on the first transient error
+	  # (wait_on_notarization: every get_submission is `?`), and this stage
+	  # waits unconditionally. Output is teed to a file because the id and the
+	  # outcome are read back off it; the strings matched are the ones the
+	  # binary prints, cited by source line (src/notarization.rs; its log is
+	  # stderr, bare lines -- src/cli/mod.rs main_impl turns env_logger's
+	  # prefixes off). src/main.rs prints `Error: <msg>` and exits 1 for every
+	  # Err, so an exit status alone never says which of these happened.
+	  #   created submission ID: <uuid>       :277
+	  #   S3 upload completed successfully    :338; without it an id can exist
+	  #     that Apple will never process, and waiting on it would never end
+	  #   poll state after <N>s: <Status>     :388; Status is the Debug form of
+	  #     app-store-connect 0.7.0's SubmissionResponseStatus -- InProgress,
+	  #     Accepted, Invalid, Rejected, Unknown
+	  #   reached wait limit after <N>s       :401; one notary-wait call ended
+	  #     with Apple still working, and nothing else happened
+	  #   notary log> <line>                  :432; Apple's log, fetched by the
+	  #     wait on ANY terminal state, Invalid included
+	  echo "==> uploading to Apple's notary service"
+	  NOTARY_LOG="$$OUT/notary.log"; : > "$$NOTARY_LOG"
+	  if $(RCODESIGN) notary-submit --api-key-file "$$KEYJSON" "$$APP" 2>&1 | tee "$$NOTARY_LOG"; then
+	    UPLOADED=1
 	  else
-	    NOTARY_STATUS=failed
+	    UPLOADED=
+	  fi
+	  SUBMISSION_ID="$$(sed -n 's/.*created submission ID: \([0-9A-Fa-f-]*\).*/\1/p' "$$NOTARY_LOG" | head -1)"
+	  grep -q 'S3 upload completed successfully' "$$NOTARY_LOG" || UPLOADED=
+	  if [ -n "$$UPLOADED" ] && [ -n "$$SUBMISSION_ID" ]; then
+	    echo "    submission id: $$SUBMISSION_ID"
+	    # The recovery record, written the moment Apple has the bytes and
+	    # before a second is spent waiting: the id, the word, and -- when a zip
+	    # is wanted at all -- the bundle under the name that is true of it
+	    # right now. A job cut off while waiting (GitHub's job bound, a lost
+	    # runner) leaves these for the workflow to publish and for
+	    # finish-notarization to complete without a rebuild; a job that
+	    # finishes overwrites them below.
+	    printf '%s\n' "$$SUBMISSION_ID" > "$$OUT/NOTARY_SUBMISSION_ID"
+	    printf 'pending\n' > "$$OUT/NOTARIZATION"
+	    if [ -n "$(ARCHIVE)" ] && command -v zip >/dev/null 2>&1; then
+	      ( cd "$$OUT" && rm -f squallar-PENDING-NOTARIZATION.app.zip \
+	          && zip -qry squallar-PENDING-NOTARIZATION.app.zip squallar.app )
+	    fi
+	    # ---- 2. wait, unconditionally ----
+	    # One `notary-wait` call is bounded and ends on the first transient
+	    # error, so "unconditionally" is this loop: ask again after every
+	    # wait-limit exit, sleep and ask again after every other failure, stop
+	    # only on a terminal state. `notary-wait` exits 0 on ANY terminal
+	    # state, Invalid included -- src/cli/mod.rs NotaryWait::run never calls
+	    # into_result -- so its exit status says nothing about the verdict;
+	    # the verdict is the last poll line, read after the loop. The only
+	    # outer bound is GitHub's job timeout (see NOTARY_WAIT_CALL).
+	    echo "==> waiting for Apple's verdict on $$SUBMISSION_ID (unconditionally; one notary-wait call = $(NOTARY_WAIT_CALL)s)"
+	    while :; do
+	      if $(RCODESIGN) notary-wait --api-key-file "$$KEYJSON" \
+	          --max-wait-seconds $(NOTARY_WAIT_CALL) "$$SUBMISSION_ID" 2>&1 | tee -a "$$NOTARY_LOG"; then
+	        break
+	      elif tail -n 3 "$$NOTARY_LOG" | grep 'reached wait limit after' >/dev/null; then
+	        echo "==> Apple is still working on $$SUBMISSION_ID; asking again"
+	      else
+	        echo "==> the poll itself failed (above); Apple's queue is unaffected -- asking again in $(NOTARY_RETRY_SLEEP)s"
+	        sleep $(NOTARY_RETRY_SLEEP)
+	      fi
+	    done
+	  fi
+	  VERDICT="$$(sed -n 's/.*poll state after [0-9]*s: \([A-Za-z]*\).*/\1/p' "$$NOTARY_LOG" | tail -1)"
+	  if [ "$$VERDICT" = Accepted ]; then
+	    # ---- 3. staple ----
+	    # The ticket exists; `staple` fetches it by the main executable's
+	    # cdhash from Apple's public ticket service (src/stapling.rs
+	    # staple_bundle, src/ticket_lookup.rs APPLE_TICKET_LOOKUP_URL): no key,
+	    # no resubmission. A fresh ticket can take a minute to reach that
+	    # service, hence the attempts.
+	    echo "==> Accepted; stapling"
+	    n=0; STAPLE_OK=
+	    while [ "$$n" -lt $(NOTARY_STAPLE_TRIES) ]; do
+	      n=$$((n+1))
+	      if $(RCODESIGN) staple "$$APP" 2>&1 | tee -a "$$NOTARY_LOG"; then STAPLE_OK=1; break; fi
+	      echo "==> staple attempt $$n of $(NOTARY_STAPLE_TRIES) failed (above); again in $(NOTARY_RETRY_SLEEP)s"
+	      sleep $(NOTARY_RETRY_SLEEP)
+	    done
+	    if [ -n "$$STAPLE_OK" ]; then
+	      record_staple
+	    else
+	      NOTARY_STATUS=pending
+	      echo ""
+	      echo "NOTE: Apple ACCEPTED submission $$SUBMISSION_ID but the ticket could not be"
+	      echo "      stapled in $(NOTARY_STAPLE_TRIES) attempts; the 'Error:' lines above say why. The"
+	      echo "      ticket exists and needs no resubmission, so the bundle is published as"
+	      echo "      PENDING-NOTARIZATION and stapling alone finishes it, with no rebuild"
+	      echo "      and no secrets:"
+	      echo ""
+	      echo "        gh workflow run finish-notarization -f run_id=$${GITHUB_RUN_ID:-<run id>}"
+	      echo ""
+	      echo "      or 'rcodesign staple squallar.app' on the unzipped artifact, then re-zip."
+	    fi
+	  elif [ "$$VERDICT" = Invalid ] || [ "$$VERDICT" = Rejected ]; then
+	    NOTARY_STATUS=rejected
 	    echo ""
-	    echo "WARNING: notarization did not complete, and this build is NOT fatal"
-	    echo "         about that on purpose -- see the note above. The bundle is"
-	    echo "         signed with the Developer ID identity and carries the"
-	    echo "         hardened runtime; it has no ticket, so another Mac will"
-	    echo "         refuse it. It is being written as NOT-NOTARIZED rather than"
-	    echo "         thrown away, so the run leaves something to inspect."
-	    echo "         A rejection is a verdict on the bundle and re-running will not"
-	    echo "         change it: 'rcodesign notary-log <submission-id> --api-key-file"
-	    echo "         <key.json>' prints Apple's reasons, and the submission id is in"
-	    echo "         the output above. A time-out is not a verdict -- the submission"
-	    echo "         stays queued and 'rcodesign notary-wait <submission-id>' picks"
-	    echo "         it up. An 'Unauthenticated' is neither: it is the credentials."
+	    echo "WARNING: Apple REJECTED submission $$SUBMISSION_ID. That is a verdict on this"
+	    echo "         bundle, not an outage: re-running this job will not change it."
+	    echo "         Apple's reasons follow. NOT fatal on purpose -- see the note above;"
+	    echo "         the bundle is written as NOT-NOTARIZED so the run leaves something"
+	    echo "         to inspect."
+	    # Fetched here, by the recipe, so the reasons are IN the run rather than
+	    # behind an instruction to go and get them. The wait already printed the
+	    # same document as `notary log>` lines; this one is the raw JSON, which
+	    # is what the one-line-per-issue summary reads.
+	    NOTARY_ISSUES="$$SCRATCH/notary-log.json"
+	    echo "==> rcodesign notary-log $$SUBMISSION_ID (Apple's notary log, verbatim)"
+	    if $(RCODESIGN) notary-log --api-key-file "$$KEYJSON" "$$SUBMISSION_ID" > "$$NOTARY_ISSUES"; then
+	      cat "$$NOTARY_ISSUES"
+	      echo "==> issues, one per line: severity | message | path"
+	      if command -v jq >/dev/null 2>&1; then
+	        jq -r '"    status: \(.status // "?") -- \(.statusSummary // "")", ((.issues // [])[] | "    \(.severity // "?") | \(.message // "?") | \(.path // "-")")' "$$NOTARY_ISSUES" \
+	          || echo "    (jq could not read the log above; read it raw)"
+	      elif command -v python3 >/dev/null 2>&1; then
+	        python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("    status: %s -- %s" % (d.get("status","?"), d.get("statusSummary",""))); [print("    %s | %s | %s" % (i.get("severity","?"), i.get("message","?"), i.get("path") or "-")) for i in (d.get("issues") or [])]' "$$NOTARY_ISSUES" \
+	          || echo "    (python3 could not read the log above; read it raw)"
+	      else
+	        echo "    (neither jq nor python3 on PATH; read the JSON above)"
+	      fi
+	    else
+	      echo "WARNING: 'rcodesign notary-log' did not return the log. The 'notary log>' lines"
+	      echo "         above are the same document, fetched by the wait; failing that:"
+	      echo "           rcodesign notary-log $$SUBMISSION_ID --api-key-file <key.json>"
+	    fi
+	  else
+	    NOTARY_STATUS=error
+	    echo ""
+	    if [ -z "$$SUBMISSION_ID" ]; then
+	      echo "WARNING: notary-submit failed before a submission existed; the 'Error:' line"
+	      echo "         above says how. A 401 is the credentials (APPSTORE_CONNECT_ISSUER_ID /"
+	      echo "         KEY_ID / KEY_P8 do not agree, or the key was revoked); a 5xx or a"
+	      echo "         connection error is Apple or the network. Nothing is queued at Apple."
+	    elif [ -z "$$UPLOADED" ]; then
+	      echo "WARNING: submission $$SUBMISSION_ID was created but the upload to Apple did not"
+	      echo "         complete (no 'S3 upload completed successfully' above), so Apple will"
+	      echo "         never process it and waiting on it would never end. Push again: a"
+	      echo "         fresh submission costs nothing."
+	    else
+	      echo "WARNING: Apple ended submission $$SUBMISSION_ID in state '$${VERDICT:-?}', which is"
+	      echo "         neither Accepted nor a rejection this recipe knows; the lines above"
+	      echo "         say more, and 'rcodesign notary-log $$SUBMISSION_ID --api-key-file"
+	      echo "         <key.json>' prints Apple's record."
+	    fi
+	    echo "         NOT fatal on purpose -- see the note above; the bundle is written as"
+	    echo "         NOT-NOTARIZED so the run leaves something to inspect."
 	  fi
 	elif [ -n "$$NOTARY_READY" ]; then
 	  echo ""
@@ -907,11 +1069,17 @@ build:
 	  esac
 	fi
 
+	# ---- outcome, for the workflow ----
 	# The one-word outcome, written beside the zip rather than inside the .app:
 	# anything added inside the bundle after signing breaks the seal. CI reads
 	# this for its run summary; a person reading a build directory gets the
 	# same answer without having to remember what the zip's name means.
 	printf '%s\n' "$$NOTARY_STATUS" > "$$OUT/NOTARIZATION"
+	# And the submission id beside it -- empty when nothing was submitted -- so
+	# the run summary can name the thing to wait on or look up without anyone
+	# scrolling a fold for it. Both were already written the moment the
+	# upload completed (the recovery record); this is the final word.
+	printf '%s\n' "$$SUBMISSION_ID" > "$$OUT/NOTARY_SUBMISSION_ID"
 
 	if [ -n "$(ARCHIVE)" ]; then
 	  # actions/upload-artifact drops the executable bit, which turns a .app
@@ -922,19 +1090,33 @@ build:
 	  # bundle that already has one. Moving this above the notarize stage would
 	  # ship an un-ticketed zip and nothing would say so.
 	  #
-	  # The NAME is the label. `squallar.app.zip` means a ticket is stapled
-	  # inside and any Mac will open it; every other outcome -- no credentials,
-	  # an ad-hoc signature, Apple unreachable, Apple saying no -- produces
-	  # `squallar-NOT-NOTARIZED.app.zip`. One name for the shippable thing and
-	  # one for everything else, because a reader who has to work out which
-	  # they have will eventually work it out wrong.
+	  # The NAME is the label, and it asserts only what is true of the bundle.
+	  # `squallar.app.zip` means a ticket is stapled inside and any Mac will
+	  # open it. `squallar-PENDING-NOTARIZATION.app.zip` means Apple has the
+	  # bytes and no ticket is stapled yet: signed, submitted, notarized by
+	  # stapling alone once the ticket exists (the `finish-notarization`
+	  # workflow). Since the wait is unconditional, a finished job leaves it
+	  # only when Apple accepted and the ticket could not be fetched; a job
+	  # cut off mid-wait leaves the copy written before the wait began (the
+	  # recovery record above). `squallar-NOT-NOTARIZED.app.zip` is every
+	  # outcome where that word is true -- no credentials, an ad-hoc
+	  # signature, Apple saying no. The pending name exists because a bundle
+	  # Apple had ACCEPTED was once published as NOT-NOTARIZED with a summary
+	  # saying it must not ship: a name that asserts a fact that can be false
+	  # is how a reader works it out wrong.
 	  command -v zip >/dev/null 2>&1 || { echo "ERROR: ARCHIVE=1 but no zip on PATH"; exit 1; }
-	  if [ "$$NOTARY_STATUS" = stapled ]; then ZIPNAME=squallar.app.zip; else ZIPNAME=squallar-NOT-NOTARIZED.app.zip; fi
-	  ( cd "$$OUT" && rm -f squallar.app.zip squallar-NOT-NOTARIZED.app.zip && zip -qry "$$ZIPNAME" squallar.app )
+	  case "$$NOTARY_STATUS" in
+	    stapled) ZIPNAME=squallar.app.zip ;;
+	    pending) ZIPNAME=squallar-PENDING-NOTARIZATION.app.zip ;;
+	    *)       ZIPNAME=squallar-NOT-NOTARIZED.app.zip ;;
+	  esac
+	  ( cd "$$OUT" \
+	      && rm -f squallar.app.zip squallar-PENDING-NOTARIZATION.app.zip squallar-NOT-NOTARIZED.app.zip \
+	      && zip -qry "$$ZIPNAME" squallar.app )
 	  echo "Zip: $(ROOT)/$$OUT/$$ZIPNAME"
 	fi
 	echo ""
-	echo "App: $(ROOT)/$$APP   (notarization: $$NOTARY_STATUS)"
+	echo "App: $(ROOT)/$$APP   (notarization: $$NOTARY_STATUS$${SUBMISSION_ID:+, submission $$SUBMISSION_ID})"
 	echo "Run it with:  open '$(ROOT)/$$APP'"
 
 clean:
