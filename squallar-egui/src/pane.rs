@@ -3377,6 +3377,36 @@ impl PaneState {
         Self::overlay_texture_releasable(&self.layers, id)
     }
 
+    /// **Let go of every texture this pane holds, and keep the pane.**
+    ///
+    /// The counterpart of [`Self::release_disabled_overlay_textures`] for the
+    /// other way a pane stops being drawn: the layout's pane count came down
+    /// and this pane fell outside [`crate::Gui::panes`]'s visible slice.
+    /// Nothing walks a hidden pane — not the dispatch, not the loop supply —
+    /// so what it was holding when it went out of view it holds for as long
+    /// as the session lasts, while `App::scene_of` prices only the visible
+    /// panes. Pricing and residency then diverge, and `refit_to_scene`
+    /// promotes rungs UP onto memory that never left, which is the
+    /// compounding direction.
+    ///
+    /// **The `PaneState` itself is kept, deliberately.** Its site, its
+    /// product, its layer stack, its span and its playhead are the user's own
+    /// settings; six panes down to two and back to six brings them all back.
+    /// Only what can be rebuilt from them goes: the overlay pictures' GPU
+    /// textures, and the loop frames' textures, whose stamps stay so the
+    /// supply refills them in place. Modelled on
+    /// `App::release_hidden_pane_volumes`, which does exactly this for a 3D
+    /// pane's grids through `VolumeStore::hidden_holders`.
+    pub fn release_hidden_textures(&mut self) {
+        for cache in self.overlay_textures.values_mut() {
+            cache.clear();
+        }
+        for slot in self.layers.iter_mut() {
+            // The frame list and its stamps stand; only the textures go.
+            slot.time.evict_textures_outside_render_set(0);
+        }
+    }
+
     /// Let go of the GPU texture of every overlay this pane no longer draws.
     pub fn release_disabled_overlay_textures(&mut self) {
         // Two fields of one struct, borrowed disjointly, which is the whole

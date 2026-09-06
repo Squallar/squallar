@@ -506,3 +506,109 @@ fn every_pane_bearing_action_reports_the_pane_it_is_about() {
         );
     }
 }
+
+/// **A pane count coming down releases what the hidden panes hold, and keeps
+/// the panes.**
+///
+/// The count is a ceiling the user sets, never a floor: `Gui::set_pane_count`
+/// only ever grows `self.panes`, so six panes down to two and back to six
+/// brings back every site, product and layer stack the user had. What must
+/// NOT survive is the memory: nothing walks a pane outside `Gui::panes`'s
+/// visible slice — not the overlay dispatch, not the loop supply — while
+/// `App::scene_of` prices only the visible ones, so a texture held by a
+/// hidden pane is priced at zero and resident anyway, and `refit_to_scene`
+/// then promotes rungs UP onto memory that never left.
+///
+/// Both halves are asserted here because either alone is the bug: a release
+/// that truncated would lose the user's settings, and a keep with no release
+/// is the leak. Driven through the topbar's own count buttons, which is the
+/// one path a user has to this.
+#[test]
+fn lowering_the_pane_count_releases_the_hidden_panes_and_keeps_them() {
+    use squallar_source::id::known;
+
+    let mut h = desktop();
+    let click_count = |h: &mut InputHarness, count: usize| {
+        let option = h
+            .pane_options()
+            .into_iter()
+            .find(|o| o.count == count)
+            .unwrap_or_else(|| panic!("the topbar draws a {count}-pane option"));
+        h.mouse_click(option.rect.center());
+        h.warm_up();
+    };
+    click_count(&mut h, 6);
+    assert_eq!(h.gui().panes().len(), 6, "precondition: six visible panes");
+
+    // Two hidden-to-be panes given a piece of the user's own state and a
+    // texture apiece. The span is per-pane state no link group syncs, which
+    // is what makes it a witness for "the pane was kept" rather than for
+    // "the panes agree".
+    let texture = h.ctx().load_texture(
+        "hidden-pane",
+        egui::ColorImage::filled([1, 1], egui::Color32::RED),
+        egui::TextureOptions::NEAREST,
+    );
+    let spans = [4321u64, 5432];
+    for (n, idx) in [4usize, 5].into_iter().enumerate() {
+        let pane = h.gui_mut().pane_mut(idx).expect("a seeded pane");
+        pane.time.span_secs = spans[n];
+        pane.overlay_cache_mut(&known::RADAR)
+            .show(crate::overlay_cache::OverlayTextureData {
+                texture: texture.clone(),
+                placed: squallar_geo::PlacedRaster::of(squallar_geo::GeoBounds {
+                    min_lat: 34.0,
+                    max_lat: 36.0,
+                    min_lon: -98.0,
+                    max_lon: -96.0,
+                }),
+                data_generation: 0,
+                render_zoom: 0,
+                width: 1,
+                height: 1,
+                radar_meta: None,
+                hit_map: None,
+            });
+        assert!(
+            h.gui()
+                .pane(idx)
+                .and_then(|pane| pane.overlay_cache(&known::RADAR))
+                .is_some_and(|cache| cache.current().is_some()),
+            "precondition: pane {idx} is holding a picture",
+        );
+    }
+
+    click_count(&mut h, 2);
+    assert_eq!(h.gui().panes().len(), 2, "two visible panes");
+
+    for (n, idx) in [4usize, 5].into_iter().enumerate() {
+        let pane = h
+            .gui()
+            .pane(idx)
+            .expect("the pane state is kept, not truncated");
+        assert_eq!(
+            pane.time.span_secs, spans[n],
+            "pane {idx} lost the lookback the user set",
+        );
+        assert!(
+            pane.overlay_cache(&known::RADAR)
+                .is_none_or(|cache| cache.current().is_none()),
+            "pane {idx} is hidden and still holding its picture — priced at \
+             zero by `App::scene_of` and resident all the same",
+        );
+        assert!(
+            !pane.is_holding_raster(),
+            "pane {idx} is hidden and still holding an arriving raster",
+        );
+    }
+
+    // And back up: the panes the user configured are the panes they get.
+    click_count(&mut h, 6);
+    assert_eq!(h.gui().panes().len(), 6);
+    for (n, idx) in [4usize, 5].into_iter().enumerate() {
+        assert_eq!(
+            h.gui().pane(idx).expect("a restored pane").time.span_secs,
+            spans[n],
+        );
+    }
+}

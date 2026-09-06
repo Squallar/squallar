@@ -1497,6 +1497,16 @@ impl Gui {
         // active pane's state, the same way startup does.
         self.initialize_pane_enabled();
         self.pane_layout = PaneLayout::for_count(count, self.layout.width, self.split_orientation);
+        // **The count is a ceiling the user sets, never a floor, and lowering
+        // it has to release.** `self.panes` only ever grows above — a closed
+        // pane's site, product and layer stack are the user's own settings and
+        // come back when the count does — but nothing walks a pane outside
+        // `Self::panes`'s visible slice, so what it held when it went out of
+        // view it would hold for the rest of the session while `App::scene_of`
+        // priced only the visible ones. See `PaneState::release_hidden_textures`.
+        for pane in self.panes.iter_mut().skip(self.pane_layout.pane_count) {
+            pane.release_hidden_textures();
+        }
         if self.active_pane >= self.pane_layout.pane_count {
             self.active_pane = 0;
         }
