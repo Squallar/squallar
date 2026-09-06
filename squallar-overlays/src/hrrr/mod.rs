@@ -1653,6 +1653,38 @@ impl GridCoords {
         }
     }
 
+    /// The longitude interval this grid's stored coordinates lie in — the
+    /// frame [`Self::index_bounds`] reads a box's edges against — or `None`
+    /// for [`Self::Explicit`], which has no closed form and which
+    /// `index_bounds` declines anyway.
+    ///
+    /// Closed forms where the arm is one: a regular grid runs `(ni - 1) * dlon`
+    /// from `lon0` in the direction of `dlon`'s sign, and a separable grid is
+    /// its axis's two extremes. A Lambert grid is `[-180, 180)`, the band
+    /// [`lambert::LambertGrid::latlon`] folds every point into — a grid not
+    /// wholly inside one such band is a wrapping one (`step_is_discontinuous`,
+    /// cut 2) — and its `theta` folds a box's edge on its own, so the frame is
+    /// a formality there and a box already inside ±180 is left exactly where
+    /// it is.
+    pub fn lon_frame(&self) -> Option<(f64, f64)> {
+        match self {
+            GridCoords::Lambert(_) => Some((-180.0, 180.0)),
+            GridCoords::Regular { lon0, dlon, ni, .. } => {
+                let far = lon0 + ni.saturating_sub(1) as f64 * dlon;
+                Some((lon0.min(far), lon0.max(far)))
+            }
+            GridCoords::Explicit { .. } => None,
+            GridCoords::Separable { lon_axis, .. } => {
+                let (west, east) = lon_axis
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                        (lo.min(v), hi.max(v))
+                    });
+                (west.is_finite() && east.is_finite()).then_some((west, east))
+            }
+        }
+    }
+
     /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid does
     /// not cover it. O(1) for a Lambert or regular grid — the flat scan it
     /// replaces ran over all 1.9 M points on every hover frame.

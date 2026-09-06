@@ -1723,6 +1723,32 @@ fn projection_window(
         return full;
     }
 
+    // **Into the grid's own longitude frame, before an edge of the box is
+    // read.** The box arrives in the app's one continuous frame —
+    // `walkers::Projector::unproject` folds nothing — so past the antimeridian
+    // the ground at `-130..-60` is written `230..300` (`seam_frame_tests`).
+    // Each *point* is carried to the representation nearest the box as it is
+    // projected (`rasterize_gridded`, `nearest_lon`), but which points are
+    // projected is decided here, and `index_bounds` reads the box's *edges*
+    // against the grid's stored longitudes: `(min_lon - lon0) / dlon` on a
+    // regular grid, which puts `230` at column 36,000 of MRMS's 7,000 and
+    // clamps to an empty window. So the box is the datum, the grid's frame is
+    // the target, and the box moves by the whole turn that brings it nearest
+    // — the identity for a box already in frame. Not gated on
+    // `wraps_longitude`: the Lambert arm folds an edge on its own in `theta`
+    // and the wrapping separable arm locates each edge angularly, and a fold
+    // that is a no-op there is what keeps one geometry from projecting two
+    // ways depending on which arm holds it. `regional_window_frame_tests`.
+    let shift = coords.lon_frame().map_or(0.0, |(west, east)| {
+        crate::render::geo::box_lon_shift(bounds.min_lon, bounds.max_lon, west, east)
+    });
+    let carried = GeoBounds {
+        min_lon: bounds.min_lon + shift,
+        max_lon: bounds.max_lon + shift,
+        ..*bounds
+    };
+    let bounds = &carried;
+
     // `cos` at the box's own extreme latitude: the only cells that can reach
     // the texture sit within a cell of the box.
     let edge_lat = bounds.min_lat.abs().max(bounds.max_lat.abs());
@@ -2331,3 +2357,6 @@ mod gmgsi_seam_probe_tests;
 
 #[cfg(test)]
 mod seam_frame_tests;
+
+#[cfg(test)]
+mod regional_window_frame_tests;

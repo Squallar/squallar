@@ -57,7 +57,39 @@ pub fn lon_shift(datum_min: f64, datum_max: f64, target_min: f64, target_max: f6
     if !target_centre.is_finite() {
         return 0.0;
     }
-    360.0 * ((target_centre - datum_centre) / 360.0).round()
+    whole_turns(datum_centre, target_centre)
+}
+
+/// The whole multiple of 360° from `from` to the copy of it nearest `to`.
+///
+/// One expression, so the two shifts below cannot round two ways.
+fn whole_turns(from: f64, to: f64) -> f64 {
+    360.0 * ((to - from) / 360.0).round()
+}
+
+/// The whole multiple of 360° that carries a **box** spanning
+/// `[box_min, box_max]` to the copy whose centre is nearest the centre of
+/// `[target_min, target_max]` — [`lon_shift`] with the whole-turn ceiling
+/// lifted.
+///
+/// The ceiling is right for what `lon_shift` carries. A point, a ring, a
+/// pooled extent are read off ±180 coordinates, nothing written there can
+/// measure more than a turn, and a span past one is not a width. A box is the
+/// other kind of datum: stated in the one continuous frame the map works in,
+/// its span *is* its width, and at the zoom floor the viewport alone is a turn
+/// wide before `OverlayTexturePlan::coverage` grows it. Left where it is, a
+/// box a turn and a half wide written `90..630` meets a grid at `-130..-60`
+/// nowhere — `GridCoords::index_bounds` reads the box's *edges*, not the
+/// ground it shows. Carried to within a half-turn of the target's centre, a
+/// box wider than a turn covers the whole target, which is the one answer
+/// those edges can give. Zero for any non-finite input.
+pub fn box_lon_shift(box_min: f64, box_max: f64, target_min: f64, target_max: f64) -> f64 {
+    let box_centre = (box_min + box_max) / 2.0;
+    let target_centre = (target_min + target_max) / 2.0;
+    if !(box_centre.is_finite() && target_centre.is_finite()) {
+        return 0.0;
+    }
+    whole_turns(box_centre, target_centre)
 }
 
 /// A pointer's longitude carried into the frame `bounds` is written in.

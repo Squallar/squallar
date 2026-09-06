@@ -13,7 +13,7 @@
 //! place the arithmetic is known to land either side of 360 by rounding alone,
 //! which is what sizes the slack.
 
-use super::{TURN_SLACK, lon_into_bounds, lon_shift};
+use super::{TURN_SLACK, box_lon_shift, lon_into_bounds, lon_shift};
 use squallar_geo::GeoBounds;
 
 /// `walkers::mercator::unproject_at_scale`, the longitude half, verbatim:
@@ -206,4 +206,40 @@ fn a_pointer_is_carried_into_the_grids_own_frame() {
     assert_eq!(lon_into_bounds(190.0, &world), -170.0);
     assert_eq!(lon_into_bounds(-170.0, &world), -170.0);
     assert_eq!(lon_into_bounds(-97.0, &world), -97.0, "in frame, untouched");
+}
+
+/// The projection window's fold: a **box** is carried to its grid's frame at
+/// any width. MRMS's frame is `-129.995..-60.005`; the ground under it written
+/// a turn up comes back a turn, in frame it stays, and the zoom floor grown by
+/// the overdraw — a turn and a half — is carried where [`lon_shift`]'s
+/// ceiling would leave it a turn away from the grid.
+#[test]
+fn a_box_is_carried_into_the_grids_frame_at_any_width() {
+    let (west, east) = (-129.995, -60.005);
+    assert_eq!(box_lon_shift(230.0, 300.0, west, east), -360.0);
+    assert_eq!(
+        box_lon_shift(-130.0, -60.0, west, east),
+        0.0,
+        "in frame: the identity"
+    );
+    assert_eq!(box_lon_shift(-98.0, -97.0, west, east), 0.0);
+    assert_eq!(box_lon_shift(262.0, 263.0, west, east), -360.0);
+    assert_eq!(
+        box_lon_shift(-458.0, -457.0, west, east),
+        360.0,
+        "a turn the other way"
+    );
+    assert_eq!(
+        box_lon_shift(90.0, 630.0, west, east),
+        -360.0,
+        "the floor, grown, past the seam"
+    );
+    assert_eq!(
+        lon_shift(90.0, 630.0, west, east),
+        0.0,
+        "non-triviality: a datum that wide is past lon_shift's ceiling and is not carried"
+    );
+    assert_eq!(box_lon_shift(f64::NAN, 10.0, west, east), 0.0);
+    assert_eq!(box_lon_shift(0.0, f64::INFINITY, west, east), 0.0);
+    assert_eq!(box_lon_shift(0.0, 10.0, f64::NAN, east), 0.0);
 }
