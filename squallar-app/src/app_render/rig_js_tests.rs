@@ -543,6 +543,100 @@ fn every_console_scrape_executes_and_hands_back_every_family_it_was_fed() {
     );
 }
 
+/// **The `service less present` scrape reads back the lines the app formats,
+/// and the `service` scrape does not read them.**
+///
+/// The two sentences share a prefix and end in the same parenthesised family
+/// word, so a probe anchored on the shorter one would file a figure with the
+/// present taken OUT under the name the campaign's bar is stated in. Next
+/// door, `the_rig_reads_the_service_less_present_lines_the_app_actually_writes`
+/// holds that apart on the patterns' fixed heads by string arithmetic; this
+/// holds it in a real regex engine, against the app's own output, which is the
+/// only place a backtracking difference could show.
+///
+/// The lines fed in are ONLY the two `frame service less present (…)` ones, so
+/// `interact` and `idle` — the singletons `svc_interact_re`/`svc_idle_re` fill
+/// — must come back null. A non-null there is the cross-read this gate exists
+/// to catch, and it would read as a plausible service figure rather than as an
+/// absence.
+#[test]
+fn the_service_less_present_scrape_reads_back_the_lines_the_app_formats() {
+    let blocks = embedded_blocks(DRIVE_PY);
+    let probe = blocks
+        .iter()
+        .find(|b| b.name == "FRAME_LINE_PROBE")
+        .expect("drive.py no longer declares FRAME_LINE_PROBE");
+    let Some(engine) = js_engine() else {
+        eprintln!("{NO_ENGINE}");
+        return;
+    };
+    let mut interact = squallar_device_profile::hist::Hist::new();
+    interact.record(100);
+    interact.record(4_000);
+    let mut idle = squallar_device_profile::hist::Hist::new();
+    idle.record(1_000);
+    let lines = super::frame_service_less_present_lines(&interact, &idle);
+    let payload = serde_json::to_string(&serde_json::json!({
+        "src": probe.src,
+        "lines": [&lines[0], &lines[1]],
+    }))
+    .expect("the probe and the lines are plain strings");
+    let out = run_js(
+        engine,
+        &format!(
+            r#"const P = {payload};
+const C = P.lines.map((m, i) => ({{ t: 7100 + i, lvl: "INFO", msg: m }}));
+globalThis.window = {{ __rig_console: C, __rig_errors: [], __rig: {{ t0: 1 }} }};
+let got, threw = null;
+try {{ got = new Function(P.src)(); }} catch (e) {{ threw = String((e && e.stack) || e); }}
+console.log(JSON.stringify({{ threw: threw,
+  less: threw ? null : (got.frame_service_less_present_all || []),
+  interact: threw ? null : (got.interact || null),
+  idle: threw ? null : (got.idle || null) }}));
+"#
+        ),
+        "lesspresent",
+    );
+    let report: serde_json::Value = serde_json::from_str(&out).expect("the harness printed JSON");
+    assert!(
+        report["threw"].is_null(),
+        "the frame-line scrape threw on the very lines the app formats \
+         (engine: {}): {}",
+        engine.0,
+        report["threw"].as_str().unwrap_or_default(),
+    );
+    let got = report["less"].as_array().expect("`less` is a list");
+    assert_eq!(
+        got.len(),
+        2,
+        "the scrape read {} of the two `frame service less present (…)` lines \
+         the app wrote, so the family reaches the artifact short",
+        got.len(),
+    );
+    assert_eq!(got[0]["t"].as_u64(), Some(7100), "the wrong console stamp");
+    assert_eq!(got[0]["name"].as_str(), Some("interact"));
+    assert_eq!(got[0]["n"].as_u64(), Some(2));
+    // Reached by VALUE and not by "the key exists": `sum` is what a windowed
+    // mean is a subtraction of, and a group off by one would leave every key
+    // present and every figure wrong.
+    assert_eq!(got[0]["sum"].as_u64(), Some(4_100));
+    assert_eq!(got[0]["p99"].as_str(), Some("4757"));
+    assert_eq!(got[1]["name"].as_str(), Some("idle"));
+    assert_eq!(got[1]["n"].as_u64(), Some(1));
+    assert_eq!(got[1]["sum"].as_u64(), Some(1_000));
+    // **And the bar's own family stayed empty.** Nothing but the two lines
+    // above was fed in, so a `svc_interact_re` that swallowed one of them
+    // would show up here as a service reading nobody wrote.
+    assert!(
+        report["interact"].is_null() && report["idle"].is_null(),
+        "the `frame service` scrape read a `frame service less present` line, \
+         so the figure with the present taken out would be reported as the \
+         one the responsiveness bar is stated in: {} / {}",
+        report["interact"],
+        report["idle"],
+    );
+}
+
 /// **The worst-frame scrape reads back the line the app formats, timestamp
 /// included.**
 ///

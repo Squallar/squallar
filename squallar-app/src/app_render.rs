@@ -672,6 +672,54 @@ fn frame_service_idle_line(h: &squallar_device_profile::hist::Hist) -> String {
     )
 }
 
+/// The two `frame service less present (<family>):` lines — `service` with the
+/// swapchain handover's second half taken back out.
+///
+/// # The figure
+///
+/// `service` is the whole redraw minus the acquire; these are that same
+/// figure minus the `finish` split's eighth cut, the `SurfaceTexture::present`
+/// call — see `frame_ledger::service_less_present_micros`, which owns
+/// the definition, the truncation bound and the measurement that motivated it.
+///
+/// **This is not the bar and does not restate it.** The responsiveness bar is
+/// p99 interact `service`, it is read off `frame service (interact):`, and a
+/// reader who reads it off these lines is reading a different quantity. The
+/// two sentences are deliberately different: `frame service (interact)` names
+/// no exclusion, this one names its exclusion in its own name.
+///
+/// # Denominator
+///
+/// **Exactly `frame service (interact)`'s and `frame service (idle)`'s** —
+/// presented frames, split by whether the frame's raw input carried
+/// interaction — narrowed to the frames that left `finish_phases`, which is
+/// every frame either line counts: the only arm of `present_frame` that leaves
+/// none is the skipped/lost one, and `finalize` discards that frame outright.
+/// A frame with no `present` to subtract contributes no sample here rather
+/// than contributing its whole `service`, so the two `n` figures are equal on
+/// every path the app has and a divergence is readable off the pair.
+///
+/// **Never added to `frame service (…)` and never to `frame finish
+/// (present)`.** These are that line's frames one cut lighter, and that cut is
+/// what `frame finish (present)` reports on its own wider denominator; adding
+/// any pair of the three double-counts one span.
+///
+/// # Why `named_hist_line` and not `frame_service_interact_line`'s shape
+///
+/// Because these carry a running `sum` and the service lines do not, so a
+/// gesture window's mean is `(sum_b - sum_a) / (n_b - n_a)` and is exact. That
+/// is also what puts them in the rig's named-family map, where a window is a
+/// subtraction rather than a cumulative-from-boot percentile.
+fn frame_service_less_present_lines(
+    interact: &squallar_device_profile::hist::Hist,
+    idle: &squallar_device_profile::hist::Hist,
+) -> [String; 2] {
+    [
+        named_hist_line("frame service less present", "interact", interact),
+        named_hist_line("frame service less present", "idle", idle),
+    ]
+}
+
 /// The `frame segments:` line — where an interact frame's service goes.
 ///
 /// Denominator: interact frames only (see [`frame_service_interact_line`]),
@@ -2202,6 +2250,16 @@ impl super::App {
             &frame_service_interact_line(ledger.service_interact()),
         );
         say_telemetry(loud, &frame_service_idle_line(ledger.service_idle()));
+        // The two lines above with the `finish` split's eighth cut taken back
+        // out — the same frames, the same two families, one cut lighter.
+        // **Not the bar**: that is still `frame service (interact)`. See
+        // `frame_service_less_present_lines`.
+        for line in frame_service_less_present_lines(
+            ledger.service_less_present_interact(),
+            ledger.service_less_present_idle(),
+        ) {
+            say_telemetry(loud, &line);
+        }
         say_telemetry(
             loud,
             &frame_segments_line(ledger.segments(), ledger.acquire()),

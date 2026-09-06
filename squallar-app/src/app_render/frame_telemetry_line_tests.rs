@@ -22,6 +22,11 @@ use squallar_gpu::egui_renderer::pass_costs::{PassCosts, StagedGeometry};
 /// build failure rather than a skipped test.
 const DRIVE_PY: &str = include_str!("../../../.github/browser-rig/drive.py");
 
+/// The module whose telemetry sentences these tests pin, read at compile time
+/// for `DRIVE_PY`'s reason — the two source-reading gates below ask what the
+/// app writes, not what a fixture says it writes.
+const APP_RENDER: &str = include_str!("../app_render.rs");
+
 /// The body of a `var <name> = /…/;` regex literal in `drive.py`. Same
 /// extraction as `raster_telemetry_line_tests::pattern`, restated here only
 /// because the two modules pin different lines.
@@ -855,6 +860,11 @@ fn every_frame_cut_family_the_app_writes_is_scraped_and_windowed_by_the_rig() {
         ("frame post", "post"),
         ("frame pump", "pump"),
         ("frame dispatch", "dispatch"),
+        // Not a cut family — it is `frame service`'s own two families with
+        // the `finish` split's eighth cut taken out — but it is carried on
+        // the named-family wire for the `sum` a window needs, so it is
+        // subject to both halves of this gate exactly as the cuts are.
+        ("frame service less present", "lesspresent"),
     ] {
         let re = family.replace(' ', "_") + "_re";
         assert!(
@@ -978,6 +988,153 @@ fn the_rig_reads_the_worst_frame_line_the_app_actually_writes() {
     );
 }
 
+/// The two `frame service less present (…)` sentences, pinned as literals and
+/// against the rig's own pattern.
+///
+/// **The two service sentences must not read each other's lines.** `frame
+/// service (interact)` and `frame service less present (interact)` share a
+/// prefix and end in the same parenthesised family word, so a probe anchored
+/// on the shorter one would file a figure with the present taken OUT under the
+/// name of the figure the campaign's bar is stated in — the exact confusion
+/// the longer name exists to prevent, and one that reads as data rather than
+/// as a null. Held on the fixed heads of the patterns against both sentences,
+/// on `the_rig_reads_the_pre_lines_the_app_actually_writes`' terms.
+#[test]
+fn the_rig_reads_the_service_less_present_lines_the_app_actually_writes() {
+    let mut h = Hist::new();
+    h.record(100);
+    h.record(4_000);
+    let hist = counts_string(&h);
+    let expected_hist = hist.clone();
+    let [interact, idle] = super::frame_service_less_present_lines(&h, &Hist::new());
+    assert_eq!(
+        interact,
+        format!(
+            "frame service less present (interact): n=2, sum=4100 us, \
+             p50=106 us, p90=4757 us, p99=4757 us, hist={expected_hist}"
+        ),
+    );
+    assert_eq!(
+        idle,
+        format!(
+            "frame service less present (idle): n=0, sum=0 us, p50=none us, \
+             p90=none us, p99=none us, hist={}",
+            ["0"; 42].join(","),
+        ),
+        "an empty family must print a zero, not an absence",
+    );
+    assert_eq!(
+        interact,
+        rendered(
+            &pattern("frame_service_less_present_re"),
+            &["interact", "2", "4100", "106", "4757", "4757", &hist],
+        ),
+        "the `frame service less present (…)` line and the rig's probe have \
+         drifted",
+    );
+
+    // The two service sentences, held apart on the probes' fixed heads.
+    let head = |name: &str| {
+        pattern(name)
+            .split_once(r"\(")
+            .expect("a family probe opens with `<prefix> \\(`")
+            .0
+            .to_string()
+    };
+    let (service_head, less_head) = (
+        head("svc_interact_re"),
+        head("frame_service_less_present_re"),
+    );
+    assert_eq!(
+        (service_head.as_str(), less_head.as_str()),
+        ("frame service ", "frame service less present ")
+    );
+    assert!(
+        !interact.contains(&format!("{service_head}(")),
+        "the `frame service` probe's head occurs inside a `frame service less \
+         present` line, so the figure with the present taken out would be \
+         scraped as the one the bar is stated in: {interact:?}",
+    );
+    let plain = super::frame_service_interact_line(&h);
+    assert!(
+        !plain.contains(&format!("{less_head}(")),
+        "the `frame service less present` probe's head occurs inside a \
+         `frame service` line: {plain:?}",
+    );
+}
+
+/// The body of `App::report_frame_telemetry`, sliced out of `app_render.rs`.
+///
+/// The method sits in an `impl` block, so its closing brace is the first `}`
+/// at four-space indent after its signature; every block inside it closes at
+/// eight or more. Read off the source rather than brace-counted, because a
+/// brace inside one of the body's own comments would unbalance a counter and
+/// silently hand back half a body — a shorter body can only make the gate
+/// below fire, never pass, but it would fire for the wrong reason.
+fn report_frame_telemetry_body() -> &'static str {
+    const HEAD: &str = "fn report_frame_telemetry(&mut self) {";
+    let at = APP_RENDER.find(HEAD).expect(
+        "app_render.rs no longer declares `report_frame_telemetry`; the frame \
+         telemetry tick moved and this test can no longer read it",
+    );
+    let rest = &APP_RENDER[at + HEAD.len()..];
+    let end = rest
+        .find("\n    }\n")
+        .expect("`report_frame_telemetry` does not close at four-space indent");
+    &rest[..end]
+}
+
+/// **Every `frame …` line formatter in `app_render.rs` is one the report
+/// actually says.**
+///
+/// A formatter, its literal pin, its rig regex, its rename-list entry and its
+/// window prefix can all be in place while **nothing calls it**, and every
+/// other gate in this file still passes: the pins format a line and compare
+/// it, the family enumeration reads the `"frame …` literal out of the source,
+/// and the probe reads a sentence that is never written. The family is then
+/// absent from every leg for the reason absence is hardest to see — an
+/// unwritten family and an arm that produced no samples look identical in the
+/// artifact, and this campaign has twice read the second when it had the
+/// first.
+///
+/// The count is a **floor, not a pin**: families land and it climbs. It is
+/// here so that an extraction which quietly matches nothing — the shape a
+/// rename of the formatters would take — fails loudly instead of passing over
+/// an empty list.
+#[test]
+fn every_frame_line_formatter_is_one_the_report_says() {
+    const KNOWN_FORMATTER_FLOOR: usize = 15;
+    let body = report_frame_telemetry_body();
+    let mut names: Vec<&str> = APP_RENDER
+        .match_indices("\nfn frame_")
+        .map(|(at, _)| {
+            let rest = &APP_RENDER[at + 1..];
+            let end = rest.find('(').unwrap_or(rest.len());
+            &rest[3..end]
+        })
+        .filter(|name| name.ends_with("_line") || name.ends_with("_lines"))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert!(
+        names.len() >= KNOWN_FORMATTER_FLOOR,
+        "only {} `frame …` line formatters were found in app_render.rs, under \
+         the {KNOWN_FORMATTER_FLOOR} known to exist: the extraction has \
+         stopped matching and this gate is passing over an empty list: \
+         {names:?}",
+        names.len(),
+    );
+    for name in &names {
+        assert!(
+            body.contains(&format!("{name}(")),
+            "`{name}` formats a `frame …` sentence that \
+             `report_frame_telemetry` never says, so the family is ABSENT \
+             from every leg's artifact — indistinguishable there from an arm \
+             that produced no samples",
+        );
+    }
+}
+
 /// **Every `frame <name>` line family the app writes has a rig probe that reads
 /// it — by an explicit table, so a NEW family fails here until it is claimed.**
 ///
@@ -1010,7 +1167,19 @@ fn every_frame_line_family_the_app_writes_has_a_named_rig_probe() {
         ("pump", &["frame_pump_re"]),
         ("segment", &["frame_segment_re"]),
         ("segments", &["segments_re"]),
-        ("service", &["svc_interact_re", "svc_idle_re"]),
+        // Three probes, one family word. `frame service less present (…)`
+        // is the SAME `service` family word — the enumeration below reads to
+        // the first non-lowercase character — and it is deliberately the
+        // same: it is `frame service`'s two lines with one cut taken out,
+        // over `frame service`'s own frames, and never a family beside them.
+        (
+            "service",
+            &[
+                "svc_interact_re",
+                "svc_idle_re",
+                "frame_service_less_present_re",
+            ],
+        ),
         ("ui", &["frame_ui_re"]),
         ("worst", &["frame_worst_re", "frame_worst_none_re"]),
     ];

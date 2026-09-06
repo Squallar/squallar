@@ -3087,6 +3087,20 @@ FRAME_LINE_PROBE = r"""
 var C = window.__rig_console || [];
 var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var svc_idle_re = /frame service \(idle\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
+// The two lines above with the `finish` split's eighth cut -- the
+// `SurfaceTexture::present` call -- taken back out. SAME frames, same two
+// families, one cut lighter, and never added to the pair above or to
+// `finish:present`, which is that very cut on its own wider denominator.
+//
+// **Not the bar.** The responsiveness bar is p99 interact SERVICE and is read
+// off `svc_interact_re`; this family is a different figure over the same
+// frames. It exists because a display with no present path makes the WSI copy
+// rather than wait -- 21.8 ns/px on NVIDIA's Vulkan WSI under Xvfb, 87.8 ms at
+// 2878x1651 -- which is charged to `finish` and so to `service`, and makes
+// every `service` percentile on a headless arm read `over`. Two capture groups
+// more than the pair above because this family carries a running `sum`, so its
+// windowed mean is a subtraction and not a percentile of the whole run.
+var frame_service_less_present_re = /frame service less present \(([a-z0-9-]+)\): n=(\d+), sum=(\d+) us, p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
 var segments_re = /frame segments \(interact, p99 us\): pre=(\d+|none|over), pump=(\d+|none|over), ui=(\d+|none|over), prepare=(\d+|none|over), finish=(\d+|none|over), post=(\d+|none|over); acquire n=(\d+), p50=(\d+|none|over) us, p99=(\d+|none|over) us/;
 var prep_costs_re = /frame prep costs: (\d+) passes, (\d+) us tessellate, (\d+) us upload apply, (\d+) us mirror, (\d+) us buffers and callbacks/;
 // The byte side of `prep_costs_re`'s `buffers` phase, on its OWN
@@ -3321,6 +3335,7 @@ var frame_need = null, frame_need_all = [];
 var frame_segment_all = [], tile_take_all = [], tile_phase_all = [];
 var frame_prepare_all = [], frame_post_all = [], frame_dispatch_all = [];
 var frame_pre_all = [];
+var frame_service_less_present_all = [];
 var frame_pump_all = [];
 var frame_ui_all = [];
 var frame_finish_all = [];
@@ -3341,6 +3356,12 @@ for (var i = 0; i < C.length; i++) {
              p99: x[4], hist: x[5] };
     idle_all.push(idle);
   }
+  x = frame_service_less_present_re.exec(m);
+  if (x) frame_service_less_present_all.push({ t: t, name: x[1],
+                                               n: parseInt(x[2], 10),
+                                               sum: parseInt(x[3], 10),
+                                               p50: x[4], p90: x[5],
+                                               p99: x[6], hist: x[7] });
   x = segments_re.exec(m);
   if (x) segments = { t: t, pre: x[1], pump: x[2], ui: x[3], prepare: x[4],
                       finish: x[5], post: x[6],
@@ -3577,6 +3598,7 @@ return { interact: interact, idle: idle, segments: segments, prep: prep,
          frame_segment_all: frame_segment_all, tile_take_all: tile_take_all,
          tile_phase_all: tile_phase_all, frame_prepare_all: frame_prepare_all,
          frame_pre_all: frame_pre_all,
+         frame_service_less_present_all: frame_service_less_present_all,
          frame_ui_all: frame_ui_all,
          frame_pump_all: frame_pump_all,
          frame_post_all: frame_post_all,
@@ -3704,6 +3726,7 @@ class FrameLineWatcher:
         for r in sig.get("cadence_all") or []:
             self.cadence[(r.get("t"), r.get("n"))] = r
         for prefix, key in (("frame_segment_all", "segment"),
+                            ("frame_service_less_present_all", "lesspresent"),
                             ("frame_prepare_all", "prepare"),
                             ("frame_pre_all", "pre"),
                             ("frame_ui_all", "ui"),
@@ -4130,7 +4153,7 @@ def _window_stats(watcher, t0, t1, out):
 # not a zero -- that property is the dict's, not this list's.
 WINDOW_FAMILY_PREFIXES = ("segment:", "prepare:", "post:", "dispatch:",
                           "pre:", "ui:", "pump:", "finish:", "take:",
-                          "phase:")
+                          "phase:", "lesspresent:")
 
 
 def watcher_named_in(gw):
@@ -8338,6 +8361,11 @@ def selftest_named_family_reaches_the_artifact():
         len(renamed) >= 8)
     pin("`pre` is one of the families the watcher renames",
         ("frame_pre_all", "pre") in renamed)
+    # `service less present` is the newest family and the one whose absence
+    # would be least visible: `frame service (interact)` would still be in the
+    # artifact, reading `over` on every headless arm, with nothing beside it.
+    pin("`lesspresent` is one of the families the watcher renames",
+        ("frame_service_less_present_all", "lesspresent") in renamed)
 
     def hist_with(n_at_slot):
         counts = [0] * HIST_SLOTS
@@ -8356,11 +8384,28 @@ def selftest_named_family_reaches_the_artifact():
         cut = "%s-cut" % family
         sig[key] = [reading(1_000, cut, 0, 0), reading(6_000, cut, 1, 41)]
 
+    # One family also carries the cut names it REALLY writes. `service less
+    # present` is the two `frame service (…)` families with the `finish`
+    # split's eighth cut taken out, so its cuts are named `interact` and
+    # `idle` -- and `lesspresent:interact` is the key anyone reading a headless
+    # arm's artifact goes looking for, where `frame service (interact)` itself
+    # reads `over`. The generic `<family>-cut` row above proves the plumbing;
+    # these two prove the keys.
+    extra = (("frame_service_less_present_all", "interact", 84),
+             ("frame_service_less_present_all", "idle", 7))
+    for key, name, total in extra:
+        # `setdefault` and not `sig[key] +=`: a rename-list entry removed is
+        # the very defect this fixture is aimed at, and it must land as a
+        # failed PIN below, never as a KeyError -- an instrument's own
+        # breakage printed in place of a finding.
+        sig.setdefault(key, []).extend(
+            [reading(1_000, name, 0, 0), reading(6_000, name, 1, total)])
+
     watcher = FrameLineWatcher(_StubSession(sig))
     watcher.poll()
     seen = watcher.named_families()
     pin("the watcher ingested a family for every rename-list entry",
-        len(seen) == len(renamed))
+        len(seen) == len(renamed) + len(extra))
     pin("`pre:pre-cut` is one of them", "pre:pre-cut" in seen)
 
     gw = gesture_window_stats(watcher)
@@ -8390,6 +8435,11 @@ def selftest_named_family_reaches_the_artifact():
     pin("the written artifact carries `pre:pre-cut`", "pre:pre-cut" in written)
     pin("and it carries its windowed sum, not an empty family",
         (written.get("pre:pre-cut") or {}).get("mean_us") == 41)
+    for _key, name, total in extra:
+        family = "lesspresent:%s" % name
+        pin("the written artifact carries `%s`" % family, family in written)
+        pin("and `%s` carries its windowed mean off disk" % family,
+            (written.get(family) or {}).get("mean_us") == total)
     absent = [f for f in seen if f not in written]
     pin("no family reached the artifact as an ABSENCE%s"
         % (" (absent: %s)" % ", ".join(absent) if absent else ""), not absent)

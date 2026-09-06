@@ -5,7 +5,7 @@
 //! ([`squallar_device_profile::hist::Hist`]) once the frame's outcome is
 //! known. **Product telemetry, not a campaign instrument**: always on, no
 //! feature gate, and the per-frame cost is **forty-seven clock reads,
-//! fifty-five integer bin searches** and two `u32` comparisons.
+//! fifty-six integer bin searches** and two `u32` comparisons.
 //!
 //! The clock reads, counted where they are taken: the ledger's own **eight**
 //! stamps (its six `mark_*`/`finalize` reads plus the pair the acquire
@@ -17,9 +17,9 @@
 //! `process_gui_actions`) and the **seven** `present_frame` takes after the
 //! acquire returns.
 //!
-//! The bin searches, on a presented interact frame: nine outside the splits
-//! (one service, six segments, one acquire, one cadence) and forty-six in
-//! them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
+//! The bin searches, on a presented interact frame: ten outside the splits
+//! (one service, one service-less-present, six segments, one acquire, one
+//! cadence) and forty-six in them — **seven** the `pre` split ([`PreHists`]), **eight** the `pump`
 //! split ([`PumpHists`]), **nine** the `ui` split ([`UiHists`]), **six** the
 //! `prepare` split ([`PrepareHists`]), **seven** the `post` split
 //! ([`PostHists`]) and **nine** the `finish` split ([`FinishHists`]). All but
@@ -37,6 +37,13 @@
 //! itself is six of the forty-seven and seven of the fifty-five; the other
 //! fifteen and eleven were drift. Recount here rather than adjust, or the
 //! next reader inherits the same arithmetic.
+//!
+//! **`service less present` is one bin search of the ten and nothing else.**
+//! It is `service` with the `finish` split's eighth cut taken back out —
+//! arithmetic on two figures this file already has — and it records on
+//! exactly one of its two families per frame. So the forty-seven is
+//! unchanged by it and the fifty-five became fifty-six. See
+//! [`service_less_present_micros`].
 //!
 //! **The unnecessary-frame verdict adds no clock read and no bin search**, and
 //! that is the pin: [`crate::frame_need`] rides on this call and costs one
@@ -57,6 +64,11 @@
 //!   span **minus the swapchain acquire** (the vsync block — the display's
 //!   time, not ours). Only a frame that presented is a service sample; a
 //!   skipped or lost surface leaves no acquire to subtract.
+//!   **`service less present` is this denominator, not a fourth one**: the
+//!   same figure with the `finish` split's eighth cut taken back out, filed
+//!   on the same two families from the same frames. It is a different
+//!   FIGURE over the same frames, and the responsiveness bar is still
+//!   stated in `service` — see [`service_less_present_micros`].
 //! * **Interact vs idle** splits every service sample by whether the frame's
 //!   egui raw input carried at least one pointer/touch/wheel/zoom event
 //!   (`EguiRenderer::frame_had_interaction`). Interact frames are the ones
@@ -810,6 +822,12 @@ pub(crate) struct FrameLedger {
     service_interact: Hist,
     /// Service of presented frames whose input carried none.
     service_idle: Hist,
+    /// `service_interact` with the `finish` split's `present` cut taken back
+    /// out — see [`service_less_present_micros`]. Same frames as
+    /// `service_interact`, one cut lighter, and never added to it.
+    service_less_present_interact: Hist,
+    /// `service_idle`'s frames, the same cut lighter.
+    service_less_present_idle: Hist,
     /// See [`SegmentHists`] — interact frames only.
     segments: SegmentHists,
     /// See [`PreHists`] — `segments.pre`, opened up, same frames.
@@ -916,6 +934,56 @@ fn service_micros(
             .iter()
             .fold(0u32, |sum, &segment| sum.saturating_add(segment))
     }
+}
+
+/// `service` with the `finish` split's eighth cut — the
+/// `SurfaceTexture::present` call — taken back out.
+///
+/// # What it is, and what it is not
+///
+/// `service` already excludes ONE end of the swapchain handover: the acquire,
+/// which is the vsync block and the display's time rather than ours. It
+/// includes the other end. This figure excludes both. It is a different
+/// FIGURE over exactly `service`'s frames, never a different denominator, and
+/// **it is not the bar**: the responsiveness bar this instrument was built
+/// for is p99 interact `service`, it is stated in `service`, and nothing here
+/// restates it. A reader who quotes this one against that bar is quoting two
+/// different quantities.
+///
+/// # Why it exists
+///
+/// On a display with no present path the WSI does not wait — it copies.
+/// Measured on NVIDIA's Vulkan WSI under Xvfb, 2026-09-06: 6.73 ms at
+/// 640x480, 13.46 at 1024x588, 45.26 at 1920x1080 and 87.8 at 2878x1651 — a
+/// 6.73x time ratio across a 6.75x pixel ratio, which is a blit at 21.8 ns/px
+/// and not a vblank wait. That readback is charged to `finish`, therefore to
+/// `service`, so on every headless arm this campaign runs every `service`
+/// percentile reads `over` and the frame thread is held to ~11 fps. The
+/// excluded cut is the WSI's on either kind of display — a wait where there
+/// is a compositor, a copy where there is not — and taking it out is what
+/// makes a headless leg's figure comparable to a panel's at all.
+///
+/// # Truncation
+///
+/// Both terms are truncating [`micros`] results and the subtraction
+/// re-truncates one boundary, so this is NOT the same number as the same six
+/// spans measured with `finish` cut short at `freed`: it is that number or
+/// one microsecond above it, never below and never two above. The bound is
+/// the two-cut case of [`micros`]' own rule — `finish` decomposed into
+/// (everything up to `freed`) and (`present`) loses `0 ..= 1` µs to
+/// truncation — and it is derived off the pair, not chosen to fit a reading.
+/// `the_service_less_present_figure_is_service_minus_the_present_cut` holds
+/// exactly that.
+///
+/// # Saturating, not asserting
+///
+/// `present` is a cut of a segment of `service`, so it cannot legitimately
+/// exceed it. But the two are four clock reads between them and a clock that
+/// steps backwards (a coarse or non-monotonic web clock) would otherwise
+/// underflow on the frame thread. A zero is the honest report of that case,
+/// on [`dispatch_cut_micros`]' terms.
+fn service_less_present_micros(service: u32, present: u32) -> u32 {
+    service.saturating_sub(present)
 }
 
 /// The seven cuts of the `dispatch` cut, in call order:
@@ -1131,6 +1199,17 @@ fn finish_phase_micros(
     ]
 }
 
+/// Where `present` sits among [`finish_phase_micros`]' eight — the cut
+/// [`service_less_present_micros`] takes back out.
+///
+/// Named rather than spelled `7` at the site that reads it: the eight are in
+/// call order, a cut inserted or reordered moves this, and a stale index
+/// would subtract the wrong span while every telescoping gate in the file
+/// stayed green. `the_present_cut_index_names_the_present_call` holds it
+/// against the very pair of stamps `FinishPhaseStamps` documents as the
+/// present.
+const PRESENT_CUT: usize = 7;
+
 impl FrameLedger {
     /// Open a frame: stamp its start and forget the previous frame's marks.
     pub(crate) fn mark_frame_start(&mut self) {
@@ -1312,6 +1391,29 @@ impl FrameLedger {
             .as_ref()
             .map_or([0u32; 7], |phases| pre_phase_micros(start, phases, setup));
 
+        // Above the arm for the two bindings above's reason and one more of
+        // its own: the eight `finish` cuts are already recorded on EVERY
+        // presented frame (see [`FinishHists`]), and the eighth of them is
+        // the subtrahend `service less present` needs on BOTH families. The
+        // eight `self.finish.*.record` calls stay in their own block below,
+        // so no histogram's denominator moves; only the arithmetic left it.
+        // Zero new clock reads: `m.finish_phases` is already stamped on every
+        // presented frame.
+        //
+        // `None` rather than eight zeros, and the `if let` at each of the
+        // three sites below rather than a `map_or(0, …)`: a frame that left
+        // no `finish_phases` has no `present` to subtract, and subtracting a
+        // zero would file its whole `service` under a name that promises the
+        // present is out of it -- a false reading on a frame that presented,
+        // where an absent sample is an absence. The only arm that leaves none
+        // is the skipped/lost one, and `finalize` returned on it above; the
+        // two families' `n` are printed side by side so a path that ever
+        // makes them differ is readable off the line rather than inferred.
+        let finish_cuts = m
+            .finish_phases
+            .as_ref()
+            .map(|phases| finish_phase_micros(acquire_end, phases, present_return));
+
         // EVERY split below is interact-only, and that is a limit worth
         // stating rather than rediscovering. A frame the renderer did not call
         // interacted -- boot among them -- contributes to `service_idle`, to
@@ -1326,6 +1428,14 @@ impl FrameLedger {
         // tree.
         if interacted {
             self.service_interact.record(service);
+            // Beside `service` and never instead of it: the same frame, one
+            // cut lighter. See `service_less_present_micros` -- and note that
+            // the bar this instrument reports against is still the line
+            // above.
+            if let Some(cuts) = finish_cuts {
+                self.service_less_present_interact
+                    .record(service_less_present_micros(service, cuts[PRESENT_CUT]));
+            }
             let [pre, pump, ui, prepare, finish, post] = segments;
             self.segments.pre.record(pre);
             self.segments.pump.record(pump);
@@ -1456,6 +1566,10 @@ impl FrameLedger {
             }
         } else {
             self.service_idle.record(service);
+            if let Some(cuts) = finish_cuts {
+                self.service_less_present_idle
+                    .record(service_less_present_micros(service, cuts[PRESENT_CUT]));
+            }
         }
 
         // **Outside the `interacted` arm on purpose, and the only split that
@@ -1463,9 +1577,8 @@ impl FrameLedger {
         // [`FinishHists`] for the measurement that says so — so this family
         // records on every presented frame and carries its own parent
         // (`whole`) rather than borrowing `segments.finish`'s narrower one.
-        if let Some(phases) = m.finish_phases.as_ref() {
-            let [file, view, draw, resolve, submit, collect, free, present] =
-                finish_phase_micros(acquire_end, phases, present_return);
+        if let Some(cuts) = finish_cuts {
+            let [file, view, draw, resolve, submit, collect, free, present] = cuts;
             self.finish.file.record(file);
             self.finish.view.record(view);
             self.finish.draw.record(draw);
@@ -1515,6 +1628,18 @@ impl FrameLedger {
 
     pub(crate) fn service_idle(&self) -> &Hist {
         &self.service_idle
+    }
+
+    /// See [`service_less_present_micros`] — `service_interact`'s frames with
+    /// the `finish` split's eighth cut taken back out. Never added to
+    /// `service_interact` and never to `finish_phases().present`.
+    pub(crate) fn service_less_present_interact(&self) -> &Hist {
+        &self.service_less_present_interact
+    }
+
+    /// `service_idle`'s frames, the same cut lighter.
+    pub(crate) fn service_less_present_idle(&self) -> &Hist {
+        &self.service_less_present_idle
     }
 
     pub(crate) fn segments(&self) -> &SegmentHists {
@@ -1619,10 +1744,10 @@ impl FrameLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchCuts, FinishPhaseStamps, Instant, PostPhaseStamps, PrePhaseStamps, PumpPhaseStamps,
-        WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
+        DispatchCuts, FinishPhaseStamps, Instant, PRESENT_CUT, PostPhaseStamps, PrePhaseStamps,
+        PumpPhaseStamps, WorstFrame, dispatch_cut_micros, finish_phase_micros, latch_worst, micros,
         post_phase_micros, pre_phase_micros, prepare_phase_micros, pump_phase_micros,
-        service_micros, ui_phase_micros,
+        service_less_present_micros, service_micros, ui_phase_micros,
     };
     use squallar_egui::shell_api::UiPhaseStamps;
     use squallar_gpu::egui_renderer::pass_costs::PassPhaseStamps;
@@ -2173,6 +2298,372 @@ mod tests {
                  us, so they are not contiguous across it",
             );
         }
+    }
+
+    // ── `service less present`: the figure, its bound and its denominator ──
+
+    /// **[`PRESENT_CUT`] indexes the cut that brackets the
+    /// `SurfaceTexture::present` call**, and not the one beside it.
+    ///
+    /// The eight are in call order and the index is what
+    /// [`service_less_present_micros`]' subtrahend is read through, so an
+    /// index left stale by a reordering would subtract the wrong span while
+    /// every telescoping gate in this file stayed green — the sum is
+    /// unchanged by which cut you name. Held against the very pair of stamps
+    /// [`FinishPhaseStamps::freed`] and the ledger's `present_return`
+    /// document as the present, with a distinct value in every other slot so
+    /// an off-by-one cannot land on an equal number.
+    #[test]
+    fn the_present_cut_index_names_the_present_call() {
+        let acquire_end = Instant::now();
+        let phases = finish_phases_at(acquire_end, [10, 30, 60, 100, 150, 210, 280]);
+        let present_return = acquire_end + std::time::Duration::from_micros(400);
+        let cuts = finish_phase_micros(acquire_end, &phases, present_return);
+        assert_eq!(
+            cuts,
+            [10, 20, 30, 40, 50, 60, 70, 120],
+            "a finish cut moved: the eight no longer bracket the calls they \
+             are named for, and the index below names one of them",
+        );
+        assert_eq!(
+            cuts[PRESENT_CUT],
+            micros(phases.freed, present_return),
+            "PRESENT_CUT does not index the `freed -> present_return` span, \
+             so `service less present` subtracts a cut that is not the \
+             present: {cuts:?}",
+        );
+    }
+
+    /// **The figure is `service` minus the `finish` split's `present` cut, to
+    /// within the one microsecond a two-cut subtraction of truncating
+    /// [`micros`] results can gain.**
+    ///
+    /// The claim is stated against an INDEPENDENT spelling of the same
+    /// quantity — the same six segments with `finish` measured to `freed`
+    /// instead of to `present_return` — rather than against `service` minus
+    /// `present`, which the constructor makes true by construction and which
+    /// no defect in the choice of subtrahend could disturb.
+    ///
+    /// # Where the microsecond comes from, and why it is not a tolerance
+    ///
+    /// `finish` is one [`micros`] call; the pair (everything up to `freed`,
+    /// the present) is two. By [`micros`]' own rule a decomposition of `n`
+    /// cuts falls `0 ..= n - 1` µs short of its truncated parent, so with
+    /// `n = 2` the parent carries `0` or `1` µs the two cuts do not — and
+    /// that surplus stays behind in `service` when only the present is taken
+    /// out. **A third cut would raise the bound by exactly one**;
+    /// `assert_telescopes_within_truncation` derives it off the pair rather
+    /// than being handed a constant, and the residual is then asserted to be
+    /// that very gap, not merely inside it.
+    #[test]
+    fn the_service_less_present_figure_is_service_minus_the_present_cut() {
+        // The five segments that are not `finish`. Identical in both
+        // spellings, so nothing about them can absorb a truncation error.
+        let others = [150u32, 900, 2_400, 1_800, 850];
+
+        // A frame's `service less present`, its independent spelling and the
+        // telescoping gap between them, for one set of finish stamps.
+        let read = |acquire_end: Instant, phases: &FinishPhaseStamps, present_return: Instant| {
+            let finish = micros(acquire_end, present_return);
+            let up_to_present = micros(acquire_end, phases.freed);
+            let cuts = finish_phase_micros(acquire_end, phases, present_return);
+            let service = service_micros(
+                false,
+                0,
+                [
+                    others[0], others[1], others[2], others[3], finish, others[4],
+                ],
+                0,
+            );
+            let alt = others.iter().fold(up_to_present, |sum, &s| sum + s);
+            (
+                service,
+                service_less_present_micros(service, cuts[PRESENT_CUT]),
+                alt,
+                assert_telescopes_within_truncation(
+                    &[up_to_present, cuts[PRESENT_CUT]],
+                    finish,
+                    "finish into (up to the present) and (the present)",
+                ),
+            )
+        };
+
+        // ── Arm 1: whole-microsecond stamps, where the two spellings agree
+        // exactly ──
+        let acquire_end = Instant::now();
+        let phases = finish_phases_at(acquire_end, [1, 2, 3, 4, 5, 6, 6]);
+        let present_return = acquire_end + std::time::Duration::from_micros(10);
+        let (service, figure, alt, gap) = read(acquire_end, &phases, present_return);
+        assert_eq!(
+            gap, 0,
+            "seven stamps with nothing below a microsecond on them still lost \
+             time, so `finish` is not the two cuts this subtraction assumes",
+        );
+        assert_eq!(
+            figure, alt,
+            "on whole-microsecond stamps the figure must equal the same six \
+             spans with `finish` measured to `freed`; it read {figure} us \
+             against {alt} us",
+        );
+        assert_eq!(service - figure, 4, "the present of arm 1's fixture");
+
+        // ── Arm 2: half a microsecond of dust on each side of `freed`, which
+        // is the case that makes the bound above non-vacuous ──
+        //
+        // 6.5 µs up to `freed` and 3.5 µs of present truncate to 6 and 3
+        // against a parent of exactly 10, so the pair loses exactly the 1 µs
+        // two truncating cuts can lose and the figure sits exactly 1 µs above
+        // its independent spelling. Deterministic.
+        let dusty_end = Instant::now();
+        let ns = |n: u64| dusty_end + std::time::Duration::from_nanos(n);
+        let dusty = FinishPhaseStamps {
+            filed: ns(1_000),
+            viewed: ns(2_000),
+            drawn: ns(3_000),
+            resolved: ns(4_000),
+            submitted: ns(5_000),
+            collected: ns(6_000),
+            freed: ns(6_500),
+        };
+        let dusty_return = ns(10_000);
+        let (_, dusty_figure, dusty_alt, dusty_gap) = read(dusty_end, &dusty, dusty_return);
+        assert_eq!(
+            dusty_gap, 1,
+            "a 6.5 us head and a 3.5 us present did not lose the 1 us that \
+             truncating two cuts of a 10 us parent must lose, so this arm is \
+             not exercising the truncation it exists for",
+        );
+        assert_eq!(
+            dusty_figure - dusty_alt,
+            dusty_gap,
+            "the microsecond the pair lost to truncation did not stay in the \
+             figure, so the residual is not the one this gate's bound is \
+             derived from",
+        );
+
+        // ── Arm 3: instants a clock actually produced ──
+        //
+        // Seven bare `Instant::now()` reads in the order `present_frame`
+        // takes them. The bound is asserted and a non-zero gap deliberately
+        // is not — demanding truncation from a live clock would be asserting
+        // the clock, on `the_worst_frames_ui_cuts_telescope_to_its_ui`'s
+        // terms.
+        let mut samples = 0;
+        for _ in 0..256 {
+            let live_end = Instant::now();
+            let live = FinishPhaseStamps {
+                filed: Instant::now(),
+                viewed: Instant::now(),
+                drawn: Instant::now(),
+                resolved: Instant::now(),
+                submitted: Instant::now(),
+                collected: Instant::now(),
+                freed: Instant::now(),
+            };
+            let live_return = Instant::now();
+            let (_, live_figure, live_alt, live_gap) = read(live_end, &live, live_return);
+            assert_eq!(
+                live_figure - live_alt,
+                live_gap,
+                "on clock instants the figure is not its independent spelling \
+                 plus the pair's own truncation gap",
+            );
+            assert!(
+                live_gap <= 1,
+                "two truncating cuts of one parent cannot lose {live_gap} us",
+            );
+            samples += 1;
+        }
+        assert_eq!(
+            samples, 256,
+            "the real-clock arm did not take the samples it claims to have \
+             taken, so its greenness is an absence and not a reading",
+        );
+    }
+
+    /// **The figure is strictly below `service` whenever the present cost
+    /// anything, and equal to it only when the present cost nothing.**
+    ///
+    /// The direction is the whole point of the family: a figure that could
+    /// equal `service` on a frame the present ate would be `service` under a
+    /// second name, which is the confusion the line's sentence exists to
+    /// prevent. The equality arm is asserted too, because a figure that
+    /// invented a difference on a frame with no present would be reporting
+    /// its own arithmetic.
+    #[test]
+    fn the_figure_is_below_service_by_exactly_the_present_and_only_by_it() {
+        let service = 90_900u32;
+        for present in [1u32, 7, 1_000, 6_728, 87_800] {
+            let figure = service_less_present_micros(service, present);
+            assert!(
+                figure < service,
+                "a {present} us present left the figure at {figure} us \
+                 against a service of {service} us, so the two families would \
+                 report the same number on a frame the present ate",
+            );
+            assert_eq!(
+                service - figure,
+                present,
+                "the figure is below service by something other than the \
+                 present cut it is named for",
+            );
+        }
+        assert_eq!(
+            service_less_present_micros(service, 0),
+            service,
+            "a frame whose present did not reach a whole microsecond is the \
+             one frame on which the two figures agree, and this one invented \
+             a difference",
+        );
+    }
+
+    /// **The positive control: on a frame the present ate, the figure is the
+    /// work and `service` is the work plus the readback.**
+    ///
+    /// Every assertion above holds on a fixture where the present is dust,
+    /// which is what a real compositor hands back — so none of them shows the
+    /// figure doing the thing it exists for. This one states the case it was
+    /// built for: NVIDIA's Vulkan WSI with no present path copies the
+    /// swapchain image back at 21.8 ns/px, measured 87.8 ms at 2878x1651 on
+    /// 2026-09-06, and that lands inside `finish` and therefore inside
+    /// `service`. The figures are asserted against the fixture's own extent —
+    /// the segments it is built from — and not against any threshold.
+    #[test]
+    fn a_frame_the_present_ate_reads_the_work_while_service_reads_the_readback() {
+        // The measured readback at the campaign's own window size.
+        let present = 87_800u32;
+        // A healthy frame's six segments, `finish` carrying the readback.
+        let work = [150u32, 900, 2_400, 1_800, 700, 850];
+        let segments = [
+            work[0],
+            work[1],
+            work[2],
+            work[3],
+            work[4] + present,
+            work[5],
+        ];
+        let service = service_micros(false, 0, segments, 0);
+        let figure = service_less_present_micros(service, present);
+        let worked = work.iter().sum::<u32>();
+        assert_eq!(
+            service,
+            worked + present,
+            "the fixture's own service is not its work plus its readback",
+        );
+        assert_eq!(
+            figure, worked,
+            "the figure carried something other than the frame's work: it \
+             read {figure} us against the {worked} us the six segments spend \
+             outside the present",
+        );
+        assert!(
+            present > service - present,
+            "this fixture is not one the present ate, so it cannot be the \
+             positive control it claims to be",
+        );
+    }
+
+    /// A present larger than the service it sits inside cannot happen — it is
+    /// a cut of a segment of that very span — but the two are four clock
+    /// reads between them and a clock that steps backwards would underflow on
+    /// the frame thread. Zero is the honest report, on
+    /// `cuts_that_overrun_their_span_report_a_zero_residual`'s terms.
+    #[test]
+    fn a_present_larger_than_its_service_reports_zero_rather_than_underflowing() {
+        assert_eq!(service_less_present_micros(5, 9), 0);
+    }
+
+    /// Drive one presented frame through the ledger, with or without the
+    /// `finish` stamps `present_frame` takes after the acquire returns.
+    ///
+    /// Every `mark_*` reads the real clock, so the figures such a frame
+    /// produces are the machine's; what is asserted off this helper is
+    /// therefore only ever a SAMPLE COUNT, which is exactly the property the
+    /// two tests below are about.
+    fn present_one_frame(ledger: &mut super::FrameLedger, interacted: bool, with_finish: bool) {
+        ledger.mark_frame_start();
+        ledger.mark_setup_entry();
+        ledger.mark_ui_start();
+        ledger.mark_ui_end();
+        let acquire_start = Instant::now();
+        let acquire_end = Instant::now();
+        ledger.record_acquire(acquire_start, acquire_end);
+        if with_finish {
+            ledger.record_finish_phases(finish_phases_at(acquire_end, [0, 0, 0, 0, 0, 0, 0]));
+        }
+        ledger.mark_present_return();
+        ledger.finalize(interacted);
+    }
+
+    /// **`service` and `service less present` take the same frames.**
+    ///
+    /// The subtraction is only meaningful if the two figures come off one
+    /// frame each, on one denominator: a family recorded on a wider or
+    /// narrower set would be a difference between two aggregates that share
+    /// no frame, which is the defect the `finish` split's own doc spends a
+    /// paragraph on. Held on both families at once, with a different count in
+    /// each so a mis-wired `record` cannot pass by symmetry.
+    #[test]
+    fn the_two_service_families_take_the_same_frames() {
+        let mut ledger = super::FrameLedger::default();
+        for _ in 0..3 {
+            present_one_frame(&mut ledger, true, true);
+        }
+        present_one_frame(&mut ledger, false, true);
+        assert_eq!(
+            (
+                ledger.service_interact().total(),
+                ledger.service_less_present_interact().total(),
+            ),
+            (3, 3),
+            "the interact families disagree on how many frames they saw",
+        );
+        assert_eq!(
+            (
+                ledger.service_idle().total(),
+                ledger.service_less_present_idle().total(),
+            ),
+            (1, 1),
+            "the idle families disagree on how many frames they saw",
+        );
+    }
+
+    /// **A presented frame that left no `finish` stamps is an ABSENCE here,
+    /// never a zero.**
+    ///
+    /// Such a frame has no present to subtract, so filing its whole `service`
+    /// under a name that promises the present is out of it would be a false
+    /// reading — "this frame's present cost nothing" — on a frame that
+    /// presented. The app produces no such frame: the only arm of
+    /// `present_frame` that skips `record_finish_phases` also calls
+    /// `mark_skipped`, and `finalize` discards that frame outright. This gate
+    /// is what keeps the two `n` figures equal there BY the absence rather
+    /// than by luck, and what makes a divergence between them readable off
+    /// the pair of lines instead of silently filed as a zero present.
+    #[test]
+    fn a_presented_frame_with_no_finish_stamps_offers_no_service_less_present_sample() {
+        let mut ledger = super::FrameLedger::default();
+        present_one_frame(&mut ledger, true, false);
+        present_one_frame(&mut ledger, false, false);
+        assert_eq!(
+            (
+                ledger.service_interact().total(),
+                ledger.service_idle().total(),
+            ),
+            (1, 1),
+            "the frames this gate is about did not reach `service` at all, so \
+             it is not testing the case it names",
+        );
+        assert_eq!(
+            (
+                ledger.service_less_present_interact().total(),
+                ledger.service_less_present_idle().total(),
+            ),
+            (0, 0),
+            "a frame with no present to subtract was filed as one whose \
+             present cost nothing, which reports this instrument's own \
+             arithmetic as a measurement",
+        );
     }
 
     fn post_phases_at(present_return: Instant, offsets: [u64; 6]) -> PostPhaseStamps {
