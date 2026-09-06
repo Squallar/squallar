@@ -7,8 +7,11 @@ use walkers::{Tile, TileId};
 
 // ---------------------------------------------------------------------------
 /// Shared context for overlay drawing operations.
+///
+/// Holds no `&Ui`. The layer walk sets the `Ui`'s opacity around every arm,
+/// and a shared borrow kept across the whole loop would make that a borrow
+/// error, so the painter to draw with arrives per call instead.
 pub(super) struct OverlayDrawContext<'a> {
-    ui: &'a egui::Ui,
     projector: &'a walkers::Projector,
     screen_rect: egui::Rect,
     // Pre-computed click state (shared by discussion + alert drawing).
@@ -35,7 +38,7 @@ pub(super) fn is_pos_blocked(
 
 impl<'a> OverlayDrawContext<'a> {
     pub fn new(
-        ui: &'a egui::Ui,
+        ui: &egui::Ui,
         projector: &'a walkers::Projector,
         pointer_available: bool,
         pane_rect: egui::Rect,
@@ -50,7 +53,6 @@ impl<'a> OverlayDrawContext<'a> {
             .is_some_and(|p| is_pos_blocked(ui.ctx(), p, pane_rect, excluded_rects));
 
         Self {
-            ui,
             projector,
             screen_rect,
             overlay_click_pos,
@@ -67,17 +69,19 @@ impl<'a> OverlayDrawContext<'a> {
     /// a loop frame while the layer is animating, its live raster otherwise.
     /// Hit-testing below reads the same value, so what is clicked is always
     /// what was painted.
+    ///
+    /// `painter` is the walk's `ui.painter()`, carrying the layer's opacity.
     pub fn draw_overlay<'i>(
         &self,
+        painter: &egui::Painter,
         texture: Option<&OverlayTextureData>,
         labels: &[OverlayLabel],
         items: impl FnOnce() -> Vec<ClickableItem<'i>>,
     ) -> Vec<Arc<dyn OverlayItem>> {
         if let Some(tex) = texture {
-            draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
+            draw_overlay_texture(painter, self.projector, tex, self.screen_rect);
         }
 
-        let painter = self.ui.painter();
         // Once for the list: the turn this pane is looking at. A label is
         // written in the folded +/-180 frame and the pane's centre is not, so a
         // pane panned past the antimeridian projects every one of them a world

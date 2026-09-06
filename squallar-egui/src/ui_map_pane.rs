@@ -216,7 +216,9 @@ fn quantized_degrees(v: f64) -> i64 {
 /// [`overlay_cache_token`] (the ask — a data bump must repaint so the
 /// dispatch loop runs) **and** the identity of the picture it would put on
 /// the strip (the have — an arriving raster and a moving loop playhead must
-/// repaint even though the token already moved a frame ago).
+/// repaint even though the token already moved a frame ago). Each also
+/// contributes the opacity the walk paints it at, a painter tint the token
+/// deliberately never carries.
 ///
 /// The day `ui_map::pane_ground_heights` stops returning `None`,
 /// `GroundHeightField::id` joins these inputs with its own staleness fixture
@@ -267,6 +269,11 @@ pub(super) fn ground_content_key(input: &GroundKeyInputs<'_>, ground: GroundIsMe
             continue;
         }
         id.hash(h);
+        // The tint the walk paints it at. The strip is CPU-placed, so the
+        // painter dims it; this is what makes a slider drag repaint it.
+        resolved_layer_opacity(input.overlays, input.pane_idx, input.pane, id)
+            .to_bits()
+            .hash(h);
         overlay_cache_token(
             input.overlays,
             input.pane_idx,
@@ -562,6 +569,9 @@ pub(super) fn render_pane_map_content(
         let mut melting_layer_caveat: Option<MeltingLayerSource> = None;
 
         let draw_order: Vec<LayerId> = ctx.pane.draw_order_vec();
+        // Restored after every arm below; the notices painted after the loop
+        // run at it.
+        let base_opacity = ui.opacity();
         for id in &draw_order {
             if !ctx.pane.is_overlay_enabled(id) {
                 continue;
@@ -582,6 +592,17 @@ pub(super) fn render_pane_map_content(
             if ctx.double_shades(id) {
                 continue;
             }
+            // **The layer's opacity, and it is paint-time only** -- never in
+            // `overlay_cache_token`, so a slider drag re-rasters nothing. It
+            // reaches every shape the arm adds through `ui.painter()` (a
+            // `with_clip_rect` clone keeps the factor), and the vector-tile
+            // callback, the one shape a painter cannot tint, reads it through
+            // `GroundMeshes::opacity`. At 0.0 egui emits `Noop` and the arm
+            // still runs its hit-testing, so a fully transparent layer keeps
+            // hover and click: GIMP semantics.
+            ui.set_opacity(
+                base_opacity * resolved_layer_opacity(ctx.overlays, ctx.pane_idx, ctx.pane, id),
+            );
             // Every arm below paints through `ui.painter()` — the pane's own
             // paint list — so submission order IS `draw_order`.
             #[cfg(test)]
@@ -755,6 +776,7 @@ pub(super) fn render_pane_map_content(
                         // unlabelled. A frame with no picture yet paints
                         // nothing; see `overlay_texture_on_screen`.
                         selected.extend(overlay_ctx.draw_overlay(
+                            ui.painter(),
                             ctx.pane.overlay_texture_on_screen(id),
                             overlays.map_labels(id),
                             || overlays.clickable_items(id, &ctx.pane.layer_ref(ctx.pane_idx, id)),
@@ -780,6 +802,7 @@ pub(super) fn render_pane_map_content(
                     }
                 }
             }
+            ui.set_opacity(base_opacity);
             #[cfg(test)]
             ctx.paint_order.push((id.clone(), painted_layer));
         }
@@ -2995,6 +3018,10 @@ fn render_per_frame_overlay(
             }
         };
         if let Some(mesh) = mesh {
+            // Known per-frame cost: while this layer sits below 1.0 the
+            // painter tints the shape, and `Arc::make_mut` clones the cached
+            // mesh to do it, every frame. Bounded by the layer's own text;
+            // not fixed here.
             painter.add(egui::Shape::Mesh(mesh));
         }
     }
@@ -4070,3 +4097,7 @@ mod as_of_token_tests;
 #[path = "ui_map_pane/floor_strip_shading_tests.rs"]
 #[cfg(test)]
 mod floor_strip_shading_tests;
+
+#[path = "ui_map_pane/layer_opacity_walk_tests.rs"]
+#[cfg(test)]
+mod layer_opacity_walk_tests;

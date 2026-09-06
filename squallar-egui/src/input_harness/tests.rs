@@ -12743,7 +12743,7 @@ fn ring_about(lat: f64, lon: f64, half_deg: f64) -> Vec<(f64, f64)> {
 /// One NWS alert covering a square about (`lat`, `lon`), shaped like the
 /// zone-resolved alerts `nws::zones` builds: geometry in `features`, one feature
 /// per affected area.
-fn alert_over(
+pub(super) fn alert_over(
     id: &str,
     event: &str,
     lat: f64,
@@ -12816,7 +12816,10 @@ fn zone_alert_over(
 
 /// Feed `alerts` in through the production ingest path, exactly as the national
 /// fetch delivers them.
-fn ingest_alerts(h: &mut InputHarness, alerts: Vec<squallar_overlays::nws::alert::NwsAlert>) {
+pub(super) fn ingest_alerts(
+    h: &mut InputHarness,
+    alerts: Vec<squallar_overlays::nws::alert::NwsAlert>,
+) {
     use squallar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
     h.gui_mut().overlays.apply_fetch_result(
         OverlayFetchResult {
@@ -12962,7 +12965,7 @@ fn requested_cache_token(h: &InputHarness, kind: &LayerId) -> u64 {
 }
 
 /// How many rasterizes the last frame asked for, for `kind`.
-fn rasterizes_requested(h: &InputHarness, kind: &LayerId) -> usize {
+pub(super) fn rasterizes_requested(h: &InputHarness, kind: &LayerId) -> usize {
     h.last_actions()
         .iter()
         .filter(
@@ -16044,7 +16047,7 @@ fn alert_windowed(
 /// which no harness frame runs. Without it the destination stays marked and
 /// `RendersInFlight::admits` refuses every later dispatch, which would make any
 /// count below pass for the wrong reason.
-fn land_requested_rasters(h: &mut InputHarness, kind: &LayerId) {
+pub(super) fn land_requested_rasters(h: &mut InputHarness, kind: &LayerId) {
     let requests: Vec<_> = h
         .last_actions()
         .iter()

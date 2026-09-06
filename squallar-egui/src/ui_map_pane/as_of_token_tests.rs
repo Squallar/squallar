@@ -67,6 +67,50 @@ fn a_live_panes_cache_token_is_untouched_by_the_as_of_term() {
     }
 }
 
+/// **A layer's opacity is not in the token.** It is a painter tint: the walk
+/// multiplies the layer's shapes by it at paint time, and a token that
+/// carried it would re-raster the layer on every notch of a slider drag.
+/// Every registered layer, so a handler that starts folding the value into
+/// its content signature is caught here.
+#[test]
+fn a_layers_opacity_moves_no_cache_token() {
+    let mut gui = Gui::new();
+    let ids: Vec<LayerId> = gui.overlays.handlers().map(|h| h.id()).collect();
+    assert!(
+        !ids.is_empty(),
+        "non-triviality floor: there is no registered layer for this to be a \
+         statement about",
+    );
+    // A fresh `Gui` holds a slot only for the layers that ship in the stack;
+    // the rest join when the user adds them. Add them here, and read the
+    // tokens only once every slot exists, so the slot's own arrival is not
+    // mistaken for the opacity's doing.
+    for id in &ids {
+        gui.add_layer_on_pane_for_test(0, id);
+    }
+    let before: Vec<u64> = ids.iter().map(|id| token(&gui, id)).collect();
+
+    for id in &ids {
+        gui.panes[0].set_layer_opacity(id, 0.37);
+        assert_eq!(
+            gui.panes[0].layer_opacity(id),
+            Some(0.37),
+            "fixture: pane 0 holds no slot for {}, so nothing changed for the \
+             token to see",
+            id.as_str(),
+        );
+    }
+    for (id, was) in ids.iter().zip(before) {
+        assert_eq!(
+            token(&gui, id),
+            was,
+            "{}'s cache token moved with its opacity: a slider drag now \
+             re-rasters this layer",
+            id.as_str(),
+        );
+    }
+}
+
 /// Scrubbing moves the token of an as-of-dependent layer and **only** of an
 /// as-of-dependent layer: a `Live` layer draws what it last fetched and a
 /// `FrameSeries` layer's picture is one named frame, so neither re-rasterizes

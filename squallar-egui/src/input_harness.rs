@@ -182,7 +182,7 @@ impl Default for FrameFactsForTest {
 
 /// A textured quad the last frame painted: where it went, and **which way up**
 /// its texture was mapped onto it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PaintedImage {
     /// The screen rect the quad covers.
     pub rect: egui::Rect,
@@ -197,11 +197,21 @@ pub(crate) struct PaintedImage {
     /// test that reads only [`rect`](Self::rect) cannot tell a moving playhead
     /// from a stuck one.
     pub texture: egui::TextureId,
+    /// **The tint the quad was painted with**: `Color32::WHITE` for an image
+    /// at full strength, `WHITE.gamma_multiply(o)` under a layer the walk
+    /// painted at opacity `o`. Read off the first vertex, and every corner
+    /// must agree: four vertices whose colours differ are a gradient, not a
+    /// textured quad.
+    pub tint: egui::Color32,
 }
 
 /// Read a textured quad's geometry back off the mesh `Painter::image` built.
 fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
     if mesh.vertices.len() != 4 {
+        return None;
+    }
+    let tint = mesh.vertices[0].color;
+    if mesh.vertices.iter().any(|vertex| vertex.color != tint) {
         return None;
     }
     let mut rect = egui::Rect::NOTHING;
@@ -226,6 +236,7 @@ fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
         uv_at_top_left: uv_at(rect.min)?,
         uv_at_bottom_right: uv_at(rect.max)?,
         texture: mesh.texture_id,
+        tint,
     })
 }
 
@@ -2532,3 +2543,9 @@ mod loop_span_floor_tests;
 /// radar arm and the section pane's `looping`, read off the painted glass.
 #[cfg(test)]
 mod radar_draw_addressing_tests;
+
+/// **Per-layer opacity is a paint-time tint**: the half-opacity quad and the
+/// sibling drawn after it at full strength, the no-op arm, and the raster an
+/// opacity change never asks for.
+#[cfg(test)]
+mod layer_opacity_tests;

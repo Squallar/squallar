@@ -243,6 +243,70 @@ fn an_overlay_token_move_repaints_exactly_once() {
     });
 }
 
+/// **A ground layer's opacity is in the content key.** The strip is
+/// CPU-placed, so the painter dims it at paint time; what makes a slider drag
+/// reach the 3D floor at all is the key moving. One change, one key move,
+/// one repaint -- and the quiet frames after it move neither.
+#[test]
+fn a_ground_layers_opacity_change_repaints_exactly_once() {
+    let mut h = resolved_floor_harness();
+    assert!(
+        h.gui().panes()[1].is_overlay_enabled(&known::RADAR),
+        "fixture: radar is off on the 3D pane, so its opacity is not a key \
+         input and nothing below is about the key",
+    );
+    let (moves_before, _, _) = h.gui().strip_key_probe_for_test();
+    assert_one_repaint(&mut h, "ground opacity", |h| {
+        h.gui_mut().panes_mut()[1].set_layer_opacity(&known::RADAR, 0.5);
+        assert_eq!(
+            h.gui().panes()[1].layer_opacity(&known::RADAR),
+            Some(0.5),
+            "fixture: the value did not land on the 3D pane",
+        );
+    });
+    let (moves, _, _) = h.gui().strip_key_probe_for_test();
+    assert_eq!(
+        moves - moves_before,
+        1,
+        "one opacity change moved the content key {} times across the frames \
+         since: the change is one move, and the settled frames after it must \
+         move nothing",
+        moves - moves_before,
+    );
+}
+
+/// The other arm: the strip paints ground only, so a glass layer's opacity is
+/// none of its business. The colour scale is `Surface::Glass`, and its slider
+/// moves neither the key nor the paint count.
+#[test]
+fn a_glass_layers_opacity_change_leaves_the_strip_alone() {
+    let mut h = resolved_floor_harness();
+    h.set_overlay_on_pane(1, &known::COLOR_SCALE, true);
+    h.frames_for(4, FRAME_DT);
+    assert_settles_clean(&mut h, "glass opacity");
+    assert!(
+        h.gui().panes()[1].is_overlay_enabled(&known::COLOR_SCALE),
+        "fixture: the colour scale is off on the 3D pane"
+    );
+
+    let (moves_before, _, _) = h.gui().strip_key_probe_for_test();
+    let before = paints(&h);
+    h.gui_mut().panes_mut()[1].set_layer_opacity(&known::COLOR_SCALE, 0.5);
+    assert_eq!(
+        h.gui().panes()[1].layer_opacity(&known::COLOR_SCALE),
+        Some(0.5),
+        "fixture: the value did not land on the 3D pane",
+    );
+    h.frames_for(4, FRAME_DT);
+    let (moves, _, _) = h.gui().strip_key_probe_for_test();
+    assert_eq!(
+        (paints(&h) - before, moves - moves_before),
+        (0, 0),
+        "a glass layer's opacity repainted the floor strip (paints, key moves): \
+         the key is hashing a layer the strip never draws",
+    );
+}
+
 /// Overlay data bump, the picture half: a raster landing in a layer's cache
 /// is a new texture identity, and the strip must repaint to show it — the
 /// token moved a frame earlier, but the token alone cannot see the arrival.
