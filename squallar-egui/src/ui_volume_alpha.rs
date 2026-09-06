@@ -138,21 +138,24 @@ fn editor_contents(
     let palette = target.and_then(|t| painter.and_then(|p| p.palette(pane_idx, t)));
     let palette_curve = palette.as_deref().and_then(AlphaCurve::from_palette);
 
-    let shown = curves.get(&facts.id).or_else(|| palette_curve.clone());
-    let Some(shown) = shown else {
+    // No table, no editor: the curve is drawn over the palette strip, and
+    // the strip is the grid's own. What is shown once there is one is the
+    // curve the volume renders through — the user's, or the straight line.
+    if palette_curve.is_none() {
         ui.label(absent_curve_message(facts));
         return;
-    };
+    }
+    let shown = curves.effective(&facts.id);
 
     ui.horizontal(|ui| {
         if ui
             .add_enabled(curves.is_edited(&facts.id), egui::Button::new(RESET_LABEL))
             .on_hover_text(
-                "Forget the drawn curve and render through this product's default volume \
-                 opacity again - the plan-view palette's alpha shaped by the product's \
-                 own 3D transparency profile. That is not the plan view's opacity: a value \
-                 the map paints solid can be see-through here, which is what makes a storm's \
-                 interior visible.",
+                "Forget the drawn curve and render through the default volume opacity \
+                 again - a straight line from transparent at the bottom of the scale to \
+                 solid at the top. That is not the plan view's opacity: a value the map \
+                 paints solid is see-through here unless it is near the top, which is \
+                 what makes a storm's interior visible.",
             )
             .clicked()
         {
@@ -177,15 +180,15 @@ fn editor_contents(
         egui::vec2(response.rect.width(), STRIP_HEIGHT),
     );
 
+    // The grid's own 3D profile as a grey reference, always: it is not the
+    // default any more, so it is worth seeing under the straight line too.
     paint_editor(
         &canvas,
         curve_rect,
         strip_rect,
         &shown,
         palette.as_deref(),
-        palette_curve
-            .as_ref()
-            .filter(|_| curves.is_edited(&facts.id)),
+        palette_curve.as_ref(),
     );
 
     let anchor_id = response.id.with("stroke_anchor");
@@ -245,7 +248,7 @@ fn curve_point(curve_rect: egui::Rect, pos: egui::Pos2) -> (f32, f32) {
 }
 
 /// Draw the dark canvas, the palette strip, the grid table's own alpha as a
-/// reference line while an edit diverges from it, and the shown curve.
+/// grey reference line, and the shown curve over it.
 fn paint_editor(
     canvas: &egui::Painter,
     curve_rect: egui::Rect,

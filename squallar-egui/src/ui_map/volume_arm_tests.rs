@@ -277,16 +277,17 @@ fn a_pane_taken_off_live_names_the_volume_it_is_showing() {
     );
 }
 
-/// **The Volume Alpha curve rides the frame, and only when one exists.**
+/// **The Volume Alpha curve rides the frame: the user's when one is stored,
+/// the straight-line default otherwise.**
 #[test]
-fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
+fn the_alpha_curve_rides_the_frame_and_the_default_is_the_straight_line() {
     use crate::volume_alpha::{AlphaCurve, CURVE_LEN};
 
     let (mut h, painter) = volume_harness(StubVolumePainter::painting());
     assert_eq!(
         last_seen(&painter).alpha,
-        None,
-        "an untouched editor must hand the painter no curve at all",
+        Some(AlphaCurve::linear()),
+        "an untouched editor must hand the painter the straight-line default",
     );
 
     let mut alphas = [0u8; CURVE_LEN];
@@ -305,8 +306,8 @@ fn the_alpha_curve_rides_the_frame_only_when_one_is_stored() {
     h.frames_for(1, FRAME_DT);
     assert_eq!(
         last_seen(&painter).alpha,
-        None,
-        "a reset must restore the bit-exact no-curve state, not a copy of the default",
+        Some(AlphaCurve::linear()),
+        "a reset must go back to the straight-line default, not to the palette's alpha",
     );
 }
 

@@ -2,7 +2,7 @@
 //! the palette, GR2Analyst-style.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use squallar_source::product::FieldId;
 
@@ -30,9 +30,11 @@ impl AlphaCurve {
         Self(Arc::new(alphas))
     }
 
-    /// A grid table's alpha channel as a curve — what an untouched editor
-    /// shows, and what a first stroke starts from. `None` unless `lut` is the
-    /// exact 1024 bytes a `VolumeGrid::lut()` hands over.
+    /// A grid table's alpha channel as a curve — the reference line the
+    /// editor draws under an edit, so the product's own 3D profile stays in
+    /// view. Not the default: an untouched product renders through
+    /// [`Self::linear`]. `None` unless `lut` is the exact 1024 bytes a
+    /// `VolumeGrid::lut()` hands over.
     pub fn from_palette(lut: &[u8]) -> Option<Self> {
         if lut.len() != CURVE_LEN * 4 {
             return None;
@@ -64,6 +66,28 @@ impl AlphaCurve {
             Some(n) => n.saturating_sub(1) as u8,
             None => u8::MAX,
         }
+    }
+
+    /// The default curve: a straight line from transparent at the bottom of
+    /// the value axis to opaque at its top — GR2Analyst's untouched Volume
+    /// Alpha, and what an untouched product here renders through and its
+    /// editor shows. Entry `i` is alpha `i`, so entry 0 is the no-data clamp
+    /// for free and entry 255 is solid.
+    ///
+    /// One shared table rather than a fresh one per call:
+    /// [`AlphaCurves::effective`] hands it out on every frame of every
+    /// untouched product, and the bridge dedups the LUT it uploads by `Arc`
+    /// identity before content, so a fresh allocation per frame would read
+    /// as a fresh curve per frame.
+    pub fn linear() -> Self {
+        static LINEAR: LazyLock<AlphaCurve> = LazyLock::new(|| {
+            let mut alphas = [0u8; CURVE_LEN];
+            for (i, alpha) in alphas.iter_mut().enumerate() {
+                *alpha = i as u8;
+            }
+            AlphaCurve::from_alphas(alphas)
+        });
+        LINEAR.clone()
     }
 }
 
@@ -132,6 +156,16 @@ impl AlphaCurves {
         self.curves.remove(field);
     }
 
+    /// The curve `field` renders through: the user's, or [`AlphaCurve::linear`]
+    /// for a product nobody has drawn on. **The one place the default is
+    /// chosen** — the volume painter and the editor both read it, so the
+    /// curve drawn over the palette is the curve the volume is marched
+    /// through. Never stored: [`Self::is_edited`] and the save stay about what
+    /// the user drew.
+    pub fn effective(&self, field: &FieldId) -> AlphaCurve {
+        self.get(field).unwrap_or_else(AlphaCurve::linear)
+    }
+
     /// Whether `field` has a user curve at all.
     pub fn is_edited(&self, field: &FieldId) -> bool {
         self.curves.contains_key(field)
@@ -161,11 +195,41 @@ mod tests {
         lut
     }
 
-    /// The seeded default is the grid table's own alpha, entry for entry —
+    /// The default is a straight line, entry for entry, and it is not an edit.
+    #[test]
+    fn the_default_curve_is_a_straight_line_and_not_an_edit() {
+        let linear = AlphaCurve::linear();
+        for (i, alpha) in linear.alphas().iter().enumerate() {
+            assert_eq!(usize::from(*alpha), i, "entry {i} of the default curve");
+        }
+        assert_eq!(
+            linear.fade_band(),
+            0,
+            "a straight line keeps nothing but the no-data entry transparent",
+        );
+        let curves = AlphaCurves::default();
+        let field = FieldId::new("Reflectivity");
+        assert_eq!(
+            curves.effective(&field),
+            linear,
+            "an untouched product must render through the straight line",
+        );
+        assert!(
+            !curves.is_edited(&field),
+            "reading the default must not count as drawing a curve",
+        );
+        assert_eq!(
+            curves.entries().count(),
+            0,
+            "the default must never reach the save",
+        );
+    }
+
+    /// The palette reference is the grid table's own alpha, entry for entry —
     /// which is what makes "open the editor and touch nothing" a no-op by
     /// construction rather than by luck.
     #[test]
-    fn the_default_curve_is_the_grid_tables_own_alpha() {
+    fn the_palette_reference_is_the_grid_tables_own_alpha() {
         let lut = reflectivity_shaped_lut();
         let curve = AlphaCurve::from_palette(&lut).expect("a 1024-byte palette seeds");
         for (i, (alpha, entry)) in curve.alphas().iter().zip(lut.chunks_exact(4)).enumerate() {

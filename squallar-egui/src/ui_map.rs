@@ -2566,7 +2566,9 @@ fn volume_pane_outcome(
         // product -> id bridge and E9e re-typed the selection to an id, which
         // left a FieldId -> spec -> FieldId round trip whose only effect was
         // to substitute the default field's key for an unregistered one.
-        alpha: alpha_curves.get(&product),
+        // The user's curve, or the straight-line default — the same answer
+        // the editor draws, so what is shown is what is marched.
+        alpha: Some(alpha_curves.effective(&product)),
         view_mode,
         light,
         iso_threshold: iso_thresholds.get(&product),
