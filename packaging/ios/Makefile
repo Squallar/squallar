@@ -14,6 +14,93 @@
 # The app is a thin UIKit shell (packaging/ios/Sources/main.m) linking the Rust staticlib
 # and calling `squallar_ios_main`. Bundle metadata is read out of packaging/ios/project.yml
 # so Xcode and this Makefile cannot disagree about it.
+#
+# ── Signing for the App Store, and why this is not the usual answer ─────
+#
+# With `IOS_SIGNING_P12` and `IOS_PROVISIONING_PROFILE` set, this Makefile also
+# signs the bundle for App Store distribution and names the archive
+# `squallar.ipa`. Without them it names it `squallar-UNSIGNED.ipa` and says so.
+# One name means uploadable; every other outcome means not.
+#
+# The upload itself is .github/scripts/appstore-upload.py, and it runs on Linux
+# because App Store Connect API 4.1 made that possible: the `buildUploads` and
+# `buildUploadFiles` resources are a REST flow -- reserve, PUT, commit, poll --
+# with an ES256 bearer token. The tools people reach for first cannot help
+# here. `xcrun altool` and `notarytool` are inside Xcode and macOS-only, and
+# Apple's Transporter, which does have a Red Hat build, refuses on Linux with
+# "Unable to perform software analysis on Linux. Export an AppStoreInfo.plist
+# from Xcode, and use the -assetDescription option". The REST path needs none
+# of it.
+#
+# ── The three signing secrets ───────────────────────────────────────────
+#
+#   IOS_SIGNING_P12            base64 of a .p12 holding the Apple Distribution
+#                              certificate and its private key
+#   IOS_SIGNING_P12_PASSWORD   its password
+#   IOS_PROVISIONING_PROFILE   base64 of the App Store .mobileprovision
+#
+# and three more, read only by the upload script and only on a push to main:
+#
+#   APPSTORE_ISSUER_ID         App Store Connect issuer ID (a UUID)
+#   APPSTORE_KEY_ID            API key ID (10 alphanumeric characters)
+#   APPSTORE_KEY_P8            the AuthKey_<KEY_ID>.p8 Apple hands out ONCE --
+#                              either `base64 -w0` of it, or the PEM text
+#
+# All of the first three, or none. Locally, `P12_FILE=`, `P12_PASSWORD=` and
+# `PROFILE_FILE=` take paths instead.
+#
+# ── What a person has to do once the Apple Developer account is approved ─
+#
+#   1. Make a signing request. Apple never sees the private key:
+#
+#        rcodesign generate-certificate-signing-request \
+#            --csr-pem-file squallar-ios.csr \
+#            --pem-file squallar-ios-key.pem
+#
+#   2. developer.apple.com -> Certificates, IDs & Profiles -> Certificates ->
+#      "+" -> **Apple Distribution**. NOT "Apple Development", which signs
+#      builds for machines on the team, and NOT the "Developer ID Application"
+#      certificate that already exists for the macOS lane -- that one is for
+#      software handed out directly and the App Store will not take it. Upload
+#      the CSR, download the .cer, and combine it with the key into one .p12:
+#
+#        base64 -w0 squallar-ios.p12    -> IOS_SIGNING_P12
+#                                       -> IOS_SIGNING_P12_PASSWORD
+#
+#   3. Same page -> Identifiers -> "+" -> App IDs -> App, with the bundle ID
+#      `app.squallar` (it must match PRODUCT_BUNDLE_IDENTIFIER in
+#      packaging/ios/project.yml, which is what the build stamps into the
+#      bundle and what the uploader looks the app up by).
+#
+#   4. Same page -> Profiles -> "+" -> Distribution -> **App Store Connect**.
+#      Pick the App ID from step 3 and the certificate from step 2, download
+#      the .mobileprovision:
+#
+#        base64 -w0 squallar.mobileprovision -> IOS_PROVISIONING_PROFILE
+#
+#      An App Store profile provisions no devices. If the file you downloaded
+#      lists `ProvisionedDevices` it is a Development or Ad Hoc profile, and
+#      this Makefile will refuse it by name rather than let Apple reject the
+#      upload twenty minutes later.
+#
+#   5. appstoreconnect.apple.com -> Apps -> "+" -> New App, bundle ID
+#      `app.squallar`. The upload API attaches a build to an app record that
+#      already exists; it does not create one.
+#
+#   6. appstoreconnect.apple.com -> Users and Access -> Integrations ->
+#      App Store Connect API -> Team Keys -> "+", role **App Manager** (the
+#      role notarization uses, Developer, cannot upload builds). Copy the
+#      issuer ID and key ID, download the .p8 -- Apple offers it exactly once --
+#      and set the three APPSTORE_* secrets.
+#
+#   7. Bump `CURRENT_PROJECT_VERSION` in packaging/ios/project.yml for every
+#      upload. App Store Connect rejects a build whose CFBundleVersion it has
+#      already seen for that CFBundleShortVersionString.
+#
+# Until all of that exists the build still runs: it assembles, it says in the
+# log that it is not signing and why, and it uploads an artifact NAMED
+# `ios-aarch64-UNSIGNED`. A fork pull request, which never gets secrets, takes
+# exactly that path. Nothing here fails for want of a paid account.
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 .ONESHELL:
@@ -40,8 +127,8 @@ CARGO_VOL ?= squallar-xcross-cargo
 # `minos` to decide whether the binary will run, and nothing on the device
 # looks at `sdk`. App Store Connect does. Apple enforces a recent-SDK floor on
 # upload and reads exactly this field, so a build carrying `sdk 14.0` is the
-# "built with an outdated SDK" rejection -- and until this pipeline could
-# upload, it had no consumer that could tell.
+# "built with an outdated SDK" rejection -- before TestFlight, this pipeline
+# had no consumer that could tell.
 #
 # The fix is one linker flag, and the number has a source: SDKSettings.json in
 # the SDK the link just used carries `Version` (26.4) beside the
@@ -62,10 +149,29 @@ OBJDUMP ?= /opt/llvm-mingw/bin/llvm-objdump
 # Separate from target/, which holds host artifacts: one directory shared by two
 # toolchains with two file ownerships is how a stale-lock stall starts.
 TARGET_DIR ?= target-ios
+# `rcodesign sign`. Not in the rust-cross image; CI installs it (see
+# .github/workflows/build.yaml) and a developer gets it with
+# `cargo install apple-codesign` or from
+# https://github.com/indygreg/apple-platform-rs/releases.
+RCODESIGN ?= rcodesign
+# Local overrides for the two signing inputs CI passes as base64 secrets. A
+# path is what a person has on their own disk; base64 is what fits in a GitHub
+# secret. Both spellings reach the same code.
+P12_FILE ?=
+P12_PASSWORD ?=
+PROFILE_FILE ?=
 
 .PHONY: build clean
 build:
 	@cd "$(ROOT)"
+	# One scratch directory, one trap. Everything secret this recipe writes to
+	# disk -- the decoded .p12, its password, the provisioning profile -- goes
+	# here and is removed on exit, success or failure. A second `trap ... EXIT`
+	# later in the recipe would silently replace this one, so there is exactly
+	# one.
+	SCRATCH="$$(mktemp -d)"
+	trap 'rm -rf "$$SCRATCH"' EXIT
+	chmod 700 "$$SCRATCH"
 	SDK=iphoneos; RUST_TARGET=aarch64-apple-ios; IOS_CC=arm64-apple-ios-clang
 	# CFBundleSupportedPlatforms is capitalised where PLATFORM_NAME is not, and
 	# a bundle claiming the wrong one is what "not compatible" means to simctl.
@@ -211,6 +317,159 @@ build:
 	# iPads are exempt.
 	grep -A1 '<key>CADisableMinimumFrameDurationOnPhone</key>' "$$APP/Info.plist" | grep -q '<true/>' \
 	    || { echo "ERROR: CADisableMinimumFrameDurationOnPhone is not true in the bundled Info.plist"; exit 1; }
+	# ---- sign for App Store distribution ----
+	# An .ipa App Store Connect will accept needs three things this stage adds:
+	# a signature from an Apple Distribution certificate, the App Store
+	# provisioning profile as `embedded.mobileprovision` inside the bundle, and
+	# entitlements whose `application-identifier` matches both. Nothing here is
+	# Apple software -- `rcodesign` is a Rust program and the profile is parsed
+	# with openssl and sed.
+	#
+	# The entitlements are DERIVED FROM THE PROFILE rather than written down
+	# here. A hand-written team id that disagrees with the profile is the most
+	# common way this fails, and it fails on Apple's side, minutes after the
+	# upload, with a message about a mismatched application-identifier. Reading
+	# both values out of the one file that is also embedded in the bundle
+	# removes the disagreement rather than checking for it.
+	#
+	# The simulator arm is skipped: the simulator does not check signatures and
+	# there is no such thing as an App Store build for it.
+	SIGNING=unsigned
+	IPA_NAME=squallar-UNSIGNED.ipa
+	if [ "$$SDK" != iphonesimulator ]; then
+	  PROFILE=""
+	  if [ -n "$(PROFILE_FILE)" ]; then
+	    PROFILE="$(PROFILE_FILE)"
+	  elif [ -n "$${IOS_PROVISIONING_PROFILE:-}" ]; then
+	    PROFILE="$$SCRATCH/embedded.mobileprovision"
+	    printf '%s' "$${IOS_PROVISIONING_PROFILE}" | base64 -d > "$$PROFILE"
+	  fi
+	  P12=""
+	  if [ -n "$(P12_FILE)" ]; then
+	    P12="$(P12_FILE)"
+	  elif [ -n "$${IOS_SIGNING_P12:-}" ]; then
+	    P12="$$SCRATCH/signing.p12"
+	    printf '%s' "$${IOS_SIGNING_P12}" | base64 -d > "$$P12"
+	  fi
+
+	  if ! command -v $(RCODESIGN) >/dev/null 2>&1; then
+	    SIGNING=no-signer
+	  elif [ -z "$$PROFILE" ] || [ -z "$$P12" ]; then
+	    SIGNING=no-credentials
+	  else
+	    echo "==> signing for App Store distribution"
+	    # A .mobileprovision is a CMS envelope around a plain XML plist. The
+	    # signature is Apple's and there is nothing here that could check it,
+	    # so `-noverify` unwraps rather than validates; the fallback reads the
+	    # plist straight out of the file, which is what makes a synthetic
+	    # profile usable by the rehearsal gate in CI.
+	    PPLIST="$$SCRATCH/profile.plist"
+	    if openssl smime -inform DER -verify -noverify -in "$$PROFILE" -out "$$PPLIST" 2>/dev/null; then
+	      echo "    profile: unwrapped from its CMS envelope"
+	    else
+	      LC_ALL=C sed -n '/<?xml/,/<\/plist>/p' "$$PROFILE" > "$$PPLIST"
+	      echo "    profile: not a CMS envelope; read the plist directly"
+	    fi
+	    [ -s "$$PPLIST" ] || { echo "ERROR: no plist could be read out of the provisioning profile."; exit 1; }
+	    pval() { sed -n "/<key>$$1<\/key>/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}" "$$PPLIST" | head -1; }
+	    APPID="$$(pval application-identifier)"
+	    TEAMID="$$(pval com.apple.developer.team-identifier)"
+	    [ -n "$$APPID" ]  || { echo "ERROR: the profile declares no application-identifier entitlement."; exit 1; }
+	    [ -n "$$TEAMID" ] || { echo "ERROR: the profile declares no com.apple.developer.team-identifier entitlement."; exit 1; }
+
+	    # An App Store profile provisions no specific devices. A Development or
+	    # Ad Hoc one lists them, and is the profile a person reaches for by
+	    # habit -- it produces a build that installs on their own phone and is
+	    # rejected on upload, which is a slow way to find out.
+	    if grep -q '<key>ProvisionedDevices</key>' "$$PPLIST"; then
+	      echo "ERROR: this provisioning profile lists ProvisionedDevices, so it is a"
+	      echo "       Development or Ad Hoc profile, not an App Store one. App Store"
+	      echo "       Connect rejects a build signed with it. Create an App Store"
+	      echo "       distribution profile; see the note at the top of this file."
+	      exit 1
+	    fi
+
+	    # A wildcard profile (TEAMID.*) is legal and covers this bundle id; the
+	    # entitlement written into the binary must still name the app exactly.
+	    case "$$APPID" in
+	      *.\*) ENT_APPID="$${APPID%.*}.$$BUNDLE_ID" ;;
+	      *)    ENT_APPID="$$APPID" ;;
+	    esac
+	    if [ "$$ENT_APPID" != "$$TEAMID.$$BUNDLE_ID" ]; then
+	      echo "ERROR: the profile is for $$ENT_APPID but this bundle is $$BUNDLE_ID"
+	      echo "       under team $$TEAMID. The signature would claim an identity the"
+	      echo "       profile does not grant, and Apple would refuse the upload."
+	      exit 1
+	    fi
+
+	    cp "$$PROFILE" "$$APP/embedded.mobileprovision"
+
+	    # get-task-allow FALSE is the one entitlement that is not a preference.
+	    # True means the process is debuggable; App Store Connect rejects any
+	    # build carrying it, and it is the default a development profile
+	    # supplies, so it is written explicitly rather than left out.
+	    ENT="$$SCRATCH/entitlements.plist"
+	    {
+	      echo '<?xml version="1.0" encoding="UTF-8"?>'
+	      echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+	      echo '<plist version="1.0">'
+	      echo '<dict>'
+	      echo "	<key>application-identifier</key>"
+	      echo "	<string>$$ENT_APPID</string>"
+	      echo "	<key>com.apple.developer.team-identifier</key>"
+	      echo "	<string>$$TEAMID</string>"
+	      echo "	<key>get-task-allow</key>"
+	      echo "	<false/>"
+	      echo '</dict>'
+	      echo '</plist>'
+	    } > "$$ENT"
+
+	    PWFILE="$$SCRATCH/p12-password"
+	    printf '%s' "$${IOS_SIGNING_P12_PASSWORD:-$(P12_PASSWORD)}" > "$$PWFILE"
+	    $(RCODESIGN) sign --p12-file "$$P12" --p12-password-file "$$PWFILE" \
+	        --entitlements-xml-path "$$ENT" "$$APP"
+	    SIGNING=distribution
+	    IPA_NAME=squallar.ipa
+	    echo "    signed $$ENT_APPID (team $$TEAMID)"
+	  fi
+
+	  # ---- the guards the signing stage exists for ----
+	  # Read out of the signature that was written, not out of the arguments we
+	  # believe we passed. rcodesign emits the entitlements TWICE -- an XML
+	  # copy and a DER copy -- and Apple reads the DER one, so a check that
+	  # looked at the first match would pass while the field that matters said
+	  # something else. Both are counted.
+	  if [ "$$SIGNING" = distribution ]; then
+	    SIGINFO="$$SCRATCH/signature-info.yaml"
+	    $(RCODESIGN) print-signature-info "$$APP" > "$$SIGINFO" 2>/dev/null
+	    NKEY="$$(grep -c '<key>get-task-allow</key>' "$$SIGINFO" || true)"
+	    NFALSE="$$(grep -A1 '<key>get-task-allow</key>' "$$SIGINFO" | grep -c '<false' || true)"
+	    NTRUE="$$(grep -A1 '<key>get-task-allow</key>' "$$SIGINFO" | grep -c '<true' || true)"
+	    if [ "$$NKEY" != 2 ]; then
+	      echo "ERROR: the signature carries $$NKEY get-task-allow entitlements; expected"
+	      echo "       2 (the XML copy and the DER copy rcodesign writes). Either"
+	      echo "       signing did not apply the entitlements or print-signature-info"
+	      echo "       changed shape, and in both cases this guard has stopped"
+	      echo "       checking anything."
+	      exit 1
+	    fi
+	    if [ "$$NTRUE" != 0 ] || [ "$$NFALSE" != 2 ]; then
+	      echo "ERROR: get-task-allow is not false in both copies of the entitlements"
+	      echo "       ($$NTRUE true, $$NFALSE false). A true value means the app is"
+	      echo "       debuggable and is an automatic App Store Connect rejection."
+	      exit 1
+	    fi
+	    for k in application-identifier com.apple.developer.team-identifier; do
+	      n="$$(grep -c "<key>$$k</key>" "$$SIGINFO" || true)"
+	      [ "$$n" = 2 ] || { echo "ERROR: $$k appears $$n times in the signature, expected 2."; exit 1; }
+	    done
+	    [ -f "$$APP/embedded.mobileprovision" ] \
+	        || { echo "ERROR: no embedded.mobileprovision in the signed bundle."; exit 1; }
+	    echo "    entitlements: get-task-allow false in both copies, profile embedded"
+	  fi
+	fi
+	printf '%s\n' "$$SIGNING" > "$$OUT/SIGNING"
+
 	echo ""
 	if [ "$$SDK" = iphonesimulator ]; then
 	  echo "App: $(ROOT)/$$APP  (simulator, arm64)"
@@ -219,19 +478,38 @@ build:
 	  echo "  xcrun simctl install booted '$$APP'"
 	  echo "  xcrun simctl launch --console booted $$BUNDLE_ID"
 	elif command -v zip >/dev/null 2>&1; then
-	  # (Unsigned) .ipa: Payload/squallar.app zipped at the archive root.
+	  # The NAME is the label, exactly as in packaging/macos/Makefile.
+	  # `squallar.ipa` means a distribution signature and an embedded App Store
+	  # profile -- something that can be uploaded. Every other outcome is
+	  # `squallar-UNSIGNED.ipa`, which installs nowhere and uploads nowhere, so
+	  # a fork pull request's artifact cannot be mistaken for a shippable one a
+	  # week later when only the artifact list is left.
 	  rm -rf "$$OUT/Payload"; mkdir -p "$$OUT/Payload"
 	  cp -R "$$APP" "$$OUT/Payload/"
-	  ( cd "$$OUT" && zip -qr squallar.ipa Payload && rm -rf Payload )
-	  echo "App: $(ROOT)/$$APP  (UNSIGNED)"
-	  echo "IPA: $(ROOT)/$$OUT/squallar.ipa  (UNSIGNED)"
-	  echo "Sign for a device with rcodesign, e.g.:"
-	  echo "  rcodesign sign --p12-file dev.p12 --code-signature-flags runtime \\"
-	  echo "    --entitlements-xml-path ent.plist $$APP"
+	  ( cd "$$OUT" && zip -qr "$$IPA_NAME" Payload && rm -rf Payload )
+	  case "$$SIGNING" in
+	    distribution)
+	      echo "App: $(ROOT)/$$APP  (signed for App Store distribution)"
+	      echo "IPA: $(ROOT)/$$OUT/$$IPA_NAME  (uploadable)"
+	      echo "Upload it with:"
+	      echo "  .github/scripts/appstore-upload.py --ipa $$OUT/$$IPA_NAME" ;;
+	    no-signer)
+	      echo "App: $(ROOT)/$$APP  (UNSIGNED)"
+	      echo "IPA: $(ROOT)/$$OUT/$$IPA_NAME  (UNSIGNED)"
+	      echo "note: $(RCODESIGN) is not on PATH, so nothing was signed. Install it with"
+	      echo "      'cargo install apple-codesign', or from"
+	      echo "      https://github.com/indygreg/apple-platform-rs/releases" ;;
+	    *)
+	      echo "App: $(ROOT)/$$APP  (UNSIGNED)"
+	      echo "IPA: $(ROOT)/$$OUT/$$IPA_NAME  (UNSIGNED)"
+	      echo "note: no IOS_SIGNING_P12 / IOS_PROVISIONING_PROFILE given, so this"
+	      echo "      .ipa will not install on a device and cannot be uploaded. See"
+	      echo "      'What a person has to do' at the top of this file." ;;
+	  esac
 	else
 	  # The rust-cross image has no zip. The .app is the artifact that matters;
 	  # the .ipa is only Payload/ in a zip, so skipping it loses no coverage.
-	  echo "App: $(ROOT)/$$APP  (UNSIGNED)"
+	  echo "App: $(ROOT)/$$APP  ($$SIGNING)"
 	  echo "note: no 'zip' on PATH, so no .ipa was packaged."
 	fi
 

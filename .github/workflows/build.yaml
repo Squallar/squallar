@@ -97,14 +97,13 @@ jobs:
           # `zip` is not in the image and is only needed to package the .ipa.
           - name: ios-aarch64
             target: aarch64-apple-ios
+            package: ios
             workspaces: ". -> target-ios"
-            artifact: packaging/ios/build/linux/iphoneos/squallar.ipa
-            cmd: |
-              apt-get update -qq
-              apt-get install -y -qq --no-install-recommends zip
-              make -C packaging/ios IN_CONTAINER=1
-              test -f packaging/ios/build/linux/iphoneos/squallar.ipa \
-                || { echo "::error::no .ipa was packaged"; exit 1; }
+            # No `artifact:`. The .ipa's NAME depends on whether it was signed
+            # for distribution, so the upload is a pair of dedicated steps that
+            # read the outcome off the disk; see them below the matrix.
+            ios_out: packaging/ios/build/linux/iphoneos
+            cmd: make -C packaging/ios IN_CONTAINER=1
           # Same link against the simulator SDK. Not redundant: it is a
           # different target triple with its own std, its own clang wrapper and
           # its own Mach-O platform, and it is the only one testable without
@@ -567,8 +566,78 @@ jobs:
             echo "keyPassword=squallar-ci-throwaway"
           } > keystore.properties
 
+      # `rcodesign` and `zip` before the row runs, not after: unlike the macOS
+      # rows -- which build a bare binary and package it in a later step --
+      # packaging/ios/Makefile assembles, signs and zips in one pass, so the
+      # signer has to already be on PATH when the row's own command starts.
+      # Same pin and same reasoning as the macOS install step further down: a
+      # tool fetched over the wire and then trusted to sign our releases is not
+      # a tool, it is a supply chain.
+      - name: Install the iOS packaging tools
+        if: matrix.package == 'ios'
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends curl zip
+          v="$SIGNTOOL_VERSION"
+          base=apple-codesign-$v-x86_64-unknown-linux-musl
+          curl -fsSL -o /tmp/rcodesign.tar.gz \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$v/$base.tar.gz"
+          echo "$SIGNTOOL_SHA256  /tmp/rcodesign.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp
+          install -m 0755 "/tmp/$base/rcodesign" /usr/local/bin/rcodesign
+          rcodesign --version
+          # The same trap the macOS install step guards, and it applies here for
+          # the same reason: this row signs too, so an RCODESIGN_-prefixed
+          # variable leaking in would be read as configuration and kill the
+          # signature further down, where it reads as a signing failure rather
+          # than a naming one.
+          if env | grep -q '^RCODESIGN_'; then
+            echo "::error::RCODESIGN_-prefixed variables are set and rcodesign will read them as configuration:"
+            env | grep '^RCODESIGN_' | sed 's/=.*/=<redacted>/' >&2
+            echo "Rename them (this workflow uses SIGNTOOL_* for exactly this reason)." >&2
+            exit 1
+          fi
+
       - name: ${{ matrix.name }}
+        # The three iOS signing inputs are set on this step rather than in a
+        # step of their own because for iOS the row's build IS the signing --
+        # see the note above. Every other row ignores them. All three are empty
+        # on a fork pull request, which is the unsigned path, and the artifact
+        # that comes out of it is NAMED for that.
+        env:
+          IOS_SIGNING_P12: ${{ secrets.IOS_SIGNING_P12 }}
+          IOS_SIGNING_P12_PASSWORD: ${{ secrets.IOS_SIGNING_P12_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
         run: ${{ matrix.cmd }}
+
+      # Read the outcome off the disk rather than off the condition that was
+      # supposed to produce it. packaging/ios/Makefile writes exactly one of
+      # the two .ipa names and a one-word reason in SIGNING beside it.
+      - name: Name the iOS artifact by whether it can be uploaded
+        id: ios
+        if: matrix.ios_out
+        run: |
+          out='${{ matrix.ios_out }}'
+          reason=$(cat "$out/SIGNING" 2>/dev/null || echo unknown)
+          if [ -f "$out/squallar.ipa" ]; then
+            printf 'artifact=ios-aarch64\nipa=%s/squallar.ipa\nsigned=yes\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+            echo "::notice::ios-aarch64 is signed for App Store distribution and can be uploaded to TestFlight."
+          elif [ -f "$out/squallar-UNSIGNED.ipa" ]; then
+            printf 'artifact=ios-aarch64-UNSIGNED\nipa=%s/squallar-UNSIGNED.ipa\nsigned=no\nreason=%s\n' "$out" "$reason" >> "$GITHUB_OUTPUT"
+            echo "::notice::ios-aarch64-UNSIGNED cannot be installed on a device and cannot be uploaded (reason: $reason). Expected for a pull request, and for a repository whose IOS_* secrets are not set yet."
+          else
+            echo "::error::the iOS row reported success and left no .ipa under either name in $out"
+            ls -la "$out" || true
+            exit 1
+          fi
+
+      - name: Upload the iOS build
+        if: matrix.ios_out
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.ios.outputs.artifact }}
+          path: ${{ steps.ios.outputs.ipa }}
+          if-no-files-found: error
 
       - name: Prove the APK is a signed, non-debuggable release
         if: matrix.package == 'android'
@@ -936,6 +1005,141 @@ jobs:
           path: ${{ steps.package.outputs.zip }}
           if-no-files-found: error
 
+  # TestFlight, from Linux, with no Mac anywhere in the pipeline.
+  #
+  # That is worth a paragraph because the usual answer is that it cannot be
+  # done. `xcrun altool` and `notarytool` live inside Xcode and are macOS-only.
+  # Apple's Transporter does ship a Red Hat build, but on Linux it refuses the
+  # job itself: "Unable to perform software analysis on Linux. Export an
+  # AppStoreInfo.plist from Xcode, and use the -assetDescription option" -- an
+  # input whose only documented source is a Mac. fastlane's `pilot` drives that
+  # same Transporter and inherits the same wall.
+  #
+  # None of that is on this path. App Store Connect API 4.1 added the
+  # `buildUploads` and `buildUploadFiles` resources -- "You can now use Build
+  # uploads to upload and manage build uploads for your apps" -- and the WWDC25
+  # session introducing them states the intent directly: "you can upload your
+  # build using any language or platform you prefer." It is a REST flow with a
+  # bearer token: reserve, PUT the bytes, commit, poll. HTTPS and an ECDSA
+  # signature, and no Apple software at all.
+  #
+  # NOT in the rust-cross container: nothing here compiles. `python3` and
+  # `openssl` are on the runner image, which is the whole dependency list for
+  # .github/scripts/appstore-upload.py, so this job skips a 15 GB image pull.
+  ios-testflight:
+    name: ios-testflight
+    runs-on: ubuntu-24.04
+    needs: [build]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Asserted rather than discovered three steps later as a bare "command
+      # not found" out of a Python traceback.
+      - name: Assert the runner has the tools this job does not install
+        run: |
+          for t in python3 openssl; do
+            command -v "$t" >/dev/null \
+              || { echo "::error::$t is not on the ubuntu-24.04 runner image; this job assumed it was."; exit 1; }
+          done
+
+      # Only the SIGNED artifact is named `ios-aarch64`; an unsigned run
+      # publishes `ios-aarch64-UNSIGNED` instead and this download finds
+      # nothing. `continue-on-error` turns that into a fact the next steps can
+      # read rather than a red job, because "there was nothing uploadable" is
+      # the correct and expected outcome on a fork pull request.
+      - name: Download the signed iOS build
+        id: fetch
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ios-aarch64
+          path: ipa
+
+      # A rehearsal of the App Store Connect credential path that needs no
+      # Apple account, so it runs on every event including a fork pull request.
+      #
+      # The ES256 token is the piece most likely to be got wrong and the only
+      # part of the upload that can be exercised with no server on the other
+      # end: three values off three different pages, a key format that arrives
+      # two different ways, and a signature that openssl emits as DER while
+      # JOSE requires raw r||s. The rehearsal mints a throwaway P-256 key,
+      # builds a token with it, and has OPENSSL verify the signature -- so the
+      # conversion is checked by something that is not the code under test.
+      #
+      # It cannot prove Apple would accept a real key; nothing here can. It
+      # proves a typo in that path is a red pull request rather than a release
+      # that dies after the bytes are already uploaded.
+      - name: Rehearse the App Store Connect credential path
+        run: |
+          ipa=$(ls ipa/*.ipa 2>/dev/null | head -1 || true)
+          if [ -n "$ipa" ]; then
+            python3 .github/scripts/appstore-upload.py --rehearse --ipa "$ipa"
+          else
+            python3 .github/scripts/appstore-upload.py --rehearse
+            echo "note: no signed .ipa on this event, so the version fields were not read."
+          fi
+
+      # The credentials are handed over ONLY on a push to main, for the same
+      # throughput reason the macOS notary secrets are: an upload is a transfer
+      # plus a wait, this repository sees several pushes an hour, and every
+      # build sharing one CFBundleVersion would be rejected as a duplicate
+      # anyway. Everything else -- the build, the signature, the entitlement
+      # guards, the rehearsal -- runs on every event.
+      - name: Upload to TestFlight
+        id: upload
+        if: steps.fetch.outcome == 'success'
+        env:
+          APPSTORE_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_ISSUER_ID || '' }}
+          APPSTORE_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_KEY_ID || '' }}
+          APPSTORE_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_KEY_P8 || '' }}
+        run: |
+          if [ -z "$APPSTORE_ISSUER_ID$APPSTORE_KEY_ID$APPSTORE_KEY_P8" ]; then
+            echo "state=no-credentials" >> "$GITHUB_OUTPUT"
+            echo "Nothing was sent to Apple on this event."
+            exit 0
+          fi
+          ipa=$(ls ipa/*.ipa | head -1)
+          # Deliberately not fatal, and for the same reason the macOS notary
+          # submission is not: an App Store Connect outage, an expired key or a
+          # duplicate build number is not evidence about the commit that
+          # happened to be pushed when it occurred, and `build-success` gates
+          # the website. What a failure produces instead is `state=failed`, an
+          # ::error:: annotation and a run-summary section.
+          if python3 .github/scripts/appstore-upload.py --ipa "$ipa"; then
+            echo "state=uploaded" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The question a person has -- is there a build in TestFlight -- has to be
+      # answerable from the run page, not from thirty steps inside a fold.
+      - name: Say plainly whether a build reached TestFlight
+        env:
+          FETCHED: ${{ steps.fetch.outcome }}
+          STATE: ${{ steps.upload.outputs.state }}
+        run: |
+          case "$FETCHED:$STATE" in
+            success:uploaded)
+              echo "::notice::the signed .ipa was accepted by App Store Connect. It appears in TestFlight once Apple finishes processing it."
+              printf '### iOS: uploaded to App Store Connect\n\nThe signed build was accepted. TestFlight shows it once processing finishes.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            success:failed)
+              echo "::error::the signed .ipa was NOT accepted by App Store Connect. The build was not failed for it -- an outage, an expired key or a duplicate CFBundleVersion is not evidence about this commit -- but no new build reached TestFlight. Read the upload step's log for Apple's reason."
+              printf '### iOS: NOT uploaded (App Store Connect refused it)\n\nThe .ipa is signed and uploadable, but Apple did not accept it. No new TestFlight build exists for this commit.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            success:*)
+              echo "::notice::a signed, uploadable .ipa was built. Nothing was sent to Apple on this event -- expected for a pull request, and for a repository whose APPSTORE_* secrets are not set yet."
+              printf '### iOS: signed, not uploaded\n\nA distribution-signed `.ipa` exists for this commit. Nothing was sent to Apple on this event.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::notice::no signed .ipa was produced on this event, so there was nothing to upload. Expected for a fork pull request, and for a repository whose IOS_SIGNING_P12 / IOS_PROVISIONING_PROFILE secrets are not set yet."
+              printf '### iOS: nothing uploadable\n\nThis event produced `ios-aarch64-UNSIGNED`, which installs nowhere and uploads nowhere.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
   # The one required status check. `needs` on a matrix job aggregates every row,
   # and with `fail-fast: false` it is `success` only if all of them were --
   # `failure`, `cancelled` and `skipped` all fall through to the error. The
@@ -963,18 +1167,25 @@ jobs:
     name: Build success check
     if: always()
     runs-on: ubuntu-24.04
-    needs: [build, macos-universal]
+    needs: [build, macos-universal, ios-testflight]
     steps:
       - name: Fail unless every build row succeeded
         shell: bash
         env:
           RESULT: ${{ needs.build.result }}
           UNIVERSAL: ${{ needs['macos-universal'].result }}
+          TESTFLIGHT: ${{ needs['ios-testflight'].result }}
         run: |
           echo "build matrix:    $RESULT"
           echo "macos-universal: $UNIVERSAL"
+          echo "ios-testflight:  $TESTFLIGHT"
           test "$RESULT" = success || { echo "::error::the build matrix concluded '$RESULT'."; exit 1; }
           test "$UNIVERSAL" = success || { echo "::error::the macos-universal job concluded '$UNIVERSAL'."; exit 1; }
+          # Green here means the credential rehearsal passed and the artifact
+          # was named honestly -- both statements about this repository. A
+          # refusal by Apple leaves this job green and says so loudly instead;
+          # the reasoning is the same one spelled out for macos-universal above.
+          test "$TESTFLIGHT" = success || { echo "::error::the ios-testflight job concluded '$TESTFLIGHT'."; exit 1; }
 
   # The production web deploy: S3 behind CloudFront at https://squallar.app/.
   #
