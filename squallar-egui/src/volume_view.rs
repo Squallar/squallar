@@ -72,7 +72,17 @@ pub struct MapPaneGeo {
 
 impl MapPaneGeo {
     /// Where `(lat, lon)` lands on the frame, in points, by this affine.
+    ///
+    /// **The longitude is folded onto the anchor's turn first.** `anchor_lon`
+    /// is `Projector::unproject` of the pane's centre, which walkers leaves
+    /// unfolded — 185, not -175 — while everything asked to be placed here is
+    /// written in the +/-180 frame. Without the fold the difference below is a
+    /// whole turn out and the site lands one world of points off the pane. The
+    /// companion `points_per_degree_lon` is already guarded, by stepping its
+    /// probe *towards* the prime meridian (`ui_map::map_pane_geo`); this is the
+    /// other half of the same statement.
     pub fn project(&self, lat_deg: f64, lon_deg: f64) -> egui::Pos2 {
+        let lon_deg = squallar_geo::fold_lon_near(lon_deg, self.anchor_lon);
         let dx = (lon_deg - self.anchor_lon) * self.points_per_degree_lon;
         let dy = (mercator_y_of_lat(lat_deg) - mercator_y_of_lat(self.anchor_lat))
             * self.points_per_mercator_y;

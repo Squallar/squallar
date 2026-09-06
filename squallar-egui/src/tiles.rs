@@ -1,5 +1,5 @@
 use crate::tile_source::HttpsTiles;
-use squallar_geo::{lat_to_tile_y, lon_to_tile_x};
+use squallar_geo::lat_to_tile_y;
 use walkers::sources::Attribution;
 
 /// Where the basemap credit links. ODbL wants the notice reachable, not just
@@ -1170,7 +1170,9 @@ pub fn warm_net_cells(span: TileSpan, tile_zoom: u8) -> usize {
         return 0;
     }
     let step = WARM_ANCESTOR_STEPS;
-    let across = ((span.east >> step).saturating_sub(span.west >> step) as usize) + 1;
+    // An arithmetic shift on a signed column floors towards minus infinity,
+    // which is the ancestor a column west of the grid belongs to.
+    let across = usize::try_from((span.east >> step) - (span.west >> step) + 1).unwrap_or(0);
     let down = ((span.south >> step).saturating_sub(span.north >> step) as usize) + 1;
     across.saturating_mul(down)
 }
@@ -1217,18 +1219,30 @@ fn tiles_resident_grid(rect: egui::Rect, zoom_bias: u8, scale: f32) -> (usize, u
 /// The tile indices one viewport covers at one tile zoom, both ends inclusive.
 ///
 /// `north` is the *smaller* row index: tile `y` grows southward.
+///
+/// **The columns are signed and need not be on the grid.** The world wraps
+/// east-west, so a viewport straddling the antimeridian is covered by columns
+/// off one end of the grid — `-1` is the grid's last column seen from the west,
+/// and `2^zoom` is its first seen from the east. `squallar_geo::wrap_tile_x`
+/// carries a column onto the grid to ask a source for it;
+/// `walkers::Projector::tile_rect_at` places it where the viewport is looking.
+/// The rows are not signed: latitude does not wrap, and [`tile_span`] clamps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileSpan {
-    pub west: u32,
-    pub east: u32,
+    pub west: i64,
+    pub east: i64,
     pub north: u32,
     pub south: u32,
 }
 
 impl TileSpan {
-    /// How many tiles the span names.
+    /// How many tiles the span names — **cells walked, not distinct tiles.**
+    ///
+    /// A span a whole turn wide names one column twice, once off each end, and
+    /// both are walked: they are the two halves of that column that the seam
+    /// cuts, and each is asked for and drawn. See [`tile_span`]'s ceiling.
     pub fn tiles(self) -> usize {
-        let across = (self.east.saturating_sub(self.west) as usize) + 1;
+        let across = usize::try_from(self.east - self.west + 1).unwrap_or(0);
         let down = (self.south.saturating_sub(self.north) as usize) + 1;
         across.saturating_mul(down)
     }
@@ -1257,7 +1271,7 @@ pub fn tile_zoom_for(zoom: f64, whole_zoom: bool, zoom_bias: u8, source_max_zoom
 /// The tiles that cover `rect` on the glass at `tile_zoom`.
 ///
 /// **Neither end is widened, and widening one would be a bug.**
-/// [`lon_to_tile_x`] and [`lat_to_tile_y`] *floor*: the index each returns is
+/// [`squallar_geo::lon_to_tile_x`] and [`lat_to_tile_y`] *floor*: the index each returns is
 /// the tile the coordinate falls inside, so the inclusive span already carries
 /// the two part-covered edge tiles. A `+ 1` on the far end appends a column
 /// wholly east of `rect` and a row wholly south of it — at 1920x1080 that is
@@ -1266,8 +1280,14 @@ pub fn tile_zoom_for(zoom: f64, whole_zoom: bool, zoom_bias: u8, source_max_zoom
 /// `TextureHandle` clone and drop (a write lock on the texture manager each),
 /// and a fully clipped `Painter::image`.
 ///
-/// Both transforms also clamp rather than wrap, so a viewport reaching past the
-/// antimeridian or the Mercator limit gets the edge tile and not the far side.
+/// **Longitude is not clamped; latitude is.** `Projector::unproject` is linear
+/// in pixel x and folds nothing, so a viewport straddling the antimeridian reads
+/// e.g. `-186` on its western edge, and
+/// [`squallar_geo::lon_to_tile_x_unbounded`] turns that into the negative column
+/// the far side of the world is drawn into. Clamping it — which is what
+/// [`squallar_geo::lon_to_tile_x`] does, correctly, for every caller that is naming a tile to
+/// store or download rather than a column to draw — is what used to lose that
+/// far side. Latitude does not wrap and stays clamped.
 pub fn tile_span(projector: &walkers::Projector, rect: egui::Rect, tile_zoom: u8) -> TileSpan {
     let nw = projector.unproject(egui::vec2(rect.left(), rect.top()));
     let se = projector.unproject(egui::vec2(rect.right(), rect.bottom()));
@@ -1276,13 +1296,74 @@ pub fn tile_span(projector: &walkers::Projector, rect: egui::Rect, tile_zoom: u8
     let (min_lon, max_lon) = (nw.x().min(se.x()), nw.x().max(se.x()));
     let (min_lat, max_lat) = (nw.y().min(se.y()), nw.y().max(se.y()));
 
+    let (west, east) = one_turn_at_most(
+        squallar_geo::lon_to_tile_x_unbounded(min_lon, tile_zoom),
+        squallar_geo::lon_to_tile_x_unbounded(max_lon, tile_zoom),
+        max_lon - min_lon,
+        tile_zoom,
+    );
+
     TileSpan {
-        west: lon_to_tile_x(min_lon, tile_zoom),
-        east: lon_to_tile_x(max_lon, tile_zoom),
+        west,
+        east,
         north: lat_to_tile_y(max_lat, tile_zoom),
         south: lat_to_tile_y(min_lat, tile_zoom),
     }
 }
+
+/// A column range holding **at most one turn of the world**, from one that may
+/// hold more.
+///
+/// **The ceiling is stated against the world's own width, not against a
+/// number.** The grid is `2^tile_zoom` columns round, so a viewport reaches at
+/// most every column the world has, plus the one the grid's phase adds — the
+/// column the seam cuts, whose two halves arrive off opposite ends of the walk
+/// and are each drawn once. A range wider than that does not show more world;
+/// it shows the same ground twice, which is precisely what draws a continent
+/// twice. So the answer there is to draw the world once, at the columns it
+/// actually occupies, and leave the rest of the glass uncovered.
+///
+/// **Above the widget's zoom floor this never binds**, because that floor
+/// (`walkers::viewport::min_zoom`) is what holds the visible span to one turn —
+/// it is the same statement seen from the other side. Below it, which is a zoom
+/// `Map::show` refuses but a bare `Projector` will still build, this is what
+/// stops a 1920-point canvas at zoom 1.5 walking eleven copies of a
+/// four-column grid.
+fn one_turn_at_most(west: i64, east: i64, visible_deg: f64, tile_zoom: u8) -> (i64, i64) {
+    // `checked_pow`: above zoom 31 there is no grid to fall back to, so there is
+    // nothing to draw once instead of twice either. See `squallar_geo`'s
+    // `grid_side` and `walkers::mercator::total_tiles`.
+    let Some(world) = 2u32.checked_pow(u32::from(tile_zoom)).map(i64::from) else {
+        return (west, east);
+    };
+    if visible_deg > 360.0 * (1.0 + TURN_SLACK) {
+        (0, world - 1)
+    } else {
+        (west, east)
+    }
+}
+
+/// How much past a turn a viewport has to reach before it counts as reaching
+/// past a turn, relative.
+///
+/// **Not slack in the geometry — it is what stops the ceiling firing on its own
+/// arithmetic.** At the zoom floor the visible span *is* one turn, and reading
+/// it back costs a `2f64.powf(zoom)` that is not the exact inverse of the
+/// `log2` the floor was solved with: for a 1920-point pane the world lands
+/// `1919.9999999999998` and the two screen edges unproject to `-4e-14` and
+/// `360.00000000000006`. A bare `> 360.0` calls that a viewport wider than the
+/// world and redraws the world at the grid's own columns — half a screen of
+/// void at exactly the zoom the user reaches by zooming all the way out, which
+/// is the single most common way to be at the floor at all.
+///
+/// A part in a million million is four orders above that rounding (two ulps,
+/// ~4e-16 relative) and twenty below the thing it must not swallow: one column
+/// of the grid, which is `2^-tile_zoom` of a turn and so never finer than
+/// `5e-10` at any zoom this crate draws. `wrap_tests`'
+/// `the_glass_is_covered_at_the_floor_and_one_ulp_either_side` is what holds
+/// the first half and asserts its sweep really meets a short world; the
+/// column-ceiling gate beside it holds the second.
+const TURN_SLACK: f64 = 1e-12;
 
 /// **What the rig measured on the user's own window**, kept once so every
 /// test that argues from it argues from the same figures: Firefox on the
@@ -1309,6 +1390,15 @@ pub(crate) mod measured {
 #[path = "tiles/tests.rs"]
 #[cfg(test)]
 mod tests;
+
+/// The horizontal wrap's own gates: the far side draws, and no ground is drawn
+/// twice. Beside [`tests`] rather than inside it because they are stated over
+/// *geography* where that suite is stated over screen rects, and mixing the two
+/// domains in one file is how a tile-coordinate identity comes to stand in for a
+/// geographic one.
+#[path = "tiles/wrap_tests.rs"]
+#[cfg(test)]
+mod wrap_tests;
 
 /// The height reader's own suite: a fixture archive over a loopback server,
 /// read through the override. Beside [`tests`] rather than inside it because

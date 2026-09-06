@@ -91,17 +91,46 @@ impl Projector {
     /// than `round(zoom)` — a deliberately coarser layer, or an ancestor stretched over a
     /// gap — is drawn larger, and one from a deeper level smaller.
     pub fn tile_rect(&self, tile_id: TileId) -> Rect {
+        self.tile_rect_at(i64::from(tile_id.x), tile_id.y, tile_id.zoom)
+    }
+
+    /// [`Projector::tile_rect`], for a **column that need not be on the grid**.
+    ///
+    /// The world wraps east-west, so a viewport straddling the antimeridian is covered by
+    /// columns `-1`, `-2`, … west of the grid or `2^zoom`, `2^zoom + 1`, … east of it. Those
+    /// columns hold the same tiles as the ones a turn away — that is what
+    /// `squallar_geo::wrap_tile_x` is for — but they are drawn *here*, where the viewport is
+    /// looking, and not a whole world away. So the column a tile is **asked for** by and the
+    /// column it is **placed** at are two different numbers, and this is the placing one.
+    ///
+    /// Everything else about it is [`Projector::tile_rect`]: the arithmetic is affine, `x` is
+    /// exact in `f64` for every column any zoom can name, and passing a column that *is* on
+    /// the grid gives the identical `f64`s.
+    pub fn tile_rect_at(&self, x: i64, y: u32, zoom: u8) -> Rect {
         // `world_pixels` is `256 · 2^map_zoom` and the grid is `2^tile_zoom` tiles across.
         // Both are exact powers of two, so the quotient is `256 · 2^(map_zoom − tile_zoom)`
         // with no rounding of its own.
-        let side = self.world_pixels / 2f64.powi(i32::from(tile_id.zoom));
+        let side = self.world_pixels / 2f64.powi(i32::from(zoom));
 
         // The same two lines as `project`, with the tile's own projected corner in place of
         // a projected position.
-        let offset = tile_id.project(side) - self.map_center_projected_position;
+        let corner = Pixels::new(x as f64 * side, f64::from(y) * side);
+        let offset = corner - self.map_center_projected_position;
         let north_west = self.clip_rect.center().to_vec2() + offset.to_vec2();
 
         Rect::from_min_size(north_west.to_pos2(), Vec2::splat(side as f32))
+    }
+
+    /// The width of the whole world in points at this projector's zoom —
+    /// `256 · 2^zoom`, and the period of the horizontal wrap.
+    ///
+    /// In `f64`, and that is the point of it: the world at
+    /// [`crate::viewport::min_zoom`] is up to two ulps *short* of the side it
+    /// was solved for, and every `f32` spelling of it — a [`Rect`] width, a
+    /// difference of two projected points — rounds that away. A caller
+    /// reasoning about the floor has to be able to see it.
+    pub fn world_pixels(&self) -> f64 {
+        self.world_pixels
     }
 
     /// The viewport this projector places into.
@@ -109,7 +138,14 @@ impl Projector {
     /// [`crate::tiles::draw_tiles`] culls against an [`egui::Painter`]'s clip rect and places
     /// through this projector, and those two are only the same map while they are the same
     /// rect. It asserts that; this is what it reads.
-    pub(crate) fn clip_rect(&self) -> Rect {
+    ///
+    /// Public because it is also **the turn the pane is looking at**: the map's centre lands
+    /// at this rect's centre by construction of [`Projector::project`], so unprojecting that
+    /// point is how a caller holding a longitude written in the folded ±180 frame — a
+    /// station, a label, a raster's own footprint — finds which of its infinitely many
+    /// representations this pane can see. The map's centre is deliberately *not* folded (see
+    /// `crate::viewport`), so nothing else answers that question.
+    pub fn clip_rect(&self) -> Rect {
         self.clip_rect
     }
 

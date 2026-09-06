@@ -115,6 +115,46 @@ pub fn great_circle_destination(
     (sin_lat2.asin().to_degrees(), site_lon + dlon.to_degrees())
 }
 
+/// Carry `lon` to the turn `near` is written in — the representation of the
+/// same meridian that is closest to it.
+///
+/// **This is the map's fold, and it is not [`normalize_lon`].** The map's
+/// centre, and every longitude `walkers::Projector::unproject` hands back from
+/// it, live in a *continuous* frame that runs past ±180 as the map is panned
+/// past the antimeridian; the data drawn on it — a station, a label, a radar
+/// image's footprint — is written in the folded ±180 one. A datum more than
+/// half a turn from where the pane is looking names the same ground as one just
+/// off the opposite edge, and this picks the one the pane can see. Folding into
+/// ±180 instead would move the *pane's* frame onto the data's, which is the
+/// wrong direction: the pane has a viewport to keep and the datum has not.
+///
+/// A `near` or a `lon` that is not a number leaves `lon` alone: folding by
+/// nonsense moves a datum that was already placed correctly.
+///
+/// **`round_ties_even`, and the tie is the whole reason.** A datum exactly half
+/// a turn away is equally close in both representations, and `f64::round`
+/// resolves that away from zero — so `fold_lon_near(0.0, -180.0)` would answer
+/// `-360.0`, moving a prime meridian that was already as near as it can get and
+/// putting a world-wide rect a turn off the glass. Ties to even leaves the
+/// half-turn case where it is written. Every other case is a strict inequality
+/// and both roundings agree.
+///
+/// `squallar-egui`'s `site_marker::fold_into_turn` is the same fold one stage
+/// later, on a projected `x` against a screen centre. Either is correct; a
+/// caller that still holds geography should prefer this one, because a point
+/// carried before it is projected is also carried before every *difference* of
+/// projections downstream of it. Note the two break the tie oppositely —
+/// that one folds into a half-open `[centre - half, centre + half)` — which is
+/// visible only for a datum exactly 180° out and is why they are not one
+/// function.
+#[inline]
+pub fn fold_lon_near(lon: f64, near: f64) -> f64 {
+    if !lon.is_finite() || !near.is_finite() {
+        return lon;
+    }
+    lon + 360.0 * ((near - lon) / 360.0).round_ties_even()
+}
+
 /// Wrap a longitude into `[-180, 180)`, however many laps it is out by.
 ///
 /// The one place that spelling lives. `great_circle_destination` deliberately
@@ -362,8 +402,57 @@ pub fn lat_to_tile_y(lat: f64, zoom: u8) -> u32 {
     tile_index((1.0 - y / std::f64::consts::PI) / 2.0 * n, zoom)
 }
 
+/// The tile grid's side at `zoom`, or zero where there is no grid.
+///
+/// **`checked_pow`, not `saturating_pow`.** `zoom` is a `u8` and the grid is
+/// counted in `u32`, so zoom 32 and above name no grid at all — and saturating
+/// answers `u32::MAX`, which is not a power of two and would have [`wrap_tile_x`]
+/// carry a column onto a grid that does not exist and is the wrong size besides.
+/// Zero is the honest answer and the callers here read it as one.
+/// `walkers::mercator::total_tiles` says the same thing with an `Option`.
+#[inline]
+fn grid_side(zoom: u8) -> i64 {
+    2u32.checked_pow(u32::from(zoom)).map_or(0, i64::from)
+}
+
+/// Convert longitude to a tile X index **without clamping it to the grid**.
+///
+/// The continuous counterpart of [`lon_to_tile_x`], and the one a wrapping map
+/// walks its columns with: a viewport straddling the antimeridian names a
+/// *negative* column west of the grid, or one past its eastern edge, and that
+/// column is exactly where the far side of the world is drawn. Carry the answer
+/// back onto the grid with [`wrap_tile_x`] before asking a source for it.
+///
+/// `as i64` saturates rather than wrapping, and takes `NaN` to zero, so a
+/// longitude that is not a number names the prime meridian's column rather than
+/// a column at the other end of `i64`.
+pub fn lon_to_tile_x_unbounded(lon: f64, zoom: u8) -> i64 {
+    let n = 2f64.powi(zoom as i32);
+    (((lon + 180.0) / 360.0 * n).floor()) as i64
+}
+
+/// Carry a column index of any turn onto the grid at `zoom`.
+///
+/// `rem_euclid`, not `%`: the column west of zero is the grid's *last* column,
+/// and the remainder operator answers `-1` there. Zoom 32 and above have no
+/// grid to carry onto and answer column zero.
+pub fn wrap_tile_x(x: i64, zoom: u8) -> u32 {
+    let side = grid_side(zoom);
+    if side <= 0 {
+        return 0;
+    }
+    x.rem_euclid(side) as u32
+}
+
 /// Convert tile X index back to the western longitude of the tile.
 pub fn tile_to_lon(x: u32, zoom: u8) -> f64 {
+    tile_to_lon_unbounded(i64::from(x), zoom)
+}
+
+/// [`tile_to_lon`] for a column off either end of the grid, which reads as a
+/// longitude off either end of the turn — the continuous frame the map's centre
+/// and every projected position are already in.
+pub fn tile_to_lon_unbounded(x: i64, zoom: u8) -> f64 {
     let n = 2f64.powi(zoom as i32);
     x as f64 / n * 360.0 - 180.0
 }
@@ -467,6 +556,154 @@ mod tests {
                     "{lat_deg}° round trip is {ulps} ulps out: {lat_rad:e} -> {back:e}"
                 );
             }
+        }
+    }
+}
+
+/// The wrap's own primitives: the fold that carries a datum into the pane's
+/// turn, and the pair that takes a column off the grid and back onto it.
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    /// **A fold is a function of the two longitudes and nothing else**, and the
+    /// ground it names never moves: whatever turn it lands in, the answer is the
+    /// same meridian.
+    #[test]
+    fn the_fold_names_the_same_meridian_and_the_nearest_one() {
+        for lon in [-179.9, -90.0, -0.1, 0.0, 45.0, 179.9, 180.0, 359.9] {
+            for near in [
+                -540.5, -186.0, -180.0, -97.2778, 0.0, 151.2, 180.0, 185.0, 540.5,
+            ] {
+                let folded = fold_lon_near(lon, near);
+
+                // The same meridian: the two differ by a whole number of turns.
+                let turns = (folded - lon) / 360.0;
+                assert!(
+                    (turns - turns.round()).abs() < 1e-9,
+                    "fold({lon}, {near}) = {folded} is not a whole turn from {lon}"
+                );
+
+                // And the nearest one: no other representation is closer.
+                let here = (folded - near).abs();
+                for step in [-720.0, -360.0, 360.0, 720.0] {
+                    assert!(
+                        here <= (folded + step - near).abs() + 1e-9,
+                        "fold({lon}, {near}) = {folded} is {here} from the pane, but \
+                         {} is {} away",
+                        folded + step,
+                        (folded + step - near).abs()
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The half-turn tie does not move.** `f64::round` breaks it away from
+    /// zero, which would answer −360 for a prime meridian seen from a pane at
+    /// −180 — as far away as it is possible to be while still being the nearest
+    /// representation, and a whole world of misplacement for anything that is a
+    /// rect rather than a point.
+    #[test]
+    fn a_datum_exactly_half_a_turn_out_is_left_where_it_is_written() {
+        assert_eq!(fold_lon_near(0.0, -180.0), 0.0);
+        assert_eq!(fold_lon_near(0.0, 180.0), 0.0);
+        assert_eq!(fold_lon_near(180.0, 0.0), 180.0);
+        assert_eq!(fold_lon_near(-180.0, 0.0), -180.0);
+
+        // A hair either side of the tie is not a tie, and does move.
+        assert_eq!(fold_lon_near(0.0, -180.0 - 1e-9), -360.0);
+        assert_eq!(fold_lon_near(0.0, 180.0 + 1e-9), 360.0);
+    }
+
+    /// Nonsense in, the datum back out. Folding by a `NaN` would place a station
+    /// that was already correct at `NaN`, which draws nothing anywhere.
+    #[test]
+    fn the_fold_refuses_a_value_that_is_not_a_number() {
+        assert_eq!(fold_lon_near(17.0, f64::NAN), 17.0);
+        assert_eq!(fold_lon_near(17.0, f64::INFINITY), 17.0);
+        assert!(fold_lon_near(f64::NAN, 0.0).is_nan());
+    }
+
+    /// **The unbounded index is the clamped one wherever the clamp does not
+    /// bite**, and carries on past the grid where it does.
+    #[test]
+    fn the_unbounded_column_agrees_with_the_clamped_one_inside_the_grid() {
+        for zoom in [0u8, 1, 3, 8, 14, 20] {
+            let side = i64::from(2u32.pow(u32::from(zoom)));
+            for lon in [-179.999, -97.2778, -0.001, 0.0, 17.03664, 151.2093, 179.999] {
+                assert_eq!(
+                    lon_to_tile_x_unbounded(lon, zoom),
+                    i64::from(lon_to_tile_x(lon, zoom)),
+                    "lon {lon} at zoom {zoom}"
+                );
+            }
+
+            // Off the grid, the clamp collapses and this does not.
+            assert_eq!(lon_to_tile_x_unbounded(-180.0 - 360.0, zoom), -side);
+            assert_eq!(lon_to_tile_x_unbounded(180.0, zoom), side);
+            assert_eq!(lon_to_tile_x(-540.0, zoom), 0);
+        }
+    }
+
+    /// A column of any turn is asked for on the grid, and it is the column a
+    /// whole number of turns away — `rem_euclid`, so the column west of zero is
+    /// the grid's last and not `-1`.
+    #[test]
+    fn a_column_of_any_turn_wraps_onto_the_grid() {
+        for zoom in [0u8, 1, 4, 12] {
+            let side = i64::from(2u32.pow(u32::from(zoom)));
+            for column in -3 * side..3 * side {
+                let wrapped = wrap_tile_x(column, zoom);
+                assert!(i64::from(wrapped) < side, "column {column} at zoom {zoom}");
+                assert_eq!(
+                    (column - i64::from(wrapped)) % side,
+                    0,
+                    "column {column} at zoom {zoom} wrapped to a different tile"
+                );
+            }
+        }
+
+        // Zoom 32 and above name no grid at all; the answer is column zero
+        // rather than a division by nothing.
+        assert_eq!(wrap_tile_x(-7, 32), 0);
+        assert_eq!(wrap_tile_x(9, 255), 0);
+    }
+
+    /// A column and the longitude it starts at are inverses, off the grid as
+    /// well as on it.
+    #[test]
+    fn a_column_and_its_western_longitude_round_trip_off_the_grid() {
+        for zoom in [0u8, 2, 7, 15] {
+            for column in [-9i64, -1, 0, 1, 5, 100] {
+                let lon = tile_to_lon_unbounded(column, zoom);
+                assert_eq!(
+                    lon_to_tile_x_unbounded(lon, zoom),
+                    column,
+                    "column {column} at zoom {zoom} came back as a different column"
+                );
+            }
+        }
+
+        // The bounded spelling is the unbounded one, on the grid.
+        for zoom in [0u8, 3, 11] {
+            for x in [0u32, 1, 2] {
+                assert_eq!(
+                    tile_to_lon(x, zoom),
+                    tile_to_lon_unbounded(i64::from(x), zoom)
+                );
+            }
+        }
+    }
+
+    /// A longitude that is not a number names the prime meridian's column, not
+    /// a column at the other end of `i64`.
+    #[test]
+    fn an_unusable_longitude_names_a_column_a_walk_can_hold() {
+        for zoom in [0u8, 6, 18] {
+            assert_eq!(lon_to_tile_x_unbounded(f64::NAN, zoom), 0);
+            assert!(lon_to_tile_x_unbounded(f64::INFINITY, zoom) > 0);
+            assert!(lon_to_tile_x_unbounded(f64::NEG_INFINITY, zoom) < 0);
         }
     }
 }

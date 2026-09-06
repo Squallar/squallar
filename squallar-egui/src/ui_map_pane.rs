@@ -1559,8 +1559,14 @@ fn render_user_location(
     heading: Option<f32>,
     fix: Option<&squallar_location::Fix>,
 ) {
+    // Folded into the pane's turn first: the fix is written in the +/-180 frame
+    // and the map's centre is not, so past the antimeridian the dot projects a
+    // whole world away and the cull below drops it.
     let user_screen = projector
-        .project(walkers::lat_lon(user_lat, user_lon))
+        .project(walkers::lat_lon(
+            user_lat,
+            squallar_geo::fold_lon_near(user_lon, crate::overlay_cache::pane_turn_lon(projector)),
+        ))
         .to_pos2();
 
     let screen_rect = ui.max_rect();
@@ -2909,15 +2915,22 @@ fn render_per_frame_overlay(
     let collecting = text_only && kept.is_none();
     let mut sink: Vec<egui::Shape> = Vec::new();
 
+    // The turn this pane is looking at, once for the whole table. Every point
+    // below is carried into it **before** the geo cull and the projection, and
+    // not between them: `geo_bounds` is the viewport's own unfolded frame, so a
+    // station written -175 tested against a viewport reading 175..190 is
+    // rejected by the cull long before anything could place it.
+    let turn = crate::overlay_cache::pane_turn_lon(projector);
+
     for pt in points {
+        let lon = squallar_geo::fold_lon_near(pt.lon, turn);
+
         // Fast geo-bounds rejection before the costly projection.
-        if !geo_bounds.contains_point(pt.lat, pt.lon) {
+        if !geo_bounds.contains_point(pt.lat, lon) {
             continue;
         }
 
-        let screen = projector
-            .project(walkers::lat_lon(pt.lat, pt.lon))
-            .to_pos2();
+        let screen = projector.project(walkers::lat_lon(pt.lat, lon)).to_pos2();
 
         if !expanded.contains(screen) {
             continue;

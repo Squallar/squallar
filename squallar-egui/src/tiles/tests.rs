@@ -3,6 +3,7 @@
 use super::*;
 use squallar_geo::{
     MERCATOR_LAT_LIMIT_DEG, lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon,
+    tile_to_lon_unbounded,
 };
 
 /// `(lat, lon, zoom, mercantile's x, mercantile's y)`.
@@ -468,11 +469,19 @@ fn canvas() -> egui::Rect {
 /// reference `the_affine_tile_rect_agrees_with_the_geographic_round_trip`
 /// measures [`walkers::Projector::tile_rect`] against. Every other test in this
 /// file keeps using it, so the reference is not the thing under test.
-fn geographic_tile_rect(projector: &walkers::Projector, x: u32, y: u32, zoom: u8) -> egui::Rect {
-    crate::overlay_cache::geo_corner_rect(
-        projector,
-        (tile_to_lat(y, zoom), tile_to_lon(x, zoom)),
-        (tile_to_lat(y + 1, zoom), tile_to_lon(x + 1, zoom)),
+///
+/// The column is signed, as [`tile_span`]'s columns are: off either end of the
+/// grid it reads as a longitude off either end of the turn, which is the
+/// continuous frame the projector is already in — **and the reason this spells
+/// the two projections out rather than calling `geo_corner_rect`.** That helper
+/// carries its pair into the pane's own turn, which is right for a footprint
+/// written in the folded +/-180 frame and wrong for a column that is already in
+/// the continuous one and is *deliberately* a turn out.
+fn geographic_tile_rect(projector: &walkers::Projector, x: i64, y: u32, zoom: u8) -> egui::Rect {
+    let project = |lat: f64, lon: f64| projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+    egui::Rect::from_two_pos(
+        project(tile_to_lat(y, zoom), tile_to_lon_unbounded(x, zoom)),
+        project(tile_to_lat(y + 1, zoom), tile_to_lon_unbounded(x + 1, zoom)),
     )
 }
 
@@ -554,11 +563,7 @@ fn the_affine_tile_rect_agrees_with_the_geographic_round_trip() {
                     tiles += 1;
 
                     let want = geographic_tile_rect(&projector, x, y, tile_zoom);
-                    let got = projector.tile_rect(walkers::TileId {
-                        x,
-                        y,
-                        zoom: tile_zoom,
-                    });
+                    let got = projector.tile_rect_at(x, y, tile_zoom);
 
                     for (corner, err) in [
                         ("min.x", (got.min.x - want.min.x).abs()),

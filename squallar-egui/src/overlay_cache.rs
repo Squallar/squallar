@@ -1715,13 +1715,44 @@ fn pan_exceeds_coverage_at(
 
 // ── Drawing ──────────────────────────────────────────────────────────────
 
+/// The turn this pane is looking at, as a longitude.
+///
+/// The map's centre lands at the projector's own rect centre by construction,
+/// and walkers deliberately leaves that centre **unfolded** — pan a whole turn
+/// east and it reads 190, not −170 — so this is the frame every geographic
+/// datum has to be carried into before it is projected. See
+/// [`squallar_geo::fold_lon_near`].
+pub fn pane_turn_lon(projector: &walkers::Projector) -> f64 {
+    projector
+        .unproject(projector.clip_rect().center().to_vec2())
+        .x()
+}
+
 /// The screen rect a north-west / south-east geographic corner pair covers.
+///
+/// **The pair is folded as one, never corner by corner.** `Projector::project`
+/// is linear in longitude and folds nothing, so a footprint written in the
+/// ±180 frame — a radar image's, a saved download box's — lands a whole world
+/// off the glass once the map is panned past the antimeridian. Carrying it into
+/// the pane's turn ([`pane_turn_lon`]) is what puts it back. Carrying each
+/// corner *separately* would be a different and worse thing: a rect wider than
+/// half a turn — an overlay picture at the zoom floor is up to 1.42 of one,
+/// viewport plus overdraw — has corners that fold opposite ways, and the rect
+/// comes back inside out and at 40 % of its size. One shift, taken from the
+/// rect's own middle, cannot do that: it is a translation, so the width it was
+/// handed is the width it returns, whatever that width is.
 pub fn geo_corner_rect(
     projector: &walkers::Projector,
     nw: (f64, f64),
     se: (f64, f64),
 ) -> egui::Rect {
-    let project = |(lat, lon): (f64, f64)| projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+    let mid = (nw.1 + se.1) / 2.0;
+    let shift = squallar_geo::fold_lon_near(mid, pane_turn_lon(projector)) - mid;
+    let project = |(lat, lon): (f64, f64)| {
+        projector
+            .project(walkers::lat_lon(lat, lon + shift))
+            .to_pos2()
+    };
     egui::Rect::from_two_pos(project(nw), project(se))
 }
 

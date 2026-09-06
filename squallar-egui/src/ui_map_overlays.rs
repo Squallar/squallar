@@ -78,10 +78,18 @@ impl<'a> OverlayDrawContext<'a> {
         }
 
         let painter = self.ui.painter();
+        // Once for the list: the turn this pane is looking at. A label is
+        // written in the folded +/-180 frame and the pane's centre is not, so a
+        // pane panned past the antimeridian projects every one of them a world
+        // off the glass and the `contains` below culls the lot.
+        let turn = crate::overlay_cache::pane_turn_lon(self.projector);
         for label in labels {
             let screen_pos = self
                 .projector
-                .project(walkers::lat_lon(label.lat, label.lon))
+                .project(walkers::lat_lon(
+                    label.lat,
+                    squallar_geo::fold_lon_near(label.lon, turn),
+                ))
                 .to_pos2();
             if self.screen_rect.contains(screen_pos) {
                 let [r, g, b, a] = label.color;
@@ -246,7 +254,10 @@ pub(super) fn draw_tile_layer(
         for ty in (span.north >> step)..=(span.south >> step) {
             for tx in (span.west >> step)..=(span.east >> step) {
                 tiles.warm(TileId {
-                    x: tx,
+                    // The net's columns wrap exactly as the drawn ones do; a
+                    // net cell is only ever asked for, never placed, so the
+                    // grid column is the whole of what it needs.
+                    x: squallar_geo::wrap_tile_x(tx, net_zoom),
                     y: ty,
                     zoom: net_zoom,
                 });
@@ -310,8 +321,13 @@ pub(super) fn draw_tile_layer(
     let mut answered: Vec<(egui::Rect, GroundPiece, Background)> = Vec::with_capacity(span.tiles());
     for ty in span.north..=span.south {
         for tx in span.west..=span.east {
+            // **Two different columns, and that is the wrap.** `tx` is the
+            // column the viewport is looking at and may be off either end of
+            // the grid; the tile that covers it is the one a whole turn away,
+            // which is what the source is asked for. Drawing the wrapped column
+            // where the wrapped column *is* would put it a world off the glass.
             let tile_id = TileId {
-                x: tx,
+                x: squallar_geo::wrap_tile_x(tx, tile_zoom),
                 y: ty,
                 zoom: tile_zoom,
             };
@@ -329,7 +345,7 @@ pub(super) fn draw_tile_layer(
             // pairs per tile to arrive at a rect that is a linear function of
             // `(x, y, zoom)`. `tests::the_affine_tile_rect_agrees_with_the_geographic_round_trip`
             // holds the two answers together.
-            let rect = projector.tile_rect(tile_id);
+            let rect = projector.tile_rect_at(tx, ty, tile_zoom);
 
             let background = match &piece.tile {
                 Tile::Vector(shapes) => {
@@ -1303,7 +1319,7 @@ mod tests {
         for ty in (whole.north >> step)..=(whole.south >> step) {
             for tx in (whole.west >> step)..=(whole.east >> step) {
                 let net = TileId {
-                    x: tx,
+                    x: squallar_geo::wrap_tile_x(tx, net_zoom),
                     y: ty,
                     zoom: net_zoom,
                 };
@@ -1377,7 +1393,7 @@ mod tests {
             for tx in (span.west >> step)..=(span.east >> step) {
                 net_tiles += 1;
                 let net = TileId {
-                    x: tx,
+                    x: squallar_geo::wrap_tile_x(tx, net_zoom),
                     y: ty,
                     zoom: net_zoom,
                 };
@@ -1494,7 +1510,7 @@ mod tests {
         let tile_zoom = zoom.round() as u8;
         let span = crate::tiles::tile_span(&projector, canvas, tile_zoom);
         let tile_id = TileId {
-            x: span.west,
+            x: squallar_geo::wrap_tile_x(span.west, tile_zoom),
             y: span.north,
             zoom: tile_zoom,
         };
@@ -2358,7 +2374,7 @@ mod tests {
         for ty in span.north..=span.south {
             for tx in span.west..=span.east {
                 cells.push(TileId {
-                    x: tx,
+                    x: squallar_geo::wrap_tile_x(tx, tile_zoom),
                     y: ty,
                     zoom: tile_zoom,
                 });
@@ -3023,7 +3039,7 @@ mod tests {
         for ty in span.north..=span.south {
             for tx in span.west..=span.east {
                 cells.push(TileId {
-                    x: tx,
+                    x: squallar_geo::wrap_tile_x(tx, tile_zoom),
                     y: ty,
                     zoom: tile_zoom,
                 });

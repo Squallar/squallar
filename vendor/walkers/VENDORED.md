@@ -2251,6 +2251,73 @@ It is recorded here because this file is the list of everything in this
 directory that is not upstream's, and a doc comment upstream did not write is
 one of those things whether or not it changes a byte of behaviour.
 
+### Changed — source, twenty-ninth commit: a column the viewport can see, off the grid
+
+**The defect.** The twenty-seventh commit's floor holds the visible span to at
+most one turn, and said so: "the world wraps east-west and the answer on that
+axis is to draw the wrap, not to stop the pan". Nothing drew it. A viewport
+straddling the antimeridian reaches columns `-1`, `-2`, … west of the grid or
+`2^zoom`, `2^zoom + 1`, … east of it, and every consumer of a `TileId` insists a
+column is on the grid — `squallar_geo::lon_to_tile_x` clamps (its own doc: "a
+viewport straddling the antimeridian loses the far side"),
+`squallar-egui`'s `tile_source::tile_id_is_valid` refuses. So the far side was
+not drawn wrong; it was not asked for.
+
+**The mechanism, in this directory: one method and two accessors.** The wrap
+itself lives in `squallar-egui` and `squallar-geo`, where the walk is. What it
+needed from here is the ability to place a column that is not on the grid.
+
+- **`Projector::tile_rect_at(x: i64, y: u32, zoom: u8)`** — `Projector::tile_rect`
+  for a signed column, with `tile_rect` delegating to it. **The column a tile is
+  asked for and the column it is placed at are now two different numbers**, and
+  this is the placing one: the tile that covers column `-1` is the grid's last
+  column, but it is drawn one world west of where that column lives, which is
+  where the viewport is looking. Placing by the wrapped column instead puts the
+  tile a whole world off the glass, which is the defect the app's
+  `wrap_tests::the_wrap_walk_here_is_the_walk_draw_tile_layer_makes` pins
+  against. The arithmetic is unchanged and `i64::from(tile_id.x) as f64` is the
+  same `f64` `tile_id.x as f64` was, so every existing placement is bit for bit
+  what it was.
+- **`Projector::world_pixels()`** — `256 · 2^zoom`, the period of the wrap, in
+  **`f64`**. That is the whole reason it exists rather than being read off a
+  zoom-0 `tile_rect`: at `viewport::min_zoom` the world is up to two ulps
+  *short* of the side it was solved for, and an `f32` `Rect` width rounds that
+  away. The app's ceiling on how many columns a walk may name is a comparison
+  against one turn with a relative slack, and a test that cannot see the
+  shortfall cannot show the slack is needed.
+- **`Projector::clip_rect()` is now `pub`** (it was `pub(crate)`). It is also
+  **the turn the pane is looking at**: the map's centre lands at this rect's
+  centre by construction, so unprojecting that point is how a caller holding a
+  longitude written in the folded ±180 frame — a station, a label, a raster's
+  own footprint — finds which of its infinitely many representations this pane
+  can see. Nothing else answers that, because the centre is deliberately not
+  folded.
+
+**What was deliberately *not* changed, and why it is the load-bearing half.**
+
+- **The centre is still not normalised**, and `center::viewport_tests::horizontal_panning_is_never_clamped`
+  still passes untouched. Folding the centre into ±180 looks like the tidy fix
+  and is the wrong one here: the whole application works in a *continuous*
+  longitude — `Projector::unproject` folds nothing, the overlay rasterizer is
+  handed the viewport's own unfolded box, and `squallar-egui`'s
+  `rasterize::spacing` refuses a neighbour further than `half_turn_px`, a
+  quantity computed as `180 / (max_lon − min_lon) · width`. Fold the centre and
+  that denominator becomes 359 instead of 1.5, the seam refusal stops refusing,
+  and the defect commit `308f1592` fixed comes straight back. The centre's
+  magnitude is bounded instead by the fold at each consumer, which is where the
+  ±180 frame and the continuous one actually meet.
+- **`mercator::tile_id`, `lon_to_tile_x`, `TileId::valid`, `TileId::east`/`west`
+  and `flood_fill_tiles` are untouched.** `draw_tiles` is unreachable in this
+  application (see its own doc) and every one of those is correct for a caller
+  naming a tile to *store* rather than a column to *draw*.
+
+**Measured**, `cargo test -p walkers --all-features`: **132 before, 132 after**,
+exit 0 both times. No test moved and none was added here; the gates are in
+`squallar-egui/src/tiles/wrap_tests.rs`, over geography, because that is the
+domain the claim lives in — a gate stated over tile coordinates passes happily
+while the same ground is drawn from two turns of the world, which is precisely
+what a doubled continent is.
+
 ## What the pin actually selects
 
 "Upstream's 38 inline tests are the behaviour pin" is the reason this crate is
