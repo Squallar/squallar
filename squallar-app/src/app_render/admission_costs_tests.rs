@@ -90,23 +90,6 @@ fn one_more_pane_is_priced_and_is_not_free() {
     );
 }
 
-/// **Both pools carry a spare, or say they do not.** `None` is "this session
-/// has no figure", which refuses nothing; the GPU pool always has one.
-#[test]
-fn the_table_carries_the_same_spare_the_readout_publishes() {
-    let mut app = n_pane_app(2, SITE);
-    tick(&mut app);
-    assert_eq!(
-        app.admission_costs.spare.gpu_bytes, app.budget_readout.gpu.spare_bytes,
-        "the two halves of one composition disagree about GPU spare",
-    );
-    assert_eq!(
-        app.admission_costs.spare.host_bytes,
-        app.budget_readout.host.as_ref().and_then(|h| h.spare_bytes),
-        "the two halves of one composition disagree about host spare",
-    );
-}
-
 /// **Every gridded layer has a price, shown or not.** A table that listed only
 /// the layers already on screen would price the very act it exists to gate —
 /// reaching for a layer nothing is holding yet — at nothing.
@@ -420,5 +403,214 @@ fn the_frame_path_spares_the_grids_visible_panes_are_drawing_from() {
         !collapsed.contains(".volume_store.enforce_budget("),
         "the blind door has no caller left: it is the sparing door at \
          `visible_panes = 0`, and it drops the shortfall",
+    );
+}
+
+// ── The door prices at the ladder's floor ─────────────────────────────────
+
+/// The scene, the capacity and the two figures a door compares, at one
+/// `memory_percents` setting — every input to the contradiction below in one
+/// place, so a test can search for the share that reproduces it rather than
+/// hard-coding a percentage that stops meaning anything the moment a constant
+/// moves.
+struct Reading {
+    /// Whether `fit` has any rung left that could pay for more. `steps 0` on
+    /// the user's line said it had, which is what made the refusal wrong.
+    ladder_has_steps: bool,
+    /// The GPU spare the readout publishes: the allowance less the need at the
+    /// rung in force, and **the figure the door itself was compared against
+    /// until 2026-09-06**, less the volume shortfall.
+    readout_spare: u64,
+    /// What the door is given now: the allowance less the need at the ladder's
+    /// floor.
+    door_spare: squallar_device_profile::admit::Spare,
+    /// The act. One more pane, because it is the one in this fixture with a
+    /// GPU price — a whole-picture layer is a host term, and the native
+    /// fixture has no host reader, so `show_layer` is zero on both axes here
+    /// and could not fail either way.
+    act: Increment,
+}
+
+fn read_at(app: &mut App, gpu_percent: u8, host_percent: u8) -> Reading {
+    app.memory_percents =
+        squallar_device_profile::scene::PoolPercents::clamped(gpu_percent, host_percent);
+    tick(app);
+    Reading {
+        ladder_has_steps: !squallar_device_profile::fit::every_rung_at_its_stop(
+            &app.budgets,
+            &app.device_profile.limits,
+        ),
+        readout_spare: app.budget_readout.gpu.spare_bytes.expect("a GPU spare"),
+        door_spare: app.admission_costs.spare,
+        act: app.admission_costs.new_pane,
+    }
+}
+
+/// **The user's own contradiction, and it must not be reproducible.**
+///
+/// The line was `bracket wasm32, rung 0, steps 0, ... spare gpu 128 MiB host
+/// 88 MiB, admission asked 2 admitted 1 would refuse 1 refused 1`: the ladder
+/// had taken no step, both pools published room, and a door refused anyway. It
+/// refused because it priced the act at the rung the scene happened to sit at
+/// and compared it against that rung's spare — *does this fit without
+/// shedding* — when the design says refusal is what happens when there is
+/// nothing left to shed.
+///
+/// **Why the premise below proves the old spelling refused, without building
+/// it.** The spare it used was the readout's less the volume shortfall, so no
+/// larger than `readout_spare`; and the price it charged was the act at the
+/// rung in force, which is no smaller than the act at the floor, since no rung
+/// of `LADDER` raises a term. So `act_at_floor > readout_spare` implies
+/// `act_at_rung > old_spare`, and the assertion that follows is the difference
+/// between the two spellings and nothing else.
+///
+/// The share is **searched for rather than hard-coded**: what is under test is
+/// the predicate, and a percentage that lands in the window today would slide
+/// out of it on the next constant to move, leaving a test that passes by being
+/// vacuous. The search failing is itself a failure.
+#[test]
+fn a_door_admits_what_the_ladder_could_still_shed_for() {
+    let mut app = n_pane_app(2, SITE);
+    let scene = app.scene_of();
+    let floor = squallar_device_profile::fit::floor_need_for(
+        &scene,
+        &app.device_profile,
+        &app.capacity(),
+        super::GRID_BYTES,
+    );
+    let rung = squallar_device_profile::fit::need(&scene, &app.budgets, super::GRID_BYTES);
+    assert!(
+        floor.gpu_bytes <= rung.gpu_bytes,
+        "premise: no rung of the ladder raises a term, so the floor cannot \
+         cost more than the rung in force — {floor:?} against {rung:?}. The \
+         argument above depends on it",
+    );
+
+    let found = (squallar_device_profile::scene::PoolPercents::FLOOR..=100)
+        .rev()
+        .step_by(5)
+        .find_map(|percent| {
+            let r = read_at(&mut app, percent, percent);
+            (r.ladder_has_steps && r.act.gpu_bytes > r.readout_spare).then_some((percent, r))
+        });
+    let (percent, r) = found.expect(
+        "no share in FLOOR..=100 put the scene in the window this is about: \
+         the rung in force short of one more pane while the ladder still has a \
+         rung to shed. Without it the assertion below cannot fail",
+    );
+
+    assert!(
+        r.ladder_has_steps,
+        "premise at {percent} %: the ladder must have somewhere left to go, or \
+         a refusal is correct and this test is asserting the wrong thing",
+    );
+    assert!(
+        r.act.gpu_bytes > r.readout_spare,
+        "premise at {percent} %: the act must NOT fit at the rung in force \
+         ({} B against {} B of spare), or the old spelling admitted it too and \
+         this proves nothing",
+        r.act.gpu_bytes,
+        r.readout_spare,
+    );
+    assert!(
+        squallar_device_profile::admit::verdict(r.door_spare, r.act).is_admit(),
+        "at {percent} % the door refused an act the ladder could still have \
+         shed for: it wants {:?} against {:?}, while the rung in force \
+         publishes {} B",
+        r.act,
+        r.door_spare,
+        r.readout_spare,
+    );
+}
+
+/// **The other arm: a scene that genuinely cannot fit still refuses.**
+///
+/// Over-firing is the worse direction, but so is a door that has quietly
+/// stopped refusing — and a floor-priced door that admitted everything would
+/// look exactly like the advisory arm from outside. The act here is one no
+/// rung can pay for, so the ladder at its stop is the whole answer.
+#[test]
+fn a_door_still_refuses_what_no_rung_could_pay_for() {
+    let mut app = n_pane_app(2, SITE);
+    let r = read_at(
+        &mut app,
+        squallar_device_profile::scene::PoolPercents::FLOOR,
+        100,
+    );
+    let spare = r.door_spare.gpu_bytes.expect("a GPU spare");
+    let beyond = Increment {
+        gpu_bytes: spare.saturating_add(1),
+        host_bytes: 0,
+    };
+    let verdict = squallar_device_profile::admit::verdict(r.door_spare, beyond);
+    let refusal = verdict
+        .refusal()
+        .expect("one byte past the floor's own spare must refuse");
+    assert_eq!(refusal.short_bytes(), 1, "and it must say by how much");
+
+    // Control, one byte the other way: the door has not simply become a wall.
+    let inside = Increment {
+        gpu_bytes: spare,
+        host_bytes: 0,
+    };
+    assert!(
+        squallar_device_profile::admit::verdict(r.door_spare, inside).is_admit(),
+        "the act that exactly fills the floor's spare must be admitted, or \
+         the arm above passes on a door that refuses everything",
+    );
+}
+
+/// **The door's spare is the floor's, and it is not the readout's.**
+///
+/// They answer different questions about the same memory and neither is the
+/// other's approximation: the readout says how much room the scene on screen
+/// has left at the rung it is on — which is what a reader of `spare gpu`
+/// wants — and the door says whether there is a rung at which one more thing
+/// fits. Asserted against `fit::floor_need_for` directly rather than against a
+/// recorded figure, so it goes on meaning this after a term moves in `fit`.
+#[test]
+fn the_doors_spare_is_the_ladders_floor_and_the_readouts_is_the_rung_in_force() {
+    let mut app = n_pane_app(2, SITE);
+    tick(&mut app);
+    let scene = app.scene_of();
+    let cap = app.capacity();
+    let floor = squallar_device_profile::fit::floor_need_for(
+        &scene,
+        &app.device_profile,
+        &cap,
+        super::GRID_BYTES,
+    );
+    let rung = squallar_device_profile::fit::need(&scene, &app.budgets, super::GRID_BYTES);
+    assert!(
+        floor.gpu_bytes <= rung.gpu_bytes && floor.host_bytes <= rung.host_bytes,
+        "premise: the ladder's floor cannot cost more than the rung in force \
+         — {floor:?} against {rung:?}",
+    );
+
+    assert_eq!(
+        app.admission_costs.spare.gpu_bytes,
+        Some(
+            cap.allowance()
+                .saturating_sub(floor.gpu_bytes)
+                .saturating_sub(app.volume_shortfall_bytes)
+        ),
+        "the door's GPU spare is not the allowance less the FLOOR need",
+    );
+    assert_eq!(
+        app.budget_readout.gpu.spare_bytes,
+        Some(cap.allowance().saturating_sub(rung.gpu_bytes)),
+        "and the readout's is not the allowance less the need at the rung in \
+         force",
+    );
+    assert_eq!(
+        app.admission_costs.spare.host_bytes.is_some(),
+        app.budget_readout
+            .host
+            .as_ref()
+            .and_then(|h| h.spare_bytes)
+            .is_some(),
+        "the two halves of one composition must still agree about WHETHER a \
+         host figure exists: `None` refuses nothing, and one half seeing a \
+         pool the other does not is the divergence, not the arithmetic",
     );
 }

@@ -5362,9 +5362,11 @@ impl super::App {
         let terms = squallar_device_profile::fit::need_terms(&scene, &self.budgets, GRID_BYTES);
         let allocation = self.loop_allocation();
         self.compose_budget_readout(&scene, &terms, overlay_grids.clone(), &allocation);
-        // The other half of the same composition, off the same walk and the
-        // same terms - see `Self::compose_admission_costs`.
-        self.compose_admission_costs(&scene, &terms, &prospective, &overlay_grids);
+        // The other half of the same composition, off the same walk. Not off
+        // the same `terms`: those price the scene at the rung it is on, and a
+        // door prices at the ladder's floor - see
+        // `Self::compose_admission_costs`.
+        self.compose_admission_costs(&scene, &prospective, &overlay_grids);
         scene
     }
 
@@ -5372,16 +5374,16 @@ impl super::App {
     /// loop would cost, and what the pools have left.
     ///
     /// The mirror of [`Self::compose_budget_readout`]: that one describes what
-    /// is resident, this one prices what is **not yet**. Both run here, on the
-    /// telemetry tick, off the one walk and the one `NeedTerms` - the frame
-    /// path composes neither.
+    /// is resident at the rung the scene sits at, this one prices what is
+    /// **not yet** and prices it at the ladder's floor. Both run here, on the
+    /// telemetry tick, off the one walk - the frame path composes neither.
     ///
     /// # Every figure is a difference of the one model
     ///
-    /// Nothing here invents a byte figure. Each cost is
-    /// `squallar_device_profile::admit::increment` over the scene as it is and
-    /// the scene with exactly one thing added, so a term that moves in `fit`
-    /// moves in admission on the same land. That is also what makes ruling 8
+    /// Nothing here invents a byte figure. Each cost is a difference of
+    /// `squallar_device_profile::fit::floor_need_for` over the scene as it is
+    /// and the scene with exactly one thing added, so a term that moves in
+    /// `fit` moves in admission on the same land. That is also what makes ruling 8
     /// free: an alias is written into the prospective scene the way
     /// [`Self::loop_demand`] writes one - `looping: false`,
     /// `loop_scans_shared: true` - and the model prices it at its own cost and
@@ -5398,18 +5400,53 @@ impl super::App {
     fn compose_admission_costs(
         &mut self,
         scene: &Scene,
-        terms: &squallar_device_profile::fit::NeedTerms,
         prospective: &[ProspectiveLoop],
         overlay_grids: &[(squallar_source::id::LayerId, u64)],
     ) {
-        use squallar_device_profile::admit::{Increment, LoopFrames, Spare, increment};
+        use squallar_device_profile::admit::{Increment, LoopFrames, Spare};
         use squallar_device_profile::scene::Pools;
         use squallar_egui::admission::{AdmissionCosts, LayerGrid, PaneAdmission};
 
         let cap = self.capacity();
-        let need = terms.total();
         let budgets = self.budgets;
-        let price = |before: &Scene, after: &Scene| increment(before, after, &budgets, GRID_BYTES);
+
+        // **Every act is priced at the ladder's FLOOR, and the spare below is
+        // the floor's too.**
+        //
+        // `self.budgets` is the rung this scene happens to sit at, and pricing
+        // an act there asks *does it fit without shedding*. That is not the
+        // question. `fit` starts at the class rung and steps down `LADDER`
+        // while the price is over the allowance, so the wall a prospective
+        // scene actually faces is `floor_need_for` — what it costs with every
+        // rung at its stop. The design says refusal is what happens when there
+        // is nothing left to shed; the current-rung spelling refused with the
+        // whole ladder untouched, on lines reading `steps 0`, and took a user's
+        // loop with it.
+        //
+        // Both halves move together or the comparison is nonsense: `want` is a
+        // difference of floor needs and `spare` is the allowance less the floor
+        // need of the scene as it stands. `allowance - floor_need(before)` is
+        // what `floor_need(after) - floor_need(before)` has to fit inside, and
+        // the two rearrange to the one test that matters, `floor_need(after) <=
+        // allowance` — which is `fit`'s own promise, asked one act early.
+        //
+        // The floor need is taken per scene rather than from one floor
+        // `Budgets`, because `loop_frames_reachable` is admitted from the scene
+        // and the capacity before the walk (`fit::admit`) and no rung moves it:
+        // a scene with another loop in it reaches fewer frames, and a shared
+        // floor would price that away.
+        let profile = &self.device_profile;
+        let floor_need = |scene: &Scene| {
+            squallar_device_profile::fit::floor_need_for(scene, profile, &cap, GRID_BYTES)
+        };
+        let floor_now = floor_need(scene);
+        let price = |after: &Scene| {
+            let after = floor_need(after);
+            Increment {
+                gpu_bytes: after.gpu_bytes.saturating_sub(floor_now.gpu_bytes),
+                host_bytes: after.host_bytes.saturating_sub(floor_now.host_bytes),
+            }
+        };
 
         let mut panes = Vec::with_capacity(scene.panes.len());
         for (idx, pane) in scene.panes.iter().enumerate() {
@@ -5419,7 +5456,7 @@ impl super::App {
             // way the model folds it.
             let mut showing = scene.clone();
             showing.panes[idx].overlay_pictures += 1;
-            let show_layer = price(scene, &showing);
+            let show_layer = price(&showing);
 
             // Arming this pane's loop. A pane already looping cannot arm one;
             // a pane whose identity another pane owns prices as an alias, and
@@ -5433,7 +5470,7 @@ impl super::App {
                 target.looping = !would.alias;
                 target.loop_scans_shared = would.scans_shared;
                 target.cadence_secs = would.cadence_secs;
-                price(scene, &armed)
+                price(&armed)
             };
 
             // **One more frame of this pane's loop.** Priced as the whole
@@ -5453,7 +5490,7 @@ impl super::App {
                     Some(added) => {
                         let mut wider = scene.clone();
                         wider.panes[idx] = widest;
-                        let whole = price(scene, &wider);
+                        let whole = price(&wider);
                         Increment {
                             gpu_bytes: whole.gpu_bytes / added as u64,
                             host_bytes: whole.host_bytes / added as u64,
@@ -5501,7 +5538,7 @@ impl super::App {
             for source in &mut after.tile_sources {
                 source.tiles_on_glass += source.tiles_on_glass / denominator;
             }
-            price(scene, &after)
+            price(&after)
         };
 
         // **Every gridded layer, with whether some pane already holds its
@@ -5518,9 +5555,25 @@ impl super::App {
             })
             .collect();
 
-        // **Spare, as `compose_budget_readout` defines it and nowhere else** -
-        // the model's figure bounded by what the heap itself says. The joint
-        // row is the unified capacity's one memory: computed from
+        // **Spare at the ladder's floor**, bounded by what the heap itself
+        // says - the other half of the floor pricing above, and the reason
+        // this is NOT `compose_budget_readout`'s figure.
+        //
+        // The readout answers *how much room has the scene on screen left at
+        // the rung it is on*, and a user reading `spare host 88 MiB` wants
+        // that. A door answers *is there a rung at which one more thing
+        // fits*, and the only spare that question can be asked against is the
+        // allowance less what the scene costs with everything shed. The two
+        // are different questions about the same memory and neither is the
+        // other's approximation; the door's is published beside the readout's
+        // rather than replacing it.
+        //
+        // The heap bound stays. A rung shed frees bytes over the rounds that
+        // follow it, but the page heap's own room is a wall right now, and an
+        // act the ladder could pay for in principle still cannot allocate
+        // through a heap with nothing left today.
+        //
+        // The joint row is the unified capacity's one memory: computed from
         // `joint_allowance` and the whole need rather than as the two spares
         // summed, because both of those are floored at zero and would
         // over-state the pool the moment one axis went over its share.
@@ -5535,20 +5588,26 @@ impl super::App {
         let spare = Spare {
             // Less what the volume store could not shed: those bytes are held
             // by grids visible panes are drawing from, so they are resident
-            // and outside the model's own accounting of them.
+            // and outside the model's own accounting of them - and no rung
+            // sheds them either, which is why the term survives the move to
+            // the floor.
             gpu_bytes: Some(
                 cap.allowance()
-                    .saturating_sub(need.gpu_bytes)
+                    .saturating_sub(floor_now.gpu_bytes)
                     .saturating_sub(self.volume_shortfall_bytes),
             ),
             host_bytes: cap.host_allowance().map(|allowance| {
-                host_spare_bytes(allowance.saturating_sub(need.host_bytes), allowance, heap)
+                host_spare_bytes(
+                    allowance.saturating_sub(floor_now.host_bytes),
+                    allowance,
+                    heap,
+                )
             }),
             joint_bytes: match cap.pools {
                 Pools::Unified => {
                     let allowance = cap.joint_allowance();
-                    let model =
-                        allowance.saturating_sub(need.gpu_bytes.saturating_add(need.host_bytes));
+                    let model = allowance
+                        .saturating_sub(floor_now.gpu_bytes.saturating_add(floor_now.host_bytes));
                     Some(host_spare_bytes(model, allowance, heap))
                 }
                 Pools::Split => None,
