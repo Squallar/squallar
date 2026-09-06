@@ -5,9 +5,12 @@
 //! the worse direction: a door that refuses what the machine can hold gets
 //! switched off, and then nothing is gated at all.
 //!
-//! The doors are advisory under WO-G, so what a test can observe is the
-//! **verdict** and the counters, not a changed outcome. That is the point of
-//! the land: the arithmetic is proved before anything acts on it.
+//! Most of what a test here observes is the **verdict** and the counters
+//! rather than a changed outcome: the arithmetic is what these doors are, and
+//! it is provable without a scene. Whether a refusal is then acted on is
+//! [`super::ENFORCING`]'s business, and both of its arms are driven through
+//! [`AdmissionLedger::decide`] — the wasm arm is the advisory one and no test
+//! in this workspace executes a wasm build.
 //!
 //! These are the ledger's own rules. The same doors driven through the real
 //! chrome are in `crate::ui::admission_door_tests`, which sits under the
@@ -394,4 +397,194 @@ fn a_remote_notice_is_raised_once_and_ages_out() {
         "restating one sentence must not restamp it",
     );
     assert!(ledger.notice(now + NOTICE_LIFETIME * 2).is_none());
+}
+
+// ── Enforcing is per-arm; measuring is not ────────────────────────────────
+
+/// **The advisory arm counts the refusal and lets the act through.**
+///
+/// `ENFORCING` is `false` on wasm32, and the arm no test in this workspace
+/// executes is exactly the arm that took three user-visible functions with it
+/// when it started refusing. So the policy is a parameter of
+/// [`AdmissionLedger::decide`] and both arms are driven from here.
+///
+/// What must survive the advisory arm is the **measurement**: the verdict is
+/// taken, `would refuse` moves, and the pair `would refuse` / `refused` reads
+/// `1 / 0` — which is the whole signal that a door wanted to refuse and did
+/// not.
+#[test]
+fn the_advisory_arm_counts_the_refusal_and_admits() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+
+    assert!(
+        ledger.decide(Act::ShowLayer, Increment::host(10 * MIB), false),
+        "an advisory door must let the act through",
+    );
+    let counts = ledger.counts();
+    assert_eq!(counts.asked, 1, "and it still asks");
+    assert_eq!(
+        counts.would_refuse, 1,
+        "and still records that it would have refused",
+    );
+    assert_eq!(
+        counts.refused, 0,
+        "and does not claim to have turned anything away",
+    );
+    assert!(
+        ledger.notice(web_time::Instant::now()).is_none(),
+        "a notice saying the layer was refused, beside the layer that did \
+         appear, would be a lie on the glass",
+    );
+}
+
+/// **The enforcing arm, same ledger, same act, one fact changed.** Over-firing
+/// is the worse direction, so the pair is what makes either reading mean
+/// anything.
+#[test]
+fn the_enforcing_arm_turns_the_same_act_away() {
+    let mut ledger = AdmissionLedger::default();
+    ledger.adopt(&costs(0, 10 * MIB, 1));
+
+    assert!(!ledger.decide(Act::ShowLayer, Increment::host(10 * MIB), true));
+    let counts = ledger.counts();
+    assert_eq!(counts.would_refuse, 1);
+    assert_eq!(counts.refused, 1, "and this one did turn it away");
+    assert!(ledger.notice(web_time::Instant::now()).is_some());
+}
+
+/// **An act that fits is admitted on either arm** — the policy decides what
+/// happens to a refusal and nothing else. Without this the advisory arm would
+/// be indistinguishable from a door that had stopped asking.
+#[test]
+fn a_fitting_act_is_admitted_on_both_arms() {
+    for enforcing in [false, true] {
+        let mut ledger = AdmissionLedger::default();
+        ledger.adopt(&costs(64 * MIB, 10 * MIB, 1));
+        assert!(
+            ledger.decide(Act::ShowLayer, Increment::host(10 * MIB), enforcing),
+            "enforcing = {enforcing}",
+        );
+        let counts = ledger.counts();
+        assert_eq!(counts.admitted, 1, "enforcing = {enforcing}");
+        assert_eq!(counts.would_refuse, 0, "enforcing = {enforcing}");
+        assert_eq!(counts.refused, 0, "enforcing = {enforcing}");
+    }
+}
+
+/// **`enforce` is `decide` on this build's arm**, so the two cannot drift into
+/// two policies. The assertion is written against the constant rather than
+/// against `true`, so the wasm build of this file states the same identity.
+#[test]
+fn enforce_is_decide_on_this_arm() {
+    let mut through_enforce = AdmissionLedger::default();
+    through_enforce.adopt(&costs(0, 10 * MIB, 1));
+    let mut through_decide = AdmissionLedger::default();
+    through_decide.adopt(&costs(0, 10 * MIB, 1));
+
+    assert_eq!(
+        through_enforce.enforce(Act::ShowLayer, Increment::host(10 * MIB)),
+        through_decide.decide(Act::ShowLayer, Increment::host(10 * MIB), ENFORCING),
+    );
+    assert_eq!(through_enforce.counts(), through_decide.counts());
+}
+
+// ── A refusal names something the reader can move ─────────────────────────
+
+/// **A share already at its stop is not named.**
+///
+/// The Samsung Z Fold 7, 2026-09-06: a loop refused for 998 MB while Settings
+/// read `100 % asked for, 100 % in force` on both shares, and the notice told
+/// the user to raise one of them. That instruction had nothing behind it —
+/// `never-warn-about-the-unfixable`, and the defect is in the sentence, not
+/// in its tone. So at 100 % the notice may not mention the share at all, and
+/// must name a part of the scene the reader can spend instead.
+#[test]
+fn a_refusal_at_the_share_stop_names_no_slider() {
+    let mut ledger = AdmissionLedger::default();
+    let mut table = costs(0, 10 * MIB, 1);
+    table.requested_percent = (100, 100);
+    ledger.adopt(&table);
+
+    assert!(!ledger.enforce(Act::ArmLoop, Increment::host(998 * 1000 * 1000)));
+    let text = ledger
+        .notice(web_time::Instant::now())
+        .expect("a refusal must leave a notice")
+        .text
+        .clone();
+
+    for dead in ["System memory", "GPU memory", "Settings", "Raise", "100 %"] {
+        assert!(
+            !text.contains(dead),
+            "a share at its stop is not a control the reader has: {text}",
+        );
+    }
+    assert!(
+        text.contains("lookback"),
+        "and the notice must name what the reader CAN spend: {text}",
+    );
+    assert!(text.contains("998 MB short"), "{text}");
+}
+
+/// **The control arm: a share still short of its stop is named, with the
+/// number it sits at.** The reason the notice exists at all is that the two
+/// shares are the user's own setting; suppressing them whenever they are
+/// movable would be the opposite defect.
+#[test]
+fn a_refusal_below_the_stop_still_names_the_share() {
+    let mut ledger = AdmissionLedger::default();
+    let mut table = costs(0, 10 * MIB, 1);
+    table.requested_percent = (100, 60);
+    ledger.adopt(&table);
+
+    assert!(!ledger.enforce(Act::ArmLoop, Increment::host(998 * 1000 * 1000)));
+    let text = ledger
+        .notice(web_time::Instant::now())
+        .expect("a refusal must leave a notice")
+        .text
+        .clone();
+    assert!(text.contains("System memory"), "{text}");
+    assert!(text.contains("60 %"), "{text}");
+    assert!(text.contains("Settings > Memory"), "{text}");
+}
+
+/// **One memory, one share left**: a joint refusal names only the share that
+/// is still a lever. Naming a dead control beside a live one sends the reader
+/// to the wrong slider half the time.
+#[test]
+fn a_joint_refusal_names_only_the_movable_share() {
+    let mut only_gpu = AdmissionLedger::default();
+    let mut table = costs(0, 10 * MIB, 1);
+    table.requested_percent = (40, 100);
+    table.spare.joint_bytes = Some(0);
+    only_gpu.adopt(&table);
+    assert!(!only_gpu.enforce(Act::ShowLayer, Increment::host(10 * MIB)));
+    let text = only_gpu
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        text.contains("GPU memory") && text.contains("40 %"),
+        "{text}"
+    );
+    assert!(!text.contains("System memory"), "{text}");
+
+    let mut neither = AdmissionLedger::default();
+    let mut stopped = costs(0, 10 * MIB, 1);
+    stopped.requested_percent = (100, 100);
+    stopped.spare.joint_bytes = Some(0);
+    neither.adopt(&stopped);
+    assert!(!neither.enforce(Act::ShowLayer, Increment::host(10 * MIB)));
+    let text = neither
+        .notice(web_time::Instant::now())
+        .expect("a notice")
+        .text
+        .clone();
+    assert!(
+        !text.contains("GPU memory") && !text.contains("System memory"),
+        "one memory with both shares at their stop leaves no slider to name: \
+         {text}",
+    );
+    assert!(text.contains("turn off"), "{text}");
 }

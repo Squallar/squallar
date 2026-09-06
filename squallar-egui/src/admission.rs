@@ -66,9 +66,40 @@
 //! [`AdmissionLedger::enforce`] acts on one. **A silent refusal is a worse
 //! defect than the allocation it prevents**: the user asked for a layer, the
 //! layer did not appear, and nothing on the glass says why or what to change.
-//! So every refusal raises an [`AdmissionNotice`] that names the setting
-//! behind the wall - the two memory shares the user owns, by the labels the
-//! Settings screen gives them - and the pane paints it.
+//! So every refusal raises an [`AdmissionNotice`] that names something the
+//! reader can actually move - a memory share by the label the Settings screen
+//! gives it while that share is still short of its stop, and the part of the
+//! scene that would close the gap once it is not - and the pane paints it.
+//!
+//! # A refusal that cannot be revisited is worse than the allocation it
+//! prevented
+//!
+//! The twin of the rule above, and it is a **requirement of a door**, not a
+//! nicety. Every door here refuses by returning, and nothing anywhere retains
+//! the wish or asks again: `App::handle_enable_loop` returns before the pane's
+//! parked wish is consumed but `looping_panes` is drained once in `App::new`
+//! and only `TransportNotReady` re-queues, so one refused loop at startup is a
+//! session with no loop at all — and the wish is persisted, so it is *every*
+//! session. `PaneState::add_layer` and `Gui::write_pane_overlay` have the same
+//! shape on a layer. The only state a refusal writes is a six-second notice.
+//!
+//! So a refusal here is **permanent for the session**, and that turns a
+//! transient shortage into a lasting loss of function. Even a *correct*
+//! refusal has to be re-asked when the thing that made the scene tight goes
+//! away — a layer hidden, a pane closed, a loop stopped, a rung shed, the host
+//! governor recovering. Until a door retains what it refused and asks again on
+//! the telemetry tick that republishes the spare, refusing costs more than it
+//! saves, which is the other half of why [`ENFORCING`] is off on the arm every
+//! user is on.
+//!
+//! # Refusing is per-arm, measuring is not
+//!
+//! [`ENFORCING`] selects whether a refusal turns the act away. It is `false`
+//! on wasm32 as of 2026-09-06: enforcing there cost a loaded layer, every
+//! loop, and honesty in the notice, on lines that said the ladder had not
+//! been asked to shed. The verdict is still taken, still logged and still
+//! counted on [`Totals::would_refuse`] there — what a door is for is knowing,
+//! and only the turning away is off.
 //!
 //! # Restore is never a refusal
 //!
@@ -219,6 +250,40 @@ impl Act {
     }
 }
 
+/// **Whether a refusal turns the act away, or is only counted** — the one
+/// per-arm value in this module, and a selected value rather than a fork in
+/// [`AdmissionLedger::decide`]'s body.
+///
+/// `true` on native, where the doors exist for a real measured failure: an
+/// integrated adapter placing its pictures in memory shared with the
+/// compositor, on a machine that hard-froze rather than reported a wall.
+///
+/// `false` on wasm32, from 2026-09-06. Enforcing there took three user-visible
+/// functions with it inside hours of landing — a loaded whole-picture layer
+/// leaving the glass, no loop arming at all, and a refusal notice on a phone
+/// pointing at a slider already at its stop — on a `budget state:` line
+/// reading `rung 0, steps 0` with spare on both pools, which is a scene the
+/// ladder had not been asked to shed for and a door should never have refused.
+/// **A door that eats loaded content is worse than no door.** The verdict is
+/// still computed, still logged and still counted on `would refuse`, so the
+/// instrument that made all three visible goes on running; only the turning
+/// away is off, and it comes back when the door and the readout are shown to
+/// be describing the same scene.
+#[cfg(target_arch = "wasm32")]
+const ENFORCING: bool = false;
+#[cfg(not(target_arch = "wasm32"))]
+const ENFORCING: bool = true;
+
+/// **Which arm this build selected, asserted at compile time.**
+///
+/// No test in this workspace runs a wasm build, so the value of [`ENFORCING`]
+/// on the arm that matters most is otherwise carried by reading two `cfg`
+/// attributes and trusting them. This is checked by the same
+/// `cargo check --target wasm32-unknown-unknown` row CI already runs, and it
+/// is one expression rather than a per-arm pair, so it cannot itself be
+/// selected wrong.
+const _: () = assert!(ENFORCING != cfg!(target_arch = "wasm32"));
+
 /// **The always-on admission counters**, in the shape
 /// [`crate::frame_need`] and [`crate::overlay_cache::ledger`] already use:
 /// product telemetry, no feature gate, one relaxed `fetch_add` per verdict.
@@ -240,12 +305,16 @@ pub struct Totals {
     pub asked: u32,
     /// Verdicts that admitted.
     pub admitted: u32,
-    /// **Verdicts that would have refused had the door been enforcing.** The
-    /// advisory figure; it counts under WO-G and goes on counting under WO-H,
-    /// where it is the same number as [`Self::refused`].
+    /// **Verdicts that came back a refusal**, whether or not the arm acted on
+    /// one. The measurement, and it runs on every arm.
     pub would_refuse: u32,
-    /// **Acts actually turned away.** Zero for the whole of WO-G, by
-    /// construction — nothing calls [`AdmissionLedger::enforce`] yet.
+    /// **Acts actually turned away** — the subset of [`Self::would_refuse`]
+    /// that [`ENFORCING`] let through to the caller as a `false`.
+    ///
+    /// The two are the same number on native and the pair is `n / 0` on
+    /// wasm32, where the doors are advisory. **Keep them apart**: the gap
+    /// between them is what a refusal costs the user, and collapsing them
+    /// into one field is how an advisory arm stops being visible.
     pub refused: u32,
 }
 
@@ -383,9 +452,9 @@ impl AdmissionLedger {
     /// On an admission the increment is debited, so the next door in the same
     /// tick sees the smaller spare.
     ///
-    /// **WO-G: the verdict is computed and counted, and the caller ignores
-    /// it.** Under WO-G every door drops the answer on the floor; the
-    /// enforcing land is what starts reading it.
+    /// **The measurement, on every arm.** A refusing verdict counted here is
+    /// counted whether or not [`ENFORCING`] then turns the act away, so the
+    /// advisory arm reports exactly what the enforcing one would have done.
     pub fn ask(&mut self, act: Act, want: Increment) -> Verdict {
         if want.is_zero() || self.in_batch() || self.costs.generation == 0 {
             return Verdict::Admit;
@@ -437,10 +506,26 @@ impl AdmissionLedger {
     /// nothing** - refusing on an absent figure is how an admission system
     /// turns into a wall at startup, which is the moment the config restore is
     /// putting the user's panes back.
+    /// **On an arm where [`ENFORCING`] is false the refusal is counted and
+    /// the act proceeds** - see that constant for which arm and why.
     pub fn enforce(&mut self, act: Act, want: Increment) -> bool {
+        self.decide(act, want, ENFORCING)
+    }
+
+    /// [`Self::enforce`]'s body, with the arm's policy passed in rather than
+    /// read from the `const`.
+    ///
+    /// Both arms are then reachable from one test binary. A `cfg` in the body
+    /// would leave whichever arm this build did not compile with no test at
+    /// all, and the advisory arm is the wasm one — the arm no test in this
+    /// workspace executes.
+    fn decide(&mut self, act: Act, want: Increment, enforcing: bool) -> bool {
         match self.ask(act, want) {
             Verdict::Admit => true,
             Verdict::Refuse(refusal) => {
+                if !enforcing {
+                    return true;
+                }
                 REFUSED.fetch_add(1, Relaxed);
                 self.counts.refused = self.counts.refused.saturating_add(1);
                 let text = refusal_text(act, refusal, self.costs.requested_percent);
@@ -500,24 +585,55 @@ impl AdmissionLedger {
     }
 }
 
-/// **What a refusal says, and it names the setting that produced it.**
+/// **The top of the memory-share sliders**, which is where a share stops
+/// being a lever — `ui_settings`'s `Slider::new(percent, FLOOR..=100)`.
+///
+/// A share sitting on this number is a control the reader has already run out
+/// of, and a refusal that points at it is a warning about something they
+/// cannot fix.
+const SHARE_MAX_PERCENT: u8 = 100;
+
+/// **What a refusal says, and it names something the reader can actually
+/// move.**
 ///
 /// Three things, in the order a reader needs them: which memory ran out, how
-/// much short the act was, and **which control to move**. The last is the
-/// point - the two memory shares are the user's own setting, they are what
-/// the wall is made of, and a notice that stopped at "not enough memory"
-/// would be a warning about something the reader cannot fix.
+/// much short the act was, and **what to do**. The last is the point - a
+/// notice that stopped at "not enough memory" would be a warning about
+/// something the reader cannot fix.
 ///
-/// The setting is named by the label the Settings screen actually shows
-/// (`ui_settings`'s `"GPU memory"` and `"System memory"`, under the `Memory`
-/// heading), so the sentence and the screen cannot drift into two names for
-/// one control.
+/// Where a share is still a lever it is named by the label the Settings
+/// screen actually shows (`ui_settings`'s `"GPU memory"` and `"System
+/// memory"`, under the `Memory` heading), so the sentence and the screen
+/// cannot drift into two names for one control.
 ///
-/// A unified pool names both, because on one memory either share moves the
-/// same wall.
+/// **A share already at [`SHARE_MAX_PERCENT`] is not named at all.** On a
+/// phone reporting one figure for everything both shares read `100 % asked
+/// for, 100 % in force`, and the sentence this used to build told the reader
+/// to raise a slider that was already at its stop - an instruction with
+/// nothing behind it. When neither share is left to move, the notice says the
+/// device has no more to give and names the part of the *scene* that would
+/// close the gap instead ([`scene_lever`]); ruling 13 and ruling 15 keep the
+/// governor from shortening those itself, so they are the user's to spend.
+///
+/// A unified pool names both shares where both are movable, because on one
+/// memory either share moves the same wall.
 fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8)) -> String {
     let short = refusal.short_bytes().div_ceil(1000 * 1000);
     let (gpu, host) = percents;
+    let movable = |percent: u8| percent < SHARE_MAX_PERCENT;
+    let (gpu_movable, host_movable) = match refusal.pool {
+        Pool::Gpu => (movable(gpu), false),
+        Pool::Host => (false, movable(host)),
+        Pool::Joint => (movable(gpu), movable(host)),
+    };
+    if !gpu_movable && !host_movable {
+        return format!(
+            "Not enough memory for {} - {short} MB short. This device has no \
+             more to give it: {}.",
+            act.noun(),
+            scene_lever(act),
+        );
+    }
     match refusal.pool {
         Pool::Gpu => format!(
             "Not enough GPU memory for {} - {short} MB short. Raise \"GPU \
@@ -529,13 +645,45 @@ fn refusal_text(act: Act, refusal: Refusal, percents: (u8, u8)) -> String {
              \"System memory\" in Settings > Memory (now {host} %).",
             act.noun(),
         ),
-        Pool::Joint => format!(
+        // One memory, and whichever share is still short of its stop is the
+        // one that moves the wall. Naming a share already at 100 % beside a
+        // movable one would send the reader to the dead control half the time.
+        Pool::Joint if gpu_movable && host_movable => format!(
             "Not enough memory for {} - {short} MB short. This machine shares \
              one pool between the display and the system: raise \"GPU \
              memory\" (now {gpu} %) or \"System memory\" (now {host} %) in \
              Settings > Memory.",
             act.noun(),
         ),
+        Pool::Joint if gpu_movable => format!(
+            "Not enough memory for {} - {short} MB short. This machine shares \
+             one pool between the display and the system: raise \"GPU \
+             memory\" in Settings > Memory (now {gpu} %).",
+            act.noun(),
+        ),
+        Pool::Joint => format!(
+            "Not enough memory for {} - {short} MB short. This machine shares \
+             one pool between the display and the system: raise \"System \
+             memory\" in Settings > Memory (now {host} %).",
+            act.noun(),
+        ),
+    }
+}
+
+/// **What of the scene the reader can spend, when no share is left to move.**
+///
+/// The governor may not shorten a lookback or thin a loop by itself (rulings
+/// 13 and 15), so on a device that has already given everything it has these
+/// are the only figures left that can close the gap — and they are the user's
+/// to spend, not the model's. Named per act because the reader is standing in
+/// front of one act, not in front of the whole scene.
+const fn scene_lever(act: Act) -> &'static str {
+    match act {
+        Act::ArmLoop | Act::LoopSpan => "shorten the lookback, or turn off a layer",
+        Act::Panes { .. } | Act::Preset => "close a pane, or turn off a layer",
+        Act::ShowLayer | Act::DefaultLayers | Act::AdoptLayers => {
+            "turn off another layer, shorten a lookback, or close a pane"
+        }
     }
 }
 
