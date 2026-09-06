@@ -978,7 +978,7 @@ fn build_outcome_leaves_an_empty_bucket_unreported() {
 #[test]
 fn garbage_bytes_are_a_parse_failure_not_a_transport_failure() {
     let err = parse_downloaded_file(
-        b"this is not a netcdf file",
+        b"this is not a netcdf file".to_vec(),
         GlmSatellite::GoesEast,
         &[GlmDataLevel::Flash],
     )
@@ -993,7 +993,7 @@ fn garbage_bytes_are_a_parse_failure_not_a_transport_failure() {
 #[test]
 fn a_good_granule_parses_through_the_classified_stage() {
     let bytes = synthetic_glm_file(Fixture::default());
-    let flashes = parse_downloaded_file(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+    let flashes = parse_downloaded_file(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
         .expect("fixture should parse");
     assert_eq!(flashes.records.len(), 2);
     assert!(flashes.level_failures.is_empty());

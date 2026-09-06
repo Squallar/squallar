@@ -106,6 +106,40 @@ pub const FLASH_BYTES: usize = size_of::<GlmFlash>();
 /// cap keeps its **newest** hours lit rather than its oldest.
 pub const MAX_RETAINED_FLASHES: usize = 250_000;
 
+/// **How many granule GETs are in flight at once**, and therefore how many
+/// granule *files* [`download_and_parse_batch`] may hold at one time.
+///
+/// A ceiling on **peak memory**, not on politeness — the same kind of constant
+/// as `mrms::volume::STACK_FETCH_CONCURRENCY`, and priced the same way. Each
+/// slot holds one whole granule body from the moment it arrives until its parse
+/// returns: 280,380 B on the measured product granule
+/// (`squallar-overlays/testdata/OR_GLM-L2-LCFA_G19_…nc`), so twenty slots are
+/// **5,607,600 B** of file buffers.
+///
+/// **It bounds the bodies, not the parses.** `buffer_unordered` polls its
+/// sub-futures inline from one task, so however many bodies are in flight
+/// exactly one parse runs at a time — which is why the copy
+/// [`parse_glm_granule`] removed was one granule and not twenty of them.
+/// `tests/glm_poll_peak.rs::a_batch_holds_no_more_bodies_than_the_concurrency_cap`
+/// measures the bodies: a 45-object batch reads 6,970,916–8,415,961 B under
+/// this cap and 17,235,745–17,840,225 B without it.
+///
+/// **Justified, not derived.** MRMS holds four because one slot there is a
+/// 49 MB values vector; a GLM slot is 175× smaller, so the same politeness
+/// budget buys far more of them, and nothing measured here says where the
+/// latency curve of a cold poll turns over. What the figure above does is make
+/// the cost of the number sayable, which a bare `20` at the call site could
+/// not.
+///
+/// **The shipped default posture never reaches it.** A batch is one
+/// satellite's new keys, and a 300 s window at one granule per 20 s is 15 of
+/// them; the two satellites are downloaded in sequence, so a cold live poll
+/// peaks at 15 in flight. The cap binds under a wider window — this layer
+/// allows up to [`super::GLM_MAX_TIME_WINDOW_SECS`], 90 granules — and under a
+/// span or loop posture, which is where a cold round's file buffers are worth
+/// bounding at all.
+pub const GRANULE_FETCH_CONCURRENCY: usize = 20;
+
 impl GlmCache {
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
         let retained = &mut self.retained_flashes;
@@ -551,11 +585,31 @@ fn flashes_in_window(
     cutoff: NaiveDateTime,
     horizon: NaiveDateTime,
 ) -> Vec<GlmFlash> {
-    cache
-        .all_flashes()
-        .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= horizon)
-        .cloned()
-        .collect()
+    // **Presized off the level, not grown into.** A `Filter` reports a lower
+    // size hint of zero, so `collect` started this Vec at four rows and
+    // doubled: the capacity it settled on was the next power of two above the
+    // row count, and it is not a transient — it travels into
+    // `GlmFetchOutcome::flashes` and on into the render handler's
+    // `Arc<GlmSlab>`, so up to 2× the rows stayed held for as long as the
+    // delivery was. At 420,000 rows that was 25,165,824 B of capacity carrying
+    // 20,160,000 B of rows.
+    //
+    // `retained_flashes` is an exact upper bound and a free read — the
+    // maintained level, not a walk: every row this filter can keep is a row the
+    // cache holds. What it over-reserves by is what the filter drops: the
+    // granule straddling the window's end, and — for the window it takes those
+    // granules to age out of `evict_before` — a satellite just deselected. That
+    // worst case is under 2× the rows kept, which is what doubling settled on
+    // anyway, so the reservation is never dearer than the growth it replaced
+    // and is exact on a steady pane.
+    let mut in_window = Vec::with_capacity(cache.retained_flashes());
+    in_window.extend(
+        cache
+            .all_flashes()
+            .filter(|f| satellites.contains(&f.satellite) && f.time >= cutoff && f.time <= horizon)
+            .cloned(),
+    );
+    in_window
 }
 
 fn build_outcome(
@@ -585,6 +639,18 @@ fn build_outcome(
 
 #[derive(Default)]
 struct PollAccumulator {
+    /// **Holds each granule's rows until the poll ends, and that costs
+    /// nothing** — `cache_granules` moves every `Vec<GlmFlash>` into an
+    /// `Arc`, which adopts the buffer the parser built, so the rows are here
+    /// or in the cache and never in both.
+    ///
+    /// Installing per satellite instead — so GOES-East's granules leave this
+    /// Vec before GOES-West is listed — was measured against
+    /// `tests/glm_poll_peak.rs::a_cold_poll_holds_one_row_buffer_per_delivery`
+    /// and moved the cold-poll peak by **0 B** (40,329,586 B either way, three
+    /// runs each), in a window that registers a whole-cache-sized term. It
+    /// would also put satellite 2's `plan_downloads` in front of a cache
+    /// already carrying satellite 1's new keys, for no bytes.
     entries: Vec<(String, Vec<GlmFlash>)>,
     parse_errors: Vec<String>,
     transport_errors: Vec<String>,
@@ -882,8 +948,9 @@ async fn download_and_parse_batch(
                 match download_and_parse_one(&client, &url, satellite, &lvls).await {
                     Ok(parsed) => Ok((key_owned, parsed)),
                     Err(e) => {
-                        // Debug, not warn: with 20 files in flight one schema
-                        // change would produce a wall of identical lines.
+                        // Debug, not warn: with `GRANULE_FETCH_CONCURRENCY`
+                        // files in flight one schema change would produce a
+                        // wall of identical lines.
                         log::debug!("Failed to fetch GLM file {key_owned}: {}", e.message());
                         let labelled = format!("{key_owned}: {}", e.message());
                         Err(match e {
@@ -897,7 +964,7 @@ async fn download_and_parse_batch(
         .collect();
 
     let results: Vec<Result<(String, GranuleParse), FileError>> = futures::stream::iter(futs)
-        .buffer_unordered(20)
+        .buffer_unordered(GRANULE_FETCH_CONCURRENCY)
         .collect()
         .await;
 
@@ -983,15 +1050,17 @@ async fn download_and_parse_one(
     let bytes = download_bytes(client, url)
         .await
         .map_err(FileError::Transport)?;
-    parse_downloaded_file(&bytes, satellite, levels)
+    parse_downloaded_file(bytes, satellite, levels)
 }
 
+/// **Takes the body**, so the buffer the transport allocated is the only copy
+/// of this granule that ever exists — see [`parse_glm_granule`].
 fn parse_downloaded_file(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, FileError> {
-    parse_glm_netcdf(bytes, satellite, levels).map_err(FileError::Parse)
+    parse_glm_granule(bytes, satellite, levels).map_err(FileError::Parse)
 }
 
 struct LevelVars {
@@ -1046,12 +1115,44 @@ impl VarSource for squallar_netcdf::Granule {
     }
 }
 
+/// Parse a granule from **borrowed** bytes, copying them.
+///
+/// `squallar_netcdf::Granule` needs an owned buffer, so this is
+/// [`parse_glm_granule`] plus a copy of the whole file. `cfg(test)` because
+/// every caller is a test holding a `&'static [u8]` fixture or a builder's
+/// return value — the download path owns its bytes and goes through the owned
+/// door, and a shipped caller appearing here would be one paying for a copy it
+/// does not need.
+#[cfg(test)]
 pub(crate) fn parse_glm_netcdf(
     data: &[u8],
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, String> {
-    let file = squallar_netcdf::Granule::open(data)?;
+    parse_glm_granule(data.to_vec(), satellite, levels)
+}
+
+/// Parse a granule from bytes this call **takes ownership of** — the download
+/// path's door, and the no-copy form of [`parse_glm_netcdf`].
+///
+/// By value on purpose, the same argument `gmgsi::decode` makes: the reader
+/// needs an owned buffer, so taking it here lets `Granule::from_vec` adopt the
+/// body the transport already allocated instead of `Granule::open` copying it.
+/// **What the copy cost, measured**: 280,380 B on the product granule, for the
+/// length of one parse. Not one per in-flight slot —
+/// [`GRANULE_FETCH_CONCURRENCY`] bounds the *bodies* in flight, but
+/// `buffer_unordered` polls its sub-futures inline from a single task, so one
+/// parse runs at a time and one granule at a time was doubled.
+/// `tests/glm_poll_peak.rs::a_granule_under_the_parser_exists_once` is the
+/// gate, and `pub` is what lets an integration test hold it: the same window
+/// taken around a whole poll cannot see this, because the transport's own
+/// buffers vary by more than a granule between runs.
+pub fn parse_glm_granule(
+    data: Vec<u8>,
+    satellite: GlmSatellite,
+    levels: &[GlmDataLevel],
+) -> Result<GranuleParse, String> {
+    let file = squallar_netcdf::Granule::from_vec(data)?;
     parse_with_source(&file, satellite, levels)
 }
 
@@ -1119,8 +1220,10 @@ fn parse_with_source<S: VarSource>(
     })
 }
 
+/// What one granule's bytes parsed to — [`parse_glm_granule`]'s product, and
+/// `pub` for the same reason that door is.
 #[derive(Debug)]
-pub(crate) struct GranuleParse {
+pub struct GranuleParse {
     pub records: Vec<GlmFlash>,
     pub level_failures: Vec<LevelFailure>,
     pub drops: RecordDrops,
