@@ -1,4 +1,9 @@
-use crate::{Position, position::AdjustedPosition};
+use crate::{
+    Position,
+    mercator::{project, total_pixels, unproject},
+    position::{AdjustedPosition, Pixels},
+    viewport::{CENTER_SLACK_POINTS, clamp_center_y},
+};
 use egui::{DragPanButtons, PointerButton, Response, Vec2};
 
 /// Time constant of the inertia stopping filter, in **seconds**.
@@ -352,6 +357,68 @@ impl Center {
         }
     }
 
+    /// Pull the centre back until the viewport it centres lies inside the
+    /// world vertically. Returns whether it moved.
+    ///
+    /// The zoom floor makes the world at least as tall as the viewport; this is
+    /// what stops the viewport being panned off the top or the bottom of it
+    /// anyway. **Vertically only** — the horizontal axis is left free so that
+    /// the world can be drawn wrapping east-west, which no clamp can do.
+    ///
+    /// Two consequences worth naming rather than discovering:
+    ///
+    /// - The variant survives, so a coast that runs into a pole keeps coasting
+    ///   sideways and stops when its velocity says to, not when the map hits
+    ///   the edge. Only [`Center::MyPosition`] cannot: it has no position of
+    ///   its own to move, so a `my_position` that cannot be centred without
+    ///   void detaches the map, exactly once, and the map is `Exact` from then
+    ///   on.
+    /// - The pixel offset is folded into the base position on the frames this
+    ///   fires. That is what [`AdjustedPosition::position`] already resolves
+    ///   to, so the centre is unchanged, but `offset_length` restarts from
+    ///   zero — visible only to `drag_stopped`'s pull-to-`my_position`
+    ///   threshold, and only for a drag that both started attached and ended on
+    ///   the very frame the clamp bit.
+    pub(crate) fn clamp_vertically(
+        &mut self,
+        my_position: Position,
+        zoom: f64,
+        viewport_height: f64,
+    ) -> bool {
+        let world = total_pixels(zoom);
+        let projected = project(self.position(my_position), zoom);
+        if !projected.y().is_finite() || !world.is_finite() {
+            return false;
+        }
+
+        let wanted = clamp_center_y(projected.y(), viewport_height, world);
+        if (wanted - projected.y()).abs() <= CENTER_SLACK_POINTS {
+            return false;
+        }
+
+        // The x is carried through untouched, out-of-world value and all.
+        let position = AdjustedPosition::new(unproject(Pixels::new(projected.x(), wanted), zoom));
+
+        *self = match self {
+            Center::MyPosition | Center::Exact(_) => Center::Exact(position),
+            Center::PulledToMyPosition(_) => Center::PulledToMyPosition(position),
+            Center::Moving {
+                direction,
+                from_detached,
+                ..
+            } => Center::Moving {
+                position,
+                direction: *direction,
+                from_detached: *from_detached,
+            },
+            Center::Inertia { velocity, .. } => Center::Inertia {
+                position,
+                velocity: *velocity,
+            },
+        };
+        true
+    }
+
     /// Returns exact position if map is detached (i.e. not following `my_position`),
     /// `None` otherwise.
     pub(crate) fn detached(&self) -> Option<Position> {
@@ -408,6 +475,229 @@ impl Center {
                 position: position.shift(offset, zoom),
                 velocity,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::*;
+    use crate::lon_lat;
+    use crate::viewport::{clamp_zoom, min_zoom};
+    use egui::Rect;
+
+    /// The pane this was reported from, and a portrait one beside it.
+    fn viewports() -> [Rect; 4] {
+        [
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2878.0, 1651.0)),
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1651.0, 2878.0)),
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(390.0, 844.0)),
+        ]
+    }
+
+    /// How far outside the world an edge may land and still count as inside.
+    ///
+    /// `CENTER_SLACK_POINTS` is the deadband the clamp deliberately does not
+    /// fire inside; the `1e-6` beside it is the projection round trip, measured
+    /// in the same units. Both are named rather than rolled into one number so
+    /// that a change to either is visible here.
+    const EDGE_TOLERANCE: f64 = CENTER_SLACK_POINTS + 1e-6;
+
+    fn at(lon: f64, lat: f64) -> Center {
+        Center::Exact(AdjustedPosition::new(lon_lat(lon, lat)))
+    }
+
+    /// Where the viewport's top and bottom edges sit in world points.
+    fn edges(center: &Center, my_position: Position, zoom: f64, height: f64) -> (f64, f64) {
+        let y = project(center.position(my_position), zoom).y();
+        (y - height / 2.0, y + height / 2.0)
+    }
+
+    /// Every variant, carrying `position`, so that the clamp is exercised on
+    /// each of the five rather than on whichever one a test happened to build.
+    fn every_variant(position: AdjustedPosition) -> [Center; 5] {
+        [
+            Center::MyPosition,
+            Center::Exact(position.clone()),
+            Center::Moving {
+                position: position.clone(),
+                direction: Vec2::new(0., 40.),
+                from_detached: true,
+            },
+            Center::Inertia {
+                position: position.clone(),
+                velocity: Vec2::new(0., 900.),
+            },
+            Center::PulledToMyPosition(position),
+        ]
+    }
+
+    /// **Gate 8.** However the centre got where it is, once the zoom is at or
+    /// above the viewport's floor the clamp leaves the viewport's top and
+    /// bottom edges inside the world.
+    ///
+    /// And it leaves them there *without re-firing*: the second call on the
+    /// same state reports no change, which is what keeps a map resting against
+    /// a pole from requesting a repaint every frame forever.
+    #[test]
+    fn the_centre_is_pulled_back_until_the_viewport_is_inside_the_world() {
+        let my_position = lon_lat(21.0, 52.0);
+        let mut fired = 0usize;
+
+        for rect in viewports() {
+            let height = f64::from(rect.height());
+            for raw_zoom in [0.0, 1.0, 2.0, 3.326_757_482_253_017, 3.49, 5.0, 9.0, 14.0] {
+                let zoom = clamp_zoom(raw_zoom, rect);
+                let world = total_pixels(zoom);
+
+                for lat in [-85.0, -84.9, -60.0, -1.0, 0.0, 1.0, 60.0, 84.9, 85.0] {
+                    for mut center in every_variant(AdjustedPosition::new(lon_lat(17.0, lat))) {
+                        let my_position = if matches!(center, Center::MyPosition) {
+                            lon_lat(17.0, lat)
+                        } else {
+                            my_position
+                        };
+
+                        if center.clamp_vertically(my_position, zoom, height) {
+                            fired += 1;
+                        }
+
+                        let (top, bottom) = edges(&center, my_position, zoom, height);
+                        assert!(
+                            top >= -EDGE_TOLERANCE,
+                            "top edge at {top} for lat {lat}, zoom {zoom}, {rect:?}"
+                        );
+                        assert!(
+                            bottom <= world + EDGE_TOLERANCE,
+                            "bottom edge at {} past the world's {world}, for lat {lat}, \
+                             zoom {zoom}, {rect:?}",
+                            bottom - world
+                        );
+
+                        assert!(
+                            !center.clamp_vertically(my_position, zoom, height),
+                            "the clamp fired twice on the same state, which is a repaint \
+                             every frame for as long as the map rests there"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            fired > 100,
+            "only {fired} of the cases needed clamping, so this proves little"
+        );
+    }
+
+    /// A centre that cannot be centred detaches the map, and only then.
+    #[test]
+    fn a_my_position_that_cannot_be_centred_detaches_the_map() {
+        let rect = viewports()[0];
+        let zoom = min_zoom(rect);
+        let height = f64::from(rect.height());
+
+        // The equator is reachable at the floor; a pole is not.
+        let mut center = Center::MyPosition;
+        assert!(!center.clamp_vertically(lon_lat(0.0, 0.0), zoom, height));
+        assert_eq!(center, Center::MyPosition);
+
+        let mut center = Center::MyPosition;
+        assert!(center.clamp_vertically(lon_lat(0.0, 85.0), zoom, height));
+        assert!(matches!(center, Center::Exact(_)));
+    }
+
+    /// The variant survives the clamp, so a coast that runs into a pole keeps
+    /// its velocity and keeps coasting.
+    #[test]
+    fn a_coast_into_the_pole_keeps_coasting() {
+        let rect = viewports()[0];
+        let zoom = clamp_zoom(5.0, rect);
+        let height = f64::from(rect.height());
+        let world = total_pixels(zoom);
+        let velocity = Vec2::new(300.0, 4000.0);
+
+        let mut center = Center::Inertia {
+            position: AdjustedPosition::new(lon_lat(17.0, 80.0)),
+            velocity,
+        };
+
+        for frame in 0..600 {
+            center.update_movement(1.0 / 60.0, zoom);
+            center.clamp_vertically(lon_lat(21.0, 52.0), zoom, height);
+
+            let (top, bottom) = edges(&center, lon_lat(21.0, 52.0), zoom, height);
+            assert!(top >= -EDGE_TOLERANCE, "frame {frame}: top edge at {top}");
+            assert!(
+                bottom <= world + EDGE_TOLERANCE,
+                "frame {frame}: bottom edge {} past the world",
+                bottom - world
+            );
+
+            if let Center::Inertia { velocity: v, .. } = &center {
+                assert!(
+                    v.x.abs() > 0.0,
+                    "frame {frame}: the coast lost its horizontal velocity to a vertical clamp"
+                );
+            }
+        }
+
+        // And it did stop, on its own terms rather than the clamp's.
+        assert!(matches!(center, Center::Exact(_)));
+    }
+
+    /// **Phase 2 readiness.** Nothing here clamps the centre horizontally, and
+    /// a centre past the antimeridian survives a vertical clamp with its
+    /// longitude untouched — including when the vertical clamp fires.
+    ///
+    /// A horizontal clamp is the natural-looking symmetry to add to
+    /// [`Center::clamp_vertically`], and it would silently foreclose drawing
+    /// the world wrapping east-west, which is what the horizontal axis is for.
+    #[test]
+    fn horizontal_panning_is_never_clamped() {
+        let rect = viewports()[0];
+        let zoom = clamp_zoom(6.0, rect);
+        let height = f64::from(rect.height());
+        let world = total_pixels(zoom);
+        let my_position = lon_lat(21.0, 52.0);
+
+        for east in [1.0, 3.0, 17.5] {
+            // Shifting west by a whole world moves the centre a whole turn
+            // east, because the offset is subtracted from the projection.
+            let past = AdjustedPosition::new(lon_lat(0.0, 0.0))
+                .shift(Vec2::new(-((world * east) as f32), 0.0), zoom);
+
+            for lat in [0.0, 85.0, -85.0] {
+                let mut center = Center::Exact(
+                    AdjustedPosition::new(lon_lat(0.0, lat))
+                        .shift(Vec2::new(-((world * east) as f32), 0.0), zoom),
+                );
+                let before = project(center.position(my_position), zoom).x();
+
+                center.clamp_vertically(my_position, zoom, height);
+                let after = project(center.position(my_position), zoom).x();
+
+                assert!(
+                    before > world * east,
+                    "the fixture is not past the antimeridian: {before} vs {world}"
+                );
+                assert!(
+                    (after - before).abs() < 1e-6,
+                    "the vertical clamp moved the centre horizontally, from {before} to {after}"
+                );
+                assert!(
+                    after > world,
+                    "a centre {east} worlds east came back inside the world at {after}"
+                );
+            }
+
+            // The same statement about longitude rather than pixels.
+            let lon = past.position().x();
+            assert!(
+                lon > 180.0,
+                "a centre {east} worlds east reads as longitude {lon}"
+            );
         }
     }
 }

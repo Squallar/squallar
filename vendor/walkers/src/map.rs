@@ -185,12 +185,34 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
         // delta over the time this frame took.
         let delta_time = ui.input(|reader| reader.stable_dt);
 
-        let mut changed = self.handle_gestures(ui, &response, delta_time);
+        // The zoom below which this viewport shows points no map covers. Only
+        // the widget can compute it, because only the widget knows `rect`.
+        let min_zoom = crate::viewport::min_zoom(rect);
+
+        let mut changed = self.handle_gestures(ui, &response, delta_time, min_zoom);
+
+        // A gesture is not the only way a zoom becomes illegal, which is why
+        // this is here and not only inside `handle_gestures`: the pane can be
+        // resized under a zoom that was legal when it was set, and a zoom
+        // restored from a host application's persisted state arrives having
+        // never been through a gesture at all. Both are first seen here.
+        changed |= self.memory.zoom.raise_to(min_zoom);
+
         let zoom = self.memory.zoom;
         changed |= self
             .memory
             .center_mode
             .update_movement(delta_time, zoom.into());
+
+        // After the movement, not before: an inertial coast is what walks the
+        // viewport off the top of the world, and clamping the frame before it
+        // moves would let every frame show the overshoot.
+        let my_position = self.my_position;
+        changed |= self.memory.center_mode.clamp_vertically(
+            my_position,
+            zoom.into(),
+            f64::from(rect.height()),
+        );
 
         if changed {
             response.mark_changed();
@@ -246,7 +268,13 @@ impl<'a, 'b, 'c> Map<'a, 'b, 'c> {
 
 impl Map<'_, '_, '_> {
     /// Handle user inputs and recalculate everything accordingly. Returns whether something changed.
-    fn handle_gestures(&mut self, ui: &mut Ui, response: &Response, delta_time: f32) -> bool {
+    fn handle_gestures(
+        &mut self,
+        ui: &mut Ui,
+        response: &Response,
+        delta_time: f32,
+        min_zoom: f64,
+    ) -> bool {
         let zoom_delta = self.zoom_delta(ui, response);
 
         // Zooming and dragging need to be exclusive, otherwise the map will get dragged when
@@ -280,6 +308,13 @@ impl Map<'_, '_, '_> {
             self.memory
                 .zoom
                 .zoom_by((zoom_delta - 1.) * self.options.zoom_speed);
+
+            // Before the shift back, not after: the shift is what keeps the
+            // point under the pointer fixed, and it is expressed in the zoom
+            // the map will actually be drawn at. Raising the zoom afterwards
+            // would leave the anchor off by the part of the notch that was
+            // refused.
+            self.memory.zoom.raise_to(min_zoom);
 
             if let Some(offset) = offset {
                 self.memory.center_mode = self
@@ -549,6 +584,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pane the map was frozen in when the void was reported, in points,
+    /// and the zoom it was frozen at.
+    const REAL_VIEWPORT: egui::Vec2 = egui::vec2(2878.0, 1651.0);
+    const FROZEN_ZOOM: f64 = 3.326757482253017;
+
+    /// `log2(2878 / 256)` — the shallowest zoom [`REAL_VIEWPORT`] is fully
+    /// covered at. At [`FROZEN_ZOOM`] the world was 2568.58 points across, 89%
+    /// of the pane's width, and 403.37° of longitude were on screen at once.
+    const REAL_FLOOR: f64 = 3.4908508767402977;
+
+    /// One frame of a tile-less map over `viewport`, driven by `input`.
+    ///
+    /// Tile-less because both `Map::new` sites in this workspace are, and
+    /// because the zoom floor is a property of the widget's rect and not of
+    /// anything a source does.
+    fn show_over(viewport: egui::Vec2, memory: &mut MapMemory, input: egui::RawInput) {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, viewport);
+
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(screen),
+            ..input
+        });
+
+        let mut ui = Ui::new(
+            ctx.clone(),
+            egui::Id::new("map under test"),
+            UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(screen),
+        );
+        ui.set_clip_rect(screen);
+
+        Map::new(None, memory, lon_lat(21., 52.))
+            .zoom_with_ctrl(false)
+            .wheel_zoom_scales_with_frame_time(false)
+            .show(&mut ui, |_, _, _, _| ());
+
+        let _ = ctx.end_pass();
+    }
+
+    /// A frame carrying a wheel scroll with the pointer over the map.
+    fn wheel(viewport: egui::Vec2, notches: f32) -> egui::RawInput {
+        let centre = egui::Pos2::ZERO + viewport / 2.0;
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(centre),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, notches),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// **Gate 6.** A zoom that never went through a gesture — restored from a
+    /// host application's persisted state, which is exactly how the reported
+    /// pane got there — is raised on the first frame it is shown.
+    ///
+    /// This is the pin on the real numbers: a 2878x1651 pane at zoom
+    /// 3.326757482253017 comes back at 3.4908508767402977, to the bit.
+    #[test]
+    fn a_restored_zoom_below_the_floor_is_raised_on_the_first_frame() {
+        let mut memory = MapMemory::default();
+        memory
+            .set_zoom(FROZEN_ZOOM)
+            .expect("the frozen zoom is in walkers' range");
+        assert_eq!(memory.zoom().to_bits(), FROZEN_ZOOM.to_bits());
+
+        show_over(REAL_VIEWPORT, &mut memory, egui::RawInput::default());
+
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
+
+        // And the second frame leaves it exactly where the first put it.
+        show_over(REAL_VIEWPORT, &mut memory, egui::RawInput::default());
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
+    }
+
+    /// **Gate 5.** A resize can make a zoom that was legal when it was set
+    /// illegal, with no gesture and no state change of any kind. The next frame
+    /// is where that is noticed, because the rect is what changed.
+    #[test]
+    fn a_resize_the_world_no_longer_covers_raises_the_zoom() {
+        let small = egui::vec2(800.0, 600.0);
+        let mut memory = MapMemory::default();
+        memory.set_zoom(2.0).expect("zoom 2 is in walkers' range");
+
+        // Legal in the small pane: log2(800 / 256) is 1.64.
+        show_over(small, &mut memory, egui::RawInput::default());
+        assert_eq!(memory.zoom().to_bits(), 2.0f64.to_bits());
+
+        // The same zoom in the big one is not.
+        show_over(REAL_VIEWPORT, &mut memory, egui::RawInput::default());
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
+
+        // Shrinking back does not zoom in again -- the floor only ever raises.
+        show_over(small, &mut memory, egui::RawInput::default());
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
+    }
+
+    /// **Gate 4.** Zooming out, by whatever route, stops at the floor and does
+    /// not pass it.
+    ///
+    /// Both routes are driven, because they raise the zoom in different places:
+    /// `MapMemory::zoom_out` is a host application's own button and is caught
+    /// by the per-frame clamp, while a wheel notch is caught inside the gesture
+    /// so that the point under the pointer stays put.
+    #[test]
+    fn zooming_out_repeatedly_stops_at_the_viewport_floor() {
+        let mut memory = MapMemory::default();
+        memory.set_zoom(12.0).expect("zoom 12 is in walkers' range");
+
+        for step in 0..40 {
+            let _ = memory.zoom_out();
+            show_over(REAL_VIEWPORT, &mut memory, egui::RawInput::default());
+            assert!(
+                memory.zoom() >= REAL_FLOOR,
+                "step {step} left the map at zoom {} , under the floor {REAL_FLOOR}",
+                memory.zoom()
+            );
+        }
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
+
+        // The wheel, all the way out. The control below is what stops this
+        // being a test of a gesture that never fired.
+        let mut memory = MapMemory::default();
+        memory.set_zoom(12.0).expect("zoom 12 is in walkers' range");
+
+        show_over(REAL_VIEWPORT, &mut memory, wheel(REAL_VIEWPORT, -60.0));
+        let after_one_notch = memory.zoom();
+        assert!(
+            after_one_notch < 12.0,
+            "the wheel moved nothing, so nothing below is a test of anything"
+        );
+
+        for step in 0..200 {
+            show_over(REAL_VIEWPORT, &mut memory, wheel(REAL_VIEWPORT, -60.0));
+            assert!(
+                memory.zoom() >= REAL_FLOOR,
+                "notch {step} left the map at zoom {}, under the floor {REAL_FLOOR}",
+                memory.zoom()
+            );
+        }
+        assert_eq!(memory.zoom().to_bits(), REAL_FLOOR.to_bits());
     }
 
     /// **A 512-px source is a tile one zoom shallower, and is drawn twice the

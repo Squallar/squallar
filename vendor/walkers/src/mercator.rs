@@ -21,6 +21,17 @@ pub(crate) fn total_pixels(zoom: f64) -> f64 {
     2f64.powf(zoom) * (TILE_SIZE as f64)
 }
 
+/// The zoom at which the world is `pixels` points across: the inverse of
+/// [`total_pixels`].
+///
+/// Deliberately unclamped to any zoom range and total. Fewer points than one
+/// tile gives a negative answer and zero gives `-inf`, both of which are the
+/// honest "the world is that small at no zoom this crate has", and are what let
+/// a caller compare against the result instead of special-casing it.
+pub(crate) fn zoom_for_total_pixels(pixels: f64) -> f64 {
+    (pixels / (TILE_SIZE as f64)).log2()
+}
+
 /// Number of tiles along one axis of the grid at `zoom`.
 ///
 /// `None` above zoom 31: the grid is counted in `u32` but [`TileId::zoom`] is a

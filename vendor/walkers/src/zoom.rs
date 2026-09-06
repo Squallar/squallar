@@ -54,6 +54,32 @@ impl Zoom {
             *self = new_self;
         }
     }
+
+    /// Raise this zoom to `floor` if it is below it. Returns whether it moved.
+    ///
+    /// **Only ever raises**, and it is a separate operation from `zoom_by`
+    /// rather than a second range on this type because the floor is not a
+    /// property of a zoom at all — it is a property of the viewport the map is
+    /// being drawn into, which only the widget knows. The artificial `0..=26`
+    /// above is untouched.
+    ///
+    /// A floor this type cannot represent moves nothing: below zero it is
+    /// already satisfied by the range's own bottom, and above 26 it would need
+    /// a viewport 1.7e10 points across. Neither is a reason to leave the zoom
+    /// somewhere `try_from` refuses. `NaN` moves nothing for the same reason a
+    /// `NaN` viewport says nothing about coverage.
+    pub(crate) fn raise_to(&mut self, floor: f64) -> bool {
+        if floor.is_nan() || floor <= self.0 {
+            return false;
+        }
+        match Self::try_from(floor) {
+            Ok(raised) => {
+                *self = raised;
+                true
+            }
+            Err(InvalidZoom) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +99,39 @@ mod tests {
         assert!(zoom.zoom_in().is_ok());
         assert_eq!(26, zoom.round());
         assert_eq!(Err(InvalidZoom), zoom.zoom_in());
+    }
+
+    /// A floor raises a zoom below it, leaves one at or above it alone, and is
+    /// itself bounded by the type's own range.
+    #[test]
+    fn raising_a_zoom_to_a_viewport_floor() {
+        const FLOOR: f64 = 3.4908508767402977;
+
+        let mut zoom = Zoom::try_from(3.326757482253017).unwrap();
+        assert!(zoom.raise_to(FLOOR));
+        assert_eq!(Into::<f64>::into(zoom).to_bits(), FLOOR.to_bits());
+
+        // Idempotent: the second frame's floor is the same floor.
+        assert!(!zoom.raise_to(FLOOR));
+        assert_eq!(Into::<f64>::into(zoom).to_bits(), FLOOR.to_bits());
+
+        // One ulp either side of it, through the type this time.
+        let mut zoom = Zoom::try_from(f64::from_bits(FLOOR.to_bits() - 1)).unwrap();
+        assert!(zoom.raise_to(FLOOR));
+        assert_eq!(Into::<f64>::into(zoom).to_bits(), FLOOR.to_bits());
+
+        let above = f64::from_bits(FLOOR.to_bits() + 1);
+        let mut zoom = Zoom::try_from(above).unwrap();
+        assert!(!zoom.raise_to(FLOOR));
+        assert_eq!(Into::<f64>::into(zoom).to_bits(), above.to_bits());
+
+        // A floor the type cannot hold, and a floor that is no floor at all.
+        let mut zoom = Zoom::try_from(5.).unwrap();
+        assert!(!zoom.raise_to(27.));
+        assert!(!zoom.raise_to(-3.));
+        assert!(!zoom.raise_to(f64::NAN));
+        assert!(!zoom.raise_to(f64::NEG_INFINITY));
+        assert_eq!(Into::<f64>::into(zoom).to_bits(), 5.0f64.to_bits());
     }
 
     #[test]

@@ -37,6 +37,10 @@ mod position;
 mod projector;
 pub mod sources;
 mod tiles;
+// Public because the floor it computes is the host application's business
+// too: a persisted zoom is restored before any `Map` is shown, and a caller
+// that wants to restore a legal one has to be able to ask what legal is.
+pub mod viewport;
 mod zoom;
 
 pub use local_tiles::LocalTiles;

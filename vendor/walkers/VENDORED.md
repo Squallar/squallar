@@ -193,6 +193,7 @@ parsing that lands next; that work is not in either of these commits.
 | --- | --- |
 | `LICENSE` | See above — the tarball ships none. |
 | `VENDORED.md` | This file. |
+| `src/viewport.rs` | Ours, and the first source file this directory adds. The zoom floor and the centre band that keep the viewport covered by map; see [the twenty-seventh commit](#changed--source-twenty-seventh-commit-the-viewport-is-always-covered-by-map). A `diff -rq` against the tarball reports it as `Only in`. |
 
 ### Changed — `Cargo.toml`
 
@@ -2115,6 +2116,118 @@ re-appliable.
 After, on the same rig and scene: the 47 tiles are **one primitive, one draw,
 one bind group, two buffer binds** — one 270-index mesh for the 45 tiles that
 frame — and no `terrain-hillshade` texture is allocated at all.
+
+### Changed — source, twenty-seventh commit: the viewport is always covered by map
+
+**The defect.** Nothing bounded how far out a map could be zoomed except
+`Zoom`'s own `0..=26`, which upstream's comment calls artificial and which knows
+nothing about the widget's rect. Below `log2(max(width, height) / 256)` the
+Mercator world — a square `2^zoom · 256` points on a side — is smaller than the
+viewport, so the map draws into part of the screen and the rest shows points no
+geography covers. It was reported from a 2878x1651 pane at zoom
+`3.326757482253017`, where the world is 2568.58 points across: 89 % of the
+pane's width, with **403.37°** of longitude on screen at once. More than one
+turn of longitude on screen is also what draws the same continent twice, so the
+floor closes that as a free consequence rather than as a second mechanism.
+
+**The mechanism.** Two things, and one of them is deliberately half a thing.
+
+1. A **zoom floor**, `log2(max(w, h) / 256)`. The larger side binds because the
+   world is square — a floor taken from the width alone leaves void above and
+   below any portrait viewport, and the two agree on every landscape one, which
+   is what makes that the mistake to guard against rather than to notice.
+2. A **vertical band for the centre**, `[height/2, world − height/2]`, because a
+   world at least as tall as the viewport can still be panned off the top of it.
+
+**Horizontally, nothing.** The world wraps east-west and the answer on that axis
+is to draw the wrap, not to stop the pan; a horizontal clamp would foreclose it.
+`center::viewport_tests::horizontal_panning_is_never_clamped` is a standing test
+that the symmetry has not been "fixed" in later — it pans the centre a whole
+world east and asserts the longitude comes back past 180° with the vertical
+clamp firing on the same frame.
+
+**Five files.** `src/viewport.rs` is new and holds all of the arithmetic;
+`src/mercator.rs` gains `zoom_for_total_pixels`, the inverse of its own
+`total_pixels`; `src/zoom.rs` gains `Zoom::raise_to`, which only ever raises and
+leaves the `0..=26` range alone; `src/center.rs` gains
+`Center::clamp_vertically`; `src/map.rs` applies both in `Map::show`.
+
+**Applied every frame, not only on a zoom gesture**, and that is the part worth
+stating because a gesture-only clamp looks complete. A pane can be *resized*
+under a zoom that was legal when it was set, and a host application restores a
+persisted zoom that has never been through a gesture at all — which is exactly
+how the reported pane got where it was. `Map::show` is the only place the rect
+is known, so it is the only place either can be noticed. There is a *second*
+`raise_to` inside `handle_gestures`, immediately after `zoom_by` and **before**
+the shift that puts the point back under the pointer: without it the anchor is
+off by whatever part of the notch the floor refused.
+
+**Three details that are arithmetic and not policy:**
+
+- `2f64.powf(x.log2())` is not exactly `x`. At the floor for the reported pane
+  the world comes out `2877.999999999999545`, a **hair short** of 2878. Worst
+  case over the 2008 viewports the tests sweep: **1.72 ulps**, measured
+  2026-09-06. So the centre band's two bounds *cross* at the floor for a square
+  viewport, and `f64::clamp` panics on `min > max`; `clamp_center_y` centres in
+  that case instead, which is the position that misses each bound equally.
+- The centre clamp has a **deadband** of a 64th of a point, and it is not slack
+  in the geometry. The centre is stored as a geographical position, so reading
+  it back costs an `unproject` that does not return the identical `f64` — worth
+  ~1e-10 points here. Without a deadband a map resting against a pole would
+  register as out of bounds every frame, move by a ten-billionth of a point, and
+  `request_repaint` forever. A permanently non-idle map is a worse defect than
+  the one this commit fixes.
+- A floor the `Zoom` type cannot hold moves nothing. Below zero it is already
+  satisfied by the range's own bottom (a viewport under one tile across), and
+  above 26 it would need a viewport 1.7e10 points across.
+
+**One behaviour change worth naming.** `Center::MyPosition` has no position of
+its own to move, so a `my_position` that cannot be centred without void —
+a pole, at a floor a large pane forces — **detaches** the map, once, and it is
+`Center::Exact` from then on. Every other variant survives the clamp intact, so
+a coast that runs into a pole keeps its horizontal velocity and stops when the
+inertia says to rather than when the map hits the edge.
+
+**Measured**, `cargo test -p walkers --all-features`: **116 before, 132 after**,
+exit 0 both times. The sixteen are eight in `src/viewport.rs`, four in
+`center.rs`, three in `map.rs` and one in `zoom.rs`; several of them fold a
+sweep of thousands of cases into one fn, so the count is not the coverage. The
+pins that matter:
+
+| Gate | Where |
+| --- | --- |
+| the floor is `log2(max(w,h)/256)`, to the bit, for 2878x1651 → `3.4908508767402977`, and the larger side binds | `viewport::tests::the_floor_is_log2_of_the_larger_side_over_one_tile` |
+| at the floor the world is the viewport, to `f64::EPSILON` — and short of it, which is why the crossed-bounds branch exists | `viewport::tests::at_the_floor_the_world_is_the_viewport` |
+| one ulp below the floor is raised to exactly it, one ulp above is untouched | `viewport::tests::the_boundary_is_exact_to_one_ulp` |
+| after clamping, the world always covers the viewport, over 2008 viewports × 16 zooms | `viewport::tests::a_clamped_zoom_always_covers_the_viewport` |
+| zooming out, by a host application's button and by the wheel, stops at the floor | `map::tests::zooming_out_repeatedly_stops_at_the_viewport_floor` |
+| a resize the world no longer covers raises the zoom | `map::tests::a_resize_the_world_no_longer_covers_raises_the_zoom` |
+| a restored zoom below the floor is raised on the first frame — the reported pane's own numbers | `map::tests::a_restored_zoom_below_the_floor_is_raised_on_the_first_frame` |
+| the viewport's top and bottom stay inside the world, for every `Center` variant, and the clamp does not fire twice on the same state | `center::viewport_tests::the_centre_is_pulled_back_until_the_viewport_is_inside_the_world` |
+| an inertial coast into a pole stays inside and keeps coasting | `center::viewport_tests::a_coast_into_the_pole_keeps_coasting` |
+| **phase 2 readiness**: nothing clamps horizontally | `center::viewport_tests::horizontal_panning_is_never_clamped` |
+
+Each was shown red by a tamper before it was believed. Six tampers, each
+asserting its own pattern matched exactly once before writing, each file
+`touch`ed on restore, and the tree checked clean after every one. Healthy arm:
+132 passed, exit 0. What each tamper printed:
+
+| Tamper | Red | The quantity it named |
+| --- | --- | --- |
+| `min_zoom` returns `-inf` — no floor at all | 10 | `at zoom 0 -> 0 the world is 256 for a 2878-point viewport`; `step 8 left the map at zoom 3, under the floor 3.4908508767402977`; `top edge at -697.5` |
+| the floor taken from `rect.width()` rather than `max(w, h)` | 4 | `at the floor for [255 x 257] the world is 255, not 257`; on a 1651x2878 pane the width's floor of 2.689124404913258 left `top edge at -613.5` |
+| `zoom + 1e-6 >= floor` — a tolerance on the boundary | 1 | `one ulp below the floor was let through, for [2878 x 1651]` — and *only* that gate, which is the whole reason it exists |
+| the per-frame `raise_to` in `Map::show` deleted, leaving the gesture's | 3 | the restored 3.326757482253017 stayed; the resize never raised; `step 8 left the map at zoom 3` |
+| the centre band written `[0, world]` rather than `[height/2, world − height/2]` | 5 | `bottom edge at 820.7860812457361 past the world's 2877.9999999999995`, on the reported pane at its own floor |
+| a horizontal clamp added beside the vertical one | 1 | `the vertical clamp moved the centre horizontally, from 24576 to 16384` |
+
+**What this makes harder for the wrap.** Nothing in `src/viewport.rs` is
+horizontal, `lon_to_tile_x` is untouched, and `squallar-geo` is untouched. The
+one thing a wrap has to know about this commit is that the floor is *also* what
+keeps the visible span under 360°: once panning past the antimeridian draws the
+far side, the "no duplicate continents" half of the requirement stops being free
+and becomes the wrap's own problem to state — because a wrapped world can show
+the same continent twice without the viewport ever exceeding the world's width.
 
 ## What the pin actually selects
 
