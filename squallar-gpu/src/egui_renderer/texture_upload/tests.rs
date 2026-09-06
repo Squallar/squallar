@@ -191,8 +191,9 @@ fn a_web_picture_bands_on_a_ringless_device_instead_of_blocking_whole() {
 fn the_font_atlas_crosses_whole_however_large_it_has_grown() {
     let atlas = egui::TextureId::default();
     let picture = egui::TextureId::Managed(7);
-    // The atlas at its full 8192 square: 256 MiB, thirty-two ring bands.
-    let full_square = 8192 * 8192 * 4;
+    // The atlas at the full square it reaches on the arm that governs: the web
+    // atlas is 16384 wide (`is_font_atlas` carries the chain), so 1 GiB.
+    let full_square = 16384 * 16384 * 4;
     for capable in [false, true] {
         let device = if capable {
             "a ring device"
@@ -200,22 +201,141 @@ fn the_font_atlas_crosses_whole_however_large_it_has_grown() {
             "a ringless device"
         };
         assert!(
-            crosses_whole(atlas, capable, full_square),
+            crosses_whole_now(atlas, capable, full_square, 0),
             "on {device} the font atlas at {full_square} B was filed as bands, \
              so every label whose glyphs sit past the first band draws from \
              rows that have not landed",
         );
         assert!(
-            !crosses_whole(picture, capable, full_square),
+            !crosses_whole_now(picture, capable, full_square, 0),
             "on {device} a picture of {full_square} B crossed whole: the atlas \
              exemption leaked onto the rasters this module exists to band",
         );
         assert!(
-            crosses_whole(picture, capable, band_cap(capable)),
+            crosses_whole_now(picture, capable, band_cap(capable), 0),
             "on {device} a picture at the cap must still go whole, exactly as \
              `goes_whole` says",
         );
     }
+}
+
+/// One frame's whole-crossing route spends at most [`whole_budget`], however
+/// many deltas egui hands over.
+///
+/// **The bound is the frame, not the delta.** [`goes_whole`] caps one delta at
+/// [`band_cap`], and that was read as though it capped the frame; `apply` loops
+/// the whole delta set through the route with nothing counting what it spends,
+/// so N deltas at the cap cost N times the cap on one frame thread. On web that
+/// is 4 MiB each with no N — see [`whole_budget`] for the loop frames that
+/// supply them.
+#[test]
+fn one_frame_cannot_spend_more_than_its_budget_on_whole_writes() {
+    for capable in [false, true] {
+        // The largest a single delta may be and still take this route, so the
+        // worst case per delta.
+        let each = band_cap(capable);
+        let mut spent = 0usize;
+        let mut crossed = 0usize;
+        for i in 0..64u64 {
+            if crosses_whole_now(egui::TextureId::Managed(i), capable, each, spent) {
+                spent += each;
+                crossed += 1;
+            }
+        }
+        // The non-vacuity floor: a predicate that refused everything would
+        // satisfy the bound below and move no bytes at all.
+        assert!(
+            crossed >= 1,
+            "capable={capable}: nothing crossed whole, so the bound below is \
+             vacuous — a delta at the cap must always cross on a fresh frame",
+        );
+        assert!(
+            spent <= whole_budget(capable),
+            "capable={capable}: 64 deltas of {each} B put {spent} B of blocking \
+             `write_texture` on one frame thread, over the {} B that frame is \
+             allowed — this is the unbounded route, and at the web figures it \
+             is the 53.8-64.0 ms `prep` bin the panel reported",
+            whole_budget(capable),
+        );
+    }
+}
+
+/// The atlas exemption outlives a spent budget, and takes nothing with it.
+///
+/// The budget must not become a second way to band the atlas: that is the
+/// defect `is_font_atlas` exists to prevent, and it would be reintroduced
+/// silently by a frame that happened to have spent its allowance first.
+#[test]
+fn the_font_atlas_still_crosses_whole_on_a_frame_whose_budget_is_gone() {
+    for capable in [false, true] {
+        let spent = whole_budget(capable) * 4;
+        assert!(
+            crosses_whole_now(
+                egui::TextureId::default(),
+                capable,
+                16384 * 16384 * 4,
+                spent
+            ),
+            "capable={capable}: a frame that had already spent {spent} B banded \
+             the font atlas, so every label drew from rows that had not landed",
+        );
+        assert!(
+            !crosses_whole_now(egui::TextureId::Managed(7), capable, 1024, spent),
+            "capable={capable}: the atlas's exemption leaked onto a picture on a \
+             frame whose budget was gone",
+        );
+    }
+}
+
+/// A web loop frame sits *exactly* on the whole/banded boundary, and one frame
+/// admits exactly one of them.
+///
+/// The two constants are owned by different crates and were never written down
+/// beside each other: `WASM_LOOP_IMAGE_SIZE` is 1024, so a loop frame's texture
+/// is 4 MiB, and `BLOCKING_BAND_BYTES` is 4 MiB, and [`goes_whole`] compares
+/// with `<=`. Every loop frame takes the whole route by one byte. If either
+/// constant moves this test says so, because the routing it decides is not
+/// visible from either side alone.
+#[test]
+fn a_web_loop_frame_is_exactly_the_blocking_band_and_one_frame_admits_one() {
+    use squallar_device_profile::constants::{BLOCKING_BAND_BYTES, WASM_LOOP_IMAGE_SIZE};
+
+    let bytes = WASM_LOOP_IMAGE_SIZE * WASM_LOOP_IMAGE_SIZE * 4;
+    assert_eq!(
+        bytes, BLOCKING_BAND_BYTES,
+        "a {WASM_LOOP_IMAGE_SIZE} px loop frame is {bytes} B against a \
+         {BLOCKING_BAND_BYTES} B blocking band",
+    );
+    assert!(
+        goes_whole(false, bytes),
+        "a loop frame stopped taking the whole route, so this test no longer \
+         pins the traffic it was written for",
+    );
+    assert_eq!(
+        whole_budget(false) / bytes,
+        1,
+        "a ringless frame admitted {} loop frames whole; one is the budget, and \
+         the rest must band",
+        whole_budget(false) / bytes,
+    );
+
+    // What the route used to cost, from the same constants: a dispatch textures
+    // `min(render budget, frames held)` of them, and every one crossed whole.
+    let textured = squallar_device_profile::constants::WASM_MAX_LOOP_RENDER_BUDGET
+        .min(squallar_device_profile::constants::WASM_MAX_LOOP_FRAMES);
+    let unbounded = textured * bytes;
+    assert_eq!(
+        (textured, unbounded),
+        (14, 58_720_256),
+        "the loop's textured-frame count or its frame size moved, so the 56 MiB \
+         this route used to put on one frame thread — the arithmetic behind the \
+         reported [53.8, 64.0) ms `prep` bin — is no longer what is pinned here",
+    );
+    assert!(
+        unbounded > whole_budget(false) * 13,
+        "the bounded route must be more than an order below the {unbounded} B \
+         it replaced, or this fix bought nothing",
+    );
 }
 
 /// A raster the app loaded `NEAREST` is bound `NEAREST`.

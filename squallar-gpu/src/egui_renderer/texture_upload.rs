@@ -80,22 +80,89 @@ fn goes_whole(capable: bool, bytes: usize) -> bool {
     bytes <= band_cap(capable)
 }
 
-/// [`goes_whole`], with the one texture that crosses whole at any size.
+/// Whether `id` is the font atlas, the one texture that crosses whole at any
+/// size.
 ///
 /// **The font atlas is never banded.** Every galley on the glass holds its
 /// glyphs' positions in that texture as texel coordinates, so a texture that
 /// is only partly uploaded draws every label whose rows have not landed yet
 /// from whatever the fresh allocation holds — and it stays that way for as
 /// long as the bands take, and for as long as no frame is asked for after
-/// that. egui hands the atlas over whole on every doubling of its height
-/// (1 MiB at 32 rows on an 8192-wide atlas, 256 MiB at the full square), so
+/// that. egui hands the atlas over whole on every doubling of its height, so
 /// once the height crossed the band cap the banded route took it, and the
 /// place names broke on every doubling — at the zooms whose new label sizes
 /// forced one. One blocking write per doubling is the honest cost, and the
 /// doublings are rare once no text size is a continuous function of zoom —
-/// see `station_model::font_size_for_zoom`, which was the one that was.
-fn crosses_whole(id: egui::TextureId, capable: bool, bytes: usize) -> bool {
-    id == egui::TextureId::default() || goes_whole(capable, bytes)
+/// see `station_model::font_size_for_zoom`, which was the one that was, and
+/// `walkers::mvt`, whose label sizes evaluate against an integer tile zoom
+/// and so are bounded by construction.
+///
+/// # What one doubling costs, read from the arm rather than from a note
+///
+/// The atlas is `max_texture_side.at_most(16 * 1024)` wide (epaint
+/// `text/fonts.rs`, `FontsImpl::new`), and `max_texture_side` is
+/// `device.limits().max_texture_dimension_2d` (`EguiRenderer::new`). On web
+/// [`crate::device::device_limits`] copies the adapter's resolution verbatim,
+/// and Firefox's WebGL2 reports 32768 on a real driver — so **the web atlas is
+/// 16384 wide, not the 8192 the note here used to price it at**. Every figure
+/// is double what it read: 2 MiB at the initial 32 rows, 8 MiB at 128, 64 MiB
+/// at 1024, and 1 GiB at the full square (`TextureAtlas::max_height` is the
+/// width). A doubling costs that twice over on one frame — epaint clones the
+/// whole `ColorImage` into `ImageDelta::full`, and this module then writes all
+/// of it.
+fn is_font_atlas(id: egui::TextureId) -> bool {
+    id == egui::TextureId::default()
+}
+
+/// Whole-crossing bytes one frame may push through `Renderer::update_texture`
+/// before the rest are filed as bands.
+///
+/// **The same per-frame allowance the banded route already has**, derived
+/// rather than chosen: [`band_cap`] is the largest blocking chunk a frame was
+/// measured to absorb, and [`bands_per_frame`] is how many of them the drain
+/// moves. A route handed an *unbounded* number of chunks that each fit the cap
+/// is not bounded by the cap. The frame is what has to be bounded, and it was
+/// not: [`TextureUploads::apply`] loops the whole delta set through this route
+/// with nothing counting what it spends.
+///
+/// Not a hypothetical arithmetic, and the figures are pinned constants rather
+/// than a fit. On web `squallar_device_profile::constants::WASM_LOOP_IMAGE_SIZE`
+/// is 1024, so one loop frame's texture is 1024·1024·4 = 4 MiB — *exactly*
+/// [`squallar_device_profile::constants::BLOCKING_BAND_BYTES`], which
+/// [`goes_whole`] compares with `<=`. Every loop frame takes this route. A
+/// dispatch textures `Budgets::textured_frames` of them, which on web is
+/// `min(WASM_MAX_LOOP_RENDER_BUDGET, WASM_MAX_LOOP_FRAMES)` = `min(14, 14)` =
+/// **14**, and 14 × 4 MiB = **56 MiB of blocking `write_texture` on one frame
+/// thread**. Out of wasm linear memory at ~1 GB/s that is ~56 ms, and the panel
+/// that reported this defect put its `prep` p99 in the **[53.8, 64.0) ms** bin.
+/// The font atlas is *not* what fills that bin: measured headless over the
+/// app's own bounded size sets, the 16384-wide web atlas settles at 16384×64
+/// and its largest whole delta is 4 MiB.
+///
+/// Nothing is starved by this: [`goes_whole`] already caps one whole-crossing
+/// delta at [`band_cap`], which is never above this budget, so the first delta
+/// of a frame always crosses. What overflows falls to the bands, which carry it
+/// from the next frame — the arrival every raster past the cap already has.
+fn whole_budget(capable: bool) -> usize {
+    band_cap(capable) * bands_per_frame(capable)
+}
+
+/// Bands one frame moves, by device capability. See
+/// [`TextureUploads::bands_per_frame`], which is this with the flag read off
+/// `self`.
+fn bands_per_frame(capable: bool) -> usize {
+    if capable { DMA_BANDS_PER_FRAME } else { 1 }
+}
+
+/// [`goes_whole`], bounded by what this frame has already spent on the route.
+///
+/// The font atlas is exempt from the budget — banding it draws broken labels,
+/// which is what [`is_font_atlas`] exists to prevent — but it is *charged* to
+/// it, so a frame that spends its budget on a doubling defers the rest rather
+/// than adding to it.
+fn crosses_whole_now(id: egui::TextureId, capable: bool, bytes: usize, spent: usize) -> bool {
+    is_font_atlas(id)
+        || (goes_whole(capable, bytes) && spent.saturating_add(bytes) <= whole_budget(capable))
 }
 
 /// Consecutive frames the ring may decline a band before it is pushed across by
@@ -141,7 +208,8 @@ pub struct UploadTotals {
     pub deltas: u64,
     /// Bytes handed whole to `Renderer::update_texture` — every delta at or
     /// under [`UPLOAD_BAND_BYTES`] for an id this module does not own, and
-    /// the font atlas at any size (see [`crosses_whole`]). **A
+    /// the font atlas at any size (see [`is_font_atlas`]), bounded per frame
+    /// by [`whole_budget`]. **A
     /// routing figure and a subset of [`Self::blocking_bytes`], never added to
     /// it**: `update_texture` is `write_texture` on the frame's own queue, so
     /// these bytes are blocking too, whatever the device.
@@ -234,6 +302,10 @@ pub struct TextureUploads {
     delivered: HashSet<egui::TextureId>,
     /// What this renderer has actually moved. See [`UploadTotals`].
     totals: UploadTotals,
+    /// Bytes this frame has already pushed through the whole-crossing route.
+    /// Reset by [`Self::apply`], spent by [`Self::file`], bounded by
+    /// [`whole_budget`]. A `usize` because that is what it is compared against.
+    whole_spent: usize,
     /// What the device is holding right now. See [`ResidentTextures`] — a
     /// level, maintained at the sites below that create, replace and free,
     /// and the answer [`UploadTotals`] structurally cannot give.
@@ -279,6 +351,7 @@ impl TextureUploads {
             totals: UploadTotals::default(),
             resident: ResidentTextures::default(),
             reported: 0,
+            whole_spent: 0,
         }
     }
 
@@ -294,6 +367,7 @@ impl TextureUploads {
             totals: UploadTotals::default(),
             resident: ResidentTextures::default(),
             reported: 0,
+            whole_spent: 0,
         }
     }
 
@@ -304,7 +378,7 @@ impl TextureUploads {
 
     /// Bands this may move in one frame.
     fn bands_per_frame(&self) -> usize {
-        if self.capable { DMA_BANDS_PER_FRAME } else { 1 }
+        bands_per_frame(self.capable)
     }
 
     /// File this frame's deltas and move what the budget allows.
@@ -315,6 +389,9 @@ impl TextureUploads {
         renderer: &mut Renderer,
         set: &[(egui::TextureId, egui::epaint::ImageDelta)],
     ) -> bool {
+        // Per frame, and `apply` is called once per frame. Reset here rather
+        // than in `file`, which is the thing being bounded.
+        self.whole_spent = 0;
         for (id, delta) in set {
             self.file(device, queue, renderer, *id, delta);
         }
@@ -342,14 +419,17 @@ impl TextureUploads {
         // until then the renderer holds only the 1×1 stand-in.
         let mine = self.owned.contains_key(&id) || self.pending.iter().any(|band| band.id == id);
 
-        // Not already ours, and either small or the font atlas: every overlay
-        // under this device's whole-delta limit goes through `update_texture`
-        // untouched, and the atlas does at any size — see `crosses_whole`. On
-        // a ringless device the limit is the blocking band, so a
-        // web-picture-sized raster spreads over frames instead of spending
-        // one frame whole.
-        if !mine && crosses_whole(id, self.capable, image.as_raw().len()) {
+        // Not already ours, and either small-and-within-budget or the font
+        // atlas: an overlay under this device's whole-delta limit goes through
+        // `update_texture` untouched while the frame's `whole_budget` holds,
+        // and the atlas does at any size — see `crosses_whole_now`. On a
+        // ringless device the limit is the blocking band, so a
+        // web-picture-sized raster spreads over frames instead of spending one
+        // frame whole; so now does the N+1st loop frame of a dispatch, which
+        // used to spend a whole frame each with nothing counting them.
+        if !mine && crosses_whole_now(id, self.capable, image.as_raw().len(), self.whole_spent) {
             renderer.update_texture(device, queue, id, delta);
+            self.whole_spent = self.whole_spent.saturating_add(image.as_raw().len());
             self.totals.count_whole_write(image.as_raw().len() as u64);
             if delta.pos.is_none() {
                 // egui allocated a texture of exactly this image and dropped
