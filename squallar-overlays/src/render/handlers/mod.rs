@@ -54,6 +54,25 @@ pub fn source_grid_budget_bytes(id: &LayerId) -> u64 {
     }
 }
 
+/// **Every layer that keeps a decoded source grid, with its budget** — the
+/// three rows [`source_grid_budget_bytes`] answers non-zero for, enumerated
+/// so a caller that has to price a layer nothing is showing yet can reach
+/// them without walking a registry it does not own.
+///
+/// Kept beside that function on purpose: the two are the same three names,
+/// and a fourth gridded layer that landed in one and not the other would make
+/// the admission door blind to exactly the largest term it exists to price.
+pub fn gridded_layers() -> [(LayerId, u64); 3] {
+    [
+        (known::MRMS, source_grid_budget_bytes(&known::MRMS)),
+        (known::GMGSI, source_grid_budget_bytes(&known::GMGSI)),
+        (
+            known::MODEL_DATA,
+            source_grid_budget_bytes(&known::MODEL_DATA),
+        ),
+    ]
+}
+
 /// **This crate's layer registrations — fifteen rows, and the only place they
 /// are named.**
 ///

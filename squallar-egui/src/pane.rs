@@ -2740,10 +2740,26 @@ impl PaneState {
     /// The other half of [`Self::remove_layer`], and the catalogue's real
     /// "add". A layer already in the stack is left exactly where it is —
     /// adding twice is not a reorder — and answers `false`.
+    /// **An admission door** (WO-G). A slot minted here lands **enabled**, so
+    /// the add IS the transition that puts a picture on the glass, and it is
+    /// priced here rather than at the `write_pane_overlay` that follows it —
+    /// by then the layer already reads as shown and that door would charge
+    /// nothing.
+    ///
+    /// The pane index travels with the ledger because a picture's price is
+    /// the pane's own — its glass, at this rung's oversampling.
+    ///
+    /// `admission` is `None` from exactly one caller,
+    /// [`Self::set_layer_enabled`], because the door above it
+    /// (`Gui::write_pane_overlay`) already priced the same transition: it
+    /// reads the pane's enabled flag *before* the write, so a layer this pane
+    /// does not hold is off there and charged there. Passing a ledger here
+    /// too would charge one eye-click twice.
     pub fn add_layer(
         &mut self,
         registry: &squallar_overlays::render::overlay_state::OverlayRegistry,
         id: &LayerId,
+        admission: Option<(usize, &mut crate::admission::AdmissionLedger)>,
     ) -> bool {
         if self.layers.holds(id) {
             return false;
@@ -2753,6 +2769,13 @@ impl PaneState {
             // draw; the catalogue cannot offer one, and neither can this.
             return false;
         };
+        if let Some((pane_idx, admission)) = admission {
+            let want = admission
+                .pane(pane_idx)
+                .show_layer
+                .plus(admission.layer_grid(id));
+            let _ = admission.ask(crate::admission::Act::ShowLayer, want);
+        }
         let weight = handler.draw_order_weight();
         let weights: HashMap<LayerId, u32> = registry
             .handlers()
@@ -2767,6 +2790,14 @@ impl PaneState {
         slot.opacity = self.layers.saved_opacity_of_removed(id);
         self.insert_slot_at_weight(slot, weight, &|id| weights.get(id).copied());
         true
+    }
+
+    /// Whether this pane's stack would take `id` on the next reconcile —
+    /// [`LayerStack::admits`] by index, for the admission door that has to
+    /// price what `insert_missing_slots` is about to mint without
+    /// re-spelling the predicate it uses.
+    pub fn admits_layer(&self, id: &LayerId, default_on: bool) -> bool {
+        self.layers.admits(id, default_on)
     }
 
     pub fn is_overlay_enabled(&self, id: &LayerId) -> bool {
@@ -3199,7 +3230,9 @@ impl PaneState {
             // there is nothing to hide, and minting a disabled slot to say so
             // would put a removed layer back in the list as a row.
             if enabled {
-                self.add_layer(registry, id);
+                // `None`: `Gui::write_pane_overlay` above priced this exact
+                // transition off the pane's pre-write enabled flag.
+                self.add_layer(registry, id, None);
             } else {
                 return;
             }

@@ -1040,15 +1040,13 @@ impl Budgets {
     /// budget — the same clamp as [`Self::frames_for_span`], with the pane's
     /// span in place of the budget's. A loop with no cadence yet buys the whole
     /// render budget, as it always has.
+    /// **The body lives on [`crate::admit::LoopFrames`]**, which carries the
+    /// two figures alone so an admission door can ask the same question for a
+    /// span the user is dragging toward without the whole `Budgets` crossing
+    /// the Gui seam. One spelling, delegated, so the model and the door
+    /// cannot come to count a span's frames differently.
     pub fn frames_for_span_of(&self, span_secs: usize, cadence_secs: Option<u32>) -> usize {
-        let Some(cadence) = cadence_secs.filter(|secs| *secs > 0) else {
-            return self.loop_render_budget;
-        };
-        (1 + span_secs.min(self.loop_span_secs) / cadence as usize).clamp(
-            constants::MIN_LOOP_FRAMES_PER_PANE,
-            self.loop_render_budget
-                .max(constants::MIN_LOOP_FRAMES_PER_PANE),
-        )
+        crate::admit::LoopFrames::of(self).frames(span_secs, cadence_secs)
     }
 
     /// The grid shape to **request** on a device whose 3D textures may be

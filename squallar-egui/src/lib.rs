@@ -1,4 +1,7 @@
 pub mod actions;
+/// Admission: what a scene-changing act would cost, summed against what the
+/// App last priced as spare, before the bytes are committed.
+pub mod admission;
 /// The PMTiles v3 basemap archive reader. Read by
 /// [`tile_source::HttpsTiles::from_archive_url`], which is THE base map
 /// source on every target since the raster (CartoDB) path was deleted.

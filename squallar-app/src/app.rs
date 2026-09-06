@@ -298,6 +298,26 @@ pub struct App {
     /// one `u64` on each side of the seam. The pane vector is reused
     /// composition to composition.
     budget_readout: squallar_egui::shell_api::BudgetReadout,
+    /// **The admission cost table** - what one more pane, layer or loop would
+    /// cost and what the pools have left, composed beside the readout on the
+    /// same tick and off the same walk
+    /// ([`Self::compose_admission_costs`]). Re-stated in every frame's
+    /// inputs; the Gui's ledger copies it only when its `generation` moved.
+    admission_costs: squallar_egui::admission::AdmissionCosts,
+    /// **This layer's own admission ledger**, holding the same table.
+    ///
+    /// A second ledger rather than a reach into the Gui's: the App-side door
+    /// (`App::handle_enable_loop`) has to ask the same question the UI doors
+    /// ask, and the App-pokes-Gui coupling ceiling is permanent and sits on
+    /// its measured value - a read through `self.gui` to borrow the UI's
+    /// ledger would raise it.
+    ///
+    /// **What the two ledgers do not share is the debit.** Each spends its
+    /// own copy of one tick's spare, so a burst that mixes UI acts with loop
+    /// arms inside a single telemetry tick can admit up to one tick's spare
+    /// twice. Named rather than discovered: the bound is one tick, and
+    /// closing it means one owner for the table, which is a seam change.
+    admission: squallar_egui::admission::AdmissionLedger,
     /// The page heap as the frame last sampled it ([`Self::sample_page_heap`]
     /// and the telemetry tick), kept so the readout's host spare is held to
     /// the heap's own room without a second `byteLength` read. `None` on a
@@ -855,6 +875,8 @@ impl App {
             memory_percents,
             host_headroom_bytes: 0,
             budget_readout: squallar_egui::shell_api::BudgetReadout::default(),
+            admission_costs: squallar_egui::admission::AdmissionCosts::default(),
+            admission: squallar_egui::admission::AdmissionLedger::default(),
             page_heap_reading: None,
             worker_memory_watch: crate::pressure::LinearMemoryWatch::default(),
             gpu_probe: GpuProbeReport::Absent,

@@ -69,6 +69,7 @@ fn every_frame_input_surfaces_and_persists() {
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
         budget_readout: None,
+        admission: None,
     });
 
     // Two frames, no re-application: the values must persist. Frame 1 lays the
@@ -183,6 +184,7 @@ fn a_none_gps_clears_the_fix() {
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
         budget_readout: None,
+        admission: None,
     };
     h.gui_mut().apply_frame_inputs(base);
     assert!(
@@ -207,6 +209,7 @@ fn a_none_gps_clears_the_fix() {
         mirror_plan_stamp: 0,
         frame_diagnostics: None,
         budget_readout: None,
+        admission: None,
     });
     h.frame();
     assert!(
@@ -275,6 +278,7 @@ mod readout_cadence {
             mirror_plan_stamp: 0,
             frame_diagnostics: None,
             budget_readout,
+            admission: None,
         });
     }
 

@@ -230,7 +230,14 @@ const ALERTS: LayerId = squallar_source::id::known::NWS_ALERTS;
 /// The production per-pane write — the same call a stack row's eye makes.
 fn set_pane_layer(gui: &mut Gui, idx: usize, on: bool) {
     let mut pane = std::mem::take(gui.pane_mut(idx).expect("the pane exists"));
-    Gui::write_pane_overlay(&mut gui.overlays, idx, &mut pane, &ALERTS, on);
+    Gui::write_pane_overlay(
+        &mut gui.overlays,
+        &mut gui.admission,
+        idx,
+        &mut pane,
+        &ALERTS,
+        on,
+    );
     *gui.pane_mut(idx).expect("the pane exists") = pane;
 }
 

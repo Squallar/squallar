@@ -32,6 +32,7 @@ fn budget_line(app: &App) -> String {
         // whatever the harness is holding, and these tests pin the line.
         None,
         &crate::recovery::HostRecovery::untouched(),
+        squallar_egui::admission::Totals::default(),
     )
 }
 
@@ -513,6 +514,7 @@ fn a_measured_capacity_reaches_the_fit_and_a_presumed_one_does_not_pretend_to() 
             &app.budget_readout,
             None,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         )
     };
     let six = squallar_device_profile::scene::Scene {

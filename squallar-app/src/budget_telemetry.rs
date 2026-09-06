@@ -41,7 +41,10 @@
 //!
 //! **After everything the rig reads**, in this order: `spare gpu <n> MiB host
 //! <n> MiB`, what each pool has left for one more pane or layer, `none` where
-//! the pool itself is unknown; then `live <page>/<worker> MiB`, what each wasm
+//! the pool itself is unknown; then `admission asked <n> admitted <n> would
+//! refuse <n> refused <n>`, the scene-changing doors' running totals from
+//! boot — `would refuse` is what they priced and would have turned away,
+//! `refused` what they actually did; then `live <page>/<worker> MiB`, what each wasm
 //! instance's allocator is holding — the one host figure here that can FALL,
 //! where `linear` only grows; then, LAST, one group per visible pane —
 //! `pane<i> gpu <n> MiB host <n> MiB shared <n> MiB own <n> MiB`: what the
@@ -210,6 +213,7 @@ pub(crate) fn budget_state_line(
     readout: &squallar_egui::shell_api::BudgetReadout,
     page_live_bytes: Option<u64>,
     host_recovery: &crate::recovery::HostRecovery,
+    doors: squallar_egui::admission::Totals,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -265,6 +269,25 @@ pub(crate) fn budget_state_line(
         ", spare gpu {} host {}",
         spare(Some(&readout.gpu)),
         spare(readout.host.as_ref()),
+    );
+    // **The admission doors' running totals, handed in.** Read by the caller
+    // (`squallar_egui::admission::totals()`) rather than here, for the reason
+    // every other moving figure on this line is a parameter: they are
+    // process-wide counters, and a composer that read them itself would write
+    // a different sentence every time anything else in the process opened a
+    // door.
+    //
+    // Appended among the
+    // fixed-width fields and BEFORE the variable-arity `pane<i>` rows: the
+    // rig's regex is positional and stops at `balloon`, and a group of
+    // varying length ahead of these would put them where nothing could name
+    // them. `would refuse` is the advisory figure - what the doors WOULD have
+    // turned away - and `refused` is what they actually did, which is zero
+    // for the whole of WO-G by construction.
+    let _ = write!(
+        line,
+        ", admission asked {} admitted {} would refuse {} refused {}",
+        doors.asked, doors.admitted, doors.would_refuse, doors.refused,
     );
     let _ = write!(
         line,
@@ -593,13 +616,15 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             ),
             "budget state: bracket desktop, rung 1, steps 3, pool 3072 MiB, \
              ceiling 3840 MiB, vram 24576 MiB, ram 65536 MiB, declared 8192 MiB, \
              threads 32, form 2, linear 300/700 MiB, cap 5120 3, probe 5, \
              balloon 7 MiB, page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, \
-             spare gpu none host none, live 250/600 MiB",
+             spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             live 250/600 MiB",
         );
         // The figure follows the pool it is handed, not a field of the budgets.
         assert!(
@@ -615,6 +640,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .contains(", pool 576 MiB,"),
         );
@@ -633,11 +659,12 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .ends_with(
                 ", probe 5, balloon 0 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
-                 spare gpu none host none, \
+                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -657,11 +684,12 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .ends_with(
                 ", cap 24576 2, probe 0, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
-                 spare gpu none host none, \
+                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -679,11 +707,12 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .ends_with(
                 ", cap 3456 0, probe 1, balloon 7 MiB, page heap acts 0 at 0 MiB, \
                  heap max 900/1100 MiB, host steps 0 promotions 0 churn 0, \
-                 spare gpu none host none, \
+                 spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 250/600 MiB"
             ),
         );
@@ -764,6 +793,7 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         );
         let (_, tail) = line
             .split_once(", vram ")
@@ -773,11 +803,12 @@ mod tests {
             "0 MiB, ram 0 MiB, declared 0 MiB, threads 0, form 0, linear 0/0 MiB, \
              cap 3840 0, probe 0, balloon 0 MiB, page heap acts 0 at 0 MiB, \
              heap max 0/0 MiB, host steps 0 promotions 0 churn 0, \
-             spare gpu none host none, live 0/0 MiB",
+             spare gpu none host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             live 0/0 MiB",
         );
         assert_eq!(
             line.matches(", ").count(),
-            18,
+            19,
             "nineteen comma-separated groups with no pane rows, eighteen separators: a \
              field was dropped or gained. It was seventeen until the recovery \
              governor's `host steps N promotions N churn N` landed, which is ONE \
@@ -826,6 +857,7 @@ mod tests {
             &no_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         );
         let read_by_the_rig = rendered(&pattern("budget_state_re"), &DISTINCT_GROUPS);
         assert!(
@@ -837,6 +869,7 @@ mod tests {
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, spare gpu none host none, \
+             admission asked 0 admitted 0 would refuse 0 refused 0, \
              live 250/600 MiB",
             "the tail the rig does not read drifted",
         );
@@ -867,6 +900,7 @@ mod tests {
             &two_pane_readout(),
             LIVE,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         );
         assert!(
             line.starts_with(&read_by_the_rig),
@@ -876,7 +910,8 @@ mod tests {
             &line[read_by_the_rig.len()..],
             ", page heap acts 0 at 0 MiB, heap max 900/1100 MiB, \
              host steps 0 promotions 0 churn 0, \
-             spare gpu 3568 MiB host 601 MiB, live 250/600 MiB, \
+             spare gpu 3568 MiB host 601 MiB, admission asked 0 admitted 0 would refuse 0 refused 0, \
+             live 250/600 MiB, \
              pane0 gpu 272 MiB host 0 MiB shared 0 MiB own 272 MiB, \
              pane1 gpu 33 MiB host 41 MiB shared 16 MiB own 17 MiB",
         );
@@ -906,6 +941,7 @@ mod tests {
                 &readout,
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             );
             let (fixed, _) = line.split_once(", pane0 ").unwrap_or((line.as_str(), ""));
             assert!(
@@ -941,8 +977,12 @@ mod tests {
                 &exhausted,
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
             )
-            .ends_with(", spare gpu 0 MiB host none, live 250/600 MiB"),
+            .ends_with(
+                ", spare gpu 0 MiB host none, admission asked 0 admitted 0 would refuse 0 refused 0, \
+                 live 250/600 MiB"
+            ),
         );
     }
 
@@ -964,6 +1004,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .starts_with(&good)
         );
@@ -982,6 +1023,7 @@ mod tests {
                 &no_readout(),
                 LIVE,
                 &crate::recovery::HostRecovery::untouched(),
+                squallar_egui::admission::Totals::default(),
             )
             .starts_with(&drifted),
             "a line with one extra space compared equal to the real one, so the \
@@ -1022,11 +1064,13 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         );
         assert!(
             never.ends_with(
                 ", page heap acts 0 at 0 MiB, heap max 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, spare gpu none host none, \
+                 admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
             "a watch that never acted must still print its zero: {never}",
@@ -1056,11 +1100,13 @@ mod tests {
             &no_readout(),
             None,
             &crate::recovery::HostRecovery::untouched(),
+            squallar_egui::admission::Totals::default(),
         );
         assert!(
             acted.ends_with(
                 ", page heap acts 2 at 1011 MiB, heap max 0/0 MiB, \
                  host steps 0 promotions 0 churn 0, spare gpu none host none, \
+                 admission asked 0 admitted 0 would refuse 0 refused 0, \
                  live 0/0 MiB"
             ),
             "the act count and the mark are not both on the line: {acted}",
@@ -1123,6 +1169,7 @@ mod tests {
             &no_readout(),
             None,
             &recovery,
+            squallar_egui::admission::Totals::default(),
         );
         assert!(
             line.contains(", host steps 2 promotions 1 churn 1,"),

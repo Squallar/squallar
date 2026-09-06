@@ -300,6 +300,21 @@ pub struct FrameInputs<'a> {
     /// moved, which on every frame but that one is a single `u64` compare.
     /// `None` from a caller that prices no scene (the test harness).
     pub budget_readout: Option<&'a BudgetReadout>,
+    /// **The admission table** — what one more pane, layer or loop would cost
+    /// and what the pools have left, as the App last priced it
+    /// ([`crate::admission::AdmissionCosts`]).
+    ///
+    /// The other half of [`Self::budget_readout`] and composed on the same
+    /// tick off the same scene: that one describes what is resident, this one
+    /// prices what is *not yet*. Borrowed for the frame; the ledger takes a
+    /// copy only when the generation moved, which on every other frame is a
+    /// single `u64` compare.
+    ///
+    /// `None` from a caller that prices no scene (the test harness). A door
+    /// with no table admits everything — an application that has not yet
+    /// priced a scene has nothing to refuse against, and refusing on an
+    /// absent figure is how an admission system turns into a wall.
+    pub admission: Option<&'a crate::admission::AdmissionCosts>,
 }
 
 /// Event-shaped pushes applied at the call site's existing control-flow

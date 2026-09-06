@@ -839,6 +839,15 @@ impl Gui {
             Some(_) => {}
             None => self.budget_readout = None,
         }
+        // The admission table's own generation compare, in the ledger — see
+        // `AdmissionLedger::adopt`, which also clears what the doors have
+        // spent, because a fresher spare already accounts for it. A `None`
+        // leaves the ledger holding its last table rather than clearing it:
+        // the test harness passes `None` every frame, and a door that lost
+        // its table between two frames would silently stop asking.
+        if let Some(costs) = inputs.admission {
+            self.admission.adopt(costs);
+        }
         self.floor_tile_zoom_bias = inputs.floor_tile_zoom_bias;
         // Before the pane loop, when every slot is full: the live sources
         // and the parked ones are held to the device's allowance from here.
@@ -887,6 +896,13 @@ impl Gui {
     /// App publishes, never once per frame. See the field.
     pub fn budget_readout_copies(&self) -> u64 {
         self.budget_readout_copies
+    }
+
+    /// **The admission ledger**: the cost table the App last published, what
+    /// the doors have admitted against it since, and the notice a refusal
+    /// left for the glass. See [`crate::admission`].
+    pub fn admission(&self) -> &crate::admission::AdmissionLedger {
+        &self.admission
     }
 
     /// **The share of each memory pool the user allows this application** —
@@ -1155,13 +1171,28 @@ impl Gui {
     }
 
     /// Turn an overlay on or off for `pane` — **both halves**.
+    ///
+    /// **An admission door** (WO-G), and it charges for the transition rather
+    /// than for the call: showing a layer this pane already shows is free,
+    /// and hiding one is always free. The pane's flag is read *before* the
+    /// write, so a layer the pane does not hold at all is off here and is
+    /// charged here — which is why the `PaneState::add_layer` inside
+    /// `set_layer_enabled` is handed no ledger.
     pub(super) fn write_pane_overlay(
         overlays: &mut OverlayRegistry,
+        admission: &mut crate::admission::AdmissionLedger,
         pane_idx: usize,
         pane: &mut PaneState,
         kind: &LayerId,
         on: bool,
     ) {
+        if on && !pane.is_overlay_enabled(kind) {
+            let want = admission
+                .pane(pane_idx)
+                .show_layer
+                .plus(admission.layer_grid(kind));
+            let _ = admission.ask(crate::admission::Act::ShowLayer, want);
+        }
         pane.hydrate_layer_states(overlays, pane_idx);
         // The pane's own state is where "on" lives — for every handler, since
         // WO-M10c. There is no second half to keep in step.
@@ -1174,9 +1205,17 @@ impl Gui {
     }
 
     fn set_active_pane_overlay(&mut self, kind: &LayerId, on: bool) {
-        let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-        Self::write_pane_overlay(&mut self.overlays, self.active_pane, &mut pane, kind, on);
-        self.panes[self.active_pane] = pane;
+        let idx = self.active_pane;
+        let mut pane = std::mem::take(&mut self.panes[idx]);
+        Self::write_pane_overlay(
+            &mut self.overlays,
+            &mut self.admission,
+            idx,
+            &mut pane,
+            kind,
+            on,
+        );
+        self.panes[idx] = pane;
     }
 
     /// Select `kind`'s options in the inspector and make sure it is open —
@@ -1415,7 +1454,21 @@ impl Gui {
 
     /// Grow or shrink the layout to `count` panes, seeding any new ones, and
     /// report whether the layout actually reached that count.
+    ///
+    /// **An admission door** (WO-G), and the only one for a pane: `grown_pane`
+    /// comes through here, so gating it as well would refuse the same pane
+    /// twice. It charges for the panes the layout actually **gains** — a
+    /// count that shrinks or stands still asks for nothing — and for those
+    /// panes bare. The layers `initialize_pane_enabled` then default-enables
+    /// on them are that door's charge, two lines down.
     fn set_pane_count(&mut self, count: usize) -> bool {
+        let added = count.saturating_sub(self.pane_layout.pane_count);
+        if added > 0 {
+            let want = self.admission.costs().new_pane.times(added as u64);
+            let _ = self
+                .admission
+                .ask(crate::admission::Act::Panes { added }, want);
+        }
         let active_site = self.panes[self.active_pane].site().to_string();
         let active_scan_info = self.panes[self.active_pane].scan_info.clone();
         while self.panes.len() < count {
@@ -2485,6 +2538,10 @@ mod overlay_texture_release_tests;
 /// What the frame's retirement drain actually moved.
 #[cfg(test)]
 mod retired_drain_tests;
+
+/// The admission doors, driven through the real chrome — both arms at each.
+#[cfg(test)]
+mod admission_door_tests;
 
 /// Which panes each scan-info event is addressed to.
 #[cfg(test)]

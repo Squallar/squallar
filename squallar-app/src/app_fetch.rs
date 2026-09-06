@@ -1658,7 +1658,28 @@ impl super::App {
     /// transport's whole `LayerTimeState` — a flag set before
     /// [`begin_loop_for_pane`] was wiped by that replacement and the restored
     /// loop came back paused.
-    fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64, autoplay: bool) {
+    pub(super) fn handle_enable_loop(
+        &mut self,
+        pane_idx: usize,
+        lookback_secs: u64,
+        autoplay: bool,
+    ) {
+        // **An admission door** (WO-G), and the only one for a loop.
+        //
+        // It charges for arming a loop on a pane that is **not looping now**.
+        // A pane already looping is re-listing - the same frames over a window
+        // the lookback slider already priced (`Gui::set_loop_span_secs`) - and
+        // charging here too would price one drag of that slider twice, once
+        // for the span and once for each `EnableLoop` the drag emits.
+        //
+        // The price is the App's own, off its own ledger. Aliasing is already
+        // in it: `App::loop_demand` answered whether this pane's prospective
+        // identity is one another pane owns, and the increment was taken over
+        // a scene that says so.
+        let want = self.admission.pane(pane_idx).arm_loop;
+        let _ = self
+            .admission
+            .ask(squallar_egui::admission::Act::ArmLoop, want);
         // One clock reading for both halves of the range, so a forward-reaching
         // rail's past and future cannot be anchored a tick apart.
         let now = chrono::Utc::now().naive_utc();

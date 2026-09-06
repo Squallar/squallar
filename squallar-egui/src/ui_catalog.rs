@@ -617,7 +617,7 @@ impl super::Gui {
     fn catalog_apply_overlay(&mut self, kind: LayerId, actions: &mut Vec<GuiAction>) {
         let idx = self.active_pane;
         let mut pane = std::mem::take(&mut self.panes[idx]);
-        pane.add_layer(&self.overlays, &kind);
+        pane.add_layer(&self.overlays, &kind, Some((idx, &mut self.admission)));
         self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, true, actions);
         self.panes[idx] = pane;
         self.propagate_pane_sync();
@@ -657,7 +657,7 @@ impl super::Gui {
                 // acts now: put it in the pane if it is not there, then show
                 // it. A field tile for a layer the user removed must bring the
                 // layer back with it, or the click draws nothing.
-                pane.add_layer(&self.overlays, owner);
+                pane.add_layer(&self.overlays, owner, Some((idx, &mut self.admission)));
                 self.set_pane_overlay_with_fetch(&mut pane, idx, owner, true, actions);
 
                 // Through `apply_control` rather than a field write, so the
@@ -709,10 +709,13 @@ impl super::Gui {
                     self.request_pane_view(idx, squallar_radar::types::RenderView::PlanView);
                 }
                 let Self {
-                    overlays, panes, ..
+                    overlays,
+                    panes,
+                    admission,
+                    ..
                 } = self;
-                panes[idx].add_layer(overlays, owner);
-                Self::write_pane_overlay(overlays, idx, &mut panes[idx], owner, true);
+                panes[idx].add_layer(overlays, owner, Some((idx, admission)));
+                Self::write_pane_overlay(overlays, admission, idx, &mut panes[idx], owner, true);
                 let pane = &mut self.panes[idx];
                 if pane.selected_product() != spec.id {
                     pane.set_selected_product(spec.id.clone());
@@ -756,8 +759,82 @@ impl super::Gui {
 
     /// Rebuild the layout from `preset`: pane count, per-pane product and
     /// tilt with every pane a map again, and the overlay set on each pane.
+    ///
+    /// **An admission door** (WO-G), and the one that has to be a **batch**:
+    /// a preset is one act with one name, and pricing its panes and its
+    /// layers as separate asks would let the panes in and stop at the third
+    /// layer — a half-applied preset, which is a scene the user never asked
+    /// for and cannot say the name of. So the whole increment is summed
+    /// first, asked once, and the inner doors ([`Gui::set_pane_count`],
+    /// [`crate::pane::PaneState::add_layer`], `Gui::write_pane_overlay`)
+    /// charge nothing while the batch is open — the transitions they make are
+    /// exactly the ones already priced.
     fn apply_preset(&mut self, preset: &PresetConfig, actions: &mut Vec<GuiAction>) {
         let count = preset.pane_count.clamp(1, self.layout.width.max_panes());
+        let _ = self.admission.ask(
+            crate::admission::Act::Preset,
+            self.preset_increment(preset, count),
+        );
+        self.admission.begin_batch();
+        self.apply_preset_within_batch(preset, count, actions);
+        self.admission.end_batch();
+    }
+
+    /// **What `preset` would add**, summed over exactly the transitions
+    /// [`Self::apply_preset_within_batch`] is about to make: the panes the
+    /// layout gains, and every (pane, layer) pair the preset turns on that is
+    /// off now. A layer's decoded grid is scene-level and counted once
+    /// however many panes show it.
+    fn preset_increment(
+        &self,
+        preset: &PresetConfig,
+        count: usize,
+    ) -> squallar_device_profile::admit::Increment {
+        let added = count.saturating_sub(self.pane_layout.pane_count);
+        let mut want = self.admission.costs().new_pane.times(added as u64);
+        let mut grids_counted: Vec<LayerId> = Vec::new();
+        for idx in 0..count {
+            for kind in self.overlays.default_draw_order() {
+                if !preset.overlays.known.contains(&kind) {
+                    continue;
+                }
+                // A pane the layout has not grown yet holds nothing, so every
+                // layer the preset names is a transition on it.
+                let already_on = self
+                    .panes
+                    .get(idx)
+                    .is_some_and(|pane| pane.is_overlay_enabled(&kind));
+                if already_on {
+                    continue;
+                }
+                want = want.plus(self.admission.pane(idx).show_layer);
+                if !grids_counted.contains(&kind) {
+                    grids_counted.push(kind.clone());
+                    want = want.plus(self.admission.layer_grid(&kind));
+                }
+            }
+        }
+        want
+    }
+
+    /// [`Self::apply_preset`] by name, for the door tests — the modal that
+    /// normally reaches it is a click on a tile inside a `Window`.
+    #[cfg(test)]
+    pub(crate) fn apply_preset_for_test(
+        &mut self,
+        preset: &PresetConfig,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        self.apply_preset(preset, actions);
+    }
+
+    /// [`Self::apply_preset`]'s body, run with the batch open.
+    fn apply_preset_within_batch(
+        &mut self,
+        preset: &PresetConfig,
+        count: usize,
+        actions: &mut Vec<GuiAction>,
+    ) {
         let _ = self.set_pane_count(count);
         let count = self.pane_layout.pane_count;
 
@@ -794,7 +871,7 @@ impl super::Gui {
                 // pane keeps the row and its settings, and one preset click
                 // cannot throw away a stack the user built.
                 if on {
-                    pane.add_layer(&self.overlays, &kind);
+                    pane.add_layer(&self.overlays, &kind, Some((idx, &mut self.admission)));
                 }
                 self.set_pane_overlay_with_fetch(&mut pane, idx, &kind, on, actions);
             }

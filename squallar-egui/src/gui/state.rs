@@ -31,6 +31,10 @@ pub struct Gui {
     /// One copy is two `Vec` allocations plus a `Cow` clone per gridded
     /// layer; the compare that guards it is one `u64`.
     pub(super) budget_readout_copies: u64,
+    /// **The admission ledger**: the cost table the App last published, what
+    /// has been admitted against it since, and the notice a refusal left for
+    /// the glass. See [`crate::admission`].
+    pub(crate) admission: crate::admission::AdmissionLedger,
     pub(super) time_dialog: TimeDialogState,
     pub(super) initial_zoom_set: bool,
     pub(super) map_tiles: MapTileState,
@@ -583,6 +587,7 @@ impl Gui {
             liveness: Vec::new(),
             budget_readout: None,
             budget_readout_copies: 0,
+            admission: crate::admission::AdmissionLedger::default(),
             time_dialog: TimeDialogState {
                 timestamp,
                 date_string: timestamp.format("%Y-%m-%d").to_string(),

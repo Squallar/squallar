@@ -155,6 +155,11 @@ struct FrameFactsForTest {
     /// The shell's mirror-plan stamp; a fixture bumps it to stand in for a
     /// rung/plan/size change deferred off a clean frame.
     mirror_plan_stamp: u64,
+    /// **The admission cost table**, as the App would have priced it. `None`
+    /// until a fixture publishes one, which is what every test that is not
+    /// about admission carries — and a `None` table means the doors ask
+    /// nothing, so the whole existing suite runs through them untouched.
+    admission: Option<crate::admission::AdmissionCosts>,
 }
 
 impl Default for FrameFactsForTest {
@@ -176,6 +181,7 @@ impl Default for FrameFactsForTest {
             radar_liveness: crate::radar_layer::RadarLiveness::default(),
             floor_tile_zoom_bias: 0,
             mirror_plan_stamp: 0,
+            admission: None,
         }
     }
 }
@@ -493,7 +499,16 @@ impl InputHarness {
             mirror_plan_stamp: self.facts.mirror_plan_stamp,
             frame_diagnostics: None,
             budget_readout: None,
+            admission: self.facts.admission.as_ref(),
         });
+    }
+
+    /// **Publish an admission cost table**, as the App's telemetry tick does.
+    /// The one door a test takes to put a spare and a price in front of the
+    /// scene-changing doors.
+    pub(crate) fn set_admission(&mut self, costs: crate::admission::AdmissionCosts) {
+        self.facts.admission = Some(costs);
+        self.apply_facts();
     }
 
     /// State that the site list is still short of the network, as `App::new`

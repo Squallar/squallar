@@ -24,7 +24,7 @@ use squallar_kv::MemoryKvStore;
 /// apart the same way so the registry and the pane can be borrowed at once.
 fn toggle(gui: &mut Gui, id: &LayerId, on: bool) {
     let mut pane = std::mem::take(gui.pane_mut(0).expect("pane 0"));
-    Gui::write_pane_overlay(&mut gui.overlays, 0, &mut pane, id, on);
+    Gui::write_pane_overlay(&mut gui.overlays, &mut gui.admission, 0, &mut pane, id, on);
     *gui.pane_mut(0).expect("pane 0") = pane;
 }
 

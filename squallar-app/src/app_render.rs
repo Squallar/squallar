@@ -1557,6 +1557,10 @@ impl super::App {
                 // copies it only when its generation moved, so re-stating it
                 // every frame costs a pointer here and a `u64` compare there.
                 budget_readout: Some(&self.budget_readout),
+                // The other half of the same composition. Borrowed and
+                // re-stated every frame; the ledger copies it only when its
+                // generation moved - see `Self::compose_admission_costs`.
+                admission: Some(&self.admission_costs),
             });
     }
 
@@ -2232,6 +2236,7 @@ impl super::App {
                     &self.budget_readout,
                     squallar_alloc::live_bytes(),
                     &self.host_recovery,
+                    squallar_egui::admission::totals(),
                 )),
         );
         // What this frame's panes' overlay pictures are sized at, so a
@@ -4777,6 +4782,13 @@ impl super::App {
         // The site and frame list of every pane that reached the radar arm,
         // by its index in `scene.panes`, for that second pass.
         let mut scan_owners: Vec<(usize, &str, &[squallar_egui::pane::LoopFrame])> = Vec::new();
+        // **What each pane's radar loop WOULD be, whether or not it runs one**
+        // — the identity and site every pane already carries, taken on this
+        // walk so the admission door can ask `seen` and `scan_sites` the
+        // aliasing question about a loop that has not been armed. Resolved
+        // after the walk, like `scan_owners`, because a later pane can be the
+        // owner.
+        let mut prospective_rows: Vec<(Option<LoopIdentity>, String, Option<u32>)> = Vec::new();
         let model = LoopFrameModel::from_budgets(&self.budgets);
         for (pane_idx, pane) in self.gui.panes().iter().enumerate() {
             if counts.advance_us == 0 {
@@ -4854,6 +4866,14 @@ impl super::App {
                 [0, 0] => window_px,
                 planned => planned,
             };
+            let ls = pane.time_state(&known::RADAR);
+            // Every pane, before the arms below return early: a pane running
+            // no radar loop is exactly the one the arm-a-loop door prices.
+            prospective_rows.push((
+                loop_product(ls).map(|product| LoopIdentity::of(pane, ls, product)),
+                radar_layer::site(ls).to_string(),
+                ls.cadence_secs,
+            ));
             let mut pane_need = PaneNeed {
                 px,
                 view,
@@ -4873,7 +4893,6 @@ impl super::App {
                 loop_scans_resident_frames: 0,
                 loop_scans_needed: true,
             };
-            let ls = pane.time_state(&known::RADAR);
             if !ls.is_active() {
                 // **A pane looping something other than radar is a share
                 // too.** Radar's timeline is the only one the three arms below
@@ -5019,6 +5038,25 @@ impl super::App {
             pane.loop_scans_resident_bytes = (named_bytes + parked_bytes) as u64;
             pane.loop_scans_resident_frames = named_frames;
         }
+        // **Ruling 8 for a loop that is not running yet.** Resolved against
+        // the same two lists the running loops were: a pane whose identity
+        // another pane already owns would be an alias, and a pane whose site
+        // is already counted holds that pane's decoded volumes. `owner != idx`
+        // throughout, so a pane never reads itself as its own share.
+        let prospective: Vec<ProspectiveLoop> = prospective_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, (identity, site, cadence_secs))| ProspectiveLoop {
+                alias: identity.as_ref().is_some_and(|key| {
+                    seen.iter()
+                        .any(|(held, owner)| held == key && *owner != idx)
+                }),
+                scans_shared: scan_sites
+                    .iter()
+                    .any(|(counted, owner)| counted == site && *owner != idx),
+                cadence_secs: *cadence_secs,
+            })
+            .collect();
         counts.shared = self.loop_frames.shared();
         scene.overlay_grids = overlay_grids
             .iter()
@@ -5031,6 +5069,7 @@ impl super::App {
             counts,
             scene,
             overlay_grids,
+            prospective,
         }
     }
 
@@ -5038,6 +5077,14 @@ impl super::App {
     /// the one pane walk [`Self::loop_demand`] already makes.
     pub(super) fn scene_of(&self) -> Scene {
         self.loop_demand().scene
+    }
+
+    /// The whole walk, for the tests whose subject is what it decided rather
+    /// than what the scene costs — the prospective-loop rows in particular,
+    /// which nothing else can read.
+    #[cfg(test)]
+    pub(super) fn loop_demand_for_test(&self) -> LoopWalk {
+        self.loop_demand()
     }
 
     /// The division of the pool in force, after the dwell and the dead band
@@ -5052,6 +5099,9 @@ impl super::App {
             // The readout's, and composed on the readout's cadence rather
             // than this one — see `Self::compose_budget_readout`.
             overlay_grids: _,
+            // The readout's cadence composes the admission table too, and
+            // this is the frame path - see `Self::compose_admission_costs`.
+            prospective: _,
         } = self.loop_demand();
         self.loop_counts = counts;
         self.refit_to_scene(&scene);
@@ -5111,12 +5161,210 @@ impl super::App {
         let LoopWalk {
             scene,
             overlay_grids,
+            prospective,
             ..
         } = self.loop_demand();
         let terms = squallar_device_profile::fit::need_terms(&scene, &self.budgets, GRID_BYTES);
         let allocation = self.loop_allocation();
-        self.compose_budget_readout(&scene, &terms, overlay_grids, &allocation);
+        self.compose_budget_readout(&scene, &terms, overlay_grids.clone(), &allocation);
+        // The other half of the same composition, off the same walk and the
+        // same terms - see `Self::compose_admission_costs`.
+        self.compose_admission_costs(&scene, &terms, &prospective, &overlay_grids);
         scene
+    }
+
+    /// **Compose the admission cost table** - what one more pane, layer or
+    /// loop would cost, and what the pools have left.
+    ///
+    /// The mirror of [`Self::compose_budget_readout`]: that one describes what
+    /// is resident, this one prices what is **not yet**. Both run here, on the
+    /// telemetry tick, off the one walk and the one `NeedTerms` - the frame
+    /// path composes neither.
+    ///
+    /// # Every figure is a difference of the one model
+    ///
+    /// Nothing here invents a byte figure. Each cost is
+    /// `squallar_device_profile::admit::increment` over the scene as it is and
+    /// the scene with exactly one thing added, so a term that moves in `fit`
+    /// moves in admission on the same land. That is also what makes ruling 8
+    /// free: an alias is written into the prospective scene the way
+    /// [`Self::loop_demand`] writes one - `looping: false`,
+    /// `loop_scans_shared: true` - and the model prices it at its own cost and
+    /// no more without this function knowing what an alias is.
+    ///
+    /// # What the cadence costs, and what it does not buy
+    ///
+    /// A table composed every 2 s is a table a burst of clicks can outrun, so
+    /// the UI ledger debits what it admits and compares against the remainder
+    /// (`squallar_egui::admission::AdmissionLedger::spare`). What the cadence
+    /// does buy is the promise this land was given: **no per-frame walk**. The
+    /// arithmetic here is a handful of `need_terms` passes over a scene of at
+    /// most six panes, on the tick that already priced one.
+    fn compose_admission_costs(
+        &mut self,
+        scene: &Scene,
+        terms: &squallar_device_profile::fit::NeedTerms,
+        prospective: &[ProspectiveLoop],
+        overlay_grids: &[(squallar_source::id::LayerId, u64)],
+    ) {
+        use squallar_device_profile::admit::{Increment, LoopFrames, Spare, increment};
+        use squallar_device_profile::scene::Pools;
+        use squallar_egui::admission::{AdmissionCosts, LayerGrid, PaneAdmission};
+
+        let cap = self.capacity();
+        let need = terms.total();
+        let budgets = self.budgets;
+        let price = |before: &Scene, after: &Scene| increment(before, after, &budgets, GRID_BYTES);
+
+        let mut panes = Vec::with_capacity(scene.panes.len());
+        for (idx, pane) in scene.panes.iter().enumerate() {
+            // One more whole-picture overlay layer on this pane: its raster,
+            // the same batch again in the upload queue, and whatever the
+            // arrival maximum rises by - all of it the model's, folded the
+            // way the model folds it.
+            let mut showing = scene.clone();
+            showing.panes[idx].overlay_pictures += 1;
+            let show_layer = price(scene, &showing);
+
+            // Arming this pane's loop. A pane already looping cannot arm one;
+            // a pane whose identity another pane owns prices as an alias, and
+            // one whose site is already counted charges no decoded volumes.
+            let would = prospective.get(idx).copied().unwrap_or_default();
+            let arm_loop = if pane.looping {
+                Increment::ZERO
+            } else {
+                let mut armed = scene.clone();
+                let target = &mut armed.panes[idx];
+                target.looping = !would.alias;
+                target.loop_scans_shared = would.scans_shared;
+                target.cadence_secs = would.cadence_secs;
+                price(scene, &armed)
+            };
+
+            // **One more frame of this pane's loop.** Priced as the whole
+            // distance from here to the budget's own span ceiling divided by
+            // the frames that distance adds - exact, because both terms a
+            // frame moves (`NeedTerms::loops` and `loop_scans_host`) are
+            // linear in the frame count. Zero for a pane that is not looping,
+            // for an alias (which holds the owner's frames), and for a loop
+            // with no cadence yet, which already buys the whole render budget
+            // and cannot be given another frame by a wider window.
+            let now_frames = squallar_device_profile::fit::loop_frames(pane, &budgets);
+            let loop_frame = if pane.looping {
+                let mut widest = *pane;
+                widest.loop_span_secs = budgets.loop_span_secs;
+                let most = squallar_device_profile::fit::loop_frames(&widest, &budgets);
+                match most.checked_sub(now_frames).filter(|added| *added > 0) {
+                    Some(added) => {
+                        let mut wider = scene.clone();
+                        wider.panes[idx] = widest;
+                        let whole = price(scene, &wider);
+                        Increment {
+                            gpu_bytes: whole.gpu_bytes / added as u64,
+                            host_bytes: whole.host_bytes / added as u64,
+                        }
+                    }
+                    None => Increment::ZERO,
+                }
+            } else {
+                Increment::ZERO
+            };
+
+            panes.push(PaneAdmission {
+                show_layer,
+                arm_loop,
+                loop_frame,
+                loop_frames_now: now_frames,
+                cadence_secs: pane.cadence_secs.or(would.cadence_secs),
+                looping: pane.looping,
+            });
+        }
+
+        // **One more pane, bare.** Seeded from the first pane on screen - a
+        // pane `Gui::set_pane_count` opens is born from the active pane's site
+        // and scan info - with its overlays and its loop taken off and its
+        // decoded volumes already counted, because the site it copies is one
+        // some pane already holds. The tile working set grows with it: a pane
+        // opened onto a map wants tiles of its own, and one pane's share of
+        // what is on the glass now is the figure this walk has. **That share
+        // is an average over the panes drawing, not a measurement of the pane
+        // being opened, and it is the one estimate in this table.**
+        let new_pane = {
+            let mut after = scene.clone();
+            if let Some(seed) = scene.panes.first().copied() {
+                after.panes.push(squallar_device_profile::scene::PaneNeed {
+                    overlay_pictures: 0,
+                    looping: false,
+                    volume_grids: 0,
+                    loop_scans_shared: true,
+                    loop_scans_resident_bytes: 0,
+                    loop_scans_resident_frames: 0,
+                    ..seed
+                });
+            }
+            let denominator = scene.panes.len().max(1);
+            for source in &mut after.tile_sources {
+                source.tiles_on_glass += source.tiles_on_glass / denominator;
+            }
+            price(scene, &after)
+        };
+
+        // **Every gridded layer, with whether some pane already holds its
+        // decoded source.** The shown set is the walk's own; the rest come
+        // from the roster beside `source_grid_budget_bytes`, so a layer no
+        // pane shows yet still has a price when the user reaches for it.
+        let layer_grids = squallar_overlays::render::handlers::gridded_layers()
+            .into_iter()
+            .filter(|(_, grid_bytes)| *grid_bytes > 0)
+            .map(|(id, grid_bytes)| LayerGrid {
+                resident: overlay_grids.iter().any(|(shown, _)| *shown == id),
+                id,
+                grid_bytes,
+            })
+            .collect();
+
+        // **Spare, as `compose_budget_readout` defines it and nowhere else** -
+        // the model's figure bounded by what the heap itself says. The joint
+        // row is the unified capacity's one memory: computed from
+        // `joint_allowance` and the whole need rather than as the two spares
+        // summed, because both of those are floored at zero and would
+        // over-state the pool the moment one axis went over its share.
+        let heap = HostSpareInputs {
+            wall: self
+                .page_heap_reading
+                .filter(|heap| heap.page_max_bytes > 0)
+                .map(|heap| (heap.page_max_bytes, heap.page_bytes)),
+            live_bytes: squallar_alloc::live_bytes(),
+            headroom_bytes: self.host_headroom_bytes,
+        };
+        let spare = Spare {
+            gpu_bytes: Some(cap.allowance().saturating_sub(need.gpu_bytes)),
+            host_bytes: cap.host_allowance().map(|allowance| {
+                host_spare_bytes(allowance.saturating_sub(need.host_bytes), allowance, heap)
+            }),
+            joint_bytes: match cap.pools {
+                Pools::Unified => {
+                    let allowance = cap.joint_allowance();
+                    let model =
+                        allowance.saturating_sub(need.gpu_bytes.saturating_add(need.host_bytes));
+                    Some(host_spare_bytes(model, allowance, heap))
+                }
+                Pools::Split => None,
+            },
+        };
+
+        self.admission_costs = AdmissionCosts {
+            generation: self.admission_costs.generation.wrapping_add(1),
+            spare,
+            panes,
+            new_pane,
+            layer_grids,
+            frames: LoopFrames {
+                budget_span_secs: budgets.loop_span_secs,
+                render_budget: budgets.loop_render_budget,
+            },
+        };
+        self.admission.adopt(&self.admission_costs);
     }
 
     /// **Compose the budget readout** from a scene a walk has priced: per
@@ -6780,11 +7028,36 @@ fn section_source_refusal(
 /// on the pool, the telemetry's count of what they hold, the scene the
 /// budget system prices, and the gridded overlays that scene's shared-grid
 /// term was built from, keyed for the readout.
-struct LoopWalk {
+pub(super) struct LoopWalk {
     demand: LoopDemand,
     counts: crate::loop_telemetry::LoopState,
     scene: Scene,
     overlay_grids: Vec<(squallar_source::id::LayerId, u64)>,
+    /// **What arming each pane's radar loop would be**, in the two terms the
+    /// price turns on — one entry per pane, in `scene.panes` order. Read only
+    /// by [`App::compose_admission_costs`]; see [`ProspectiveLoop`].
+    prospective: Vec<ProspectiveLoop>,
+}
+
+/// **Whether a loop a pane does not run yet would be a share.**
+///
+/// Ruling 8 priced before the fact: `App::loop_demand`'s own `seen` and
+/// `scan_sites` walks answer aliasing for the loops that are running, and the
+/// admission door has to ask the same question of a loop that is not. A pane
+/// whose prospective identity is one another pane already owns holds that
+/// pane's frames and owes none of its own; a pane whose site's decoded
+/// volumes are already counted owes none of those either. Both are read off
+/// the same two lists the retention uses, so the price and the residency
+/// cannot disagree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProspectiveLoop {
+    /// Another pane already runs this pane's loop identity.
+    alias: bool,
+    /// Another pane already counts this pane's site's decoded volumes.
+    scans_shared: bool,
+    /// The cadence its radar timeline reports, for converting a span to a
+    /// frame count.
+    cadence_secs: Option<u32>,
 }
 
 /// **What makes two panes' radar loops one loop for the pool.** Two panes
@@ -8213,6 +8486,12 @@ mod host_spare_tests;
 #[path = "app_render/budget_readout_cadence_tests.rs"]
 #[cfg(test)]
 mod budget_readout_cadence_tests;
+
+/// What the App prices for the admission doors, and what the one door on this
+/// side of the seam does with it.
+#[path = "app_render/admission_costs_tests.rs"]
+#[cfg(test)]
+mod admission_costs_tests;
 
 /// The user's two memory shares end to end: restored before the first fit,
 /// applied ahead of every allowance, and reported beside what was allowed.

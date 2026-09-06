@@ -35,7 +35,7 @@ const SLIDER_DEFAULT: u64 = 3600;
 fn draw(h: &mut InputHarness, id: &LayerId, on: bool) {
     let gui = h.gui_mut();
     let mut pane = std::mem::take(gui.pane_mut(0).expect("pane 0"));
-    Gui::write_pane_overlay(&mut gui.overlays, 0, &mut pane, id, on);
+    Gui::write_pane_overlay(&mut gui.overlays, &mut gui.admission, 0, &mut pane, id, on);
     *gui.pane_mut(0).expect("pane 0") = pane;
     h.warm_up();
 }

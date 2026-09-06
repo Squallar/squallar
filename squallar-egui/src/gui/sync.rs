@@ -135,11 +135,43 @@ impl Gui {
     /// [`Self::loop_span_secs_for`], which raises this to the addressed
     /// layer's own floor. The two are the same number for radar and for every
     /// layer that declares no minimum.
+    /// **An admission door** (WO-G), and a **batch**: this writes every pane
+    /// at once, so the increment is the whole window's, summed over the panes
+    /// that are actually looping and asked once. Refusing pane by pane would
+    /// leave the panes at two different lookbacks with one slider showing one
+    /// number, which the slider's own caption says cannot happen.
+    ///
+    /// It charges the **delta**, in frames: a pane already looping pays for
+    /// the frames a wider window adds and nothing for the ones it already
+    /// holds. A narrower window is free. A pane that is not looping is not
+    /// charged at all — arming it is `App::handle_enable_loop`'s door, and
+    /// charging here as well would price one gesture twice.
     pub(crate) fn set_loop_span_secs(&mut self, secs: u64) {
+        let want = self.loop_span_increment(secs);
+        let _ = self.admission.ask(crate::admission::Act::LoopSpan, want);
         self.loop_lookback_secs = secs;
         for pane in &mut self.panes {
             pane.time.span_secs = secs;
         }
+    }
+
+    /// **What widening the window to `secs` would add**: for every looping
+    /// pane, the frames it gains at its own cadence, at that pane's own
+    /// frame cost. Zero for a pane whose loop is an alias of another's — its
+    /// per-frame cost is zero, priced that way by the App.
+    fn loop_span_increment(&self, secs: u64) -> squallar_device_profile::admit::Increment {
+        let costs = self.admission.costs();
+        let mut want = squallar_device_profile::admit::Increment::ZERO;
+        for idx in 0..self.panes.len() {
+            let pane = self.admission.pane(idx);
+            if !pane.looping {
+                continue;
+            }
+            let wanted = costs.frames.frames(secs as usize, pane.cadence_secs);
+            let added = wanted.saturating_sub(pane.loop_frames_now);
+            want = want.plus(pane.loop_frame.times(added as u64));
+        }
+        want
     }
 
     /// **The window `pane_idx`'s loop is actually listed over**: the setting,
@@ -215,11 +247,20 @@ impl Gui {
     /// The layer half: layer settings from a layer-linked active pane to the
     /// other layer-linked panes **in its group**. Also converges site and
     /// scan_info so the group displays the same radar site.
+    ///
+    /// **An admission door** (WO-G), and a **batch**: a linked group shares
+    /// one arrangement, so the fan-out is one act. `PaneState::adopt_layers`
+    /// takes the whole stack wholesale with no kind named and no `on` to
+    /// read — it is the one way a pane's enabled set moves that
+    /// `write_pane_overlay` never sees — so the price is summed here, over
+    /// every layer each destination pane is about to gain.
     fn propagate_layer_state(&mut self) {
         if !self.panes[self.active_pane].layer_link || self.panes[self.active_pane].group.is_none()
         {
             return;
         }
+        let want = self.adopt_layers_increment();
+        let _ = self.admission.ask(crate::admission::Act::AdoptLayers, want);
         let src = &self.panes[self.active_pane];
         let group = src.group;
         let active_site = src.site().to_string();
@@ -250,6 +291,39 @@ impl Gui {
             // siblings, which just adopted the same off-switch, keep theirs.
             p.release_disabled_overlay_textures();
         }
+    }
+
+    /// **What the layer-link fan-out would add**: for every destination pane
+    /// in the active pane's group, every layer the adopted stack shows that
+    /// the pane does not show now. A layer's decoded grid is scene-level and
+    /// counted once across the whole fan-out.
+    fn adopt_layers_increment(&self) -> squallar_device_profile::admit::Increment {
+        let src = &self.panes[self.active_pane];
+        let group = src.group;
+        let adopted: Vec<squallar_source::id::LayerId> = src
+            .layers
+            .iter()
+            .filter(|slot| slot.enabled)
+            .map(|slot| slot.id.clone())
+            .collect();
+        let mut want = squallar_device_profile::admit::Increment::ZERO;
+        let mut grids_counted: Vec<squallar_source::id::LayerId> = Vec::new();
+        for (idx, pane) in self.panes.iter().enumerate() {
+            if idx == self.active_pane || !pane.layer_link || pane.group != group {
+                continue;
+            }
+            for id in &adopted {
+                if pane.is_overlay_enabled(id) {
+                    continue;
+                }
+                want = want.plus(self.admission.pane(idx).show_layer);
+                if !grids_counted.contains(id) {
+                    grids_counted.push(id.clone());
+                    want = want.plus(self.admission.layer_grid(id));
+                }
+            }
+        }
+        want
     }
 
     /// Propagate the interacted pane's viewport (zoom + position) to the

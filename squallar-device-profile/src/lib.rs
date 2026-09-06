@@ -13,7 +13,11 @@
 //! * the need / capacity arithmetic in [`scene`] and [`fit`] — what the scene
 //!   on screen costs at a budget, and the largest budget whose cost fits the
 //!   device's capacity, shedding down the resolver's own ladder. Pure, and
-//!   priced only through cost functions the tree already has.
+//!   priced only through cost functions the tree already has;
+//! * the admission arithmetic in [`admit`] — what one more pane, layer or
+//!   loop would cost, priced as a difference of [`fit`]'s own model over two
+//!   scenes, and whether the pools have room for it. [`fit`] answers after
+//!   the bytes are committed; this answers before.
 //! * the fixed-shape latency histogram in [`hist`] — pure integer arithmetic
 //!   over a compile-time bin layout. It sits here, under both the UI and the
 //!   wgpu boundary, because both sides read one: the recorder fills on the
@@ -23,6 +27,7 @@
 //! Data and policy only, denominated in `squallar-radar`'s size vocabulary.
 //! Nothing here renders, allocates, or touches a device.
 
+pub mod admit;
 pub mod budget;
 pub mod constants;
 pub mod fit;

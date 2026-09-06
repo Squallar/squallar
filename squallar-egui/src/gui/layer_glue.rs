@@ -104,10 +104,10 @@ impl Gui {
                 );
             }
             if response.changed() {
-                if on && pane.slot(&guest).is_none() {
-                    pane.add_layer(&self.overlays, &guest);
-                }
                 let idx = self.active_pane;
+                if on && pane.slot(&guest).is_none() {
+                    pane.add_layer(&self.overlays, &guest, Some((idx, &mut self.admission)));
+                }
                 self.set_pane_overlay_with_fetch(pane, idx, &guest, on, actions);
             }
         }
@@ -195,7 +195,14 @@ impl Gui {
         on: bool,
         actions: &mut Vec<GuiAction>,
     ) {
-        Self::write_pane_overlay(&mut self.overlays, pane_idx, pane, kind, on);
+        Self::write_pane_overlay(
+            &mut self.overlays,
+            &mut self.admission,
+            pane_idx,
+            pane,
+            kind,
+            on,
+        );
         let stale = self
             .overlays
             .fetch_health(kind)
@@ -235,12 +242,41 @@ impl Gui {
     /// the config swap was, and it dies with it. A slot with a `null` config
     /// gets its state from `create_pane_state(slot.enabled)` at the hydrate
     /// below, which is the same answer without the borrowed opinion.
+    /// **An admission door** (WO-G), and a **batch**: one increment for every
+    /// slot this call will actually mint enabled, over every pane, asked once.
+    /// Per-slot refusal would leave a pane holding some of the layers it
+    /// ships with and not others — a curation the user never made.
+    ///
+    /// The charge is the transition, so a pane that already holds every layer
+    /// asks for nothing, which is what every frame after the first does.
     pub fn initialize_pane_enabled(&mut self) {
         let mut wanted: Vec<(LayerId, u32, bool)> = self
             .overlays
             .handlers()
             .map(|h| (h.id(), h.draw_order_weight(), h.default_enabled()))
             .collect();
+        // Priced before the insert, over exactly the (pane, layer) pairs
+        // `insert_missing_slots` will mint enabled below — `LayerStack::admits`
+        // is the same predicate it uses, so the two cannot disagree about
+        // what is about to be added. A layer's grid is scene-level and
+        // counted once however many panes gain it.
+        let mut want = squallar_device_profile::admit::Increment::ZERO;
+        let mut grids_counted: Vec<LayerId> = Vec::new();
+        for (pane_idx, pane) in self.panes.iter().enumerate() {
+            for (id, _, default_on) in &wanted {
+                if !*default_on || !pane.admits_layer(id, *default_on) {
+                    continue;
+                }
+                want = want.plus(self.admission.pane(pane_idx).show_layer);
+                if !grids_counted.contains(id) {
+                    grids_counted.push(id.clone());
+                    want = want.plus(self.admission.layer_grid(id));
+                }
+            }
+        }
+        let _ = self
+            .admission
+            .ask(crate::admission::Act::DefaultLayers, want);
         // Weight order, so each insertion lands among slots that are already
         // in it — the same walk `reconcile_draw_order` made.
         wanted.sort_by_key(|&(_, weight, _)| weight);
@@ -280,9 +316,12 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn add_layer_on_pane_for_test(&mut self, idx: usize, kind: &LayerId) -> bool {
         let Self {
-            overlays, panes, ..
+            overlays,
+            panes,
+            admission,
+            ..
         } = self;
-        panes[idx].add_layer(overlays, kind)
+        panes[idx].add_layer(overlays, kind, Some((idx, admission)))
     }
 
     /// Set one pane's overlay state, writing the config as well as the enabled map
