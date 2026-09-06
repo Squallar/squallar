@@ -3,9 +3,14 @@
 
 use egui_wgpu::wgpu;
 use squallar_app::platform::{
-    GpuProbeReport, HostSignals, LinearMemory, PlatformBridge, ProbedCapacity, gpu_probe_applies_to,
+    GpuProbeReport, HostSignals, LinearMemory, PlatformBridge, ProbedCapacity, RedrawWaker,
+    gpu_probe_applies_to,
 };
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
 use winit::platform::web::WindowAttributesExtWebSys;
+
+use crate::context_loss::ContextLoss;
 
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";
 
@@ -41,16 +46,106 @@ pub struct WebPlatform {
     last_theme: Option<bool>,
     /// See [`GpuProbe`].
     gpu_probe: GpuProbe,
+    /// What the two listeners below write into; see [`ContextLoss`].
+    context_loss: ContextLoss,
+    /// **The two DOM closures, held for their lifetime and never called from
+    /// here.** A `Closure` unregisters nothing when it drops — it invalidates
+    /// the JS function the listener still holds, so the next event reaches a
+    /// dangling closure and the page throws
+    /// `closure invoked recursively or after being dropped`. Keeping them as
+    /// fields makes their lifetime the bridge's, which is the application's,
+    /// which is the page's. `_` because nothing reads them: they exist to be
+    /// alive.
+    ///
+    /// `None` only where the canvas refused a listener, which is a browser
+    /// with no `addEventListener` on an element — no shipping engine — and is
+    /// logged rather than silently dropped.
+    _on_context_lost: Option<Closure<dyn FnMut(web_sys::Event)>>,
+    /// See [`Self::_on_context_lost`].
+    _on_context_restored: Option<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl WebPlatform {
     pub fn new(canvas: web_sys::HtmlCanvasElement) -> Self {
+        let context_loss = ContextLoss::new();
+        let (_on_context_lost, _on_context_restored) =
+            listen_for_context_loss(&canvas, &context_loss);
         Self {
             canvas,
             last_theme: None,
             gpu_probe: GpuProbe::NotStarted,
+            context_loss,
+            _on_context_lost,
+            _on_context_restored,
         }
     }
+}
+
+/// **Wire the canvas's two context events into `cell`**, answering the two
+/// closures to hold alive for as long as the listeners are wanted.
+///
+/// # `preventDefault()` is the whole of the first listener
+///
+/// It is not politeness and it is not about the default action being
+/// unwanted: the WebGL spec makes the browser's *attempt to restore* the
+/// context conditional on the `webglcontextlost` event having been cancelled.
+/// A page with no listener, or a listener that does not cancel, is a page the
+/// browser never offers a new context to — so the canvas stays dead for the
+/// life of the tab. That is the state this whole path exists to leave, and
+/// this one call is what leaves it.
+///
+/// # Why the loss is only recorded
+///
+/// Between the two events every GL object the app holds is invalid and
+/// `getContext('webgl2')` on this canvas keeps answering the same lost
+/// context, so there is nothing to rebuild onto yet. The app's teardown runs
+/// on the **restore** (`squallar_app`'s `App::observe_graphics_restore`), which
+/// is the first moment a fresh context exists.
+fn listen_for_context_loss(
+    canvas: &web_sys::HtmlCanvasElement,
+    cell: &ContextLoss,
+) -> (
+    Option<Closure<dyn FnMut(web_sys::Event)>>,
+    Option<Closure<dyn FnMut(web_sys::Event)>>,
+) {
+    let lost_cell = cell.clone();
+    let on_lost = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        // Before anything else in this body: the cancellation is what buys the
+        // restore, and a panic further down must not be able to cost it.
+        event.prevent_default();
+        lost_cell.note_lost();
+        log::warn!(
+            "the page's graphics context was lost ({} so far); a restore has been asked for",
+            lost_cell.losses(),
+        );
+    });
+
+    let restored_cell = cell.clone();
+    let on_restored = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        log::warn!("the page's graphics context was restored");
+        restored_cell.note_restored();
+    });
+
+    let mut installed = (None, None);
+    for (name, closure, slot) in [
+        (
+            "webglcontextlost",
+            on_lost,
+            &mut installed.0 as &mut Option<Closure<dyn FnMut(web_sys::Event)>>,
+        ),
+        ("webglcontextrestored", on_restored, &mut installed.1),
+    ] {
+        match canvas.add_event_listener_with_callback(name, closure.as_ref().unchecked_ref()) {
+            // Held rather than `forget()`: the bridge outlives every event, so
+            // there is nothing to leak the closure for.
+            Ok(()) => *slot = Some(closure),
+            Err(e) => log::error!(
+                "the canvas refused a {name} listener ({e:?}); a lost graphics \
+                 context on this page will not be restored"
+            ),
+        }
+    }
+    installed
 }
 
 impl PlatformBridge for WebPlatform {
@@ -180,6 +275,35 @@ impl PlatformBridge for WebPlatform {
             // watermark spells `Quiet` rather than guessing a wall.
             worker_max_bytes: crate::heap_max::worker_instance().unwrap_or(0),
         })
+    }
+
+    /// **How the canvas's restore listener asks the event loop for a frame.**
+    ///
+    /// The page runs on `ControlFlow::Wait` and a DOM event is not a winit
+    /// event, so a `webglcontextrestored` that only set a flag would sit
+    /// unread on an idle map until the user happened to move the mouse — with
+    /// the canvas dead the whole time. This is the one thing on this bridge
+    /// that a background source wakes for, and it is the reason the trait's
+    /// default is not enough here.
+    ///
+    /// Called from `App::new`, after [`Self::new`] has already installed the
+    /// listeners: a restore in that window still sets the flag and is still
+    /// drained by the next frame, of which boot draws several.
+    fn set_redraw_waker(&mut self, waker: RedrawWaker) {
+        self.context_loss
+            .set_wake(Box::new(move || waker.wake()) as Box<dyn Fn()>);
+    }
+
+    /// **Whether the canvas's context was lost and has come back**, consuming.
+    ///
+    /// The one bridge in the tree that ever answers `true`, for the reason the
+    /// trait's own doc gives: on the web GL surface a context loss never
+    /// becomes `SurfaceStatus::Lost`, because wgpu-hal's `acquire_texture`
+    /// hands back the pre-configured swapchain texture without consulting the
+    /// context at all. The DOM events on the canvas are the only notice the
+    /// page gets, and [`ContextLoss`] is where the two listeners put them.
+    fn poll_graphics_restore(&mut self) -> bool {
+        self.context_loss.take_restore()
     }
 
     /// The browser probe, driven from the app's asks. The first ask starts

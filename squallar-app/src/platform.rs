@@ -711,6 +711,33 @@ pub trait PlatformBridge {
         None
     }
 
+    /// **Whether the graphics context under this app was lost and has since
+    /// been restored** — asked once a frame, and **consuming**: a restore is
+    /// reported exactly once, so a caller that acts on it cannot act twice and
+    /// a frame that misses it cannot be told again.
+    ///
+    /// `false` here, which is every native bridge's answer, and that is a
+    /// statement rather than a stub: a native surface loss arrives through
+    /// wgpu as `SurfaceError::Lost` on the acquire, which the frame path
+    /// already sees. **On the web GL surface it does not.** `acquire_texture`
+    /// on wgpu-hal's GL backend hands back the pre-configured swapchain
+    /// texture unconditionally — nothing consults the context's
+    /// `is_context_lost`, so no acquire ever answers `Lost` — and neither this
+    /// tree nor winit listens for the DOM's own `webglcontextlost`. Without a
+    /// listener that calls `preventDefault()` the browser does not even
+    /// attempt a restore, so a GPU reset, a driver hiccup or some backgrounding
+    /// paths leave a dead canvas nobody repairs, on every WebGL2 page.
+    ///
+    /// It is a trait method with a default rather than a `cfg` inside the
+    /// caller for the reason
+    /// [`exits_on_unhandled_back`](Self::exits_on_unhandled_back) states: a
+    /// `cfg(target_arch)` may select a value, a dependency or a type alias and
+    /// may never fork behaviour inside a function body. The app has one shape
+    /// and the platform that can lose a context is the one that answers `true`.
+    fn poll_graphics_restore(&mut self) -> bool {
+        false
+    }
+
     /// The GPU's capacity in bytes and how that figure was obtained, or
     /// `None` where no reader exists for this adapter.
     ///

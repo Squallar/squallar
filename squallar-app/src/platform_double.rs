@@ -148,6 +148,14 @@ pub(crate) struct TestBridge {
     /// it between ticks could not tell a re-read from a value remembered at
     /// construction. `None`, as every browser answers, until a test sets one.
     available_memory: Rc<Cell<Option<u64>>>,
+    /// **Whether the next `poll_graphics_restore` reports a restore.** A gauge
+    /// rather than a value because the event it stands for arrives *between*
+    /// frames: only a handle a test still holds after the bridge is the app's
+    /// can fire one where the real DOM listener would.
+    ///
+    /// `false` until a test raises it, which is what every native bridge
+    /// answers for the life of the process.
+    graphics_restore: Rc<Cell<bool>>,
     /// What `gpu_probe_report` answers when asked about a WebGPU backend,
     /// standing in for the browser probe's outcome cell. `None` makes the
     /// double a native bridge, which reports `Absent`; `Some` makes it a web
@@ -186,6 +194,7 @@ impl TestBridge {
             linear_memory: Rc::new(Cell::new(None)),
             available_memory: Rc::new(Cell::new(None)),
             probed_gpu_capacity: None,
+            graphics_restore: Rc::new(Cell::new(false)),
         }
     }
 
@@ -277,6 +286,13 @@ impl TestBridge {
     /// ticks the way another program on the machine moves it.
     pub(crate) fn available_memory_gauge(&self) -> Rc<Cell<Option<u64>>> {
         Rc::clone(&self.available_memory)
+    }
+
+    /// The gauge behind `poll_graphics_restore`, taken before the bridge is
+    /// handed to `App`, so a test can fire a context restore between two
+    /// frames the way the canvas's own listener fires one.
+    pub(crate) fn graphics_restore_gauge(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.graphics_restore)
     }
 
     /// A handle on the blobs `kv` hands out, for seeding a config
@@ -384,6 +400,12 @@ impl PlatformBridge for TestBridge {
 
     fn available_memory_bytes(&self) -> Option<u64> {
         self.available_memory.get()
+    }
+
+    /// Consuming, as the web bridge's is: a restore fired into the gauge is
+    /// reported to the app exactly once.
+    fn poll_graphics_restore(&mut self) -> bool {
+        self.graphics_restore.replace(false)
     }
 
     fn poll_theme(&mut self) -> Option<bool> {

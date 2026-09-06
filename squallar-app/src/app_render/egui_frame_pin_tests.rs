@@ -112,20 +112,61 @@ fn app_state_probes_the_device_and_installs_the_latch() {
 }
 
 /// A lost surface only counts against the volume when one was on screen.
+///
+/// **Scraped from `abandon_graphics_state` rather than from `present_frame`,
+/// which is where this teardown used to be spelled.** It moved out whole when
+/// the WebGL2 context-restore path landed and needed the identical seven
+/// steps: the browser's own context loss never reaches `present_frame`'s
+/// acquire at all, so the two callers reach one function. The assertion is
+/// unchanged — the call must still be inside a check that a volume pane was on
+/// screen — only the body it reads moved with the code.
 #[test]
 fn a_surface_loss_is_only_counted_when_a_volume_was_on_screen() {
-    let body = body_of(
-        include_str!("../app_render.rs"),
-        "pub(super) fn present_frame(",
+    let source = include_str!("../app_render.rs");
+    let body = body_of(source, "fn abandon_graphics_state(");
+
+    // Control: the teardown is still what a lost surface reaches. A scrape of
+    // a function nothing calls would pass while the arm did nothing.
+    let present = body_of(source, "pub(super) fn present_frame(");
+    assert!(
+        present.contains("self.abandon_graphics_state("),
+        "present_frame no longer reaches the teardown this test scrapes, so a \
+         lost surface leaves the app holding the dead device's handles"
     );
 
     let call = body
         .find("note_surface_loss_with_volume(")
-        .expect("present_frame no longer counts surface losses against the volume view");
+        .expect("the graphics teardown no longer counts surface losses against the volume view");
     let preamble = &body[..call];
     assert!(
         preamble.contains("squallar_radar::types::RenderView::Volume"),
-        "present_frame counts a surface loss against the volume view without \
-         first checking that a volume pane was on screen"
+        "the graphics teardown counts a surface loss against the volume view \
+         without first checking that a volume pane was on screen"
+    );
+}
+
+/// **Every path that abandons a graphics context takes the one teardown.** The
+/// steps were copied nowhere when the browser's restore path landed: a copy
+/// that drifted by one step would leave a handle pointing at a dead device,
+/// which is a crash rather than a stale picture.
+#[test]
+fn the_graphics_teardown_has_exactly_one_spelling() {
+    let source = include_str!("../app_render.rs");
+    let teardown = body_of(source, "fn abandon_graphics_state(");
+    // Split so this file cannot count itself, exactly as
+    // `app/gui_seam_ratchet_tests.rs` splits its own scrape: the crate-wide
+    // `self.``gui.` walk counts every file in this crate, test files included.
+    let step = concat!("self.", "gui.", "clear_graphics_state()");
+    assert!(
+        teardown.contains(step),
+        "control: the teardown no longer contains `{step}`, so the count \
+         below is not reading the code it exists to guard"
+    );
+    let spellings = source.matches(step).count();
+    assert_eq!(
+        spellings, 1,
+        "`{step}` is spelled {spellings} times in app_render.rs; the surface \
+         loss and the context restore must reach ONE teardown, not two that \
+         agree today"
     );
 }

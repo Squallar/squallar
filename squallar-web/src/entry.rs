@@ -81,6 +81,14 @@ pub fn start(page_heap_max_bytes: f64, worker_heap_max_bytes: f64) -> Result<(),
 
     // `WebBackend::new` starts a *permission query*, which prompts nobody; the
     // watch waits for the gate.
+    //
+    // The canvas goes to the bridge and stays there: besides handing it to
+    // winit through `window_attributes`, the bridge is what puts the
+    // `webglcontextlost` / `webglcontextrestored` listeners on it. They are
+    // installed here, before the app exists, because a context lost during
+    // boot is the case with no frame coming to notice it; the listener that
+    // calls `preventDefault()` is also the only reason the browser will offer
+    // a replacement context at all (`crate::context_loss`).
     let platform = crate::bridge::WebPlatform::new(canvas);
     let location =
         squallar_location::LocationFacade::new(Box::new(squallar_location::web::WebBackend::new()));

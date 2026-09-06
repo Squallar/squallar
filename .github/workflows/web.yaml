@@ -5,7 +5,7 @@ name: Web
 #
 #   Tier 1: .github/scripts/wasm-threads.sh wasm-pack test --headless --firefox \
 #             --geckodriver "$(bash .github/browser-rig/ensure-geckodriver.sh)" \
-#             squallar-web --test tier1_wasm          # test result: ok. 4 passed
+#             squallar-web --test tier1_wasm          # test result: ok. 5 passed
 #           .github/scripts/wasm-threads.sh wasm-pack test --headless --chrome \
 #             squallar-web --test tier1_wasm
 #   Tier 2: .github/scripts/wasm-threads.sh wasm-pack build squallar-web \
@@ -92,7 +92,7 @@ jobs:
           echo "RIG_GECKODRIVER=$GECKODRIVER" >> "$GITHUB_ENV"
       - name: Run the Tier-1 wasm tests (${{ matrix.browser }})
         # The harness exits 0 on zero tests, so the count is asserted rather
-        # than assumed: exactly `4 passed` or this step is red. The
+        # than assumed: exactly `5 passed` or this step is red. The
         # --geckodriver flag pins the sha-verified binary -- wasm-pack ignores
         # a GECKODRIVER env var and downloads its own otherwise. (Cargo args
         # ride beside the path per wasm-pack's cargo-CLI pass-through; after
@@ -107,7 +107,7 @@ jobs:
               wasm-pack test --headless --chrome \
               squallar-web --test tier1_wasm | tee "$RUNNER_TEMP/tier1.log"
           fi
-          grep -q 'test result: ok\. 4 passed' "$RUNNER_TEMP/tier1.log"
+          grep -q 'test result: ok\. 5 passed' "$RUNNER_TEMP/tier1.log"
 
   tier2:
     name: 'Tier 2: full PWA (${{ matrix.browser }})'

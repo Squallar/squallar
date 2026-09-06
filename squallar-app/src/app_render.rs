@@ -3855,6 +3855,96 @@ impl super::App {
         }
     }
 
+    /// **Everything the app holds that belonged to a graphics context that is
+    /// gone** — the one definition of that teardown, and the only one.
+    ///
+    /// Seven things, and the count is the point: two callers reach this and a
+    /// copy that drifted by one step would leave a handle pointing at a dead
+    /// device, which is a crash rather than a stale picture.
+    ///
+    /// 1. a 3D volume on screen when the context went is counted against the
+    ///    volume view's own degradation latch, and only then — a loss with no
+    ///    volume up says nothing about the raymarch;
+    /// 2. `Pressure::SurfaceLost` goes to the pressure ladder;
+    /// 3. every pane's `last_rendered` is cleared, so the next frame **rebuilds**
+    ///    rather than deduping against a picture the dead device drew;
+    /// 4. the loop frame store is emptied — its images are `TextureHandle`s the
+    ///    dead device owned;
+    /// 5. `Gui::clear_graphics_state` releases the same for every pane's live
+    ///    textures, every animating layer's frames, the tile cache and the
+    ///    pane-kind rasters;
+    /// 6. the applied mirror plan is forgotten, because the strip cache it
+    ///    described was force-flagged by the call above and the plan must not
+    ///    claim otherwise;
+    /// 7. `state` is dropped, so the next `handle_redraw` lazily recreates the
+    ///    surface, the device and the renderer together.
+    ///
+    /// `why` is the log's subject, and it is a parameter because the two
+    /// callers reach the same teardown from opposite directions. A native
+    /// display change arrives as `SurfaceStatus::Lost` on the acquire and the
+    /// context is already gone. A browser's WebGL2 context loss **never**
+    /// reaches that acquire (`PlatformBridge::poll_graphics_restore` has the
+    /// account) and arrives instead as the DOM's own `webglcontextrestored`,
+    /// after the browser has handed the page a fresh context — so on that path
+    /// this runs at the moment there is something to rebuild onto.
+    fn abandon_graphics_state(&mut self, why: &str) {
+        // The variant is imported and the slice is taken on its own line for
+        // one reason: rustfmt breaks a chain over `chain_width`, and a reach
+        // split across lines lowers the `self.``gui.` walk's raw count for no
+        // change in coupling at all. The reach itself is spelled here and
+        // counted; what is bound is the SLICE, never `gui`, which is the
+        // construct that scrape forbids by name.
+        // `egui_frame_pin_tests` reads this path.
+        use squallar_radar::types::RenderView::Volume;
+
+        let panes = self.gui.panes();
+        let volume_on_screen = panes.iter().any(|pane| pane.render_view() == Volume);
+        if volume_on_screen {
+            let losses = squallar_volumetric::degrade::note_surface_loss_with_volume();
+            log::warn!("{why} with a 3D volume on screen ({losses} so far)");
+        }
+
+        self.on_pressure(crate::pressure::Pressure::SurfaceLost);
+
+        // Drop the entire rendering state so the next handle_redraw() lazily
+        // recreates it with a fresh surface.
+        self.render.clear_last_rendered();
+        drop(self.loop_frames.clear());
+        self.gui.clear_graphics_state();
+        // The mirror texture died with the device; the strip cache was
+        // force-flagged by `clear_graphics_state`, and the applied plan must
+        // not claim otherwise.
+        self.mirror_plan_applied = None;
+        self.state = None;
+    }
+
+    /// **Take the browser's word that the graphics context came back, and
+    /// rebuild onto it.**
+    ///
+    /// Polled once a frame, from `App::poll_platform_state`, and the ask is
+    /// consuming, so a restore is acted on exactly once. Every native bridge
+    /// answers `false` for the reason
+    /// [`PlatformBridge::poll_graphics_restore`](crate::platform::PlatformBridge::poll_graphics_restore)
+    /// gives: their losses reach the frame path as `SurfaceStatus::Lost`, and
+    /// this is the path for the one platform whose losses do not reach it at
+    /// all.
+    ///
+    /// It is the **restore** that is acted on and not the loss, and the
+    /// ordering is not a preference. Between the two events the page's WebGL2
+    /// context is lost: every GL object is invalid, and asking wgpu for a new
+    /// surface would only get the same lost context back, because
+    /// `getContext('webgl2')` on that canvas keeps answering it until the
+    /// browser restores it. There is nothing to rebuild onto until the restore
+    /// says so, so what the loss listener does is call `preventDefault()` —
+    /// without which the browser never attempts a restore and this is never
+    /// reached.
+    pub(super) fn observe_graphics_restore(&mut self) {
+        if self.platform.poll_graphics_restore() {
+            log::warn!("the graphics context was lost and restored; rebuilding");
+            self.abandon_graphics_state("graphics context lost");
+        }
+    }
+
     /// Returns how soon egui asked to be painted again — the frame's
     /// `repaint_delay`, which `handle_redraw` turns into an immediate
     /// redraw or a scheduled wake (the second user test's animation fix;
@@ -4002,29 +4092,7 @@ impl super::App {
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
                 if matches!(status, SurfaceStatus::Lost) {
-                    let volume_on_screen = self.gui.panes().iter().any(|pane| {
-                        pane.render_view() == squallar_radar::types::RenderView::Volume
-                    });
-                    if volume_on_screen {
-                        let losses = squallar_volumetric::degrade::note_surface_loss_with_volume();
-                        log::warn!(
-                            "wgpu surface lost with a 3D volume on screen ({losses} so far)"
-                        );
-                    }
-
-                    self.on_pressure(crate::pressure::Pressure::SurfaceLost);
-
-                    // Surface is irrecoverably lost (e.g. display changed on a
-                    // foldable). Drop the entire rendering state so the next
-                    // handle_redraw() lazily recreates it with a fresh surface.
-                    self.render.clear_last_rendered();
-                    drop(self.loop_frames.clear());
-                    self.gui.clear_graphics_state();
-                    // The mirror texture died with the device; the strip
-                    // cache was force-flagged by `clear_graphics_state`, and
-                    // the applied plan must not claim otherwise.
-                    self.mirror_plan_applied = None;
-                    self.state = None;
+                    self.abandon_graphics_state("wgpu surface lost");
                 }
                 self.frame_ledger.mark_present_return();
                 return repaint_delay;
@@ -9143,3 +9211,9 @@ mod admission_costs_tests;
 #[path = "app_render/memory_share_tests.rs"]
 #[cfg(test)]
 mod memory_share_tests;
+
+/// A graphics context the platform lost and got back runs the same teardown a
+/// native surface loss runs, once, and a page that lost nothing is left alone.
+#[path = "app_render/graphics_restore_tests.rs"]
+#[cfg(test)]
+mod graphics_restore_tests;

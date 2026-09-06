@@ -139,6 +139,13 @@ pub mod form_factor;
 /// and `gpu_probe::webgl2_run`, which hold a device or a context, are gated.
 pub mod gpu_probe;
 
+/// **What the canvas's `webglcontextlost` / `webglcontextrestored` listeners
+/// write into, and the bridge's poll reads out.** Not wasm32-gated for
+/// `form_factor`'s reason: the once-only delivery, the loss/restore ordering
+/// and the ask-for-a-frame are the half with a decision in them and they are
+/// host-tested; only the two `addEventListener` calls in `bridge` are gated.
+pub mod context_loss;
+
 #[cfg(target_arch = "wasm32")]
 pub mod bridge;
 

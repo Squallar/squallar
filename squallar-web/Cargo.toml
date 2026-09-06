@@ -138,6 +138,13 @@ features = [
     "Document",
     "Element",
     "HtmlCanvasElement",
+    # The canvas's own `webglcontextlost` / `webglcontextrestored` listeners
+    # (`src/bridge.rs`): `EventTarget` is what `addEventListener` lives on, and
+    # `Event` is what the loss listener calls `preventDefault()` through —
+    # without which the browser does not attempt a restore at all, and a lost
+    # context leaves a dead canvas for the life of the tab.
+    "EventTarget",
+    "Event",
     "Storage",
     # `Location::href`, which is how the zone pack's asset URL is resolved
     # against the page: the deploy is served from `/squallar/` on Pages and from
@@ -221,5 +228,7 @@ squallar-geo = { workspace = true }
 version = "=0.3.105"
 # Additive on top of the [dependencies] list (web-sys features unify across
 # the graph): only what the Tier-1 tests need beyond the app itself -- a real
-# `MessageChannel` transfer.
-features = ["MessageChannel", "MessagePort"]
+# `MessageChannel` transfer, and the `EventInit` that makes a dispatched
+# `webglcontextlost` cancelable so the test can read back whether the bridge's
+# listener cancelled it.
+features = ["MessageChannel", "MessagePort", "EventInit"]

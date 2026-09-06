@@ -351,9 +351,18 @@ pub struct App {
     /// The rasterization worker's own watermark, judged apart from the
     /// page's ([`crate::pressure::Pressure::WorkerMemory`]).
     worker_memory_watch: crate::pressure::LinearMemoryWatch,
-    /// **Where the browser's WebGPU probe stands**, as the bridge last said:
+    /// **Where the browser's GPU probe stands**, as the bridge last said:
     /// `Absent` natively and until the first ask, then skipped, pending, empty
-    /// or found. A found figure is the per-tab allowance in bytes, which
+    /// or found.
+    ///
+    /// **The WebGPU or the WebGL2 probe, selected by the bound backend** — not
+    /// the WebGPU one alone, which is what this said until 2026-09-06 and had
+    /// stopped being true: the web bridge starts a throwaway-device walk on
+    /// `BrowserWebGpu` and a raw-WebGL2 walk on `Gl`
+    /// ([`platform::gpu_probe_applies_to`] names both), and Firefox — the
+    /// browser that governs here — is on the second of them.
+    ///
+    /// A found figure is the per-tab allowance in bytes, which
     /// [`Self::capacity`] spends in place of the bracket's presumption on a
     /// web profile the driver would not class ([`capacity_with_probe`]).
     /// Printed as `probe <code>` on every `budget state:` line, so the state
@@ -1261,8 +1270,15 @@ impl App {
         dark
     }
 
-    /// Poll for platform-specific theme, location, GPS fix, and compass heading changes.
+    /// Poll for platform-specific theme, location, GPS fix, compass heading and
+    /// graphics-context changes.
     fn poll_platform_state(&mut self) {
+        // **First, because everything below it would be composed onto a
+        // context that is not there.** A browser's WebGL2 context loss never
+        // reaches the frame path's acquire, so this is the only place the app
+        // learns the device it holds handles for has been replaced; the
+        // teardown and the account are `App::observe_graphics_restore`.
+        self.observe_graphics_restore();
         if let Some(new_theme) = self.platform.poll_theme()
             && self.adopt_theme(new_theme)
         {

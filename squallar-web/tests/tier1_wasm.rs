@@ -3,9 +3,15 @@
 //! Run inside a real browser by `wasm-pack test --headless --firefox` and
 //! `--chrome` (`.github/workflows/web.yaml`, `tier1` job).
 //!
-//! Scope is deliberately exactly these four tests: the wasm-bindgen-test
+//! Scope is deliberately exactly these five tests: the wasm-bindgen-test
 //! harness never serves `worker.js` + `pkg/`, so the real spawn/HELLO handshake
 //! and the doctored-token respawn are Tier 2's (`.github/browser-rig/run_tier2.sh`).
+//!
+//! The fifth is the canvas's graphics-context listeners, here for the same
+//! reason as the others: it needs a real DOM `EventTarget` and a browser that
+//! reads `preventDefault()` back, neither of which a host test has. The
+//! decision half of that path is `squallar_web::context_loss`, tested on the
+//! host beside it.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -187,5 +193,73 @@ fn local_storage_round_trips_through_the_kv_store() {
         raw.as_deref(),
         Some(sentinel),
         "the raw browser key must be exactly `squallar.ui`; anything else orphans every saved layout"
+    );
+}
+
+/// **The canvas's two context listeners are really attached, and the loss one
+/// really cancels** — the half of the restore path that no host test can
+/// reach.
+///
+/// `squallar_web::context_loss` is host-tested and covers the once-only
+/// delivery and the ask-for-a-frame; what it cannot cover is whether anything
+/// is listening on the canvas at all, and whether `preventDefault()` is called
+/// where the browser reads it. **That second one is the whole path**: the WebGL
+/// spec makes the browser's attempt to restore conditional on the
+/// `webglcontextlost` event having been cancelled, so an uncancelled loss is a
+/// canvas that stays dead for the life of the tab — and nothing logs it.
+///
+/// Synthetic events rather than a forced GPU reset: `WEBGL_lose_context` is an
+/// optional extension and a real reset is not something a test can ask for, so
+/// what is under test is the wiring, dispatched through the browser's own
+/// event machinery on a real canvas.
+#[wasm_bindgen_test]
+fn a_canvas_context_loss_is_cancelled_and_its_restore_reaches_the_bridge() {
+    use squallar_app::platform::PlatformBridge;
+    use wasm_bindgen::JsCast;
+
+    let canvas = web_sys::window()
+        .expect("window")
+        .document()
+        .expect("document")
+        .create_element("canvas")
+        .expect("create canvas")
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .expect("a <canvas> element");
+    let mut bridge = squallar_web::bridge::WebPlatform::new(canvas.clone());
+    assert!(
+        !bridge.poll_graphics_restore(),
+        "a fresh bridge reports a restore nothing caused",
+    );
+
+    let init = web_sys::EventInit::new();
+    init.set_cancelable(true);
+    let lost = web_sys::Event::new_with_event_init_dict("webglcontextlost", &init)
+        .expect("construct a cancelable webglcontextlost");
+    canvas.dispatch_event(&lost).expect("dispatch the loss");
+    assert!(
+        lost.default_prevented(),
+        "the loss was not cancelled, so this browser would never offer the \
+         page a replacement context and the canvas stays dead",
+    );
+    assert!(
+        !bridge.poll_graphics_restore(),
+        "a loss alone was reported as a restore; the app would tear its \
+         graphics state down while there is nothing to rebuild onto",
+    );
+
+    let restored =
+        web_sys::Event::new("webglcontextrestored").expect("construct a webglcontextrestored");
+    canvas
+        .dispatch_event(&restored)
+        .expect("dispatch the restore");
+    assert!(
+        bridge.poll_graphics_restore(),
+        "the restore listener is not attached to the canvas, so a recovered \
+         context is never rebuilt onto",
+    );
+    assert!(
+        !bridge.poll_graphics_restore(),
+        "the restore was reported twice; the app would tear down the state it \
+         had just rebuilt",
     );
 }
