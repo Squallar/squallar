@@ -1011,6 +1011,11 @@ fn render_symbol(
     let Some(text) = layout.text(context) else {
         return Ok(());
     };
+    // **The one allocation of the name, and it is here.** `layout.text` hands
+    // back a fresh `String`; every label this feature emits shares it from
+    // now on, and so does every frame that places one. See
+    // [`crate::text::Text::text`].
+    let text: std::sync::Arc<str> = text.into();
 
     let text_size = symbol_text_size(context, layout);
     let text_color = symbol_text_color(context, paint);
@@ -2259,7 +2264,7 @@ mod tests {
         // `places` is points, `roads` is lines; the fixture carries both.
         let (points, lines): (Vec<&Text>, Vec<&Text>) = labels
             .iter()
-            .partition(|t| t.angle == 0.0 && t.font_size == 12.0 && t.text != "Back Alley");
+            .partition(|t| t.angle == 0.0 && t.font_size == 12.0 && &*t.text != "Back Alley");
 
         assert!(!points.is_empty(), "fixture: the tile has point labels");
         assert!(!lines.is_empty(), "fixture: the tile has line labels");

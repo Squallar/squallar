@@ -2376,6 +2376,61 @@ tarball's 38 — the one absent is `style::tests::test_style_parsing`. The 15
 above is the figure for a default-feature run, and the two are not
 interchangeable.
 
+### Changed — source, thirtieth commit: a label's name is shared, not copied twice a frame
+
+**The defect.** `Text::text` was a `String`, and two spellings on the per-frame
+path cloned it.
+
+- `ShapeOrText::placed` builds the placed label as `text.clone()` with
+  `position` overwritten. It needs the new position and nothing else, but the
+  clone copies the name.
+- `Text::galley_cached` builds a `GalleyKey` to probe the layout memo, and the
+  key held `self.text.clone()`. The key is only hashed and compared; the copy
+  exists solely to reach the table. That is the same allocation
+  `GalleyCache::galley_for_point` was split in two to avoid on the point-label
+  path (see its `points` field) — the map-label path never got the same
+  treatment.
+
+So a consumer drawing a basemap paid **two `malloc`s and two `memcpy`s of every
+place name on the glass, on every frame**, on a map that had not moved.
+
+**The measurement.** `squallar`'s release binary under its rig's scene D (one
+1920x1080 pane, every layer on, the `ui-sweep` gesture script, NVIDIA RTX 3090 /
+Vulkan), 58,122 `perf` samples on the frame thread: the caller of `placed`
+(`squallar_egui`'s `place_one`) was **26.2 % of that app's `render_panes` cut**,
+the largest single item in it, and its own leaves were 20 %
+`copy_nonoverlapping<u8>` and ~22 % libc `malloc`/`free`. The app's always-on
+ledger counted 2,746,425 label anchors placed over 12,425 frames on the same
+leg, so the pair of copies was being paid ~221 times a frame.
+
+**The change: `pub text: std::sync::Arc<str>`.** Both clones become a refcount
+bump. `Text::new` takes `impl Into<Arc<str>>`, so every existing caller passing
+a `String` still compiles and pays the one conversion. `GalleyKey::text` is
+`Arc<str>` too; `Arc<str>` hashes and compares as the `str` it holds, so the
+memo answers exactly the entries it answered before.
+
+`render_symbol` converts once, above the closure that emits a feature's labels,
+rather than once per label: `layout.text` already hands back a fresh `String`,
+and every label of that feature — and every frame that places one — now shares
+the one buffer. Before this commit each label of a multi-point or multi-line
+feature carried its own copy.
+
+**What a consumer must know.** `Text::text` no longer owns its bytes, so a
+consumer pricing a styled tile's heap by `String::capacity` has to price `len`
+plus the `Arc` header instead, and a name shared by several labels is then
+counted once per label rather than once per buffer — an over-count bounded by
+the feature's label count. `squallar-egui`'s `tile_source::styled_heap_bytes`
+takes it that way deliberately, because it is the conservative direction for a
+resident-bytes budget.
+
+**The gate**, in the consumer rather than here, because that is where the
+per-frame path is: `squallar-egui/tests/label_text_is_shared.rs` counts real
+`GlobalAlloc` calls at or above the fixture's own name length across three
+windows — placing every label of a tile, probing the warm galley memo for every
+label, and a control that copies the same names the same number of times. On
+this tree the first two read 0 and the control reads the fixture's label count;
+on the tree before this commit all three read that count.
+
 ### A correction to the paragraph above, from the third commit
 
 The sentence "the other 23 arrive the day `mvt` is enabled" was **wrong by one

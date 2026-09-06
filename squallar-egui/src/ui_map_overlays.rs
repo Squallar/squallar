@@ -1073,7 +1073,7 @@ pub(super) fn paint_labels(
     // Where each name has already been drawn, so a fragmented river is named
     // once per stretch of screen rather than once per OSM way. See
     // [`MIN_REPEAT_DISTANCE`].
-    let mut placed_names: std::collections::HashMap<String, Vec<egui::Pos2>> =
+    let mut placed_names: std::collections::HashMap<std::sync::Arc<str>, Vec<egui::Pos2>> =
         std::collections::HashMap::new();
 
     let mut placed: Vec<egui::Shape> = Vec::with_capacity(labels.len());

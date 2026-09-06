@@ -2,7 +2,16 @@ use egui::{Color32, Pos2, Rect, Vec2, vec2};
 
 #[derive(Debug, Clone)]
 pub struct Text {
-    pub text: String,
+    /// **Refcounted, not owned bytes.** A label is placed once per tile per
+    /// frame ([`crate::mvt::ShapeOrText::placed`]) and probed against the
+    /// galley memo once more ([`Self::galley_cached`]), and both spellings
+    /// clone this field. Owned, that was two `malloc`s and two copies of the
+    /// name per label per frame on a map that had not moved -- measured as
+    /// 26% of the pane walk on a 1920x1080 basemap frame, of which ~40% was
+    /// `memcpy` and `malloc`/`free` under `place_one`. `Arc<str>` makes both
+    /// clones a refcount bump; the bytes are allocated once, where the tile
+    /// is styled.
+    pub text: std::sync::Arc<str>,
     pub position: Pos2,
     pub font_size: f32,
     pub text_color: Color32,
@@ -22,11 +31,12 @@ pub struct Text {
 impl Text {
     pub fn new(
         position: Pos2,
-        text: String,
+        text: impl Into<std::sync::Arc<str>>,
         font_size: f32,
         text_color: Color32,
         angle: f32,
     ) -> Self {
+        let text = text.into();
         Self {
             position,
             text,
@@ -482,7 +492,7 @@ struct PointStyle {
 /// layout, a spurious hit draws the wrong text.
 #[derive(PartialEq, Eq, Hash)]
 struct GalleyKey {
-    text: String,
+    text: std::sync::Arc<str>,
     font_size: u32,
     text_color: Color32,
     max_width_ems: Option<u32>,
@@ -547,7 +557,7 @@ mod tests {
 
     fn label(text: &str) -> Text {
         Text {
-            text: text.to_owned(),
+            text: text.into(),
             position: pos2(10.0, 20.0),
             font_size: 14.0,
             text_color: Color32::WHITE,
@@ -641,7 +651,7 @@ mod tests {
             (
                 "text",
                 Text {
-                    text: "Canadian River".to_owned(),
+                    text: "Canadian River".into(),
                     ..base.clone()
                 },
             ),

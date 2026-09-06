@@ -193,7 +193,20 @@ pub fn styled_heap_bytes(shapes: &[walkers::ShapeOrText]) -> usize {
                     std::mem::size_of::<egui::epaint::PathShape>()
                         + path.points.capacity() * std::mem::size_of::<egui::Pos2>()
                 }
-                walkers::ShapeOrText::Text(text) => text.text.capacity(),
+                // The name's bytes plus the `Arc` header (two counters).
+                // **Counted once per label, and a name shared by the several
+                // labels one feature emits is therefore counted more than
+                // once** -- since `walkers::Text::text` became `Arc<str>` the
+                // buffer is allocated once where the tile is styled, not once
+                // per label. The over-count is bounded by that feature's own
+                // label count and is in the conservative direction for a
+                // resident-bytes budget, which is why it is left as a sum
+                // rather than de-duplicated: reading `Arc::strong_count` here
+                // would price a tile differently depending on how many of its
+                // labels a frame happened to be holding.
+                walkers::ShapeOrText::Text(text) => {
+                    text.text.len() + 2 * std::mem::size_of::<usize>()
+                }
                 walkers::ShapeOrText::Shape(_) => 0,
             })
             .sum::<usize>()
