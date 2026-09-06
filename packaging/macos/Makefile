@@ -47,6 +47,12 @@
 #       --person-name squallar --validity-days 3650 \
 #       --p12-file squallar-signing.p12 --p12-password "$$PW"
 #
+# The p12 that writes is one rcodesign can read back. Measured with 0.29.0:
+# `openssl pkcs12 -info` on the file it wrote reports
+# pbeWithSHA1And40BitRC2-CBC and pbeWithSHAAnd3-KeyTripleDES-CBC, the two
+# ciphers its parser has. A p12 made with `openssl pkcs12 -export` needs
+# `-legacy` to come out that way; step 3 below says why.
+#
 # `--algorithm rsa` is load-bearing and is checked below. Apple's
 # Security.framework verifies only RSA and ECDSA code signatures; it has no
 # Ed25519 code-signing path at all. An Ed25519 key still *signs* — rcodesign
@@ -125,29 +131,49 @@
 # but a build that is quietly indistinguishable from a good one is how "we
 # ship notarized releases" stops being true without anybody deciding it.
 #
-# ── The three notarization secrets ──────────────────────────────────────
+# ── The App Store Connect API key: one key, three secrets ───────────────
 #
-#   MACOS_NOTARY_ISSUER_ID   the App Store Connect issuer ID (a UUID)
-#   MACOS_NOTARY_KEY_ID      the API key ID (10 alphanumeric characters)
-#   MACOS_NOTARY_KEY_P8      the AuthKey_<KEY_ID>.p8 Apple hands out ONCE:
-#                            either `base64 -w0` of it, or the PEM text itself
+#   APPSTORE_CONNECT_ISSUER_ID   the App Store Connect issuer ID (a UUID)
+#   APPSTORE_CONNECT_KEY_ID      the API key ID (10 alphanumeric characters)
+#   APPSTORE_CONNECT_KEY_P8      the AuthKey_<KEY_ID>.p8 Apple hands out ONCE:
+#                                either `base64 -w0` of it, or the PEM text itself
 #
-# All three, or none. This recipe combines them with
+# All three, or none. The same three secrets drive the iOS TestFlight upload
+# (.github/scripts/appstore-upload.py), so there is one key and its role is
+# **App Manager**: the Developer role notarizes but cannot upload builds, and
+# App Manager does both. Two copies of one key under two names is a rotation
+# hazard, which is why the earlier MACOS_NOTARY_* and APPSTORE_* spellings
+# are gone rather than kept as fallbacks -- a fallback leaves "which key did
+# this run use?" unanswerable. This recipe combines them with
 # `rcodesign encode-app-store-connect-api-key` into the single JSON file the
 # notary client wants; that file is written into a scratch directory that is
 # removed on exit, success or failure.
 #
+# When the workflow passes NONE of them on purpose it says so, in
+# APPSTORE_CONNECT_WITHHELD: `not-main-push` on any event that is not a push
+# to main (the key is handed over only there), `per-arch-row` on the two
+# per-architecture rows (which never notarize; the universal job does). The
+# notarize stage reads that marker before it reads the secrets, so the log
+# says "withheld" for a key that exists and "missing" only for one that does
+# not -- and names which of the three, never the values.
+#
 # ── What a person has to do once the Apple Developer account is approved ─
 #
-#   1. Make a signing request. Apple never sees the private key:
+#   1. Make a key, then a signing request from it. Apple never sees the
+#      private key:
 #
+#        openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+#            -out squallar-signing-key.pem
 #        rcodesign generate-certificate-signing-request \
-#            --csr-pem-file squallar.csr \
-#            --pem-file squallar-signing-key.pem
+#            --pem-file squallar-signing-key.pem \
+#            --csr-pem-file squallar.csr
 #
-#      (or `--p12-file`, if the key already lives in one). The key must be RSA
-#      or ECDSA -- see the Ed25519 note above, which is a different failure and
-#      a worse one.
+#      `--pem-file` READS a key; it does not write one. Measured with 0.29.0:
+#      run without the genpkey line first, it exits with "I/O error: No such
+#      file or directory" and writes no CSR. `--p12-file` reads the key out of
+#      a p12 instead, if it already lives in one. The key must be RSA or ECDSA
+#      -- see the Ed25519 note above, which is a different failure and a worse
+#      one.
 #
 #   2. developer.apple.com -> Certificates, IDs & Profiles -> Certificates ->
 #      "+" -> **Developer ID Application**. Not "Mac Development", not
@@ -155,10 +181,47 @@
 #      the team, and Gatekeeper does not accept them for software handed to
 #      the public. Upload the CSR, download the .cer.
 #
-#   3. Put the certificate and its key into one .p12 and set the secrets:
+#   3. Put the LEAF certificate and its key -- those two and nothing else --
+#      into one .p12, with `-legacy`, and set the secrets:
 #
+#        openssl x509 -inform DER -in developerID_application.cer \
+#            -out developerID_application.pem
+#        openssl pkcs12 -export -legacy \
+#            -inkey squallar-signing-key.pem -in developerID_application.pem \
+#            -out squallar-signing.p12
 #        base64 -w0 squallar-signing.p12   -> MACOS_SIGNING_P12
 #                                          -> MACOS_SIGNING_P12_PASSWORD
+#
+#      Two ways a correct certificate under a correct password still fails,
+#      both decided by how `pkcs12 -export` is invoked, and both checked by
+#      the signing stage below before rcodesign sees the file:
+#
+#      No `-certfile`, no `-chain`. rcodesign signs with the FIRST
+#      certificate in the file, and OpenSSL writes a `-certfile` CA before
+#      the leaf. Measured with 0.29.0: a throwaway CA with OU=G2 (the OU of
+#      Apple's Developer ID CA G2) in front of a leaf with OU=ABCDE12345 made
+#      `analyze-certificate` report Certificate 0 with Team ID G2 and made
+#      `sign` emit a signature whose certificate was the CA; the same leaf
+#      and key alone reported ABCDE12345. Under --for-notarization rcodesign
+#      then says "doesn't appear to be such a certificate" -- the TYPE is
+#      named, the ORDER is the cause. The intermediates are not needed in
+#      the file: rcodesign ships Apple's CA certificates
+#      (src/apple-certs/DeveloperIDG2CA.cer, DeveloperIDCA.cer, ...) and adds
+#      the chain from the leaf upward when it loads the key
+#      (chain_apple_certificates); `analyze-certificate` on a bare
+#      Apple-issued leaf prints that chain as "Apple Issuing Chain".
+#
+#      `-legacy` because OpenSSL 3 encrypts a p12 with PBES2/PBKDF2/AES-256-CBC
+#      by default, and rcodesign's PKCS#12 parser (the p12 crate, 0.6.3 in
+#      apple-codesign 0.29.0) decrypts exactly two ciphers, the pre-OpenSSL-3
+#      pbeWithSHA1And40BitRC2-CBC and pbeWithSHAAnd3-KeyTripleDES-CBC -- and a
+#      bag it cannot decrypt comes out as "incorrect password given when
+#      decrypting PFX data", the same words it uses for a wrong password.
+#      Measured: one cert and key exported without `-legacy` fail with that
+#      message under the right password; exported with it, they sign. The
+#      signing stage below asks openssl about the file before rcodesign sees
+#      it and names this failure by name. The x509 line first because the
+#      .cer the portal downloads is DER, and `pkcs12 -export` reads PEM.
 #
 #      Replacing the self-signed certificate changes the app's designated
 #      requirement once, which costs every existing user one more location
@@ -166,9 +229,13 @@
 #      Developer ID certificate is then kept.
 #
 #   4. appstoreconnect.apple.com -> Users and Access -> Integrations ->
-#      App Store Connect API -> Team Keys -> "+", role **Developer**. Copy the
-#      issuer ID and key ID, download the .p8 (Apple offers it once), and set
-#      the three MACOS_NOTARY_* secrets above.
+#      App Store Connect API -> Team Keys -> "+", role **App Manager**. The
+#      Developer role notarizes but cannot upload builds, and this one key
+#      also feeds the iOS TestFlight upload. Copy the issuer ID and key ID,
+#      download the .p8 (Apple offers it once), and set the three
+#      APPSTORE_CONNECT_* secrets above -- once, for both lanes. Any
+#      MACOS_NOTARY_* or APPSTORE_* secrets still in the repository are read
+#      by nothing and should be deleted.
 #
 # Until all of that exists the build still runs: it signs, it says in the log
 # that it is not notarizing and why, and it uploads the artifact. A fork pull
@@ -400,7 +467,7 @@ build:
 	# signs. An app signed without it is an app the notary rejects, and finding
 	# that out costs a full upload and wait per attempt.
 	NOTARY_READY=
-	if [ -n "$${MACOS_NOTARY_ISSUER_ID:-}" ] && [ -n "$${MACOS_NOTARY_KEY_ID:-}" ] && [ -n "$${MACOS_NOTARY_KEY_P8:-}" ]; then
+	if [ -n "$${APPSTORE_CONNECT_ISSUER_ID:-}" ] && [ -n "$${APPSTORE_CONNECT_KEY_ID:-}" ] && [ -n "$${APPSTORE_CONNECT_KEY_P8:-}" ]; then
 	  NOTARY_READY=1
 	fi
 	IDENTITY=none
@@ -422,6 +489,145 @@ build:
 	  fi
 	  PWFILE="$$SCRATCH/p12-password"
 	  printf '%s' "$${MACOS_SIGNING_P12_PASSWORD:-$(P12_PASSWORD)}" > "$$PWFILE"
+
+	  # ---- can rcodesign read this p12 at all? ----
+	  # rcodesign's PKCS#12 parser (the p12 crate, 0.6.3 in apple-codesign
+	  # 0.29.0) decrypts exactly two ciphers -- pbeWithSHA1And40BitRC2-CBC and
+	  # pbeWithSHAAnd3-KeyTripleDES-CBC, the pre-OpenSSL-3 form -- and a bag in
+	  # any other cipher decrypts to the same None as a bag under the wrong
+	  # password. Both surface as "incorrect password given when decrypting PFX
+	  # data", so a p12 written by OpenSSL 3's default `pkcs12 -export`
+	  # (PBES2/PBKDF2/AES-256-CBC) sends the reader chasing a password that is
+	  # right. openssl can tell the two apart, so it is asked first when it is
+	  # on PATH: the MAC check, which is what a wrong password fails, runs
+	  # before the bag ciphers are printed, and the ciphers are printed before
+	  # any bag is decrypted. The rust-cross image has it at /usr/bin (3.5.6,
+	  # measured), and the ubuntu-24.04 runner has it too -- the ios-testflight
+	  # job asserts exactly that.
+	  if command -v openssl >/dev/null 2>&1; then
+	    P12INFO="$$SCRATCH/p12-info"
+	    # `-legacy` first, plain second, and the exit status of neither is what
+	    # is read. On OpenSSL 3 the RC2-40 cipher lives in the legacy provider,
+	    # which is not loaded by default, so reading a GOOD file without the
+	    # flag stops after the first algorithm line with "unsupported ...
+	    # RC2-40-CBC" (measured on 3.5.6 and 3.6.3); the retry is for an
+	    # openssl that has no such flag. What is inspected is the text: a
+	    # "Mac verify error" is the password, a PBES2/PBKDF2/AES line is the
+	    # cipher, and neither is a file rcodesign can read.
+	    openssl pkcs12 -info -noout -legacy -in "$$P12" -passin "file:$$PWFILE" > "$$P12INFO" 2>&1 \
+	      || openssl pkcs12 -info -noout -in "$$P12" -passin "file:$$PWFILE" > "$$P12INFO" 2>&1 \
+	      || true
+	    if grep -q 'Mac verify error' "$$P12INFO"; then
+	      echo ""
+	      echo "ERROR: the p12 password is wrong. openssl could not verify the file's MAC"
+	      echo "       with the password in MACOS_SIGNING_P12_PASSWORD / P12_PASSWORD=, and"
+	      echo "       the MAC is checked before any cipher question arises -- so this is"
+	      echo "       the password, not the file's encryption."
+	      exit 1
+	    elif grep -qE 'PBES2|PBKDF2|AES' "$$P12INFO"; then
+	      echo ""
+	      echo "ERROR: the p12 is encrypted with a cipher rcodesign cannot read:"
+	      grep -E '^(PKCS7 Encrypted data|Shrouded Keybag):' "$$P12INFO" | sed 's/^/         /'
+	      echo "       The password is right: openssl verified the MAC with it. OpenSSL 3"
+	      echo "       writes PBES2/PBKDF2/AES-256 by default; rcodesign's parser reads only"
+	      echo "       the legacy RC2-40/3DES/SHA-1 form, and reports this file as"
+	      echo "       'incorrect password given when decrypting PFX data'. Re-export it:"
+	      echo "         openssl pkcs12 -export -legacy -in cert.pem -inkey key.pem -out squallar-signing.p12"
+	      echo "       or from this file alone -- through a file, not a pipe: -export opens"
+	      echo "       its input once for the certificate and again for the key, and piped"
+	      echo "       it finds no certificate (measured):"
+	      echo "         openssl pkcs12 -in old.p12 -out both.pem   # the key stays encrypted"
+	      echo "         openssl pkcs12 -export -legacy -in both.pem -out squallar-signing.p12"
+	      echo "         rm both.pem"
+	      echo "       then replace MACOS_SIGNING_P12 with 'base64 -w0' of the result."
+	      exit 1
+	    else
+	      CIPHERS="$$(grep -E '^(PKCS7 Encrypted data|Shrouded Keybag):' "$$P12INFO" | sed 's/^[^:]*: *//; s/,.*//' | sort -u | paste -sd/ || true)"
+	      echo "    p12 cipher: $${CIPHERS:-not reported by openssl; rcodesign decides}"
+	    fi
+	  else
+	    echo "    note: no openssl on PATH, so the p12 cipher was not checked before rcodesign."
+	  fi
+
+	  # ---- is Certificate 0 the leaf, and the right kind of leaf? ----
+	  # rcodesign signs with the FIRST certificate in the p12, and `openssl
+	  # pkcs12 -export -certfile` writes the CA it was handed before the leaf.
+	  # Measured with 0.29.0: a throwaway CA with OU=G2 -- the OU Apple's
+	  # Developer ID CA G2 carries -- in front of a leaf with OU=ABCDE12345
+	  # produced a signature whose certificate was the CA and whose team id
+	  # was G2; the same leaf and key alone gave ABCDE12345. Under
+	  # --for-notarization both throwaways fail with the same two lines ("not
+	  # signed by Apple", "doesn't appear to be such a certificate"), so
+	  # rcodesign's own words name the certificate's TYPE when the cause is
+	  # its ORDER. The Team ID tells them apart: Apple's are ten upper-case
+	  # alphanumerics and a CA's OU is not. Nothing but the leaf and its key
+	  # belongs in the file: rcodesign carries Apple's CA certificates itself
+	  # (src/apple-certs/DeveloperIDG2CA.cer among them) and adds the chain
+	  # from the leaf upward when it loads the key (chain_apple_certificates,
+	  # called from cli/certificate_source.rs); `analyze-certificate` on a bare
+	  # Apple-issued leaf prints that resolved chain as "Apple Issuing Chain",
+	  # measured on the leaves the crate ships for its own tests.
+	  CERTINFO="$$SCRATCH/certificate-0"
+	  $(RCODESIGN) analyze-certificate --p12-file "$$P12" --p12-password-file "$$PWFILE" 2>/dev/null \
+	    | awk '/^# Certificate 0$$/{f=1; next} /^# Certificate [0-9]/{f=0} /^-----BEGIN/{f=0} f' > "$$CERTINFO" || true
+	  [ -s "$$CERTINFO" ] || { echo "ERROR: $(RCODESIGN) analyze-certificate printed no 'Certificate 0' for the p12."; exit 1; }
+	  cfield() { sed -n "s/^$$1: *//p" "$$CERTINFO" | head -1; }
+	  C_SUBJECT="$$(cfield 'Subject CN')";      C_ISSUER="$$(cfield 'Issuer CN')"
+	  C_TEAM="$$(cfield 'Team ID')";            C_SELF="$$(cfield 'Subject is Issuer?')"
+	  C_APPLE="$$(cfield 'Signed by Apple?')";  C_PROFILE="$$(cfield 'Guessed Certificate Profile')"
+	  C_INTER="$$(cfield 'Is Apple Intermediate CA?')"; C_ROOT="$$(cfield 'Is Apple Root CA?')"
+	  echo "    certificate 0: $$C_SUBJECT (team id $$C_TEAM, profile $$C_PROFILE, Apple-issued: $$C_APPLE)"
+	  C_LEAF=; printf '%s' "$$C_TEAM" | LC_ALL=C grep -qxE '[A-Z0-9]{10}' && C_LEAF=1
+	  # A CA in slot 0 is wrong on every path, and it looks like this: Apple's own
+	  # intermediates rcodesign recognises by name, anything else's carries an OU
+	  # that is not a team id. A self-signed certificate with NO team id (the
+	  # throwaway this file's header makes prints 'unset'; one with no OU at all
+	  # prints '<missing>') is not this case; it is handled on the Apple-facing
+	  # path below and is a legitimate identity on the other one.
+	  if [ "$$C_INTER" = true ] || [ "$$C_ROOT" = true ] \
+	     || { [ -z "$$C_LEAF" ] && [ "$$C_TEAM" != "<missing>" ] && [ "$$C_TEAM" != unset ]; }; then
+	    echo ""
+	    echo "ERROR: Certificate 0 in the p12 is not your leaf -- a Team ID of '$$C_TEAM' is a"
+	    echo "       CA's OU; rebuild the p12 with -inkey + -in <leaf> only, no -certfile."
+	    echo "       rcodesign signs with the first certificate in the file, and OpenSSL"
+	    echo "       writes a -certfile CA first. Apple's intermediates do not belong in"
+	    echo "       the file: rcodesign carries them and chains them at sign time."
+	    echo "         openssl pkcs12 -export -legacy -inkey <key.pem> -in <leaf.pem> -out squallar-signing.p12"
+	    echo "       then replace MACOS_SIGNING_P12 with 'base64 -w0' of the result."
+	    exit 1
+	  fi
+	  if [ -n "$$NOTARY_READY" ]; then
+	    # The notary path takes exactly one kind of certificate, and the three
+	    # ways to hold the wrong kind are three different errands, so each is
+	    # named. rcodesign would refuse all three a moment later with the same
+	    # two lines; this is what makes them different messages.
+	    if [ "$$C_SELF" = true ]; then
+	      echo ""
+	      echo "ERROR: Certificate 0 is self-signed ($$C_SUBJECT): MACOS_SIGNING_P12 holds the"
+	      echo "       throwaway identity the top of this file makes for the stable-identity"
+	      echo "       fallback, and Apple notarizes only Developer ID Application certificates"
+	      echo "       it issued. Either request one (steps 1-3 at the top) and replace the"
+	      echo "       secret, or clear the three APPSTORE_CONNECT_* secrets to get the"
+	      echo "       signed-but-not-notarized build back."
+	      exit 1
+	    elif [ "$$C_APPLE" != true ]; then
+	      echo ""
+	      echo "ERROR: Certificate 0 is a leaf for team $$C_TEAM, but it was not issued by Apple"
+	      echo "       (issuer: $$C_ISSUER), and Apple notarizes only what its own CA signed."
+	      echo "       A Developer ID Application certificate comes from developer.apple.com"
+	      echo "       against a CSR: steps 1-3 at the top of this file."
+	      exit 1
+	    elif [ "$$C_PROFILE" != DeveloperIdApplication ]; then
+	      echo ""
+	      echo "ERROR: Certificate 0 is an Apple-issued '$$C_PROFILE' certificate, not a"
+	      echo "       Developer ID Application one, and Apple notarizes only the latter."
+	      echo "       Apple Development, Apple Distribution and Mac App Distribution are"
+	      echo "       other products of the same portal page; request Developer ID"
+	      echo "       Application (step 2 at the top), then rebuild the p12 (step 3)."
+	      exit 1
+	    fi
+	  fi
+
 	  if [ -n "$$NOTARY_READY" ]; then
 	    IDENTITY=devid
 	    echo "==> signing for notarization with the project identity"
@@ -439,7 +645,7 @@ build:
 	      echo "       MACOS_SIGNING_P12 still holds the self-signed certificate. The"
 	      echo "       notary path needs a real Developer ID Application certificate;"
 	      echo "       see 'What a person has to do' at the top of this file. Clearing"
-	      echo "       the three MACOS_NOTARY_* secrets returns this build to the"
+	      echo "       the three APPSTORE_CONNECT_* secrets returns this build to the"
 	      echo "       signed-but-not-notarized path, which still produces an artifact."
 	      exit 1
 	    }
@@ -577,28 +783,28 @@ build:
 	  # thing to paste wrong, and base64 is what the p12 secret next door
 	  # already uses. Whichever arrives, the log says which was recognised, so
 	  # a mangled secret is a named failure rather than a puzzling one.
-	  case "$${MACOS_NOTARY_KEY_P8}" in
+	  case "$${APPSTORE_CONNECT_KEY_P8}" in
 	    -----BEGIN*)
 	      echo "==> notary key: PEM text"
-	      printf '%s\n' "$${MACOS_NOTARY_KEY_P8}" > "$$KEYP8" ;;
+	      printf '%s\n' "$${APPSTORE_CONNECT_KEY_P8}" > "$$KEYP8" ;;
 	    *)
 	      echo "==> notary key: base64"
-	      printf '%s' "$${MACOS_NOTARY_KEY_P8}" | base64 -d > "$$KEYP8" || {
-	        echo "ERROR: MACOS_NOTARY_KEY_P8 is neither PEM text starting '-----BEGIN'"
+	      printf '%s' "$${APPSTORE_CONNECT_KEY_P8}" | base64 -d > "$$KEYP8" || {
+	        echo "ERROR: APPSTORE_CONNECT_KEY_P8 is neither PEM text starting '-----BEGIN'"
 	        echo "       nor valid base64. It should be the AuthKey_<KEY_ID>.p8 file"
 	        echo "       Apple gave you, either verbatim or as 'base64 -w0'."
 	        exit 1
 	      } ;;
 	  esac
 	  grep -q 'BEGIN PRIVATE KEY' "$$KEYP8" || {
-	    echo "ERROR: MACOS_NOTARY_KEY_P8 decoded to something that is not a PKCS#8"
+	    echo "ERROR: APPSTORE_CONNECT_KEY_P8 decoded to something that is not a PKCS#8"
 	    echo "       private key. Apple's App Store Connect key is a PEM file whose"
 	    echo "       first line is '-----BEGIN PRIVATE KEY-----'."
 	    exit 1
 	  }
 	  KEYJSON="$$SCRATCH/notary-key.json"
 	  $(RCODESIGN) encode-app-store-connect-api-key -o "$$KEYJSON" \
-	      "$${MACOS_NOTARY_ISSUER_ID}" "$${MACOS_NOTARY_KEY_ID}" "$$KEYP8" >/dev/null
+	      "$${APPSTORE_CONNECT_ISSUER_ID}" "$${APPSTORE_CONNECT_KEY_ID}" "$$KEYP8" >/dev/null
 
 	  # What proves a staple happened. `notary-submit --staple` writes the
 	  # ticket INTO the bundle directory; rather than assert a path this file
@@ -642,20 +848,63 @@ build:
 	  fi
 	elif [ -n "$$NOTARY_READY" ]; then
 	  echo ""
-	  echo "WARNING: the MACOS_NOTARY_* credentials are set, but this bundle was not"
+	  echo "WARNING: the APPSTORE_CONNECT_* credentials are set, but this bundle was not"
 	  echo "         signed with a Developer ID certificate ($$IDENTITY), and Apple"
 	  echo "         only notarizes Developer ID signed software. Not submitting."
-	elif [ "$$IDENTITY" = cert ] || [ "$$IDENTITY" = devid ]; then
-	  echo ""
-	  echo "NOTE: signed, NOT notarized -- the three MACOS_NOTARY_* secrets are not"
-	  echo "      set. On the machine that built it this app is fine. On anyone"
-	  echo "      else's Mac, Gatekeeper will refuse it and offer no plain way"
-	  echo "      through; see the note at the top of this file for what to create."
 	else
+	  # Four situations end here with the same un-notarized bundle, and the
+	  # old one-line wording -- "the three secrets are not set" -- was wrong
+	  # for three of them: the workflow withholds the key on purpose off
+	  # main, a per-architecture row never notarizes by design, and one
+	  # missing name is not three. The marker is set by the workflow and by
+	  # nothing else; the secret facts are read here by name, never by value.
+	  # The word written to NOTARIZATION carries the same distinction so the
+	  # run summary can say "withheld" and not "skipped".
 	  echo ""
-	  echo "NOTE: not notarized (nothing to notarize an ad-hoc bundle with). Another"
-	  echo "      person's Mac will refuse to open this; that is expected for a"
-	  echo "      build with no secrets, and it still runs on the machine that made it."
+	  case "$${APPSTORE_CONNECT_WITHHELD:-}" in
+	    per-arch-row)
+	      NOTARY_STATUS=per-arch
+	      echo "NOTE: per-architecture build, never notarized here by design; the"
+	      echo "      macos-universal job fuses both halves and notarizes that one --"
+	      echo "      look there for the notarized artifact."
+	      ;;
+	    not-main-push)
+	      NOTARY_STATUS=withheld
+	      echo "NOTE: notarization credentials withheld: this is a $${GITHUB_EVENT_NAME:-?} on"
+	      echo "      $${GITHUB_REF:-?}, and they are passed only on a push to main. The"
+	      echo "      secrets may well be configured; this run was never going to use them."
+	      ;;
+	    "")
+	      if [ "$$IDENTITY" = cert ]; then
+	        FACTS=""; PRESENT=""
+	        for n in APPSTORE_CONNECT_ISSUER_ID APPSTORE_CONNECT_KEY_ID APPSTORE_CONNECT_KEY_P8; do
+	          if [ -n "$${!n:-}" ]; then FACTS="$$FACTS; $$n: set"; PRESENT=1
+	          else FACTS="$$FACTS; $$n: missing"; fi
+	        done
+	        if [ -n "$$PRESENT" ]; then
+	          NOTARY_STATUS=partial
+	          echo "NOTE: signed, NOT notarized -- the App Store Connect key is only partly"
+	          echo "      configured, and it takes all three names:"
+	          echo "      $${FACTS#; }"
+	          echo "      Add the missing one(s); see the note at the top of this file."
+	        else
+	          echo "NOTE: signed, NOT notarized -- none of the three APPSTORE_CONNECT_* secrets"
+	          echo "      is set. On the machine that built it this app is fine. On anyone"
+	          echo "      else's Mac, Gatekeeper will refuse it and offer no plain way"
+	          echo "      through; see the note at the top of this file for what to create."
+	        fi
+	      else
+	        echo "NOTE: not notarized (nothing to notarize an ad-hoc bundle with). Another"
+	        echo "      person's Mac will refuse to open this; that is expected for a"
+	        echo "      build with no secrets, and it still runs on the machine that made it."
+	      fi
+	      ;;
+	    *)
+	      NOTARY_STATUS=withheld
+	      echo "NOTE: notarization credentials withheld by the workflow"
+	      echo "      (APPSTORE_CONNECT_WITHHELD=$${APPSTORE_CONNECT_WITHHELD}); nothing was submitted."
+	      ;;
+	  esac
 	fi
 
 	# The one-word outcome, written beside the zip rather than inside the .app:

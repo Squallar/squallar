@@ -58,11 +58,14 @@ jobs:
             artifact: target/x86_64-unknown-linux-gnu/release/squallar
           # The artifact is a signed .app in a zip, not the bare executable.
           # `-NOT-NOTARIZED` in the file name is not a warning about these two
-          # rows going wrong: nothing notarizes a per-arch bundle, by design --
-          # `macos-universal` sends the one submission, for the one download.
-          # The name is written by packaging/macos/Makefile from what actually
-          # happened, so it says the true thing here rather than a special case
-          # saying nothing.
+          # rows going wrong. Per-architecture build, never notarized here by
+          # design; the macos-universal job fuses both halves and notarizes
+          # that one -- look there for the notarized artifact. The name is
+          # written by packaging/macos/Makefile from what actually happened,
+          # so it says the true thing here rather than a special case saying
+          # nothing; the Package step's marker is what keeps the recipe from
+          # calling the App Store Connect key "missing" on a row that is not
+          # supposed to have it.
           # Three reasons, and none of them is polish: arm64 macOS refuses to
           # execute an unsigned Mach-O at all, so the old `macos-aarch64`
           # artifact was never runnable; `upload-artifact` drops the executable
@@ -745,9 +748,10 @@ jobs:
       # `MACOS_SIGNING_P12`          base64 of a .p12 signing certificate
       # `MACOS_SIGNING_P12_PASSWORD` its password
       #
-      # Three more exist for notarization -- `MACOS_NOTARY_ISSUER_ID`,
-      # `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_KEY_P8` -- and they are NOT read
-      # here. This step signs; the `macos-universal` job below is what submits
+      # Three more exist for the App Store Connect API key --
+      # `APPSTORE_CONNECT_ISSUER_ID`, `APPSTORE_CONNECT_KEY_ID`,
+      # `APPSTORE_CONNECT_KEY_P8`, one App Manager key shared with the iOS
+      # TestFlight upload -- and they are NOT read here. This step signs; the `macos-universal` job below is what submits
       # to Apple, because it is the job that has both architectures and so is
       # the only one that can send a single submission. What each of the five
       # is, and what a person has to do at developer.apple.com to obtain them,
@@ -789,11 +793,19 @@ jobs:
       # fails the build if the signature it just wrote does not — on every arm,
       # so the check has teeth on a fork pull request and does not wait for a
       # paid Apple account to start working.
+      #
+      # Per-architecture build, never notarized here by design; the
+      # macos-universal job fuses both halves and notarizes that one -- look
+      # there for the notarized artifact. The marker tells the Makefile so:
+      # without it the recipe would report the App Store Connect key as
+      # missing on a row that is not supposed to have it, which is what it
+      # told the person who had just configured all three.
       - name: Package squallar.app
         if: matrix.package == 'macos'
         env:
           MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
           MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPSTORE_CONNECT_WITHHELD: per-arch-row
         run: |
           make -C packaging/macos IN_CONTAINER=1 ARCHIVE=1 \
             ARCH=${{ matrix.macos_arch }} \
@@ -937,9 +949,15 @@ jobs:
         env:
           MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
           MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
-          MACOS_NOTARY_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_ISSUER_ID || '' }}
-          MACOS_NOTARY_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_KEY_ID || '' }}
-          MACOS_NOTARY_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.MACOS_NOTARY_KEY_P8 || '' }}
+          APPSTORE_CONNECT_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_ISSUER_ID || '' }}
+          APPSTORE_CONNECT_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_KEY_ID || '' }}
+          APPSTORE_CONNECT_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_KEY_P8 || '' }}
+          # The same condition, inverted, so the recipe can say "withheld"
+          # rather than "not set" when it was this gate and not the secrets
+          # page that left the three empty. Inverted because GitHub's
+          # `a && b || c` yields c whenever b is the empty string, so the
+          # value has to sit on the true side.
+          APPSTORE_CONNECT_WITHHELD: ${{ (github.event_name != 'push' || github.ref != 'refs/heads/main') && 'not-main-push' || '' }}
         run: |
           make -C packaging/macos ARCH=universal ARCHIVE=1 \
             BIN_ARM64=halves/aarch64/squallar \
@@ -988,8 +1006,20 @@ jobs:
               echo "::error::$ARTIFACT is NOT NOTARIZED: the submission to Apple was attempted and did not complete. The build was not failed for it -- a notary outage, an expired credential or a rate limit is not evidence about this commit -- but this artifact must not be published to anyone. Read the make step's log for the submission id and Apple's reason."
               printf '### macOS: NOT NOTARIZED (submission failed)\n\n`%s` is signed with the Developer ID identity and carries the hardened runtime, but Apple did not return a ticket, so **another Mac will refuse to open it**. The build was not failed for this on purpose: the cause is outside this repository. Do not publish this artifact.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
               ;;
+            no:withheld)
+              echo "::notice::$ARTIFACT is NOT NOTARIZED: the App Store Connect key is handed over only on a push to main, and this is a ${{ github.event_name }} on ${{ github.ref }}. The secrets may well be configured; nothing was submitted to Apple on this event."
+              printf '### macOS: not notarized (credentials withheld)\n\nThe App Store Connect key is passed only on a push to main; this run was never going to use it. `%s` will be refused by any Mac but the one that built it.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            no:partial)
+              echo "::warning::$ARTIFACT is NOT NOTARIZED: the App Store Connect key is only partly configured. The make step's log names which of APPSTORE_CONNECT_ISSUER_ID, APPSTORE_CONNECT_KEY_ID and APPSTORE_CONNECT_KEY_P8 is missing."
+              printf '### macOS: not notarized (key partly configured)\n\nOne or two of the three `APPSTORE_CONNECT_*` secrets are missing; the make step names which. `%s` will be refused by any Mac but the one that built it.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            no:skipped)
+              echo "::notice::$ARTIFACT is NOT NOTARIZED: none of the three APPSTORE_CONNECT_* secrets is set, so nothing was submitted to Apple. packaging/macos/Makefile says what to create."
+              printf '### macOS: not notarized (no credentials configured)\n\nNothing was submitted to Apple, so `%s` will be refused by any Mac but the one that built it.\n' "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
+              ;;
             *)
-              echo "::notice::$ARTIFACT is NOT NOTARIZED (reason: $REASON). Nothing was submitted to Apple on this event. Expected for a pull request, and for a repository whose MACOS_NOTARY_* secrets are not set yet."
+              echo "::notice::$ARTIFACT is NOT NOTARIZED (reason: $REASON). Nothing was submitted to Apple on this event."
               printf '### macOS: not notarized (%s)\n\nNothing was submitted to Apple on this event, so `%s` will be refused by any Mac but the one that built it.\n' "$REASON" "$ARTIFACT" >> "$GITHUB_STEP_SUMMARY"
               ;;
           esac
@@ -1092,15 +1122,37 @@ jobs:
         id: upload
         if: steps.fetch.outcome == 'success'
         env:
-          APPSTORE_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_ISSUER_ID || '' }}
-          APPSTORE_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_KEY_ID || '' }}
-          APPSTORE_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_KEY_P8 || '' }}
+          APPSTORE_CONNECT_ISSUER_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_ISSUER_ID || '' }}
+          APPSTORE_CONNECT_KEY_ID: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_KEY_ID || '' }}
+          APPSTORE_CONNECT_KEY_P8: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.APPSTORE_CONNECT_KEY_P8 || '' }}
+          # Inverted, for the reason given at the macos-universal job: the
+          # value has to sit on the true side of GitHub's `&& ||`.
+          APPSTORE_CONNECT_WITHHELD: ${{ (github.event_name != 'push' || github.ref != 'refs/heads/main') && 'not-main-push' || '' }}
         run: |
-          if [ -z "$APPSTORE_ISSUER_ID$APPSTORE_KEY_ID$APPSTORE_KEY_P8" ]; then
-            echo "state=no-credentials" >> "$GITHUB_OUTPUT"
-            echo "Nothing was sent to Apple on this event."
+          # Three reasons the key can be absent, and "not set" was the right
+          # wording for one of them. The marker is read first, so a key the
+          # gate withheld is never reported as unconfigured; then the three
+          # names are checked one by one, so one missing name is reported as
+          # one, by name and never by value.
+          if [ "${APPSTORE_CONNECT_WITHHELD:-}" = not-main-push ]; then
+            echo "state=withheld" >> "$GITHUB_OUTPUT"
+            echo "NOTE: upload credentials withheld: this is a $GITHUB_EVENT_NAME on $GITHUB_REF, and they are passed only on a push to main. The secrets may well be configured; this run was never going to use them."
             exit 0
           fi
+          facts=""; present=""
+          for n in APPSTORE_CONNECT_ISSUER_ID APPSTORE_CONNECT_KEY_ID APPSTORE_CONNECT_KEY_P8; do
+            if [ -n "${!n:-}" ]; then facts="$facts; $n: set"; present=1; else facts="$facts; $n: missing"; fi
+          done
+          if [ -z "$present" ]; then
+            echo "state=no-credentials" >> "$GITHUB_OUTPUT"
+            echo "NOTE: none of the three APPSTORE_CONNECT_* secrets is set, so nothing was sent to Apple. packaging/ios/Makefile says what to create."
+            exit 0
+          fi
+          case "$facts" in *missing*)
+            echo "state=partial-credentials" >> "$GITHUB_OUTPUT"
+            echo "::warning::the App Store Connect key is only partly configured, so nothing was sent to Apple: ${facts#; }"
+            exit 0 ;;
+          esac
           ipa=$(ls ipa/*.ipa | head -1)
           # Deliberately not fatal, and for the same reason the macOS notary
           # submission is not: an App Store Connect outage, an expired key or a
@@ -1130,8 +1182,20 @@ jobs:
               echo "::error::the signed .ipa was NOT accepted by App Store Connect. The build was not failed for it -- an outage, an expired key or a duplicate CFBundleVersion is not evidence about this commit -- but no new build reached TestFlight. Read the upload step's log for Apple's reason."
               printf '### iOS: NOT uploaded (App Store Connect refused it)\n\nThe .ipa is signed and uploadable, but Apple did not accept it. No new TestFlight build exists for this commit.\n' >> "$GITHUB_STEP_SUMMARY"
               ;;
+            success:withheld)
+              echo "::notice::a signed, uploadable .ipa was built. The App Store Connect key is handed over only on a push to main, and this is a ${{ github.event_name }} on ${{ github.ref }}; the secrets may well be configured. Nothing was sent to Apple on this event."
+              printf '### iOS: signed, not uploaded (credentials withheld)\n\nA distribution-signed `.ipa` exists for this commit. The key is passed only on a push to main; this run was never going to use it.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            success:partial-credentials)
+              echo "::warning::a signed, uploadable .ipa was built, and the App Store Connect key is only partly configured. The upload step's log names which of APPSTORE_CONNECT_ISSUER_ID, APPSTORE_CONNECT_KEY_ID and APPSTORE_CONNECT_KEY_P8 is missing."
+              printf '### iOS: signed, not uploaded (key partly configured)\n\nA distribution-signed `.ipa` exists for this commit. One or two of the three `APPSTORE_CONNECT_*` secrets are missing; the upload step names which.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            success:no-credentials)
+              echo "::notice::a signed, uploadable .ipa was built. None of the three APPSTORE_CONNECT_* secrets is set, so nothing was sent to Apple; packaging/ios/Makefile says what to create."
+              printf '### iOS: signed, not uploaded (no credentials configured)\n\nA distribution-signed `.ipa` exists for this commit. Nothing was sent to Apple.\n' >> "$GITHUB_STEP_SUMMARY"
+              ;;
             success:*)
-              echo "::notice::a signed, uploadable .ipa was built. Nothing was sent to Apple on this event -- expected for a pull request, and for a repository whose APPSTORE_* secrets are not set yet."
+              echo "::notice::a signed, uploadable .ipa was built. Nothing was sent to Apple on this event (state: ${STATE:-none})."
               printf '### iOS: signed, not uploaded\n\nA distribution-signed `.ipa` exists for this commit. Nothing was sent to Apple on this event.\n' >> "$GITHUB_STEP_SUMMARY"
               ;;
             *)

@@ -448,12 +448,12 @@ def main() -> int:
     if not os.path.isfile(a.ipa):
         fail(f"no such file: {a.ipa}")
 
-    issuer = os.environ.get("APPSTORE_ISSUER_ID", "")
-    key_id = os.environ.get("APPSTORE_KEY_ID", "")
-    p8 = os.environ.get("APPSTORE_KEY_P8", "")
-    missing = [n for n, v in (("APPSTORE_ISSUER_ID", issuer),
-                              ("APPSTORE_KEY_ID", key_id),
-                              ("APPSTORE_KEY_P8", p8)) if not v]
+    issuer = os.environ.get("APPSTORE_CONNECT_ISSUER_ID", "")
+    key_id = os.environ.get("APPSTORE_CONNECT_KEY_ID", "")
+    p8 = os.environ.get("APPSTORE_CONNECT_KEY_P8", "")
+    missing = [n for n, v in (("APPSTORE_CONNECT_ISSUER_ID", issuer),
+                              ("APPSTORE_CONNECT_KEY_ID", key_id),
+                              ("APPSTORE_CONNECT_KEY_P8", p8)) if not v]
     if missing:
         fail(f"{', '.join(missing)} not set. All three are required to reach App "
              "Store Connect; see packaging/ios/Makefile for where they come from.")
@@ -468,9 +468,9 @@ def main() -> int:
             try:
                 blob = base64.b64decode(blob, validate=True).decode()
             except Exception:
-                fail("APPSTORE_KEY_P8 is neither PEM text nor valid base64 of it.")
+                fail("APPSTORE_CONNECT_KEY_P8 is neither PEM text nor valid base64 of it.")
         if "-----BEGIN" not in blob:
-            fail("APPSTORE_KEY_P8 decoded to something with no PEM header.")
+            fail("APPSTORE_CONNECT_KEY_P8 decoded to something with no PEM header.")
         with open(key_path, "w") as f:
             f.write(blob if blob.endswith("\n") else blob + "\n")
         os.chmod(key_path, 0o600)
@@ -485,8 +485,8 @@ def main() -> int:
             hint = ""
             if e.status == 401:
                 hint = ("\nA 401 means the token was well formed and the key was "
-                        "not accepted: check APPSTORE_KEY_ID against the key, "
-                        "APPSTORE_ISSUER_ID against the team, and that the key "
+                        "not accepted: check APPSTORE_CONNECT_KEY_ID against the key, "
+                        "APPSTORE_CONNECT_ISSUER_ID against the team, and that the key "
                         "has not been revoked.")
             elif e.status == 403:
                 hint = ("\nA 403 usually means the key's role is too low. "
