@@ -898,11 +898,11 @@ fn an_outlook_day_with_no_ticked_products_has_no_data_to_draw() {
 /// Whether `id` resolves clicks through a hit map, and therefore must answer
 /// [`OverlayHandler::hit_items`] exactly when it answers `prepare_job`.
 fn has_hit_map(id: &LayerId) -> bool {
-    // METAR is the third, and the first that is not a pure texture layer: its
-    // picture carries the station geometry and its cells index the same
-    // observations `hit_items` hands back, so a hover on a plotted station
-    // resolves through the map exactly as a storm report does.
-    *id == known::STORM_REPORTS || *id == known::LIGHTNING || *id == known::METAR
+    // METAR is not here on purpose. Its picture carries the station geometry,
+    // but it is `TextureAndPoint`, and the point pass resolves its clicks from
+    // live projected positions; a hit map beside that was a second answer to
+    // the same click, and the popup paged one station twice.
+    *id == known::STORM_REPORTS || *id == known::LIGHTNING
 }
 
 /// **Every texture kind that renders through a handler has a described job**
@@ -1009,22 +1009,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
             .prepare_job(&ctx, &PaneRef::bare(0))
             .expect("seeded, and the agreement walk pins this");
         let items = handler.hit_items().expect("seeded");
-        if let Some(input) = job.downcast_ref::<rasterize::MetarInput>() {
-            assert_eq!(items.len(), input.obs.len(), "one item per row");
-            for (i, (row, item)) in input.obs.iter().zip(items.iter()).enumerate() {
-                let item = item
-                    .as_any()
-                    .downcast_ref::<super::metar::MetarItem>()
-                    .expect("a metar handler captures station items");
-                assert_eq!(
-                    (item.ob.lat, item.ob.lon),
-                    (row.lat, row.lon),
-                    "{name} row {i} and item {i} are different stations — a \
-                     hover here would name the wrong one, and no downstream \
-                     test can see it because they all zip with this very list",
-                );
-            }
-        } else if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
+        if let Some(input) = job.downcast_ref::<rasterize::ReportsInput>() {
             assert_eq!(items.len(), input.reports.len(), "one item per row");
             for (i, (row, item)) in input.reports.iter().zip(items.iter()).enumerate() {
                 let item = item
@@ -1067,7 +1052,7 @@ fn a_hit_map_kinds_items_align_with_its_described_rows() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 3, "all three hit-map kinds must be walked seeded");
+    assert_eq!(checked, 2, "both hit-map kinds must be walked seeded");
 }
 
 /// **The registry pairing gate, bidirectional.** Every texture handler that

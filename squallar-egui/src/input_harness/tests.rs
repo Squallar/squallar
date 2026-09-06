@@ -12830,6 +12830,257 @@ pub(super) fn ingest_alerts(
     );
 }
 
+// ── METAR: two click paths over one list ─────────────────────────────────
+
+/// One observation, with every field the station model may read left at a
+/// value that draws.
+fn a_station(id: &str, lat: f64, lon: f64) -> squallar_overlays::metar::types::MetarOb {
+    squallar_overlays::metar::types::MetarOb {
+        station_id: id.to_string(),
+        name: String::new(),
+        lat,
+        lon,
+        elev_m: None,
+        temp_c: Some(20.0),
+        dewp_c: Some(10.0),
+        wind_dir: None,
+        wind_speed_kt: Some(10),
+        wind_gust_kt: None,
+        visibility: None,
+        altimeter_hpa: None,
+        mslp_hpa: Some(1013.0),
+        flight_category: None,
+        raw_ob: String::new(),
+        clouds: Vec::new(),
+        wx_string: None,
+        obs_time: String::new(),
+    }
+}
+
+/// Feed observations in through the production ingest path.
+fn ingest_metar(h: &mut InputHarness, obs: Vec<squallar_overlays::metar::types::MetarOb>) {
+    use squallar_overlays::render::overlay_state::{OverlayFetchResult, OverlayRegistry};
+    let networks_asked = 1;
+    h.gui_mut().overlays.apply_fetch_result(
+        OverlayFetchResult {
+            kind: known::METAR,
+            data: OverlayRegistry::metar_payload(squallar_overlays::metar::fetch::MetarRound {
+                observations: obs,
+                failed_networks: Vec::new(),
+                networks_asked,
+            }),
+        },
+        &PaneRef::bare(0),
+    );
+}
+
+/// Stand METAR's cache up the way a landed render leaves it — with **exactly**
+/// the hit map the real dispatch would zip, built by the real rasterizer over
+/// the bounds, size and zoom the last frame asked for. Today that is `None`;
+/// `forced_cells` is how the control puts one there anyway.
+fn settle_metar_cache(
+    h: &mut InputHarness,
+    obs: Vec<squallar_overlays::metar::types::MetarOb>,
+    forced_cells: Option<squallar_overlays::render::rasterize::HitCells>,
+) {
+    let requests: Vec<_> = h
+        .last_actions()
+        .iter()
+        .filter_map(|a| match a {
+            GuiAction::RenderOverlay {
+                pane_idx,
+                overlay_kind,
+                geo_bounds,
+                texture,
+                data_generation,
+                zoom,
+            } if *overlay_kind == known::METAR => {
+                Some((*pane_idx, *geo_bounds, *texture, *data_generation, *zoom))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !requests.is_empty(),
+        "fixture: nothing asked for a METAR raster"
+    );
+    for (pane_idx, geo_bounds, plan, token, zoom) in requests {
+        let coverage = plan.coverage(&geo_bounds);
+        let out = squallar_overlays::render::rasterize::rasterize_metar_stations(
+            &squallar_overlays::render::rasterize::MetarInput {
+                obs: std::sync::Arc::new(obs.clone()),
+                zoom: f64::from(zoom),
+                is_dark: false,
+                device_scale: plan.pixels_per_point,
+            },
+            &coverage,
+            plan.width,
+            plan.height,
+        );
+        let hit_map = forced_cells.clone().or(out.hit_cells).map(|cells| {
+            // The handler answers no items now, so the control supplies the
+            // page-side half from the same list the rasterizer drew.
+            let items: squallar_overlays::render::overlay_state::HitItems = h
+                .gui_mut()
+                .overlays
+                .hit_items(&known::METAR)
+                .unwrap_or_else(|| {
+                    obs.iter()
+                        .map(|ob| {
+                            std::sync::Arc::new(MetarStub(ob.station_id.clone()))
+                                as std::sync::Arc<
+                                    dyn squallar_overlays::render::overlay_state::OverlayItem,
+                                >
+                        })
+                        .collect()
+                });
+            squallar_overlays::render::rasterize::HitMap::from_cells(cells, &items)
+        });
+        let texture = h.ctx.load_texture(
+            format!("settled-metar-{pane_idx}"),
+            egui::ColorImage::filled([1, 1], egui::Color32::RED),
+            egui::TextureOptions::default(),
+        );
+        h.gui_mut().panes_mut()[pane_idx]
+            .overlay_cache_mut(&known::METAR)
+            .show(crate::overlay_cache::OverlayTextureData {
+                texture,
+                placed: squallar_geo::PlacedRaster::of(coverage),
+                data_generation: token,
+                render_zoom: zoom,
+                width: plan.width,
+                height: plan.height,
+                radar_meta: None,
+                hit_map,
+            });
+    }
+}
+
+/// A stand-in for the control's forced hit map: it only has to be an
+/// `OverlayItem` the pane can select.
+#[derive(Debug)]
+struct MetarStub(String);
+
+impl squallar_overlays::render::overlay_state::OverlayItem for MetarStub {
+    fn layer_id(&self) -> LayerId {
+        known::METAR
+    }
+
+    fn popup_content(
+        &self,
+        _prefs: &squallar_units::UserPreferences,
+    ) -> squallar_overlays::render::overlay_state::PopupContent {
+        squallar_overlays::render::overlay_state::PopupContent {
+            title: self.0.clone(),
+            accent_rgb: [80, 80, 80],
+            width: 300.0,
+            sections: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn matches(&self, _other: &dyn squallar_overlays::render::overlay_state::OverlayItem) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// **A click on one station selects one station.**
+///
+/// METAR is the only `RenderMode::TextureAndPoint` layer, so both of the
+/// pane's click paths run for it on one frame. Only one of them answers: the
+/// rasterizer builds no hit map and the handler offers no `hit_items`, so
+/// `draw_overlay` finds nothing to test and `render_per_frame_overlay` alone
+/// resolves the click, from the station's live projected position.
+///
+/// It read 2 before that cut — `["KOKC - ", "KOKC - "]` — because both paths
+/// answered, over the same `state.data` list at the same
+/// `station_model::hit_radius_for_zoom` radius, and nothing between them or in
+/// `ui_popups` dedupes. If this reads 2 again, one station's popup says
+/// "1 of 2" with the same observation on both pages.
+#[test]
+fn a_click_on_a_metar_station_selects_it_once() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&known::METAR);
+    h.warm_up();
+
+    let target = h.pane_rects()[0].center();
+    let ground = h.ground_at(0, target);
+    let obs = vec![a_station("KOKC", ground.y(), ground.x())];
+    ingest_metar(&mut h, obs.clone());
+    h.warm_up();
+    settle_metar_cache(&mut h, obs, None);
+    h.warm_up();
+
+    h.mouse_click(target);
+
+    let selected = &h.gui_mut().overlays.selected_overlays;
+    let prefs = squallar_units::UserPreferences::default();
+    let titles: Vec<String> = selected
+        .iter()
+        .map(|s| s.popup_content(&prefs).title)
+        .collect();
+    assert_eq!(
+        selected.len(),
+        1,
+        "a click on one station selected {} items: {titles:?}",
+        selected.len(),
+    );
+}
+
+/// **The control that keeps the test above from being vacuous.** Same fixture,
+/// same click, with a hit map forced onto the texture that covers the whole
+/// picture. Two here says the texture path is still wired and still able to add
+/// a second copy — so the `1` above is the rasterizer answering no cells, not a
+/// click that stopped landing or a pane that stopped hit-testing.
+#[test]
+fn control_a_forced_metar_hit_map_still_doubles_the_selection() {
+    let mut h = InputHarness::new();
+    h.gui_mut().enable_overlay_for_test(&known::METAR);
+    h.warm_up();
+
+    let target = h.pane_rects()[0].center();
+    let ground = h.ground_at(0, target);
+    let obs = vec![a_station("KOKC", ground.y(), ground.x())];
+    ingest_metar(&mut h, obs.clone());
+    h.warm_up();
+
+    // Every cell names station 0, so wherever in the picture the click lands
+    // the texture path answers it.
+    let plan = h
+        .last_actions()
+        .iter()
+        .find_map(|a| match a {
+            GuiAction::RenderOverlay {
+                overlay_kind,
+                texture,
+                ..
+            } if *overlay_kind == known::METAR => Some(*texture),
+            _ => None,
+        })
+        .expect("fixture: nothing asked for a METAR raster");
+    let (cw, ch) = (plan.width.div_ceil(4), plan.height.div_ceil(4));
+    let cells = squallar_overlays::render::rasterize::HitCells {
+        width: cw,
+        height: ch,
+        cells: (0..cw * ch).map(|idx| (idx, vec![0u32])).collect(),
+    };
+    settle_metar_cache(&mut h, obs, Some(cells));
+    h.warm_up();
+
+    h.mouse_click(target);
+
+    assert_eq!(
+        h.gui_mut().overlays.selected_overlays.len(),
+        2,
+        "a forced hit map did not add a second copy, so the test above cannot \
+         fail and proves nothing about the rasterizer",
+    );
+}
+
 /// A click inside a warning's polygon still selects that warning.
 #[test]
 fn a_click_inside_an_alert_polygon_still_selects_it() {

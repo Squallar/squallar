@@ -765,8 +765,9 @@ squallar_source::impl_job_input!(ReportsInput);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetarInput {
-    /// The observations, in the handler's own order — **row `i` is
-    /// `hit_items()[i]`**, the same index contract every hit-mapped row keeps.
+    /// The observations, in the handler's own order — **row `i` is the
+    /// station the handler's `per_frame_points()[i]` carries as `MapPoint::id`**,
+    /// so the drawn model and its click target are one index apart.
     /// Behind an `Arc` so the page can hold one built row set across the
     /// dispatches whose only moving terms are the scalars below; the wire
     /// carries the rows, never the sharing.
@@ -783,6 +784,18 @@ squallar_source::impl_job_input!(MetarInput);
 /// Everything except the text: see [`PixmapPointPainter`] for why the five
 /// texts a station draws stay behind, and what the 41 shapes that move were
 /// costing.
+///
+/// **No hit map, deliberately** — the one texture layer that builds none. A
+/// METAR click is resolved by the pane's point pass against live projected
+/// positions ([`crate::render::handlers`]' METAR `per_frame_points`), which
+/// tests the same stations at the same
+/// [`station_model::hit_radius_for_zoom`](crate::render::station_model::hit_radius_for_zoom)
+/// radius; a second answer off the picture only duplicated it. It was not
+/// cheap duplication: at 799 stations on a 1568x1424 picture the disc stamp
+/// was 122,354 occupied cells — one `Vec` allocation each, 1.47 MB of the
+/// reply (14.7%), and about 8 MB held for as long as the texture was cached.
+/// Handlers whose clicks have no other answer — storm reports, GLM — still
+/// build one, and for them it is the only click path there is.
 pub fn rasterize_metar_stations(
     input: &MetarInput,
     bounds: &GeoBounds,
@@ -815,10 +828,7 @@ pub fn rasterize_metar_stations(
         zoom: *zoom as f32,
         is_dark: *is_dark,
     };
-    let hit_radius = crate::render::station_model::hit_radius_for_zoom(*zoom as f32) * scale;
-    let mut hit_cells = HitCells::new(width, height);
-
-    for (idx, ob) in obs.iter().enumerate() {
+    for ob in obs.iter() {
         // Into the viewport's frame first, as every point row does.
         let lon = mb.nearest_lon(ob.lon);
         let (px, py) = mb.project(ob.lat, lon, w, h);
@@ -841,33 +851,11 @@ pub fn rasterize_metar_stations(
             let text = crate::render::station_model::StationText::of(ob);
             crate::render::station_model::draw_metar_station(ob, &text, &mut painter, &ctx);
         }
-        // The station's position in the input list **is** its id, the same
-        // contract `hit_items` is index-aligned against. Stepped by 4 because
-        // the cell grid is quarter resolution.
-        let item_id = idx as u32;
-        let min_x = (px - hit_radius).max(0.0) as i32;
-        let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
-        let min_y = (py - hit_radius).max(0.0) as i32;
-        let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
-        let r2 = hit_radius * hit_radius;
-        let mut sy = min_y;
-        while sy <= max_y {
-            let mut sx = min_x;
-            while sx <= max_x {
-                let dx = sx as f32 - px;
-                let dy = sy as f32 - py;
-                if dx * dx + dy * dy <= r2 {
-                    hit_cells.record(sx as f32, sy as f32, item_id);
-                }
-                sx += 4;
-            }
-            sy += 4;
-        }
     }
 
     RasterizeOutput {
         rgba: pixmap.take(),
-        hit_cells: Some(hit_cells),
+        hit_cells: None,
         alpha: AlphaMode::Premultiplied,
         blank: None,
     }

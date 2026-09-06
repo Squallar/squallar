@@ -423,6 +423,19 @@ impl OverlayHandler for MetarHandler {
 
     // ── Per-frame point rendering ─────────────────────────────────────
 
+    /// **Where a METAR click is resolved, and the only place.** This layer is
+    /// `TextureAndPoint`, so the pane runs both of its click paths over one
+    /// layer; these points are the half that answers. The rasterizer builds no
+    /// hit map ([`rasterize::rasterize_metar_stations`]) and this handler
+    /// answers no [`OverlayHandler::hit_items`], so the texture path finds
+    /// nothing to test and the walk below is unopposed.
+    ///
+    /// It was not always: both paths answered, over this same list, at the same
+    /// `station_model::hit_radius_for_zoom` radius, and a click pushed one
+    /// station into `selected_overlays` twice — a popup reading "1 of 2" with
+    /// the same observation on both pages. Resolving here rather than off the
+    /// picture is also what makes the answer a function of where the station is
+    /// **now** instead of where the last raster put it.
     fn per_frame_points(&self) -> &[MapPoint] {
         &self.cached_points
     }
@@ -435,9 +448,12 @@ impl OverlayHandler for MetarHandler {
 
     /// What the rasterizer reads, captured once.
     ///
-    /// **Row `i` is `state.data[i]`'s station**, the indexing
-    /// [`Self::hit_items`] answers — the same contract the storm-reports and
-    /// GLM rows keep, and the one `HitMap::from_cells` zips on.
+    /// **Row `i` is `state.data[i]`'s station**, the same indexing
+    /// [`Self::per_frame_points`] carries in `MapPoint::id`, so a station's
+    /// drawn model and its click target are one index apart from one list.
+    /// Storm reports and GLM keep the stricter form of this contract, where the
+    /// row order is also the hit-map id space `HitMap::from_cells` zips on;
+    /// this layer has no hit map to zip.
     ///
     /// **The rows are built once per poll, not once per dispatch.** An
     /// observation is three `String`s and a `Vec` of cloud layers, and the
@@ -473,25 +489,6 @@ impl OverlayHandler for MetarHandler {
         crate::render::jobs::JOB_CODECS
             .iter()
             .find(|row| row.label == "overlay/metar")
-    }
-
-    /// Index-aligned with [`Self::prepare_job`]'s rows: `hit_items()[i]` **is**
-    /// the station whose observation travelled at row `i`.
-    ///
-    /// The items stay here, page-side, and never ride the wire — which is why
-    /// the six fields the picture does not need can be dropped from it. A
-    /// hover is answered from these, not from anything the worker decoded.
-    fn hit_items(&self) -> Option<crate::render::overlay_state::HitItems> {
-        if self.state.data.is_empty() {
-            return None;
-        }
-        Some(
-            self.state
-                .data
-                .iter()
-                .map(|i| i.clone() as Arc<dyn OverlayItem>)
-                .collect(),
-        )
     }
 
     fn point_hit_radius(&self, zoom: f32) -> f32 {

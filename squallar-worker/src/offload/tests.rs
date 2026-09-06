@@ -3102,19 +3102,22 @@ fn the_metar_render_is_byte_identical_direct_and_via_the_wire() {
         "the metar raster differs between the direct call and the wire — the \
          two paths have stopped being one renderer",
     );
-    let wire_cells = wire_cells.expect("a hit-map kind answers cells over the wire");
-    assert_eq!(
-        Some(&wire_cells),
-        direct.hit_cells.as_ref(),
-        "the hit cells differ between the direct call and the wire — same \
-         picture, different hover targets",
+    // **METAR is the texture layer that answers no cells**, on both sides of
+    // the wire. Its clicks are the pane's point pass alone, against live
+    // projected positions; the disc this rasterizer used to stamp answered the
+    // same stations at the same radius and only duplicated that, at 122,354
+    // `Vec` allocations and 1.47 MB of reply on a 799-station picture. Asserted
+    // on both paths and not just the wire's, because a rasterizer that started
+    // building cells again while the codec dropped them would read as "no cells
+    // on the wire" and still pay every allocation.
+    assert!(
+        direct.hit_cells.is_none(),
+        "the metar rasterizer built hit cells again; its clicks are the point \
+         pass's, so these cells are allocated, encoded, sent and discarded",
     );
-    assert_eq!(
-        ids_of(&wire_cells),
-        HashSet::from([0, 1, 2]),
-        "the three in-box stations must each record cells and the culled \
-         fourth must not: the id space is the row order the dispatch captured \
-         its items in",
+    assert!(
+        wire_cells.is_none(),
+        "a metar reply carried hit cells over the wire",
     );
 }
 

@@ -15,7 +15,7 @@ pub(crate) mod glm;
 mod gmgsi;
 mod labels;
 mod location;
-mod metar;
+pub(crate) mod metar;
 mod model;
 mod mrms;
 pub mod outlook;

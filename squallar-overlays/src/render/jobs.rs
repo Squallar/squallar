@@ -402,8 +402,8 @@ impl JobOutCodec for ReportsJob {
 ///
 /// **The wire carries the twelve fields the drawing reads and no others.**
 /// `name`, `elev_m`, `wind_gust_kt`, `altimeter_hpa`, `raw_ob` and `obs_time`
-/// are hover content, answered page-side from the real items that
-/// `hit_items` holds, and `draw_metar_station` never reads them — which is a
+/// are hover content, answered page-side from the real items the handler's
+/// point pass selects, and `draw_metar_station` never reads them — which is a
 /// claim under test rather than a comment: see
 /// `two_observations_differing_only_in_dropped_fields_paint_identically`.
 pub struct MetarJob;
@@ -578,7 +578,8 @@ impl JobSpec for MetarJob {
             }
             // The six fields the wire does not carry, defaulted. The drawing
             // never reads them; the hover does, and the hover is answered
-            // page-side from `hit_items`, never from a decoded picture.
+            // page-side from the handler's own rows, never from a decoded
+            // picture.
             obs.push(MetarOb {
                 station_id,
                 name: String::new(),
@@ -2000,7 +2001,8 @@ mod tests {
     ///
     /// The codec omits `name`, `elev_m`, `wind_gust_kt`, `altimeter_hpa`,
     /// `raw_ob` and `obs_time` on the grounds that `draw_metar_station` never
-    /// reads them and a hover is answered page-side from `hit_items`. That is
+    /// reads them and a hover is answered page-side from the handler's own
+    /// rows. That is
     /// a claim about behaviour, and a comment asserting it would rot the first
     /// time somebody plots the gust. Here it is a test: two observations that
     /// differ in ALL SIX and in nothing else must record the same calls.
@@ -3274,6 +3276,94 @@ mod tests {
     #[test]
     fn the_reply_round_trips_without_hit_cells() {
         assert_reply_round_trips(&JOB_CODECS[2], vec![9, 8, 7, 6], None);
+    }
+
+    /// **A METAR reply spends zero bytes on a hit map, and the raster
+    /// allocates none building one.**
+    ///
+    /// Counted, not inspected: the reply this row encodes is compared against
+    /// the same reply with the cells block removed by construction, and the
+    /// difference must be zero bytes. A tag-byte assertion would pass just as
+    /// well if the rasterizer went on stamping 122,354 cells and the codec
+    /// threw them away, which is the whole cost minus the transmission.
+    ///
+    /// The fixture must paint and must carry stations, or "no hit bytes" is
+    /// what an empty picture says too.
+    #[test]
+    fn a_metar_reply_carries_no_hit_map_bytes() {
+        use crate::render::rasterize::{MetarInput, rasterize_metar_stations};
+
+        let bounds = squallar_geo::GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.5,
+            min_lon: -98.5,
+            max_lon: -96.0,
+        };
+        let obs: Vec<_> = (0..24)
+            .map(|i| {
+                let mut ob = a_full_station();
+                ob.lat = 34.2 + 0.09 * f64::from(i);
+                ob.lon = -98.3 + 0.09 * f64::from(i);
+                ob
+            })
+            .collect();
+        let stations = obs.len();
+        let out = rasterize_metar_stations(
+            &MetarInput {
+                obs: std::sync::Arc::new(obs),
+                zoom: 7.0,
+                is_dark: false,
+                device_scale: 1.0,
+            },
+            &bounds,
+            256,
+            256,
+        );
+        assert!(
+            crate::render::rasterize::has_ink(&out.rgba),
+            "fixture: {stations} stations painted nothing, so a reply with no \
+             hit bytes would say nothing about hit maps",
+        );
+
+        let row = JOB_CODECS
+            .iter()
+            .find(|row| row.label == "overlay/metar")
+            .expect("the metar row ships");
+        let encode = |cells: Option<HitCells>| {
+            let mut head = Vec::new();
+            let mut tails = Vec::new();
+            (row.encode_out)(
+                DescribedOut(Box::new(RasterizeOutput {
+                    rgba: out.rgba.clone(),
+                    hit_cells: cells,
+                    alpha: AlphaMode::Premultiplied,
+                    blank: out.blank,
+                })),
+                &mut head,
+                &mut tails,
+            );
+            assert!(tails.is_empty(), "the raster reply writes no tails");
+            head.len()
+        };
+
+        let shipped = encode(out.hit_cells.clone());
+        let cellless = encode(None);
+        assert_eq!(
+            shipped - cellless,
+            0,
+            "a metar reply spent {} bytes on a hit map nothing resolves \
+             clicks from; {stations} stations, {} bytes of picture",
+            shipped - cellless,
+            out.rgba.len(),
+        );
+        // The allocation side, after the count: a reply can read zero bytes
+        // while the rasterizer still builds every cell and the codec drops
+        // them, which is the whole cost minus the transmission.
+        assert!(
+            out.hit_cells.is_none(),
+            "the metar rasterizer built hit cells for {stations} stations; \
+             they are allocated and discarded whatever the wire does",
+        );
     }
 
     #[test]

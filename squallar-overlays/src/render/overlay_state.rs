@@ -184,6 +184,11 @@ impl OverlayRegistry {
     }
 
     #[doc(hidden)]
+    pub fn metar_payload(round: crate::metar::fetch::MetarRound) -> FetchPayload {
+        Box::new(super::handlers::metar::MetarFetchResult(Ok(round)))
+    }
+
+    #[doc(hidden)]
     pub fn spc_discussions_payload(
         discussions: Vec<crate::spc::discussion::SpcDiscussion>,
     ) -> FetchPayload {
